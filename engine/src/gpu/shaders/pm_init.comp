@@ -1,0 +1,48 @@
+#version 450
+// PatchMatch step 1: initialise one checkerboard colour of the interior from a
+// fresh random plane. Pixels whose reference window is too flat are marked
+// inactive and never touched again. Runs once per colour, followed by a descent
+// half-sweep of the same colour.
+#include "pm_math.glsl"
+#include "pm_core.glsl"
+
+layout(local_size_x = PM_LANES) in;
+
+void main() {
+    // Staged before any early return: every lane of the workgroup must reach
+    // the shared-memory barrier.
+    stage_views();
+    int lane = int(gl_LocalInvocationID.x);
+    ivec2 p = lane_pixel(lane);
+    int x = p.x;
+    int y = p.y;
+    int w = int(pc.width);
+    int h = int(pc.height);
+    if (x < pc.radius || y < pc.radius || x > w - 1 - pc.radius || y > h - 1 - pc.radius) {
+        return;
+    }
+    if (((x + y) & 1) != int(pc.colour)) {
+        return;
+    }
+    int pixel = y * w + x;
+    if (!window_is_textured(pixel)) {
+        state_active[pixel] = 0u;
+        return;
+    }
+    state_active[pixel] = 1u;
+    vec3 b_p = pixel_bearing(pixel);
+    Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+    Best best;
+    best.depth = -1.0;
+    best.normal = vec3(0.0, 0.0, -1.0);
+    best.cost = 3.402823466e+38;
+    evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p, best);
+    if (best.depth > 0.0) {
+        state_depth[pixel] = best.depth;
+        state_normal[pixel * 3 + 0] = best.normal.x;
+        state_normal[pixel * 3 + 1] = best.normal.y;
+        state_normal[pixel * 3 + 2] = best.normal.z;
+        state_cost[pixel] = best.cost;
+    }
+    keep_bindings_alive(pixel);
+}

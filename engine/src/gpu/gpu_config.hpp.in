@@ -1,0 +1,15 @@
+// Vulkan SDK locations baked at configure time. Included by the backend only.
+#pragma once
+
+#include <string>
+
+namespace alphashape::gpu::detail {
+
+#define ALPHASHAPE_GPU_HAS_VULKAN @ALPHASHAPE_GPU_HAS_VULKAN@
+
+inline constexpr bool kCompiledIn = ALPHASHAPE_GPU_HAS_VULKAN != 0;
+inline constexpr const char* kLibraryPath = "@ALPHASHAPE_VULKAN_LIBRARY@";
+inline constexpr const char* kIcdPath = "@ALPHASHAPE_VULKAN_ICD@";
+inline constexpr const char* kValidationLayerDir = "@ALPHASHAPE_VULKAN_LAYER_DIR@";
+
+}  // namespace alphashape::gpu::detail

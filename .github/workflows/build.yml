@@ -1,0 +1,245 @@
+name: Build
+
+# Reusable build + test + package for Linux, macOS and Windows. Called by ci.yml, nightly.yml,
+# preview.yml and release.yml so every channel builds exactly the same way.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build (default: the triggering commit)
+        type: string
+        default: ""
+      version:
+        description: Version string stamped into archive names
+        type: string
+        default: dev
+      package:
+        description: Produce downloadable archives
+        type: boolean
+        default: false
+      windows-required:
+        description: Fail the call when the Windows job fails (off until the port is complete)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+  CTEST_OUTPUT_ON_FAILURE: "1"
+  OMP_NUM_THREADS: "4"
+  OMP_WAIT_POLICY: passive
+  VMA_TAG: v3.1.0
+
+jobs:
+  linux:
+    name: Linux x86-64 (GCC, lavapipe)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache \
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
+            libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
+            mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          sudo mkdir -p /usr/include/vma
+          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+            "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-gcc-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-gcc-${{ github.ref_name }}-
+            ccache-linux-gcc-main-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # A missing Vulkan tool silently turns the GPU layer off; refuse that in CI.
+          grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test (GPU suites on Mesa lavapipe)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          vulkaninfo --summary | head -20 || true
+          ctest --test-dir build --parallel 4 --timeout 3600
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Package
+        if: inputs.package
+        run: |
+          name="alphashape-${{ inputs.version }}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp build/src/apps/cli/alphashape-cli "dist/$name/"
+          find build/python -maxdepth 2 -name 'alphashape*.so' -exec cp {} "dist/$name/" \;
+          cp README.md LICENSE engine/LIMITATIONS.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.package
+        with:
+          name: alphashape-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 (Clang, MoltenVK)
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install dependencies
+        run: |
+          brew install ninja ccache eigen ceres-solver proj libtiff libpng jpeg-turbo googletest \
+            pybind11 libomp molten-vk vulkan-loader vulkan-headers vulkan-tools shaderc spirv-tools \
+            vulkan-validationlayers
+          prefix="$(brew --prefix)"
+          mkdir -p "$prefix/include/vma"
+          curl -fsSL -o "$prefix/include/vma/vk_mem_alloc.h" \
+            "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-macos-clang-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-clang-${{ github.ref_name }}-
+            ccache-macos-clang-main-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_WARNINGS_AS_ERRORS=ON -DALPHASHAPE_GPU=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp
+
+      - name: Build
+        run: cmake --build build --parallel 3
+
+      - name: Test (GPU suites on the runner's Apple paravirtual GPU via MoltenVK)
+        run: |
+          vulkaninfo --summary | head -20 || true
+          ctest --test-dir build --parallel 3 --timeout 3600
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Package
+        if: inputs.package
+        run: |
+          name="alphashape-${{ inputs.version }}-macos-arm64"
+          mkdir -p "dist/$name"
+          cp build/src/apps/cli/alphashape-cli "dist/$name/"
+          find build/python -maxdepth 2 -name 'alphashape*.so' -exec cp {} "dist/$name/" \;
+          cp README.md LICENSE engine/LIMITATIONS.md "dist/$name/"
+          codesign --force --sign - "dist/$name/alphashape-cli"
+          (cd dist && zip -qry "$name.zip" "$name")
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.package
+        with:
+          name: alphashape-macos-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86-64 (clang-cl, CPU only)
+    runs-on: windows-2022
+    timeout-minutes: 300
+    continue-on-error: ${{ !inputs.windows-required }}
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: vcpkg-x64-windows-
+
+      - name: Install dependencies (vcpkg)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
+            $env:VCPKG_PACKAGES.Split(' ')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows -DALPHASHAPE_WARNINGS_AS_ERRORS=ON `
+            -DALPHASHAPE_BUILD_PYTHON=OFF -DALPHASHAPE_GPU=OFF
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          cmake --build build --parallel 4
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          ctest --test-dir build --parallel 4 --timeout 3600
+
+      - name: Package
+        if: inputs.package
+        shell: pwsh
+        run: |
+          $name = "alphashape-${{ inputs.version }}-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist\$name" | Out-Null
+          Copy-Item build\src\apps\cli\alphashape-cli.exe "dist\$name\"
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" "dist\$name\"
+          Copy-Item "C:\Program Files\LLVM\bin\libomp.dll" "dist\$name\" -ErrorAction SilentlyContinue
+          Copy-Item README.md, LICENSE, engine\LIMITATIONS.md "dist\$name\"
+          Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.package
+        with:
+          name: alphashape-windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error

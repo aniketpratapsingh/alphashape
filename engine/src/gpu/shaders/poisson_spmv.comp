@@ -1,0 +1,168 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// One CG step, part 1: q = A p_k and the search direction itself, fused.
+//
+//   p_k = z + beta * p_{k-1}     (z = r * inv_diag, stored by the update; the
+//                                 direction is materialised into p_new)
+//   q   = A p_k                  (screened Poisson operator)
+//   pq  = sum(p_k . q)           (balanced pairwise partials, then a
+//                                 last-workgroup reduction -> alpha)
+//
+// Folding the search-direction recurrence into the stencil is what keeps a CG
+// iteration at TWO dispatches: the global reduction of p.q must sit between
+// q = A p and the x/r update, and beta is only known after that update, so a
+// separate direction pass would be a third. beta is written by the previous
+// iteration's update dispatch, so p_k is exact.
+//
+// A = -Delta + alpha_s W. -Delta is the 7-point Neumann Laplacian
+// (n_i p_i - sum_j p_j) / h^2 over the in-grid neighbours only (zero-flux
+// boundary); W is the per-voxel splat weight. Same stencil and operation order
+// as PoissonSystem::apply() on the CPU.
+//
+// MEMORY. The operator is bandwidth-bound on unified memory. Two shared-memory
+// tilings were tried and both measured slower than the plain version below (a
+// haloed 64 x 4 in-plane tile: 1.11 ms against 1.04 ms per dispatch; a haloed
+// 32 x 8 x 4 volumetric tile: 1.7 ms): the staging pass costs more than the
+// neighbour re-reads it saves. The six in-plane taps are L1/L2 hits either way
+// because a warp row covers a coalesced run of x.
+//
+// The workgroup reduction is a balanced pairwise tree, so a partial is a pure
+// function of the inputs. The last workgroup sums the partials in FIXED index
+// order (independent of which workgroup arrives last), so the solve is
+// deterministic. M1 has no fp64: the on-device sums are float, and the host
+// re-sums the same partials in double for the convergence decision.
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(binding = 0) buffer POld { float p_old[]; };
+layout(binding = 1) buffer PNew { float p_new[]; };
+layout(binding = 2) buffer Q { float q[]; };
+layout(binding = 3) buffer Weight { float weight[]; };
+layout(binding = 4) buffer Partials { float partial[]; };
+layout(binding = 5) buffer Scalars { float scalars[]; };
+layout(binding = 6) buffer Counters { uint counters[]; };
+layout(binding = 7) buffer Z { float z[]; };
+
+layout(push_constant) uniform Params {
+    uint nx;
+    uint ny;
+    uint nz;
+    uint n;
+    uint groups;
+    float inv_h2;
+    float alpha;
+} pc;
+
+// Warp-level reduction: each subgroup reduces its lanes with one shuffle tree,
+// one lane per subgroup writes to shared memory, and lane 0 of the workgroup
+// combines the subgroup totals. That is one barrier instead of the eight a
+// shared-memory tree needs, and it is what keeps the fused reduction from
+// dominating the dispatch.
+//
+// SAFETY: every buffer index below is bounded. gl_SubgroupID < gl_NumSubgroups
+// <= gl_WorkGroupSize == 256, so warp_sums is sized to the workgroup and the
+// combine loop is bounded by gl_NumSubgroups (never more than 256 iterations);
+// linear_group is checked against pc.groups before it indexes `partial`; the
+// voxel index is checked against the pushed pc.n before any access. Every loop
+// in this kernel is bounded by a compile-time constant or a push constant.
+shared float warp_sums[256];
+shared float scratch[256];
+shared uint is_last;
+shared uint linear_group;
+
+/// The search direction at a global voxel.
+float direction(uint i) { return z[i] + scalars[3] * p_old[i]; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.y * 64u + gl_LocalInvocationID.x;
+    if (tid == 0u) {
+        linear_group = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) *
+                           gl_NumWorkGroups.x +
+                       gl_WorkGroupID.x;
+    }
+    barrier();
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    const uint zz = gl_WorkGroupID.z;
+    float contribution = 0.0;
+    // The voxel index is formed from the dispatch ids and then checked against
+    // the pushed size BEFORE it dereferences anything: no buffer index in this
+    // kernel is reachable unless i < pc.n. Because the host dispatches exactly
+    // (ceil(nx/64), ceil(ny/4), nz) groups, the guards below are also what makes
+    // the stencil taps either in-range or provably skipped.
+    const uint plane = pc.nx * pc.ny;
+    const uint i = zz * plane + y * pc.nx + x;
+    if (x < pc.nx && y < pc.ny && i < pc.n) {
+        const float own = direction(i);
+        float sum = 0.0;
+        float count = 0.0;
+        if (x > 0u) {
+            sum += direction(i - 1u);
+            count += 1.0;
+        }
+        if (x + 1u < pc.nx) {
+            sum += direction(i + 1u);
+            count += 1.0;
+        }
+        if (y > 0u) {
+            sum += direction(i - pc.nx);
+            count += 1.0;
+        }
+        if (y + 1u < pc.ny) {
+            sum += direction(i + pc.nx);
+            count += 1.0;
+        }
+        if (zz > 0u) {
+            sum += direction(i - plane);
+            count += 1.0;
+        }
+        if (zz + 1u < pc.nz) {
+            sum += direction(i + plane);
+            count += 1.0;
+        }
+        const float value = (count * own - sum) * pc.inv_h2 + pc.alpha * weight[i] * own;
+        q[i] = value;
+        p_new[i] = own;
+        contribution = own * value;
+    }
+    contribution = subgroupAdd(contribution);
+    if (subgroupElect()) {
+        warp_sums[gl_SubgroupID] = contribution;
+    }
+    barrier();
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) {
+            total += warp_sums[k];
+        }
+        if (linear_group < pc.groups) {
+            partial[linear_group] = total;
+        }
+        memoryBarrierBuffer();
+        is_last = (atomicAdd(counters[0], 1u) == pc.groups - 1u) ? 1u : 0u;
+    }
+    barrier();
+    if (is_last != 0u) {
+        memoryBarrierBuffer();
+        // Fixed index order over the dispatcher's own group count: one partial
+        // per workgroup, so every k below is a live, written slot.
+        float total = 0.0;
+        for (uint k = tid; k < pc.groups; k += 256u) {
+            total += partial[k];
+        }
+        scratch[tid] = total;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            const float pq = scratch[0];
+            scalars[1] = pq;
+            scalars[2] = pq > 0.0 ? scalars[0] / pq : 0.0;  // alpha; 0 stalls CG safely
+            counters[0] = 0u;
+            memoryBarrierBuffer();
+        }
+    }
+}

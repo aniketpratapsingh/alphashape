@@ -1,0 +1,413 @@
+#include "common/core/chunk.hpp"
+
+#include <cstddef>
+
+#include "common/core/frame.hpp"
+
+namespace alphashape {
+
+namespace {
+
+/// "<Kind> <n>" with the smallest n >= 1 not already used as an exact label in
+/// `existing`. Keeps labels stable when assets are added and removed.
+template <class Slot>
+std::string default_asset_label(const std::vector<Slot>& existing, const char* kind) {
+    for (int n = 1;; ++n) {
+        const std::string candidate = std::string(kind) + " " + std::to_string(n);
+        bool taken = false;
+        for (const auto& slot : existing) {
+            if (slot.label == candidate) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) {
+            return candidate;
+        }
+    }
+}
+
+/// Copy a slot vector with deep-cloned payloads. AssetSlot::data is a
+/// shared_ptr, so the implicit copy would alias the payload; every slot gets
+/// its own payload object here.
+template <class Slot>
+std::vector<Slot> clone_slots(const std::vector<Slot>& source) {
+    std::vector<Slot> out = source;
+    for (auto& slot : out) {
+        if (slot.data) {
+            slot.data = std::make_shared<typename Slot::value_type>(*slot.data);
+        } else {
+            slot.data = std::make_shared<typename Slot::value_type>();
+        }
+    }
+    return out;
+}
+
+template <class Slot>
+Slot* find_slot(std::vector<Slot>& slots, std::int32_t id) {
+    for (auto& slot : slots) {
+        if (slot.id == id) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+template <class Slot>
+const Slot* find_slot(const std::vector<Slot>& slots, std::int32_t id) {
+    for (const auto& slot : slots) {
+        if (slot.id == id) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+/// Append `slot` keeping the vector sorted by id (ids are allocated
+/// monotonically, so this is almost always a push_back).
+template <class Slot>
+Slot& append_slot(std::vector<Slot>& slots, Slot slot) {
+    auto it = slots.begin();
+    while (it != slots.end() && it->id < slot.id) {
+        ++it;
+    }
+    return *slots.insert(it, std::move(slot));
+}
+
+}  // namespace
+
+Chunk::Chunk(std::string label) : label_(std::move(label)) {}
+
+Chunk::Chunk(const Chunk& other) { copy_from(other); }
+
+Chunk& Chunk::operator=(const Chunk& other) {
+    if (this != &other) {
+        copy_from(other);
+    }
+    return *this;
+}
+
+void Chunk::copy_from(const Chunk& other) {
+    id_ = other.id_;
+    label_ = other.label_;
+    sensors_ = other.sensors_;
+    cameras_ = other.cameras_;
+    frames_ = other.frames_;
+    tie_points_ = other.tie_points_;
+
+    point_clouds_ = clone_slots(other.point_clouds_);
+    active_point_cloud_id_ = other.active_point_cloud_id_;
+    models_ = clone_slots(other.models_);
+    active_model_id_ = other.active_model_id_;
+    depth_map_sets_ = clone_slots(other.depth_map_sets_);
+    active_depth_maps_id_ = other.active_depth_maps_id_;
+    elevations_ = clone_slots(other.elevations_);
+    active_elevation_id_ = other.active_elevation_id_;
+    orthomosaics_ = clone_slots(other.orthomosaics_);
+    active_orthomosaic_id_ = other.active_orthomosaic_id_;
+
+    next_id_ = other.next_id_;
+    markers_ = other.markers_;
+    marker_groups_ = other.marker_groups_;
+    scalebars_ = other.scalebars_;
+    camera_groups_ = other.camera_groups_;
+    masks_ = other.masks_;
+    shapes_ = other.shapes_;
+    trajectories_ = other.trajectories_;
+    panorama_ = other.panorama_;
+    if (panorama_.has_value()) {
+        panorama_->data = panorama_->data
+                              ? std::make_shared<Image>(*other.panorama_->data)
+                              : std::make_shared<Image>();
+    }
+    tiled_models_ = clone_slots(other.tiled_models_);
+    active_tiled_model_id_ = other.active_tiled_model_id_;
+
+    region_ = other.region_;
+    transform_ = other.transform_;
+    meta_ = other.meta_;
+    crs_ = other.crs_;
+}
+
+// -- asset addition --------------------------------------------------------
+
+PointCloudAsset& Chunk::add_point_cloud(std::string label) {
+    PointCloudAsset slot;
+    slot.id = allocate_id();
+    slot.label = label.empty() ? default_asset_label(point_clouds_, "Point Cloud")
+                               : std::move(label);
+    active_point_cloud_id_ = slot.id;
+    return append_slot(point_clouds_, std::move(slot));
+}
+
+ModelAsset& Chunk::add_model(std::string label) {
+    ModelAsset slot;
+    slot.id = allocate_id();
+    slot.label = label.empty() ? default_asset_label(models_, "Model") : std::move(label);
+    active_model_id_ = slot.id;
+    return append_slot(models_, std::move(slot));
+}
+
+DepthMapsAsset& Chunk::add_depth_maps(std::string label) {
+    DepthMapsAsset slot;
+    slot.id = allocate_id();
+    slot.label = label.empty() ? default_asset_label(depth_map_sets_, "Depth Maps")
+                               : std::move(label);
+    active_depth_maps_id_ = slot.id;
+    return append_slot(depth_map_sets_, std::move(slot));
+}
+
+ElevationAsset& Chunk::add_elevation(std::string label) {
+    ElevationAsset slot;
+    slot.id = allocate_id();
+    slot.label =
+        label.empty() ? default_asset_label(elevations_, "Elevation") : std::move(label);
+    active_elevation_id_ = slot.id;
+    return append_slot(elevations_, std::move(slot));
+}
+
+OrthomosaicAsset& Chunk::add_orthomosaic(std::string label) {
+    OrthomosaicAsset slot;
+    slot.id = allocate_id();
+    slot.label = label.empty() ? default_asset_label(orthomosaics_, "Orthomosaic")
+                               : std::move(label);
+    active_orthomosaic_id_ = slot.id;
+    return append_slot(orthomosaics_, std::move(slot));
+}
+
+// -- legacy single-slot accessors -----------------------------------------
+// Const overloads fall back to shared empty singletons when the vector is
+// empty; non-const overloads lazily create (and activate) the first asset.
+
+namespace {
+
+const PointCloud& empty_point_cloud() {
+    static const PointCloud empty;
+    return empty;
+}
+const Mesh& empty_model() {
+    static const Mesh empty;
+    return empty;
+}
+const std::vector<DepthMap>& empty_depth_maps() {
+    static const std::vector<DepthMap> empty;
+    return empty;
+}
+const std::vector<Image>& empty_textures() {
+    static const std::vector<Image> empty;
+    return empty;
+}
+const Elevation& empty_elevation() {
+    static const Elevation empty;
+    return empty;
+}
+const Orthomosaic& empty_orthomosaic() {
+    static const Orthomosaic empty;
+    return empty;
+}
+
+}  // namespace
+
+std::vector<DepthMap>& Chunk::depth_maps() {
+    if (depth_map_sets_.empty()) {
+        add_depth_maps();
+    }
+    DepthMapsAsset* slot = find_slot(depth_map_sets_, active_depth_maps_id_);
+    if (slot == nullptr) {
+        slot = &depth_map_sets_.front();
+    }
+    return *slot->data;
+}
+
+const std::vector<DepthMap>& Chunk::depth_maps() const {
+    const DepthMapsAsset* slot = find_slot(depth_map_sets_, active_depth_maps_id_);
+    return slot == nullptr ? empty_depth_maps() : *slot->data;
+}
+
+PointCloud& Chunk::point_cloud() {
+    if (point_clouds_.empty()) {
+        add_point_cloud();
+    }
+    PointCloudAsset* slot = find_slot(point_clouds_, active_point_cloud_id_);
+    if (slot == nullptr) {
+        slot = &point_clouds_.front();
+    }
+    return *slot->data;
+}
+
+const PointCloud& Chunk::point_cloud() const {
+    const PointCloudAsset* slot = find_slot(point_clouds_, active_point_cloud_id_);
+    return slot == nullptr ? empty_point_cloud() : *slot->data;
+}
+
+Mesh& Chunk::model() {
+    if (models_.empty()) {
+        add_model();
+    }
+    ModelAsset* slot = find_slot(models_, active_model_id_);
+    if (slot == nullptr) {
+        slot = &models_.front();
+    }
+    return *slot->data;
+}
+
+const Mesh& Chunk::model() const {
+    const ModelAsset* slot = find_slot(models_, active_model_id_);
+    return slot == nullptr ? empty_model() : *slot->data;
+}
+
+std::vector<Image>& Chunk::model_textures() {
+    if (models_.empty()) {
+        add_model();
+    }
+    ModelAsset* slot = find_slot(models_, active_model_id_);
+    if (slot == nullptr) {
+        slot = &models_.front();
+    }
+    return slot->textures;
+}
+
+const std::vector<Image>& Chunk::model_textures() const {
+    const ModelAsset* slot = find_slot(models_, active_model_id_);
+    return slot == nullptr ? empty_textures() : slot->textures;
+}
+
+Elevation& Chunk::elevation() {
+    if (elevations_.empty()) {
+        add_elevation();
+    }
+    ElevationAsset* slot = find_slot(elevations_, active_elevation_id_);
+    if (slot == nullptr) {
+        slot = &elevations_.front();
+    }
+    return *slot->data;
+}
+
+const Elevation& Chunk::elevation() const {
+    const ElevationAsset* slot = find_slot(elevations_, active_elevation_id_);
+    return slot == nullptr ? empty_elevation() : *slot->data;
+}
+
+Orthomosaic& Chunk::orthomosaic() {
+    if (orthomosaics_.empty()) {
+        add_orthomosaic();
+    }
+    OrthomosaicAsset* slot = find_slot(orthomosaics_, active_orthomosaic_id_);
+    if (slot == nullptr) {
+        slot = &orthomosaics_.front();
+    }
+    return *slot->data;
+}
+
+const Orthomosaic& Chunk::orthomosaic() const {
+    const OrthomosaicAsset* slot = find_slot(orthomosaics_, active_orthomosaic_id_);
+    return slot == nullptr ? empty_orthomosaic() : *slot->data;
+}
+
+KeypointSet* TiePoints::find_by_camera(std::int32_t camera_id) {
+    for (auto& set : keypoint_sets) {
+        if (set.camera_id == camera_id) {
+            return &set;
+        }
+    }
+    return nullptr;
+}
+
+const KeypointSet* TiePoints::find_by_camera(std::int32_t camera_id) const {
+    for (const auto& set : keypoint_sets) {
+        if (set.camera_id == camera_id) {
+            return &set;
+        }
+    }
+    return nullptr;
+}
+
+std::size_t TiePoints::total_keypoints() const {
+    std::size_t total = 0;
+    for (const auto& set : keypoint_sets) {
+        total += set.keypoints.size();
+    }
+    return total;
+}
+
+bool Chunk::operator==(const Chunk& other) const {
+    if (id_ != other.id_ || label_ != other.label_) {
+        return false;
+    }
+    if (sensors_ != other.sensors_ || cameras_ != other.cameras_) {
+        return false;
+    }
+    if (frames_.size() != other.frames_.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < frames_.size(); ++i) {
+        if (!(*frames_[i] == *other.frames_[i])) {
+            return false;
+        }
+    }
+    if (!(tie_points_ == other.tie_points_)) {
+        return false;
+    }
+    if (!(point_clouds_ == other.point_clouds_) ||
+        active_point_cloud_id_ != other.active_point_cloud_id_) {
+        return false;
+    }
+    if (!(models_ == other.models_) || active_model_id_ != other.active_model_id_) {
+        return false;
+    }
+    if (!(depth_map_sets_ == other.depth_map_sets_) ||
+        active_depth_maps_id_ != other.active_depth_maps_id_) {
+        return false;
+    }
+    if (!(elevations_ == other.elevations_) ||
+        active_elevation_id_ != other.active_elevation_id_) {
+        return false;
+    }
+    if (!(orthomosaics_ == other.orthomosaics_) ||
+        active_orthomosaic_id_ != other.active_orthomosaic_id_) {
+        return false;
+    }
+    if (next_id_ != other.next_id_ || markers_ != other.markers_ ||
+        marker_groups_ != other.marker_groups_ || scalebars_ != other.scalebars_ ||
+        camera_groups_ != other.camera_groups_ || !(masks_ == other.masks_) ||
+        !(shapes_ == other.shapes_) ||
+        !(trajectories_ == other.trajectories_)) {
+        return false;
+    }
+    if (panorama_.has_value() != other.panorama_.has_value()) {
+        return false;
+    }
+    if (panorama_.has_value() && !(*panorama_ == *other.panorama_)) {
+        return false;
+    }
+    if (!(tiled_models_ == other.tiled_models_) ||
+        active_tiled_model_id_ != other.active_tiled_model_id_) {
+        return false;
+    }
+    if (!(region_ == other.region_) || !(meta_ == other.meta_) ||
+        !(crs_ == other.crs_)) {
+        return false;
+    }
+    return transform_ == other.transform_;
+}
+
+// -- coordinate system -----------------------------------------------------
+
+crs::CoordinateSystem Chunk::coordinate_system() const {
+#if defined(ALPHASHAPE_USE_PROJ)
+    return static_cast<crs::CoordinateSystem>(crs_);
+#else
+    throw Error("coordinate systems need a build with PROJ (ALPHASHAPE_USE_PROJ=ON)");
+#endif
+}
+
+void Chunk::set_coordinate_system(const crs::CoordinateSystem& cs) {
+#if defined(ALPHASHAPE_USE_PROJ)
+    crs_ = CRS(cs);
+#else
+    static_cast<void>(cs);
+    throw Error("coordinate systems need a build with PROJ (ALPHASHAPE_USE_PROJ=ON)");
+#endif
+}
+
+}  // namespace alphashape

@@ -1,0 +1,35 @@
+#version 450
+// One partial sum per workgroup over a strided segment. The launch is 2D (x
+// <= 256 groups) and each group g sums delta[g], delta[g + G*256], ... where G
+// is the total group count, so consecutive lanes in a group stay on consecutive
+// entries and the partial order is fixed. The caller sums the partials on the
+// CPU in double. Workgroup size must be 256 (shared scratch below).
+#include "tvl1_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer Delta { float delta[]; };
+layout(binding = 1) buffer Partials { float partial[]; };
+
+shared float scratch[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint groups = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    const uint group = gl_GlobalInvocationID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    float sum = 0.0;
+    for (uint i = group * 256u + tid; i < pc.voxel_count; i += groups * 256u) {
+        sum += delta[i];
+    }
+    scratch[tid] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        partial[group] = scratch[0];
+    }
+}

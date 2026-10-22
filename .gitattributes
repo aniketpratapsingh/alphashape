@@ -1,0 +1,11 @@
+*.xml text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.comp text eol=lf
+*.glsl text eol=lf
+*.sh text eol=lf
+*.bin binary
+*.tif binary
+*.jpg binary
+*.png binary
+docs/**/*.md text

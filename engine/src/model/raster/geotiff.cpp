@@ -1,0 +1,759 @@
+// GeoTIFF 1.1 writer/reader implemented directly against TIFF 6.0 via libtiff.
+// See geotiff.hpp for the interface. Tag numbers come from the GeoTIFF 1.1
+// spec (OGC 19-008r4): ModelPixelScale 33550, ModelTiepoint 33922,
+// GeoKeyDirectory 34735, and GDAL's private GDAL_NODATA 42113.
+#include "model/raster/geotiff.hpp"
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include <tiffio.h>
+
+#include "base/utils/error.hpp"
+
+namespace alphashape {
+namespace {
+
+// --- GeoTIFF tag numbers ------------------------------------------------
+constexpr std::uint32_t kTagModelPixelScale = 33550;
+constexpr std::uint32_t kTagModelTiepoint = 33922;
+constexpr std::uint32_t kTagGeoKeyDirectory = 34735;
+constexpr std::uint32_t kTagGdalNodata = 42113;
+
+// --- GeoKey IDs ---------------------------------------------------------
+constexpr std::uint16_t kKeyGtModelType = 1024;
+constexpr std::uint16_t kKeyGtRasterType = 1025;
+constexpr std::uint16_t kKeyGeographicType = 2048;
+constexpr std::uint16_t kKeyProjectedCstType = 3072;
+
+constexpr std::uint16_t kModelProjected = 1;
+constexpr std::uint16_t kModelGeographic = 2;
+constexpr std::uint16_t kModelUserDefined = 32767;
+constexpr std::uint16_t kRasterTypePixelIsArea = 1;
+
+/// A 4xxx EPSG code is a geographic CRS; the special-cased 4326 always is.
+bool is_geographic_epsg(int epsg) { return epsg >= 4000 && epsg <= 4999; }
+
+/// The extender libtiff installed before us, so our hook can chain to it.
+TIFFExtendProc g_parent_extender = nullptr;
+
+/// Merges the four private GeoTIFF/GDAL tags into ONE handle. libtiff keeps no
+/// process-global slot for custom fields: the fields live on the handle, so
+/// this must run for every TIFF we open (not once per process).
+void merge_geotiff_fields(TIFF* tif) {
+    // field_readcount/field_writecount of TIFF_VARIABLE says "a count is passed
+    // alongside the data" (TIFFSetField(tif, tag, count, ptr)) — the same
+    // convention libgeotiff uses. GDAL_NODATA is a passcount-less ASCII string,
+    // matching how GDAL itself declares it. The names must outlive the handle,
+    // hence static storage.
+    static char kNamePixelScale[] = "ModelPixelScaleTag";
+    static char kNameTiepoint[] = "ModelTiepointTag";
+    static char kNameGeoKeys[] = "GeoKeyDirectoryTag";
+    static char kNameNodata[] = "GDAL_NODATA";
+    static const TIFFFieldInfo fields[] = {
+        {kTagModelPixelScale, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
+         kNamePixelScale},
+        {kTagModelTiepoint, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
+         kNameTiepoint},
+        {kTagGeoKeyDirectory, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_SHORT, FIELD_CUSTOM, 1, 1,
+         kNameGeoKeys},
+        {kTagGdalNodata, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII, FIELD_CUSTOM, 1, 0,
+         kNameNodata},
+    };
+    TIFFMergeFieldInfo(tif, fields, static_cast<std::uint32_t>(std::size(fields)));
+}
+
+/// Tag extender: libtiff calls this from TIFFClientOpen on EVERY handle, right
+/// after the standard tags are registered, which is the only supported place to
+/// add custom fields. Installed once per process via install_geotiff_tags().
+void geotiff_tag_extender(TIFF* tif) {
+    merge_geotiff_fields(tif);
+    if (g_parent_extender != nullptr) {
+        g_parent_extender(tif);
+    }
+}
+
+/// Installs the extender exactly once for the process (thread-safe via
+/// call_once; this only guards the one-time global install, not tag merging).
+void install_geotiff_tags() {
+    static std::once_flag once;
+    std::call_once(once, [] { g_parent_extender = TIFFSetTagExtender(geotiff_tag_extender); });
+}
+
+// --- Silence libtiff, collecting the message into the thrown exception ---
+
+/// Per-handle handlers so a corrupt file produces an exception and not a wall
+/// of stderr text, without mutating libtiff's process-global handlers (which
+/// would race with another thread decoding at the same time). Mirrors the
+/// approach in image/io/tiff_codec.cpp.
+struct TiffOpener {
+    TIFFOpenOptions* options = nullptr;
+    std::string last_message;
+
+    TiffOpener() : options(TIFFOpenOptionsAlloc()) {}
+    ~TiffOpener() {
+        if (options != nullptr) {
+            TIFFOpenOptionsFree(options);
+        }
+    }
+    TiffOpener(const TiffOpener&) = delete;
+    TiffOpener& operator=(const TiffOpener&) = delete;
+
+    static int handler(TIFF* /*tif*/, void* user, const char* module, const char* fmt,
+                       va_list ap) {
+        if (user != nullptr) {
+            auto* self = static_cast<TiffOpener*>(user);
+            char buffer[512];
+            // libtiff hands us a printf format plus a va_list; formatting it is
+            // exactly the point, so the non-literal warning is silenced here.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
+            const int n = std::vsnprintf(buffer, sizeof(buffer), fmt, ap);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+            self->last_message.assign(buffer, n > 0 ? static_cast<std::size_t>(n) : 0U);
+            if (module != nullptr) {
+                self->last_message += " (";
+                self->last_message += module;
+                self->last_message += ")";
+            }
+        }
+        return 1;  // handled: print nothing
+    }
+
+    TIFF* open(const std::string& path, const char* mode) {
+        if (options == nullptr) {
+            throw ProjectIOError("GeoTIFF: cannot allocate TIFF open options");
+        }
+        // The extender must be installed before the handle is created: libtiff
+        // invokes it from inside the open path to add our custom fields.
+        install_geotiff_tags();
+        TIFFOpenOptionsSetErrorHandlerExtR(options, handler, this);
+        TIFFOpenOptionsSetWarningHandlerExtR(options, handler, this);
+        TIFF* tif = TIFFOpenExt(path.c_str(), mode, options);
+        if (tif == nullptr) {
+            throw ProjectIOError("GeoTIFF: cannot open '" + path + "'" +
+                                 (last_message.empty() ? "" : " (" + last_message + ")"));
+        }
+        return tif;
+    }
+};
+
+/// RAII close.
+struct TiffCloser {
+    TIFF* tif = nullptr;
+    TiffCloser() = default;
+    ~TiffCloser() {
+        if (tif != nullptr) {
+            TIFFClose(tif);
+        }
+    }
+    TiffCloser(const TiffCloser&) = delete;
+    TiffCloser& operator=(const TiffCloser&) = delete;
+};
+
+void validate_grid(const RasterGrid& g, const char* what) {
+    if (g.width <= 0 || g.height <= 0) {
+        throw ValueError(std::string("GeoTIFF: ") + what + " has non-positive dimensions");
+    }
+    if (!(g.pixel_size_x > 0.0) || !(g.pixel_size_y > 0.0)) {
+        throw ValueError(std::string("GeoTIFF: ") + what + " has non-positive pixel size");
+    }
+}
+
+/// Builds the 4 + 4*N SHORT GeoKeyDirectory for `epsg`, sorted by key id.
+std::vector<std::uint16_t> build_geo_keys(int epsg) {
+    std::uint16_t model_type = kModelUserDefined;
+    std::uint16_t crs_key = 0;
+    std::uint16_t crs_value = 0;
+    if (epsg != 0) {
+        if (is_geographic_epsg(epsg)) {
+            model_type = kModelGeographic;
+            crs_key = kKeyGeographicType;
+        } else {
+            model_type = kModelProjected;
+            crs_key = kKeyProjectedCstType;
+        }
+        crs_value = static_cast<std::uint16_t>(epsg);
+    }
+    // Entries must be sorted by KeyID: 1024, 1025, then 2048 or 3072.
+    std::vector<std::uint16_t> keys;
+    keys.reserve(crs_key == 0 ? 12 : 16);
+    keys.push_back(1);  // KeyDirectoryVersion
+    keys.push_back(1);  // KeyRevision
+    keys.push_back(0);  // MinorRevision
+    keys.push_back(crs_key == 0 ? 2 : 3);  // NumberOfKeys
+    const auto push = [&keys](std::uint16_t id, std::uint16_t value) {
+        keys.push_back(id);
+        keys.push_back(0);  // TIFFTagLocation: value is stored inline
+        keys.push_back(1);  // Count
+        keys.push_back(value);
+    };
+    push(kKeyGtModelType, model_type);
+    push(kKeyGtRasterType, kRasterTypePixelIsArea);
+    if (crs_key != 0) {
+        push(crs_key, crs_value);
+    }
+    return keys;
+}
+
+/// Writes the georeferencing tags shared by all variants.
+void write_geo_tags(TIFF* tif, const RasterGrid& g, const GeoTiffOptions& options) {
+    const double pixel_scale[3] = {g.pixel_size_x, g.pixel_size_y, 0.0};
+    TIFFSetField(tif, kTagModelPixelScale, 3, pixel_scale);
+    // PixelIsArea: the tiepoint is the outer top-left corner of pixel (0,0).
+    const double tiepoint[6] = {0.0, 0.0, 0.0, g.origin_x, g.origin_y, 0.0};
+    TIFFSetField(tif, kTagModelTiepoint, 6, tiepoint);
+
+    const std::vector<std::uint16_t> keys = build_geo_keys(options.epsg);
+    TIFFSetField(tif, kTagGeoKeyDirectory, static_cast<std::uint32_t>(keys.size()), keys.data());
+
+    if (options.nodata.has_value()) {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%.17g", *options.nodata);
+        TIFFSetField(tif, kTagGdalNodata, buffer);
+    }
+}
+
+/// The layout choices (tiling, compression, predictor) common to both writers.
+void apply_common_tags(TIFF* tif, int width, int height, const GeoTiffOptions& options,
+                       int samples_per_pixel, int bits_per_sample) {
+    if (options.tiled) {
+        TIFFSetField(tif, TIFFTAG_TILEWIDTH, options.tile_size);
+        TIFFSetField(tif, TIFFTAG_TILELENGTH, options.tile_size);
+    }
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, static_cast<std::uint32_t>(width));
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH, static_cast<std::uint32_t>(height));
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, samples_per_pixel);
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, bits_per_sample);
+    TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    if (options.deflate) {
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_ADOBE_DEFLATE);
+    } else {
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+    }
+}
+
+/// Opens for writing, choosing BigTIFF when the raw payload would overflow a
+/// classic 4 GB TIFF. Registering the tags happens inside.
+TIFF* open_for_write(const std::string& path, std::uint64_t raw_bytes, TiffOpener& opener) {
+    const char* mode = raw_bytes > (std::uint64_t{7} << 29) ? "w8" : "w";
+    return opener.open(path, mode);
+}
+
+}  // namespace
+
+void write_geotiff(const std::string& path, const GeoRaster<float>& raster,
+                   const GeoTiffOptions& options) {
+    validate_grid(raster.grid, "float raster");
+    if (raster.channels != 1) {
+        throw ValueError("GeoTIFF: float GeoTIFF must have exactly one band (a DEM)");
+    }
+    const std::size_t expected = static_cast<std::size_t>(raster.grid.width) *
+                                 static_cast<std::size_t>(raster.grid.height) *
+                                 static_cast<std::size_t>(raster.channels);
+    if (raster.data.size() != expected) {
+        throw ValueError("GeoTIFF: float raster data size does not match width*height*channels");
+    }
+    if (options.tiled && (options.tile_size <= 0 || options.tile_size % 16 != 0)) {
+        throw ValueError("GeoTIFF: tile_size must be a positive multiple of 16");
+    }
+
+    TiffOpener opener;
+    const std::uint64_t raw_bytes = static_cast<std::uint64_t>(raster.data.size()) * sizeof(float);
+    TiffCloser close;
+    close.tif = open_for_write(path, raw_bytes, opener);
+    TIFF* tif = close.tif;
+
+    apply_common_tags(tif, raster.grid.width, raster.grid.height, options, 1, 32);
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    if (options.deflate) {
+        // Predictor 3 (floating-point horizontal differencing) needs the
+        // samples to be written as raw IEEE bytes, which the default byte
+        // order gives us.
+        TIFFSetField(tif, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
+    }
+    write_geo_tags(tif, raster.grid, options);
+
+    const int width = raster.grid.width;
+    const int height = raster.grid.height;
+    if (options.tiled) {
+        const int ts = options.tile_size;
+        std::vector<float> tile(static_cast<std::size_t>(ts) * static_cast<std::size_t>(ts), 0.0F);
+        for (int y = 0; y < height; y += ts) {
+            for (int x = 0; x < width; x += ts) {
+                const int copy_w = std::min(ts, width - x);
+                const int copy_h = std::min(ts, height - y);
+                std::fill(tile.begin(), tile.end(),
+                          options.nodata.has_value() ? static_cast<float>(*options.nodata) : 0.0F);
+                for (int ty = 0; ty < copy_h; ++ty) {
+                    const float* src = raster.data.data() +
+                                       (static_cast<std::size_t>(y + ty) *
+                                            static_cast<std::size_t>(width) +
+                                        static_cast<std::size_t>(x));
+                    std::copy(src, src + copy_w,
+                              tile.data() + static_cast<std::size_t>(ty) * static_cast<std::size_t>(ts));
+                }
+                if (TIFFWriteTile(tif, tile.data(), static_cast<std::uint32_t>(x),
+                                  static_cast<std::uint32_t>(y), 0, 0) < 0) {
+                    throw ProjectIOError("GeoTIFF: failed to write a tile to '" + path + "'");
+                }
+            }
+        }
+    } else {
+        // libtiff's predictors encode *in place* in the buffer handed to
+        // TIFFWriteScanline (both the horizontal and the floating-point one
+        // accumulate into it), so the caller's raster must not be passed
+        // directly: doing so silently corrupts it. One scratch row is reused.
+        std::vector<float> row(static_cast<std::size_t>(width));
+        for (int y = 0; y < height; ++y) {
+            const float* src = raster.data.data() + static_cast<std::size_t>(y) *
+                                                       static_cast<std::size_t>(width);
+            std::copy(src, src + width, row.begin());
+            if (TIFFWriteScanline(tif, row.data(), static_cast<std::uint32_t>(y), 0) < 0) {
+                throw ProjectIOError("GeoTIFF: failed to write a scanline to '" + path + "'");
+            }
+        }
+    }
+    if (TIFFFlush(tif) != 1) {
+        throw ProjectIOError("GeoTIFF: failed to flush '" + path + "'");
+    }
+}
+
+void write_geotiff(const std::string& path, const GeoRaster<std::uint8_t>& raster,
+                   const GeoTiffOptions& options) {
+    validate_grid(raster.grid, "8-bit raster");
+    if (raster.channels != 1 && raster.channels != 3 && raster.channels != 4) {
+        throw ValueError("GeoTIFF: 8-bit GeoTIFF must have 1, 3 or 4 channels");
+    }
+    const std::size_t expected = static_cast<std::size_t>(raster.grid.width) *
+                                 static_cast<std::size_t>(raster.grid.height) *
+                                 static_cast<std::size_t>(raster.channels);
+    if (raster.data.size() != expected) {
+        throw ValueError("GeoTIFF: 8-bit raster data size does not match width*height*channels");
+    }
+    if (options.tiled && (options.tile_size <= 0 || options.tile_size % 16 != 0)) {
+        throw ValueError("GeoTIFF: tile_size must be a positive multiple of 16");
+    }
+
+    TiffOpener opener;
+    TiffCloser close;
+    close.tif = open_for_write(path, static_cast<std::uint64_t>(raster.data.size()), opener);
+    TIFF* tif = close.tif;
+
+    apply_common_tags(tif, raster.grid.width, raster.grid.height, options, raster.channels, 8);
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_UINT);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC,
+                 raster.channels == 1 ? PHOTOMETRIC_MINISBLACK : PHOTOMETRIC_RGB);
+    if (raster.channels == 4) {
+        const std::uint16_t extra = EXTRASAMPLE_UNASSALPHA;
+        TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extra);
+    }
+    if (options.deflate) {
+        TIFFSetField(tif, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
+    }
+    write_geo_tags(tif, raster.grid, options);
+
+    const int width = raster.grid.width;
+    const int height = raster.grid.height;
+    const int ch = raster.channels;
+    const std::uint8_t pad =
+        options.nodata.has_value() ? static_cast<std::uint8_t>(*options.nodata) : std::uint8_t{0};
+    if (options.tiled) {
+        const int ts = options.tile_size;
+        std::vector<std::uint8_t> tile(static_cast<std::size_t>(ts) * static_cast<std::size_t>(ts) *
+                                           static_cast<std::size_t>(ch),
+                                       pad);
+        for (int y = 0; y < height; y += ts) {
+            for (int x = 0; x < width; x += ts) {
+                const int copy_w = std::min(ts, width - x);
+                const int copy_h = std::min(ts, height - y);
+                std::fill(tile.begin(), tile.end(), pad);
+                const std::size_t tile_row = static_cast<std::size_t>(ts) * static_cast<std::size_t>(ch);
+                for (int ty = 0; ty < copy_h; ++ty) {
+                    const std::uint8_t* src =
+                        raster.data.data() +
+                        (static_cast<std::size_t>(y + ty) * static_cast<std::size_t>(width) +
+                         static_cast<std::size_t>(x)) *
+                            static_cast<std::size_t>(ch);
+                    std::copy(src, src + static_cast<std::size_t>(copy_w) * static_cast<std::size_t>(ch),
+                              tile.data() + static_cast<std::size_t>(ty) * tile_row);
+                }
+                if (TIFFWriteTile(tif, tile.data(), static_cast<std::uint32_t>(x),
+                                  static_cast<std::uint32_t>(y), 0, 0) < 0) {
+                    throw ProjectIOError("GeoTIFF: failed to write a tile to '" + path + "'");
+                }
+            }
+        }
+    } else {
+        // Same in-place predictor hazard as the float path above: encode into a
+        // scratch row rather than the caller's raster.
+        std::vector<std::uint8_t> row(static_cast<std::size_t>(width) *
+                                      static_cast<std::size_t>(ch));
+        for (int y = 0; y < height; ++y) {
+            const std::uint8_t* src =
+                raster.data.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(width) *
+                                         static_cast<std::size_t>(ch);
+            std::copy(src, src + row.size(), row.begin());
+            if (TIFFWriteScanline(tif, row.data(), static_cast<std::uint32_t>(y), 0) < 0) {
+                throw ProjectIOError("GeoTIFF: failed to write a scanline to '" + path + "'");
+            }
+        }
+    }
+    if (TIFFFlush(tif) != 1) {
+        throw ProjectIOError("GeoTIFF: failed to flush '" + path + "'");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Enough of the first IFD to lay out the pixel buffer and the GeoTIFF tags.
+struct ReadLayout {
+    int width = 0;
+    int height = 0;
+    int channels = 1;
+    int bits_per_sample = 0;
+    bool is_float = false;
+    bool tiled = false;
+    int tile_width = 0;
+    int tile_height = 0;
+};
+
+ReadLayout read_layout(TIFF* tif, const std::string& path) {
+    ReadLayout out;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    if (TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) == 0 ||
+        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height) == 0) {
+        throw ProjectIOError("'" + path + "': TIFF has no image dimensions");
+    }
+    if (width == 0 || height == 0) {
+        throw ProjectIOError("'" + path + "': TIFF has zero size");
+    }
+    std::uint16_t bits = 1;
+    std::uint16_t samples = 1;
+    std::uint16_t planar = PLANARCONFIG_CONTIG;
+    std::uint16_t sample_format = SAMPLEFORMAT_UINT;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bits);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &samples);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &sample_format);
+
+    if (planar != PLANARCONFIG_CONTIG) {
+        throw ProjectIOError("'" + path + "': only planar-contiguous TIFF is supported");
+    }
+    if (bits != 8 && bits != 32) {
+        throw ProjectIOError("'" + path + "': only 8- and 32-bit samples are supported (got " +
+                             std::to_string(bits) + ")");
+    }
+    if (bits == 32 && sample_format != SAMPLEFORMAT_IEEEFP) {
+        throw ProjectIOError("'" + path + "': 32-bit samples must be IEEE float");
+    }
+    if (bits == 8 && sample_format != SAMPLEFORMAT_UINT && sample_format != SAMPLEFORMAT_VOID) {
+        throw ProjectIOError("'" + path + "': 8-bit samples must be unsigned integer");
+    }
+    if (samples != 1 && samples != 3 && samples != 4) {
+        throw ProjectIOError("'" + path + "': unsupported sample count (" +
+                             std::to_string(samples) + ")");
+    }
+    // Guard against a malicious header before any buffer is sized from it.
+    // A sidecar entry is bounded by the archive, but a GeoTIFF's dimensions
+    // live in fixed-width tags, so a 40-byte file can still claim 2^32-1 per
+    // side. The per-side limit keeps width*height*channels*bytes far from
+    // overflow and from any allocation the process could not honour; the byte
+    // limit then bounds the whole raster.
+    constexpr std::uint64_t kMaxSide = 1U << 20U;
+    if (width > kMaxSide || height > kMaxSide) {
+        throw ProjectIOError("'" + path + "': TIFF declares an implausible size");
+    }
+    const std::uint64_t pixels = static_cast<std::uint64_t>(width) *
+                                 static_cast<std::uint64_t>(height);
+    const std::uint64_t bytes = pixels * samples * (bits / 8U);
+    if (bytes > (std::uint64_t{4} << 30)) {
+        throw ProjectIOError("'" + path + "': TIFF declares an implausible size");
+    }
+    // A GeoTIFF payload cannot be much larger than the file that carries it:
+    // even at Deflate's theoretical best, storage expands by at most 1032:1
+    // (the same bound the zip layer enforces). Reject a geometry the file is far
+    // too small to hold, rather than allocating it. A size we cannot read is not
+    // evidence of corruption, so that passes.
+    constexpr std::uint64_t kMaxDeflateRatio = 1032;
+    std::error_code size_ec;
+    const std::uintmax_t file_bytes = std::filesystem::file_size(path, size_ec);
+    if (!size_ec && static_cast<std::uint64_t>(file_bytes) < bytes / kMaxDeflateRatio) {
+        throw ProjectIOError("'" + path +
+                             "': TIFF declares a raster larger than its file can hold");
+    }
+
+    out.width = static_cast<int>(width);
+    out.height = static_cast<int>(height);
+    out.channels = samples;
+    out.bits_per_sample = bits;
+    out.is_float = bits == 32;
+    if (TIFFIsTiled(tif) != 0) {
+        out.tiled = true;
+        std::uint32_t tw = 0;
+        std::uint32_t th = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tw);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &th);
+        if (tw == 0 || th == 0) {
+            throw ProjectIOError("'" + path + "': tiled TIFF with zero tile size");
+        }
+        out.tile_width = static_cast<int>(tw);
+        out.tile_height = static_cast<int>(th);
+    }
+    return out;
+}
+
+RasterGrid read_grid(TIFF* tif, const std::string& path, int width, int height) {
+    // ModelTiepointTag: {i,j,k, x,y,z}; with PixelIsArea the (0,0,0) tie maps
+    // to the outer top-left corner, which is exactly RasterGrid::origin_*.
+    std::uint16_t tp_count = 0;
+    double* tp = nullptr;
+    double origin_x = 0.0;
+    double origin_y = 0.0;
+    if (TIFFGetField(tif, kTagModelTiepoint, &tp_count, &tp) != 0 && tp != nullptr && tp_count >= 6) {
+        origin_x = tp[3];
+        origin_y = tp[4];
+    }
+    double psx = 1.0;
+    double psy = 1.0;
+    std::uint16_t ps_count = 0;
+    double* ps = nullptr;
+    if (TIFFGetField(tif, kTagModelPixelScale, &ps_count, &ps) != 0 && ps != nullptr && ps_count >= 2) {
+        psx = ps[0];
+        psy = ps[1];
+    }
+    if (!(psx > 0.0) || !(psy > 0.0)) {
+        throw ProjectIOError("'" + path + "': pixel scale must be positive");
+    }
+    RasterGrid grid;
+    grid.width = width;
+    grid.height = height;
+    grid.origin_x = origin_x;
+    grid.origin_y = origin_y;
+    grid.pixel_size_x = psx;
+    grid.pixel_size_y = psy;
+    return grid;
+}
+
+/// Recovers the EPSG code from the GeoKeyDirectory: the GeographicTypeGeoKey
+/// (2048) or ProjectedCSTypeGeoKey (3072) value; 0 when the directory is
+/// absent or user-defined.
+int read_epsg(TIFF* tif) {
+    std::uint16_t count = 0;
+    std::uint16_t* keys = nullptr;
+    if (TIFFGetField(tif, kTagGeoKeyDirectory, &count, &keys) == 0 || keys == nullptr) {
+        return 0;
+    }
+    if (count < 4) {
+        return 0;
+    }
+    const std::uint16_t entries = keys[3];
+    // Each entry is 4 SHORTs, following the 4-SHORT header.
+    if (static_cast<std::uint32_t>(4) + static_cast<std::uint32_t>(entries) * 4U > count) {
+        return 0;
+    }
+    for (std::uint16_t i = 0; i < entries; ++i) {
+        const std::size_t base = 4 + static_cast<std::size_t>(i) * 4;
+        const std::uint16_t key_id = keys[base];
+        // TIFFTagLocation must be 0 (value stored inline) for these keys.
+        if (keys[base + 1] != 0 || keys[base + 2] < 1) {
+            continue;
+        }
+        if (key_id == kKeyGeographicType || key_id == kKeyProjectedCstType) {
+            return static_cast<int>(keys[base + 3]);
+        }
+    }
+    return 0;
+}
+
+std::optional<double> read_nodata(TIFF* tif) {
+    char* text = nullptr;
+    if (TIFFGetField(tif, kTagGdalNodata, &text) == 0 || text == nullptr) {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text) {
+        return std::nullopt;  // not parseable
+    }
+    return value;
+}
+
+/// Reads every pixel into `out`, handling tiled and stripped files. The
+/// destination is sized and zero/nodata-padded by the caller.
+void read_pixels(TIFF* tif, const ReadLayout& layout, const std::string& path,
+                 std::uint8_t* out, std::size_t out_row_bytes) {
+    const std::size_t sample_bytes = static_cast<std::size_t>(layout.bits_per_sample) / 8U;
+    const std::size_t pixel_bytes =
+        static_cast<std::size_t>(layout.channels) * sample_bytes;
+    if (layout.tiled) {
+        const tmsize_t tile_size = TIFFTileSize(tif);
+        const tmsize_t tile_row = TIFFTileRowSize(tif);
+        if (tile_size <= 0 || tile_row <= 0) {
+            throw ProjectIOError("'" + path + "': tiled TIFF with unusable tile size");
+        }
+        if (static_cast<std::size_t>(tile_row) <
+            static_cast<std::size_t>(layout.tile_width) * pixel_bytes) {
+            throw ProjectIOError("'" + path + "': tile row is smaller than its pixels");
+        }
+        std::vector<std::uint8_t> tile(static_cast<std::size_t>(tile_size));
+        for (int y = 0; y < layout.height; y += layout.tile_height) {
+            for (int x = 0; x < layout.width; x += layout.tile_width) {
+                if (TIFFReadTile(tif, tile.data(), static_cast<std::uint32_t>(x),
+                                 static_cast<std::uint32_t>(y), 0, 0) < 0) {
+                    throw ProjectIOError("'" + path + "': failed to read a tile");
+                }
+                const int copy_w = std::min(layout.tile_width, layout.width - x);
+                const int copy_h = std::min(layout.tile_height, layout.height - y);
+                const std::size_t copy_bytes =
+                    static_cast<std::size_t>(copy_w) * pixel_bytes;
+                for (int ty = 0; ty < copy_h; ++ty) {
+                    const std::uint8_t* src =
+                        tile.data() + static_cast<std::size_t>(ty) *
+                                          static_cast<std::size_t>(tile_row);
+                    std::uint8_t* dst = out +
+                                        static_cast<std::size_t>(y + ty) * out_row_bytes +
+                                        static_cast<std::size_t>(x) * pixel_bytes;
+                    std::memcpy(dst, src, copy_bytes);
+                }
+            }
+        }
+        return;
+    }
+
+    const tmsize_t scanline = TIFFScanlineSize(tif);
+    if (scanline <= 0 || static_cast<std::size_t>(scanline) > out_row_bytes) {
+        throw ProjectIOError("'" + path + "': unusable scanline size");
+    }
+    for (int y = 0; y < layout.height; ++y) {
+        std::uint8_t* dst = out + static_cast<std::size_t>(y) * out_row_bytes;
+        if (TIFFReadScanline(tif, dst, static_cast<std::uint32_t>(y), 0) < 0) {
+            throw ProjectIOError("'" + path + "': failed to read scanline " + std::to_string(y));
+        }
+    }
+}
+
+}  // namespace
+
+GeoTiffInfo read_geotiff_info(const std::string& path) {
+    TiffOpener opener;
+    TiffCloser close;
+    close.tif = opener.open(path, "r");
+    TIFF* tif = close.tif;
+
+    const ReadLayout layout = read_layout(tif, path);
+    GeoTiffInfo info;
+    info.grid = read_grid(tif, path, layout.width, layout.height);
+    info.channels = layout.channels;
+    info.bits_per_sample = layout.bits_per_sample;
+    info.is_float = layout.is_float;
+    info.epsg = read_epsg(tif);
+    info.tiled = layout.tiled;
+    info.nodata = read_nodata(tif);
+    return info;
+}
+
+GeoRaster<float> read_geotiff_float(const std::string& path) {
+    TiffOpener opener;
+    TiffCloser close;
+    close.tif = opener.open(path, "r");
+    TIFF* tif = close.tif;
+
+    const ReadLayout layout = read_layout(tif, path);
+    if (!layout.is_float) {
+        throw ProjectIOError("'" + path + "': not a 32-bit float GeoTIFF (bits=" +
+                             std::to_string(layout.bits_per_sample) + ")");
+    }
+    if (layout.channels != 1) {
+        throw ProjectIOError("'" + path + "': float GeoTIFF must have exactly one band");
+    }
+
+    GeoRaster<float> raster;
+    raster.grid = read_grid(tif, path, layout.width, layout.height);
+    raster.channels = 1;
+    raster.data.assign(static_cast<std::size_t>(layout.width) *
+                           static_cast<std::size_t>(layout.height),
+                       0.0F);
+    const std::size_t row_bytes = static_cast<std::size_t>(layout.width) * sizeof(float);
+    read_pixels(tif, layout, path, reinterpret_cast<std::uint8_t*>(raster.data.data()), row_bytes);
+    return raster;
+}
+
+GeoRaster<std::uint8_t> read_geotiff_u8(const std::string& path) {
+    TiffOpener opener;
+    TiffCloser close;
+    close.tif = opener.open(path, "r");
+    TIFF* tif = close.tif;
+
+    const ReadLayout layout = read_layout(tif, path);
+    if (layout.is_float || layout.bits_per_sample != 8) {
+        throw ProjectIOError("'" + path + "': not an 8-bit GeoTIFF");
+    }
+
+    GeoRaster<std::uint8_t> raster;
+    raster.grid = read_grid(tif, path, layout.width, layout.height);
+    raster.channels = layout.channels;
+    raster.data.assign(static_cast<std::size_t>(layout.width) *
+                           static_cast<std::size_t>(layout.height) *
+                           static_cast<std::size_t>(layout.channels),
+                       0);
+    const std::size_t row_bytes = static_cast<std::size_t>(layout.width) *
+                                  static_cast<std::size_t>(layout.channels);
+    read_pixels(tif, layout, path, raster.data.data(), row_bytes);
+    return raster;
+}
+
+void write_world_file(const std::string& path, const RasterGrid& grid) {
+    if (grid.width <= 0 || grid.height <= 0) {
+        throw ValueError("world file: grid has non-positive dimensions");
+    }
+    if (!(grid.pixel_size_x > 0.0) || !(grid.pixel_size_y > 0.0)) {
+        throw ValueError("world file: grid has non-positive pixel size");
+    }
+    const Eigen::Vector2d top_left = grid.pixel_center(0, 0);
+    std::ofstream out(path);
+    if (!out) {
+        throw ProjectIOError("world file: cannot open '" + path + "' for writing");
+    }
+    // Six lines: A, D, B, E, C, F in the ESRI convention. "%.17g" round-trips
+    // an IEEE double exactly.
+    out.precision(17);
+    out << grid.pixel_size_x << '\n'
+        << 0.0 << '\n'
+        << 0.0 << '\n'
+        << -grid.pixel_size_y << '\n'
+        << top_left.x() << '\n'
+        << top_left.y() << '\n';
+    if (!out) {
+        throw ProjectIOError("world file: failed to write '" + path + "'");
+    }
+}
+
+}  // namespace alphashape

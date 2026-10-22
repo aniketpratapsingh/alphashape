@@ -1,0 +1,33 @@
+#version 450
+// One partial sum per workgroup: partial[gid] = sum(values[gid*256 .. +255]).
+// The caller dispatches ceil(n / 256) groups and sums the partials on the CPU.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer Values { float values[]; };
+layout(binding = 1) buffer Partials { float partial[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+} pc;
+
+shared float scratch[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint i = gl_WorkGroupID.x * 256u + tid;
+    float v = 0.0;
+    if (i < pc.n) {
+        v = values[i];
+    }
+    scratch[tid] = v;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        partial[gl_WorkGroupID.x] = scratch[0];
+    }
+}

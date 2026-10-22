@@ -1,0 +1,151 @@
+#version 450
+// TV-L1 Chambolle-Pock, step (1): dual ascent with projection onto the unit
+// ball, p <- P(p + sigma * grad(ubar)). Forward differences with a zero
+// (Neumann) face at the upper grid boundary, exactly as tv_fusion.cpp.
+//
+// Both updates touch only this voxel and its +x/+y/+z neighbours of ubar, which
+// the preceding dispatch has finished writing (gpu::run barriers between
+// dispatches), so the sweep is the CPU's Jacobi update.
+//
+// Each invocation handles FOUR consecutive x voxels. x is the fastest-varying
+// axis, so the four values are contiguous: p is read and written as three
+// float4 stores and the neighbour rows as float4 loads, which is what gets the
+// M1 near its bandwidth ceiling (a scalar launch measured roughly half). The
+// tail of an nx not divisible by four is handled by the same code with a
+// shorter vector; pc.nx is at least 16 for every fused volume.
+#include "tvl1_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(binding = 0) buffer Ubar { float ubar[]; };
+// The dual field is packed half precision (px, py, pz in two uints per voxel:
+// packHalf2x16(px, py) and packHalf2x16(pz, 0)). |p| <= 1 by the projection, so
+// fp16's ~5e-4 resolution is far below the field's own scale, and the sweep is
+// memory-bound: halving the dominant stream is what lifts the speed-up. The
+// half-precision perturbation of u is ~1e-3, well under a bin spacing.
+//
+// The packing is a STORAGE format only: every gradient, accumulation, norm and
+// projection above runs in fp32, so accuracy is that of a float32 solver. It is
+// also why the host declines software devices before creating this pipeline:
+// llvmpipe advertises the core functions but its LLVM backend aborts the whole
+// process compiling the pack/unpack pattern (a hard exit, not a VkResult).
+layout(binding = 1) buffer P { uint p[]; };
+// Row list: the row index per dispatched slot in the second grid dimension, or
+// kCulled for the rounded-up tail (declared in tvl1_common.glsl). The host
+// dispatches every row, so the list is the identity over rows.
+layout(binding = 2) buffer Blocks { uint block_list[]; };
+
+void main() {
+    // Same flattened-row convention as tvl1_primal.comp: x from the first grid
+    // dimension (four voxels per invocation), (y, z) flattened into the second,
+    // so no division is needed per voxel.
+    const uint x = gl_GlobalInvocationID.x * 4u;
+    const uint slot = gl_GlobalInvocationID.y;
+    const uint row = slot < pc.row_count ? block_list[slot] : kCulled;
+    if (row == kCulled || x >= pc.nx) {
+        return;
+    }
+    const uint index = row * pc.nx + x;
+    const uint count = min(4u, pc.nx - x);
+    const uint y = row % pc.ny;
+    const uint z = row / pc.ny;
+
+    // The four dual components and the two lateral gradients, unrolled into
+    // scalar registers (a vec4 indexed by a loop variable spills).
+    float h0 = ubar[index];
+    float h1 = count > 1u ? ubar[index + 1u] : h0;
+    float h2 = count > 2u ? ubar[index + 2u] : h1;
+    float h3 = count > 3u ? ubar[index + 3u] : h2;
+
+    const float nx0 = (x + 1u < pc.nx) ? h1 : h0;
+    const float nx1 = (x + 2u < pc.nx) ? h2 : h1;
+    const float nx2 = (x + 3u < pc.nx) ? h3 : h2;
+    const float nx3 = (x + 4u < pc.nx) ? ubar[index + 4u] : h3;
+
+    const uint row_y = index + pc.nx;
+    const uint row_z = index + pc.nx * pc.ny;
+    const bool has_y = y + 1u < pc.ny;
+    const bool has_z = z + 1u < pc.nz;
+    const float y0 = has_y ? ubar[row_y] : h0;
+    const float y1 = has_y ? ubar[row_y + 1u] : h1;
+    const float y2 = has_y ? ubar[row_y + 2u] : h2;
+    const float y3 = has_y ? ubar[row_y + 3u] : h3;
+    const float z0 = has_z ? ubar[row_z] : h0;
+    const float z1 = has_z ? ubar[row_z + 1u] : h1;
+    const float z2 = has_z ? ubar[row_z + 2u] : h2;
+    const float z3 = has_z ? ubar[row_z + 3u] : h3;
+
+    const uint b0 = index * 2u;
+    const vec2 xy0 = unpackHalf2x16(p[b0]);
+    const vec2 xy1 = unpackHalf2x16(p[b0 + 2u]);
+    const vec2 xy2 = unpackHalf2x16(p[b0 + 4u]);
+    const vec2 xy3 = unpackHalf2x16(p[b0 + 6u]);
+    const float az_in0 = unpackHalf2x16(p[b0 + 1u]).x;
+    const float az_in1 = unpackHalf2x16(p[b0 + 3u]).x;
+    const float az_in2 = unpackHalf2x16(p[b0 + 5u]).x;
+    const float az_in3 = unpackHalf2x16(p[b0 + 7u]).x;
+    float ax0 = xy0.x + pc.sigma * (nx0 - h0);
+    float ax1 = xy1.x + pc.sigma * (nx1 - h1);
+    float ax2 = xy2.x + pc.sigma * (nx2 - h2);
+    float ax3 = xy3.x + pc.sigma * (nx3 - h3);
+    float ay0 = xy0.y + pc.sigma * (y0 - h0);
+    float ay1 = xy1.y + pc.sigma * (y1 - h1);
+    float ay2 = xy2.y + pc.sigma * (y2 - h2);
+    float ay3 = xy3.y + pc.sigma * (y3 - h3);
+    float az0 = az_in0 + pc.sigma * (z0 - h0);
+    float az1 = az_in1 + pc.sigma * (z1 - h1);
+    float az2 = az_in2 + pc.sigma * (z2 - h2);
+    float az3 = az_in3 + pc.sigma * (z3 - h3);
+
+    {
+        const float norm = sqrt(ax0 * ax0 + ay0 * ay0 + az0 * az0);
+        if (norm > 1.0) {
+            const float inverse = 1.0 / norm;
+            ax0 *= inverse;
+            ay0 *= inverse;
+            az0 *= inverse;
+        }
+    }
+    {
+        const float norm = sqrt(ax1 * ax1 + ay1 * ay1 + az1 * az1);
+        if (norm > 1.0) {
+            const float inverse = 1.0 / norm;
+            ax1 *= inverse;
+            ay1 *= inverse;
+            az1 *= inverse;
+        }
+    }
+    {
+        const float norm = sqrt(ax2 * ax2 + ay2 * ay2 + az2 * az2);
+        if (norm > 1.0) {
+            const float inverse = 1.0 / norm;
+            ax2 *= inverse;
+            ay2 *= inverse;
+            az2 *= inverse;
+        }
+    }
+    {
+        const float norm = sqrt(ax3 * ax3 + ay3 * ay3 + az3 * az3);
+        if (norm > 1.0) {
+            const float inverse = 1.0 / norm;
+            ax3 *= inverse;
+            ay3 *= inverse;
+            az3 *= inverse;
+        }
+    }
+
+    p[b0] = packHalf2x16(vec2(ax0, ay0));
+    p[b0 + 1u] = packHalf2x16(vec2(az0, 0.0));
+    if (count > 1u) {
+        p[b0 + 2u] = packHalf2x16(vec2(ax1, ay1));
+        p[b0 + 3u] = packHalf2x16(vec2(az1, 0.0));
+    }
+    if (count > 2u) {
+        p[b0 + 4u] = packHalf2x16(vec2(ax2, ay2));
+        p[b0 + 5u] = packHalf2x16(vec2(az2, 0.0));
+    }
+    if (count > 3u) {
+        p[b0 + 6u] = packHalf2x16(vec2(ax3, ay3));
+        p[b0 + 7u] = packHalf2x16(vec2(az3, 0.0));
+    }
+}

@@ -1,0 +1,24 @@
+#version 450
+// delta[i] = |u_new[i] - u_old[i]| over the whole grid; tvl1_reduce sums it.
+// Runs right after the last tvl1_primal of a batch, inside that batch's own
+// gpu::run; `previous` holds the iterate from before the batch. Kept separate
+// from tvl1_primal so the hot sweep stays free of the reduction.
+#include "tvl1_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) buffer U { float u[]; };
+layout(binding = 1) buffer Previous { float previous[]; };
+layout(binding = 2) buffer Delta { float delta[]; };
+
+void main() {
+    // Same flattened-row convention as tvl1_primal.comp: x from the first grid
+    // dimension, (y, z) flattened into the second.
+    const uint x = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (x >= pc.nx || row >= pc.ny * pc.nz) {
+        return;
+    }
+    const uint index = row * pc.nx + x;
+    delta[index] = abs(u[index] - previous[index]);
+}

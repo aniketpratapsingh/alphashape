@@ -1,0 +1,124 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// One CG step, part 2: the x/r update and the Jacobi preconditioner.
+//
+//   x += alpha * p_k
+//   r -= alpha * q
+//   z  = r * inv_diag   (stored: the next stencil reads it once per voxel)
+//   rr = sum(r.r)  -> the host's convergence diagnostic
+//   rz = sum(r.z)  -> beta = rz / rho, rho <- rz
+//
+// alpha comes from the scalar block the preceding spmv wrote, so the whole step
+// stays on the device. Both sums use the fused last-workgroup reduction: each
+// workgroup writes a balanced pairwise partial (rr into [0, groups), rz into
+// [groups, 2 * groups)) and the last workgroup adds them in fixed index order.
+//
+// A four-voxels-per-thread path (float4 aliases of the same storage) was tried
+// to quarter the memory instructions and measured slower on the M1 through
+// MoltenVK (2.1 ms per dispatch against 1.4 ms): the alias loads are not
+// coalesced. The scalar path below is the shipped one.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer P { float p[]; };
+layout(binding = 1) buffer Q { float q[]; };
+layout(binding = 2) buffer X { float x[]; };
+layout(binding = 3) buffer R { float r[]; };
+layout(binding = 4) buffer InvDiag { float inv_diag[]; };
+layout(binding = 5) buffer Partials { float partial[]; };
+layout(binding = 6) buffer Scalars { float scalars[]; };
+layout(binding = 7) buffer Counters { uint counters[]; };
+layout(binding = 8) buffer Z { float z[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+    uint groups;
+} pc;
+
+// Warp-level reductions (see poisson_spmv.comp): rr and rz both go through one
+// subgroup shuffle tree per lane, one lane per subgroup writes to shared
+// memory, and lane 0 combines the subgroup totals. One barrier in total.
+//
+// SAFETY: gl_SubgroupID < gl_NumSubgroups <= gl_WorkGroupSize == 256, so both
+// per-subgroup arrays are sized to the workgroup; the loops run over pc.groups
+// (a push constant) and the partial buffer is allocated for 2 * groups floats,
+// so every index below is in range.
+shared float warp_rr[256];
+shared float warp_rz[256];
+shared float scratch_rr[256];
+shared float scratch_rz[256];
+shared uint is_last;
+
+void sum_ranges(uint tid) {
+    float rr = 0.0;
+    float rz = 0.0;
+    for (uint k = tid; k < pc.groups; k += 256u) {
+        rr += partial[k];
+        rz += partial[pc.groups + k];
+    }
+    scratch_rr[tid] = rr;
+    scratch_rz[tid] = rz;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint gid = gl_GlobalInvocationID.x;
+    const float alpha = scalars[2];
+    float rr = 0.0;
+    float rz = 0.0;
+    if (gid < pc.n) {
+        const float xi = x[gid] + alpha * p[gid];
+        const float ri = r[gid] - alpha * q[gid];
+        x[gid] = xi;
+        r[gid] = ri;
+        z[gid] = ri * inv_diag[gid];
+        rr = ri * ri;
+        rz = ri * z[gid];
+    }
+    rr = subgroupAdd(rr);
+    rz = subgroupAdd(rz);
+    if (subgroupElect()) {
+        warp_rr[gl_SubgroupID] = rr;
+        warp_rz[gl_SubgroupID] = rz;
+    }
+    barrier();
+    if (tid == 0u) {
+        float total_rr = 0.0;
+        float total_rz = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) {
+            total_rr += warp_rr[k];
+            total_rz += warp_rz[k];
+        }
+        if (gl_WorkGroupID.x < pc.groups) {
+            partial[gl_WorkGroupID.x] = total_rr;
+            partial[pc.groups + gl_WorkGroupID.x] = total_rz;
+        }
+        memoryBarrierBuffer();
+        is_last = (atomicAdd(counters[0], 1u) == pc.groups - 1u) ? 1u : 0u;
+    }
+    barrier();
+    if (is_last != 0u) {
+        memoryBarrierBuffer();
+        sum_ranges(tid);
+        float rr_sum = subgroupAdd(scratch_rr[tid]);
+        float rz_sum = subgroupAdd(scratch_rz[tid]);
+        if (subgroupElect()) {
+            warp_rr[gl_SubgroupID] = rr_sum;
+            warp_rz[gl_SubgroupID] = rz_sum;
+        }
+        barrier();
+        if (tid == 0u) {
+            float total_rr = 0.0;
+            float rz_total = 0.0;
+            for (uint k = 0u; k < gl_NumSubgroups; ++k) {
+                total_rr += warp_rr[k];
+                rz_total += warp_rz[k];
+            }
+            scalars[4] = total_rr;  // rr, for the host's diagnostic read-back
+            scalars[5] = rz_total;
+            scalars[3] = scalars[0] > 0.0 ? rz_total / scalars[0] : 0.0;  // beta
+            scalars[0] = rz_total;                                        // rho <- rz
+            counters[0] = 0u;
+            memoryBarrierBuffer();
+        }
+    }
+}

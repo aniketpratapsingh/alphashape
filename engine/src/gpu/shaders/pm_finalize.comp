@@ -1,0 +1,29 @@
+#version 450
+// PatchMatch finalisation: copy the converged state into the result containers
+// and drop pixels whose cost exceeds max_cost (depth -1, normal zero), exactly
+// as the CPU does after the last sweep.
+#include "pm_math.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    int pixel = int(gl_GlobalInvocationID.x);
+    int count = int(pc.width) * int(pc.height);
+    if (pixel >= count) {
+        return;
+    }
+    float depth = state_depth[pixel];
+    float cost = state_cost[pixel];
+    vec3 n = vec3(state_normal[pixel * 3 + 0], state_normal[pixel * 3 + 1],
+                  state_normal[pixel * 3 + 2]);
+    if (!(depth > 0.0) || cost > pc.max_cost) {
+        depth = -1.0;
+        n = vec3(0.0, 0.0, 0.0);
+    }
+    out_depth[pixel] = depth;
+    out_normals[pixel * 3 + 0] = n.x;
+    out_normals[pixel * 3 + 1] = n.y;
+    out_normals[pixel * 3 + 2] = n.z;
+    out_cost[pixel] = state_cost[pixel];
+    keep_bindings_alive(pixel);
+}

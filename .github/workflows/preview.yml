@@ -1,0 +1,44 @@
+name: Pre-release
+
+# Pushing a tag like v0.2.0-rc.1, v0.2.0-beta.1 or v0.2.0-preview.1 (from any branch) builds every
+# platform and publishes a GitHub pre-release. Pre-releases never become "latest".
+
+on:
+  push:
+    tags:
+      - "v*-rc*"
+      - "v*-beta*"
+      - "v*-preview*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.ref }}
+      version: ${{ github.ref_name }}
+      package: true
+
+  prerelease:
+    name: Publish pre-release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && ls -lh
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --prerelease --latest=false \
+            --title "alphashape ${GITHUB_REF_NAME} (pre-release)" --generate-notes

@@ -1,0 +1,30 @@
+#version 450
+// 3x3 box filter on a row-major float image, clamp-to-edge.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) buffer Src { float src[]; };
+layout(binding = 1) buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Params {
+    uint w;
+    uint h;
+} pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    int w = int(pc.w);
+    int h = int(pc.h);
+    if (x >= w || y >= h) {
+        return;
+    }
+    float sum = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        int yy = clamp(y + dy, 0, h - 1);
+        for (int dx = -1; dx <= 1; ++dx) {
+            int xx = clamp(x + dx, 0, w - 1);
+            sum += src[yy * w + xx];
+        }
+    }
+    dst[y * w + x] = sum * (1.0 / 9.0);
+}

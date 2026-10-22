@@ -1,0 +1,84 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Start-of-solve pass: z = r * inv_diag, and rho = sum(r.z) via a fused
+// last-workgroup reduction. With p_old = 0 and beta = 0 the first stencil
+// dispatch then forms p_0 = z.
+//
+// The reduction is fused into this dispatch with the standard "last workgroup
+// wins" pattern: each workgroup reduces its lanes with subgroupAdd, writes its
+// partial, publishes it with a buffer memory barrier, then bumps an atomic
+// counter; the workgroup that observes the last increment sums the partials in a
+// FIXED index order, so the result does not depend on which workgroup finished
+// last (deterministic run to run), and then clears the counter for the next
+// dispatch.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer R { float r[]; };
+layout(binding = 1) buffer InvDiag { float inv_diag[]; };
+layout(binding = 2) buffer Partials { float partial[]; };
+layout(binding = 3) buffer Scalars { float scalars[]; };
+layout(binding = 4) buffer Counters { uint counters[]; };
+layout(binding = 5) buffer Z { float z[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+    uint groups;
+} pc;
+
+// SAFETY: gl_SubgroupID < gl_NumSubgroups <= gl_WorkGroupSize == 256, so the
+// per-subgroup shared array is sized to the workgroup; every loop bound is a
+// push constant or a compile-time constant, and every buffer index against
+// pc.n / pc.groups is guarded.
+shared float warp_sums[256];
+shared uint is_last;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    float contribution = 0.0;
+    if (i < pc.n) {
+        const float ri = r[i];
+        const float pi = ri * inv_diag[i];
+        z[i] = pi;
+        contribution = ri * pi;
+    }
+    contribution = subgroupAdd(contribution);
+    if (subgroupElect()) {
+        warp_sums[gl_SubgroupID] = contribution;
+    }
+    barrier();
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) {
+            total += warp_sums[k];
+        }
+        if (gl_WorkGroupID.x < pc.groups) {
+            partial[gl_WorkGroupID.x] = total;
+        }
+        memoryBarrierBuffer();
+        is_last = (atomicAdd(counters[0], 1u) == pc.groups - 1u) ? 1u : 0u;
+    }
+    barrier();
+    if (is_last != 0u) {
+        memoryBarrierBuffer();
+        float sum = 0.0;
+        for (uint k = tid; k < pc.groups; k += 256u) {
+            sum += partial[k];
+        }
+        sum = subgroupAdd(sum);
+        if (subgroupElect()) {
+            warp_sums[gl_SubgroupID] = sum;
+        }
+        barrier();
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint k = 0u; k < gl_NumSubgroups; ++k) {
+                total += warp_sums[k];
+            }
+            scalars[0] = total;  // rho
+            scalars[3] = 0.0;    // beta: the first direction is p_0 = z
+            counters[0] = 0u;
+            memoryBarrierBuffer();
+        }
+    }
+}

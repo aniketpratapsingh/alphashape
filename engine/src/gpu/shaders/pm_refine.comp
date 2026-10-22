@@ -1,0 +1,86 @@
+#version 450
+// PatchMatch step 2: one descent half-sweep of one checkerboard colour. Every
+// pixel of that colour starts from its incumbent, propagates the planes of its
+// 4 adjacent and 4 distance-3 neighbours through the plane transfer, then draws
+// a fresh random plane and a perturbation of the current one. The propagation
+// sources are always of the opposite colour (all offsets are odd), i.e. pixels
+// this half-sweep does not write, so the pass is a fixed point of the parallel
+// update and the result is independent of scheduling.
+#include "pm_math.glsl"
+#include "pm_core.glsl"
+
+layout(local_size_x = PM_LANES) in;
+
+const ivec2 PM_ADJ[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+const ivec2 PM_FAR[4] = ivec2[4](ivec2(-3, 0), ivec2(3, 0), ivec2(0, -3), ivec2(0, 3));
+
+void main() {
+    // Staged before any early return: every lane of the workgroup must reach
+    // the shared-memory barrier.
+    stage_views();
+    int lane = int(gl_LocalInvocationID.x);
+    ivec2 p = lane_pixel(lane);
+    int x = p.x;
+    int y = p.y;
+    int w = int(pc.width);
+    int h = int(pc.height);
+    if (x < pc.radius || y < pc.radius || x > w - 1 - pc.radius || y > h - 1 - pc.radius) {
+        return;
+    }
+    if (((x + y) & 1) != int(pc.colour)) {
+        return;
+    }
+    int pixel = y * w + x;
+    if (state_active[pixel] == 0u) {
+        return;
+    }
+    vec3 b_p = pixel_bearing(pixel);
+    Best best;
+    best.depth = state_depth[pixel];
+    best.normal = vec3(state_normal[pixel * 3 + 0], state_normal[pixel * 3 + 1],
+                       state_normal[pixel * 3 + 2]);
+    best.cost = state_cost[pixel];
+    if (!(best.depth > 0.0)) {
+        // No incumbent yet: seed from a fresh random plane.
+        Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+        evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p,
+                            best);
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            ivec2 q = ivec2(x, y) + PM_ADJ[i];
+            if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
+                continue;
+            }
+            propagate(x, y, q.y * w + q.x, b_p, best);
+        }
+        for (int i = 0; i < 4; ++i) {
+            ivec2 q = ivec2(x, y) + PM_FAR[i];
+            if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
+                continue;
+            }
+            propagate(x, y, q.y * w + q.x, b_p, best);
+        }
+        // Refinement: a fresh random plane, then the current plane perturbed in
+        // inverse depth and normal.
+        Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+        evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p,
+                            best);
+
+        Rng rng_d = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 1u);
+        float inv_d = 1.0 / best.depth;
+        float perturbed_inv = inv_d + (2.0 * rng_next(rng_d) - 1.0) * pc.depth_delta;
+        if (perturbed_inv > 0.0) {
+            Rng rng_n = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 2u);
+            vec3 perturbed = perturb_normal(rng_n, best.normal, pc.normal_angle);
+            evaluate_hypothesis(x, y, 1.0 / perturbed_inv, perturbed, b_p, best);
+        }
+    }
+    if (best.depth > 0.0) {
+        state_depth[pixel] = best.depth;
+        state_normal[pixel * 3 + 0] = best.normal.x;
+        state_normal[pixel * 3 + 1] = best.normal.y;
+        state_normal[pixel * 3 + 2] = best.normal.z;
+        state_cost[pixel] = best.cost;
+    }
+    keep_bindings_alive(pixel);
+}

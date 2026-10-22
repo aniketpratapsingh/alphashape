@@ -1,0 +1,82 @@
+name: Nightly
+
+# Builds main every night (only when it changed since the last nightly) and publishes the result to a
+# single rolling pre-release tagged `nightly`, replaced each time. Never marked "latest".
+
+on:
+  schedule:
+    - cron: "30 20 * * *"   # 02:00 IST
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if main has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Changed since last nightly?
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)
+          echo "version=${base}-nightly.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          last=$(gh release view nightly --json targetCommitish --jq .targetCommitish 2>/dev/null || true)
+          if [ "${{ inputs.force }}" = "true" ] || [ "$last" != "$(git rev-parse HEAD)" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "main unchanged since the last nightly ($last); skipping."
+          fi
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: main
+      version: ${{ needs.gate.outputs.version }}
+      package: true
+
+  publish:
+    name: Publish nightly pre-release
+    needs: [gate, build]
+    if: needs.gate.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && ls -lh
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly dist/* --target "$sha" --prerelease --latest=false \
+            --title "Nightly ${{ needs.gate.outputs.version }}" \
+            --notes "Automated build of main at ${sha}. Untested by humans; for trying the newest changes only. Checksums in SHA256SUMS."

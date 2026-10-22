@@ -1,0 +1,73 @@
+name: Release
+
+# Manual. Steps:
+#   1. bump `VERSION x.y.z` in engine/CMakeLists.txt, commit to main
+#   2. git tag vx.y.z && git push origin vx.y.z
+#   3. gh workflow run release.yml -f tag=vx.y.z            (publishes)
+#      gh workflow run release.yml -f tag=vx.y.z -f draft=true   (builds a private draft; publish
+#      or delete it from the Releases page)
+# Re-running for the same tag replaces the release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v0.2.0)
+        required: true
+        type: string
+      draft:
+        description: Build everything but keep the release as an unpublished draft
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Tag matches the project version
+        run: |
+          version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)
+          if [ "v${version}" != "${{ inputs.tag }}" ]; then
+            echo "::error::Tag ${{ inputs.tag }} does not match engine/CMakeLists.txt VERSION ${version}"
+            exit 1
+          fi
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.tag }}
+      version: ${{ inputs.tag }}
+      package: true
+      windows-required: false
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && ls -lh
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete "${{ inputs.tag }}" --yes 2>/dev/null || true
+          draft=""
+          if [ "${{ inputs.draft }}" = "true" ]; then draft="--draft"; fi
+          gh release create "${{ inputs.tag }}" dist/* --verify-tag $draft \
+            --title "alphashape ${{ inputs.tag }}" --generate-notes

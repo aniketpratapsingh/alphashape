@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>alphashape — main window</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --app:#0D1114; --panel:#12171B; --raised:#171E23; --overlay:#1D252B; --sunken:#0A0E11;
+    --t1:#E8EEF1; --t2:#A7B4BC; --t3:#828F98;
+    --bd:#28323A; --bd2:#33414B; --bd3:#4A5A65;
+    --accent:#35BDAF; --accent-h:#48CBBE; --accent-t:#4FD1C3; --accent-s:#16302E; --on-accent:#04211E;
+    --sel:#1E3F3C; --ok:#48B875; --warn:#E3A33C; --err:#F07068; --info:#6BA8E0; --proc:#A78BFA;
+    --vp:#1D252B; --vp2:#141B20; --grid:#3A4A54; --cam:#F2C94C; --marker:#F2994A;
+    --hover:rgba(255,255,255,.05);
+    --vt1:#E8EEF1; --vt2:#A7B4BC; --vt3:#828F98; --vbd:#33414B;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--app);color:var(--t1);
+    font-family:Inter,-apple-system,"Segoe UI",sans-serif;font-size:13px;line-height:19px;
+    -webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1;letter-spacing:0}
+  .app{width:1600px;height:1000px;display:grid;grid-template-rows:38px 1fr;overflow:hidden;background:var(--app)}
+  .mono{font-family:"JetBrains Mono",monospace}
+  .sec{color:var(--t2)} .mut{color:var(--t3)}
+  .k{color:var(--t3)}
+  svg{flex:none}
+  .winbar{display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--panel);
+    border-bottom:1px solid var(--bd)}
+  .lights{display:flex;gap:8px;margin-right:6px}
+  .lights i{width:11px;height:11px;border-radius:50%;background:#3A464E;display:block}
+  .brand{display:flex;align-items:center;gap:8px;font-weight:600}
+  .winbar .right{margin-left:auto;display:flex;align-items:center;gap:10px;color:var(--t3);font-size:11px}
+  .iconbtn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:3px;
+    border:1px solid transparent;color:var(--t2);background:transparent}
+  .iconbtn:hover{background:var(--hover);color:var(--t1)}
+  .iconbtn.on{background:var(--accent-s);border-color:var(--accent);color:var(--accent-t)}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:26px;padding:0 10px;border-radius:3px;
+    border:1px solid var(--bd2);background:var(--raised);color:var(--t1);font:500 12px Inter;white-space:nowrap}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+  .btn.ghost{background:transparent;border-color:transparent;color:var(--t2)}
+  .btn.sm{height:22px;font-size:11px;padding:0 8px}
+  .btn.danger{background:transparent;border-color:var(--err);color:var(--err)}
+  .chip{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 7px;border-radius:3px;
+    background:var(--raised);border:1px solid var(--bd);color:var(--t2);font-size:10.5px}
+  .chip.ok{color:var(--ok);border-color:#22402C;background:#12281B}
+  .chip.warn{color:var(--warn);border-color:#3A3018;background:#2A2214}
+  .chip.err{color:var(--err);border-color:#43231F;background:#2E1917}
+  .chip.acc{color:var(--accent-t);border-color:#22443F;background:var(--accent-s)}
+  .dock{background:var(--panel);border:1px solid var(--bd);display:flex;flex-direction:column;min-height:0}
+  .dockhead{display:flex;align-items:center;gap:6px;height:30px;padding:0 8px;border-bottom:1px solid var(--bd);background:var(--panel)}
+  .dockhead .ttl{font-size:10.5px;font-weight:600;letter-spacing:.055em;text-transform:uppercase;color:var(--t2)}
+  .dockhead .right{margin-left:auto;display:flex;gap:2px}
+  .tabs{display:flex;height:30px;border-bottom:1px solid var(--bd);background:var(--app);align-items:stretch}
+  .tab{display:inline-flex;align-items:center;gap:6px;padding:0 12px;font-size:12px;color:var(--t2);
+    border-bottom:2px solid transparent;white-space:nowrap}
+  .tab.on{color:var(--t1);border-bottom-color:var(--accent);background:var(--panel)}
+  .tab .cnt{font-size:10px;color:var(--t3);background:var(--raised);border:1px solid var(--bd);border-radius:8px;padding:0 5px;line-height:14px}
+  .tab.on .cnt{color:var(--t2)}
+  .field{height:24px;background:var(--sunken);border:1px solid var(--bd2);border-radius:3px;display:flex;align-items:center;
+    gap:6px;padding:0 7px;color:var(--t3);font-size:11px}
+  .field input{border:none;background:transparent;color:var(--t1);font:12px Inter;outline:none;width:100%}
+  .toggle{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:2px;
+    border:1px solid var(--bd3);background:var(--sunken);color:var(--on-accent)}
+  .toggle.on{background:var(--accent);border-color:var(--accent)}
+  .toggle.on svg{display:block} .toggle svg{display:none}
+  .kbd{font-family:"JetBrains Mono";font-size:10px;padding:1px 4px;border:1px solid var(--bd3);border-radius:2px;color:var(--t2);background:var(--sunken)}
+  .divider{height:1px;background:var(--bd)}
+  .progress{height:4px;border-radius:2px;background:var(--sunken);overflow:hidden;position:relative}
+  .progress > i{display:block;height:100%;background:var(--accent);border-radius:2px}
+  .progress.proc > i{background:var(--proc)}
+  .progress.err > i{background:var(--err)}
+  .scroll::-webkit-scrollbar{width:10px;height:10px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px;border:2px solid var(--panel)}
+  .scroll::-webkit-scrollbar-track{background:transparent}
+  .tiny{font-size:10.5px;line-height:15px}
+  .micro{font-size:10px;line-height:14px}
+  .label{font-size:10.5px;font-weight:600;letter-spacing:.055em;text-transform:uppercase;color:var(--t2)}
+  .num{font-variant-numeric:tabular-nums}
+  .dot{width:6px;height:6px;border-radius:50%;display:inline-block;flex:none}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.warn{background:var(--warn)}
+  .dot.run{background:var(--proc);box-shadow:0 0 0 3px rgba(167,139,250,.15)}
+  .dot.idle{background:var(--bd3)}
+  .callout{background:var(--overlay);border:1px solid var(--bd2);border-radius:4px}
+
+.work{display:grid;grid-template-columns:44px 268px minmax(0,1fr) 320px;min-height:0;gap:0}
+.rail{background:var(--app);border-right:1px solid var(--bd);display:flex;flex-direction:column;align-items:center;padding:8px 0;gap:4px}
+.railitem{width:40px;height:46px;border-radius:5px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  color:var(--t3);border:1px solid transparent;position:relative}
+.railitem .rlabel{font-size:9px;letter-spacing:.02em}
+.railitem:hover{background:var(--raised);color:var(--t2)}
+.railitem.done{color:var(--t2)}
+.railitem.done:after{content:"";position:absolute;left:6px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--ok)}
+.railitem.active{background:var(--accent-s);border-color:var(--accent);color:var(--accent-t)}
+.railitem.active:after{content:"";position:absolute;left:6px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.railitem.disabled{opacity:.42}
+.ws{border-left:none;border-top:none;border-bottom:none;border-right:1px solid var(--bd)}
+.ws .tree{flex:1;overflow:auto;font-size:12px}
+.row{display:flex;align-items:center;gap:6px;height:22px;padding:0 8px 0 4px;border-left:2px solid transparent;white-space:nowrap}
+.row:hover{background:var(--hover)}
+.row.sel{background:var(--sel);border-left-color:var(--accent)}
+.row .tw{width:14px;display:flex;justify-content:center;color:var(--t3)}
+.row .ico{color:var(--t2)}
+.row .nm{overflow:hidden;text-overflow:ellipsis}
+.row .sp{flex:1}
+.row .cnt{color:var(--t3);font-size:10.5px;font-variant-numeric:tabular-nums}
+.row .badge{margin-left:auto;font-size:9.5px;padding:0 5px;line-height:14px;border-radius:8px;border:1px solid var(--bd2);color:var(--t2);background:var(--raised)}
+.row .badge.g{color:var(--ok);border-color:rgba(72,184,117,.3);background:rgba(72,184,117,.08)}
+.row .endbadge{margin-left:auto;font-size:9.5px;color:var(--ok)}
+.row .go{margin-left:auto;font-size:10px;color:var(--accent-t);display:flex;align-items:center;gap:3px}
+.row .ic{display:flex;align-items:center;color:var(--t3)}
+.row.root{height:26px;font-weight:600}
+.row.l1{padding-left:18px}
+.row.l2{padding-left:36px}
+.row.dimrow{color:var(--t3)}
+.row.next{background:linear-gradient(90deg,rgba(53,189,175,.10),transparent 70%)}
+.wsfoot{border-top:1px solid var(--bd);padding:7px 9px}
+.center{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) 160px;min-width:0;min-height:0}
+.viewport{position:relative;min-width:0;overflow:hidden;background:radial-gradient(120% 100% at 45% 25%,#243038 0%,var(--vp) 45%,var(--vp2) 100%);
+  border-bottom:1px solid var(--bd);overflow:hidden;display:flex;flex-direction:column}
+/* The viewport (canvas + its toolbar and overlays) stays dark-neutral in both
+   themes so sparse points, frustums and the yellow camera wireframes keep their
+   contrast; only the app chrome follows the theme. */
+.vptop{height:36px;flex:none;display:flex;align-items:center;gap:4px;padding:0 8px;background:#121A1F;
+  border-bottom:1px solid #33414B;position:relative;z-index:3;min-width:0;overflow:hidden;color:#A7B4BC}
+.vptop .iconbtn{color:#A7B4BC}
+.vptop .iconbtn.on{background:#16302E;border-color:#35BDAF;color:#4FD1C3}
+.vptop .vsep{background:#33414B}
+.vptop .vchip{color:#A7B4BC}
+.vptop .vchip.on{color:#E8EEF1;background:#1D252B;border-color:#33414B}
+.vptop .vchip.ghost{color:#A7B4BC;border-color:#33414B}
+.modes{display:flex;gap:2px;align-items:center}
+.vsep{width:1px;height:18px;background:var(--bd2);margin:0 6px}
+.vchip{padding:0 8px;height:22px;display:inline-flex;align-items:center;border-radius:3px;font-size:11px;color:var(--t3);border:1px solid transparent}
+.vchip.on{color:var(--t1);background:var(--raised);border-color:var(--bd2)}
+.vchip.ghost{color:var(--t2);border-color:var(--bd)}
+.canvas{position:relative;flex:1;min-height:0;overflow:hidden}
+.cloudimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.96}
+.cvignette{position:absolute;inset:0;background:radial-gradient(95% 80% at 52% 42%,transparent 45%,rgba(6,10,13,.5) 100%)}
+.vp-info{position:absolute;left:12px;top:12px;background:#141C21;border:1px solid #33414B;border-radius:3px;padding:6px 8px}
+.legend{display:flex;height:4px;width:92px;margin-top:5px;border-radius:2px;overflow:hidden}
+.legend span{flex:1}
+.scalebar{position:absolute;left:12px;bottom:12px;color:var(--t2)}
+.scalebar .bar{height:5px;border-left:1px solid var(--t2);border-right:1px solid var(--t2);border-bottom:1px solid var(--t2);width:96px;margin-bottom:3px}
+.gizmo{position:absolute;right:14px;bottom:12px;width:90px;height:90px}
+.selcard{position:absolute;right:14px;top:12px;width:244px;background:#10171B;
+  border:1px solid #33414B;border-radius:4px;padding:8px;color:#E8EEF1}
+.sc-h{display:flex;align-items:center;gap:6px;color:#A7B4BC}
+.sc-grid{display:grid;grid-template-columns:60px 1fr;gap:3px 8px;margin-top:7px}
+.sc-grid .k{color:#9AA7AE;font-size:10.5px}
+.sc-grid .mono{color:#E8EEF1}
+.sc-actions{display:flex;gap:4px;margin-top:6px;border-top:1px solid #33414B;padding-top:5px}
+.sc-actions .btn{color:#A7B4BC;border-color:#33414B}
+.sc-actions .btn:hover{background:rgba(255,255,255,.06)}
+.selcard .chip{background:#171E23;border-color:#33414B;color:#A7B4BC}
+.vp-hint{position:absolute;left:50%;transform:translateX(-50%);bottom:10px;color:#A7B4BC;font-size:10.5px;
+  background:#141C21;border:1px solid #33414B;border-radius:3px;padding:3px 8px}
+.photos .strip{display:flex;gap:6px;padding:8px;overflow-x:auto;flex:1;align-items:flex-start}
+.ph{width:100px;flex:none;border:1px solid var(--bd2);border-radius:3px;overflow:hidden;position:relative;background:#0B0F12}
+.ph.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);background:var(--accent-s)}
+.ph img{width:100%;height:70px;object-fit:cover;display:block;filter:saturate(.95) contrast(1.02)}
+.phbadge{position:absolute;right:3px;top:3px;height:15px;padding:0 4px;border-radius:7px;background:#0B0F12;
+  font:500 9.5px "JetBrains Mono";display:flex;align-items:center;gap:2px;border:1px solid rgba(72,184,117,.45);color:#7DD99A}
+.phbadge.warn{border-color:rgba(227,163,60,.5);color:#F0BE6A}
+.phname{display:block;font-size:9px;line-height:13px;color:var(--t3);padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ph.sel .phname{color:var(--accent-t);font-weight:500}
+.phfilter{height:22px;border:1px solid var(--bd2);border-radius:3px;display:flex;align-items:center;gap:5px;padding:0 6px;color:var(--t3);margin:4px 6px 4px 0;width:150px;background:var(--sunken)}
+.phfilter input{background:transparent;border:none;outline:none;color:var(--t1);font:11px Inter;width:100%}
+.rightdock{display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto auto;min-height:0;min-width:0;
+  border-left:1px solid var(--bd);background:var(--panel)}
+.rightdock .tabs{background:var(--panel)}
+.reftoolbar{display:flex;align-items:center;gap:2px;padding:5px 7px;border-bottom:1px solid var(--bd)}
+.refmeta{display:flex;gap:5px;padding:5px 7px;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.reftable{min-height:0;display:flex;flex-direction:column}
+.rt-head{display:grid;grid-template-columns:minmax(0,1fr) 54px 56px 74px;gap:3px;padding:5px 8px;border-bottom:1px solid var(--bd);
+  font-size:9.5px;color:var(--t3);text-transform:uppercase;letter-spacing:.03em}
+.rt-head .num{text-align:right}
+.rt{flex:1;overflow:auto}
+.rr{display:grid;grid-template-columns:minmax(0,1fr) 54px 56px 74px;gap:3px;align-items:center;height:21px;padding:0 8px;white-space:nowrap}
+.rr:hover{background:var(--hover)}
+.rr.sel{background:var(--sel)}
+.rr.sel .mut{color:#B2C0C8;font-weight:500}
+.rr.sel .okt{color:#7DD99A;font-weight:500}
+.rr.sel .warnt{color:#F0BE6A;font-weight:500}
+.rr .nm{overflow:hidden;text-overflow:ellipsis}
+.rr .num{text-align:right}
+.rr.rhead{height:19px;color:var(--t3);font-size:9px;text-transform:uppercase;letter-spacing:.04em}
+.okt{color:var(--ok)} .warnt{color:var(--warn)}
+.reffoot{padding:6px 8px;border-top:1px solid var(--bd)}
+.jobcard{padding:8px 10px;background:var(--raised);border-top:1px solid var(--bd2)}
+.jobhead{display:flex;align-items:center;gap:7px}
+.jobtitle{margin-top:6px;font-size:12px;font-weight:600}
+.jobstage{margin-top:2px}
+.jobmeta{display:flex;align-items:center;gap:8px;color:var(--t2)}
+.joba{display:flex;align-items:center;gap:2px;margin-top:6px}
+.statusbar{display:flex;align-items:center;gap:0;height:26px;padding:0 10px;background:var(--panel);border-top:1px solid var(--bd);
+  font-size:10.5px;color:var(--t2)}
+.sb{display:inline-flex;align-items:center;gap:5px;padding:0 10px}
+.sbd{width:1px;height:12px;background:var(--bd2)}
+.sp{flex:1}
+.jobpill{display:inline-flex;align-items:center;gap:6px;color:var(--t2)}
+.sbp{width:80px;height:3px;background:var(--sunken);border-radius:2px;overflow:hidden}
+.sbp i{display:block;height:100%;background:var(--proc)}
+</style></head>
+<body class="">
+<div class="app">
+  <div class="winbar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <div class="brand"><span style="color:var(--accent-t)"><svg class="" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 3 4 8 5-5 5 15H2L8 3z"/></svg></span>alphashape</div>
+    <div class="mut" style="font-size:11px">Rheinfeld survey.alphashape</div>
+    <div class="right">
+      <span class="chip"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>GPU · M1</span>
+      <span class="chip"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M4 10h16"/><path d="M8 16h.01M12 16h.01"/></svg>74.2 GB free</span>
+      <span class="iconbtn" title="Command palette"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 0 0 0-6z"/></svg></span>
+      <span class="iconbtn" title="Theme"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span>
+      <span class="iconbtn" title="Preferences"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></span>
+    </div>
+  </div>
+
+  <div class="work">
+    <div class="rail">
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5M9.5 13.5 12 11l2.5 2.5"/></svg></span><span class="rlabel">Photos</span></div>
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg></span><span class="rlabel">Align</span></div>
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></span><span class="rlabel">Control</span></div>
+      <div class="railitem active"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg></span><span class="rlabel">Points</span></div>
+      <div class="railitem disabled"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.7l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.7l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></span><span class="rlabel">Surface</span></div>
+      <div class="railitem disabled"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 15 5h4v4l3 3-3 3v4h-4l-3 3-3-3H5v-4l-3-3 3-3V5h4z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="rlabel">Check</span></div>
+      <div class="railitem disabled"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.2"/><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></span><span class="rlabel">Export</span></div>
+      <div style="flex:1"></div>
+      <div class="railitem" style="height:34px"><svg class="" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg></div>
+    </div>
+
+    <div class="dock ws">
+      <div class="dockhead">
+        <span class="ttl">Workspace</span>
+        <div class="right">
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></span>
+        </div>
+      </div>
+      <div class="wssearch"><div class="field" style="margin:6px 8px"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input placeholder="Search cameras, markers…"><span class="kbd">/</span></div></div>
+      <div class="tree scroll">
+        <div class="row root"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span class="nm">Chunk 1</span><span class="badge">12 aligned</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></svg><span class="nm">Cameras</span><span class="cnt">12</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l2"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">aerial_r0c0.jpg</span><span class="badge g">0.38 px</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div><div class="row l2"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">aerial_r0c1.jpg</span><span class="badge g">0.41 px</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div><div class="row l2"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">aerial_r0c2.jpg</span><span class="badge g">0.44 px</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l2 sel"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">aerial_r1c1.jpg</span><span class="badge">selected</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l2"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">aerial_r1c2.jpg</span><span class="badge g">0.43 px</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l2 dimrow"><span class="tw"></span><svg class="ico dim" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="nm mono tiny">+ 7 more</span></div>
+        <div class="row l1"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg><span class="nm">Markers</span><span class="cnt">4</span><span class="endbadge">RMSE 0.021 m</span></div>
+        <div class="row l1"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg><span class="nm">Tie points</span><span class="cnt">4,945</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span class="nm">Depth maps</span><span class="cnt">—</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 7 10 7a13.2 13.2 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.5 13.5 0 0 0 2 11s3.5 7 10 7a9 9 0 0 0 5.39-1.61"/><path d="m2 2 20 20"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg></span></div>
+        <div class="row l1 next"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg><span class="nm">Point cloud</span><span class="cnt">—</span><span class="sp"></span><span class="go">Build <svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span></div>
+        <div class="row l1 dimrow"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.7l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.7l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg><span class="nm">Model</span><span class="cnt">—</span></div>
+        <div class="row l1 dimrow"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 3 4 8 5-5 5 15H2L8 3z"/><path d="M4.14 15.08c2.62-1.57 5.24-1.43 7.86.42 2.74 1.94 5.49 2 8.23.19"/></svg><span class="nm">DEM</span><span class="cnt">—</span></div>
+        <div class="row l1 dimrow"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3z"/><path d="M9 3v15M15 6v15"/></svg><span class="nm">Orthomosaic</span><span class="cnt">—</span></div>
+      </div>
+      <div class="wsfoot">
+        <div class="tiny mut" style="display:flex;justify-content:space-between"><span>12 cameras · 4 markers</span><span class="mono">4,945 pts</span></div>
+        <div class="tiny" style="color:var(--t2);margin-top:4px;display:flex;align-items:center;gap:5px"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg><span>Alignment done · median 0.42 px</span></div>
+      </div>
+    </div>
+
+    <div class="center">
+      <div class="viewport">
+        <div class="vptop">
+          <div class="modes">
+            <span class="iconbtn on"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M3.5 9.5c-1.5 3-.5 6 2 7.5s6.5 1 9-1.5"/><path d="M20.5 14.5c1.5-3 .5-6-2-7.5s-6.5-1-9 1.5"/></svg></span>
+            <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-4 0v4"/><path d="M14 10V5a2 2 0 0 0-4 0v5"/><path d="M10 10V6a2 2 0 0 0-4 0v8a6 6 0 0 0 12 0v-3a2 2 0 0 0-4 0"/></svg></span>
+            <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3M8 11h6"/></svg></span>
+          </div>
+          <div class="vsep"></div>
+          <div class="modes">
+            <span class="vchip on">Sparse</span><span class="vchip">Dense</span><span class="vchip">Mesh</span>
+          </div>
+          <div class="vsep"></div>
+          <span class="iconbtn on"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></svg></span>
+          <span class="iconbtn on"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg></span>
+          <div style="flex:1"></div>
+          <span class="vchip ghost">Perspective</span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M16 21h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></span>
+        </div>
+        <div class="canvas">
+          <img class="cloudimg" src="assets/sparse_cloud.svg" alt="">
+          <div class="cvignette"></div>
+          <div class="vp-info">
+            <div class="mono tiny" style="color:#A7B4BC">Tie points · 4,945</div>
+            <div class="mono micro" style="margin-top:3px;color:#7E8C95">Colour: height · 0–9.5 m</div>
+            <div class="legend"><span style="background:#7F9AA8"></span><span style="background:#A9C6D4"></span><span style="background:#DCEBF3"></span></div>
+          </div>
+          <div class="scalebar"><div class="bar"></div><span class="mono micro">20 m</span></div>
+          <svg class="gizmo" viewBox="0 0 90 90">
+            <circle cx="45" cy="45" r="34" fill="rgba(13,17,20,.5)" stroke="var(--bd2)"/>
+            <line x1="45" y1="45" x2="45" y2="16" stroke="#F07068" stroke-width="1.8"/>
+            <line x1="45" y1="45" x2="71" y2="56" stroke="#48B875" stroke-width="1.8"/>
+            <line x1="45" y1="45" x2="19" y2="56" stroke="#6BA8E0" stroke-width="1.8"/>
+            <text x="41" y="12" fill="#F07068" font-family="JetBrains Mono" font-size="9">Z</text>
+            <text x="74" y="62" fill="#48B875" font-family="JetBrains Mono" font-size="9">X</text>
+            <text x="9" y="62" fill="#6BA8E0" font-family="JetBrains Mono" font-size="9">Y</text>
+          </svg>
+          <div class="selcard">
+            <div class="sc-h"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg><span class="mono tiny" style="color:#A7B4BC">aerial_r1c1.jpg</span><span class="sp"></span><span class="chip">500 px</span></div>
+            <div class="sc-grid">
+              <span class="k">Centre</span><span class="mono tiny num">−11.000, 0.000, 60.000</span>
+              <span class="k">Reproj.</span><span class="mono tiny num okt">0.41 px</span>
+              <span class="k">Observed</span><span class="mono tiny num">1,284 points</span>
+            </div>
+            <div class="sc-actions"><span class="btn sm ghost">Open photo</span><span class="btn sm ghost">Disable</span></div>
+          </div>
+          <div class="vp-hint"><span class="kbd">LMB</span> orbit <span class="kbd">MMB</span> pan <span class="kbd">wheel</span> zoom <span class="kbd">F</span> fit</div>
+        </div>
+      </div>
+
+      <div class="dock photos">
+        <div class="tabs">
+          <span class="tab on"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 22H4a2 2 0 0 1-2-2V6"/><path d="m22 13-1.3-1.3a2 2 0 0 0-2.8 0L11 18"/><circle cx="12" cy="8" r="2"/><rect x="6" y="2" width="16" height="16" rx="2"/></svg>Photos <span class="cnt">12</span></span>
+          <span class="tab"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>Masks <span class="cnt">0</span></span>
+          <span class="tab"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2h4"/><path d="M12 14v-4"/><circle cx="12" cy="14" r="8"/></svg>Depth <span class="cnt">—</span></span>
+          <div style="flex:1"></div>
+          <span class="phfilter"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input placeholder="Filter…"></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span>
+        </div>
+        <div class="strip"><div class="ph "><img src="assets/aerial_r0c0.jpg" alt=""><span class="phbadge ok">0.38</span><span class="phname mono">aerial_r0c0.jpg</span></div><div class="ph "><img src="assets/aerial_r0c1.jpg" alt=""><span class="phbadge ok">0.41</span><span class="phname mono">aerial_r0c1.jpg</span></div><div class="ph "><img src="assets/aerial_r0c2.jpg" alt=""><span class="phbadge ok">0.44</span><span class="phname mono">aerial_r0c2.jpg</span></div><div class="ph "><img src="assets/aerial_r0c3.jpg" alt=""><span class="phbadge ok">0.40</span><span class="phname mono">aerial_r0c3.jpg</span></div><div class="ph "><img src="assets/aerial_r1c0.jpg" alt=""><span class="phbadge ok">0.45</span><span class="phname mono">aerial_r1c0.jpg</span></div><div class="ph sel"><img src="assets/aerial_r1c1.jpg" alt=""><span class="phbadge ok">0.41</span><span class="phname mono">aerial_r1c1.jpg</span></div><div class="ph "><img src="assets/aerial_r1c2.jpg" alt=""><span class="phbadge ok">0.43</span><span class="phname mono">aerial_r1c2.jpg</span></div><div class="ph "><img src="assets/aerial_r1c3.jpg" alt=""><span class="phbadge ok">0.47</span><span class="phname mono">aerial_r1c3.jpg</span></div><div class="ph "><img src="assets/aerial_r2c0.jpg" alt=""><span class="phbadge warn">0.51</span><span class="phname mono">aerial_r2c0.jpg</span></div><div class="ph "><img src="assets/aerial_r2c1.jpg" alt=""><span class="phbadge ok">0.49</span><span class="phname mono">aerial_r2c1.jpg</span></div><div class="ph "><img src="assets/aerial_r2c2.jpg" alt=""><span class="phbadge warn">0.62</span><span class="phname mono">aerial_r2c2.jpg</span></div><div class="ph "><img src="assets/aerial_r2c3.jpg" alt=""><span class="phbadge ok">0.46</span><span class="phname mono">aerial_r2c3.jpg</span></div></div>
+      </div>
+    </div>
+
+    <div class="rightdock">
+      <div class="tabs">
+        <span class="tab">Properties</span>
+        <span class="tab on">Reference <span class="cnt">16</span></span>
+      </div>
+      <div class="reftoolbar">
+        <span class="iconbtn on" title="Pick in viewport"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></span>
+        <span class="iconbtn" title="Re-optimise"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></span>
+        <span class="iconbtn" title="Import…"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5M12 3v12"/></svg></span>
+        <span class="iconbtn" title="Export…"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></span>
+        <div style="flex:1"></div>
+        <span class="btn sm" title="Optimise camera and marker alignment"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 4 5 5"/><path d="M3 21 17 7l-5-5L-2 16z" transform="translate(5 0)"/><path d="M9 3h.01M4 9h.01M15 21h.01M20 15h.01"/></svg>Optimize</span>
+      </div>
+      <div class="refmeta">
+        <span class="chip acc"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>4 markers</span>
+        <span class="chip ok">RMSE 0.021 m</span>
+        <span class="chip">EPSG:25832</span>
+      </div>
+      <div class="reftable">
+        <div class="rt-head"><span>Camera</span><span class="num">Error (m)</span><span class="num">Error (px)</span><span class="num">Projections</span></div>
+        <div class="rt scroll">
+          <div class="rr "><span class="mono tiny nm">aerial_r0c0.jpg</span><span class="num tiny mut">0.041</span><span class="num tiny okt">0.38</span><span class="num tiny mut">1284</span></div><div class="rr "><span class="mono tiny nm">aerial_r0c1.jpg</span><span class="num tiny mut">0.044</span><span class="num tiny okt">0.41</span><span class="num tiny mut">1301</span></div><div class="rr "><span class="mono tiny nm">aerial_r0c2.jpg</span><span class="num tiny mut">0.047</span><span class="num tiny okt">0.44</span><span class="num tiny mut">1298</span></div><div class="rr "><span class="mono tiny nm">aerial_r0c3.jpg</span><span class="num tiny mut">0.043</span><span class="num tiny okt">0.40</span><span class="num tiny mut">1277</span></div><div class="rr "><span class="mono tiny nm">aerial_r1c0.jpg</span><span class="num tiny mut">0.048</span><span class="num tiny okt">0.45</span><span class="num tiny mut">1310</span></div><div class="rr sel"><span class="mono tiny nm">aerial_r1c1.jpg</span><span class="num tiny mut">0.044</span><span class="num tiny okt">0.41</span><span class="num tiny mut">1284</span></div><div class="rr "><span class="mono tiny nm">aerial_r1c2.jpg</span><span class="num tiny mut">0.046</span><span class="num tiny okt">0.43</span><span class="num tiny mut">1299</span></div><div class="rr "><span class="mono tiny nm">aerial_r1c3.jpg</span><span class="num tiny mut">0.050</span><span class="num tiny okt">0.47</span><span class="num tiny mut">1265</span></div><div class="rr "><span class="mono tiny nm">aerial_r2c0.jpg</span><span class="num tiny mut">0.057</span><span class="num tiny warnt">0.51</span><span class="num tiny mut">1240</span></div><div class="rr "><span class="mono tiny nm">aerial_r2c1.jpg</span><span class="num tiny mut">0.054</span><span class="num tiny okt">0.49</span><span class="num tiny mut">1252</span></div><div class="rr "><span class="mono tiny nm">aerial_r2c2.jpg</span><span class="num tiny mut">0.068</span><span class="num tiny warnt">0.62</span><span class="num tiny mut">1198</span></div><div class="rr "><span class="mono tiny nm">aerial_r2c3.jpg</span><span class="num tiny mut">0.049</span><span class="num tiny okt">0.46</span><span class="num tiny mut">1271</span></div>
+          <div class="rr rhead" style="margin-top:6px"><span>Markers</span><span class="num">est.</span><span class="num">reproj.</span><span class="num">obs.</span></div>
+          <div class="rr"><span class="mono tiny nm">GCP-01</span><span class="num tiny okt">0.014</span><span class="num tiny mut">—</span><span class="num tiny mut">6</span></div><div class="rr"><span class="mono tiny nm">GCP-02</span><span class="num tiny okt">0.019</span><span class="num tiny mut">—</span><span class="num tiny mut">5</span></div><div class="rr"><span class="mono tiny nm">GCP-03</span><span class="num tiny warnt">0.031</span><span class="num tiny mut">—</span><span class="num tiny mut">6</span></div><div class="rr"><span class="mono tiny nm">GCP-04</span><span class="num tiny okt">0.022</span><span class="num tiny mut">—</span><span class="num tiny mut">5</span></div>
+        </div>
+      </div>
+      <div class="reffoot">
+        <div class="tiny mut">Errors estimated vs. source coordinates · sort by |error|</div>
+      </div>
+
+      <div class="jobcard">
+        <div class="jobhead"><span class="dot run"></span><span class="label" style="letter-spacing:.02em">Processing</span><span class="sp"></span><span class="mono micro mut">00:04:12</span></div>
+        <div class="jobtitle">Build point cloud <span class="mut" style="font-weight:400">· Chunk 1</span></div>
+        <div class="jobstage tiny mut">Depth maps · 7 of 12 cameras</div>
+        <div class="progress proc" style="margin:7px 0 6px"><i style="width:58%"></i></div>
+        <div class="jobmeta tiny mut"><span>ETA 00:02:40</span><span class="sp"></span><span class="mono">RAM 3.1 / 12 GB</span></div>
+        <div class="joba">
+          <span class="btn sm ghost"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg>Pause</span>
+          <span class="btn sm ghost"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>Stop</span>
+          <span class="sp"></span>
+          <span class="tiny" style="color:var(--accent-t);display:inline-flex;align-items:center;gap:3px">Queue <svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span class="sb"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>Chunk 1</span><span class="sbd"></span>
+    <span class="sb mono">EPSG:25832</span><span class="sbd"></span>
+    <span class="sb mono">GSD 0.29 m</span><span class="sbd"></span>
+    <span class="sb mono">X 9.200000° · Y 48.700000°</span>
+    <span class="sp"></span>
+    <span class="sb jobpill"><span class="dot run"></span>1 job running<span class="mono mut">· ETA 00:02:40</span></span>
+    <span class="sbd"></span><span class="sb mono">12 / 12 aligned</span>
+  </div>
+</div></body></html>

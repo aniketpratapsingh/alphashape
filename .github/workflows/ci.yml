@@ -1,0 +1,59 @@
+name: CI
+
+# Runs on every pull request to main, every push to main, and on demand. All jobs run in parallel;
+# "CI OK" at the bottom depends on all of them and is the single check required on main.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same pull request cancels the older, now-stale run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repository hygiene
+        run: tools/check_repo_hygiene.sh
+      - name: Seeded-RNG evaluation order
+        run: python3 engine/tools/check_rng_order.py engine/src engine/tests
+      - name: No reverse-engineering material
+        run: |
+          if grep -rInE 'research/[0-9]|studied (product|implementation)|decompil|ghidra' \
+               --include='*.cpp' --include='*.hpp' --include='*.h' --include='*.py' \
+               --include='*.cmake' --include='CMakeLists.txt' --include='*.md' engine; then
+            echo "::error::References to reverse-engineering material are not allowed in this repository."
+            exit 1
+          fi
+
+  build:
+    name: Build
+    uses: ./.github/workflows/build.yml
+    with:
+      package: false
+
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [checks, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All required jobs passed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "A required job did not pass:"
+            echo '${{ toJSON(needs) }}'
+            exit 1
+          fi

@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>alphashape — processing queue (dark, ember)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>:root{--app:#0D1114;--panel:#12171B;--raised:#171E23;--overlay:#1D252B;--sunken:#0A0E11;--t1:#E8EEF1;--t2:#A7B4BC;--t3:#828F98;--bd:#28323A;--bd2:#33414B;--bd3:#4A5A65;--hover:rgba(255,255,255,.05);--track:#0A0E11;--phbg:#0B0F12;--lights:#3A464E;--scroll-thumb:#33414B;--dim:rgba(5,8,10,.62);--accent:#C2410C;--accent-h:#CC4A15;--accent-p:#A93608;--accent-t:#F08A58;--accent-s:#331A0E;--on-accent:#FFFFFF;--accent-chipbd:#5E2A12;--accent-fade:rgba(194,65,12,.12);--accent-ring:rgba(194,65,12,.40);--sel:#3A1D12;--sel-t2:#B2C0C8;--sel-ok:#7DD99A;--sel-warn:#EAC65A;--sel-bd:#F08A58;--ok:#48B875;--okbg:#12281B;--okbd:#22402C;--warn:#EAC65A;--warnbg:#2C2712;--warnbd:#3D3714;--err:#F4738B;--errbg:#2E191F;--errbd:#43232B;--info:#6BA8E0;--proc:#A78BFA;--app-hi:#1B242A;--app-mid:#12181C;--scrim:rgba(13,17,20,.72);--sgvig:radial-gradient(120% 90% at 50% 40%,transparent 55%,rgba(0,0,0,.45));--thumbf:brightness(.9) saturate(.9);--proc-fade:rgba(167,139,250,.12);--proc-fade-sm:rgba(167,139,250,.07);--proc-bd:rgba(167,139,250,.40);--err-bd-soft:rgba(240,112,104,.35);--err-bg-soft:rgba(240,112,104,.08);--vp-hi:#243038;--vp:#1D252B;--vp2:#141B20;--vvig:radial-gradient(95% 80% at 52% 42%,transparent 45%,rgba(6,10,13,.5) 100%);--vgrid:#6B8391;--vbbox:#5FA79C;--vp-p1:#9DB2BE;--vp-p2:#A9C6D4;--vp-p3:#DCEBF3;--vcam:#5BC8E8;--vcam-op:0.7;--vcore:#FFFFFF;--vring:#E8681F;--vlabel:#F5C08C;--vsig:#E8681F;--vsel:#F08A58;--vsel-s:#331A0E;--vacc:#C2410C;--vacc-h:#CC4A15;--vacc-t:#F08A58;--vacc-s:#331A0E;--von-accent:#FFFFFF;--vt1:#E8EEF1;--vt2:#A7B4BC;--vt3:#9AA7AE;--vbd:#33414B;--vpanel:#121A1F;--vraised:#1D252B;--vcard:#141C21;--vcard2:#10171B;--gz:#F07068;--gx:#48B875;--gy:#6BA8E0;--gfill:rgba(13,17,20,.5);--gstroke:#33414B;--vok:#7DD99A;--vwarn:#F0BE6A;--verr:#F47C94;--vkbd:#1D252B;}
+  /* Colour custom properties are emitted by page() from _tokens.theme_tokens();
+     BASE_CSS only carries structure and the fallback for non-tokenised values. */
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--app);color:var(--t1);
+    font-family:Inter,-apple-system,"Segoe UI",sans-serif;font-size:13px;line-height:19px;
+    -webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1;letter-spacing:0}
+  .app{width:1600px;height:1000px;display:grid;grid-template-rows:38px 1fr;overflow:hidden;background:var(--app)}
+  .mono{font-family:"JetBrains Mono",monospace}
+  .sec{color:var(--t2)} .mut{color:var(--t3)}
+  .k{color:var(--t3)}
+  svg{flex:none}
+  .winbar{display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--panel);
+    border-bottom:1px solid var(--bd)}
+  .lights{display:flex;gap:8px;margin-right:6px}
+  .lights i{width:11px;height:11px;border-radius:50%;background:var(--lights,#3A464E);display:block}
+  .brand{display:flex;align-items:center;gap:8px;font-weight:600}
+  .winbar .right{margin-left:auto;display:flex;align-items:center;gap:10px;color:var(--t3);font-size:11px}
+  .iconbtn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:3px;
+    border:1px solid transparent;color:var(--t2);background:transparent}
+  .iconbtn:hover{background:var(--hover);color:var(--t1)}
+  .iconbtn.on{background:var(--accent-s);border-color:var(--accent);color:var(--accent-t)}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:26px;padding:0 10px;border-radius:3px;
+    border:1px solid var(--bd2);background:var(--raised);color:var(--t1);font:500 12px Inter;white-space:nowrap}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+  .btn.ghost{background:transparent;border-color:transparent;color:var(--t2)}
+  .btn.sm{height:22px;font-size:11px;padding:0 8px}
+  .btn.danger{background:transparent;border-color:var(--err);color:var(--err)}
+  .chip{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 7px;border-radius:3px;
+    background:var(--raised);border:1px solid var(--bd);color:var(--t2);font-size:10.5px}
+  .chip.ok{color:var(--ok);border-color:var(--okbd);background:var(--okbg)}
+  .chip.warn{color:var(--warn);border-color:var(--warnbd);background:var(--warnbg)}
+  .chip.err{color:var(--err);border-color:var(--errbd);background:var(--errbg)}
+  .chip.acc{color:var(--accent-t);border-color:var(--accent-chipbd);background:var(--accent-s)}
+  .dock{background:var(--panel);border:1px solid var(--bd);display:flex;flex-direction:column;min-height:0}
+  .dockhead{display:flex;align-items:center;gap:6px;height:30px;padding:0 8px;border-bottom:1px solid var(--bd);background:var(--panel)}
+  .dockhead .ttl{font-size:10.5px;font-weight:600;letter-spacing:.055em;text-transform:uppercase;color:var(--t2)}
+  .dockhead .right{margin-left:auto;display:flex;gap:2px}
+  .tabs{display:flex;height:30px;border-bottom:1px solid var(--bd);background:var(--app);align-items:stretch}
+  .tab{display:inline-flex;align-items:center;gap:6px;padding:0 12px;font-size:12px;color:var(--t2);
+    border-bottom:2px solid transparent;white-space:nowrap}
+  .tab.on{color:var(--t1);border-bottom-color:var(--accent);background:var(--panel)}
+  .tab .cnt{font-size:10px;color:var(--t3);background:var(--raised);border:1px solid var(--bd);border-radius:8px;padding:0 5px;line-height:14px}
+  .tab.on .cnt{color:var(--t2)}
+  .field{height:24px;background:var(--sunken);border:1px solid var(--bd2);border-radius:3px;display:flex;align-items:center;
+    gap:6px;padding:0 7px;color:var(--t3);font-size:11px}
+  .field input{border:none;background:transparent;color:var(--t1);font:12px Inter;outline:none;width:100%}
+  .toggle{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:2px;
+    border:1px solid var(--bd3);background:var(--sunken);color:var(--on-accent)}
+  .toggle.on{background:var(--accent);border-color:var(--accent)}
+  .toggle.on svg{display:block} .toggle svg{display:none}
+  .kbd{font-family:"JetBrains Mono";font-size:10px;padding:1px 4px;border:1px solid var(--bd3);border-radius:2px;color:var(--t2);background:var(--sunken)}
+  .divider{height:1px;background:var(--bd)}
+  .progress{height:4px;border-radius:2px;background:var(--track);overflow:hidden;position:relative}
+  .progress > i{display:block;height:100%;background:var(--accent);border-radius:2px}
+  .progress.proc > i{background:var(--proc)}
+  .progress.err > i{background:var(--err)}
+  .scroll::-webkit-scrollbar{width:10px;height:10px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border-radius:4px;border:2px solid var(--panel)}
+  .scroll::-webkit-scrollbar-track{background:transparent}
+  .tiny{font-size:10.5px;line-height:15px}
+  .micro{font-size:10px;line-height:14px}
+  .label{font-size:10.5px;font-weight:600;letter-spacing:.055em;text-transform:uppercase;color:var(--t2)}
+  .num{font-variant-numeric:tabular-nums}
+  .dot{width:6px;height:6px;border-radius:50%;display:inline-block;flex:none}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.warn{background:var(--warn)}
+  .dot.run{background:var(--proc);box-shadow:0 0 0 3px rgba(167,139,250,.15)}
+  .dot.idle{background:var(--bd3)}
+  .callout{background:var(--overlay);border:1px solid var(--bd2);border-radius:4px}
+
+.work{display:grid;grid-template-columns:44px 240px 1fr 300px;min-height:0}
+.rail{background:var(--app);border-right:1px solid var(--bd);display:flex;flex-direction:column;align-items:center;padding:8px 0;gap:4px}
+.railitem{width:40px;height:46px;border-radius:5px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--t3);border:1px solid transparent;position:relative}
+.railitem .rlabel{font-size:9px}
+.railitem.done{color:var(--t2)} .railitem.done:after{content:"";position:absolute;left:6px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--ok)}
+.railitem.active{background:var(--accent-s);border-color:var(--accent);color:var(--accent-t)}
+.railitem.active:after{content:"";position:absolute;left:6px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.railitem.disabled{opacity:.42}
+.ws{border:none;border-right:1px solid var(--bd)}
+.tree{flex:1;overflow:auto;font-size:12px}
+.row{display:flex;align-items:center;gap:6px;height:22px;padding:0 8px 0 4px;border-left:2px solid transparent;white-space:nowrap}
+.row .tw{width:14px;display:flex;justify-content:center;color:var(--t3)}
+.row .ico{color:var(--t2)} .row .nm{overflow:hidden;text-overflow:ellipsis}
+.row .sp{flex:1} .row .cnt{color:var(--t3);font-size:10.5px} .row .ic{color:var(--t3)}
+.row .badge{margin-left:auto;font-size:9.5px;padding:0 5px;line-height:14px;border-radius:8px;border:1px solid var(--bd2);color:var(--t2);background:var(--raised)}
+.row .badge.err{color:var(--err);border-color:var(--err-bd-soft);background:var(--err-bg-soft)}
+.row.run{background:linear-gradient(90deg,var(--proc-fade),transparent 80%);border-left-color:var(--proc)}
+.row.l1{padding-left:18px}.row.dimrow{color:var(--t3)}
+.wsfoot{border-top:1px solid var(--bd);padding:7px 9px}
+.center{display:grid;grid-template-rows:46px 1fr 236px;min-width:0;min-height:0;border-right:1px solid var(--bd)}
+.qtop{display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid var(--bd);background:var(--panel)}
+.qtitle{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600}
+.qt-i{color:var(--accent-t)}
+.qactions{margin-left:auto;display:flex;align-items:center;gap:6px}
+.vsep{width:1px;height:16px;background:var(--bd2);margin:0 4px}
+.jobs{overflow:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px;background:var(--app)}
+.job{display:grid;grid-template-columns:104px 1fr 210px 96px;gap:12px;align-items:center;
+  background:var(--panel);border:1px solid var(--bd);border-radius:4px;padding:9px 11px;min-height:58px}
+.job.runrow{border-color:var(--proc-bd);background:linear-gradient(90deg,var(--proc-fade-sm),var(--panel) 45%)}
+.job.failrow{border-color:var(--err-bd-soft)}
+.jstate{display:flex;align-items:center;gap:7px}
+.js-t{font-size:10px;text-transform:uppercase;letter-spacing:.055em;font-weight:600;color:var(--t3)}
+.js-t.run{color:var(--proc)} .js-t.done{color:var(--ok)} .js-t.fail{color:var(--err)} .js-t.paused{color:var(--warn)}
+.jt{font-size:12.5px;font-weight:600}
+.js{font-size:11px;color:var(--t2);margin-top:2px}
+.jp-meta{font-size:10.5px;color:var(--t3);margin-top:5px;font-variant-numeric:tabular-nums}
+.jact{display:flex;justify-content:flex-end;gap:2px}
+.qlog{border-top:1px solid var(--bd);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+.qlog-h{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--bd);height:32px}
+.qlog-h .sp{flex:1}
+.log{flex:1;overflow:auto;padding:6px 0;font-family:"JetBrains Mono",monospace;font-size:10.5px;line-height:17px}
+.ln{display:grid;grid-template-columns:64px 40px 1fr;gap:8px;padding:0 12px;white-space:nowrap}
+.ln:hover{background:var(--hover)}
+.lt{color:var(--t3)} .lv{font-size:9.5px;text-transform:uppercase}
+.lv.info{color:var(--info)} .lv.warn{color:var(--warn)} .lv.proc{color:var(--proc)}
+.ln.dim{opacity:.6}
+.ln.cur{background:var(--proc-fade-sm)}
+.cursor{display:inline-block;width:6px;height:11px;background:var(--proc);vertical-align:-1px;margin-left:3px}
+.side{border:none;border-left:1px solid var(--bd)}
+.sidebody{flex:1;overflow:auto}
+.kv{display:grid;grid-template-columns:84px 1fr;gap:8px;padding:4px 10px;font-size:11.5px}
+.kv .k{color:var(--t3)}
+.fmtnote{padding:10px;line-height:16px}
+.statusbar{display:flex;align-items:center;height:26px;padding:0 10px;background:var(--panel);border-top:1px solid var(--bd);font-size:10.5px;color:var(--t2)}
+.sb{display:inline-flex;align-items:center;gap:5px;padding:0 10px}
+.sbd{width:1px;height:12px;background:var(--bd2)} .sp{flex:1}
+
+.row .badge.g{color:var(--ok);border-color:var(--okbd);background:var(--okbg)}
+.row .badge.err{color:var(--err);border-color:var(--errbd);background:var(--errbg)}
+.railitem.disabled{opacity:.5}
+.ph.sel{background:var(--sel)}
+.phname{color:var(--t2)}
+.rr.sel .mut{color:var(--sel-t2)}
+.rr.sel .okt{color:var(--sel-ok)}
+.rr.sel .warnt{color:var(--sel-warn)}
+.lights i{background:var(--lights)}
+</style></head>
+<body class="">
+<div class="app">
+  <div class="winbar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <div class="brand"><span style="color:var(--accent-t)"><svg class="" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 3 4 8 5-5 5 15H2L8 3z"/></svg></span>alphashape</div>
+    <div class="mut" style="font-size:11px">Rheinfeld survey.alphashape</div>
+    <div class="right"><span class="chip"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>GPU · M1</span><span class="chip"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>4 active · 2 finished</span><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 0 0 0-6z"/></svg></span></div>
+  </div>
+
+  <div class="work">
+    <div class="rail">
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5M9.5 13.5 12 11l2.5 2.5"/></svg></span><span class="rlabel">Photos</span></div>
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg></span><span class="rlabel">Align</span></div>
+      <div class="railitem done"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></span><span class="rlabel">Control</span></div>
+      <div class="railitem active"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg></span><span class="rlabel">Points</span></div>
+      <div class="railitem disabled"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.7l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.7l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></span><span class="rlabel">Surface</span></div>
+      <div class="railitem disabled"><span class="rn"><svg class="" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.4 7.5 4.2"/><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></span><span class="rlabel">Export</span></div>
+      <div style="flex:1"></div>
+      <div class="railitem" style="height:34px"><svg class="" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg></div>
+    </div>
+
+    <div class="dock ws">
+      <div class="dockhead"><span class="ttl">Workspace</span><div class="right"><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></span><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span></div></div>
+      <div class="tree">
+        <div class="row root"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span class="nm">Chunk 1</span><span class="badge">12 aligned</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></svg><span class="nm">Cameras</span><span class="cnt">12</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg><span class="nm">Markers</span><span class="cnt">4</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg><span class="nm">Tie points</span><span class="cnt">4,945</span><span class="sp"></span><span class="ic"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        <div class="row l1 run"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg><span class="nm">Point cloud</span><span class="mono tiny" style="color:var(--proc)">building</span><span class="sp"></span><span class="ic"></span></div>
+        <div class="row l1 dimrow"><span class="tw"></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v8a2 2 0 0 1-1 1.7l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.7l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg><span class="nm">Model</span></div>
+        <div class="row root" style="margin-top:8px;height:22px;font-weight:500;color:var(--t2)"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span class="nm">Chunk 2</span><span class="badge err">3 failed</span></div>
+        <div class="row root" style="height:22px;font-weight:500;color:var(--t2)"><span class="tw"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span><svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span class="nm">Chunk 3</span><span class="badge">queued</span></div>
+      </div>
+      <div class="wsfoot"><div class="tiny mut">3 chunks · 2 processing</div></div>
+    </div>
+
+    <div class="center">
+      <div class="qtop">
+        <div class="qtitle">
+          <span class="qt-i"><svg class="" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg></span>
+          <span>Processing queue</span>
+          <span class="chip acc">1 running</span>
+          <span class="chip">3 waiting</span>
+          <span class="chip ok">2 done</span>
+          <span class="chip err">1 failed</span>
+        </div>
+        <div class="qactions">
+          <span class="btn sm"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg>Pause all</span>
+          <span class="btn sm ghost"><svg class="" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 14h10l1-14"/><path d="M9 7V4h6v3"/></svg>Clear finished</span>
+          <span class="vsep"></span>
+          <span class="tiny mut">Concurrency</span>
+          <span class="field" style="width:64px;height:24px">1 job <span style="margin-left:auto"><svg class="" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span></span>
+        </div>
+      </div>
+
+      <div class="jobs scroll">
+        
+    <div class="job runrow">
+      <div class="jstate"><span class="dot run"></span><span class="js-t run">Running</span></div>
+      <div class="jmain">
+        <div class="jt">Build point cloud</div>
+        <div class="js">Chunk 1 · <span class='mut'>Depth maps · 7 / 12 cameras</span></div>
+      </div>
+      <div class="jprog"><div class="progress proc"><i style="width:58%"></i></div><div class="jp-meta"><span class='mono'>58%</span> · ETA 00:02:40 · RAM 3.1 / 12 GB</div></div>
+      <div class="jact"><span class="iconbtn" title="Pause"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg></span><span class="iconbtn" title="Stop"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/></svg></span><span class="iconbtn" title="Show log"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg></span></div>
+    </div>
+    <div class="job ">
+      <div class="jstate"><span class="dot idle"></span><span class="js-t queued">Queued</span></div>
+      <div class="jmain">
+        <div class="jt">Build DEM</div>
+        <div class="js">Chunk 1 · <span class='mut'>after point cloud</span></div>
+      </div>
+      <div class="jprog"><div class="jp-meta"><span class='mut'>Queued 00:04 ago</span> · est. 00:01:30 · 640 MB</div></div>
+      <div class="jact"><span class="iconbtn" title="Move up"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg></span><span class="iconbtn" title="Remove"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 14h10l1-14"/><path d="M9 7V4h6v3"/></svg></span><span class="iconbtn" title="Edit…"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></span></div>
+    </div>
+    <div class="job ">
+      <div class="jstate"><span class="dot idle"></span><span class="js-t queued">Queued</span></div>
+      <div class="jmain">
+        <div class="jt">Build orthomosaic</div>
+        <div class="js">Chunk 1 · <span class='mut'>after DEM</span></div>
+      </div>
+      <div class="jprog"><div class="jp-meta"><span class='mut'>Queued 00:04 ago</span> · est. 00:04:10 · 3.8 GB</div></div>
+      <div class="jact"><span class="iconbtn" title="Move up"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg></span><span class="iconbtn" title="Remove"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6"/><path d="M6 7l1 14h10l1-14"/><path d="M9 7V4h6v3"/></svg></span><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></span></div>
+    </div>
+    <div class="job failrow">
+      <div class="jstate"><span class="dot err"></span><span class="js-t fail">Failed</span></div>
+      <div class="jmain">
+        <div class="jt">Align photos</div>
+        <div class="js">Chunk 2 · <span class='mut'>3 cameras could not be matched</span></div>
+      </div>
+      <div class="jprog"><div class="jp-meta"><span style='color:var(--err)'>Failed after 00:00:52</span> · overlap below 40%</div></div>
+      <div class="jact"><span class="iconbtn" title="Retry"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></span><span class="iconbtn" title="Retry with changes"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></span><span class="iconbtn" title="Show log"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg></span></div>
+    </div>
+    <div class="job donerow">
+      <div class="jstate"><span class="dot ok"></span><span class="js-t done">Done</span></div>
+      <div class="jmain">
+        <div class="jt">Align photos</div>
+        <div class="js">Chunk 1 · <span class='mut'>12 / 12 cameras · median 0.42 px</span></div>
+      </div>
+      <div class="jprog"><div class="progress ok"><i style="width:100%"></i></div><div class="jp-meta"><span class='mono'>00:00:41</span> · finished 14:02 · 1.4 GB peak</div></div>
+      <div class="jact"><span class="iconbtn" title="Show log"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg></span><span class="iconbtn" title="Reveal output"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="14.5" cy="13.5" r="2.5"/><path d="m16.3 15.3 1.7 1.7"/></svg></span><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></span></div>
+    </div>
+    <div class="job donerow">
+      <div class="jstate"><span class="dot ok"></span><span class="js-t done">Done</span></div>
+      <div class="jmain">
+        <div class="jt">Import markers</div>
+        <div class="js">Chunk 1 · <span class='mut'>4 GCPs from gcp_rheinfeld.csv</span></div>
+      </div>
+      <div class="jprog"><div class="progress ok"><i style="width:100%"></i></div><div class="jp-meta"><span class='mono'>00:00:01</span> · finished 14:01</div></div>
+      <div class="jact"><span class="iconbtn" title="Show log"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg></span><span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></span></div>
+    </div>
+      </div>
+
+      <div class="qlog">
+        <div class="qlog-h">
+          <span class="tab on"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>Log · Build point cloud</span>
+          <span class="tab"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>Log file</span>
+          <span class="sp"></span>
+          <span class="tiny mut">All levels <svg class="" viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+          <span class="iconbtn"><svg class="" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></span>
+        </div>
+        <div class="log scroll">
+          <div class="ln"><span class="lt">14:06:02</span><span class="lv info">info</span><span>Build point cloud started · Chunk 1 · 12 cameras · Balanced preset</span></div>
+          <div class="ln"><span class="lt">14:06:02</span><span class="lv info">info</span><span>Depth maps: reusing none · 12 to compute · 480×360 · f=500.00</span></div>
+          <div class="ln"><span class="lt">14:06:11</span><span class="lv info">info</span><span>depth aerial_r0c0.jpg 100% (0.8 s)</span></div>
+          <div class="ln"><span class="lt">14:06:12</span><span class="lv info">info</span><span>depth aerial_r0c1.jpg 100% (0.9 s)</span></div>
+          <div class="ln"><span class="lt">14:06:14</span><span class="lv warn">warn</span><span>aerial_r2c2.jpg: overlap 38% below filter threshold 40% · depth will be sparse in 14% of pixels</span></div>
+          <div class="ln"><span class="lt">14:06:15</span><span class="lv info">info</span><span>depth aerial_r1c0.jpg 100% (1.0 s)</span></div>
+          <div class="ln cur"><span class="lt">14:06:16</span><span class="lv proc">run</span><span>depth aerial_r1c1.jpg 62% …<i class="cursor"></i></span></div>
+          <div class="ln dim"><span class="lt">—</span><span class="lv">·</span><span class="mut">Triangulating points · filtering · colouring</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dock side">
+      <div class="tabs"><span class="tab">Properties</span><span class="tab">Reference</span><span class="tab on">Queue <span class="cnt">6</span></span></div>
+      <div class="sidebody">
+        <div class="label" style="margin:10px 10px 6px">Selected job</div>
+        <div class="kv"><span class="k">Stage</span><span>Point cloud</span></div>
+        <div class="kv"><span class="k">Preset</span><span>Balanced</span></div>
+        <div class="kv"><span class="k">Started</span><span class="mono">14:06:02</span></div>
+        <div class="kv"><span class="k">Elapsed</span><span class="mono">00:04:12</span></div>
+        <div class="kv"><span class="k">ETA</span><span class="mono">00:02:40</span></div>
+        <div class="kv"><span class="k">Peak RAM</span><span class="mono">3.1 GB</span></div>
+        <div class="kv"><span class="k">Disk</span><span class="mono">1.42 GB</span></div>
+        <div class="divider" style="margin:10px"></div>
+        <div class="label" style="margin:0 10px 6px">On failure</div>
+        <div class="kv"><span class="k">Policy</span><span>Pause queue</span></div>
+        <div class="kv"><span class="k">Retries</span><span>Manual</span></div>
+        <div class="fmtnote tiny mut">
+          Point clouds are written to <span class="mono">chunk1/point_cloud/</span> and appear in the Workspace as soon as the job finishes.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span class="sb"><span class="dot run"></span>1 running</span><span class="sbd"></span>
+    <span class="sb mono">Queue 3</span><span class="sbd"></span>
+    <span class="sb mono">2 done</span><span class="sbd"></span>
+    <span class="sb" style="color:var(--err)">1 failed</span>
+    <span class="sp"></span>
+    <span class="sb mono">CPU 312% · GPU 41% · RAM 3.1 / 16 GB</span>
+  </div>
+</div></body></html>

@@ -1,0 +1,15 @@
+name: Feature request
+description: A capability you need
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you want to do?
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: References
+      description: Papers, equivalent Metashape Python API call, file-format specs.

@@ -1,0 +1,590 @@
+#include "gpu/vulkan/device.hpp"
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "base/utils/log.hpp"
+
+namespace alphashape::gpu::detail {
+namespace {
+
+std::string vk_result_string(const char* call, VkResult result) {
+    return std::string(call) + " failed with VkResult " + std::to_string(result);
+}
+
+/// Compact textual form of the bindings of one kind, for validation messages.
+std::string binding_list(const std::vector<BindingInfo>& bindings, BindingKind kind) {
+    std::string text;
+    for (const BindingInfo& binding : bindings) {
+        if (binding.kind != kind) {
+            continue;
+        }
+        if (!text.empty()) {
+            text += ", ";
+        }
+        text += std::to_string(binding.binding);
+        if (kind == BindingKind::CombinedImageSampler) {
+            text += ":image";
+        }
+    }
+    return text.empty() ? "(none)" : text;
+}
+
+const VulkanBuffer* as_vulkan(const BufferHandle* handle) {
+    return dynamic_cast<const VulkanBuffer*>(handle);
+}
+
+const VulkanImage* as_vulkan(const ImageHandle* handle) {
+    return dynamic_cast<const VulkanImage*>(handle);
+}
+
+const VulkanSampler* as_vulkan(const SamplerHandle* handle) {
+    return dynamic_cast<const VulkanSampler*>(handle);
+}
+
+VkDescriptorType descriptor_type(BindingKind kind) {
+    return kind == BindingKind::CombinedImageSampler
+               ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+               : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+}
+
+}  // namespace
+
+const Pipeline& VulkanBackend::pipeline_for(const KernelEntry& kernel) {
+    auto existing = pipelines_.find(kernel.name);
+    if (existing != pipelines_.end()) {
+        return existing->second;
+    }
+
+    const Functions& fns = instance_->fns;
+    Pipeline pipeline;
+    if (!reflect_spirv(kernel.words, kernel.word_count, &pipeline.info)) {
+        throw Error(std::string("kernel '") + kernel.name + "' reflection failed: " +
+                    pipeline.info.error);
+    }
+
+    if (!pipeline.info.bindings.empty()) {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        bindings.reserve(pipeline.info.bindings.size());
+        for (const BindingInfo& binding : pipeline.info.bindings) {
+            VkDescriptorSetLayoutBinding entry{};
+            entry.binding = binding.binding;
+            entry.descriptorType = descriptor_type(binding.kind);
+            entry.descriptorCount = 1;
+            entry.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            bindings.push_back(entry);
+        }
+        VkDescriptorSetLayoutCreateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set_info.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        set_info.pBindings = bindings.data();
+        VkResult result =
+            fns.CreateDescriptorSetLayout(device_handle_, &set_info, nullptr, &pipeline.set_layout);
+        if (result != VK_SUCCESS) {
+            destroy_pipeline(&pipeline);
+            throw Error(vk_result_string("vkCreateDescriptorSetLayout", result));
+        }
+    }
+
+    VkShaderModuleCreateInfo module_info{};
+    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    module_info.codeSize = kernel.word_count * sizeof(std::uint32_t);
+    module_info.pCode = kernel.words;
+    VkResult result = fns.CreateShaderModule(device_handle_, &module_info, nullptr, &pipeline.module);
+    if (result != VK_SUCCESS) {
+        destroy_pipeline(&pipeline);
+        throw Error(std::string("kernel '") + kernel.name + "': " +
+                    vk_result_string("vkCreateShaderModule", result));
+    }
+
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.offset = 0;
+    range.size = pipeline.info.push_constant_size;
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = pipeline.set_layout != VK_NULL_HANDLE ? 1u : 0u;
+    layout_info.pSetLayouts = pipeline.set_layout != VK_NULL_HANDLE ? &pipeline.set_layout : nullptr;
+    layout_info.pushConstantRangeCount = pipeline.info.push_constant_size != 0 ? 1u : 0u;
+    layout_info.pPushConstantRanges = pipeline.info.push_constant_size != 0 ? &range : nullptr;
+    result = fns.CreatePipelineLayout(device_handle_, &layout_info, nullptr, &pipeline.layout);
+    if (result != VK_SUCCESS) {
+        destroy_pipeline(&pipeline);
+        throw Error(std::string("kernel '") + kernel.name + "': " +
+                    vk_result_string("vkCreatePipelineLayout", result));
+    }
+
+    VkComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = pipeline.module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline.layout;
+    result = fns.CreateComputePipelines(device_handle_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+                                        &pipeline.pipeline);
+    if (result != VK_SUCCESS) {
+        destroy_pipeline(&pipeline);
+        throw Error(std::string("kernel '") + kernel.name + "': " +
+                    vk_result_string("vkCreateComputePipelines", result));
+    }
+
+    auto inserted = pipelines_.emplace(std::string(kernel.name), pipeline);
+    return inserted.first->second;
+}
+
+void VulkanBackend::wait_fence(VkFence fence) {
+    const Functions& fns = instance_->fns;
+    // Fence waits poll in 5 s slices and are bounded, so a wedged device raises
+    // Error("gpu: fence timeout") instead of hanging. Hardware gets a 30 s total
+    // budget; a CPU driver (llvmpipe) legitimately takes minutes for a large
+    // Poisson batch, and a false timeout there would turn a slow-but-correct
+    // device into a silent CPU fallback (see README "Fence timeout").
+    constexpr std::uint64_t kSliceNs = 5'000'000'000ULL;
+    const int slices = device_.info.software ? 120 : 6;
+    for (int slice = 0; slice < slices; ++slice) {
+        const VkResult result = fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, kSliceNs);
+        if (result == VK_SUCCESS) {
+            return;
+        }
+        if (result == VK_TIMEOUT) {
+            continue;
+        }
+        if (result == VK_ERROR_DEVICE_LOST) {
+            throw Error("Vulkan device lost while waiting for GPU completion");
+        }
+        throw Error(vk_result_string("vkWaitForFences", result));
+    }
+    throw Error("gpu: fence timeout");
+}
+
+VulkanBackend::Slot* VulkanBackend::reserve_slot() {
+    for (Slot& slot : slots_) {
+        if (!slot.pending) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+std::uint64_t VulkanBackend::oldest_pending_id() {
+    std::uint64_t oldest = 0;
+    for (const Slot& slot : slots_) {
+        if (slot.pending && (oldest == 0 || slot.id < oldest)) {
+            oldest = slot.id;
+        }
+    }
+    return oldest;
+}
+
+void VulkanBackend::release_slot(Slot& slot) {
+    const Functions& fns = instance_->fns;
+    if (slot.descriptor_pool != VK_NULL_HANDLE) {
+        fns.DestroyDescriptorPool(device_handle_, slot.descriptor_pool, nullptr);
+        slot.descriptor_pool = VK_NULL_HANDLE;
+    }
+    slot.pending = false;
+    slot.id = 0;
+}
+
+void VulkanBackend::record_and_submit(Slot& slot,
+                                      const std::vector<DispatchRequest>& dispatches) {
+    const Functions& fns = instance_->fns;
+    VkResult result = fns.ResetCommandBuffer(slot.command_buffer, 0);
+    if (result != VK_SUCCESS) {
+        throw Error(vk_result_string("vkResetCommandBuffer", result));
+    }
+
+    // Descriptors: one set per dispatch, from a pool sized to fit them all.
+    // The pool must cover every descriptor actually bound: kernels with more
+    // than eight bindings (pm_* use fourteen) would otherwise fail
+    // vkAllocateDescriptorSets with VK_ERROR_OUT_OF_POOL_MEMORY. A pool size
+    // with descriptorCount == 0 is itself a validation error
+    // (VUID-VkDescriptorPoolSize-descriptorCount-00302), so each kind is only
+    // declared when the batch actually uses it.
+    std::uint32_t total_sets = 0;
+    std::uint32_t total_buffers = 0;
+    std::uint32_t total_images = 0;
+    for (const DispatchRequest& dispatch : dispatches) {
+        const bool has_bindings =
+            !dispatch.buffers.empty() || !dispatch.images.empty();
+        total_sets += static_cast<std::uint32_t>(has_bindings ? 1 : 0);
+        total_buffers += static_cast<std::uint32_t>(dispatch.buffers.size());
+        total_images += static_cast<std::uint32_t>(dispatch.images.size());
+    }
+    if (total_sets != 0) {
+        VkDescriptorPoolSize sizes[2]{};
+        std::uint32_t size_count = 0;
+        if (total_buffers != 0) {
+            sizes[size_count].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            sizes[size_count].descriptorCount = total_buffers;
+            ++size_count;
+        }
+        if (total_images != 0) {
+            sizes[size_count].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            sizes[size_count].descriptorCount = total_images;
+            ++size_count;
+        }
+        VkDescriptorPoolCreateInfo descriptor_info{};
+        descriptor_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        descriptor_info.maxSets = total_sets;
+        descriptor_info.poolSizeCount = size_count;
+        descriptor_info.pPoolSizes = sizes;
+        result = fns.CreateDescriptorPool(device_handle_, &descriptor_info, nullptr,
+                                          &slot.descriptor_pool);
+        if (result != VK_SUCCESS) {
+            throw Error(vk_result_string("vkCreateDescriptorPool", result));
+        }
+    }
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = fns.BeginCommandBuffer(slot.command_buffer, &begin_info);
+    if (result != VK_SUCCESS) {
+        throw Error(vk_result_string("vkBeginCommandBuffer", result));
+    }
+
+    for (std::size_t index = 0; index < dispatches.size(); ++index) {
+        const DispatchRequest& dispatch = dispatches[index];
+        const Pipeline& pipeline = pipeline_for(*dispatch.kernel);
+
+        if (index != 0) {
+            // Storage-buffer writes from the previous dispatch must be visible
+            // to the next one.
+            VkMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            fns.CmdPipelineBarrier(slot.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0,
+                                   nullptr, 0, nullptr);
+        }
+
+        fns.CmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline.pipeline);
+        if (!dispatch.buffers.empty() || !dispatch.images.empty()) {
+            VkDescriptorSetAllocateInfo set_allocate{};
+            set_allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            set_allocate.descriptorPool = slot.descriptor_pool;
+            set_allocate.descriptorSetCount = 1;
+            set_allocate.pSetLayouts = &pipeline.set_layout;
+            VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+            result = fns.AllocateDescriptorSets(device_handle_, &set_allocate, &descriptor_set);
+            if (result != VK_SUCCESS) {
+                throw Error(vk_result_string("vkAllocateDescriptorSets", result));
+            }
+            const std::size_t write_count = dispatch.buffers.size() + dispatch.images.size();
+            std::vector<VkDescriptorBufferInfo> buffer_infos(dispatch.buffers.size());
+            std::vector<VkDescriptorImageInfo> image_infos(dispatch.images.size());
+            std::vector<VkWriteDescriptorSet> writes(write_count);
+            // Buffers fill the STORAGE_BUFFER bindings in ascending order;
+            // images carry their explicit binding (validated in submit()).
+            std::size_t storage_index = 0;
+            for (std::size_t b = 0; b < pipeline.info.bindings.size(); ++b) {
+                if (pipeline.info.bindings[b].kind != BindingKind::StorageBuffer) {
+                    continue;
+                }
+                if (storage_index >= dispatch.buffers.size()) {
+                    break;
+                }
+                const VulkanBuffer* buffer = as_vulkan(dispatch.buffers[storage_index]);
+                if (buffer == nullptr) {
+                    throw Error("buffer passed to GPU dispatch did not come from this layer");
+                }
+                buffer_infos[storage_index].buffer = buffer->handle();
+                buffer_infos[storage_index].offset = 0;
+                buffer_infos[storage_index].range = VK_WHOLE_SIZE;
+                writes[storage_index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[storage_index].dstSet = descriptor_set;
+                writes[storage_index].dstBinding = pipeline.info.bindings[b].binding;
+                writes[storage_index].descriptorCount = 1;
+                writes[storage_index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[storage_index].pBufferInfo = &buffer_infos[storage_index];
+                ++storage_index;
+            }
+            for (std::size_t i = 0; i < dispatch.images.size(); ++i) {
+                const VulkanImage* image = as_vulkan(dispatch.images[i].image);
+                const VulkanSampler* sampler = as_vulkan(dispatch.images[i].sampler);
+                if (image == nullptr || sampler == nullptr) {
+                    throw Error(
+                        "image or sampler passed to GPU dispatch did not come from this layer");
+                }
+                image_infos[i].sampler = sampler->handle();
+                image_infos[i].imageView = image->view();
+                image_infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                const std::size_t write_index = dispatch.buffers.size() + i;
+                writes[write_index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[write_index].dstSet = descriptor_set;
+                writes[write_index].dstBinding = dispatch.images[i].binding;
+                writes[write_index].descriptorCount = 1;
+                writes[write_index].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[write_index].pImageInfo = &image_infos[i];
+            }
+            fns.UpdateDescriptorSets(device_handle_, static_cast<std::uint32_t>(writes.size()),
+                                     writes.data(), 0, nullptr);
+            fns.CmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      pipeline.layout, 0, 1, &descriptor_set, 0, nullptr);
+        }
+        if (!dispatch.push_constants.empty()) {
+            fns.CmdPushConstants(slot.command_buffer, pipeline.layout,
+                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                 static_cast<std::uint32_t>(dispatch.push_constants.size()),
+                                 dispatch.push_constants.data());
+        }
+        fns.CmdDispatch(slot.command_buffer, dispatch.groups[0], dispatch.groups[1],
+                        dispatch.groups[2]);
+    }
+
+    // Make the final writes visible to host reads and to a later staging copy.
+    VkMemoryBarrier final_barrier{};
+    final_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    final_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    final_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    fns.CmdPipelineBarrier(slot.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                           &final_barrier, 0, nullptr, 0, nullptr);
+
+    result = fns.EndCommandBuffer(slot.command_buffer);
+    if (result != VK_SUCCESS) {
+        throw Error(vk_result_string("vkEndCommandBuffer", result));
+    }
+
+    if (slot.fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = fns.CreateFence(device_handle_, &fence_info, nullptr, &slot.fence);
+        if (result != VK_SUCCESS) {
+            throw Error(vk_result_string("vkCreateFence", result));
+        }
+    }
+    result = fns.ResetFences(device_handle_, 1, &slot.fence);
+    if (result != VK_SUCCESS) {
+        throw Error(vk_result_string("vkResetFences", result));
+    }
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &slot.command_buffer;
+    result = fns.QueueSubmit(queue(slot.queue), 1, &submit, slot.fence);
+    if (result != VK_SUCCESS) {
+        throw Error(vk_result_string("vkQueueSubmit", result));
+    }
+}
+
+std::uint64_t VulkanBackend::submit(const std::vector<DispatchRequest>& dispatches, int queue_index,
+                                    bool block_when_full) {
+    if (dispatches.empty()) {
+        return 0;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Validate every dispatch against its kernel's reflected interface before
+    // touching Vulkan, so a bad call is a clean gpu::Error.
+    for (const DispatchRequest& dispatch : dispatches) {
+        if (dispatch.kernel == nullptr) {
+            throw Error("null kernel in GPU dispatch");
+        }
+        const Pipeline& pipeline = pipeline_for(*dispatch.kernel);
+        const std::string name = dispatch.kernel->name;
+        const std::size_t expected_buffers =
+            pipeline.info.count(BindingKind::StorageBuffer);
+        const std::size_t expected_images =
+            pipeline.info.count(BindingKind::CombinedImageSampler);
+        if (dispatch.buffers.size() != expected_buffers) {
+            throw Error("kernel '" + name + "' expects " +
+                        std::to_string(expected_buffers) +
+                        " storage buffer binding(s) [" +
+                        binding_list(pipeline.info.bindings, BindingKind::StorageBuffer) +
+                        "] but the dispatch supplied " + std::to_string(dispatch.buffers.size()));
+        }
+        for (std::size_t i = 0; i < dispatch.buffers.size(); ++i) {
+            if (dispatch.buffers[i] == nullptr) {
+                throw Error("null buffer at index " + std::to_string(i) + " of kernel '" + name +
+                            "'");
+            }
+        }
+        if (dispatch.images.size() != expected_images) {
+            throw Error("kernel '" + name + "' expects " + std::to_string(expected_images) +
+                        " combined image sampler binding(s) [" +
+                        binding_list(pipeline.info.bindings, BindingKind::CombinedImageSampler) +
+                        "] but the dispatch supplied " + std::to_string(dispatch.images.size()));
+        }
+        // Every image binding must name a binding the shader declares as a
+        // combined image sampler, exactly once, and must be paired with a
+        // sampler that comes from this backend with contents uploaded.
+        for (std::size_t i = 0; i < dispatch.images.size(); ++i) {
+            const ImageBinding& entry = dispatch.images[i];
+            const BindingInfo* declared = pipeline.info.find(entry.binding);
+            if (declared == nullptr) {
+                throw Error("kernel '" + name + "' has no binding " +
+                            std::to_string(entry.binding) + " (declared: [" +
+                            binding_list(pipeline.info.bindings, BindingKind::StorageBuffer) +
+                            "] buffers, [" +
+                            binding_list(pipeline.info.bindings, BindingKind::CombinedImageSampler) +
+                            "] images)");
+            }
+            if (declared->kind != BindingKind::CombinedImageSampler) {
+                throw Error("binding " + std::to_string(entry.binding) + " of kernel '" + name +
+                            "' is a storage buffer, not a combined image sampler");
+            }
+            if (i != 0 && dispatch.images[i - 1].binding == entry.binding) {
+                throw Error("binding " + std::to_string(entry.binding) +
+                            " appears twice in the dispatch of kernel '" + name + "'");
+            }
+            if (entry.image == nullptr || entry.sampler == nullptr) {
+                throw Error("binding " + std::to_string(entry.binding) + " of kernel '" + name +
+                            "' has an image without a sampler");
+            }
+            const VulkanImage* image = as_vulkan(entry.image);
+            const VulkanSampler* sampler = as_vulkan(entry.sampler);
+            if (image == nullptr) {
+                throw Error("image at binding " + std::to_string(entry.binding) + " of kernel '" +
+                            name + "' did not come from this layer");
+            }
+            if (sampler == nullptr) {
+                throw Error("sampler at binding " + std::to_string(entry.binding) + " of kernel '" +
+                            name + "' did not come from this layer");
+            }
+            if (image->owner() != this || sampler->owner() != this) {
+                throw Error("image or sampler at binding " + std::to_string(entry.binding) +
+                            " of kernel '" + name + "' belongs to a different GPU context");
+            }
+            if (!image->has_contents()) {
+                throw Error("image at binding " + std::to_string(entry.binding) + " of kernel '" +
+                            name + "' has never been uploaded");
+            }
+        }
+        if (dispatch.push_constants.size() != pipeline.info.push_constant_size) {
+            throw Error("kernel '" + name + "' expects " +
+                        std::to_string(pipeline.info.push_constant_size) +
+                        " push-constant byte(s) but the dispatch supplied " +
+                        std::to_string(dispatch.push_constants.size()));
+        }
+        for (std::uint32_t axis = 0; axis < 3; ++axis) {
+            if (dispatch.groups[axis] == 0) {
+                throw Error("kernel '" + name + "' dispatch has a zero workgroup count");
+            }
+        }
+    }
+
+    // Acquire a slot. run_async (block_when_full == false) throws on a full
+    // ring; the synchronous path drains the oldest ticket and retries, bounded
+    // because a sibling thread may re-take the slot in between.
+    Slot* reserved = nullptr;
+    for (int attempt = 0; attempt <= static_cast<int>(kMaxInFlight); ++attempt) {
+        reserved = reserve_slot();
+        if (reserved != nullptr) {
+            break;
+        }
+        if (!block_when_full) {
+            break;
+        }
+        const std::uint64_t oldest = oldest_pending_id();
+        if (oldest == 0) {
+            break;
+        }
+        // Outside the lock: the fence wait must be able to release the slot.
+        lock.unlock();
+        wait(oldest);
+        lock.lock();
+    }
+    if (reserved == nullptr) {
+        throw Error("gpu: " + std::to_string(kMaxInFlight) +
+                    " submissions already in flight on this context; wait() one before "
+                    "submitting");
+    }
+    Slot& slot = *reserved;
+    const std::size_t index = static_cast<std::size_t>(reserved - slots_.data());
+    if (slot.command_buffer == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo allocate_info{};
+        allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocate_info.commandPool = command_pools_[index % command_pools_.size()];
+        allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate_info.commandBufferCount = 1;
+        const VkResult result = instance_->fns.AllocateCommandBuffers(
+            device_handle_, &allocate_info, &slot.command_buffer);
+        if (result != VK_SUCCESS) {
+            throw Error(vk_result_string("vkAllocateCommandBuffers", result));
+        }
+    }
+    if (queue_index == 1 && queue_count_ < 2) {
+        // One log line per process: the fallback is silent otherwise.
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            log(LogLevel::Info) << "GPU: Submission{.queue = 1} requested but the queue family "
+                                   "has one queue; using queue 0";
+        }
+    }
+    slot.queue = queue_index == 1 && queue_count_ >= 2 ? 1 : 0;
+    slot.pending = true;
+    slot.id = next_ticket_++;
+    try {
+        record_and_submit(slot, dispatches);
+    } catch (...) {
+        release_slot(slot);
+        throw;
+    }
+    return slot.id;
+}
+
+void VulkanBackend::wait(std::uint64_t ticket) {
+    if (ticket == 0) {
+        return;
+    }
+    // The fence wait runs under the submission mutex: a slot must not be
+    // recycled (and its fence reset for a new submission) while another thread
+    // is still waiting on it, and a single queue serialises the work anyway.
+    // On a wait failure the slot stays pending, so it is never reused while its
+    // fence is unsignalled.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (Slot& slot : slots_) {
+        if (slot.pending && slot.id == ticket) {
+            wait_fence(slot.fence);
+            release_slot(slot);
+            return;
+        }
+    }
+    // Already completed (waited for by another call), or an unknown ticket.
+}
+
+std::uint32_t VulkanBackend::in_flight() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint32_t count = 0;
+    for (const Slot& slot : slots_) {
+        if (slot.pending) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void VulkanBackend::wait_all_pending() {
+    // Called from the host-copy paths (upload/download/staging). Holding the
+    // submission mutex keeps slots from being recycled while their fences are
+    // waited on; the transfer mutex is always taken before this one, so the
+    // order transfer_mutex_ -> mutex_ is consistent with run()/wait().
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const Slot& slot : slots_) {
+        if (slot.pending && slot.fence != VK_NULL_HANDLE) {
+            wait_fence(slot.fence);
+        }
+    }
+    // The slots stay pending: they are owned by their tickets until wait().
+}
+
+void VulkanBackend::run(const std::vector<DispatchRequest>& dispatches) {
+    if (dispatches.empty()) {
+        return;
+    }
+    // The synchronous path drains the oldest pending submission instead of
+    // rejecting a full ring: run() is documented to wait, and under
+    // concurrency a run_async from another thread may hold every slot.
+    const std::uint64_t ticket = submit(dispatches, 0, true);
+    wait(ticket);
+}
+
+}  // namespace alphashape::gpu::detail

@@ -1,0 +1,157 @@
+#version 450
+// TV-L1 Chambolle-Pock, step (2): primal descent with the histogram L1 prox,
+// u <- prox_{tau f}(u + tau div p), and the over-relaxed extrapolation
+// ubar <- 2 u_new - u_old folded into the same pass.
+//
+// div is the exact negative adjoint of tvl1_dual.comp's forward difference: at
+// a voxel the outward face contributes p[i], the inward face p[i - 1], and the
+// missing (Neumann) face nothing.
+//
+// Each invocation handles FOUR consecutive x voxels (see tvl1_dual.comp for
+// why: contiguous reads/writes are what reach the M1's bandwidth ceiling).
+//
+// Histograms are compacted to measured voxels (the CPU's row-normalised
+// weights): row_start[i] is that voxel's row in `rows`, or kNoRow when it was
+// never measured, in which case the CPU's prox falls through to clamp(v) and
+// the kernel skips the read entirely. Only 6-11% of voxels carry data; a dense
+// V x bins table would dominate the sweep's memory traffic.
+//
+// The prox streams the row from global memory twice: a register array indexed
+// by the runtime bin count spills to local memory on the M1 and measured 3x
+// slower than the whole sweep.
+#include "tvl1_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) buffer U { float u[]; };
+layout(binding = 1) buffer Ubar { float ubar[]; };
+layout(binding = 2) buffer P { uint p[]; };  // px, py, pz packed as two uints
+layout(binding = 3) buffer Rows { float rows[]; };
+layout(binding = 4) buffer RowStart { uint row_start[]; };
+// Row list; kCulled is declared in tvl1_common.glsl.
+layout(binding = 5) buffer Blocks { uint block_list[]; };
+
+const uint kNoRow = 0xFFFFFFFFu;
+
+// The packed dual triple written by tvl1_dual.comp.
+vec3 primal_unpack(uint xy, uint z) {
+    const vec2 front = unpackHalf2x16(xy);
+    return vec3(front.x, front.y, unpackHalf2x16(z).x);
+}
+
+// The CPU's tv_l1_prox for one voxel, streaming the compacted row.
+float primal_prox(uint index, float divergence) {
+    const float base = u[index] + pc.tau * divergence;
+    const uint row_index = row_start[index];
+    if (row_index == kNoRow) {
+        return clamp(base, -1.0, 1.0);
+    }
+    const uint row = row_index * pc.bins;
+    // One pass finds the total and the number of non-zero bins. A histogram
+    // with a single non-zero bin (the common case: 83% of measured voxels on
+    // the dense scene) is a point mass at c_k, and its prox is the closed form
+    // below with two candidates on either side of that knot - far cheaper than
+    // the general interval sweep.
+    float total = 0.0;
+    uint occupied = 0u;
+    uint only_bin = 0u;
+    for (uint k = 0u; k < pc.bins; ++k) {
+        const float w = rows[row + k];
+        total += w;
+        if (w > 0.0) {
+            ++occupied;
+            only_bin = k;
+        }
+    }
+    if (!(total > 0.0) || !(pc.data_weight > 0.0)) {
+        return clamp(base, -1.0, 1.0);
+    }
+    if (occupied == 1u) {
+        // 0.5 (u - base)^2 + a * |u - c|; the minimum is c if the subgradient
+        // interval [-a, a] contains (c - base), otherwise the nearer one-sided
+        // point.
+        // Stationarity of 0.5 (u - v)^2 + a |u - c| gives u = v + a for
+        // v + a < c, u = v - a for v - a > c, and u = c otherwise.
+        const float centre = tvl1_centre(only_bin, pc.bins);
+        if (centre - base > pc.data_weight) {
+            return clamp(base + pc.data_weight, -1.0, 1.0);
+        }
+        if (centre - base < -pc.data_weight) {
+            return clamp(base - pc.data_weight, -1.0, 1.0);
+        }
+        return clamp(centre, -1.0, 1.0);
+    }
+    const float inf = 3.402823466e+38;
+    float left = 0.0;
+    for (uint j = 0u; j <= pc.bins; ++j) {
+        const float right = total - left;
+        const float candidate = base - pc.data_weight * (left - right);
+        const float lower = (j == 0u) ? -inf : tvl1_centre(j - 1u, pc.bins);
+        const float upper = (j == pc.bins) ? inf : tvl1_centre(j, pc.bins);
+        if (candidate > lower && candidate < upper) {
+            return clamp(candidate, -1.0, 1.0);
+        }
+        if (j < pc.bins) {
+            left += rows[row + j];
+        }
+    }
+    // Knot fallback: u = c_k with 0 in the subgradient at that knot.
+    float lower_weight = 0.0;
+    for (uint k = 0u; k < pc.bins; ++k) {
+        const float h = rows[row + k];
+        const float upper_weight = total - lower_weight - h;
+        const float residual = base - tvl1_centre(k, pc.bins) -
+                               pc.data_weight * (lower_weight - upper_weight);
+        if (abs(residual) <= pc.data_weight * h) {
+            return clamp(tvl1_centre(k, pc.bins), -1.0, 1.0);
+        }
+        lower_weight += h;
+    }
+    return clamp(base, -1.0, 1.0);
+}
+
+void main() {
+    // x from the first grid dimension (FOUR voxels per invocation, the same
+    // unroll as tvl1_dual.comp: the four divergence neighbours along x are the
+    // previous voxel of the same invocation, so a 4-voxel lane reuses them);
+    // (y, z) is flattened into the second dimension.
+    // x comes from the first grid dimension (four voxels per invocation, the
+    // same unroll as tvl1_dual.comp); (y, z) is flattened into the second, so
+    // no division is needed for the flat index and only ny for y/z.
+    const uint xbase = gl_GlobalInvocationID.x * 4u;
+    const uint slot = gl_GlobalInvocationID.y;
+    const uint row = slot < pc.row_count ? block_list[slot] : kCulled;
+    if (row == kCulled || xbase >= pc.nx) {
+        return;
+    }
+    const uint index = row * pc.nx + xbase;
+    const uint count = min(4u, pc.nx - xbase);
+    const uint z = row / pc.ny;
+    const uint y = row - z * pc.ny;
+    const uint stride_y = pc.nx;
+    const uint stride_z = pc.nx * pc.ny;
+
+    // The packed dual triple for the four voxels: `here_*` is p[i..i+3] and
+    // `back_*` is p[i-1..i+2] on each axis (the divergence needs the inward
+    // face), with the Neumann boundary reading zero.
+    float div[4];
+    for (uint k = 0u; k < count; ++k) {
+        const uint v = index + k;
+        const uint b = v * 2u;
+        const vec3 here = primal_unpack(p[b], p[b + 1u]);
+        const vec3 back_x = (xbase + k > 0u) ? primal_unpack(p[b - 2u], p[b - 1u]) : vec3(0.0);
+        const vec3 back_y =
+            y > 0u ? primal_unpack(p[b - 2u * stride_y], p[b - 2u * stride_y + 1u]) : vec3(0.0);
+        const vec3 back_z =
+            z > 0u ? primal_unpack(p[b - 2u * stride_z], p[b - 2u * stride_z + 1u]) : vec3(0.0);
+        div[k] = (here.x - back_x.x) + (here.y - back_y.y) + (here.z - back_z.z);
+    }
+
+    for (uint k = 0u; k < count; ++k) {
+        const uint v = index + k;
+        const float old = u[v];
+        const float updated = primal_prox(v, div[k]);
+        ubar[v] = 2.0 * updated - old;
+        u[v] = updated;
+    }
+}

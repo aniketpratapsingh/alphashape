@@ -1,0 +1,16 @@
+# AddressSanitizer suppressions for the bug-hunting configuration.
+#
+# All entries here are third-party, not ours. Keep them as narrow as possible:
+# each one is justified in TESTING.md and the final report.
+
+# GoogleTest's JSON result printer (gtest.cc). CMake's gtest_discover_tests()
+# runs the test binary with `--gtest_list_tests --gtest_output=json:...` at
+# build time to enumerate the suite. libc++'s vector<string> range constructor
+# over-allocates (the capacity is rounded up past the written size), and ASan's
+# container-overflow check (only on in this configuration) reports a write into
+# that slack while the printer copies label strings. It is a false positive:
+# every element written is within size(), the JSON that comes out is valid and
+# complete, and no frame of ours is involved. The suppressions file is only
+# consulted during discovery and during ctest runs; nothing in our code paths
+# reaches OutputJsonKey.
+interceptor_via_fun:OutputJsonKey
