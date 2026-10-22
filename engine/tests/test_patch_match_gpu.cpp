@@ -492,6 +492,11 @@ TEST(PatchMatchGpu, ForcedFailureFallsBackAndCounts) {
 // 6. Dense fixture: accuracy contract and timing
 // ---------------------------------------------------------------------------
 
+static double cpu_depth_dbg(double d0, const PatchMatchOptions& o) {
+    const double lo = 1.0 / o.depth_max, hi = 1.0 / o.depth_min;
+    return 1.0 / (lo + (hi - lo) * d0);
+}
+
 // TMPDIAG probe
 struct ProbeParams {
     std::uint32_t width, height, colour, iteration, iteration_hi, n_neighbours, n_samples, best_k;
@@ -647,6 +652,11 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
             const double cpu_depth = 1.0 / (depth_lo + (depth_hi - depth_lo) * d[0]);
             const double ct_cpu = 0.5 + 0.5 * d[1];
             const double phi_cpu = 6.283185307179586 * d[2];
+            std::printf("[diag] dbg px %zu: phi+0.001*depth gpu %.5f (cpu %.5f) | ct gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f\n", i,
+                        static_cast<double>(g0.depth[i]), 6.283185307179586 * d[2] + 0.001 * cpu_depth_dbg(d[0], options),
+                        static_cast<double>(g0.normals[3 * i]), 0.5 + 0.5 * d[1],
+                        static_cast<double>(g0.normals[3 * i + 1]), std::cos(6.283185307179586 * d[2]),
+                        static_cast<double>(g0.normals[3 * i + 2]), std::sin(6.283185307179586 * d[2]));
             {
                 PatchMatchOptions oc = o0;
                 oc.cost_epsilon = 0.0;

@@ -39,10 +39,14 @@ void main() {
     const float seed_depth = random_depth(rng);
     const vec3 seed_normal = random_cone_normal(rng, b_p);
     if (pc.cost_epsilon < -1000.0) {
-        state_depth[pixel] = seed_depth;
-        state_normal[pixel * 3 + 0] = seed_normal.x;
-        state_normal[pixel * 3 + 1] = seed_normal.y;
-        state_normal[pixel * 3 + 2] = seed_normal.z;
+        Rng dbg = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+        float dbg_depth = random_depth(dbg);
+        float dbg_ct = 0.5 + 0.5 * rng_next(dbg);
+        float dbg_phi = PM_TWO_PI * rng_next(dbg);
+        state_depth[pixel] = dbg_phi + 0.001 * dbg_depth;
+        state_normal[pixel * 3 + 0] = dbg_ct;
+        state_normal[pixel * 3 + 1] = cos(dbg_phi);
+        state_normal[pixel * 3 + 2] = sin(dbg_phi);
         state_cost[pixel] = 0.25;
         return;
     }
