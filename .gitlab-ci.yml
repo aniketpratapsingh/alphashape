@@ -45,7 +45,7 @@ build:
     - mkdir -p /usr/include/vma
     - curl -fsSL -o /usr/include/vma/vk_mem_alloc.h "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
     - >
-      cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DALPHASHAPE_WARNINGS_AS_ERRORS=ON
+      cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DALPHASHAPE_WARNINGS_AS_ERRORS=ON -DALPHASHAPE_SHADER_OPTIMIZE=OFF
       -DALPHASHAPE_BUILD_PYTHON=OFF
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     - grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp

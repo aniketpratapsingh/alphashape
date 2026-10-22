@@ -146,7 +146,13 @@ function(alphashape_vulkan_job_pools)
     set_property(GLOBAL PROPERTY JOB_POOLS alphashape_shader_pool=1)
 endfunction()
 
+option(ALPHASHAPE_SHADER_OPTIMIZE "Run the SPIR-V optimiser (glslc -O) on the compute kernels" ON)
+
 function(alphashape_add_shader shader)
+    set(_opt_flag "")
+    if(ALPHASHAPE_SHADER_OPTIMIZE)
+        set(_opt_flag -O)
+    endif()
     get_filename_component(_name "${shader}" NAME_WE)
     set(_spv "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_name}.spv")
     # Shared GLSL headers live beside the kernels (pm_math.glsl, pm_core.glsl);
@@ -155,7 +161,7 @@ function(alphashape_add_shader shader)
     add_custom_command(
         OUTPUT "${_spv}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-        COMMAND "${ALPHASHAPE_VULKAN_GLSLC}" --target-env=vulkan1.2 -O
+        COMMAND "${ALPHASHAPE_VULKAN_GLSLC}" --target-env=vulkan1.2 ${_opt_flag}
                 -fshader-stage=compute "${shader}" -o "${_spv}"
         COMMAND "${ALPHASHAPE_VULKAN_SPIRV_VAL}" --target-env vulkan1.2 "${_spv}"
         DEPENDS "${shader}" ${_shader_includes}
