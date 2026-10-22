@@ -19,9 +19,9 @@ on:
         type: boolean
         default: false
       windows-required:
-        description: Fail the call when the Windows job fails (off until the port is complete)
+        description: Fail the call when the Windows job fails
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read

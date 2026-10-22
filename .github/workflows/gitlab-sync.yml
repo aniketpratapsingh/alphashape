@@ -1,0 +1,34 @@
+name: GitLab GPU mirror sync
+
+# gitlab.com/alphashape/alphashape pull-mirrors this repository and runs the NVIDIA
+# T4 GPU lane (.gitlab-ci.yml); its result is posted back here as a commit status.
+# GitLab polls on its own schedule, so ask it to pull right after every push.
+# Fork pull requests never reach this (no secrets, branches are not mirrored).
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: gitlab-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Trigger GitLab mirror pull
+    if: github.repository == 'aniketpratapsingh/alphashape'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Request mirror update
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+            "https://gitlab.com/api/v4/projects/87954344/mirror/pull")
+          echo "GitLab answered HTTP ${code}"
+          # 429: a pull was requested moments ago; GitLab will still pick this push up.
+          case "$code" in 200|202|429) ;; *) exit 1 ;; esac
