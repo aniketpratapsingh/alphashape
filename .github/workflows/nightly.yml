@@ -70,7 +70,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS && ls -lh
+        run: cd dist && sha256sum -- * > SHA256SUMS && ls -lh
       - name: Replace the nightly release
         env:
           GH_TOKEN: ${{ github.token }}

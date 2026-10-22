@@ -32,10 +32,12 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
       - name: Tag matches the project version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)
-          if [ "v${version}" != "${{ inputs.tag }}" ]; then
-            echo "::error::Tag ${{ inputs.tag }} does not match engine/CMakeLists.txt VERSION ${version}"
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::Tag ${TAG} does not match engine/CMakeLists.txt VERSION ${version}"
             exit 1
           fi
 
@@ -60,7 +62,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS && ls -lh
+        run: cd dist && sha256sum -- * > SHA256SUMS && ls -lh
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
