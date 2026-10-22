@@ -1,0 +1,87 @@
+# GitLab runs only the NVIDIA GPU lane (GitLab for Open Source, Tesla T4 runner).
+# The code lives on GitHub; gitlab.com/alphashape/alphashape is a pull mirror and
+# pipeline results are posted back to the GitHub commit / pull request as a status.
+#
+# build      : compile once on a CPU runner (cheap), hand the test binary on
+# gpu-tests  : run the GPU suites on the T4 through the NVIDIA Vulkan driver
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|pull_mirror_update|web|api|schedule)$/
+
+stages: [build, gpu]
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+  VMA_TAG: v3.1.0
+  OMP_NUM_THREADS: "4"
+  OMP_WAIT_POLICY: passive
+  CCACHE_DIR: $CI_PROJECT_DIR/.ccache
+  CCACHE_MAXSIZE: 1500M
+  # Shared cloud machines: report GPU speed-ups, do not fail on them.
+  ALPHASHAPE_PERF_ASSERTS: "0"
+  # Override when triggering a pipeline by API to run a single suite on the T4.
+  GPU_TEST_FILTER: "*Gpu*:BuildDense*:BuildModel*:FullPipelineDense*:BuildTexture*:BuildDemPipeline*:BuildOrthomosaic*"
+
+.deps: &deps
+  - apt-get update -qq
+  - >
+    apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build ccache curl
+    ca-certificates libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
+    libpng-dev libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools
+    vulkan-tools libxext6 libx11-6 libegl1 >/dev/null
+
+build:
+  stage: build
+  image: ubuntu:24.04
+  tags: [saas-linux-medium-amd64]
+  timeout: 90m
+  cache:
+    key: ccache-linux-gcc
+    paths: [.ccache/]
+  script:
+    - *deps
+    - mkdir -p /usr/include/vma
+    - curl -fsSL -o /usr/include/vma/vk_mem_alloc.h "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
+    - >
+      cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DALPHASHAPE_WARNINGS_AS_ERRORS=ON
+      -DALPHASHAPE_BUILD_PYTHON=OFF
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    - grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp
+    - cmake --build build --parallel 4 --target alphashape_tests
+    - ccache --show-stats || true
+  artifacts:
+    expire_in: 2 days
+    paths: [build/tests/alphashape_tests]
+
+gpu-tests:
+  stage: gpu
+  needs: [build]
+  # A CUDA base image: the runner only injects the NVIDIA driver (under
+  # /usr/local/nvidia) into images that declare the NVIDIA_* environment.
+  image: nvidia/cuda:12.6.3-base-ubuntu24.04
+  tags: [saas-linux-medium-amd64-gpu-standard]
+  timeout: 45m
+  variables:
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: all
+    # The driver ships no ICD manifest. Its GLX entry point cannot create a Vulkan
+    # instance without an X server (libnvidia-glcore needs X symbols); the EGL one can.
+    VK_DRIVER_FILES: /etc/vulkan/icd.d/nvidia_icd.json
+  script:
+    - *deps
+    - nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+    - mkdir -p /etc/vulkan/icd.d
+    - printf '{"file_format_version":"1.0.0","ICD":{"library_path":"/usr/local/nvidia/lib64/libEGL_nvidia.so.0","api_version":"1.3"}}\n' > /etc/vulkan/icd.d/nvidia_icd.json
+    - vulkaninfo --summary 2>/dev/null | grep -E "deviceName|deviceType|driverVersion"
+    # Refuse to "pass" on a software device: the point of this lane is real hardware.
+    - vulkaninfo --summary 2>/dev/null | grep -q "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"
+    - >
+      build/tests/alphashape_tests --gtest_brief=1
+      --gtest_filter="$GPU_TEST_FILTER"
+      --gtest_output=xml:gpu-tests.xml
+  artifacts:
+    when: always
+    expire_in: 14 days
+    reports:
+      junit: gpu-tests.xml

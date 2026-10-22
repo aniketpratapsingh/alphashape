@@ -146,7 +146,19 @@ function(alphashape_vulkan_job_pools)
     set_property(GLOBAL PROPERTY JOB_POOLS alphashape_shader_pool=1)
 endfunction()
 
+# alphashape_add_shader(<shader.comp> [NO_OPTIMIZE])
+#
+# Compiles one compute kernel to SPIR-V with glslc and validates it. NO_OPTIMIZE
+# skips the SPIR-V optimiser (glslc -O). The PatchMatch search kernels need it:
+# their optimised SPIR-V is miscompiled by the NVIDIA Vulkan driver (535 series,
+# Tesla T4), which returns a wrong random-plane normal for most pixels, while the
+# unoptimised module is executed correctly there and elsewhere. The driver runs
+# its own optimiser, so the unoptimised module costs no measurable speed.
 function(alphashape_add_shader shader)
+    set(_opt_flag -O)
+    if("NO_OPTIMIZE" IN_LIST ARGN)
+        set(_opt_flag "")
+    endif()
     get_filename_component(_name "${shader}" NAME_WE)
     set(_spv "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_name}.spv")
     # Shared GLSL headers live beside the kernels (pm_math.glsl, pm_core.glsl);
@@ -155,7 +167,7 @@ function(alphashape_add_shader shader)
     add_custom_command(
         OUTPUT "${_spv}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-        COMMAND "${ALPHASHAPE_VULKAN_GLSLC}" --target-env=vulkan1.2 -O
+        COMMAND "${ALPHASHAPE_VULKAN_GLSLC}" --target-env=vulkan1.2 ${_opt_flag}
                 -fshader-stage=compute "${shader}" -o "${_spv}"
         COMMAND "${ALPHASHAPE_VULKAN_SPIRV_VAL}" --target-env vulkan1.2 "${_spv}"
         DEPENDS "${shader}" ${_shader_includes}

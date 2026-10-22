@@ -36,7 +36,9 @@ void main() {
     best.depth = -1.0;
     best.normal = vec3(0.0, 0.0, -1.0);
     best.cost = 3.402823466e+38;
-    evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p, best);
+    const float seed_depth = random_depth(rng);
+    const vec3 seed_normal = random_cone_normal(rng, b_p);
+    evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
     if (best.depth > 0.0) {
         state_depth[pixel] = best.depth;
         state_normal[pixel * 3 + 0] = best.normal.x;

@@ -525,6 +525,67 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
                 0.05 * static_cast<double>(cpu_valid));
 }
 
+// The random initial planes are a pure function of (seed, pixel), so with no
+// sweeps the GPU and CPU must pick the same plane for every pixel: the same
+// depth, the same normal and (up to float32 rounding) the same cost. This is
+// the cheapest check that the kernels were compiled and executed correctly on a
+// device; a driver that mishandles the module shows up here as a wrong normal
+// long before the full search's agreement figure moves.
+TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
+    REQUIRE_GPU_PM();
+    const auto inputs = dense_inputs(2);
+    const stereo::ViewNeighbourhood& hood = inputs->neighbourhoods.front();
+    std::vector<PMView> neighbours;
+    for (const std::int32_t id : hood.neighbours) {
+        neighbours.push_back(inputs->view(id));
+    }
+    const PMView reference = inputs->view(hood.camera_id);
+    PatchMatchOptions options;
+    options.depth_min = hood.depth_min;
+    options.depth_max = hood.depth_max;
+    options.seed = 7;
+    options.iterations = 0;
+    options.max_cost = 3.0;  // keep every initialised pixel
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result = stereo::run_patch_match(reference, neighbours, options);
+    ASSERT_EQ(gpu_result.depth.size(), cpu_result.depth.size());
+
+    std::size_t both = 0, depth_ok = 0, normal_ok = 0, cost_ok = 0;
+    for (std::size_t i = 0; i < gpu_result.depth.size(); ++i) {
+        if (!(gpu_result.depth[i] > 0.0F) || !(cpu_result.depth[i] > 0.0F)) {
+            continue;
+        }
+        ++both;
+        const double cpu_depth = static_cast<double>(cpu_result.depth[i]);
+        if (std::abs(static_cast<double>(gpu_result.depth[i]) - cpu_depth) / cpu_depth < 1e-4) {
+            ++depth_ok;
+        }
+        double dot = 0.0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            dot += static_cast<double>(gpu_result.normals[3 * i + k]) *
+                   static_cast<double>(cpu_result.normals[3 * i + k]);
+        }
+        if (dot > 1.0 - 1e-4) {
+            ++normal_ok;
+        }
+        if (std::abs(static_cast<double>(gpu_result.cost[i]) -
+                     static_cast<double>(cpu_result.cost[i])) < 1e-2) {
+            ++cost_ok;
+        }
+    }
+    const double n = static_cast<double>(std::max<std::size_t>(both, 1));
+    std::printf("[gpu init] %zu pixels: depth %.2f%% normal %.2f%% cost(<0.01) %.2f%%\n", both,
+                100.0 * static_cast<double>(depth_ok) / n,
+                100.0 * static_cast<double>(normal_ok) / n,
+                100.0 * static_cast<double>(cost_ok) / n);
+    ASSERT_GT(both, 1000U);
+    EXPECT_GT(static_cast<double>(depth_ok) / n, 0.999);
+    EXPECT_GT(static_cast<double>(normal_ok) / n, 0.999);
+    EXPECT_GT(static_cast<double>(cost_ok) / n, 0.99);
+}
+
 // ---------------------------------------------------------------------------
 // 7. Fused-cloud accuracy: the same contract as BuildDenseTruthPoses
 // ---------------------------------------------------------------------------

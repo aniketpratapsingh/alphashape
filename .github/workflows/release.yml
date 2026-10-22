@@ -48,7 +48,6 @@ jobs:
       ref: ${{ inputs.tag }}
       version: ${{ inputs.tag }}
       package: true
-      windows-required: false
 
   release:
     name: Publish release
