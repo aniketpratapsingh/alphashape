@@ -1,0 +1,108 @@
+name: Coverity Scan
+
+# Weekly static analysis with Coverity Scan (free for open-source projects). The build is
+# instrumented with cov-build and the capture is uploaded to https://scan.coverity.com, where
+# results are reviewed by the maintainers. Needs the repository secrets COVERITY_SCAN_TOKEN and
+# COVERITY_SCAN_EMAIL. Scan limits for the free tier are per day/week, so this runs weekly only.
+
+on:
+  schedule:
+    - cron: "23 5 * * 0"   # Sundays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  COVERITY_PROJECT: aniketpratapsingh/alphashape
+  VMA_TAG: v3.1.0
+
+jobs:
+  scan:
+    name: Coverity build and upload
+    if: github.repository == 'aniketpratapsingh/alphashape'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build \
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
+            libtiff-dev libvulkan-dev glslc spirv-tools
+          sudo mkdir -p /usr/include/vma
+          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+            "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
+
+      - name: Look up the Coverity tool checksum
+        id: md5
+        env:
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsS -o cov-analysis.md5 https://scan.coverity.com/download/cxx/linux64 \
+            --form "token=${COVERITY_SCAN_TOKEN}" --form "project=${COVERITY_PROJECT}" --form md5=1
+          echo "md5=$(tr -d '[:space:]' < cov-analysis.md5)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Coverity analysis tool
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cov-analysis
+          key: cov-analysis-linux64-${{ steps.md5.outputs.md5 }}
+
+      - name: Download the Coverity analysis tool
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsS -o cov-analysis.tgz https://scan.coverity.com/download/cxx/linux64 \
+            --form "token=${COVERITY_SCAN_TOKEN}" --form "project=${COVERITY_PROJECT}"
+          mkdir cov-analysis
+          tar -xzf cov-analysis.tgz --strip-components=1 -C cov-analysis
+          rm cov-analysis.tgz
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_BUILD_PYTHON=OFF -DALPHASHAPE_BUILD_TESTS=OFF
+
+      - name: Build under cov-build
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/cov-analysis/bin:$PATH"
+          cov-build --dir cov-int cmake --build build --parallel 4
+
+      - name: Package the capture
+        run: tar -czf alphashape-cov.tgz cov-int
+
+      - name: Upload to Coverity Scan
+        env:
+          COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          COVERITY_SCAN_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_SHA::8}"
+          # --silent keeps the token out of the log; the response body is printed on failure.
+          code=$(curl -sS -o upload-response.txt -w '%{http_code}' \
+            --form "token=${COVERITY_SCAN_TOKEN}" \
+            --form "email=${COVERITY_SCAN_EMAIL}" \
+            --form "file=@alphashape-cov.tgz" \
+            --form "version=${version}" \
+            --form "description=alphashape ${version} (weekly scan)" \
+            "https://scan.coverity.com/builds?project=aniketpratapsingh%2Falphashape")
+          cat upload-response.txt
+          [ "$code" = "200" ] || [ "$code" = "201" ] || { echo "::error::Coverity upload failed (HTTP $code)"; exit 1; }
+
+      - name: Keep the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverity-build-log
+          path: cov-int/build-log.txt
+          if-no-files-found: ignore
