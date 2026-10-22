@@ -37,6 +37,7 @@
 #include "image/io/image_io.hpp"
 #include "image/operators/downsample.hpp"
 #include "model/camera/calibration.hpp"
+#include "perf_gate.hpp"
 
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #include <omp.h>
@@ -759,7 +760,9 @@ TEST(PatchMatchGpu, TimingAgainstCpu) {
     // Target was >= 3x; measured 2.4-2.9x on the M1 and reported in
     // LIMITATIONS.md. The floor below catches a real regression (the first
     // working version was 0.4x) without failing on the documented gap.
-    EXPECT_GT(speedup, 2.0) << "target >= 3x on the M1 at downscale 1";
+    if (test::perf_asserts_enabled()) {
+        EXPECT_GT(speedup, 2.0) << "target >= 3x on the M1 at downscale 1";
+    }
 }
 
 }  // namespace

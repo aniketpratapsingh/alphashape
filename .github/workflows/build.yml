@@ -32,6 +32,8 @@ env:
   CTEST_OUTPUT_ON_FAILURE: "1"
   OMP_NUM_THREADS: "4"
   OMP_WAIT_POLICY: passive
+  # Shared runners: report GPU speed-ups, do not fail on them (see engine/tests/perf_gate.hpp).
+  ALPHASHAPE_PERF_ASSERTS: "0"
   VMA_TAG: v3.1.0
 
 jobs:
@@ -217,7 +219,8 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
-          cmake --build build --parallel 4
+          # -k 0: report every compile error in one run while the port is in progress.
+          cmake --build build --parallel 4 -- -k 0
 
       - name: Test
         shell: pwsh

@@ -92,7 +92,8 @@ bool network_requested_by_env() {
 
 /// Write an environment variable for this process. `overwrite` is separate
 /// from the caller's intent because tests set values before first use.
-bool set_env(const char* name, const std::string& value, bool overwrite = true) {
+bool set_env(const char* name, const std::string& value,
+             [[maybe_unused]] bool overwrite = true) {
 #if defined(_WIN32)
     return _putenv_s(name, value.c_str()) == 0;
 #else

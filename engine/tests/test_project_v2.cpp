@@ -749,10 +749,18 @@ TEST_F(ProjectV2, V1FixtureBytesMatchTheGenerator) {
     ASSERT_TRUE(in) << "tests/fixtures/v1_project.zip is missing";
     const std::vector<std::uint8_t> checked_in((std::istreambuf_iterator<char>(in)),
                                                std::istreambuf_iterator<char>());
-    ASSERT_EQ(regenerated.size(), checked_in.size())
+    // Compare decoded entries, not archive bytes: deflate output differs between
+    // zlib builds (zlib, zlib-ng, Apple's), so raw bytes are platform-dependent.
+    const std::vector<ZipEntry> want = ZipArchive::parse(regenerated).entries();
+    const std::vector<ZipEntry> have = ZipArchive::parse(checked_in).entries();
+    ASSERT_EQ(want.size(), have.size())
         << "regenerate with: make_v1_fixture > tests/fixtures/v1_project.zip";
-    EXPECT_EQ(regenerated, checked_in)
-        << "regenerate with: make_v1_fixture > tests/fixtures/v1_project.zip";
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        EXPECT_EQ(want[i].name, have[i].name) << "entry " << i;
+        EXPECT_EQ(want[i].data, have[i].data)
+            << want[i].name
+            << " differs; regenerate with: make_v1_fixture > tests/fixtures/v1_project.zip";
+    }
 }
 
 /// The checked-in fixture loads to exactly the document it was built from:
