@@ -43,8 +43,9 @@ void main() {
     if (!(best.depth > 0.0)) {
         // No incumbent yet: seed from a fresh random plane.
         Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
-        evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p,
-                            best);
+        const float seed_depth = random_depth(rng);
+        const vec3 seed_normal = random_cone_normal(rng, b_p);
+        evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
     } else {
         for (int i = 0; i < 4; ++i) {
             ivec2 q = ivec2(x, y) + PM_ADJ[i];
@@ -63,8 +64,9 @@ void main() {
         // Refinement: a fresh random plane, then the current plane perturbed in
         // inverse depth and normal.
         Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
-        evaluate_hypothesis(x, y, random_depth(rng), random_cone_normal(rng, b_p), b_p,
-                            best);
+        const float seed_depth = random_depth(rng);
+        const vec3 seed_normal = random_cone_normal(rng, b_p);
+        evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
 
         Rng rng_d = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 1u);
         float inv_d = 1.0 / best.depth;
