@@ -612,6 +612,7 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
         PatchMatchOptions o0 = options;
         o0.iterations = 0;
         o0.max_cost = 3.0;
+        o0.cost_epsilon = -1234.0;
         const PatchMatchResult g0 = stereo::run_patch_match_device(reference, neighbours, o0);
         const auto mix = [](std::uint64_t x) {
             x += 0x9E3779B97F4A7C15ULL;
@@ -647,7 +648,9 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
             const double ct_cpu = 0.5 + 0.5 * d[1];
             const double phi_cpu = 6.283185307179586 * d[2];
             {
-                const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
+                PatchMatchOptions oc = o0;
+                oc.cost_epsilon = 0.0;
+                const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, oc);
                 const double cph = 6.283185307179586 * d[2];
                 const Eigen::Vector3d ncpu = (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(cph) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(cph) * v + ct_cpu * axis).normalized();
                 std::printf("[diag] vec px %zu: b(%.5f %.5f %.5f) axis(%.5f %.5f %.5f) gpu n(%.5f %.5f %.5f) cpu-run n(%.5f %.5f %.5f) formula n(%.5f %.5f %.5f)\n", i,
