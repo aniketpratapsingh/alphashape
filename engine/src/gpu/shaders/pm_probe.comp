@@ -54,5 +54,8 @@ void main() {
     out_normals[o + 21] = cos_min;
     out_normals[o + 22] = v.x;
     out_normals[o + 23] = axis.z;
+    if (pc.touch != 0u) {
+        out_cost[0] = state_depth[o] + state_normal[o] + state_cost[o];
+    }
     keep_bindings_alive(o);
 }
