@@ -19,11 +19,12 @@
 #include <random>
 #include <set>
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "base/platform/temp.hpp"
 
 #include "base/io/zip.hpp"
 #include "base/utils/error.hpp"
@@ -55,7 +56,7 @@ class ProjectV2 : public ::testing::Test {
 protected:
     void SetUp() override {
         const auto base = fs::temp_directory_path() /
-                          ("alphashape_v2_" + std::to_string(::getpid()) + "_" +
+                          ("alphashape_v2_" + std::to_string(platform::process_id()) + "_" +
                            std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
         dir_ = base.string() + "_" + std::to_string(counter_++);
         std::error_code ec;
@@ -751,12 +752,18 @@ TEST_F(ProjectV2, V1FixtureBytesMatchTheGenerator) {
                                                std::istreambuf_iterator<char>());
     // Compare decoded entries, not archive bytes: deflate output differs between
     // zlib builds (zlib, zlib-ng, Apple's), so raw bytes are platform-dependent.
+    // The .tif sidecars are deflate-compressed inside too; their decoded content is
+    // checked by the load test below, so here only their presence is compared.
     const std::vector<ZipEntry> want = ZipArchive::parse(regenerated).entries();
     const std::vector<ZipEntry> have = ZipArchive::parse(checked_in).entries();
     ASSERT_EQ(want.size(), have.size())
         << "regenerate with: make_v1_fixture > tests/fixtures/v1_project.zip";
     for (std::size_t i = 0; i < want.size(); ++i) {
         EXPECT_EQ(want[i].name, have[i].name) << "entry " << i;
+        const std::string& name = want[i].name;
+        if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".tif") == 0) {
+            continue;
+        }
         EXPECT_EQ(want[i].data, have[i].data)
             << want[i].name
             << " differs; regenerate with: make_v1_fixture > tests/fixtures/v1_project.zip";
