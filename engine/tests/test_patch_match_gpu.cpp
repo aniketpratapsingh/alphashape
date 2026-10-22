@@ -525,27 +525,42 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
         o0.iterations = 0;
         o0.max_cost = 3.0;
         const PatchMatchResult g0 = stereo::run_patch_match_device(reference, neighbours, o0);
-        const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
-        std::vector<double> ndiff, cdiff;
-        std::size_t depth_far = 0;
-        for (std::size_t i = 0; i < g0.depth.size(); ++i) {
-            if (!(g0.depth[i] > 0.0F) && !(c0.depth[i] > 0.0F)) continue;
-            const double cd = static_cast<double>(c0.depth[i]);
-            if (std::abs(static_cast<double>(g0.depth[i]) - cd) / cd > 1e-4) ++depth_far;
-            double dot = 0.0;
-            for (std::size_t k = 0; k < 3; ++k) dot += static_cast<double>(g0.normals[3 * i + k]) * static_cast<double>(c0.normals[3 * i + k]);
-            ndiff.push_back(1.0 - dot);
-            cdiff.push_back(std::abs(static_cast<double>(g0.cost[i]) - static_cast<double>(c0.cost[i])));
+        const auto mix = [](std::uint64_t x) {
+            x += 0x9E3779B97F4A7C15ULL;
+            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+            return x ^ (x >> 31);
+        };
+        int shown = 0;
+        for (std::size_t i = 4000; i < g0.depth.size() && shown < 6; i += 997) {
+            if (!(g0.depth[i] > 0.0F)) continue;
+            ++shown;
+            std::uint64_t h = mix(options.seed + 0x9E3779B97F4A7C15ULL);
+            h = mix(h ^ (static_cast<std::uint64_t>(i) * 0x100000001B3ULL));
+            h = mix(h ^ (static_cast<std::uint64_t>(-1) * 0xC2B2AE3D27D4EB4FULL));
+            h = mix(h ^ (0ULL * 0x9E3779B97F4A7C15ULL));
+            double d[6];
+            for (double& v : d) {
+                h = mix(h);
+                v = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
+            }
+            const int x = static_cast<int>(i % static_cast<std::size_t>(g0.width));
+            const int y = static_cast<int>(i / static_cast<std::size_t>(g0.width));
+            const Eigen::Vector3d b = reference.calibration.unproject(Eigen::Vector2d(x + 0.5, y + 0.5));
+            const Eigen::Vector3d axis = (-b).normalized();
+            const Eigen::Vector3d u = axis.unitOrthogonal();
+            const Eigen::Vector3d v = axis.cross(u);
+            const Eigen::Vector3d n(static_cast<double>(g0.normals[3 * i]), static_cast<double>(g0.normals[3 * i + 1]), static_cast<double>(g0.normals[3 * i + 2]));
+            const double ct = n.dot(axis);
+            double phi = std::atan2(n.dot(v), n.dot(u));
+            if (phi < 0) phi += 6.283185307179586;
+            const double depth_lo = 1.0 / options.depth_max, depth_hi = 1.0 / options.depth_min;
+            const double cpu_depth = 1.0 / (depth_lo + (depth_hi - depth_lo) * d[0]);
+            const double ct_cpu = 0.5 + 0.5 * d[1];
+            const double phi_cpu = 6.283185307179586 * d[2];
+            std::printf("[diag] px %zu: draws %.4f %.4f %.4f %.4f %.4f %.4f | cpu depth %.4f gpu depth %.4f | ct cpu %.4f gpu %.4f (as draw %.4f) | phi cpu %.4f gpu %.4f (as draw %.4f) | |n| %.5f u=(%.3f %.3f %.3f)\n",
+                        i, d[0], d[1], d[2], d[3], d[4], d[5], cpu_depth, static_cast<double>(g0.depth[i]), ct_cpu, ct, (ct - 0.5) / 0.5, phi_cpu, phi, phi / 6.283185307179586, n.norm(), u.x(), u.y(), u.z());
         }
-        std::sort(ndiff.begin(), ndiff.end());
-        std::sort(cdiff.begin(), cdiff.end());
-        const auto q = [](const std::vector<double>& v, double f) { return v.empty() ? 0.0 : v[static_cast<std::size_t>(f * static_cast<double>(v.size() - 1))]; };
-        std::size_t nbad = 0, cbad = 0;
-        for (const double d : ndiff) if (d > 1e-4) ++nbad;
-        for (const double d : cdiff) if (d > 1e-2) ++cbad;
-        std::printf("[diag] init n %zu depth-far %zu | 1-dot(normal) p50 %.2e p90 %.2e p99 %.2e max %.2e (>1e-4: %zu) | |dcost| p50 %.2e p90 %.2e p99 %.2e (>1e-2: %zu)\n",
-                    ndiff.size(), depth_far, q(ndiff, 0.5), q(ndiff, 0.9), q(ndiff, 0.99), q(ndiff, 1.0), nbad,
-                    q(cdiff, 0.5), q(cdiff, 0.9), q(cdiff, 0.99), cbad);
     }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
