@@ -21,7 +21,7 @@ variables:
   # Shared cloud machines: report GPU speed-ups, do not fail on them.
   ALPHASHAPE_PERF_ASSERTS: "0"
   # Override when triggering a pipeline by API to run a single suite on the T4.
-  GPU_TEST_FILTER: "PatchMatchGpu.ProbeRandomPlane" # TMP
+  GPU_TEST_FILTER: "PatchMatchGpu.DenseFixtureAccuracy" # TMP
   GPU_TEST_FILTER_FULL: "*Gpu*:BuildDense*:BuildModel*:FullPipelineDense*:BuildTexture*:BuildDemPipeline*:BuildOrthomosaic*"
 
 .deps: &deps

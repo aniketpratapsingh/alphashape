@@ -646,6 +646,16 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
             const double cpu_depth = 1.0 / (depth_lo + (depth_hi - depth_lo) * d[0]);
             const double ct_cpu = 0.5 + 0.5 * d[1];
             const double phi_cpu = 6.283185307179586 * d[2];
+            {
+                const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
+                const double cph = 6.283185307179586 * d[2];
+                const Eigen::Vector3d ncpu = (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(cph) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(cph) * v + ct_cpu * axis).normalized();
+                std::printf("[diag] vec px %zu: b(%.5f %.5f %.5f) axis(%.5f %.5f %.5f) gpu n(%.5f %.5f %.5f) cpu-run n(%.5f %.5f %.5f) formula n(%.5f %.5f %.5f)\n", i,
+                            b.x(), b.y(), b.z(), axis.x(), axis.y(), axis.z(),
+                            static_cast<double>(g0.normals[3 * i]), static_cast<double>(g0.normals[3 * i + 1]), static_cast<double>(g0.normals[3 * i + 2]),
+                            static_cast<double>(c0.normals[3 * i]), static_cast<double>(c0.normals[3 * i + 1]), static_cast<double>(c0.normals[3 * i + 2]),
+                            ncpu.x(), ncpu.y(), ncpu.z());
+            }
             std::printf("[diag] px %zu: draws %.4f %.4f %.4f %.4f %.4f %.4f | cpu depth %.4f gpu depth %.4f | ct cpu %.4f gpu %.4f (as draw %.4f) | phi cpu %.4f gpu %.4f (as draw %.4f) | |n| %.5f u=(%.3f %.3f %.3f)\n",
                         i, d[0], d[1], d[2], d[3], d[4], d[5], cpu_depth, static_cast<double>(g0.depth[i]), ct_cpu, ct, (ct - 0.5) / 0.5, phi_cpu, phi, phi / 6.283185307179586, n.norm(), u.x(), u.y(), u.z());
         }
