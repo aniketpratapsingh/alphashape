@@ -95,7 +95,7 @@ jobs:
       - name: Install dependencies
         run: |
           # The hosted mirrors occasionally stall; bound each attempt and retry.
-          apt_retry() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed"; done; return 1; }
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
           apt_retry update
           apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
@@ -375,11 +375,12 @@ jobs:
       - name: Install runtime dependencies
         run: |
           # The hosted mirrors occasionally stall; bound each attempt and retry.
-          apt_retry() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed"; done; return 1; }
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
           apt_retry update
-          apt_retry install -y --no-install-recommends cmake libceres-dev libproj-dev proj-data \
-            zlib1g-dev libjpeg-dev libpng-dev libtiff-dev python3-dev libvulkan-dev \
-            mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          # Runtime libraries only (cmake and Python come with the image): the Azure mirror is slow
+          # enough that every avoided megabyte matters.
+          apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data libtiff6 \
+            libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
 
       - uses: actions/download-artifact@v4
         with:
