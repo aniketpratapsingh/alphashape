@@ -15,7 +15,9 @@ namespace alphashape::gpu::detail {
 namespace {
 
 std::mutex g_mutex;
-Loader g_loader;
+// Never destroyed (so never dlclose'd): the default GPU context outlives static
+// destruction and still calls into the library.
+Loader& g_loader = *new Loader();
 std::string g_reason;
 bool g_attempted = false;
 

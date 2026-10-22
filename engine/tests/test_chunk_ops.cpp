@@ -14,12 +14,13 @@
 #include <iostream>
 #include <memory>
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Core>
 #include <gtest/gtest.h>
+
+#include "base/platform/temp.hpp"
 
 #include "base/utils/error.hpp"
 #include "common/commands/command.hpp"
@@ -633,7 +634,7 @@ TEST(ChunkOps, DuplicateIsUndoable) {
 TEST(ChunkOps, SaveChunksSubsetRoundTrip) {
     const std::filesystem::path dir =
         std::filesystem::temp_directory_path() /
-        ("alphashape_chunk_subset_" + std::to_string(::getpid()));
+        ("alphashape_chunk_subset_" + std::to_string(platform::process_id()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const std::string path = (dir / "subset.psx").string();
@@ -677,7 +678,7 @@ TEST(ChunkOps, SaveChunksSubsetRoundTrip) {
 TEST(ChunkOps, AppendOffsetsIds) {
     const std::filesystem::path dir =
         std::filesystem::temp_directory_path() /
-        ("alphashape_chunk_append_" + std::to_string(::getpid()));
+        ("alphashape_chunk_append_" + std::to_string(platform::process_id()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const std::string source_path = (dir / "source.psx").string();

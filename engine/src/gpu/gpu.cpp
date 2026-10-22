@@ -22,7 +22,10 @@ std::once_flag g_env_once;
 bool g_enabled = true;
 
 std::once_flag g_default_once;
-std::shared_ptr<Context> g_default_context;
+// Deliberately never destroyed: at process exit the Vulkan driver (MoltenVK in
+// particular) may already have run its own static teardown, so destroying the
+// device from our static destructors crashes. The OS reclaims it instead.
+std::shared_ptr<Context>& g_default_context = *new std::shared_ptr<Context>();
 
 std::mutex g_state_mutex;
 std::string g_reason;
