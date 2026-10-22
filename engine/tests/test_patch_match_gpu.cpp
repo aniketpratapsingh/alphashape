@@ -529,10 +529,11 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
         for (std::size_t p = 0; p < gpu_result.depth.size(); ++p) {
             if (gpu_result.depth[p] > 0.0F && cpu_result.depth[p] > 0.0F) {
                 if (gpu_result.depth[p] == cpu_result.depth[p]) ++exact;
-                const double rel = std::abs(double(gpu_result.depth[p]) - cpu_result.depth[p]) / cpu_result.depth[p];
+                const double cd = static_cast<double>(cpu_result.depth[p]);
+                const double rel = std::abs(static_cast<double>(gpu_result.depth[p]) - cd) / cd;
                 if (rel >= 0.01) {
                     ++fcount;
-                    const double dc = std::abs(double(gpu_result.cost[p]) - cpu_result.cost[p]);
+                    const double dc = std::abs(static_cast<double>(gpu_result.cost[p]) - static_cast<double>(cpu_result.cost[p]));
                     if (gpu_result.cost[p] <= cpu_result.cost[p]) ++ccount;
                     if (dc < 0.02) ++ncount;
                 }
