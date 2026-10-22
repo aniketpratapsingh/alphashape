@@ -372,15 +372,27 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs so
+      # the shards usually install without downloading anything.
+      - name: Restore apt package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-debs
+          # Bump the suffix when the package list below changes.
+          key: apt-linux-runtime-v1
+
       - name: Install runtime dependencies
         run: |
           # The hosted mirrors occasionally stall; bound each attempt and retry.
           apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          mkdir -p ~/apt-debs
+          sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
           apt_retry update
           # Runtime libraries only (cmake and Python come with the image): the Azure mirror is slow
           # enough that every avoided megabyte matters.
           apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data libtiff6 \
             libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
       - uses: actions/download-artifact@v4
         with:
