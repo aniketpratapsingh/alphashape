@@ -448,7 +448,6 @@ struct Best {
     double depth = -1.0;
     Eigen::Vector3d normal = Eigen::Vector3d(0.0, 0.0, -1.0);
     double cost = std::numeric_limits<double>::infinity();
-    double epsilon = 0.0;
 };
 
 void evaluate(const CostContext& ctx, WindowCache& wc, double rho, double depth,
@@ -461,7 +460,7 @@ void evaluate(const CostContext& ctx, WindowCache& wc, double rho, double depth,
         return;
     }
     const double c = multiview_cost(ctx, wc, rho, n);
-    if (c < best.cost - best.epsilon) {
+    if (c < best.cost) {
         best.cost = c;
         best.depth = depth;
         best.normal = n;
@@ -787,7 +786,6 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                         const std::size_t base = p * 3;
                         const Eigen::Vector3d& b_p = bearings[p];
                         Best best;
-                        best.epsilon = options.cost_epsilon;
                         best.depth = static_cast<double>(result.depth[p]);
                         best.normal =
                             Eigen::Vector3d(static_cast<double>(result.normals[base + 0]),

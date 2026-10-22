@@ -32,7 +32,6 @@ struct PatchMatchOptions {
     int best_k = 0;              // neighbours averaged per pixel; 0 = ceil(n/2)
     double max_cost = 0.5;       // final pixels with cost above this get depth -1
     double min_texture_stddev = 1.0 / 255.0;  // skip windows flatter than this (intensity 0..1)
-    double cost_epsilon = 0.0;   // a candidate must beat the incumbent by more than this
     std::uint64_t seed = 1;
 };
 

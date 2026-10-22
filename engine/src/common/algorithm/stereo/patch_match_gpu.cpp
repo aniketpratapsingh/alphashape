@@ -93,10 +93,9 @@ struct PmParams {
     std::uint32_t seed_lo;
     std::uint32_t seed_hi;
     std::uint32_t touch;
-    float cost_epsilon;
 };
 
-static_assert(sizeof(PmParams) == 80, "PmParams must match the GLSL push-constant size");
+static_assert(sizeof(PmParams) == 76, "PmParams must match the GLSL push-constant size");
 static_assert(offsetof(PmParams, depth_min) == 32, "PmParams layout drifted");
 static_assert(offsetof(PmParams, radius) == 60, "PmParams layout drifted");
 static_assert(offsetof(PmParams, seed_lo) == 64, "PmParams layout drifted");
@@ -348,7 +347,6 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     params.max_cost = static_cast<float>(options.max_cost);
     params.radius = radius;
     params.touch = 0;
-    params.cost_epsilon = static_cast<float>(options.cost_epsilon);
 
     const std::array<std::uint32_t, 3> groups{
         static_cast<std::uint32_t>((width + kTileX - 1) / kTileX),

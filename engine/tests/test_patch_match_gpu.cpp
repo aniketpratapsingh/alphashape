@@ -492,99 +492,6 @@ TEST(PatchMatchGpu, ForcedFailureFallsBackAndCounts) {
 // 6. Dense fixture: accuracy contract and timing
 // ---------------------------------------------------------------------------
 
-static double cpu_depth_dbg(double d0, const PatchMatchOptions& o) {
-    const double lo = 1.0 / o.depth_max, hi = 1.0 / o.depth_min;
-    return 1.0 / (lo + (hi - lo) * d0);
-}
-
-// TMPDIAG probe
-struct ProbeParams {
-    std::uint32_t width, height, colour, iteration, iteration_hi, n_neighbours, n_samples, best_k;
-    float depth_min, depth_max, inv_span, normal_angle, depth_delta, min_texture, max_cost;
-    std::int32_t radius;
-    std::uint32_t seed_lo, seed_hi, touch;
-    float cost_epsilon;
-};
-
-TEST(PatchMatchGpu, ProbeRandomPlane) {
-    REQUIRE_GPU_PM();
-    const auto context = gpu::default_context();
-    ASSERT_NE(context, nullptr);
-    const std::size_t count = 240 * 180;
-    std::vector<float> zeros_f(count * 3, 0.0F);
-    std::vector<std::uint32_t> zeros_u(count, 0U);
-    std::vector<std::int32_t> zeros_i(count, 0);
-    gpu::Buffer b0 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b1 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b2 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b3 = gpu::Buffer::of(*context, zeros_u, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b4 = gpu::Buffer::of(*context, zeros_i, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b5 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b6 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b7 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b8 = gpu::Buffer::of(*context, zeros_u, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b9 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b10 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b11 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b12 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    gpu::Buffer b13 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
-    ProbeParams pp{};
-    pp.n_samples = 6;
-    pp.iteration = 0xFFFFFFFFU;
-    pp.iteration_hi = 0xFFFFFFFFU;
-    pp.depth_min = 2.0F;
-    pp.depth_max = 30.0F;
-    pp.seed_lo = 7;
-    pp.seed_hi = 0;
-    gpu::Dispatch d;
-    d.kernel = "pm_probe";
-    d.buffers = {&b0, &b1, &b2, &b3, &b4, &b5, &b6, &b7, &b8, &b9, &b10, &b11, &b12, &b13};
-    d.push_constants = gpu::push(pp);
-    d.groups = {1, 1, 1};
-    gpu::run(*context, {d});
-    const std::vector<float> out = b12.read<float>(count * 3);
-
-    const auto mix = [](std::uint64_t x) {
-        x += 0x9E3779B97F4A7C15ULL;
-        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-        return x ^ (x >> 31);
-    };
-    for (std::size_t k = 0; k < 6; ++k) {
-        const std::size_t pixel = 4000 + k * 997;
-        std::uint64_t h = mix(7ULL + 0x9E3779B97F4A7C15ULL);
-        h = mix(h ^ (static_cast<std::uint64_t>(pixel) * 0x100000001B3ULL));
-        h = mix(h ^ (static_cast<std::uint64_t>(-1) * 0xC2B2AE3D27D4EB4FULL));
-        h = mix(h ^ 0ULL);
-        double dr[6];
-        for (double& v : dr) {
-            h = mix(h);
-            v = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
-        }
-        const double x = static_cast<double>(pixel % 240), y = static_cast<double>(pixel / 240);
-        Eigen::Vector3d b((x + 0.5 - 120.0) / 250.0, (y + 0.5 - 90.0) / 250.0, 1.0);
-        b.normalize();
-        const Eigen::Vector3d axis = (-b).normalized();
-        const Eigen::Vector3d u = axis.unitOrthogonal();
-        const Eigen::Vector3d v = axis.cross(u);
-        const double ct = 0.5 + 0.5 * dr[1];
-        const double st = std::sqrt(1.0 - ct * ct);
-        const double phi = 6.283185307179586 * dr[2];
-        const Eigen::Vector3d n = (st * std::cos(phi) * u + st * std::sin(phi) * v + ct * axis).normalized();
-        const float* g = out.data() + k * 24;
-        std::printf("[probe] px %zu draws gpu %.5f %.5f %.5f %.5f %.5f %.5f | cpu %.5f %.5f %.5f %.5f %.5f %.5f\n", pixel,
-                    static_cast<double>(g[0]), static_cast<double>(g[1]), static_cast<double>(g[2]), static_cast<double>(g[3]), static_cast<double>(g[4]), static_cast<double>(g[5]),
-                    dr[0], dr[1], dr[2], dr[3], dr[4], dr[5]);
-        std::printf("[probe]   ct gpu %.5f cpu %.5f | phi gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f | cos_min gpu %.6f axis.z gpu %.5f cpu %.5f\n",
-                    static_cast<double>(g[10]), ct, static_cast<double>(g[11]), phi, static_cast<double>(g[15]), std::cos(phi), static_cast<double>(g[16]), std::sin(phi),
-                    static_cast<double>(g[21]), static_cast<double>(g[23]), axis.z());
-        std::printf("[probe]   u gpu (%.5f %.5f %.5f) cpu (%.5f %.5f %.5f) | v.x gpu %.5f cpu %.5f\n", static_cast<double>(g[12]), static_cast<double>(g[13]), static_cast<double>(g[14]),
-                    u.x(), u.y(), u.z(), static_cast<double>(g[22]), v.x());
-        std::printf("[probe]   n via function gpu (%.5f %.5f %.5f) | n inline gpu (%.5f %.5f %.5f) | cpu (%.5f %.5f %.5f)\n", static_cast<double>(g[7]), static_cast<double>(g[8]), static_cast<double>(g[9]),
-                    static_cast<double>(g[17]), static_cast<double>(g[18]), static_cast<double>(g[19]), n.x(), n.y(), n.z());
-    }
-}
-
 TEST(PatchMatchGpu, DenseFixtureAccuracy) {
     REQUIRE_GPU_PM();
     const auto inputs = dense_inputs(2);
@@ -612,94 +519,71 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
                 hood.camera_id, gpu_valid, gpu_result.depth.size(), cpu_valid,
                 cpu_result.depth.size(), 100.0 * agreement.fraction, agreement.both);
 
-    // TMPDIAG
-    {
-        PatchMatchOptions o0 = options;
-        o0.iterations = 0;
-        o0.max_cost = 3.0;
-        o0.cost_epsilon = -1234.0;
-        const PatchMatchResult g0 = stereo::run_patch_match_device(reference, neighbours, o0);
-        const auto mix = [](std::uint64_t x) {
-            x += 0x9E3779B97F4A7C15ULL;
-            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-            return x ^ (x >> 31);
-        };
-        int shown = 0;
-        for (std::size_t i = 4000; i < g0.depth.size() && shown < 6; i += 997) {
-            if (!(g0.depth[i] > 0.0F)) continue;
-            ++shown;
-            std::uint64_t h = mix(options.seed + 0x9E3779B97F4A7C15ULL);
-            h = mix(h ^ (static_cast<std::uint64_t>(i) * 0x100000001B3ULL));
-            h = mix(h ^ (static_cast<std::uint64_t>(-1) * 0xC2B2AE3D27D4EB4FULL));
-            h = mix(h ^ (0ULL * 0x9E3779B97F4A7C15ULL));
-            double d[6];
-            for (double& v : d) {
-                h = mix(h);
-                v = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
-            }
-            const int x = static_cast<int>(i % static_cast<std::size_t>(g0.width));
-            const int y = static_cast<int>(i / static_cast<std::size_t>(g0.width));
-            const Eigen::Vector3d b = reference.calibration.unproject(Eigen::Vector2d(x + 0.5, y + 0.5));
-            const Eigen::Vector3d axis = (-b).normalized();
-            const Eigen::Vector3d u = axis.unitOrthogonal();
-            const Eigen::Vector3d v = axis.cross(u);
-            const Eigen::Vector3d n(static_cast<double>(g0.normals[3 * i]), static_cast<double>(g0.normals[3 * i + 1]), static_cast<double>(g0.normals[3 * i + 2]));
-            const double ct = n.dot(axis);
-            double phi = std::atan2(n.dot(v), n.dot(u));
-            if (phi < 0) phi += 6.283185307179586;
-            const double depth_lo = 1.0 / options.depth_max, depth_hi = 1.0 / options.depth_min;
-            const double cpu_depth = 1.0 / (depth_lo + (depth_hi - depth_lo) * d[0]);
-            const double ct_cpu = 0.5 + 0.5 * d[1];
-            const double phi_cpu = 6.283185307179586 * d[2];
-            {
-                PatchMatchOptions o2 = o0;
-                o2.cost_epsilon = -2345.0;
-                static PatchMatchResult g2;
-                if (shown == 1) g2 = stereo::run_patch_match_device(reference, neighbours, o2);
-                std::printf("[diag] dbg2 px %zu: u.x gpu %.5f cpu %.5f | u.y gpu %.5f cpu %.5f | n gpu (%.5f %.5f %.5f) cpu (%.5f %.5f %.5f)\n", i,
-                            static_cast<double>(g2.depth[i]) - 10.0, u.x(), 2.0 * (static_cast<double>(g2.cost[i]) - 1.5), u.y(),
-                            static_cast<double>(g2.normals[3 * i]), static_cast<double>(g2.normals[3 * i + 1]), static_cast<double>(g2.normals[3 * i + 2]),
-                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().x(),
-                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().y(),
-                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().z());
-            }
-            {
-                PatchMatchOptions o3 = o0;
-                o3.cost_epsilon = -3456.0;
-                static PatchMatchResult g3;
-                if (shown == 1) g3 = stereo::run_patch_match_device(reference, neighbours, o3);
-                std::printf("[diag] dbg3 px %zu: phi gpu %.5f cpu %.5f | u.x gpu %.5f cpu %.5f | u.y gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f\n", i,
-                            static_cast<double>(g3.depth[i]) - 10.0, 6.283185307179586 * d[2],
-                            static_cast<double>(g3.normals[3 * i]), u.x(), static_cast<double>(g3.normals[3 * i + 1]), u.y(),
-                            static_cast<double>(g3.normals[3 * i + 2]), std::cos(6.283185307179586 * d[2]),
-                            4.0 * (static_cast<double>(g3.cost[i]) - 1.5), std::sin(6.283185307179586 * d[2]));
-            }
-            std::printf("[diag] dbg px %zu: phi+0.001*depth gpu %.5f (cpu %.5f) | ct gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f\n", i,
-                        static_cast<double>(g0.depth[i]), 6.283185307179586 * d[2] + 0.001 * cpu_depth_dbg(d[0], options),
-                        static_cast<double>(g0.normals[3 * i]), 0.5 + 0.5 * d[1],
-                        static_cast<double>(g0.normals[3 * i + 1]), std::cos(6.283185307179586 * d[2]),
-                        static_cast<double>(g0.normals[3 * i + 2]), std::sin(6.283185307179586 * d[2]));
-            {
-                PatchMatchOptions oc = o0;
-                oc.cost_epsilon = 0.0;
-                const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, oc);
-                const double cph = 6.283185307179586 * d[2];
-                const Eigen::Vector3d ncpu = (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(cph) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(cph) * v + ct_cpu * axis).normalized();
-                std::printf("[diag] vec px %zu: b(%.5f %.5f %.5f) axis(%.5f %.5f %.5f) gpu n(%.5f %.5f %.5f) cpu-run n(%.5f %.5f %.5f) formula n(%.5f %.5f %.5f)\n", i,
-                            b.x(), b.y(), b.z(), axis.x(), axis.y(), axis.z(),
-                            static_cast<double>(g0.normals[3 * i]), static_cast<double>(g0.normals[3 * i + 1]), static_cast<double>(g0.normals[3 * i + 2]),
-                            static_cast<double>(c0.normals[3 * i]), static_cast<double>(c0.normals[3 * i + 1]), static_cast<double>(c0.normals[3 * i + 2]),
-                            ncpu.x(), ncpu.y(), ncpu.z());
-            }
-            std::printf("[diag] px %zu: draws %.4f %.4f %.4f %.4f %.4f %.4f | cpu depth %.4f gpu depth %.4f | ct cpu %.4f gpu %.4f (as draw %.4f) | phi cpu %.4f gpu %.4f (as draw %.4f) | |n| %.5f u=(%.3f %.3f %.3f)\n",
-                        i, d[0], d[1], d[2], d[3], d[4], d[5], cpu_depth, static_cast<double>(g0.depth[i]), ct_cpu, ct, (ct - 0.5) / 0.5, phi_cpu, phi, phi / 6.283185307179586, n.norm(), u.x(), u.y(), u.z());
-        }
-    }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
     EXPECT_NEAR(static_cast<double>(gpu_valid), static_cast<double>(cpu_valid),
                 0.05 * static_cast<double>(cpu_valid));
+}
+
+// The random initial planes are a pure function of (seed, pixel), so with no
+// sweeps the GPU and CPU must pick the same plane for every pixel: the same
+// depth, the same normal and (up to float32 rounding) the same cost. This is
+// the cheapest check that the kernels were compiled and executed correctly on a
+// device; a driver that mishandles the module shows up here as a wrong normal
+// long before the full search's agreement figure moves.
+TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
+    REQUIRE_GPU_PM();
+    const auto inputs = dense_inputs(2);
+    const stereo::ViewNeighbourhood& hood = inputs->neighbourhoods.front();
+    std::vector<PMView> neighbours;
+    for (const std::int32_t id : hood.neighbours) {
+        neighbours.push_back(inputs->view(id));
+    }
+    const PMView reference = inputs->view(hood.camera_id);
+    PatchMatchOptions options;
+    options.depth_min = hood.depth_min;
+    options.depth_max = hood.depth_max;
+    options.seed = 7;
+    options.iterations = 0;
+    options.max_cost = 3.0;  // keep every initialised pixel
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result = stereo::run_patch_match(reference, neighbours, options);
+    ASSERT_EQ(gpu_result.depth.size(), cpu_result.depth.size());
+
+    std::size_t both = 0, depth_ok = 0, normal_ok = 0, cost_ok = 0;
+    for (std::size_t i = 0; i < gpu_result.depth.size(); ++i) {
+        if (!(gpu_result.depth[i] > 0.0F) || !(cpu_result.depth[i] > 0.0F)) {
+            continue;
+        }
+        ++both;
+        const double cpu_depth = static_cast<double>(cpu_result.depth[i]);
+        if (std::abs(static_cast<double>(gpu_result.depth[i]) - cpu_depth) / cpu_depth < 1e-4) {
+            ++depth_ok;
+        }
+        double dot = 0.0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            dot += static_cast<double>(gpu_result.normals[3 * i + k]) *
+                   static_cast<double>(cpu_result.normals[3 * i + k]);
+        }
+        if (dot > 1.0 - 1e-4) {
+            ++normal_ok;
+        }
+        if (std::abs(static_cast<double>(gpu_result.cost[i]) -
+                     static_cast<double>(cpu_result.cost[i])) < 1e-2) {
+            ++cost_ok;
+        }
+    }
+    const double n = static_cast<double>(std::max<std::size_t>(both, 1));
+    std::printf("[gpu init] %zu pixels: depth %.2f%% normal %.2f%% cost(<0.01) %.2f%%\n", both,
+                100.0 * static_cast<double>(depth_ok) / n,
+                100.0 * static_cast<double>(normal_ok) / n,
+                100.0 * static_cast<double>(cost_ok) / n);
+    ASSERT_GT(both, 1000U);
+    EXPECT_GT(static_cast<double>(depth_ok) / n, 0.999);
+    EXPECT_GT(static_cast<double>(normal_ok) / n, 0.999);
+    EXPECT_GT(static_cast<double>(cost_ok) / n, 0.99);
 }
 
 // ---------------------------------------------------------------------------
