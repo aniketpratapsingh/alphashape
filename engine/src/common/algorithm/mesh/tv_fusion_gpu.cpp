@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +75,12 @@ constexpr std::uint32_t kMaxBatch = 64;
 constexpr double kSettleTolerance = 1.0e-15;
 
 std::atomic<bool> g_force_failure{false};
+std::mutex g_profile_mutex;
+TvFusionGpuProfile g_profile;
+
+double seconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
 
 /// Push-constant block, byte-for-byte Tvl1Params in tvl1_common.glsl. Inert
 /// second members are named "_unused" so the shader compiler keeps them.
@@ -190,6 +198,8 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
                        " histogram bins on the GPU");
     }
 
+    const auto upload_start = std::chrono::steady_clock::now();
+    TvFusionGpuProfile profile;
     // -- device buffers ------------------------------------------------------
     // The CPU setup's initial field is the first iterate; the histograms are
     // the CPU's row-normalised weights, uploaded once. The dual fields start at
@@ -283,6 +293,8 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
     // One gpu::run per batch: the batch's dual/primal pairs, then the settle
     // statistic (delta against the pre-batch iterate, reduce to partials). The
     // host reads the partials and sums them in double.
+    profile.upload_seconds = seconds_since(upload_start);
+    const auto iterate_start = std::chrono::steady_clock::now();
     int remaining = std::max(0, options.iterations);
     std::uint32_t batch = kFirstBatch;
     double movement = 0.0;
@@ -311,6 +323,7 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
                                  << " iterations, mean |du| " << movement;
         }
         remaining -= static_cast<int>(count);
+        ++profile.batches;
         if (remaining <= 0 || movement <= kSettleTolerance) {
             break;
         }
@@ -319,9 +332,16 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
         batch = std::min<std::uint32_t>(batch * 2U, kMaxBatch);
     }
 
+    profile.iterate_seconds = seconds_since(iterate_start);
+    const auto readback_start = std::chrono::steady_clock::now();
     VolumeResult result;
     result.field = VoxelGrid<float>(grid, 0.0F);
     result.field.data = g_u.read<float>(voxels);
+    profile.readback_seconds = seconds_since(readback_start);
+    {
+        const std::lock_guard<std::mutex> lock(g_profile_mutex);
+        g_profile = profile;
+    }
     result.iso = 0.0F;
     result.observed = setup.observed;
     return result;
@@ -372,6 +392,10 @@ bool tv_l1_fusion_gpu_would_run() {
     // the inputs (the kernels have no size limits), hence no arguments.
     return tv_l1_fusion_gpu_supported();
 }
+TvFusionGpuProfile tv_fusion_gpu_last_profile() {
+    const std::lock_guard<std::mutex> lock(g_profile_mutex);
+    return g_profile;
+}
 void tv_fusion_gpu_force_failure(bool value) { g_force_failure.store(value); }
 
 VolumeResult tv_l1_fusion_device(const std::vector<FusionView>& views,
@@ -381,7 +405,9 @@ VolumeResult tv_l1_fusion_device(const std::vector<FusionView>& views,
     // Validate up front with the CPU's own rules, so a bad call throws before
     // any device work and is not absorbed by the fallback (which only catches
     // device failures; a validation error is thrown outside with_fallback).
+    const auto setup_start = std::chrono::steady_clock::now();
     detail::TvFusionSetup setup = detail::tv_l1_fusion_setup(views, bbox_min, bbox_max, options);
+    const double setup_seconds = seconds_since(setup_start);
     // The dual kernel packs p as fp16. Mesa's llvmpipe cannot compile that
     // pattern: LLVM 20 aborts the whole process with "Cannot select:
     // load<(load (s16) ...), anyext from i16>" inside its JIT (a hard exit, not
@@ -398,6 +424,10 @@ VolumeResult tv_l1_fusion_device(const std::vector<FusionView>& views,
         "TV-L1 fusion",
         [&] { return run_gpu(std::move(setup), options); },
         [&] { return detail::tv_l1_fusion_solve(std::move(setup), options); });
+    {
+        const std::lock_guard<std::mutex> lock(g_profile_mutex);
+        g_profile.setup_seconds = setup_seconds;
+    }
     if (check) {
         log_self_check(result, cpu_copy, options);
     }
