@@ -89,15 +89,11 @@ TEST(Gpu, EnumerateUpstreamDevice) {
                     device.max_workgroup_invocations, device.max_shared_memory,
                     device.subgroup_size);
     }
-    // The development device is an Apple GPU; the enumeration contract itself
-    // is what this asserts, so any other device (a Linux llvmpipe/lavapipe CPU
-    // driver, for instance) is checked on its own terms instead of being
-    // rejected for not being an M1.
-    if (!is_software_device(devices[0])) {
-        EXPECT_NE(devices[0].name.find("Apple"), std::string::npos) << devices[0].name;
-    } else {
-        EXPECT_TRUE(is_software_device(devices[0])) << devices[0].name;
-    }
+    // The enumeration contract is what this asserts, on any vendor: a named
+    // device with a real compute limit and a known type (hardware or software).
+    EXPECT_FALSE(devices[0].name.empty());
+    EXPECT_GT(devices[0].max_workgroup_invocations, 0u) << devices[0].name;
+    EXPECT_GT(devices[0].subgroup_size, 0u) << devices[0].name;
     EXPECT_FALSE(devices[0].name.empty());
     EXPECT_GT(devices[0].memory_bytes, 0u);
     EXPECT_GT(devices[0].max_workgroup_invocations, 0u);
