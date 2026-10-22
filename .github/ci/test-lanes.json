@@ -1,0 +1,12 @@
+{
+  "comment": "Test lanes for build.yml. Every ctest test not named under \"heavy\" is a light test and is spread over light_shards[os] stride shards. Each heavy lane is one job holding a few multi-minute pipeline tests, balanced by measured Linux CI time. Heavy lanes run on main, nightly and release; on pull requests only for the OSes in heavy_on_pr. macOS merges all heavy tests into a single lane.",
+  "light_shards": { "linux": 4, "windows": 4, "macos": 2 },
+  "heavy_on_pr": ["macos"],
+  "heavy": [
+    { "name": "ortho-truth", "tests": ["BuildOrthomosaic.MatchesTruthOrtho"] },
+    { "name": "ortho-surface", "tests": ["BuildOrthomosaic.ModelSurface", "ExportOrthomosaic.WritesGeoTiff"] },
+    { "name": "dem-plane", "tests": ["BuildDemPipeline.AerialDepthMapsToDem", "BuildOrthomosaic.PlaneToLocalIsExact"] },
+    { "name": "errors-dense-model", "tests": ["BuildOrthomosaic.Errors", "FullPipelineDenseNoWorseThanSfm.DenseStaysAtLeastAsAccurateAsSfm", "BuildModelEndToEnd.MatchesTheSceneOnTruthPoses"] },
+    { "name": "texture-python", "tests": ["BuildTextureEndToEnd.BakesTheSceneOnTruthPoses", "BuildTextureDiagnostics.GroundsTheSeenTexelCoverageGap", "BuildDenseTruthPoses.DenseOnTruthPosesMatchesScene", "python_dem_ortho", "python_mesh", "python_parity"] }
+  ]
+}

@@ -2,6 +2,11 @@ name: Build
 
 # Reusable build + test + package for Linux, macOS and Windows. Called by ci.yml, nightly.yml,
 # preview.yml and release.yml so every channel builds exactly the same way.
+#
+# Per OS: one build job (ccache / vcpkg cache, packaging) uploads the build tree minus object files,
+# then a matrix of test jobs unpacks it and runs one ctest slice each. The slices come from
+# .github/ci/test-lanes.json: N stride shards of the light tests, plus (when `full`) a few lanes of
+# heavy tests. The shard-coverage job proves the slices together are exactly the full test list.
 
 on:
   workflow_call:
@@ -18,6 +23,10 @@ on:
         description: Produce downloadable archives
         type: boolean
         default: false
+      full:
+        description: Run the heavy pipeline test lanes too (see .github/ci/test-lanes.json)
+        type: boolean
+        default: true
       windows-required:
         description: Fail the call when the Windows job fails
         type: boolean
@@ -37,10 +46,47 @@ env:
   VMA_TAG: v3.1.0
 
 jobs:
+  plan:
+    name: Plan test lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      linux: ${{ steps.matrix.outputs.linux }}
+      macos: ${{ steps.matrix.outputs.macos }}
+      windows: ${{ steps.matrix.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: matrix
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          # shellcheck disable=SC2016  # jq program, not shell, expands these
+          prog='
+            . as $c
+            | ($c.heavy | map(.tests[]) | map(gsub("\\."; "\\.")) | join("|")) as $all
+            | def rx($t): "^(" + ($t | map(gsub("\\."; "\\.")) | join("|")) + ")$";
+              def light($n): [range(1; $n + 1) as $i
+                  | {lane: "light-\($i)-of-\($n)", flag: "-E", regex: ("^(" + $all + ")$"), index: $i, total: $n}];
+              def heavy: $c.heavy | map({lane: ("heavy-" + .name), flag: "-R", regex: rx(.tests), index: 0, total: 0});
+              def merged: [{lane: "heavy", flag: "-R", regex: ("^(" + $all + ")$"), index: 0, total: 0}];
+              def mac: if $full or ($c.heavy_on_pr | index("macos")) then merged else [] end;
+            {
+              linux:   {include: (light($c.light_shards.linux)   + (if $full then heavy else [] end))},
+              windows: {include: (light($c.light_shards.windows) + (if $full then heavy else [] end))},
+              macos:   {include: (light($c.light_shards.macos)   + mac)}
+            }'
+          jq -c --argjson full "$FULL" "$prog" .github/ci/test-lanes.json > matrix.json
+          for os in linux macos windows; do
+            echo "$os=$(jq -c ".$os" matrix.json)" >> "$GITHUB_OUTPUT"
+          done
+          jq . matrix.json
+
   linux:
     name: Linux x86-64 (GCC, lavapipe)
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,13 +94,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache \
+          # The hosted mirrors occasionally stall; bound each attempt and retry.
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
             libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
           sudo mkdir -p /usr/include/vma
-          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/include/vma/vk_mem_alloc.h \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
@@ -77,12 +125,26 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
 
-      - name: Test (GPU suites on Mesa lavapipe)
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      - name: Pack test tree
         run: |
-          vulkaninfo --summary | head -20 || true
-          ctest --test-dir build --parallel 4 --timeout 3600
+          ctest --test-dir build -N | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-all.txt
+          wc -l tests-all.txt
+          tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
+          ls -lh build.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: build.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-linux-all
+          path: tests-all.txt
+          retention-days: 1
 
       - name: Compiler cache statistics
         if: always()
@@ -108,7 +170,7 @@ jobs:
   macos:
     name: macOS arm64 (Clang, MoltenVK)
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -124,7 +186,7 @@ jobs:
             vulkan-validationlayers
           prefix="$(brew --prefix)"
           mkdir -p "$prefix/include/vma"
-          curl -fsSL -o "$prefix/include/vma/vk_mem_alloc.h" \
+          curl -fsSL --retry 3 --max-time 60 -o "$prefix/include/vma/vk_mem_alloc.h" \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
@@ -146,10 +208,26 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 3
 
-      - name: Test (GPU suites on the runner's Apple paravirtual GPU via MoltenVK)
+      - name: Pack test tree
         run: |
-          vulkaninfo --summary | head -20 || true
-          ctest --test-dir build --parallel 3 --timeout 3600
+          ctest --test-dir build -N | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-all.txt
+          wc -l tests-all.txt
+          tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
+          ls -lh build.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos
+          path: build.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-macos-all
+          path: tests-all.txt
+          retention-days: 1
 
       - name: Compiler cache statistics
         if: always()
@@ -176,7 +254,7 @@ jobs:
   windows:
     name: Windows x86-64 (clang-cl, CPU only)
     runs-on: windows-2022
-    timeout-minutes: 300
+    timeout-minutes: 120
     continue-on-error: ${{ !inputs.windows-required }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
@@ -201,6 +279,12 @@ jobs:
             $env:VCPKG_PACKAGES.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
+      # test shards must find the same one (image Python patch versions differ between runners).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -222,13 +306,35 @@ jobs:
           # -k 0: report every compile error in one run while the port is in progress.
           cmake --build build --parallel 4 -- -k 0
 
-      - name: Test
+      - name: List tests
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
-          # vcpkg installs proj.db under share/proj; nothing on Windows points PROJ at it.
-          $env:ALPHASHAPE_PROJ_DATA = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\share\proj"
-          ctest --test-dir build --parallel 4 --timeout 3600
+          $lines = ctest --test-dir build -N | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } }
+          $lines | Set-Content -Encoding ascii tests-all.txt
+          "tests: $($lines.Count)"
+
+      - name: Pack test tree
+        shell: cmd
+        timeout-minutes: 15
+        run: |
+          %SystemRoot%\System32\tar.exe -czf build.tar.gz --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
+          dir build.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-windows
+          path: build.tar.gz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-windows-all
+          path: tests-all.txt
+          retention-days: 1
 
       - name: Package
         if: inputs.package
@@ -248,3 +354,249 @@ jobs:
           name: alphashape-windows-x86_64
           path: dist/*.zip
           if-no-files-found: error
+
+  # ---- test lanes: one job per matrix entry, each runs a ctest slice of the build above ----
+
+  linux-test:
+    name: Linux test ${{ matrix.lane }}
+    needs: [plan, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
+    steps:
+      # The build tree holds absolute paths (fixtures, binaries), so the workspace path must match
+      # the build job: same runner image, same repository, same checkout location.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs so
+      # the shards usually install without downloading anything.
+      - name: Restore apt package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-debs
+          # Bump the suffix when the package list below changes.
+          key: apt-linux-runtime-v1
+
+      - name: Install runtime dependencies
+        run: |
+          # The hosted mirrors occasionally stall; bound each attempt and retry.
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          mkdir -p ~/apt-debs
+          sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          apt_retry update
+          # Runtime libraries only (cmake and Python come with the image): the Azure mirror is slow
+          # enough that every avoided megabyte matters.
+          apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data libtiff6 \
+            libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-linux
+
+      - name: Unpack build tree
+        run: tar --zstd -xf build.tar.zst
+
+      - name: Select tests
+        env:
+          FLAG: ${{ matrix.flag }}
+          REGEX: ${{ matrix.regex }}
+          INDEX: ${{ matrix.index }}
+          TOTAL: ${{ matrix.total }}
+        run: |
+          args=("$FLAG" "$REGEX")
+          if [ "$INDEX" != 0 ]; then args+=(-I "$INDEX,,$TOTAL"); fi
+          printf '%s\n' "${args[@]}" > ctest-args.txt
+          ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
+          echo "tests in this lane: $(wc -l < tests-lane.txt)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-linux-${{ matrix.lane }}
+          path: tests-lane.txt
+          retention-days: 1
+
+      - name: Test (GPU suites on Mesa lavapipe)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          vulkaninfo --summary | head -20 || true
+          mapfile -t args < ctest-args.txt
+          # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
+          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 "${args[@]}"
+
+  macos-test:
+    name: macOS test ${{ matrix.lane }}
+    needs: [plan, macos]
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.macos) }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install runtime dependencies
+        run: |
+          brew install eigen ceres-solver proj libtiff libpng jpeg-turbo pybind11 libomp molten-vk \
+            vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macos
+
+      - name: Unpack build tree
+        run: tar --zstd -xf build.tar.zst
+
+      - name: Select tests
+        env:
+          FLAG: ${{ matrix.flag }}
+          REGEX: ${{ matrix.regex }}
+          INDEX: ${{ matrix.index }}
+          TOTAL: ${{ matrix.total }}
+        run: |
+          args=("$FLAG" "$REGEX")
+          if [ "$INDEX" != 0 ]; then args+=(-I "$INDEX,,$TOTAL"); fi
+          printf '%s\n' "${args[@]}" > ctest-args.txt
+          ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
+          echo "tests in this lane: $(wc -l < tests-lane.txt)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-macos-${{ matrix.lane }}
+          path: tests-lane.txt
+          retention-days: 1
+
+      - name: Test (GPU suites on the runner's Apple paravirtual GPU via MoltenVK)
+        run: |
+          vulkaninfo --summary | head -20 || true
+          args=()
+          while IFS= read -r line; do args+=("$line"); done < ctest-args.txt
+          # --repeat until-pass:2 absorbs MoltenVK "device lost" flakes on the paravirtual GPU.
+          ctest --test-dir build --parallel 3 --timeout 3600 --repeat until-pass:2 "${args[@]}"
+
+  windows-test:
+    name: Windows test ${{ matrix.lane }}
+    needs: [plan, windows]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    continue-on-error: ${{ !inputs.windows-required }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The build job saved this cache under the same key; restore only, never save from a shard.
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: vcpkg-x64-windows-
+
+      - name: Install runtime dependencies (vcpkg, from binary cache)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
+            $env:VCPKG_PACKAGES.Split(' ')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
+      # test shards must find the same one (image Python patch versions differ between runners).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-windows
+
+      - name: Unpack build tree
+        shell: pwsh
+        run: |
+          & "$env:SystemRoot\System32\tar.exe" -xzf build.tar.gz
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Select tests
+        shell: pwsh
+        env:
+          FLAG: ${{ matrix.flag }}
+          REGEX: ${{ matrix.regex }}
+          INDEX: ${{ matrix.index }}
+          TOTAL: ${{ matrix.total }}
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          $ctestArgs = @($env:FLAG, $env:REGEX)
+          if ($env:INDEX -ne '0') { $ctestArgs += '-I'; $ctestArgs += "$($env:INDEX),,$($env:TOTAL)" }
+          $ctestArgs | Set-Content -Encoding ascii ctest-args.txt
+          ctest --test-dir build -N @ctestArgs | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } } | Set-Content -Encoding ascii tests-lane.txt
+          "tests in this lane: $((Get-Content tests-lane.txt).Count)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-windows-${{ matrix.lane }}
+          path: tests-lane.txt
+          retention-days: 1
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          # vcpkg installs proj.db under share/proj; nothing on Windows points PROJ at it.
+          $env:ALPHASHAPE_PROJ_DATA = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\share\proj"
+          $ctestArgs = Get-Content ctest-args.txt
+          # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
+          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 @ctestArgs
+
+  # The lanes must together run every test exactly once; fails if a lane was dropped or overlaps.
+  shard-coverage:
+    name: Test shard coverage
+    needs: [linux-test, macos-test, windows-test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tests-*
+          path: lists
+
+      - name: Compare lanes with the full test list
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          status=0
+          for os in linux macos windows; do
+            [ -f "lists/tests-$os-all/tests-all.txt" ] || { echo "$os: no build, skipping"; continue; }
+            cat lists/tests-$os-[!a]*/tests-lane.txt 2>/dev/null | tr -d '\r' | sort > "$os.lanes"
+            tr -d '\r' < "lists/tests-$os-all/tests-all.txt" | sort > "$os.all"
+            echo "$os: $(wc -l < "$os.all") tests, $(wc -l < "$os.lanes") run across $(compgen -G "lists/tests-$os-[!a]*" | wc -l) lanes"
+            if [ -d "lists/tests-$os-all" ] && ! compgen -G "lists/tests-$os-[!a]*" >/dev/null; then
+              echo "$os: build succeeded but no test lanes reported"; status=1; continue
+            fi
+            if [ "$os" = macos ] || [ "$FULL" = true ]; then
+              diff "$os.all" "$os.lanes" || { echo "::error::$os lanes differ from the full test list"; status=1; }
+            else
+              # Pull request: heavy lanes are skipped, so lanes must be a duplicate-free subset.
+              [ -z "$(uniq -d "$os.lanes")" ] || { echo "::error::$os: a test is in two lanes"; status=1; }
+              missing=$(comm -13 "$os.all" "$os.lanes")
+              [ -z "$missing" ] || { echo "::error::$os: lanes run unknown tests: $missing"; status=1; }
+            fi
+          done
+          exit $status
