@@ -521,35 +521,42 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
 
     // TMPDIAG
     {
-        PatchMatchOptions o0 = options;
-        o0.iterations = 0;
-        o0.max_cost = 3.0;
-        const PatchMatchResult g0 = stereo::run_patch_match_device(reference, neighbours, o0);
-        const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
-        std::vector<double> diffs;
-        std::size_t sentinel_mismatch = 0, same_depth = 0, active = 0;
-        int shown = 0;
-        for (std::size_t i = 0; i < g0.depth.size(); ++i) {
-            if (!(g0.depth[i] > 0.0F) && !(c0.depth[i] > 0.0F)) continue;
-            ++active;
-            const double cd = static_cast<double>(c0.depth[i]);
-            if (std::abs(static_cast<double>(g0.depth[i]) - cd) / cd < 1e-4) ++same_depth;
-            const double gc = static_cast<double>(g0.cost[i]);
-            const double cc = static_cast<double>(c0.cost[i]);
-            diffs.push_back(std::abs(gc - cc));
-            if ((gc >= 2.0) != (cc >= 2.0)) ++sentinel_mismatch;
-            if (std::abs(gc - cc) > 0.01 && shown < 12) {
-                ++shown;
-                std::printf("[diag] px %zu: gpu cost %.5f cpu cost %.5f depth %.4f / %.4f\n", i, gc, cc,
-                            static_cast<double>(g0.depth[i]), cd);
-            }
+        const auto pr = [](const char* tag, const PMView& v) {
+            const Calibration& c = v.calibration;
+            std::printf("[diag] %s: type %d %dx%d f %.3f cx %.3f cy %.3f b1 %.4f b2 %.4f k %.5f %.5f %.5f %.5f p %.5f %.5f t(%.3f %.3f %.3f)\n",
+                        tag, static_cast<int>(c.type), c.width, c.height, c.f, c.cx, c.cy, c.b1, c.b2, c.k1, c.k2, c.k3, c.k4, c.p1, c.p2,
+                        v.t.x(), v.t.y(), v.t.z());
+        };
+        pr("ref", reference);
+        for (std::size_t j = 0; j < neighbours.size(); ++j) {
+            pr("nb", neighbours[j]);
+            const Eigen::Matrix3d M = neighbours[j].R * reference.R.transpose();
+            const double angle = std::acos(std::max(-1.0, std::min(1.0, (M.trace() - 1.0) / 2.0))) * 57.29578;
+            std::printf("[diag] nb %zu relative rotation %.2f deg\n", j, angle);
         }
-        std::sort(diffs.begin(), diffs.end());
-        const auto q = [&](double f) { return diffs.empty() ? 0.0 : diffs[static_cast<std::size_t>(f * static_cast<double>(diffs.size() - 1))]; };
-        std::size_t gt3 = 0, gt2 = 0, gt1 = 0;
-        for (const double d : diffs) { if (d > 1e-3) ++gt3; if (d > 1e-2) ++gt2; if (d > 1e-1) ++gt1; }
-        std::printf("[diag] init costs: active %zu same-depth %zu sentinel-mismatch %zu | |dcost| p50 %.2e p90 %.2e p99 %.2e max %.2e | >1e-3 %zu >1e-2 %zu >1e-1 %zu\n",
-                    active, same_depth, sentinel_mismatch, q(0.5), q(0.9), q(0.99), q(1.0), gt3, gt2, gt1);
+        for (std::size_t j = 0; j < neighbours.size(); ++j) {
+            std::vector<PMView> sub{neighbours[j]};
+            PatchMatchOptions o0 = options;
+            o0.iterations = 0;
+            o0.max_cost = 3.0;
+            const PatchMatchResult g0 = stereo::run_patch_match_device(reference, sub, o0);
+            const PatchMatchResult c0 = stereo::run_patch_match(reference, sub, o0);
+            std::vector<double> diffs;
+            std::size_t sentinel_mismatch = 0;
+            for (std::size_t i = 0; i < g0.depth.size(); ++i) {
+                if (!(g0.depth[i] > 0.0F) && !(c0.depth[i] > 0.0F)) continue;
+                const double gc = static_cast<double>(g0.cost[i]);
+                const double cc = static_cast<double>(c0.cost[i]);
+                diffs.push_back(std::abs(gc - cc));
+                if ((gc >= 2.0) != (cc >= 2.0)) ++sentinel_mismatch;
+            }
+            std::sort(diffs.begin(), diffs.end());
+            const auto q = [&](double f) { return diffs.empty() ? 0.0 : diffs[static_cast<std::size_t>(f * static_cast<double>(diffs.size() - 1))]; };
+            std::size_t gt = 0;
+            for (const double d : diffs) if (d > 1e-2) ++gt;
+            std::printf("[diag] single nb %zu: n %zu sentinel-mismatch %zu |dcost| p50 %.2e p90 %.2e p99 %.2e >1e-2 %zu\n",
+                        j, diffs.size(), sentinel_mismatch, q(0.5), q(0.9), q(0.99), gt);
+        }
     }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
