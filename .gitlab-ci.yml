@@ -26,13 +26,17 @@ stages: [probe]
     - ls /dev | grep -i nvidia || echo "no /dev/nvidia* devices"
     - ls /usr/lib/x86_64-linux-gnu | grep -iE "nvidia|GLX|libcuda" || echo "no NVIDIA user-space libraries mounted"
     - ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true
+    - ls -la /usr/local/nvidia /usr/local/nvidia/lib64 2>&1 | head -120
+    - find /usr/local/nvidia -name "*icd*.json" -o -name "*vulkan*" 2>/dev/null
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends vulkan-tools libvulkan1 >/dev/null
     - |
       if [ ! -e /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ ! -e /etc/vulkan/icd.d/nvidia_icd.json ]; then
         mkdir -p /etc/vulkan/icd.d
-        printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3"}}\n' > /etc/vulkan/icd.d/nvidia_icd.json
+        lib=$(ls /usr/local/nvidia/lib64/libGLX_nvidia.so.0 2>/dev/null || echo libGLX_nvidia.so.0)
+        printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"1.3"}}\n' "$lib" > /etc/vulkan/icd.d/nvidia_icd.json
+        cat /etc/vulkan/icd.d/nvidia_icd.json
       fi
-    - vulkaninfo --summary 2>&1 | grep -iE "deviceName|deviceType|driverName|apiVersion" || true
+    - VK_LOADER_DEBUG=error,warn,driver vulkaninfo --summary 2>&1 | tail -40 || true
     - vulkaninfo --summary 2>/dev/null | grep -iE "deviceName.*(Tesla|T4|NVIDIA)"
 
 # Images differ in what the NVIDIA container runtime injects: CUDA base images
