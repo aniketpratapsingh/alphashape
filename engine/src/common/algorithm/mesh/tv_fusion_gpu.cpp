@@ -201,17 +201,21 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
     const auto upload_start = std::chrono::steady_clock::now();
     TvFusionGpuProfile profile;
     // -- device buffers ------------------------------------------------------
+    // Every buffer is DeviceLocal. The default (HostVisible) is host RAM on a
+    // discrete GPU, so each of the 600 sweeps would stream the whole working set
+    // over PCIe: that made the T4 run at 0.4x the CPU. On unified memory
+    // (Apple, integrated) DeviceLocal resolves to the same heap at no cost.
     // The CPU setup's initial field is the first iterate; the histograms are
     // the CPU's row-normalised weights, uploaded once. The dual fields start at
     // zero, exactly the CPU's px/py/pz.
-    g::Buffer g_u = g::Buffer::of(*context, setup.initial_field);
-    g::Buffer g_ubar = g::Buffer::of(*context, setup.initial_field);
+    g::Buffer g_u = g::Buffer::of(*context, setup.initial_field, g::MemoryKind::DeviceLocal);
+    g::Buffer g_ubar = g::Buffer::of(*context, setup.initial_field, g::MemoryKind::DeviceLocal);
     // The dual field is packed half precision, two uints per voxel (see
     // tvl1_dual.comp): |p| <= 1, so fp16 resolution is far below the field's
     // scale while the stream shrinks by 6 bytes per voxel. Starts at zero,
     // exactly the CPU's px/py/pz.
     const std::vector<std::uint32_t> zero_dual(voxels * 2, 0U);
-    g::Buffer g_p = g::Buffer::of(*context, zero_dual);
+    g::Buffer g_p = g::Buffer::of(*context, zero_dual, g::MemoryKind::DeviceLocal);
     // Compact the dense V x bins histograms to the measured voxels. Unmeasured
     // rows are all zero, which the CPU's prox answers with clamp(v), so the
     // kernel skips their read via kNoRow. In a typical build only 6-11% of
@@ -235,8 +239,8 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
             rows.push_back(static_cast<float>(source[k]));
         }
     }
-    g::Buffer g_rows = g::Buffer::of(*context, rows);
-    g::Buffer g_row_start = g::Buffer::of(*context, row_start);
+    g::Buffer g_rows = g::Buffer::of(*context, rows, g::MemoryKind::DeviceLocal);
+    g::Buffer g_row_start = g::Buffer::of(*context, row_start, g::MemoryKind::DeviceLocal);
 
     // Every row is dispatched and every 128-voxel x-block of every row runs; the
     // second grid dimension is rounded up per kernel shape (the dual kernel
@@ -262,9 +266,11 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
     for (std::uint32_t slot = 0; slot < block_list.size(); ++slot) {
         block_list[slot] = slot;
     }
-    g::Buffer g_blocks = g::Buffer::of(*context, block_list);
-    g::Buffer g_previous = g::Buffer::of(*context, setup.initial_field);
-    g::Buffer g_delta = g::make_buffer(*context, voxels * sizeof(float));
+    g::Buffer g_blocks = g::Buffer::of(*context, block_list, g::MemoryKind::DeviceLocal);
+    g::Buffer g_previous =
+        g::Buffer::of(*context, setup.initial_field, g::MemoryKind::DeviceLocal);
+    g::Buffer g_delta =
+        g::make_buffer(*context, voxels * sizeof(float), g::MemoryKind::DeviceLocal);
 
     // One dispatched slot per (y, z) row.
     const std::uint32_t resident = static_cast<std::uint32_t>(block_list.size());
@@ -282,7 +288,8 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
         (resident + 7) / 8, 1};
     const std::uint32_t group_count = reduce_group_count();
     const std::array<std::uint32_t, 3> reduce_launch = reduce_groups(group_count);
-    g::Buffer g_partials = g::make_buffer(*context, group_count * sizeof(float));
+    g::Buffer g_partials =
+        g::make_buffer(*context, group_count * sizeof(float), g::MemoryKind::DeviceLocal);
 
     const std::vector<const g::Buffer*> dual_buffers = {&g_ubar, &g_p, &g_blocks};
     const std::vector<const g::Buffer*> primal_buffers = {
