@@ -279,6 +279,12 @@ jobs:
             $env:VCPKG_PACKAGES.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
+      # test shards must find the same one (image Python patch versions differ between runners).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -496,6 +502,12 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
             $env:VCPKG_PACKAGES.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
+      # test shards must find the same one (image Python patch versions differ between runners).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: actions/download-artifact@v4
         with:
