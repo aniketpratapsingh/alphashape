@@ -43,6 +43,8 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       package: false
+      # PRs run the light lanes only; main runs everything (see .github/ci/test-lanes.json).
+      full: ${{ github.event_name != 'pull_request' }}
 
   ci-ok:
     name: CI OK
