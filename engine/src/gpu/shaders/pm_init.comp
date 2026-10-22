@@ -64,6 +64,14 @@ void main() {
         return;
     }
     evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+    if (pc.cost_epsilon < -3000.0) {
+        state_depth[pixel] = 10.0 + g_dbg[1];
+        state_normal[pixel * 3 + 0] = g_dbg[2];
+        state_normal[pixel * 3 + 1] = g_dbg[3];
+        state_normal[pixel * 3 + 2] = g_dbg[4];
+        state_cost[pixel] = 1.5 + 0.25 * g_dbg[5];
+        return;
+    }
     if (best.depth > 0.0) {
         state_depth[pixel] = best.depth;
         state_normal[pixel * 3 + 0] = best.normal.x;

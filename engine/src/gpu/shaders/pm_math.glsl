@@ -196,6 +196,8 @@ vec3 random_unit_vector(inout Rng rng) {
     return vec3(r * cos(phi), r * sin(phi), z);
 }
 
+float g_dbg[6];
+
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
 vec3 random_cone_normal(inout Rng rng, vec3 b_p) {
     vec3 axis = normalize(-b_p);
@@ -205,6 +207,12 @@ vec3 random_cone_normal(inout Rng rng, vec3 b_p) {
     float phi = PM_TWO_PI * rng_next(rng);
     vec3 u = any_orthogonal(axis);
     vec3 v = cross(axis, u);
+    g_dbg[0] = ct;
+    g_dbg[1] = phi;
+    g_dbg[2] = u.x;
+    g_dbg[3] = u.y;
+    g_dbg[4] = cos(phi);
+    g_dbg[5] = sin(phi);
     return normalize(st * cos(phi) * u + st * sin(phi) * v + ct * axis);
 }
 
