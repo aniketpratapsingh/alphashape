@@ -226,6 +226,8 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          # vcpkg installs proj.db under share/proj; nothing on Windows points PROJ at it.
+          $env:ALPHASHAPE_PROJ_DATA = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\share\proj"
           ctest --test-dir build --parallel 4 --timeout 3600
 
       - name: Package

@@ -30,6 +30,7 @@
 #include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/raster/geo_raster.hpp"
+#include "perf_gate.hpp"
 
 namespace alphashape {
 namespace {
@@ -800,7 +801,9 @@ TEST(Ortho, FullPipelineTiming) {
     // work. The bound only catches an algorithmic regression (the pipeline is
     // seconds, not minutes), so it is scaled for slower hosts rather than acting
     // as a performance target.
-    EXPECT_LT(seconds, 30.0);
+    if (test::perf_asserts_enabled()) {
+        EXPECT_LT(seconds, 30.0);
+    }
 }
 
 }  // namespace
