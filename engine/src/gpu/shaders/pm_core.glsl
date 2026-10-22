@@ -278,7 +278,7 @@ void evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, inout Best
         return;
     }
     float cost = multiview_cost(x, y, depth * nb, n);
-    if (cost < best.cost) {
+    if (cost < best.cost - pc.cost_epsilon) {
         best.cost = cost;
         best.depth = depth;
         best.normal = n;

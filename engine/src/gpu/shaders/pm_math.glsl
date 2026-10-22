@@ -38,6 +38,7 @@ layout(push_constant) uniform PmParams {
     uint seed_lo;       // PatchMatchOptions::seed, low word
     uint seed_hi;       // PatchMatchOptions::seed, high word
     uint touch;         // always 0: keeps every binding alive through -O
+    float cost_epsilon; // a candidate must beat the incumbent by more than this
 } pc;
 
 layout(binding = 0) buffer RefImage { float ref_img[]; };

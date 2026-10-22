@@ -520,89 +520,30 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
                 cpu_result.depth.size(), 100.0 * agreement.fraction, agreement.both);
 
     // TMPDIAG
-    std::printf("[diag] neighbours %zu radius %d step %d iterations %d best_k %d min_tex %.3f max_cost %.3f\n",
-                neighbours.size(), options.window_radius, options.window_step, options.iterations,
-                options.best_k, options.min_texture_stddev, options.max_cost);
-    {
-        PatchMatchOptions o2 = options;
-        o2.seed = 8;
-        const PatchMatchResult cpu8 = stereo::run_patch_match(reference, neighbours, o2);
-        std::printf("[diag] cpu7 vs cpu8: %.1f%%\n", 100.0 * relative_agreement(cpu8, cpu_result, 0.01).fraction);
-        const PatchMatchResult gpu8 = stereo::run_patch_match_device(reference, neighbours, o2);
-        std::printf("[diag] gpu7 vs gpu8: %.1f%%  gpu8 vs cpu8: %.1f%%\n",
-                    100.0 * relative_agreement(gpu8, gpu_result, 0.01).fraction,
-                    100.0 * relative_agreement(gpu8, cpu8, 0.01).fraction);
-        const PatchMatchResult gpu7b = stereo::run_patch_match_device(reference, neighbours, options);
-        std::printf("[diag] gpu7 rerun identical depth: %d\n", gpu7b.depth == gpu_result.depth ? 1 : 0);
-        for (const int its : {0, 1, 2}) {
-            PatchMatchOptions o3 = options;
-            o3.iterations = its;
-            const PatchMatchResult c3 = stereo::run_patch_match(reference, neighbours, o3);
-            const PatchMatchResult g3 = stereo::run_patch_match_device(reference, neighbours, o3);
-            std::printf("[diag] iterations %d: gpu vs cpu %.1f%% (valid gpu %zu cpu %zu)\n", its,
-                        100.0 * relative_agreement(g3, c3, 0.01).fraction, valid_pixels(g3), valid_pixels(c3));
-        }
-        for (const std::size_t nn : {std::size_t{2}, std::size_t{4}, std::size_t{6}}) {
-            if (nn >= neighbours.size()) continue;
-            std::vector<PMView> sub(neighbours.begin(), neighbours.begin() + static_cast<std::ptrdiff_t>(nn));
-            const PatchMatchResult c4 = stereo::run_patch_match(reference, sub, options);
-            const PatchMatchResult g4 = stereo::run_patch_match_device(reference, sub, options);
-            std::printf("[diag] %zu neighbours: gpu vs cpu %.1f%%\n", nn,
-                        100.0 * relative_agreement(g4, c4, 0.01).fraction);
-        }
-        // Spatial breakdown of disagreement (8 x 6 blocks).
-        const int w = gpu_result.width;
-        const int h = gpu_result.height;
-        std::vector<int> bad(48, 0), tot(48, 0);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-                if (!(gpu_result.depth[i] > 0.0F) || !(cpu_result.depth[i] > 0.0F)) continue;
-                const int blk = (y * 6 / h) * 8 + (x * 8 / w);
-                ++tot[static_cast<std::size_t>(blk)];
-                const double cd = static_cast<double>(cpu_result.depth[i]);
-                if (std::abs(static_cast<double>(gpu_result.depth[i]) - cd) / cd >= 0.01) ++bad[static_cast<std::size_t>(blk)];
+    for (const double eps : {0.0, 1e-5, 1e-4, 1e-3, 1e-2}) {
+        for (const int its : {1, 6}) {
+            PatchMatchOptions o = options;
+            o.cost_epsilon = eps;
+            o.iterations = its;
+            const PatchMatchResult c = stereo::run_patch_match(reference, neighbours, o);
+            const PatchMatchResult g = stereo::run_patch_match_device(reference, neighbours, o);
+            PatchMatchOptions o0 = o;
+            o0.cost_epsilon = 0.0;
+            const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
+            std::size_t tie = 0, gworse = 0, gbetter = 0, both = 0;
+            for (std::size_t i = 0; i < g.depth.size(); ++i) {
+                if (!(g.depth[i] > 0.0F) || !(c.depth[i] > 0.0F)) continue;
+                ++both;
+                const double cd = static_cast<double>(c.depth[i]);
+                if (std::abs(static_cast<double>(g.depth[i]) - cd) / cd < 0.01) continue;
+                const double dc = static_cast<double>(g.cost[i]) - static_cast<double>(c.cost[i]);
+                if (std::abs(dc) < 1e-3) ++tie; else if (dc > 0) ++gworse; else ++gbetter;
             }
+            std::printf("[diag] eps %.0e its %d: gpu-vs-cpu %.1f%%  gpu-vs-cpu(eps0) %.1f%%  cpu-vs-cpu(eps0) %.1f%% | disagree: tie %zu gpu-worse %zu gpu-better %zu of %zu\n",
+                        eps, its, 100.0 * relative_agreement(g, c, 0.01).fraction,
+                        100.0 * relative_agreement(g, c0, 0.01).fraction,
+                        100.0 * relative_agreement(c, c0, 0.01).fraction, tie, gworse, gbetter, both);
         }
-        for (int by = 0; by < 6; ++by) {
-            std::printf("[diag] bad%% row %d:", by);
-            for (int bx = 0; bx < 8; ++bx) {
-                const std::size_t b = static_cast<std::size_t>(by * 8 + bx);
-                std::printf(" %3d", tot[b] > 0 ? 100 * bad[b] / tot[b] : -1);
-            }
-            std::printf("\n");
-        }
-        // Direction of error: ratio gpu/cpu depth over disagreeing pixels.
-        std::size_t nearer = 0, farther = 0;
-        for (std::size_t i = 0; i < gpu_result.depth.size(); ++i) {
-            if (!(gpu_result.depth[i] > 0.0F) || !(cpu_result.depth[i] > 0.0F)) continue;
-            const double cd = static_cast<double>(cpu_result.depth[i]);
-            const double g = static_cast<double>(gpu_result.depth[i]);
-            if (std::abs(g - cd) / cd >= 0.01) { if (g < cd) ++nearer; else ++farther; }
-        }
-        std::printf("[diag] disagree: gpu nearer %zu farther %zu\n", nearer, farther);
-    }
-    for (const double tol : {0.0001, 0.001, 0.01, 0.05, 0.2}) {
-        const Agreement a2 = relative_agreement(gpu_result, cpu_result, tol);
-        std::printf("[diag] tol %.4f agree %.1f%%\n", tol, 100.0 * a2.fraction);
-    }
-    {
-        std::size_t exact = 0, ncount = 0, fcount = 0, ccount = 0;
-        for (std::size_t p = 0; p < gpu_result.depth.size(); ++p) {
-            if (gpu_result.depth[p] > 0.0F && cpu_result.depth[p] > 0.0F) {
-                if (gpu_result.depth[p] == cpu_result.depth[p]) ++exact;
-                const double cd = static_cast<double>(cpu_result.depth[p]);
-                const double rel = std::abs(static_cast<double>(gpu_result.depth[p]) - cd) / cd;
-                if (rel >= 0.01) {
-                    ++fcount;
-                    const double dc = std::abs(static_cast<double>(gpu_result.cost[p]) - static_cast<double>(cpu_result.cost[p]));
-                    if (gpu_result.cost[p] <= cpu_result.cost[p]) ++ccount;
-                    if (dc < 0.02) ++ncount;
-                }
-            }
-        }
-        std::printf("[diag] exact %zu, disagree %zu, of which gpu cost<=cpu cost %zu, cost within 0.02 %zu\n",
-                    exact, fcount, ccount, ncount);
     }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
