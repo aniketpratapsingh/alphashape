@@ -94,8 +94,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache \
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends build-essential cmake ninja-build ccache \
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
             libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
@@ -298,16 +298,21 @@ jobs:
           # -k 0: report every compile error in one run while the port is in progress.
           cmake --build build --parallel 4 -- -k 0
 
-      - name: Pack test tree
+      - name: List tests
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
-          ctest --test-dir build -N | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } } | Set-Content -Encoding ascii tests-all.txt
-          (Get-Content tests-all.txt).Count
-          # System bsdtar (zstd built in); Git's GNU tar earlier on PATH has no --zstd.
-          & "$env:SystemRoot\System32\tar.exe" --zstd -cf build.tar.zst --exclude='*.obj' --exclude='*.lib' --exclude=.ninja_deps build
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-Item build.tar.zst | Select-Object Name, Length
+          $lines = ctest --test-dir build -N | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } }
+          $lines | Set-Content -Encoding ascii tests-all.txt
+          "tests: $($lines.Count)"
+
+      - name: Pack test tree
+        shell: cmd
+        timeout-minutes: 15
+        run: |
+          %SystemRoot%\System32\tar.exe --zstd -cf build.tar.zst --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
+          dir build.tar.zst
 
       - uses: actions/upload-artifact@v4
         with:
@@ -361,8 +366,8 @@ jobs:
 
       - name: Install runtime dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake libceres-dev libproj-dev proj-data \
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake libceres-dev libproj-dev proj-data \
             zlib1g-dev libjpeg-dev libpng-dev libtiff-dev python3-dev libvulkan-dev \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
 
