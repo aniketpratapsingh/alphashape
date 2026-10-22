@@ -982,6 +982,11 @@ TEST(TvFusionGpu, TimingAgainstCpu) {
         const double cpu_seconds =
             best_of_three([&] { return tv_l1_fusion(views, box_min, box_max, options); });
         gpu::set_enabled(true);
+        const TvFusionGpuProfile profile = tv_fusion_gpu_last_profile();
+        std::printf("[tv gpu profile] %d^3: setup %.3f s, upload %.3f s, iterate %.3f s "
+                    "(%d batches), readback %.3f s\n",
+                    resolution, profile.setup_seconds, profile.upload_seconds,
+                    profile.iterate_seconds, profile.batches, profile.readback_seconds);
         const double speedup = cpu_seconds / gpu_seconds;
         std::printf("[tv gpu timing] %d^3, %d bins, %d iters: gpu %.3f s cpu %.3f s "
                     "speed-up %.2fx\n",

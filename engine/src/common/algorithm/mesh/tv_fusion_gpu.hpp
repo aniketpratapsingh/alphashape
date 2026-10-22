@@ -49,6 +49,19 @@ VolumeResult tv_l1_fusion_device(const std::vector<FusionView>& views,
 /// gpu::failure_count().
 void tv_fusion_gpu_force_failure(bool value);
 
+/// Wall-clock breakdown of the most recent GPU solve (zero when the CPU path
+/// ran). setup_seconds is the CPU histogram integration, upload_seconds the row
+/// compaction plus buffer creation, iterate_seconds the dispatch batches
+/// including their partial read-backs, readback_seconds the final field read.
+struct TvFusionGpuProfile {
+    double setup_seconds = 0.0;
+    double upload_seconds = 0.0;
+    double iterate_seconds = 0.0;
+    double readback_seconds = 0.0;
+    int batches = 0;
+};
+TvFusionGpuProfile tv_fusion_gpu_last_profile();
+
 /// True when the next tv_l1_fusion_device() call will attempt the GPU.
 bool tv_l1_fusion_gpu_would_run();
 
