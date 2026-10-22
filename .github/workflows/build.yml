@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -58,7 +58,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-linux-gcc-${{ github.ref_name }}-${{ github.sha }}
@@ -98,7 +98,7 @@ jobs:
           cp README.md LICENSE engine/LIMITATIONS.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-linux-x86_64
@@ -113,7 +113,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -128,7 +128,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-macos-clang-${{ github.ref_name }}-${{ github.sha }}
@@ -166,7 +166,7 @@ jobs:
           codesign --force --sign - "dist/$name/alphashape-cli"
           (cd dist && zip -qry "$name.zip" "$name")
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-macos-arm64
@@ -182,12 +182,12 @@ jobs:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .vcpkg-bincache
           key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
@@ -242,7 +242,7 @@ jobs:
           Copy-Item README.md, LICENSE, engine\LIMITATIONS.md "dist\$name\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-windows-x86_64
