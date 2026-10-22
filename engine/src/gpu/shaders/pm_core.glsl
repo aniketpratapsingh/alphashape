@@ -51,6 +51,7 @@ void stage_views() {
     for (int i = int(gl_LocalInvocationID.x); i < int(pc.n_samples); i += PM_LANES) {
         s_offsets[i] = ivec2(offsets[2 * i], offsets[2 * i + 1]);
     }
+    memoryBarrierShared();
     barrier();
 }
 
@@ -130,8 +131,12 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
     int n = int(pc.n_samples);
     int window_base = (y * int(pc.width) + x) * n;
 
-    float ref_sum = 0.0, ref_sq = 0.0, nb_sum = 0.0, nb_sq = 0.0, cross_sum = 0.0;
+    precise float ref_sum = 0.0, ref_sq = 0.0, nb_sum = 0.0, nb_sq = 0.0, cross_sum = 0.0;
     int valid = 0;
+    // Sums are accumulated about the first valid sample so the variance and
+    // covariance below do not cancel catastrophically; contracted multiply-adds
+    // (NVIDIA fuses them) otherwise change the result near ties.
+    float r0 = 0.0, m0 = 0.0;
     for (int k = 0; k < n; ++k) {
         float depth_q = dq[k];
         if (!(depth_q > 0.0)) {
@@ -161,6 +166,12 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
         }
         float r = ref_windows[window_base + k];
         float m = sample_image(v.image_base, v.vw, v.vh, sx, sy);
+        if (valid == 0) {
+            r0 = r;
+            m0 = m;
+        }
+        r -= r0;
+        m -= m0;
         ref_sum += r;
         ref_sq += r * r;
         nb_sum += m;
@@ -175,12 +186,12 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
     float inv = 1.0 / float(valid);
     float ref_mean = ref_sum * inv;
     float nb_mean = nb_sum * inv;
-    float ref_var = max(0.0, ref_sq - ref_sum * ref_mean);
-    float nb_var = max(0.0, nb_sq - nb_sum * nb_mean);
+    precise float ref_var = max(0.0, ref_sq - ref_sum * ref_mean);
+    precise float nb_var = max(0.0, nb_sq - nb_sum * nb_mean);
     if (ref_var <= 1e-12 || nb_var <= 1e-12) {
         return PM_NO_MATCH_COST;
     }
-    float covariance = cross_sum - ref_sum * nb_mean;
+    precise float covariance = cross_sum - ref_sum * nb_mean;
     float z = clamp(covariance / sqrt(ref_var * nb_var), -1.0, 1.0);
     return 1.0 - z;
 }
