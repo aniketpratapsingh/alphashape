@@ -492,6 +492,94 @@ TEST(PatchMatchGpu, ForcedFailureFallsBackAndCounts) {
 // 6. Dense fixture: accuracy contract and timing
 // ---------------------------------------------------------------------------
 
+// TMPDIAG probe
+struct ProbeParams {
+    std::uint32_t width, height, colour, iteration, iteration_hi, n_neighbours, n_samples, best_k;
+    float depth_min, depth_max, inv_span, normal_angle, depth_delta, min_texture, max_cost;
+    std::int32_t radius;
+    std::uint32_t seed_lo, seed_hi, touch;
+    float cost_epsilon;
+};
+
+TEST(PatchMatchGpu, ProbeRandomPlane) {
+    REQUIRE_GPU_PM();
+    const auto context = gpu::default_context();
+    ASSERT_NE(context, nullptr);
+    const std::size_t count = 240 * 180;
+    std::vector<float> zeros_f(count * 3, 0.0F);
+    std::vector<std::uint32_t> zeros_u(count, 0U);
+    std::vector<std::int32_t> zeros_i(count, 0);
+    gpu::Buffer b0 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b1 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b2 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b3 = gpu::Buffer::of(*context, zeros_u, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b4 = gpu::Buffer::of(*context, zeros_i, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b5 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b6 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b7 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b8 = gpu::Buffer::of(*context, zeros_u, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b9 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b10 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b11 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b12 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    gpu::Buffer b13 = gpu::Buffer::of(*context, zeros_f, gpu::MemoryKind::HostVisible);
+    ProbeParams pp{};
+    pp.n_samples = 6;
+    pp.iteration = 0xFFFFFFFFU;
+    pp.iteration_hi = 0xFFFFFFFFU;
+    pp.depth_min = 2.0F;
+    pp.depth_max = 30.0F;
+    pp.seed_lo = 7;
+    pp.seed_hi = 0;
+    gpu::Dispatch d;
+    d.kernel = "pm_probe";
+    d.buffers = {&b0, &b1, &b2, &b3, &b4, &b5, &b6, &b7, &b8, &b9, &b10, &b11, &b12, &b13};
+    d.push_constants = gpu::push(pp);
+    d.groups = {1, 1, 1};
+    gpu::run(*context, {d});
+    const std::vector<float> out = b12.read<float>(count * 3);
+
+    const auto mix = [](std::uint64_t x) {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    };
+    for (std::size_t k = 0; k < 6; ++k) {
+        const std::size_t pixel = 4000 + k * 997;
+        std::uint64_t h = mix(7ULL + 0x9E3779B97F4A7C15ULL);
+        h = mix(h ^ (static_cast<std::uint64_t>(pixel) * 0x100000001B3ULL));
+        h = mix(h ^ (static_cast<std::uint64_t>(-1) * 0xC2B2AE3D27D4EB4FULL));
+        h = mix(h ^ 0ULL);
+        double dr[6];
+        for (double& v : dr) {
+            h = mix(h);
+            v = static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
+        }
+        const double x = static_cast<double>(pixel % 240), y = static_cast<double>(pixel / 240);
+        Eigen::Vector3d b((x + 0.5 - 120.0) / 250.0, (y + 0.5 - 90.0) / 250.0, 1.0);
+        b.normalize();
+        const Eigen::Vector3d axis = (-b).normalized();
+        const Eigen::Vector3d u = axis.unitOrthogonal();
+        const Eigen::Vector3d v = axis.cross(u);
+        const double ct = 0.5 + 0.5 * dr[1];
+        const double st = std::sqrt(1.0 - ct * ct);
+        const double phi = 6.283185307179586 * dr[2];
+        const Eigen::Vector3d n = (st * std::cos(phi) * u + st * std::sin(phi) * v + ct * axis).normalized();
+        const float* g = out.data() + k * 24;
+        std::printf("[probe] px %zu draws gpu %.5f %.5f %.5f %.5f %.5f %.5f | cpu %.5f %.5f %.5f %.5f %.5f %.5f\n", pixel,
+                    static_cast<double>(g[0]), static_cast<double>(g[1]), static_cast<double>(g[2]), static_cast<double>(g[3]), static_cast<double>(g[4]), static_cast<double>(g[5]),
+                    dr[0], dr[1], dr[2], dr[3], dr[4], dr[5]);
+        std::printf("[probe]   ct gpu %.5f cpu %.5f | phi gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f | cos_min gpu %.6f axis.z gpu %.5f cpu %.5f\n",
+                    static_cast<double>(g[10]), ct, static_cast<double>(g[11]), phi, static_cast<double>(g[15]), std::cos(phi), static_cast<double>(g[16]), std::sin(phi),
+                    static_cast<double>(g[21]), static_cast<double>(g[23]), axis.z());
+        std::printf("[probe]   u gpu (%.5f %.5f %.5f) cpu (%.5f %.5f %.5f) | v.x gpu %.5f cpu %.5f\n", static_cast<double>(g[12]), static_cast<double>(g[13]), static_cast<double>(g[14]),
+                    u.x(), u.y(), u.z(), static_cast<double>(g[22]), v.x());
+        std::printf("[probe]   n via function gpu (%.5f %.5f %.5f) | n inline gpu (%.5f %.5f %.5f) | cpu (%.5f %.5f %.5f)\n", static_cast<double>(g[7]), static_cast<double>(g[8]), static_cast<double>(g[9]),
+                    static_cast<double>(g[17]), static_cast<double>(g[18]), static_cast<double>(g[19]), n.x(), n.y(), n.z());
+    }
+}
+
 TEST(PatchMatchGpu, DenseFixtureAccuracy) {
     REQUIRE_GPU_PM();
     const auto inputs = dense_inputs(2);

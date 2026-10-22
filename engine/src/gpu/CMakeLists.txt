@@ -47,6 +47,7 @@ if(ALPHASHAPE_GPU)
         shaders/pm_init.comp
         shaders/pm_refine.comp
         shaders/pm_finalize.comp
+        shaders/pm_probe.comp
         shaders/tvl1_dual.comp
         shaders/tvl1_primal.comp
         shaders/tvl1_delta.comp

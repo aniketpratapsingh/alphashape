@@ -1,0 +1,58 @@
+#version 450
+// Diagnostic probe for the PatchMatch random-plane construction: writes the
+// raw draws and the intermediate quantities of random_cone_normal for a few
+// pixels so a test can compare them with the CPU's values term by term.
+#include "pm_math.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_samples) {
+        return;
+    }
+    int pixel = 4000 + int(i) * 997;
+    int x = pixel % 240;
+    int y = pixel / 240;
+    vec3 b_p = normalize(vec3((float(x) + 0.5 - 120.0) / 250.0, (float(y) + 0.5 - 90.0) / 250.0, 1.0));
+    int o = int(i) * 24;
+
+    Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+    for (int k = 0; k < 6; ++k) {
+        out_normals[o + k] = rng_next(rng);
+    }
+
+    Rng rng2 = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+    float dep = random_depth(rng2);
+    vec3 n = random_cone_normal(rng2, b_p);
+    out_normals[o + 6] = dep;
+    out_normals[o + 7] = n.x;
+    out_normals[o + 8] = n.y;
+    out_normals[o + 9] = n.z;
+
+    Rng rng3 = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+    float d0 = rng_next(rng3);
+    float cos_min = cos(PM_CONE_HALF_ANGLE);
+    float ct = cos_min + (1.0 - cos_min) * rng_next(rng3);
+    float st = sqrt(max(0.0, 1.0 - ct * ct));
+    float phi = PM_TWO_PI * rng_next(rng3);
+    vec3 axis = normalize(-b_p);
+    vec3 u = any_orthogonal(axis);
+    vec3 v = cross(axis, u);
+    vec3 m = normalize(st * cos(phi) * u + st * sin(phi) * v + ct * axis);
+    out_normals[o + 10] = ct;
+    out_normals[o + 11] = phi;
+    out_normals[o + 12] = u.x;
+    out_normals[o + 13] = u.y;
+    out_normals[o + 14] = u.z;
+    out_normals[o + 15] = cos(phi);
+    out_normals[o + 16] = sin(phi);
+    out_normals[o + 17] = m.x;
+    out_normals[o + 18] = m.y;
+    out_normals[o + 19] = m.z;
+    out_normals[o + 20] = d0;
+    out_normals[o + 21] = cos_min;
+    out_normals[o + 22] = v.x;
+    out_normals[o + 23] = axis.z;
+    keep_bindings_alive(o);
+}
