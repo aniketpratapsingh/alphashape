@@ -519,6 +519,28 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
                 hood.camera_id, gpu_valid, gpu_result.depth.size(), cpu_valid,
                 cpu_result.depth.size(), 100.0 * agreement.fraction, agreement.both);
 
+    // TMPDIAG
+    for (const double tol : {0.0001, 0.001, 0.01, 0.05, 0.2}) {
+        const Agreement a2 = relative_agreement(gpu_result, cpu_result, tol);
+        std::printf("[diag] tol %.4f agree %.1f%%\n", tol, 100.0 * a2.fraction);
+    }
+    {
+        std::size_t exact = 0, ncount = 0, fcount = 0, ccount = 0;
+        for (std::size_t p = 0; p < gpu_result.depth.size(); ++p) {
+            if (gpu_result.depth[p] > 0.0F && cpu_result.depth[p] > 0.0F) {
+                if (gpu_result.depth[p] == cpu_result.depth[p]) ++exact;
+                const double rel = std::abs(double(gpu_result.depth[p]) - cpu_result.depth[p]) / cpu_result.depth[p];
+                if (rel >= 0.01) {
+                    ++fcount;
+                    const double dc = std::abs(double(gpu_result.cost[p]) - cpu_result.cost[p]);
+                    if (gpu_result.cost[p] <= cpu_result.cost[p]) ++ccount;
+                    if (dc < 0.02) ++ncount;
+                }
+            }
+        }
+        std::printf("[diag] exact %zu, disagree %zu, of which gpu cost<=cpu cost %zu, cost within 0.02 %zu\n",
+                    exact, fcount, ccount, ncount);
+    }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
     EXPECT_NEAR(static_cast<double>(gpu_valid), static_cast<double>(cpu_valid),
