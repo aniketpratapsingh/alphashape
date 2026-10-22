@@ -38,6 +38,19 @@ void main() {
     best.cost = 3.402823466e+38;
     const float seed_depth = random_depth(rng);
     const vec3 seed_normal = random_cone_normal(rng, b_p);
+    if (pc.cost_epsilon < -2000.0) {
+        Rng dbg2 = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
+        float dd = random_depth(dbg2);
+        vec3 nn = random_cone_normal(dbg2, b_p);
+        vec3 ax = normalize(-b_p);
+        vec3 uu = any_orthogonal(ax);
+        state_depth[pixel] = 10.0 + uu.x;
+        state_normal[pixel * 3 + 0] = nn.x;
+        state_normal[pixel * 3 + 1] = nn.y;
+        state_normal[pixel * 3 + 2] = nn.z;
+        state_cost[pixel] = 1.5 + 0.5 * uu.y;
+        return;
+    }
     if (pc.cost_epsilon < -1000.0) {
         Rng dbg = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
         float dbg_depth = random_depth(dbg);

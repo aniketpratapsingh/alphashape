@@ -652,6 +652,18 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
             const double cpu_depth = 1.0 / (depth_lo + (depth_hi - depth_lo) * d[0]);
             const double ct_cpu = 0.5 + 0.5 * d[1];
             const double phi_cpu = 6.283185307179586 * d[2];
+            {
+                PatchMatchOptions o2 = o0;
+                o2.cost_epsilon = -2345.0;
+                static PatchMatchResult g2;
+                if (shown == 1) g2 = stereo::run_patch_match_device(reference, neighbours, o2);
+                std::printf("[diag] dbg2 px %zu: u.x gpu %.5f cpu %.5f | u.y gpu %.5f cpu %.5f | n gpu (%.5f %.5f %.5f) cpu (%.5f %.5f %.5f)\n", i,
+                            static_cast<double>(g2.depth[i]) - 10.0, u.x(), 2.0 * (static_cast<double>(g2.cost[i]) - 1.5), u.y(),
+                            static_cast<double>(g2.normals[3 * i]), static_cast<double>(g2.normals[3 * i + 1]), static_cast<double>(g2.normals[3 * i + 2]),
+                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().x(),
+                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().y(),
+                            (std::sqrt(1.0 - ct_cpu * ct_cpu) * std::cos(6.283185307179586 * d[2]) * u + std::sqrt(1.0 - ct_cpu * ct_cpu) * std::sin(6.283185307179586 * d[2]) * v + ct_cpu * axis).normalized().z());
+            }
             std::printf("[diag] dbg px %zu: phi+0.001*depth gpu %.5f (cpu %.5f) | ct gpu %.5f cpu %.5f | cos gpu %.5f cpu %.5f | sin gpu %.5f cpu %.5f\n", i,
                         static_cast<double>(g0.depth[i]), 6.283185307179586 * d[2] + 0.001 * cpu_depth_dbg(d[0], options),
                         static_cast<double>(g0.normals[3 * i]), 0.5 + 0.5 * d[1],
