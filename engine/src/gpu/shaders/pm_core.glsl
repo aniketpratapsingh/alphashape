@@ -51,6 +51,7 @@ void stage_views() {
     for (int i = int(gl_LocalInvocationID.x); i < int(pc.n_samples); i += PM_LANES) {
         s_offsets[i] = ivec2(offsets[2 * i], offsets[2 * i + 1]);
     }
+    memoryBarrierShared();
     barrier();
 }
 
