@@ -20,6 +20,8 @@ variables:
   CCACHE_MAXSIZE: 1500M
   # Shared cloud machines: report GPU speed-ups, do not fail on them.
   ALPHASHAPE_PERF_ASSERTS: "0"
+  # Override when triggering a pipeline by API to run a single suite on the T4.
+  GPU_TEST_FILTER: "*Gpu*:BuildDense*:BuildModel*:FullPipelineDense*:BuildTexture*:BuildDemPipeline*:BuildOrthomosaic*"
 
 .deps: &deps
   - apt-get update -qq
@@ -76,7 +78,7 @@ gpu-tests:
     - vulkaninfo --summary 2>/dev/null | grep -q "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"
     - >
       build/tests/alphashape_tests --gtest_brief=1
-      --gtest_filter='*Gpu*:BuildDense*:BuildModel*:FullPipelineDense*:BuildTexture*:BuildDemPipeline*:BuildOrthomosaic*'
+      --gtest_filter="$GPU_TEST_FILTER"
       --gtest_output=xml:gpu-tests.xml
   artifacts:
     when: always
