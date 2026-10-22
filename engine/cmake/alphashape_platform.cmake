@@ -31,9 +31,12 @@ if(WIN32)
     # _USE_MATH_DEFINES: the UCRT's <cmath> hides M_PI and friends behind it,
     # while glibc/libc++ expose them under POSIX. Defining it here keeps the
     # tests that use M_PI portable without a per-file #define.
+    # _ENABLE_EXTENDED_ALIGNED_STORAGE: MSVC's STL rejects std::stable_sort and
+    # friends on over-aligned value types (Eigen fixed-size members) without it.
     target_compile_definitions(ALPHASHAPE_COMPILER_FLAGS INTERFACE
         _CRT_SECURE_NO_WARNINGS
         _SCL_SECURE_NO_WARNINGS
+        _ENABLE_EXTENDED_ALIGNED_STORAGE
         _USE_MATH_DEFINES
         NOMINMAX
         WIN32_LEAN_AND_MEAN)

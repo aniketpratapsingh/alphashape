@@ -39,6 +39,7 @@
 #include "model/mesh/point_cloud.hpp"
 
 #include "common/core/chunk.hpp"
+#include "perf_gate.hpp"
 
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #include <omp.h>
@@ -617,6 +618,8 @@ TEST(PoissonGpu, TimingAgainstCpu) {
                      << "): the speed-up bound applies to hardware GPUs only; measured "
                      << speedup << "x";
     }
-    EXPECT_GE(speedup, 3.0) << "GPU solve must be at least 3x faster than the CPU solve";
+    if (test::perf_asserts_enabled()) {
+        EXPECT_GE(speedup, 3.0) << "GPU solve must be at least 3x faster than the CPU solve";
+    }
 }
 }  // namespace alphashape
