@@ -94,13 +94,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends build-essential cmake ninja-build ccache \
+          # The hosted mirrors occasionally stall; bound each attempt and retry.
+          apt_retry() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
             libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
           sudo mkdir -p /usr/include/vma
-          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/include/vma/vk_mem_alloc.h \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
@@ -184,7 +186,7 @@ jobs:
             vulkan-validationlayers
           prefix="$(brew --prefix)"
           mkdir -p "$prefix/include/vma"
-          curl -fsSL -o "$prefix/include/vma/vk_mem_alloc.h" \
+          curl -fsSL --retry 3 --max-time 60 -o "$prefix/include/vma/vk_mem_alloc.h" \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
@@ -366,8 +368,10 @@ jobs:
 
       - name: Install runtime dependencies
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends cmake libceres-dev libproj-dev proj-data \
+          # The hosted mirrors occasionally stall; bound each attempt and retry.
+          apt_retry() { for i in 1 2 3; do sudo timeout 240 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends cmake libceres-dev libproj-dev proj-data \
             zlib1g-dev libjpeg-dev libpng-dev libtiff-dev python3-dev libvulkan-dev \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
 
