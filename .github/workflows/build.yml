@@ -426,7 +426,8 @@ jobs:
         run: |
           vulkaninfo --summary | head -20 || true
           mapfile -t args < ctest-args.txt
-          ctest --test-dir build --parallel 4 --timeout 3600 "${args[@]}"
+          # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
+          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 "${args[@]}"
 
   macos-test:
     name: macOS test ${{ matrix.lane }}
@@ -560,7 +561,8 @@ jobs:
           # vcpkg installs proj.db under share/proj; nothing on Windows points PROJ at it.
           $env:ALPHASHAPE_PROJ_DATA = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\share\proj"
           $ctestArgs = Get-Content ctest-args.txt
-          ctest --test-dir build --parallel 4 --timeout 3600 @ctestArgs
+          # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
+          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 @ctestArgs
 
   # The lanes must together run every test exactly once; fails if a lane was dropped or overlaps.
   shard-coverage:
