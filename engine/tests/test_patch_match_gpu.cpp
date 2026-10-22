@@ -523,47 +523,33 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
     {
         PatchMatchOptions o0 = options;
         o0.iterations = 0;
-        PatchMatchOptions o1 = options;
-        o1.iterations = 1;
+        o0.max_cost = 3.0;
         const PatchMatchResult g0 = stereo::run_patch_match_device(reference, neighbours, o0);
-        const PatchMatchResult g1 = stereo::run_patch_match_device(reference, neighbours, o1);
-        const PatchMatchResult c1 = stereo::run_patch_match(reference, neighbours, o1);
-        const int W = g1.width;
-        for (int cat = 0; cat < 4; ++cat) {
-            // cat: 0 no incumbent colour0, 1 no incumbent colour1, 2 incumbent colour0, 3 incumbent colour1
-            std::size_t n = 0, valid_mismatch = 0, close4 = 0, close2 = 0, gbetter = 0, gworse = 0;
-            for (std::size_t i = 0; i < g1.depth.size(); ++i) {
-                const int x = static_cast<int>(i % static_cast<std::size_t>(W));
-                const int y = static_cast<int>(i / static_cast<std::size_t>(W));
-                const int colour = (x + y) & 1;
-                const bool inc = g0.depth[i] > 0.0F;
-                if ((cat & 1) != colour || ((cat >> 1) != 0) != inc) continue;
-                ++n;
-                const bool gv = g1.depth[i] > 0.0F, cv = c1.depth[i] > 0.0F;
-                if (gv != cv) { ++valid_mismatch; continue; }
-                if (!gv) { ++close4; ++close2; continue; }
-                const double cd = static_cast<double>(c1.depth[i]);
-                const double rel = std::abs(static_cast<double>(g1.depth[i]) - cd) / cd;
-                if (rel < 1e-4) ++close4;
-                if (rel < 1e-2) ++close2;
-                else if (g1.cost[i] < c1.cost[i]) ++gbetter; else ++gworse;
-            }
-            std::printf("[diag] cat %d: n %zu valid-mismatch %zu within1e-4 %zu within1e-2 %zu far: gpu-better %zu gpu-worse %zu\n",
-                        cat, n, valid_mismatch, close4, close2, gbetter, gworse);
-        }
-        // A few concrete disagreeing pixels of the no-incumbent, colour-0 category.
+        const PatchMatchResult c0 = stereo::run_patch_match(reference, neighbours, o0);
+        std::vector<double> diffs;
+        std::size_t sentinel_mismatch = 0, same_depth = 0, active = 0;
         int shown = 0;
-        for (std::size_t i = 0; i < g1.depth.size() && shown < 8; ++i) {
-            const int x = static_cast<int>(i % static_cast<std::size_t>(W));
-            const int y = static_cast<int>(i / static_cast<std::size_t>(W));
-            if (((x + y) & 1) != 0 || g0.depth[i] > 0.0F || !(g1.depth[i] > 0.0F) || !(c1.depth[i] > 0.0F)) continue;
-            const double cd = static_cast<double>(c1.depth[i]);
-            if (std::abs(static_cast<double>(g1.depth[i]) - cd) / cd < 1e-2) continue;
-            std::printf("[diag] px (%d,%d): gpu d %.5f c %.5f n(%.4f %.4f %.4f) | cpu d %.5f c %.5f n(%.4f %.4f %.4f)\n", x, y,
-                        static_cast<double>(g1.depth[i]), static_cast<double>(g1.cost[i]), static_cast<double>(g1.normals[3 * i]), static_cast<double>(g1.normals[3 * i + 1]), static_cast<double>(g1.normals[3 * i + 2]),
-                        cd, static_cast<double>(c1.cost[i]), static_cast<double>(c1.normals[3 * i]), static_cast<double>(c1.normals[3 * i + 1]), static_cast<double>(c1.normals[3 * i + 2]));
-            ++shown;
+        for (std::size_t i = 0; i < g0.depth.size(); ++i) {
+            if (!(g0.depth[i] > 0.0F) && !(c0.depth[i] > 0.0F)) continue;
+            ++active;
+            const double cd = static_cast<double>(c0.depth[i]);
+            if (std::abs(static_cast<double>(g0.depth[i]) - cd) / cd < 1e-4) ++same_depth;
+            const double gc = static_cast<double>(g0.cost[i]);
+            const double cc = static_cast<double>(c0.cost[i]);
+            diffs.push_back(std::abs(gc - cc));
+            if ((gc >= 2.0) != (cc >= 2.0)) ++sentinel_mismatch;
+            if (std::abs(gc - cc) > 0.01 && shown < 12) {
+                ++shown;
+                std::printf("[diag] px %zu: gpu cost %.5f cpu cost %.5f depth %.4f / %.4f\n", i, gc, cc,
+                            static_cast<double>(g0.depth[i]), cd);
+            }
         }
+        std::sort(diffs.begin(), diffs.end());
+        const auto q = [&](double f) { return diffs.empty() ? 0.0 : diffs[static_cast<std::size_t>(f * static_cast<double>(diffs.size() - 1))]; };
+        std::size_t gt3 = 0, gt2 = 0, gt1 = 0;
+        for (const double d : diffs) { if (d > 1e-3) ++gt3; if (d > 1e-2) ++gt2; if (d > 1e-1) ++gt1; }
+        std::printf("[diag] init costs: active %zu same-depth %zu sentinel-mismatch %zu | |dcost| p50 %.2e p90 %.2e p99 %.2e max %.2e | >1e-3 %zu >1e-2 %zu >1e-1 %zu\n",
+                    active, same_depth, sentinel_mismatch, q(0.5), q(0.9), q(0.99), q(1.0), gt3, gt2, gt1);
     }
     EXPECT_GT(agreement.both, 1000U);
     EXPECT_GT(agreement.fraction, 0.90);
