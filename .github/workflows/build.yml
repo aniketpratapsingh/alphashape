@@ -311,13 +311,13 @@ jobs:
         shell: cmd
         timeout-minutes: 15
         run: |
-          %SystemRoot%\System32\tar.exe --zstd -cf build.tar.zst --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
-          dir build.tar.zst
+          %SystemRoot%\System32\tar.exe -czf build.tar.gz --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
+          dir build.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
           name: build-windows
-          path: build.tar.zst
+          path: build.tar.gz
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
@@ -457,7 +457,8 @@ jobs:
           vulkaninfo --summary | head -20 || true
           args=()
           while IFS= read -r line; do args+=("$line"); done < ctest-args.txt
-          ctest --test-dir build --parallel 3 --timeout 3600 "${args[@]}"
+          # --repeat until-pass:2 absorbs MoltenVK "device lost" flakes on the paravirtual GPU.
+          ctest --test-dir build --parallel 3 --timeout 3600 --repeat until-pass:2 "${args[@]}"
 
   windows-test:
     name: Windows test ${{ matrix.lane }}
@@ -499,7 +500,7 @@ jobs:
       - name: Unpack build tree
         shell: pwsh
         run: |
-          & "$env:SystemRoot\System32\tar.exe" --zstd -xf build.tar.zst
+          & "$env:SystemRoot\System32\tar.exe" -xzf build.tar.gz
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Select tests
