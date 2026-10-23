@@ -330,17 +330,17 @@ TEST_F(LogPaneTest, WorkerThreadLogLineReachesThePane) {
 }
 
 TEST_F(LogPaneTest, LevelFilterShowsTheChosenLevelAndAbove) {
-    LogView* view = log_pane().view();
-    view->clear_entries();
-    view->append(LogEntry{LogLevel::Debug, QStringLiteral("debug line")});
-    view->append(LogEntry{LogLevel::Info, QStringLiteral("info line")});
-    view->append(LogEntry{LogLevel::Warn, QStringLiteral("warn line")});
-    view->append(LogEntry{LogLevel::Error, QStringLiteral("error line")});
-    EXPECT_EQ(view->line_count(), 4U);
-    EXPECT_EQ(view->plain_text().split(QLatin1Char('\n')).size(), 4);
+    LogView* console = log_pane().view();
+    console->clear_entries();
+    console->append(LogEntry{LogLevel::Debug, QStringLiteral("debug line")});
+    console->append(LogEntry{LogLevel::Info, QStringLiteral("info line")});
+    console->append(LogEntry{LogLevel::Warn, QStringLiteral("warn line")});
+    console->append(LogEntry{LogLevel::Error, QStringLiteral("error line")});
+    EXPECT_EQ(console->line_count(), 4U);
+    EXPECT_EQ(console->plain_text().split(QLatin1Char('\n')).size(), 4);
 
     log_pane().set_minimum_level(LogLevel::Warn);
-    const QString warnings_only = view->plain_text();
+    const QString warnings_only = console->plain_text();
     EXPECT_TRUE(warnings_only.contains(QStringLiteral("warn line")));
     EXPECT_TRUE(warnings_only.contains(QStringLiteral("error line")));
     EXPECT_FALSE(warnings_only.contains(QStringLiteral("info line")));
@@ -348,49 +348,56 @@ TEST_F(LogPaneTest, LevelFilterShowsTheChosenLevelAndAbove) {
 
     // Hidden lines are kept, not discarded: widening the filter brings them back.
     log_pane().set_minimum_level(LogLevel::Trace);
-    EXPECT_EQ(view->plain_text().split(QLatin1Char('\n')).size(), 4);
+    EXPECT_EQ(console->plain_text().split(QLatin1Char('\n')).size(), 4);
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
 TEST_F(LogPaneTest, ClearAndCopyActOnTheVisibleLog) {
-    LogView* view = log_pane().view();
-    view->clear_entries();
-    view->append(LogEntry{LogLevel::Info, QStringLiteral("first line")});
-    view->append(LogEntry{LogLevel::Error, QStringLiteral("second line")});
-    EXPECT_EQ(view->plain_text(), QStringLiteral("first line\nsecond line"));
+    LogView* console = log_pane().view();
+    console->clear_entries();
+    console->append(LogEntry{LogLevel::Info, QStringLiteral("first line")});
+    console->append(LogEntry{LogLevel::Error, QStringLiteral("second line")});
+    EXPECT_EQ(console->plain_text(), QStringLiteral("first line\nsecond line"));
 
-    // Copy puts exactly the visible lines on the clipboard. The offscreen platform has no
-    // clipboard of its own, so the payload is asserted through the action's return value; the
-    // button click proves the action is wired.
-    EXPECT_EQ(log_pane().copy_all(), static_cast<int>(view->plain_text().size()));
-    EXPECT_TRUE(log_pane().copy_button()->isEnabled());
+    // Copy hands exactly the visible lines to the clipboard writer. The writer is a seam: the
+    // offscreen platform has no clipboard, so a real QClipboard write could not be read back.
+    QString copied;
+    log_pane().set_clipboard_writer([&copied](const QString& text) { copied = text; });
     log_pane().copy_button()->click();
+    EXPECT_EQ(copied, QStringLiteral("first line\nsecond line"));
+    EXPECT_EQ(log_pane().copy_all(), copied);
+
+    // A level filter narrows what Copy yields.
+    log_pane().set_minimum_level(LogLevel::Error);
+    EXPECT_EQ(log_pane().copy_all(), QStringLiteral("second line"));
+    log_pane().set_minimum_level(LogLevel::Trace);
 
     log_pane().clear_button()->click();
-    EXPECT_EQ(view->line_count(), 0U);
-    EXPECT_TRUE(view->plain_text().isEmpty());
-    EXPECT_TRUE(view->toPlainText().isEmpty());
+    EXPECT_EQ(console->line_count(), 0U);
+    EXPECT_TRUE(console->plain_text().isEmpty());
+    EXPECT_TRUE(console->toPlainText().isEmpty());
+    EXPECT_TRUE(log_pane().copy_all().isEmpty());
     EXPECT_FALSE(log_pane().copy_button()->isEnabled());
     EXPECT_FALSE(log_pane().clear_button()->isEnabled());
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
 TEST_F(LogPaneTest, TheLogKeepsAtMostTheLineCap) {
-    LogView* view = log_pane().view();
-    view->clear_entries();
+    LogView* console = log_pane().view();
+    console->clear_entries();
     const std::size_t extra = 5;
     for (std::size_t i = 0; i < LogView::kMaxLines + extra; ++i) {
-        view->append(LogEntry{LogLevel::Info, QStringLiteral("line %1").arg(static_cast<qulonglong>(i))});
+        console->append(LogEntry{LogLevel::Info, QStringLiteral("line %1").arg(static_cast<qulonglong>(i))});
     }
-    EXPECT_EQ(view->line_count(), LogView::kMaxLines);
-    const std::deque<LogEntry>& entries = view->entries();
+    EXPECT_EQ(console->line_count(), LogView::kMaxLines);
+    const std::deque<LogEntry>& entries = console->entries();
     ASSERT_FALSE(entries.empty());
     // The oldest lines were dropped, the newest kept.
     EXPECT_EQ(entries.front().text, QStringLiteral("line %1").arg(static_cast<qulonglong>(extra)));
     EXPECT_EQ(entries.back().text,
               QStringLiteral("line %1").arg(static_cast<qulonglong>(LogView::kMaxLines + extra - 1)));
     // The widget document is bounded the same way, so memory cannot outgrow the cap.
-    EXPECT_LE(view->document()->blockCount(), static_cast<int>(LogView::kMaxLines) + 1);
+    EXPECT_LE(console->document()->blockCount(), static_cast<int>(LogView::kMaxLines) + 1);
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 

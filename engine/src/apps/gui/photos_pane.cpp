@@ -249,6 +249,9 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
         update_summary();
     });
     connect(&app_.jobs(), &JobManager::busy_changed, this, [this](bool) { update_actions(); });
+    // The badges are painted from the theme's status colours, so a theme switch needs a repaint.
+    connect(&app_.theme(), &Theme::changed, this,
+            [this](ThemeMode) { view_->viewport()->update(); });
 
     update_actions();
     update_summary();

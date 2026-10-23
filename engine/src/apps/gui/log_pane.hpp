@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <functional>
 
 #include <QColor>
 #include <QList>
@@ -88,8 +89,13 @@ public:
     QToolButton* clear_button() { return clear_; }
     QToolButton* copy_button() { return copy_; }
 
-    /// Copy the visible console text to the clipboard. Returns its length.
-    int copy_all();
+    /// Where Copy sends the visible text. Default: the system clipboard. A seam for the tests,
+    /// which run on the offscreen platform and have no clipboard of their own.
+    using ClipboardWriter = std::function<void(const QString&)>;
+    void set_clipboard_writer(ClipboardWriter writer);
+
+    /// Copy the visible console text and return it (empty when there is nothing to copy).
+    QString copy_all();
     void set_minimum_level(alphashape::LogLevel level);
 
 private:
@@ -100,6 +106,7 @@ private:
     QComboBox* level_ = nullptr;
     QToolButton* clear_ = nullptr;
     QToolButton* copy_ = nullptr;
+    ClipboardWriter clipboard_writer_;
 };
 
 }  // namespace alphashape::gui

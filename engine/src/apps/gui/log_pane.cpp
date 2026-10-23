@@ -7,6 +7,7 @@
 #include <QHBoxLayout>
 #include <QPalette>
 #include <QScrollBar>
+#include <QStringList>
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QToolButton>
@@ -208,6 +209,7 @@ LogPane::LogPane(GuiApp& app, QWidget* parent) : QWidget(parent), app_(app) {
 
     connect(&app_.theme(), &Theme::changed, this,
             [this](ThemeMode mode) { view_->set_theme_mode(mode); });
+    clipboard_writer_ = [](const QString& text) { QApplication::clipboard()->setText(text); };
     connect(level_, &QComboBox::currentIndexChanged, this, [this](int) {
         set_minimum_level(static_cast<LogLevel>(level_->currentData().toInt()));
         update_actions();
@@ -235,12 +237,16 @@ void LogPane::set_minimum_level(LogLevel level) {
     }
 }
 
-int LogPane::copy_all() {
+void LogPane::set_clipboard_writer(ClipboardWriter writer) {
+    clipboard_writer_ = std::move(writer);
+}
+
+QString LogPane::copy_all() {
     const QString text = view_->plain_text();
-    if (!text.isEmpty()) {
-        QApplication::clipboard()->setText(text);
+    if (!text.isEmpty() && clipboard_writer_) {
+        clipboard_writer_(text);
     }
-    return static_cast<int>(text.size());
+    return text;
 }
 
 void LogPane::update_actions() {
