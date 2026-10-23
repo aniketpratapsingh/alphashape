@@ -17,6 +17,10 @@ target_link_libraries(alphashape_gui_lib
     PUBLIC Qt6::Widgets alphashape_core
     PRIVATE alphashape_warnings)
 
+# The engine uses `slots` and `signals` as ordinary identifiers (core/assets.hpp), which Qt's
+# keyword macros would break, so Qt code here spells them Q_SLOTS / Q_SIGNALS / Q_EMIT.
+target_compile_definitions(alphashape_gui_lib PUBLIC QT_NO_KEYWORDS)
+
 # The style sheets are generated from design/system/tokens.json by tools/theme/compile_qss.py
 # and checked in; they are embedded so the binary has no files to find at run time.
 qt_add_resources(alphashape_gui_lib alphashape_theme

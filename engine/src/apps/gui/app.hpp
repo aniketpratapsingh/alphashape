@@ -48,7 +48,7 @@ public:
     /// Window title fragment for the current document ("Untitled" when it has no path).
     QString document_title() const;
 
-signals:
+Q_SIGNALS:
     /// Emitted after new_document() / open_document() swapped the document.
     void document_replaced();
 

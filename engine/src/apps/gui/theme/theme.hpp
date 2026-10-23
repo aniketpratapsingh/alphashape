@@ -50,7 +50,7 @@ public:
     /// that are missing.
     static int load_bundled_fonts();
 
-signals:
+Q_SIGNALS:
     void changed(ThemeMode mode);
     void viewport_changed(ThemeMode mode);
 
