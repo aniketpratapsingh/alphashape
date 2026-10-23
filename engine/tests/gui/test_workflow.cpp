@@ -528,9 +528,7 @@ TEST_F(WorkflowTest, OpensTheRealDialogPresetToTheExistingSource) {
     timer->deleteLater();
     ASSERT_TRUE(ran);
     EXPECT_EQ(*accept_real_dialog, 1) << "the real dialog was shown exactly once";
-
-    // Clicking the menu action runs the whole path: run() -> real TaskDialog -> params -> submit.
-    ASSERT_TRUE(trigger("action.workflow.build_model"));
+    // Clicking the menu action ran the whole path: run() -> real TaskDialog -> params -> submit.
     ASSERT_TRUE(submitted_params.has_value()) << "the real dialog was accepted and submitted";
 
     const Params& params = *submitted_params;

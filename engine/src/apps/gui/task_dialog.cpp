@@ -80,6 +80,55 @@ int nearest_power_of_two(int value) {
     return (value - lower) <= (upper - value) ? lower : upper;
 }
 
+/// The legal range for a power-of-two parameter: the smallest power of two at or above
+/// `lower`, and the largest at or below `upper`.
+std::pair<int, int> power_of_two_range(int lower, int upper) {
+    int low = std::max(1, lower);
+    while (low <= upper && (low & (low - 1)) != 0) {
+        ++low;
+    }
+    int high = std::max(1, upper);
+    while (high > 0 && (high & (high - 1)) != 0) {
+        high /= 2;
+    }
+    return {std::min(low, upper), std::max(high, low)};
+}
+
+/// A spin box for a parameter whose legal values are the powers of two. stepBy is overridden
+/// rather than the value signal watched, because snapping on every change would undo the very
+/// step that asked for the next legal value (stepUp from 4 moves to 5, which snaps back to 4).
+/// Here the arrows double and halve within the range, and a typed value is snapped when it is
+/// committed, so the box only ever holds a power of two.
+class PowerOfTwoSpinBox : public QSpinBox {
+public:
+    explicit PowerOfTwoSpinBox(QWidget* parent) : QSpinBox(parent) {}
+
+    void stepBy(int steps) override {
+        int value = this->value();
+        for (int i = 0; i < std::abs(steps); ++i) {
+            if (steps > 0) {
+                if (value > maximum() / 2) {
+                    break;
+                }
+                value *= 2;
+            } else {
+                if (value <= minimum() || value / 2 < minimum()) {
+                    break;
+                }
+                value /= 2;
+            }
+        }
+        setValue(value);
+    }
+
+protected:
+    int valueFromText(const QString& text) const override {
+        bool ok = false;
+        const int typed = text.trimmed().toInt(&ok);
+        return ok ? nearest_power_of_two(typed) : value();
+    }
+};
+
 TaskDialog::EditorKind kind_for(const ParamSpec& spec) {
     switch (spec.type) {
         case ParamType::Bool:
@@ -273,7 +322,8 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
             break;
         }
         case EditorKind::SpinBox: {
-            auto* spin = new QSpinBox(host);
+            auto* spin = spec.power_of_two ? static_cast<QSpinBox*>(new PowerOfTwoSpinBox(host))
+                                           : new QSpinBox(host);
             // The declared range wins. Without one, the old heuristic: a negative default
             // suggests the parameter takes negative values, so the floor is the default and
             // anything below 0 stays out of reach; a non-negative default means 0 is a
@@ -286,27 +336,14 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
                 declared_bound(spec.minimum, static_cast<int>(std::min<std::int64_t>(
                                                  default_value, 0)));
             const int maximum = declared_bound(spec.maximum, INT_MAX);
-            spin->setRange(minimum, maximum);
+            if (spec.power_of_two) {
+                const std::pair<int, int> legal = power_of_two_range(minimum, maximum);
+                spin->setRange(legal.first, legal.second);
+            } else {
+                spin->setRange(minimum, maximum);
+            }
             field->editor = spin;
             connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, mark_dirty);
-            if (spec.power_of_two) {
-                // A power-of-two parameter (an image downscale) has only a handful of legal
-                // values: the arrows step between them and a typed value snaps to the nearest
-                // one, so the editor cannot hold a value the task would reject. Tracking is
-                // off so the snap happens when the field is committed, not per keystroke.
-                spin->setKeyboardTracking(false);
-                const int step = std::max(1, minimum);
-                spin->setSingleStep(step);
-                QObject::connect(spin, qOverload<int>(&QSpinBox::valueChanged), spin,
-                                 [spin](int value) {
-                                     const int snapped = nearest_power_of_two(value);
-                                     if (snapped != value &&
-                                         snapped >= spin->minimum() &&
-                                         snapped <= spin->maximum()) {
-                                         spin->setValue(snapped);
-                                     }
-                                 });
-            }
             column->addWidget(spin);
             break;
         }

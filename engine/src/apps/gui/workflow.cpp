@@ -339,11 +339,26 @@ QString WorkflowController::unavailable_reason(const std::string& task) const {
 }
 
 void WorkflowController::update_enabled() {
+    // While a job runs the answer does not depend on the document at all: every action is
+    // disabled with the same reason. Reading it anyway would be more than wasted work — the
+    // worker holds the document lock for the whole task, and busy_changed(true) is emitted
+    // synchronously from submit() on this thread, so a read here would block the GUI thread
+    // until the job ended.
+    const bool busy = app_.jobs().busy();
+    if (busy) {
+        for (const auto& [task, act] : actions_) {
+            (void)task;
+            act->setEnabled(false);
+            act->setToolTip(tr("A job is running."));
+            act->setStatusTip(tr("A job is running."));
+        }
+        return;
+    }
+
     // One locked read and one walk over the chunk for the whole menu, rather than one read per
     // action: undo_changed() fires on every edit and the menu is re-evaluated on every open, so
     // eleven locked scans of the camera and track lists would add up. Only the survey (plain
     // flags and counts) leaves the lock.
-    const bool busy = app_.jobs().busy();
     const std::pair<bool, ChunkSurvey> state =
         app_.read_document([](const Document& document) -> std::pair<bool, ChunkSurvey> {
             const Chunk* chunk = active_chunk_of(document);
@@ -355,9 +370,7 @@ void WorkflowController::update_enabled() {
     for (const auto& [task, act] : actions_) {
         QString reason;
         const TaskEntry* entry = builtin_registry().find(task);
-        if (busy) {
-            reason = tr("A job is running.");
-        } else if (entry == nullptr || !entry->enabled) {
+        if (entry == nullptr || !entry->enabled) {
             reason = tr("This task is not available.");
         } else if (!has_chunk) {
             reason = tr("There is no active chunk.");
