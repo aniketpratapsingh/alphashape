@@ -483,9 +483,18 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          # Pin the interpreter. The vcpkg toolchain puts its own python3 ahead of
+          # the one actions/setup-python installed, and a module built against it
+          # (3.14 here) would not import in the smoke job's 3.12. pythonLocation is
+          # what setup-python exports; the fallback covers a manual run.
+          $python = if ($env:pythonLocation) { Join-Path $env:pythonLocation "python.exe" } `
+                    else { (Get-Command python -ErrorAction Stop).Source }
+          "packaging against python: $python"
+          & $python -c "import sys; print('  version', sys.version.split()[0])"
           cmake -S engine -B build `
             -DALPHASHAPE_BUILD_PYTHON=ON -DALPHASHAPE_BUILD_INSTALLER=ON `
-            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}"
+            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}" `
+            -DPython3_EXECUTABLE="$python"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The module is new; the GUI relinks because the install rules add its
           # icon and version resource to it. Everything else is already built.

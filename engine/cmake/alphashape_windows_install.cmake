@@ -120,7 +120,12 @@ if(ALPHASHAPE_BUILD_GUI AND TARGET alphashape-gui)
 endif()
 
 if(ALPHASHAPE_BUILD_PYTHON AND TARGET alphashape_python)
-    install(TARGETS alphashape_python RUNTIME DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR}
+    # A Python extension module is a MODULE library. On Windows CMake places the
+    # .pyd through RUNTIME, elsewhere through LIBRARY, so both destinations are
+    # given (install(TARGETS) rejects a module target that names only one).
+    install(TARGETS alphashape_python
+            RUNTIME DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR}
+            LIBRARY DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR}
             COMPONENT python)
     install(FILES ${ALPHASHAPE_PACKAGING_DIR}/python-usage.txt
             DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR} COMPONENT python)
@@ -289,9 +294,19 @@ foreach(_grid IN LISTS ALPHASHAPE_PROJ_GRID_FILES)
 endforeach()
 list(LENGTH ALPHASHAPE_PROJ_GRID_SELECTED ALPHASHAPE_PROJ_GRID_COUNT)
 math(EXPR ALPHASHAPE_PROJ_GRID_MIB "${ALPHASHAPE_PROJ_GRID_BYTES} / 1048576")
-message(STATUS
-    "  PROJ data ........ ${ALPHASHAPE_PROJ_GRID_COUNT} grids, ${ALPHASHAPE_PROJ_GRID_MIB} MiB "
-    "(${ALPHASHAPE_PROJ_GRID_MAX_BYTES} B per file, ${ALPHASHAPE_PROJ_TOTAL_MAX_BYTES} B total)")
+if(ALPHASHAPE_PROJ_GRID_COUNT EQUAL 0)
+    # vcpkg's proj port ships proj.db but no grid files. That is workable --
+    # transforms that need no grid work, and the ones that do fail offline with
+    # PROJ's "grid not found" rather than silently downloading -- but it is worth
+    # saying out loud, because a grid-less install cannot do a geoid transform.
+    message(STATUS
+        "  PROJ data ........ proj.db only, no grids in ${ALPHASHAPE_PROJ_DATA_SRC} "
+        "(geoid transforms will need ALPHASHAPE_PROJ_DATA pointing at a full proj-data)")
+else()
+    message(STATUS
+        "  PROJ data ........ ${ALPHASHAPE_PROJ_GRID_COUNT} grids, ${ALPHASHAPE_PROJ_GRID_MIB} MiB "
+        "(${ALPHASHAPE_PROJ_GRID_MAX_BYTES} B per file, ${ALPHASHAPE_PROJ_TOTAL_MAX_BYTES} B total)")
+endif()
 install(FILES ${ALPHASHAPE_PROJ_GRID_SELECTED} DESTINATION share/proj COMPONENT core)
 
 # ---- documentation and licences ----------------------------------------------------------------
