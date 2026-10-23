@@ -1,8 +1,8 @@
 #pragma once
 
-// Command line of alphashape-gui. Parsed before the QApplication exists, so that a bad
-// command line exits 64 (EX_USAGE, the same code alphashape-cli uses) on a machine with no
-// display, and --help / --version never need one.
+// Command line of alphashape-gui. Parsed after the QApplication has stripped Qt's own options;
+// a bad command line exits 64 (EX_USAGE, the same code alphashape-cli uses). Arguments are
+// UTF-8 (converted from QCoreApplication::arguments()).
 
 #include <optional>
 #include <string>
@@ -39,7 +39,7 @@ struct ParseResult {
     bool ok() const { return error.empty(); }
 };
 
-/// `args` excludes argv[0].
+/// `args` excludes argv[0] and any Qt options; strings are UTF-8.
 ParseResult parse_command_line(const std::vector<std::string>& args);
 
 /// Full --help text.

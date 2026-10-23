@@ -112,10 +112,9 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           cache: true
           setup-python: false
-
 
       - name: Restore compiler cache
         uses: actions/cache@v4
@@ -208,10 +207,9 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           cache: true
           setup-python: false
-
 
       - name: Restore compiler cache
         uses: actions/cache@v4
@@ -320,11 +318,10 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           arch: win64_msvc2022_64
           cache: true
           setup-python: false
-
 
       - name: Configure
         shell: pwsh
@@ -439,10 +436,9 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           cache: true
           setup-python: false
-
 
       - uses: actions/download-artifact@v4
         with:
@@ -534,10 +530,9 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           cache: true
           setup-python: false
-
 
       - uses: actions/download-artifact@v4
         with:
@@ -618,11 +613,10 @@ jobs:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
-          version: "6.8.*"
+          version: "6.8.3"
           arch: win64_msvc2022_64
           cache: true
           setup-python: false
-
 
       - uses: actions/download-artifact@v4
         with:

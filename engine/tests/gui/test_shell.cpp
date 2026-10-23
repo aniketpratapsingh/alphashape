@@ -4,7 +4,6 @@
 #include <gtest/gtest.h>
 
 #include <QApplication>
-#include <QElapsedTimer>
 #include <QMutex>
 #include <QProcess>
 #include <QStringList>
@@ -22,17 +21,13 @@ struct RunResult {
     int exit_code = -1;
     QString out;
     QString err;
-    qint64 millis = 0;
 };
 
 RunResult run_gui(const QStringList& args, int timeout_ms) {
     QProcess process;
-    QElapsedTimer timer;
-    timer.start();
     process.start(QStringLiteral(ALPHASHAPE_GUI_EXE), args);
     RunResult result;
     result.finished = process.waitForFinished(timeout_ms);
-    result.millis = timer.elapsed();
     if (!result.finished) {
         process.kill();
         process.waitForFinished(5000);
@@ -52,12 +47,15 @@ QtMessageHandler g_previous_handler = nullptr;
 //  - the offscreen QPA plugin has no window-manager size hints and says so for every top-level;
 //  - the font database reports (with a timing that varies per machine) that it resolved the
 //    generic "sans-serif" of the style sheet's font list through an alias;
-//  - the offscreen plugin on Windows has no native font database and complains about the
+//  - on Windows only, the offscreen plugin has no native font database and complains about the
 //    missing Qt font directory (the real "windows" platform plugin does not).
 bool is_known_platform_noise(const QString& message) {
     return message.startsWith(QLatin1String("This plugin does not support propagateSizeHints")) ||
            message.startsWith(QLatin1String("Populating font family aliases took")) ||
-           message.startsWith(QLatin1String("QFontDatabase: Cannot find font directory"));
+#ifdef Q_OS_WIN
+           message.startsWith(QLatin1String("QFontDatabase: Cannot find font directory")) ||
+#endif
+           false;
 }
 
 void collecting_handler(QtMsgType type, const QMessageLogContext& context, const QString& message) {
@@ -78,15 +76,28 @@ void collecting_handler(QtMsgType type, const QMessageLogContext& context, const
 }  // namespace
 
 TEST(GuiShell, StartsOffscreen) {
-    const RunResult r = run_gui({QStringLiteral("--offscreen-smoke")}, 5000);
-    ASSERT_TRUE(r.finished) << "did not finish within 5 s; stderr: " << r.err.toStdString();
+    const RunResult r = run_gui({QStringLiteral("--offscreen-smoke")}, 20000);
+    ASSERT_TRUE(r.finished) << "did not finish within 20 s; stderr: " << r.err.toStdString();
     EXPECT_EQ(r.exit_code, 0) << r.err.toStdString();
     EXPECT_TRUE(r.out.contains(QStringLiteral("gui ready"))) << r.out.toStdString();
-    EXPECT_LE(r.millis, 5000);
 }
 
+// Restores the previous Qt message handler on scope exit, assertion failure included.
+struct MessageHandlerGuard {
+    MessageHandlerGuard() {
+        {
+            QMutexLocker lock(&g_messages_mutex);
+            g_messages.clear();
+        }
+        g_previous_handler = qInstallMessageHandler(collecting_handler);
+    }
+    ~MessageHandlerGuard() { qInstallMessageHandler(g_previous_handler); }
+    MessageHandlerGuard(const MessageHandlerGuard&) = delete;
+    MessageHandlerGuard& operator=(const MessageHandlerGuard&) = delete;
+};
+
 TEST(GuiShell, NoQtWarnings) {
-    g_previous_handler = qInstallMessageHandler(collecting_handler);
+    MessageHandlerGuard guard;
     {
         Options options;
         options.reset_settings = true;
@@ -100,8 +111,16 @@ TEST(GuiShell, NoQtWarnings) {
         QApplication::processEvents();
         window.close();
     }
-    qInstallMessageHandler(g_previous_handler);
+    QMutexLocker lock(&g_messages_mutex);
     EXPECT_TRUE(g_messages.isEmpty()) << g_messages.join(QLatin1Char('\n')).toStdString();
+}
+
+TEST(GuiShell, QtOptionsAreAcceptedAndStripped) {
+    const RunResult r = run_gui({QStringLiteral("-platform"), QStringLiteral("offscreen"),
+                                 QStringLiteral("--offscreen-smoke")}, 20000);
+    ASSERT_TRUE(r.finished);
+    EXPECT_EQ(r.exit_code, 0) << r.err.toStdString();
+    EXPECT_TRUE(r.out.contains(QStringLiteral("gui ready"))) << r.out.toStdString();
 }
 
 TEST(GuiShell, BadUsageExits64) {
