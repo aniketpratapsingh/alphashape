@@ -309,23 +309,56 @@ jobs:
         if: always()
         run: ccache --show-stats || true
 
-      - name: Package
+      # alphashape.app is assembled from the build tree: Qt via macdeployqt, every other Homebrew
+      # library, the Vulkan loader, MoltenVK and the PROJ data by packaging/macos. Ad-hoc signed.
+      - name: Package (.app, .dmg)
         if: inputs.package
         run: |
-          name="alphashape-${{ inputs.version }}-macos-arm64"
-          mkdir -p "dist/$name"
-          cp build/src/apps/cli/alphashape-cli "dist/$name/"
-          find build/python -maxdepth 2 -name 'alphashape*.so' -exec cp {} "dist/$name/" \;
-          cp README.md LICENSE engine/LIMITATIONS.md "dist/$name/"
-          codesign --force --sign - "dist/$name/alphashape-cli"
-          (cd dist && zip -qry "$name.zip" "$name")
+          brew install librsvg
+          export PATH="$QT_ROOT_DIR/bin:$PATH"
+          packaging/macos/build-app.sh build dist/app
+          packaging/macos/build-dmg.sh dist/app/alphashape.app \
+            "dist/alphashape-${{ inputs.version }}-macos-arm64.dmg"
 
       - uses: actions/upload-artifact@v4
         if: inputs.package
         with:
           name: alphashape-macos-arm64
-          path: dist/*.zip
+          path: dist/*.dmg
           if-no-files-found: error
+
+  # Mount the DMG on a fresh runner with Homebrew moved out of the way, then run everything.
+  macos-package-smoke:
+    name: macOS DMG (fresh runner, no Homebrew)
+    needs: macos
+    if: inputs.package
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-macos-arm64
+          path: dist
+      - name: Package size
+        run: ls -l dist
+      - name: Python version the module was built for
+        id: py
+        run: |
+          mnt="$(mktemp -d)"
+          hdiutil attach dist/*.dmg -mountpoint "$mnt" -nobrowse -readonly
+          so="$(ls "$mnt"/alphashape.app/Contents/Resources/python/*.so)"
+          hdiutil detach "$mnt"
+          echo "version=$(basename "$so" | sed -E 's/.*cpython-3([0-9]+)-darwin.*/3.\1/')" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.py.outputs.version }}
+      - name: Hide Homebrew
+        run: sudo mv /opt/homebrew /opt/homebrew.hidden
+      - name: Install and run from the DMG
+        run: packaging/macos/smoke-app.sh dist/*.dmg engine/data
 
   windows:
     name: Windows x86-64 (clang-cl, CPU only)
