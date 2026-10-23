@@ -7,6 +7,10 @@
 // Not offered, because the engine has no command for them: renaming a chunk and removing
 // cameras. Making a chunk active (double-click) sets the document's active id directly and
 // marks the project dirty; it is not on the undo stack.
+//
+// Jobs: while a job is active the pane never reads the document and every mutating action is
+// disabled (menu entries stay listed but greyed; the operations refuse). The model rebuilds
+// itself when the job finishes; the pane restores selection and expansion afterwards.
 
 #include <functional>
 #include <cstdint>
@@ -64,12 +68,22 @@ private:
     /// from one chunk. Empty when the selection spans chunks or holds no cameras.
     std::vector<std::int32_t> selected_cameras(std::int32_t& chunk_id) const;
     void report(const QString& title, const QString& message);
+    /// Reports and returns true when a job is active (the document must not be touched).
+    bool refuse_while_busy(const QString& title);
+    /// Selection-only check (no document read) used for the menu while a job runs.
+    bool selection_only_cameras() const;
+    void remember_view();
+    void restore_view();
 
     GuiApp& app_;
     WorkspaceSelection& selection_;
     WorkspaceModel* model_ = nullptr;
     QTreeView* tree_ = nullptr;
     ErrorHandler error_handler_;
+    QList<NodeRef> saved_selection_;
+    QList<NodeRef> saved_expanded_;
+    NodeRef saved_current_;
+    bool has_saved_current_ = false;
 };
 
 }  // namespace alphashape::gui

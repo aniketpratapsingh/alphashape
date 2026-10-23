@@ -1,15 +1,22 @@
 #include "base/utils/log.hpp"
 
 #include <iostream>
+#include <utility>
 
 namespace alphashape {
 
 LogLevel Log::level_ = LogLevel::Info;
 std::mutex Log::mutex_;
+Log::Sink Log::sink_;
 
 void Log::set_level(LogLevel level) { level_ = level; }
 
 LogLevel Log::level() { return level_; }
+
+void Log::set_sink(Sink sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sink_ = std::move(sink);
+}
 
 bool Log::enabled(LogLevel level) { return level >= level_; }
 
@@ -32,6 +39,10 @@ void Log::write(LogLevel level, const std::string& message) {
         return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (sink_) {
+        sink_(level, message);
+        return;
+    }
     std::ostream& out = (level >= LogLevel::Warn) ? std::cerr : std::cout;
     out << '[' << level_name(level) << "] " << message << '\n';
     out.flush();

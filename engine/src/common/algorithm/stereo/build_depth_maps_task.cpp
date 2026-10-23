@@ -372,7 +372,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         progress.update("buildDepthMaps",
                         static_cast<double>(i + 1) / static_cast<double>(neighbourhoods.size()));
         if (progress.is_cancelled()) {
-            throw Error("BuildDepthMaps was cancelled");
+            throw CancelledError("BuildDepthMaps was cancelled");
         }
     }
     for (const std::string& error : errors) {
@@ -451,7 +451,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         progress.update("filterDepthMaps",
                         static_cast<double>(i + 1) / static_cast<double>(camera_count));
         if (progress.is_cancelled()) {
-            throw Error("BuildDepthMaps was cancelled");
+            throw CancelledError("BuildDepthMaps was cancelled");
         }
     }
     progress.update("filterDepthMaps", 1.0);

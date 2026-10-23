@@ -91,9 +91,19 @@ public:
 
     /// Re-read the document and update the tree in place. Called on execute/undo/redo; call it
     /// after changing the document by other means.
+    /// While a job is active the document must not be read: refresh() then only marks the tree
+    /// stale() and the rebuild happens when the job finishes.
     void refresh();
+    bool stale() const { return stale_; }
+
+Q_SIGNALS:
+    /// The tree was fully rebuilt because a job finished (the previous selection is gone).
+    void reset_after_job();
 
 private:
+    void refresh_after_job();
+    std::unique_ptr<detail::TreeNode> build_fresh();
+    bool stale_ = false;
     using Node = detail::TreeNode;
 
     void reset();

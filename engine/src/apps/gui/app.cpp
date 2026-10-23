@@ -1,6 +1,10 @@
 #include "apps/gui/app.hpp"
 
+#include <iostream>
+
 #include <QApplication>
+#include <QMetaObject>
+#include <QDir>
 #include <QFileInfo>
 #include <QString>
 
@@ -13,6 +17,8 @@ namespace {
 constexpr const char* kThemeKey = "ui/theme";
 constexpr const char* kRecentKey = "files/recent";
 constexpr std::size_t kUnreachable = static_cast<std::size_t>(-1);
+/// The GuiApp that currently receives engine log lines (the sink is process-wide).
+GuiApp* g_log_owner = nullptr;
 }  // namespace
 
 GuiApp::GuiApp(const Options& options, QObject* parent)
@@ -20,11 +26,15 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
       settings_(QStringLiteral("alphashape"), QStringLiteral("alphashape")),
       document_(std::make_shared<Document>()),
       undo_stack_(document_.get()),
-      theme_(this) {
+      theme_(this),
+      jobs_(*this) {
+    qRegisterMetaType<alphashape::LogLevel>("alphashape::LogLevel");
     if (options.reset_settings) {
         settings_.clear();
         settings_.sync();
     }
+
+    recent_ = settings_.value(kRecentKey).toStringList();
 
     Theme::load_bundled_fonts();
     // Fusion honours the whole QPalette on every platform, so widgets the style sheet does not
@@ -45,9 +55,45 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
     } else if (options.new_project) {
         new_document(options.new_path);
     }
+
+    // Engine log lines may come from the worker thread; hand them to the GUI thread.
+    g_log_owner = this;
+    Log::set_sink([this](LogLevel level, const std::string& message) {
+        // Keep warnings and errors on the console too, so CI logs still show them.
+        if (level >= LogLevel::Warn && level != LogLevel::Off) {
+            std::cerr << '[' << (level == LogLevel::Warn ? "warn" : "error") << "] " << message
+                      << '\n';
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, level, text = QString::fromStdString(message)]() {
+                Q_EMIT log_message(level, text);
+            },
+            Qt::QueuedConnection);
+    });
 }
 
-GuiApp::~GuiApp() = default;
+GuiApp::~GuiApp() {
+    jobs_.shutdown();  // the worker uses the document and the lock, so end it first
+    if (g_log_owner == this) {
+        Log::set_sink({});
+        g_log_owner = nullptr;
+    }
+}
+
+void GuiApp::require_idle(const char* what) const {
+    if (jobs_.busy()) {
+        throw Error(std::string("cannot ") + what + " while a job is running");
+    }
+}
+
+void GuiApp::task_changed_document() {
+    undo_stack_.clear();
+    force_dirty_ = true;
+    clean_position_ = undo_stack_.position();
+    Q_EMIT undo_changed();
+    publish_dirty();
+}
 
 void GuiApp::set_theme(ThemeMode mode) {
     theme_.apply(mode);
@@ -55,6 +101,7 @@ void GuiApp::set_theme(ThemeMode mode) {
 }
 
 void GuiApp::new_document(const std::string& path) {
+    require_idle("replace the project");
     undo_stack_.clear();
     document_ = path.empty() ? std::make_shared<Document>() : std::make_shared<Document>(path);
     undo_stack_.bind(document_.get());
@@ -65,6 +112,7 @@ void GuiApp::new_document(const std::string& path) {
 }
 
 void GuiApp::open_document(const std::string& path) {
+    require_idle("open a project");
     std::shared_ptr<Document> loaded = ProjectIO::load(path);
     undo_stack_.clear();
     document_ = std::move(loaded);
@@ -77,16 +125,19 @@ void GuiApp::open_document(const std::string& path) {
 }
 
 void GuiApp::save_document() {
-    if (document_->path().empty()) {
+    require_idle("save the project");
+    const std::string path = read_document([](const Document& d) { return d.path(); });
+    if (path.empty()) {
         throw Error("the project has no file name yet");
     }
-    ProjectIO::save(*document_, document_->path());
+    ProjectIO::save(*document_, path);
     reset_dirty_tracking();
-    add_recent_file(QString::fromStdString(document_->path()));
+    add_recent_file(QString::fromStdString(path));
     publish_dirty();
 }
 
 void GuiApp::save_document_as(const std::string& path) {
+    require_idle("save the project");
     ProjectIO::save(*document_, path);
     document_->set_path(path);
     reset_dirty_tracking();
@@ -118,6 +169,7 @@ void GuiApp::publish_dirty() {
 }
 
 void GuiApp::execute(std::unique_ptr<AbstractCommand> command) {
+    require_idle("edit the project");
     const std::size_t before = undo_stack_.position();
     const std::size_t dropped_before = undo_stack_.dropped_count();
     undo_stack_.execute(std::move(command));  // throws without touching the document
@@ -133,54 +185,92 @@ void GuiApp::execute(std::unique_ptr<AbstractCommand> command) {
 }
 
 void GuiApp::undo() {
+    require_idle("undo");
     undo_stack_.undo();
     Q_EMIT undo_changed();
     publish_dirty();
 }
 
 void GuiApp::redo() {
+    require_idle("redo");
     undo_stack_.redo();
     Q_EMIT undo_changed();
     publish_dirty();
 }
 
 QStringList GuiApp::recent_files() const {
-    return settings_.value(kRecentKey).toStringList();
+    return recent_;
 }
+
+// The in-memory list is authoritative; QSettings is only where it is persisted. QSettings writes
+// lazily and re-reads the file when it looks changed; on Windows a write that loses a race with a
+// lock (antivirus, indexer) leaves the file stale and a later re-read then replaced what had just
+// been stored, which made the list come back empty or old. Reading our own copy removes that
+// dependency on write timing.
+void GuiApp::store_recent_files() {
+    if (recent_.isEmpty()) {
+        settings_.remove(kRecentKey);
+    } else {
+        settings_.setValue(kRecentKey, recent_);
+    }
+    settings_.sync();
+}
+
+namespace {
+// Same normal form for storing and for matching: absolute, '/' separators, "." and ".." resolved.
+QString recent_key(const QString& path) {
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+// Windows paths ignore case, and so must the duplicate check or "C:/x" and "c:/x" list twice.
+#ifdef Q_OS_WIN
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseInsensitive;
+#else
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
+#endif
+void remove_path(QStringList& list, const QString& key) {
+    for (int i = list.size() - 1; i >= 0; --i) {
+        if (list[i].compare(key, kPathCase) == 0) {
+            list.removeAt(i);
+        }
+    }
+}
+}  // namespace
 
 void GuiApp::add_recent_file(const QString& path) {
     if (path.isEmpty()) {
         return;
     }
-    const QString absolute = QFileInfo(path).absoluteFilePath();
-    QStringList list = recent_files();
-    list.removeAll(absolute);
-    list.prepend(absolute);
-    while (list.size() > kMaxRecentFiles) {
-        list.removeLast();
+    const QString absolute = recent_key(path);
+    remove_path(recent_, absolute);
+    recent_.prepend(absolute);
+    while (recent_.size() > kMaxRecentFiles) {
+        recent_.removeLast();
     }
-    settings_.setValue(kRecentKey, list);
+    store_recent_files();
     Q_EMIT recent_files_changed();
 }
 
 void GuiApp::remove_recent_file(const QString& path) {
-    QStringList list = recent_files();
-    if (list.removeAll(QFileInfo(path).absoluteFilePath()) > 0) {
-        settings_.setValue(kRecentKey, list);
+    const qsizetype before = recent_.size();
+    remove_path(recent_, recent_key(path));
+    if (recent_.size() != before) {
+        store_recent_files();
         Q_EMIT recent_files_changed();
     }
 }
 
 void GuiApp::clear_recent_files() {
-    settings_.remove(kRecentKey);
+    recent_.clear();
+    store_recent_files();
     Q_EMIT recent_files_changed();
 }
 
 QString GuiApp::document_title() const {
-    if (document_->path().empty()) {
+    const std::string path = read_document([](const Document& d) { return d.path(); });
+    if (path.empty()) {
         return QStringLiteral("Untitled");
     }
-    return QFileInfo(QString::fromStdString(document_->path())).completeBaseName();
+    return QFileInfo(QString::fromStdString(path)).completeBaseName();
 }
 
 }  // namespace alphashape::gui

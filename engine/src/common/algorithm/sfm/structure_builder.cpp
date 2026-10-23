@@ -641,7 +641,7 @@ BuilderResult build_incremental(const BuilderInput& input, const BuilderOptions&
     std::size_t since_ba = 0;
     while (true) {
         if (cancelled && cancelled()) {
-            throw Error("cancelled");
+            throw CancelledError("cancelled");
         }
         // Best candidate: most triangulated-point views, ties by lower index.
         std::size_t best = kNoIndex, best_count = 0;

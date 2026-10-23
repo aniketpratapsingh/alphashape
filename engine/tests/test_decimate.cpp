@@ -448,7 +448,13 @@ TEST(Decimate, LargeMeshTiming) {
 
     EXPECT_LE(result, 20000U);
     EXPECT_EQ(result, mesh.faces.size());
+    // Timing budget, not a correctness bound; the ASan+UBSan build is several
+    // times slower than Release.
+#ifdef ALPHASHAPE_SANITIZED_BUILD
+    EXPECT_LT(ms, 60000.0);
+#else
     EXPECT_LT(ms, 10000.0);
+#endif
     EXPECT_EQ(edge_stats(mesh).non_manifold, 0U);
 }
 

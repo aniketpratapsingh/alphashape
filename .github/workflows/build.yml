@@ -162,7 +162,7 @@ jobs:
         if: always()
         run: ccache --show-stats || true
 
-      - name: Package
+      - name: Package (tar.gz)
         if: inputs.package
         run: |
           name="alphashape-${{ inputs.version }}-linux-x86_64"
@@ -172,12 +172,65 @@ jobs:
           cp README.md LICENSE engine/LIMITATIONS.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
+      # .deb: the GUI's Qt 6.8 is bundled privately (Ubuntu 24.04 only has Qt 6.4), see
+      # packaging/linux/README.md. Packaging reuses the build tree; only install rules change.
+      - name: Package (.deb)
+        if: inputs.package
+        run: |
+          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
+          desktop-file-validate packaging/linux/org.alphashape.app.desktop
+          cmake -S engine -B build -DALPHASHAPE_BUNDLE_QT=ON -DALPHASHAPE_BUNDLE_PROJ_DATA=OFF
+          (cd build && cpack -G DEB)
+          deb=$(ls build/alphashape_*_amd64.deb)
+          cp "$deb" "dist/alphashape-${{ inputs.version }}-linux-amd64.deb"
+          appstreamcli validate --no-net build/org.alphashape.app.metainfo.xml
+          dpkg-deb -I "$deb"
+          ls -lh dist
+
+      # AppImage: linuxdeploy + the Qt plugin bundle every non-glibc dependency. It ships PROJ data
+      # itself (no proj-data package to rely on) and no Python module.
+      - name: Package (AppImage)
+        if: inputs.package
+        run: |
+          cmake -S engine -B build -DALPHASHAPE_BUNDLE_QT=OFF -DALPHASHAPE_BUNDLE_PROJ_DATA=ON
+          packaging/linux/build-appimage.sh build "dist/alphashape-${{ inputs.version }}-linux-x86_64.AppImage"
+          ls -lh dist
+
       - uses: actions/upload-artifact@v4
         if: inputs.package
         with:
           name: alphashape-linux-x86_64
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
           if-no-files-found: error
+
+  # Install the packages the way a user would, on a clean Ubuntu 24.04, and run them.
+  linux-package-smoke:
+    name: Linux packages (clean ubuntu:24.04)
+    needs: linux
+    if: inputs.package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-linux-x86_64
+          path: dist
+      - name: Package sizes
+        run: ls -l dist
+      - name: .deb in a clean container
+        run: |
+          docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
+            bash -c 'bash /w/packaging/linux/smoke-deb.sh /w/dist/*.deb /w/engine/data'
+      - name: AppImage in a clean container (no FUSE)
+        run: |
+          docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
+            bash -c 'bash /w/packaging/linux/smoke-appimage.sh /w/dist/*.AppImage /w/engine/data'
 
   macos:
     name: macOS arm64 (Clang, MoltenVK)

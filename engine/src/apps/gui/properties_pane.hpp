@@ -43,6 +43,8 @@ public:
     QList<QPair<QString, QString>> rows() const { return sheet_.rows; }
     /// Value of the row named `name`, or a null string.
     QString value(const QString& name) const;
+    /// True when a refresh was requested during a job and is waiting for job_finished.
+    bool stale() const { return stale_; }
 
 private:
     void rebuild();
@@ -53,6 +55,7 @@ private:
     QLabel* hint_ = nullptr;
     QTableWidget* table_ = nullptr;
     PropertySheet sheet_;
+    bool stale_ = false;
 };
 
 }  // namespace alphashape::gui

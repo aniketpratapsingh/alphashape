@@ -1,0 +1,15 @@
+#!/bin/sh
+# AppImage entry point: the GUI by default, the command-line app with `cli` as the first argument.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+# Hooks written by linuxdeploy-plugin-qt (QT_PLUGIN_PATH and friends).
+for hook in "$HERE"/apprun-hooks/*.sh; do
+    [ -r "$hook" ] && . "$hook"
+done
+export PATH="$HERE/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ "${1:-}" = "cli" ]; then
+    shift
+    exec "$HERE/usr/bin/alphashape-cli" "$@"
+fi
+exec "$HERE/usr/bin/alphashape-gui" "$@"

@@ -3,9 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <QAbstractItemModelTester>
@@ -17,14 +22,17 @@
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "apps/gui/workspace_pane.hpp"
+#include "base/utils/error.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/tasks/registry.hpp"
 #include "harness.hpp"
 
 using namespace alphashape;
 using namespace alphashape::gui;
 using alphashape::gui::testing::GuiTest;
+using alphashape::gui::testing::pump_until;
 
 namespace {
 
@@ -403,4 +411,225 @@ TEST_F(WorkspaceTree, PropertiesTableIsReadOnly) {
     EXPECT_EQ(table->columnCount(), 2);
     EXPECT_EQ(table->rowCount(), props().rows().size());
     EXPECT_EQ(table->editTriggers(), QAbstractItemView::NoEditTriggers);
+}
+
+// --- Jobs: the tree and the Properties pane obey the document concurrency rule ------------
+//
+// While a job is active the panes must not read the document and nothing may mutate it; when the
+// job ends (whatever the outcome) the tree is rebuilt from scratch. A test-only task that waits at
+// a gate makes this deterministic, the same pattern as test_jobs.cpp.
+
+namespace {
+
+struct WorkspaceGate {
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+};
+
+/// Waits for the gate, then makes the changes the tests look for: camera 3 becomes enabled and a
+/// chunk "Task chunk" appears. mode "fail" throws after changing (a failed task leaves its
+/// changes behind), mode "cancel" waits for cancellation and throws CancelledError.
+class WorkspaceGateTask : public AbstractTask {
+public:
+    explicit WorkspaceGateTask(std::shared_ptr<WorkspaceGate> gate) : gate_(std::move(gate)) {}
+
+    std::string name() const override { return "WorkspaceGateTask"; }
+    void declare_params(Params& params) const override {
+        params.declare({"mode", ParamType::String, std::string{"ok"}, "ok, fail or cancel."});
+    }
+    TargetType target_type() const override { return TargetType::Chunk; }
+    std::vector<Stage> stages() const override { return {Stage{"a", 0}}; }
+
+    void apply(Document& document, Params& params, const Progress& progress) override {
+        const std::string mode = params.get_string("mode");
+        progress.update("a", 0.0);
+        gate_->started = true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!gate_->release.load()) {
+            if (progress.is_cancelled()) {
+                document.workspace().add_chunk("Task chunk");
+                throw CancelledError("WorkspaceGateTask was cancelled");
+            }
+            if (std::chrono::steady_clock::now() > deadline) {
+                throw Error("WorkspaceGateTask timed out waiting for the test");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (const auto& workspace : document.workspaces()) {
+            for (const auto& chunk : workspace->chunks()) {
+                for (Camera& camera : chunk->cameras()) {
+                    camera.enabled = true;
+                }
+            }
+        }
+        document.workspace().add_chunk("Task chunk");
+        if (mode == "fail") {
+            throw Error("workspace gate task failed on purpose");
+        }
+    }
+
+private:
+    std::shared_ptr<WorkspaceGate> gate_;
+};
+
+class WorkspaceJobs : public WorkspaceTree {
+protected:
+    void SetUp() override {
+        WorkspaceTree::SetUp();
+        gate_ = std::make_shared<WorkspaceGate>();
+        registry_.register_task(std::make_shared<WorkspaceGateTask>(gate_));
+        app().jobs().set_registry(&registry_);
+        window().set_error_handler([this](const QString&, const QString& message) {
+            errors_.push_back(message);
+        });
+        pane().set_error_handler([this](const QString&, const QString& message) {
+            errors_.push_back(message);
+        });
+        // Count every structural or data change the model announces.
+        auto count = [this]() { ++model_events_; };
+        connect_all(count);
+    }
+
+    void connect_all(const std::function<void()>& count) {
+        QObject::connect(&model(), &QAbstractItemModel::modelReset, &model(), count);
+        QObject::connect(&model(), &QAbstractItemModel::rowsInserted, &model(), count);
+        QObject::connect(&model(), &QAbstractItemModel::rowsRemoved, &model(), count);
+        QObject::connect(&model(), &QAbstractItemModel::dataChanged, &model(), count);
+        QObject::connect(&model(), &QAbstractItemModel::layoutChanged, &model(), count);
+    }
+
+    void submit(const char* mode) {
+        Params params = make_params(registry_.require("WorkspaceGateTask"));
+        params.set("mode", ParamValue{std::string(mode)});
+        app().jobs().submit("WorkspaceGateTask", std::move(params));
+        ASSERT_TRUE(pump_until([&] { return gate_->started.load(); }, 60000));
+        ASSERT_TRUE(app().jobs().busy());
+    }
+    void finish_job() {
+        gate_->release = true;
+        ASSERT_TRUE(pump_until([&] { return !app().jobs().busy(); }, 60000));
+    }
+
+    std::shared_ptr<WorkspaceGate> gate_;
+    TaskRegistry registry_;
+    std::vector<QString> errors_;
+    int model_events_ = 0;
+};
+
+}  // namespace
+
+TEST_F(WorkspaceJobs, TreeAndMenuAreFrozenWhileAJobRunsAndRefreshWhenItEnds) {
+    const std::int32_t first = build_chunk("One");
+    const std::int32_t second = build_chunk("Two");  // becomes the active chunk
+    model().refresh();
+    ASSERT_EQ(chunk_count(), 2);
+    pane().tree()->expand(find(NodeKind::Cameras, first));
+    ASSERT_TRUE(pane().select(NodeRef{NodeKind::Camera, first, 3}));
+    ASSERT_EQ(props().value("Enabled"), "no");
+    ASSERT_TRUE(find(NodeKind::Camera, first, 3).data(Qt::ForegroundRole).isValid());  // greyed
+    {
+        auto idle_menu = pane().build_context_menu();
+        EXPECT_TRUE(idle_menu->findChild<QAction*>("action.workspace.add_chunk")->isEnabled());
+        EXPECT_TRUE(idle_menu->findChild<QAction*>("action.workspace.enable_cameras")->isEnabled());
+    }
+    model_events_ = 0;
+
+    ASSERT_NO_FATAL_FAILURE(submit("ok"));
+
+    // Refresh triggers during the job only mark the panes stale; nothing is rebuilt. (Only
+    // undo_changed: path_changed would make the window re-read the title under the shared lock
+    // and wait for the gate.)
+    Q_EMIT app().undo_changed();
+    EXPECT_TRUE(model().stale());
+    EXPECT_TRUE(props().stale());
+    EXPECT_EQ(model_events_, 0);
+    EXPECT_EQ(chunk_count(), 2);
+    EXPECT_EQ(props().value("Enabled"), "no");
+
+    // Context menu: every mutating entry is listed but disabled; only the camera ones apply here.
+    {
+        auto menu = pane().build_context_menu();
+        for (const char* name : {"add_chunk", "enable_cameras", "disable_cameras"}) {
+            QAction* entry = menu->findChild<QAction*>(QString("action.workspace.") + name);
+            ASSERT_NE(entry, nullptr) << name;
+            EXPECT_FALSE(entry->isEnabled()) << name;
+        }
+    }
+    ASSERT_TRUE(pane().select(NodeRef{NodeKind::Chunk, first, -1}));
+    {
+        auto menu = pane().build_context_menu();
+        for (const char* name : {"add_chunk", "set_active_chunk", "remove_chunk"}) {
+            QAction* entry = menu->findChild<QAction*>(QString("action.workspace.") + name);
+            ASSERT_NE(entry, nullptr) << name;
+            EXPECT_FALSE(entry->isEnabled()) << name;
+        }
+    }
+    // The operations themselves (shortcuts, programmatic calls, double-click) refuse too.
+    EXPECT_FALSE(pane().add_chunk());
+    EXPECT_FALSE(pane().remove_chunk(first));
+    EXPECT_FALSE(pane().set_cameras_enabled(first, {3}, true));
+    EXPECT_FALSE(pane().activate_chunk(first));
+    EXPECT_EQ(errors_.size(), 4U);
+    tree_double_click(first);
+    EXPECT_EQ(errors_.size(), 4U);  // double-click is silent
+    EXPECT_EQ(model_events_, 0);
+
+    finish_job();
+
+    // The task changed the document without a command: the tree was rebuilt from scratch.
+    EXPECT_FALSE(model().stale());
+    EXPECT_FALSE(props().stale());
+    EXPECT_GE(model_events_, 1);
+    EXPECT_EQ(chunk_count(), 3);
+    EXPECT_FALSE(find(NodeKind::Camera, first, 3).data(Qt::ForegroundRole).isValid());
+    EXPECT_EQ(app().document().active_chunk_id(), second);  // the double-click did nothing
+    EXPECT_TRUE(app().dirty());
+    EXPECT_FALSE(app().undo_stack().can_undo());
+    // Expansion and selection came back by identity.
+    EXPECT_TRUE(pane().tree()->isExpanded(find(NodeKind::Cameras, first)));
+    ASSERT_EQ(selection().items().size(), 1);
+    EXPECT_EQ(selection().current(), (NodeRef{NodeKind::Chunk, first, -1}));
+
+    // The menu works again.
+    auto menu = pane().build_context_menu();
+    EXPECT_TRUE(menu->findChild<QAction*>("action.workspace.add_chunk")->isEnabled());
+    EXPECT_TRUE(menu->findChild<QAction*>("action.workspace.set_active_chunk")->isEnabled());
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(WorkspaceJobs, PropertiesUpdateAfterTheJob) {
+    const std::int32_t id = build_chunk("One");
+    model().refresh();
+    ASSERT_TRUE(pane().select(NodeRef{NodeKind::Camera, id, 3}));
+    ASSERT_EQ(props().value("Enabled"), "no");
+
+    ASSERT_NO_FATAL_FAILURE(submit("ok"));
+    EXPECT_EQ(props().value("Enabled"), "no");  // still the pre-job sheet; the document is locked
+    finish_job();
+
+    EXPECT_FALSE(props().stale());
+    EXPECT_EQ(props().title(), "IMG_3");
+    EXPECT_EQ(props().value("Enabled"), "yes");
+}
+
+TEST_F(WorkspaceJobs, FailedAndCancelledJobsAlsoRebuildTheTree) {
+    const std::int32_t id = build_chunk("One");
+    model().refresh();
+    ASSERT_EQ(chunk_count(), 1);
+
+    // A task that fails after changing the document leaves its changes; the tree shows them.
+    ASSERT_NO_FATAL_FAILURE(submit("fail"));
+    finish_job();
+    EXPECT_EQ(chunk_count(), 2);
+    EXPECT_TRUE(find(NodeKind::Camera, id, 3).isValid());
+    EXPECT_FALSE(find(NodeKind::Camera, id, 3).data(Qt::ForegroundRole).isValid());
+
+    // A cancelled one that had already added a chunk does too.
+    gate_->started = false;
+    gate_->release = false;
+    ASSERT_NO_FATAL_FAILURE(submit("cancel"));
+    app().jobs().cancel();
+    ASSERT_TRUE(pump_until([&] { return !app().jobs().busy(); }, 60000));
+    EXPECT_EQ(chunk_count(), 3);
+    EXPECT_FALSE(model().stale());
 }

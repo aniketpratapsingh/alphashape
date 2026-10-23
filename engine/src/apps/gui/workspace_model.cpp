@@ -263,13 +263,41 @@ WorkspaceModel::WorkspaceModel(GuiApp& app, QObject* parent)
     connect(&app_, &GuiApp::document_replaced, this, &WorkspaceModel::reset);
     connect(&app_, &GuiApp::undo_changed, this, &WorkspaceModel::refresh);
     connect(&app_, &GuiApp::path_changed, this, &WorkspaceModel::refresh);
+    // Tasks change the document without commands, so after every job, whatever its outcome, the
+    // tree is rebuilt from scratch. With more jobs queued the document is about to be locked again,
+    // so only the last job of a batch (the one that leaves the manager idle) rebuilds.
+    connect(&app_.jobs(), &JobManager::job_finished, this,
+            [this](quint64, JobManager::State, const QString&) { refresh_after_job(); });
+}
+
+// Concurrency rule (see GuiApp): the document is never read while a job is active. Every read
+// goes through read_document() (shared lock), and is skipped entirely while busy(); the trigger is
+// remembered in stale_ and served when the manager reports job_finished.
+std::unique_ptr<detail::TreeNode> WorkspaceModel::build_fresh() {
+    return app_.read_document([this](const Document&) { return build_root(app_); });
+}
+
+void WorkspaceModel::refresh_after_job() {
+    if (app_.jobs().busy()) {
+        stale_ = true;
+        return;
+    }
+    stale_ = false;
+    reset();
+    Q_EMIT reset_after_job();
 }
 
 WorkspaceModel::~WorkspaceModel() = default;
 
 void WorkspaceModel::reset() {
+    if (app_.jobs().busy()) {
+        stale_ = true;
+        return;
+    }
+    stale_ = false;
+    NodePtr fresh = build_fresh();
     beginResetModel();
-    root_ = build_root(app_);
+    root_ = std::move(fresh);
     endResetModel();
 }
 
@@ -379,7 +407,12 @@ QModelIndex WorkspaceModel::index_for(const NodeRef& ref) const {
 }
 
 void WorkspaceModel::refresh() {
-    NodePtr fresh = build_root(app_);
+    if (app_.jobs().busy()) {
+        stale_ = true;
+        return;
+    }
+    stale_ = false;
+    NodePtr fresh = build_fresh();
     merge_children(*root_, fresh->children);
 }
 

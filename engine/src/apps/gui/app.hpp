@@ -2,22 +2,28 @@
 
 // GuiApp: the state that outlives any window. It owns the settings store, the engine
 // Document that the windows edit, the UndoStack bound to that document, and the Theme.
-// (Job manager, Python host and action host arrive with the WPs that need them.)
+// The JobManager runs engine tasks on a worker thread; while it is busy, everything that would
+// replace, save or edit the document throws (the window disables those actions up front).
+// (The Python host and action host arrive with the WPs that need them.)
 //
 // A QApplication must exist before a GuiApp is constructed.
 
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <QObject>
 #include <QSettings>
 #include <QStringList>
 
 #include "apps/gui/command_line.hpp"
+#include "apps/gui/job_manager.hpp"
 #include "apps/gui/theme/theme.hpp"
+#include "base/utils/log.hpp"
 #include "common/commands/command.hpp"
 #include "common/core/document.hpp"
+#include "common/core/document_lock.hpp"
 
 namespace alphashape::gui {
 
@@ -35,6 +41,28 @@ public:
     Theme& theme() { return theme_; }
     Document& document() { return *document_; }
     UndoStack& undo_stack() { return undo_stack_; }
+    JobManager& jobs() { return jobs_; }
+
+    /// Held exclusively by a running task; readers that run alongside jobs take it shared.
+    /// Rule for GUI panes: refresh from the document only when no job is active, i.e. on
+    /// JobManager::job_finished / busy_changed(false); never read it while busy().
+    DocumentLock& document_lock() { return document_lock_; }
+
+    /// Run `fn(const Document&)` under the shared document lock and return its result. Use this
+    /// for GUI-thread reads (title, path, ...) so they never overlap a running task's writes.
+    template <typename Fn>
+    auto read_document(Fn&& fn) const {
+        const auto lock = document_lock_.read();
+        return std::forward<Fn>(fn)(std::as_const(*document_));
+    }
+    /// The same document, shared with the job worker so it outlives a swap.
+    std::shared_ptr<Document> shared_document() { return document_; }
+
+    /// Called by the job manager after a task ended (also Failed / Cancelled once it had started,
+    /// since tasks mutate in place and may leave partial changes). Tasks are not reversible through the
+    /// command layer (there is no reversal command for them yet), so the undo history, whose
+    /// entries assume the pre-task state, is cleared and the document is marked dirty.
+    void task_changed_document();
 
     /// Switch theme at runtime and remember the choice for the next start.
     void set_theme(ThemeMode mode);
@@ -77,6 +105,9 @@ public:
     void clear_recent_files();
 
 Q_SIGNALS:
+    /// One line for the Log pane: engine log lines, and job start / stage / end notes. Always
+    /// emitted on the GUI thread.
+    void log_message(alphashape::LogLevel level, const QString& text);
     /// Emitted after new_document() / open_document() swapped the document.
     void document_replaced();
     /// Emitted when the document keeps its content but gets a new file path (Save As).
@@ -93,14 +124,21 @@ private:
     std::shared_ptr<Document> document_;
     UndoStack undo_stack_;
     Theme theme_;
+    mutable DocumentLock document_lock_;
+    JobManager jobs_;
     /// Undo position at the last load/save; npos when that state is no longer reachable
     /// (a new edit overwrote the redo branch that led back to it).
     std::size_t clean_position_ = 0;
     bool force_dirty_ = false;
     bool last_dirty_ = false;
 
+    QStringList recent_;  ///< authoritative copy of the persisted recent-files list
+    void store_recent_files();
+    void require_idle(const char* what) const;
     void reset_dirty_tracking();
     void publish_dirty();
 };
 
 }  // namespace alphashape::gui
+
+Q_DECLARE_METATYPE(alphashape::LogLevel)

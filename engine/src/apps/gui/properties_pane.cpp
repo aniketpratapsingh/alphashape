@@ -431,6 +431,9 @@ PropertiesPane::PropertiesPane(GuiApp& app, WorkspaceSelection& selection, QWidg
     connect(&selection_, &WorkspaceSelection::changed, this, &PropertiesPane::rebuild);
     connect(&app_, &GuiApp::undo_changed, this, &PropertiesPane::rebuild);
     connect(&app_, &GuiApp::document_replaced, this, &PropertiesPane::rebuild);
+    // Tasks change the document without going through commands, so every finished job re-reads it.
+    connect(&app_.jobs(), &JobManager::job_finished, this,
+            [this](quint64, JobManager::State, const QString&) { rebuild(); });
     rebuild();
 }
 
@@ -443,8 +446,16 @@ QString PropertiesPane::value(const QString& name) const {
     return {};
 }
 
+// Concurrency rule (see GuiApp): never read the document while a job is active. A trigger that
+// arrives meanwhile only sets stale_; the sheet keeps its last content until job_finished.
 void PropertiesPane::rebuild() {
-    sheet_ = describe(app_.document(), selection_.items());
+    if (app_.jobs().busy()) {
+        stale_ = true;
+        return;
+    }
+    stale_ = false;
+    sheet_ = app_.read_document(
+        [this](const Document& document) { return describe(document, selection_.items()); });
     const bool empty = sheet_.title.isEmpty() && sheet_.rows.isEmpty();
     title_->setText(sheet_.title);
     title_->setVisible(!empty);
