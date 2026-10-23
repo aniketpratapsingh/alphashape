@@ -474,8 +474,16 @@ TEST_F(JobsTest, QuittingWhileRunningAsksToCancel) {
     EXPECT_EQ(asked_about, QStringLiteral("GateTask"));
     EXPECT_TRUE(app().jobs().busy());
 
+    // The cancelled task may have changed the project, so quitting now offers the usual
+    // unsaved-changes question.
+    bool asked_unsaved = false;
+    window().set_unsaved_handler([&](const QString&) {
+        asked_unsaved = true;
+        return UnsavedChoice::Discard;
+    });
     answer = true;
     EXPECT_TRUE(window().close());
+    EXPECT_TRUE(asked_unsaved);
     EXPECT_FALSE(app().jobs().busy());
     ASSERT_EQ(finished_.size(), 1U);
     EXPECT_EQ(finished_[0].state, JobManager::State::Cancelled);
