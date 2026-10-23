@@ -27,6 +27,10 @@
 
 namespace alphashape::gui {
 
+/// Window/tree title fragment for `document` ("Untitled" when it has no path). Pure: it reads
+/// the document it is given and takes no lock, so it is safe to call from inside read_document().
+QString document_title_of(const Document& document);
+
 class GuiApp : public QObject {
     Q_OBJECT
 
@@ -84,6 +88,8 @@ public:
     void save_document_as(const std::string& path);
 
     /// Window title fragment for the current document ("Untitled" when it has no path).
+    /// Takes the shared lock itself: call it from the GUI thread outside read_document(),
+    /// use document_title_of() for a document you already hold under the lock.
     QString document_title() const;
 
     /// True when the document differs from what was last loaded or saved. Edits made through

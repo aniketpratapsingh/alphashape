@@ -521,7 +521,14 @@ bool MainWindow::open_project(const QString& path) {
 }
 
 bool MainWindow::save_project() {
-    if (app_.document().path().empty()) {
+    // The menu action is disabled while a job runs; a programmatic or shortcut call is not.
+    if (app_.jobs().busy()) {
+        statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+        return false;
+    }
+    const QString current = app_.read_document(
+        [](const Document& document) { return QString::fromStdString(document.path()); });
+    if (current.isEmpty()) {
         return save_project_as();
     }
     try {
@@ -535,9 +542,16 @@ bool MainWindow::save_project() {
 }
 
 bool MainWindow::save_project_as() {
-    const QString current = QString::fromStdString(app_.document().path());
-    const QString suggested = current.isEmpty() ? app_.document_title() + QStringLiteral(".psx")
-                                                : current;
+    if (app_.jobs().busy()) {
+        statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+        return false;
+    }
+    const auto current = app_.read_document([](const Document& document) {
+        return QPair<QString, QString>(QString::fromStdString(document.path()),
+                                       document_title_of(document));
+    });
+    const QString suggested =
+        current.first.isEmpty() ? current.second + QStringLiteral(".psx") : current.first;
     QString path = save_path_handler_(suggested);
     if (path.isEmpty()) {
         return false;

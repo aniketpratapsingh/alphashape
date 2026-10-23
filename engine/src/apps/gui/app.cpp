@@ -228,7 +228,7 @@ constexpr Qt::CaseSensitivity kPathCase = Qt::CaseInsensitive;
 constexpr Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
 #endif
 void remove_path(QStringList& list, const QString& key) {
-    for (int i = list.size() - 1; i >= 0; --i) {
+    for (qsizetype i = list.size(); i-- > 0;) {
         if (list[i].compare(key, kPathCase) == 0) {
             list.removeAt(i);
         }
@@ -265,12 +265,16 @@ void GuiApp::clear_recent_files() {
     Q_EMIT recent_files_changed();
 }
 
-QString GuiApp::document_title() const {
-    const std::string path = read_document([](const Document& d) { return d.path(); });
+QString document_title_of(const Document& document) {
+    const std::string path = document.path();
     if (path.empty()) {
         return QStringLiteral("Untitled");
     }
     return QFileInfo(QString::fromStdString(path)).completeBaseName();
+}
+
+QString GuiApp::document_title() const {
+    return read_document([](const Document& d) { return document_title_of(d); });
 }
 
 }  // namespace alphashape::gui

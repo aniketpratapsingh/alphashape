@@ -413,6 +413,66 @@ TEST_F(WorkspaceTree, PropertiesTableIsReadOnly) {
     EXPECT_EQ(table->editTriggers(), QAbstractItemView::NoEditTriggers);
 }
 
+// Save As keeps the document's content but gives it a path; the Document sheet must follow.
+TEST_F(WorkspaceTree, PropertiesPathRowFollowsSaveAs) {
+    build_chunk("One");
+    model().refresh();
+    ASSERT_TRUE(pane().select(NodeRef{NodeKind::Document, -1, -1}));
+    EXPECT_EQ(props().title(), "Project");
+    EXPECT_EQ(props().value("Path"), "(unsaved)");
+
+    const QString path = scratch("survey.psx");
+    window().set_save_path_handler([&](const QString&) { return path; });
+    ASSERT_TRUE(trigger("action.file.save_as"));
+    EXPECT_EQ(props().value("Path"), path);
+    EXPECT_EQ(model().index(0, 0).data(Qt::DisplayRole).toString(), QStringLiteral("survey"));
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+// A slot whose data pointer is null (an asset the engine has not loaded) must not be dereferenced.
+TEST_F(WorkspaceTree, PropertiesTolerateUnloadedAssets) {
+    const std::int32_t id = build_chunk("One");
+    Chunk& chunk = chunk_ref(id);
+    const std::int32_t cloud_id = chunk.point_clouds().front().id;
+    const std::int32_t model_id = chunk.models().front().id;
+    const std::int32_t maps_id = chunk.add_depth_maps("Maps").id;
+    const std::int32_t dem_id = chunk.add_elevation("DEM").id;
+    const std::int32_t ortho_id = chunk.add_orthomosaic("Ortho").id;
+    TiledModelAsset tiled;
+    tiled.id = chunk.allocate_id();
+    tiled.label = "Tiles";
+    const std::int32_t tiled_id = tiled.id;
+    chunk.tiled_models().push_back(std::move(tiled));
+    chunk.set_active_tiled_model_id(tiled_id);
+
+    // Clear the payloads of the slots that live in the chunk; AssetSlot allows a null data pointer.
+    find_asset(chunk.point_clouds(), cloud_id)->data.reset();
+    find_asset(chunk.models(), model_id)->data.reset();
+    find_asset(chunk.depth_map_sets(), maps_id)->data.reset();
+    find_asset(chunk.elevations(), dem_id)->data.reset();
+    find_asset(chunk.orthomosaics(), ortho_id)->data.reset();
+    find_asset(chunk.tiled_models(), tiled_id)->data.reset();
+    model().refresh();
+    ASSERT_EQ(find_asset(chunk.depth_map_sets(), maps_id)->data, nullptr);
+
+    struct Case {
+        NodeKind kind;
+        std::int32_t item;
+    };
+    const Case cases[] = {
+        {NodeKind::PointCloud, cloud_id}, {NodeKind::Model, model_id},
+        {NodeKind::DepthMapSet, maps_id}, {NodeKind::TiledModel, tiled_id},
+        {NodeKind::Elevation, dem_id},    {NodeKind::Orthomosaic, ortho_id},
+    };
+    for (const Case& item : cases) {
+        ASSERT_TRUE(pane().select(NodeRef{item.kind, id, item.item}));
+        EXPECT_FALSE(props().title().isEmpty());
+        EXPECT_FALSE(props().rows().isEmpty());
+        EXPECT_FALSE(props().value("Enabled").isEmpty());
+    }
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
 // --- Jobs: the tree and the Properties pane obey the document concurrency rule ------------
 //
 // While a job is active the panes must not read the document and nothing may mutate it; when the

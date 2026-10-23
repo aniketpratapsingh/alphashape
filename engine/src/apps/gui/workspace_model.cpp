@@ -239,10 +239,12 @@ NodePtr build_chunk(const Document& document, const Chunk& chunk) {
     return chunk_node;
 }
 
-NodePtr build_root(GuiApp& app) {
-    const Document& document = app.document();
+/// Build the whole tree from `document`. Pure with respect to the app: it takes no lock and
+/// calls nothing that does, so build_fresh() can run it inside read_document() without a nested
+/// shared lock (which is undefined for std::shared_mutex and deadlocks against a waiting writer).
+NodePtr build_root(const Document& document, const QString& title) {
     auto root = std::make_unique<Node>();
-    Node* doc_node = adopt(*root, make_node(NodeKind::Document, -1, -1, app.document_title()));
+    Node* doc_node = adopt(*root, make_node(NodeKind::Document, -1, -1, title));
     for (const auto& workspace : document.workspaces()) {
         for (const auto& chunk : workspace->chunks()) {
             adopt(*doc_node, build_chunk(document, *chunk));
@@ -259,7 +261,7 @@ Key key_of(const NodeRef& ref) { return {static_cast<int>(ref.kind), ref.chunk_i
 // --- WorkspaceModel ----------------------------------------------------------------------
 
 WorkspaceModel::WorkspaceModel(GuiApp& app, QObject* parent)
-    : QAbstractItemModel(parent), app_(app), root_(build_root(app)) {
+    : QAbstractItemModel(parent), app_(app), root_(build_fresh()) {
     connect(&app_, &GuiApp::document_replaced, this, &WorkspaceModel::reset);
     connect(&app_, &GuiApp::undo_changed, this, &WorkspaceModel::refresh);
     connect(&app_, &GuiApp::path_changed, this, &WorkspaceModel::refresh);
@@ -274,7 +276,8 @@ WorkspaceModel::WorkspaceModel(GuiApp& app, QObject* parent)
 // goes through read_document() (shared lock), and is skipped entirely while busy(); the trigger is
 // remembered in stale_ and served when the manager reports job_finished.
 std::unique_ptr<detail::TreeNode> WorkspaceModel::build_fresh() {
-    return app_.read_document([this](const Document&) { return build_root(app_); });
+    return app_.read_document(
+        [](const Document& document) { return build_root(document, document_title_of(document)); });
 }
 
 void WorkspaceModel::refresh_after_job() {

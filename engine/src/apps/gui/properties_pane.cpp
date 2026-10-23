@@ -218,11 +218,15 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->point_clouds(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_point_cloud_id());
-                const PointCloud& cloud = *slot->data;
-                add(r, QObject::tr("Points"), num(cloud.points.size()));
-                add(r, QObject::tr("Colours"), yes_no(!cloud.colours.empty()));
-                add(r, QObject::tr("Normals"), yes_no(!cloud.normals.empty()));
-                add(r, QObject::tr("Confidence"), yes_no(!cloud.confidence.empty()));
+                if (slot->data) {
+                    const PointCloud& cloud = *slot->data;
+                    add(r, QObject::tr("Points"), num(cloud.points.size()));
+                    add(r, QObject::tr("Colours"), yes_no(!cloud.colours.empty()));
+                    add(r, QObject::tr("Normals"), yes_no(!cloud.normals.empty()));
+                    add(r, QObject::tr("Confidence"), yes_no(!cloud.confidence.empty()));
+                } else {
+                    add(r, QObject::tr("Points"), QObject::tr("(not loaded)"));
+                }
                 return true;
             }
             return false;
@@ -230,14 +234,19 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->models(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_model_id());
-                const Mesh& mesh = *slot->data;
-                add(r, QObject::tr("Vertices"), num(mesh.vertices.size()));
-                add(r, QObject::tr("Faces"), num(mesh.faces.size()));
+                if (slot->data) {
+                    const Mesh& mesh = *slot->data;
+                    add(r, QObject::tr("Vertices"), num(mesh.vertices.size()));
+                    add(r, QObject::tr("Faces"), num(mesh.faces.size()));
+                } else {
+                    add(r, QObject::tr("Faces"), QObject::tr("(not loaded)"));
+                }
                 add(r, QObject::tr("Textured"), yes_no(!slot->textures.empty()));
                 if (!slot->textures.empty()) {
                     add(r, QObject::tr("Texture pages"), num(slot->textures.size()));
                 }
-                add(r, QObject::tr("Vertex colours"), yes_no(!mesh.colours.empty()));
+                add(r, QObject::tr("Vertex colours"),
+                    slot->data ? yes_no(!slot->data->colours.empty()) : QObject::tr("(not loaded)"));
                 return true;
             }
             return false;
@@ -245,11 +254,15 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->depth_map_sets(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_depth_maps_id());
-                add(r, QObject::tr("Depth maps"), num(slot->data->size()));
-                if (!slot->data->empty()) {
-                    const DepthMap& first = slot->data->front();
-                    add(r, QObject::tr("Resolution"), size_text(first.width, first.height));
-                    add(r, QObject::tr("Downscale"), QString::number(first.downscale));
+                if (slot->data) {
+                    add(r, QObject::tr("Depth maps"), num(slot->data->size()));
+                    if (!slot->data->empty()) {
+                        const DepthMap& first = slot->data->front();
+                        add(r, QObject::tr("Resolution"), size_text(first.width, first.height));
+                        add(r, QObject::tr("Downscale"), QString::number(first.downscale));
+                    }
+                } else {
+                    add(r, QObject::tr("Depth maps"), QObject::tr("(not loaded)"));
                 }
                 return true;
             }
@@ -258,7 +271,8 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->tiled_models(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_tiled_model_id());
-                add(r, QObject::tr("Size (bytes)"), num(slot->data->payload.size()));
+                add(r, QObject::tr("Size (bytes)"),
+                    slot->data ? num(slot->data->payload.size()) : QObject::tr("(not loaded)"));
                 return true;
             }
             return false;
@@ -266,9 +280,13 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->elevations(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_elevation_id());
-                describe_raster(r, slot->data->raster.grid, slot->data->epsg);
-                add(r, QObject::tr("Source"), qs(slot->data->source));
-                add(r, QObject::tr("No-data value"), num(static_cast<double>(slot->data->nodata)));
+                if (slot->data) {
+                    describe_raster(r, slot->data->raster.grid, slot->data->epsg);
+                    add(r, QObject::tr("Source"), qs(slot->data->source));
+                    add(r, QObject::tr("No-data value"), num(static_cast<double>(slot->data->nodata)));
+                } else {
+                    add(r, QObject::tr("Resolution"), QObject::tr("(not loaded)"));
+                }
                 return true;
             }
             return false;
@@ -276,8 +294,12 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
             if (const auto* slot = find_asset(chunk->orthomosaics(), id)) {
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_orthomosaic_id());
-                describe_raster(r, slot->data->raster.grid, slot->data->epsg);
-                add(r, QObject::tr("Surface"), qs(slot->data->surface));
+                if (slot->data) {
+                    describe_raster(r, slot->data->raster.grid, slot->data->epsg);
+                    add(r, QObject::tr("Surface"), qs(slot->data->surface));
+                } else {
+                    add(r, QObject::tr("Resolution"), QObject::tr("(not loaded)"));
+                }
                 return true;
             }
             return false;
@@ -431,6 +453,8 @@ PropertiesPane::PropertiesPane(GuiApp& app, WorkspaceSelection& selection, QWidg
     connect(&selection_, &WorkspaceSelection::changed, this, &PropertiesPane::rebuild);
     connect(&app_, &GuiApp::undo_changed, this, &PropertiesPane::rebuild);
     connect(&app_, &GuiApp::document_replaced, this, &PropertiesPane::rebuild);
+    // Save As changes the Document "Path" row without touching the document's content.
+    connect(&app_, &GuiApp::path_changed, this, &PropertiesPane::rebuild);
     // Tasks change the document without going through commands, so every finished job re-reads it.
     connect(&app_.jobs(), &JobManager::job_finished, this,
             [this](quint64, JobManager::State, const QString&) { rebuild(); });
