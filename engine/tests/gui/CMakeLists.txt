@@ -1,4 +1,5 @@
-# GUI tests: Theme.*, GuiShell.*, GuiApp.*, CommandLine.*. Registered with ctest like the engine
+# GUI tests: Theme.*, GuiShell.*, GuiApp.*, CommandLine.*, MainWindow.* (the last on the
+# harness in harness.hpp). Registered with ctest like the engine
 # suite, so they run in the CI shard lanes. QT_QPA_PLATFORM=offscreen: no display needed.
 
 find_package(GTest REQUIRED)
@@ -8,6 +9,8 @@ set(CMAKE_AUTOMOC OFF)
 
 add_executable(alphashape_gui_tests
     test_main.cpp
+    harness.cpp
+    test_main_window.cpp
     test_command_line.cpp
     test_theme.cpp
     test_gui_app.cpp
