@@ -1,0 +1,7 @@
+alphashape Python module (Python 3.x matching the file name, arm64)
+
+  export PYTHONPATH="/Applications/alphashape.app/Contents/Resources/python"
+  python3 -c "import alphashape; print(alphashape.__file__)"
+
+The module finds its PROJ data, Vulkan loader and MoltenVK inside the app by itself.
+Use the Python version named in the module's file name (for example cpython-313).

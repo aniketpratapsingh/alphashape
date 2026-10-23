@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Install-and-run check for the macOS DMG, executed on a fresh runner.
+# Usage: smoke-app.sh <alphashape-*.dmg> <data-dir>
+#   python3 on PATH must be the version the bundled module was built for.
+set -euo pipefail
+
+dmg=$1
+data=$2
+work=$(mktemp -d)
+mnt="$work/mnt"
+mkdir "$mnt"
+hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -readonly
+trap 'hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+
+echo "== image contents"
+ls -la "$mnt"
+[ -L "$mnt/Applications" ] || { echo "error: no /Applications link in the DMG" >&2; exit 1; }
+
+ditto "$mnt/alphashape.app" "$work/alphashape.app"
+app="$work/alphashape.app"
+cli="$app/Contents/MacOS/alphashape-cli"
+gui="$app/Contents/MacOS/alphashape-gui"
+
+echo "== bundle metadata"
+plutil -p "$app/Contents/Info.plist"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = org.alphashape.app ]
+[ -f "$app/Contents/Resources/alphashape.icns" ]
+codesign --verify --deep --strict --verbose=2 "$app"
+lipo -archs "$cli" | grep -qx arm64
+
+echo "== no Homebrew or /usr/local references in any Mach-O"
+count=0
+bad=0
+while IFS= read -r f; do
+    if ! head -c4 "$f" | xxd -p | grep -qE '^(cffaedfe|feedfacf|cafebabe|bebafeca)$'; then continue; fi
+    count=$((count + 1))
+    if otool -L "$f" | tail -n +2 | grep -E '/opt/homebrew|/usr/local|/Users/|/Volumes/'; then
+        echo "error: $f references a build-machine path" >&2
+        bad=1
+    fi
+    if otool -l "$f" | grep -A2 LC_RPATH | grep -E 'path /'; then
+        echo "error: $f has an absolute rpath" >&2
+        bad=1
+    fi
+done < <(find "$app" -type f ! -name '*.png' ! -name '*.icns')
+echo "checked $count Mach-O files"
+[ "$count" -gt 20 ] || { echo "error: suspiciously few Mach-O files" >&2; exit 1; }
+[ "$bad" = 0 ] || exit 1
+
+echo "== CLI"
+"$cli" --help
+"$cli" --list-tasks | tee "$work/tasks.txt"
+grep -q '^AddPhotos' "$work/tasks.txt"
+
+echo "== PROJ data comes from the bundle"
+"$cli" --proj-info | tee "$work/proj.txt"
+grep -q "alphashape.app/Contents/Resources/share/proj/proj.db" "$work/proj.txt"
+
+echo "== project from images (JPEG and project I/O)"
+"$cli" --new "$work/smoke.psx" --add-images "$data"/aerial_r0c0.jpg "$data"/aerial_r0c1.jpg
+test -s "$work/smoke.psx"
+
+echo "== GPU: Vulkan loader and MoltenVK from the bundle"
+DYLD_PRINT_LIBRARIES=1 "$cli" --gpu-info >"$work/gpu.out" 2>"$work/gpu.err" || {
+    cat "$work/gpu.out" "$work/gpu.err"; echo "error: no Vulkan device enumerated" >&2; exit 1; }
+cat "$work/gpu.out"
+grep -q '^gpu device 0:' "$work/gpu.out"
+grep -q "alphashape.app/Contents/Frameworks/libvulkan.1.dylib" "$work/gpu.err"
+grep -q "alphashape.app/Contents/Frameworks/libMoltenVK.dylib" "$work/gpu.err"
+
+echo "== GUI (offscreen)"
+QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
+grep -q 'gui ready' "$work/gui.txt"
+
+echo "== Python module"
+PYTHONPATH="$app/Contents/Resources/python" python3 - <<'PY'
+import sys
+import alphashape
+assert "alphashape.app/Contents/Resources/python" in alphashape.__file__, alphashape.__file__
+tasks = alphashape.list_tasks()
+assert "AddPhotos" in tasks, tasks
+print("alphashape python module ok:", alphashape.__file__, len(tasks), "tasks")
+PY
+
+echo "macOS bundle smoke test passed"
