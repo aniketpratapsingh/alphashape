@@ -109,8 +109,12 @@ if(ALPHASHAPE_SANITIZE)
     # ASan's option parser splits an unquoted value at whitespace, and this
     # source tree lives under a path containing a space, so the suppressions
     # path is wrapped in single quotes — ASan strips them before opening it.
+    # ALPHASHAPE_SANITIZE_ASAN_OPTIONS is the leading part of ASAN_OPTIONS (default
+    # keeps LeakSanitizer off); the Linux sanitizer CI job passes
+    # "detect_leaks=1:abort_on_error=1". lsan.supp only matters when leak detection is on.
+    set(_alphashape_lsan_supp "${PROJECT_SOURCE_DIR}/cmake/sanitizers/lsan.supp")
     set_target_properties(alphashape_tests PROPERTIES TEST_LAUNCHER
-        "${CMAKE_COMMAND};-E;env;ASAN_OPTIONS=detect_leaks=0:suppressions='${_alphashape_asan_supp}';UBSAN_OPTIONS=print_stacktrace=1")
+        "${CMAKE_COMMAND};-E;env;ASAN_OPTIONS=${ALPHASHAPE_SANITIZE_ASAN_OPTIONS}:suppressions='${_alphashape_asan_supp}';LSAN_OPTIONS=suppressions='${_alphashape_lsan_supp}';UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
     # The instrumented Debug binary takes longer than the 5 s default just to
     # start up and enumerate its tests, and the slowest tests (StructureBuilder,
     # under ASan) run for several minutes.
