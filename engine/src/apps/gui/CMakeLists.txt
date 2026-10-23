@@ -49,5 +49,8 @@ qt_add_resources(alphashape_gui_lib alphashape_fonts
 add_executable(alphashape-gui main.cpp)
 target_link_libraries(alphashape-gui PRIVATE alphashape_gui_lib alphashape_warnings)
 target_compile_definitions(alphashape-gui PRIVATE ALPHASHAPE_GUI_VERSION="${PROJECT_VERSION}")
-# Console subsystem on Windows for now: --help, --version and the smoke run write to stdout.
-# The installer WP switches the shipped binary to a windowed one.
+# Console subsystem on every platform, including the installed Windows copy: --help,
+# --version, --offscreen-smoke and diagnostics all write to stdout, and the packaging
+# smoke tests read it. A GUI-subsystem build (no console window beside the app) is a
+# separate change: it needs the WinMain entry point, and every test that captures this
+# executable's output would have to stop relying on it. See engine/LIMITATIONS.md.

@@ -19,6 +19,7 @@
 #include "base/platform/console.hpp"
 #include "base/platform/dynamic_library.hpp"
 #include "base/platform/env.hpp"
+#include "base/platform/paths.hpp"
 #include "base/platform/process.hpp"
 #include "base/platform/temp.hpp"
 
@@ -27,6 +28,11 @@ namespace {
 
 namespace fs = std::filesystem;
 namespace plat = platform;
+
+/// A data address inside this test binary, used as a module anchor. Data
+/// rather than a function so no function-pointer-to-void* conversion is
+/// involved (that conversion is only conditionally supported).
+const int kAnchorAddress = 0;
 
 TEST(Platform, TempDirectoryIsWritable) {
     const std::string dir = plat::temp_directory();
@@ -216,6 +222,42 @@ TEST(Platform, EnvRoundTrip) {
 
     // An unset variable reads empty, never null-derefs.
     EXPECT_EQ(plat::get_env("ALPHASHAPE_PLATFORM_TEST_VAR_NEVER_SET"), "");
+}
+
+TEST(Platform, ExecutablePathNamesThisBinary) {
+    const std::string exe = plat::executable_path();
+    ASSERT_FALSE(exe.empty()) << "the platform could not name the running image";
+    const fs::path path(exe);
+    EXPECT_TRUE(fs::exists(path)) << exe;
+    EXPECT_TRUE(fs::is_regular_file(path)) << exe;
+    // The test process is alphashape_tests(.exe): the stem must say so rather
+    // than naming some unrelated loader path.
+    EXPECT_NE(path.stem().string().find("alphashape"), std::string::npos) << exe;
+}
+
+TEST(Platform, ModulePathOfAnAddressInThisImage) {
+    // An address inside this test binary: module_path must resolve it to the
+    // image executable_path names. That is the property the PROJ data search
+    // relies on when the Python extension module is the loaded image. A data
+    // address is used rather than a function pointer because casting a function
+    // pointer to void* is only conditionally supported.
+    const std::string exe = plat::executable_path();
+    ASSERT_FALSE(exe.empty());
+    const std::string module = plat::module_path(&kAnchorAddress);    ASSERT_FALSE(module.empty()) << "no image resolved for an address in this binary";
+
+    // Compare canonical paths: the loader may report one through a symlink
+    // (Homebrew's bin/) and the other not.
+    std::error_code ec_exe;
+    std::error_code ec_module;
+    const fs::path resolved_exe = fs::weakly_canonical(fs::path(exe), ec_exe);
+    const fs::path resolved_module = fs::weakly_canonical(fs::path(module), ec_module);
+    ASSERT_FALSE(ec_exe) << ec_exe.message();
+    ASSERT_FALSE(ec_module) << ec_module.message();
+    EXPECT_EQ(resolved_module.filename(), resolved_exe.filename());
+    EXPECT_EQ(resolved_module.parent_path(), resolved_exe.parent_path());
+
+    // A null anchor is a caller bug, not a crash.
+    EXPECT_EQ(plat::module_path(nullptr), "");
 }
 
 }  // namespace

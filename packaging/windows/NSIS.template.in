@@ -1,0 +1,417 @@
+; alphashape's Windows installer script (M29 WP-29.7).
+;
+; CPack configures this file (it replaces the at-sign placeholders with
+; CPack variables) and runs makensis. It is found through CPACK_MODULE_PATH,
+; which cpack turns into CMAKE_MODULE_PATH when it searches for
+; "NSIS.template.in" (cmCPackGenerator::FindTemplate), so
+; engine/cmake/alphashape_windows_install.cmake points that at packaging/windows.
+;
+; Why this file exists rather than CPack's stock template: the stock one always
+; requires administrator rights and always installs into %ProgramFiles%. This
+; installer defaults to a per-user install into %LOCALAPPDATA%\Programs\alphashape
+; that needs no administrator rights, and offers a per-machine install into
+; %ProgramFiles% when the process is elevated. MultiUser.nsh supplies the mode
+; handling, the /CurrentUser and /AllUsers command-line switches, and the
+; uninstaller's ability to find the right registry hive again.
+;
+; It is deliberately simpler than the stock template: uninstall deletes every
+; file CPack staged (CPACK_NSIS_DELETE_FILES is built from the complete staged
+; tree, not per component), so there is no per-component registry bookkeeping
+; that could drift out of step with what is actually on disk.
+
+Unicode true
+
+!define VERSION "@CPACK_PACKAGE_VERSION@"
+!define PRODUCT "@CPACK_NSIS_DISPLAY_NAME@"
+!define VENDOR "@CPACK_PACKAGE_VENDOR@"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\@CPACK_PACKAGE_INSTALL_REGISTRY_KEY@"
+!define APP_KEY "Software\@CPACK_PACKAGE_VENDOR@\@CPACK_PACKAGE_INSTALL_REGISTRY_KEY@"
+!define INSTALL_DIR_NAME "@CPACK_PACKAGE_INSTALL_DIRECTORY@"
+!define MACHINE_ROOT "@CPACK_NSIS_INSTALL_ROOT@"
+!define INST_DIR "@CPACK_TEMPORARY_DIRECTORY@"
+
+Name "@CPACK_NSIS_PACKAGE_NAME@"
+OutFile "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
+; Per-user by default: no elevation, no administrator password, and the
+; uninstaller runs without one too. MultiUser overrides this for a per-machine
+; install.
+InstallDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
+SetCompressor /SOLID @CPACK_NSIS_COMPRESSOR@
+SetCompressorDictSize 64
+; MultiUser.nsh emits RequestExecutionLevel from this. "Highest" means: elevated
+; when the user can be elevated (so a per-machine install can write
+; %ProgramFiles% and HKLM), unelevated otherwise, where only the per-user mode
+; is offered. The default MODE is still per-user; see
+; MULTIUSER_INSTALLMODE_DEFAULT_CURRENTUSER.
+!define MULTIUSER_EXECUTIONLEVEL Highest
+!define MULTIUSER_MUI
+; /CurrentUser and /AllUsers select the mode unattended, which is how CI
+; exercises both.
+!define MULTIUSER_INSTALLMODE_COMMANDLINE
+!define MULTIUSER_INSTALLMODE_DEFAULT_CURRENTUSER
+!define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_KEY "${UNINSTALL_KEY}"
+!define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_VALUENAME "InstallMode"
+; MULTIUSER_INSTALLMODE_INSTDIR is deliberately NOT defined: MultiUser would
+; then rewrite $INSTDIR and nothing here wants that. $INSTDIR is adjusted for
+; the mode in .onInit instead, so an explicit "/D=<dir>" survives.
+
+!include "MUI2.nsh"
+!include "MultiUser.nsh"
+!include "LogicLib.nsh"
+!include "FileFunc.nsh"
+!include "WinMessages.nsh"
+; SectionSetFlags and ${SF_SELECTED} live here; MUI2 does not pull it in.
+!include "Sections.nsh"
+
+!define MUI_ABORTWARNING
+!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\alphashape.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Start alphashape"
+
+;--------------------------------
+; Installer icons. CPack fills this with "!define MUI_ICON ..." lines when
+; CPACK_NSIS_MUI_ICON / CPACK_NSIS_MUI_UNIICON are set, and with nothing at all
+; when they are not, so the default icon is never overridden with "".
+@CPACK_NSIS_INSTALLER_MUI_ICON_CODE@
+
+Var PerUserDefaultDir
+Var PathEntry
+
+;--------------------------------
+; Pages
+; Declared before the component sections: MUI_PAGE_COMPONENTS is what declares
+; the description widgets that MUI_DESCRIPTION_TEXT writes to, and the installer
+; then reaches them through SectionSetFlags/component state.
+
+@CPACK_NSIS_INSTALLER_WELCOME_TITLE_CODE@
+@CPACK_NSIS_INSTALLER_WELCOME_TITLE_3LINES_CODE@
+!insertmacro MUI_PAGE_WELCOME
+
+@CPACK_NSIS_LICENSE_PAGE@
+
+; Offers "for me" / "for all users". MultiUser hides the choice by itself when
+; the process is not elevated, going straight to the per-user default.
+!insertmacro MULTIUSER_PAGE_INSTALLMODE
+
+!insertmacro MUI_PAGE_DIRECTORY
+@CPACK_NSIS_PAGE_COMPONENTS@
+!insertmacro MUI_PAGE_INSTFILES
+@CPACK_NSIS_INSTALLER_FINISH_TITLE_CODE@
+@CPACK_NSIS_INSTALLER_FINISH_TITLE_3LINES_CODE@
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+;--------------------------------
+; Components
+
+; CPack writes one Section per selected component, each ending with SectionEnd.
+; The description table follows them because MUI_DESCRIPTION_TEXT names the
+; section constants CPack just defined.
+@CPACK_NSIS_COMPONENT_SECTIONS@
+
+@CPACK_NSIS_INSTALLER_MUI_COMPONENTS_DESC@
+
+; "Add to PATH" is a section rather than a component: NSIS cannot show a
+; component that owns no file, and bin\ belongs to the gui and cli components.
+; /o deselects it so that no installer edits PATH unasked; the components page
+; can still tick it, and /AddToPath does it unattended.
+Section /o "Add to PATH" SecPath
+  Call AddToPath
+SectionEnd
+
+!insertmacro MUI_LANGUAGE "English"
+
+;--------------------------------
+; Install-mode initialization
+
+Function .onInit
+  StrCpy $PerUserDefaultDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
+
+  !insertmacro MULTIUSER_INIT
+
+  ; The mode decides the default directory, but only while the caller has not
+  ; chosen one. $INSTDIR already holds either the InstallDir default, or the
+  ; value a "/D=<dir>" put there before .onInit, or - once an install exists -
+  ; the previous install's directory. Anything that is neither default is
+  ; treated as the caller's and left alone.
+  ${If} $MultiUser.InstallMode == "AllUsers"
+    StrCmp "$INSTDIR" "$PerUserDefaultDir" 0 +2
+      StrCpy $INSTDIR "${MACHINE_ROOT}\${INSTALL_DIR_NAME}"
+  ${Else}
+    StrCmp "$INSTDIR" "${MACHINE_ROOT}\${INSTALL_DIR_NAME}" 0 +2
+      StrCpy $INSTDIR "$PerUserDefaultDir"
+  ${EndIf}
+
+  ; A silent install has no components page, so the PATH section cannot be
+  ; ticked by hand there.
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/AddToPath" $1
+  ${IfNot} ${Errors}
+    SectionSetFlags ${SecPath} ${SF_SELECTED}
+  ${EndIf}
+FunctionEnd
+
+Function un.onInit
+  !insertmacro MULTIUSER_UNINIT
+FunctionEnd
+
+;--------------------------------
+; PATH. An NSIS string holds 1024 characters, so a PATH near that limit is left
+; alone with a message instead of being truncated, which would lose entries.
+;
+; Both routines walk PATH one element at a time instead of doing string
+; replacement. Replacement cannot tell an element from a prefix of a longer one
+; (";C:\x\bin" also matches ";C:\x\bin2"), and PATH comparisons on Windows are
+; case-insensitive and ignore a trailing backslash, so the comparison below
+; normalises both.
+
+!macro BROADCAST_ENV_CHANGE
+  SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
+!macroend
+
+!macro READ_PATH_HIVE OUT
+  ${If} $MultiUser.InstallMode == "AllUsers"
+    ReadRegStr ${OUT} HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+  ${Else}
+    ReadRegStr ${OUT} HKCU "Environment" "Path"
+  ${EndIf}
+!macroend
+
+!macro WRITE_PATH_HIVE VALUE
+  ${If} $MultiUser.InstallMode == "AllUsers"
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "${VALUE}"
+  ${Else}
+    WriteRegExpandStr HKCU "Environment" "Path" "${VALUE}"
+  ${EndIf}
+!macroend
+
+; Walks $0 (a PATH) and rebuilds it in $3 without any element that equals
+; $PathEntry; $9 is 1 when such an element was found, 0 otherwise. An empty
+; element (the "" between two ";;", or a trailing ";") is dropped, which is what
+; Windows itself does when it parses PATH.
+;
+; Elements are compared whole. String replacement cannot do this: ";C:\x\bin" is
+; also a prefix of ";C:\x\bin2". StrCmp is case-insensitive, matching how
+; Windows compares PATH entries, and one trailing backslash is ignored on both
+; sides because "C:\x\bin" and "C:\x\bin\" name the same directory.
+;
+; Clobbers $1-$8 apart from $PathEntry. On return $3 holds the rebuilt PATH.
+!macro REBUILD_PATH_WITHOUT_ENTRY
+  StrCpy $3 ""
+  StrCpy $9 0
+  StrCpy $4 0                       ; scan position in $0
+  StrLen $6 $0
+
+  ; Normalise the entry being looked for once.
+  StrCpy $8 $PathEntry
+  StrCpy $2 $8 1 -1
+  ${If} $2 == "\"
+    StrCpy $8 $8 -1
+  ${EndIf}
+
+  ${Do}
+    ${If} $4 >= $6
+      ${ExitDo}
+    ${EndIf}
+
+    ; Copy the element starting at $4 up to the next ';'.
+    StrCpy $5 ""
+    StrCpy $7 $4
+    ${Do}
+      StrCpy $2 $0 1 $7
+      ${If} $2 == ""
+      ${OrIf} $2 == ";"
+        ${ExitDo}
+      ${EndIf}
+      StrCpy $5 "$5$2"
+      IntOp $7 $7 + 1
+    ${Loop}
+
+    ; One trailing backslash is not significant.
+    StrCpy $2 $5 1 -1
+    ${If} $5 != ""
+    ${AndIf} $2 == "\"
+      StrCpy $5 $5 -1
+    ${EndIf}
+
+    ${If} $5 == ""
+      ; Empty element: drop it rather than keep a doubled separator.
+    ${ElseIf} $5 == $8
+      StrCpy $9 1
+    ${Else}
+      ${If} $3 == ""
+        StrCpy $3 "$5"
+      ${Else}
+        StrCpy $3 "$3;$5"
+      ${EndIf}
+    ${EndIf}
+
+    IntOp $4 $7 + 1
+  ${Loop}
+!macroend
+
+Function AddToPath
+  StrCpy $PathEntry "$INSTDIR\bin"
+
+  !insertmacro READ_PATH_HIVE $0
+
+  StrLen $1 $0
+  ${If} $1 > 900
+    IfSilent pathTooLongSilent
+    MessageBox MB_OK|MB_ICONEXCLAMATION "The PATH environment variable is too long for this \
+installer to edit safely. Add $\"$PathEntry$\" to your PATH by hand."
+    Goto pathDone
+    pathTooLongSilent:
+    DetailPrint "PATH is too long to edit safely; not adding $PathEntry"
+    Goto pathDone
+  ${EndIf}
+
+  !insertmacro REBUILD_PATH_WITHOUT_ENTRY
+  ${If} $9 == 1
+    DetailPrint "$PathEntry is already on PATH"
+    Goto pathDone
+  ${EndIf}
+
+  ; $3 is the cleaned PATH, so this also drops stray empty elements.
+  ${If} $3 == ""
+    StrCpy $3 "$PathEntry"
+  ${Else}
+    StrCpy $3 "$3;$PathEntry"
+  ${EndIf}
+  !insertmacro WRITE_PATH_HIVE $3
+  !insertmacro BROADCAST_ENV_CHANGE
+  DetailPrint "Added $PathEntry to PATH"
+
+  pathDone:
+FunctionEnd
+
+Function un.RemoveFromPath
+  StrCpy $PathEntry "$INSTDIR\bin"
+
+  !insertmacro READ_PATH_HIVE $0
+  StrCmp $0 "" pathDone
+
+  StrLen $1 $0
+  ${If} $1 > 900
+    DetailPrint "PATH is too long to edit safely; leaving it alone"
+    Goto pathDone
+  ${EndIf}
+
+  !insertmacro REBUILD_PATH_WITHOUT_ENTRY
+  ${If} $9 == 0
+    DetailPrint "$PathEntry was not on PATH"
+    Goto pathDone
+  ${EndIf}
+
+  ; Only write when something changed, so an uninstall that never added the
+  ; entry cannot rewrite PATH at all.
+  ${If} $3 == $0
+    Goto pathDone
+  ${EndIf}
+
+  ${If} $3 == ""
+    ${If} $MultiUser.InstallMode == "AllUsers"
+      DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    ${Else}
+      DeleteRegValue HKCU "Environment" "Path"
+    ${EndIf}
+  ${Else}
+    !insertmacro WRITE_PATH_HIVE $3
+  ${EndIf}
+  !insertmacro BROADCAST_ENV_CHANGE
+  DetailPrint "Removed $PathEntry from PATH"
+
+  pathDone:
+FunctionEnd
+
+;--------------------------------
+; Core section: everything no component owns. The hidden "-" prefix keeps it off
+; the components page while still installing it unconditionally.
+
+Section "-Installation"
+  SetOutPath "$INSTDIR"
+
+  @CPACK_NSIS_EXTRA_PREINSTALL_COMMANDS@
+
+  ; Every file of every component. CPack's per-component sections each do their
+  ; own "File" commands; this one only writes the metadata.
+  @CPACK_NSIS_FULL_INSTALL@
+
+  ; The uninstaller reads this from both hives to find the install mode again.
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "InstallMode" "$MultiUser.InstallMode"
+  WriteRegStr SHCTX "${APP_KEY}" "InstallDir" "$INSTDIR"
+  WriteRegStr SHCTX "${APP_KEY}" "Version" "${VERSION}"
+
+  WriteUninstaller "$INSTDIR\@CPACK_NSIS_UNINSTALL_NAME@.exe"
+
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT}"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\@CPACK_NSIS_INSTALLED_ICON_NAME@"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "Publisher" "${VENDOR}"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "URLInfoAbout" "@CPACK_NSIS_URL_INFO_ABOUT@"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "HelpLink" "@CPACK_NSIS_HELP_LINK@"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "Contact" "@CPACK_NSIS_CONTACT@"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\@CPACK_NSIS_UNINSTALL_NAME@.exe"'
+  WriteRegStr SHCTX "${UNINSTALL_KEY}" "QuietUninstallString" \
+      '"$INSTDIR\@CPACK_NSIS_UNINSTALL_NAME@.exe" /S'
+  WriteRegDWORD SHCTX "${UNINSTALL_KEY}" "NoModify" 1
+  WriteRegDWORD SHCTX "${UNINSTALL_KEY}" "NoRepair" 1
+
+  ; The size Settings > Apps shows: measured from what was actually written
+  ; rather than baked in at build time.
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  IntFmt $0 "0x%08X" $0
+  WriteRegDWORD SHCTX "${UNINSTALL_KEY}" "EstimatedSize" "$0"
+
+  CreateDirectory "$SMPROGRAMS\${PRODUCT}"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT}\alphashape.lnk" "$INSTDIR\bin\alphashape.exe"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT}\Uninstall alphashape.lnk" \
+                 "$INSTDIR\@CPACK_NSIS_UNINSTALL_NAME@.exe"
+
+  @CPACK_NSIS_EXTRA_INSTALL_COMMANDS@
+SectionEnd
+
+;--------------------------------
+; Uninstaller
+
+Section "Uninstall"
+  @CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS@
+
+  ; Every staged file, whichever components were selected: a file that was not
+  ; installed is simply absent, and Delete is a no-op for it.
+  @CPACK_NSIS_DELETE_FILES@
+  @CPACK_NSIS_DELETE_DIRECTORIES@
+
+  Delete "$INSTDIR\@CPACK_NSIS_UNINSTALL_NAME@.exe"
+
+  ; Only touch PATH if the entry is really there; RemoveFromPath decides.
+  Call un.RemoveFromPath
+
+  Delete "$SMPROGRAMS\${PRODUCT}\alphashape.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT}\Uninstall alphashape.lnk"
+  RMDir "$SMPROGRAMS\${PRODUCT}"
+
+  ; Empty directories bottom-up. The list above only covers directories that
+  ; existed at package time; this catches the rest and then the install root.
+  RMDir "$INSTDIR\bin\platforms"
+  RMDir "$INSTDIR\bin\styles"
+  RMDir "$INSTDIR\bin\imageformats"
+  RMDir "$INSTDIR\bin\networkinformation"
+  RMDir "$INSTDIR\bin\tls"
+  RMDir "$INSTDIR\bin"
+  RMDir "$INSTDIR\python"
+  RMDir "$INSTDIR\share\proj"
+  RMDir "$INSTDIR\share"
+  RMDir "$INSTDIR\LICENSES\Qt"
+  RMDir "$INSTDIR\LICENSES\Fonts"
+  RMDir "$INSTDIR\LICENSES"
+  ; The per-user default's "Programs" parent may now be empty; RMDir refuses a
+  ; directory that still holds anything, so this only removes an empty one.
+  RMDir "$INSTDIR"
+
+  DeleteRegKey SHCTX "${UNINSTALL_KEY}"
+  DeleteRegKey SHCTX "${APP_KEY}"
+SectionEnd

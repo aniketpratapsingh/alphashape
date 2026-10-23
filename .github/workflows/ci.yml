@@ -64,7 +64,7 @@ jobs:
           package=false
           if [ "$REQUESTED" = true ]; then package=true; fi
           if [ "$EVENT" = pull_request ] && git diff --name-only "$BASE" HEAD |
-               grep -qE '^(packaging/|engine/cmake/alphashape_(install|macos_bundle)\.cmake|\.github/workflows/(build|ci)\.yml)'; then
+               grep -qE '^(packaging/|engine/cmake/alphashape_(install|macos_bundle|windows_install)\.cmake|\.github/workflows/(build|ci)\.yml)'; then
             package=true
           fi
           echo "package=$package" >> "$GITHUB_OUTPUT"
@@ -78,6 +78,11 @@ jobs:
       # PRs run the light lanes only; main runs everything (see .github/ci/test-lanes.json).
       full: ${{ github.event_name != 'pull_request' }}
 
+  # CI OK depends on `build`, which is the whole reusable build.yml run, so every
+  # job inside it gates CI OK by failing that run -- including the packaging jobs
+  # (linux-package-smoke, macos-package-smoke, windows-package,
+  # windows-package-smoke). When `package` is false those jobs are skipped and a
+  # skipped job inside a reusable workflow does not fail it.
   ci-ok:
     name: CI OK
     if: always()

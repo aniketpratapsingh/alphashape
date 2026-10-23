@@ -24,6 +24,10 @@ option(ALPHASHAPE_BUILD_TESTS   "Build the test suite"        ON)
 option(ALPHASHAPE_USE_PROJ      "Use PROJ for coordinate systems (M12)" ON)
 option(ALPHASHAPE_BUILD_PYTHON  "Build the Python bindings"   ON)
 option(ALPHASHAPE_BUILD_CLI     "Build the CLI application"   ON)
+# Windows only: install rules and the CPack NSIS installer. Off by default
+# because it needs a fully populated build (vcpkg DLLs, Qt, VCToolsRedistDir),
+# which a developer build on Windows often is not.
+option(ALPHASHAPE_BUILD_INSTALLER "Install rules and the NSIS installer (Windows)" OFF)
 # The Qt 6 desktop GUI is opt-in. With it ON, a missing Qt 6.6+ (QPalette::Accent) is a
 # configuration error rather than a silent downgrade.
 option(ALPHASHAPE_BUILD_GUI     "Build the Qt 6 desktop GUI (requires Qt 6.6+)" OFF)
@@ -233,12 +237,17 @@ if(ALPHASHAPE_BUILD_PYTHON)
 endif()
 
 # ---------------------------------------------------------------------------
-# Install layout, Linux packages (.deb) and macOS bundle inputs
+# Install layout and packages
+#   Linux: .deb via CPack, AppImage from the same install tree
+#   macOS: app bundle inputs for packaging/macos/build-app.sh
+#   Windows: NSIS installer via CPack (M29 WP-29.7)
 # ---------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(${CMAKE_SOURCE_DIR}/cmake/alphashape_install.cmake)
 elseif(APPLE)
     include(${CMAKE_SOURCE_DIR}/cmake/alphashape_macos_bundle.cmake)
+elseif(WIN32 AND ALPHASHAPE_BUILD_INSTALLER)
+    include(${CMAKE_SOURCE_DIR}/cmake/alphashape_windows_install.cmake)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -269,6 +278,9 @@ message(STATUS "  OpenMP ........... ${OpenMP_CXX_FOUND}")
 message(STATUS "  tests ............ ${ALPHASHAPE_BUILD_TESTS}")
 message(STATUS "  python bindings .. ${ALPHASHAPE_BUILD_PYTHON}")
 message(STATUS "  CLI .............. ${ALPHASHAPE_BUILD_CLI}")
+if(WIN32)
+    message(STATUS "  installer ........ ${ALPHASHAPE_BUILD_INSTALLER} (NSIS via CPack)")
+endif()
 message(STATUS "  sanitizers ....... ${ALPHASHAPE_SANITIZE} (ASan+UBSan)")
 message(STATUS "  Eigen NaN init ... ${ALPHASHAPE_EIGEN_NAN_INIT}")
 message(STATUS "  CRS engine ....... ${ALPHASHAPE_USE_PROJ} (PROJ)")

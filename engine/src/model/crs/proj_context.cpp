@@ -10,19 +10,14 @@
 
 #include <proj.h>
 
+#include "base/platform/paths.hpp"
 #include "base/utils/log.hpp"
-
-#ifdef __APPLE__
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-#elif defined(__linux__)
-#include <unistd.h>
-#endif
 
 namespace alphashape::crs {
 namespace {
 
 namespace fs = std::filesystem;
+namespace plat = platform;
 
 std::filesystem::path env_path(const char* name) {
     const char* value = std::getenv(name);
@@ -38,39 +33,26 @@ bool has_database(const fs::path& dir) {
 }
 
 std::filesystem::path executable_directory() {
-#ifdef __APPLE__
-    uint32_t size = 0;
-    if (_NSGetExecutablePath(nullptr, &size) != -1 || size == 0) {
-        return {};
-    }
-    std::string buffer(size, '\0');
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+    const std::string exe = plat::executable_path();
+    if (exe.empty()) {
         return {};
     }
     std::error_code ec;
-    return fs::weakly_canonical(fs::path(buffer.c_str()), ec).parent_path();
-#elif defined(__linux__)
-    std::error_code ec;
-    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    return ec ? fs::path{} : exe.parent_path();
-#else
-    return {};
-#endif
+    // weakly_canonical resolves symlinks (a Homebrew or distro bin/ link) and
+    // leaves a not-yet-existing tail alone; it never throws here.
+    return fs::weakly_canonical(fs::path(exe), ec).parent_path();
 }
 
-#ifdef __APPLE__
-/// Directory of the Mach-O image this code is linked into (the executable, or the Python
+/// Directory of the image this code is linked into (the executable, or the Python
 /// extension module inside somebody else's interpreter).
 std::filesystem::path image_directory() {
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<const void*>(&image_directory), &info) == 0 ||
-        info.dli_fname == nullptr) {
+    const std::string image = plat::module_path(reinterpret_cast<const void*>(&image_directory));
+    if (image.empty()) {
         return {};
     }
     std::error_code ec;
-    return fs::weakly_canonical(fs::path(info.dli_fname), ec).parent_path();
+    return fs::weakly_canonical(fs::path(image), ec).parent_path();
 }
-#endif
 
 std::filesystem::path source_root() {
 #ifdef ALPHASHAPE_PROJECT_SOURCE_DIR
@@ -185,19 +167,28 @@ ResolvedDataDir resolve_data_directory(const DataSearchOptions& options) {
         accept(opts.exe_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative)) {
         return resolved;
     }
-#ifdef __APPLE__
-    // App bundle: Contents/MacOS/<exe> finds Contents/Resources/share/proj; the Python module in
-    // Contents/Resources/python finds Contents/Resources/share/proj through its parent.
+    // The Python module is not next to the executable: the Windows installer
+    // keeps it in <install>\python\alphashape.pyd, so its own directory's
+    // parent is the install root. Reached through the image containing this
+    // code, which is the module when Python imported it and the executable
+    // otherwise (in which case the two steps above already decided).
     {
         const fs::path image_dir = image_directory();
-        if (!image_dir.empty() &&
-            (accept(image_dir.parent_path() / "Resources" / "share" / "proj", SearchStep::ExeRelative) ||
-             accept(image_dir / "share" / "proj", SearchStep::ExeRelative) ||
-             accept(image_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative))) {
-            return resolved;
+        if (!image_dir.empty()) {
+#ifdef __APPLE__
+            // App bundle: Contents/MacOS/<exe> finds Contents/Resources/share/proj; the Python
+            // module in Contents/Resources/python finds it through the bundle's Resources.
+            if (accept(image_dir.parent_path() / "Resources" / "share" / "proj",
+                       SearchStep::ExeRelative)) {
+                return resolved;
+            }
+#endif
+            if (accept(image_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative) ||
+                accept(image_dir / "share" / "proj", SearchStep::ExeRelative)) {
+                return resolved;
+            }
         }
     }
-#endif
     if (!opts.project_source.empty()) {
         const fs::path tool_dir =
             opts.project_source.parent_path() / "tools" / "proj-data";

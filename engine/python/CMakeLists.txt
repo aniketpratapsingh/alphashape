@@ -22,7 +22,12 @@ target_link_libraries(alphashape_python PRIVATE
 
 set_target_properties(alphashape_python PROPERTIES
     OUTPUT_NAME alphashape
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+    # LIBRARY_OUTPUT_DIRECTORY is where a .so goes; a Windows .pyd is a DLL-like
+    # module and CMake places it via RUNTIME_OUTPUT_DIRECTORY. Both are set to
+    # build/python so the module is in one known place on every platform (the
+    # tests below, packaging, and the installer all look there).
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
 
 # ---------------------------------------------------------------------------
 # Tests. TESTS=OFF (the default for this build) suppresses the C++ suite in

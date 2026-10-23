@@ -1,0 +1,20 @@
+alphashape Python module
+=======================
+
+This directory holds alphashape.pyd and the DLLs it needs. The module is built
+against one CPython version and is loadable only by that minor version; the file
+name does not carry the version, so check the installer page or the release
+notes for the one this build used.
+
+  set PYTHONPATH=%LOCALAPPDATA%\Programs\alphashape\python
+  python -c "import alphashape; print(alphashape.__file__)"
+
+For a per-machine install the path is %ProgramFiles%\alphashape\python.
+
+The module finds the PROJ data, and the DLLs beside it, by itself: keep this
+directory and share\proj where the installer put them.
+
+Do not copy alphashape.pyd to another Python installation without the DLLs in
+this directory: Windows resolves a module's dependencies from the module's own
+directory first, and a .pyd without them fails to import with a message about
+the missing DLL, not about the module.

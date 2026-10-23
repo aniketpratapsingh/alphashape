@@ -421,6 +421,34 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   installer. `WP-29.3` owns numeric parity: the 710 passing tests include every
   accuracy bound unchanged — **no bound was widened for Windows**.
 
+### Windows installer (M29 WP-29.7)
+
+- **Unsigned.** There is no code-signing certificate, so SmartScreen shows its
+  "unrecognised app" warning on first run of the installer and of
+  `alphashape.exe`. `packaging/windows/README-smartscreen.md` says what that
+  means and how to verify the download against the published SHA-256.
+- **The GUI is a console-subsystem binary**, so starting it from a shortcut
+  opens a console window beside the app. Making it windowed needs the WinMain
+  entry point and removes the stdout that the packaging smoke test and
+  `GuiShell.StartsOffscreen` read; that is a separate change.
+- **`alphashape.pyd` needs a matching CPython installed.** It is built for one
+  interpreter minor version and the file name carries no ABI tag, so a user
+  without Python, or with another minor version, cannot import it. A bundled
+  standalone interpreter is the fix (roughly 30 MB plus its licence texts) and
+  is not in this WP.
+- **No server or worker component.** The installer ships the GUI, the CLI and
+  the Python module; the distributed worker is Phase 14.
+- **No GPU path in the Windows build**, so the installer ships no Vulkan loader
+  or ICD (WP-29.2).
+- **Component selection is coarse:** deselecting the desktop app still installs
+  the shared runtime, PROJ data and licences (the required `core` component),
+  and no per-component record is kept, so a later installer cannot remember the
+  previous selection. Uninstall removes everything that was staged.
+- **PROJ grids are size-capped** (32 MiB per file, 64 MiB in total, smallest
+  first), so a transform needing a dropped continental grid fails offline with
+  PROJ's "grid not found" rather than downloading. `ALPHASHAPE_PROJ_DATA` can be
+  pointed at a full `proj-data` directory to restore them.
+
 ## M11 — Multi-instance containers (WP-11.1 / WP-11.2)
 
 - **Every container is now persisted (WP-11.3).** Markers, marker groups, scale
