@@ -46,8 +46,14 @@ cp "$here/python-usage.txt" "$contents/Resources/python/README.txt"
 
 echo "== PROJ data"
 # The engine finds Contents/Resources/share/proj from Contents/MacOS and from Resources/python.
-(cd "$PROJ_DATA_SRC" && find . -maxdepth 1 -type f \( -name '*.db' -o -name '*.ini' -o -name '*.tif' \
-    -o -name '*.gtx' -o -name '*.json' \) -exec cp {} "$contents/Resources/share/proj/" \;)
+# proj.db and the config always ship. Grid files ship when they are at most 32 MB, which keeps the
+# worldwide geoid models (EGM96, EGM2008) and drops the very large national grids.
+(cd "$PROJ_DATA_SRC" && find . -maxdepth 1 -type f \( -name '*.db' -o -name '*.ini' -o -name '*.json' \) \
+    -exec cp {} "$contents/Resources/share/proj/" \;)
+(cd "$PROJ_DATA_SRC" && find . -maxdepth 1 -type f \( -name '*.tif' -o -name '*.gtx' \) -size -32769k \
+    -exec cp {} "$contents/Resources/share/proj/" \;)
+echo "PROJ data shipped: $(ls "$contents/Resources/share/proj" | wc -l | tr -d ' ') files," \
+     "$(du -sh "$contents/Resources/share/proj" | cut -f1)"
 
 echo "== Vulkan loader and MoltenVK"
 # The loader (a dlopen target, so not in any otool -L) and the MoltenVK driver live in
@@ -86,5 +92,7 @@ codesign --force -s - "$contents/MacOS/alphashape-cli"
 codesign --force --deep -s - "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
+echo "== size breakdown"
+du -sk "$contents"/* "$contents/Frameworks/"* 2>/dev/null | sort -n | tail -15
 du -sh "$app"
 echo "built $app (minimum macOS $min_os)"

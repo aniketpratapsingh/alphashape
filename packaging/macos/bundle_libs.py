@@ -52,18 +52,19 @@ def macho_files(app):
 def deps_of(path):
     """Install names referenced by `path` (its own id is excluded)."""
     lines = run(["otool", "-L", path]).splitlines()[1:]
-    own_id = ""
-    try:
-        id_lines = run(["otool", "-D", path]).splitlines()
-        own_id = id_lines[1].strip() if len(id_lines) > 1 else ""
-    except subprocess.CalledProcessError:
-        pass
+    own_id = id_of(path)
     deps = []
     for line in lines:
         match = re.match(r"\s+(\S.*?) \(compatibility", line)
         if match and match.group(1) != own_id:
             deps.append(match.group(1))
     return deps
+
+
+def id_of(path):
+    """Install-name id of a dylib/framework binary, or '' for executables and bundles."""
+    lines = run(["otool", "-D", path]).splitlines()
+    return lines[1].strip() if len(lines) > 1 else ""
 
 
 def rpaths_of(path):
@@ -222,12 +223,18 @@ class Bundle:
                     run(["install_name_tool", "-change", ref,
                          "@rpath/" + os.path.basename(dest), path])
                 self.fix_rpaths(path)
+                own_id = id_of(path)
+                if own_id.startswith("/"):
+                    # Copied by macdeployqt with its Homebrew install name still on it.
+                    run(["install_name_tool", "-id", "@rpath/" + os.path.basename(own_id), path])
 
     def audit(self):
         bad = []
         files = macho_files(self.app)
         for path in files:
             rpaths = rpaths_of(path)
+            if id_of(path).startswith("/"):
+                bad.append(f"{path}: absolute install name {id_of(path)}")
             for rpath in rpaths:
                 if not rpath.startswith("@"):
                     bad.append(f"{path}: absolute rpath {rpath}")
