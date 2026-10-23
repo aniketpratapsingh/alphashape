@@ -3,9 +3,9 @@
 #include "apps/gui/app.hpp"
 #include "apps/gui/main_window.hpp"
 #include "base/utils/error.hpp"
+#include "harness.hpp"
 
 using alphashape::gui::GuiApp;
-using alphashape::gui::MainWindow;
 using alphashape::gui::Options;
 using alphashape::gui::ThemeMode;
 
@@ -60,10 +60,10 @@ TEST(GuiApp, OpeningAMissingProjectThrowsAndKeepsTheDocument) {
     EXPECT_THROW(GuiApp{options}, alphashape::Error);
 }
 
-TEST(GuiApp, MainWindowTitleFollowsTheDocument) {
-    GuiApp app{Options{}};
-    MainWindow window(app);
-    EXPECT_TRUE(window.windowTitle().startsWith(QStringLiteral("Untitled")));
-    app.new_document("survey.psx");
-    EXPECT_TRUE(window.windowTitle().startsWith(QStringLiteral("survey")));
+using GuiAppWindow = alphashape::gui::testing::GuiTest;
+
+TEST_F(GuiAppWindow, MainWindowTitleFollowsTheDocument) {
+    EXPECT_TRUE(window().windowTitle().startsWith(QStringLiteral("Untitled")));
+    app().new_document("survey.psx");
+    EXPECT_TRUE(window().windowTitle().startsWith(QStringLiteral("survey")));
 }
