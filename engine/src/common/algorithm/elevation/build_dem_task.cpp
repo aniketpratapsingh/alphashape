@@ -70,22 +70,39 @@ DemOptions resolve_options(const Params& params) {
 void BuildDemTask::declare_params(Params& params) const {
     // Names follow Metashape's public Python API (buildDem); the value
     // sets are ours.
-    params.declare({"source_data", ParamType::String, std::string("depth_maps"),
-                    "Elevation source: \"depth_maps\", \"point_cloud\" or \"model\"."});
-    params.declare({"interpolation", ParamType::String, std::string("enabled"),
-                    "How holes are filled: \"disabled\" (nodata), \"enabled\" (interior "
-                    "holes only) or \"extrapolated\" (every hole)."});
-    params.declare({"resolution", ParamType::Float, 0.0,
-                    "Cell size in projection units. 0 selects an automatic value from the "
-                    "source's sample spacing."});
+    ParamSpec source_data{"source_data", ParamType::String, std::string("depth_maps"),
+                          "Elevation source: \"depth_maps\", \"point_cloud\" or \"model\"."};
+    source_data.choices = {"depth_maps", "point_cloud", "model"};
+    params.declare(source_data);
+
+    ParamSpec interpolation{"interpolation", ParamType::String, std::string("enabled"),
+                            "How holes are filled: \"disabled\" (nodata), \"enabled\" (interior "
+                            "holes only) or \"extrapolated\" (every hole)."};
+    interpolation.choices = {"disabled", "enabled", "extrapolated"};
+    params.declare(interpolation);
+
+    ParamSpec resolution{"resolution", ParamType::Float, 0.0,
+                         "Cell size in projection units. 0 selects an automatic value from the "
+                         "source's sample spacing."};
+    resolution.minimum = 0.0;
+    params.declare(resolution);
+
     params.declare({"projection", ParamType::Int, std::int64_t{0},
                     "Output EPSG code. 0 selects UTM for a georeferenced chunk, or a "
                     "chunk-local frame when unreferenced."});
-    params.declare({"fill_method", ParamType::String, std::string("natural_neighbour"),
-                    "Hole-filling interpolation: \"natural_neighbour\", \"idw\" or \"nearest\"."});
-    params.declare({"smoothing", ParamType::String, std::string("tgv"),
-                    "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "
-                    "never smoothed."});
+
+    ParamSpec fill_method{"fill_method", ParamType::String, std::string("natural_neighbour"),
+                          "Hole-filling interpolation: \"natural_neighbour\", \"idw\" or "
+                          "\"nearest\"."};
+    fill_method.choices = {"natural_neighbour", "idw", "nearest"};
+    params.declare(fill_method);
+
+    ParamSpec smoothing{"smoothing", ParamType::String, std::string("tgv"),
+                        "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "
+                        "never smoothed."};
+    smoothing.choices = {"tgv", "none"};
+    params.declare(smoothing);
+
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new elevation asset. Empty selects \"Elevation <n>\", "
                     "with the smallest unused n. Each run creates a new asset."});

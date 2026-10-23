@@ -20,6 +20,7 @@ namespace alphashape::gui {
 class GuiApp;
 class PropertiesPane;
 class ViewportPlaceholder;
+class WorkflowController;
 class WorkspacePane;
 class WorkspaceSelection;
 
@@ -79,6 +80,8 @@ public:
     void reset_layout();
 
     QDockWidget* dock(const QString& object_name) const;
+    /// The Workflow menu's controller (task actions and their hooks).
+    WorkflowController& workflow() { return *workflow_; }
     /// Text of the About box (version and licence).
     QString about_text() const;
 
@@ -117,6 +120,7 @@ private:
     WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties pane
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
+    WorkflowController* workflow_ = nullptr;
     QLabel* jobs_label_ = nullptr;          ///< stage / idle text ("status.jobs")
     QProgressBar* jobs_progress_ = nullptr; ///< "status.progress", visible while a job runs
     QToolButton* jobs_cancel_ = nullptr;    ///< "status.cancel", visible while a job runs

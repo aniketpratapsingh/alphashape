@@ -1,0 +1,600 @@
+// Workflow.*: the Workflow menu (task actions in pipeline order, enabled state, and the flow
+// from a triggered action through the parameter hooks to JobManager::submit).
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <Eigen/Core>
+#include <QAction>
+#include <QApplication>
+#include <QDialog>
+#include <QFile>
+#include <QMenu>
+#include <QPushButton>
+#include <QStringList>
+#include <QTimer>
+#include <QWidget>
+
+#include "apps/gui/task_dialog.hpp"
+#include "apps/gui/workflow.hpp"
+#include "base/utils/error.hpp"
+#include "common/core/chunk.hpp"
+#include "common/tasks/registry.hpp"
+#include "harness.hpp"
+
+using namespace alphashape;
+using namespace alphashape::gui;
+using alphashape::gui::testing::GuiTest;
+using alphashape::gui::testing::pump_until;
+
+namespace {
+
+/// How long a test waits for the event loop to observe something. Well under ctest's 120 s
+/// per-test ceiling, so a hung assert is reported as a failure instead of the whole test being
+/// killed with no message.
+constexpr int kPumpTimeoutMs = 15000;
+
+/// Blocks until released, so a test can observe the "job running" state. The wait is on a
+/// condition variable rather than a 1 ms poll: a spinning worker would burn a core for as long
+/// as the test needs the job alive, which on a shared CI machine slows every other lane.
+class Gate {
+public:
+    void open() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            open_ = true;
+        }
+        ready_.notify_all();
+    }
+
+    /// Wait until open() or the timeout; true when it was opened.
+    bool wait(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return ready_.wait_for(lock, timeout, [this]() { return open_; });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    bool open_ = false;
+};
+
+class HoldTask : public AbstractTask {
+public:
+    HoldTask(std::shared_ptr<Gate> release, std::shared_ptr<std::atomic<bool>> started)
+        : release_(std::move(release)), started_(std::move(started)) {}
+    std::string name() const override { return "HoldTask"; }
+    void declare_params(Params&) const override {}
+    TargetType target_type() const override { return TargetType::Chunk; }
+    void apply(Document&, Params&, const Progress& progress) override {
+        started_->store(true);
+        while (!release_->wait(std::chrono::milliseconds(20))) {
+            if (progress.is_cancelled()) {
+                throw CancelledError("cancelled");
+            }
+        }
+    }
+
+private:
+    std::shared_ptr<Gate> release_;
+    std::shared_ptr<std::atomic<bool>> started_;
+};
+
+struct Submitted {
+    std::string task;
+    Params params;
+    std::int32_t chunk_id = -2;
+};
+
+class WorkflowTest : public GuiTest {
+protected:
+    void SetUp() override {
+        GuiTest::SetUp();
+        Chunk& added = app().document().workspace().add_chunk("Chunk 1");
+        chunk_id_ = added.id();
+        app().document().set_active_chunk_id(chunk_id_);
+        // A failing job would otherwise open the window's modal error box, which never closes
+        // offscreen. Collect the messages instead.
+        window().set_error_handler([this](const QString& title, const QString& message) {
+            errors_.emplace_back(title, message);
+        });
+        window().workflow().set_submit_handler(
+            [this](const std::string& task, Params params, std::int32_t target) {
+                submitted_.push_back(Submitted{task, std::move(params), target});
+            });
+        window().workflow().update_enabled();
+        ready_ = true;
+    }
+
+    /// Leave the job manager idle and pointed at the built-in registry, whatever the test did.
+    /// Without this a failed assertion before the test's own cleanup would leave the manager
+    /// holding a fixture-owned registry (and, for the blocking task, a worker waiting out its
+    /// deadline) while the fixture is destroyed.
+    void TearDown() override {
+        if (!ready_) {
+            GuiTest::TearDown();  // SetUp never finished: there is nothing of ours to unwind
+            return;
+        }
+        hold_release_->open();
+        if (!pump_until([this]() { return !app().jobs().busy(); }, kPumpTimeoutMs)) {
+            app().jobs().cancel_all_and_wait();
+        }
+        app().jobs().set_registry(&builtin_registry());
+        GuiTest::TearDown();
+    }
+
+    Chunk& chunk() { return *app().document().active_chunk(); }
+    WorkflowController& workflow() { return window().workflow(); }
+    bool enabled(const char* name) { return action(name)->isEnabled(); }
+    void refresh() { workflow().update_enabled(); }
+
+    std::int32_t chunk_id_ = -1;
+    std::vector<Submitted> submitted_;
+    std::vector<std::pair<QString, QString>> errors_;
+    /// Released by the "job running" test and by TearDown, so a blocked worker always ends.
+    std::shared_ptr<Gate> hold_release_ = std::make_shared<Gate>();
+    /// A test registry for the "job running" test. A member, not a local: the job manager keeps
+    /// the pointer until TearDown restores the built-in one.
+    TaskRegistry hold_registry_;
+    /// Set once SetUp has built everything TearDown unwinds, so a SetUp failure (no GuiApp) is
+    /// not mistaken for a job left running.
+    bool ready_ = false;
+};
+
+Camera make_camera(Chunk& chunk, bool aligned) {
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.enabled = aligned;
+    return camera;
+}
+
+/// Add a depth-map set that actually holds a map, as BuildDepthMaps would leave behind.
+void give_depth_maps(Chunk& chunk) {
+    DepthMap map;
+    map.camera_id = chunk.cameras().empty() ? -1 : chunk.cameras().front().id;
+    map.width = 2;
+    map.height = 2;
+    map.downscale = 1;
+    map.depths.assign(4, 1.0F);
+    chunk.add_depth_maps().data->push_back(std::move(map));
+}
+
+/// Add a model with geometry, as BuildModel would leave behind.
+void give_model(Chunk& chunk) {
+    Mesh& mesh = *chunk.add_model().data;
+    mesh.vertices = {Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Vector3d(1.0, 0.0, 0.0),
+                     Eigen::Vector3d(0.0, 1.0, 0.0)};
+    mesh.faces = {Eigen::Vector3i(0, 1, 2)};
+}
+
+/// Give the active model UVs, as BuildUV would leave behind.
+void give_uvs(Chunk& chunk) {
+    Mesh& mesh = chunk.model();
+    mesh.uvs = {Eigen::Vector2f(0.0F, 0.0F), Eigen::Vector2f(1.0F, 0.0F),
+                Eigen::Vector2f(0.0F, 1.0F)};
+    mesh.uv_faces = {Eigen::Vector3i(0, 1, 2)};
+}
+
+/// Add a point cloud with normals, as BuildPointCloud would leave behind.
+void give_point_cloud(Chunk& chunk) {
+    PointCloud& cloud = chunk.point_cloud();
+    cloud.points = {Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Vector3d(1.0, 0.0, 0.0)};
+    cloud.normals = {Eigen::Vector3f(0.0F, 0.0F, 1.0F), Eigen::Vector3f(0.0F, 0.0F, 1.0F)};
+}
+
+/// Add an elevation with a raster, as BuildDem would leave behind.
+void give_elevation(Chunk& chunk) {
+    Elevation& dem = *chunk.add_elevation().data;
+    dem.raster.grid.width = 2;
+    dem.raster.grid.height = 2;
+    dem.raster.grid.pixel_size_x = 1.0;
+    dem.raster.grid.pixel_size_y = 1.0;
+    dem.raster.data.assign(4, 0.0F);
+}
+
+}  // namespace
+
+TEST_F(WorkflowTest, ActionsExistInPipelineOrder) {
+    QMenu* workflow_menu = menu("menu.workflow");
+    ASSERT_NE(workflow_menu, nullptr);
+    QStringList names;
+    for (QAction* entry : workflow_menu->actions()) {
+        if (!entry->isSeparator()) {
+            names << entry->objectName();
+        }
+    }
+    const QStringList expected = {
+        "action.workflow.add_photos",       "action.workflow.match_photos",
+        "action.workflow.align_cameras",    "action.workflow.optimize_cameras",
+        "action.workflow.build_depth_maps", "action.workflow.build_point_cloud",
+        "action.workflow.build_model",      "action.workflow.build_uv",
+        "action.workflow.build_texture",    "action.workflow.build_dem",
+        "action.workflow.build_orthomosaic"};
+    EXPECT_EQ(names, expected);
+    // Every step names a task the registry really has.
+    for (const WorkflowStep& step : WorkflowController::steps()) {
+        EXPECT_NE(builtin_registry().find(step.task), nullptr) << step.task;
+        EXPECT_NE(workflow().action(step.task), nullptr) << step.task;
+    }
+    // The two group separators split the input/aligned block from the dense block and that
+    // from the surface block.
+    int separators = 0;
+    for (QAction* entry : workflow_menu->actions()) {
+        if (entry->isSeparator()) {
+            ++separators;
+        }
+    }
+    EXPECT_EQ(separators, 2);
+}
+
+TEST_F(WorkflowTest, NothingIsEnabledWithoutAnActiveChunk) {
+    app().document().set_active_chunk_id(-1);
+    refresh();
+    for (const WorkflowStep& step : WorkflowController::steps()) {
+        EXPECT_FALSE(workflow().action(step.task)->isEnabled()) << step.task;
+        EXPECT_EQ(workflow().unavailable_reason(step.task), QStringLiteral("There is no active chunk."))
+            << step.task;
+    }
+    EXPECT_FALSE(workflow().run("AddPhotos"));
+    EXPECT_TRUE(submitted_.empty());
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(WorkflowTest, PreconditionsFollowTheChunkState) {
+    // An empty chunk can only take photos.
+    for (const WorkflowStep& step : WorkflowController::steps()) {
+        EXPECT_EQ(workflow().action(step.task)->isEnabled(), step.task == "AddPhotos") << step.task;
+    }
+
+    chunk().cameras().push_back(make_camera(chunk(), false));
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.match_photos"));
+    EXPECT_FALSE(enabled("action.workflow.align_cameras"));
+    EXPECT_FALSE(enabled("action.workflow.build_depth_maps"));
+
+    // Two aligned cameras without sparse points are still not enough for depth maps.
+    chunk().cameras().push_back(make_camera(chunk(), true));
+    chunk().cameras().push_back(make_camera(chunk(), true));
+    refresh();
+    EXPECT_FALSE(enabled("action.workflow.build_depth_maps"));
+    EXPECT_FALSE(enabled("action.workflow.optimize_cameras"));
+    Track track;
+    track.point = Eigen::Vector3d(0.0, 0.0, 1.0);
+    chunk().tie_points().tracks.push_back(track);
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.build_depth_maps"));
+    EXPECT_TRUE(enabled("action.workflow.optimize_cameras"));
+
+    // No derived products yet: the dense and surface stages stay blocked.
+    EXPECT_FALSE(enabled("action.workflow.build_point_cloud"));
+    EXPECT_FALSE(enabled("action.workflow.build_model"));
+    EXPECT_FALSE(enabled("action.workflow.build_dem"));
+
+    // An empty asset does not count: the stage must really have produced data.
+    chunk().add_depth_maps();
+    refresh();
+    EXPECT_FALSE(enabled("action.workflow.build_point_cloud"))
+        << "an empty depth-map set is not a depth map";
+    give_depth_maps(chunk());
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.build_point_cloud"));
+    EXPECT_TRUE(enabled("action.workflow.build_model"));
+    EXPECT_TRUE(enabled("action.workflow.build_dem"));
+
+    EXPECT_FALSE(enabled("action.workflow.build_uv"));
+    EXPECT_FALSE(enabled("action.workflow.build_texture"));
+    give_model(chunk());
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.build_uv"));
+    EXPECT_FALSE(enabled("action.workflow.build_texture"))
+        << "texturing needs the UV coordinates BuildUV produces";
+    give_uvs(chunk());
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.build_texture"));
+
+    // The ortho projects on either the DEM ("elevation", the schema default) or the mesh
+    // ("model"). This chunk has only the mesh, so the action is enabled and the dialog must be
+    // preset to surface_data="model" (checked by OpensTheRealDialogPresetToTheExistingSource).
+    EXPECT_TRUE(enabled("action.workflow.build_orthomosaic"))
+        << "surface_data=\"model\" needs only the mesh";
+}
+
+TEST_F(WorkflowTest, TheOrthomosaicNeedsASurfaceToProjectOn) {
+    // A chunk with neither a DEM nor a mesh: the ortho has nothing to project on.
+    give_depth_maps(chunk());
+    refresh();
+    EXPECT_FALSE(enabled("action.workflow.build_orthomosaic"));
+    EXPECT_TRUE(
+        workflow().action("BuildOrthomosaic")->toolTip().contains(QStringLiteral("elevation")));
+
+    give_elevation(chunk());
+    refresh();
+    EXPECT_TRUE(enabled("action.workflow.build_orthomosaic"));
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(WorkflowTest, ATaskTheMenuDoesNotOfferCannotRun) {
+    // Not in the menu, so no action; and run() refuses rather than opening a dialog for it
+    // (exporting is a separate feature, not a Workflow step).
+    EXPECT_EQ(workflow().action("ExportModel"), nullptr);
+    EXPECT_EQ(workflow().unavailable_reason("ExportModel"), QStringLiteral("This task is not available."));
+    EXPECT_FALSE(workflow().run("ExportModel"));
+    // An invented name is refused the same way, before the registry is even consulted.
+    EXPECT_FALSE(workflow().run("NoSuchTask"));
+    EXPECT_TRUE(submitted_.empty());
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(WorkflowTest, DisabledActionsSayWhatIsMissing) {
+    // A runnable action has no explanation. QAction::toolTip() falls back to the action's text
+    // when the tip is empty, so the question "is there a tip?" is asked of the text, not toolTip().
+    QAction* photos = workflow().action("AddPhotos");
+    ASSERT_NE(photos, nullptr);
+    EXPECT_TRUE(photos->isEnabled());
+    EXPECT_TRUE(photos->text() != photos->toolTip());
+    EXPECT_TRUE(workflow().unavailable_reason("AddPhotos").isEmpty());
+
+    QAction* model = workflow().action("BuildModel");
+    ASSERT_NE(model, nullptr);
+    EXPECT_FALSE(model->isEnabled());
+    const QString blocking = workflow().unavailable_reason("BuildModel");
+    EXPECT_FALSE(blocking.isEmpty());
+    EXPECT_TRUE(blocking.contains(QStringLiteral("depth maps")));
+    // The action shows exactly that text as its tip, in the menu and on the status bar.
+    EXPECT_EQ(model->toolTip(), blocking);
+    EXPECT_EQ(model->statusTip(), blocking);
+}
+
+TEST_F(WorkflowTest, ActionsAreDisabledWhileAJobRuns) {
+    auto started = std::make_shared<std::atomic<bool>>(false);
+    hold_registry_.register_task(std::make_shared<HoldTask>(hold_release_, started));
+    app().jobs().set_registry(&hold_registry_);
+
+    EXPECT_TRUE(enabled("action.workflow.add_photos"));
+    app().jobs().submit("HoldTask", Params{}, chunk_id_);
+    ASSERT_TRUE(pump_until([&]() { return started->load(); }, kPumpTimeoutMs));
+    for (const WorkflowStep& step : WorkflowController::steps()) {
+        EXPECT_FALSE(workflow().action(step.task)->isEnabled()) << step.task;
+        EXPECT_EQ(workflow().action(step.task)->toolTip(), QStringLiteral("A job is running."));
+    }
+    EXPECT_FALSE(workflow().run("AddPhotos"));
+    EXPECT_EQ(workflow().unavailable_reason("AddPhotos"), QStringLiteral("A job is running."));
+
+    hold_release_->open();
+    ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, kPumpTimeoutMs));
+    app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(enabled("action.workflow.add_photos"));
+    EXPECT_TRUE(submitted_.empty());
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(WorkflowTest, TriggeringAnActionSubmitsTheDialogParamsForTheActiveChunk) {
+    give_depth_maps(chunk());
+    refresh();
+    std::vector<std::string> asked;
+    size_t preset_count = 0;
+    workflow().set_params_handler(
+        [&](const std::string& task, const Presets& presets) -> std::optional<Params> {
+            asked.push_back(task);
+            preset_count = presets.size();
+            Params params = make_params(builtin_registry().require(task));
+            params.set("resolution", 0.25);
+            params.set("source_data", std::string("depth_maps"));
+            return params;
+        });
+
+    ASSERT_TRUE(trigger("action.workflow.build_dem"));
+    ASSERT_EQ(asked, (std::vector<std::string>{"BuildDem"}));
+    EXPECT_EQ(preset_count, 1U) << "BuildDem's source_data is preset to the data present";
+    ASSERT_EQ(submitted_.size(), 1U);
+    EXPECT_EQ(submitted_[0].task, "BuildDem");
+    EXPECT_EQ(submitted_[0].chunk_id, chunk_id_);
+    EXPECT_DOUBLE_EQ(submitted_[0].params.get_float("resolution"), 0.25);
+    EXPECT_EQ(submitted_[0].params.get_string("source_data"), "depth_maps");
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(WorkflowTest, ACancelledDialogSubmitsNothing) {
+    workflow().set_params_handler([](const std::string&, const Presets&) -> std::optional<Params> {
+        return std::nullopt;
+    });
+    chunk().cameras().push_back(make_camera(chunk(), false));
+    refresh();
+    ASSERT_TRUE(trigger("action.workflow.match_photos"));
+    EXPECT_TRUE(submitted_.empty());
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(WorkflowTest, AddPhotosUsesTheFilePickerAndSubmitsTheFileList) {
+    int dialog_calls = 0;
+    workflow().set_params_handler(
+        [&](const std::string&, const Presets&) -> std::optional<Params> {
+            ++dialog_calls;
+            return std::nullopt;
+        });
+    workflow().set_photos_handler([]() { return QStringList{"/data/a.jpg", "/data/b.jpg"}; });
+    ASSERT_TRUE(trigger("action.workflow.add_photos"));
+    EXPECT_EQ(dialog_calls, 0) << "AddPhotos asks for files, not for a JSON list";
+    ASSERT_EQ(submitted_.size(), 1U);
+    EXPECT_EQ(submitted_[0].task, "AddPhotos");
+    EXPECT_EQ(submitted_[0].chunk_id, chunk_id_);
+    EXPECT_EQ(submitted_[0].params.get_string_list("filenames"),
+              (std::vector<std::string>{"/data/a.jpg", "/data/b.jpg"}));
+    EXPECT_TRUE(submitted_[0].params.get_bool("load_reference"));
+
+    // Cancelling the picker submits nothing.
+    workflow().set_photos_handler([]() { return QStringList(); });
+    ASSERT_TRUE(trigger("action.workflow.add_photos"));
+    EXPECT_EQ(submitted_.size(), 1U);
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(WorkflowTest, ASubmitFailureIsReportedNotThrown) {
+    workflow().set_photos_handler([]() { return QStringList{"x.jpg"}; });
+    workflow().set_submit_handler(
+        [](const std::string&, Params, std::int32_t) { throw Error("shutting down"); });
+    QString title, message;
+    workflow().set_error_handler([&](const QString& t, const QString& m) {
+        title = t;
+        message = m;
+    });
+    ASSERT_TRUE(trigger("action.workflow.add_photos"));
+    EXPECT_FALSE(title.isEmpty());
+    EXPECT_EQ(message, "shutting down");
+
+    // A failed submission leaves the menu usable.
+    EXPECT_TRUE(enabled("action.workflow.add_photos"));
+}
+
+TEST_F(WorkflowTest, TheDefaultSubmitReachesTheJobManager) {
+    // No submit spy: a file that does not exist makes the real AddPhotos task fail, which proves
+    // the request went through the job manager for the active chunk.
+    workflow().set_submit_handler([this](const std::string& task, Params params,
+                                         std::int32_t target) {
+        app().jobs().submit(task, std::move(params), target);
+    });
+    // A path in this test's own scratch directory, so it is spelled the way the platform spells
+    // paths (the task reports it back through std::filesystem) and cannot exist.
+    const QString missing = scratch(QStringLiteral("not-here.jpg"));
+    ASSERT_FALSE(QFile::exists(missing));
+    workflow().set_photos_handler([missing]() { return QStringList{missing}; });
+    // Shared, not a reference capture: the connection lives in the window, which outlives the
+    // test body, so a late emit during teardown must not touch a destroyed local.
+    auto final_state = std::make_shared<std::optional<JobManager::State>>();
+    QObject::connect(&app().jobs(), &JobManager::job_finished, &app(),
+                     [final_state](quint64, JobManager::State state, const QString&) {
+                         *final_state = state;
+                     });
+    ASSERT_TRUE(trigger("action.workflow.add_photos"));
+    ASSERT_TRUE(pump_until([&]() { return final_state->has_value(); }, kPumpTimeoutMs));
+    EXPECT_EQ(*final_state, JobManager::State::Failed);
+    ASSERT_EQ(errors_.size(), 1U);
+    // The failure names the file it could not read (only the base name: separators differ per
+    // platform, and the task reports the path it resolved).
+    EXPECT_TRUE(errors_[0].second.contains(QStringLiteral("not-here.jpg")))
+        << errors_[0].second.toStdString();
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(WorkflowTest, OpensTheRealDialogPresetToTheExistingSource) {
+    // Finding: the generated dialog opened on the schema default even when the chunk held the
+    // other source, so the job failed. The preset goes through the real TaskDialog, not a
+    // stubbed handler. This chunk has a point cloud but no depth maps, and BuildModel's schema
+    // default is "depth_maps".
+    give_point_cloud(chunk());
+    refresh();
+    ASSERT_TRUE(enabled("action.workflow.build_model"));
+
+    // No handler stub: a timer clicks the real dialog's OK button as soon as it is up, so
+    // exec() returns without a user and the rest of the chain (params() -> submit) is the
+    // production one. The submit hook is stubbed only to capture the Params instead of
+    // handing them to the job manager.
+    std::optional<Params> submitted_params;
+    workflow().set_submit_handler(
+        [&](const std::string& task, Params params, std::int32_t target) {
+            EXPECT_EQ(task, "BuildModel");
+            EXPECT_EQ(target, chunk_id_);
+            submitted_params = std::move(params);
+        });
+    auto accept_real_dialog = std::make_shared<int>(0);
+    auto* timer = new QTimer(&window());
+    timer->setInterval(5);
+    QObject::connect(timer, &QTimer::timeout, timer, [accept_real_dialog]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            auto* dialog = qobject_cast<QDialog*>(widget);
+            if (dialog != nullptr && dialog->objectName() == QStringLiteral("dialog.task") &&
+                dialog->isVisible()) {
+                // TaskDialog::accept() re-checks the schema constraints, so this also proves
+                // the preset value passes them.
+                dialog->accept();
+                ++*accept_real_dialog;
+            }
+        }
+    });
+    timer->start();
+    const bool ran = trigger("action.workflow.build_model");
+    timer->stop();
+    timer->deleteLater();
+    ASSERT_TRUE(ran);
+    EXPECT_EQ(*accept_real_dialog, 1) << "the real dialog was shown exactly once";
+    // Clicking the menu action ran the whole path: run() -> real TaskDialog -> params -> submit.
+    ASSERT_TRUE(submitted_params.has_value()) << "the real dialog was accepted and submitted";
+
+    const Params& params = *submitted_params;
+    // Exactly the schema keys, no more: the dialog declares every parameter and sets each one.
+    const TaskEntry& entry = builtin_registry().require("BuildModel");
+    ASSERT_EQ(params.specs().size(), entry.schema.specs().size());
+    for (const ParamSpec& spec : entry.schema.specs()) {
+        EXPECT_TRUE(params.declares(spec.name)) << spec.name;
+    }
+    // The preset, which is the whole point: point_cloud, not the schema default depth_maps.
+    EXPECT_EQ(params.get_string("source_data"), "point_cloud");
+    // Everything else is the schema default.
+    EXPECT_EQ(params.get_string("face_count"), "medium");
+    EXPECT_EQ(params.get_int("face_count_custom"), 200000);
+    EXPECT_EQ(params.get_int("volume_resolution"), 128);
+    EXPECT_TRUE(params.get_bool("vertex_colors"));
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(WorkflowTest, PresetsTheOrthoSurfaceToTheDEMWhenOnlyTheDEMExists) {
+    give_elevation(chunk());
+    refresh();
+    ASSERT_TRUE(enabled("action.workflow.build_orthomosaic"));
+    Presets seen;
+    workflow().set_params_handler(
+        [&](const std::string&, const Presets& presets) -> std::optional<Params> {
+            seen = presets;
+            return std::nullopt;
+        });
+    ASSERT_TRUE(trigger("action.workflow.build_orthomosaic"));
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(seen[0].first, "surface_data");
+    EXPECT_EQ(std::get<std::string>(seen[0].second), "elevation");
+    EXPECT_TRUE(submitted_.empty()) << "no params, so nothing is submitted";
+}
+
+TEST_F(WorkflowTest, PresetsTheOrthoSurfaceToTheModelWhenOnlyTheModelExists) {
+    give_model(chunk());
+    refresh();
+    ASSERT_TRUE(enabled("action.workflow.build_orthomosaic"));
+    Presets seen;
+    workflow().set_params_handler(
+        [&](const std::string&, const Presets& presets) -> std::optional<Params> {
+            seen = presets;
+            return std::nullopt;
+        });
+    ASSERT_TRUE(trigger("action.workflow.build_orthomosaic"));
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(seen[0].first, "surface_data");
+    EXPECT_EQ(std::get<std::string>(seen[0].second), "model");
+}
+
+TEST_F(WorkflowTest, PresetsBuildModelToDepthMapsWhenBothSourcesExist) {
+    // The schema default wins when the chunk has it, so a chunk with both sources runs what an
+    // untouched dialog used to ask for.
+    give_depth_maps(chunk());
+    give_point_cloud(chunk());
+    refresh();
+    ASSERT_TRUE(enabled("action.workflow.build_model"));
+    Presets seen;
+    workflow().set_params_handler(
+        [&](const std::string&, const Presets& presets) -> std::optional<Params> {
+            seen = presets;
+            return std::nullopt;
+        });
+    ASSERT_TRUE(trigger("action.workflow.build_model"));
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(std::get<std::string>(seen[0].second), "depth_maps");
+}

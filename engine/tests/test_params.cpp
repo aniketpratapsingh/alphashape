@@ -98,6 +98,49 @@ TEST(Params, RequiredParameterUnsetThrowsValueError) {
     EXPECT_EQ(p.get_int("required"), 5);
 }
 
+TEST(Params, ConstraintMetadataIsCheckedAgainstTheDeclaration) {
+    // A bound of the wrong type names a range a front end could never apply.
+    {
+        Params p;
+        ParamSpec spec{"limit", ParamType::Int, std::int64_t{10}, ""};
+        spec.minimum = 1.0;
+        EXPECT_THROW(p.declare(spec), ValueError);
+    }
+    // power_of_two only means something for an integer.
+    {
+        Params p;
+        ParamSpec spec{"scale", ParamType::Float, 1.0, ""};
+        spec.power_of_two = true;
+        EXPECT_THROW(p.declare(spec), ValueError);
+    }
+    // A choice list belongs to a String parameter, and the default must be one of the choices.
+    {
+        Params p;
+        ParamSpec spec{"count", ParamType::Int, std::int64_t{1}, ""};
+        spec.choices = {"one"};
+        EXPECT_THROW(p.declare(spec), ValueError);
+    }
+    {
+        Params p;
+        ParamSpec spec{"mode", ParamType::String, std::string("b"), ""};
+        spec.choices = {"a", "c"};
+        EXPECT_THROW(p.declare(spec), ValueError);
+    }
+    // A consistent declaration is accepted and reaches the schema unchanged. The constraints
+    // are metadata, not enforcement, so a value outside them is still storable here: the task's
+    // own checks stay the only authority.
+    {
+        Params p;
+        ParamSpec spec{"mode", ParamType::String, std::string("a"), ""};
+        spec.choices = {"a", "b"};
+        p.declare(spec);
+        ASSERT_EQ(p.specs().size(), 1U);
+        EXPECT_EQ(p.specs()[0].choices, (std::vector<std::string>{"a", "b"}));
+        p.set("mode", std::string("outside"));
+        EXPECT_EQ(p.get_string("mode"), "outside");
+    }
+}
+
 TEST(Params, DoubleRoundTripsExactly) {
     Params p;
     p.declare(ParamSpec{"d", ParamType::Float, 0.0, ""});

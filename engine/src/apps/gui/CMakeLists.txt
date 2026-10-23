@@ -11,6 +11,8 @@ add_library(alphashape_gui_lib STATIC
     command_line.cpp
     app.cpp
     job_manager.cpp
+    task_dialog.cpp
+    workflow.cpp
     main_window.cpp
     viewport_placeholder.cpp
     workspace_model.cpp

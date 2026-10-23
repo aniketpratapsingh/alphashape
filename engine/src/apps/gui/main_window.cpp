@@ -29,6 +29,7 @@
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/viewport_placeholder.hpp"
+#include "apps/gui/workflow.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
 #define ALPHASHAPE_GUI_VERSION "0.0.0"
@@ -362,13 +363,10 @@ void MainWindow::create_menus() {
     view->addSeparator();
     view->addAction(act("action.view.reset_layout"));
 
-    // The Workflow menu is filled by the task actions work package; until then it holds one
-    // disabled entry so the menu is not an empty (and, on some platforms, hidden) stub.
-    QMenu* workflow = menu(QStringLiteral("menu.workflow"), tr("&Workflow"));
-    QAction* placeholder =
-        make_action(QStringLiteral("action.workflow.placeholder"), tr("(no workflow steps yet)"));
-    placeholder->setEnabled(false);
-    workflow->addAction(placeholder);
+    QMenu* workflow_menu = menu(QStringLiteral("menu.workflow"), tr("&Workflow"));
+    workflow_ = new WorkflowController(app_, workflow_menu, this);
+    workflow_->set_error_handler(
+        [this](const QString& title, const QString& message) { error_handler_(title, message); });
 
     QMenu* help = menu(QStringLiteral("menu.help"), tr("&Help"));
     help->addAction(act("action.help.about"));
