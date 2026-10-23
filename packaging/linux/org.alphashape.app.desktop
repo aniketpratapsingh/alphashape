@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=alphashape
+GenericName=Photogrammetry
+Comment=Turn overlapping photographs into point clouds, meshes, DEMs and orthomosaics
+Exec=alphashape-gui %F
+Icon=org.alphashape.app
+Terminal=false
+Categories=Graphics;3DGraphics;Science;Geoscience;
+Keywords=photogrammetry;3D;mapping;orthomosaic;drone;
+StartupNotify=true

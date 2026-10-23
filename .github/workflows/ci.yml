@@ -9,6 +9,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      package:
+        description: Also build and smoke-test the release packages (.deb, AppImage, archives)
+        type: boolean
+        default: false
 
 # A new push to the same pull request cancels the older, now-stale run.
 concurrency:
@@ -38,18 +43,45 @@ jobs:
             exit 1
           fi
 
+  # Pull requests that touch packaging build and smoke-test the packages too, so packaging can be
+  # iterated on without cutting a release.
+  changes:
+    name: Packaging files changed?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      package: ${{ steps.filter.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          REQUESTED: ${{ inputs.package }}
+        run: |
+          package=false
+          if [ "$REQUESTED" = true ]; then package=true; fi
+          if [ "$EVENT" = pull_request ] && git diff --name-only "$BASE" HEAD |
+               grep -qE '^(packaging/|engine/cmake/alphashape_install\.cmake|\.github/workflows/(build|ci)\.yml)'; then
+            package=true
+          fi
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build
+    needs: changes
     uses: ./.github/workflows/build.yml
     with:
-      package: false
+      package: ${{ needs.changes.outputs.package == 'true' }}
       # PRs run the light lanes only; main runs everything (see .github/ci/test-lanes.json).
       full: ${{ github.event_name != 'pull_request' }}
 
   ci-ok:
     name: CI OK
     if: always()
-    needs: [checks, build]
+    needs: [checks, changes, build]
     runs-on: ubuntu-24.04
     steps:
       - name: All required jobs passed

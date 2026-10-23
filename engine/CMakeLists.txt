@@ -233,6 +233,13 @@ if(ALPHASHAPE_BUILD_PYTHON)
 endif()
 
 # ---------------------------------------------------------------------------
+# Install layout and Linux packages (.deb)
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(${CMAKE_SOURCE_DIR}/cmake/alphashape_install.cmake)
+endif()
+
+# ---------------------------------------------------------------------------
 # Source guards
 # ---------------------------------------------------------------------------
 # tools/check_rng_order.py flags seeded scenes whose draws the compiler is free

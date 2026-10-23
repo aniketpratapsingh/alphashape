@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.alphashape.app</id>
+  <name>alphashape</name>
+  <summary>Open-source photogrammetry engine</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.aniketpratapsingh">
+    <name>Aniket Singh</name>
+  </developer>
+  <description>
+    <p>
+      alphashape turns overlapping photographs into georeferenced point clouds, meshes, textured
+      models, digital elevation models and orthomosaics.
+    </p>
+    <p>
+      Processing runs on the GPU through Vulkan and falls back to the CPU when no suitable GPU is
+      present. The same task pipeline is available from the desktop app, the command line and Python.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.alphashape.app.desktop</launchable>
+  <url type="homepage">https://github.com/aniketpratapsingh/alphashape</url>
+  <url type="bugtracker">https://github.com/aniketpratapsingh/alphashape/issues</url>
+  <provides>
+    <binary>alphashape-gui</binary>
+    <binary>alphashape-cli</binary>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+    <category>3DGraphics</category>
+    <category>Science</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@PROJECT_VERSION@" date="@ALPHASHAPE_RELEASE_DATE@"/>
+  </releases>
+</component>
