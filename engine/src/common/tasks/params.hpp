@@ -21,6 +21,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -68,6 +69,18 @@ struct ParamSpec {
     /// An Int parameter that must be a power of two (a resolution downscale factor).
     /// `minimum` / `maximum` still apply.
     bool power_of_two = false;
+
+    ParamSpec() = default;
+
+    /// The four-field form every declaration uses. It is a constructor rather than an
+    /// aggregate so callers may omit the constraint fields without the compiler warning about
+    /// the ones they left out, and then set the constraints they need on the returned object.
+    ParamSpec(std::string param_name, ParamType param_type, ParamValue default_val,
+              std::string documentation)
+        : name(std::move(param_name)),
+          type(param_type),
+          default_value(std::move(default_val)),
+          doc(std::move(documentation)) {}
 
     /// Full schema key, e.g. "DetectFeatures/keypoint_limit".
     std::string qualified(const std::string& task_name) const {
