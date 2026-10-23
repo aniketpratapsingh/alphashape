@@ -6,7 +6,6 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
-#include <QSignalSpy>
 #include <QString>
 
 #include "apps/gui/theme/theme.hpp"
@@ -16,6 +15,16 @@ using alphashape::gui::ThemeMode;
 using alphashape::gui::ViewportBackground;
 
 namespace {
+
+// Counts emissions of a signal (QtTest's QSignalSpy would pull in another Qt module).
+struct SignalCounter {
+    template <typename Sender, typename Signal>
+    SignalCounter(Sender* sender, Signal signal) {
+        QObject::connect(sender, signal, sender, [this](ThemeMode) { ++n; });
+    }
+    int count() const { return n; }
+    int n = 0;
+};
 
 QString repo_path(const char* relative) {
     return QStringLiteral(ALPHASHAPE_REPO_ROOT "/") + QString::fromLatin1(relative);
@@ -130,7 +139,7 @@ TEST(Theme, QssMatchesTokens) {
 
 TEST(Theme, SwitchesAtRuntime) {
     Theme theme;
-    QSignalSpy changed(&theme, &Theme::changed);
+    SignalCounter changed(&theme, &Theme::changed);
 
     theme.apply(ThemeMode::Dark);
     EXPECT_EQ(changed.count(), 1);
@@ -157,7 +166,7 @@ TEST(Theme, ViewportCanStayDarkUnderLightTheme) {
     theme.apply(ThemeMode::Light);
     EXPECT_EQ(theme.viewport_mode(), ThemeMode::Light);  // Follow theme
 
-    QSignalSpy viewport(&theme, &Theme::viewport_changed);
+    SignalCounter viewport(&theme, &Theme::viewport_changed);
     theme.set_viewport_background(ViewportBackground::Dark);
     EXPECT_EQ(theme.viewport_mode(), ThemeMode::Dark);
     EXPECT_EQ(viewport.count(), 1);
