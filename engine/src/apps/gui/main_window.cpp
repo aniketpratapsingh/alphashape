@@ -23,6 +23,8 @@
 #include <QWidget>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/properties_pane.hpp"
+#include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/viewport_placeholder.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -148,6 +150,16 @@ void MainWindow::create_docks() {
                                  tr("Properties"));
     photos_dock_ = make_dock(this, QStringLiteral("dock.photos"), tr("Photos"), tr("Photos"));
     log_dock_ = make_dock(this, QStringLiteral("dock.log"), tr("Log"), tr("Log"));
+
+    // The Workspace tree and the Properties sheet replace their placeholders.
+    selection_ = new WorkspaceSelection(this);
+    selection_->setObjectName(QStringLiteral("selection.workspace"));
+    workspace_pane_ = new WorkspacePane(app_, *selection_, workspace_dock_);
+    properties_pane_ = new PropertiesPane(app_, *selection_, properties_dock_);
+    delete workspace_dock_->widget();
+    workspace_dock_->setWidget(workspace_pane_);
+    delete properties_dock_->widget();
+    properties_dock_->setWidget(properties_pane_);
 }
 
 void MainWindow::apply_default_layout() {
