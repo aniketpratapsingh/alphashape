@@ -176,7 +176,7 @@ find_package(TIFF REQUIRED)
 
 # Qt is LGPL-3: it is always linked dynamically (the official binaries are shared).
 if(ALPHASHAPE_BUILD_GUI)
-    find_package(Qt6 6.6 QUIET COMPONENTS Widgets)
+    find_package(Qt6 6.6 QUIET COMPONENTS Widgets Test)
     if(NOT Qt6_FOUND)
         message(FATAL_ERROR "alphashape: ALPHASHAPE_BUILD_GUI=ON but Qt 6.6 or newer (Widgets) was "
                             "not found. Point CMAKE_PREFIX_PATH at a Qt 6 install, or pass "
