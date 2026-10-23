@@ -470,14 +470,42 @@ jobs:
           path: tests-lane.txt
           retention-days: 1
 
-      - name: Test (GPU suites on Mesa lavapipe)
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # Point the Vulkan loader at lavapipe. The ICD file name differs between Mesa packagings
+      # (lvp_icd.json, lvp_icd.x86_64.json), so look it up rather than hard-code it. A missing
+      # lavapipe must fail the job: without it every GPU suite skips and the pipelines fall back
+      # to the CPU, silently.
+      - name: Locate lavapipe and verify it enumerates
         run: |
-          vulkaninfo --summary | head -20 || true
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1 || true)
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD (lvp_icd*.json) under /usr/share/vulkan/icd.d"
+            ls -l /usr/share/vulkan/icd.d || true
+            exit 1
+          fi
+          echo "lavapipe ICD: $icd"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES="$icd" VK_ICD_FILENAMES="$icd" vulkaninfo --summary | tee vulkaninfo.txt | head -40
+          if ! grep -qi 'llvmpipe' vulkaninfo.txt; then
+            echo "::error::vulkaninfo does not list a llvmpipe device; GPU suites would silently skip"
+            exit 1
+          fi
+
+      - name: Test (GPU suites on Mesa lavapipe)
+        run: |
           mapfile -t args < ctest-args.txt
           # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
-          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 "${args[@]}"
+          ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 "${args[@]}" 2>&1 | tee ctest.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Skip summary
+        if: always()
+        run: |
+          log=build/Testing/Temporary/LastTest.log
+          sed -nE 's/^\[  SKIPPED \] ([A-Za-z0-9_\/.]+) \(.*$/\1/p' "$log" | sort -u > skipped.txt || true
+          echo "gtest skips in this lane: $(wc -l < skipped.txt)"
+          head -40 skipped.txt
+          grep -c 'vkCreateInstance failed' "$log" || true
 
   macos-test:
     name: macOS test ${{ matrix.lane }}
