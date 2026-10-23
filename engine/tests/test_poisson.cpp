@@ -404,8 +404,13 @@ TEST(Poisson, Sphere128Performance) {
     // Wall-clock budget, not a correctness bound: 60 s was tuned on the M1
     // development machine. This 4-core x86 host takes ~43 s alone and ~79 s
     // with a second test running beside it, so the budget is scaled for slower
-    // hosts (the solve itself is seconds on the device path).
+    // hosts (the solve itself is seconds on the device path). The ASan+UBSan
+    // build is several times slower again, so it gets that much more headroom.
+#ifdef ALPHASHAPE_SANITIZED_BUILD
+    EXPECT_LT(seconds, 600.0);
+#else
     EXPECT_LT(seconds, 120.0);
+#endif
 }
 
 }  // namespace

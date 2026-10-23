@@ -4,6 +4,10 @@ name: Sanitizers
 # UndefinedBehaviorSanitizer on Linux. Undefined behaviour aborts the test
 # (-fno-sanitize-recover=undefined). Third-party and deliberate-at-exit leaks are suppressed
 # narrowly in engine/cmake/sanitizers/lsan.supp; nothing is disabled globally.
+#
+# One job builds the instrumented tree, then a matrix runs ctest slices of it: stride shards of the
+# light tests (the heavy lanes of .github/ci/test-lanes.json are excluded) plus one lane for the three
+# GPU pipeline tests that take 5-20 minutes each when instrumented.
 
 on:
   schedule:
@@ -32,10 +36,12 @@ env:
   # Instrumented code is several times slower; speed-up assertions are meaningless here.
   ALPHASHAPE_PERF_ASSERTS: "0"
   VMA_TAG: v3.1.0
+  # Multi-minute GPU pipeline tests (instrumented, on lavapipe); they get their own lane.
+  SLOW_TESTS: ^(PatchMatchGpu\.DenseFusedCloudMeetsAccuracyContract|TvFusionGpu\.BuildModelMeetsCpuBounds|PoissonGpu\.BuildModelPointCloudMatchesCpuBounds)$
 
 jobs:
-  sanitize:
-    name: ASan + UBSan (Linux, GCC, lavapipe)
+  build:
+    name: Build (ASan + UBSan, GCC)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -46,7 +52,7 @@ jobs:
           # The hosted mirrors occasionally stall; bound each attempt and retry.
           apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
           apt_retry update
-          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache jq \
+          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
             libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
@@ -76,9 +82,54 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
 
+      - name: Pack test tree
+        run: |
+          tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
+          ls -lh build.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-san
+          path: build.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
       - name: Compiler cache statistics
         if: always()
         run: ccache --show-stats || true
+
+  test:
+    name: Test ${{ matrix.lane }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { lane: light-1-of-4, index: 1, total: 4 }
+          - { lane: light-2-of-4, index: 2, total: 4 }
+          - { lane: light-3-of-4, index: 3, total: 4 }
+          - { lane: light-4-of-4, index: 4, total: 4 }
+          - { lane: slow-gpu, index: 0, total: 0 }
+    steps:
+      # The build tree holds absolute paths, so the checkout location must match the build job.
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends jq libceres4t64 libproj25 proj-data libtiff6 \
+            libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-san
+
+      - name: Unpack build tree
+        run: tar --zstd -xf build.tar.zst
 
       # Point the Vulkan loader at lavapipe. The ICD file name differs between Mesa packagings
       # (lvp_icd.json, lvp_icd.x86_64.json), so look it up rather than hard-code it. A missing
@@ -100,28 +151,33 @@ jobs:
             exit 1
           fi
 
-      - name: Test (light set, heavy lanes excluded)
+      - name: Test
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          INDEX: ${{ matrix.index }}
+          TOTAL: ${{ matrix.total }}
         run: |
           # Same heavy-test list build.yml uses; those multi-minute pipelines are too slow instrumented.
-          exclude=$(jq -r '"^(" + ([.heavy[].tests[]] | map(gsub("\\."; "\\.")) | join("|")) + ")$"' .github/ci/test-lanes.json)
-          echo "excluding: $exclude"
-          ctest --test-dir build --parallel 4 --timeout 1800 -E "$exclude" 2>&1 | tee ctest.log
+          heavy=$(jq -r '[.heavy[].tests[]] | map(gsub("\\."; "\\.")) | join("|")' .github/ci/test-lanes.json)
+          if [ "$INDEX" = 0 ]; then
+            args=(-R "$SLOW_TESTS")
+          else
+            args=(-E "^($heavy)\$|$SLOW_TESTS" -I "$INDEX,,$TOTAL")
+          fi
+          printf '%s\n' "${args[@]}"
+          ctest --test-dir build -N "${args[@]}" | tail -3
+          ctest --test-dir build --parallel 4 --timeout 2400 "${args[@]}" 2>&1 | tee ctest.log
           exit "${PIPESTATUS[0]}"
 
       - name: Sanitizer reports
         if: always()
         run: |
-          log=build/Testing/Temporary/LastTest.log
-          grep -E "runtime error:|ERROR: (Address|Leak)Sanitizer|SUMMARY: " "$log" | sort | uniq -c | sort -rn | head -50 || true
+          grep -E "runtime error:|ERROR: (Address|Leak)Sanitizer|SUMMARY: " ctest.log | sort | uniq -c | sort -rn | head -50 || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sanitizer-logs
-          path: |
-            ctest.log
-            build/Testing/Temporary/LastTest.log
+          name: sanitizer-logs-${{ matrix.lane }}
+          path: ctest.log
           retention-days: 7
