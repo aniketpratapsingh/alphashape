@@ -14,6 +14,7 @@ Usage: bundle_libs.py <alphashape.app> [--min-os-out FILE]
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -96,6 +97,26 @@ def min_os_of(path):
     return best
 
 
+BREW_ROOTS = ("/opt/homebrew", "/usr/local")
+
+
+def find_in_homebrew(name):
+    """Locate a library by file name under a Homebrew prefix.
+
+    macdeployqt strips the rpaths of what it copies, so a library such as libgfortran arrives
+    with `@rpath/libgcc_s.1.1.dylib` and nowhere to look; Homebrew keeps those in versioned
+    keg directories.
+    """
+    for root in BREW_ROOTS:
+        for pattern in (f"{root}/lib/{name}", f"{root}/lib/gcc/current/{name}",
+                        f"{root}/opt/*/lib/{name}", f"{root}/opt/*/lib/gcc/current/{name}",
+                        f"{root}/Cellar/*/*/lib/{name}", f"{root}/Cellar/*/*/lib/gcc/*/{name}"):
+            hits = sorted(glob.glob(pattern))
+            if hits:
+                return hits[0]
+    return None
+
+
 class Bundle:
     def __init__(self, app):
         self.app = os.path.realpath(app)
@@ -168,6 +189,8 @@ class Bundle:
                         if os.path.exists(os.path.join(self.frameworks, os.path.basename(ref))):
                             source = os.path.join(self.frameworks, os.path.basename(ref))
                         else:
+                            source = find_in_homebrew(os.path.basename(ref))
+                        if source is None:
                             sys.exit(f"error: cannot resolve {ref} (needed by {path})")
                     if self.inside(source):
                         continue
