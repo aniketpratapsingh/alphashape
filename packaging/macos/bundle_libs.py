@@ -63,8 +63,10 @@ def deps_of(path):
 
 def id_of(path):
     """Install-name id of a dylib/framework binary, or '' for executables and bundles."""
-    lines = run(["otool", "-D", path]).splitlines()
-    return lines[1].strip() if len(lines) > 1 else ""
+    # Output is "<path>:" (or "<path> (architecture arm64):") followed by the id, if there is one.
+    lines = [l.strip() for l in run(["otool", "-D", path]).splitlines()]
+    ids = [l for l in lines if l and not l.endswith(":")]
+    return ids[-1] if ids else ""
 
 
 def rpaths_of(path):
