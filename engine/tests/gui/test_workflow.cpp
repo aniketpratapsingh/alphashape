@@ -15,6 +15,7 @@
 
 #include <Eigen/Core>
 #include <QAction>
+#include <QFile>
 #include <QMenu>
 #include <QStringList>
 
@@ -414,7 +415,11 @@ TEST_F(WorkflowTest, TheDefaultSubmitReachesTheJobManager) {
                                          std::int32_t target) {
         app().jobs().submit(task, std::move(params), target);
     });
-    workflow().set_photos_handler([]() { return QStringList{"/definitely/not/here.jpg"}; });
+    // A path in this test's own scratch directory, so it is spelled the way the platform spells
+    // paths (the task reports it back through std::filesystem) and cannot exist.
+    const QString missing = scratch(QStringLiteral("not-here.jpg"));
+    ASSERT_FALSE(QFile::exists(missing));
+    workflow().set_photos_handler([missing]() { return QStringList{missing}; });
     // Shared, not a reference capture: the connection lives in the window, which outlives the
     // test body, so a late emit during teardown must not touch a destroyed local.
     auto final_state = std::make_shared<std::optional<JobManager::State>>();
@@ -426,6 +431,9 @@ TEST_F(WorkflowTest, TheDefaultSubmitReachesTheJobManager) {
     ASSERT_TRUE(pump_until([&]() { return final_state->has_value(); }, 60000));
     EXPECT_EQ(*final_state, JobManager::State::Failed);
     ASSERT_EQ(errors_.size(), 1U);
-    EXPECT_TRUE(errors_[0].second.contains(QStringLiteral("not/here.jpg")));
+    // The failure names the file it could not read (only the base name: separators differ per
+    // platform, and the task reports the path it resolved).
+    EXPECT_TRUE(errors_[0].second.contains(QStringLiteral("not-here.jpg")))
+        << errors_[0].second.toStdString();
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
