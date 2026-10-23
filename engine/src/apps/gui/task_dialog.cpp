@@ -83,15 +83,19 @@ int nearest_power_of_two(int value) {
 /// The legal range for a power-of-two parameter: the smallest power of two at or above
 /// `lower`, and the largest at or below `upper`.
 std::pair<int, int> power_of_two_range(int lower, int upper) {
-    int low = std::max(1, lower);
-    while (low <= upper && (low & (low - 1)) != 0) {
-        ++low;
+    // The first legal value at or above `lower`, by doubling from 1 (never by incrementing
+    // from `lower`, which would overshoot the bound when no power of two fits between them).
+    int low = 1;
+    while (low < lower && low <= INT_MAX / 2) {
+        low *= 2;
     }
+    // The last legal value at or below `upper`. Clear the bits under the highest set one:
+    // halving an odd `upper` would not converge on a power of two.
     int high = std::max(1, upper);
-    while (high > 0 && (high & (high - 1)) != 0) {
-        high /= 2;
+    while ((high & (high - 1)) != 0) {
+        high &= high - 1;
     }
-    return {std::min(low, upper), std::max(high, low)};
+    return {low, std::max(high, low)};
 }
 
 /// A spin box for a parameter whose legal values are the powers of two. stepBy is overridden
