@@ -226,11 +226,11 @@ jobs:
       - name: .deb in a clean container
         run: |
           docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
-            bash /w/packaging/linux/smoke-deb.sh /w/dist/*.deb /w/engine/data
+            bash -c 'bash /w/packaging/linux/smoke-deb.sh /w/dist/*.deb /w/engine/data'
       - name: AppImage in a clean container (no FUSE)
         run: |
           docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
-            bash /w/packaging/linux/smoke-appimage.sh /w/dist/*.AppImage /w/engine/data
+            bash -c 'bash /w/packaging/linux/smoke-appimage.sh /w/dist/*.AppImage /w/engine/data'
 
   macos:
     name: macOS arm64 (Clang, MoltenVK)
