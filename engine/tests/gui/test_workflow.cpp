@@ -200,7 +200,8 @@ TEST_F(WorkflowTest, NothingIsEnabledWithoutAnActiveChunk) {
     refresh();
     for (const WorkflowStep& step : WorkflowController::steps()) {
         EXPECT_FALSE(workflow().action(step.task)->isEnabled()) << step.task;
-        EXPECT_FALSE(workflow().action(step.task)->toolTip().isEmpty()) << step.task;
+        EXPECT_EQ(workflow().unavailable_reason(step.task), QStringLiteral("There is no active chunk."))
+            << step.task;
     }
     EXPECT_FALSE(workflow().run("AddPhotos"));
     EXPECT_TRUE(submitted_.empty());
@@ -292,13 +293,23 @@ TEST_F(WorkflowTest, ATaskTheMenuDoesNotOfferCannotRun) {
 }
 
 TEST_F(WorkflowTest, DisabledActionsSayWhatIsMissing) {
-    EXPECT_TRUE(workflow().action("AddPhotos")->toolTip().isEmpty());
-    const QString blocking = workflow().action("BuildModel")->toolTip();
+    // A runnable action has no explanation. QAction::toolTip() falls back to the action's text
+    // when the tip is empty, so the question "is there a tip?" is asked of the text, not toolTip().
+    QAction* photos = workflow().action("AddPhotos");
+    ASSERT_NE(photos, nullptr);
+    EXPECT_TRUE(photos->isEnabled());
+    EXPECT_TRUE(photos->text() != photos->toolTip());
+    EXPECT_TRUE(workflow().unavailable_reason("AddPhotos").isEmpty());
+
+    QAction* model = workflow().action("BuildModel");
+    ASSERT_NE(model, nullptr);
+    EXPECT_FALSE(model->isEnabled());
+    const QString blocking = workflow().unavailable_reason("BuildModel");
     EXPECT_FALSE(blocking.isEmpty());
     EXPECT_TRUE(blocking.contains(QStringLiteral("depth maps")));
-    EXPECT_EQ(workflow().action("BuildModel")->statusTip(), blocking);
-    EXPECT_EQ(workflow().unavailable_reason("BuildModel"), blocking);
-    EXPECT_TRUE(workflow().unavailable_reason("AddPhotos").isEmpty());
+    // The action shows exactly that text as its tip, in the menu and on the status bar.
+    EXPECT_EQ(model->toolTip(), blocking);
+    EXPECT_EQ(model->statusTip(), blocking);
 }
 
 TEST_F(WorkflowTest, ActionsAreDisabledWhileAJobRuns) {
