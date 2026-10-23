@@ -157,7 +157,7 @@ void DetectFeaturesTask::apply(Document& document, Params& params, const Progres
         processed = batch_end;
         progress.update("detect", static_cast<double>(processed) / static_cast<double>(total));
         if (progress.is_cancelled()) {
-            throw Error("DetectFeatures was cancelled");
+            throw CancelledError("DetectFeatures was cancelled");
         }
     }
 

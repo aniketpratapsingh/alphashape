@@ -20,6 +20,7 @@
 #include <QStatusBar>
 #include <QToolButton>
 
+#include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/tasks/registry.hpp"
@@ -57,21 +58,34 @@ public:
     std::vector<Stage> stages() const override { return {Stage{"a", 0}, Stage{"b", 0}}; }
 
     void apply(Document& document, Params& params, const Progress& progress) override {
+        const std::string label = params.get_string("label");
         progress.update("a", 0.0);
         gate_->started = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!gate_->release.load()) {
             if (progress.is_cancelled()) {
-                throw Error("GateTask was cancelled");
+                if (label == "cancel_then_fail") {
+                    // A real failure that merely arrives after the cancel request.
+                    throw Error("gate task broke while stopping");
+                }
+                // The engine's cancellation exception; the document is touched first, as a task
+                // that stopped half way through its work would have.
+                if (label == "mutate") {
+                    document.workspace().add_chunk("Partial");
+                }
+                throw CancelledError("GateTask was cancelled");
             }
             if (std::chrono::steady_clock::now() > deadline) {
                 throw Error("GateTask timed out waiting for the test");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        const std::string label = params.get_string("label");
         if (label == "fail") {
             throw Error("gate task failed on purpose");
+        }
+        if (label == "mutate_fail") {
+            document.workspace().add_chunk("Partial");
+            throw Error("gate task failed after mutating");
         }
         progress.update("a", 0.5);
         alphashape::log(LogLevel::Info) << "gate halfway " << label;
@@ -125,6 +139,12 @@ protected:
         window().set_error_handler([this](const QString& title, const QString& message) {
             errors_.emplace_back(title, message);
         });
+    }
+
+    void TearDown() override {
+        // The app (and its job manager, which points at registry_) goes first; registry_ is a
+        // member of this class and is only destroyed afterwards.
+        GuiTest::TearDown();
     }
 
     void use_gate_registry() { app().jobs().set_registry(&registry_); }
@@ -233,12 +253,11 @@ TEST_F(JobsTest, ProgressIsMonotonicAndReportsStages) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
-TEST_F(JobsTest, CancelMidRunLeavesTheDocumentUnchanged) {
+TEST_F(JobsTest, CancelMidRunEndsCancelledAndInvalidatesTheHistory) {
     use_gate_registry();
     app().execute(make_add_chunk_command(app().document().workspace(), "Extra", -1));
     const Chunk before = chunk();
     const std::size_t chunks_before = app().document().workspace().chunks().size();
-    const bool dirty_before = app().dirty();
 
     const quint64 id = app().jobs().submit("GateTask", gate_params());
     wait_started();
@@ -256,11 +275,86 @@ TEST_F(JobsTest, CancelMidRunLeavesTheDocumentUnchanged) {
     EXPECT_TRUE(errors_.empty());  // a cancel is not an error
     EXPECT_TRUE(chunk() == before);
     EXPECT_EQ(app().document().workspace().chunks().size(), chunks_before);
-    EXPECT_EQ(app().dirty(), dirty_before);
-    EXPECT_TRUE(app().undo_stack().can_undo());  // history survives a cancel
-    EXPECT_TRUE(action("action.edit.undo")->isEnabled());
+    // The task had started, so it may have changed the document: dirty, and no stale undo.
+    EXPECT_TRUE(app().dirty());
+    EXPECT_FALSE(app().undo_stack().can_undo());
+    EXPECT_FALSE(action("action.edit.undo")->isEnabled());
     EXPECT_FALSE(button->isVisibleTo(&window()));
     EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(JobsTest, CancelAfterPartialMutationMarksDirtyAndClearsUndo) {
+    use_gate_registry();
+    app().execute(make_add_chunk_command(app().document().workspace(), "Extra", -1));
+    const std::size_t chunks_before = app().document().workspace().chunks().size();
+
+    const quint64 id = app().jobs().submit("GateTask", gate_params("mutate"));
+    wait_started();
+    app().jobs().cancel(id);
+    wait_finished();
+
+    ASSERT_EQ(finished_.size(), 1U);
+    EXPECT_EQ(finished_[0].state, JobManager::State::Cancelled);
+    EXPECT_EQ(app().document().workspace().chunks().size(), chunks_before + 1);  // partial
+    EXPECT_TRUE(app().dirty());
+    EXPECT_FALSE(app().undo_stack().can_undo());
+    EXPECT_FALSE(app().jobs().busy());
+}
+
+TEST_F(JobsTest, FailureAfterPartialMutationMarksDirtyAndClearsUndo) {
+    use_gate_registry();
+    app().execute(make_add_chunk_command(app().document().workspace(), "Extra", -1));
+    const std::size_t chunks_before = app().document().workspace().chunks().size();
+
+    app().jobs().submit("GateTask", gate_params("mutate_fail"));
+    wait_started();
+    gate_->release = true;
+    wait_finished();
+
+    ASSERT_EQ(finished_.size(), 1U);
+    EXPECT_EQ(finished_[0].state, JobManager::State::Failed);
+    EXPECT_EQ(app().document().workspace().chunks().size(), chunks_before + 1);
+    EXPECT_TRUE(app().dirty());
+    EXPECT_FALSE(app().undo_stack().can_undo());
+}
+
+TEST_F(JobsTest, FailureBeforeAnyTaskCodeLeavesDirtyAndUndoAlone) {
+    use_gate_registry();
+    app().execute(make_add_chunk_command(app().document().workspace(), "Extra", -1));
+    const bool dirty_before = app().dirty();
+
+    app().jobs().submit("NoSuchTask", Params{});
+    app().jobs().submit("GateTask", gate_params(), /*chunk_id=*/999);
+    wait_finished(2);
+
+    EXPECT_EQ(finished_[0].state, JobManager::State::Failed);
+    EXPECT_EQ(finished_[1].state, JobManager::State::Failed);
+    EXPECT_EQ(app().dirty(), dirty_before);
+    EXPECT_TRUE(app().undo_stack().can_undo());
+}
+
+TEST_F(JobsTest, ARealErrorAfterCancelIsFailedNotCancelled) {
+    use_gate_registry();
+    const quint64 id = app().jobs().submit("GateTask", gate_params("cancel_then_fail"));
+    wait_started();
+    app().jobs().cancel(id);
+    wait_finished();
+
+    ASSERT_EQ(finished_.size(), 1U);
+    EXPECT_EQ(finished_[0].state, JobManager::State::Failed);
+    EXPECT_TRUE(finished_[0].message.contains(QStringLiteral("broke while stopping")));
+    EXPECT_EQ(errors_.size(), 1U);
+}
+
+TEST_F(JobsTest, StateOfAnUnknownIdIsUnknown) {
+    EXPECT_EQ(app().jobs().state(424242), JobManager::State::Unknown);
+    EXPECT_FALSE(app().jobs().job(424242).has_value());
+}
+
+TEST_F(JobsTest, ReadDocumentRunsUnderTheSharedLockAndLogSinkKeepsWorking) {
+    const std::string name = app().read_document([](const Document& d) { return d.path(); });
+    EXPECT_TRUE(name.empty());
+    EXPECT_TRUE(app().document_lock().try_write().owns_lock());  // the read lock was released
 }
 
 TEST_F(JobsTest, FailingRealTaskEndsFailedAndCallsTheErrorHandler) {

@@ -33,6 +33,13 @@ public:
     explicit ValueError(const std::string& what) : Error(what) {}
 };
 
+/// A task stopped because Progress::cancelled asked it to. The one exception type front ends
+/// treat as "cancelled" rather than "failed".
+class CancelledError : public Error {
+public:
+    explicit CancelledError(const std::string& what) : Error(what) {}
+};
+
 /// Project file IO failed (bad container, missing doc.xml, corrupt zip).
 class ProjectIOError : public Error {
 public:

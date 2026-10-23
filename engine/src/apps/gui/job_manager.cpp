@@ -32,6 +32,7 @@ QString JobManager::state_name(State state) {
         case State::Succeeded: return QStringLiteral("succeeded");
         case State::Failed: return QStringLiteral("failed");
         case State::Cancelled: return QStringLiteral("cancelled");
+        case State::Unknown: return QStringLiteral("unknown");
     }
     return QStringLiteral("?");
 }
@@ -75,7 +76,7 @@ std::optional<JobManager::Job> JobManager::job(JobId id) const {
 
 JobManager::State JobManager::state(JobId id) const {
     const std::optional<Job> found = job(id);
-    return found ? found->state : State::Cancelled;
+    return found ? found->state : State::Unknown;
 }
 
 // --- Submitting and cancelling ---------------------------------------------------------------
@@ -197,6 +198,8 @@ void JobManager::start_next() {
 void JobManager::run_worker(const std::shared_ptr<Worker>& worker, Request request,
                             std::shared_ptr<Document> document) {
     std::string error;
+    bool cancelled_error = false;
+    bool touched = false;
     try {
         std::unique_lock<std::shared_mutex> lock = app_.document_lock().write();
         const std::int32_t previous_active = document->active_chunk_id();
@@ -225,11 +228,21 @@ void JobManager::run_worker(const std::shared_ptr<Worker>& worker, Request reque
         progress.cancelled = [&worker]() { return worker->cancel.load(); };
 
         try {
+            touched = true;  // from here on a task may have changed the document
             run_task(*registry_, *document, request.task_name, request.params, progress);
         } catch (...) {
             // A task that did not finish must leave the document as it found it.
             document->set_active_chunk_id(previous_active);
             throw;
+        }
+    } catch (const UnsupportedTaskError& e) {
+        touched = false;  // rejected by the registry lookup, before any task code ran
+        error = e.what();
+    } catch (const CancelledError& e) {
+        cancelled_error = true;
+        error = e.what();
+        if (error.empty()) {
+            error = "the task was cancelled";
         }
     } catch (const std::exception& e) {
         error = e.what();
@@ -242,6 +255,8 @@ void JobManager::run_worker(const std::shared_ptr<Worker>& worker, Request reque
     {
         std::lock_guard<std::mutex> guard(worker->mutex);
         worker->error = std::move(error);
+        worker->cancelled_error = cancelled_error;
+        worker->touched_document = touched;
         worker->done = true;
     }
     QMetaObject::invokeMethod(
@@ -296,22 +311,26 @@ void JobManager::worker_done(const std::shared_ptr<Worker>& worker) {
         worker->thread.join();
     }
     std::string error;
+    bool cancelled_error = false;
+    bool touched = false;
     {
         std::lock_guard<std::mutex> guard(worker->mutex);
         error = worker->error;
+        cancelled_error = worker->cancelled_error;
+        touched = worker->touched_document;
     }
-    const bool cancelled = worker->cancel.load();
     worker_.reset();
     if (error.empty()) {
-        finish_current(State::Succeeded, QString());
-    } else if (cancelled) {
-        finish_current(State::Cancelled, QString());
+        finish_current(State::Succeeded, QString(), true);
+    } else if (cancelled_error) {
+        finish_current(State::Cancelled, QString(), touched);
     } else {
-        finish_current(State::Failed, QString::fromStdString(error));
+        finish_current(State::Failed, QString::fromStdString(error), touched);
     }
 }
 
-void JobManager::finish_current(State final_state, const QString& message) {
+void JobManager::finish_current(State final_state, const QString& message,
+                                bool touched_document) {
     Request request = std::move(queue_.front());
     queue_.pop_front();
     Job done = std::move(request.job);
@@ -319,9 +338,12 @@ void JobManager::finish_current(State final_state, const QString& message) {
     done.message = message;
     done.elapsed_ms = clock_.elapsed();
 
-    if (final_state == State::Succeeded) {
-        // The task changed the document in ways the undo stack cannot reverse.
+    if (touched_document) {
+        // The task changed (or, if it stopped early, may have partly changed) the document in
+        // ways the undo stack cannot reverse.
         app_.task_changed_document();
+    }
+    if (final_state == State::Succeeded) {
         done.percent = 100.0;
         Q_EMIT job_progress(done.id, 100.0, done.stage, 0);
     }

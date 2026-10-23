@@ -12,8 +12,13 @@
 //
 // Cancellation is cooperative: cancel() raises the flag behind Progress::cancelled, which the
 // tasks poll at their stage / work-item boundaries and answer by throwing. A job that was asked
-// to cancel and then threw (or was still pending) ends Cancelled; one that finished anyway
-// ends Succeeded.
+// to cancel and then threw CancelledError (or was still pending) ends Cancelled; one that
+// finished anyway ends Succeeded; any other exception ends Failed, cancel requested or not.
+//
+// Tasks mutate the document in place, so a job that ends Failed or Cancelled after its task
+// started may have left partial changes: the undo history is cleared and the document marked
+// dirty, exactly as for Succeeded. Only a job that failed before it reached a task's apply()
+// (unknown task, unknown chunk) leaves the document alone.
 
 #include <atomic>
 #include <cstdint>
@@ -42,7 +47,8 @@ class JobManager : public QObject {
 public:
     using JobId = quint64;
 
-    enum class State { Pending, Running, Succeeded, Failed, Cancelled };
+    /// Unknown is never a job's own state; state() returns it for an id it does not know.
+    enum class State { Pending, Running, Succeeded, Failed, Cancelled, Unknown };
     Q_ENUM(State)
 
     /// What the manager remembers about a job (also after it finished).
@@ -84,7 +90,7 @@ public:
     std::optional<JobId> running_job() const;
     std::size_t pending_count() const;
     std::optional<Job> job(JobId id) const;
-    /// State of a job; an id the manager never issued (or has forgotten) reports Cancelled.
+    /// State of a job; an id the manager never issued (or has forgotten) reports Unknown.
     State state(JobId id) const;
 
     /// Replace the registry tasks are looked up in (default: the built-in one). Tests register
@@ -120,6 +126,8 @@ private:
         bool progress_posted = false;
         bool done = false;
         std::string error;  // empty on success
+        bool cancelled_error = false;  // the error was a CancelledError
+        bool touched_document = false; // a task may have started changing the document
         std::thread thread;
     };
 
@@ -138,7 +146,7 @@ private:
                     std::shared_ptr<Document> document);
     void deliver_progress(const std::shared_ptr<Worker>& worker);
     void worker_done(const std::shared_ptr<Worker>& worker);
-    void finish_current(State final_state, const QString& message);
+    void finish_current(State final_state, const QString& message, bool touched_document);
     void set_state(Request& request, State next);
 };
 

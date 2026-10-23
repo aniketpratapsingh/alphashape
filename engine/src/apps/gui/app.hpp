@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <QObject>
 #include <QSettings>
@@ -43,11 +44,22 @@ public:
     JobManager& jobs() { return jobs_; }
 
     /// Held exclusively by a running task; readers that run alongside jobs take it shared.
+    /// Rule for GUI panes: refresh from the document only when no job is active, i.e. on
+    /// JobManager::job_finished / busy_changed(false); never read it while busy().
     DocumentLock& document_lock() { return document_lock_; }
+
+    /// Run `fn(const Document&)` under the shared document lock and return its result. Use this
+    /// for GUI-thread reads (title, path, ...) so they never overlap a running task's writes.
+    template <typename Fn>
+    auto read_document(Fn&& fn) const {
+        const auto lock = document_lock_.read();
+        return std::forward<Fn>(fn)(std::as_const(*document_));
+    }
     /// The same document, shared with the job worker so it outlives a swap.
     std::shared_ptr<Document> shared_document() { return document_; }
 
-    /// Called by the job manager after a task succeeded. Tasks are not reversible through the
+    /// Called by the job manager after a task ended (also Failed / Cancelled once it had started,
+    /// since tasks mutate in place and may leave partial changes). Tasks are not reversible through the
     /// command layer (there is no reversal command for them yet), so the undo history, whose
     /// entries assume the pre-task state, is cleared and the document is marked dirty.
     void task_changed_document();
@@ -112,7 +124,7 @@ private:
     std::shared_ptr<Document> document_;
     UndoStack undo_stack_;
     Theme theme_;
-    DocumentLock document_lock_;
+    mutable DocumentLock document_lock_;
     JobManager jobs_;
     /// Undo position at the last load/save; npos when that state is no longer reachable
     /// (a new edit overwrote the redo branch that led back to it).

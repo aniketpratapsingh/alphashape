@@ -1,5 +1,7 @@
 #include "apps/gui/app.hpp"
 
+#include <iostream>
+
 #include <QApplication>
 #include <QMetaObject>
 #include <QFileInfo>
@@ -54,6 +56,11 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
     // Engine log lines may come from the worker thread; hand them to the GUI thread.
     g_log_owner = this;
     Log::set_sink([this](LogLevel level, const std::string& message) {
+        // Keep warnings and errors on the console too, so CI logs still show them.
+        if (level >= LogLevel::Warn && level != LogLevel::Off) {
+            std::cerr << '[' << (level == LogLevel::Warn ? "warn" : "error") << "] " << message
+                      << '\n';
+        }
         QMetaObject::invokeMethod(
             this,
             [this, level, text = QString::fromStdString(message)]() {
@@ -116,12 +123,13 @@ void GuiApp::open_document(const std::string& path) {
 
 void GuiApp::save_document() {
     require_idle("save the project");
-    if (document_->path().empty()) {
+    const std::string path = read_document([](const Document& d) { return d.path(); });
+    if (path.empty()) {
         throw Error("the project has no file name yet");
     }
-    ProjectIO::save(*document_, document_->path());
+    ProjectIO::save(*document_, path);
     reset_dirty_tracking();
-    add_recent_file(QString::fromStdString(document_->path()));
+    add_recent_file(QString::fromStdString(path));
     publish_dirty();
 }
 
@@ -220,10 +228,11 @@ void GuiApp::clear_recent_files() {
 }
 
 QString GuiApp::document_title() const {
-    if (document_->path().empty()) {
+    const std::string path = read_document([](const Document& d) { return d.path(); });
+    if (path.empty()) {
         return QStringLiteral("Untitled");
     }
-    return QFileInfo(QString::fromStdString(document_->path())).completeBaseName();
+    return QFileInfo(QString::fromStdString(path)).completeBaseName();
 }
 
 }  // namespace alphashape::gui
