@@ -1,0 +1,323 @@
+/* QSS only: no variables, calc(), flex, grid, transitions or box-shadow.
+ * Accent = selected/primary only. Status colors are reserved for status. */
+
+QWidget {
+    background-color: $surface.app;
+    color: $text.primary;
+    font-family: "Inter", "Segoe UI", "Helvetica Neue", sans-serif;
+    font-size: 13px;
+}
+QMainWindow, QWidget#appBackground { background-color: $surface.app; }
+QWidget#panel, QDockWidget > QWidget { background-color: $surface.panel; }
+
+/* ---------- docks ---------- */
+QDockWidget {
+    titlebar-close-icon: none;
+    titlebar-normal-icon: none;
+    font-size: 12px;
+    color: $text.secondary;
+}
+QDockWidget::title {
+    background-color: $surface.panel;
+    border-bottom: 1px solid $border.subtle;
+    padding-left: 12px;
+    height: 30px;
+    text-align: left;
+}
+#dockTitleBar { background-color: $surface.panel; border-bottom: 1px solid $border.subtle; }
+#dockTitleBar QLabel {
+    background: transparent; color: $text.secondary;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.055em; text-transform: uppercase;
+}
+#dockTitleBar QToolButton {
+    background: transparent; border: none; border-radius: 3px;
+    padding: 4px; min-width: 18px; min-height: 18px;
+}
+#dockTitleBar QToolButton:hover { background-color: <<rgba(255,255,255,0.05)||rgba(16,22,25,0.04)>>; }
+#dockTitleBar QToolButton:pressed { background-color: <<rgba(0,0,0,0.25)||rgba(16,22,25,0.09)>>; }
+
+/* ---------- trees & tables ---------- */
+QTreeView, QTableView, QListView {
+    background-color: $surface.panel;
+    alternate-background-color: $surface.app;
+    border: none;
+    outline: 0;
+    selection-background-color: $selection.bg;
+    selection-color: $text.primary;
+    show-decoration-selected: 1;
+}
+QTreeView::item, QTableView::item, QListView::item {
+    min-height: 22px;
+    padding: 2px 6px;
+    border: 1px solid transparent;
+}
+QTreeView::item:hover, QTableView::item:hover, QListView::item:hover {
+    background-color: <<rgba(255,255,255,0.05)||rgba(16,22,25,0.04)>>;
+}
+QTreeView::item:selected, QTableView::item:selected, QListView::item:selected {
+    background-color: $selection.bg;
+    color: $text.primary;
+}
+QTreeView::item:selected:active { border: 1px solid $accent.base; }
+QTreeView::branch { background: transparent; }
+QTreeView::branch:has-children:closed { image: url(:/icons/chevron-right.svg); }
+QTreeView::branch:has-children:open { image: url(:/icons/chevron-down.svg); }
+
+QHeaderView { background-color: $surface.app; border: none; }
+QHeaderView::section {
+    background-color: $surface.app;
+    color: $text.secondary;
+    border: none;
+    border-bottom: 1px solid $border.subtle;
+    border-right: 1px solid $border.subtle;
+    padding: 4px 6px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QTableCornerButton::section { background-color: $surface.app; border: none; }
+
+/* ---------- tabs ---------- */
+QTabWidget::pane { border: none; border-top: 1px solid $border.subtle; background-color: $surface.panel; }
+QTabBar { background-color: $surface.app; }
+QTabBar::tab {
+    background-color: transparent;
+    color: $text.secondary;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 12px;
+    min-width: 64px;
+    font-size: 12px;
+}
+QTabBar::tab:hover { color: $text.primary; background-color: <<rgba(255,255,255,0.05)||rgba(16,22,25,0.04)>>; }
+QTabBar::tab:selected {
+    color: $text.primary;
+    border-bottom: 2px solid $accent.base;
+    background-color: $surface.panel;
+}
+QTabBar::tab:disabled { color: $text.disabled; }
+QTabBar::close-button { image: url(:/icons/x.svg); subcontrol-position: right; }
+
+/* ---------- toolbars ---------- */
+QToolBar {
+    background-color: $surface.panel;
+    border: none;
+    border-bottom: 1px solid $border.subtle;
+    spacing: 4px;
+    padding: 4px 8px;
+    min-height: 36px;
+}
+QToolBar::separator { background-color: $border.subtle; width: 1px; margin: 4px 6px; }
+QToolButton {
+    background-color: transparent;
+    color: $text.secondary;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 4px;
+    min-width: 24px; min-height: 24px;
+}
+QToolButton:hover { background-color: <<rgba(255,255,255,0.05)||rgba(16,22,25,0.04)>>; color: $text.primary; }
+QToolButton:pressed { background-color: <<rgba(0,0,0,0.25)||rgba(16,22,25,0.09)>>; }
+QToolButton:checked { background-color: $accent.subtle; border-color: $accent.base; color: $accent.text; }
+QToolButton:disabled { color: $text.disabled; }
+QToolButton::menu-indicator { image: none; }
+
+/* ---------- buttons ---------- */
+QPushButton {
+    background-color: $surface.raised;
+    color: $text.primary;
+    border: 1px solid $border.default;
+    border-radius: 3px;
+    padding: 0 12px;
+    min-height: 24px;
+    font-size: 12px;
+}
+QPushButton:hover { border-color: $border.strong; background-color: $surface.overlay; }
+QPushButton:pressed { background-color: <<rgba(0,0,0,0.25)||rgba(16,22,25,0.09)>>; }
+QPushButton:focus { border: 1px solid $focus.ring; }
+QPushButton:disabled { color: $text.disabled; border-color: $border.subtle; background-color: $surface.panel; }
+QPushButton[role="primary"] {
+    background-color: $accent.base;
+    color: $accent.onAccent;
+    border: 1px solid $accent.base;
+    font-weight: 600;
+}
+QPushButton[role="primary"]:hover { background-color: $accent.hover; border-color: $accent.hover; }
+QPushButton[role="primary"]:pressed { background-color: $accent.pressed; }
+QPushButton[role="primary"]:focus { border: 1px solid $focus.ring; }
+QPushButton[role="primary"]:disabled {
+    background-color: $surface.raised; color: $text.disabled; border-color: $border.subtle;
+}
+QPushButton[role="ghost"] {
+    background: transparent; border-color: transparent; color: $text.secondary;
+}
+QPushButton[role="ghost"]:hover { background-color: <<rgba(255,255,255,0.05)||rgba(16,22,25,0.04)>>; color: $text.primary; }
+QPushButton[role="destructive"] {
+    background-color: transparent; border-color: $status.error; color: $status.error;
+}
+QPushButton[role="destructive"]:hover { background-color: $status.errorBg; }
+QPushButton[role="destructive"]:focus { border: 1px solid $focus.ring; }
+
+/* ---------- inputs ---------- */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: $surface.sunken;
+    color: $text.primary;
+    border: 1px solid $border.default;
+    border-radius: 3px;
+    padding: 0 6px;
+    min-height: 24px;
+    selection-background-color: $selection.bg;
+    selection-color: $text.primary;
+}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover { border-color: $border.strong; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: $focus.ring; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+    color: $text.disabled; background-color: $surface.panel; border-color: $border.subtle;
+}
+QLineEdit[invalid="true"], QSpinBox[invalid="true"], QDoubleSpinBox[invalid="true"] {
+    border-color: $status.error;
+}
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox::down-arrow { image: url(:/icons/chevron-down.svg); width: 12px; height: 12px; }
+QComboBox QAbstractItemView {
+    background-color: $surface.overlay;
+    border: 1px solid $border.default;
+    selection-background-color: $selection.bg;
+    selection-color: $text.primary;
+    outline: 0;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background-color: transparent; border: none; width: 16px;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url(:/icons/chevron-up.svg); width: 9px; height: 9px; }
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url(:/icons/chevron-down.svg); width: 9px; height: 9px; }
+
+/* ---------- progress ---------- */
+QProgressBar {
+    background-color: $surface.sunken;
+    border: none;
+    border-radius: 2px;
+    height: 4px;
+    text-align: center;
+    color: $text.secondary;
+    font-size: 10px;
+}
+QProgressBar::chunk { background-color: $accent.base; border-radius: 2px; }
+QProgressBar[state="processing"]::chunk { background-color: $status.processing; }
+QProgressBar[state="error"]::chunk { background-color: $status.error; }
+QProgressBar[state="success"]::chunk { background-color: $status.success; }
+QProgressBar[textVisible="true"] { height: 16px; border-radius: 2px; background-color: $surface.sunken; }
+
+/* ---------- scrollbars ---------- */
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical {
+    background-color: $border.default; min-height: 28px; border-radius: 4px; margin: 2px;
+}
+QScrollBar::handle:vertical:hover { background-color: $border.strong; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal {
+    background-color: $border.default; min-width: 28px; border-radius: 4px; margin: 2px;
+}
+QScrollBar::handle:horizontal:hover { background-color: $border.strong; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QScrollArea { border: none; background: transparent; }
+
+/* ---------- menus & tooltips ---------- */
+QMenu {
+    background-color: $surface.overlay;
+    border: 1px solid $border.default;
+    padding: 4px 0;
+    color: $text.primary;
+}
+QMenu::item {
+    padding: 6px 20px 6px 16px;
+    border: 1px solid transparent;
+    background: transparent;
+}
+QMenu::item:selected { background-color: $selection.bg; border-color: $accent.base; }
+QMenu::item:disabled { color: $text.disabled; }
+QMenu::separator { height: 1px; background-color: $border.subtle; margin: 4px 6px; }
+QMenu::icon { padding-left: 16px; }
+
+QToolTip {
+    background-color: $surface.overlay;
+    color: $text.primary;
+    border: 1px solid $border.default;
+    padding: 6px 8px;
+    font-size: 11px;
+}
+
+/* ---------- group boxes / cards ---------- */
+QGroupBox {
+    background-color: transparent;
+    border: 1px solid $border.subtle;
+    border-radius: 4px;
+    margin-top: 16px;
+    padding: 12px 8px 8px 8px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 6px;
+    padding: 0 4px;
+    color: $text.secondary;
+    font-size: 11px;
+    font-weight: 600;
+}
+QFrame[role="card"] {
+    background-color: $surface.panel;
+    border: 1px solid $border.subtle;
+    border-radius: 4px;
+}
+QFrame[role="divider"] { background-color: $border.subtle; max-height: 1px; border: none; }
+
+/* ---------- check / radio ---------- */
+QCheckBox, QRadioButton { background: transparent; spacing: 6px; color: $text.primary; }
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 14px; height: 14px;
+    border: 1px solid $border.strong;
+    background-color: $surface.sunken;
+}
+QCheckBox::indicator { border-radius: 2px; }
+QRadioButton::indicator { border-radius: 7px; }
+QCheckBox::indicator:checked,
+QRadioButton::indicator:checked {
+    background-color: $accent.base; border-color: $accent.base;
+    image: url(:/icons/check-contrast.svg);
+}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    border-color: $border.subtle; background-color: $surface.panel;
+}
+
+/* ---------- status / splitter ---------- */
+QStatusBar {
+    background-color: $surface.panel;
+    color: $text.secondary;
+    border-top: 1px solid $border.subtle;
+    min-height: 26px;
+}
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: $text.secondary; font-size: 11px; background: transparent; }
+QSplitter::handle { background-color: $surface.app; }
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+QSplitter::handle:hover { background-color: $border.default; }
+
+/* ---------- app-specific ---------- */
+#stageRail { background-color: $surface.app; border-right: 1px solid $border.subtle; }
+#stageRail QToolButton { border-radius: 4px; min-width: 32px; min-height: 32px; }
+#stageRail QToolButton:checked { background-color: $accent.subtle; border-color: $accent.base; }
+#statusStrip QLabel[role="muted"] { color: $text.secondary; }
+#statusStrip QLabel[role="mono"] { font-family: "JetBrains Mono", monospace; color: $text.secondary; }
+QLabel[role="label"] { color: $text.secondary; font-size: 11px; font-weight: 600; }
+QLabel[role="secondary"] { color: $text.secondary; }
+QLabel[role="mono"] { font-family: "JetBrains Mono", monospace; font-size: 11px; }
+QLabel[role="title"] { font-size: 14px; font-weight: 600; }
+QLabel[role="dialogTitle"] { font-size: 16px; font-weight: 600; }
+QLabel[status="success"] { color: $status.success; }
+QLabel[status="warning"] { color: $status.warning; }
+QLabel[status="error"] { color: $status.error; }
+QLabel[status="processing"] { color: $status.processing; }
