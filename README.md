@@ -2,8 +2,11 @@
 
 **An open-source photogrammetry engine: photos in, 3D models and maps out.**
 
-[![CI](https://github.com/aniketpratapsingh/alphashape/actions/workflows/ci.yml/badge.svg)](https://github.com/aniketpratapsingh/alphashape/actions/workflows/ci.yml)
+[![CI](https://github.com/aniketpratapsingh/alphashape/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aniketpratapsingh/alphashape/actions/workflows/ci.yml)
 [![Nightly](https://github.com/aniketpratapsingh/alphashape/actions/workflows/nightly.yml/badge.svg)](https://github.com/aniketpratapsingh/alphashape/actions/workflows/nightly.yml)
+[![CodeQL](https://github.com/aniketpratapsingh/alphashape/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/aniketpratapsingh/alphashape/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/aniketpratapsingh/alphashape/badge)](https://securityscorecards.dev/viewer/?uri=github.com/aniketpratapsingh/alphashape)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15791/badge)](https://www.bestpractices.dev/projects/15791)
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 
 alphashape turns overlapping photographs into camera poses, dense point clouds, textured meshes,
