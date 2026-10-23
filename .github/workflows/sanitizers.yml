@@ -1,0 +1,127 @@
+name: Sanitizers
+
+# Dynamic analysis: the light test set under AddressSanitizer (with LeakSanitizer) and
+# UndefinedBehaviorSanitizer on Linux. Undefined behaviour aborts the test
+# (-fno-sanitize-recover=undefined). Third-party and deliberate-at-exit leaks are suppressed
+# narrowly in engine/cmake/sanitizers/lsan.supp; nothing is disabled globally.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/sanitizers.yml
+      - engine/cmake/sanitizers/**
+      - engine/CMakeLists.txt
+      - engine/tests/CMakeLists.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1500M
+  CTEST_OUTPUT_ON_FAILURE: "1"
+  OMP_NUM_THREADS: "4"
+  OMP_WAIT_POLICY: passive
+  # Instrumented code is several times slower; speed-up assertions are meaningless here.
+  ALPHASHAPE_PERF_ASSERTS: "0"
+  VMA_TAG: v3.1.0
+
+jobs:
+  sanitize:
+    name: ASan + UBSan (Linux, GCC, lavapipe)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # The hosted mirrors occasionally stall; bound each attempt and retry.
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache jq \
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
+            libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools \
+            mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          sudo mkdir -p /usr/include/vma
+          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/include/vma/vk_mem_alloc.h \
+            "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-san-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-san-${{ github.ref_name }}-
+            ccache-linux-san-main-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DALPHASHAPE_SANITIZE=ON \
+            "-DALPHASHAPE_SANITIZE_ASAN_OPTIONS=detect_leaks=1:abort_on_error=1" \
+            -DALPHASHAPE_BUILD_PYTHON=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # A missing Vulkan tool silently turns the GPU layer off; refuse that in CI.
+          grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # Point the Vulkan loader at lavapipe. The ICD file name differs between Mesa packagings
+      # (lvp_icd.json, lvp_icd.x86_64.json), so look it up rather than hard-code it. A missing
+      # lavapipe must fail the job: without it every GPU suite skips, silently.
+      - name: Locate lavapipe and verify it enumerates
+        run: |
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1 || true)
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD (lvp_icd*.json) under /usr/share/vulkan/icd.d"
+            ls -l /usr/share/vulkan/icd.d || true
+            exit 1
+          fi
+          echo "lavapipe ICD: $icd"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES="$icd" VK_ICD_FILENAMES="$icd" vulkaninfo --summary | tee vulkaninfo.txt | head -40
+          if ! grep -qi 'llvmpipe' vulkaninfo.txt; then
+            echo "::error::vulkaninfo does not list a llvmpipe device; GPU suites would silently skip"
+            exit 1
+          fi
+
+      - name: Test (light set, heavy lanes excluded)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          # Same heavy-test list build.yml uses; those multi-minute pipelines are too slow instrumented.
+          exclude=$(jq -r '"^(" + ([.heavy[].tests[]] | map(gsub("\\."; "\\.")) | join("|")) + ")$"' .github/ci/test-lanes.json)
+          echo "excluding: $exclude"
+          ctest --test-dir build --parallel 4 --timeout 1800 -E "$exclude" 2>&1 | tee ctest.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Sanitizer reports
+        if: always()
+        run: |
+          log=build/Testing/Temporary/LastTest.log
+          grep -E "runtime error:|ERROR: (Address|Leak)Sanitizer|SUMMARY: " "$log" | sort | uniq -c | sort -rn | head -50 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sanitizer-logs
+          path: |
+            ctest.log
+            build/Testing/Temporary/LastTest.log
+          retention-days: 7

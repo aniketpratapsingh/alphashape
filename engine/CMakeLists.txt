@@ -29,6 +29,8 @@ option(ALPHASHAPE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 # Eigen NaN initialisation so a matrix that is declared then partially written
 # surfaces as NaN rather than whatever the heap happened to hold. See TESTING.md.
 option(ALPHASHAPE_SANITIZE       "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+set(ALPHASHAPE_SANITIZE_ASAN_OPTIONS "detect_leaks=0" CACHE STRING
+    "ASAN_OPTIONS (without suppressions) the sanitized tests run under; detect_leaks=1 on Linux")
 option(ALPHASHAPE_EIGEN_NAN_INIT "Define EIGEN_INITIALIZE_MATRICES_BY_NAN in our translation units" OFF)
 
 # ---------------------------------------------------------------------------

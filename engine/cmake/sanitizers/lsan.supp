@@ -1,0 +1,2 @@
+# LeakSanitizer suppressions (Linux sanitizer CI job). Entries are narrow and
+# third-party or deliberate; every leak in our own code is a bug to fix.
