@@ -568,7 +568,13 @@ TEST(AtlasPack, PacksFiveThousandChartsQuickly) {
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start);
     std::printf("[AtlasPack] 5000 charts: %.3f s, fill = %.4f, texels_per_unit = %.3f\n",
                 elapsed.count(), result.fill_ratio, result.texels_per_unit);
+    // Timing budget, not a correctness bound; the ASan+UBSan build is several
+    // times slower than Release.
+#ifdef ALPHASHAPE_SANITIZED_BUILD
+    EXPECT_LT(elapsed.count(), 20.0);
+#else
     EXPECT_LT(elapsed.count(), 2.0);
+#endif
     EXPECT_GT(result.fill_ratio, 0.0);
 }
 
