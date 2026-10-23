@@ -38,6 +38,14 @@ while IFS= read -r f; do
         echo "error: $f references a build-machine path" >&2
         bad=1
     fi
+    # @executable_path means "next to the running process": the bundle's MacOS directory for the
+    # two executables, but python3 for the module in Resources/python. Every reference must be
+    # @rpath, which the bundle's contents can actually satisfy.
+    if otool -L "$f" | tail -n +2 | grep -q '@executable_path/'; then
+        otool -L "$f" | tail -n +2 | grep '@executable_path/' >&2
+        echo "error: $f uses @executable_path, which is not the bundle for a loaded module" >&2
+        bad=1
+    fi
     if otool -l "$f" | grep -A2 LC_RPATH | grep -E 'path /'; then
         echo "error: $f has an absolute rpath" >&2
         bad=1

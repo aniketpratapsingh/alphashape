@@ -248,14 +248,22 @@ class Bundle:
                             run(["install_name_tool", "-change", ref, canonical, path])
                         continue
                     if self.inside(source):
+                        # Already in the bundle, but the spelling matters: `@executable_path`
+                        # is the Python interpreter for a .so loaded into it and `./lib/x.dylib`
+                        # is silently used by nothing on a modern dyld. Canonicalise to @rpath.
+                        canonical = "@rpath/" + os.path.basename(source)
+                        if ref != canonical:
+                            run(["install_name_tool", "-change", ref, canonical, path])
                         continue
                     dest = self.copy_in(source)
                     run(["install_name_tool", "-change", ref,
                          "@rpath/" + os.path.basename(dest), path])
                 self.fix_rpaths(path)
                 own_id = id_of(path)
-                if own_id.startswith("/"):
-                    # Copied by macdeployqt with its Homebrew install name still on it.
+                if own_id and not own_id.startswith("@rpath/") and not self.qt_framework_ref(own_id):
+                    # macdeployqt leaves Homebrew install names and the @executable_path spelling
+                    # on what it copies. The latter means "next to the process", which is the
+                    # Python interpreter for the module in Resources/python.
                     run(["install_name_tool", "-id", "@rpath/" + os.path.basename(own_id), path])
 
     def audit(self):
@@ -263,8 +271,9 @@ class Bundle:
         files = macho_files(self.app)
         for path in files:
             rpaths = rpaths_of(path)
-            if id_of(path).startswith("/"):
-                bad.append(f"{path}: absolute install name {id_of(path)}")
+            if id_of(path) and not id_of(path).startswith("@rpath/") \
+                    and not self.qt_framework_ref(id_of(path)):
+                bad.append(f"{path}: non-@rpath install name {id_of(path)}")
             for rpath in rpaths:
                 if not rpath.startswith("@"):
                     bad.append(f"{path}: absolute rpath {rpath}")
@@ -273,6 +282,11 @@ class Bundle:
                     continue
                 if ref.startswith("/"):
                     bad.append(f"{path}: absolute reference {ref}")
+                    continue
+                if ref.startswith("@executable_path/"):
+                    # Only true for the two executables; a .so loaded into python3 or a Qt
+                    # plugin loaded into the app would look for it next to the wrong binary.
+                    bad.append(f"{path}: @executable_path reference {ref}")
                     continue
                 source = self.resolve(ref, path, rpaths)
                 if source is None or not self.inside(source):
