@@ -48,7 +48,20 @@ QStringList g_messages;
 QMutex g_messages_mutex;
 QtMessageHandler g_previous_handler = nullptr;
 
+// Messages that come from Qt's platform layer rather than from our code and carry no action:
+//  - the offscreen QPA plugin has no window-manager size hints and says so for every top-level;
+//  - the font database reports (with a timing that varies per machine) that it resolved the
+//    generic "sans-serif" of the style sheet's font list through an alias.
+bool is_known_platform_noise(const QString& message) {
+    return message.startsWith(QLatin1String("This plugin does not support propagateSizeHints")) ||
+           message.startsWith(QLatin1String("Populating font family aliases took"));
+}
+
 void collecting_handler(QtMsgType type, const QMessageLogContext& context, const QString& message) {
+    if ((type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg) &&
+        is_known_platform_noise(message)) {
+        return;
+    }
     if (type == QtWarningMsg || type == QtCriticalMsg || type == QtFatalMsg) {
         QMutexLocker lock(&g_messages_mutex);
         g_messages << message;
