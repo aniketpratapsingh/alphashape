@@ -415,7 +415,11 @@ TEST_F(WorkspaceTree, PropertiesTableIsReadOnly) {
 
 // Save As keeps the document's content but gives it a path; the Document sheet must follow.
 TEST_F(WorkspaceTree, PropertiesPathRowFollowsSaveAs) {
-    build_chunk("One");
+    // No error box: a failing save must fail the test, not block the offscreen run on a modal.
+    window().set_error_handler([](const QString& title, const QString& message) {
+        ADD_FAILURE() << title.toStdString() << ": " << message.toStdString();
+    });
+    app().execute(make_add_chunk_command(app().document().workspace(), "Block A", -1));
     model().refresh();
     ASSERT_TRUE(pane().select(NodeRef{NodeKind::Document, -1, -1}));
     EXPECT_EQ(props().title(), "Project");
