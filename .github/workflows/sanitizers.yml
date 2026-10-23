@@ -117,12 +117,23 @@ jobs:
       # The build tree holds absolute paths, so the checkout location must match the build job.
       - uses: actions/checkout@v4
 
+      # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs.
+      - name: Restore apt package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-debs
+          # Bump the suffix when the package list below changes.
+          key: apt-san-runtime-v1
+
       - name: Install runtime dependencies
         run: |
           apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          mkdir -p ~/apt-debs
+          sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
           apt_retry update
           apt_retry install -y --no-install-recommends jq libceres4t64 libproj25 proj-data libtiff6 \
             libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+          cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
       - uses: actions/download-artifact@v4
         with:
