@@ -13,6 +13,7 @@
 #include "base/utils/log.hpp"
 
 #ifdef __APPLE__
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #elif defined(__linux__)
 #include <unistd.h>
@@ -56,6 +57,20 @@ std::filesystem::path executable_directory() {
     return {};
 #endif
 }
+
+#ifdef __APPLE__
+/// Directory of the Mach-O image this code is linked into (the executable, or the Python
+/// extension module inside somebody else's interpreter).
+std::filesystem::path image_directory() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&image_directory), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return {};
+    }
+    std::error_code ec;
+    return fs::weakly_canonical(fs::path(info.dli_fname), ec).parent_path();
+}
+#endif
 
 std::filesystem::path source_root() {
 #ifdef ALPHASHAPE_PROJECT_SOURCE_DIR
@@ -170,6 +185,19 @@ ResolvedDataDir resolve_data_directory(const DataSearchOptions& options) {
         accept(opts.exe_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative)) {
         return resolved;
     }
+#ifdef __APPLE__
+    // App bundle: Contents/MacOS/<exe> finds Contents/Resources/share/proj; the Python module in
+    // Contents/Resources/python finds Contents/Resources/share/proj through its parent.
+    {
+        const fs::path image_dir = image_directory();
+        if (!image_dir.empty() &&
+            (accept(image_dir.parent_path() / "Resources" / "share" / "proj", SearchStep::ExeRelative) ||
+             accept(image_dir / "share" / "proj", SearchStep::ExeRelative) ||
+             accept(image_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative))) {
+            return resolved;
+        }
+    }
+#endif
     if (!opts.project_source.empty()) {
         const fs::path tool_dir =
             opts.project_source.parent_path() / "tools" / "proj-data";

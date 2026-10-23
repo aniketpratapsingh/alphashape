@@ -25,12 +25,16 @@
 #include "common/io/project_io.hpp"
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
+#include "gpu/gpu.hpp"
+#include "model/crs/proj_context.hpp"
 
 namespace {
 
 constexpr const char* kUsage =
     "Usage:\n"
     "  alphashape-cli --list-tasks\n"
+    "  alphashape-cli --gpu-info\n"
+    "  alphashape-cli --proj-info\n"
     "  alphashape-cli --list-params <Task>\n"
     "  alphashape-cli --project <file.psx> --task <Task> [--set key=value ...]\n"
     "  alphashape-cli --new <file.psx> --add-images <img> [<img> ...]\n"
@@ -85,6 +89,8 @@ alphashape::Progress make_progress(bool tty) {
 struct Options {
     bool help = false;
     bool list_tasks = false;
+    bool gpu_info = false;
+    bool proj_info = false;
     bool has_list_params = false;
     std::string list_params;
     bool has_project = false;
@@ -111,6 +117,10 @@ Options parse_args(int argc, char** argv) {
             opts.help = true;
         } else if (arg == "--list-tasks") {
             opts.list_tasks = true;
+        } else if (arg == "--gpu-info") {
+            opts.gpu_info = true;
+        } else if (arg == "--proj-info") {
+            opts.proj_info = true;
         } else if (arg == "--list-params") {
             opts.has_list_params = true;
             opts.list_params = take_value();
@@ -152,6 +162,34 @@ int run_list_tasks() {
         std::printf("%s%s\n", name.c_str(), enabled ? "" : " (disabled)");
     }
     return 0;
+}
+
+/// Prints the Vulkan devices the GPU layer can see. Exit 0 when at least one device is listed, 1
+/// otherwise (the reason is printed), so packaging smoke tests can prove the loader and driver
+/// were found.
+int run_gpu_info() {
+    const std::vector<alphashape::gpu::DeviceInfo> devices = alphashape::gpu::enumerate_devices();
+    if (devices.empty()) {
+        std::printf("gpu: unavailable (%s)\n", alphashape::gpu::unavailable_reason().c_str());
+        return 1;
+    }
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        const alphashape::gpu::DeviceInfo& device = devices[i];
+        std::printf("gpu device %zu: %s (%s, vendor 0x%04x, %llu MiB)\n", i, device.name.c_str(),
+                    device.software ? "software" : (device.integrated ? "integrated" : "discrete"),
+                    device.vendor_id,
+                    static_cast<unsigned long long>(device.memory_bytes >> 20U));
+    }
+    return 0;
+}
+
+/// Prints the PROJ library version and the proj.db the engine resolved. Exit 1 when no database
+/// was found (coordinate transforms would fail).
+int run_proj_info() {
+    const alphashape::crs::ProjDataInfo info = alphashape::crs::proj_data_info();
+    std::printf("proj %s\n", alphashape::crs::proj_version().c_str());
+    std::printf("proj database: %s\n", info.database_path.string().c_str());
+    return info.database_path.empty() ? 1 : 0;
 }
 
 int run_list_params(const std::string& task_name) {
@@ -233,7 +271,7 @@ int dispatch(const Options& opts) {
     }
 
     // Exactly one primary mode may be selected; mixing them is a usage error.
-    const int modes = (opts.list_tasks ? 1 : 0) + (opts.has_list_params ? 1 : 0) +
+    const int modes = (opts.list_tasks ? 1 : 0) + (opts.gpu_info ? 1 : 0) + (opts.proj_info ? 1 : 0) + (opts.has_list_params ? 1 : 0) +
                       (opts.has_new ? 1 : 0) + (opts.has_project ? 1 : 0);
     if (modes > 1) {
         throw UsageError{};
@@ -246,6 +284,8 @@ int dispatch(const Options& opts) {
     }
 
     if (opts.list_tasks) return run_list_tasks();
+    if (opts.gpu_info) return run_gpu_info();
+    if (opts.proj_info) return run_proj_info();
     if (opts.has_list_params) return run_list_params(opts.list_params);
     if (opts.has_new) return run_new(opts.new_project, opts.images);
     if (opts.has_project) return run_project(opts.project, opts.task, opts.set_values);
