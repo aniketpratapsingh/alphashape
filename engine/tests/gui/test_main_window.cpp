@@ -72,7 +72,8 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
         "action.edit.redo", "action.edit.preferences", "action.view.dock.workspace",
         "action.view.dock.properties", "action.view.dock.photos", "action.view.dock.log",
         "action.view.theme.light", "action.view.theme.dark", "action.view.reset_layout",
-        "action.workflow.placeholder", "action.help.about", "action.help.repository",
+        "action.workflow.add_photos", "action.workflow.build_orthomosaic", "action.help.about",
+        "action.help.repository",
     };
     for (const QString& name : actions) {
         EXPECT_NE(action(name), nullptr) << name.toStdString();
@@ -85,9 +86,8 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
     }
     EXPECT_EQ(titles, (QStringList{"File", "Edit", "View", "Workflow", "Help"}));
 
-    // Preferences and the Workflow placeholder are present but disabled for now.
+    // Preferences is present but disabled for now.
     EXPECT_FALSE(action("action.edit.preferences")->isEnabled());
-    EXPECT_FALSE(action("action.workflow.placeholder")->isEnabled());
 
     // Standard shortcuts.
     EXPECT_EQ(action("action.file.new")->shortcut(), QKeySequence(QKeySequence::New));
