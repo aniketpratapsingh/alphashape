@@ -11,6 +11,7 @@ add_library(alphashape_gui_lib STATIC
     command_line.cpp
     app.cpp
     main_window.cpp
+    viewport_placeholder.cpp
     theme/theme.cpp)
 target_include_directories(alphashape_gui_lib PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_gui_lib
@@ -20,6 +21,7 @@ target_link_libraries(alphashape_gui_lib
 # The engine uses `slots` and `signals` as ordinary identifiers (core/assets.hpp), which Qt's
 # keyword macros would break, so Qt code here spells them Q_SLOTS / Q_SIGNALS / Q_EMIT.
 target_compile_definitions(alphashape_gui_lib PUBLIC QT_NO_KEYWORDS)
+target_compile_definitions(alphashape_gui_lib PRIVATE ALPHASHAPE_GUI_VERSION="${PROJECT_VERSION}")
 
 # The style sheets are generated from design/system/tokens.json by tools/theme/compile_qss.py
 # and checked in; they are embedded so the binary has no files to find at run time.
