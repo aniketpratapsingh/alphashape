@@ -10,6 +10,7 @@ set(ALPHASHAPE_DESIGN_DIR ${PROJECT_SOURCE_DIR}/../design/system)
 add_library(alphashape_gui_lib STATIC
     command_line.cpp
     app.cpp
+    job_manager.cpp
     main_window.cpp
     viewport_placeholder.cpp
     theme/theme.cpp)
