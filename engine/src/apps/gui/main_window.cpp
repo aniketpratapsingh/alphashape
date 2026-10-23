@@ -7,6 +7,7 @@
 #include <QActionGroup>
 #include <QCloseEvent>
 #include <QDesktopServices>
+#include <QDialog>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -82,8 +83,15 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
                                             tr(kProjectFilter));
     };
     save_path_handler_ = [this](const QString& suggested) {
-        return QFileDialog::getSaveFileName(this, tr("Save project"), suggested,
-                                            tr(kProjectFilter));
+        // A default suffix makes the dialog itself append ".psx", so its own overwrite
+        // confirmation sees the real target name.
+        QFileDialog dialog(this, tr("Save project"), suggested, tr(kProjectFilter));
+        dialog.setAcceptMode(QFileDialog::AcceptSave);
+        dialog.setDefaultSuffix(QStringLiteral("psx"));
+        if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
+            return QString();
+        }
+        return dialog.selectedFiles().first();
     };
     error_handler_ = [this](const QString& title, const QString& message) {
         QMessageBox::critical(this, title, message);
@@ -106,6 +114,7 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     update_undo_actions();
     update_recent_menu();
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_title);
+    connect(&app_, &GuiApp::path_changed, this, &MainWindow::update_title);
     connect(&app_, &GuiApp::dirty_changed, this, [this](bool) { update_title(); });
     connect(&app_, &GuiApp::undo_changed, this, &MainWindow::update_undo_actions);
     connect(&app_, &GuiApp::recent_files_changed, this, &MainWindow::update_recent_menu);
@@ -359,9 +368,7 @@ bool MainWindow::new_project() {
 }
 
 bool MainWindow::open_project() {
-    if (!confirm_discard()) {
-        return false;
-    }
+    // Ask for the file first: cancelling the dialog must not prompt about unsaved changes.
     const QString path = open_path_handler_();
     if (path.isEmpty()) {
         return false;

@@ -61,6 +61,7 @@ void GuiApp::new_document(const std::string& path) {
     reset_dirty_tracking();
     Q_EMIT document_replaced();
     Q_EMIT undo_changed();
+    publish_dirty();
 }
 
 void GuiApp::open_document(const std::string& path) {
@@ -72,6 +73,7 @@ void GuiApp::open_document(const std::string& path) {
     add_recent_file(QString::fromStdString(path));
     Q_EMIT document_replaced();
     Q_EMIT undo_changed();
+    publish_dirty();
 }
 
 void GuiApp::save_document() {
@@ -89,7 +91,7 @@ void GuiApp::save_document_as(const std::string& path) {
     document_->set_path(path);
     reset_dirty_tracking();
     add_recent_file(QString::fromStdString(path));
-    Q_EMIT document_replaced();
+    Q_EMIT path_changed();
     publish_dirty();
 }
 
@@ -105,7 +107,6 @@ void GuiApp::mark_dirty() {
 void GuiApp::reset_dirty_tracking() {
     force_dirty_ = false;
     clean_position_ = undo_stack_.position();
-    last_dirty_ = false;
 }
 
 void GuiApp::publish_dirty() {

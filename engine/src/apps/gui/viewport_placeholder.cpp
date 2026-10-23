@@ -6,6 +6,7 @@
 #include <QPainter>
 
 #include "apps/gui/theme/theme.hpp"
+#include "apps/gui/theme/viewport_colors.hpp"
 
 namespace alphashape::gui {
 
@@ -23,10 +24,11 @@ void ViewportPlaceholder::paintEvent(QPaintEvent*) {
     const bool dark = mode_ == ThemeMode::Dark;
     QPainter painter(this);
     QLinearGradient gradient(0, 0, 0, height());
-    gradient.setColorAt(0.0, QColor(dark ? "#1D252B" : "#D9E0E3"));
-    gradient.setColorAt(1.0, QColor(dark ? "#141B20" : "#EDF1F2"));
+    namespace vc = viewport_colors;
+    gradient.setColorAt(0.0, QColor(dark ? vc::dark::background : vc::light::background));
+    gradient.setColorAt(1.0, QColor(dark ? vc::dark::gradient_to : vc::light::gradient_to));
     painter.fillRect(rect(), gradient);
-    painter.setPen(QColor(dark ? "#B9C8D2" : "#2C3A42"));
+    painter.setPen(QColor(dark ? vc::dark::label : vc::light::label));
     painter.drawText(rect(), Qt::AlignCenter, tr("3-D view"));
 }
 

@@ -79,6 +79,8 @@ public:
 Q_SIGNALS:
     /// Emitted after new_document() / open_document() swapped the document.
     void document_replaced();
+    /// Emitted when the document keeps its content but gets a new file path (Save As).
+    void path_changed();
     /// Emitted when the dirty flag may have changed (always after a change, never spuriously
     /// for a no-op).
     void dirty_changed(bool dirty);

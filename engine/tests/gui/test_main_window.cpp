@@ -3,7 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <vector>
+
 #include <QAction>
+#include <QDir>
 #include <QDockWidget>
 #include <QFile>
 #include <QFileInfo>
@@ -298,7 +302,7 @@ TEST_F(MainWindowTest, DirtyFlagFollowsTheCleanPointOfTheHistory) {
     const QString path = scratch("dirty.psx");
     window().set_save_path_handler([&](const QString&) { return path; });
     add_chunk(app(), "A");
-    ASSERT_TRUE(window().save_project());
+    ASSERT_TRUE(window().save_project());  // clean point at history index 1
     EXPECT_FALSE(app().dirty());
 
     add_chunk(app(), "B");
@@ -306,11 +310,171 @@ TEST_F(MainWindowTest, DirtyFlagFollowsTheCleanPointOfTheHistory) {
     app().undo();
     EXPECT_FALSE(app().dirty());  // undone back to the saved state
     app().undo();
-    EXPECT_TRUE(app().dirty());   // before the saved state
-    // A new edit from inside the history makes the saved state unreachable.
+    EXPECT_TRUE(app().dirty());   // index 0, before the saved state
+
+    // A new edit C from index 0 puts the history at index 1 again, but it is a different
+    // history: the saved state is unreachable, so the document must be dirty right away.
     add_chunk(app(), "C");
+    EXPECT_TRUE(app().dirty());
     app().undo();
     EXPECT_TRUE(app().dirty());
+    app().redo();  // index 1 once more
+    EXPECT_TRUE(app().dirty());
+    app().undo();
+    app().redo();
+    EXPECT_TRUE(app().dirty());  // stays dirty until the next save
+
+    ASSERT_TRUE(window().save_project());
+    EXPECT_FALSE(app().dirty());
+}
+
+TEST_F(MainWindowTest, DroppingTheCleanPointOffTheUndoCapMakesTheDocumentDirty) {
+    window().set_save_path_handler([&](const QString&) { return scratch("cap.psx"); });
+    for (std::size_t i = 0; i < kMaxUndoDepth; ++i) {
+        add_chunk(app(), "X");
+    }
+    ASSERT_TRUE(window().save_project());  // clean point at the cap
+    EXPECT_FALSE(app().dirty());
+
+    // One more edit pushes the oldest command off the bottom; the history length (and so the
+    // position) is unchanged, but the saved state is gone.
+    add_chunk(app(), "Y");
+    EXPECT_GT(app().undo_stack().dropped_count(), 0U);
+    EXPECT_TRUE(app().dirty());
+    app().undo();
+    app().redo();
+    EXPECT_TRUE(app().dirty());
+    ASSERT_TRUE(window().save_project());
+    EXPECT_FALSE(app().dirty());
+}
+
+TEST_F(MainWindowTest, OpenPromptsExactlyOnceAndNotWhenTheFileDialogIsCancelled) {
+    int prompts = 0;
+    window().set_unsaved_handler([&](const QString&) {
+        ++prompts;
+        return UnsavedChoice::Discard;
+    });
+    const QString other = make_engine_project(scratch("other.psx"));
+    QString chosen = other;
+    int dialogs = 0;
+    window().set_open_path_handler([&]() {
+        ++dialogs;
+        return chosen;
+    });
+
+    add_chunk(app(), "Dirty");
+    ASSERT_TRUE(window().open_project());
+    EXPECT_EQ(dialogs, 1);
+    EXPECT_EQ(prompts, 1);
+    EXPECT_EQ(app().document().workspace().chunks().size(), 2U);
+
+    // Cancelling the file dialog does nothing and does not prompt.
+    prompts = 0;
+    add_chunk(app(), "Dirty again");
+    chosen.clear();
+    EXPECT_FALSE(window().open_project());
+    EXPECT_EQ(prompts, 0);
+    EXPECT_TRUE(app().dirty());
+    EXPECT_EQ(app().document().workspace().chunks().size(), 3U);
+
+    // The recent-files path (open_project(path)) prompts once as well.
+    EXPECT_TRUE(window().open_project(other));
+    EXPECT_EQ(prompts, 1);
+}
+
+TEST_F(MainWindowTest, SaveChoiceThatFailsAbortsAndReportsTheError) {
+    // The project path is a directory, so writing it fails.
+    const QString blocked = scratch("blocked.psx");
+    ASSERT_TRUE(QDir().mkpath(blocked));
+    app().new_document(blocked.toStdString());
+    add_chunk(app(), "Unsaved");
+    window().set_unsaved_handler([](const QString&) { return UnsavedChoice::Save; });
+    int errors = 0;
+    window().set_error_handler([&](const QString&, const QString&) { ++errors; });
+
+    EXPECT_FALSE(window().new_project());
+    EXPECT_EQ(errors, 1);
+    EXPECT_TRUE(app().dirty());
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+    EXPECT_EQ(app().document().path(), blocked.toStdString());
+
+    EXPECT_FALSE(window().close_project());
+    EXPECT_EQ(errors, 2);
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+}
+
+TEST_F(MainWindowTest, SaveChoiceThenCancelledSaveAsAbortsTheOperation) {
+    add_chunk(app(), "Unsaved");
+    window().set_unsaved_handler([](const QString&) { return UnsavedChoice::Save; });
+    int asked = 0;
+    window().set_save_path_handler([&](const QString&) {
+        ++asked;
+        return QString();
+    });
+    const QString other = make_engine_project(scratch("elsewhere.psx"));
+    EXPECT_FALSE(window().new_project());
+    EXPECT_FALSE(window().open_project(other));
+    EXPECT_FALSE(window().close_project());
+    EXPECT_EQ(asked, 3);
+    EXPECT_TRUE(app().dirty());
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+}
+
+TEST_F(MainWindowTest, DiscardReplacesTheDocumentOnNewOpenAndClose) {
+    window().set_unsaved_handler([](const QString&) { return UnsavedChoice::Discard; });
+    const QString other = make_engine_project(scratch("discard.psx"));
+
+    add_chunk(app(), "A");
+    ASSERT_TRUE(window().new_project());
+    EXPECT_TRUE(app().document().workspace().chunks().empty());
+    EXPECT_FALSE(app().dirty());
+
+    add_chunk(app(), "B");
+    ASSERT_TRUE(window().open_project(other));
+    EXPECT_EQ(app().document().workspace().chunks().size(), 2U);
+    EXPECT_FALSE(app().dirty());
+
+    add_chunk(app(), "C");
+    ASSERT_TRUE(window().close_project());
+    EXPECT_TRUE(app().document().workspace().chunks().empty());
+    EXPECT_FALSE(app().dirty());
+}
+
+TEST_F(MainWindowTest, FailedOpenKeepsThePreviousDocumentAndItsDirtyState) {
+    add_chunk(app(), "Keep me");
+    window().set_unsaved_handler([](const QString&) { return UnsavedChoice::Discard; });
+    window().set_error_handler([](const QString&, const QString&) {});
+    EXPECT_FALSE(window().open_project(scratch("missing.psx")));
+    EXPECT_TRUE(app().dirty());
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+    EXPECT_EQ(app().document().workspace().chunks()[0]->label(), "Keep me");
+    app().undo();  // the history survived too
+    EXPECT_TRUE(app().document().workspace().chunks().empty());
+}
+
+TEST_F(MainWindowTest, SaveAsRefreshesTheTitleWithoutReplacingTheDocument) {
+    int replaced = 0;
+    QObject::connect(&app(), &GuiApp::document_replaced, [&]() { ++replaced; });
+    window().set_save_path_handler([&](const QString&) { return scratch("titled.psx"); });
+    add_chunk(app(), "A");
+    ASSERT_TRUE(window().save_project_as());
+    EXPECT_EQ(replaced, 0);
+    EXPECT_TRUE(window().windowTitle().contains(QStringLiteral("titled")));
+}
+
+TEST_F(MainWindowTest, ReplacingADirtyDocumentEmitsDirtyChanged) {
+    std::vector<bool> seen;
+    QObject::connect(&app(), &GuiApp::dirty_changed, [&](bool d) { seen.push_back(d); });
+    add_chunk(app(), "A");
+    app().new_document("");
+    ASSERT_EQ(seen.size(), 2U);
+    EXPECT_TRUE(seen[0]);
+    EXPECT_FALSE(seen[1]);
+
+    add_chunk(app(), "B");
+    app().open_document(make_engine_project(scratch("replace.psx")).toStdString());
+    ASSERT_EQ(seen.size(), 4U);
+    EXPECT_FALSE(seen[3]);
 }
 
 TEST_F(MainWindowTest, UnsavedChangesPromptOnCloseNewAndOpen) {
