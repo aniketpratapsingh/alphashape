@@ -2,6 +2,7 @@ build*/
 engine/build*/
 datasets/
 tools/*
+!tools/theme/
 !tools/*.sh
 run/
 work/
