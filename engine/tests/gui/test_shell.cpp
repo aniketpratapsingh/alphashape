@@ -51,10 +51,13 @@ QtMessageHandler g_previous_handler = nullptr;
 // Messages that come from Qt's platform layer rather than from our code and carry no action:
 //  - the offscreen QPA plugin has no window-manager size hints and says so for every top-level;
 //  - the font database reports (with a timing that varies per machine) that it resolved the
-//    generic "sans-serif" of the style sheet's font list through an alias.
+//    generic "sans-serif" of the style sheet's font list through an alias;
+//  - the offscreen plugin on Windows has no native font database and complains about the
+//    missing Qt font directory (the real "windows" platform plugin does not).
 bool is_known_platform_noise(const QString& message) {
     return message.startsWith(QLatin1String("This plugin does not support propagateSizeHints")) ||
-           message.startsWith(QLatin1String("Populating font family aliases took"));
+           message.startsWith(QLatin1String("Populating font family aliases took")) ||
+           message.startsWith(QLatin1String("QFontDatabase: Cannot find font directory"));
 }
 
 void collecting_handler(QtMsgType type, const QMessageLogContext& context, const QString& message) {
