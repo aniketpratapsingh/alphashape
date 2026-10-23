@@ -11,6 +11,8 @@ class QAction;
 class QActionGroup;
 class QDockWidget;
 class QLabel;
+class QProgressBar;
+class QToolButton;
 class QMenu;
 
 namespace alphashape::gui {
@@ -49,6 +51,11 @@ public:
     using ErrorHandler = std::function<void(const QString& title, const QString& message)>;
     void set_error_handler(ErrorHandler handler);
 
+    /// Asked when the window is closed while a job runs; true = cancel the job and quit. The
+    /// argument is the running task's name.
+    using CancelJobsHandler = std::function<bool(const QString& task_name)>;
+    void set_cancel_jobs_handler(CancelJobsHandler handler);
+
     // --- Project operations (what the File menu does). Each returns false if cancelled or
     // failed; failures are reported through the error handler. ---
 
@@ -84,6 +91,9 @@ private:
     void update_title();
     void update_undo_actions();
     void update_recent_menu();
+    void update_job_ui();
+    void on_job_progress(double percent, const QString& stage, qint64 eta_ms);
+    void on_job_finished(int state, const QString& message);
     void show_about();
     void report_error(const QString& title, const std::exception& error);
     QAction* make_action(const QString& object_name, const QString& text,
@@ -94,13 +104,17 @@ private:
     OpenPathHandler open_path_handler_;
     SavePathHandler save_path_handler_;
     ErrorHandler error_handler_;
+    CancelJobsHandler cancel_jobs_handler_;
 
     QDockWidget* workspace_dock_ = nullptr;
     QDockWidget* properties_dock_ = nullptr;
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     ViewportPlaceholder* viewport_ = nullptr;
-    QLabel* jobs_label_ = nullptr;
+    QLabel* jobs_label_ = nullptr;          ///< stage / idle text ("status.jobs")
+    QProgressBar* jobs_progress_ = nullptr; ///< "status.progress", visible while a job runs
+    QToolButton* jobs_cancel_ = nullptr;    ///< "status.cancel", visible while a job runs
+    QList<QAction*> project_actions_;       ///< actions that touch the document
 
     QMenu* recent_menu_ = nullptr;
     QList<QAction*> recent_actions_;  ///< fixed pool, shown or hidden as the list changes

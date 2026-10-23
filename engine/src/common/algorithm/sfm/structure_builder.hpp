@@ -75,7 +75,7 @@ struct BuilderResult {
 ///
 /// Throws ValueError for malformed input (unknown camera id, keypoint index out
 /// of range). `cancelled` (may be empty) is polled between registrations; if it
-/// returns true, throws Error("cancelled").
+/// returns true, throws CancelledError("cancelled").
 BuilderResult build_incremental(const BuilderInput& input, const BuilderOptions& options,
                                 const std::function<bool()>& cancelled = {});
 
