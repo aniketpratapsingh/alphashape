@@ -53,11 +53,11 @@ WorkspacePane::WorkspacePane(GuiApp& app, WorkspaceSelection& selection, QWidget
     expand_top();
     connect(&app_, &GuiApp::document_replaced, this, expand_top);
     connect(model_, &QAbstractItemModel::rowsInserted, this,
-            [this](const QModelIndex& parent, int first, int last) {
+            [this](const QModelIndex& inserted_under, int first, int last) {
                 // A chunk that was just added opens by itself; deeper inserts keep user state.
-                if (parent.isValid() && model_->ref_at(parent).kind == NodeKind::Document) {
+                if (inserted_under.isValid() && model_->ref_at(inserted_under).kind == NodeKind::Document) {
                     for (int i = first; i <= last; ++i) {
-                        tree_->expand(model_->index(i, 0, parent));
+                        tree_->expand(model_->index(i, 0, inserted_under));
                     }
                 }
             });
