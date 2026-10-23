@@ -117,6 +117,11 @@ def find_in_homebrew(name):
     return None
 
 
+def qt_lib_dir():
+    root = os.environ.get("QT_ROOT_DIR", "")
+    return os.path.join(root, "lib") if root else ""
+
+
 class Bundle:
     def __init__(self, app):
         self.app = os.path.realpath(app)
@@ -162,6 +167,24 @@ class Bundle:
             print(f"  bundled {name}  <-  {source}")
         return dest
 
+    def deploy_qt_framework(self, ref):
+        """Copy a Qt framework that a deployed plugin needs but macdeployqt left out
+        (for example QtSvg, required by the SVG icon-engine plugin)."""
+        match = re.match(r"@rpath/(Qt\w+\.framework)/", ref)
+        lib = qt_lib_dir()
+        if not match or not lib:
+            return None
+        name = match.group(1)
+        source = os.path.join(lib, name)
+        dest = os.path.join(self.frameworks, name)
+        if not os.path.isdir(source):
+            return None
+        if not os.path.exists(dest):
+            shutil.copytree(source, dest, symlinks=True,
+                            ignore=shutil.ignore_patterns("Headers", "*.prl"))
+            print(f"  deployed {name}  <-  {source}")
+        return os.path.join(self.frameworks, ref[len("@rpath/"):])
+
     def fix_rpaths(self, path):
         wanted = "@loader_path/" + os.path.relpath(self.frameworks, os.path.dirname(path))
         current = rpaths_of(path)
@@ -189,7 +212,8 @@ class Bundle:
                         if os.path.exists(os.path.join(self.frameworks, os.path.basename(ref))):
                             source = os.path.join(self.frameworks, os.path.basename(ref))
                         else:
-                            source = find_in_homebrew(os.path.basename(ref))
+                            source = (self.deploy_qt_framework(ref)
+                                      or find_in_homebrew(os.path.basename(ref)))
                         if source is None:
                             sys.exit(f"error: cannot resolve {ref} (needed by {path})")
                     if self.inside(source):
