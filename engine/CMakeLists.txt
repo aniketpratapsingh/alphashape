@@ -24,6 +24,9 @@ option(ALPHASHAPE_BUILD_TESTS   "Build the test suite"        ON)
 option(ALPHASHAPE_USE_PROJ      "Use PROJ for coordinate systems (M12)" ON)
 option(ALPHASHAPE_BUILD_PYTHON  "Build the Python bindings"   ON)
 option(ALPHASHAPE_BUILD_CLI     "Build the CLI application"   ON)
+# The Qt 6 desktop GUI is opt-in. With it ON, a missing Qt 6.6+ (QPalette::Accent) is a
+# configuration error rather than a silent downgrade.
+option(ALPHASHAPE_BUILD_GUI     "Build the Qt 6 desktop GUI (requires Qt 6.6+)" OFF)
 option(ALPHASHAPE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 # Bug-hunting configuration: ASan + UBSan (abort on undefined behaviour), and
 # Eigen NaN initialisation so a matrix that is declared then partially written
@@ -171,6 +174,16 @@ find_package(JPEG REQUIRED)
 find_package(PNG REQUIRED)
 find_package(TIFF REQUIRED)
 
+# Qt is LGPL-3: it is always linked dynamically (the official binaries are shared).
+if(ALPHASHAPE_BUILD_GUI)
+    find_package(Qt6 6.6 QUIET COMPONENTS Widgets)
+    if(NOT Qt6_FOUND)
+        message(FATAL_ERROR "alphashape: ALPHASHAPE_BUILD_GUI=ON but Qt 6.6 or newer (Widgets) was "
+                            "not found. Point CMAKE_PREFIX_PATH at a Qt 6 install, or pass "
+                            "-DALPHASHAPE_BUILD_GUI=OFF.")
+    endif()
+endif()
+
 # Restore only what was there: on non-Apple hosts CMAKE_FIND_FRAMEWORK is unset,
 # and assigning an empty string back leaves an invalid value that later
 # find_package(Python3) calls warn about.
@@ -208,6 +221,9 @@ enable_testing()
 
 if(ALPHASHAPE_BUILD_TESTS)
     add_subdirectory(tests)
+    if(ALPHASHAPE_BUILD_GUI)
+        add_subdirectory(tests/gui)
+    endif()
 endif()
 
 if(ALPHASHAPE_BUILD_PYTHON)

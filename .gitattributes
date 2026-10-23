@@ -9,3 +9,8 @@
 *.jpg binary
 *.png binary
 docs/**/*.md text
+*.qss text eol=lf
+*.qss.in text eol=lf
+design/system/tokens.json text eol=lf
+*.py text eol=lf
+*.ttf binary
