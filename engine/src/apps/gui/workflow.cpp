@@ -234,7 +234,8 @@ QString WorkflowController::unavailable_reason(const std::string& task) const {
     }
     // Read under the shared document lock: the menu can be updated from any signal, and a
     // long-running job holds the write lock. A read here never nests inside another one.
-    return app_.read_document([this, &task](const Document& document) -> QString {
+    // (tr() is a static of this class, so the lambda needs no `this` capture.)
+    return app_.read_document([&task](const Document& document) -> QString {
         const Chunk* chunk = active_chunk_of(document);
         if (chunk == nullptr) {
             return tr("There is no active chunk.");
