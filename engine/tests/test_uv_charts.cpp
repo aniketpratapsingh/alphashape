@@ -581,7 +581,12 @@ TEST(UvCharts, LargeSphereWithinTimeBudget) {
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start);
     std::cout << "[UvCharts] icosphere(6) charts=" << charts.size()
               << " time=" << elapsed.count() << "s" << std::endl;
+    // Timing budget, not a correctness bound; Debug with ASan+UBSan is several times slower.
+#ifdef ALPHASHAPE_SANITIZED_BUILD
+    EXPECT_LT(elapsed.count(), 20.0);
+#else
     EXPECT_LT(elapsed.count(), 2.0);
+#endif
     expect_partition(sphere, charts);
 }
 
