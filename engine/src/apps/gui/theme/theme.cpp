@@ -140,10 +140,10 @@ void Theme::apply(ThemeMode mode) {
     qApp->setStyleSheet(sheet);
 
     if (mode_changed) {
-        emit changed(mode);
+        Q_EMIT changed(mode);
     }
     if (viewport_mode() != previous_viewport) {
-        emit viewport_changed(viewport_mode());
+        Q_EMIT viewport_changed(viewport_mode());
     }
 }
 
@@ -160,7 +160,7 @@ void Theme::set_viewport_background(ViewportBackground background) {
     const ThemeMode before = viewport_mode();
     viewport_background_ = background;
     if (viewport_mode() != before) {
-        emit viewport_changed(viewport_mode());
+        Q_EMIT viewport_changed(viewport_mode());
     }
 }
 

@@ -55,7 +55,7 @@ void GuiApp::new_document(const std::string& path) {
     undo_stack_.clear();
     document_ = path.empty() ? std::make_shared<Document>() : std::make_shared<Document>(path);
     undo_stack_.bind(document_.get());
-    emit document_replaced();
+    Q_EMIT document_replaced();
 }
 
 void GuiApp::open_document(const std::string& path) {
@@ -63,7 +63,7 @@ void GuiApp::open_document(const std::string& path) {
     undo_stack_.clear();
     document_ = std::move(loaded);
     undo_stack_.bind(document_.get());
-    emit document_replaced();
+    Q_EMIT document_replaced();
 }
 
 QString GuiApp::document_title() const {
