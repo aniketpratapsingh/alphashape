@@ -1,10 +1,14 @@
-// Shared main for the GUI tests: one offscreen QApplication, with QSettings redirected to a
-// scratch directory so no test reads or writes the developer's real settings.
+// Shared main for the GUI tests: one offscreen QApplication and a scratch directory. Every
+// GuiApp here — and every alphashape-gui this binary spawns — is pointed at a settings file of
+// its own (see GuiApp's ALPHASHAPE_GUI_SETTINGS_FILE), because QSettings' default store is one
+// machine-wide registry key on Windows and parallel ctest processes would share it.
 
 #include <gtest/gtest.h>
 
 #include <QApplication>
-#include <QSettings>
+#include <QCoreApplication>
+#include <QDir>
+#include <QString>
 #include <QTemporaryDir>
 #include <QtGlobal>
 
@@ -13,8 +17,10 @@ int main(int argc, char** argv) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
     }
     QTemporaryDir settings_dir;
-    QSettings::setDefaultFormat(QSettings::IniFormat);
-    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings_dir.path());
+    const QString file = QDir(settings_dir.path())
+                             .filePath(QStringLiteral("settings-%1.ini")
+                                           .arg(QCoreApplication::applicationPid()));
+    qputenv("ALPHASHAPE_GUI_SETTINGS_FILE", file.toLocal8Bit());
 
     QApplication app(argc, argv);
     ::testing::InitGoogleTest(&argc, argv);

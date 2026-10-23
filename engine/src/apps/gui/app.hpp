@@ -41,7 +41,7 @@ public:
     explicit GuiApp(const Options& options, QObject* parent = nullptr);
     ~GuiApp() override;
 
-    QSettings& settings() { return settings_; }
+    QSettings& settings() { return *settings_; }
     Theme& theme() { return theme_; }
     Document& document() { return *document_; }
     UndoStack& undo_stack() { return undo_stack_; }
@@ -126,7 +126,7 @@ Q_SIGNALS:
     void recent_files_changed();
 
 private:
-    QSettings settings_;
+    std::unique_ptr<QSettings> settings_;
     std::shared_ptr<Document> document_;
     UndoStack undo_stack_;
     Theme theme_;

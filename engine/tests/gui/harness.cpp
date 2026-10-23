@@ -112,10 +112,19 @@ void GuiTest::TearDown() {
 void GuiTest::rebuild(bool reset_settings) {
     window_.reset();
     app_.reset();
+    // A file of this test's own (read by GuiApp through ALPHASHAPE_GUI_SETTINGS_FILE). QSettings'
+    // default store is one machine-wide registry key on Windows, so parallel ctest processes
+    // would otherwise clear each other's settings: a neighbour's SetUp clear() wiped the layout
+    // this test had just saved.
+    qputenv("ALPHASHAPE_GUI_SETTINGS_FILE", settings_path().toLocal8Bit());
     Options options;
     options.reset_settings = reset_settings;
     app_ = std::make_unique<GuiApp>(options);
     window_ = std::make_unique<MainWindow>(*app_);
+}
+
+QString GuiTest::settings_path() const {
+    return QDir(scratch_->path()).filePath(QStringLiteral("settings.ini"));
 }
 
 QAction* GuiTest::action(const QString& object_name) {

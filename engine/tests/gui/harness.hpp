@@ -89,6 +89,10 @@ protected:
     /// A path inside this test's scratch directory.
     QString scratch(const QString& name) const;
 
+    /// The settings file every GuiApp of this test uses (see rebuild()). It lives in the scratch
+    /// directory, so it is removed with it and no other test process can see it.
+    QString settings_path() const;
+
     /// Debugging aid: save a screenshot of `widget` as `<name>.png` when the environment
     /// variable ALPHASHAPE_GUI_GRAB_DIR names a directory. Returns true when a file was
     /// written. Never used for assertions.

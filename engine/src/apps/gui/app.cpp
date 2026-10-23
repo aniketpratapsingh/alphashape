@@ -1,12 +1,16 @@
 #include "apps/gui/app.hpp"
 
 #include <iostream>
+#include <memory>
 
 #include <QApplication>
+#include <QByteArray>
 #include <QMetaObject>
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
+#include <QSettings>
+#include <QtGlobal>
 
 #include "base/utils/error.hpp"
 #include "common/io/project_io.hpp"
@@ -19,22 +23,36 @@ constexpr const char* kRecentKey = "files/recent";
 constexpr std::size_t kUnreachable = static_cast<std::size_t>(-1);
 /// The GuiApp that currently receives engine log lines (the sink is process-wide).
 GuiApp* g_log_owner = nullptr;
+
+/// The platform store, or an explicit INI file named by ALPHASHAPE_GUI_SETTINGS_FILE. The file
+/// form is a test seam: QSettings' default store is one machine-wide registry key on Windows, so
+/// test processes running in parallel would read and clear each other's settings (a neighbour's
+/// reset wiped the layout another test had just saved). The environment variable covers the
+/// spawned alphashape-gui binary as well as the in-process apps.
+std::unique_ptr<QSettings> make_settings() {
+    const QByteArray file = qgetenv("ALPHASHAPE_GUI_SETTINGS_FILE");
+    if (!file.isEmpty()) {
+        return std::make_unique<QSettings>(QString::fromLocal8Bit(file), QSettings::IniFormat);
+    }
+    return std::make_unique<QSettings>(QStringLiteral("alphashape"),
+                                       QStringLiteral("alphashape"));
+}
 }  // namespace
 
 GuiApp::GuiApp(const Options& options, QObject* parent)
     : QObject(parent),
-      settings_(QStringLiteral("alphashape"), QStringLiteral("alphashape")),
+      settings_(make_settings()),
       document_(std::make_shared<Document>()),
       undo_stack_(document_.get()),
       theme_(this),
       jobs_(*this) {
     qRegisterMetaType<alphashape::LogLevel>("alphashape::LogLevel");
     if (options.reset_settings) {
-        settings_.clear();
-        settings_.sync();
+        settings_->clear();
+        settings_->sync();
     }
 
-    recent_ = settings_.value(kRecentKey).toStringList();
+    recent_ = settings_->value(kRecentKey).toStringList();
 
     Theme::load_bundled_fonts();
     // Fusion honours the whole QPalette on every platform, so widgets the style sheet does not
@@ -45,7 +63,7 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
     if (options.theme) {
         mode = *options.theme;
     } else if (const auto stored =
-                   theme_from_name(settings_.value(kThemeKey).toString().toStdString())) {
+                   theme_from_name(settings_->value(kThemeKey).toString().toStdString())) {
         mode = *stored;
     }
     theme_.apply(mode);
@@ -97,7 +115,7 @@ void GuiApp::task_changed_document() {
 
 void GuiApp::set_theme(ThemeMode mode) {
     theme_.apply(mode);
-    settings_.setValue(kThemeKey, QString::fromLatin1(theme_name(mode)));
+    settings_->setValue(kThemeKey, QString::fromLatin1(theme_name(mode)));
 }
 
 void GuiApp::new_document(const std::string& path) {
@@ -209,11 +227,11 @@ QStringList GuiApp::recent_files() const {
 // dependency on write timing.
 void GuiApp::store_recent_files() {
     if (recent_.isEmpty()) {
-        settings_.remove(kRecentKey);
+        settings_->remove(kRecentKey);
     } else {
-        settings_.setValue(kRecentKey, recent_);
+        settings_->setValue(kRecentKey, recent_);
     }
-    settings_.sync();
+    settings_->sync();
 }
 
 namespace {
