@@ -151,6 +151,14 @@ jobs:
             exit 1
           fi
 
+      # A green run means nothing if the binary was built without the runtimes.
+      - name: Verify the test binary is instrumented
+        run: |
+          bin=$(find build -name alphashape_tests -type f -perm -u+x | head -n1)
+          echo "binary: $bin"
+          ldd "$bin" | grep -E 'libasan|libubsan'
+          ldd "$bin" | grep -q libasan && ldd "$bin" | grep -q libubsan
+
       - name: Test
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
