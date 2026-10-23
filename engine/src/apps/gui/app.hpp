@@ -27,6 +27,10 @@
 
 namespace alphashape::gui {
 
+/// Window/tree title fragment for `document` ("Untitled" when it has no path). Pure: it reads
+/// the document it is given and takes no lock, so it is safe to call from inside read_document().
+QString document_title_of(const Document& document);
+
 class GuiApp : public QObject {
     Q_OBJECT
 
@@ -37,7 +41,7 @@ public:
     explicit GuiApp(const Options& options, QObject* parent = nullptr);
     ~GuiApp() override;
 
-    QSettings& settings() { return settings_; }
+    QSettings& settings() { return *settings_; }
     Theme& theme() { return theme_; }
     Document& document() { return *document_; }
     UndoStack& undo_stack() { return undo_stack_; }
@@ -84,6 +88,8 @@ public:
     void save_document_as(const std::string& path);
 
     /// Window title fragment for the current document ("Untitled" when it has no path).
+    /// Takes the shared lock itself: call it from the GUI thread outside read_document(),
+    /// use document_title_of() for a document you already hold under the lock.
     QString document_title() const;
 
     /// True when the document differs from what was last loaded or saved. Edits made through
@@ -120,7 +126,7 @@ Q_SIGNALS:
     void recent_files_changed();
 
 private:
-    QSettings settings_;
+    std::unique_ptr<QSettings> settings_;
     std::shared_ptr<Document> document_;
     UndoStack undo_stack_;
     Theme theme_;
@@ -132,6 +138,8 @@ private:
     bool force_dirty_ = false;
     bool last_dirty_ = false;
 
+    QStringList recent_;  ///< authoritative copy of the persisted recent-files list
+    void store_recent_files();
     void require_idle(const char* what) const;
     void reset_dirty_tracking();
     void publish_dirty();

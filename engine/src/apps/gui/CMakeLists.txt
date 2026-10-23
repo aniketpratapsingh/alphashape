@@ -13,6 +13,9 @@ add_library(alphashape_gui_lib STATIC
     job_manager.cpp
     main_window.cpp
     viewport_placeholder.cpp
+    workspace_model.cpp
+    workspace_pane.cpp
+    properties_pane.cpp
     theme/theme.cpp)
 target_include_directories(alphashape_gui_lib PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_gui_lib

@@ -18,7 +18,10 @@ class QMenu;
 namespace alphashape::gui {
 
 class GuiApp;
+class PropertiesPane;
 class ViewportPlaceholder;
+class WorkspacePane;
+class WorkspaceSelection;
 
 /// What the user chose when asked about unsaved changes.
 enum class UnsavedChoice { Save, Discard, Cancel };
@@ -111,6 +114,9 @@ private:
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     ViewportPlaceholder* viewport_ = nullptr;
+    WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties pane
+    WorkspacePane* workspace_pane_ = nullptr;
+    PropertiesPane* properties_pane_ = nullptr;
     QLabel* jobs_label_ = nullptr;          ///< stage / idle text ("status.jobs")
     QProgressBar* jobs_progress_ = nullptr; ///< "status.progress", visible while a job runs
     QToolButton* jobs_cancel_ = nullptr;    ///< "status.cancel", visible while a job runs

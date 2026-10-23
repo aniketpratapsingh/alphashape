@@ -1,11 +1,16 @@
 #include "apps/gui/app.hpp"
 
 #include <iostream>
+#include <memory>
 
 #include <QApplication>
+#include <QByteArray>
 #include <QMetaObject>
+#include <QDir>
 #include <QFileInfo>
 #include <QString>
+#include <QSettings>
+#include <QtGlobal>
 
 #include "base/utils/error.hpp"
 #include "common/io/project_io.hpp"
@@ -18,20 +23,36 @@ constexpr const char* kRecentKey = "files/recent";
 constexpr std::size_t kUnreachable = static_cast<std::size_t>(-1);
 /// The GuiApp that currently receives engine log lines (the sink is process-wide).
 GuiApp* g_log_owner = nullptr;
+
+/// The platform store, or an explicit INI file named by ALPHASHAPE_GUI_SETTINGS_FILE. The file
+/// form is a test seam: QSettings' default store is one machine-wide registry key on Windows, so
+/// test processes running in parallel would read and clear each other's settings (a neighbour's
+/// reset wiped the layout another test had just saved). The environment variable covers the
+/// spawned alphashape-gui binary as well as the in-process apps.
+std::unique_ptr<QSettings> make_settings() {
+    const QByteArray file = qgetenv("ALPHASHAPE_GUI_SETTINGS_FILE");
+    if (!file.isEmpty()) {
+        return std::make_unique<QSettings>(QString::fromLocal8Bit(file), QSettings::IniFormat);
+    }
+    return std::make_unique<QSettings>(QStringLiteral("alphashape"),
+                                       QStringLiteral("alphashape"));
+}
 }  // namespace
 
 GuiApp::GuiApp(const Options& options, QObject* parent)
     : QObject(parent),
-      settings_(QStringLiteral("alphashape"), QStringLiteral("alphashape")),
+      settings_(make_settings()),
       document_(std::make_shared<Document>()),
       undo_stack_(document_.get()),
       theme_(this),
       jobs_(*this) {
     qRegisterMetaType<alphashape::LogLevel>("alphashape::LogLevel");
     if (options.reset_settings) {
-        settings_.clear();
-        settings_.sync();
+        settings_->clear();
+        settings_->sync();
     }
+
+    recent_ = settings_->value(kRecentKey).toStringList();
 
     Theme::load_bundled_fonts();
     // Fusion honours the whole QPalette on every platform, so widgets the style sheet does not
@@ -42,7 +63,7 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
     if (options.theme) {
         mode = *options.theme;
     } else if (const auto stored =
-                   theme_from_name(settings_.value(kThemeKey).toString().toStdString())) {
+                   theme_from_name(settings_->value(kThemeKey).toString().toStdString())) {
         mode = *stored;
     }
     theme_.apply(mode);
@@ -94,7 +115,7 @@ void GuiApp::task_changed_document() {
 
 void GuiApp::set_theme(ThemeMode mode) {
     theme_.apply(mode);
-    settings_.setValue(kThemeKey, QString::fromLatin1(theme_name(mode)));
+    settings_->setValue(kThemeKey, QString::fromLatin1(theme_name(mode)));
 }
 
 void GuiApp::new_document(const std::string& path) {
@@ -196,43 +217,82 @@ void GuiApp::redo() {
 }
 
 QStringList GuiApp::recent_files() const {
-    return settings_.value(kRecentKey).toStringList();
+    return recent_;
 }
+
+// The in-memory list is authoritative; QSettings is only where it is persisted. QSettings writes
+// lazily and re-reads the file when it looks changed; on Windows a write that loses a race with a
+// lock (antivirus, indexer) leaves the file stale and a later re-read then replaced what had just
+// been stored, which made the list come back empty or old. Reading our own copy removes that
+// dependency on write timing.
+void GuiApp::store_recent_files() {
+    if (recent_.isEmpty()) {
+        settings_->remove(kRecentKey);
+    } else {
+        settings_->setValue(kRecentKey, recent_);
+    }
+    settings_->sync();
+}
+
+namespace {
+// Same normal form for storing and for matching: absolute, '/' separators, "." and ".." resolved.
+QString recent_key(const QString& path) {
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
+// Windows paths ignore case, and so must the duplicate check or "C:/x" and "c:/x" list twice.
+#ifdef Q_OS_WIN
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseInsensitive;
+#else
+constexpr Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
+#endif
+void remove_path(QStringList& list, const QString& key) {
+    for (qsizetype i = list.size(); i-- > 0;) {
+        if (list[i].compare(key, kPathCase) == 0) {
+            list.removeAt(i);
+        }
+    }
+}
+}  // namespace
 
 void GuiApp::add_recent_file(const QString& path) {
     if (path.isEmpty()) {
         return;
     }
-    const QString absolute = QFileInfo(path).absoluteFilePath();
-    QStringList list = recent_files();
-    list.removeAll(absolute);
-    list.prepend(absolute);
-    while (list.size() > kMaxRecentFiles) {
-        list.removeLast();
+    const QString absolute = recent_key(path);
+    remove_path(recent_, absolute);
+    recent_.prepend(absolute);
+    while (recent_.size() > kMaxRecentFiles) {
+        recent_.removeLast();
     }
-    settings_.setValue(kRecentKey, list);
+    store_recent_files();
     Q_EMIT recent_files_changed();
 }
 
 void GuiApp::remove_recent_file(const QString& path) {
-    QStringList list = recent_files();
-    if (list.removeAll(QFileInfo(path).absoluteFilePath()) > 0) {
-        settings_.setValue(kRecentKey, list);
+    const qsizetype before = recent_.size();
+    remove_path(recent_, recent_key(path));
+    if (recent_.size() != before) {
+        store_recent_files();
         Q_EMIT recent_files_changed();
     }
 }
 
 void GuiApp::clear_recent_files() {
-    settings_.remove(kRecentKey);
+    recent_.clear();
+    store_recent_files();
     Q_EMIT recent_files_changed();
 }
 
-QString GuiApp::document_title() const {
-    const std::string path = read_document([](const Document& d) { return d.path(); });
+QString document_title_of(const Document& document) {
+    const std::string path = document.path();
     if (path.empty()) {
         return QStringLiteral("Untitled");
     }
     return QFileInfo(QString::fromStdString(path)).completeBaseName();
+}
+
+QString GuiApp::document_title() const {
+    return read_document([](const Document& d) { return document_title_of(d); });
 }
 
 }  // namespace alphashape::gui
