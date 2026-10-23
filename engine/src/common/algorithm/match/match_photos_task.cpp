@@ -223,7 +223,7 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
             done = end;
             progress.update("detect", static_cast<double>(done) / static_cast<double>(total));
             if (progress.is_cancelled()) {
-                throw Error("MatchPhotos was cancelled");
+                throw CancelledError("MatchPhotos was cancelled");
             }
         }
         for (const std::string& error : errors) {
@@ -355,7 +355,7 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
             done = end;
             progress.update("match", static_cast<double>(done) / static_cast<double>(total));
             if (progress.is_cancelled()) {
-                throw Error("MatchPhotos was cancelled");
+                throw CancelledError("MatchPhotos was cancelled");
             }
         }
         for (const std::string& error : match_errors) {

@@ -1,6 +1,7 @@
 #include "apps/gui/main_window.hpp"
 
 #include <exception>
+#include <optional>
 #include <utility>
 
 #include <QAction>
@@ -16,9 +17,11 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QPair>
+#include <QProgressBar>
 #include <QMessageBox>
 #include <QSettings>
 #include <QStatusBar>
+#include <QToolButton>
 #include <QUrl>
 #include <QWidget>
 
@@ -93,6 +96,13 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
         }
         return dialog.selectedFiles().first();
     };
+    cancel_jobs_handler_ = [this](const QString& task) {
+        QMessageBox box(QMessageBox::Question, tr("Job running"),
+                        tr("%1 is still running. Cancel it and quit?").arg(task),
+                        QMessageBox::Yes | QMessageBox::No, this);
+        box.setDefaultButton(QMessageBox::No);
+        return box.exec() == QMessageBox::Yes;
+    };
     error_handler_ = [this](const QString& title, const QString& message) {
         QMessageBox::critical(this, title, message);
     };
@@ -118,6 +128,23 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     connect(&app_, &GuiApp::dirty_changed, this, [this](bool) { update_title(); });
     connect(&app_, &GuiApp::undo_changed, this, &MainWindow::update_undo_actions);
     connect(&app_, &GuiApp::recent_files_changed, this, &MainWindow::update_recent_menu);
+
+    JobManager& jobs = app_.jobs();
+    connect(&jobs, &JobManager::busy_changed, this, [this](bool) {
+        update_job_ui();
+        update_undo_actions();
+    });
+    connect(&jobs, &JobManager::job_state_changed, this,
+            [this](quint64, JobManager::State) { update_job_ui(); });
+    connect(&jobs, &JobManager::job_progress, this,
+            [this](quint64, double percent, const QString& stage, qint64 eta_ms) {
+                on_job_progress(percent, stage, eta_ms);
+            });
+    connect(&jobs, &JobManager::job_finished, this,
+            [this](quint64, JobManager::State state, const QString& message) {
+                on_job_finished(static_cast<int>(state), message);
+            });
+    update_job_ui();
 }
 
 // --- Hooks -------------------------------------------------------------------------------
@@ -133,6 +160,10 @@ void MainWindow::set_save_path_handler(SavePathHandler handler) {
 }
 void MainWindow::set_error_handler(ErrorHandler handler) {
     error_handler_ = std::move(handler);
+}
+
+void MainWindow::set_cancel_jobs_handler(CancelJobsHandler handler) {
+    cancel_jobs_handler_ = std::move(handler);
 }
 
 void MainWindow::report_error(const QString& title, const std::exception& error) {
@@ -335,10 +366,96 @@ void MainWindow::create_menus() {
 void MainWindow::create_status_strip() {
     statusBar()->setObjectName(QStringLiteral("statusStrip"));
     statusBar()->showMessage(tr("Ready"));
-    // Right side: the job manager's progress widget replaces this label.
+    // Right side: stage text, a progress bar and a cancel button. The bar and the button only
+    // show while a job is active.
     jobs_label_ = new QLabel(tr("No jobs running"), this);
     jobs_label_->setObjectName(QStringLiteral("status.jobs"));
+    jobs_progress_ = new QProgressBar(this);
+    jobs_progress_->setObjectName(QStringLiteral("status.progress"));
+    jobs_progress_->setRange(0, 100);
+    jobs_progress_->setFixedWidth(160);
+    jobs_progress_->setTextVisible(true);
+    jobs_cancel_ = new QToolButton(this);
+    jobs_cancel_->setObjectName(QStringLiteral("status.cancel"));
+    jobs_cancel_->setText(tr("Cancel"));
+    jobs_cancel_->setToolTip(tr("Cancel the running job"));
+    connect(jobs_cancel_, &QToolButton::clicked, &app_.jobs(), qOverload<>(&JobManager::cancel));
     statusBar()->addPermanentWidget(jobs_label_);
+    statusBar()->addPermanentWidget(jobs_progress_);
+    statusBar()->addPermanentWidget(jobs_cancel_);
+    jobs_progress_->setVisible(false);
+    jobs_cancel_->setVisible(false);
+}
+
+// --- Jobs ----------------------------------------------------------------------------------
+
+namespace {
+QString format_eta(qint64 eta_ms) {
+    const qint64 seconds = (eta_ms + 999) / 1000;
+    if (seconds < 60) {
+        return QObject::tr("%1 s").arg(seconds);
+    }
+    if (seconds < 3600) {
+        return QObject::tr("%1 min").arg((seconds + 59) / 60);
+    }
+    return QObject::tr("%1 h %2 min").arg(seconds / 3600).arg((seconds % 3600 + 59) / 60);
+}
+}  // namespace
+
+void MainWindow::update_job_ui() {
+    const JobManager& jobs = app_.jobs();
+    const bool busy = jobs.busy();
+
+    // Everything that edits, replaces or saves the document waits for the job.
+    for (const char* name : {"action.file.new", "action.file.open", "action.file.save",
+                             "action.file.save_as", "action.file.close"}) {
+        if (QAction* item = findChild<QAction*>(QString::fromLatin1(name))) {
+            item->setEnabled(!busy);
+        }
+    }
+    update_recent_menu();
+
+    jobs_progress_->setVisible(busy);
+    jobs_cancel_->setVisible(busy);
+    if (!busy) {
+        jobs_label_->setText(tr("No jobs running"));
+        jobs_label_->setToolTip(QString());
+        return;
+    }
+    const std::optional<JobManager::JobId> running = jobs.running_job();
+    const std::optional<JobManager::Job> current =
+        running ? jobs.job(*running) : std::optional<JobManager::Job>{};
+    QString text = current ? current->task : tr("Waiting");
+    if (current && !current->stage.isEmpty()) {
+        text += QStringLiteral(": ") + current->stage;
+    }
+    if (jobs.pending_count() > 0) {
+        text += tr(" (+%1 queued)").arg(static_cast<qulonglong>(jobs.pending_count()));
+    }
+    jobs_label_->setText(text);
+    jobs_progress_->setValue(current ? static_cast<int>(current->percent) : 0);
+}
+
+void MainWindow::on_job_progress(double percent, const QString& stage, qint64 eta_ms) {
+    jobs_progress_->setValue(static_cast<int>(percent));
+    update_job_ui();
+    jobs_label_->setToolTip(eta_ms >= 0 ? tr("%1 remaining").arg(format_eta(eta_ms)) : stage);
+}
+
+void MainWindow::on_job_finished(int state, const QString& message) {
+    switch (static_cast<JobManager::State>(state)) {
+        case JobManager::State::Failed:
+            error_handler_(tr("Task failed"), message);
+            break;
+        case JobManager::State::Succeeded:
+            statusBar()->showMessage(tr("Task finished"), 4000);
+            break;
+        case JobManager::State::Cancelled:
+            statusBar()->showMessage(tr("Task cancelled"), 4000);
+            break;
+        default:
+            break;
+    }
 }
 
 // --- Project operations ------------------------------------------------------------------
@@ -457,10 +574,11 @@ void MainWindow::update_title() {
 
 void MainWindow::update_undo_actions() {
     const UndoStack& stack = app_.undo_stack();
-    undo_action_->setEnabled(stack.can_undo());
+    const bool idle = !app_.jobs().busy();  // the document belongs to the job until it ends
+    undo_action_->setEnabled(stack.can_undo() && idle);
     undo_action_->setText(stack.can_undo() ? QString::fromStdString(stack.undo_label())
                                            : tr("Undo"));
-    redo_action_->setEnabled(stack.can_redo());
+    redo_action_->setEnabled(stack.can_redo() && idle);
     redo_action_->setText(stack.can_redo() ? QString::fromStdString(stack.redo_label())
                                            : tr("Redo"));
 }
@@ -478,7 +596,7 @@ void MainWindow::update_recent_menu() {
         }
     }
     recent_clear_->setEnabled(!recent.isEmpty());
-    recent_menu_->setEnabled(!recent.isEmpty());
+    recent_menu_->setEnabled(!recent.isEmpty() && !app_.jobs().busy());
 }
 
 QString MainWindow::about_text() const {
@@ -496,6 +614,17 @@ void MainWindow::show_about() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    JobManager& jobs = app_.jobs();
+    if (jobs.busy()) {
+        const std::optional<JobManager::JobId> running = jobs.running_job();
+        const std::optional<JobManager::Job> current =
+            running ? jobs.job(*running) : std::optional<JobManager::Job>{};
+        if (!cancel_jobs_handler_(current ? current->task : tr("A job"))) {
+            event->ignore();
+            return;
+        }
+        jobs.cancel_all_and_wait();
+    }
     if (!confirm_discard()) {
         event->ignore();
         return;

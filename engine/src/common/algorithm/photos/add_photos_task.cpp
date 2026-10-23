@@ -244,7 +244,7 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     for (std::size_t i = 0; i < absolute.size(); ++i) {
         const std::string& path = absolute[i];
         if (progress.is_cancelled()) {
-            throw Error("AddPhotos was cancelled");
+            throw CancelledError("AddPhotos was cancelled");
         }
 
         PendingCamera item;
