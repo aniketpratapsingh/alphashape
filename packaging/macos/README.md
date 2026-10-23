@@ -18,7 +18,8 @@ alphashape.app/Contents/
   MacOS/alphashape-gui, alphashape-cli
   Frameworks/                 Qt 6.8 (macdeployqt), Ceres, PROJ, glog, gflags, jpeg, png, tiff, libomp,
                               libvulkan.1.dylib (Vulkan loader), libMoltenVK.dylib
-  PlugIns/                    Qt plugins
+  PlugIns/                    Qt plugins (macdeployqt) plus platforms/libqoffscreen.dylib (and
+                              libqminimal.dylib when the Qt kit has it) for headless runs
   Resources/python/           alphashape.cpython-3XX-darwin.so  (use with PYTHONPATH)
   Resources/share/proj/       proj.db and PROJ data
   Resources/vulkan/icd.d/     MoltenVK_icd.json (library_path is relative to the manifest)

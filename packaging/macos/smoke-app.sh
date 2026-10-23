@@ -69,6 +69,12 @@ grep -q "alphashape.app/Contents/Frameworks/libvulkan.1.dylib" "$work/gpu.err"
 grep -q "alphashape.app/Contents/Frameworks/libMoltenVK.dylib" "$work/gpu.err"
 
 echo "== GUI (offscreen)"
+# The offscreen platform plugin is not one macdeployqt picks (it deploys cocoa only), so
+# build-app.sh copies it in; check it is present before handing the GUI a headless platform.
+[ -f "$app/Contents/PlugIns/platforms/libqoffscreen.dylib" ] || {
+    echo "error: the bundle is missing PlugIns/platforms/libqoffscreen.dylib" >&2
+    ls "$app/Contents/PlugIns/platforms" >&2 || true
+    exit 1; }
 QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
 grep -q 'gui ready' "$work/gui.txt"
 

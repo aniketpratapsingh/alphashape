@@ -5,7 +5,9 @@
 #   needs on PATH: macdeployqt (from the Qt 6.8 install), rsvg-convert, iconutil, codesign,
 #   python3. Homebrew supplies the libraries being bundled (proj, MoltenVK, Vulkan loader, ...).
 #
-# Environment overrides: PROJ_DATA_SRC, MOLTENVK_LIB, MOLTENVK_ICD, VULKAN_LOADER_LIB.
+# Environment overrides: PROJ_DATA_SRC, MOLTENVK_LIB, MOLTENVK_ICD, VULKAN_LOADER_LIB,
+# QT_PLUGINS_DIR. QT_ROOT_DIR and qmake are used to locate the Qt plugin directory when
+# QT_PLUGINS_DIR is not given.
 set -euo pipefail
 
 build=$(cd "$1" && pwd)
@@ -78,6 +80,61 @@ PY
 echo "== Info.plist (provisional), Qt"
 sed 's/__MIN_OS__/11.0/' "$build/macos/Info.plist" > "$contents/Info.plist"
 macdeployqt "$app" -always-overwrite
+
+echo "== extra Qt platform plugins"
+# macdeployqt deploys only the platform plugin for the machine it runs on (cocoa), but the smoke
+# test and any headless run need the offscreen plugin; minimal is the generic fallback. Both are
+# copied here, before bundle_libs.py, so their install names and rpaths are normalised with the
+# rest of the bundle and the signing pass below covers them.
+if [ -z "${QT_PLUGINS_DIR:-}" ]; then
+    candidates=""
+    if [ -n "${QT_ROOT_DIR:-}" ]; then
+        candidates="$QT_ROOT_DIR/plugins $QT_ROOT_DIR/../plugins"
+    fi
+    if command -v macdeployqt >/dev/null 2>&1; then
+        candidates="$candidates $(cd "$(dirname "$(command -v macdeployqt)")/.." && pwd)/plugins"
+    fi
+    for candidate in $candidates; do
+        if [ -d "$candidate/platforms" ]; then
+            QT_PLUGINS_DIR="$candidate"
+            break
+        fi
+    done
+fi
+[ -n "${QT_PLUGINS_DIR:-}" ] && [ -d "$QT_PLUGINS_DIR/platforms" ] || {
+    echo "error: cannot locate the Qt plugin directory (set QT_PLUGINS_DIR)" >&2; exit 1; }
+echo "  Qt plugin directory: $QT_PLUGINS_DIR"
+mkdir -p "$contents/PlugIns/platforms"
+# offscreen is what the headless smoke run needs; minimal is a useful generic fallback for a
+# session without a window server. Ship offscreen unconditionally, minimal when the Qt kit has it.
+for plugin in libqoffscreen.dylib libqminimal.dylib; do
+    src="$QT_PLUGINS_DIR/platforms/$plugin"
+    if [ ! -f "$src" ]; then
+        if [ "$plugin" = "libqminimal.dylib" ]; then
+            echo "  (no $plugin in this Qt install; skipping)"
+            continue
+        fi
+        echo "error: missing Qt platform plugin $src" >&2
+        exit 1
+    fi
+    cp -L "$src" "$contents/PlugIns/platforms/$plugin"
+    chmod 755 "$contents/PlugIns/platforms/$plugin"
+    echo "  added $plugin  <-  $src"
+done
+ls "$contents/PlugIns/platforms"
+# Qt resolves a bundle's plugins to Contents/PlugIns without a qt.conf, and macdeployqt does not
+# write one. If it ever appears, keep it honest: a Plugins entry must name PlugIns, since paths
+# in Resources/qt.conf are relative to the bundle's Contents directory.
+qt_conf="$contents/Resources/qt.conf"
+if [ -f "$qt_conf" ]; then
+    echo "qt.conf in the bundle:"; sed 's/^/  /' "$qt_conf"
+    plugins=$(sed -n 's/^[[:space:]]*Plugins[[:space:]]*=[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' \
+              "$qt_conf" | tail -1)
+    if [ -n "$plugins" ] && [ "$plugins" != "PlugIns" ]; then
+        echo "error: $qt_conf points Plugins at '$plugins', expected PlugIns" >&2
+        exit 1
+    fi
+fi
 
 echo "== remaining libraries"
 python3 "$here/bundle_libs.py" "$app" --min-os-out "$out/min-os.txt"

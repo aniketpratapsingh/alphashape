@@ -170,15 +170,30 @@ class Bundle:
             print(f"  bundled {name}  <-  {source}")
         return dest
 
-    def deploy_qt_framework(self, ref):
-        """Copy a Qt framework that a deployed plugin needs but macdeployqt left out
-        (for example QtSvg, required by the SVG icon-engine plugin)."""
-        match = re.match(r"@rpath/(Qt\w+\.framework)/", ref)
-        lib = qt_lib_dir()
-        if not match or not lib:
+    @staticmethod
+    def qt_framework_ref(ref):
+        """(framework name, path inside it) when `ref` points into a Qt framework, else None.
+
+        Qt plugins copied out of the Qt install by build-app.sh still use both `@rpath/...` and
+        absolute references into that install, so both spellings have to be recognised."""
+        match = re.search(r"(Qt\w+\.framework)/", ref)
+        return (match.group(1), ref[match.end():]) if match else None
+
+    def deploy_qt_framework(self, ref, resolved=None):
+        """Copy a Qt framework that is missing from the bundle but referenced by something
+        already in it (for example QtSvg, required by the SVG icon-engine plugin).
+
+        `resolved` is the reference already expanded to a path outside the bundle, which is
+        where the framework content is copied from; QT_ROOT_DIR is the fallback source."""
+        parsed = self.qt_framework_ref(ref)
+        if not parsed:
             return None
-        name = match.group(1)
-        source = os.path.join(lib, name)
+        name, tail = parsed
+        source = None
+        if resolved:
+            source = resolved[:resolved.index(name) + len(name)]
+        if not source or not os.path.isdir(source):
+            source = os.path.join(qt_lib_dir(), name)
         dest = os.path.join(self.frameworks, name)
         if not os.path.isdir(source):
             return None
@@ -186,7 +201,7 @@ class Bundle:
             shutil.copytree(source, dest, symlinks=True,
                             ignore=shutil.ignore_patterns("Headers", "*.prl"))
             print(f"  deployed {name}  <-  {source}")
-        return os.path.join(self.frameworks, ref[len("@rpath/"):])
+        return os.path.join(dest, tail)
 
     def fix_rpaths(self, path):
         wanted = "@loader_path/" + os.path.relpath(self.frameworks, os.path.dirname(path))
@@ -219,6 +234,19 @@ class Bundle:
                                       or find_in_homebrew(os.path.basename(ref)))
                         if source is None:
                             sys.exit(f"error: cannot resolve {ref} (needed by {path})")
+                    framework = self.qt_framework_ref(ref)
+                    if framework:
+                        # A Qt framework binary keeps its framework-relative install name, so
+                        # the framework finds its own QtCore; copy_in would flatten it.
+                        name, tail = framework
+                        if not self.inside(source):
+                            source = self.deploy_qt_framework(ref, source)
+                            if source is None:
+                                sys.exit(f"error: cannot deploy {ref} (needed by {path})")
+                        canonical = f"@rpath/{name}/{tail}"
+                        if ref != canonical:
+                            run(["install_name_tool", "-change", ref, canonical, path])
+                        continue
                     if self.inside(source):
                         continue
                     dest = self.copy_in(source)
