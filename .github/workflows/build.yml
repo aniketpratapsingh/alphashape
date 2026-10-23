@@ -55,7 +55,7 @@ jobs:
       macos: ${{ steps.matrix.outputs.macos }}
       windows: ${{ steps.matrix.outputs.windows }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       - id: matrix
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -117,7 +117,7 @@ jobs:
           setup-python: false
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-linux-gcc-${{ github.ref_name }}-${{ github.sha }}
@@ -144,7 +144,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-linux
           path: build.tar.zst
@@ -152,7 +152,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-linux-all
           path: tests-all.txt
@@ -196,7 +196,7 @@ jobs:
           packaging/linux/build-appimage.sh build "dist/alphashape-${{ inputs.version }}-linux-x86_64.AppImage"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-linux-x86_64
@@ -214,10 +214,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-linux-x86_64
           path: dist
@@ -240,7 +240,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -265,7 +265,7 @@ jobs:
           setup-python: false
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-macos-clang-${{ github.ref_name }}-${{ github.sha }}
@@ -291,7 +291,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-macos
           path: build.tar.zst
@@ -299,7 +299,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-macos-all
           path: tests-all.txt
@@ -320,7 +320,7 @@ jobs:
           packaging/macos/build-dmg.sh dist/app/alphashape.app \
             "dist/alphashape-${{ inputs.version }}-macos-arm64.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-macos-arm64
@@ -335,10 +335,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-macos-arm64
           path: dist
@@ -352,7 +352,7 @@ jobs:
           so="$(ls "$mnt"/alphashape.app/Contents/Resources/python/*.so)"
           hdiutil detach "$mnt"
           echo "version=$(basename "$so" | sed -E 's/.*cpython-3([0-9]+)-darwin.*/3.\1/')" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ steps.py.outputs.version }}
       - name: Hide Homebrew
@@ -369,12 +369,12 @@ jobs:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .vcpkg-bincache
           key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
@@ -390,7 +390,7 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -443,7 +443,7 @@ jobs:
           %SystemRoot%\System32\tar.exe -czf build.tar.gz --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
           dir build.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-windows
           path: build.tar.gz
@@ -451,7 +451,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-windows-all
           path: tests-all.txt
@@ -469,7 +469,7 @@ jobs:
           Copy-Item README.md, LICENSE, engine\LIMITATIONS.md "dist\$name\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-windows-x86_64
@@ -489,14 +489,14 @@ jobs:
     steps:
       # The build tree holds absolute paths (fixtures, binaries), so the workspace path must match
       # the build job: same runner image, same repository, same checkout location.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs so
       # the shards usually install without downloading anything.
       - name: Restore apt package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/apt-debs
           # Bump the suffix when the package list below changes.
@@ -526,7 +526,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-linux
 
@@ -546,7 +546,7 @@ jobs:
           ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
           echo "tests in this lane: $(wc -l < tests-lane.txt)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-linux-${{ matrix.lane }}
           path: tests-lane.txt
@@ -601,7 +601,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -620,7 +620,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-macos
 
@@ -640,7 +640,7 @@ jobs:
           ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
           echo "tests in this lane: $(wc -l < tests-lane.txt)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-macos-${{ matrix.lane }}
           path: tests-lane.txt
@@ -667,13 +667,13 @@ jobs:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       # The build job saved this cache under the same key; restore only, never save from a shard.
       - name: Restore vcpkg binary cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .vcpkg-bincache
           key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
@@ -689,7 +689,7 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -704,7 +704,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-windows
 
@@ -729,7 +729,7 @@ jobs:
           ctest --test-dir build -N @ctestArgs | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } } | Set-Content -Encoding ascii tests-lane.txt
           "tests in this lane: $((Get-Content tests-lane.txt).Count)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-windows-${{ matrix.lane }}
           path: tests-lane.txt
@@ -753,7 +753,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: tests-*
           path: lists
