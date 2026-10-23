@@ -277,7 +277,7 @@ TEST_F(TaskDialogTest, AnErrorRestylesTheEditorOnlyOnTransitions) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
-
+TEST_F(TaskDialogTest, ResetButtonRestoresDefaults) {
     TaskDialog dialog("BuildDepthMaps", registry(), store());
     qobject_cast<QSpinBox*>(dialog.editor("downscale"))->setValue(2);
     auto* reset = dialog.findChild<QPushButton*>("task.reset");

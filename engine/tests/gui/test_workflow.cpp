@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <Eigen/Core>
@@ -495,9 +496,10 @@ TEST_F(WorkflowTest, OpensTheRealDialogPresetToTheExistingSource) {
     refresh();
     ASSERT_TRUE(enabled("action.workflow.build_model"));
 
-    // No handler stub: the dialog is connected to a slot that accepts it as soon as it opens
-    // (so exec() returns without a user), and the submitted Params are captured from the one
-    // step in the chain that differs from the real one.
+    // No handler stub: a timer clicks the real dialog's OK button as soon as it is up, so
+    // exec() returns without a user and the rest of the chain (params() -> submit) is the
+    // production one. The submit hook is stubbed only to capture the Params instead of
+    // handing them to the job manager.
     std::optional<Params> submitted_params;
     workflow().set_submit_handler(
         [&](const std::string& task, Params params, std::int32_t target) {
@@ -505,19 +507,27 @@ TEST_F(WorkflowTest, OpensTheRealDialogPresetToTheExistingSource) {
             EXPECT_EQ(target, chunk_id_);
             submitted_params = std::move(params);
         });
-    QTimer::singleShot(0, qApp, []() {
+    auto accept_real_dialog = std::make_shared<int>(0);
+    auto* timer = new QTimer(&window());
+    timer->setInterval(5);
+    QObject::connect(timer, &QTimer::timeout, timer, [accept_real_dialog]() {
         for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (auto* dialog = qobject_cast<QDialog*>(widget)) {
-                const QString name = dialog->objectName();
-                if (name == QStringLiteral("dialog.task")) {
-                    auto* ok = dialog->findChild<QPushButton*>(QStringLiteral("task.ok"));
-                    if (ok != nullptr) {
-                        ok->click();
-                    }
-                }
+            auto* dialog = qobject_cast<QDialog*>(widget);
+            if (dialog != nullptr && dialog->objectName() == QStringLiteral("dialog.task") &&
+                dialog->isVisible()) {
+                // TaskDialog::accept() re-checks the schema constraints, so this also proves
+                // the preset value passes them.
+                dialog->accept();
+                ++*accept_real_dialog;
             }
         }
     });
+    timer->start();
+    const bool ran = trigger("action.workflow.build_model");
+    timer->stop();
+    timer->deleteLater();
+    ASSERT_TRUE(ran);
+    EXPECT_EQ(*accept_real_dialog, 1) << "the real dialog was shown exactly once";
 
     // Clicking the menu action runs the whole path: run() -> real TaskDialog -> params -> submit.
     ASSERT_TRUE(trigger("action.workflow.build_model"));
