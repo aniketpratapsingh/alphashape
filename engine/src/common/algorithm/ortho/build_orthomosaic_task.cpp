@@ -376,24 +376,38 @@ double auto_resolution(const std::vector<CameraEntry>& cameras,
 void BuildOrthomosaicTask::declare_params(Params& params) const {
     // Names follow Metashape's public buildOrthomosaic() Python API;
     // the accepted values, defaults and the true-ortho implementation are ours.
-    params.declare({"surface_data", ParamType::String, std::string("elevation"),
-                    "Surface the ortho is projected on: \"elevation\" (the chunk DEM) or "
-                    "\"model\" (a DSM rasterised from the mesh)."});
-    params.declare({"blending_mode", ParamType::String, std::string("mosaic"),
-                    "How camera tiles combine: \"mosaic\" (multiresolution spline), "
-                    "\"average\" (score-weighted mean) or \"disabled\" (seam labels as-is)."});
+    ParamSpec surface_data{"surface_data", ParamType::String, std::string("elevation"),
+                           "Surface the ortho is projected on: \"elevation\" (the chunk DEM) or "
+                           "\"model\" (a DSM rasterised from the mesh)."};
+    surface_data.choices = {"elevation", "model"};
+    params.declare(surface_data);
+
+    ParamSpec blending_mode{"blending_mode", ParamType::String, std::string("mosaic"),
+                            "How camera tiles combine: \"mosaic\" (multiresolution spline), "
+                            "\"average\" (score-weighted mean) or \"disabled\" (seam labels "
+                            "as-is)."};
+    blending_mode.choices = {"mosaic", "average", "disabled"};
+    params.declare(blending_mode);
+
     params.declare({"fill_holes", ParamType::Bool, true,
                     "Fill interior nodata holes of the colour image from the surroundings."});
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
-    params.declare({"resolution", ParamType::Float, 0.0,
-                    "Output cell size in projection units. 0 selects the median camera "
-                    "ground sample distance (3 significant figures), never finer than DEM "
-                    "cell / 4."});
-    params.declare({"projection", ParamType::Int, std::int64_t{0},
-                    "Output EPSG code. 0 uses the DEM's own projection; any other value "
-                    "must equal it (reproject the DEM first)."});
+
+    ParamSpec resolution{"resolution", ParamType::Float, 0.0,
+                         "Output cell size in projection units. 0 selects the median camera "
+                         "ground sample distance (3 significant figures), never finer than DEM "
+                         "cell / 4."};
+    resolution.minimum = 0.0;
+    params.declare(resolution);
+
+    ParamSpec projection{"projection", ParamType::Int, std::int64_t{0},
+                         "Output EPSG code. 0 uses the DEM's own projection; any other value "
+                         "must equal it (reproject the DEM first)."};
+    projection.minimum = std::int64_t{0};
+    params.declare(projection);
+
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new orthomosaic asset. Empty selects "
                     "\"Orthomosaic <n>\". Each run creates a new asset."});

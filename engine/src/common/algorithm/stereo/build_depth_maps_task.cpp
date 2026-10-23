@@ -155,13 +155,26 @@ void log_self_check(const stereo::PatchMatchResult& gpu_result,
 
 void BuildDepthMapsTask::declare_params(Params& params) const {
     // Defaults follow Metashape's public Python API.
-    params.declare({"downscale", ParamType::Int, std::int64_t{4},
-                    "Image downscale factor (power of two). Depth maps are built at the "
-                    "reduced resolution."});
-    params.declare({"filter_mode", ParamType::String, std::string{"mild"},
-                    "Depth filter strength: disabled, mild, moderate or aggressive."});
-    params.declare({"max_neighbors", ParamType::Int, std::int64_t{16},
-                    "Maximum number of neighbour cameras per reference. Must be in [1, 256)."});
+    ParamSpec downscale{"downscale", ParamType::Int, std::int64_t{4},
+                        "Image downscale factor (power of two). Depth maps are built at the "
+                        "reduced resolution."};
+    downscale.minimum = std::int64_t{1};
+    downscale.power_of_two = true;
+    params.declare(downscale);
+
+    ParamSpec filter_mode{"filter_mode", ParamType::String, std::string{"mild"},
+                          "Depth filter strength: \"disabled\", \"mild\", \"moderate\" or "
+                          "\"aggressive\"."};
+    filter_mode.choices = {"disabled", "mild", "moderate", "aggressive"};
+    params.declare(filter_mode);
+
+    ParamSpec max_neighbors{"max_neighbors", ParamType::Int, std::int64_t{16},
+                            "Maximum number of neighbour cameras per reference. Must be in "
+                            "[1, 256)."};
+    max_neighbors.minimum = std::int64_t{1};
+    max_neighbors.maximum = static_cast<std::int64_t>(kMaxNeighborsExclusive) - 1;
+    params.declare(max_neighbors);
+
     params.declare({"reuse_depth", ParamType::Bool, false,
                     "Keep existing depth maps whose downscale matches for cameras that still "
                     "have usable neighbours."});

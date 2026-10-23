@@ -38,15 +38,60 @@ const Chunk* active_chunk_of(const Document& document) {
     return nullptr;
 }
 
-std::size_t aligned_cameras(const Chunk& chunk) {
-    return static_cast<std::size_t>(
-        std::count_if(chunk.cameras().begin(), chunk.cameras().end(),
-                      [](const Camera& camera) { return camera.enabled; }));
-}
+/// One pass over the chunk, answering every question the menu asks about it. Computing this
+/// once per update (rather than once per action) keeps a menu refresh to a single short read
+/// even when the chunk holds many cameras or tracks: the counts are accumulated in one walk,
+/// and the walk stops as soon as a later question cannot change.
+struct ChunkSurvey {
+    bool has_cameras = false;
+    std::size_t aligned_cameras = 0;
+    bool has_matches = false;
+    bool has_tracks = false;
+    bool has_sparse_points = false;
+    bool has_depth_maps = false;
+    bool has_point_cloud = false;
+    bool has_model = false;
+    bool has_model_uvs = false;
+    bool has_elevation = false;
+};
 
-bool has_sparse_points(const Chunk& chunk) {
-    return std::any_of(chunk.tie_points().tracks.begin(), chunk.tie_points().tracks.end(),
-                       [](const Track& track) { return track.point.has_value(); });
+ChunkSurvey survey(const Chunk& chunk) {
+    ChunkSurvey found;
+    found.has_cameras = !chunk.cameras().empty();
+
+    // One pass over the cameras. Alignment is the only per-camera question, and every later
+    // question is answered by a container's emptiness, so the walk ends once the count can no
+    // longer matter: everything that needs aligned cameras needs at least two.
+    for (const Camera& camera : chunk.cameras()) {
+        if (found.aligned_cameras >= 2) {
+            break;
+        }
+        if (camera.enabled) {
+            ++found.aligned_cameras;
+        }
+    }
+
+    // Sparse points: one track with a point is enough, so stop at the first. The two empty()
+    // checks come first because they are O(1) and settle the common "nothing tracked yet" case.
+    const TiePoints& tie = chunk.tie_points();
+    found.has_matches = !tie.matches.empty();
+    found.has_tracks = !tie.tracks.empty();
+    for (const Track& track : tie.tracks) {
+        if (track.point.has_value()) {
+            found.has_sparse_points = true;
+            break;
+        }
+    }
+
+    // The CONST accessors: the non-const ones create an empty asset, which a menu update must
+    // never do. "Exists" means "holds something" for the products whose payload is the point.
+    found.has_depth_maps = !chunk.depth_maps().empty();
+    found.has_point_cloud = !chunk.point_cloud().points.empty();
+    const Mesh& mesh = chunk.model();
+    found.has_model = !mesh.empty();
+    found.has_model_uvs = !mesh.uv_faces.empty();
+    found.has_elevation = !chunk.elevation().empty();
+    return found;
 }
 
 /// What `task` needs from the chunk, as the engine checks it when it runs; "" when satisfied.
@@ -58,62 +103,104 @@ bool has_sparse_points(const Chunk& chunk) {
 /// of creating an asset the way the non-const ones do. They ask the same question the engine
 /// asks ("is there any depth map / a mesh with faces / an elevation raster"), so an asset that
 /// exists but holds nothing does not count as a satisfied prerequisite.
-QString missing_input(const std::string& task, const Chunk& chunk) {
+QString missing_input(const std::string& task, const ChunkSurvey& chunk) {
     const QString none;
     if (task == "AddPhotos") {
         return none;  // any active chunk takes photos
     }
     if (task == "MatchPhotos") {
-        return chunk.cameras().empty() ? QObject::tr("Add photos first.") : none;
+        return chunk.has_cameras ? none : QObject::tr("Add photos first.");
     }
     if (task == "AlignCameras") {
-        const TiePoints& tie = chunk.tie_points();
-        return tie.matches.empty() || tie.tracks.empty() ? QObject::tr("Match photos first.")
-                                                         : none;
+        return chunk.has_matches && chunk.has_tracks ? none : QObject::tr("Match photos first.");
     }
-    if (task == "OptimizeCameras") {
+    if (task == "OptimizeCameras" || task == "BuildDepthMaps") {
         // The engine needs at least two aligned cameras with sparse points.
-        return aligned_cameras(chunk) < 2 || !has_sparse_points(chunk)
-                   ? QObject::tr("Align cameras first.")
-                   : none;
-    }
-    if (task == "BuildDepthMaps") {
-        return aligned_cameras(chunk) < 2 || !has_sparse_points(chunk)
-                   ? QObject::tr("Align cameras first.")
-                   : none;
+        return chunk.aligned_cameras >= 2 && chunk.has_sparse_points
+                   ? none
+                   : QObject::tr("Align cameras first.");
     }
     if (task == "BuildPointCloud") {
-        return chunk.depth_maps().empty() ? QObject::tr("Build depth maps first.") : none;
+        return chunk.has_depth_maps ? none : QObject::tr("Build depth maps first.");
     }
     if (task == "BuildModel") {
-        // Either source is fine; the dialog picks which one the run uses.
-        return chunk.depth_maps().empty() && chunk.point_cloud().points.empty()
-                   ? QObject::tr("Build depth maps or a point cloud first.")
-                   : none;
+        // Either source is fine; the dialog is preset to one the chunk actually has.
+        return chunk.has_depth_maps || chunk.has_point_cloud
+                   ? none
+                   : QObject::tr("Build depth maps or a point cloud first.");
     }
     if (task == "BuildUV") {
-        return chunk.model().empty() ? QObject::tr("Build a model first.") : none;
+        return chunk.has_model ? none : QObject::tr("Build a model first.");
     }
     if (task == "BuildTexture") {
-        if (chunk.model().empty()) {
+        if (!chunk.has_model) {
             return QObject::tr("Build a model first.");
         }
-        return chunk.model().uv_faces.empty() ? QObject::tr("Build UV coordinates first.") : none;
+        return chunk.has_model_uvs ? none : QObject::tr("Build UV coordinates first.");
     }
     if (task == "BuildDem") {
-        return chunk.depth_maps().empty() && chunk.point_cloud().points.empty() &&
-                       chunk.model().empty()
-                   ? QObject::tr("Build depth maps, a point cloud or a model first.")
-                   : none;
+        return chunk.has_depth_maps || chunk.has_point_cloud || chunk.has_model
+                   ? none
+                   : QObject::tr("Build depth maps, a point cloud or a model first.");
     }
     if (task == "BuildOrthomosaic") {
-        // Either surface works: "elevation" (the default) needs the DEM, "model" a mesh.
-        // The DEM is the one the automatic parameters assume, so it is what is asked for.
-        return chunk.elevation().empty() && chunk.model().empty()
-                   ? QObject::tr("Build an elevation model or a model first.")
-                   : none;
+        // Either surface works. "elevation" (the schema default) needs the DEM; "model"
+        // rasterises a DSM from the mesh and runs with no DEM at all (the task's own grid
+        // handling covers that case). The dialog is preset to whichever one exists, so the
+        // default cannot name a surface the chunk lacks.
+        return chunk.has_elevation || chunk.has_model
+                   ? none
+                   : QObject::tr("Build an elevation model or a model first.");
     }
     return none;
+}
+
+/// The schema parameter through which a task picks which existing data it consumes, and the
+/// values this chunk can satisfy, best first (the schema default heads the list when the chunk
+/// has it). A generated dialog otherwise opens on the schema default (source_data="depth_maps",
+/// surface_data="elevation") and the run fails on a chunk that only holds the other source, so
+/// run() presets the parameter from this before showing the dialog.
+struct SourceChoice {
+    const char* param = nullptr;        ///< the schema parameter name
+    std::vector<std::string> present;   ///< the values that exist, schema default first
+};
+
+std::optional<SourceChoice> source_choice(const std::string& task, const ChunkSurvey& chunk) {
+    SourceChoice choice;
+    if (task == "BuildModel") {
+        choice.param = "source_data";
+        if (chunk.has_depth_maps) {
+            choice.present.emplace_back("depth_maps");
+        }
+        if (chunk.has_point_cloud) {
+            choice.present.emplace_back("point_cloud");
+        }
+        return choice;
+    }
+    if (task == "BuildDem") {
+        choice.param = "source_data";
+        if (chunk.has_depth_maps) {
+            choice.present.emplace_back("depth_maps");
+        }
+        if (chunk.has_point_cloud) {
+            choice.present.emplace_back("point_cloud");
+        }
+        if (chunk.has_model) {
+            choice.present.emplace_back("model");
+        }
+        return choice;
+    }
+    if (task == "BuildOrthomosaic") {
+        choice.param = "surface_data";
+        if (chunk.has_elevation) {
+            choice.present.emplace_back("elevation");
+        }
+        if (chunk.has_model) {
+            choice.present.emplace_back("model");
+        }
+        return choice;
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -149,8 +236,15 @@ std::vector<WorkflowStep> WorkflowController::steps() {
 
 WorkflowController::WorkflowController(GuiApp& app, QMenu* menu, QWidget* dialog_parent)
     : QObject(dialog_parent), app_(app), dialog_parent_(dialog_parent) {
-    params_handler_ = [this](const std::string& task) -> std::optional<Params> {
+    params_handler_ = [this](const std::string& task,
+                             const Presets& presets) -> std::optional<Params> {
         TaskDialog dialog(task, builtin_registry(), app_.settings(), dialog_parent_);
+        // The presets override whatever the dialog would otherwise start on (the schema
+        // default, or the value the user last accepted): they name data this chunk has, so
+        // they are the right starting point for this run.
+        for (const auto& [param, value] : presets) {
+            dialog.set_value(param, value);
+        }
         if (dialog.exec() != QDialog::Accepted) {
             return std::nullopt;
         }
@@ -240,14 +334,39 @@ QString WorkflowController::unavailable_reason(const std::string& task) const {
         if (chunk == nullptr) {
             return tr("There is no active chunk.");
         }
-        return missing_input(task, *chunk);
+        return missing_input(task, survey(*chunk));
     });
 }
 
 void WorkflowController::update_enabled() {
+    // One locked read and one walk over the chunk for the whole menu, rather than one read per
+    // action: undo_changed() fires on every edit and the menu is re-evaluated on every open, so
+    // eleven locked scans of the camera and track lists would add up. Only the survey (plain
+    // flags and counts) leaves the lock.
+    const bool busy = app_.jobs().busy();
+    const std::pair<bool, ChunkSurvey> state =
+        app_.read_document([](const Document& document) -> std::pair<bool, ChunkSurvey> {
+            const Chunk* chunk = active_chunk_of(document);
+            return {chunk != nullptr, chunk != nullptr ? survey(*chunk) : ChunkSurvey{}};
+        });
+    const bool has_chunk = state.first;
+    const ChunkSurvey& chunk = state.second;
+
     for (const auto& [task, act] : actions_) {
-        const QString reason = unavailable_reason(task);
+        QString reason;
+        const TaskEntry* entry = builtin_registry().find(task);
+        if (busy) {
+            reason = tr("A job is running.");
+        } else if (entry == nullptr || !entry->enabled) {
+            reason = tr("This task is not available.");
+        } else if (!has_chunk) {
+            reason = tr("There is no active chunk.");
+        } else {
+            reason = missing_input(task, chunk);
+        }
         act->setEnabled(reason.isEmpty());
+        // QAction::toolTip() falls back to the action text when no tip is set, so an empty
+        // reason must be stored as an empty string (the default) to keep that behaviour.
         act->setToolTip(reason);
         act->setStatusTip(reason);
     }
@@ -260,16 +379,30 @@ bool WorkflowController::run(const std::string& task) {
     // Read the id before the dialogs run: a nested event loop (the dialog) could in principle
     // swap the document, and the task must target the chunk the user was looking at. A missing
     // chunk is impossible here (unavailable_reason just said there is one), but the id is read
-    // the same guarded way as everything else rather than trusting that.
-    const std::optional<std::int32_t> chunk_id =
-        app_.read_document([](const Document& document) -> std::optional<std::int32_t> {
+    // the same guarded way as everything else rather than trusting that. The same read picks
+    // the source presets, so the dialog opens on data the chunk really holds instead of on the
+    // schema default, which the run would then reject.
+    struct Target {
+        std::int32_t chunk_id = -1;
+        Presets presets;
+    };
+    const std::optional<Target> target =
+        app_.read_document([&task](const Document& document) -> std::optional<Target> {
             const Chunk* chunk = active_chunk_of(document);
             if (chunk == nullptr) {
                 return std::nullopt;
             }
-            return chunk->id();
+            Target found;
+            found.chunk_id = chunk->id();
+            if (const std::optional<SourceChoice> choice = source_choice(task, survey(*chunk))) {
+                // The schema default heads `present` when the chunk has it, so taking the
+                // first entry is "prefer the schema default when it is available".
+                found.presets.emplace_back(choice->param,
+                                           ParamValue(choice->present.front()));
+            }
+            return found;
         });
-    if (!chunk_id) {
+    if (!target) {
         return false;
     }
 
@@ -294,13 +427,13 @@ bool WorkflowController::run(const std::string& task) {
             values.set("filenames", ParamValue(std::move(names)));
             params = std::move(values);
         } else if (params_handler_) {
-            params = params_handler_(task);
+            params = params_handler_(task, target->presets);
         }
         if (!params) {
             return false;
         }
         if (submit_handler_) {
-            submit_handler_(task, std::move(*params), *chunk_id);
+            submit_handler_(task, std::move(*params), target->chunk_id);
         }
     } catch (const std::exception& error) {
         error_handler_(tr("Cannot start task"), QString::fromUtf8(error.what()));

@@ -499,24 +499,45 @@ void colour_vertices(const Document& document, const Chunk& chunk, const FusionV
 void BuildModelTask::declare_params(Params& params) const {
     // Names follow Metashape's public Python API; the value sets and
     // presets are ours.
-    params.declare({"source_data", ParamType::String, std::string("depth_maps"),
-                    "Volume source: \"depth_maps\" (TV-L1 fusion) or \"point_cloud\" "
-                    "(screened Poisson, needs cloud normals)."});
-    params.declare({"surface_type", ParamType::String, std::string("arbitrary"),
-                    "Surface class: \"arbitrary\" (general) or \"height_field\" (not supported)."});
-    params.declare({"interpolation", ParamType::String, std::string("enabled"),
-                    "How far the surface may bridge unmeasured space: \"disabled\", "
-                    "\"enabled\" or \"extrapolated\"."});
-    params.declare({"face_count", ParamType::String, std::string("medium"),
-                    "Decimation target: \"low\", \"medium\", \"high\" or \"custom\"."});
-    params.declare({"face_count_custom", ParamType::Int, kFaceCountCustomDefault,
-                    "Face target used when face_count is \"custom\"."});
+    ParamSpec source_data{"source_data", ParamType::String, std::string("depth_maps"),
+                          "Volume source: \"depth_maps\" (TV-L1 fusion) or \"point_cloud\" "
+                          "(screened Poisson, needs cloud normals)."};
+    source_data.choices = {"depth_maps", "point_cloud"};
+    params.declare(source_data);
+
+    ParamSpec surface_type{"surface_type", ParamType::String, std::string("arbitrary"),
+                           "Surface class. Only \"arbitrary\" (general) is implemented; "
+                           "\"height_field\" is rejected."};
+    surface_type.choices = {"arbitrary"};
+    params.declare(surface_type);
+
+    ParamSpec interpolation{"interpolation", ParamType::String, std::string("enabled"),
+                            "How far the surface may bridge unmeasured space: \"disabled\", "
+                            "\"enabled\" or \"extrapolated\"."};
+    interpolation.choices = {"disabled", "enabled", "extrapolated"};
+    params.declare(interpolation);
+
+    ParamSpec face_count{"face_count", ParamType::String, std::string("medium"),
+                         "Decimation target: \"low\", \"medium\", \"high\" or \"custom\"."};
+    face_count.choices = {"low", "medium", "high", "custom"};
+    params.declare(face_count);
+
+    ParamSpec face_count_custom{"face_count_custom", ParamType::Int, kFaceCountCustomDefault,
+                                "Face target used when face_count is \"custom\"."};
+    face_count_custom.minimum = std::int64_t{1};
+    params.declare(face_count_custom);
+
     params.declare({"vertex_colors", ParamType::Bool, true,
                     "Colour the mesh vertices from the source images."});
     params.declare({"vertex_confidence", ParamType::Bool, true,
                     "Store a per-vertex confidence (the number of supporting views)."});
-    params.declare({"volume_resolution", ParamType::Int, std::int64_t{128},
-                    "Voxels along the longest bounding-box axis."});
+
+    ParamSpec volume_resolution{"volume_resolution", ParamType::Int, std::int64_t{128},
+                                "Voxels along the longest bounding-box axis."};
+    volume_resolution.minimum = kVolumeResolutionMin;
+    volume_resolution.maximum = kVolumeResolutionMax;
+    params.declare(volume_resolution);
+
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new model asset. Empty selects \"Model <n>\". Each run "
                     "creates a new asset; the previous model keeps its own textures."});

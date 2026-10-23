@@ -102,9 +102,15 @@ TEST_F(TaskDialogTest, WidgetTypeFollowsTheParamType) {
     EXPECT_NE(qobject_cast<QCheckBox*>(depth.editor("reuse_depth")), nullptr);
     EXPECT_EQ(depth.kind("downscale"), EditorKind::SpinBox);
     EXPECT_NE(qobject_cast<QSpinBox*>(depth.editor("downscale")), nullptr);
-    // No list of accepted values in quotes in its doc: a plain line edit.
-    EXPECT_EQ(depth.kind("filter_mode"), EditorKind::LineEdit);
-    EXPECT_NE(qobject_cast<QLineEdit*>(depth.editor("filter_mode")), nullptr);
+    // filter_mode declares its value set in the schema, so it is a closed combo box rather
+    // than free text.
+    EXPECT_EQ(depth.kind("filter_mode"), EditorKind::ComboBox);
+    auto* filter = qobject_cast<QComboBox*>(depth.editor("filter_mode"));
+    ASSERT_NE(filter, nullptr);
+    QStringList modes;
+    for (int i = 0; i < filter->count(); ++i) modes << filter->itemText(i);
+    EXPECT_EQ(modes, (QStringList{"disabled", "mild", "moderate", "aggressive"}));
+    EXPECT_EQ(filter->currentText(), "mild");
 
     TaskDialog dem("BuildDem", registry(), store());
     EXPECT_EQ(dem.kind("resolution"), EditorKind::DoubleSpinBox);
@@ -156,7 +162,7 @@ TEST_F(TaskDialogTest, LastUsedValuesAreRememberedAndResetRestoresDefaults) {
         EXPECT_EQ(downscale->value(), 4);
         downscale->setValue(8);
         qobject_cast<QCheckBox*>(dialog.editor("reuse_depth"))->setChecked(true);
-        qobject_cast<QLineEdit*>(dialog.editor("filter_mode"))->setText("aggressive");
+        qobject_cast<QComboBox*>(dialog.editor("filter_mode"))->setCurrentText("aggressive");
         dialog.accept();
         ASSERT_EQ(dialog.result(), QDialog::Accepted);
         EXPECT_EQ(dialog.params().get_int("downscale"), 8);
@@ -181,7 +187,97 @@ TEST_F(TaskDialogTest, LastUsedValuesAreRememberedAndResetRestoresDefaults) {
     EXPECT_EQ(third.params().get_int("downscale"), 4);
 }
 
-TEST_F(TaskDialogTest, ResetButtonRestoresDefaults) {
+TEST_F(TaskDialogTest, DeclaredRangesBindTheEditors) {
+    TaskDialog depth("BuildDepthMaps", registry(), store());
+    auto* downscale = qobject_cast<QSpinBox*>(depth.editor("downscale"));
+    ASSERT_NE(downscale, nullptr);
+    EXPECT_EQ(downscale->minimum(), 1);
+    // Power of two: the arrows step by a factor of two and the values stay legal.
+    EXPECT_EQ(downscale->value(), 4);
+    downscale->stepUp();
+    EXPECT_EQ(downscale->value(), 8);
+    downscale->stepDown();
+    EXPECT_EQ(downscale->value(), 4);
+
+    auto* neighbours = qobject_cast<QSpinBox*>(depth.editor("max_neighbors"));
+    ASSERT_NE(neighbours, nullptr);
+    EXPECT_EQ(neighbours->minimum(), 1);
+    EXPECT_EQ(neighbours->maximum(), 255) << "the engine accepts [1, 256)";
+    neighbours->setValue(9999);
+    EXPECT_EQ(neighbours->value(), 255);
+
+    TaskDialog model("BuildModel", registry(), store());
+    auto* faces = qobject_cast<QSpinBox*>(model.editor("face_count_custom"));
+    ASSERT_NE(faces, nullptr);
+    EXPECT_EQ(faces->minimum(), 1);
+    auto* volume = qobject_cast<QSpinBox*>(model.editor("volume_resolution"));
+    ASSERT_NE(volume, nullptr);
+    EXPECT_EQ(volume->minimum(), 16);
+    EXPECT_EQ(volume->maximum(), 512);
+
+    // A Float lower bound is honoured too: resolution 0 means "automatic", never negative.
+    TaskDialog dem("BuildDem", registry(), store());
+    auto* resolution = qobject_cast<QDoubleSpinBox*>(dem.editor("resolution"));
+    ASSERT_NE(resolution, nullptr);
+    EXPECT_DOUBLE_EQ(resolution->minimum(), 0.0);
+}
+
+TEST_F(TaskDialogTest, AConstraintViolationBlocksOkWithAnInlineError) {
+    // A remembered value bypasses the editor's own clamping, so validate() is what catches a
+    // value the engine would reject.
+    store().setValue(TaskDialog::settings_key("BuildDepthMaps", "downscale"), "3");
+    TaskDialog depth("BuildDepthMaps", registry(), store());
+    EXPECT_EQ(qobject_cast<QSpinBox*>(depth.editor("downscale"))->value(), 3);
+    depth.accept();
+    EXPECT_NE(depth.result(), QDialog::Accepted);
+    EXPECT_EQ(depth.invalid_params(), (std::vector<std::string>{"downscale"}));
+    EXPECT_EQ(depth.error("downscale"), QStringLiteral("Must be a power of two."));
+
+    // Fixing the value clears the error and lets OK through.
+    depth.set_value("downscale", std::int64_t{8});
+    depth.accept();
+    EXPECT_EQ(depth.result(), QDialog::Accepted);
+    EXPECT_TRUE(depth.error("downscale").isEmpty());
+}
+
+TEST_F(TaskDialogTest, ADeclaredChoiceOutsideTheSetIsRejected) {
+    // A remembered value that is not one of the declared choices is dropped on load, and a
+    // value forced in anyway is caught by validate().
+    store().setValue(TaskDialog::settings_key("BuildDem", "source_data"), "bogus");
+    TaskDialog dem("BuildDem", registry(), store());
+    EXPECT_EQ(dem.params().get_string("source_data"), "depth_maps")
+        << "a remembered value outside the closed set falls back to the default";
+
+    dem.set_value("source_data", std::string("bogus"));
+    dem.accept();
+    EXPECT_NE(dem.result(), QDialog::Accepted);
+    EXPECT_EQ(dem.invalid_params(), (std::vector<std::string>{"source_data"}));
+    EXPECT_EQ(dem.error("source_data"), QStringLiteral("Must be one of: depth_maps, point_cloud, model."));
+
+    dem.set_value("source_data", std::string("point_cloud"));
+    dem.accept();
+    EXPECT_EQ(dem.result(), QDialog::Accepted);
+}
+
+TEST_F(TaskDialogTest, AnErrorRestylesTheEditorOnlyOnTransitions) {
+    // The inline error is a style-sheet rule on the dynamic "invalid" property; set_error()
+    // re-polishes the widget so the property change is actually painted. This checks the
+    // observable half: the property tracks the error text and the editor survives the
+    // re-polish (a re-polish during construction is what used to be missing).
+    TaskDialog photos("AddPhotos", registry(), store());
+    QWidget* editor = photos.editor("filenames");
+    ASSERT_NE(editor, nullptr);
+    EXPECT_FALSE(editor->property("invalid").toBool());
+    photos.accept();
+    EXPECT_TRUE(editor->property("invalid").toBool());
+    qobject_cast<QLineEdit*>(editor)->setText("[\"a.jpg\"]");
+    photos.accept();
+    EXPECT_EQ(photos.result(), QDialog::Accepted);
+    EXPECT_FALSE(editor->property("invalid").toBool());
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+
     TaskDialog dialog("BuildDepthMaps", registry(), store());
     qobject_cast<QSpinBox*>(dialog.editor("downscale"))->setValue(2);
     auto* reset = dialog.findChild<QPushButton*>("task.reset");

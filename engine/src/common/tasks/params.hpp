@@ -41,12 +41,33 @@ using ParamValue =
 
 enum class ParamType { Bool, Int, Float, String, StringList };
 
-/// Declaration of one parameter: name, type, default, and documentation.
+/// Declaration of one parameter: name, type, default, and documentation, plus optional
+/// value constraints.
+///
+/// The constraints exist so a front end can offer an editor that cannot produce a value the
+/// task would reject, without knowing the task by name: an interactive dialog builds a combo
+/// box for a closed value set and a spin box with the declared bounds. They are metadata
+/// only — Params never enforces them, so a task's own argument checks remain the single
+/// authority on what is acceptable, and a declaration that omits them keeps the old
+/// permissive behaviour.
 struct ParamSpec {
     std::string name;          ///< bare name, e.g. "keypoint_limit"
     ParamType type = ParamType::Int;
     ParamValue default_value;  ///< monostate if the parameter is required
     std::string doc;           ///< surfaced as the Python docstring
+
+    /// The accepted values of a String parameter, in display order. Empty means "not a
+    /// closed set" (a front end may still scrape a list out of `doc`).
+    std::vector<std::string> choices;
+
+    /// Inclusive bounds of an Int or Float parameter; monostate on either side means that
+    /// side is unbounded. The type must match `type`.
+    ParamValue minimum;
+    ParamValue maximum;
+
+    /// An Int parameter that must be a power of two (a resolution downscale factor).
+    /// `minimum` / `maximum` still apply.
+    bool power_of_two = false;
 
     /// Full schema key, e.g. "DetectFeatures/keypoint_limit".
     std::string qualified(const std::string& task_name) const {

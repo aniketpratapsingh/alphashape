@@ -21,6 +21,7 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStyle>
 #include <QVBoxLayout>
 
 namespace alphashape::gui {
@@ -34,12 +35,49 @@ QString q(const std::string& text) { return QString::fromStdString(text); }
 
 bool is_unset(const ParamValue& value) { return std::holds_alternative<std::monostate>(value); }
 
-bool has_choices(const ParamSpec& spec) {
-    if (spec.type != ParamType::String || !std::holds_alternative<std::string>(spec.default_value)) {
-        return false;
+/// The accepted values of a String parameter: the schema's own list when it declares one,
+/// otherwise the words the doc quotes (the older, weaker convention). Empty = free text.
+QStringList accepted_values(const ParamSpec& spec) {
+    if (spec.type != ParamType::String) {
+        return {};
     }
-    const QStringList choices = TaskDialog::choices_from_doc(spec.doc);
-    return choices.contains(q(std::get<std::string>(spec.default_value)));
+    if (!spec.choices.empty()) {
+        QStringList declared;
+        declared.reserve(static_cast<int>(spec.choices.size()));
+        for (const std::string& choice : spec.choices) {
+            declared << q(choice);
+        }
+        return declared;
+    }
+    if (!std::holds_alternative<std::string>(spec.default_value)) {
+        return {};
+    }
+    const QStringList scraped = TaskDialog::choices_from_doc(spec.doc);
+    return scraped.contains(q(std::get<std::string>(spec.default_value))) ? scraped
+                                                                         : QStringList{};
+}
+
+bool has_choices(const ParamSpec& spec) { return !accepted_values(spec).isEmpty(); }
+
+/// The inclusive integer bound the schema declares, or `fallback` when it declares none.
+int declared_bound(const ParamValue& bound, int fallback) {
+    if (const auto* value = std::get_if<std::int64_t>(&bound)) {
+        return static_cast<int>(std::clamp<std::int64_t>(*value, INT_MIN, INT_MAX));
+    }
+    return fallback;
+}
+
+/// The power of two closest to `value` (ties round up); at least 1.
+int nearest_power_of_two(int value) {
+    if (value <= 1) {
+        return 1;
+    }
+    int lower = 1;
+    while (lower <= value / 2) {
+        lower *= 2;
+    }
+    const int upper = lower <= INT_MAX / 2 ? lower * 2 : lower;
+    return (value - lower) <= (upper - value) ? lower : upper;
 }
 
 TaskDialog::EditorKind kind_for(const ParamSpec& spec) {
@@ -236,20 +274,52 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
         }
         case EditorKind::SpinBox: {
             auto* spin = new QSpinBox(host);
-            int minimum = 0;
-            if (const auto* d = std::get_if<std::int64_t>(&spec.default_value)) {
-                minimum = static_cast<int>(std::clamp<std::int64_t>(std::min<std::int64_t>(*d, 0), INT_MIN, 0));
-            }
-            spin->setRange(minimum, INT_MAX);
+            // The declared range wins. Without one, the old heuristic: a negative default
+            // suggests the parameter takes negative values, so the floor is the default and
+            // anything below 0 stays out of reach; a non-negative default means 0 is a
+            // sensible floor.
+            const std::int64_t default_value =
+                std::holds_alternative<std::int64_t>(spec.default_value)
+                    ? std::get<std::int64_t>(spec.default_value)
+                    : 0;
+            const int minimum =
+                declared_bound(spec.minimum, static_cast<int>(std::min<std::int64_t>(
+                                                 default_value, 0)));
+            const int maximum = declared_bound(spec.maximum, INT_MAX);
+            spin->setRange(minimum, maximum);
             field->editor = spin;
             connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, mark_dirty);
+            if (spec.power_of_two) {
+                // A power-of-two parameter (an image downscale) has only a handful of legal
+                // values: the arrows step between them and a typed value snaps to the nearest
+                // one, so the editor cannot hold a value the task would reject. Tracking is
+                // off so the snap happens when the field is committed, not per keystroke.
+                spin->setKeyboardTracking(false);
+                const int step = std::max(1, minimum);
+                spin->setSingleStep(step);
+                QObject::connect(spin, qOverload<int>(&QSpinBox::valueChanged), spin,
+                                 [spin](int value) {
+                                     const int snapped = nearest_power_of_two(value);
+                                     if (snapped != value &&
+                                         snapped >= spin->minimum() &&
+                                         snapped <= spin->maximum()) {
+                                         spin->setValue(snapped);
+                                     }
+                                 });
+            }
             column->addWidget(spin);
             break;
         }
         case EditorKind::DoubleSpinBox: {
             auto* spin = new QDoubleSpinBox(host);
             spin->setDecimals(kFloatDecimals);
-            spin->setRange(-kFloatLimit, kFloatLimit);
+            const double declared_min =
+                std::holds_alternative<double>(spec.minimum) ? std::get<double>(spec.minimum)
+                                                             : -kFloatLimit;
+            const double declared_max =
+                std::holds_alternative<double>(spec.maximum) ? std::get<double>(spec.maximum)
+                                                             : kFloatLimit;
+            spin->setRange(declared_min, declared_max);
             const double d = std::holds_alternative<double>(spec.default_value)
                                  ? std::get<double>(spec.default_value)
                                  : 0.0;
@@ -261,7 +331,7 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
         }
         case EditorKind::ComboBox: {
             auto* combo = new QComboBox(host);
-            combo->addItems(choices_from_doc(spec.doc));
+            combo->addItems(accepted_values(spec));
             field->editor = combo;
             connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this, mark_dirty);
             column->addWidget(combo);
@@ -418,11 +488,64 @@ ParamValue TaskDialog::read(const Field& field) const {
 }
 
 void TaskDialog::set_error(Field& field, const QString& text) {
+    const bool changed = field.error != text;
     field.error = text;
     field.error_label->setText(text);
     field.error_label->setVisible(!text.isEmpty());
     field.editor->setProperty("invalid", !text.isEmpty());
     field.editor->setToolTip(text.isEmpty() ? q(field.spec.doc) : text);
+    if (changed) {
+        // The "invalid" flag is a dynamic property the style sheet matches on; a property
+        // change alone does not make Qt repaint the widget, so the style has to be
+        // re-resolved. Only on a real transition: validate() runs on every OK.
+        field.editor->style()->unpolish(field.editor);
+        field.editor->style()->polish(field.editor);
+        field.editor->update();
+    }
+}
+
+/// The schema's own constraints, the ones an editor can also express. A spin box already
+/// clamps to the declared range and a combo box can only hold a declared choice, so what is
+/// left to catch here is a value that got in another way: a remembered setting, a typed
+/// number, or a hand-set value in a test or a script.
+QString TaskDialog::constraint_problem(const Field& field) const {
+    const ParamSpec& spec = field.spec;
+    const ParamValue value = read(field);
+    if (const auto* integer = std::get_if<std::int64_t>(&value)) {
+        if (const auto* low = std::get_if<std::int64_t>(&spec.minimum)) {
+            if (*integer < *low) {
+                return tr("Must be at least %1.").arg(*low);
+            }
+        }
+        if (const auto* high = std::get_if<std::int64_t>(&spec.maximum)) {
+            if (*integer > *high) {
+                return tr("Must be at most %1.").arg(*high);
+            }
+        }
+        if (spec.power_of_two && (*integer <= 0 || (*integer & (*integer - 1)) != 0)) {
+            return tr("Must be a power of two.");
+        }
+    } else if (const auto* real = std::get_if<double>(&value)) {
+        if (const auto* low = std::get_if<double>(&spec.minimum)) {
+            if (*real < *low) {
+                return tr("Must be at least %1.").arg(*low);
+            }
+        }
+        if (const auto* high = std::get_if<double>(&spec.maximum)) {
+            if (*real > *high) {
+                return tr("Must be at most %1.").arg(*high);
+            }
+        }
+    } else if (const auto* text = std::get_if<std::string>(&value)) {
+        // Only a declared closed set is checked: the doc-scraped list is a display heuristic
+        // and must not turn a free-text parameter into a rejected one.
+        if (!spec.choices.empty() &&
+            std::find(spec.choices.begin(), spec.choices.end(), *text) == spec.choices.end()) {
+            return tr("Must be one of: %1.")
+                .arg(accepted_values(spec).join(QStringLiteral(", ")));
+        }
+    }
+    return {};
 }
 
 bool TaskDialog::validate() {
@@ -431,7 +554,8 @@ bool TaskDialog::validate() {
         QString problem;
         try {
             const ParamValue value = read(field);
-            if (field.required) {
+            problem = constraint_problem(field);
+            if (problem.isEmpty() && field.required) {
                 if (const auto* s = std::get_if<std::string>(&value)) {
                     if (QString::fromStdString(*s).trimmed().isEmpty()) {
                         problem = tr("This value is required.");

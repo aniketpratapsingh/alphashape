@@ -3,26 +3,29 @@
 // TaskDialog: a parameter dialog generated from an engine task's param schema.
 //
 // Nothing here is task-specific. The dialog reads the TaskEntry's declared parameters
-// (name, type, default, doc) and builds one editor per parameter:
+// (name, type, default, doc, and the optional value constraints) and builds one editor per
+// parameter:
 //
 //   Bool        -> QCheckBox
-//   Int         -> QSpinBox
-//   Float       -> QDoubleSpinBox
-//   String      -> QComboBox when the doc text lists the accepted values in quotes and the
-//                  default is one of them; QLineEdit otherwise. A parameter named "path" gets a
-//                  browse button.
+//   Int         -> QSpinBox, bounded by the declared minimum/maximum (a power-of-two
+//                  parameter snaps typed values to the nearest one and steps between them)
+//   Float       -> QDoubleSpinBox, bounded by the declared minimum/maximum
+//   String      -> QComboBox for a declared choice list (or a doc that quotes the values and
+//                  whose default is one of them); QLineEdit otherwise. A parameter named
+//                  "path" gets a browse button.
 //   StringList  -> QLineEdit holding the JSON array text the engine itself uses
 //                  (["a", "b"]), parsed and checked on OK. "filenames" gets a browse button.
 //
-// The schema carries no ranges, enum tables, display names or groups, so those are heuristics:
-// integers accept [min(default, 0), INT_MAX], floats [-1e9, 1e9]; the first kGeneralCount
-// parameters form the "General" group and any further ones a collapsed "Advanced" group; names
-// are made readable by replacing '_' with ' '. The doc string is the tooltip.
+// What the schema does not carry stays a heuristic: display names replace '_' with ' ', and
+// the first kGeneralCount parameters form the "General" group while any further ones go to a
+// collapsed "Advanced" group. The doc string is the tooltip.
 //
 // Values come from the schema default, overlaid with what the user last accepted for this task
 // (stored in QSettings under "taskdialog/<Task>/<param>"). An editor the user did not touch
 // returns the exact schema value, so accepting an untouched dialog yields the defaults
-// bit-for-bit. A parameter without a default (or whose doc says "Required") must be filled in.
+// bit-for-bit. A parameter without a default (or whose doc says "Required") must be filled in,
+// and validate() also rejects a value that violates a declared constraint — the same range or
+// choice set the editor offers, re-checked because a remembered setting bypasses the editor.
 
 #include <map>
 #include <string>
@@ -116,6 +119,7 @@ private:
     void load_remembered();
     void remember() const;
     void set_error(Field& field, const QString& text);
+    QString constraint_problem(const Field& field) const;
 
     std::string task_name_;
     QSettings& settings_;

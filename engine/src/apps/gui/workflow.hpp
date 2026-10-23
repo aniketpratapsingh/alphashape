@@ -43,6 +43,12 @@ struct WorkflowStep {
     bool separator_before = false;
 };
 
+/// Values the controller presets before showing a task's dialog. The parameter that selects
+/// which existing data a task consumes (BuildModel's source_data, BuildOrthomosaic's
+/// surface_data, BuildDem's source_data) otherwise keeps its schema default, which may name
+/// data the chunk does not have, so the run would fail. Empty for tasks with no such choice.
+using Presets = std::vector<std::pair<std::string, ParamValue>>;
+
 class WorkflowController : public QObject {
     Q_OBJECT
 
@@ -54,8 +60,11 @@ public:
     /// window is built rather than once at first use.
     static std::vector<WorkflowStep> steps();
 
-    /// Asked for a task's parameters; nullopt = the user cancelled. Default: a TaskDialog.
-    using ParamsHandler = std::function<std::optional<Params>(const std::string& task)>;
+    /// Asked for a task's parameters; nullopt = the user cancelled. `presets` holds the values
+    /// the controller wants the dialog to start on (see Presets above), so the default handler
+    /// applies them to the generated TaskDialog before showing it. Default: a TaskDialog.
+    using ParamsHandler =
+        std::function<std::optional<Params>(const std::string& task, const Presets& presets)>;
     void set_params_handler(ParamsHandler handler);
     /// Asked for the photo files to add (empty list = cancelled). Default: a file dialog.
     using PhotosHandler = std::function<QStringList()>;

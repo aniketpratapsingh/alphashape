@@ -1,5 +1,6 @@
 #include "common/tasks/params.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <sstream>
@@ -272,6 +273,30 @@ void Params::declare(const ParamSpec& spec) {
     // a caller reads the parameter, far from the declaration that is wrong.
     if (!std::holds_alternative<std::monostate>(spec.default_value)) {
         require_type(spec.name, spec.type, spec.default_value);
+    }
+    // The constraints are documentation for the front ends, but a bound or a
+    // choice list that contradicts the declaration is a declaration bug, so it
+    // is caught here rather than presenting an editor that cannot be satisfied.
+    for (const ParamValue* bound : {&spec.minimum, &spec.maximum}) {
+        if (!std::holds_alternative<std::monostate>(*bound)) {
+            require_type(spec.name, spec.type, *bound);
+        }
+    }
+    if (spec.power_of_two && spec.type != ParamType::Int) {
+        throw ValueError("parameter '" + spec.name + "': power_of_two needs an Int parameter");
+    }
+    if (!spec.choices.empty()) {
+        if (spec.type != ParamType::String) {
+            throw ValueError("parameter '" + spec.name + "': choices need a String parameter");
+        }
+        const auto* chosen = std::get_if<std::string>(&spec.default_value);
+        const bool listed = chosen != nullptr && std::find(spec.choices.begin(),
+                                                          spec.choices.end(), *chosen) !=
+                                                      spec.choices.end();
+        if (chosen != nullptr && !listed) {
+            throw ValueError("parameter '" + spec.name + "': the default '" + *chosen +
+                             "' is not one of its choices");
+        }
     }
     specs_.push_back(spec);
 }
