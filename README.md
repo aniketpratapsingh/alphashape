@@ -102,8 +102,21 @@ is in [`engine/TESTING.md`](engine/TESTING.md).
 | Pre-release | `vX.Y.Z-rc.N` / `-beta.N` tags; never marked "latest" | [Releases](https://github.com/aniketpratapsingh/alphashape/releases) |
 | Nightly | Built from `main` every night when it changed | [`nightly` release](https://github.com/aniketpratapsingh/alphashape/releases/tag/nightly) |
 
-macOS builds are ad-hoc signed, not notarized: on first launch, right-click the app and choose
-**Open**.
+macOS (Apple silicon, `alphashape-<version>-macos-arm64.dmg`): open the image and drag
+`alphashape.app` to Applications. The app is ad-hoc signed, not notarized, so on first launch
+right-click it and choose **Open**, or clear the download quarantine flag once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/alphashape.app
+```
+
+The command line and the Python module live inside the app
+([details](packaging/macos/README.md)):
+
+```sh
+/Applications/alphashape.app/Contents/MacOS/alphashape-cli --list-tasks
+PYTHONPATH=/Applications/alphashape.app/Contents/Resources/python python3 -c "import alphashape"
+```
 
 ## Repository layout
 

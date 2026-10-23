@@ -233,10 +233,12 @@ if(ALPHASHAPE_BUILD_PYTHON)
 endif()
 
 # ---------------------------------------------------------------------------
-# Install layout and Linux packages (.deb)
+# Install layout, Linux packages (.deb) and macOS bundle inputs
 # ---------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(${CMAKE_SOURCE_DIR}/cmake/alphashape_install.cmake)
+elseif(APPLE)
+    include(${CMAKE_SOURCE_DIR}/cmake/alphashape_macos_bundle.cmake)
 endif()
 
 # ---------------------------------------------------------------------------

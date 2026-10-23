@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: Also build and smoke-test the release packages (.deb, AppImage, archives)
+        description: Also build and smoke-test the release packages (.deb, AppImage, DMG, archives)
         type: boolean
         default: false
 
@@ -64,7 +64,7 @@ jobs:
           package=false
           if [ "$REQUESTED" = true ]; then package=true; fi
           if [ "$EVENT" = pull_request ] && git diff --name-only "$BASE" HEAD |
-               grep -qE '^(packaging/|engine/cmake/alphashape_install\.cmake|\.github/workflows/(build|ci)\.yml)'; then
+               grep -qE '^(packaging/|engine/cmake/alphashape_(install|macos_bundle)\.cmake|\.github/workflows/(build|ci)\.yml)'; then
             package=true
           fi
           echo "package=$package" >> "$GITHUB_OUTPUT"

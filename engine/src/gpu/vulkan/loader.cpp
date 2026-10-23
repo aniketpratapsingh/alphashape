@@ -11,6 +11,10 @@
 #include "base/platform/env.hpp"
 #include "gpu/gpu_config.hpp"
 
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
+
 namespace alphashape::gpu::detail {
 namespace {
 
@@ -22,6 +26,41 @@ std::string g_reason;
 bool g_attempted = false;
 
 bool getenv_set(const char* name) { return !platform::get_env(name).empty(); }
+
+#ifdef __APPLE__
+/// Directory of the Mach-O image (executable or Python extension module) this code was linked
+/// into. dladdr is used instead of the executable path so the Python module, which runs inside
+/// somebody else's interpreter, finds its own app bundle too.
+std::filesystem::path image_directory() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&image_directory), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return {};
+    }
+    std::error_code ec;
+    return std::filesystem::weakly_canonical(info.dli_fname, ec).parent_path();
+}
+
+/// First existing <ancestor>/<relative>, starting at this image's directory and climbing three
+/// levels. That covers Contents/MacOS/<exe> and Contents/Resources/python/<module>, which both
+/// reach Contents/ within two steps. Empty when this is not an app bundle.
+std::filesystem::path find_in_bundle(const char* relative) {
+    std::filesystem::path dir = image_directory();
+    for (int level = 0; level < 4 && !dir.empty(); ++level) {
+        std::error_code ec;
+        const std::filesystem::path candidate = dir / relative;
+        if (std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+        const std::filesystem::path parent = dir.parent_path();
+        if (parent == dir) {
+            break;
+        }
+        dir = parent;
+    }
+    return {};
+}
+#endif
 
 template <class T>
 T lookup(PFN_vkGetInstanceProcAddr gipa, const char* name) {
@@ -220,6 +259,17 @@ bool ensure_icd_configured(std::string* reason) {
     // its own. Baking nothing here is deliberate -- setting VK_DRIVER_FILES to a
     // single system manifest would hide every other installed driver, and an
     // empty VK_LAYER_PATH would hide the installed layers.
+#ifdef __APPLE__
+    // An app bundle ships its own loader and MoltenVK manifest. Use them unless the caller chose
+    // a driver explicitly, so the app runs on a Mac with no Vulkan SDK or Homebrew.
+    if (!getenv_set("VK_ICD_FILENAMES") && !getenv_set("VK_DRIVER_FILES")) {
+        const std::filesystem::path bundled = find_in_bundle("Resources/vulkan/icd.d/MoltenVK_icd.json");
+        if (!bundled.empty()) {
+            (void)platform::set_env("VK_DRIVER_FILES", bundled.string());
+            return true;
+        }
+    }
+#endif
     const bool baked_icd = kIcdPath[0] != '\0';
     const bool baked_layers = kValidationLayerDir[0] != '\0';
     if (!baked_icd && !baked_layers) {
@@ -254,6 +304,14 @@ const Loader* load_library(std::string* reason) {
         if (!library_override.empty()) {
             candidates.emplace_back(library_override);
         }
+#ifdef __APPLE__
+        {
+            const std::filesystem::path bundled = find_in_bundle("Frameworks/libvulkan.1.dylib");
+            if (!bundled.empty()) {
+                candidates.emplace_back(bundled.string());
+            }
+        }
+#endif
         if (kLibraryPath[0] != '\0') {
             candidates.emplace_back(kLibraryPath);
         }
