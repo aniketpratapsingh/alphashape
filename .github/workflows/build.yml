@@ -331,11 +331,11 @@ jobs:
 
       # Size guard. The bundle was 520 MB when this job copied Homebrew's complete proj-data
       # collection instead of a curated subset; the guard keeps that from coming back. The job
-      # produces about 55 MB, so the budget is roughly 20% above that.
+      # produces about 58 MB, so the budget is roughly 20% above that.
       - name: DMG size guard
         if: inputs.package
         run: |
-          budget=68
+          budget=72
           dmg=$(ls dist/*-macos-arm64.dmg)
           mb=$(( $(stat -f %z "$dmg") / 1048576 ))
           echo "DMG: $dmg, ${mb} MB (budget ${budget} MB)"

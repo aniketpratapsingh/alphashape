@@ -874,13 +874,14 @@ yet.
   startup. An AppImage or macOS bundle now carries its own copy; a source build
   uses the installed package (Homebrew `share/proj`, Ubuntu `/usr/share/proj`)
   or `tools/proj-data/` from `tools/stage_proj_data.sh`. The packaged subset is
-  `proj.db`, `proj.ini`, the licence/attribution text and a bounded set of grids
-  (about 27 MB in the macOS bundle): EGM96 and one continental datum-shift grid
-  always ship, and the macOS packager then takes regional grids smallest first
-  until a byte budget is spent. EGM2008 (77 MB) and the large national grids
-  are therefore not in that archive; a transformation that needs one of them
-  fails offline with PROJ's "File not found" unless `ALPHASHAPE_PROJ_DATA`
-  points at a full `proj-data` directory, which always outranks the bundled copy.
+  `proj.db`, `proj.ini`, the licence/attribution text, every PROJJSON TIN grid
+  and a bounded set of raster grids (about 29 MB in the macOS bundle): EGM96 and
+  one continental datum-shift grid always ship, and the macOS packager then takes
+  regional grids smallest first until a byte budget is spent. EGM2008 (77 MB) and
+  the large national grids are therefore not in that archive; a transformation
+  that needs one of them fails offline with PROJ's "File not found" unless
+  `ALPHASHAPE_PROJ_DATA` points at a full `proj-data` directory, which always
+  outranks the bundled copy.
 - **Network access is off.** `proj_context_initialize()` forces
   `PROJ_NETWORK=OFF` and every thread context has network access and grid
   caching disabled. A transformation that needs an uninstalled grid fails with

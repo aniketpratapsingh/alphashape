@@ -7,13 +7,15 @@ DMG 520 MB while the Linux AppImage, which bundles Ubuntu's curated `proj-data`
 package, is 52 MB. A distribution package is a subset by design, so this script
 applies the same idea to the bundle:
 
-  * proj.db, proj.ini, the licence/attribution text and small auxiliary JSON always
-    ship -- without proj.db nothing works at all;
+  * proj.db, proj.ini, the licence/attribution text and every PROJJSON grid always
+    ship -- without proj.db nothing works at all, and a TIN grid such as
+    no_kv_ETRS89NO_NGO48_TIN.json is a datum shift, not metadata (the whole set is
+    under 3 MB);
   * a short essentials list ships unconditionally (EGM96 and the small continental
     datum-shift grid) even when a regional grid would not fit the budget;
-  * the remaining grids are taken smallest first until the byte budget is spent,
-    skipping any single file over the per-file cap, so the bundle covers as many
-    countries as possible for the bytes available.
+  * the remaining raster grids are taken smallest first until the byte budget is
+    spent, skipping any single file over the per-file cap, so the bundle covers as
+    many countries as possible for the bytes available.
 
 Anything left out is still reachable: `ALPHASHAPE_PROJ_DATA` can point at a full
 proj-data checkout, and `crs::resolve_data_directory` prefers that over the bundle.
@@ -40,8 +42,11 @@ ESSENTIAL_GRIDS = (
 
 # proj.db, the config, the attribution READMEs and the licence CSV always ship.
 ALWAYS_EXTENSIONS = (".db", ".ini", ".txt", ".csv")
-# Small PROJJSON TIN grids are cheap and tiny; the multi-megabyte ones are not.
-JSON_MAX_BYTES = 256 * 1024
+# PROJJSON files are a third kind of grid: a triangulated (TIN) transformation such as
+# no_kv_ETRS89NO_NGO48_TIN.json, which is 2.4 MB and cannot be dropped without breaking a
+# datum shift. The whole set is under 3 MB, so all of it ships rather than competing for the
+# raster budget.
+JSON_EXTENSION = ".json"
 GRID_EXTENSIONS = (".tif", ".gtx")
 
 
@@ -82,9 +87,7 @@ def main():
                 essential.append((size, name, path))
             else:
                 grids.append((size, name, path))
-        elif extension in ALWAYS_EXTENSIONS:
-            auxiliary.append((size, name, path))
-        elif extension == ".json" and size <= JSON_MAX_BYTES:
+        elif extension in ALWAYS_EXTENSIONS or extension == JSON_EXTENSION:
             auxiliary.append((size, name, path))
 
     chosen = list(essential)

@@ -9,22 +9,22 @@ arm64 only, ad-hoc signed (no notarization).
 | `select-proj-data.py` | Stages the size-bounded PROJ data subset into `Resources/share/proj` |
 | `bundle_libs.py` | Copies the remaining non-system dylibs into `Contents/Frameworks`, rewrites install names to `@rpath`, audits the result |
 | `make-icns.sh` | Renders `../linux/org.alphashape.app.svg` into `alphashape.icns` (`rsvg-convert`, `iconutil`) |
-| `build-dmg.sh` | UDZO disk image (zlib level 9) with the app and an `/Applications` link |
+| `build-dmg.sh` | ULFO (lzfse) disk image with the app and an `/Applications` link |
 | `smoke-app.sh` | Mount, audit and run checks, executed on a fresh runner with Homebrew moved away |
 
 ## Size budget
 
-The DMG must stay under 68 MB, which the CI packaging job enforces. Two things account for it:
+The DMG must stay under 72 MB, which the CI packaging job enforces. Two things account for it:
 
 * **PROJ data is a curated subset.** Homebrew's `proj` keg carries the complete world-wide
   `proj-data` collection (~760 MB of GeoTIFF/GTX grids). Copying every grid under a per-file size
   cap produced a 520 MB bundle, because nearly all of those grids are under 32 MB.
-  `select-proj-data.py` ships `proj.db`, the licence/attribution text, the small auxiliary JSON, a
-  fixed essentials list (EGM96, the continental datum-shift grid) and then as many regional grids
-  as fit the budget, smallest first: about 27 MB instead of 491 MB, comparable to Ubuntu's
-  `proj-data` package that the AppImage uses. A user who needs an omitted national grid points
-  `ALPHASHAPE_PROJ_DATA` at a full `proj-data` directory, which outranks the bundle in the search
-  order.
+  `select-proj-data.py` ships `proj.db`, the licence/attribution text, every PROJJSON TIN grid
+  (a second kind of grid, under 3 MB in total), a fixed essentials list (EGM96, the continental
+  datum-shift grid) and then as many raster grids as fit the budget, smallest first: about 29 MB
+  instead of 491 MB, comparable to Ubuntu's `proj-data` package that the AppImage uses. A user who
+  needs an omitted national grid points `ALPHASHAPE_PROJ_DATA` at a full `proj-data` directory,
+  which outranks the bundle in the search order.
 * **DMG compression is LZFSE.** `hdiutil`'s UDZO default is zlib level 1 (fastest). Measured on
   the code portion alone: UDZO 41.2 MB, UDZO at level 9 38.2 MB, ULFO (lzfse) 37.2 MB, UDBZ
   (bzip2) 35.9 MB but slow to mount. ULFO is the size/speed trade the script uses, with UDZO at
