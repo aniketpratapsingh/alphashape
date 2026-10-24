@@ -53,11 +53,30 @@ function Read-RegistryPath([string] $key, [string] $name) {
     # Under Set-StrictMode a missing property is an error, so the name is checked
     # rather than indexed: an unset Path is a valid state (a fresh profile) and
     # must read as empty, not abort the run.
-    if (-not (Test-Path -LiteralPath $key)) { return $null }
-    $item = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
-    if ($null -eq $item) { return $null }
-    if (-not (@($item.PSObject.Properties.Name) -contains $name)) { return $null }
-    return [string] $item.$name
+    #
+    # The value is read through .NET with DoNotExpandEnvironmentNames. PATH is a
+    # REG_EXPAND_SZ, and Get-ItemProperty expands "%SystemRoot%\..." while the
+    # installer writes the unexpanded text back: comparing one with the other
+    # would fail on a perfectly correct edit. Raw bytes on both sides is the only
+    # comparison that answers "did the installer change anything else".
+    $parts = $key -split ':', 2
+    if ($parts.Count -ne 2) { Fail "not a registry path: $key" }
+    $hive = switch ($parts[0].ToUpperInvariant()) {
+        'HKLM' { [Microsoft.Win32.Registry]::LocalMachine }
+        'HKCU' { [Microsoft.Win32.Registry]::CurrentUser }
+        default { Fail "unsupported registry hive in '$key'" }
+    }
+    $subkey = $parts[1].TrimStart('\')
+    $opened = $hive.OpenSubKey($subkey, $false)
+    if ($null -eq $opened) { return $null }
+    try {
+        $value = $opened.GetValue($name, $null, `
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $value) { return $null }
+        return [string] $value
+    } finally {
+        $opened.Dispose()
+    }
 }
 
 function Path-Elements([string] $value) {
