@@ -22,4 +22,7 @@ if ! hdiutil create -volname alphashape -srcfolder "$stage" -fs HFS+ -format ULF
     hdiutil create -volname alphashape -srcfolder "$stage" -fs HFS+ -format UDZO \
         -imagekey zlib-level=9 -ov "$dmg"
 fi
+# A truncated or corrupt image is a download nobody can mount, and CI would only find out in the
+# fresh-runner smoke job. Verify checksums against the image's partition map here instead.
+hdiutil verify "$dmg"
 ls -lh "$dmg"
