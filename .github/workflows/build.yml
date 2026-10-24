@@ -335,12 +335,26 @@ jobs:
       - name: DMG size guard
         if: inputs.package
         run: |
-          budget=72
-          dmg=$(ls dist/*-macos-arm64.dmg)
-          mb=$(( $(stat -f %z "$dmg") / 1048576 ))
-          echo "DMG: $dmg, ${mb} MB (budget ${budget} MB)"
-          if [ "$mb" -gt "$budget" ]; then
-            echo "::error::the macOS DMG is ${mb} MB, over the ${budget} MB budget"
+          # Compare bytes, not rounded megabytes: 72.9 MB must fail a 72 MB budget.
+          budget_bytes=$(( 72 * 1048576 ))
+          budget_mb=$(( budget_bytes / 1048576 ))
+          shopt -s nullglob
+          dmgs=(dist/*-macos-arm64.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one dist/*-macos-arm64.dmg, found ${#dmgs[@]}"
+            ls -l dist >&2 || true
+            exit 1
+          fi
+          dmg=${dmgs[0]}
+          bytes=$(stat -f %z "$dmg")
+          if [ "$bytes" -le 0 ]; then
+            echo "::error::$dmg is empty (${bytes} bytes)"
+            exit 1
+          fi
+          mb=$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }')
+          echo "DMG: $dmg, ${mb} MB (budget ${budget_mb} MB)"
+          if [ "$bytes" -gt "$budget_bytes" ]; then
+            echo "::error::the macOS DMG is ${mb} MB, over the ${budget_mb} MB budget"
             exit 1
           fi
 
