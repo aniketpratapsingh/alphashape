@@ -21,8 +21,8 @@ sections below give the engineering detail behind each item.
   next to the binaries; verify it rather than trusting the warning.
 - **The downloads are large.** The Windows installer is budgeted at up to
   350 MB and the AppImage at up to 400 MB (each build fails its packaging job
-  if it exceeds that). The macOS DMG is large — several hundred MB — and its
-  size is being reduced.
+  if it exceeds that). The macOS DMG is about 56 MB and budgeted at up to
+  72 MB; it ships a subset of the PROJ grids (EGM2008 is not included).
 - **The Windows installer defaults to a per-user install.** By default it
   installs into `%LOCALAPPDATA%\Programs\alphashape` without administrator
   rights, and does not touch `PATH`: `bin` is added only if the optional
