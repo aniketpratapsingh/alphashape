@@ -66,10 +66,12 @@ function Path-Elements([string] $value) {
 }
 
 # The value after "prefix" on the first matching line of a program's output, as
-# a single string. Where-Object/-replace would give an array when a line is
+# a single string. The input may be an array of lines or one multi-line string
+# (PowerShell gives the latter when the command is invoked with a here-string),
+# so both are split. Where-Object/-replace would give an array when a line is
 # printed twice, and a method call on an array fails.
 function Output-Value([string[]] $lines, [string] $prefix) {
-    foreach ($line in $lines) {
+    foreach ($line in ($lines -join "`n" -split "`r?`n")) {
         if ($line.StartsWith($prefix)) { return $line.Substring($prefix.Length).Trim() }
     }
     return ''
