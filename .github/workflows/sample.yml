@@ -1,0 +1,107 @@
+name: Sample dataset
+
+# Renders the synthetic 12-image sample dataset and uploads it as a downloadable Actions
+# artifact (alphashape-sample-<version>.zip, artifact name "alphashape-sample"). Download
+# it from this workflow's latest run, or with `gh run download --workflow sample.yml
+# --name alphashape-sample`. Attaching the zip to the release assets is planned but not
+# implemented yet; this workflow only produces the artifact, and never publishes anything
+# itself.
+#
+# Runs on demand and on release tags. It needs no compiler: the generator is pure
+# Python (numpy + Pillow) over engine/data/make_aerial_fixture.py.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    name: Render sample dataset
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # actions/checkout v4
+
+      # The version is the tag on a release build, and the project version otherwise, so
+      # the zip name always matches the release it will be attached to.
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::could not determine a version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sample version: $version"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # actions/setup-python v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the generator's dependencies
+        run: pip install --disable-pip-version-check numpy Pillow
+
+      # The generator's own test: it renders the dataset, checks the tree, the
+      # GPS EXIF, the manifest, and that two runs are byte-identical. It lives
+      # here rather than in the ctest lanes because those images carry no
+      # numpy/Pillow, and this is the one workflow that always installs them.
+      - name: Test the generator
+        run: python3 tools/sample/test_make_sample.py -v
+
+      - name: Render the sample
+        run: python3 tools/sample/make_sample.py --out build/sample
+
+      # The generator is deterministic, so a wrong image count or a missing file means the
+      # render broke rather than that the scene changed.
+      - name: Check the output
+        run: |
+          dir=build/sample/alphashape-sample
+          images=$(ls "$dir"/images/aerial_*.jpg | wc -l)
+          echo "images: $images"
+          if [ "$images" -ne 12 ]; then
+            echo "::error::expected 12 sample images, found $images"
+            exit 1
+          fi
+          for required in manifest.json README.md SOURCE.md; do
+            if [ ! -s "$dir/$required" ]; then
+              echo "::error::$required is missing or empty"
+              exit 1
+            fi
+          done
+          du -sh "$dir"
+          # A sample that a user cannot download quickly is not a sample. The block renders
+          # to roughly 1 MiB; 10 MiB is the point at which something is wrong.
+          size=$(du -sk "$dir" | cut -f1)
+          if [ "$size" -gt 10240 ]; then
+            echo "::error::sample is ${size} KiB, over the 10 MiB budget"
+            exit 1
+          fi
+
+      - name: Zip
+        run: |
+          cd build/sample
+          zip -r -9 "alphashape-sample-${{ steps.version.outputs.version }}.zip" alphashape-sample
+          ls -l ./*.zip
+          sha256sum ./*.zip > SHA256SUMS-sample.txt
+
+      # The artifact name is fixed ("alphashape-sample") so a download (Actions page or
+      # `gh run download --name alphashape-sample`) needs no knowledge of the version. The
+      # file inside carries the version.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact v4
+        with:
+          name: alphashape-sample
+          path: |
+            build/sample/*.zip
+            build/sample/SHA256SUMS-sample.txt
+          retention-days: 30
+          if-no-files-found: error
