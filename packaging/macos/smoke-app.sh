@@ -63,14 +63,32 @@ grep -q '^AddPhotos' "$work/tasks.txt"
 echo "== PROJ data comes from the bundle"
 "$cli" --proj-info | tee "$work/proj.txt"
 grep -q "alphashape.app/Contents/Resources/share/proj/proj.db" "$work/proj.txt"
-# The bundle ships a curated subset of proj-data, not Homebrew's whole collection, and the
-# essentials must be in it: the geoid the vertical-CRS support names and the small continental
-# datum-shift grid. A regression that copies every grid is caught by the DMG size guard; this
-# catches the opposite mistake of trimming the essentials away.
+# The bundle ships a curated subset of proj-data, not Homebrew's whole collection. The selector
+# writes SELECTED.txt with exactly the names it copied (which EGM96 spelling that platform's
+# package uses, and whether conus was available at all, both vary), so check the bundle against
+# the manifest rather than against one distribution's filenames. A regression that copies every
+# grid is caught by the DMG size guard; this catches the opposite mistake of trimming the
+# essentials away.
 proj="$app/Contents/Resources/share/proj"
 [ -f "$proj/proj.db" ] || { echo "error: no proj.db in the bundle" >&2; exit 1; }
-[ -f "$proj/us_nga_egm96_15.tif" ] || { echo "error: EGM96 grid missing" >&2; exit 1; }
-[ -f "$proj/us_noaa_conus.tif" ] || { echo "error: the conus datum-shift grid is missing" >&2; exit 1; }
+[ -f "$proj/SELECTED.txt" ] || { echo "error: no SELECTED.txt manifest in the bundle" >&2; exit 1; }
+grep -qx 'proj.db' "$proj/SELECTED.txt" || {
+    echo "error: SELECTED.txt does not list proj.db" >&2; exit 1; }
+missing=0
+while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ ! -f "$proj/$name" ]; then
+        echo "error: SELECTED.txt lists $name, which is not in the bundle" >&2
+        missing=1
+    fi
+done <"$proj/SELECTED.txt"
+[ "$missing" = 0 ] || exit 1
+# EGM96 is the geoid the vertical-CRS support names; either spelling is accepted, but one must
+# be there.
+if [ ! -f "$proj/us_nga_egm96_15.tif" ] && [ ! -f "$proj/egm96_15.gtx" ]; then
+    echo "error: no EGM96 grid (us_nga_egm96_15.tif or egm96_15.gtx) in the bundle" >&2
+    exit 1
+fi
 proj_mb=$(( $(du -sk "$proj" | cut -f1) / 1024 ))
 echo "bundled PROJ data: $(ls -1 "$proj" | wc -l | tr -d ' ') files, ${proj_mb} MB"
 [ "$proj_mb" -le 64 ] || {

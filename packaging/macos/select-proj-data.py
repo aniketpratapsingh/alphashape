@@ -20,6 +20,10 @@ applies the same idea to the bundle:
 Anything left out is still reachable: `ALPHASHAPE_PROJ_DATA` can point at a full
 proj-data checkout, and `crs::resolve_data_directory` prefers that over the bundle.
 
+The selection is recorded in SELECTED.txt in the destination, sorted, so the smoke test can
+assert that the bundle contains exactly what this script chose instead of hard-coding the
+filenames of one distribution's grids.
+
 Usage: select-proj-data.py <source-data-dir> <destination-dir>
        [--grid-budget-mib N] [--grid-max-mib N]
 """
@@ -27,7 +31,6 @@ Usage: select-proj-data.py <source-data-dir> <destination-dir>
 import argparse
 import os
 import shutil
-import sys
 
 # Grids that ship whatever their size. EGM96 (15', worldwide) is the geoid model the engine's
 # vertical-CRS support names, and us_noaa_conus is the small continental datum-shift grid the
@@ -49,6 +52,13 @@ ALWAYS_EXTENSIONS = (".db", ".ini", ".txt", ".csv")
 JSON_EXTENSION = ".json"
 GRID_EXTENSIONS = (".tif", ".gtx")
 
+# Every filename the selector copied, one per line, sorted. packaging/macos/smoke-app.sh uses
+# it to check the bundle against what was actually chosen; PROJ itself ignores it.
+MANIFEST_NAME = "SELECTED.txt"
+
+DEFAULT_GRID_BUDGET_MIB = 16
+DEFAULT_GRID_MAX_MIB = 16
+
 
 def files_in(source):
     for name in sorted(os.listdir(source)):
@@ -57,29 +67,22 @@ def files_in(source):
             yield name, path
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source")
-    parser.add_argument("destination")
-    parser.add_argument("--grid-budget-mib", type=int, default=16,
-                        help="total bytes of grid files to ship (default: 16)")
-    parser.add_argument("--grid-max-mib", type=int, default=16,
-                        help="largest single grid file to ship (default: 16)")
-    args = parser.parse_args()
-
-    source = args.source
-    destination = args.destination
+def select(source, destination, budget_mib=DEFAULT_GRID_BUDGET_MIB,
+           per_file_mib=DEFAULT_GRID_MAX_MIB):
+    """Stage the subset and write the manifest; returns a summary dict."""
     if not os.path.isfile(os.path.join(source, "proj.db")):
-        sys.exit(f"error: no proj.db in {source}")
+        raise SystemExit(f"error: no proj.db in {source}")
     os.makedirs(destination, exist_ok=True)
 
-    budget = args.grid_budget_mib * 1024 * 1024
-    per_file = args.grid_max_mib * 1024 * 1024
+    budget = budget_mib * 1024 * 1024
+    per_file = per_file_mib * 1024 * 1024
 
     essential = []
     grids = []
     auxiliary = []
     for name, path in files_in(source):
+        if name == MANIFEST_NAME:
+            continue
         extension = os.path.splitext(name)[1].lower()
         size = os.path.getsize(path)
         if extension in GRID_EXTENSIONS:
@@ -108,26 +111,59 @@ def main():
     chosen = essential + sorted(chosen[len(essential):], key=lambda item: item[1])
 
     copied = 0
+    names = []
     for _size, name, path in sorted(auxiliary) + chosen:
         target = os.path.join(destination, name)
+        names.append(name)
         if os.path.exists(target) and os.path.getsize(target) == os.path.getsize(path):
             continue
         shutil.copyfile(path, target)
         copied += 1
 
     total = sum(size for size, _n, _p in auxiliary) + chosen_bytes
-    print(f"PROJ data: {len(auxiliary)} auxiliary + {len(chosen)} grid files, "
-          f"{total / 1048576:.1f} MB (grid budget {args.grid_budget_mib} MB, "
-          f"per-file cap {args.grid_max_mib} MB)")
-    print(f"  copied {copied}; left out {dropped_budget} grids over the budget and "
-          f"{dropped_large} grids over the per-file cap")
     if not os.path.isfile(os.path.join(destination, "proj.db")):
-        sys.exit("error: proj.db was not copied")
+        raise SystemExit("error: proj.db was not copied")
     missing = [name for name in ESSENTIAL_GRIDS
                if os.path.isfile(os.path.join(source, name))
                and not os.path.isfile(os.path.join(destination, name))]
     if missing:
-        sys.exit(f"error: essential grids missing from the bundle: {', '.join(missing)}")
+        raise SystemExit(f"error: essential grids missing from the bundle: {', '.join(missing)}")
+
+    # Written last, so a manifest never claims a file that failed to copy. Sorted, so the smoke
+    # test can compare the bundle against it (and two runs produce identical bytes).
+    with open(os.path.join(destination, MANIFEST_NAME), "w", encoding="utf-8") as handle:
+        for name in sorted(names):
+            handle.write(name + "\n")
+
+    return {
+        "auxiliary": len(auxiliary),
+        "grids": len(chosen),
+        "total_bytes": total,
+        "copied": copied,
+        "dropped_budget": dropped_budget,
+        "dropped_large": dropped_large,
+        "names": sorted(names),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source")
+    parser.add_argument("destination")
+    parser.add_argument("--grid-budget-mib", type=int, default=DEFAULT_GRID_BUDGET_MIB,
+                        help=f"total bytes of grid files to ship "
+                             f"(default: {DEFAULT_GRID_BUDGET_MIB})")
+    parser.add_argument("--grid-max-mib", type=int, default=DEFAULT_GRID_MAX_MIB,
+                        help=f"largest single grid file to ship "
+                             f"(default: {DEFAULT_GRID_MAX_MIB})")
+    args = parser.parse_args()
+
+    summary = select(args.source, args.destination, args.grid_budget_mib, args.grid_max_mib)
+    print(f"PROJ data: {summary['auxiliary']} auxiliary + {summary['grids']} grid files, "
+          f"{summary['total_bytes'] / 1048576:.1f} MB (grid budget {args.grid_budget_mib} MB, "
+          f"per-file cap {args.grid_max_mib} MB)")
+    print(f"  copied {summary['copied']}; left out {summary['dropped_budget']} grids over the "
+          f"budget and {summary['dropped_large']} grids over the per-file cap")
 
 
 if __name__ == "__main__":
