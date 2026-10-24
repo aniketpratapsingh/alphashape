@@ -57,17 +57,18 @@ namespace {
 /// backend borrows (the Vulkan instance, the GL fallback surface) live here too, so their
 /// lifetime covers the QRhi's.
 struct Device {
-    std::unique_ptr<QRhi> rhi;
+    // Declaration order is destruction order reversed: the borrowed objects (the Vulkan instance,
+    // the GL fallback surface) are declared BEFORE the QRhi, so the QRhi is destroyed first and
+    // never outlives what it borrows.
+#if ALPHASHAPE_VIEWER_TRY_VULKAN
+    std::unique_ptr<QVulkanInstance> vulkan_instance;
+#endif
     std::unique_ptr<QOffscreenSurface> gl_surface;
+    std::unique_ptr<QRhi> rhi;
     QString reason;
     bool software = false;
 
     bool usable() const { return rhi != nullptr; }
-
-#if ALPHASHAPE_VIEWER_TRY_VULKAN
-    /// The Vulkan instance the QRhi borrows; it must outlive the device.
-    std::unique_ptr<QVulkanInstance> vulkan_instance;
-#endif
 };
 
 Device make_device() {
