@@ -4,6 +4,101 @@ Running list, one section per milestone. Each entry says what is missing or
 approximate and, where known, what would fix it. Update it at the close of every
 milestone (and whenever a review turns up a new limitation).
 
+## v0.1.0 — what the first release does not do
+
+What a user of the 0.1.0 downloads should know before trusting a result. The
+sections below give the engineering detail behind each item.
+
+**Installers**
+
+- **The installers are unsigned.** The macOS app is ad-hoc signed and not
+  notarized, so the first launch needs a right-click **Open** (or
+  `xattr -dr com.apple.quarantine`). The Windows installer has no
+  Authenticode signature, so SmartScreen shows "Windows protected your PC"
+  until **More info → Run anyway**. Every release publishes `SHA256SUMS`
+  next to the binaries; verify it rather than trusting the warning.
+- **macOS is Apple silicon only.** There is no Intel build, and the
+  minimum macOS version is whatever the packaging script stamps for the
+  current runner. Linux is x86-64 only, built against Ubuntu 24.04's glibc;
+  the Windows build is x86-64 only.
+- **GPU acceleration is off in the Windows build.** It needs the Vulkan
+  loader and driver headers, which the current vcpkg recipe does not carry
+  yet, so every Windows task runs on the CPU. Linux and macOS builds
+  include it and fall back to the CPU when no suitable device is found.
+- **The Python module is per interpreter.** A `.so`/`.pyd` is loadable only
+  by the CPython minor version it was built against (3.12 for the current
+  packages). On Windows the module needs the DLLs in its own directory; the
+  installer ships them together, and copying just the `.pyd` elsewhere fails
+  at import with a DLL error.
+- **The macOS bundle's Python module is not on a default path.** Run it with
+  `PYTHONPATH=/Applications/alphashape.app/Contents/Resources/python`.
+  The `.deb` installs into the system `python3` directory; the AppImage
+  carries no Python module at all.
+
+**Desktop application**
+
+- **One chunk at a time in the view.** The project format and the tasks
+  support several chunks, and the workspace tree lists them, but selection,
+  editing and the 3-D view all operate on the active chunk. There is no
+  multi-chunk viewport or chunk comparison yet.
+- **No picking, no level of detail.** The viewer draws the whole scene at
+  one level of detail; you cannot click a point or a face to select or
+  measure it, and a very large cloud is stride-sampled so the upload stays
+  bounded. A point-cloud or model selection in the tree is a tree
+  selection, not a 3-D one.
+- **Photo thumbnails are not persisted.** They are decoded on a worker
+  thread and cached per run, so reopening a large project re-decodes them.
+- **The project has no autosave or crash recovery.** Save before a long
+  Build step; a crash loses the work since the last save.
+- **The viewer needs a graphics backend.** On a platform whose Qt plugin
+  offers no RHI (Qt's `offscreen` and `minimal` plugins, which is also what
+  `--offscreen-smoke` uses) the 3-D page shows a message instead of a
+  scene. The panes, the workflow and the exports still work.
+
+**Georeferencing and measurement**
+
+- **There is no GUI for georeferencing yet.** A chunk that already carries
+  coordinates (from EXIF GPS, or a coordinate system set through the API)
+  georeferences itself, and the DEM and orthomosaic come out in that
+  projected CRS. There is no CRS selector, no marker placement or editing,
+  no scale bars and no GCP import in the window: those objects exist in the
+  data model, the commands and the Python API, but the interface for them
+  is not in this release.
+- **Accuracy is unproven on real surveys.** Every end-to-end check runs on
+  synthetic scenes with known geometry. The dense stage has not been
+  measured against a real camera with real lens distortion, real GPS error
+  or real texture, so treat a first real project as an experiment.
+
+**Products and exports**
+
+- **No tiled model, no panorama, no video.** The exports in this release
+  are the model (OBJ/PLY), the point cloud (PLY), the DEM and the
+  orthomosaic (GeoTIFF).
+- **One texture page per model.** The atlas packer writes a single square
+  page (up to 16384 px); `page_count > 1` is rejected. The viewer previews
+  at most 4096 px on a side while the saved page keeps its full size.
+- **No camera or spherical mapping modes.** Only the generic chart-based
+  UV layout is implemented; `mapping_mode` names the other modes only to
+  reject them with a clear message.
+- **Ghosting filter is accepted and ignored.** `ghosting_filter` is in the
+  schema for script compatibility, logs a warning, and changes nothing.
+- **The DEM and orthomosaic are single products per build.** Building again
+  adds a new labelled asset, but there is no comparison, differencing or
+  contour export.
+
+**Formats and interoperability**
+
+- **The project format is not final.** `.psx` plus `.files/` is versioned
+  and the reader refuses versions it does not know rather than guessing,
+  but the layout may still change between 0.1.x releases. Export anything
+  you would be sorry to lose.
+- **Depth maps are not invalidated by a re-alignment.** Building depth maps
+  again after re-running Align Cameras gives correct maps; the ones from
+  before are left in place and can be consumed by accident.
+- **Colour runs at 8 bits per channel end to end.** A 16-bit TIFF input is read and
+  reduced to 8 bits, and GeoTIFF export writes 32-bit float elevations and 8-bit RGBA
+  colour. There is no 16-bit colour pipeline and no 8-bit DEM export.
+
 ## M6 — Dense stereo
 
 - Every scene run end to end has no lens distortion, so speed on a real distorted

@@ -9,15 +9,17 @@
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15791/badge)](https://www.bestpractices.dev/projects/15791)
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 
-alphashape turns overlapping photographs into camera poses, dense point clouds, textured meshes,
-digital elevation models (DEMs) and orthomosaics. It is written in C++20, scriptable from Python and
-a command-line tool, and accelerated with Vulkan compute on GPUs that support it. A Qt desktop
-application is in development.
+alphashape turns overlapping photographs into camera poses, dense point clouds, textured
+meshes, digital elevation models (DEMs) and orthomosaics. It has a desktop application, a
+command-line tool and a Python module, all driving the same processing tasks, and it uses
+Vulkan compute on GPUs that support it. The engine is C++20; the desktop application is
+Qt 6.
 
-> **Status: early development (0.1.x).** The full pipeline runs from the CLI and Python, but formats,
-> APIs and results still change between versions. Not yet suitable for production surveys.
+> **Status: early development (0.1.x).** The whole pipeline runs end to end, but formats,
+> APIs and results still change between versions. Not yet suitable for production
+> surveys. Known gaps are listed in [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md).
 
-## What it does today
+## What it does
 
 | Stage | Task | Notes |
 |---|---|---|
@@ -29,52 +31,188 @@ application is in development.
 | Mesh | `BuildModel` | TV-L1 volumetric fusion or screened Poisson, decimation (GPU optional) |
 | Texture | `BuildUV`, `BuildTexture` | chart UV layout, atlas packing, mosaic/average blending |
 | Raster | `BuildDem`, `BuildOrthomosaic`, `ExportDem`, `ExportOrthomosaic` | GeoTIFF output, PROJ coordinate systems |
-| Export | `ExportModel`, `ExportPointCloud` | OBJ/PLY and more |
+| Export | `ExportModel`, `ExportPointCloud` | OBJ (with its texture) or PLY |
 | Chunks | `DuplicateChunk`, `MergeChunks`, `AppendProject`, `AlignChunks` | multi-chunk projects |
 
-Projects are saved as a `.psx` file plus a `.files/` folder. Every task has one parameter schema shared
-by the CLI, Python and the project file, so the three cannot drift apart. Edits that change the project
-are undoable.
+Projects are saved as a `.psx` file plus a `.files/` folder. Every task declares its
+parameters once and the CLI, the Python module, the desktop dialogs and the project file
+all bind against that one schema, so the four cannot drift apart. Edits that change the
+project are undoable.
 
-Task and parameter names follow the naming of Agisoft Metashape's public Python API, so that existing
-processing scripts are easy to port. alphashape is an independent project. It is not affiliated with,
-endorsed by or derived from Agisoft or Metashape.
+Task and parameter names follow the naming of Agisoft Metashape's public Python API, so
+that existing processing scripts are easy to port. alphashape is an independent project.
+It is not affiliated with, endorsed by or derived from Agisoft or Metashape.
 
-Known gaps are listed honestly in [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md).
+## Install
 
-## Quick start
+Download the package for your platform from the
+[latest release](https://github.com/aniketpratapsingh/alphashape/releases/latest):
+
+| Platform | File | What it installs |
+|---|---|---|
+| macOS (Apple silicon) | `alphashape-<version>-macos-arm64.dmg` | `alphashape.app` with the GUI, `alphashape-cli` and the Python module inside it |
+| Ubuntu 24.04 / x86-64 | `alphashape-<version>-linux-amd64.deb` | GUI, CLI and the Python module for the system `python3` |
+| Linux, any distribution | `alphashape-<version>-linux-x86_64.AppImage` | GUI and CLI with every non-glibc dependency bundled (no Python module) |
+| Windows 10/11 / x86-64 | `alphashape-<version>-windows-x86_64.exe` | GUI, CLI and the Python module |
+
+Every release publishes `SHA256SUMS` next to the packages. Check the download before
+running it:
 
 ```sh
-# create a project from photos, then run the pipeline task by task
-alphashape-cli --new site.psx --add-images photos/*.jpg
-alphashape-cli --project site.psx --task MatchPhotos --set keypoint_limit=40000
-alphashape-cli --project site.psx --task AlignCameras
-alphashape-cli --project site.psx --task BuildDepthMaps
-alphashape-cli --project site.psx --task BuildPointCloud
-alphashape-cli --project site.psx --task BuildModel
-alphashape-cli --list-tasks          # every task and its parameters
+sha256sum --check --ignore-missing SHA256SUMS      # Linux
+shasum -a 256 -c SHA256SUMS 2>/dev/null            # macOS
 ```
+
+```powershell
+# Windows
+$actual = (Get-FileHash .\alphashape-*-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+$expected = (Select-String -Path .\SHA256SUMS -Pattern 'windows-x86_64\.exe').Line.Split()[0]
+if ($actual -eq $expected) { "OK" } else { "MISMATCH" }
+```
+
+**The builds are unsigned, so both operating systems warn you.**
+
+- **macOS.** The app is ad-hoc signed and not notarized. On first launch, right-click
+  `alphashape.app` in Applications and choose **Open**, or clear the quarantine flag once:
+
+  ```sh
+  xattr -dr com.apple.quarantine /Applications/alphashape.app
+  ```
+
+- **Windows.** Defender SmartScreen shows "Windows protected your PC". Choose **More
+  info**, check that the app is **alphashape**, then **Run anyway** — see
+  [why this happens and how to verify the download instead](packaging/windows/README-smartscreen.md).
+
+The macOS app carries the command line and the Python module
+([details](packaging/macos/README.md)); on Linux and Windows they are installed alongside
+the GUI.
+
+## Quick start: the desktop app
+
+1. **Launch alphashape.** The start screen offers **New project**, **Open...** and
+   **Add photos...**, and lists your recent projects. You can also drag photographs (or a
+   folder of them) onto it.
+2. **Add photos.** Choose the images of one site. Every part of the subject should appear
+   in several photographs; 60–80% overlap between neighbours is a good starting point.
+3. **Run the Workflow menu top to bottom.** Each entry asks for its parameters in a dialog
+   built from the task's own schema, then runs the task on a worker thread with progress,
+   an estimated time and a Cancel button:
+
+   | Menu entry | What it produces |
+   |---|---|
+   | Add Photos | imports the photographs (the start screen's **Add photos...** does the same) |
+   | Match Photos | keypoints, matches and tracks |
+   | Align Photos | camera positions and orientations, and the sparse point cloud |
+   | Optimize Cameras | refines the alignment; optional, re-runnable |
+   | Build Depth Maps | a depth map per photograph |
+   | Build Point Cloud | the dense point cloud |
+   | Build Model | a triangle mesh |
+   | Build UV | texture coordinates on the mesh |
+   | Build Texture | a baked texture page |
+   | Build DEM | an elevation model over the site |
+   | Build Orthomosaic | a georeferenced mosaic of the photographs |
+
+   Align Photos needs the matches from Match Photos, so run them in this order. While a
+   stage's input is missing, its entry is greyed out with the reason ("Build depth maps
+   first").
+4. **Inspect the result** in the 3-D view: drag to orbit, drag with the right button to
+   pan, scroll to zoom, **F** to frame the whole scene and **5** to switch between
+   perspective and orthographic.
+5. **Export** from **File > Export**: the model as OBJ (with its material and texture
+   page) or PLY, the point cloud as PLY, and the DEM and orthomosaic as GeoTIFF. The DEM
+   and orthomosaic are *built* from the Workflow menu and *exported* from this menu.
+6. **Save** the project with **File > Save** (`.psx` plus a `.files/` folder). Reopen it
+   later and every product is still there.
+
+A sample site to practise on is attached to the
+[Releases](https://github.com/aniketpratapsingh/alphashape/releases) page as
+`alphashape-sample-<version>.zip`: twelve synthetic aerial photographs with GPS, plus a
+manifest of the true camera poses. See
+[`tools/sample/SOURCE.md`](tools/sample/SOURCE.md) for how it is made and its licence.
+
+## Quick start: the command line
+
+`alphashape-cli` runs one task per invocation and saves the project after each, so a
+script can stop between stages and resume:
+
+```sh
+alphashape-cli --list-tasks                      # every task this build ships
+alphashape-cli --list-params BuildDepthMaps      # one task's parameters, types and defaults
+
+# Create a project from photographs, then run the pipeline task by task.
+alphashape-cli --new site.psx --add-images photos/*.jpg
+alphashape-cli --project site.psx --task MatchPhotos --set keypoint_limit_per_mpx=10000
+alphashape-cli --project site.psx --task AlignCameras
+alphashape-cli --project site.psx --task BuildDepthMaps --set downscale=4
+alphashape-cli --project site.psx --task BuildPointCloud
+alphashape-cli --project site.psx --task BuildModel --set face_count=medium
+alphashape-cli --project site.psx --task BuildUV --set texture_size=4096
+alphashape-cli --project site.psx --task BuildTexture
+alphashape-cli --project site.psx --task ExportModel --set path=site.obj --set format=obj
+```
+
+`--set key=value` is parsed against the parameter's declared type, so a mistyped name or
+an out-of-range value fails before anything is computed. Progress goes to stderr. Exit
+codes: `0` success, `1` engine error, `2` unknown task, `64` bad usage.
+
+Two diagnostics help with setup: `--gpu-info` lists the Vulkan devices the engine can see,
+and `--proj-info` names the PROJ database it resolved.
+
+The AppImage runs the command line when `cli` is its first argument:
+
+```sh
+./alphashape-*.AppImage cli --list-tasks
+```
+
+## Quick start: Python
+
+The module takes the same tasks and parameter names as the CLI:
 
 ```python
 import alphashape
 
 doc = alphashape.Document()
-doc.active_chunk = doc.add_chunk("Chunk 1")
-# the same tasks and parameter names as the CLI
-doc.run_task("AddPhotos", filenames=["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg"])
-doc.run_task("MatchPhotos", keypoint_limit=40000)
+chunk = doc.add_chunk("Site")
+doc.active_chunk = chunk
+
+doc.run_task("AddPhotos", filenames=["photos/IMG_0001.jpg", "photos/IMG_0002.jpg"])
+doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
 doc.run_task("AlignCameras")
 doc.run_task("BuildDepthMaps", downscale=4)
 doc.run_task("BuildPointCloud")
+doc.run_task("BuildModel", face_count="medium")
+doc.run_task("BuildUV")
+doc.run_task("BuildTexture")
+
+print(chunk.aligned_camera_count, "of", chunk.camera_count, "cameras aligned")
 doc.save("site.psx")
+
+# Later:
+doc = alphashape.load_project("site.psx")
+print(alphashape.list_tasks())
 ```
+
+An unknown keyword raises `InvalidArgumentError` and a rejected value raises
+`ValueError`, so a typo surfaces at the call rather than in the middle of a run.
+
+On macOS the module lives inside the app bundle:
+
+```sh
+PYTHONPATH=/Applications/alphashape.app/Contents/Resources/python python3 -c "import alphashape"
+```
+
+A compiled module is loadable only by the CPython minor version it was built against
+(3.12 in the current packages). [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md) has the
+per-platform detail.
 
 ## Building from source
 
-Requirements: CMake ≥ 3.24, a C++20 compiler (Clang, GCC 13+, or clang-cl on Windows), Eigen 3, Ceres
-Solver, PROJ ≥ 9.3, zlib, libjpeg, libpng, libtiff, GoogleTest, pybind11 and Python 3. The GPU backend
-also needs the Vulkan headers and loader, `glslc`, `spirv-val` and the VulkanMemoryAllocator header;
-without them it is switched off and every task runs on the CPU.
+Requirements: CMake ≥ 3.24, a C++20 compiler (Clang, GCC 13+, or clang-cl on Windows),
+Eigen 3, Ceres Solver, PROJ ≥ 9.3, zlib, libjpeg, libpng, libtiff, GoogleTest, pybind11
+and Python 3. The GPU backend also needs the Vulkan headers and loader, `glslc`,
+`spirv-val` and the VulkanMemoryAllocator header; without them it is switched off and
+every task runs on the CPU. The desktop app needs Qt 6.6 or newer (it is built and tested
+against Qt 6.8).
 
 ```sh
 # Ubuntu 24.04
@@ -91,32 +229,20 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Windows (clang-cl + vcpkg) is being brought up; see the CI workflow for the current recipe. More detail
-is in [`engine/TESTING.md`](engine/TESTING.md).
+The desktop app is opt-in: add `-DALPHASHAPE_BUILD_GUI=ON` and put a Qt 6.8 kit on
+`CMAKE_PREFIX_PATH`. Windows (clang-cl + vcpkg) is described in
+[`engine/TESTING.md`](engine/TESTING.md), and [CONTRIBUTING.md](CONTRIBUTING.md) has the
+rules every change is held to.
 
 ## Releases
 
 | Channel | What | Where |
 |---|---|---|
-| Stable | Tagged `vX.Y.Z`, full test suite, installers for Linux, macOS and Windows | [Releases](https://github.com/aniketpratapsingh/alphashape/releases/latest) |
+| Stable | Tagged `vX.Y.Z`, full test suite, packages for Linux, macOS and Windows | [Releases](https://github.com/aniketpratapsingh/alphashape/releases/latest) |
 | Pre-release | `vX.Y.Z-rc.N` / `-beta.N` tags; never marked "latest" | [Releases](https://github.com/aniketpratapsingh/alphashape/releases) |
 | Nightly | Built from `main` every night when it changed | [`nightly` release](https://github.com/aniketpratapsingh/alphashape/releases/tag/nightly) |
 
-macOS (Apple silicon, `alphashape-<version>-macos-arm64.dmg`): open the image and drag
-`alphashape.app` to Applications. The app is ad-hoc signed, not notarized, so on first launch
-right-click it and choose **Open**, or clear the download quarantine flag once:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/alphashape.app
-```
-
-The command line and the Python module live inside the app
-([details](packaging/macos/README.md)):
-
-```sh
-/Applications/alphashape.app/Contents/MacOS/alphashape-cli --list-tasks
-PYTHONPATH=/Applications/alphashape.app/Contents/Resources/python python3 -c "import alphashape"
-```
+What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Repository layout
 
@@ -128,22 +254,39 @@ engine/
   src/common    data model, task registry, commands (undo), project I/O, algorithms
   src/gpu       Vulkan compute backend and shaders
   src/apps/cli  the command-line tool
+  src/apps/gui  the Qt desktop application
   python/       Python bindings
   tests/        C++ tests (GoogleTest) and synthetic fixtures
+  data/         the synthetic scenes the tests and the sample dataset are rendered from
+packaging/      per-OS bundling, installers and their smoke tests
+tools/sample/   the sample dataset generator and its provenance
 design/         design system and GUI mockups
 ```
+
+## Documentation
+
+- [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md) — what is missing or approximate in this
+  release, and what would fix it.
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
+- [`engine/TESTING.md`](engine/TESTING.md) — how to build and test, and what CI runs.
+- [`SECURITY.md`](SECURITY.md) — supported versions and how to report a vulnerability.
+- [`packaging/`](packaging/) — how each platform's package is assembled.
 
 ## Contributing
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues privately as described in
-[SECURITY.md](SECURITY.md).
+[SECURITY.md](SECURITY.md), not in a public issue.
 
 ## License
 
-alphashape is free software: you can redistribute it and/or modify it under the terms of the GNU
-General Public License as published by the Free Software Foundation, either version 3 of the License,
-or (at your option) any later version. See [LICENSE](LICENSE).
+alphashape is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
 
-Third-party libraries keep their own licences (PROJ: MIT, Ceres: BSD, Eigen: MPL-2.0, and others).
-They are linked dynamically, and their notices ship with the installers.
+Third-party libraries keep their own licences (PROJ: MIT, Ceres: BSD, Eigen: MPL-2.0, Qt:
+LGPL-3, and others). They are linked dynamically, and their notices ship with the
+installers.
+
+The sample dataset is dedicated to the public domain under CC0-1.0; see
+[`tools/sample/SOURCE.md`](tools/sample/SOURCE.md).

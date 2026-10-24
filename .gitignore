@@ -4,6 +4,7 @@ datasets/
 tools/*
 !tools/theme/
 !tools/*.sh
+!tools/sample/
 run/
 work/
 .claude/
