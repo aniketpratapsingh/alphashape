@@ -321,3 +321,23 @@ QLabel[status="success"] { color: $status.success; }
 QLabel[status="warning"] { color: $status.warning; }
 QLabel[status="error"] { color: $status.error; }
 QLabel[status="processing"] { color: $status.processing; }
+
+/* ---------- start screen ---------- */
+/* The launcher in the central area while no project is open. Colours come from the same
+   tokens as the rest of the shell; no literal values here. ID selectors use objectNames
+   without dots: QSS reads a dot as a class selector, so "#start.title" would never match. */
+#startScreen { background-color: $surface.app; }
+#startScreen QPushButton { min-height: 30px; padding: 0 12px; }
+#startScreen QPushButton[role="primary"] { min-height: 34px; }
+#startScreen QListWidget {
+    background-color: $surface.panel;
+    border: 1px solid $border.subtle;
+    border-radius: 4px;
+    padding: 4px;
+}
+#startScreen QListWidget::item { padding: 5px 8px; }
+#startTitle { font-size: 26px; font-weight: 600; }
+#startVersion { color: $text.secondary; font-size: 12px; }
+#startRecentTitle { color: $text.secondary; font-size: 11px; font-weight: 600; }
+#startHint { color: $text.disabled; font-size: 11px; }
+#statusReveal { color: $accent.text; font-size: 11px; }

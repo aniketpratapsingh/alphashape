@@ -9,10 +9,14 @@ set(ALPHASHAPE_DESIGN_DIR ${PROJECT_SOURCE_DIR}/../design/system)
 
 add_library(alphashape_gui_lib STATIC
     command_line.cpp
+    image_files.cpp
+    drop_paths.cpp
     app.cpp
     job_manager.cpp
     task_dialog.cpp
     workflow.cpp
+    export_controller.cpp
+    start_screen.cpp
     main_window.cpp
     workspace_model.cpp
     workspace_pane.cpp

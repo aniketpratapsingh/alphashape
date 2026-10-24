@@ -22,6 +22,7 @@
 #include <QTemporaryDir>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/command_line.hpp"
 #include "apps/gui/main_window.hpp"
 
 namespace alphashape::gui::testing {
@@ -58,6 +59,11 @@ protected:
     /// Destroy the window and the app and build new ones. With `reset_settings` false the new
     /// instances read what the old ones stored (used to test persistence).
     void rebuild(bool reset_settings = false);
+
+    /// The same, from an Options built the way the real command line builds one (--open, --new,
+    /// --theme, ...), so a test can prove what the GUI does for that startup request. The
+    /// options are used verbatim, `reset_settings` included.
+    void rebuild_with(const Options& startup);
 
     GuiApp& app() { return *app_; }
     MainWindow& window() { return *window_; }

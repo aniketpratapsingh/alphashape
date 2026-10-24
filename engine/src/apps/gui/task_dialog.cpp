@@ -412,8 +412,13 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
                         }
                         return;
                     }
-                    const QString file = saving ? QFileDialog::getSaveFileName(this, title)
-                                                : QFileDialog::getOpenFileName(this, title);
+                    const QString file = saving
+                                             ? QFileDialog::getSaveFileName(
+                                                   this, title, edit->text(),
+                                                   fields_[index].path_filter)
+                                             : QFileDialog::getOpenFileName(
+                                                   this, title, edit->text(),
+                                                   fields_[index].path_filter);
                     if (!file.isEmpty()) {
                         edit->setText(file);
                         fields_[index].dirty = true;
@@ -659,6 +664,17 @@ void TaskDialog::set_value(const std::string& param, const ParamValue& value) {
     if (Field* field = find(param)) {
         load(*field, value);
     }
+}
+
+void TaskDialog::set_path_filter(const std::string& param, const QString& filter) {
+    if (Field* field = find(param)) {
+        field->path_filter = filter;
+    }
+}
+
+QString TaskDialog::path_filter(const std::string& param) const {
+    const Field* field = find(param);
+    return field != nullptr ? field->path_filter : QString();
 }
 
 QWidget* TaskDialog::editor(const std::string& param) const {
