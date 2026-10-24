@@ -3,13 +3,13 @@ name: Pre-release
 # Pushing a tag like v0.2.0-rc.1, v0.2.0-beta.1 or v0.2.0-preview.1 (from any branch) builds every
 # platform and publishes a GitHub pre-release. Pre-releases never become "latest".
 #
-# Two dry runs exercise the whole pipeline -- assets, NOTICE.txt, sbom.spdx.json, SHA256SUMS,
+# A dry run exercises the whole pipeline -- assets, NOTICE.txt, sbom.spdx.json, SHA256SUMS,
 # provenance and the fresh-runner verification of the published downloads -- without publishing
-# anything:
-#   * label a pull request `release-dry-run` (remove and re-add the label to run it again)
-#   * `gh workflow run preview.yml -f tag=v0.1.0-dryrun`
-# Both create a DRAFT pre-release, so nothing is visible until someone publishes it. Delete a
-# dry run when done:
+# anything. It is manual only:
+#   gh workflow run preview.yml -f tag=v0.1.0-dryrun -f ref=<branch>
+# workflow_dispatch requires write access, so untrusted pull-request code never runs the build
+# and verification steps with a write token. The run creates a DRAFT pre-release, so nothing is
+# visible until someone publishes it. Delete a dry run when done:
 #   gh release delete <tag> --yes
 #   git push origin :refs/tags/<tag>     # only if the tag was created by the run
 
@@ -19,8 +19,6 @@ on:
       - "v*-rc*"
       - "v*-beta*"
       - "v*-preview*"
-  pull_request:
-    types: [labeled]
   workflow_dispatch:
     inputs:
       tag:
@@ -36,11 +34,9 @@ permissions:
   contents: read
 
 jobs:
-  # One place decides what is being published, because three different events lead here.
+  # One place decides what is being published, because two different events lead here.
   plan:
     name: Plan
-    # A pull request only runs this on the dry-run label, not on every label.
-    if: github.event_name != 'pull_request' || github.event.label.name == 'release-dry-run'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -49,9 +45,9 @@ jobs:
       draft: ${{ steps.plan.outputs.draft }}
       tag-exists: ${{ steps.plan.outputs.tag_exists }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      # No checkout: the plan only derives the tag/ref/draft triple, and a plain
+      # `github.ref` on a dispatch is the branch the workflow file came from, not
+      # the ref being built.
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
@@ -59,21 +55,19 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
           REF_SHA: ${{ github.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          version="v$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' engine/CMakeLists.txt | head -1)"
           case "$EVENT" in
             push)
               # The tag that was pushed. It must exist, and the release is a real pre-release.
               tag="$REF_NAME"; ref="$REF_SHA"; draft=false; tag_exists=true ;;
             workflow_dispatch)
-              tag="$INPUT_TAG"; ref="${INPUT_REF:-$REF_SHA}"; draft=true; tag_exists=false ;;
-            pull_request)
-              # A dry run for this pull request's head commit. The tag cannot collide with a
-              # real one (real pre-releases carry -rc/-beta/-preview) and is deleted with the
-              # draft.
-              tag="${version}-dryrun.pr${PR_NUMBER}"; ref="$HEAD_SHA"; draft=true; tag_exists=false ;;
+              tag="$INPUT_TAG"; ref="${INPUT_REF:-$REF_SHA}"; draft=true; tag_exists=false
+              # A dry run must never claim a stable version: a run that pushes a stable tag name
+              # would collide with the real release and could be promoted by accident.
+              if printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "::error::refusing to dry-run the stable version name '$tag'; add a suffix such as -dryrun or -rc.1"
+                exit 1
+              fi ;;
             *)
               echo "::error::unexpected event $EVENT"; exit 1 ;;
           esac
