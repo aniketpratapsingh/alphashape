@@ -551,10 +551,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+      # The upload's "dist/" prefix is preserved, so downloading into "." lands
+      # dist/<installer>.exe at the top level instead of dist/dist/.
       - uses: actions/download-artifact@v4
         with:
           name: alphashape-windows-x86_64
-          path: dist
+          path: .
 
       # 7-Zip reads inside the NSIS installer, so this is the payload as
       # CPack and windeployqt actually produced it rather than what a build log
@@ -653,14 +655,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+      # The artifact preserves the upload's "dist/" prefix, so downloading into
+      # "." reproduces dist/<installer>.exe rather than nesting another dist/.
       - uses: actions/download-artifact@v4
         with:
           name: alphashape-windows-installer
-          path: dist
+          path: .
 
-      # The .pyd is loadable only by the CPython it was built against, and its
-      # file name carries no ABI tag, so the build job publishes the version and
-      # this job installs exactly that one.
+      # The .pyd is loadable only by the CPython it was built against. Its file
+      # name carries the tag, but the patch level matters too, so the build job
+      # publishes the exact version and this job installs that minor release.
       - name: Python version the module was built for
         id: abi
         shell: pwsh
