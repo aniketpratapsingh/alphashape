@@ -366,6 +366,12 @@ try {
 
     $env:PYTHONPATH = Join-Path $perUserDir 'python'
     $env:PYTHONHOME = $null
+    # A redirected stdout makes Python encode with the ANSI code page, which
+    # turns this install's "Jörg-ü" into replacement characters on the way out
+    # and would make the path assertion below fail on a correct import. The
+    # engine's own output is UTF-8; Python's must be too.
+    $env:PYTHONIOENCODING = 'utf-8'
+    $env:PYTHONUTF8 = '1'
     try {
         $pythonCheck = & python -c @"
 import sys, alphashape
@@ -377,6 +383,8 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
         $pythonExit = $LASTEXITCODE
     } finally {
         Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+        Remove-Item Env:\PYTHONIOENCODING -ErrorAction SilentlyContinue
+        Remove-Item Env:\PYTHONUTF8 -ErrorAction SilentlyContinue
     }
     $pythonCheck | ForEach-Object { Write-Host "  $_" }
     if ($pythonExit -ne 0) { Fail "importing alphashape from $pyd failed" }
