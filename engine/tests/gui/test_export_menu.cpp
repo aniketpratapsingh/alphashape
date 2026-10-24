@@ -84,7 +84,9 @@ protected:
 
     Chunk& chunk() { return *app().document().active_chunk(); }
     ExportController& exports() { return window().exports(); }
-    bool enabled(const char* task) { return exports().action(task)->isEnabled(); }
+    /// Whether the action with this objectName ("action.export.model") is enabled. Going
+    /// through the window means a missing action fails the test instead of dereferencing null.
+    bool enabled(const char* object_name) { return action(object_name)->isEnabled(); }
     void refresh() { exports().update_enabled(); }
 
     struct Submitted {
@@ -139,10 +141,13 @@ void give_orthomosaic(Chunk& chunk) {
     }
 }
 
-/// A project on disk, so the export lands in this test's own scratch directory.
+/// A project on disk, so the export lands in this test's own scratch directory. The chunk is
+/// made active first: the exporters address the ACTIVE chunk, so a save that left no active id
+/// would load a document with nothing to export.
 QString save_project(const QString& path) {
     Document document;
-    document.workspace().add_chunk("Chunk 1");
+    Chunk& chunk = document.workspace().add_chunk("Chunk 1");
+    document.set_active_chunk_id(chunk.id());
     ProjectIO::save(document, path.toStdString());
     return path;
 }

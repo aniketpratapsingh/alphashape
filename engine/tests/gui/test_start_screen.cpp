@@ -28,6 +28,7 @@
 #include "apps/gui/start_screen.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "common/commands/model_commands.hpp"
+#include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
@@ -365,14 +366,16 @@ TEST_F(StartScreenTest, EntryPointsAreDisabledWhileAJobRuns) {
     EXPECT_TRUE(window().start_screen()->new_button()->isEnabled());
     EXPECT_TRUE(window().start_screen()->open_button()->isEnabled());
 
-    // A job that blocks, so the busy window is wide enough to observe on any machine.
+    // A job that blocks, so the busy window is wide enough to observe on any machine. It needs
+    // an active chunk (the task targets Chunk), which is added directly, behind the command
+    // layer, so no signal switches the window away from the launcher.
+    Chunk& chunk = app().document().workspace().add_chunk("Chunk 1");
+    app().document().set_active_chunk_id(chunk.id());
     auto started = std::make_shared<std::atomic<bool>>(false);
     registry_.register_task(
         std::make_shared<alphashape::gui::testing::HoldTask>(release_, started));
     app().jobs().set_registry(&registry_);
-    app().jobs().submit("HoldTask", Params{}, app().document().workspace().chunks().empty()
-                                                  ? -1
-                                                  : app().document().active_chunk_id());
+    app().jobs().submit("HoldTask", Params{}, chunk.id());
     ASSERT_TRUE(pump_until([&]() { return started->load(); }, kPumpTimeoutMs));
 
     EXPECT_FALSE(window().start_screen()->new_button()->isEnabled());
