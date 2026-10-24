@@ -36,6 +36,11 @@ OutFile "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
 ; uninstaller runs without one too. MultiUser overrides this for a per-machine
 ; install.
 InstallDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
+; An existing install's directory is reused, so an upgrade lands where the user
+; put the last one. MultiUser reads this from HKLM in a per-machine install and
+; from HKCU in a per-user one, which plain InstallDirRegKey could not do.
+!define MULTIUSER_INSTALLMODE_INSTDIR_REGISTRY_KEY "${APP_KEY}"
+!define MULTIUSER_INSTALLMODE_INSTDIR_REGISTRY_VALUENAME "InstallDir"
 SetCompressor /SOLID @CPACK_NSIS_COMPRESSOR@
 SetCompressorDictSize 64
 ; MultiUser.nsh emits RequestExecutionLevel from this. "Highest" means: elevated

@@ -135,17 +135,23 @@ Assert-Present (Join-Path $startMenu 'alphashape.lnk') "Start menu shortcut"
 
 Step "CLI"
 $cli = Join-Path $perUserDir 'bin\alphashape-cli.exe'
+$ErrorActionPreference = 'Continue'
 $tasks = & $cli --list-tasks
-if ($LASTEXITCODE -ne 0) { Fail "alphashape-cli --list-tasks exited $LASTEXITCODE" }
+$cliExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($cliExit -ne 0) { Fail "alphashape-cli --list-tasks exited $cliExit" }
 $tasks | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
 Assert ($tasks -contains 'AddPhotos') "AddPhotos is not in --list-tasks"
 Write-Host "  $($tasks.Count) tasks"
 
 Step "CLI resolves PROJ data from the install"
-$projInfo = & $cli --proj-info
-if ($LASTEXITCODE -ne 0) {
+$ErrorActionPreference = 'Continue'
+$projInfo = & $cli --proj-info 2>&1 | ForEach-Object { "$_" }
+$projExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($projExit -ne 0) {
     $projInfo | ForEach-Object { Write-Host "  $_" }
-    Fail "alphashape-cli --proj-info exited $LASTEXITCODE; the install could not find proj.db"
+    Fail "alphashape-cli --proj-info exited $projExit; the install could not find proj.db"
 }
 $projInfo | ForEach-Object { Write-Host "  $_" }
 $expectedDb = Join-Path $perUserDir 'share\proj\proj.db'
@@ -158,17 +164,30 @@ $gui = Join-Path $perUserDir 'bin\alphashape.exe'
 $previousPlatform = $env:QT_QPA_PLATFORM
 $env:QT_QPA_PLATFORM = 'offscreen'
 try {
+    # `2>&1` on a native program turns stderr lines into ErrorRecords in
+    # PowerShell 7, and $ErrorActionPreference = 'Stop' would then abort on a
+    # warning the program printed while exiting 0. $ErrorActionPreference is
+    # relaxed for the call instead, and the exit code decides.
+    $ErrorActionPreference = 'Continue'
     $guiOutput = & $gui --offscreen-smoke 2>&1
     $guiExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = 'Stop'
     $env:QT_QPA_PLATFORM = $previousPlatform
 }
 $guiOutput | ForEach-Object { Write-Host "  $_" }
 if ($guiExit -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $guiExit" }
 Assert (($guiOutput -join "`n") -match 'gui ready') "the GUI did not report 'gui ready'"
 
-$version = & $gui --version
-if ($LASTEXITCODE -ne 0) { Fail "alphashape.exe --version exited $LASTEXITCODE" }
+$previousQt = $env:QT_QPA_PLATFORM
+$env:QT_QPA_PLATFORM = 'offscreen'
+try {
+    $version = & $gui --version 2>$null
+    $versionExit = $LASTEXITCODE
+} finally {
+    $env:QT_QPA_PLATFORM = $previousQt
+}
+if ($versionExit -ne 0) { Fail "alphashape.exe --version exited $versionExit" }
 Write-Host "  $version"
 
 Step "Python module"
@@ -189,6 +208,7 @@ Write-Host "  module      : $pyd"
 Write-Host "  interpreter : Python $PythonVersion"
 $env:PYTHONPATH = Join-Path $perUserDir 'python'
 $env:PYTHONHOME = $null
+$ErrorActionPreference = 'Continue'
 try {
     $pythonCheck = & python -c @"
 import sys, alphashape
@@ -199,6 +219,7 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
 "@
     $pythonExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = 'Stop'
     Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
 }
 $pythonCheck | ForEach-Object { Write-Host "  $_" }
@@ -239,8 +260,11 @@ Write-Host "  InstallLocation: $($machineEntry.InstallLocation)"
 Assert ($machineEntry.InstallLocation -eq $machineDir) `
     "per-machine InstallLocation is '$($machineEntry.InstallLocation)', expected '$machineDir'"
 
+$ErrorActionPreference = 'Continue'
 $machineTasks = & (Join-Path $machineDir 'bin\alphashape-cli.exe') --list-tasks
-if ($LASTEXITCODE -ne 0) { Fail "the per-machine CLI exited $LASTEXITCODE" }
+$machineExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($machineExit -ne 0) { Fail "the per-machine CLI exited $machineExit" }
 Assert ($machineTasks -contains 'AddPhotos') "the per-machine CLI has no AddPhotos task"
 
 Step "uninstall (per-machine)"
