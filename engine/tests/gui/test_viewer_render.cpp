@@ -29,8 +29,13 @@
 #include <QSurfaceFormat>
 #include <QtGlobal>
 
-#if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+// QVulkanInstance exists only in a build whose Qt was configured with Vulkan. The Vulkan attempt
+// is compiled only where the header is there.
+#if __has_include(<QtGui/qvulkaninstance.h>)
+#define ALPHASHAPE_VIEWER_HAS_VULKAN 1
 #include <QVulkanInstance>
+#else
+#define ALPHASHAPE_VIEWER_HAS_VULKAN 0
 #endif
 
 #include <rhi/qrhi.h>
@@ -52,12 +57,16 @@ namespace {
 /// lifetime covers the QRhi's.
 struct Device {
     std::unique_ptr<QRhi> rhi;
-    std::unique_ptr<QVulkanInstance> vulkan_instance;
     std::unique_ptr<QOffscreenSurface> gl_surface;
     QString reason;
     bool software = false;
 
     bool usable() const { return rhi != nullptr; }
+
+#if ALPHASHAPE_VIEWER_HAS_VULKAN
+    /// The Vulkan instance the QRhi borrows; it must outlive the device.
+    std::unique_ptr<QVulkanInstance> vulkan_instance;
+#endif
 };
 
 Device make_device() {
@@ -89,6 +98,7 @@ Device make_device() {
         device.reason = QStringLiteral("D3D11 could not be initialised");
     }
 #else
+#if ALPHASHAPE_VIEWER_HAS_VULKAN
     {
         // Vulkan first: the Linux CI lane runs this suite under Xvfb so the xcb platform can
         // create an instance, and lavapipe does the rasterising.
@@ -103,6 +113,9 @@ Device make_device() {
                 return device;
             }
         }
+    }
+#endif
+    {
         // OpenGL next: it needs an offscreen surface, which needs a platform that reports
         // OpenGL support (xcb does, the plain offscreen plugin does not).
         QSurfaceFormat format;

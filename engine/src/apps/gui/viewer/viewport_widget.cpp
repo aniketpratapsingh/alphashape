@@ -16,7 +16,8 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QWheelEvent>
-#include <QrhiWidget>
+// The class is QRhiWidget (capital R); the camel-case header is the portable spelling.
+#include <QtWidgets/QRhiWidget>
 
 #include <rhi/qrhi.h>
 
