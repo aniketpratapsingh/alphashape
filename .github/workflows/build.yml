@@ -551,12 +551,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      # The upload's "dist/" prefix is preserved, so downloading into "." lands
-      # dist/<installer>.exe at the top level instead of dist/dist/.
+      # upload-artifact stores everything relative to the uploaded files' common
+      # ancestor. The build job uploads only "dist/..." now, so that ancestor is
+      # dist/ and the entries are bare file names: downloading into dist/
+      # reproduces the layout the rest of this job looks for.
       - uses: actions/download-artifact@v4
         with:
           name: alphashape-windows-x86_64
-          path: .
+          path: dist
 
       # 7-Zip reads inside the NSIS installer, so this is the payload as
       # CPack and windeployqt actually produced it rather than what a build log
@@ -655,8 +657,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      # The artifact preserves the upload's "dist/" prefix, so downloading into
-      # "." reproduces dist/<installer>.exe rather than nesting another dist/.
+      # This artifact was uploaded from "dist/*.exe" plus "payload.txt" at the
+      # repository root, so its common ancestor is the root and the entries keep
+      # their "dist/" prefix. Downloading into "." therefore lands them in dist/.
       - uses: actions/download-artifact@v4
         with:
           name: alphashape-windows-installer
