@@ -6,7 +6,13 @@ name: Release
 #   3. gh workflow run release.yml -f tag=vx.y.z            (publishes)
 #      gh workflow run release.yml -f tag=vx.y.z -f draft=true   (builds a private draft; publish
 #      or delete it from the Releases page)
-# Re-running for the same tag replaces the release.
+# Re-running for the same tag replaces the release only while it is still a draft. Once it is
+# published the run stops with "release vx.y.z is already published": a shipped download must
+# not change under its own name. Bump the version and tag again instead.
+#
+# Building, packaging and publishing live in publish.yml, which preview.yml shares. Everything
+# after the build happens there: NOTICE.txt, sbom.spdx.json, SHA256SUMS, provenance attestations
+# and the per-OS check of the published downloads.
 
 on:
   workflow_dispatch:
@@ -49,50 +55,25 @@ jobs:
       version: ${{ inputs.tag }}
       package: true
 
-  release:
+  publish:
     name: Publish release
     needs: build
-    runs-on: ubuntu-24.04
+    # Serialise publishes per tag: a re-run replaces the draft under this tag.
+    concurrency:
+      group: publish-${{ inputs.tag }}
+      cancel-in-progress: false
+    # A called workflow can only narrow the caller's token, so everything publish.yml's jobs
+    # ask for is granted here: contents: write to create the release, id-token + attestations
+    # to attest the installers, pull-requests: read for --generate-notes.
     permissions:
       contents: write
-    steps:
-      # Only release assets are collected. The Windows artifacts also carry
-      # build bookkeeping (PYTHON-ABI.txt, the payload listing, the packaging
-      # job's own SHA256SUMS.txt), and "pattern: alphashape-*" with
-      # merge-multiple would have published all of it -- including a second
-      # SHA256SUMS that the checksum step below then hashed alongside the real
-      # assets. The three platform artifacts are downloaded individually and
-      # the Windows one is filtered, which is the smallest change that keeps
-      # WP-29.8 free to restructure this job.
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          pattern: alphashape-linux-*
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          pattern: alphashape-macos-*
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          name: alphashape-windows-x86_64
-          path: dist-windows
-      - name: Collect the Windows assets
-        run: |
-          find dist-windows -name '*.exe' -exec cp {} dist/ \;
-          find dist-windows -name '*.zip' -exec cp {} dist/ \;
-          rm -rf dist-windows
-          ls -lh dist
-      - name: Checksums
-        run: cd dist && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS && ls -lh
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          gh release delete "${{ inputs.tag }}" --yes 2>/dev/null || true
-          draft=""
-          if [ "${{ inputs.draft }}" = "true" ]; then draft="--draft"; fi
-          gh release create "${{ inputs.tag }}" dist/* --verify-tag $draft \
-            --title "alphashape ${{ inputs.tag }}" --generate-notes
+      pull-requests: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ inputs.tag }}
+      ref: ${{ inputs.tag }}
+      prerelease: false
+      draft: ${{ inputs.draft }}
+      tag-exists: true
