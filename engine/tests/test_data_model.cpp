@@ -802,6 +802,63 @@ TEST(Assets, ConstAccessorsOnEmptyChunkAreEmptySingleton) {
     EXPECT_EQ(chunk.active_orthomosaic_id(), -1);
 }
 
+TEST(Assets, NullPayloadsReadAsEmptyAndAreRecreatedOnMutableAccess) {
+    Chunk chunk;
+    chunk.add_point_cloud();
+    chunk.add_model();
+    chunk.add_elevation();
+    chunk.add_orthomosaic();
+    chunk.add_depth_maps();
+
+    // Simulate an unloaded payload (what validate() reports as "null payload").
+    chunk.point_clouds().front().data.reset();
+    chunk.models().front().data.reset();
+    chunk.elevations().front().data.reset();
+    chunk.orthomosaics().front().data.reset();
+    chunk.depth_map_sets().front().data.reset();
+
+    // The const accessors never dereference the cleared pointer.
+    const Chunk& view = chunk;
+    EXPECT_TRUE(view.point_cloud().points.empty());
+    EXPECT_TRUE(view.model().empty());
+    EXPECT_TRUE(view.elevation().empty());
+    EXPECT_TRUE(view.orthomosaic().empty());
+    EXPECT_TRUE(view.depth_maps().empty());
+    EXPECT_FALSE(chunk.validate().empty()) << "the cleared payloads are reported";
+
+    // The mutable accessors create a payload on demand instead of dereferencing null, so a
+    // caller that writes to the active asset gets a live object rather than undefined behaviour.
+    chunk.point_cloud().points.push_back(Eigen::Vector3d(1.0, 2.0, 3.0));
+    chunk.model().vertices.push_back(Eigen::Vector3d::Zero());
+    chunk.elevation().epsg = 32632;
+    chunk.orthomosaic().epsg = 3857;
+    chunk.depth_maps().push_back(DepthMap{});
+
+    ASSERT_NE(chunk.point_clouds().front().data, nullptr);
+    ASSERT_NE(chunk.models().front().data, nullptr);
+    ASSERT_NE(chunk.elevations().front().data, nullptr);
+    ASSERT_NE(chunk.orthomosaics().front().data, nullptr);
+    ASSERT_NE(chunk.depth_map_sets().front().data, nullptr);
+    EXPECT_EQ(chunk.point_cloud().points.size(), 1U);
+    EXPECT_EQ(chunk.model().vertices.size(), 1U);
+    EXPECT_EQ(chunk.elevation().epsg, 32632);
+    EXPECT_EQ(chunk.depth_maps().size(), 1U);
+    // The write landed in the slot the accessors hand out, so validation passes again.
+    EXPECT_TRUE(chunk.validate().empty()) << chunk.validate().front();}
+
+TEST(Assets, ConstTexturesSurviveAnUnloadedMeshPayload) {
+    Chunk chunk;
+    chunk.add_model();
+    chunk.models().front().textures.push_back(Image(2, 2, 3));
+    // The pages live in the slot, independently of the mesh payload.
+    chunk.models().front().data.reset();
+
+    const Chunk& view = chunk;
+    EXPECT_TRUE(view.model().empty());
+    ASSERT_EQ(view.model_textures().size(), 1U);
+    EXPECT_EQ(view.model_textures().front().width(), 2);
+}
+
 TEST(Assets, ValidateChecksActiveIdsAndSorting) {
     Chunk chunk;
     chunk.add_elevation();

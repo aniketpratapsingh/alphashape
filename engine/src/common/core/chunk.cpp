@@ -206,6 +206,18 @@ const Orthomosaic& empty_orthomosaic() {
     return empty;
 }
 
+/// The payload of `slot`, created on demand. The non-const accessors hand out a mutable
+/// reference, so they must never dereference a cleared payload; a slot whose `data` was reset
+/// (validate() reports it) gets a fresh, empty one the same way `Chunk::point_cloud() = ...`
+/// creates its slot.
+template <class Slot>
+typename Slot::value_type& payload_of(Slot& slot) {
+    if (!slot.data) {
+        slot.data = std::make_shared<typename Slot::value_type>();
+    }
+    return *slot.data;
+}
+
 }  // namespace
 
 std::vector<DepthMap>& Chunk::depth_maps() {
@@ -216,7 +228,7 @@ std::vector<DepthMap>& Chunk::depth_maps() {
     if (slot == nullptr) {
         slot = &depth_map_sets_.front();
     }
-    return *slot->data;
+    return payload_of(*slot);
 }
 
 const std::vector<DepthMap>& Chunk::depth_maps() const {
@@ -233,7 +245,7 @@ PointCloud& Chunk::point_cloud() {
     if (slot == nullptr) {
         slot = &point_clouds_.front();
     }
-    return *slot->data;
+    return payload_of(*slot);
 }
 
 const PointCloud& Chunk::point_cloud() const {
@@ -249,7 +261,7 @@ Mesh& Chunk::model() {
     if (slot == nullptr) {
         slot = &models_.front();
     }
-    return *slot->data;
+    return payload_of(*slot);
 }
 
 const Mesh& Chunk::model() const {
@@ -269,8 +281,10 @@ std::vector<Image>& Chunk::model_textures() {
 }
 
 const std::vector<Image>& Chunk::model_textures() const {
+    // The texture pages live in the slot, not in its mesh payload, so they stay readable when
+    // the mesh was unloaded; only a missing slot reads as empty.
     const ModelAsset* slot = find_slot(models_, active_model_id_);
-    return slot == nullptr || !slot->data ? empty_textures() : slot->textures;
+    return slot == nullptr ? empty_textures() : slot->textures;
 }
 
 Elevation& Chunk::elevation() {
@@ -281,7 +295,7 @@ Elevation& Chunk::elevation() {
     if (slot == nullptr) {
         slot = &elevations_.front();
     }
-    return *slot->data;
+    return payload_of(*slot);
 }
 
 const Elevation& Chunk::elevation() const {
@@ -297,7 +311,7 @@ Orthomosaic& Chunk::orthomosaic() {
     if (slot == nullptr) {
         slot = &orthomosaics_.front();
     }
-    return *slot->data;
+    return payload_of(*slot);
 }
 
 const Orthomosaic& Chunk::orthomosaic() const {
