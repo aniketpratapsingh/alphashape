@@ -16,6 +16,7 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QWheelEvent>
+#include <QrhiWidget>
 
 #include <rhi/qrhi.h>
 
