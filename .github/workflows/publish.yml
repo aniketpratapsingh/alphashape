@@ -13,6 +13,7 @@ name: Publish release
 #   alphashape-<tag>-linux-x86_64.tar.gz    CLI + Python module, no install
 #   alphashape-<tag>-windows-x86_64.zip     CLI + Python module, no install
 #   NOTICE.txt                              third-party notices, from packaging/licenses/deps.yaml
+#   LICENSE                                 the GPL text NOTICE.txt refers to
 #   sbom.spdx.json                          SPDX 2.3, the same component list
 #   SHA256SUMS                              every file above except itself
 #
@@ -118,14 +119,17 @@ jobs:
           [ "$fail" = 0 ] || { ls -l dist; exit 1; }
 
       # NOTICE.txt and sbom.spdx.json are generated from the same list, so they cannot disagree
-      # about which components this release contains.
-      - name: Licence notice and bill of materials
+      # about which components this release contains. LICENSE is copied verbatim: NOTICE.txt
+      # points at it ("the LICENSE file beside this one"), and every installer already carries
+      # the same text, so the release itself has to as well.
+      - name: Licence notice, licence text and bill of materials
         env:
           TAG: ${{ inputs.tag }}
           SHA: ${{ inputs.ref }}
         run: |
           python3 packaging/licenses/collect.py --version "$TAG" --out dist/NOTICE.txt
           python3 packaging/sbom/make_sbom.py --version "$TAG" --ref "$SHA" --out dist/sbom.spdx.json
+          cp LICENSE dist/LICENSE
           head -5 dist/NOTICE.txt
           python3 -c "import json; d = json.load(open('dist/sbom.spdx.json')); print(d['spdxVersion'], len(d['packages']), 'packages')"
 
@@ -273,7 +277,7 @@ jobs:
       - name: Every asset is on the release
         shell: bash
         run: |
-          for required in '*.deb' '*.AppImage' '*.dmg' '*.exe' '*.tar.gz' '*.zip' SHA256SUMS NOTICE.txt sbom.spdx.json; do
+          for required in '*.deb' '*.AppImage' '*.dmg' '*.exe' '*.tar.gz' '*.zip' SHA256SUMS NOTICE.txt sbom.spdx.json LICENSE; do
             compgen -G "dist/${required}" >/dev/null || { echo "::error::$required is missing from the release"; ls -l dist; exit 1; }
           done
           ls -l dist
