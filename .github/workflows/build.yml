@@ -634,13 +634,30 @@ jobs:
           }
           foreach ($required in 'bin/platforms/qwindows.dll', 'bin/platforms/qoffscreen.dll',
                                 'bin/alphashape.exe', 'bin/alphashape-cli.exe',
-                                'share/proj/proj.db', 'LICENSES/LICENSE') {
+                                'share/proj/proj.db', 'LICENSES/LICENSE',
+                                'LICENSES/THIRD-PARTY-NOTICES.txt',
+                                'LICENSES/Qt/LGPL-3.0-only.txt') {
             if (-not ($paths | Where-Object { $_ -like "*$required" })) {
               throw "$required is not in the installer payload"
             }
           }
+          # The licence texts of the shipped third-party runtime. The glob at
+          # configure time copies whatever vcpkg installed; these are the ports
+          # known to be in the payload today, so losing one would mean the glob
+          # stopped following vcpkg rather than that a port was removed.
+          foreach ($port in 'libjpeg-turbo', 'tiff', 'libpng', 'proj', 'ceres', 'libomp') {
+            $want = "LICENSES/third-party/$port.txt"
+            if (-not ($paths | Where-Object { $_ -like "*$want" })) {
+              throw "$want is not in the installer payload"
+            }
+          }
+          $licences = @($paths | Where-Object { $_ -like 'LICENSES/third-party/*.txt' })
+          "payload third-party licences: $($licences.Count)"
+          if ($licences.Count -lt 8) {
+            throw "only $($licences.Count) third-party licence texts; the vcpkg share glob did not run"
+          }
           # The module ships under the ABI-tagged name CMake gives it
-          # (alphashape.cp314-win_amd64.pyd), so the tag is matched rather than
+          # (alphashape.cp312-win_amd64.pyd), so the tag is matched rather than
           # a fixed file name.
           if (-not ($paths | Where-Object { $_ -like 'python/alphashape*.pyd' })) {
             throw 'the Python module is not in the installer payload'
