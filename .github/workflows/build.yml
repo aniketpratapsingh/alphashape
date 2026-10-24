@@ -615,12 +615,19 @@ jobs:
             "$hash  $($_.Name)" | Tee-Object -FilePath dist/SHA256SUMS.txt -Append
           }
           Get-Content dist/SHA256SUMS.txt
+          # The ABI file the smoke job needs to pick its interpreter; it comes
+          # from the build job's artifact and is republished here so the smoke
+          # job downloads one artifact, not two.
+          $abi = Get-ChildItem dist -Filter PYTHON-ABI.txt -Recurse | Select-Object -First 1
+          if (-not $abi) { throw 'PYTHON-ABI.txt did not survive the build artifact' }
+          "python ABI: $((Get-Content $abi.FullName -Raw).Trim())"
 
       - uses: actions/upload-artifact@v4
         with:
           name: alphashape-windows-installer
           path: |
             dist/SHA256SUMS.txt
+            dist/PYTHON-ABI.txt
             dist/*.exe
             payload.txt
           if-no-files-found: error
