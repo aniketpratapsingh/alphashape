@@ -21,7 +21,7 @@ class GuiApp;
 class LogPane;
 class PhotosPane;
 class PropertiesPane;
-class ViewportPlaceholder;
+class ViewportWidget;
 class WorkflowController;
 class WorkspacePane;
 class WorkspaceSelection;
@@ -118,8 +118,8 @@ private:
     QDockWidget* properties_dock_ = nullptr;
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
-    ViewportPlaceholder* viewport_ = nullptr;
-    WorkspaceSelection* selection_ = nullptr;  ///< tree, Properties and Photos panes share it
+    ViewportWidget* viewport_ = nullptr;
+    WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties, Photos panes and viewport
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
     PhotosPane* photos_pane_ = nullptr;

@@ -29,8 +29,8 @@
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
+#include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_pane.hpp"
-#include "apps/gui/viewport_placeholder.hpp"
 #include "apps/gui/workflow.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -112,13 +112,16 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
         QMessageBox::critical(this, title, message);
     };
 
-    viewport_ = new ViewportPlaceholder(app_.theme(), this);
+    viewport_ = new ViewportWidget(app_, app_.theme(), this);
     setCentralWidget(viewport_);
 
     create_docks();
     create_actions();
     create_menus();
     create_status_strip();
+
+    // The viewport highlights a selected camera, so it follows the tree selection.
+    viewport_->set_selection(selection_);
 
     resize(1280, 800);
     apply_default_layout();
@@ -317,6 +320,30 @@ void MainWindow::create_actions() {
     connect(make_action(QStringLiteral("action.view.reset_layout"), tr("Reset Layout")),
             &QAction::triggered, this, [this]() { reset_layout(); });
 
+    // Viewport: frame the scene, switch projection, show or hide the grid and axes. The viewport
+    // itself handles F (fit) and 5 (projection) while it has focus; these menu entries carry no
+    // application-wide shortcut, because a bare key would also fire while typing in a pane.
+    QAction* fit = make_action(QStringLiteral("action.view.fit_scene"), tr("&Fit Scene"));
+    fit->setToolTip(tr("Frame the whole scene (F)"));
+    QAction* orthographic = make_action(QStringLiteral("action.view.orthographic"),
+                                        tr("&Orthographic"));
+    orthographic->setCheckable(true);
+    orthographic->setToolTip(tr("Toggle the perspective / orthographic projection (5)"));
+    QAction* grid = make_action(QStringLiteral("action.view.show_grid"), tr("Show &Grid"));
+    grid->setCheckable(true);
+    grid->setChecked(true);
+    QAction* axes = make_action(QStringLiteral("action.view.show_axes"), tr("Show &Axes"));
+    axes->setCheckable(true);
+    axes->setChecked(true);
+    connect(fit, &QAction::triggered, this, [this]() { viewport_->fit_scene(); });
+    connect(orthographic, &QAction::triggered, this,
+            [this](bool on) { viewport_->set_orthographic(on); });
+    connect(grid, &QAction::triggered, this, [this](bool on) { viewport_->set_show_grid(on); });
+    connect(axes, &QAction::triggered, this, [this](bool on) { viewport_->set_show_axes(on); });
+    // Keep the checkable entries in step when the viewport changes the state itself (a key).
+    connect(viewport_, &ViewportWidget::projection_changed, orthographic,
+            &QAction::setChecked);
+
     // Help.
     QAction* about = make_action(QStringLiteral("action.help.about"), tr("&About alphashape"));
     about->setMenuRole(QAction::AboutRole);
@@ -379,6 +406,11 @@ void MainWindow::create_menus() {
     theme_menu->setObjectName(QStringLiteral("menu.view.theme"));
     theme_menu->addAction(theme_light_);
     theme_menu->addAction(theme_dark_);
+    view->addSeparator();
+    view->addAction(act("action.view.fit_scene"));
+    view->addAction(act("action.view.orthographic"));
+    view->addAction(act("action.view.show_grid"));
+    view->addAction(act("action.view.show_axes"));
     view->addSeparator();
     view->addAction(act("action.view.reset_layout"));
 

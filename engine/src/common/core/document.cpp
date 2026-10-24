@@ -55,6 +55,20 @@ Chunk* Document::active_chunk() {
     return nullptr;
 }
 
+const Chunk* Document::active_chunk() const {
+    if (active_chunk_id_ < 0) {
+        return nullptr;
+    }
+    for (const auto& workspace : workspaces_) {
+        for (const auto& chunk : workspace->chunks()) {
+            if (chunk != nullptr && chunk->id() == active_chunk_id_) {
+                return chunk.get();
+            }
+        }
+    }
+    return nullptr;
+}
+
 // -- coordinate system -----------------------------------------------------
 
 crs::CoordinateSystem Document::global_coordinate_system() const {

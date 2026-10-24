@@ -237,7 +237,9 @@ public:
     // Signatures are unchanged so existing call sites keep compiling. When the
     // container is empty the const overload returns a shared empty singleton;
     // the non-const overload lazily creates a first asset (allocating an id and
-    // making it active), so `chunk.point_cloud() = ...` still works.
+    // making it active), so `chunk.point_cloud() = ...` still works. A slot whose
+    // payload pointer was cleared (validate() reports it) reads as empty through
+    // the const overload and gets a fresh empty payload through the non-const one.
 
     std::vector<DepthMap>& depth_maps();
     const std::vector<DepthMap>& depth_maps() const;
