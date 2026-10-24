@@ -56,13 +56,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only release assets are collected. The Windows artifacts also carry
+      # build bookkeeping (PYTHON-ABI.txt, the payload listing, the packaging
+      # job's own SHA256SUMS.txt), and "pattern: alphashape-*" with
+      # merge-multiple would have published all of it -- including a second
+      # SHA256SUMS that the checksum step below then hashed alongside the real
+      # assets. The three platform artifacts are downloaded individually and
+      # the Windows one is filtered, which is the smallest change that keeps
+      # WP-29.8 free to restructure this job.
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: alphashape-*
+          pattern: alphashape-linux-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: alphashape-macos-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-windows-x86_64
+          path: dist-windows
+      - name: Collect the Windows assets
+        run: |
+          find dist-windows -name '*.exe' -exec cp {} dist/ \;
+          find dist-windows -name '*.zip' -exec cp {} dist/ \;
+          rm -rf dist-windows
+          ls -lh dist
       - name: Checksums
-        run: cd dist && sha256sum -- * > SHA256SUMS && ls -lh
+        run: cd dist && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS && ls -lh
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

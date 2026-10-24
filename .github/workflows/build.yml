@@ -483,18 +483,36 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
-          # No -DPython3_EXECUTABLE: the vcpkg toolchain wraps find_package(Python3)
-          # and only its own python3 port supplies Development.Module on this
-          # image, so that is the interpreter the module is built for. Which one
-          # it is gets recorded below and the smoke job installs the same minor
-          # version; nothing else may assume a version.
+          # The module is built against the interpreter actions/setup-python
+          # installed earlier in this job (3.12), not against whatever else is
+          # on the image: a .pyd is loadable only by the CPython whose ABI it
+          # was compiled for, and the smoke job installs the version in
+          # PYTHON-ABI.txt, so the two must be the same interpreter family.
+          # $env:pythonLocation is setup-python's rooting directory;
+          # FIND_STRATEGY=LOCATION makes FindPython3 take the interpreter and
+          # its headers/libs from that tree instead of the registry, and
+          # FIND_REGISTRY=NEVER stops it from wandering off to a system-wide
+          # install. (pybind11's own probe honours the same variable, but the
+          # explicit -DPython3_* values are what pin it.)
+          if (-not $env:pythonLocation) { throw 'pythonLocation is not set; actions/setup-python must run before the package step' }
+          $python = Join-Path $env:pythonLocation 'python.exe'
+          if (-not (Test-Path -LiteralPath $python)) { throw "no python.exe under $env:pythonLocation" }
+          & $python -c "import sys; print('packaging with Python ' + sys.version.split()[0])"
           cmake -S engine -B build `
             -DALPHASHAPE_BUILD_PYTHON=ON -DALPHASHAPE_BUILD_INSTALLER=ON `
-            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}"
+            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}" `
+            "-DPython3_ROOT_DIR=$env:pythonLocation" `
+            -DPython3_FIND_STRATEGY=LOCATION -DPython3_FIND_REGISTRY=NEVER `
+            "-DPython3_EXECUTABLE=$python"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # engine/python/CMakeLists.txt writes dist/PYTHON-ABI.txt: the version
           # the module was configured against, which the smoke job installs.
-          Get-Content build/dist/PYTHON-ABI.txt | ForEach-Object { "module built for Python $_" }
+          $abi = (Get-Content build/dist/PYTHON-ABI.txt -Raw).Trim()
+          "module built for Python $abi"
+          $expected = (& $python -c "import sys; print(str(sys.version_info[0]) + '.' + str(sys.version_info[1]) + '.' + str(sys.version_info[2]))").Trim()
+          if ($abi -ne $expected) {
+            throw "the module was configured for Python $abi, but $python is $expected"
+          }
           # The module is new; the GUI relinks because the install rules add its
           # icon and version resource to it. Everything else is already built.
           cmake --build build --target alphashape_python alphashape-gui
