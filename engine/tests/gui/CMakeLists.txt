@@ -1,9 +1,7 @@
 # GUI tests: Theme.*, GuiShell.*, GuiApp.*, CommandLine.*, Jobs.*, TaskDialog.*, Workflow.*,
-# MainWindow.*, WorkspaceTree.* (MainWindow on the
-# harness in harness.hpp). Registered with ctest like the engine
-# suite, so they run in the CI shard lanes. QT_QPA_PLATFORM=offscreen: no display needed.
-# harness in harness.hpp). Registered with ctest like the engine
-# suite, so they run in the CI shard lanes. QT_QPA_PLATFORM=offscreen: no display needed.
+# MainWindow.*, WorkspaceTree.*, PhotosPane.*, LogPane.* and Undo.* (MainWindow on the harness in
+# harness.hpp). Registered with ctest like the engine suite, so they run in the CI shard lanes.
+# QT_QPA_PLATFORM=offscreen: no display needed.
 
 find_package(GTest REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -21,7 +19,8 @@ add_executable(alphashape_gui_tests
     test_task_dialog.cpp
     test_workflow.cpp
     test_shell.cpp
-    test_workspace.cpp)
+    test_workspace.cpp
+    test_photos_log.cpp)
 target_link_libraries(alphashape_gui_tests PRIVATE alphashape_gui_lib Qt6::Test GTest::gtest
                                               alphashape_warnings)
 add_dependencies(alphashape_gui_tests alphashape-gui)

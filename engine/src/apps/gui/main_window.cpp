@@ -26,6 +26,8 @@
 #include <QWidget>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/log_pane.hpp"
+#include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/viewport_placeholder.hpp"
@@ -183,15 +185,32 @@ void MainWindow::create_docks() {
     photos_dock_ = make_dock(this, QStringLiteral("dock.photos"), tr("Photos"), tr("Photos"));
     log_dock_ = make_dock(this, QStringLiteral("dock.log"), tr("Log"), tr("Log"));
 
-    // The Workspace tree and the Properties sheet replace their placeholders.
+    // The four panes replace their placeholders. The selection object is shared by all of them:
+    // the tree publishes what is selected, the Properties sheet describes it, and the Photos
+    // list mirrors camera selections both ways.
     selection_ = new WorkspaceSelection(this);
     selection_->setObjectName(QStringLiteral("selection.workspace"));
     workspace_pane_ = new WorkspacePane(app_, *selection_, workspace_dock_);
     properties_pane_ = new PropertiesPane(app_, *selection_, properties_dock_);
-    delete workspace_dock_->widget();
-    workspace_dock_->setWidget(workspace_pane_);
-    delete properties_dock_->widget();
-    properties_dock_->setWidget(properties_pane_);
+    photos_pane_ = new PhotosPane(app_, *selection_, photos_dock_);
+    log_pane_ = new LogPane(app_, log_dock_);
+
+    // Each pane replaces its placeholder widget (which existed so the dock had the right
+    // minimum size before the pane landed).
+    struct Pane {
+        QDockWidget* dock;
+        QWidget* widget;
+    };
+    const Pane panes[] = {
+        {workspace_dock_, workspace_pane_},
+        {properties_dock_, properties_pane_},
+        {photos_dock_, photos_pane_},
+        {log_dock_, log_pane_},
+    };
+    for (const Pane& pane : panes) {
+        delete pane.dock->widget();
+        pane.dock->setWidget(pane.widget);
+    }
 }
 
 void MainWindow::apply_default_layout() {

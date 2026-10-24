@@ -18,6 +18,8 @@ class QMenu;
 namespace alphashape::gui {
 
 class GuiApp;
+class LogPane;
+class PhotosPane;
 class PropertiesPane;
 class ViewportPlaceholder;
 class WorkflowController;
@@ -117,9 +119,11 @@ private:
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     ViewportPlaceholder* viewport_ = nullptr;
-    WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties pane
+    WorkspaceSelection* selection_ = nullptr;  ///< tree, Properties and Photos panes share it
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
+    PhotosPane* photos_pane_ = nullptr;
+    LogPane* log_pane_ = nullptr;
     WorkflowController* workflow_ = nullptr;
     QLabel* jobs_label_ = nullptr;          ///< stage / idle text ("status.jobs")
     QProgressBar* jobs_progress_ = nullptr; ///< "status.progress", visible while a job runs

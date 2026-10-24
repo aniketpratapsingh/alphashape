@@ -104,6 +104,20 @@ QPalette Theme::palette_for(ThemeMode mode) {
     return p;
 }
 
+// The status colours per tokens.json, mirroring the accent's teal family (the default the
+// sheets are compiled from). Comment names the token the value comes from.
+QColor Theme::status_success(ThemeMode mode) {
+    return QColor::fromRgb(mode == ThemeMode::Dark ? 0xFF48B875 : 0xFF1E7A44);  // status.success
+}
+
+QColor Theme::status_warning(ThemeMode mode) {
+    return QColor::fromRgb(mode == ThemeMode::Dark ? 0xFFE3A33C : 0xFF8A5A00);  // status.warning
+}
+
+QColor Theme::status_error(ThemeMode mode) {
+    return QColor::fromRgb(mode == ThemeMode::Dark ? 0xFFF07068 : 0xFFB3261E);  // status.error
+}
+
 QString Theme::style_sheet_for(ThemeMode mode) {
     return read_resource(mode == ThemeMode::Dark
                              ? QStringLiteral(":/alphashape/theme/alphashape-dark.qss")

@@ -17,7 +17,10 @@ add_library(alphashape_gui_lib STATIC
     viewport_placeholder.cpp
     workspace_model.cpp
     workspace_pane.cpp
+    photos_model.cpp
+    photos_pane.cpp
     properties_pane.cpp
+    log_pane.cpp
     theme/theme.cpp)
 target_include_directories(alphashape_gui_lib PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_gui_lib
