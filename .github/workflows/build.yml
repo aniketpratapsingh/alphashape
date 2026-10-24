@@ -55,7 +55,7 @@ jobs:
       macos: ${{ steps.matrix.outputs.macos }}
       windows: ${{ steps.matrix.outputs.windows }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       - id: matrix
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -107,7 +107,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -120,7 +120,7 @@ jobs:
           setup-python: false
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-linux-gcc-${{ github.ref_name }}-${{ github.sha }}
@@ -147,7 +147,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-linux
           path: build.tar.zst
@@ -155,7 +155,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-linux-all
           path: tests-all.txt
@@ -199,7 +199,7 @@ jobs:
           packaging/linux/build-appimage.sh build "dist/alphashape-${{ inputs.version }}-linux-x86_64.AppImage"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-linux-x86_64
@@ -217,10 +217,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-linux-x86_64
           path: dist
@@ -243,7 +243,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -258,7 +258,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -271,7 +271,7 @@ jobs:
           setup-python: false
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-macos-clang-${{ github.ref_name }}-${{ github.sha }}
@@ -297,7 +297,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-macos
           path: build.tar.zst
@@ -305,7 +305,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-macos-all
           path: tests-all.txt
@@ -344,7 +344,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-macos-arm64
@@ -359,10 +359,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-macos-arm64
           path: dist
@@ -376,7 +376,7 @@ jobs:
           so="$(ls "$mnt"/alphashape.app/Contents/Resources/python/*.so)"
           hdiutil detach "$mnt"
           echo "version=$(basename "$so" | sed -E 's/.*cpython-3([0-9]+)-darwin.*/3.\1/')" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ steps.py.outputs.version }}
       - name: Hide Homebrew
@@ -400,12 +400,12 @@ jobs:
       # supposed to carry a module for.
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .vcpkg-bincache
           key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
@@ -421,16 +421,16 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
         with:
           arch: x64
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -478,7 +478,7 @@ jobs:
           %SystemRoot%\System32\tar.exe -czf build.tar.gz --exclude=*.obj --exclude=*.lib --exclude=.ninja_deps build
           dir build.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-windows
           path: build.tar.gz
@@ -486,7 +486,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-windows-all
           path: tests-all.txt
@@ -578,7 +578,7 @@ jobs:
           Copy-Item build/dist/*.exe dist/
           Copy-Item build/dist/PYTHON-ABI.txt dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: inputs.package
         with:
           name: alphashape-windows-x86_64
@@ -603,14 +603,14 @@ jobs:
     env:
       MAX_INSTALLER_MB: "350"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       # upload-artifact stores everything relative to the uploaded files' common
       # ancestor. The build job uploads only "dist/..." now, so that ancestor is
       # dist/ and the entries are bare file names: downloading into dist/
       # reproduces the layout the rest of this job looks for.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-windows-x86_64
           path: dist
@@ -706,7 +706,7 @@ jobs:
           if (-not $abi) { throw 'PYTHON-ABI.txt did not survive the build artifact' }
           "python ABI: $((Get-Content $abi.FullName -Raw).Trim())"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: alphashape-windows-installer
           path: |
@@ -726,13 +726,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       # This artifact was uploaded from "dist/*.exe" plus "payload.txt" at the
       # repository root, so its common ancestor is the root and the entries keep
       # their "dist/" prefix. Downloading into "." therefore lands them in dist/.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-windows-installer
           path: .
@@ -752,7 +752,7 @@ jobs:
           "module built for $version, installing $minor"
           "minor=$minor" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ steps.abi.outputs.minor }}
 
@@ -776,14 +776,14 @@ jobs:
     steps:
       # The build tree holds absolute paths (fixtures, binaries), so the workspace path must match
       # the build job: same runner image, same repository, same checkout location.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs so
       # the shards usually install without downloading anything.
       - name: Restore apt package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/apt-debs
           # Bump the suffix when the package list below changes.
@@ -806,7 +806,7 @@ jobs:
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -818,7 +818,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-linux
 
@@ -838,7 +838,7 @@ jobs:
           ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
           echo "tests in this lane: $(wc -l < tests-lane.txt)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-linux-${{ matrix.lane }}
           path: tests-lane.txt
@@ -893,7 +893,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -903,7 +903,7 @@ jobs:
             vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -915,7 +915,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-macos
 
@@ -935,7 +935,7 @@ jobs:
           ctest --test-dir build -N "${args[@]}" | sed -nE 's/^ +Test +#[0-9]+: (.*)$/\1/p' > tests-lane.txt
           echo "tests in this lane: $(wc -l < tests-lane.txt)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-macos-${{ matrix.lane }}
           path: tests-lane.txt
@@ -969,13 +969,13 @@ jobs:
       # supposed to carry a module for.
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       # The build job saved this cache under the same key; restore only, never save from a shard.
       - name: Restore vcpkg binary cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .vcpkg-bincache
           key: vcpkg-x64-windows-${{ hashFiles('.github/workflows/build.yml') }}
@@ -991,12 +991,12 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -1007,7 +1007,7 @@ jobs:
           cache: true
           setup-python: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-windows
 
@@ -1032,7 +1032,7 @@ jobs:
           ctest --test-dir build -N @ctestArgs | ForEach-Object { if ($_ -match '^\s+Test\s+#\d+: (.*)$') { $Matches[1] } } | Set-Content -Encoding ascii tests-lane.txt
           "tests in this lane: $((Get-Content tests-lane.txt).Count)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tests-windows-${{ matrix.lane }}
           path: tests-lane.txt
@@ -1056,7 +1056,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: tests-*
           path: lists

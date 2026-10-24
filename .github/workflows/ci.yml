@@ -29,11 +29,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Repository hygiene
         run: tools/check_repo_hygiene.sh
       - name: Seeded-RNG evaluation order
         run: python3 engine/tools/check_rng_order.py engine/src engine/tests
+      - name: Release metadata generators
+        # NOTICE.txt and sbom.spdx.json are generated from packaging/licenses/deps.yaml at
+        # release time; a change to the parser or the renderer must not wait for a release to
+        # find out it is broken.
+        run: python3 packaging/tests/test_release_metadata.py
       - name: No reverse-engineering material
         run: |
           if grep -rInE 'research/[0-9]|studied (product|implementation)|decompil|ghidra' \
@@ -52,7 +57,7 @@ jobs:
     outputs:
       package: ${{ steps.filter.outputs.package }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -64,7 +69,7 @@ jobs:
           package=false
           if [ "$REQUESTED" = true ]; then package=true; fi
           if [ "$EVENT" = pull_request ] && git diff --name-only "$BASE" HEAD |
-               grep -qE '^(packaging/|engine/cmake/alphashape_(install|macos_bundle|windows_install)\.cmake|\.github/workflows/(build|ci)\.yml)'; then
+               grep -qE '^(packaging/|engine/cmake/alphashape_(install|macos_bundle|windows_install)\.cmake|\.github/workflows/(build|ci|publish|preview|release)\.yml)'; then
             package=true
           fi
           echo "package=$package" >> "$GITHUB_OUTPUT"

@@ -2,6 +2,16 @@ name: Pre-release
 
 # Pushing a tag like v0.2.0-rc.1, v0.2.0-beta.1 or v0.2.0-preview.1 (from any branch) builds every
 # platform and publishes a GitHub pre-release. Pre-releases never become "latest".
+#
+# A dry run exercises the whole pipeline -- assets, NOTICE.txt, sbom.spdx.json, SHA256SUMS,
+# provenance and the fresh-runner verification of the published downloads -- without publishing
+# anything. It is manual only:
+#   gh workflow run preview.yml -f tag=v0.1.0-dryrun -f ref=<branch>
+# workflow_dispatch requires write access, so untrusted pull-request code never runs the build
+# and verification steps with a write token. The run creates a DRAFT pre-release, so nothing is
+# visible until someone publishes it. Delete a dry run when done:
+#   gh release delete <tag> --yes
+#   git push origin :refs/tags/<tag>     # only if the tag was created by the run
 
 on:
   push:
@@ -9,56 +19,90 @@ on:
       - "v*-rc*"
       - "v*-beta*"
       - "v*-preview*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Name for the draft release and its version stamp (e.g. v0.1.0-dryrun)"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag or commit to build (default: the default branch)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
+  # One place decides what is being published, because two different events lead here.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      ref: ${{ steps.plan.outputs.ref }}
+      draft: ${{ steps.plan.outputs.draft }}
+      tag-exists: ${{ steps.plan.outputs.tag_exists }}
+    steps:
+      # No checkout: the plan only derives the tag/ref/draft triple, and a plain
+      # `github.ref` on a dispatch is the branch the workflow file came from, not
+      # the ref being built.
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_REF: ${{ inputs.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+            push)
+              # The tag that was pushed. It must exist, and the release is a real pre-release.
+              tag="$REF_NAME"; ref="$REF_SHA"; draft=false; tag_exists=true ;;
+            workflow_dispatch)
+              tag="$INPUT_TAG"; ref="${INPUT_REF:-$REF_SHA}"; draft=true; tag_exists=false
+              # A dry run must never claim a stable version: a run that pushes a stable tag name
+              # would collide with the real release and could be promoted by accident.
+              if printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "::error::refusing to dry-run the stable version name '$tag'; add a suffix such as -dryrun or -rc.1"
+                exit 1
+              fi ;;
+            *)
+              echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "ref=$ref"
+            echo "draft=$draft"
+            echo "tag_exists=$tag_exists"
+          } >> "$GITHUB_OUTPUT"
+          printf 'plan: tag=%s ref=%s draft=%s tag_exists=%s\n' "$tag" "$ref" "$draft" "$tag_exists"
+
   build:
+    needs: plan
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ github.ref }}
-      version: ${{ github.ref_name }}
+      ref: ${{ needs.plan.outputs.ref }}
+      version: ${{ needs.plan.outputs.tag }}
       package: true
 
-  prerelease:
+  publish:
     name: Publish pre-release
-    needs: build
-    runs-on: ubuntu-24.04
+    needs: [plan, build]
+    concurrency:
+      group: publish-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
+    # See release.yml: a called workflow can only narrow the caller's token.
     permissions:
       contents: write
-    steps:
-      # Same asset selection as release.yml: the Windows artifacts carry build
-      # bookkeeping (PYTHON-ABI.txt, payload.txt, the packaging job's own
-      # SHA256SUMS.txt) that must not be published, so only the three platform
-      # artifacts are collected and the Windows one is filtered to .exe/.zip.
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: alphashape-linux-*
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: alphashape-macos-*
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          name: alphashape-windows-x86_64
-          path: dist-windows
-      - name: Collect the Windows assets
-        run: |
-          find dist-windows -name '*.exe' -exec cp {} dist/ \;
-          find dist-windows -name '*.zip' -exec cp {} dist/ \;
-          rm -rf dist-windows
-          ls -lh dist
-      - name: Checksums
-        run: cd dist && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS && ls -lh
-      - name: Create pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --prerelease --latest=false \
-            --title "alphashape ${GITHUB_REF_NAME} (pre-release)" --generate-notes
+      pull-requests: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      ref: ${{ needs.plan.outputs.ref }}
+      prerelease: true
+      draft: ${{ needs.plan.outputs.draft == 'true' }}
+      tag-exists: ${{ needs.plan.outputs.tag-exists == 'true' }}

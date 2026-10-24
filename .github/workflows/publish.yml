@@ -1,0 +1,472 @@
+name: Publish release
+
+# Reusable publisher for every channel that ships binaries: release.yml (stable), preview.yml
+# (pre-releases and dry runs). One place decides which files are published, how they are
+# checksummed, what the licence notice and the bill of materials contain, and how the published
+# bytes are verified afterwards.
+#
+# What gets published, from the three `package: true` jobs in build.yml:
+#   alphashape-<tag>-linux-amd64.deb        GUI + CLI + Python module (Ubuntu 24.04)
+#   alphashape-<tag>-linux-x86_64.AppImage  GUI + CLI, portable
+#   alphashape-<tag>-macos-arm64.dmg        the app bundle
+#   alphashape-<tag>-windows-x86_64.exe     NSIS installer
+#   alphashape-<tag>-linux-x86_64.tar.gz    CLI + Python module, no install
+#   alphashape-<tag>-windows-x86_64.zip     CLI + Python module, no install
+#   NOTICE.txt                              third-party notices, from packaging/licenses/deps.yaml
+#   LICENSE                                 the GPL text NOTICE.txt refers to
+#   sbom.spdx.json                          SPDX 2.3, the same component list
+#   SHA256SUMS                              every file above except itself
+#
+# The two command-line archives stay: they are built already, they are what a script or a
+# headless host wants, and dropping them would break download links users have today. Nothing
+# else from the build artifacts is published -- the Windows artifact also carries PYTHON-ABI.txt
+# and the packaging job's own SHA256SUMS.txt, which are build bookkeeping.
+#
+# Callers must grant the permissions this workflow's jobs ask for -- a called workflow can only
+# narrow the caller's token: contents: write, pull-requests: read (generated release notes),
+# id-token: write and attestations: write (provenance).
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag; also the version stamped into the asset names
+        required: true
+        type: string
+      ref:
+        description: Commit the assets were built from (the release's target)
+        required: true
+        type: string
+      prerelease:
+        description: Mark the release as a pre-release (never "latest")
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: >-
+          Leave the release unpublished. Every run creates a draft, verifies the downloaded
+          assets and only then publishes; true stops before that last step, which is what a dry
+          run wants.
+        required: false
+        type: boolean
+        default: false
+      tag-exists:
+        description: >-
+          The tag already exists and must be published as-is (true for a tagged release or a
+          pre-release). false creates the tag at `ref`, which is what a dry run needs.
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      release-url:
+        description: URL of the created release
+        value: ${{ jobs.publish.outputs.release-url }}
+
+# One publisher per tag. A re-run replaces the release, so two concurrent runs for the same tag
+# would race over `gh release delete` + create. The callers set it, because a job that calls a
+# reusable workflow is where `concurrency` is honoured.
+jobs:
+  publish:
+    name: Publish assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      # --generate-notes reads the pull requests since the last release.
+      pull-requests: read
+    outputs:
+      release-url: ${{ steps.create.outputs.url }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The three platform artifacts, downloaded separately: the Windows one is filtered
+      # below, and `pattern: alphashape-*` would also pick up alphashape-windows-installer
+      # (a second SHA256SUMS.txt and the payload listing).
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: dist
+          pattern: alphashape-linux-*
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: dist
+          pattern: alphashape-macos-*
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: alphashape-windows-x86_64
+          path: dist-windows
+
+      - name: Collect the Windows assets
+        run: |
+          find dist-windows -maxdepth 2 -name '*.exe' -exec mv {} dist/ \;
+          find dist-windows -maxdepth 2 -name '*.zip' -exec mv {} dist/ \;
+          rm -rf dist-windows
+          ls -lh dist
+
+      # A missing platform must fail here, not publish a release with two of three installers.
+      - name: Every platform has its installer
+        run: |
+          fail=0
+          for pattern in '*.deb' '*.AppImage' '*.dmg' '*.exe'; do
+            if ! compgen -G "dist/${pattern}" >/dev/null; then
+              echo "::error::no ${pattern} in the built assets"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || { ls -l dist; exit 1; }
+
+      # NOTICE.txt and sbom.spdx.json are generated from the same list, so they cannot disagree
+      # about which components this release contains. LICENSE is copied verbatim: NOTICE.txt
+      # points at it ("the LICENSE file beside this one"), and every installer already carries
+      # the same text, so the release itself has to as well.
+      - name: Licence notice, licence text and bill of materials
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.ref }}
+        run: |
+          python3 packaging/licenses/collect.py --version "$TAG" --out dist/NOTICE.txt
+          python3 packaging/sbom/make_sbom.py --version "$TAG" --ref "$SHA" --out dist/sbom.spdx.json
+          cp LICENSE dist/LICENSE
+          head -5 dist/NOTICE.txt
+          python3 -c "import json; d = json.load(open('dist/sbom.spdx.json')); print(d['spdxVersion'], len(d['packages']), 'packages')"
+
+      # One file covering every published asset except itself. Sorted, so two releases with the
+      # same inputs produce the same order.
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          files=$(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
+          [ -n "$files" ] || { echo "::error::nothing to checksum"; exit 1; }
+          # shellcheck disable=SC2086  # the file names are the list; none contains a space
+          sha256sum $files > SHA256SUMS
+          cat SHA256SUMS
+          echo "checksummed $(wc -l < SHA256SUMS) assets"
+
+      - name: Release notes
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          sed "s|@VERSION@|${TAG}|g" packaging/release-notes-header.md > notes.md
+          wc -l notes.md
+
+      # Always created as a draft, then published by `promote` once the downloads have been
+      # verified. A release that nobody has checked must not be the visible one, even for the
+      # few minutes before the verify matrix finishes.
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.ref }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          TAG_EXISTS: ${{ inputs.tag-exists }}
+        run: |
+          # A re-run for the same tag replaces the draft rather than failing on the duplicate
+          # tag. Only ever this workflow's own tag -- and never a published release: replacing
+          # one would swap a shipped, possibly already-downloaded asset set for a fresh rebuild
+          # under the same name and checksums. Bump the version instead.
+          err=$(mktemp)
+          if existing_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>"$err"); then
+            if [ "$existing_draft" != "true" ]; then
+              echo "::error::release $TAG is already published; refusing to replace it"
+              exit 1
+            fi
+            gh release delete "$TAG" --yes
+          elif ! grep -qi 'not found' "$err"; then
+            # Only "there is no such release" means "go ahead". A token or API failure must
+            # stop the run, or the guard above would be skipped exactly when it matters.
+            echo "::error::could not check whether release $TAG exists:"
+            cat "$err"
+            exit 1
+          fi
+          rm -f "$err"
+
+          args=(--title "alphashape $TAG" --generate-notes --notes-file notes.md --draft)
+          if [ "$TAG_EXISTS" = "true" ]; then
+            # A real release: the tag must already exist, so a typo cannot tag a new commit.
+            args+=(--verify-tag)
+          else
+            # A dry run: create the tag at the commit the assets were built from, so the
+            # release points at the tree that produced it. The tag is a side effect and is
+            # removed with the draft (see the header of preview.yml).
+            args+=(--target "$REF")
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease --latest=false)
+          fi
+
+          echo "gh release create $TAG ${args[*]}"
+          gh release create "$TAG" dist/* "${args[@]}"
+          url=$(gh release view "$TAG" --json url --jq .url)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "created draft $url"
+
+  # Provenance for the four installer files, computed from the bytes that were just published
+  # (downloaded back from the release), so the attestation is about the downloads and not about
+  # a working directory that happened to have the same names.
+  attest:
+    name: Attest installers
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # Reading a draft release needs push access; the pre-release and dry-run channels publish
+      # drafts. No other use of the token here.
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the published installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --dir dist \
+            --pattern '*.deb' --pattern '*.AppImage' --pattern '*.dmg' --pattern '*.exe'
+          ls -l dist
+          for pattern in '*.deb' '*.AppImage' '*.dmg' '*.exe'; do
+            compgen -G "dist/${pattern}" >/dev/null || { echo "::error::$pattern is not on the release"; exit 1; }
+          done
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.dmg
+            dist/*.exe
+
+  # A fresh runner per OS, no build dependencies: download from the release, check the
+  # checksums, then run the same install-and-use scripts the build job ran -- on the bytes a
+  # user will get.
+  #
+  # The macOS image is the one the DMG was built and smoke-tested on. It is not interchangeable:
+  # on macos-14's paravirtual GPU, MoltenVK aborts inside MVKPhysicalDevice::initMetalFeatures
+  # (AppleParavirtGPUMetalIOGPUFamily, doUncompressedBlit) during vkCreateInstance, so the
+  # bundle's own GPU check cannot pass there whatever the bundle contains.
+  verify:
+    name: Verify ${{ matrix.name }} download
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-15
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      # Draft releases are only readable with push access (see the attest job).
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download the published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --dir dist
+        shell: bash
+
+      - name: Every asset is on the release
+        shell: bash
+        run: |
+          for required in '*.deb' '*.AppImage' '*.dmg' '*.exe' '*.tar.gz' '*.zip' SHA256SUMS NOTICE.txt sbom.spdx.json LICENSE; do
+            compgen -G "dist/${required}" >/dev/null || { echo "::error::$required is missing from the release"; ls -l dist; exit 1; }
+          done
+          ls -l dist
+
+      - name: Check the checksums (Linux)
+        if: runner.os == 'Linux'
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Check the checksums (macOS)
+        if: runner.os == 'macOS'
+        working-directory: dist
+        run: shasum -a 256 -c SHA256SUMS
+
+      - name: Check the checksums (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # SHA256SUMS is the sha256sum format: 64 hex digits, two spaces, the bare file name.
+          $checked = 0
+          foreach ($line in Get-Content dist/SHA256SUMS) {
+            if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw "unparseable SHA256SUMS line: $line" }
+            $expected = $Matches[1]
+            $name = $Matches[2]
+            $path = Join-Path dist $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "$name is in SHA256SUMS but not on the release" }
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) { throw "$name is corrupt: $actual, SHA256SUMS says $expected" }
+            $checked++
+          }
+          if ($checked -lt 8) { throw "only $checked assets checked; the release is incomplete" }
+          "checked $checked assets"
+
+      # The notice and the SBOM must describe the release, not just exist. One platform runs
+      # this: the files are the same bytes everywhere.
+      - name: Licence notice and SBOM are complete
+        if: runner.os == 'Linux'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          sys.path.insert(0, "packaging/licenses")
+          from depsfile import parse_deps
+
+          deps = parse_deps("packaging/licenses/deps.yaml")
+          names = [entry["name"] for entry in deps]
+
+          notice = Path("dist/NOTICE.txt").read_text(encoding="utf-8")
+          missing = [name for name in names if name not in notice]
+          assert not missing, f"NOTICE.txt does not mention {missing}"
+
+          document = json.loads(Path("dist/sbom.spdx.json").read_text(encoding="utf-8"))
+          assert document["spdxVersion"] == "SPDX-2.3", document["spdxVersion"]
+          packages = {package["name"] for package in document["packages"]}
+          missing = [name for name in names if name not in packages]
+          assert not missing, f"sbom.spdx.json does not contain {missing}"
+
+          # SHA256SUMS covers every other published file, and nothing that is not there.
+          listed = {line.split("  ", 1)[1] for line in
+                    Path("dist/SHA256SUMS").read_text(encoding="utf-8").splitlines() if line}
+          on_disk = {p.name for p in Path("dist").iterdir() if p.is_file()} - {"SHA256SUMS"}
+          assert listed == on_disk, f"SHA256SUMS mismatch: extra {listed - on_disk}, missing {on_disk - listed}"
+
+          print(f"NOTICE.txt and sbom.spdx.json cover {len(names)} components; "
+                f"SHA256SUMS covers {len(listed)} files")
+          PY
+
+      - name: Install and run the .deb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
+            bash -c 'bash /w/packaging/linux/smoke-deb.sh /w/dist/*.deb /w/engine/data'
+
+      - name: Run the AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 \
+            bash -c 'bash /w/packaging/linux/smoke-appimage.sh /w/dist/*.AppImage /w/engine/data'
+
+      - name: The DMG is an Apple silicon build
+        if: runner.os == 'macOS'
+        run: |
+          test "$(uname -m)" = arm64 || { echo "::error::macos-14 must select an arm64 runner"; exit 1; }
+
+      - name: Python version the published module was built for (macOS)
+        if: runner.os == 'macOS'
+        id: py
+        run: |
+          mnt="$(mktemp -d)"
+          hdiutil attach dist/*.dmg -mountpoint "$mnt" -nobrowse -readonly
+          so="$(ls "$mnt"/alphashape.app/Contents/Resources/python/*.so)"
+          hdiutil detach "$mnt"
+          echo "version=$(basename "$so" | sed -E 's/.*cpython-3([0-9]+)-darwin.*/3.\1/')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        if: runner.os == 'macOS'
+        with:
+          python-version: ${{ steps.py.outputs.version }}
+
+      # Same as the build job's smoke: the bundle must not quietly rely on the runner's Homebrew.
+      - name: Hide Homebrew (macOS)
+        if: runner.os == 'macOS'
+        run: sudo mv /opt/homebrew /opt/homebrew.hidden
+
+      - name: Install and run from the DMG (macOS)
+        if: runner.os == 'macOS'
+        run: packaging/macos/smoke-app.sh dist/*.dmg engine/data
+
+      # The Python ABI the module was built for is read out of the installer's own payload
+      # rather than from a build artifact, so the check follows the published file.
+      - name: Python version the published module was built for (Windows)
+        if: runner.os == 'Windows'
+        id: abi
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+            foreach ($candidate in 'C:\Program Files\7-Zip\7z.exe',
+                                   'C:\Program Files (x86)\7-Zip\7z.exe') {
+              if (Test-Path -LiteralPath $candidate) { $sevenZip = $candidate; break }
+            }
+          }
+          if (-not $sevenZip) { throw '7z.exe not found on the runner image' }
+          # -slt prints one "Path = ..." line per payload entry, relative to the install root.
+          # 7-Zip emits the platform separator there, so the backslashes are normalised before
+          # matching -- the same normalisation the build job's payload audit does.
+          $installer = (Get-ChildItem dist -Filter *.exe | Select-Object -First 1).FullName
+          $paths = & $sevenZip l -slt $installer | ForEach-Object {
+            if ($_ -match '^Path = (.*)$') { $Matches[1].Replace('\', '/') }
+          }
+          $pyd = @($paths | Where-Object { $_ -like 'python/alphashape*.pyd' }) | Select-Object -First 1
+          if (-not $pyd) {
+            $python = @($paths | Where-Object { $_ -like 'python/*' })
+            throw "the installer payload has no Python module; python/ holds: $($python -join ', ')"
+          }
+          $tag = [regex]::Match($pyd, 'alphashape\.cp(\d+)-').Groups[1].Value
+          if ($tag.Length -ne 3) { throw "unexpected ABI tag in '$pyd'" }
+          $minor = "$($tag.Substring(0,1)).$($tag.Substring(1))"
+          "module in the installer: $pyd -> Python $minor"
+          "minor=$minor" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        if: runner.os == 'Windows'
+        with:
+          python-version: ${{ steps.abi.outputs.minor }}
+
+      - name: Install, run and uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem dist -Filter *.exe | Select-Object -First 1).FullName
+          packaging/windows/smoke.ps1 -Installer $installer -PythonVersion "${{ steps.abi.outputs.minor }}"
+
+  # The draft becomes a published release only after every verify job has passed, so the
+  # downloads a user can reach are the ones that were checked. A dry run stops here and leaves
+  # the draft for someone to delete.
+  promote:
+    name: Publish (after verification)
+    needs: [publish, attest, verify]
+    if: inputs.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          [ "$state" = "true" ] || { echo "::error::$TAG is not a draft; refusing to touch it"; exit 1; }
+          args=(--draft=false)
+          # Keep a pre-release out of "latest" on the way out of the draft state.
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release edit "$TAG" "${args[@]}"
+          gh release view "$TAG" --json url,isDraft,isPrerelease --jq '"published \(.url) draft=\(.isDraft) prerelease=\(.isPrerelease)"'

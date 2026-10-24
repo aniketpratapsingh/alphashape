@@ -1,0 +1,232 @@
+# Third-party components that ship inside, or are required at run time by, the
+# alphashape installers. The distribution packages (.deb) declare their system
+# dependencies instead of bundling them; the other three installers carry their
+# runtime themselves. Both cases are listed, because a user reading NOTICE.txt
+# needs the licences of everything the application runs on either way.
+#
+# This file is the single source of truth for NOTICE.txt (packaging/licenses/collect.py)
+# and sbom.spdx.json (packaging/sbom/make_sbom.py), so the release's licence notice and
+# its bill of materials cannot drift apart.
+#
+# Format: a block sequence of mappings, scalars only. Full-line comments (a line whose
+# first non-space character is "#") are ignored; trailing comments are not supported,
+# because several values are URLs. Lists are inline: [linux, macos, windows].
+#
+# Required keys: name, copyright, spdx, url.
+# Optional keys: version (only when every platform ships the same one), platforms,
+#                note (one line of prose, rendered by both generators).
+#
+# The licence texts themselves are not duplicated here: each installer already carries
+# them (LICENSES/third-party/<port>.txt in the Windows installer, the macOS bundle's
+# Resources/doc, and /usr/share/doc/alphashape/copyright in the .deb).
+
+- name: Qt (QtCore, QtGui, QtWidgets)
+  version: "6.8.3"
+  copyright: The Qt Company Ltd. and other contributors.
+  spdx: LGPL-3.0-only
+  url: https://download.qt.io/official_releases/qt/6.8/
+  platforms: [linux, macos, windows]
+  note: Linked dynamically and installed beside the application, so it can be replaced with a compatible build of Qt.
+
+- name: PROJ
+  copyright: PROJ contributors.
+  spdx: MIT
+  url: https://proj.org/
+  platforms: [linux, macos, windows]
+  note: Ships as the proj library plus coordinate-system data (proj.db and the bundled grid files).
+
+- name: Ceres Solver
+  copyright: Google Inc. and the Ceres Solver contributors.
+  spdx: BSD-3-Clause
+  url: https://ceres-solver.org/
+  platforms: [linux, macos, windows]
+
+- name: Eigen
+  copyright: Gael Guennebaud, Benoit Jacob and contributors.
+  spdx: MPL-2.0
+  url: https://eigen.tuxfamily.org/
+  platforms: [linux, macos, windows]
+  note: Header-only library compiled into the binaries.
+
+- name: glog
+  copyright: Google Inc. and the glog contributors.
+  spdx: BSD-3-Clause
+  url: https://github.com/google/glog
+  platforms: [linux, macos, windows]
+
+- name: gflags
+  copyright: Google Inc. and the gflags contributors.
+  spdx: BSD-3-Clause
+  url: https://gflags.github.io/gflags/
+  platforms: [linux, macos, windows]
+
+- name: METIS
+  copyright: The Regents of the University of Minnesota and the METIS contributors.
+  spdx: Apache-2.0
+  url: https://github.com/KarypisLab/METIS
+  platforms: [macos, windows]
+  note: Graph partitioning and fill-reducing ordering used by Ceres's sparse solvers; bundled as a shared library. On Windows GKlib, its Apache-2.0 helper library, is linked into metis.dll rather than shipped separately.
+  # macOS takes METIS through Homebrew's Ceres; Windows through vcpkg's ceres[eigensparse].
+  # The Debian Ceres in the .deb is built against SuiteSparse instead, so no METIS there.
+
+- name: OpenBLAS
+  copyright: The OpenBLAS project contributors; based on GotoBLAS2 by Kazushige Goto.
+  spdx: BSD-3-Clause
+  url: https://www.openblas.net/
+  platforms: [macos]
+  note: BLAS and LAPACK implementation linked by Ceres and SuiteSparse on macOS, bundled with its gfortran runtime.
+
+- name: oneTBB
+  copyright: Intel Corporation and the oneAPI TBB contributors.
+  spdx: Apache-2.0
+  url: https://github.com/uxlfoundation/oneTBB
+  platforms: [macos]
+  note: Threading runtime linked by Homebrew's Ceres.
+
+- name: SuiteSparse
+  copyright: Timothy A. Davis and the SuiteSparse contributors.
+  spdx: BSD-3-Clause AND LGPL-2.1-or-later AND GPL-2.0-or-later
+  url: https://people.engr.tamu.edu/davis/suitesparse.html
+  platforms: [linux, macos]
+  note: Sparse solver components linked by Ceres (CHOLMOD, SPQR, AMD, CAMD, COLAMD, CCOLAMD and the shared config); the exact set depends on how the platform's Ceres was built, and each component's text ships with it. The Windows Ceres is built against Eigen's sparse solvers and METIS instead, so SuiteSparse is not in the NSIS installer.
+
+- name: libjpeg-turbo
+  copyright: The libjpeg-turbo project contributors; based on work by the Independent JPEG Group.
+  spdx: BSD-3-Clause
+  url: https://libjpeg-turbo.org/
+  platforms: [linux, macos, windows]
+  note: Under BSD-3-Clause and the IJG licence.
+
+- name: libpng
+  copyright: The libpng project contributors.
+  spdx: libpng-2.0
+  url: https://www.libpng.org/
+  platforms: [linux, macos, windows]
+
+- name: zlib
+  copyright: Jean-loup Gailly and Mark Adler.
+  spdx: Zlib
+  url: https://zlib.net/
+  platforms: [linux, macos, windows]
+
+- name: libtiff
+  copyright: The libtiff project contributors.
+  spdx: libtiff
+  url: https://libtiff.gitlab.io/libtiff/
+  platforms: [linux, macos, windows]
+
+- name: liblzma (xz)
+  copyright: Lasse Collin, Jia Tan and the XZ Utils contributors.
+  spdx: 0BSD
+  url: https://tukaani.org/xz/
+  platforms: [macos, windows]
+  note: LZMA decompression for libtiff; ships as liblzma alongside it. The .deb takes it from the distribution.
+
+- name: zstd
+  copyright: Meta Platforms Inc. and the Zstandard contributors.
+  spdx: BSD-3-Clause
+  url: https://facebook.github.io/zstd/
+  platforms: [macos]
+  note: Zstandard decompression for libtiff; ships alongside it. The .deb takes it from the distribution.
+
+- name: libwebp
+  copyright: Google Inc. and the WebP project contributors.
+  spdx: BSD-3-Clause
+  url: https://developers.google.com/speed/webp/
+  platforms: [macos]
+  note: WebP decompression for libtiff; ships alongside it. The .deb takes it from the distribution.
+
+- name: SQLite
+  copyright: D. Richard Hipp and the SQLite contributors.
+  spdx: blessing
+  url: https://sqlite.org/
+  platforms: [windows]
+  note: Storage for PROJ's coordinate-system database, shipped as sqlite3.dll. macOS and the .deb use the system SQLite.
+
+- name: BLAS and LAPACK (reference implementation)
+  copyright: The University of Tennessee, the University of California Berkeley and the LAPACK contributors.
+  spdx: BSD-3-Clause
+  url: https://www.netlib.org/lapack/
+  platforms: [linux]
+  note: libblas3 and liblapack3, pulled in by the distribution's Ceres and SuiteSparse packages.
+
+- name: VulkanMemoryAllocator
+  copyright: Advanced Micro Devices, Inc. and the VulkanMemoryAllocator contributors.
+  spdx: MIT
+  url: https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+  platforms: [linux, macos, windows]
+  note: Header-only; its implementation is compiled into the GPU backend (engine/src/gpu/vulkan/vma_impl.cpp).
+
+- name: LLVM OpenMP runtime (libomp)
+  copyright: The LLVM Project.
+  spdx: Apache-2.0 WITH LLVM-exception
+  url: https://llvm.org/
+  platforms: [macos, windows]
+
+- name: GNU OpenMP runtime (libgomp)
+  copyright: The GNU Project.
+  spdx: GPL-3.0-or-later WITH GCC-exception-3.1
+  url: https://gcc.gnu.org/
+  platforms: [linux]
+
+- name: GNU C++ runtime (libstdc++, libgcc_s)
+  copyright: The GNU Project.
+  spdx: GPL-3.0-or-later WITH GCC-exception-3.1
+  url: https://gcc.gnu.org/
+  platforms: [linux]
+  note: Bundled in the AppImage; taken from the distribution for the .deb.
+
+- name: GNU Fortran runtime (libgfortran, libquadmath)
+  copyright: The GNU Project.
+  spdx: GPL-3.0-or-later WITH GCC-exception-3.1
+  url: https://gcc.gnu.org/
+  platforms: [linux, macos]
+  note: Run-time support for the Fortran-compiled BLAS/LAPACK kernels inside SuiteSparse and OpenBLAS; bundled with them.
+
+- name: Vulkan Loader
+  copyright: The Khronos Group Inc. and contributors.
+  spdx: Apache-2.0
+  url: https://github.com/KhronosGroup/Vulkan-Loader
+  platforms: [linux, macos, windows]
+  note: Bundled in the macOS app and the AppImage; the .deb and the Windows installer use the system loader when a driver provides one.
+
+- name: MoltenVK
+  copyright: The Brenwill Workshop Ltd. and contributors.
+  spdx: Apache-2.0
+  url: https://github.com/KhronosGroup/MoltenVK
+  platforms: [macos]
+
+- name: pybind11
+  copyright: Wenzel Jakob and the pybind11 contributors.
+  spdx: BSD-3-Clause
+  url: https://github.com/pybind/pybind11
+  platforms: [linux, macos, windows]
+  note: Header-only library compiled into the Python module.
+
+- name: libxcb and the X11 client libraries
+  copyright: The X.Org Foundation and the xcb contributors.
+  spdx: MIT
+  url: https://xcb.freedesktop.org/
+  platforms: [linux]
+  note: Bundled in the AppImage where the desktop stack is not glibc; taken from the distribution for the .deb.
+
+- name: Inter
+  copyright: The Inter Project Authors.
+  spdx: OFL-1.1
+  url: https://rsms.me/inter/
+  platforms: [linux, macos, windows]
+  note: Compiled into the GUI binary; the licence text ships with the application.
+
+- name: JetBrains Mono
+  copyright: JetBrains s.r.o.
+  spdx: OFL-1.1
+  url: https://www.jetbrains.com/lp/mono/
+  platforms: [linux, macos, windows]
+  note: Compiled into the GUI binary; the licence text ships with the application.
+
+- name: Microsoft Visual C++ runtime
+  copyright: Microsoft Corporation.
+  spdx: LicenseRef-Microsoft-Redistributable
+  url: https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+  platforms: [windows]
+  note: Redistributed app-locally under the Microsoft Visual Studio licence terms for redistributable files; no system-wide component is registered.
