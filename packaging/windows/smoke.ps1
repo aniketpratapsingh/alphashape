@@ -529,8 +529,20 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
     # The machine PATH was edited by the machine install only; it must be back to
     # exactly what it was, with no residue of the temporary directory.
     $finalMachinePath = Read-RegistryPath $machinePathKey 'Path'
-    Assert (((Path-Elements $finalMachinePath) -join ';') -eq ((Path-Elements $originalMachinePath) -join ';')) `
-        'the machine PATH did not return to its original value'
+    $machineBefore = @(Path-Elements $originalMachinePath)
+    $machineAfter = @(Path-Elements $finalMachinePath)
+    if (($machineAfter -join ';') -ne ($machineBefore -join ';')) {
+        # Name the elements that differ rather than printing two long strings:
+        # an installer that rewrites unrelated entries usually changes one
+        # character on each of several of them.
+        Write-Host "  before: $($machineBefore.Count) elements, after: $($machineAfter.Count)" -ForegroundColor Yellow
+        for ($i = 0; $i -lt [Math]::Max($machineBefore.Count, $machineAfter.Count); $i++) {
+            $b = if ($i -lt $machineBefore.Count) { $machineBefore[$i] } else { '<none>' }
+            $a = if ($i -lt $machineAfter.Count) { $machineAfter[$i] } else { '<none>' }
+            if ($a -ne $b) { Write-Host "    [$i] '$b' -> '$a'" -ForegroundColor Yellow }
+        }
+        Fail 'the machine PATH did not return to its original value'
+    }
 
     Write-Host "`nWindows installer smoke test passed" -ForegroundColor Green
 } finally {

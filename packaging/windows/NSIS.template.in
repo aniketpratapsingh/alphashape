@@ -308,6 +308,12 @@ FunctionEnd
 ; Windows compares PATH entries, and one trailing backslash is ignored on both
 ; sides because "C:\x\bin" and "C:\x\bin\" name the same directory.
 ;
+; The comparison alone is normalised: every other element is copied into the
+; rebuilt PATH exactly as it was spelled. Writing the normalised form back would
+; rewrite unrelated entries (the machine PATH's many "Program Files\...\" tails
+; among them), and "did not alter other entries" is the property this has to
+; keep. $5 is the element as written, $2 its normalised form for comparison.
+;
 ; Clobbers $1-$8 apart from $PathEntry. On return $3 holds the rebuilt PATH.
 !macro REBUILD_PATH_WITHOUT_ENTRY
   StrCpy $3 ""
@@ -340,16 +346,17 @@ FunctionEnd
       IntOp $7 $7 + 1
     ${Loop}
 
-    ; One trailing backslash is not significant.
-    StrCpy $2 $5 1 -1
-    ${If} $5 != ""
-    ${AndIf} $2 == "\"
-      StrCpy $5 $5 -1
+    ; One trailing backslash is not significant for the comparison only.
+    StrCpy $2 $5
+    StrCpy $1 $2 1 -1
+    ${If} $2 != ""
+    ${AndIf} $1 == "\"
+      StrCpy $2 $2 -1
     ${EndIf}
 
     ${If} $5 == ""
       ; Empty element: drop it rather than keep a doubled separator.
-    ${ElseIf} $5 == $8
+    ${ElseIf} $2 == $8
       StrCpy $9 1
     ${Else}
       ${If} $3 == ""
