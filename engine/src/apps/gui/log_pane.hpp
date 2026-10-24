@@ -63,6 +63,10 @@ public:
     ThemeMode theme_mode() const { return mode_; }
 
     std::size_t line_count() const { return entries_.size(); }
+    /// Lines actually drawn in the widget: the visible subset after the filter. Every line ends
+    /// with a newline, which leaves one trailing empty block in the document, so this is the
+    /// block count minus that block.
+    int visible_line_count() const;
     const std::deque<LogEntry>& entries() const { return entries_; }
     /// The visible text, one line per entry, without level decoration.
     QString plain_text() const;

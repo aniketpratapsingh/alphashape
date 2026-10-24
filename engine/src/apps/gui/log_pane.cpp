@@ -11,6 +11,7 @@
 #include <QStringList>
 #include <QTextCharFormat>
 #include <QTextCursor>
+#include <QTextDocument>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -21,9 +22,10 @@ namespace alphashape::gui {
 
 namespace {
 
-/// Trimmed to what an entry can be at kMaxLines; the widget keeps the same bound so the two
-/// can never disagree.
-constexpr int kMaxBlocks = static_cast<int>(LogView::kMaxLines);
+/// Blocks the widget document may hold: one per kept line, plus the empty block the trailing
+/// newline of the last line leaves behind. A maximum of exactly kMaxLines would trim that extra
+/// block by dropping the oldest line, so the console would show kMaxLines - 1 lines.
+constexpr int kMaxBlocks = static_cast<int>(LogView::kMaxLines) + 1;
 
 QString level_name(LogLevel level) {
     switch (level) {
@@ -46,6 +48,7 @@ LogView::LogView(QWidget* parent) : QPlainTextEdit(parent) {
     setReadOnly(true);
     setUndoRedoEnabled(false);
     setLineWrapMode(QPlainTextEdit::NoWrap);
+    // One block per line plus the trailing empty block; see kMaxBlocks.
     setMaximumBlockCount(kMaxBlocks);
     setCenterOnScroll(false);
     QFont console = QFontDatabase::systemFont(QFontDatabase::FixedFont);
@@ -143,6 +146,16 @@ void LogView::clear_entries() {
     entries_.clear();
     clear();
     Q_EMIT changed();
+}
+
+int LogView::visible_line_count() const {
+    // Every appended line ends with '\n', so the document carries one extra, empty final block.
+    // An empty document has that single empty block and no lines.
+    const int blocks = document()->blockCount();
+    if (blocks <= 1) {
+        return 0;
+    }
+    return blocks - 1;
 }
 
 QString LogView::plain_text() const {

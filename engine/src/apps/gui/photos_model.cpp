@@ -10,7 +10,6 @@
 #include <QGuiApplication>
 #include <QImage>
 #include <QMetaObject>
-#include <QPointer>
 #include <QRunnable>
 #include <QThreadPool>
 
@@ -68,18 +67,26 @@ struct ThumbnailPool {
 };
 
 /// One decode. Runs on the pool thread; posts the result back to the GUI thread.
+///
+/// Lifetime: `owner_` is a bare pointer, never dereferenced after ~ThumbnailCache returned. The
+/// destructor stops the pool and waits for it (pool.clear() then waitForDone()), so every job --
+/// running or queued -- has finished before the cache object dies. That is what makes the raw
+/// pointer safe here: a QPointer would have to be read and constructed from the pool thread,
+/// which is not thread-safe, and its guard is not needed while the destructor already
+/// serialises with the jobs.
+///
+/// The result is delivered with a queued call targeting the cache as its context object: when the
+/// cache is destroyed, Qt discards the still-queued call, so the lambda never runs against a dead
+/// object either.
 struct ThumbnailJob : QRunnable {
-    ThumbnailJob(QPointer<ThumbnailCache> owner, QString path, qint64 mtime, quint64 generation)
-        : owner_(std::move(owner)),
+    ThumbnailJob(ThumbnailCache* owner, QString path, qint64 mtime, quint64 generation)
+        : owner_(owner),
           path_(std::move(path)),
           mtime_(mtime),
           generation_(generation) {}
 
     void run() override {
-        ThumbnailCache* owner = owner_.data();
-        if (owner != nullptr) {
-            owner->off_thread_.store(true);
-        }
+        owner_->off_thread_.store(true);
         QImage thumbnail;
         try {
             thumbnail = make_thumbnail(path_.toStdString());
@@ -90,27 +97,20 @@ struct ThumbnailJob : QRunnable {
             alphashape::log(LogLevel::Debug) << "thumbnail for '" << path_.toStdString()
                                              << "' failed with an unknown error";
         }
-        if (owner == nullptr) {
-            return;  // the cache went away while the decode ran
-        }
-        // Local copies: the lambda must not depend on this job outliving the queued call. The
-        // guarded pointer makes a cache destroyed before the call is delivered a no-op, and the
-        // invoke targets it as the context object as well.
+        // Local copies: the lambda must not depend on this job outliving the queued call.
+        ThumbnailCache* const cache = owner_;
         const QString path = path_;
         const qint64 mtime = mtime_;
         const quint64 generation = generation_;
         QMetaObject::invokeMethod(
-            owner,
-            [guard = QPointer<ThumbnailCache>(owner), path, mtime, generation,
-             thumbnail = std::move(thumbnail)]() {
-                if (ThumbnailCache* cache = guard.data()) {
-                    cache->deliver(path, mtime, generation, thumbnail);
-                }
+            cache,
+            [cache, path, mtime, generation, thumbnail = std::move(thumbnail)]() {
+                cache->deliver(path, mtime, generation, thumbnail);
             },
             Qt::QueuedConnection);
     }
 
-    QPointer<ThumbnailCache> owner_;
+    ThumbnailCache* owner_;
     QString path_;
     qint64 mtime_ = 0;
     quint64 generation_ = 0;
@@ -122,8 +122,9 @@ ThumbnailCache::ThumbnailCache(QObject* parent)
     : QObject(parent), pool_(std::make_unique<ThumbnailPool>()) {}
 
 ThumbnailCache::~ThumbnailCache() {
-    // Jobs post back through a guarded pointer, so the cache could die first; waiting is still
-    // the clean shutdown (and keeps the off-thread flag meaningful for a torn-down cache).
+    // The jobs hold a raw pointer back to this object: stop the queue and wait until every
+    // running decode has returned, which is what makes that pointer safe. Queued deliveries that
+    // had not run yet are dropped by Qt with the object.
     pool_->pool.clear();
     pool_->pool.waitForDone();
 }
@@ -184,8 +185,8 @@ void ThumbnailCache::request(const QString& path, qint64 mtime) {
     entry.mtime = mtime;
     entry.pending = true;
     touch(path);
-    // The job holds a guarded pointer back to this object, so a destroyed cache is safe.
-    pool_->pool.start(new ThumbnailJob(QPointer<ThumbnailCache>(this), path, mtime, generation_));
+    // The destructor waits for the pool, so the job may hold a raw pointer back to this object.
+    pool_->pool.start(new ThumbnailJob(this, path, mtime, generation_));
 }
 
 void ThumbnailCache::deliver(const QString& path, qint64 mtime, quint64 generation,
@@ -233,7 +234,6 @@ void PhotosModel::refresh_after_job() {
     }
     stale_ = false;
     rebuild();
-    Q_EMIT reset_after_job();
 }
 
 void PhotosModel::refresh() {
@@ -319,7 +319,7 @@ void PhotosModel::rebuild() {
                 const QModelIndex changed = index(static_cast<int>(v), 0);
                 Q_EMIT dataChanged(changed, changed,
                                    {Qt::ToolTipRole, Qt::ForegroundRole, AlignedRole,
-                                    EnabledRole, BadgesRole});
+                                    EnabledRole, BadgesRole, BadgeKindsRole});
             }
         }
         return;
@@ -331,10 +331,25 @@ void PhotosModel::rebuild() {
     rows_ = std::move(rows);
     chunk_id_ = chunk_id;
     document_path_ = document_path;
-    beginResetModel();
+    begin_reset();
     rebuild_visible();
-    endResetModel();
+    end_reset();
     request_thumbnails();
+}
+
+// A reset makes every QItemSelectionModel watching this model clear itself and emit
+// selectionChanged from inside endResetModel(). resetting_ stays raised for the whole bracket
+// (the clear happens while end_reset() runs), so a pane can tell a "the model was rebuilt" clear
+// from a user deselecting and re-publish the shared selection afterwards.
+void PhotosModel::begin_reset() {
+    resetting_ = true;
+    beginResetModel();
+}
+
+void PhotosModel::end_reset() {
+    endResetModel();
+    resetting_ = false;
+    Q_EMIT reset_completed();
 }
 
 void PhotosModel::rebuild_visible() {
@@ -360,9 +375,9 @@ void PhotosModel::set_filter(const QString& text) {
         return;
     }
     filter_ = text;
-    beginResetModel();
+    begin_reset();
     rebuild_visible();
-    endResetModel();
+    end_reset();
 }
 
 void PhotosModel::thumbnails_changed(const QString& path) {
@@ -479,6 +494,16 @@ QVariant PhotosModel::data(const QModelIndex& index, int role) const {
                 badges << tr("disabled");
             }
             return badges;
+        }
+        case BadgeKindsRole: {
+            QVariantList kinds;
+            if (!row->aligned) {
+                kinds << static_cast<int>(NotAlignedBadge);
+            }
+            if (!row->enabled) {
+                kinds << static_cast<int>(DisabledBadge);
+            }
+            return kinds;
         }
         case ThumbnailStateRole:
             if (row->path.isEmpty() || thumbnails_->unavailable(row->path)) {

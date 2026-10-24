@@ -29,6 +29,7 @@
 #include <QPlainTextEdit>
 #include <QPixmap>
 #include <QString>
+#include <QTextDocument>
 #include <QToolButton>
 #include <QVariant>
 
@@ -36,12 +37,14 @@
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/photos_model.hpp"
 #include "apps/gui/photos_pane.hpp"
+#include "apps/gui/properties_pane.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "base/utils/log.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/tasks/registry.hpp"
 #include "harness.hpp"
 
 using namespace alphashape;
@@ -71,6 +74,7 @@ protected:
         return *window().findChild<WorkspaceSelection*>("selection.workspace");
     }
     WorkspacePane& tree() { return *widget<WorkspacePane>("pane.workspace"); }
+    PropertiesPane& properties() { return *widget<PropertiesPane>("pane.properties"); }
     Chunk& chunk_ref(std::int32_t id) { return *app().document().workspace().find_chunk(id); }
 
     /// Copies the committed baseline JPEG into the scratch directory under `name`.
@@ -161,10 +165,15 @@ TEST_F(PhotosPaneTest, ModelHasOneRowPerCameraWithBadges) {
     EXPECT_EQ(model().index(0, 0).data(Qt::DisplayRole).toString(), QStringLiteral("IMG_0"));
     EXPECT_TRUE(model().index(0, 0).data(PhotosModel::AlignedRole).toBool());
     EXPECT_TRUE(model().index(0, 0).data(PhotosModel::BadgesRole).toStringList().isEmpty());
+    EXPECT_TRUE(model().index(0, 0).data(PhotosModel::BadgeKindsRole).toList().isEmpty());
     EXPECT_TRUE(model().index(1, 0)
                     .data(PhotosModel::BadgesRole)
                     .toStringList()
                     .contains(QStringLiteral("not aligned")));
+    // The kind travels beside the text, so a delegate picks the colour from an enum rather than
+    // by comparing a translated string.
+    EXPECT_EQ(model().index(1, 0).data(PhotosModel::BadgeKindsRole).toList(),
+              (QVariantList{static_cast<int>(PhotosModel::NotAlignedBadge)}));
     EXPECT_TRUE(model().index(0, 0).data(PhotosModel::EnabledRole).toBool());
 
     // A camera disabled through the document greys out and carries the badge.
@@ -174,6 +183,8 @@ TEST_F(PhotosPaneTest, ModelHasOneRowPerCameraWithBadges) {
     EXPECT_TRUE(disabled.data(PhotosModel::BadgesRole)
                     .toStringList()
                     .contains(QStringLiteral("disabled")));
+    EXPECT_EQ(disabled.data(PhotosModel::BadgeKindsRole).toList(),
+              (QVariantList{static_cast<int>(PhotosModel::DisabledBadge)}));
     EXPECT_TRUE(disabled.data(Qt::ForegroundRole).isValid());
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
@@ -302,6 +313,68 @@ TEST_F(PhotosPaneTest, MissingFilesReportNoPreviewInsteadOfWaiting) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
+TEST_F(PhotosPaneTest, ModelResetKeepsTheSharedSelectionAndProperties) {
+    // The bug: a model reset clears the view's QItemSelectionModel, which emits selectionChanged.
+    // Mirrored blindly, that wiped the shared selection the tree had published, so the tree looked
+    // selected while the Properties sheet went blank. Select a camera in the tree, then rebuild the
+    // photos model both ways that reset it -- a finished job, and an undo that changes the camera
+    // set -- and the shared selection and the Properties sheet must be untouched.
+    const BuiltChunk built = build_chunk(4, /*with_files=*/false);
+    ASSERT_TRUE(tree().select(NodeRef{NodeKind::Camera, built.id, 1}));
+    pump(10);
+    const QList<NodeRef> expected{NodeRef{NodeKind::Camera, built.id, 1}};
+    ASSERT_EQ(selection().items(), expected);
+    ASSERT_EQ(properties().title(), QStringLiteral("IMG_1"));
+    ASSERT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{1}));
+
+    // (a) An undo that changes the camera set. Adding a chunk makes it the active one, so the
+    // photos model rebuilds against another chunk and takes the reset path; undoing switches back
+    // and resets again. Both resets happen through refresh(), not through a job.
+    app().execute(make_add_chunk_command(app().document().workspace(), "Second", -1));
+    pump(10);
+    EXPECT_EQ(selection().items(), expected) << "the first reset wiped the shared selection";
+    EXPECT_EQ(properties().title(), QStringLiteral("IMG_1"));
+    ASSERT_TRUE(app().undo_stack().can_undo());
+    app().undo();
+    pump(10);
+    EXPECT_EQ(selection().items(), expected) << "the undo's model reset wiped the shared selection";
+    EXPECT_EQ(properties().title(), QStringLiteral("IMG_1"));
+    EXPECT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{1}));
+
+    // (b) A reset driven by a finished job. The built-in AddPhotos task adds cameras to the active
+    // chunk, so the row set really changes and the model takes the reset path.
+    {
+        Params params = make_params(builtin_registry().require("AddPhotos"));
+        const std::string dir = ALPHASHAPE_GUI_DATA_DIR;
+        params.set("filenames", ParamValue{std::vector<std::string>{dir + "/cam_a1.jpg",
+                                                                   dir + "/cam_a2.jpg"}});
+        app().jobs().submit("AddPhotos", params, built.id);
+        ASSERT_TRUE(pump_until([this]() { return !app().jobs().busy(); }, 15000));
+        pump(20);
+    }
+    EXPECT_EQ(selection().items(), expected) << "the job's model reset wiped the shared selection";
+    EXPECT_EQ(properties().title(), QStringLiteral("IMG_1"));
+    EXPECT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{1}));
+    EXPECT_EQ(model().total_count(), 6);
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(PhotosPaneTest, FilteringKeepsTheSharedSelectionWhenTheCameraStaysVisible) {
+    // A filter change resets the model too. The selected camera is still listed, so its row comes
+    // back after the reset; the shared selection must survive the bracket.
+    const BuiltChunk built = build_chunk(6, /*with_files=*/false, "DSC_");
+    ASSERT_TRUE(tree().select(NodeRef{NodeKind::Camera, built.id, 3}));
+    pump(10);
+    ASSERT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{3}));
+
+    filter()->setText(QStringLiteral("DSC_"));  // everything still matches
+    pump(10);
+    EXPECT_EQ(selection().items(), (QList<NodeRef>{NodeRef{NodeKind::Camera, built.id, 3}}));
+    EXPECT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(properties().title(), QStringLiteral("DSC_3"));
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
 TEST_F(PhotosPaneTest, ReplacingTheDocumentRebuildsTheList) {
     QAbstractItemModelTester tester(&model(),
                                     QAbstractItemModelTester::FailureReportingMode::Warning);
@@ -399,8 +472,13 @@ TEST_F(LogPaneTest, TheLogKeepsAtMostTheLineCap) {
     EXPECT_EQ(entries.front().text, QStringLiteral("line %1").arg(static_cast<qulonglong>(extra)));
     EXPECT_EQ(entries.back().text,
               QStringLiteral("line %1").arg(static_cast<qulonglong>(LogView::kMaxLines + extra - 1)));
-    // The widget document is bounded the same way, so memory cannot outgrow the cap.
+    // Exactly kMaxLines lines are drawn: the widget's block cap has to allow for the empty block
+    // the trailing newline leaves behind, or the cap would trim one real line.
+    EXPECT_EQ(console->visible_line_count(), static_cast<int>(LogView::kMaxLines));
     EXPECT_LE(console->document()->blockCount(), static_cast<int>(LogView::kMaxLines) + 1);
+    EXPECT_TRUE(console->plain_text().startsWith(QStringLiteral("line 5\n")));
+    EXPECT_TRUE(console->plain_text().endsWith(
+        QStringLiteral("line %1").arg(static_cast<qulonglong>(LogView::kMaxLines + extra - 1))));
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
@@ -480,8 +558,7 @@ TEST_F(Undo, LabelsFollowCommandNames) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
-TEST_F(Undo, MacroIsOneEntry) {
-    QAbstractItemModelTester tester(&model(),
+TEST_F(Undo, MacroIsOneEntry) {    QAbstractItemModelTester tester(&model(),
                                     QAbstractItemModelTester::FailureReportingMode::Warning);
     const BuiltChunk built = build_chunk(4, /*with_files=*/false);
     EXPECT_EQ(app().undo_stack().size(), 0U);
@@ -499,5 +576,35 @@ TEST_F(Undo, MacroIsOneEntry) {
     EXPECT_EQ(app().undo_stack().size(), 1U);
     app().redo();
     EXPECT_EQ(enabled_flags(built), (std::vector<bool>{false, false, false, true}));
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(Undo, AFailedMultiEditLeavesTheUndoStackBalanced) {
+    const BuiltChunk built = build_chunk(4, /*with_files=*/false);
+    // Failures are reported through the pane's handler seam; the default would open a modal box.
+    std::vector<std::pair<QString, QString>> errors;
+    photos().set_error_handler([&errors](const QString& title, const QString& message) {
+        errors.emplace_back(title, message);
+    });
+    // A selection that no longer exists makes the command refuse, so the body of the macro throws
+    // after the group is open. The guard must close it: an open group would refuse every later
+    // undo/redo and keep collecting edits into a transaction that never ends.
+    ASSERT_TRUE(photos().set_cameras_enabled({0, 1}, false));
+    const std::size_t before = app().undo_stack().size();
+    EXPECT_FALSE(photos().set_cameras_enabled({0, 1, 9999}, true));
+    EXPECT_EQ(errors.size(), 1U);
+    EXPECT_FALSE(app().undo_stack().macro_open()) << "the macro was left open after the failure";
+    EXPECT_EQ(app().undo_stack().macro_depth(), 0U);
+    // The refused command never applied, so it added nothing to the history.
+    EXPECT_EQ(app().undo_stack().size(), before);
+    EXPECT_EQ(enabled_flags(built), (std::vector<bool>{false, false, true, true}));
+
+    // The stack is still usable: an ordinary edit and its undo both go through.
+    select_rows({2});
+    ASSERT_TRUE(photos().disable_selected());
+    ASSERT_FALSE(app().undo_stack().macro_open());
+    EXPECT_EQ(app().undo_stack().undo_name(), "Disable photo");
+    app().undo();
+    EXPECT_EQ(enabled_flags(built), (std::vector<bool>{false, false, true, true}));
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }

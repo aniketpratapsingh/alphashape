@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <string>
 #include <utility>
 
 #include <QAbstractItemView>
@@ -22,6 +23,7 @@
 #include <QSize>
 #include <QStyle>
 #include <QStyledItemDelegate>
+#include <QVariant>
 #include <QVBoxLayout>
 
 #include "apps/gui/app.hpp"
@@ -127,14 +129,21 @@ public:
                                              Qt::ElideMiddle, kThumbWidth));
 
         // Badges, right to left along the top of the thumbnail: amber for "not aligned", red
-        // for "disabled", the two states the engine distinguishes.
+        // for "disabled", the two states the engine distinguishes. The kind decides the colour, so
+        // a translation of the text can never be mistaken for the other badge. Text and kind come
+        // from the same role pair and always have the same length.
         const QStringList badges = index.data(PhotosModel::BadgesRole).toStringList();
+        const QVariantList badge_kinds = index.data(PhotosModel::BadgeKindsRole).toList();
         const QFont badge_font = smaller_font(option.font, 2.0, true);
         painter->setFont(badge_font);
         const QFontMetrics badge_metrics(badge_font);
         int right = thumb_area.right() - 2;
-        for (const QString& badge : badges) {
-            const bool aligned_warning = badge == QObject::tr("not aligned");
+        const int badge_count =
+            std::min(static_cast<int>(badges.size()), static_cast<int>(badge_kinds.size()));
+        for (int i = 0; i < badge_count; ++i) {
+            const QString& badge = badges[i];
+            const auto kind = static_cast<PhotosModel::Badge>(badge_kinds[i].toInt());
+            const bool aligned_warning = kind == PhotosModel::NotAlignedBadge;
             const QColor colour = aligned_warning ? Theme::status_warning(theme_.mode())
                                                   : Theme::status_error(theme_.mode());
             const int width = badge_metrics.horizontalAdvance(badge) + 10;
@@ -153,6 +162,40 @@ public:
 
 private:
     Theme& theme_;
+};
+
+/// Pairs GuiApp::begin_macro() with end_macro() for the duration of a scope.
+///
+/// The macro is opened by the constructor and closed by the destructor, so an early return or an
+/// exception thrown by the body can never leave the undo stack with an open group (which would
+/// hold every later edit hostage and refuse undo/redo). If the body threw after some commands
+/// were applied, the destructor still closes the group: those edits become one reversible
+/// transaction that the caller reports as failed, instead of an unbalanced stack.
+class MacroGuard {
+public:
+    MacroGuard(GuiApp& app, const std::string& name) : app_(app) {
+        app_.begin_macro(name);
+        open_ = true;
+    }
+
+    ~MacroGuard() {
+        if (!open_) {
+            return;
+        }
+        // Closing never touches the document (see GuiApp::end_macro), so the exception path is
+        // safe. The catch only covers an unbalanced stack, which cannot happen from here.
+        try {
+            app_.end_macro();
+        } catch (...) {
+        }
+    }
+
+    MacroGuard(const MacroGuard&) = delete;
+    MacroGuard& operator=(const MacroGuard&) = delete;
+
+private:
+    GuiApp& app_;
+    bool open_ = false;
 };
 
 }  // namespace
@@ -222,9 +265,8 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
     view_->addAction(disable_action_);
 
     connect(filter_, &QLineEdit::textChanged, this, [this](const QString& text) {
-        model_->set_filter(text);
+        model_->set_filter(text);  // the reset that follows re-applies the shared selection
         update_summary();
-        on_view_selection_changed();
     });
     connect(view_->selectionModel(), &QItemSelectionModel::selectionChanged, this,
             &PhotosPane::on_view_selection_changed);
@@ -243,8 +285,12 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
         update_actions();
         update_summary();
     });
-    connect(model_, &PhotosModel::reset_after_job, this, [this]() {
-        on_shared_selection_changed();  // put the selection back by identity
+    // Every rebuild (a finished job, an undo that changed the camera set, the filter, a replaced
+    // document) clears the list's selection as part of the reset. Re-apply the shared selection
+    // from the identity the tree and the Properties sheet are holding, the way the Workspace
+    // tree restores its view after its own reset.
+    connect(model_, &PhotosModel::reset_completed, this, [this]() {
+        on_shared_selection_changed();
         update_actions();
         update_summary();
     });
@@ -339,6 +385,12 @@ void PhotosPane::on_view_selection_changed() {
     if (syncing_) {
         return;
     }
+    // A model reset clears the view's selection from inside endResetModel(). That is the rebuild
+    // talking, not the user deselecting: publishing it would wipe the shared selection the tree
+    // (and with it the Properties sheet) is holding. The restore after the reset re-syncs instead.
+    if (model_->resetting()) {
+        return;
+    }
     syncing_ = true;
     const int chunk_id = model_->chunk_id();
     QList<NodeRef> items;
@@ -354,7 +406,9 @@ void PhotosPane::on_shared_selection_changed() {
     if (syncing_) {
         return;
     }
-    // Mirror a camera selection in the tree into the list; anything else clears it.
+    // Mirror a camera selection in the tree into the list; a selection of anything else clears it.
+    // An empty shared selection is not a command to clear the list: the reset above re-syncs from
+    // whatever the tree is holding and leaves an untouched list alone.
     const NodeRef current = selection_.current();
     const bool camera = selection_.has_current() && current.kind == NodeKind::Camera &&
                         current.chunk_id == model_->chunk_id();
@@ -404,14 +458,10 @@ bool PhotosPane::set_cameras_enabled(const std::vector<std::int32_t>& camera_ids
                                     : (enabled ? tr("Enable %1 photos") : tr("Disable %1 photos"))
                                           .arg(count);
     try {
-        app_.begin_macro(name.toStdString());
-        try {
-            app_.execute(make_set_camera_enabled_command(chunk_id, camera_ids, enabled));
-        } catch (...) {
-            app_.end_macro();
-            throw;
-        }
-        app_.end_macro();
+        // One macro for the whole selection: the guard closes it however this function leaves,
+        // so a refused command cannot leave an open group behind.
+        const MacroGuard macro(app_, name.toStdString());
+        app_.execute(make_set_camera_enabled_command(chunk_id, camera_ids, enabled));
         return true;
     } catch (const std::exception& error) {
         report(enabled ? tr("Enable photos") : tr("Disable photos"),

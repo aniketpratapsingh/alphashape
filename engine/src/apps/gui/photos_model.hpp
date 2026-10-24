@@ -105,12 +105,21 @@ class PhotosModel : public QAbstractListModel {
     Q_OBJECT
 
 public:
+    /// The state badges a row can carry. The model publishes them as roles so a view can pick a
+    /// colour from the kind instead of comparing translated text.
+    enum Badge {
+        NotAlignedBadge = 0,  ///< the camera has no pose yet (amber)
+        DisabledBadge,        ///< the user disabled the photo (red)
+    };
+    Q_ENUM(Badge)
+
     enum Role {
         CameraIdRole = Qt::UserRole + 1,  ///< int: the camera's id inside the chunk
         ChunkIdRole,                      ///< int: the camera's chunk id
         AlignedRole,                      ///< bool
         EnabledRole,                      ///< bool
-        BadgesRole,                       ///< QStringList ("not aligned", "disabled")
+        BadgesRole,                       ///< QStringList: the badge texts, in BadgeKindsRole order
+        BadgeKindsRole,                   ///< QVariantList of int(Badge)
         ThumbnailStateRole,               ///< int(ThumbnailState)
     };
 
@@ -146,11 +155,20 @@ public:
     void refresh();
     bool stale() const { return stale_; }
 
+    /// True from beginResetModel() to endResetModel(). A view's QItemSelectionModel clears its
+    /// selection inside that bracket and emits selectionChanged; a pane that mirrors the
+    /// selection into shared state must ignore those clears, because the model is being rebuilt
+    /// rather than the user deselecting.
+    bool resetting() const { return resetting_; }
+
     ThumbnailCache& thumbnails() { return *thumbnails_; }
 
 Q_SIGNALS:
-    /// The model was rebuilt after a job finished.
-    void reset_after_job();
+    /// A structural rebuild finished and the model is consistent again. Every reset (a finished
+    /// job, an undo that changed the camera set, a filter change, a replaced document) ends with
+    /// this; a view's selection was cleared by the reset itself, so a pane re-applies the shared
+    /// selection here.
+    void reset_completed();
 
 private:
     struct Row {
@@ -171,6 +189,9 @@ private:
     void thumbnails_changed(const QString& path);
     const Row* row_at(int visible_row) const;
     QString absolute_path(const QString& document_path, const QString& frame_path) const;
+    /// beginResetModel()/endResetModel() with resetting_ held across both ends.
+    void begin_reset();
+    void end_reset();
 
     GuiApp& app_;
     ThumbnailCache* thumbnails_ = nullptr;
@@ -180,6 +201,7 @@ private:
     std::int32_t chunk_id_ = -1;
     QString document_path_;
     bool stale_ = false;
+    bool resetting_ = false;
 };
 
 }  // namespace alphashape::gui
