@@ -2,7 +2,6 @@
 
 #include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -28,8 +27,12 @@ fs::path path_from_utf8(const std::string& utf8) { return plat::path_from_utf8(u
 std::string path_to_utf8(const fs::path& path) { return plat::path_to_utf8(path); }
 
 std::filesystem::path env_path(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? path_from_utf8(value) : fs::path{};
+    // platform::get_env reads through GetEnvironmentVariableW on Windows, whose
+    // value is UTF-16 and is returned as UTF-8; std::getenv there would hand
+    // back the ANSI-narrowed copy the CRT made at startup, which mangles a
+    // non-ASCII directory.
+    const std::string value = plat::get_env(name);
+    return value.empty() ? fs::path{} : path_from_utf8(value);
 }
 
 bool has_database(const fs::path& dir) {
@@ -87,20 +90,26 @@ struct TempContext {
 };
 
 bool network_requested_by_env() {
-    const char* value = std::getenv("PROJ_NETWORK");
-    if (value == nullptr) {
+    const std::string value = plat::get_env("PROJ_NETWORK");
+    if (value.empty()) {
         return false;
     }
-    return std::strcmp(value, "ON") == 0 || std::strcmp(value, "on") == 0 ||
-           std::strcmp(value, "1") == 0;
+    return value == "ON" || value == "on" || value == "1";
 }
 
-/// Write an environment variable for this process. `overwrite` is separate
-/// from the caller's intent because tests set values before first use.
+/// Write an environment variable for this process.
+///
+/// Both halves are needed on Windows: PROJ is a C library and reads the value
+/// with getenv(), which sees the CRT's copy, while child processes (and the
+/// platform's own get_env) see the Win32 environment. The CRT copy is derived
+/// from the Win32 one at startup and does not follow a later SetEnvironment-
+/// VariableW, so the value is written to both.
 bool set_env(const char* name, const std::string& value,
              [[maybe_unused]] bool overwrite = true) {
 #if defined(_WIN32)
-    return _putenv_s(name, value.c_str()) == 0;
+    const bool crt_ok = _putenv_s(name, value.c_str()) == 0;
+    // Values are UTF-8 here (paths, "OFF", "ON"); the wide writer converts.
+    return plat::set_env(name, value) && crt_ok;
 #else
     return ::setenv(name, value.c_str(), overwrite ? 1 : 0) == 0;
 #endif

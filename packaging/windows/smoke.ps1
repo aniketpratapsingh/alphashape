@@ -104,8 +104,12 @@ function Invoke-Installer([string[]] $arguments) {
 # explicit redirection hands it real handles (which the app must use instead of
 # adopting CONOUT$), and the exit code is read from the process object.
 function Invoke-Captured([string] $exe, [string[]] $arguments, [hashtable] $environment = @{}) {
-    $stdout = New-TemporaryFile
-    $stderr = New-TemporaryFile
+    # Redirect files that do not exist yet: Start-Process writes them itself,
+    # and reusing a file left over from a previous call would append confusion
+    # rather than capture this run.
+    $tag = [guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $env:RUNNER_TEMP "alphashape-smoke-$tag.out"
+    $stderr = Join-Path $env:RUNNER_TEMP "alphashape-smoke-$tag.err"
     $previous = @{}
     foreach ($name in $environment.Keys) {
         $previous[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -113,15 +117,14 @@ function Invoke-Captured([string] $exe, [string[]] $arguments, [hashtable] $envi
     }
     try {
         $process = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru `
-            -RedirectStandardOutput $stdout.FullName -RedirectStandardError $stderr.FullName `
-            -NoNewWindow
-        $out = @(Get-Content -LiteralPath $stdout.FullName -Encoding utf8 -ErrorAction SilentlyContinue)
-        $err = @(Get-Content -LiteralPath $stderr.FullName -Encoding utf8 -ErrorAction SilentlyContinue)
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow
+        $out = @(Get-Content -LiteralPath $stdout -Encoding utf8 -ErrorAction SilentlyContinue)
+        $err = @(Get-Content -LiteralPath $stderr -Encoding utf8 -ErrorAction SilentlyContinue)
     } finally {
         foreach ($name in $environment.Keys) {
             [Environment]::SetEnvironmentVariable($name, $previous[$name])
         }
-        Remove-Item -LiteralPath $stdout.FullName, $stderr.FullName -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{
         ExitCode = $process.ExitCode
