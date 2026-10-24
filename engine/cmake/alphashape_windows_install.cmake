@@ -24,6 +24,15 @@ include(GNUInstallDirs)
 set(ALPHASHAPE_PACKAGING_DIR "${PROJECT_SOURCE_DIR}/../packaging/windows")
 set(ALPHASHAPE_REPO_ROOT "${PROJECT_SOURCE_DIR}/..")
 
+# The installer exists to ship the desktop app. That target is optional, and its
+# absence would otherwise fail much later with a message about a missing Qt
+# version or an unset windeployqt, so it is diagnosed here instead.
+if(NOT ALPHASHAPE_BUILD_GUI)
+    message(FATAL_ERROR
+        "alphashape: ALPHASHAPE_BUILD_INSTALLER=ON needs -DALPHASHAPE_BUILD_GUI=ON; the "
+        "installer lays out bin\\alphashape.exe and its notice file names the Qt it ships.")
+endif()
+
 # ALPHASHAPE_PACKAGE_VERSION lets a release stamp its tag (v0.2.0) into the
 # installer while the source tree keeps its own version. "dev" is what the
 # reusable workflow passes for a plain CI run, and it belongs in no installer's
@@ -31,6 +40,36 @@ set(ALPHASHAPE_REPO_ROOT "${PROJECT_SOURCE_DIR}/..")
 if(NOT ALPHASHAPE_PACKAGE_VERSION OR ALPHASHAPE_PACKAGE_VERSION STREQUAL "dev")
     set(ALPHASHAPE_PACKAGE_VERSION "${PROJECT_VERSION}")
 endif()
+
+# The numeric triple behind the package version. A release version arrives as
+# "v0.2.0" and a nightly as "0.1.0-nightly", neither of which an EXE's
+# FILEVERSION or NSIS's VIProductVersion accepts: strip the tag's leading v,
+# take the numeric prefix, and pad the missing fields with zeros. The same
+# numbers go into the GUI's version resource and into CPack's
+# CPACK_PACKAGE_VERSION_MAJOR/MINOR/PATCH, which the installer template uses.
+string(REGEX REPLACE "^[vV]" "" _alphashape_version_numeric "${ALPHASHAPE_PACKAGE_VERSION}")
+string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" _alphashape_version_numeric "${_alphashape_version_numeric}")
+if(NOT _alphashape_version_numeric)
+    set(_alphashape_version_numeric "${PROJECT_VERSION}")
+endif()
+string(REPLACE "." ";" _alphashape_version_parts "${_alphashape_version_numeric}")
+set(ALPHASHAPE_VERSION_QUADRUPLE "")
+set(_alphashape_version_fields "")
+foreach(_part RANGE 0 3)
+    list(LENGTH _alphashape_version_parts _count)
+    if(_part LESS _count)
+        list(GET _alphashape_version_parts ${_part} _value)
+    else()
+        set(_value 0)
+    endif()
+    list(APPEND _alphashape_version_fields "${_value}")
+    string(APPEND ALPHASHAPE_VERSION_QUADRUPLE "${_value},")
+endforeach()
+string(REGEX REPLACE ",$" "" ALPHASHAPE_VERSION_QUADRUPLE "${ALPHASHAPE_VERSION_QUADRUPLE}")
+list(GET _alphashape_version_fields 0 ALPHASHAPE_VERSION_MAJOR)
+list(GET _alphashape_version_fields 1 ALPHASHAPE_VERSION_MINOR)
+list(GET _alphashape_version_fields 2 ALPHASHAPE_VERSION_PATCH)
+unset(_value)
 
 # The installer's and the shortcuts' icon, rendered from the design-token
 # geometry by packaging/windows/make-ico.py. Generated rather than committed so
@@ -74,33 +113,12 @@ endif()
 # alphashape-gui so the tests and the other platforms' packaging scripts go on
 # naming one file.
 if(ALPHASHAPE_BUILD_GUI AND TARGET alphashape-gui)
-    # The resource's FILEVERSION is a numeric quadruple; a release version like
-    # "v0.2.0" or "0.1.0-nightly" is not. Strip the tag's leading v, take the
-    # numeric prefix and pad to four fields.
-    string(REGEX REPLACE "^[vV]" "" _version_numeric "${ALPHASHAPE_PACKAGE_VERSION}")
-    string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" _version_numeric "${_version_numeric}")
-    if(NOT _version_numeric)
-        set(_version_numeric "${PROJECT_VERSION}")
-    endif()
-    string(REPLACE "." ";" _version_parts "${_version_numeric}")
-    set(_version_rc "")
-    foreach(_part RANGE 0 3)
-        list(LENGTH _version_parts _count)
-        if(_part LESS _count)
-            list(GET _version_parts ${_part} _value)
-        else()
-            set(_value 0)
-        endif()
-        string(APPEND _version_rc "${_value},")
-    endforeach()
-    string(REGEX REPLACE ",$" "" _version_rc "${_version_rc}")
-
     set(ALPHASHAPE_WINDOWS_RC "${CMAKE_BINARY_DIR}/windows/alphashape.rc")
     file(WRITE "${ALPHASHAPE_WINDOWS_RC}"
          "IDI_ICON1 ICON DISCARDABLE \"${ALPHASHAPE_ICON}\"\n"
          "VS_VERSION_INFO VERSIONINFO\n"
-         "FILEVERSION ${_version_rc}\n"
-         "PRODUCTVERSION ${_version_rc}\n"
+         "FILEVERSION ${ALPHASHAPE_VERSION_QUADRUPLE}\n"
+         "PRODUCTVERSION ${ALPHASHAPE_VERSION_QUADRUPLE}\n"
          "BEGIN\n"
          "  BLOCK \"StringFileInfo\"\n"
          "  BEGIN\n"
@@ -110,6 +128,8 @@ if(ALPHASHAPE_BUILD_GUI AND TARGET alphashape-gui)
          "      VALUE \"FileVersion\", \"${ALPHASHAPE_PACKAGE_VERSION}\"\n"
          "      VALUE \"ProductName\", \"alphashape\"\n"
          "      VALUE \"ProductVersion\", \"${ALPHASHAPE_PACKAGE_VERSION}\"\n"
+         "      VALUE \"CompanyName\", \"alphashape contributors\"\n"
+         "      VALUE \"LegalCopyright\", \"GPL-3.0-or-later\"\n"
          "    END\n"
          "  END\n"
          "END\n")
@@ -332,28 +352,122 @@ install(FILES ${ALPHASHAPE_REPO_ROOT}/README.md
 
 string(TIMESTAMP ALPHASHAPE_RELEASE_YEAR "%Y" UTC)
 # Qt's version for the notices, taken from the package that found it so a Qt
-# upgrade cannot leave a stale number behind.
+# upgrade cannot leave a stale number behind. The notices template names these
+# three exactly: a Qt-version line rendered as "Qt " with no number is a licence
+# notice that does not say which Qt it is about, so an unset version is a hard
+# error rather than an empty substitution. (It also catches a template that
+# drifts back to a bare @QT_VERSION@, which CPack does not define.)
 set(ALPHASHAPE_QT_VERSION "${Qt6_VERSION}")
+if(NOT ALPHASHAPE_QT_VERSION MATCHES "^[0-9]+\\.[0-9]+")
+    message(FATAL_ERROR
+        "alphashape: the third-party notices need Qt's version, but Qt6_VERSION is "
+        "'${Qt6_VERSION}'. Configure with the GUI enabled (ALPHASHAPE_BUILD_GUI=ON) so "
+        "find_package(Qt6) records it.")
+endif()
 string(REGEX REPLACE "^([0-9]+)\\..*$" "\\1" ALPHASHAPE_QT_VERSION_MAJOR
        "${ALPHASHAPE_QT_VERSION}")
 string(REGEX REPLACE "^[0-9]+\\.([0-9]+).*$" "\\1" ALPHASHAPE_QT_VERSION_MINOR
        "${ALPHASHAPE_QT_VERSION}")
 configure_file(${ALPHASHAPE_PACKAGING_DIR}/THIRD-PARTY-NOTICES.txt.in
                ${CMAKE_BINARY_DIR}/windows/THIRD-PARTY-NOTICES.txt @ONLY)
+# A placeholder that survived configuration (a misspelt name, or a CPack
+# variable used where a CMake one belongs) would ship a literal "@...@" in a
+# licence file. Fail at configure time instead.
+file(READ ${CMAKE_BINARY_DIR}/windows/THIRD-PARTY-NOTICES.txt _alphashape_notices)
+if(_alphashape_notices MATCHES "@[A-Za-z_][A-Za-z0-9_]*@")
+    message(FATAL_ERROR
+        "alphashape: THIRD-PARTY-NOTICES.txt still contains ${CMAKE_MATCH_0}; the "
+        "template names a variable configure_file did not set.")
+endif()
+unset(_alphashape_notices)
 install(FILES ${CMAKE_BINARY_DIR}/windows/THIRD-PARTY-NOTICES.txt
         DESTINATION LICENSES COMPONENT core)
 
-# Qt is LGPL-3 and links against GPL-3 code paths only when asked to; the licence
-# texts Qt does not have windeployqt copy are copied here. A Qt install without
-# its LICENSES directory (some binary-only packs) is tolerated, the rest is not.
-set(ALPHASHAPE_QT_LICENSE_DIR "${ALPHASHAPE_QT_PREFIX}/../LICENSES" CACHE PATH
+# Qt is LGPL-3: whoever receives the DLLs must receive that licence text, so a
+# Qt install that cannot supply it is a hard error rather than a smaller
+# installer. aqtinstall (what install-qt-action downloads) unpacks Qt's LICENSES
+# directory beside the version's architecture directory; a distro or a hand-built
+# Qt keeps it in the prefix. Both are searched, then the vendored copy under
+# packaging/licenses that ships with this repository.
+set(ALPHASHAPE_QT_LICENSE_DIR "${ALPHASHAPE_QT_PREFIX}/LICENSES" CACHE PATH
     "Qt's LICENSES directory, copied into LICENSES/Qt")
-foreach(_license LGPL-3.0-only.txt GPL-3.0-only.txt GPL-2.0-only.txt)
-    if(EXISTS "${ALPHASHAPE_QT_LICENSE_DIR}/${_license}")
-        install(FILES "${ALPHASHAPE_QT_LICENSE_DIR}/${_license}"
-                DESTINATION LICENSES/Qt COMPONENT gui)
+set(ALPHASHAPE_VENDORED_LICENSE_DIR "${ALPHASHAPE_PACKAGING_DIR}/../licenses")
+foreach(_license LGPL-3.0-only.txt GPL-3.0-only.txt LGPL-2.1-only.txt GPL-2.0-only.txt)
+    set(_license_source "")
+    foreach(_candidate "${ALPHASHAPE_QT_LICENSE_DIR}/${_license}"
+                       "${ALPHASHAPE_QT_PREFIX}/../LICENSES/${_license}"
+                       "${ALPHASHAPE_QT_PREFIX}/../../LICENSES/${_license}"
+                       "${ALPHASHAPE_VENDORED_LICENSE_DIR}/${_license}")
+        if(EXISTS "${_candidate}")
+            set(_license_source "${_candidate}")
+            break()
+        endif()
+    endforeach()
+    if(NOT _license_source)
+        # LGPL-3.0-only is the licence Qt itself is under; the others only cover
+        # modules this installer does not link, so they stay optional.
+        if(_license STREQUAL "LGPL-3.0-only.txt")
+            message(FATAL_ERROR
+                "alphashape: no ${_license} for the shipped Qt. Looked under "
+                "'${ALPHASHAPE_QT_PREFIX}' and in '${ALPHASHAPE_VENDORED_LICENSE_DIR}'. "
+                "Ship the text in packaging/licenses/ rather than producing an installer "
+                "without it.")
+        endif()
+        continue()
+    endif()
+    install(FILES "${_license_source}" DESTINATION LICENSES/Qt COMPONENT gui)
+endforeach()
+
+# ---- third-party licence texts ----------------------------------------------------------------
+# Every port whose runtime DLL is installed above has its licence text beside it
+# in vcpkg's share/<port>/copyright. Copying the whole set rather than a hand
+# list means a DLL cannot be added without its text: the glob follows whatever
+# vcpkg actually installed, and the smoke test asserts the ones known to be
+# shipped today are still there.
+set(ALPHASHAPE_VCPKG_SHARE_DIR "")
+if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+    file(TO_CMAKE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share"
+         ALPHASHAPE_VCPKG_SHARE_DIR)
+endif()
+file(GLOB ALPHASHAPE_THIRD_PARTY_COPYRIGHTS "${ALPHASHAPE_VCPKG_SHARE_DIR}/*/copyright")
+list(LENGTH ALPHASHAPE_THIRD_PARTY_COPYRIGHTS ALPHASHAPE_THIRD_PARTY_COUNT)
+if(ALPHASHAPE_THIRD_PARTY_COUNT EQUAL 0)
+    message(FATAL_ERROR
+        "alphashape: no share/<port>/copyright under '${ALPHASHAPE_VCPKG_SHARE_DIR}'; the "
+        "installer would ship third-party DLLs without their licence texts.")
+endif()
+foreach(_copyright IN LISTS ALPHASHAPE_THIRD_PARTY_COPYRIGHTS)
+    get_filename_component(_port_dir "${_copyright}" DIRECTORY)
+    get_filename_component(_port "${_port_dir}" NAME)
+    install(FILES "${_copyright}"
+            DESTINATION "LICENSES/third-party" RENAME "${_port}.txt" COMPONENT core)
+endforeach()
+message(STATUS "  licences ......... ${ALPHASHAPE_THIRD_PARTY_COUNT} third-party texts")
+
+# libomp is not a vcpkg port here: it comes from the LLVM install beside
+# clang-cl, whose principal licence text is <llvm>/LICENSE.TXT (Apache-2.0 with
+# the LLVM exception). The file name differs between LLVM releases and an
+# install may carry individual licences instead, so candidates are probed and
+# the vendored Apache-2.0 text is the fallback.
+set(ALPHASHAPE_LIBOMP_LICENSE "")
+get_filename_component(ALPHASHAPE_LLVM_PREFIX "${ALPHASHAPE_COMPILER_BIN}" DIRECTORY)
+foreach(_candidate
+        "${ALPHASHAPE_LLVM_PREFIX}/LICENSE.TXT"
+        "${ALPHASHAPE_LLVM_PREFIX}/LICENSE.txt"
+        "${ALPHASHAPE_LLVM_PREFIX}/licenses/Apache-2.0.txt"
+        "${ALPHASHAPE_VENDORED_LICENSE_DIR}/Apache-2.0.txt")
+    if(EXISTS "${_candidate}")
+        set(ALPHASHAPE_LIBOMP_LICENSE "${_candidate}")
+        break()
     endif()
 endforeach()
+if(NOT ALPHASHAPE_LIBOMP_LICENSE)
+    message(FATAL_ERROR
+        "alphashape: libomp.dll is shipped but no Apache-2.0 licence text was found under "
+        "'${ALPHASHAPE_LLVM_PREFIX}' or '${ALPHASHAPE_VENDORED_LICENSE_DIR}'.")
+endif()
+install(FILES "${ALPHASHAPE_LIBOMP_LICENSE}"
+        DESTINATION LICENSES/third-party RENAME "libomp.txt" COMPONENT core)
 
 # The fonts are compiled into alphashape.exe; their OFL texts must ship with it.
 install(FILES ${PROJECT_SOURCE_DIR}/src/apps/gui/fonts/OFL-Inter.txt
@@ -364,6 +478,12 @@ install(FILES ${PROJECT_SOURCE_DIR}/src/apps/gui/fonts/OFL-Inter.txt
 set(CPACK_GENERATOR "NSIS")
 set(CPACK_PACKAGE_NAME "alphashape")
 set(CPACK_PACKAGE_VERSION "${ALPHASHAPE_PACKAGE_VERSION}")
+# NSIS's VIProductVersion takes a four-number quadruple and CPack does not
+# derive one, so the numbers the GUI's version resource already uses are given
+# to CPack as well; the template names them.
+set(CPACK_PACKAGE_VERSION_MAJOR "${ALPHASHAPE_VERSION_MAJOR}")
+set(CPACK_PACKAGE_VERSION_MINOR "${ALPHASHAPE_VERSION_MINOR}")
+set(CPACK_PACKAGE_VERSION_PATCH "${ALPHASHAPE_VERSION_PATCH}")
 set(CPACK_PACKAGE_VENDOR "alphashape")
 set(CPACK_PACKAGE_CONTACT "Aniket Singh <16048767+aniketpratapsingh@users.noreply.github.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Open-source photogrammetry engine")

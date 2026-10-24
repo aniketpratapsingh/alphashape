@@ -32,6 +32,20 @@ Unicode true
 
 Name "@CPACK_NSIS_PACKAGE_NAME@"
 OutFile "@CPACK_TOPLEVEL_DIRECTORY@/@CPACK_OUTPUT_FILE_NAME@"
+
+; Explorer's Details pane and Properties > Details read these. VIProductVersion
+; must be a four-number quadruple, which CPack does not derive, so the numeric
+; triple the build computed is given to CPack as CPACK_PACKAGE_VERSION_MAJOR/
+; MINOR/PATCH and padded here. The free-form VERSION string stays as the tag
+; wrote it (v0.2.0, 0.1.0-nightly).
+VIProductVersion "@CPACK_PACKAGE_VERSION_MAJOR@.@CPACK_PACKAGE_VERSION_MINOR@.@CPACK_PACKAGE_VERSION_PATCH@.0"
+VIAddVersionKey /LANG=1033 "ProductName" "@CPACK_NSIS_DISPLAY_NAME@"
+VIAddVersionKey /LANG=1033 "FileDescription" "alphashape installer"
+VIAddVersionKey /LANG=1033 "FileVersion" "@CPACK_PACKAGE_VERSION@"
+VIAddVersionKey /LANG=1033 "ProductVersion" "@CPACK_PACKAGE_VERSION@"
+VIAddVersionKey /LANG=1033 "CompanyName" "alphashape contributors"
+VIAddVersionKey /LANG=1033 "LegalCopyright" "GPL-3.0-or-later"
+
 ; Per-user by default: no elevation, no administrator password, and the
 ; uninstaller runs without one too. MultiUser overrides this for a per-machine
 ; install.
@@ -79,6 +93,8 @@ SetCompressorDictSize 64
 @CPACK_NSIS_INSTALLER_MUI_ICON_CODE@
 
 Var PerUserDefaultDir
+Var RequestedDir
+Var UninstallDir
 Var PathEntry
 
 ;--------------------------------
@@ -143,19 +159,47 @@ Function .onInit
 
   StrCpy $PerUserDefaultDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
 
+  ; "/D=<dir>" is the one NSIS option applied to $INSTDIR before .onInit runs.
+  ; Everything else is empty here: NSIS applies the InstallDir directive's
+  ; default later, in the UI code (Ui.c), and only when $INSTDIR is not already
+  ; a valid path. ${MULTIUSER_INIT} then reads a previous install's directory
+  ; out of the registry into $INSTDIR, which used to overwrite an explicit /D=
+  ; -- so an unattended install into a chosen directory landed in the old one
+  ; instead. A non-empty $INSTDIR at this point can only have come from /D=, so
+  ; it is remembered and restored after the macro.
+  StrCpy $RequestedDir ""
+  ${If} $INSTDIR != ""
+    StrCpy $RequestedDir "$INSTDIR"
+  ${EndIf}
+
   !insertmacro MULTIUSER_INIT
 
-  ; The mode decides the default directory, but only while the caller has not
-  ; chosen one. $INSTDIR already holds either the InstallDir default, or the
-  ; value a "/D=<dir>" put there before .onInit, or - once an install exists -
-  ; the previous install's directory. Anything that is neither default is
-  ; treated as the caller's and left alone.
-  ${If} $MultiUser.InstallMode == "AllUsers"
-    StrCmp "$INSTDIR" "$PerUserDefaultDir" 0 +2
+  ; Precedence: the caller's /D=, then the directory a previous install
+  ; recorded, then the mode's own default.
+  ;
+  ; $INSTDIR is still "" when there is neither a /D= nor a previous install,
+  ; and NSIS would then apply InstallDir's default -- which is the per-user
+  ; path -- for a per-machine install as well. Setting the default here, from
+  ; the mode actually chosen, is what makes /AllUsers install into
+  ; %ProgramFiles% rather than into the user's own profile.
+  ${If} $RequestedDir != ""
+    StrCpy $INSTDIR $RequestedDir
+  ${ElseIf} $INSTDIR == ""
+    ${If} $MultiUser.InstallMode == "AllUsers"
       StrCpy $INSTDIR "${MACHINE_ROOT}\${INSTALL_DIR_NAME}"
-  ${Else}
-    StrCmp "$INSTDIR" "${MACHINE_ROOT}\${INSTALL_DIR_NAME}" 0 +2
+    ${Else}
       StrCpy $INSTDIR "$PerUserDefaultDir"
+    ${EndIf}
+  ${ElseIf} $MultiUser.InstallMode == "AllUsers"
+    ; A recorded directory of the other mode is not this mode's: an upgrade
+    ; that switches modes starts from this mode's default.
+    ${If} $INSTDIR == "$PerUserDefaultDir"
+      StrCpy $INSTDIR "${MACHINE_ROOT}\${INSTALL_DIR_NAME}"
+    ${EndIf}
+  ${Else}
+    ${If} $INSTDIR == "${MACHINE_ROOT}\${INSTALL_DIR_NAME}"
+      StrCpy $INSTDIR "$PerUserDefaultDir"
+    ${EndIf}
   ${EndIf}
 
   ; A silent install has no components page, so the PATH section cannot be
@@ -172,12 +216,61 @@ Function un.onInit
   ; Same 32-bit-process view as .onInit: the uninstaller must delete the key the
   ; installer wrote, and that is in the native view.
   SetRegView 64
+
+  ; Which install this uninstaller belongs to. ${MULTIUSER_UNINIT} works it out
+  ; from the registry, and because MULTIUSER_INSTALLMODE_DEFAULT_CURRENTUSER is
+  ; compiled in it reads HKCU first: with a per-user and a per-machine copy both
+  ; installed, the machine copy's Uninstall.exe would find the per-user key,
+  ; choose CurrentUser, and delete the wrong tree. This copy's own directory is
+  ; authoritative, so it is saved before the macro (which rewrites $INSTDIR from
+  ; the registry) and put back afterwards.
+  StrCpy $UninstallDir "$INSTDIR"
+  ; NSIS sets $INSTDIR to the uninstaller's own directory (or to the argument of
+  ; "_?=<dir>") and trims the trailing backslash itself, but a directory the
+  ; caller spelled with one would not compare equal to the registry value, so
+  ; both sides are trimmed for safety.
+  StrLen $0 $UninstallDir
+  ${If} $0 > 3
+    StrCpy $1 $UninstallDir 1 -1
+    ${If} $1 == "\"
+      StrCpy $UninstallDir $UninstallDir -1
+    ${EndIf}
+  ${EndIf}
+
   !insertmacro MULTIUSER_UNINIT
+
+  ; The mode is taken from the uninstall key that registered *this* directory:
+  ; the per-user key is not consulted unless its InstallLocation matches, so a
+  ; per-user copy cannot hijack the per-machine uninstaller (and the other way
+  ; round). The context is set directly rather than through
+  ; (un.)MultiUser.InstallMode.*, whose AllUsers branch silently keeps the
+  ; previous mode when the process turns out not to be elevated.
+  StrCpy $0 ""
+  ReadRegStr $1 HKCU "${UNINSTALL_KEY}" "InstallLocation"
+  ${If} $1 == $UninstallDir
+    ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallMode"
+    StrCpy $MultiUser.InstallMode CurrentUser
+    SetShellVarContext current
+  ${Else}
+    ReadRegStr $1 HKLM "${UNINSTALL_KEY}" "InstallLocation"
+    ${If} $1 == $UninstallDir
+      ReadRegStr $0 HKLM "${UNINSTALL_KEY}" "InstallMode"
+      StrCpy $MultiUser.InstallMode AllUsers
+      SetShellVarContext all
+    ${EndIf}
+  ${EndIf}
+
+  ; Whatever the macro decided, this is the tree being removed.
+  StrCpy $INSTDIR $UninstallDir
 FunctionEnd
 
 ;--------------------------------
-; PATH. An NSIS string holds 1024 characters, so a PATH near that limit is left
-; alone with a message instead of being truncated, which would lose entries.
+; PATH. An NSIS string holds 1024 characters, so a PATH near that limit cannot
+; be read into a variable and rewritten without truncating it and losing
+; entries. A PATH in that state is left exactly as it is and the user is told:
+; the registry value itself is fine -- it is this installer's string handling
+; that is bounded. (Reading and rewriting a longer value would need a plugin
+; that edits REG_EXPAND_SZ in place; see packaging/windows/README.md.)
 ;
 ; Both routines walk PATH one element at a time instead of doing string
 ; replacement. Replacement cannot tell an element from a prefix of a longer one
@@ -313,7 +406,15 @@ Function un.RemoveFromPath
 
   StrLen $1 $0
   ${If} $1 > 900
-    DetailPrint "PATH is too long to edit safely; leaving it alone"
+    ; The entry this uninstall would remove cannot be located in a PATH this
+    ; long with an NSIS string, so nothing is edited. Say so: a silent
+    ; uninstall would otherwise leave a stale entry behind with no explanation.
+    IfSilent pathTooLongSilent
+    MessageBox MB_OK|MB_ICONINFORMATION "The PATH environment variable is too long for this \
+uninstaller to edit safely, so $\"$PathEntry$\" has been left in it. Remove it by hand."
+    Goto pathDone
+    pathTooLongSilent:
+    DetailPrint "PATH is too long to edit safely; leaving $PathEntry in it"
     Goto pathDone
   ${EndIf}
 

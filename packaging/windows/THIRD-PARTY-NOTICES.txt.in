@@ -10,14 +10,19 @@ comes with ABSOLUTELY NO WARRANTY.
 This installer contains the following third-party components. They are shipped
 unmodified, as separate files, so they stay replaceable.
 
+Each component's own licence text ships as LICENSES\third-party\<port>.txt,
+verbatim as the package publishes it. Where a component's text is not carried
+by its package (Qt, the LLVM runtime and the bundled fonts) the file name is
+given in that component's entry instead.
 
-Qt @QT_VERSION@ (QtCore, QtGui, QtWidgets, and the platform plugins)
+
+Qt @ALPHASHAPE_QT_VERSION@ (QtCore, QtGui, QtWidgets, and the platform plugins)
 -------------------------------------------------------------------
 Copyright (C) The Qt Company Ltd. and other contributors.
 License: GNU Lesser General Public License, version 3 (LGPL-3).
   Qt is linked dynamically and installed in bin\. You may replace the Qt DLLs
   with a compatible build of Qt; the application will use them.
-  Source: https://download.qt.io/official_releases/qt/@QT_VERSION_MAJOR@.@QT_VERSION_MINOR@/
+  Source: https://download.qt.io/official_releases/qt/@ALPHASHAPE_QT_VERSION_MAJOR@.@ALPHASHAPE_QT_VERSION_MINOR@/
   License texts: LICENSES\Qt\ and https://www.gnu.org/licenses/lgpl-3.0.html
   Qt bundles further components under their own terms; see
   https://doc.qt.io/qt-6/licenses-used-in-qt.html
