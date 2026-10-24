@@ -1,8 +1,9 @@
 ## alphashape @VERSION@
 
 Everything below is generated from the tagged source tree. Every asset was built on
-GitHub-hosted runners, and the published files are the ones a fresh runner re-downloaded
-from this release and exercised before it was published.
+GitHub-hosted runners. The release was created as a draft, a fresh runner on each of the
+three platforms downloaded every file from it, checked the checksums and ran the installer,
+and only then was it published — so the downloads here are the ones that were exercised.
 
 ### Downloads
 

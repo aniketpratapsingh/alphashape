@@ -21,8 +21,9 @@ name: Publish release
 # else from the build artifacts is published -- the Windows artifact also carries PYTHON-ABI.txt
 # and the packaging job's own SHA256SUMS.txt, which are build bookkeeping.
 #
-# Callers must grant the permissions this workflow asks for (a called workflow can only narrow
-# the caller's token): contents: write, id-token: write, attestations: write.
+# Callers must grant the permissions this workflow's jobs ask for -- a called workflow can only
+# narrow the caller's token: contents: write, pull-requests: read (generated release notes),
+# id-token: write and attestations: write (provenance).
 
 on:
   workflow_call:
@@ -41,7 +42,10 @@ on:
         type: boolean
         default: false
       draft:
-        description: Leave the release unpublished
+        description: >-
+          Leave the release unpublished. Every run creates a draft, verifies the downloaded
+          assets and only then publishes; true stops before that last step, which is what a dry
+          run wants.
         required: false
         type: boolean
         default: false
@@ -60,7 +64,6 @@ on:
 # One publisher per tag. A re-run replaces the release, so two concurrent runs for the same tag
 # would race over `gh release delete` + create. The callers set it, because a job that calls a
 # reusable workflow is where `concurrency` is honoured.
-
 jobs:
   publish:
     name: Publish assets
