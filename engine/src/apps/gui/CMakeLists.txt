@@ -71,5 +71,19 @@ qt_add_shaders(alphashape_gui_lib alphashape_shaders
 add_executable(alphashape-gui main.cpp)
 target_link_libraries(alphashape-gui PRIVATE alphashape_gui_lib alphashape_warnings)
 target_compile_definitions(alphashape-gui PRIVATE ALPHASHAPE_GUI_VERSION="${PROJECT_VERSION}")
-# Console subsystem on Windows for now: --help, --version and the smoke run write to stdout.
-# The installer WP switches the shipped binary to a windowed one.
+# Windows gets a GUI subsystem, so starting the app from Explorer or a shortcut
+# does not open a console window beside it. Qt's WinMain (Qt6::EntryPointPrivate,
+# which Qt6::Core pulls in for a WIN32_EXECUTABLE target) calls the main() below,
+# and the shim at the top of main.cpp adopts the parent's console when one
+# launched the process, so --help, --version, --offscreen-smoke and the log stay
+# visible from a terminal. The other platforms have no console subsystem and keep
+# their ordinary executable. Every test that captures this binary's output runs
+# through a pipe, where a GUI-subsystem process has valid inherited handles;
+# engine/tests/gui/test_shell.cpp proves that.
+if(WIN32)
+    set_target_properties(alphashape-gui PROPERTIES WIN32_EXECUTABLE TRUE)
+else()
+    # Explicit rather than left to the default, so a future platform switch does
+    # not silently take the console away from a test that reads stdout.
+    set_target_properties(alphashape-gui PROPERTIES WIN32_EXECUTABLE FALSE)
+endif()

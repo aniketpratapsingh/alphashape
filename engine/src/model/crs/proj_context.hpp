@@ -13,8 +13,10 @@
 ///   1. ALPHASHAPE_PROJ_DATA, if set and valid.
 ///   2. <exe_dir>/share/proj, then <exe_dir>/../share/proj (packaged builds:
 ///      a bundle keeps data beside the binary, an install keeps share/ beside
-///      bin/). On macOS the directory of the image holding this code is tried too, with
-///      ../Resources/share/proj (app bundle executable) and ../share/proj (bundled Python module).
+///      bin/). The directory of the image holding this code is tried too, which
+///      is the Python extension module when Python imported it: on macOS
+///      ../Resources/share/proj (app bundle) and ../share/proj, on Windows
+///      <install>\python\alphashape.pyd -> <install>\share\proj.
 ///   3. <project_source>/../tools/proj-data (the SSD tool layout).
 ///   4. PROJ's own search (proj_context_get_database_path()).
 /// A candidate is valid when it contains proj.db.

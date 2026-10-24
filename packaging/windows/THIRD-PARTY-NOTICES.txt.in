@@ -1,0 +1,76 @@
+THIRD-PARTY NOTICES
+===================
+
+alphashape @ALPHASHAPE_PACKAGE_VERSION@, built @ALPHASHAPE_RELEASE_YEAR@.
+
+alphashape itself is free software under the GNU General Public License,
+version 3 or later. The full text is LICENSES\LICENSE beside this file. It
+comes with ABSOLUTELY NO WARRANTY.
+
+This installer contains the following third-party components. They are shipped
+unmodified, as separate files, so they stay replaceable.
+
+Each component's own licence text ships as LICENSES\third-party\<port>.txt,
+verbatim as the package publishes it. Where a component's text is not carried
+by its package (Qt, the LLVM runtime and the bundled fonts) the file name is
+given in that component's entry instead.
+
+
+Qt @ALPHASHAPE_QT_VERSION@ (QtCore, QtGui, QtWidgets, and the platform plugins)
+-------------------------------------------------------------------
+Copyright (C) The Qt Company Ltd. and other contributors.
+License: GNU Lesser General Public License, version 3 (LGPL-3).
+  Qt is linked dynamically and installed in bin\. You may replace the Qt DLLs
+  with a compatible build of Qt; the application will use them.
+  Source: https://download.qt.io/official_releases/qt/@ALPHASHAPE_QT_VERSION_MAJOR@.@ALPHASHAPE_QT_VERSION_MINOR@/
+  License texts: LICENSES\Qt\ and https://www.gnu.org/licenses/lgpl-3.0.html
+  Qt bundles further components under their own terms; see
+  https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+
+Visual C++ runtime (msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll)
+----------------------------------------------------------------------
+Copyright (C) Microsoft Corporation.
+Redistributed app-locally under the Microsoft Visual Studio licence terms for
+redistributable files. The installer registers no system-wide component and
+needs no separate redistributable package.
+
+
+PROJ
+----
+Copyright (C) PROJ contributors. License: MIT (X/MIT).
+  Ships as proj.dll plus coordinate-system data (proj.db and grid files) under
+  share\proj. https://proj.org/
+
+
+Ceres Solver
+------------
+Copyright (C) Google Inc. and the Ceres Solver contributors.
+License: BSD-3-Clause. https://ceres-solver.org/
+
+
+Eigen
+-----
+Copyright (C) Gaël Guennebaud, Benoît Jacob and contributors.
+License: MPL-2.0 (the shipped headers' licence). https://eigen.tuxfamily.org/
+
+
+libjpeg-turbo, libpng, zlib, libtiff
+------------------------------------
+libjpeg-turbo: BSD-3-Clause and the IJG licence; libpng: libpng licence;
+zlib: zlib licence; libtiff: libtiff licence.
+  https://libjpeg-turbo.org/ https://www.libpng.org/ https://zlib.net/
+  https://libtiff.gitlab.io/libtiff/
+
+
+LLVM libomp
+-----------
+Copyright (C) the LLVM Project. License: Apache-2.0 with the LLVM exception.
+  https://llvm.org/
+
+
+Inter and JetBrains Mono (fonts)
+--------------------------------
+Copyright (C) The Inter Project Authors; JetBrains s.r.o.
+License: SIL Open Font License 1.1. Compiled into alphashape.exe; the licence
+texts are LICENSES\Fonts\OFL-Inter.txt and LICENSES\Fonts\OFL-JetBrainsMono.txt.

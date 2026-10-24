@@ -66,6 +66,22 @@ std::string to_utf8(const std::wstring& wide) { return narrow(wide.c_str(), wide
 std::wstring from_utf8(const std::string& utf8) { return widen(utf8); }
 #endif
 
+std::filesystem::path path_from_utf8(const std::string& utf8) {
+    // u8string, not string: the path's string constructor decodes in the native
+    // narrow encoding, which is the ANSI code page on Windows. The
+    // reinterpret_cast is a view, not a sign change: the engine builds with
+    // -Wsign-conversion -Werror and char -> char8_t is a signedness change.
+    const auto* data = reinterpret_cast<const char8_t*>(utf8.data());
+    return std::filesystem::path(std::u8string(data, utf8.size()));
+}
+
+std::string path_to_utf8(const std::filesystem::path& path) {
+    // u8string returns std::u8string (char8_t) in C++20; the bytes are exactly
+    // the UTF-8 the engine's std::string carries.
+    const std::u8string utf8 = path.u8string();
+    return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+}
+
 std::string get_env(const char* name) {
 #if defined(_WIN32)
     const std::wstring wide_name = from_utf8(name);

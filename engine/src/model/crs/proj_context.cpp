@@ -2,7 +2,6 @@
 
 #include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -10,23 +9,30 @@
 
 #include <proj.h>
 
+#include "base/platform/env.hpp"
+#include "base/platform/paths.hpp"
 #include "base/utils/log.hpp"
-
-#ifdef __APPLE__
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-#elif defined(__linux__)
-#include <unistd.h>
-#endif
 
 namespace alphashape::crs {
 namespace {
 
 namespace fs = std::filesystem;
+namespace plat = platform;
+
+/// Paths in the engine are UTF-8 (base/platform/env.hpp); PROJ is a C library
+/// and takes UTF-8 too, so the only conversion needed is between a path and
+/// that encoding. path::string() would narrow with the ANSI code page on
+/// Windows, which mangles an install directory such as "C:\Users\Jörg\...".
+fs::path path_from_utf8(const std::string& utf8) { return plat::path_from_utf8(utf8); }
+std::string path_to_utf8(const fs::path& path) { return plat::path_to_utf8(path); }
 
 std::filesystem::path env_path(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? fs::path(value) : fs::path{};
+    // platform::get_env reads through GetEnvironmentVariableW on Windows, whose
+    // value is UTF-16 and is returned as UTF-8; std::getenv there would hand
+    // back the ANSI-narrowed copy the CRT made at startup, which mangles a
+    // non-ASCII directory.
+    const std::string value = plat::get_env(name);
+    return value.empty() ? fs::path{} : path_from_utf8(value);
 }
 
 bool has_database(const fs::path& dir) {
@@ -38,43 +44,30 @@ bool has_database(const fs::path& dir) {
 }
 
 std::filesystem::path executable_directory() {
-#ifdef __APPLE__
-    uint32_t size = 0;
-    if (_NSGetExecutablePath(nullptr, &size) != -1 || size == 0) {
-        return {};
-    }
-    std::string buffer(size, '\0');
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+    const std::string exe = plat::executable_path();
+    if (exe.empty()) {
         return {};
     }
     std::error_code ec;
-    return fs::weakly_canonical(fs::path(buffer.c_str()), ec).parent_path();
-#elif defined(__linux__)
-    std::error_code ec;
-    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    return ec ? fs::path{} : exe.parent_path();
-#else
-    return {};
-#endif
+    // weakly_canonical resolves symlinks (a Homebrew or distro bin/ link) and
+    // leaves a not-yet-existing tail alone; it never throws here.
+    return fs::weakly_canonical(path_from_utf8(exe), ec).parent_path();
 }
 
-#ifdef __APPLE__
-/// Directory of the Mach-O image this code is linked into (the executable, or the Python
+/// Directory of the image this code is linked into (the executable, or the Python
 /// extension module inside somebody else's interpreter).
 std::filesystem::path image_directory() {
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<const void*>(&image_directory), &info) == 0 ||
-        info.dli_fname == nullptr) {
+    const std::string image = plat::module_path(reinterpret_cast<const void*>(&image_directory));
+    if (image.empty()) {
         return {};
     }
     std::error_code ec;
-    return fs::weakly_canonical(fs::path(info.dli_fname), ec).parent_path();
+    return fs::weakly_canonical(path_from_utf8(image), ec).parent_path();
 }
-#endif
 
 std::filesystem::path source_root() {
 #ifdef ALPHASHAPE_PROJECT_SOURCE_DIR
-    return fs::path(ALPHASHAPE_PROJECT_SOURCE_DIR);
+    return path_from_utf8(ALPHASHAPE_PROJECT_SOURCE_DIR);
 #else
     return {};
 #endif
@@ -97,20 +90,26 @@ struct TempContext {
 };
 
 bool network_requested_by_env() {
-    const char* value = std::getenv("PROJ_NETWORK");
-    if (value == nullptr) {
+    const std::string value = plat::get_env("PROJ_NETWORK");
+    if (value.empty()) {
         return false;
     }
-    return std::strcmp(value, "ON") == 0 || std::strcmp(value, "on") == 0 ||
-           std::strcmp(value, "1") == 0;
+    return value == "ON" || value == "on" || value == "1";
 }
 
-/// Write an environment variable for this process. `overwrite` is separate
-/// from the caller's intent because tests set values before first use.
+/// Write an environment variable for this process.
+///
+/// Both halves are needed on Windows: PROJ is a C library and reads the value
+/// with getenv(), which sees the CRT's copy, while child processes (and the
+/// platform's own get_env) see the Win32 environment. The CRT copy is derived
+/// from the Win32 one at startup and does not follow a later SetEnvironment-
+/// VariableW, so the value is written to both.
 bool set_env(const char* name, const std::string& value,
              [[maybe_unused]] bool overwrite = true) {
 #if defined(_WIN32)
-    return _putenv_s(name, value.c_str()) == 0;
+    const bool crt_ok = _putenv_s(name, value.c_str()) == 0;
+    // Values are UTF-8 here (paths, "OFF", "ON"); the wide writer converts.
+    return plat::set_env(name, value) && crt_ok;
 #else
     return ::setenv(name, value.c_str(), overwrite ? 1 : 0) == 0;
 #endif
@@ -185,19 +184,28 @@ ResolvedDataDir resolve_data_directory(const DataSearchOptions& options) {
         accept(opts.exe_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative)) {
         return resolved;
     }
-#ifdef __APPLE__
-    // App bundle: Contents/MacOS/<exe> finds Contents/Resources/share/proj; the Python module in
-    // Contents/Resources/python finds Contents/Resources/share/proj through its parent.
+    // The Python module is not next to the executable: the Windows installer
+    // keeps it in <install>\python\alphashape.pyd, so its own directory's
+    // parent is the install root. Reached through the image containing this
+    // code, which is the module when Python imported it and the executable
+    // otherwise (in which case the two steps above already decided).
     {
         const fs::path image_dir = image_directory();
-        if (!image_dir.empty() &&
-            (accept(image_dir.parent_path() / "Resources" / "share" / "proj", SearchStep::ExeRelative) ||
-             accept(image_dir / "share" / "proj", SearchStep::ExeRelative) ||
-             accept(image_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative))) {
-            return resolved;
+        if (!image_dir.empty()) {
+#ifdef __APPLE__
+            // App bundle: Contents/MacOS/<exe> finds Contents/Resources/share/proj; the Python
+            // module in Contents/Resources/python finds it through the bundle's Resources.
+            if (accept(image_dir.parent_path() / "Resources" / "share" / "proj",
+                       SearchStep::ExeRelative)) {
+                return resolved;
+            }
+#endif
+            if (accept(image_dir.parent_path() / "share" / "proj", SearchStep::ExeRelative) ||
+                accept(image_dir / "share" / "proj", SearchStep::ExeRelative)) {
+                return resolved;
+            }
         }
     }
-#endif
     if (!opts.project_source.empty()) {
         const fs::path tool_dir =
             opts.project_source.parent_path() / "tools" / "proj-data";
@@ -209,7 +217,9 @@ ResolvedDataDir resolve_data_directory(const DataSearchOptions& options) {
         TempContext temp;
         const char* database = proj_context_get_database_path(temp.ctx);
         if (database != nullptr && *database != '\0') {
-            const fs::path dir = fs::path(database).parent_path();
+            // PROJ reports UTF-8 (it converts to wide internally on Windows), so
+            // the string must not go through the ANSI-decoding constructor.
+            const fs::path dir = path_from_utf8(database).parent_path();
             if (accept(dir, SearchStep::ProjDefault)) {
                 return resolved;
             }
@@ -242,8 +252,8 @@ ProjDataInfo proj_data_info() {
     TempContext temp;
     const char* database = proj_context_get_database_path(temp.ctx);
     if (database != nullptr && *database != '\0') {
-        info.database_path = database;
-        info.search_directory = fs::path(database).parent_path();
+        info.database_path = path_from_utf8(database);
+        info.search_directory = info.database_path.parent_path();
     }
     const char* version = proj_context_get_database_metadata(temp.ctx, "PROJ.VERSION");
     if (version != nullptr) {
@@ -295,7 +305,9 @@ void configure_context(PJ_CONTEXT* ctx) {
     }
     const fs::path& dir = environment_state().data_dir;
     if (!dir.empty()) {
-        const std::string value = dir.string();
+        // PROJ takes UTF-8 paths; path::string() would narrow with the ANSI code
+        // page on Windows and the search path would not match any file.
+        const std::string value = path_to_utf8(dir);
         const char* paths[1] = {value.c_str()};
         proj_context_set_search_paths(ctx, 1, paths);
     }
@@ -348,13 +360,15 @@ std::filesystem::path proj_context_initialize() {
             // choice is stable across a process tree even when it was made by
             // the exe-relative or tools/proj-data step rather than by the
             // caller's environment.
-            set_env("PROJ_DATA", resolved.path.string());
-            set_env("ALPHASHAPE_PROJ_DATA", resolved.path.string());
-            log(LogLevel::Info) << "PROJ data: " << resolved.path << " ("
+            set_env("PROJ_DATA", path_to_utf8(resolved.path));
+            set_env("ALPHASHAPE_PROJ_DATA", path_to_utf8(resolved.path));
+            // path's own operator<< narrows with the native encoding, so a log
+            // line about a non-ASCII directory would be mojibake on Windows.
+            log(LogLevel::Info) << "PROJ data: " << path_to_utf8(resolved.path) << " ("
                                 << search_step_name(resolved.step) << ")";
             if (!override_dir.empty() && resolved.step != SearchStep::EnvOverride) {
                 log(LogLevel::Warn)
-                    << "ALPHASHAPE_PROJ_DATA=" << override_dir
+                    << "ALPHASHAPE_PROJ_DATA=" << path_to_utf8(override_dir)
                     << " has no proj.db; ignored";
             }
         }
@@ -400,11 +414,10 @@ std::string describe_environment() {
         text += ")";
     }
     text += "\n  data dir: ";
-    text += env.data_dir.empty() ? std::string("(not resolved)")
-                                 : env.data_dir.string();
+    text += env.data_dir.empty() ? std::string("(not resolved)") : path_to_utf8(env.data_dir);
     text += "\n  proj.db: ";
     text += info.database_path.empty() ? std::string("(missing)")
-                                       : info.database_path.string();
+                                       : path_to_utf8(info.database_path);
     text += "\n  network: ";
     text += env.network ? "on" : "off (offline)";
     return text;

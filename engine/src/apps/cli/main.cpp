@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "base/platform/console.hpp"
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
@@ -188,7 +189,12 @@ int run_gpu_info() {
 int run_proj_info() {
     const alphashape::crs::ProjDataInfo info = alphashape::crs::proj_data_info();
     std::printf("proj %s\n", alphashape::crs::proj_version().c_str());
-    std::printf("proj database: %s\n", info.database_path.string().c_str());
+    // printf takes bytes, so the path is converted to UTF-8 rather than
+    // narrowed with the ANSI code page: an install under "C:\Users\Jörg\..."
+    // would otherwise print mojibake and the smoke test's comparison against
+    // the install directory would fail.
+    std::printf("proj database: %s\n",
+                alphashape::platform::path_to_utf8(info.database_path).c_str());
     return info.database_path.empty() ? 1 : 0;
 }
 

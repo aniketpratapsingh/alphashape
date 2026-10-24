@@ -421,6 +421,46 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   installer. `WP-29.3` owns numeric parity: the 710 passing tests include every
   accuracy bound unchanged — **no bound was widened for Windows**.
 
+### Windows installer (M29 WP-29.7)
+
+- **Unsigned.** There is no code-signing certificate, so SmartScreen shows its
+  "unrecognised app" warning on first run of the installer and of
+  `alphashape.exe`. `packaging/windows/README-smartscreen.md` says what that
+  means and how to verify the download against the published SHA-256.
+- **The GUI is a Windows-subsystem binary**, so a shortcut or Explorer launch
+  opens no console window beside it. It is not silent: when a console started
+  it, `main()` adopts that console (`AttachConsole(ATTACH_PARENT_PROCESS)` plus
+  a `CONOUT$` reopen), so `--help`, `--version`, `--offscreen-smoke` and the log
+  stay visible from a command prompt. A redirection handed to the process
+  (`Start-Process -RedirectStandardOutput`, `prog > file`) is used as given
+  rather than replaced with the console. The other platforms keep a
+  console-subsystem executable.
+- **The Python module is built against the runner's `actions/setup-python`
+  3.12**, not against whatever interpreter vcpkg happens to provide: the
+  packaging configure is given `-DPython3_ROOT_DIR=$env:pythonLocation`,
+  `-DPython3_FIND_STRATEGY=LOCATION` and `-DPython3_FIND_REGISTRY=NEVER`, so the
+  shipped `alphashape.cp312-win_amd64.pyd` is a python.org 3.12 build. A user
+  needs CPython 3.12 to import it. `dist/PYTHON-ABI.txt` records the exact
+  version, the packaging job fails if the configured version differs from the
+  interpreter it was pointed at, and the smoke job installs that same minor
+  before importing. A bundled standalone interpreter (so the module works with
+  no Python installed at all) is a later improvement and is not in this WP.
+- **No server or worker component.** The installer ships the GUI, the CLI and
+  the Python module; the distributed worker is Phase 14.
+- **No GPU path in the Windows build**, so the installer ships no Vulkan loader
+  or ICD (WP-29.2).
+- **Component selection is coarse:** deselecting the desktop app still installs
+  the shared runtime, PROJ data and licences (the required `core` component),
+  and no per-component record is kept, so a later installer cannot remember the
+  previous selection. Uninstall removes everything that was staged.
+- **PROJ ships `proj.db` but no grids.** vcpkg's `proj` port bundles the
+  database and not the grid files, so the installer's grid set is empty and a
+  transform that needs a geoid model fails offline with PROJ's "grid not found"
+  rather than downloading (which is deliberate: `PROJ_NETWORK` is forced off).
+  The size cap that would apply is 32 MiB per file and 64 MiB in total, smallest
+  first, and the configure says which case it took. `ALPHASHAPE_PROJ_DATA` can be
+  pointed at a full `proj-data` directory to supply them.
+
 ## M11 — Multi-instance containers (WP-11.1 / WP-11.2)
 
 - **Every container is now persisted (WP-11.3).** Markers, marker groups, scale

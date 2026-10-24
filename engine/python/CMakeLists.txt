@@ -22,7 +22,21 @@ target_link_libraries(alphashape_python PRIVATE
 
 set_target_properties(alphashape_python PROPERTIES
     OUTPUT_NAME alphashape
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+    # LIBRARY_OUTPUT_DIRECTORY is where a .so goes; a Windows .pyd is a DLL-like
+    # module and CMake places it via RUNTIME_OUTPUT_DIRECTORY. Both are set to
+    # build/python so the module is in one known place on every platform (the
+    # tests below, packaging, and the installer all look there).
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+
+# The .pyd/.so is loadable only by the CPython it was built against, and its
+# file name carries no ABI tag off Linux. Packaging publishes this next to the
+# installer so the smoke test can install the same interpreter instead of
+# guessing one. Written from Python3_VERSION, which is the version pybind11 and
+# the extension itself were configured with.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/dist)
+file(WRITE ${CMAKE_BINARY_DIR}/dist/PYTHON-ABI.txt "${Python3_VERSION}\n")
+message(STATUS "  python module ..... alphashape for Python ${Python3_VERSION}")
 
 # ---------------------------------------------------------------------------
 # Tests. TESTS=OFF (the default for this build) suppresses the C++ suite in

@@ -28,13 +28,32 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Same asset selection as release.yml: the Windows artifacts carry build
+      # bookkeeping (PYTHON-ABI.txt, payload.txt, the packaging job's own
+      # SHA256SUMS.txt) that must not be published, so only the three platform
+      # artifacts are collected and the Windows one is filtered to .exe/.zip.
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: alphashape-*
+          pattern: alphashape-linux-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: alphashape-macos-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-windows-x86_64
+          path: dist-windows
+      - name: Collect the Windows assets
+        run: |
+          find dist-windows -name '*.exe' -exec cp {} dist/ \;
+          find dist-windows -name '*.zip' -exec cp {} dist/ \;
+          rm -rf dist-windows
+          ls -lh dist
       - name: Checksums
-        run: cd dist && sha256sum -- * > SHA256SUMS && ls -lh
+        run: cd dist && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS && ls -lh
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}

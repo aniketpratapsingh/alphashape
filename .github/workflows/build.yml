@@ -373,6 +373,13 @@ jobs:
     continue-on-error: ${{ !inputs.windows-required }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      # pybind11 and its python3 port are absent on purpose: that port ships a
+      # vcpkg-cmake-wrapper which forces its own Python headers and libraries
+      # into find_package(Python3) whenever Development.Module is requested, so
+      # the .pyd could only ever be built for vcpkg's interpreter. The packaging
+      # step installs pybind11's headers into the setup-python interpreter
+      # instead (`pip install pybind11`), which is the one the installer is
+      # supposed to carry a module for.
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
       - uses: actions/checkout@v4
@@ -420,6 +427,9 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          # The Python module and the installer are configured later, in the
+          # Package step: this configuration is what the test lanes unpack, so it
+          # stays exactly what it always was.
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
@@ -476,12 +486,264 @@ jobs:
           Copy-Item README.md, LICENSE, engine\LIMITATIONS.md "dist\$name\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
 
+      # NSIS installer. The configure above deliberately leaves the Python module
+      # and the install rules off, so the test lanes unpack exactly the tree they
+      # always did; this step turns both on in the same build directory (object
+      # files survive, only the module and the installer's inputs are new).
+      - name: Package (NSIS installer)
+        if: inputs.package
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          # The module is built against the interpreter actions/setup-python
+          # installed earlier in this job (3.12), not against whatever else is
+          # on the image: a .pyd is loadable only by the CPython whose ABI it
+          # was compiled for, and the smoke job installs the version in
+          # PYTHON-ABI.txt, so the two must be the same interpreter family.
+          #
+          # pybind11 comes from pip for the same reason. The vcpkg port is not
+          # installed (see VCPKG_PACKAGES above) because its python3 port's
+          # CMake wrapper replaces the Development.Module result with vcpkg's
+          # own interpreter, which is exactly the mismatch this step exists to
+          # prevent.
+          if (-not $env:pythonLocation) { throw 'pythonLocation is not set; actions/setup-python must run before the package step' }
+          $python = Join-Path $env:pythonLocation 'python.exe'
+          if (-not (Test-Path -LiteralPath $python)) { throw "no python.exe under $env:pythonLocation" }
+          & $python -m pip install --disable-pip-version-check --no-input pybind11==2.13.6
+          if ($LASTEXITCODE -ne 0) { throw 'pip install pybind11 failed' }
+          $pybind11Dir = (& $python -c "import pybind11, sys; sys.stdout.write(pybind11.get_cmake_dir())").Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $pybind11Dir 'pybind11Config.cmake'))) {
+            throw "pybind11's CMake package was not found at '$pybind11Dir'"
+          }
+          & $python -c "import sys; print('packaging with Python ' + sys.version.split()[0])"
+          cmake -S engine -B build `
+            -DALPHASHAPE_BUILD_PYTHON=ON -DALPHASHAPE_BUILD_INSTALLER=ON `
+            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}" `
+            "-DPython3_ROOT_DIR=$env:pythonLocation" `
+            -DPython3_FIND_STRATEGY=LOCATION -DPython3_FIND_REGISTRY=NEVER `
+            "-DPython3_EXECUTABLE=$python" `
+            "-Dpybind11_DIR=$pybind11Dir"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # engine/python/CMakeLists.txt writes dist/PYTHON-ABI.txt: the version
+          # the module was configured against, which the smoke job installs.
+          $abi = (Get-Content build/dist/PYTHON-ABI.txt -Raw).Trim()
+          "module built for Python $abi"
+          $expected = (& $python -c "import sys; print(str(sys.version_info[0]) + '.' + str(sys.version_info[1]) + '.' + str(sys.version_info[2]))").Trim()
+          if ($abi -ne $expected) {
+            throw "the module was configured for Python $abi, but $python is $expected"
+          }
+          # The module is new; the GUI relinks because the install rules add its
+          # icon and version resource to it. Everything else is already built.
+          cmake --build build --target alphashape_python alphashape-gui
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # NSIS ships on the runner image (Program Files (x86)\NSIS, on PATH via
+          # the image's machine Path). CPack fails with a clear message if not.
+          # The output directory comes from CPACK_OUTPUT_FILE_PREFIX in the
+          # generated CPackConfig.cmake (build/dist), so -B is not repeated here.
+          cpack --config build/CPackConfig.cmake -G NSIS
+          if ($LASTEXITCODE -ne 0) {
+            # CPack writes the compiler's own output next to the generated
+            # script; print it, because "Problem running NSIS command" alone
+            # does not say which line failed.
+            Get-ChildItem build/_CPack_Packages -Recurse -Filter NSISOutput.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "---- $($_.FullName)"; Get-Content $_.FullName }
+            exit 1
+          }
+          $installer = Get-ChildItem build/dist -Filter *.exe
+          if (-not $installer) { throw 'cpack produced no installer in build/dist' }
+          $installer | ForEach-Object {
+            "installer: $($_.Name)  $([math]::Round($_.Length / 1MB, 1)) MB"
+          }
+          # Flat, beside the .zip, so the artifact upload and every consumer
+          # have one directory to look in.
+          Copy-Item build/dist/*.exe dist/
+          Copy-Item build/dist/PYTHON-ABI.txt dist/
+
       - uses: actions/upload-artifact@v4
         if: inputs.package
         with:
           name: alphashape-windows-x86_64
-          path: dist/*.zip
+          # CPack writes the installer and PYTHON-ABI.txt into build/dist;
+          # copy them up so the artifact has one flat top level and every
+          # consumer can look for *.exe in one place.
+          path: |
+            dist/*.zip
+            dist/*.exe
+            dist/PYTHON-ABI.txt
           if-no-files-found: error
+
+  # The installer is attested here: SHA-256 for the download instructions in
+  # packaging/windows/README-smartscreen.md, a listing of what the payload
+  # actually contains, and the size budget.
+  windows-package:
+    name: Windows installer
+    needs: windows
+    if: inputs.package && !cancelled()
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      MAX_INSTALLER_MB: "350"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      # upload-artifact stores everything relative to the uploaded files' common
+      # ancestor. The build job uploads only "dist/..." now, so that ancestor is
+      # dist/ and the entries are bare file names: downloading into dist/
+      # reproduces the layout the rest of this job looks for.
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-windows-x86_64
+          path: dist
+
+      # 7-Zip reads inside the NSIS installer, so this is the payload as
+      # CPack and windeployqt actually produced it rather than what a build log
+      # claims they staged. 7zip is on the runner image; the install path is
+      # probed because the image does not always put it on PATH.
+      - name: Payload breakdown
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+            foreach ($candidate in 'C:\Program Files\7-Zip\7z.exe',
+                                   'C:\Program Files (x86)\7-Zip\7z.exe') {
+              if (Test-Path -LiteralPath $candidate) { $sevenZip = $candidate; break }
+            }
+          }
+          if (-not $sevenZip) { throw '7z.exe not found on the runner image' }
+          $installerFile = Get-ChildItem dist -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $installerFile) { throw 'no installer artifact' }
+          # The download size, which is what the 350 MB budget is about, plus the
+          # install size a user ends up with.
+          $mb = $installerFile.Length / 1MB
+          "installer: {0} {1:N1} MB (budget {2} MB)" -f $installerFile.Name, $mb, $env:MAX_INSTALLER_MB
+          if ($mb -gt [double]$env:MAX_INSTALLER_MB) {
+            throw ("installer is {0:N1} MB, over the {1} MB budget" -f $mb, $env:MAX_INSTALLER_MB)
+          }
+
+          # -slt prints one "Path = ..." line per payload entry, which is stable
+          # across 7-Zip versions; the columnar listing is not. 7-Zip reports the
+          # paths with '/' separators, relative to the install root, so they are
+          # normalised before comparing (checked against a real installer: the
+          # output is "bin/alphashape.exe", "python/alphashape.pyd", ...).
+          $raw = & $sevenZip l -slt $installerFile.FullName | ForEach-Object {
+            if ($_ -match '^Path = (.*)$') { $Matches[1] }
+          }
+          $paths = @($raw | ForEach-Object { $_.Replace('\', '/') })
+          $paths | Set-Content -Encoding ascii payload.txt
+          "payload: $($paths.Count) entries"
+          $dlls = @($paths | Where-Object { $_ -like '*.dll' })
+          "payload DLLs: $($dlls.Count)"
+          $paths | Where-Object { $_ -like 'bin/Qt6*' } | Select-Object -First 6
+          if ($dlls.Count -lt 20) {
+            throw "only $($dlls.Count) DLLs in the payload; Qt or the vcpkg runtime did not deploy"
+          }
+          foreach ($required in 'bin/platforms/qwindows.dll', 'bin/platforms/qoffscreen.dll',
+                                'bin/alphashape.exe', 'bin/alphashape-cli.exe',
+                                'share/proj/proj.db', 'LICENSES/LICENSE',
+                                'LICENSES/THIRD-PARTY-NOTICES.txt',
+                                'LICENSES/Qt/LGPL-3.0-only.txt') {
+            if (-not ($paths | Where-Object { $_ -like "*$required" })) {
+              throw "$required is not in the installer payload"
+            }
+          }
+          # The licence texts of the shipped third-party runtime. The glob at
+          # configure time copies whatever vcpkg installed; these are the ports
+          # known to be in the payload today, so losing one would mean the glob
+          # stopped following vcpkg rather than that a port was removed.
+          foreach ($port in 'libjpeg-turbo', 'tiff', 'libpng', 'proj', 'ceres', 'libomp') {
+            $want = "LICENSES/third-party/$port.txt"
+            if (-not ($paths | Where-Object { $_ -like "*$want" })) {
+              throw "$want is not in the installer payload"
+            }
+          }
+          $licences = @($paths | Where-Object { $_ -like 'LICENSES/third-party/*.txt' })
+          "payload third-party licences: $($licences.Count)"
+          if ($licences.Count -lt 8) {
+            throw "only $($licences.Count) third-party licence texts; the vcpkg share glob did not run"
+          }
+          # The module ships under the ABI-tagged name CMake gives it
+          # (alphashape.cp312-win_amd64.pyd), so the tag is matched rather than
+          # a fixed file name.
+          if (-not ($paths | Where-Object { $_ -like 'python/alphashape*.pyd' })) {
+            throw 'the Python module is not in the installer payload'
+          }
+          $pyd = ($paths | Where-Object { $_ -like 'python/alphashape*.pyd' } | Select-Object -First 1)
+          "payload python module: $pyd"
+          "payload contains every expected file"
+
+      - name: SHA-256
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Filter *.exe -Recurse | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Tee-Object -FilePath dist/SHA256SUMS.txt -Append
+          }
+          Get-Content dist/SHA256SUMS.txt
+          # The ABI file the smoke job needs to pick its interpreter; it comes
+          # from the build job's artifact and is republished here so the smoke
+          # job downloads one artifact, not two.
+          $abi = Get-ChildItem dist -Filter PYTHON-ABI.txt -Recurse | Select-Object -First 1
+          if (-not $abi) { throw 'PYTHON-ABI.txt did not survive the build artifact' }
+          "python ABI: $((Get-Content $abi.FullName -Raw).Trim())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alphashape-windows-installer
+          path: |
+            dist/SHA256SUMS.txt
+            dist/PYTHON-ABI.txt
+            dist/*.exe
+            payload.txt
+          if-no-files-found: error
+
+  # A fresh runner with no build dependencies at all: download the one .exe,
+  # install it silently in both install modes, run everything, uninstall, and
+  # prove the install directory and both registry keys are gone.
+  windows-package-smoke:
+    name: Windows installer (fresh runner)
+    needs: windows-package
+    if: inputs.package && !cancelled()
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      # This artifact was uploaded from "dist/*.exe" plus "payload.txt" at the
+      # repository root, so its common ancestor is the root and the entries keep
+      # their "dist/" prefix. Downloading into "." therefore lands them in dist/.
+      - uses: actions/download-artifact@v4
+        with:
+          name: alphashape-windows-installer
+          path: .
+
+      # The .pyd is loadable only by the CPython it was built against. Its file
+      # name carries the tag, but the patch level matters too, so the build job
+      # publishes the exact version and this job installs that minor release.
+      - name: Python version the module was built for
+        id: abi
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem dist -Filter PYTHON-ABI.txt -Recurse | Select-Object -First 1
+          if (-not $file) { throw 'PYTHON-ABI.txt is missing from the artifact' }
+          $version = (Get-Content $file.FullName -Raw).Trim()
+          # setup-python wants major.minor; the cache carries the patch too.
+          $minor = ($version -split '\.')[0..1] -join '.'
+          "module built for $version, installing $minor"
+          "minor=$minor" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.abi.outputs.minor }}
+
+      - name: Install, run and uninstall
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Filter *.exe -Recurse | Select-Object -First 1
+          packaging/windows/smoke.ps1 -Installer $installer.FullName `
+              -PythonVersion "${{ steps.abi.outputs.minor }}"
 
   # ---- test lanes: one job per matrix entry, each runs a ctest slice of the build above ----
 
@@ -680,6 +942,13 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      # pybind11 and its python3 port are absent on purpose: that port ships a
+      # vcpkg-cmake-wrapper which forces its own Python headers and libraries
+      # into find_package(Python3) whenever Development.Module is requested, so
+      # the .pyd could only ever be built for vcpkg's interpreter. The packaging
+      # step installs pybind11's headers into the setup-python interpreter
+      # instead (`pip install pybind11`), which is the one the installer is
+      # supposed to carry a module for.
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
       - uses: actions/checkout@v4
