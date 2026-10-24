@@ -169,13 +169,21 @@ jobs:
           # tag. Only ever this workflow's own tag -- and never a published release: replacing
           # one would swap a shipped, possibly already-downloaded asset set for a fresh rebuild
           # under the same name and checksums. Bump the version instead.
-          if existing_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null); then
+          err=$(mktemp)
+          if existing_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>"$err"); then
             if [ "$existing_draft" != "true" ]; then
               echo "::error::release $TAG is already published; refusing to replace it"
               exit 1
             fi
             gh release delete "$TAG" --yes
+          elif ! grep -qi 'not found' "$err"; then
+            # Only "there is no such release" means "go ahead". A token or API failure must
+            # stop the run, or the guard above would be skipped exactly when it matters.
+            echo "::error::could not check whether release $TAG exists:"
+            cat "$err"
+            exit 1
           fi
+          rm -f "$err"
 
           args=(--title "alphashape $TAG" --generate-notes --notes-file notes.md --draft)
           if [ "$TAG_EXISTS" = "true" ]; then
