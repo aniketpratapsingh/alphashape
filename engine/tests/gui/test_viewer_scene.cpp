@@ -220,10 +220,16 @@ TEST(ViewerScene, TexturedMeshSplitsCornersAndCarriesThePage) {
     EXPECT_EQ(scene.texture.width, 2);
     EXPECT_EQ(scene.texture.height, 2);
     EXPECT_EQ(scene.texture.rgba.size(), 2U * 2U * 4U);
-    // Alpha is filled in opaque; RGB comes from the page.
-    EXPECT_EQ(scene.texture.rgba[3], 255U);
-    EXPECT_EQ(scene.texture.rgba[4], 255U);  // x = 1, y = 0 -> red channel
-    EXPECT_EQ(scene.texture.rgba[7], 40U);   // blue channel of the same texel
+    // Alpha is filled in opaque; RGB comes from the page. Texel (x=1, y=0) sits at byte 4, so
+    // bytes 4..7 are that texel's R, G, B, A.
+    EXPECT_EQ(scene.texture.rgba[3], 255U);  // alpha of texel (0, 0)
+    EXPECT_EQ(scene.texture.rgba[4], 255U);  // R of texel (1, 0): 255 * x
+    EXPECT_EQ(scene.texture.rgba[5], 0U);    // G of texel (1, 0): 255 * y
+    EXPECT_EQ(scene.texture.rgba[6], 40U);   // B of texel (1, 0)
+    EXPECT_EQ(scene.texture.rgba[7], 255U);  // alpha of texel (1, 0)
+    // Row 0 of the page is v = 0 (the mesh UV convention), i.e. it occupies the first row of the
+    // RGBA buffer.
+    EXPECT_EQ(scene.texture.rgba[(1U * 2U + 0U) * 4U + 1U], 255U);  // G of texel (0, 1)
     // One vertex per face corner: the UV pool is per corner.
     EXPECT_EQ(scene.mesh_vertices.size(), 6U);
     EXPECT_EQ(scene.mesh_indices.size(), 6U);
@@ -329,8 +335,10 @@ TEST(ViewerScene, StyleFollowsTheThemeTokens) {
     const SceneStyle light = scene_style_for(ThemeMode::Light);
     // The light canvas is lighter than the dark one (the tokens' own invariant).
     EXPECT_GT(light.background_bottom.x(), dark.background_bottom.x());
-    EXPECT_GT(light.label.x(), light.background_bottom.x());
-    EXPECT_LT(dark.label.x(), 1.0F);
+    // Each canvas's label contrasts with its own background: a light canvas has a dark label and
+    // a dark canvas a light one. (The two token sets are not ordered the same way.)
+    EXPECT_LT(light.label.x(), light.background_bottom.x());
+    EXPECT_GT(dark.label.x(), dark.background_bottom.x());
     EXPECT_GE(dark.camera.x(), 0.0F);
     EXPECT_LE(dark.camera.x(), 1.0F);
 }

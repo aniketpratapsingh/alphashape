@@ -221,7 +221,8 @@ std::vector<DepthMap>& Chunk::depth_maps() {
 
 const std::vector<DepthMap>& Chunk::depth_maps() const {
     const DepthMapsAsset* slot = find_slot(depth_map_sets_, active_depth_maps_id_);
-    return slot == nullptr ? empty_depth_maps() : *slot->data;
+    // A slot whose payload was unloaded (data == nullptr) reads as empty, like a missing one.
+    return slot == nullptr || !slot->data ? empty_depth_maps() : *slot->data;
 }
 
 PointCloud& Chunk::point_cloud() {
@@ -237,7 +238,7 @@ PointCloud& Chunk::point_cloud() {
 
 const PointCloud& Chunk::point_cloud() const {
     const PointCloudAsset* slot = find_slot(point_clouds_, active_point_cloud_id_);
-    return slot == nullptr ? empty_point_cloud() : *slot->data;
+    return slot == nullptr || !slot->data ? empty_point_cloud() : *slot->data;
 }
 
 Mesh& Chunk::model() {
@@ -253,7 +254,7 @@ Mesh& Chunk::model() {
 
 const Mesh& Chunk::model() const {
     const ModelAsset* slot = find_slot(models_, active_model_id_);
-    return slot == nullptr ? empty_model() : *slot->data;
+    return slot == nullptr || !slot->data ? empty_model() : *slot->data;
 }
 
 std::vector<Image>& Chunk::model_textures() {
@@ -269,7 +270,7 @@ std::vector<Image>& Chunk::model_textures() {
 
 const std::vector<Image>& Chunk::model_textures() const {
     const ModelAsset* slot = find_slot(models_, active_model_id_);
-    return slot == nullptr ? empty_textures() : slot->textures;
+    return slot == nullptr || !slot->data ? empty_textures() : slot->textures;
 }
 
 Elevation& Chunk::elevation() {
@@ -285,7 +286,7 @@ Elevation& Chunk::elevation() {
 
 const Elevation& Chunk::elevation() const {
     const ElevationAsset* slot = find_slot(elevations_, active_elevation_id_);
-    return slot == nullptr ? empty_elevation() : *slot->data;
+    return slot == nullptr || !slot->data ? empty_elevation() : *slot->data;
 }
 
 Orthomosaic& Chunk::orthomosaic() {
@@ -301,7 +302,7 @@ Orthomosaic& Chunk::orthomosaic() {
 
 const Orthomosaic& Chunk::orthomosaic() const {
     const OrthomosaicAsset* slot = find_slot(orthomosaics_, active_orthomosaic_id_);
-    return slot == nullptr ? empty_orthomosaic() : *slot->data;
+    return slot == nullptr || !slot->data ? empty_orthomosaic() : *slot->data;
 }
 
 KeypointSet* TiePoints::find_by_camera(std::int32_t camera_id) {

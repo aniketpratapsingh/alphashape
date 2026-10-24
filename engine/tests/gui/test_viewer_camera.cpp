@@ -174,29 +174,40 @@ TEST(ViewerCamera, PanMovesThePivotInTheViewPlaneOnly) {
     CameraController camera = make_camera(Box{});
     camera.fit(1.6);
     const Eigen::Vector3d pivot = camera.pivot();
+    const double distance = camera.distance();
+    const Eigen::Vector3d forward = camera.forward();
+    const Eigen::Vector3d right = camera.right();
+    const Eigen::Vector3d up = camera.up();
+
+    // A rightward + upward drag of the mouse (dx > 0, dy < 0 in screen coordinates).
     camera.pan(50.0, -20.0, 800);
     const Eigen::Vector3d moved = camera.pivot() - pivot;
-    // Screen-space pan: the pivot moves perpendicular to the view direction...
-    EXPECT_NEAR(moved.dot(camera.forward()), 0.0, 1e-9);
+    // Screen-space pan: the pivot moves in the view plane (perpendicular to the view direction).
+    EXPECT_NEAR(moved.dot(forward), 0.0, 1e-9);
     EXPECT_GT(moved.norm(), 0.0);
-    // ...along -right for a rightward drag and +up for an upward drag (the scene follows the
-    // cursor).
-    EXPECT_LT(moved.dot(camera.right()), 0.0);
-    EXPECT_GT(moved.dot(camera.up()), 0.0);
-    // The distance and the viewing direction are untouched.
-    EXPECT_NEAR(camera.distance(), make_camera(Box{}).distance(), 1e-6);
+    // "The scene follows the cursor": dragging right moves the scene right, so the camera's pivot
+    // travels left (-right); dragging up moves it up, so the pivot travels down (-up).
+    EXPECT_LT(moved.dot(right), 0.0);
+    EXPECT_LT(moved.dot(up), 0.0);
+    // Panning never changes the distance or the viewing direction.
+    EXPECT_NEAR(camera.distance(), distance, 1e-12);
+    EXPECT_NEAR(camera.forward().dot(forward), 1.0, 1e-12);
 }
 
-TEST(ViewerCamera, PanScaleFollowsTheDistance) {
+TEST(ViewerCamera, PanScaleIsProportionalToTheDistance) {
     CameraController near_camera = make_camera(Box{});
     near_camera.fit(1.6);
     CameraController far_camera = near_camera;
     far_camera.set_distance(near_camera.distance() * 4.0);
+    const Eigen::Vector3d near_pivot = near_camera.pivot();
+    const Eigen::Vector3d far_pivot = far_camera.pivot();
 
     near_camera.pan(10.0, 0.0, 600);
     far_camera.pan(10.0, 0.0, 600);
-    const double near_travel = (near_camera.pivot() - make_camera(Box{}).pivot()).norm();
-    const double far_travel = (far_camera.pivot() - make_camera(Box{}).pivot()).norm();
+    const double near_travel = (near_camera.pivot() - near_pivot).norm();
+    const double far_travel = (far_camera.pivot() - far_pivot).norm();
+    EXPECT_GT(near_travel, 0.0);
+    // Four times as far away: the same drag covers four times the world distance.
     EXPECT_NEAR(far_travel / near_travel, 4.0, 1e-6);
 }
 

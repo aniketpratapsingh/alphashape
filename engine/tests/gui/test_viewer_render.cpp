@@ -298,7 +298,9 @@ protected:
 
 }  // namespace
 
-TEST(ViewerRender, CompiledShadersAreEmbeddedAndValid) {
+// A separate suite name from the fixture-based tests below: gtest forbids mixing TEST and TEST_F
+// under one suite name. This one needs no device at all.
+TEST(ViewerShaders, CompiledShadersCarryEveryBackendVariant) {
     // Backend-independent: this catches a broken qsb step (or a missing qt_add_shaders call)
     // even on a host where nothing can render.
     for (const char* name : {"mesh.vert.qsb", "mesh.frag.qsb", "points.vert.qsb",
