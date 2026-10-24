@@ -145,7 +145,10 @@ jobs:
           sed "s|@VERSION@|${TAG}|g" packaging/release-notes-header.md > notes.md
           wc -l notes.md
 
-      - name: Create release
+      # Always created as a draft, then published by `promote` once the downloads have been
+      # verified. A release that nobody has checked must not be the visible one, even for the
+      # few minutes before the verify matrix finishes.
+      - name: Create draft release
         id: create
         env:
           GH_TOKEN: ${{ github.token }}
@@ -153,14 +156,13 @@ jobs:
           TAG: ${{ inputs.tag }}
           REF: ${{ inputs.ref }}
           PRERELEASE: ${{ inputs.prerelease }}
-          DRAFT: ${{ inputs.draft }}
           TAG_EXISTS: ${{ inputs.tag-exists }}
         run: |
           # A re-run for the same tag replaces the release rather than failing on the
           # duplicate tag. Only ever this workflow's own tag.
           gh release delete "$TAG" --yes 2>/dev/null || true
 
-          args=(--title "alphashape $TAG" --generate-notes --notes-file notes.md)
+          args=(--title "alphashape $TAG" --generate-notes --notes-file notes.md --draft)
           if [ "$TAG_EXISTS" = "true" ]; then
             # A real release: the tag must already exist, so a typo cannot tag a new commit.
             args+=(--verify-tag)
@@ -173,15 +175,12 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             args+=(--prerelease --latest=false)
           fi
-          if [ "$DRAFT" = "true" ]; then
-            args+=(--draft)
-          fi
 
           echo "gh release create $TAG ${args[*]}"
           gh release create "$TAG" dist/* "${args[@]}"
           url=$(gh release view "$TAG" --json url --jq .url)
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "published $url"
+          echo "created draft $url"
 
   # Provenance for the four installer files, computed from the bytes that were just published
   # (downloaded back from the release), so the attestation is about the downloads and not about
@@ -222,6 +221,11 @@ jobs:
   # A fresh runner per OS, no build dependencies: download from the release, check the
   # checksums, then run the same install-and-use scripts the build job ran -- on the bytes a
   # user will get.
+  #
+  # The macOS image is the one the DMG was built and smoke-tested on. It is not interchangeable:
+  # on macos-14's paravirtual GPU, MoltenVK aborts inside MVKPhysicalDevice::initMetalFeatures
+  # (AppleParavirtGPUMetalIOGPUFamily, doUncompressedBlit) during vkCreateInstance, so the
+  # bundle's own GPU check cannot pass there whatever the bundle contains.
   verify:
     name: Verify ${{ matrix.name }} download
     needs: publish
@@ -232,7 +236,7 @@ jobs:
           - name: Linux
             os: ubuntu-24.04
           - name: macOS
-            os: macos-14
+            os: macos-15
           - name: Windows
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -385,10 +389,18 @@ jobs:
             }
           }
           if (-not $sevenZip) { throw '7z.exe not found on the runner image' }
+          # -slt prints one "Path = ..." line per payload entry, relative to the install root.
+          # 7-Zip emits the platform separator there, so the backslashes are normalised before
+          # matching -- the same normalisation the build job's payload audit does.
           $installer = (Get-ChildItem dist -Filter *.exe | Select-Object -First 1).FullName
-          $paths = & $sevenZip l -slt $installer | ForEach-Object { if ($_ -match '^Path = (.*)$') { $Matches[1] } }
-          $pyd = @($paths | Where-Object { $_ -like '*python/alphashape.cp*' }) | Select-Object -First 1
-          if (-not $pyd) { throw 'the installer payload has no Python module' }
+          $paths = & $sevenZip l -slt $installer | ForEach-Object {
+            if ($_ -match '^Path = (.*)$') { $Matches[1].Replace('\', '/') }
+          }
+          $pyd = @($paths | Where-Object { $_ -like 'python/alphashape*.pyd' }) | Select-Object -First 1
+          if (-not $pyd) {
+            $python = @($paths | Where-Object { $_ -like 'python/*' })
+            throw "the installer payload has no Python module; python/ holds: $($python -join ', ')"
+          }
           $tag = [regex]::Match($pyd, 'alphashape\.cp(\d+)-').Groups[1].Value
           if ($tag.Length -ne 3) { throw "unexpected ABI tag in '$pyd'" }
           $minor = "$($tag.Substring(0,1)).$($tag.Substring(1))"
@@ -406,3 +418,32 @@ jobs:
         run: |
           $installer = (Get-ChildItem dist -Filter *.exe | Select-Object -First 1).FullName
           packaging/windows/smoke.ps1 -Installer $installer -PythonVersion "${{ steps.abi.outputs.minor }}"
+
+  # The draft becomes a published release only after every verify job has passed, so the
+  # downloads a user can reach are the ones that were checked. A dry run stops here and leaves
+  # the draft for someone to delete.
+  promote:
+    name: Publish (after verification)
+    needs: [publish, attest, verify]
+    if: inputs.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          [ "$state" = "true" ] || { echo "::error::$TAG is not a draft; refusing to touch it"; exit 1; }
+          args=(--draft=false)
+          # Keep a pre-release out of "latest" on the way out of the draft state.
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release edit "$TAG" "${args[@]}"
+          gh release view "$TAG" --json url,isDraft,isPrerelease --jq '"published \(.url) draft=\(.isDraft) prerelease=\(.isPrerelease)"'
