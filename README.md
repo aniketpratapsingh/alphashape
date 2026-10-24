@@ -211,7 +211,7 @@ Requirements: CMake ≥ 3.24, a C++20 compiler (Clang, GCC 13+, or clang-cl on W
 Eigen 3, Ceres Solver, PROJ ≥ 9.3, zlib, libjpeg, libpng, libtiff, GoogleTest, pybind11
 and Python 3. The GPU backend also needs the Vulkan headers and loader, `glslc`,
 `spirv-val` and the VulkanMemoryAllocator header; without them it is switched off and
-every task runs on the CPU. The desktop app needs Qt 6.6 or newer (it is built and tested
+every task runs on the CPU. The desktop app needs Qt 6.7 or newer (it is built and tested
 against Qt 6.8).
 
 ```sh
