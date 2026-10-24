@@ -194,10 +194,7 @@ public:
         }
         QRhiTextureRenderTargetDescription description(QRhiColorAttachment(color_.get()),
                                                        depth_.get());
-        target_.reset(rhi->newTextureRenderTarget(description,
-                                                  // Keep the colour contents across passes: the
-                                                  // readback below runs in its own frame.
-                                                  QRhiTextureRenderTarget::PreserveColorContents));
+        target_.reset(rhi->newTextureRenderTarget(description));
         pass_.reset(target_->newCompatibleRenderPassDescriptor());
         target_->setRenderPassDescriptor(pass_.get());
         ok_ = target_->create();
@@ -208,22 +205,20 @@ public:
     QRhiRenderPassDescriptor* pass() { return pass_.get(); }
     QSize size() const { return size_; }
 
-    /// Read the rendered image back. Caller must have ended the frame.
-    QImage read(QRhi* rhi) {
+    /// Read the rendered image back. Must be called inside the frame that recorded the pass:
+    /// a texture render target does not keep its contents for a later one (and asking it to
+    /// would turn the pass's clear into a load of uninitialised memory).
+    QImage read(QRhi* rhi, QRhiCommandBuffer* cb, bool* completed_out = nullptr) {
         QRhiReadbackResult result;
         bool completed = false;
         result.completed = [&completed]() { completed = true; };
-        QRhiReadbackDescription description(color_.get());
         QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
-        batch->readBackTexture(description, &result);
-
-        QRhiCommandBuffer* cb = nullptr;
-        if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess) {
-            return QImage();
-        }
+        batch->readBackTexture(QRhiReadbackDescription(color_.get()), &result);
         cb->resourceUpdate(batch);
-        rhi->endOffscreenFrame();
         rhi->finish();
+        if (completed_out != nullptr) {
+            *completed_out = completed;
+        }
         if (!completed || result.data.isEmpty()) {
             return QImage();
         }
@@ -278,11 +273,13 @@ RenderResult render_once(QRhi* rhi, Scene scene, const CameraController& camera,
         return result;
     }
     renderer.render(cb, target.target(), camera, size);
+    // The readback is queued in the same frame as the pass: a texture render target does not
+    // keep its contents into the next one.
+    result.image = target.read(rhi, cb);
     rhi->endOffscreenFrame();
     rhi->finish();
 
     result.stats = renderer.stats();
-    result.image = target.read(rhi);
     result.ok = true;
     return result;
 }
