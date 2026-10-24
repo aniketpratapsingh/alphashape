@@ -1,9 +1,11 @@
 name: Sample dataset
 
-# Renders the synthetic 12-image sample dataset and publishes it as a downloadable zip
-# (alphashape-sample-<version>.zip, artifact name "alphashape-sample"). The release and
-# pre-release publishing jobs attach that artifact to the release; this workflow only
-# produces it, and never publishes anything itself.
+# Renders the synthetic 12-image sample dataset and uploads it as a downloadable Actions
+# artifact (alphashape-sample-<version>.zip, artifact name "alphashape-sample"). Download
+# it from this workflow's latest run, or with `gh run download --workflow sample.yml
+# --name alphashape-sample`. Attaching the zip to the release assets is planned but not
+# implemented yet; this workflow only produces the artifact, and never publishes anything
+# itself.
 #
 # Runs on demand and on release tags. It needs no compiler: the generator is pure
 # Python (numpy + Pillow) over engine/data/make_aerial_fixture.py.
@@ -92,8 +94,9 @@ jobs:
           ls -l ./*.zip
           sha256sum ./*.zip > SHA256SUMS-sample.txt
 
-      # The artifact name is fixed ("alphashape-sample") so the release job can download it
-      # without knowing the version. The file inside carries the version.
+      # The artifact name is fixed ("alphashape-sample") so a download (Actions page or
+      # `gh run download --name alphashape-sample`) needs no knowledge of the version. The
+      # file inside carries the version.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # actions/upload-artifact v4
         with:
           name: alphashape-sample

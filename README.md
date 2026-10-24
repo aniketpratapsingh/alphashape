@@ -55,25 +55,30 @@ Download the package for your platform from the
 | Linux, any distribution | `alphashape-<version>-linux-x86_64.AppImage` | GUI and CLI with every non-glibc dependency bundled (no Python module) |
 | Windows 10/11 / x86-64 | `alphashape-<version>-windows-x86_64.exe` | GUI, CLI and the Python module |
 
-Every release publishes `SHA256SUMS` next to the packages. Check the download before
-running it:
+Every release publishes `SHA256SUMS` next to the packages. It lists every platform's
+assets, so check the file you downloaded rather than the whole list:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS      # Linux
-shasum -a 256 -c SHA256SUMS 2>/dev/null            # macOS
+# Linux
+sha256sum --ignore-missing -c SHA256SUMS
+
+# macOS (no --ignore-missing in shasum; check the one line)
+grep 'macos-arm64' SHA256SUMS | shasum -a 256 -c -
 ```
 
 ```powershell
-# Windows
-$actual = (Get-FileHash .\alphashape-*-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+# Windows: compare the hash of the downloaded file with its SHA256SUMS line
+$file = Get-ChildItem .\alphashape-*-windows-x86_64.exe
+$actual = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
 $expected = (Select-String -Path .\SHA256SUMS -Pattern 'windows-x86_64\.exe').Line.Split()[0]
 if ($actual -eq $expected) { "OK" } else { "MISMATCH" }
 ```
 
 **The builds are unsigned, so both operating systems warn you.**
 
-- **macOS.** The app is ad-hoc signed and not notarized. On first launch, right-click
-  `alphashape.app` in Applications and choose **Open**, or clear the quarantine flag once:
+- **macOS.** The app is ad-hoc signed and not notarized. macOS 15 removed the
+  right-click **Open** shortcut, so approve it in **System Settings → Privacy & Security →
+  Open Anyway** after the first blocked launch. Or clear the quarantine flag once:
 
   ```sh
   xattr -dr com.apple.quarantine /Applications/alphashape.app
@@ -85,7 +90,22 @@ if ($actual -eq $expected) { "OK" } else { "MISMATCH" }
 
 The macOS app carries the command line and the Python module
 ([details](packaging/macos/README.md)); on Linux and Windows they are installed alongside
-the GUI.
+the GUI. Where each one ends up:
+
+- **Linux .deb.** `alphashape-cli` and `alphashape-gui` go to `/usr/bin`, so both are on
+  `PATH`, and the Python module goes to `/usr/lib/python3/dist-packages`.
+- **AppImage.** The command line is reached through the AppImage itself:
+  `./alphashape-*.AppImage cli ...` (see below).
+- **macOS.** The binaries live inside the bundle:
+  `/Applications/alphashape.app/Contents/MacOS/alphashape-cli` (and `alphashape-gui`).
+  Add that directory to `PATH` or call the full path.
+- **Windows.** The installer defaults to a per-user install in
+  `%LOCALAPPDATA%\Programs\alphashape`, with **bin** *not* added to `PATH` unless you tick
+  the optional **Add to PATH** entry on the components page. Without it, call
+  `%LOCALAPPDATA%\Programs\alphashape\bin\alphashape-cli.exe`, or the same path under
+  `%ProgramFiles%\alphashape` for a per-machine install. The Python module needs
+  `PYTHONPATH=%LOCALAPPDATA%\Programs\alphashape\python` (`%ProgramFiles%\alphashape\python`
+  for a per-machine install).
 
 ## Quick start: the desktop app
 
@@ -102,7 +122,7 @@ the GUI.
    |---|---|
    | Add Photos | imports the photographs (the start screen's **Add photos...** does the same) |
    | Match Photos | keypoints, matches and tracks |
-   | Align Photos | camera positions and orientations, and the sparse point cloud |
+   | Align Cameras | camera positions and orientations, and the sparse point cloud |
    | Optimize Cameras | refines the alignment; optional, re-runnable |
    | Build Depth Maps | a depth map per photograph |
    | Build Point Cloud | the dense point cloud |
@@ -112,7 +132,7 @@ the GUI.
    | Build DEM | an elevation model over the site |
    | Build Orthomosaic | a georeferenced mosaic of the photographs |
 
-   Align Photos needs the matches from Match Photos, so run them in this order. While a
+   Align Cameras needs the matches from Match Photos, so run them in this order. While a
    stage's input is missing, its entry is greyed out with the reason ("Build depth maps
    first").
 4. **Inspect the result** in the 3-D view: drag to orbit, drag with the right button to
@@ -124,16 +144,28 @@ the GUI.
 6. **Save** the project with **File > Save** (`.psx` plus a `.files/` folder). Reopen it
    later and every product is still there.
 
-A sample site to practise on is attached to the
-[Releases](https://github.com/aniketpratapsingh/alphashape/releases) page as
-`alphashape-sample-<version>.zip`: twelve synthetic aerial photographs with GPS, plus a
-manifest of the true camera poses. See
+A sample site to practise on is produced by the
+[`sample` workflow](.github/workflows/sample.yml) and published as a downloadable Actions
+artifact named `alphashape-sample` holding `alphashape-sample-<version>.zip`: twelve
+synthetic aerial photographs with GPS, plus a manifest of the true camera poses. Download
+it from the [Actions page](https://github.com/aniketpratapsingh/alphashape/actions/workflows/sample.yml)
+(the latest run's **Artifacts** section), or with the GitHub CLI:
+
+```sh
+gh run download --repo aniketpratapsingh/alphashape \
+  --workflow sample.yml --name alphashape-sample
+```
+
+Attaching the zip to the release itself is planned but is not done yet. See
 [`tools/sample/SOURCE.md`](tools/sample/SOURCE.md) for how it is made and its licence.
 
 ## Quick start: the command line
 
 `alphashape-cli` runs one task per invocation and saves the project after each, so a
-script can stop between stages and resume:
+script can stop between stages and resume. It is on `PATH` for the `.deb`; on macOS,
+Windows and the AppImage, substitute the full path from the list above (for example
+`/Applications/alphashape.app/Contents/MacOS/alphashape-cli`, or
+`.\alphashape-<version>.AppImage cli`).
 
 ```sh
 alphashape-cli --list-tasks                      # every task this build ships
@@ -192,8 +224,10 @@ doc = alphashape.load_project("site.psx")
 print(alphashape.list_tasks())
 ```
 
-An unknown keyword raises `InvalidArgumentError` and a rejected value raises
-`ValueError`, so a typo surfaces at the call rather than in the middle of a run.
+Error types follow the failure: an unknown keyword raises `InvalidArgumentError`, an
+argument of the wrong Python type raises `TypeError`, and an out-of-range or unaccepted
+value raises `ValueError`, so a mistake surfaces at the call rather than in the middle of
+a run.
 
 On macOS the module lives inside the app bundle:
 
@@ -201,9 +235,12 @@ On macOS the module lives inside the app bundle:
 PYTHONPATH=/Applications/alphashape.app/Contents/Resources/python python3 -c "import alphashape"
 ```
 
-A compiled module is loadable only by the CPython minor version it was built against
-(3.12 in the current packages). [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md) has the
-per-platform detail.
+A compiled module is loadable only by the CPython minor version it was built against. The
+packages are built against 3.12 (Ubuntu 24.04's `python3` for the `.deb`, and the pinned
+3.12 interpreter in the Windows build). The macOS module is built against whichever
+`python3` the build machine had; the module's file name names it, for example
+`alphashape.cpython-313-darwin.so`. [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md) has
+the per-platform detail.
 
 ## Building from source
 
@@ -248,7 +285,9 @@ What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ```
 engine/
-  src/base      foundation: math, zip, platform layer, logging
+  src/base      foundation: errors, logging, a portable RNG, the OpenMP helper, zip,
+                the platform layer (paths, env, temp files, processes, console) and a
+                voxel grid
   src/image     image types and codecs
   src/model     geometry: cameras, meshes, rasters, coordinate systems
   src/common    data model, task registry, commands (undo), project I/O, algorithms

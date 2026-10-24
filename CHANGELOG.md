@@ -39,11 +39,17 @@ line or Python.
   into a dense point cloud with normals, colours and confidence.
 - Meshing: TV-L1 volumetric fusion or screened Poisson, with quadric decimation.
 - Texturing: chart-based UV unwrapping, single-page atlas packing, and a baked texture
-  page with mosaic, average or single-view blending and per-view gain correction.
+  page. `blending_mode` is `mosaic` (the default: each face takes its single best view,
+  with optional gain correction between views), `average` (weighted across the views that
+  see the texel), or `disabled` (the same best view with gain correction off). `BuildUV`
+  clears the model's texture pages and `BuildTexture` replaces page 0, so a texture is
+  rebuilt rather than kept beside an older one.
 - Rasters: DEM and orthomosaic on a north-up grid in a PROJ coordinate system, exported
   as GeoTIFF.
-- Multi-chunk projects: duplicate, merge, append and align chunks; every product is a
-  labelled asset, so a second build adds to the project rather than replacing the first.
+- Multi-chunk projects: duplicate, merge, append and align chunks. Models, point clouds,
+  DEMs and orthomosaics are labelled assets, so building one again adds a new asset and
+  keeps the previous one. Textures are the exception: there is one texture set per model,
+  replaced in place by the runs above.
 - GPU acceleration through Vulkan compute (PatchMatch and the Poisson solve) where a
   suitable device and driver are present, with an automatic CPU fallback.
 
@@ -53,8 +59,8 @@ line or Python.
   `--proj-info`, `--new`, and `--project ... --task ... --set key=value`.
 - A Python module (`import alphashape`) with the same tasks, parameters and error types,
   so a pipeline script ports between the two front ends unchanged.
-- Projects are a `.psx` file plus a `.files/` folder, with a versioned format that never
-  silently drops data it does not understand.
+- Projects are a `.psx` file plus a `.files/` folder with a versioned format; the reader
+  refuses project files from a newer format version instead of guessing.
 - A sample dataset of twelve synthetic aerial photographs with true camera poses, released
   under CC0, and a generator script that regenerates it.
 
