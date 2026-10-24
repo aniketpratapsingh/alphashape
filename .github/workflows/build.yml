@@ -113,6 +113,9 @@ jobs:
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
           version: "6.8.3"
+          # qtshadertools provides qsb and qt_add_shaders(), which compile the viewport's
+          # GLSL to the .qsb files every QRhi backend loads.
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 
@@ -261,6 +264,9 @@ jobs:
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
           version: "6.8.3"
+          # qtshadertools provides qsb and qt_add_shaders(), which compile the viewport's
+          # GLSL to the .qsb files every QRhi backend loads.
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 
@@ -406,6 +412,7 @@ jobs:
         with:
           version: "6.8.3"
           arch: win64_msvc2022_64
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 
@@ -500,7 +507,7 @@ jobs:
         with:
           path: ~/apt-debs
           # Bump the suffix when the package list below changes.
-          key: apt-linux-runtime-v2
+          key: apt-linux-runtime-v3
 
       - name: Install runtime dependencies
         run: |
@@ -513,7 +520,9 @@ jobs:
           # enough that every avoided megabyte matters.
           apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data libtiff6 \
             libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools \
-            libgl1 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+            libgl1 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3 \
+            xvfb xauth libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-randr0 \
+            libxcb-render-util0 libxcb-xinerama0 libxkbcommon-x11-0 libxcb-xkb1
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
       - name: Install Qt 6.8 (GUI)
@@ -523,6 +532,9 @@ jobs:
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
           version: "6.8.3"
+          # qtshadertools provides qsb and qt_add_shaders(), which compile the viewport's
+          # GLSL to the .qsb files every QRhi backend loads.
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 
@@ -617,6 +629,9 @@ jobs:
           PIP_BREAK_SYSTEM_PACKAGES: "1"
         with:
           version: "6.8.3"
+          # qtshadertools provides qsb and qt_add_shaders(), which compile the viewport's
+          # GLSL to the .qsb files every QRhi backend loads.
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 
@@ -701,6 +716,7 @@ jobs:
         with:
           version: "6.8.3"
           arch: win64_msvc2022_64
+          modules: "qtshadertools"
           cache: true
           setup-python: false
 

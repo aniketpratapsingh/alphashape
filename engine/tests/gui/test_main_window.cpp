@@ -20,7 +20,7 @@
 #include <QStatusBar>
 #include <QStringList>
 
-#include "apps/gui/viewport_placeholder.hpp"
+#include "apps/gui/viewer/viewport_widget.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
@@ -105,10 +105,15 @@ TEST_F(MainWindowTest, DefaultDockLayout) {
     EXPECT_EQ(window().dockWidgetArea(dock("dock.log")), Qt::BottomDockWidgetArea);
     EXPECT_TRUE(window().tabifiedDockWidgets(dock("dock.photos")).contains(dock("dock.log")));
 
-    auto* viewport = dynamic_cast<ViewportPlaceholder*>(window().centralWidget());
+    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(viewport->objectName(), QStringLiteral("viewport"));
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Dark);
+    // The GUI lanes run on the offscreen plugin, which offers no RHI: the viewport must survive
+    // that and say so, rather than construct a QRhiWidget (which Qt warns about there).
+    EXPECT_FALSE(viewport->rendering_available());
+    EXPECT_NE(viewport->findChild<QLabel*>(QStringLiteral("viewport.message")), nullptr);
+    EXPECT_TRUE(viewport->scene_is_empty());  // an empty document draws nothing
 
     EXPECT_NE(window().statusBar()->findChild<QLabel*>("status.jobs"), nullptr);
 }
@@ -117,7 +122,7 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
     show_window();
     ASSERT_TRUE(action("action.view.theme.dark")->isChecked());
     trigger("action.view.theme.light");
-    auto* viewport = dynamic_cast<ViewportPlaceholder*>(window().centralWidget());
+    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(app().theme().mode(), ThemeMode::Light);
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Light);
@@ -126,6 +131,31 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
     trigger("action.view.theme.dark");
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Dark);
     GuiTest::grab(&window(), "main_window_dark");
+}
+
+TEST_F(MainWindowTest, ViewportSceneFollowsTheDocument) {
+    show_window();
+    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ASSERT_NE(viewport, nullptr);
+    EXPECT_TRUE(viewport->scene_is_empty());
+
+    // Adding a chunk through the command layer rebuilds the scene (triggered by undo_changed).
+    add_chunk(app(), "Block A");
+    pump(20);
+    EXPECT_TRUE(viewport->scene_is_empty());
+    EXPECT_EQ(viewport->scene().total_cameras, 0U);
+
+    // A point cloud added through the command layer shows up on the next rebuild.
+    const std::int32_t chunk_id = app().document().workspace().chunks().front()->id();
+    PointCloud cloud;
+    cloud.points = {Eigen::Vector3d(-2.0, -2.0, 0.0), Eigen::Vector3d(2.0, 2.0, 4.0)};
+    app().execute(make_add_asset_command(chunk_id, cloud, "Cloud"));
+    pump(20);
+    EXPECT_EQ(viewport->scene().dense_points.size(), 2U);
+    EXPECT_TRUE(viewport->scene().has_bounds);
+    // The camera framed the new scene, so the points are near the pivot rather than far away.
+    EXPECT_NEAR(viewport->camera().pivot().z(), 2.0, 1e-6);
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
 TEST_F(MainWindowTest, DockTogglesHideAndShowTheirDocks) {

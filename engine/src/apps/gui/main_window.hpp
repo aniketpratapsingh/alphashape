@@ -19,7 +19,7 @@ namespace alphashape::gui {
 
 class GuiApp;
 class PropertiesPane;
-class ViewportPlaceholder;
+class ViewportWidget;
 class WorkflowController;
 class WorkspacePane;
 class WorkspaceSelection;
@@ -116,8 +116,8 @@ private:
     QDockWidget* properties_dock_ = nullptr;
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
-    ViewportPlaceholder* viewport_ = nullptr;
-    WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties pane
+    ViewportWidget* viewport_ = nullptr;
+    WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties pane and the viewport
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
     WorkflowController* workflow_ = nullptr;
