@@ -126,6 +126,28 @@ class SelectProjDataTest(unittest.TestCase):
             self.assertEqual(manifest.read_bytes(),
                              (second / selector.MANIFEST_NAME).read_bytes())
 
+    def test_rerun_into_the_same_destination_copies_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = build_source(root)
+            dest = root / "out"
+            selector.select(source, dest)
+            manifest = (dest / selector.MANIFEST_NAME).read_bytes()
+            summary = selector.select(source, dest)
+            self.assertEqual(summary["copied"], 0)
+            self.assertEqual((dest / selector.MANIFEST_NAME).read_bytes(), manifest)
+
+    def test_manifest_in_the_source_is_not_treated_as_data(self):
+        # A destination used twice as a source (a re-staged bundle) must not list its own
+        # manifest, which would make the manifest self-referential.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = build_source(root)
+            (source / selector.MANIFEST_NAME).write_text("stale\n", encoding="utf-8")
+            dest = root / "out"
+            summary = selector.select(source, dest)
+            self.assertNotIn(selector.MANIFEST_NAME, summary["names"])
+
     def test_missing_proj_db_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
