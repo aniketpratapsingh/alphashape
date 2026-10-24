@@ -176,10 +176,10 @@ QTimer* accept_dialogs(QWidget* owner, std::shared_ptr<int> accepted) {
 }  // namespace
 
 TEST_F(ExportTest, MenuListsAllFourExports) {
-    QMenu* menu = menu("menu.file.export");
-    ASSERT_NE(menu, nullptr);
+    QMenu* export_menu = menu("menu.file.export");
+    ASSERT_NE(export_menu, nullptr);
     QStringList names;
-    for (QAction* entry : menu->actions()) {
+    for (QAction* entry : export_menu->actions()) {
         if (!entry->isSeparator()) {
             names << entry->objectName();
         }

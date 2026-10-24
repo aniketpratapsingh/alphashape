@@ -367,7 +367,8 @@ TEST_F(StartScreenTest, EntryPointsAreDisabledWhileAJobRuns) {
 
     // A job that blocks, so the busy window is wide enough to observe on any machine.
     auto started = std::make_shared<std::atomic<bool>>(false);
-    registry_.register_task(std::make_shared<HoldTask>(release_, started));
+    registry_.register_task(
+        std::make_shared<alphashape::gui::testing::HoldTask>(release_, started));
     app().jobs().set_registry(&registry_);
     app().jobs().submit("HoldTask", Params{}, app().document().workspace().chunks().empty()
                                                   ? -1
