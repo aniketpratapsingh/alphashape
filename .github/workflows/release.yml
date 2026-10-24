@@ -6,7 +6,9 @@ name: Release
 #   3. gh workflow run release.yml -f tag=vx.y.z            (publishes)
 #      gh workflow run release.yml -f tag=vx.y.z -f draft=true   (builds a private draft; publish
 #      or delete it from the Releases page)
-# Re-running for the same tag replaces the release.
+# Re-running for the same tag replaces the release only while it is still a draft. Once it is
+# published the run stops with "release vx.y.z is already published": a shipped download must
+# not change under its own name. Bump the version and tag again instead.
 #
 # Building, packaging and publishing live in publish.yml, which preview.yml shares. Everything
 # after the build happens there: NOTICE.txt, sbom.spdx.json, SHA256SUMS, provenance attestations
@@ -56,7 +58,7 @@ jobs:
   publish:
     name: Publish release
     needs: build
-    # Serialise publishes per tag: the job deletes and recreates the release.
+    # Serialise publishes per tag: a re-run replaces the draft under this tag.
     concurrency:
       group: publish-${{ inputs.tag }}
       cancel-in-progress: false
