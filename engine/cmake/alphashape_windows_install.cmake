@@ -123,6 +123,10 @@ if(ALPHASHAPE_BUILD_PYTHON AND TARGET alphashape_python)
     # A Python extension module is a MODULE library. On Windows CMake places the
     # .pyd through RUNTIME, elsewhere through LIBRARY, so both destinations are
     # given (install(TARGETS) rejects a module target that names only one).
+    # The file keeps the name CMake gave it -- alphashape.cp314-win_amd64.pyd --
+    # because Python recognises the ".cpXXX-win_amd64" tag and still imports it
+    # as `alphashape`; renaming it to alphashape.pyd would also work but would
+    # make the interpreter it was built for invisible.
     install(TARGETS alphashape_python
             RUNTIME DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR}
             LIBRARY DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR}
@@ -137,7 +141,8 @@ endif()
 # installer neither needs a redistributable nor writes outside its own tree.
 if(NOT ALPHASHAPE_RUNTIME_DLL_DIR)
     if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
-        set(ALPHASHAPE_RUNTIME_DLL_DIR "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+        file(TO_CMAKE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+             ALPHASHAPE_RUNTIME_DLL_DIR)
     endif()
 endif()
 if(NOT EXISTS "${ALPHASHAPE_RUNTIME_DLL_DIR}")
@@ -149,9 +154,14 @@ endif()
 
 # The Visual C++ runtime is copied app-locally: no vc_redist, no system write.
 # msvc-dev-cmd exports VCToolsRedistDir; the glob survives a toolset rename.
+# The value arrives with backslashes ("C:\Program Files\..."), and CMake writes
+# a literal backslash into cmake_install.cmake, where "\P" is an invalid escape
+# and the generated script would be rejected at install time, so the path is
+# normalised to CMake's forward-slash form first.
 if(DEFINED ENV{VCToolsRedistDir})
+    file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" ALPHASHAPE_VC_RUNTIME_ROOT)
     file(GLOB ALPHASHAPE_VC_RUNTIME_DLLS
-         "$ENV{VCToolsRedistDir}/x64/Microsoft.VC*.CRT/*.dll")
+         "${ALPHASHAPE_VC_RUNTIME_ROOT}/x64/Microsoft.VC*.CRT/*.dll")
 else()
     set(ALPHASHAPE_VC_RUNTIME_DLLS "")
 endif()
@@ -162,8 +172,10 @@ if(NOT ALPHASHAPE_VC_RUNTIME_DLLS)
         "environment (after ilammy/msvc-dev-cmd) so VCToolsRedistDir is set.")
 endif()
 
-# clang-cl links LLVM's libomp, which sits in the LLVM toolchain's bin.
+# clang-cl links LLVM's libomp, which sits in the LLVM toolchain's bin. Same
+# backslash caveat as the redist directory above.
 get_filename_component(ALPHASHAPE_COMPILER_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+file(TO_CMAKE_PATH "${ALPHASHAPE_COMPILER_BIN}" ALPHASHAPE_COMPILER_BIN)
 if(EXISTS "${ALPHASHAPE_COMPILER_BIN}/libomp.dll")
     set(ALPHASHAPE_LIBOMP_DLL "${ALPHASHAPE_COMPILER_BIN}/libomp.dll")
 else()
@@ -258,7 +270,8 @@ endif()
 set(ALPHASHAPE_PROJ_DATA_SRC "" CACHE PATH
     "Directory holding proj.db to bundle (defaults to the vcpkg share/proj)")
 if(NOT ALPHASHAPE_PROJ_DATA_SRC AND VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
-    set(ALPHASHAPE_PROJ_DATA_SRC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/proj")
+    file(TO_CMAKE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/proj"
+         ALPHASHAPE_PROJ_DATA_SRC)
 endif()
 if(NOT EXISTS "${ALPHASHAPE_PROJ_DATA_SRC}/proj.db")
     message(FATAL_ERROR
@@ -378,8 +391,10 @@ set(CPACK_NSIS_PACKAGE_NAME "alphashape ${ALPHASHAPE_PACKAGE_VERSION}")
 set(CPACK_NSIS_URL_INFO_ABOUT "${CPACK_PACKAGE_HOMEPAGE_URL}")
 set(CPACK_NSIS_HELP_LINK "${CPACK_PACKAGE_HOMEPAGE_URL}/issues")
 set(CPACK_NSIS_CONTACT "${CPACK_PACKAGE_CONTACT}")
-# The template prefixes "$INSTDIR\", so this is one relative path.
-set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\alphashape.exe")
+# Written into NSIS as "$INSTDIR\<this>", so it is a forward-slash relative path:
+# a backslash in a CMake string is an escape ("\a" is not one) and the generated
+# CPackConfig.cmake would be rejected.
+set(CPACK_NSIS_INSTALLED_ICON_NAME "bin/alphashape.exe")
 # Installer, uninstaller and shortcut icon: the rendered product mark.
 set(CPACK_NSIS_MUI_ICON "${ALPHASHAPE_ICON}")
 set(CPACK_NSIS_MUI_UNIICON "${ALPHASHAPE_ICON}")

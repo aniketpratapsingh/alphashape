@@ -592,12 +592,19 @@ jobs:
           }
           foreach ($required in 'bin/platforms/qwindows.dll', 'bin/platforms/qoffscreen.dll',
                                 'bin/alphashape.exe', 'bin/alphashape-cli.exe',
-                                'python/alphashape.pyd', 'share/proj/proj.db',
-                                'LICENSES/LICENSE') {
+                                'share/proj/proj.db', 'LICENSES/LICENSE') {
             if (-not ($paths | Where-Object { $_ -like "*$required" })) {
               throw "$required is not in the installer payload"
             }
           }
+          # The module ships under the ABI-tagged name CMake gives it
+          # (alphashape.cp314-win_amd64.pyd), so the tag is matched rather than
+          # a fixed file name.
+          if (-not ($paths | Where-Object { $_ -like 'python/alphashape*.pyd' })) {
+            throw 'the Python module is not in the installer payload'
+          }
+          $pyd = ($paths | Where-Object { $_ -like 'python/alphashape*.pyd' } | Select-Object -First 1)
+          "payload python module: $pyd"
           "payload contains every expected file"
 
       - name: SHA-256

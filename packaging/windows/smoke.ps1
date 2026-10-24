@@ -102,7 +102,7 @@ $expected = @(
     'bin\alphashape-cli.exe',
     'bin\platforms\qwindows.dll',
     'bin\platforms\qoffscreen.dll',
-    'python\alphashape.pyd',
+    'python\python-usage.txt',
     'share\proj\proj.db',
     'LICENSES\LICENSE',
     'LICENSES\THIRD-PARTY-NOTICES.txt'
@@ -172,7 +172,11 @@ if ($LASTEXITCODE -ne 0) { Fail "alphashape.exe --version exited $LASTEXITCODE" 
 Write-Host "  $version"
 
 Step "Python module"
-$pyd = Join-Path $perUserDir 'python\alphashape.pyd'
+# The module ships under the ABI-tagged name CMake gives it
+# (alphashape.cp314-win_amd64.pyd), which Python still imports as `alphashape`.
+$pyd = Get-ChildItem (Join-Path $perUserDir 'python') -Filter 'alphashape*.pyd' |
+    Select-Object -First 1 -ExpandProperty FullName
+if (-not $pyd) { Fail "no alphashape*.pyd under $perUserDir\python" }
 if (-not $PythonVersion) {
     # The .pyd's file name carries no ABI tag, so the only way to know which
     # interpreter it was built for is to be told. CI passes the version it

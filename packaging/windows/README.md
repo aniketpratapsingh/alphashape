@@ -20,7 +20,9 @@ bin\alphashape-cli.exe         command line
 bin\*.dll                      vcpkg runtime, VC++ runtime, libomp, Qt
 bin\platforms\qwindows.dll     the Windows platform plugin
 bin\platforms\qoffscreen.dll   headless runs (--offscreen-smoke, CI, services)
-python\alphashape.pyd          Python module, with the same DLLs beside it
+python\alphashape.cp3XX-win_amd64.pyd   Python module, with the same DLLs
+                               beside it; the tag is the interpreter it was
+                               built for and Python imports it as `alphashape`
 python\*.dll
 share\proj\                    proj.db and a size-capped grid set
 LICENSES\                      GPL, Qt (LGPL-3), bundled fonts (OFL), this file
@@ -56,7 +58,7 @@ PATH option that the components page offers.
 
 * **PROJ.** `ALPHASHAPE_PROJ_DATA` wins, then `share\proj` beside the
   executable (`bin\alphashape.exe` -> `..\share\proj`) and beside the module's
-  image (`python\alphashape.pyd` -> `..\share\proj`). `alphashape-cli
+  image (`python\alphashape*.pyd` -> `..\share\proj`). `alphashape-cli
   --proj-info` shows the database in use.
 * **Qt.** Plugins are found in `bin\` because Qt looks in the application
   directory first; no `qt.conf` is needed.
@@ -72,11 +74,12 @@ and runs `cpack -G NSIS`. `windows-package-smoke` then installs the single
 
 ## Python version
 
-`alphashape.pyd` is built against one CPython and loadable only by that minor
-version; the file name does not carry the version, so `python-usage.txt` and the
-component description name the interpreter the build used. The smoke test
-installs the same minor version with `actions/setup-python` and imports the
-module from `python\`.
+`alphashape*.pyd` builds against one CPython and is loadable only by that
+minor version. CMake names it `alphashape.cp314-win_amd64.pyd`, so the tag in
+the file name already names the interpreter and Python imports it as
+`alphashape`; the packaging job also writes `dist/PYTHON-ABI.txt` with the
+exact version, and the smoke job reads that and installs the same minor with
+`actions/setup-python`.
 
 A bundled standalone CPython (so the module works with no Python installed at
 all) is a later improvement: it means shipping the interpreter, its standard
