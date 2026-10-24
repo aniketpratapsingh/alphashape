@@ -367,9 +367,14 @@ jobs:
     continue-on-error: ${{ !inputs.windows-required }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
-      # pybind11 is only needed by the packaging configure (the module), but vcpkg
-      # installs the whole list either way and the test lanes ignore it.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib pybind11
+      # pybind11 and its python3 port are absent on purpose: that port ships a
+      # vcpkg-cmake-wrapper which forces its own Python headers and libraries
+      # into find_package(Python3) whenever Development.Module is requested, so
+      # the .pyd could only ever be built for vcpkg's interpreter. The packaging
+      # step installs pybind11's headers into the setup-python interpreter
+      # instead (`pip install pybind11`), which is the one the installer is
+      # supposed to carry a module for.
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
       - uses: actions/checkout@v4
         with:
@@ -488,22 +493,29 @@ jobs:
           # on the image: a .pyd is loadable only by the CPython whose ABI it
           # was compiled for, and the smoke job installs the version in
           # PYTHON-ABI.txt, so the two must be the same interpreter family.
-          # $env:pythonLocation is setup-python's rooting directory;
-          # FIND_STRATEGY=LOCATION makes FindPython3 take the interpreter and
-          # its headers/libs from that tree instead of the registry, and
-          # FIND_REGISTRY=NEVER stops it from wandering off to a system-wide
-          # install. (pybind11's own probe honours the same variable, but the
-          # explicit -DPython3_* values are what pin it.)
+          #
+          # pybind11 comes from pip for the same reason. The vcpkg port is not
+          # installed (see VCPKG_PACKAGES above) because its python3 port's
+          # CMake wrapper replaces the Development.Module result with vcpkg's
+          # own interpreter, which is exactly the mismatch this step exists to
+          # prevent.
           if (-not $env:pythonLocation) { throw 'pythonLocation is not set; actions/setup-python must run before the package step' }
           $python = Join-Path $env:pythonLocation 'python.exe'
           if (-not (Test-Path -LiteralPath $python)) { throw "no python.exe under $env:pythonLocation" }
+          & $python -m pip install --disable-pip-version-check --no-input pybind11==2.13.6
+          if ($LASTEXITCODE -ne 0) { throw 'pip install pybind11 failed' }
+          $pybind11Dir = (& $python -c "import pybind11, sys; sys.stdout.write(pybind11.get_cmake_dir())").Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $pybind11Dir 'pybind11Config.cmake'))) {
+            throw "pybind11's CMake package was not found at '$pybind11Dir'"
+          }
           & $python -c "import sys; print('packaging with Python ' + sys.version.split()[0])"
           cmake -S engine -B build `
             -DALPHASHAPE_BUILD_PYTHON=ON -DALPHASHAPE_BUILD_INSTALLER=ON `
             -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}" `
             "-DPython3_ROOT_DIR=$env:pythonLocation" `
             -DPython3_FIND_STRATEGY=LOCATION -DPython3_FIND_REGISTRY=NEVER `
-            "-DPython3_EXECUTABLE=$python"
+            "-DPython3_EXECUTABLE=$python" `
+            "-Dpybind11_DIR=$pybind11Dir"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # engine/python/CMakeLists.txt writes dist/PYTHON-ABI.txt: the version
           # the module was configured against, which the smoke job installs.
@@ -898,9 +910,14 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
-      # pybind11 is only needed by the packaging configure (the module), but vcpkg
-      # installs the whole list either way and the test lanes ignore it.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib pybind11
+      # pybind11 and its python3 port are absent on purpose: that port ships a
+      # vcpkg-cmake-wrapper which forces its own Python headers and libraries
+      # into find_package(Python3) whenever Development.Module is requested, so
+      # the .pyd could only ever be built for vcpkg's interpreter. The packaging
+      # step installs pybind11's headers into the setup-python interpreter
+      # instead (`pip install pybind11`), which is the one the installer is
+      # supposed to carry a module for.
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
     steps:
       - uses: actions/checkout@v4
         with:
