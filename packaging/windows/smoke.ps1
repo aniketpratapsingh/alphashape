@@ -216,7 +216,19 @@ if ($null -eq $originalUserPath) { $originalUserPath = '' }
 $baselineUserPath = "$sentinelEntry;$originalUserPath"
 if ($baselineUserPath.EndsWith(';')) { $baselineUserPath = $baselineUserPath.Substring(0, $baselineUserPath.Length - 1) }
 Set-ItemProperty -LiteralPath $userPathKey -Name 'Path' -Value $baselineUserPath -Type ExpandString
+
+# The machine PATH on a CI image is longer than an NSIS string can hold, and the
+# installer deliberately refuses to edit one it cannot read (writing the empty
+# result back would delete every entry). That is the correct behaviour but it
+# leaves nothing to assert, so the machine PATH is first replaced with a short
+# baseline of the same shape -- a sentinel, a system directory, a trailing
+# backslash -- and restored in the finally block. The HKLM edit is then tested
+# for real rather than skipped on the one machine that happens to have a long
+# PATH.
+$machineSentinelEntry = 'C:\alphashape-smoke-machine-sentinel'
 $originalMachinePath = Read-RegistryPath $machinePathKey 'Path'
+$baselineMachinePath = "$machineSentinelEntry;$env:SystemRoot;C:\alphashape-smoke-trailing\"
+Set-ItemProperty -LiteralPath $machinePathKey -Name 'Path' -Value $baselineMachinePath -Type ExpandString
 
 try {
     # ---- per-user, silent, with PATH, into a non-ASCII directory -------------------------------
@@ -444,8 +456,15 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
 
     Step "PATH (per-machine)"
     $machinePath = Read-RegistryPath $machinePathKey 'Path'
+    Write-Host "  $machinePath"
     Assert (Path-Contains $machinePath (Join-Path $machineDir 'bin')) `
         "$machineDir\bin was not added to the machine PATH"
+    Assert (Path-Contains $machinePath $machineSentinelEntry) `
+        'the per-machine PATH edit dropped an existing entry'
+    # The trailing-backslash element must come back exactly as written: the
+    # comparison normalises a trailing backslash, but the value must not.
+    Assert ($machinePath.Contains('C:\alphashape-smoke-trailing\')) `
+        "the per-machine PATH edit rewrote an unrelated element: '$machinePath'"
     # The per-user entry must still be in HKCU: the two hives are edited
     # independently, and an installer that wrote both modes to one hive shows it here.
     Assert (Path-Contains (Read-RegistryPath $userPathKey 'Path') (Join-Path $perUserDir 'bin')) `
@@ -494,8 +513,6 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
         "the per-user InstallLocation became '$survivingLocation'"
     Assert (Path-Contains (Read-RegistryPath $userPathKey 'Path') (Join-Path $perUserDir 'bin')) `
         'the machine uninstall removed the per-user PATH entry'
-    Assert (-not (Path-Contains (Read-RegistryPath $machinePathKey 'Path') (Join-Path $machineDir 'bin'))) `
-        'the machine uninstall left its own PATH entry behind'
 
     # The surviving copy must still work, not merely still exist.
     $afterMachine = Invoke-Captured (Join-Path $perUserDir 'bin\alphashape-cli.exe') @('--proj-info')
@@ -527,9 +544,11 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
         "PATH is '$finalUserPath', expected '$baselineUserPath' intact"
 
     # The machine PATH was edited by the machine install only; it must be back to
-    # exactly what it was, with no residue of the temporary directory.
+    # exactly what the baseline was, with no residue of the temporary directory.
     $finalMachinePath = Read-RegistryPath $machinePathKey 'Path'
-    $machineBefore = @(Path-Elements $originalMachinePath)
+    Assert (-not (Path-Contains $finalMachinePath (Join-Path $machineDir 'bin'))) `
+        'the machine uninstall left its PATH entry behind'
+    $machineBefore = @(Path-Elements $baselineMachinePath)
     $machineAfter = @(Path-Elements $finalMachinePath)
     if (($machineAfter -join ';') -ne ($machineBefore -join ';')) {
         # Name the elements that differ rather than printing two long strings:
@@ -541,7 +560,7 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
             $a = if ($i -lt $machineAfter.Count) { $machineAfter[$i] } else { '<none>' }
             if ($a -ne $b) { Write-Host "    [$i] '$b' -> '$a'" -ForegroundColor Yellow }
         }
-        Fail 'the machine PATH did not return to its original value'
+        Fail 'the machine PATH did not return to its baseline value'
     }
 
     Write-Host "`nWindows installer smoke test passed" -ForegroundColor Green

@@ -265,12 +265,15 @@ Function un.onInit
 FunctionEnd
 
 ;--------------------------------
-; PATH. An NSIS string holds 1024 characters, so a PATH near that limit cannot
-; be read into a variable and rewritten without truncating it and losing
-; entries. A PATH in that state is left exactly as it is and the user is told:
-; the registry value itself is fine -- it is this installer's string handling
-; that is bounded. (Reading and rewriting a longer value would need a plugin
-; that edits REG_EXPAND_SZ in place; see packaging/windows/README.md.)
+; PATH. An NSIS string holds NSIS_MAX_STRLEN (1024) characters. A PATH that
+; does not fit cannot be read into a variable at all: ReadRegStr sets the error
+; flag and leaves the variable empty. Using that empty value as "PATH is empty"
+; and writing PATH = "<one entry>" would delete every existing entry -- which is
+; exactly what a machine PATH on a CI image is long enough to trigger. So a
+; failed read is treated as "too long to edit" and nothing is written. The
+; registry value itself is fine; it is this installer's string handling that is
+; bounded. (Editing a longer value would need a plugin that reads and writes
+; REG_EXPAND_SZ in place; see packaging/windows/README.md.)
 ;
 ; Both routines walk PATH one element at a time instead of doing string
 ; replacement. Replacement cannot tell an element from a prefix of a longer one
@@ -282,7 +285,10 @@ FunctionEnd
   SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 !macroend
 
+; Reads PATH into ${OUT} and leaves the error flag set when it did not fit.
+; Callers must check with IfErrors before touching the value.
 !macro READ_PATH_HIVE OUT
+  ClearErrors
   ${If} $MultiUser.InstallMode == "AllUsers"
     ReadRegStr ${OUT} HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
   ${Else}
@@ -375,15 +381,14 @@ Function AddToPath
 
   !insertmacro READ_PATH_HIVE $0
 
+  ; A PATH longer than an NSIS string fails the read and reports the error: it
+  ; must never be mistaken for an empty PATH, which would be overwritten with
+  ; this one entry. The length check covers a PATH that fits but leaves no room
+  ; for the insertion.
+  IfErrors pathTooLong
   StrLen $1 $0
   ${If} $1 > 900
-    IfSilent pathTooLongSilent
-    MessageBox MB_OK|MB_ICONEXCLAMATION "The PATH environment variable is too long for this \
-installer to edit safely. Add $\"$PathEntry$\" to your PATH by hand."
-    Goto pathDone
-    pathTooLongSilent:
-    DetailPrint "PATH is too long to edit safely; not adding $PathEntry"
-    Goto pathDone
+    Goto pathTooLong
   ${EndIf}
 
   !insertmacro REBUILD_PATH_WITHOUT_ENTRY
@@ -401,6 +406,15 @@ installer to edit safely. Add $\"$PathEntry$\" to your PATH by hand."
   !insertmacro WRITE_PATH_HIVE $3
   !insertmacro BROADCAST_ENV_CHANGE
   DetailPrint "Added $PathEntry to PATH"
+  Goto pathDone
+
+  pathTooLong:
+  IfSilent pathTooLongSilent
+  MessageBox MB_OK|MB_ICONEXCLAMATION "The PATH environment variable is too long for this \
+installer to edit safely. Add $\"$PathEntry$\" to your PATH by hand."
+  Goto pathDone
+  pathTooLongSilent:
+  DetailPrint "PATH is too long to edit safely; not adding $PathEntry"
 
   pathDone:
 FunctionEnd
@@ -409,20 +423,13 @@ Function un.RemoveFromPath
   StrCpy $PathEntry "$INSTDIR\bin"
 
   !insertmacro READ_PATH_HIVE $0
+  ; Same rule as AddToPath: a failed read is "too long", never "empty".
+  IfErrors pathTooLong
   StrCmp $0 "" pathDone
 
   StrLen $1 $0
   ${If} $1 > 900
-    ; The entry this uninstall would remove cannot be located in a PATH this
-    ; long with an NSIS string, so nothing is edited. Say so: a silent
-    ; uninstall would otherwise leave a stale entry behind with no explanation.
-    IfSilent pathTooLongSilent
-    MessageBox MB_OK|MB_ICONINFORMATION "The PATH environment variable is too long for this \
-uninstaller to edit safely, so $\"$PathEntry$\" has been left in it. Remove it by hand."
-    Goto pathDone
-    pathTooLongSilent:
-    DetailPrint "PATH is too long to edit safely; leaving $PathEntry in it"
-    Goto pathDone
+    Goto pathTooLong
   ${EndIf}
 
   !insertmacro REBUILD_PATH_WITHOUT_ENTRY
@@ -448,6 +455,18 @@ uninstaller to edit safely, so $\"$PathEntry$\" has been left in it. Remove it b
   ${EndIf}
   !insertmacro BROADCAST_ENV_CHANGE
   DetailPrint "Removed $PathEntry from PATH"
+  Goto pathDone
+
+  pathTooLong:
+  ; The entry this uninstall would remove cannot be located in a PATH this long
+  ; with an NSIS string, so nothing is edited. Say so: a silent uninstall would
+  ; otherwise leave a stale entry behind with no explanation.
+  IfSilent pathTooLongSilent
+  MessageBox MB_OK|MB_ICONINFORMATION "The PATH environment variable is too long for this \
+uninstaller to edit safely, so $\"$PathEntry$\" has been left in it. Remove it by hand."
+  Goto pathDone
+  pathTooLongSilent:
+  DetailPrint "PATH is too long to edit safely; leaving $PathEntry in it"
 
   pathDone:
 FunctionEnd
