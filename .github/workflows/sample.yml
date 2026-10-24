@@ -64,7 +64,7 @@ jobs:
       - name: Check the output
         run: |
           dir=build/sample/alphashape-sample
-          images=$(find "$dir/images" -name 'aerial_*.jpg' | wc -l)
+          images=$(ls "$dir"/images/aerial_*.jpg | wc -l)
           echo "images: $images"
           if [ "$images" -ne 12 ]; then
             echo "::error::expected 12 sample images, found $images"
