@@ -114,26 +114,29 @@ std::optional<Frustum> frustum_of(const Chunk& chunk, const Camera& camera, doub
     const Eigen::Matrix3d rotation_t = rotation.transpose();
 
     // A camera pixel -> a unit ray in the camera frame (Calibration::unproject), then to the
-    // chunk frame: p_chunk = R^T (p_cam - t) because the stored pose is world -> camera.
+    // chunk frame: p_chunk = R^T (p_cam - t), because the stored pose is world -> camera.
     const Sensor* sensor = sensor_for(chunk, camera);
-    const float width = sensor != nullptr && sensor->width > 0 ? static_cast<float>(sensor->width)
-                                                               : 1500.0F;
-    const float height = sensor != nullptr && sensor->height > 0
-                             ? static_cast<float>(sensor->height)
-                             : 1000.0F;
-    const Calibration fallback = Calibration::initial(
-        CameraType::Frame, static_cast<int>(width), static_cast<int>(height),
-        1.2 * static_cast<double>(width));
+    const bool sensor_calibrated =
+        sensor != nullptr && sensor->calibration.f > 0.0 && sensor->calibration.width > 0 &&
+        sensor->calibration.height > 0;
+    const int sensor_width = sensor != nullptr && sensor->width > 0 ? sensor->width : 1500;
+    const int sensor_height = sensor != nullptr && sensor->height > 0 ? sensor->height : 1000;
+    const Calibration fallback =
+        Calibration::initial(CameraType::Frame, sensor_width, sensor_height,
+                             1.2 * static_cast<double>(sensor_width));
     const Calibration& calibration =
-        sensor != nullptr && sensor->calibration.f > 0.0 ? sensor->calibration : fallback;
+        sensor_calibrated ? sensor->calibration : fallback;
+    // The corner pixels must come from the same geometry the rays are unprojected with.
+    const double width = static_cast<double>(calibration.width);
+    const double height = static_cast<double>(calibration.height);
 
     Frustum frustum;
     frustum.apex = rotation_t * (-translation);
     const std::array<Eigen::Vector2d, 4> pixels = {
         Eigen::Vector2d(0.0, 0.0),
-        Eigen::Vector2d(static_cast<double>(width), 0.0),
-        Eigen::Vector2d(static_cast<double>(width), static_cast<double>(height)),
-        Eigen::Vector2d(0.0, static_cast<double>(height)),
+        Eigen::Vector2d(width, 0.0),
+        Eigen::Vector2d(width, height),
+        Eigen::Vector2d(0.0, height),
     };
     for (std::size_t i = 0; i < pixels.size(); ++i) {
         const Eigen::Vector3d ray = calibration.unproject(pixels[i]);
@@ -200,7 +203,7 @@ void add_mesh(const Chunk& chunk, const Mesh& mesh, Scene& scene) {
         scene.textured = true;
     }
 
-    const auto colour_of = [&](std::size_t vertex) {
+    const auto colour_of = [&](std::size_t vertex) -> Eigen::Vector3f {
         if (scene.textured || !has_vertex_colours) {
             return Eigen::Vector3f::Constant(0.72F);
         }
@@ -209,12 +212,12 @@ void add_mesh(const Chunk& chunk, const Mesh& mesh, Scene& scene) {
                                static_cast<float>(mesh.colours[base + 1]) / 255.0F,
                                static_cast<float>(mesh.colours[base + 2]) / 255.0F);
     };
-    const auto normal_of = [&](std::size_t vertex) {
+    const auto normal_of = [&](std::size_t vertex) -> Eigen::Vector3f {
         if (vertex < normals.size() && normals[vertex].allFinite() &&
             normals[vertex].squaredNorm() > 1e-12F) {
             return normals[vertex];
         }
-        return Eigen::Vector3f::UnitZ();
+        return Eigen::Vector3f::UnitZ().eval();
     };
 
     if (scene.textured) {

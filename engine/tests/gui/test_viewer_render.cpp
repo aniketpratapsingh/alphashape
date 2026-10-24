@@ -24,7 +24,6 @@
 #include <QFile>
 #include <QImage>
 #include <QOffscreenSurface>
-#include <QShader>
 #include <QSize>
 #include <QString>
 #include <QSurfaceFormat>

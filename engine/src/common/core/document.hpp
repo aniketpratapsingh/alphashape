@@ -76,6 +76,8 @@ public:
     void set_active_chunk_id(std::int32_t id) { active_chunk_id_ = id; }
 
     Chunk* active_chunk();
+    /// The same chunk for a document held through the shared read lock (the GUI's normal way in).
+    const Chunk* active_chunk() const;
 
     /// Write this document to `path` with only the chunks named in `chunk_ids`
     /// (empty = every chunk). Chunk ids, their chunk-local id counters and

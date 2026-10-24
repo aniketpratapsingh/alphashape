@@ -10,9 +10,10 @@
 #include <QFile>
 #include <QImage>
 #include <QMatrix4x4>
-#include <QShader>
 #include <QSize>
 
+// The RHI headers are Qt's private-module ones (Qt6::GuiPrivate); there is no public
+// <QShader> header, only <rhi/qshader.h>.
 #include <rhi/qrhi.h>
 #include <rhi/qshader.h>
 
