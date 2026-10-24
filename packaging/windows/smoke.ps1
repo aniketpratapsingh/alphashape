@@ -226,10 +226,14 @@ try {
     }
     $thirdParty = @(Get-ChildItem -LiteralPath (Join-Path $perUserDir 'LICENSES\third-party') -Filter '*.txt')
     Assert ($thirdParty.Count -ge 8) "only $($thirdParty.Count) third-party licence texts shipped"
-    $empty = @($thirdParty | Where-Object { $_.Length -lt 200 })
-    Assert ($empty.Count -eq 0) ("licence texts too short to be a licence: " +
+    # Non-empty only: a length floor would be wrong. Several ports are public
+    # domain or carry a single-sentence dedication (sqlite3's is one line), and
+    # the point here is that the copy happened at all -- the per-port existence
+    # checks above and the build-time glob are what guarantee the content.
+    $empty = @($thirdParty | Where-Object { $_.Length -eq 0 })
+    Assert ($empty.Count -eq 0) ("empty licence texts: " +
         (($empty | ForEach-Object { $_.Name }) -join ', '))
-    Write-Host "  $($thirdParty.Count) third-party texts, all non-empty"
+    Write-Host "  $($thirdParty.Count) third-party texts: $(($thirdParty | ForEach-Object { $_.BaseName }) -join ', ')"
 
     # The notices must name the exact Qt in the payload. The template used to
     # spell @QT_VERSION@, which CPack never defines, so the shipped file said
