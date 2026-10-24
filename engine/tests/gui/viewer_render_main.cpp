@@ -111,9 +111,13 @@ int main(int argc, char** argv) {
         list_tests = list_tests || argument == "--gtest_list_tests";
     }
 
-    // ctest asks for the test list at build time, on a host (the CI build job) that has no
-    // display and no reason to start one. Listing needs no window, so never pay for the probe
-    // there.
+    // ctest asks for the test list at build time (gtest_discover_tests), on a host that has no
+    // display and no reason to start one. Listing needs no window, so go straight to the
+    // offscreen plugin there.
+    if (list_tests) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
+
     const bool needs_platform = !list_tests && !has_display() &&
                                 qEnvironmentVariableIsEmpty(kReexecMarker);
 
