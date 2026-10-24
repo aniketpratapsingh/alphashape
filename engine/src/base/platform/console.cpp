@@ -86,4 +86,54 @@ void setup_console_utf8() {
 #endif
 }
 
+bool attach_parent_console() {
+#if defined(_WIN32)
+    const auto valid = [](DWORD which) {
+        const HANDLE handle = ::GetStdHandle(which);
+        return handle != nullptr && handle != INVALID_HANDLE_VALUE;
+    };
+    // A handle that is already a console (only possible for a console-subsystem
+    // build) means there is nothing to adopt.
+    if (::GetConsoleWindow() != nullptr) {
+        return true;
+    }
+    // A caller that redirected the streams (Start-Process -RedirectStandardOutput,
+    // a shell's "> file") passed valid handles: they must be used as they are,
+    // and adopting CONOUT$ would throw the redirection away.
+    const bool have_out = valid(STD_OUTPUT_HANDLE);
+    const bool have_err = valid(STD_ERROR_HANDLE);
+    if (have_out && have_err) {
+        return true;
+    }
+    // AttachConsole replaces the invalid standard handles of a windowed process.
+    // A parent with no console -- Explorer, a service -- makes it fail with
+    // ERROR_INVALID_HANDLE, which is the ordinary "no terminal" case.
+    if (::AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
+        return false;
+    }
+    // The CRT streams were bound to the invalid handles at startup, so each
+    // missing one is rebound onto the console's. freopen keeps the stream
+    // buffered and associates it with the new console device.
+    bool ok = true;
+    if (!have_out && std::freopen("CONOUT$", "w", stdout) == nullptr) {
+        ok = false;
+    }
+    if (!have_err && std::freopen("CONOUT$", "w", stderr) == nullptr) {
+        ok = false;
+    }
+    // A stdin too, so a prompt or a pager does not read from a closed handle.
+    if (!valid(STD_INPUT_HANDLE)) {
+        (void)std::freopen("CONIN$", "r", stdin);
+    }
+    // The console's code page is the parent's, and the parent may be a legacy
+    // console: put it into UTF-8 and keep ANSI output working.
+    setup_console_utf8();
+    return ok;
+#else
+    // POSIX: a GUI program already inherits its parent's streams, so this is a
+    // no-op that always succeeds.
+    return true;
+#endif
+}
+
 }  // namespace alphashape::platform

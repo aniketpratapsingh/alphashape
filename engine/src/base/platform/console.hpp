@@ -30,4 +30,19 @@ void set_binary_mode(std::FILE* stream);
 /// caller's business. Safe to call more than once.
 void setup_console_utf8();
 
+/// Gives a GUI-subsystem Windows program the console it was started from.
+///
+/// Windows starts a /SUBSYSTEM:WINDOWS process with no standard handles even
+/// when a console launched it, so `alphashape.exe --version` in a terminal
+/// would print nothing anywhere. AttachConsole(ATTACH_PARENT_PROCESS) adopts
+/// the parent's console and the CRT streams are reopened onto CONOUT$.
+///
+/// Returns false when there is no console to attach to (a shortcut, Explorer,
+/// a service). On POSIX this returns whether the streams are usable and does
+/// nothing else: a POSIX GUI program already inherits its parent's streams.
+/// Redirected streams are left alone -- a pipe or a file handed over by
+/// CreateProcess is inherited and valid, and replacing it with CONOUT$ would
+/// lose the redirection the caller asked for. Call this first thing in main().
+bool attach_parent_console();
+
 }  // namespace alphashape::platform

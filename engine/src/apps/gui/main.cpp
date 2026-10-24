@@ -19,6 +19,7 @@
 #include "apps/gui/app.hpp"
 #include "apps/gui/command_line.hpp"
 #include "apps/gui/main_window.hpp"
+#include "base/platform/console.hpp"
 #include "base/utils/log.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -28,6 +29,14 @@
 int main(int argc, char** argv) {
     using namespace alphashape;
     using namespace alphashape::gui;
+
+    // On Windows the installed executable is a GUI-subsystem binary (no console
+    // window beside the app), and Windows gives such a process no standard
+    // handles even when a terminal started it. Adopting the parent's console
+    // keeps --help, --version, --offscreen-smoke and the log visible from a
+    // command prompt; a redirection the caller set up is left untouched. It is
+    // a no-op off Windows.
+    (void)platform::attach_parent_console();
 
     // The smoke run must work on a machine with no display server. Only the literal flag is
     // looked for here; the real parse happens below, once Qt has removed its own options.
