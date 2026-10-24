@@ -459,9 +459,18 @@ TEST_F(ExportTest, TheRealDialogOffersTheTasksFormatsAsAFilter) {
 
 TEST_F(ExportTest, SuggestPathUsesTheProjectFolderOrDocuments) {
     const ExportStep step = ExportController::find_step("ExportDem").value();
-    const QString beside = ExportController::suggest_path(QStringLiteral("/tmp/site.psx"),
-                                                          QStringLiteral("site"), step);
-    EXPECT_EQ(beside, QStringLiteral("/tmp/site_dem.tif"));
+    // Platform-neutral: the fixture names a real project in this test's scratch directory, so
+    // the assertion does not depend on POSIX spacer separators or a /tmp that Windows lacks.
+    const QString project = scratch("site.psx");
+    const QString beside =
+        ExportController::suggest_path(project, QStringLiteral("site"), step);
+    EXPECT_EQ(beside,
+              QDir(QFileInfo(project).absolutePath()).filePath(QStringLiteral("site_dem.tif")));
+
+    // The extension is the step's own, and the stem is the document title.
+    const ExportStep model = ExportController::find_step("ExportModel").value();
+    EXPECT_TRUE(ExportController::suggest_path(project, QStringLiteral("site"), model)
+                    .endsWith(QStringLiteral("site_model.ply")));
 
     // A project that was never saved has no folder; the Documents location is the fallback.
     const QString unsaved =
