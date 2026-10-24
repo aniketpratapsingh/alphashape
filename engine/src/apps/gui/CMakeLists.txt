@@ -13,6 +13,8 @@ add_library(alphashape_gui_lib STATIC
     job_manager.cpp
     task_dialog.cpp
     workflow.cpp
+    export_controller.cpp
+    start_screen.cpp
     main_window.cpp
     workspace_model.cpp
     workspace_pane.cpp

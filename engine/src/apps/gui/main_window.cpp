@@ -9,6 +9,7 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QDialog>
+#include <QDir>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -20,18 +21,25 @@
 #include <QProgressBar>
 #include <QMessageBox>
 #include <QSettings>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QToolButton>
 #include <QUrl>
 #include <QWidget>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/export_controller.hpp"
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
+#include "apps/gui/start_screen.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/workflow.hpp"
+#include "base/utils/error.hpp"
+#include "common/commands/model_commands.hpp"
+#include "common/core/chunk.hpp"
+#include "common/tasks/registry.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
 #define ALPHASHAPE_GUI_VERSION "0.0.0"
@@ -113,7 +121,15 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     };
 
     viewport_ = new ViewportWidget(app_, app_.theme(), this);
-    setCentralWidget(viewport_);
+    start_screen_ = new StartScreen(app_, this);
+
+    // Two central pages: the 3-D view, and the start screen that shows while no project is
+    // open. A widget stack (not QML) keeps the application free of a QML runtime.
+    stack_ = new QStackedWidget(this);
+    stack_->setObjectName(QStringLiteral("centralStack"));
+    stack_->addWidget(viewport_);
+    stack_->addWidget(start_screen_);
+    setCentralWidget(stack_);
 
     create_docks();
     create_actions();
@@ -122,6 +138,20 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
 
     // The viewport highlights a selected camera, so it follows the tree selection.
     viewport_->set_selection(selection_);
+
+    connect(start_screen_, &StartScreen::new_requested, this, [this]() { new_project(); });
+    connect(start_screen_, &StartScreen::open_requested, this, [this]() { open_project(); });
+    connect(start_screen_, &StartScreen::open_path_requested, this,
+            [this](const QString& path) { open_project(path); });
+    connect(start_screen_, &StartScreen::add_photos_requested, this,
+            [this](const QStringList& files) { new_project_from_photos(files); });
+    connect(start_screen_, &StartScreen::paths_dropped, this,
+            [this](const QStringList& paths) { handle_dropped_paths(paths); });
+
+    // The start screen appears when no project is open. The command line decides the initial
+    // page: an explicit --open / --new is a request for a project, not for the launcher.
+    start_page_ = !app_.project_requested();
+    update_central_page();
 
     resize(1280, 800);
     apply_default_layout();
@@ -132,6 +162,10 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     update_undo_actions();
     update_recent_menu();
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_title);
+    connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_central_page);
+    // A chunk added through the command layer (the Workspace tree, a test) is a project open,
+    // so the launcher must give way to the view.
+    connect(&app_, &GuiApp::undo_changed, this, &MainWindow::update_central_page);
     connect(&app_, &GuiApp::path_changed, this, &MainWindow::update_title);
     connect(&app_, &GuiApp::dirty_changed, this, [this](bool) { update_title(); });
     connect(&app_, &GuiApp::undo_changed, this, &MainWindow::update_undo_actions);
@@ -149,8 +183,10 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
                 on_job_progress(percent, stage, eta_ms);
             });
     connect(&jobs, &JobManager::job_finished, this,
-            [this](quint64, JobManager::State state, const QString& message) {
-                on_job_finished(static_cast<int>(state), message);
+            [this](quint64 id, JobManager::State state, const QString& message) {
+                const std::optional<JobManager::Job> finished = app_.jobs().job(id);
+                on_job_finished(static_cast<int>(state), message,
+                                finished ? finished->task : QString());
             });
     update_job_ui();
 }
@@ -388,6 +424,16 @@ void MainWindow::create_menus() {
     file->addAction(act("action.file.save"));
     file->addAction(act("action.file.save_as"));
     file->addSeparator();
+    // The Export submenu operates on the open project's results, so it sits with the
+    // project-file entries: after Save As and before Close / Quit.
+    export_menu_ = file->addMenu(tr("&Export"));
+    export_menu_->setObjectName(QStringLiteral("menu.file.export"));
+    export_controller_ = new ExportController(app_, export_menu_, this);
+    export_controller_->set_error_handler(
+        [this](const QString& title, const QString& message) { error_handler_(title, message); });
+    connect(export_controller_, &ExportController::export_written, this,
+            [this](const QString&, const QString& path) { note_export_written(path); });
+    file->addSeparator();
     file->addAction(act("action.file.close"));
     file->addAction(act("action.file.quit"));
 
@@ -441,9 +487,22 @@ void MainWindow::create_status_strip() {
     jobs_cancel_->setText(tr("Cancel"));
     jobs_cancel_->setToolTip(tr("Cancel the running job"));
     connect(jobs_cancel_, &QToolButton::clicked, &app_.jobs(), qOverload<>(&JobManager::cancel));
+    // The Reveal button of the last finished export. It is created up front and hidden, so the
+    // status strip's layout never shifts the first time an export finishes.
+    auto* reveal_button = new QToolButton(this);
+    reveal_button->setObjectName(QStringLiteral("statusReveal"));
+    reveal_button->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    reveal_action_ = new QAction(tr("Reveal"), this);
+    reveal_action_->setObjectName(QStringLiteral("action.export.reveal"));
+    reveal_button->setDefaultAction(reveal_action_);
+    reveal_button_ = reveal_button;
+    statusBar()->addPermanentWidget(reveal_button);
     statusBar()->addPermanentWidget(jobs_label_);
     statusBar()->addPermanentWidget(jobs_progress_);
     statusBar()->addPermanentWidget(jobs_cancel_);
+    reveal_button_->setVisible(false);
+    // The button is reachable by objectName for the tests and later command wiring even while
+    // it is hidden (QAction::isVisible() is false then, so assert on the action instead).
     jobs_progress_->setVisible(false);
     jobs_cancel_->setVisible(false);
 }
@@ -475,6 +534,9 @@ void MainWindow::update_job_ui() {
         }
     }
     update_recent_menu();
+    // The start screen's entry points edit or replace the document too, so they follow the same
+    // rule as the File menu.
+    start_screen_->set_actions_enabled(!busy);
 
     jobs_progress_->setVisible(busy);
     jobs_cancel_->setVisible(busy);
@@ -503,13 +565,17 @@ void MainWindow::on_job_progress(double percent, const QString& stage, qint64 et
     jobs_label_->setToolTip(eta_ms >= 0 ? tr("%1 remaining").arg(format_eta(eta_ms)) : stage);
 }
 
-void MainWindow::on_job_finished(int state, const QString& message) {
+void MainWindow::on_job_finished(int state, const QString& message, const QString& task) {
     switch (static_cast<JobManager::State>(state)) {
         case JobManager::State::Failed:
             error_handler_(tr("Task failed"), message);
             break;
         case JobManager::State::Succeeded:
-            statusBar()->showMessage(tr("Task finished"), 4000);
+            // An export already posted its own note (file name + Reveal), which the generic
+            // "Task finished" would only wipe out.
+            if (!task.startsWith(QStringLiteral("Export"))) {
+                statusBar()->showMessage(tr("Task finished"), 4000);
+            }
             break;
         case JobManager::State::Cancelled:
             statusBar()->showMessage(tr("Task cancelled"), 4000);
@@ -540,7 +606,10 @@ bool MainWindow::new_project() {
     if (!confirm_discard()) {
         return false;
     }
+    // An explicit New is a request for a project: show the view from now on, not the launcher.
+    start_page_ = false;
     app_.new_document("");
+    update_central_page();
     statusBar()->showMessage(tr("New project"), 4000);
     return true;
 }
@@ -565,6 +634,8 @@ bool MainWindow::open_project(const QString& path) {
         report_error(tr("Could not open project"), e);
         return false;
     }
+    start_page_ = false;
+    update_central_page();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
     return true;
 }
@@ -622,9 +693,180 @@ bool MainWindow::close_project() {
     if (!confirm_discard()) {
         return false;
     }
+    // Closing leaves no project open, so the start screen takes the central area again.
+    start_page_ = true;
     app_.new_document("");
+    update_central_page();
     statusBar()->showMessage(tr("Project closed"), 4000);
     return true;
+}
+
+// --- Start screen -------------------------------------------------------------------------
+
+void MainWindow::show_start_page() {
+    stack_->setCurrentWidget(start_screen_);
+    // The launcher re-reads the recent list every time it comes up: a project may have been
+    // opened and closed since the list was built, and a recent file may have been deleted.
+    start_screen_->reload();
+}
+
+void MainWindow::show_viewport_page() {
+    stack_->setCurrentWidget(viewport_);
+}
+
+void MainWindow::update_central_page() {
+    // "No project open" means the start screen was requested AND the document is still the
+    // empty shell. Anything that puts content in the document (a chunk, a file path) means a
+    // project is open, whatever the flag said, so the view takes over.
+    if (start_page_) {
+        // A running job implies an open project with work in it, and the worker holds the
+        // document lock: decide from the job manager rather than reading the document.
+        if (app_.jobs().busy()) {
+            start_page_ = false;
+        } else {
+            const bool project_open = app_.read_document([](const Document& document) {
+                return !document.path().empty() || !document.workspace().chunks().empty();
+            });
+            if (project_open) {
+                start_page_ = false;
+            }
+        }
+    }
+    if (start_page_) {
+        show_start_page();
+    } else {
+        show_viewport_page();
+    }
+    start_screen_->set_actions_enabled(!app_.jobs().busy());
+}
+
+int MainWindow::central_page() const {
+    return stack_ == nullptr ? -1 : stack_->currentIndex();
+}
+
+bool MainWindow::showing_start_screen() const {
+    return stack_ != nullptr && stack_->currentWidget() == start_screen_;
+}
+
+bool MainWindow::new_project_from_photos(const QStringList& files) {
+    if (files.isEmpty()) {
+        return false;
+    }
+    if (!confirm_discard()) {
+        return false;
+    }
+    try {
+        start_page_ = false;
+        app_.new_document("");
+        // One chunk, then the same AddPhotos task the Workflow menu runs. The chunk addition
+        // goes through the command layer so it is undoable like any other edit.
+        const std::size_t existing = app_.read_document([](const Document& document) {
+            return document.workspace().chunks().size();
+        });
+        app_.execute(make_add_chunk_command(
+            app_.document().workspace(), tr("Chunk %1").arg(existing + 1).toStdString(), -1));
+        update_central_page();
+    } catch (const std::exception& error) {
+        report_error(tr("Could not start the project"), error);
+        start_page_ = true;
+        update_central_page();
+        return false;
+    }
+    return add_photos_to_active_chunk(files);
+}
+
+bool MainWindow::add_photos_to_active_chunk(const QStringList& files) {
+    if (files.isEmpty()) {
+        return false;
+    }
+    if (app_.jobs().busy()) {
+        statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+        return false;
+    }
+    const std::int32_t chunk_id = app_.read_document([](const Document& document) {
+        const Chunk* chunk = document.active_chunk();
+        return chunk == nullptr ? std::int32_t{-1} : chunk->id();
+    });
+    if (chunk_id < 0) {
+        report_error(tr("Could not add the photos"), Error("there is no active chunk"));
+        return false;
+    }
+    try {
+        // The parameters come from the schema, so a new declared parameter needs no change
+        // here; only the file list is bound.
+        Params values = make_params(builtin_registry().require("AddPhotos"));
+        std::vector<std::string> names;
+        names.reserve(static_cast<std::size_t>(files.size()));
+        for (const QString& file : files) {
+            names.push_back(file.toStdString());
+        }
+        values.set("filenames", ParamValue(std::move(names)));
+        app_.jobs().submit("AddPhotos", std::move(values), chunk_id);
+    } catch (const std::exception& error) {
+        report_error(tr("Could not add the photos"), error);
+        return false;
+    }
+    statusBar()->showMessage(tr("Adding %1 photos").arg(static_cast<qlonglong>(files.size())),
+                             4000);
+    return true;
+}
+
+bool MainWindow::handle_dropped_paths(const QStringList& paths) {
+    QStringList photos;
+    QStringList folders;
+    QStringList projects;
+    for (const QString& path : paths) {
+        const QFileInfo info(path);
+        if (info.isDir()) {
+            folders << path;
+        } else if (info.suffix().compare(QStringLiteral("psx"), Qt::CaseInsensitive) == 0) {
+            projects << path;
+        } else {
+            photos << path;
+        }
+    }
+    // A project file wins: dropping one project opens it. A drop that mixes a project with
+    // images is treated as photos only when there is exactly one and it is not a project.
+    if (!projects.isEmpty()) {
+        return open_project(projects.front());
+    }
+    if (!photos.isEmpty()) {
+        return new_project_from_photos(photos);
+    }
+    if (!folders.isEmpty()) {
+        // A folder is a folder of photos: list the images it holds, one level deep.
+        QStringList found;
+        for (const QString& folder : folders) {
+            const QDir dir(folder);
+            const QStringList filters = {QStringLiteral("*.jpg"), QStringLiteral("*.jpeg"),
+                                         QStringLiteral("*.png"), QStringLiteral("*.tif"),
+                                         QStringLiteral("*.tiff")};
+            const QStringList entries = dir.entryList(filters, QDir::Files, QDir::Name);
+            for (const QString& entry : entries) {
+                found << dir.absoluteFilePath(entry);
+            }
+        }
+        if (found.isEmpty()) {
+            statusBar()->showMessage(tr("No images found in the dropped folder"), 4000);
+            return false;
+        }
+        return new_project_from_photos(found);
+    }
+    return false;
+}
+
+void MainWindow::note_export_written(const QString& path) {
+    const QFileInfo info(path);
+    // The note names the file that was written and offers to show it in the file manager. The
+    // button lives on the status strip and is reused by the next export.
+    statusBar()->showMessage(tr("Exported %1 to %2").arg(info.fileName(), info.absolutePath()),
+                             8000);
+    const QString folder = info.absolutePath();
+    reveal_action_->setToolTip(tr("Show %1 in the file manager").arg(folder));
+    disconnect(reveal_action_, nullptr, this, nullptr);
+    connect(reveal_action_, &QAction::triggered, this,
+            [folder]() { QDesktopServices::openUrl(QUrl::fromLocalFile(folder)); });
+    reveal_button_->setVisible(true);
 }
 
 // --- Layout, title, menus ------------------------------------------------------------------

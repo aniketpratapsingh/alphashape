@@ -1,6 +1,7 @@
 # GUI tests: Theme.*, GuiShell.*, GuiApp.*, CommandLine.*, Jobs.*, TaskDialog.*, Workflow.*,
-# MainWindow.*, WorkspaceTree.*, PhotosPane.*, LogPane.*, Undo.*, ViewerCamera.* and ViewerScene.*
-# (MainWindow on the harness in harness.hpp), plus the viewport's renderer in its own binary
+# StartScreen.*, ExportMenu.*, MainWindow.*, WorkspaceTree.*, PhotosPane.*, LogPane.*, Undo.*,
+# ViewerCamera.* and ViewerScene.* (MainWindow on the harness in harness.hpp), plus the
+# viewport's renderer in its own binary
 # (ViewerRender.*, see below). Registered with ctest like the engine suite, so they run in the CI
 # shard lanes. QT_QPA_PLATFORM=offscreen: no display needed.
 
@@ -21,6 +22,8 @@ add_executable(alphashape_gui_tests
     test_jobs.cpp
     test_task_dialog.cpp
     test_workflow.cpp
+    test_start_screen.cpp
+    test_export_menu.cpp
     test_shell.cpp
     test_workspace.cpp
     test_photos_log.cpp

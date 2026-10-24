@@ -128,6 +128,11 @@ TEST_F(TaskDialogTest, WidgetTypeFollowsTheParamType) {
     EXPECT_EQ(save.kind("path"), EditorKind::PathEdit);
     EXPECT_NE(save.editor("path")->parentWidget()->findChild<QPushButton*>("browse.path"), nullptr);
     EXPECT_EQ(save.kind("format"), EditorKind::ComboBox);
+    // A caller-supplied filter reaches the Browse button's dialog and is readable back.
+    EXPECT_TRUE(save.path_filter("path").isEmpty());
+    save.set_path_filter("path", QStringLiteral("Model (*.ply *.obj);;All files (*)"));
+    EXPECT_EQ(save.path_filter("path"), QStringLiteral("Model (*.ply *.obj);;All files (*)"));
+    EXPECT_TRUE(save.path_filter("format").isEmpty()) << "not a path parameter";
 
     TaskDialog photos("AddPhotos", registry(), store());
     EXPECT_EQ(photos.kind("filenames"), EditorKind::ListEdit);

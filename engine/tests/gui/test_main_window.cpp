@@ -107,7 +107,7 @@ TEST_F(MainWindowTest, DefaultDockLayout) {
     EXPECT_EQ(window().dockWidgetArea(dock("dock.log")), Qt::BottomDockWidgetArea);
     EXPECT_TRUE(window().tabifiedDockWidgets(dock("dock.photos")).contains(dock("dock.log")));
 
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(viewport->objectName(), QStringLiteral("viewport"));
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Dark);
@@ -124,7 +124,7 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
     show_window();
     ASSERT_TRUE(action("action.view.theme.dark")->isChecked());
     trigger("action.view.theme.light");
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(app().theme().mode(), ThemeMode::Light);
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Light);
@@ -137,7 +137,7 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
 
 TEST_F(MainWindowTest, ViewportSceneFollowsTheDocument) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_TRUE(viewport->scene_is_empty());
 
@@ -600,7 +600,7 @@ TEST_F(MainWindowTest, AboutTextNamesTheVersionAndLicence) {
 
 TEST_F(MainWindowTest, ViewportShortcutsFitAndToggleTheProjection) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
 
     // A scene to frame: the point cloud gives the camera bounds, which fit() needs.
@@ -646,7 +646,7 @@ TEST_F(MainWindowTest, ViewportShortcutsFitAndToggleTheProjection) {
 
 TEST_F(MainWindowTest, ViewportSelectionHighlightsOnlyTheActiveChunksCamera) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     auto* selection = window().findChild<WorkspaceSelection*>(QStringLiteral("selection.workspace"));
     ASSERT_NE(selection, nullptr);

@@ -74,6 +74,11 @@ public:
     void reset_to_defaults();
     /// Load a value into a parameter's editor, as if the schema default had been that value.
     void set_value(const std::string& param, const ParamValue& value);
+    /// Filter the Browse button offers for a path parameter ("PLY (*.ply);;All files (*)");
+    /// empty keeps Qt's unfiltered dialog. Ignored for parameters without a browse button.
+    void set_path_filter(const std::string& param, const QString& filter);
+    /// The filter set for a parameter ("" when none).
+    QString path_filter(const std::string& param) const;
 
     /// The editor widget of a parameter, or nullptr. For path and list editors this is the
     /// line edit.
@@ -106,6 +111,7 @@ private:
         bool required = false;
         bool advanced = false;
         ParamValue loaded;       ///< what the editor was last loaded with
+        QString path_filter;     ///< Browse filter ("All files (*)" when empty)
         QString error;
     };
 
