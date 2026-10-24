@@ -106,6 +106,8 @@ private:
 
     // Fixed resources, created in ensure().
     QRhiBuffer* uniforms_ = nullptr;
+    /// The aligned allocation size of uniforms_ (what ubufAligned(kUniformSize) returned).
+    quint32 uniform_buffer_size_ = 0;
     QRhiSampler* sampler_ = nullptr;
     QRhiTexture* page_ = nullptr;
     QRhiBuffer* point_quad_ = nullptr;

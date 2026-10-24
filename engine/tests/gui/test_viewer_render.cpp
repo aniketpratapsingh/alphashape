@@ -194,7 +194,10 @@ public:
         }
         QRhiTextureRenderTargetDescription description(QRhiColorAttachment(color_.get()),
                                                        depth_.get());
-        target_.reset(rhi->newTextureRenderTarget(description));
+        target_.reset(rhi->newTextureRenderTarget(description,
+                                                  // Keep the colour contents across passes: the
+                                                  // readback below runs in its own frame.
+                                                  QRhiTextureRenderTarget::PreserveColorContents));
         pass_.reset(target_->newCompatibleRenderPassDescriptor());
         target_->setRenderPassDescriptor(pass_.get());
         ok_ = target_->create();

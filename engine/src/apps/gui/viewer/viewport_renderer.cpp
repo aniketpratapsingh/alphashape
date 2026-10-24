@@ -265,7 +265,12 @@ bool ViewportRenderer::create_resources(QRhi* rhi, QRhiRenderPassDescriptor* ren
         return false;
     }
 
-    uniforms_ = rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kUniformSize);
+    // Some backends (lavapipe among them) reject a uniform block whose allocation is not
+    // ubuf-aligned even though the shader only reads the declared 160 bytes; allocate the
+    // aligned size and upload only what the block declares.
+    uniform_buffer_size_ = static_cast<quint32>(rhi->ubufAligned(kUniformSize));
+    uniforms_ = rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer,
+                               uniform_buffer_size_);
     if (!uniforms_->create()) {
         error_ = QStringLiteral("could not create the uniform buffer");
         return false;
@@ -447,6 +452,9 @@ void ViewportRenderer::render(QRhiCommandBuffer* cb, QRhiRenderTarget* target,
     cb->beginPass(target, clear, {1.0F, 0}, batch);
     cb->setViewport(QRhiViewport(0.0F, 0.0F, static_cast<float>(width),
                                  static_cast<float>(height)));
+    // An explicit scissor covering the whole target: the Vulkan backends keep scissor state per
+    // pass, and leaving it unset lets a stale rect from an earlier pass clip everything away.
+    cb->setScissor(QRhiScissor(0, 0, width, height));
     if (pipeline_mesh_ != nullptr && mesh_vertices_ != nullptr && mesh_indices_ != nullptr &&
         !scene_.mesh_indices.empty()) {
         cb->setGraphicsPipeline(pipeline_mesh_);
