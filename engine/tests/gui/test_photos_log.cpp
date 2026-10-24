@@ -338,7 +338,10 @@ TEST_F(PhotosPaneTest, ModelResetKeepsTheSharedSelectionAndProperties) {
     pump(10);
     EXPECT_EQ(selection().items(), expected) << "the undo's model reset wiped the shared selection";
     EXPECT_EQ(properties().title(), QStringLiteral("IMG_1"));
-    EXPECT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{1}));
+    EXPECT_EQ(photos().selected_camera_ids(), (std::vector<std::int32_t>{1}))
+        << "the reset dropped the list's own selection and never re-applied it";
+    // The Delete action acts on that selection, so an empty list selection also disables it.
+    EXPECT_TRUE(action("action.photos.disable")->isEnabled());
 
     // (b) A reset driven by a finished job. The built-in AddPhotos task adds cameras to the active
     // chunk, so the row set really changes and the model takes the reset path.
