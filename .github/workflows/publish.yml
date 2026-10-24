@@ -161,9 +161,17 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
           TAG_EXISTS: ${{ inputs.tag-exists }}
         run: |
-          # A re-run for the same tag replaces the release rather than failing on the
-          # duplicate tag. Only ever this workflow's own tag.
-          gh release delete "$TAG" --yes 2>/dev/null || true
+          # A re-run for the same tag replaces the draft rather than failing on the duplicate
+          # tag. Only ever this workflow's own tag -- and never a published release: replacing
+          # one would swap a shipped, possibly already-downloaded asset set for a fresh rebuild
+          # under the same name and checksums. Bump the version instead.
+          if existing_draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$existing_draft" != "true" ]; then
+              echo "::error::release $TAG is already published; refusing to replace it"
+              exit 1
+            fi
+            gh release delete "$TAG" --yes
+          fi
 
           args=(--title "alphashape $TAG" --generate-notes --notes-file notes.md --draft)
           if [ "$TAG_EXISTS" = "true" ]; then
