@@ -308,8 +308,13 @@ TEST_F(GuiPipelineEndToEnd, BuildsSavesAndReopensTheSampleProject) {
     });
     ASSERT_TRUE(trigger("action.file.save_as")) << "could not save the project";
     ASSERT_TRUE(QFileInfo::exists(project));
-    EXPECT_TRUE(QFileInfo(project + QStringLiteral(".files")).isDir())
-        << "the project's sidecar folder is missing";
+    // The project is the .psx file plus a sibling folder named after the stem
+    // ("sample-site.files", NOT "sample-site.psx.files"; see ProjectIO::save).
+    const QString sidecar =
+        QFileInfo(project).absolutePath() + QStringLiteral("/") +
+        QFileInfo(project).completeBaseName() + QStringLiteral(".files");
+    EXPECT_TRUE(QFileInfo(sidecar).isDir()) << "the project's sidecar folder is missing: "
+                                           << sidecar.toStdString();
     EXPECT_FALSE(app().dirty());
 
     const std::size_t saved_cameras = chunk().cameras().size();
