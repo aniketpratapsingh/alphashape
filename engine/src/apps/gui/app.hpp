@@ -103,6 +103,13 @@ public:
     void undo();
     void redo();
 
+    /// Group the commands executed until end_macro() into one history entry called `name`
+    /// ("Disable 3 photos"), so a multi-item action is one undo step. Groups nest; an unclosed
+    /// group is closed when the app goes away. The GUI uses this from a widget that already
+    /// checked it is not busy.
+    void begin_macro(const std::string& name);
+    void end_macro();
+
     /// Most recently used project paths, newest first (at most kMaxRecentFiles).
     static constexpr int kMaxRecentFiles = 10;
     QStringList recent_files() const;

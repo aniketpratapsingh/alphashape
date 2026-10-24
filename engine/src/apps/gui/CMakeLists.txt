@@ -16,7 +16,10 @@ add_library(alphashape_gui_lib STATIC
     main_window.cpp
     workspace_model.cpp
     workspace_pane.cpp
+    photos_model.cpp
+    photos_pane.cpp
     properties_pane.cpp
+    log_pane.cpp
     viewer/camera_controller.cpp
     viewer/scene.cpp
     viewer/viewport_renderer.cpp
