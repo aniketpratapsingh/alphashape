@@ -37,6 +37,14 @@ function Assert([bool] $condition, [string] $message) {
     if (-not $condition) { Fail $message }
 }
 
+# For conditions whose value is a string rather than a comparison: an empty or
+# missing value fails, anything else passes. Calling Assert() with a bare string
+# is a type error under a [bool] parameter, which is a confusing way to report
+# "the program printed nothing".
+function Assert-NotEmpty([string] $value, [string] $message) {
+    if ([string]::IsNullOrWhiteSpace($value)) { Fail $message }
+}
+
 function Assert-Present([string] $path, [string] $what) {
     Assert (Test-Path -LiteralPath $path) "$what is missing: $path"
 }
@@ -55,6 +63,16 @@ function Read-RegistryPath([string] $key, [string] $name) {
 function Path-Elements([string] $value) {
     if ($null -eq $value -or $value -eq '') { return @() }
     return @($value -split ';' | Where-Object { $_ -ne '' })
+}
+
+# The value after "prefix" on the first matching line of a program's output, as
+# a single string. Where-Object/-replace would give an array when a line is
+# printed twice, and a method call on an array fails.
+function Output-Value([string[]] $lines, [string] $prefix) {
+    foreach ($line in $lines) {
+        if ($line.StartsWith($prefix)) { return $line.Substring($prefix.Length).Trim() }
+    }
+    return ''
 }
 
 function Path-Contains([string] $value, [string] $entry) {
@@ -295,8 +313,8 @@ try {
               'find proj.db from its own directory')
     }
     $expectedDb = Join-Path $perUserDir 'share\proj\proj.db'
-    $reportedDb = ($projInfo.Output | Where-Object { $_ -match '^proj database: ' }) -replace '^proj database: ', ''
-    Assert ($reportedDb) '--proj-info printed no database line'
+    $reportedDb = Output-Value $projInfo.Output 'proj database: '
+    Assert-NotEmpty $reportedDb '--proj-info printed no database line'
     # The bytes are UTF-8, so the non-ASCII directory must come back intact. A
     # path decoded with the ANSI code page would not compare equal here.
     Assert ($reportedDb.Contains('Jörg-ü')) `
@@ -362,7 +380,8 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
     if ($pythonExit -ne 0) { Fail "importing alphashape from $pyd failed" }
     Assert (($pythonCheck -join "`n") -match '\bpython\s+3\.') "the module did not report a Python version"
     # The import must have come from the install, not from a stray copy elsewhere.
-    $importPath = ($pythonCheck | Where-Object { $_ -match '^imported from ' }) -replace '^imported from ', ''
+    $importPath = Output-Value $pythonCheck 'imported from '
+    Assert-NotEmpty $importPath 'the module did not report where it was imported from'
     Assert ($importPath -like "$perUserDir\python\*") "alphashape was imported from '$importPath', not the install"
 
     # ---- per-machine, silent, with PATH, side by side with the per-user copy -------------------
@@ -415,7 +434,8 @@ print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
         $machineProj.Output | ForEach-Object { Write-Host "  $_" }
         Fail 'the per-machine CLI could not resolve its own proj.db'
     }
-    $machineDb = ($machineProj.Output | Where-Object { $_ -match '^proj database: ' }) -replace '^proj database: ', ''
+    $machineDb = Output-Value $machineProj.Output 'proj database: '
+    Assert-NotEmpty $machineDb 'the per-machine --proj-info printed no database line'
     Assert ((Resolve-Path -LiteralPath $machineDb).Path -eq (Resolve-Path -LiteralPath (Join-Path $machineDir 'share\proj\proj.db')).Path) `
         "the per-machine PROJ database is '$machineDb', not its own copy"
 
