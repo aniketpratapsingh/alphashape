@@ -90,6 +90,11 @@ public:
     void set_actions_enabled(bool enabled);
     bool actions_enabled() const { return actions_enabled_; }
 
+    /// Drop a project / photo paths onto the screen from code (the user's drag-and-drop, and
+    /// the tests, which cannot synthesise platform drags on the offscreen plugin). Accepts the
+    /// drop the way Qt would and emits paths_dropped(). False when nothing usable was dropped.
+    bool drop_paths(const QStringList& paths);
+
 Q_SIGNALS:
     void new_requested();
     void open_requested();
@@ -102,11 +107,6 @@ Q_SIGNALS:
     /// Files were dropped on the screen; MainWindow sorts them into "open this project" or
     /// "start a project with these photos".
     void paths_dropped(const QStringList& paths);
-
-    /// Drop a project / photo paths onto the screen from code (the user's drag-and-drop, and
-    /// the tests, which cannot synthesise platform drags on the offscreen plugin). Accepts the
-    /// drop the way Qt would and emits paths_dropped(). False when nothing usable was dropped.
-    bool drop_paths(const QStringList& paths);
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
