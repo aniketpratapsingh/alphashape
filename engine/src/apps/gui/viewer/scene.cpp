@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -57,10 +58,16 @@ Eigen::Vector3f to_float3(const Eigen::Vector3d& value) {
                            static_cast<float>(value.z()));
 }
 
-void add_line(std::vector<SceneLineVertex>& lines, const Eigen::Vector3d& a,
-              const Eigen::Vector3d& b, const Eigen::Vector3f& colour) {
+void add_line(std::vector<SceneLineVertex>& lines, std::vector<LineKind>& kinds,
+              std::vector<std::int32_t>& cameras, const Eigen::Vector3d& a,
+              const Eigen::Vector3d& b, const Eigen::Vector3f& colour, LineKind kind,
+              std::int32_t camera_id = -1) {
     lines.push_back({to_float3(a), colour});
     lines.push_back({to_float3(b), colour});
+    kinds.push_back(kind);
+    kinds.push_back(kind);
+    cameras.push_back(camera_id);
+    cameras.push_back(camera_id);
 }
 
 /// Nice grid spacing: 1, 2 or 5 times a power of ten, sized so the grid has roughly
@@ -156,9 +163,116 @@ bool valid_face(const Eigen::Vector3i& face, std::size_t vertex_count) {
            static_cast<std::size_t>(face.z()) < vertex_count;
 }
 
+/// The size the display copy of `page` gets: the page itself, or a box-filtered downscale that
+/// fits SceneTexture::kMaxTextureSize on both sides. A preview larger than the cap costs GPU
+/// memory without adding detail at any reasonable zoom level.
+Eigen::Vector2i display_size_of(const Image& page) {
+    const int longest = std::max(page.width(), page.height());
+    if (longest <= SceneTexture::kMaxTextureSize) {
+        return Eigen::Vector2i(page.width(), page.height());
+    }
+    const double scale = static_cast<double>(SceneTexture::kMaxTextureSize) /
+                         static_cast<double>(longest);
+    const auto scaled = [&](int value) {
+        return std::max(1, static_cast<int>(std::lround(static_cast<double>(value) * scale)));
+    };
+    return Eigen::Vector2i(scaled(page.width()), scaled(page.height()));
+}
+
+/// Expand `page` (1 or 3 channels) to RGBA8 and, if it is oversized, downscale it to
+/// SceneTexture::kMaxTextureSize with a box filter. Copies whole rows where it can: the source
+/// is tightly packed, so the common (no-downscale) case is one row loop over plain memcpy-ish
+/// channel expansion rather than a per-pixel accessor call.
+SceneTexture copy_page(const Image& page) {
+    const Eigen::Vector2i size = display_size_of(page);
+    SceneTexture texture;
+    texture.width = size.x();
+    texture.height = size.y();
+    texture.rgba.resize(static_cast<std::size_t>(texture.width) *
+                        static_cast<std::size_t>(texture.height) * 4U);
+
+    const int channels = page.channels();
+    const std::uint8_t* source = page.data();
+
+    if (size.x() == page.width() && size.y() == page.height()) {
+        // No resample: expand one row at a time from the tightly packed source, so the common
+        // path never calls the per-pixel accessor or walks a pixel twice.
+        for (int y = 0; y < texture.height; ++y) {
+            const std::uint8_t* in = source + static_cast<std::size_t>(y) *
+                                                  static_cast<std::size_t>(page.width()) *
+                                                  static_cast<std::size_t>(channels);
+            std::uint8_t* out = texture.rgba.data() +
+                                static_cast<std::size_t>(y) *
+                                    static_cast<std::size_t>(texture.width) * 4U;
+            for (int x = 0; x < texture.width; ++x) {
+                if (channels >= 3) {
+                    std::memcpy(out, in, 3U);
+                } else {
+                    out[0] = in[0];
+                    out[1] = in[0];
+                    out[2] = in[0];
+                }
+                out[3] = 255;
+                out += 4;
+                in += channels;
+            }
+        }
+        return texture;
+    }
+
+    // Box filter: average every source pixel of the block that maps to one output texel.
+    for (int y = 0; y < texture.height; ++y) {
+        const int y0 = static_cast<int>(static_cast<long long>(y) * page.height() /
+                                        texture.height);
+        int y1 = static_cast<int>(static_cast<long long>(y + 1) * page.height() /
+                                  texture.height);
+        y1 = std::clamp(y1, y0 + 1, page.height());
+        for (int x = 0; x < texture.width; ++x) {
+            const int x0 = static_cast<int>(static_cast<long long>(x) * page.width() /
+                                            texture.width);
+            int x1 = static_cast<int>(static_cast<long long>(x + 1) * page.width() /
+                                      texture.width);
+            x1 = std::clamp(x1, x0 + 1, page.width());
+            unsigned sum[3] = {0U, 0U, 0U};
+            unsigned count = 0U;
+            for (int sy = y0; sy < y1; ++sy) {
+                const std::uint8_t* row = source +
+                                          static_cast<std::size_t>(sy) *
+                                              static_cast<std::size_t>(page.width()) *
+                                              static_cast<std::size_t>(channels);
+                for (int sx = x0; sx < x1; ++sx) {
+                    const std::uint8_t* texel = row + static_cast<std::size_t>(sx) *
+                                                          static_cast<std::size_t>(channels);
+                    if (channels >= 3) {
+                        sum[0] += texel[0];
+                        sum[1] += texel[1];
+                        sum[2] += texel[2];
+                    } else {
+                        sum[0] += texel[0];
+                        sum[1] += texel[0];
+                        sum[2] += texel[0];
+                    }
+                    ++count;
+                }
+            }
+            std::uint8_t* out = texture.rgba.data() +
+                                (static_cast<std::size_t>(y) *
+                                     static_cast<std::size_t>(texture.width) +
+                                 static_cast<std::size_t>(x)) *
+                                    4U;
+            const unsigned divisor = std::max(count, 1U);
+            out[0] = static_cast<std::uint8_t>((sum[0] + divisor / 2U) / divisor);
+            out[1] = static_cast<std::uint8_t>((sum[1] + divisor / 2U) / divisor);
+            out[2] = static_cast<std::uint8_t>((sum[2] + divisor / 2U) / divisor);
+            out[3] = 255;
+        }
+    }
+    return texture;
+}
+
 /// Copy the mesh into the scene. Textured meshes emit one vertex per face corner (the uv pool
 /// is per corner), untextured meshes share vertices through the index buffer.
-void add_mesh(const Chunk& chunk, const Mesh& mesh, Scene& scene) {
+void add_mesh(const Chunk& chunk, const Mesh& mesh, const SceneStyle& style, Scene& scene) {
     if (mesh.empty() || mesh.vertices.empty()) {
         return;
     }
@@ -173,39 +287,16 @@ void add_mesh(const Chunk& chunk, const Mesh& mesh, Scene& scene) {
     }
 
     if (page != nullptr) {
-        const Image& image = *page;
-        SceneTexture texture;
-        texture.width = image.width();
-        texture.height = image.height();
-        texture.rgba.resize(static_cast<std::size_t>(texture.width) *
-                            static_cast<std::size_t>(texture.height) * 4U);
-        for (int y = 0; y < image.height(); ++y) {
-            for (int x = 0; x < image.width(); ++x) {
-                const std::size_t index =
-                    (static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width()) +
-                     static_cast<std::size_t>(x)) *
-                    4U;
-                const int channels = image.channels();
-                if (channels >= 3) {
-                    texture.rgba[index + 0] = image.at(x, y, 0);
-                    texture.rgba[index + 1] = image.at(x, y, 1);
-                    texture.rgba[index + 2] = image.at(x, y, 2);
-                } else {
-                    const std::uint8_t grey = image.at(x, y, 0);
-                    texture.rgba[index + 0] = grey;
-                    texture.rgba[index + 1] = grey;
-                    texture.rgba[index + 2] = grey;
-                }
-                texture.rgba[index + 3] = 255;
-            }
-        }
-        scene.texture = std::move(texture);
+        scene.texture = copy_page(*page);
         scene.textured = true;
     }
+    // A textured mesh is drawn from its flat grey times the page; the vertex colours are not
+    // used, so a theme change has to re-derive the grey.
+    scene.style_colours_mesh = scene.textured || !has_vertex_colours;
 
     const auto colour_of = [&](std::size_t vertex) -> Eigen::Vector3f {
         if (scene.textured || !has_vertex_colours) {
-            return Eigen::Vector3f::Constant(0.72F);
+            return style.mesh_base;
         }
         const std::size_t base = vertex * 3U;
         return Eigen::Vector3f(static_cast<float>(mesh.colours[base + 0]) / 255.0F,
@@ -292,6 +383,12 @@ SceneStyle scene_style_for(ThemeMode mode) {
     style.point_cloud = rgb_of(dark ? "#B9C8D2" : "#2C3A42");
     style.point_highlight = rgb_of(dark ? "#FFFFFF" : "#000000");
     style.selection = rgb_of(dark ? "#35BDAF" : "#0E7C72");
+    // Axis colours are geometry markers rather than theme surfaces: the same red / green / blue
+    // reads on both canvases, so they are not token-driven.
+    style.axis_x = Eigen::Vector3f(0.85F, 0.35F, 0.32F);
+    style.axis_y = Eigen::Vector3f(0.42F, 0.75F, 0.36F);
+    style.axis_z = Eigen::Vector3f(0.35F, 0.55F, 0.90F);
+    style.mesh_base = Eigen::Vector3f::Constant(0.72F);
     return style;
 }
 
@@ -327,6 +424,7 @@ Scene build_scene(const Chunk& chunk, const SceneStyle& style, const BuildOption
     scene.dense_points.reserve(
         std::min(cloud.points.size(), options.max_dense_points > 0 ? options.max_dense_points
                                                                    : cloud.points.size()));
+    scene.style_colours_points = !cloud.points.empty() && !cloud_has_colours;
     for (std::size_t i = 0; i < cloud.points.size(); i += dense_stride) {
         ScenePointVertex vertex;
         vertex.position = to_float3(cloud.points[i]);
@@ -347,7 +445,7 @@ Scene build_scene(const Chunk& chunk, const SceneStyle& style, const BuildOption
     for (const Eigen::Vector3d& vertex : mesh.vertices) {
         bounds.add(vertex);
     }
-    add_mesh(chunk, mesh, scene);
+    add_mesh(chunk, mesh, style, scene);
 
     // Cameras participate in the framing even before anything was reconstructed.
     for (const Camera& camera : chunk.cameras()) {
@@ -388,11 +486,13 @@ Scene build_scene(const Chunk& chunk, const SceneStyle& style, const BuildOption
             options.highlight_camera && *options.highlight_camera == camera.id;
         const Eigen::Vector3f colour = highlighted ? style.camera_active : style.camera;
         for (const Eigen::Vector3d& corner : frustum->corners) {
-            add_line(scene.lines, frustum->apex, corner, colour);
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras, frustum->apex, corner,
+                     colour, LineKind::Camera, camera.id);
         }
         for (std::size_t i = 0; i < frustum->corners.size(); ++i) {
-            add_line(scene.lines, frustum->corners[i],
-                     frustum->corners[(i + 1U) % frustum->corners.size()], colour);
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras,
+                     frustum->corners[i], frustum->corners[(i + 1U) % frustum->corners.size()],
+                     colour, LineKind::Camera, camera.id);
         }
     }
 
@@ -415,24 +515,26 @@ Scene build_scene(const Chunk& chunk, const SceneStyle& style, const BuildOption
                 std::clamp(static_cast<int>(std::lround((y1 - y0) / step)), 0, kMaxGridLines);
             for (int i = 0; i <= columns; ++i) {
                 const double x = x0 + static_cast<double>(i) * step;
-                add_line(scene.lines, Eigen::Vector3d(x, y0, z), Eigen::Vector3d(x, y1, z),
-                         style.grid);
+                add_line(scene.lines, scene.line_kinds, scene.line_cameras,
+                         Eigen::Vector3d(x, y0, z), Eigen::Vector3d(x, y1, z), style.grid,
+                         LineKind::Grid);
             }
             for (int i = 0; i <= rows; ++i) {
                 const double y = y0 + static_cast<double>(i) * step;
-                add_line(scene.lines, Eigen::Vector3d(x0, y, z), Eigen::Vector3d(x1, y, z),
-                         style.grid);
+                add_line(scene.lines, scene.line_kinds, scene.line_cameras,
+                         Eigen::Vector3d(x0, y, z), Eigen::Vector3d(x1, y, z), style.grid,
+                         LineKind::Grid);
             }
         }
         if (options.axes) {
             const double length = diagonal * 0.15;
             const Eigen::Vector3d origin = bounds.min;
-            add_line(scene.lines, origin, origin + Eigen::Vector3d::UnitX() * length,
-                     Eigen::Vector3f(0.85F, 0.35F, 0.32F));
-            add_line(scene.lines, origin, origin + Eigen::Vector3d::UnitY() * length,
-                     Eigen::Vector3f(0.42F, 0.75F, 0.36F));
-            add_line(scene.lines, origin, origin + Eigen::Vector3d::UnitZ() * length,
-                     Eigen::Vector3f(0.35F, 0.55F, 0.90F));
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras, origin,
+                     origin + Eigen::Vector3d::UnitX() * length, style.axis_x, LineKind::Axis);
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras, origin,
+                     origin + Eigen::Vector3d::UnitY() * length, style.axis_y, LineKind::Axis);
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras, origin,
+                     origin + Eigen::Vector3d::UnitZ() * length, style.axis_z, LineKind::Axis);
         }
         const Eigen::Vector3d& lo = bounds.min;
         const Eigen::Vector3d& hi = bounds.max;
@@ -448,8 +550,10 @@ Scene build_scene(const Chunk& chunk, const SceneStyle& style, const BuildOption
             {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
         }};
         for (const auto& edge : kEdges) {
-            add_line(scene.lines, corners[static_cast<std::size_t>(edge[0])],
-                     corners[static_cast<std::size_t>(edge[1])], style.bounding_box);
+            add_line(scene.lines, scene.line_kinds, scene.line_cameras,
+                     corners[static_cast<std::size_t>(edge[0])],
+                     corners[static_cast<std::size_t>(edge[1])], style.bounding_box,
+                     LineKind::BoundingBox);
         }
     }
 
@@ -462,6 +566,48 @@ Scene build_scene(const Document& document, const SceneStyle& style, const Build
         return Scene{};
     }
     return build_scene(*chunk, style, options);
+}
+
+void Scene::restyle(const SceneStyle& style, std::optional<std::int32_t> highlight_camera) {
+    // The geometry stays where it is; only the colours that came from the theme are rewritten.
+    const std::size_t line_count = std::min(lines.size(), line_kinds.size());
+    for (std::size_t i = 0; i < line_count; ++i) {
+        const std::int32_t camera_id =
+            i < line_cameras.size() ? line_cameras[i] : std::int32_t{-1};
+        switch (line_kinds[i]) {
+            case LineKind::Grid:
+                lines[i].colour = style.grid;
+                break;
+            case LineKind::BoundingBox:
+                lines[i].colour = style.bounding_box;
+                break;
+            case LineKind::Camera:
+                lines[i].colour = highlight_camera && *highlight_camera == camera_id
+                                      ? style.camera_active
+                                      : style.camera;
+                break;
+            case LineKind::Axis:
+                // Axis colours mark the world directions (X red, Y green, Z blue), not a theme
+                // surface: the same three read on either canvas, so there is nothing to redo.
+                break;
+        }
+    }
+    // Tie points are always drawn in the theme's tie-point colour, so they always follow it.
+    if (!tie_points.empty()) {
+        for (ScenePointVertex& vertex : tie_points) {
+            vertex.colour = style.tie_point;
+        }
+    }
+    if (style_colours_points) {
+        for (ScenePointVertex& vertex : dense_points) {
+            vertex.colour = style.point_cloud;
+        }
+    }
+    if (style_colours_mesh) {
+        for (SceneMeshVertex& vertex : mesh_vertices) {
+            vertex.colour = style.mesh_base;
+        }
+    }
 }
 
 }  // namespace alphashape::gui
