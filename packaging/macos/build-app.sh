@@ -155,10 +155,13 @@ codesign --verify --deep --strict --verbose=2 "$app"
 echo "== size breakdown"
 du -sk "$contents"/* "$contents/Frameworks/"* 2>/dev/null | sort -n | tail -15
 # The 20 largest individual files (not directories), so a future regression that adds a bulky
-# resource is visible in the log even when the total still looks plausible.
+# resource is visible in the log even when the total still looks plausible. Sorting into a file
+# first keeps `sort` from taking SIGPIPE from `head`, which `pipefail` would turn into a failure.
 echo "== 20 largest files"
-find "$app" -type f -print0 | xargs -0 stat -f '%z %N' | sort -rn | head -20 |
-    awk '{printf "%8.1f MB  %s\n", $1 / 1048576, substr($0, index($0, " ") + 1)}'
+largest=$(mktemp)
+trap 'rm -f "$largest"' EXIT
+find "$app" -type f -print0 | xargs -0 stat -f '%z %N' | sort -rn >"$largest"
+head -20 "$largest" | awk '{printf "%8.1f MB  %s\n", $1 / 1048576, substr($0, index($0, " ") + 1)}'
 echo "== bundle size"
 du -sh "$app"
 echo "built $app (minimum macOS $min_os)"
