@@ -11,8 +11,9 @@ applies the same idea to the bundle:
     ship -- without proj.db nothing works at all, and a TIN grid such as
     no_kv_ETRS89NO_NGO48_TIN.json is a datum shift, not metadata (the whole set is
     under 3 MB);
-  * a short essentials list ships unconditionally (EGM96 and the small continental
-    datum-shift grid) even when a regional grid would not fit the budget;
+  * a short essentials list ships unconditionally (one EGM96 variant and, when the
+    source package has it, the small continental datum-shift grid) even when a
+    regional grid would not fit the budget;
   * the remaining raster grids are taken smallest first until the byte budget is
     spent, skipping any single file over the per-file cap, so the bundle covers as
     many countries as possible for the bytes available.
