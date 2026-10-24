@@ -483,19 +483,18 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
-          # Pin the interpreter. The vcpkg toolchain puts its own python3 ahead of
-          # the one actions/setup-python installed, and a module built against it
-          # (3.14 here) would not import in the smoke job's 3.12. pythonLocation is
-          # what setup-python exports; the fallback covers a manual run.
-          $python = if ($env:pythonLocation) { Join-Path $env:pythonLocation "python.exe" } `
-                    else { (Get-Command python -ErrorAction Stop).Source }
-          "packaging against python: $python"
-          & $python -c "import sys; print('  version', sys.version.split()[0])"
+          # No -DPython3_EXECUTABLE: the vcpkg toolchain wraps find_package(Python3)
+          # and only its own python3 port supplies Development.Module on this
+          # image, so that is the interpreter the module is built for. Which one
+          # it is gets recorded below and the smoke job installs the same minor
+          # version; nothing else may assume a version.
           cmake -S engine -B build `
             -DALPHASHAPE_BUILD_PYTHON=ON -DALPHASHAPE_BUILD_INSTALLER=ON `
-            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}" `
-            -DPython3_EXECUTABLE="$python"
+            -DALPHASHAPE_PACKAGE_VERSION="${{ inputs.version }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # engine/python/CMakeLists.txt writes dist/PYTHON-ABI.txt: the version
+          # the module was configured against, which the smoke job installs.
+          Get-Content build/dist/PYTHON-ABI.txt | ForEach-Object { "module built for Python $_" }
           # The module is new; the GUI relinks because the install rules add its
           # icon and version resource to it. Everything else is already built.
           cmake --build build --target alphashape_python alphashape-gui
@@ -526,7 +525,7 @@ jobs:
           name: alphashape-windows-x86_64
           path: |
             dist/*.zip
-            build/dist/*.exe
+            build/dist/*
           if-no-files-found: error
 
   # The installer is attested here: SHA-256 for the download instructions in
@@ -637,17 +636,31 @@ jobs:
           name: alphashape-windows-installer
           path: dist
 
-      # The module is built against one CPython minor version; the smoke test
-      # imports it, so install the version the packaging job configured with.
+      # The .pyd is loadable only by the CPython it was built against, and its
+      # file name carries no ABI tag, so the build job publishes the version and
+      # this job installs exactly that one.
+      - name: Python version the module was built for
+        id: abi
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem dist -Filter PYTHON-ABI.txt -Recurse | Select-Object -First 1
+          if (-not $file) { throw 'PYTHON-ABI.txt is missing from the artifact' }
+          $version = (Get-Content $file.FullName -Raw).Trim()
+          # setup-python wants major.minor; the cache carries the patch too.
+          $minor = ($version -split '\.')[0..1] -join '.'
+          "module built for $version, installing $minor"
+          "minor=$minor" >> $env:GITHUB_OUTPUT
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ steps.abi.outputs.minor }}
 
       - name: Install, run and uninstall
         shell: pwsh
         run: |
           $installer = Get-ChildItem dist/*.exe -Recurse | Select-Object -First 1
-          packaging/windows/smoke.ps1 -Installer $installer.FullName -PythonVersion "3.12"
+          packaging/windows/smoke.ps1 -Installer $installer.FullName `
+              -PythonVersion "${{ steps.abi.outputs.minor }}"
 
   # ---- test lanes: one job per matrix entry, each runs a ctest slice of the build above ----
 
