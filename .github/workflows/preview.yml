@@ -32,17 +32,17 @@ jobs:
       # bookkeeping (PYTHON-ABI.txt, payload.txt, the packaging job's own
       # SHA256SUMS.txt) that must not be published, so only the three platform
       # artifacts are collected and the Windows one is filtered to .exe/.zip.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: alphashape-linux-*
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: alphashape-macos-*
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-windows-x86_64
           path: dist-windows
