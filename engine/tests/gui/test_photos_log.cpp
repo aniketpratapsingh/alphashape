@@ -119,7 +119,10 @@ protected:
         for (const Camera& camera : chunk.cameras()) {
             built.camera_ids.push_back(camera.id);
         }
+        // The chunk was inserted behind the models' backs (the pane paths were not used), so
+        // both the Photos list and the Workspace tree have to re-read the document.
         model().refresh();
+        tree().model().refresh();
         return built;
     }
 

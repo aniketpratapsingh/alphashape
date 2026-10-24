@@ -7,6 +7,7 @@
 #include <QHBoxLayout>
 #include <QPalette>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QStringList>
 #include <QTextCharFormat>
 #include <QTextCursor>
@@ -104,6 +105,7 @@ void LogView::append(LogEntry entry) {
     if (at_bottom) {
         verticalScrollBar()->setValue(verticalScrollBar()->maximum());
     }
+    Q_EMIT changed();
 }
 
 void LogView::append(const QList<LogEntry>& entries) {
@@ -134,11 +136,13 @@ void LogView::set_minimum_level(LogLevel lowest) {
     }
     minimum_ = lowest;
     rebuild_document();
+    Q_EMIT changed();
 }
 
 void LogView::clear_entries() {
     entries_.clear();
     clear();
+    Q_EMIT changed();
 }
 
 QString LogView::plain_text() const {
@@ -212,29 +216,31 @@ LogPane::LogPane(GuiApp& app, QWidget* parent) : QWidget(parent), app_(app) {
     clipboard_writer_ = [](const QString& text) { QApplication::clipboard()->setText(text); };
     connect(level_, &QComboBox::currentIndexChanged, this, [this](int) {
         set_minimum_level(static_cast<LogLevel>(level_->currentData().toInt()));
-        update_actions();
     });
     connect(copy_, &QToolButton::clicked, this, [this]() { copy_all(); });
-    connect(clear_, &QToolButton::clicked, this, [this]() {
-        view_->clear_entries();
-        update_actions();
-    });
+    connect(clear_, &QToolButton::clicked, this, [this]() { view_->clear_entries(); });
 
     // Lines arrive on the GUI thread by contract (GuiApp's sink marshals them), so appending is
     // a plain slot call; a queued connection would also work but loses ordering under load.
-    connect(&app_, &GuiApp::log_message, this,
-            [this](LogLevel level, const QString& text) {
-                view_->append(LogEntry{level, text});
-                update_actions();
-            });
+    connect(&app_, &GuiApp::log_message, this, [this](LogLevel level, const QString& text) {
+        view_->append(LogEntry{level, text});
+    });
+    // The view owns what is visible, so its own changes (append, clear, filter) drive the
+    // actions rather than each caller remembering to.
+    connect(view_, &LogView::changed, this, &LogPane::update_actions);
     update_actions();
 }
 
 void LogPane::set_minimum_level(LogLevel level) {
+    // Apply to the view first: when the combo is already on this level, setCurrentIndex() is a
+    // no-op and would never reach the view (which is where the filter actually lives).
+    view_->set_minimum_level(level);
     const int index = level_->findData(static_cast<int>(level));
-    if (index >= 0) {
-        level_->setCurrentIndex(index);  // currentIndexChanged applies it
+    if (index >= 0 && level_->currentIndex() != index) {
+        const QSignalBlocker blocker(level_);
+        level_->setCurrentIndex(index);
     }
+    update_actions();
 }
 
 void LogPane::set_clipboard_writer(ClipboardWriter writer) {

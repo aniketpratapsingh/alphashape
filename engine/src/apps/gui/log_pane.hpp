@@ -67,6 +67,10 @@ public:
     /// The visible text, one line per entry, without level decoration.
     QString plain_text() const;
 
+Q_SIGNALS:
+    /// Lines were added, cleared, or the filter changed what is visible.
+    void changed();
+
 private:
     void rebuild_document();
     void apply_line_format(alphashape::LogLevel level, const QString& text);
