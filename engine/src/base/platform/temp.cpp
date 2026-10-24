@@ -65,7 +65,10 @@ std::string unique_temp_path(const std::string& prefix, const std::string& suffi
     name += '_';
     name += std::to_string(ticket);
     name += suffix;
-    return (std::filesystem::path(temp_directory()) / name).string();
+    // Both conversions go through the UTF-8 helpers: a temporary directory
+    // under a user profile with non-ASCII characters would otherwise be
+    // decoded and re-encoded with the ANSI code page on Windows.
+    return path_to_utf8(path_from_utf8(temp_directory()) / path_from_utf8(name));
 }
 
 }  // namespace alphashape::platform

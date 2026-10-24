@@ -6,6 +6,7 @@
 // std::filesystem::u8path / path::u8string consume). Windows APIs are wide, so
 // the conversion lives here and nowhere else.
 
+#include <filesystem>
 #include <string>
 
 namespace alphashape::platform {
@@ -16,6 +17,18 @@ namespace alphashape::platform {
 std::string to_utf8(const std::wstring& wide);
 std::wstring from_utf8(const std::string& utf8);
 #endif
+
+/// A filesystem path from a UTF-8 string. std::filesystem::path's string
+/// constructor decodes its argument in the *native narrow* encoding, which on
+/// Windows is the ANSI code page: an install under "C:\Users\Jörg\..." would
+/// arrive as mojibake and no file would open. Going through u8string decodes
+/// UTF-8 on every platform, which is the encoding the rest of the engine uses.
+std::filesystem::path path_from_utf8(const std::string& utf8);
+
+/// The inverse: the path as a UTF-8 std::string. path::string() would narrow
+/// with the ANSI code page on Windows, so anything that prints a path or hands
+/// one to a C library (PROJ, an environment variable) must use this.
+std::string path_to_utf8(const std::filesystem::path& path);
 
 /// Returns "" when the variable is unset. A set-but-empty variable also reads
 /// as "": every caller in the engine treats empty as absent (ALPHASHAPE_GPU,

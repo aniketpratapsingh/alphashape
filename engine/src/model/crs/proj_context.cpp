@@ -10,6 +10,7 @@
 
 #include <proj.h>
 
+#include "base/platform/env.hpp"
 #include "base/platform/paths.hpp"
 #include "base/utils/log.hpp"
 
@@ -19,9 +20,16 @@ namespace {
 namespace fs = std::filesystem;
 namespace plat = platform;
 
+/// Paths in the engine are UTF-8 (base/platform/env.hpp); PROJ is a C library
+/// and takes UTF-8 too, so the only conversion needed is between a path and
+/// that encoding. path::string() would narrow with the ANSI code page on
+/// Windows, which mangles an install directory such as "C:\Users\Jörg\...".
+fs::path path_from_utf8(const std::string& utf8) { return plat::path_from_utf8(utf8); }
+std::string path_to_utf8(const fs::path& path) { return plat::path_to_utf8(path); }
+
 std::filesystem::path env_path(const char* name) {
     const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? fs::path(value) : fs::path{};
+    return value != nullptr && *value != '\0' ? path_from_utf8(value) : fs::path{};
 }
 
 bool has_database(const fs::path& dir) {
@@ -40,7 +48,7 @@ std::filesystem::path executable_directory() {
     std::error_code ec;
     // weakly_canonical resolves symlinks (a Homebrew or distro bin/ link) and
     // leaves a not-yet-existing tail alone; it never throws here.
-    return fs::weakly_canonical(fs::path(exe), ec).parent_path();
+    return fs::weakly_canonical(path_from_utf8(exe), ec).parent_path();
 }
 
 /// Directory of the image this code is linked into (the executable, or the Python
@@ -51,12 +59,12 @@ std::filesystem::path image_directory() {
         return {};
     }
     std::error_code ec;
-    return fs::weakly_canonical(fs::path(image), ec).parent_path();
+    return fs::weakly_canonical(path_from_utf8(image), ec).parent_path();
 }
 
 std::filesystem::path source_root() {
 #ifdef ALPHASHAPE_PROJECT_SOURCE_DIR
-    return fs::path(ALPHASHAPE_PROJECT_SOURCE_DIR);
+    return path_from_utf8(ALPHASHAPE_PROJECT_SOURCE_DIR);
 #else
     return {};
 #endif
@@ -200,7 +208,9 @@ ResolvedDataDir resolve_data_directory(const DataSearchOptions& options) {
         TempContext temp;
         const char* database = proj_context_get_database_path(temp.ctx);
         if (database != nullptr && *database != '\0') {
-            const fs::path dir = fs::path(database).parent_path();
+            // PROJ reports UTF-8 (it converts to wide internally on Windows), so
+            // the string must not go through the ANSI-decoding constructor.
+            const fs::path dir = path_from_utf8(database).parent_path();
             if (accept(dir, SearchStep::ProjDefault)) {
                 return resolved;
             }
@@ -233,8 +243,8 @@ ProjDataInfo proj_data_info() {
     TempContext temp;
     const char* database = proj_context_get_database_path(temp.ctx);
     if (database != nullptr && *database != '\0') {
-        info.database_path = database;
-        info.search_directory = fs::path(database).parent_path();
+        info.database_path = path_from_utf8(database);
+        info.search_directory = info.database_path.parent_path();
     }
     const char* version = proj_context_get_database_metadata(temp.ctx, "PROJ.VERSION");
     if (version != nullptr) {
@@ -286,7 +296,9 @@ void configure_context(PJ_CONTEXT* ctx) {
     }
     const fs::path& dir = environment_state().data_dir;
     if (!dir.empty()) {
-        const std::string value = dir.string();
+        // PROJ takes UTF-8 paths; path::string() would narrow with the ANSI code
+        // page on Windows and the search path would not match any file.
+        const std::string value = path_to_utf8(dir);
         const char* paths[1] = {value.c_str()};
         proj_context_set_search_paths(ctx, 1, paths);
     }
@@ -339,13 +351,15 @@ std::filesystem::path proj_context_initialize() {
             // choice is stable across a process tree even when it was made by
             // the exe-relative or tools/proj-data step rather than by the
             // caller's environment.
-            set_env("PROJ_DATA", resolved.path.string());
-            set_env("ALPHASHAPE_PROJ_DATA", resolved.path.string());
-            log(LogLevel::Info) << "PROJ data: " << resolved.path << " ("
+            set_env("PROJ_DATA", path_to_utf8(resolved.path));
+            set_env("ALPHASHAPE_PROJ_DATA", path_to_utf8(resolved.path));
+            // path's own operator<< narrows with the native encoding, so a log
+            // line about a non-ASCII directory would be mojibake on Windows.
+            log(LogLevel::Info) << "PROJ data: " << path_to_utf8(resolved.path) << " ("
                                 << search_step_name(resolved.step) << ")";
             if (!override_dir.empty() && resolved.step != SearchStep::EnvOverride) {
                 log(LogLevel::Warn)
-                    << "ALPHASHAPE_PROJ_DATA=" << override_dir
+                    << "ALPHASHAPE_PROJ_DATA=" << path_to_utf8(override_dir)
                     << " has no proj.db; ignored";
             }
         }
@@ -391,11 +405,10 @@ std::string describe_environment() {
         text += ")";
     }
     text += "\n  data dir: ";
-    text += env.data_dir.empty() ? std::string("(not resolved)")
-                                 : env.data_dir.string();
+    text += env.data_dir.empty() ? std::string("(not resolved)") : path_to_utf8(env.data_dir);
     text += "\n  proj.db: ";
     text += info.database_path.empty() ? std::string("(missing)")
-                                       : info.database_path.string();
+                                       : path_to_utf8(info.database_path);
     text += "\n  network: ";
     text += env.network ? "on" : "off (offline)";
     return text;

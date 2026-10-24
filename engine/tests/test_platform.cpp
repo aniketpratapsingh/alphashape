@@ -224,6 +224,75 @@ TEST(Platform, EnvRoundTrip) {
     EXPECT_EQ(plat::get_env("ALPHASHAPE_PLATFORM_TEST_VAR_NEVER_SET"), "");
 }
 
+TEST(Platform, Utf8PathRoundTripsNonAscii) {
+    // The property the installer depends on: a directory with characters
+    // outside the ANSI code page must survive the string -> path -> string
+    // round trip. std::filesystem::path's string constructor decodes in the
+    // native narrow encoding, so a helper that went through it would return
+    // mojibake here on Windows (and on a Linux box with a C locale).
+    //
+    // The comparison is made in two stages rather than against the input
+    // bytes: a path re-spells '/' as '\' on Windows, so equality with the
+    // original string would fail for a reason that has nothing to do with
+    // encoding. What must hold is that the characters survive and that the
+    // second round trip is a no-op.
+    const std::string utf8 = "J\xc3\xb6rg/\xc3\xbc-umlaut/\xe6\x97\xa5\xe6\x9c\xac";
+    const fs::path path = plat::path_from_utf8(utf8);
+    const std::string round_trip = plat::path_to_utf8(path);
+    EXPECT_NE(round_trip.find("J\xc3\xb6rg"), std::string::npos) << round_trip;
+    EXPECT_NE(round_trip.find("\xc3\xbc-umlaut"), std::string::npos) << round_trip;
+    EXPECT_NE(round_trip.find("\xe6\x97\xa5\xe6\x9c\xac"), std::string::npos) << round_trip;
+    EXPECT_EQ(plat::path_to_utf8(plat::path_from_utf8(round_trip)), round_trip);
+    // The component, not the spelling, is what the conversion must preserve.
+    EXPECT_EQ(path.filename(), plat::path_from_utf8("\xe6\x97\xa5\xe6\x9c\xac"));
+
+    // The same as a real directory: create, write and read back through the
+    // converted path, so this is not merely a string comparison.
+    const std::string dirname = plat::unique_temp_path("alphashape_utf8_\xc3\xb6_", "");
+    const fs::path dir = plat::path_from_utf8(dirname);
+    ASSERT_TRUE(fs::create_directories(dir));
+    const fs::path file = dir / plat::path_from_utf8("\xe6\x97\xa5.txt");
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open()) << plat::path_to_utf8(file);
+        out << "alphashape";
+    }
+    EXPECT_TRUE(fs::is_regular_file(file)) << plat::path_to_utf8(file);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    EXPECT_FALSE(ec) << ec.message();
+}
+
+TEST(Platform, Utf8PathConversionsAgreeOnAscii) {
+    // The ASCII case must be unchanged, so the helper can replace path(string)
+    // everywhere without altering existing behaviour. Compared through the
+    // conversion itself, because a path re-spells separators on Windows.
+    for (const std::string& ascii : {std::string("plain"), std::string("plain/path"),
+                                     std::string("usr/share/proj")}) {
+        const fs::path converted = plat::path_from_utf8(ascii);
+        EXPECT_EQ(plat::path_from_utf8(plat::path_to_utf8(converted)), converted);
+        EXPECT_EQ(plat::path_to_utf8(plat::path_from_utf8(plat::path_to_utf8(converted))),
+                  plat::path_to_utf8(converted));
+    }
+    // An empty string is an empty path, not an error.
+    EXPECT_TRUE(plat::path_from_utf8(std::string()).empty());
+    EXPECT_EQ(plat::path_to_utf8(fs::path{}), "");
+}
+
+TEST(Platform, Utf8PathOfATemporaryDirectorySurvivesNonAsciiParent) {
+    // The smoke test installs under a non-ASCII directory; the engine must be
+    // able to name a file below one. This is a direct check of the conversion
+    // the PROJ data search performs on the executable's own path.
+    const std::string dirname = plat::unique_temp_path("alphashape_\xe2\x82\xac_", "");
+    const fs::path dir = plat::path_from_utf8(dirname);
+    ASSERT_TRUE(fs::create_directories(dir));
+    const std::string nested = plat::path_to_utf8(dir / "share" / "proj");
+    EXPECT_NE(nested.find("\xe2\x82\xac"), std::string::npos) << nested;
+    EXPECT_EQ(plat::path_to_utf8(plat::path_from_utf8(nested)), nested);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST(Platform, ExecutablePathNamesThisBinary) {
     const std::string exe = plat::executable_path();
     ASSERT_FALSE(exe.empty()) << "the platform could not name the running image";
