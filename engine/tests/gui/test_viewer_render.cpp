@@ -104,6 +104,10 @@ Device make_device() {
         // create an instance, and lavapipe does the rasterising.
         auto instance = std::make_unique<QVulkanInstance>();
         instance->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
+        // Without an explicit version QVulkanInstance asks for API version 0, which the loader's
+        // validation layer rejects outright (the instance is then created invalid and the first
+        // device call segfaults).
+        instance->setApiVersion(QVersionNumber(1, 0));
         if (instance->create()) {
             QRhiVulkanInitParams params;
             params.inst = instance.get();
