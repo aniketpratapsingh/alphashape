@@ -131,6 +131,16 @@ SectionEnd
 ; Install-mode initialization
 
 Function .onInit
+  ; makensis produces a 32-bit installer (it runs on every Windows), and a
+  ; 32-bit process has its HKLM\Software writes redirected to
+  ; HKLM\Software\WOW6432Node. Everything this product installs is 64-bit, so
+  ; the native view is the correct one: Add/Remove Programs then lists the app
+  ; where the shell and every other 64-bit tool look for it, not under
+  ; "32-bit applications". SetRegView affects only HKLM\Software and
+  ; HKCU\Software, so HKCU\Environment and the Session Manager Environment key
+  ; are untouched.
+  SetRegView 64
+
   StrCpy $PerUserDefaultDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
 
   !insertmacro MULTIUSER_INIT
@@ -159,6 +169,9 @@ Function .onInit
 FunctionEnd
 
 Function un.onInit
+  ; Same 32-bit-process view as .onInit: the uninstaller must delete the key the
+  ; installer wrote, and that is in the native view.
+  SetRegView 64
   !insertmacro MULTIUSER_UNINIT
 FunctionEnd
 

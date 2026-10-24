@@ -247,13 +247,25 @@ Write-Host "  removed $perUserDir, both registry keys and the Start menu folder"
 # image and the removal check stays exact; the mode (HKLM registration, the
 # per-machine default directory) is what is under test here.
 Step "per-machine install (/S /AllUsers)"
+# The installer is a 32-bit program and sets SetRegView 64, so its HKLM writes
+# land in the native (64-bit) view. This check runs from 64-bit PowerShell, which
+# reads that same view; without the SetRegView the key would be under
+# WOW6432Node and this lookup would (correctly) fail.
 $machineKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
 $machineAppKey = 'HKLM:\Software\alphashape\alphashape'
 if (Test-Path -LiteralPath $machineDir) { Remove-Item -LiteralPath $machineDir -Recurse -Force }
 
 Invoke-Installer @('/S', '/AllUsers', "/D=$machineDir")
 Assert-Present (Join-Path $machineDir 'bin\alphashape-cli.exe') 'the CLI (per-machine install)'
-Assert (Test-Path $machineKey) "no machine-wide uninstall registry key $machineKey"
+if (-not (Test-Path $machineKey)) {
+    $wow = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
+    if (Test-Path $wow) {
+        Fail ('no machine-wide uninstall key at ' + $machineKey + ', but one is at ' +
+              ${wow} + ': the installer wrote through the 32-bit registry view ' +
+              '(missing SetRegView 64)')
+    }
+    Fail "no machine-wide uninstall registry key $machineKey"
+}
 $machineEntry = Get-ItemProperty -Path $machineKey
 Write-Host "  DisplayName    : $($machineEntry.DisplayName)"
 Write-Host "  InstallLocation: $($machineEntry.InstallLocation)"
