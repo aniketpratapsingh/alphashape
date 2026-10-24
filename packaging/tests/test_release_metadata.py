@@ -159,6 +159,22 @@ class SbomTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_document(entries, "v1", self.NOW, "https://example.invalid", "r")
 
+    def test_creation_info_creators_are_valid_spdx_forms(self):
+        # SPDX 2.3 section 6.8: "<type>: <value>", and for Organization the value is
+        # "name (email)" -- a URL in the parentheses is not a valid creator string.
+        doc = build_document(parse_deps(DEPS), "v1", self.NOW, "https://example.invalid", "r")
+        creators = doc["creationInfo"]["creators"]
+        self.assertIn("Tool: alphashape-sbom", creators)
+        organisations = [c for c in creators if c.startswith("Organization: ")]
+        self.assertEqual(len(organisations), 1)
+        for creator in creators:
+            self.assertRegex(creator, r"^(Tool|Organization|Person): \S")
+            if creator.startswith("Organization: "):
+                name = creator[len("Organization: "):]
+                self.assertNotIn("http", name)
+                if "(" in name:
+                    self.assertIn("@", name.split("(", 1)[1])
+
     def test_rejects_a_bad_timestamp(self):
         for value in ("2026-10-23T12:00:00", "not a date", "2026-10-23T12:00:00+02:00"):
             with self.assertRaises(ValueError, msg=value):

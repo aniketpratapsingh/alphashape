@@ -138,9 +138,12 @@ def build_document(entries, version: str, now: str, repo_url: str, ref: str) -> 
             "created": now,
             "creators": [
                 "Tool: alphashape-sbom",
-                f"Organization: alphashape contributors ({repo_url})",
+                # SPDX 2.3 section 6.8: "Organization: <name> (<email>)" -- the only
+                # thing that may sit in the parentheses is an address, so the project
+                # URL goes in the comment below rather than here.
+                "Organization: alphashape contributors",
             ],
-            "comment": f"Generated from packaging/licenses/deps.yaml at {ref}",
+            "comment": f"Generated from packaging/licenses/deps.yaml at {ref} ({repo_url})",
         },
         "packages": packages,
         "relationships": relationships,
