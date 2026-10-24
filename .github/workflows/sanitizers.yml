@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -61,7 +61,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-linux-san-${{ github.ref_name }}-${{ github.sha }}
@@ -87,7 +87,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-san
           path: build.tar.zst
@@ -115,11 +115,11 @@ jobs:
           - { lane: slow-gpu, index: 0, total: 0 }
     steps:
       # The build tree holds absolute paths, so the checkout location must match the build job.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The Azure apt mirror is intermittently throttled to a crawl; keep the .debs between runs.
       - name: Restore apt package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/apt-debs
           # Bump the suffix when the package list below changes.
@@ -135,7 +135,7 @@ jobs:
             libjpeg-turbo8 libpng16-16t64 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-san
 
@@ -194,7 +194,7 @@ jobs:
         run: |
           grep -E "runtime error:|ERROR: (Address|Leak)Sanitizer|SUMMARY: " ctest.log | sort | uniq -c | sort -rn | head -50 || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sanitizer-logs-${{ matrix.lane }}

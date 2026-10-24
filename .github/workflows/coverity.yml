@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -50,7 +50,7 @@ jobs:
 
       - name: Cache the Coverity analysis tool
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: cov-analysis
           key: cov-analysis-linux64-${{ steps.md5.outputs.md5 }}
@@ -101,7 +101,7 @@ jobs:
 
       - name: Keep the build log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverity-build-log
           path: cov-int/build-log.txt
