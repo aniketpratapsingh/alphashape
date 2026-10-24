@@ -48,13 +48,16 @@ cp "$here/python-usage.txt" "$contents/Resources/python/README.txt"
 
 echo "== PROJ data"
 # The engine finds Contents/Resources/share/proj from Contents/MacOS and from Resources/python.
-# proj.db and the config always ship. Grid files ship when they are at most 32 MB, which keeps the
-# worldwide geoid models (EGM96, EGM2008) and drops the very large national grids.
-(cd "$PROJ_DATA_SRC" && find . -maxdepth 1 -type f \( -name '*.db' -o -name '*.ini' -o -name '*.json' \) \
-    -exec cp {} "$contents/Resources/share/proj/" \;)
-(cd "$PROJ_DATA_SRC" && find . -maxdepth 1 -type f \( -name '*.tif' -o -name '*.gtx' \) -size -32769k \
-    -exec cp {} "$contents/Resources/share/proj/" \;)
-echo "PROJ data shipped: $(ls "$contents/Resources/share/proj" | wc -l | tr -d ' ') files," \
+# Homebrew's proj keg carries the full world-wide proj-data collection (about 760 MB of grids).
+# A per-file size cap alone copied 491 MB of it, ten times what the Linux AppImage's curated
+# proj-data subset costs, and made the DMG 520 MB. select-proj-data.py applies the distro
+# package's idea instead: every non-grid file, a fixed essentials list (EGM96 and the small
+# continental datum-shift grid), then as many regional grids as fit, smallest first. A user who
+# needs an omitted national grid points ALPHASHAPE_PROJ_DATA at a full proj-data directory,
+# which outranks the bundle in crs::resolve_data_directory.
+python3 "$here/select-proj-data.py" "$PROJ_DATA_SRC" "$contents/Resources/share/proj" |
+    sed 's/^/  /'
+echo "PROJ data shipped: $(ls -1 "$contents/Resources/share/proj" | wc -l | tr -d ' ') files," \
      "$(du -sh "$contents/Resources/share/proj" | cut -f1)"
 
 echo "== Vulkan loader and MoltenVK"
@@ -151,5 +154,11 @@ codesign --verify --deep --strict --verbose=2 "$app"
 
 echo "== size breakdown"
 du -sk "$contents"/* "$contents/Frameworks/"* 2>/dev/null | sort -n | tail -15
+# The 20 largest individual files (not directories), so a future regression that adds a bulky
+# resource is visible in the log even when the total still looks plausible.
+echo "== 20 largest files"
+find "$app" -type f -print0 | xargs -0 stat -f '%z %N' | sort -rn | head -20 |
+    awk '{printf "%8.1f MB  %s\n", $1 / 1048576, substr($0, index($0, " ") + 1)}'
+echo "== bundle size"
 du -sh "$app"
 echo "built $app (minimum macOS $min_os)"

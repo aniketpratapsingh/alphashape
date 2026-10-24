@@ -869,14 +869,18 @@ yet.
   describe a CRS (an invalid zone, a bare pipeline) throws `ValueError` rather
   than producing an object that fails later and further away.
 
-- **PROJ data is not bundled yet.** The CRS engine reads `proj.db` and the
-  geoid/NTv2 grids from the installed package (Homebrew `share/proj`, Ubuntu
-  `/usr/share/proj`). `tools/stage_proj_data.sh` produces a self-contained
-  `tools/proj-data/` subset (~100 MB: `proj.db`, `proj.ini`, EGM96, EGM2008,
-  `ca_nrc_ntv2_0.tif`, `us_noaa_conus.tif`) for the packaged layout, but no
-  build target copies it into an installer yet — that is M29. A machine without
-  `proj-data` therefore runs with PROJ's error on the first grid-dependent
-  transformation rather than with a bundled grid.
+- **PROJ data ships as a curated subset in the packaged builds.** The CRS engine
+  reads `proj.db` and the geoid/NTv2 grids from a data directory it resolves at
+  startup. An AppImage or macOS bundle now carries its own copy; a source build
+  uses the installed package (Homebrew `share/proj`, Ubuntu `/usr/share/proj`)
+  or `tools/proj-data/` from `tools/stage_proj_data.sh`. The packaged subset is
+  `proj.db`, `proj.ini`, the licence/attribution text and a bounded set of grids
+  (about 27 MB in the macOS bundle): EGM96 and one continental datum-shift grid
+  always ship, and the macOS packager then takes regional grids smallest first
+  until a byte budget is spent. EGM2008 (77 MB) and the large national grids
+  are therefore not in that archive; a transformation that needs one of them
+  fails offline with PROJ's "File not found" unless `ALPHASHAPE_PROJ_DATA`
+  points at a full `proj-data` directory, which always outranks the bundled copy.
 - **Network access is off.** `proj_context_initialize()` forces
   `PROJ_NETWORK=OFF` and every thread context has network access and grid
   caching disabled. A transformation that needs an uninstalled grid fails with

@@ -63,6 +63,19 @@ grep -q '^AddPhotos' "$work/tasks.txt"
 echo "== PROJ data comes from the bundle"
 "$cli" --proj-info | tee "$work/proj.txt"
 grep -q "alphashape.app/Contents/Resources/share/proj/proj.db" "$work/proj.txt"
+# The bundle ships a curated subset of proj-data, not Homebrew's whole collection, and the
+# essentials must be in it: the geoid the vertical-CRS support names and the small continental
+# datum-shift grid. A regression that copies every grid is caught by the DMG size guard; this
+# catches the opposite mistake of trimming the essentials away.
+proj="$app/Contents/Resources/share/proj"
+[ -f "$proj/proj.db" ] || { echo "error: no proj.db in the bundle" >&2; exit 1; }
+[ -f "$proj/us_nga_egm96_15.tif" ] || { echo "error: EGM96 grid missing" >&2; exit 1; }
+[ -f "$proj/us_noaa_conus.tif" ] || { echo "error: the conus datum-shift grid is missing" >&2; exit 1; }
+proj_mb=$(( $(du -sk "$proj" | cut -f1) / 1024 ))
+echo "bundled PROJ data: $(ls -1 "$proj" | wc -l | tr -d ' ') files, ${proj_mb} MB"
+[ "$proj_mb" -le 64 ] || {
+    echo "error: the PROJ data is ${proj_mb} MB; the bundle must ship a curated subset" >&2
+    exit 1; }
 
 echo "== project from images (JPEG and project I/O)"
 "$cli" --new "$work/smoke.psx" --add-images "$data"/aerial_r0c0.jpg "$data"/aerial_r0c1.jpg

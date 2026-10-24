@@ -317,6 +317,8 @@ jobs:
 
       # alphashape.app is assembled from the build tree: Qt via macdeployqt, every other Homebrew
       # library, the Vulkan loader, MoltenVK and the PROJ data by packaging/macos. Ad-hoc signed.
+      # build-app.sh prints the size breakdown and the 20 largest files, so a regression that
+      # adds a bulky resource shows up in this log.
       - name: Package (.app, .dmg)
         if: inputs.package
         run: |
@@ -325,6 +327,22 @@ jobs:
           packaging/macos/build-app.sh build dist/app
           packaging/macos/build-dmg.sh dist/app/alphashape.app \
             "dist/alphashape-${{ inputs.version }}-macos-arm64.dmg"
+          ls -lh dist/*.dmg
+
+      # Size guard. The bundle was 520 MB when this job copied Homebrew's complete proj-data
+      # collection instead of a curated subset; the guard keeps that from coming back. The job
+      # produces about 55 MB, so the budget is roughly 20% above that.
+      - name: DMG size guard
+        if: inputs.package
+        run: |
+          budget=68
+          dmg=$(ls dist/*-macos-arm64.dmg)
+          mb=$(( $(stat -f %z "$dmg") / 1048576 ))
+          echo "DMG: $dmg, ${mb} MB (budget ${budget} MB)"
+          if [ "$mb" -gt "$budget" ]; then
+            echo "::error::the macOS DMG is ${mb} MB, over the ${budget} MB budget"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         if: inputs.package
