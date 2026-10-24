@@ -39,6 +39,10 @@ jobs:
         # release time; a change to the parser or the renderer must not wait for a release to
         # find out it is broken.
         run: python3 packaging/tests/test_release_metadata.py
+      - name: macOS PROJ data selector
+        # select-proj-data.py decides what goes into the bundle and writes the manifest that
+        # the DMG smoke test checks against; its budget and determinism must hold without macOS.
+        run: python3 packaging/tests/test_select_proj_data.py
       - name: No reverse-engineering material
         run: |
           if grep -rInE 'research/[0-9]|studied (product|implementation)|decompil|ghidra' \
