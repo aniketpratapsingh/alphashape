@@ -269,7 +269,24 @@ TEST_F(MainWindowTest, NewSaveAsCloseOpenRoundTrip) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
-TEST_F(MainWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
+/// A window with a job held open: the registry must outlive the test body even when an
+/// assertion returns early, because the JobManager keeps the pointer until TearDown.
+class BusyWindowTest : public GuiTest {
+protected:
+    void TearDown() override {
+        gate_->open();
+        if (!pump_until([this]() { return !app().jobs().busy(); }, 15000)) {
+            app().jobs().cancel_all_and_wait();
+        }
+        app().jobs().set_registry(&builtin_registry());
+        GuiTest::TearDown();
+    }
+
+    std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
+    TaskRegistry registry_;
+};
+
+TEST_F(BusyWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
     // require_idle() inside GuiApp throws when a job runs; the window asks FIRST, so a
     // shortcut or a programmatic call reports it in the status bar instead of unwinding into
     // the event loop.
@@ -278,11 +295,9 @@ TEST_F(MainWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
     add_chunk(app(), "Mine");
     ASSERT_TRUE(app().dirty());
 
-    auto gate = std::make_shared<Gate>();
     auto started = std::make_shared<std::atomic<bool>>(false);
-    TaskRegistry registry;
-    registry.register_task(std::make_shared<HoldTask>(gate, started));
-    app().jobs().set_registry(&registry);
+    registry_.register_task(std::make_shared<HoldTask>(gate_, started));
+    app().jobs().set_registry(&registry_);
     app().jobs().submit("HoldTask", Params{}, app().document().workspace().chunks().front()->id());
     ASSERT_TRUE(pump_until([&]() { return started->load(); }, 15000));
 
@@ -307,9 +322,11 @@ TEST_F(MainWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
     EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
     EXPECT_TRUE(app().dirty());
 
-    gate->open();
+    // Letting the job finish restores every operation (TearDown does the same if this fails).
+    gate_->open();
     ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, 15000));
     app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(window().new_project());
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
@@ -336,12 +353,14 @@ TEST_F(MainWindowTest, TheRevealActionIsClearedWhenTheDocumentIsReplaced) {
                                           Q_ARG(QString, exported)));
     pump(20);
     EXPECT_TRUE(reveal_button->isVisible());
-    EXPECT_FALSE(reveal->toolTip().isEmpty());
+    // QAction::toolTip() falls back to the action text when none was set, so "no tip" reads as
+    // "the tip is just the label".
+    EXPECT_NE(reveal->toolTip(), reveal->text());
 
     ASSERT_TRUE(window().new_project());
     pump(20);
     EXPECT_FALSE(reveal_button->isVisible()) << "the old export folder is no longer offered";
-    EXPECT_TRUE(reveal->toolTip().isEmpty());
+    EXPECT_EQ(reveal->toolTip(), reveal->text()) << "the note's tip was cleared";
 }
 
 TEST_F(MainWindowTest, ClosingAProjectClearsTheRevealActionToo) {
