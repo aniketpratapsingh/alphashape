@@ -431,11 +431,15 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   opens a console window beside the app. Making it windowed needs the WinMain
   entry point and removes the stdout that the packaging smoke test and
   `GuiShell.StartsOffscreen` read; that is a separate change.
-- **`alphashape.pyd` needs a matching CPython installed.** It is built for one
-  interpreter minor version and the file name carries no ABI tag, so a user
-  without Python, or with another minor version, cannot import it. A bundled
-  standalone interpreter is the fix (roughly 30 MB plus its licence texts) and
-  is not in this WP.
+- **The Python module needs a matching CPython installed.** It ships as
+  `python\alphashape.cp314-win_amd64.pyd` on the current CI image, because CMake
+  tags a pybind11 module with the ABI it was built for; Python imports that name
+  as `alphashape`. A user without Python, or with another minor version, cannot
+  import it. The version comes from the vcpkg toolchain's own python3 port,
+  which is the only interpreter on the runner that supplies
+  `Development.Module`; `dist/PYTHON-ABI.txt` records it and the smoke job
+  installs that same minor version. A bundled standalone interpreter is the fix
+  for users (roughly 30 MB plus its licence texts) and is not in this WP.
 - **No server or worker component.** The installer ships the GUI, the CLI and
   the Python module; the distributed worker is Phase 14.
 - **No GPU path in the Windows build**, so the installer ships no Vulkan loader
@@ -444,10 +448,13 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   the shared runtime, PROJ data and licences (the required `core` component),
   and no per-component record is kept, so a later installer cannot remember the
   previous selection. Uninstall removes everything that was staged.
-- **PROJ grids are size-capped** (32 MiB per file, 64 MiB in total, smallest
-  first), so a transform needing a dropped continental grid fails offline with
-  PROJ's "grid not found" rather than downloading. `ALPHASHAPE_PROJ_DATA` can be
-  pointed at a full `proj-data` directory to restore them.
+- **PROJ ships `proj.db` but no grids.** vcpkg's `proj` port bundles the
+  database and not the grid files, so the installer's grid set is empty and a
+  transform that needs a geoid model fails offline with PROJ's "grid not found"
+  rather than downloading (which is deliberate: `PROJ_NETWORK` is forced off).
+  The size cap that would apply is 32 MiB per file and 64 MiB in total, smallest
+  first, and the configure says which case it took. `ALPHASHAPE_PROJ_DATA` can be
+  pointed at a full `proj-data` directory to supply them.
 
 ## M11 — Multi-instance containers (WP-11.1 / WP-11.2)
 

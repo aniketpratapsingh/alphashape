@@ -59,7 +59,10 @@ PATH option that the components page offers.
 * **PROJ.** `ALPHASHAPE_PROJ_DATA` wins, then `share\proj` beside the
   executable (`bin\alphashape.exe` -> `..\share\proj`) and beside the module's
   image (`python\alphashape*.pyd` -> `..\share\proj`). `alphashape-cli
-  --proj-info` shows the database in use.
+  --proj-info` shows the database in use. vcpkg's `proj` ships `proj.db` and no
+  grid files, so the installed grid set is normally empty: transforms that need
+  a geoid fail offline, by design, until `ALPHASHAPE_PROJ_DATA` names a full
+  `proj-data` directory.
 * **Qt.** Plugins are found in `bin\` because Qt looks in the application
   directory first; no `qt.conf` is needed.
 * **GPU.** Vulkan is off in this build (`ALPHASHAPE_GPU=OFF` on Windows until
