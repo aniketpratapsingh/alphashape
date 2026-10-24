@@ -60,12 +60,35 @@
   url: https://gflags.github.io/gflags/
   platforms: [linux, macos, windows]
 
-- name: SuiteSparse (AMD, COLAMD, CCOLAMD, CHOLMOD, SPQR, UMFPACK)
+- name: METIS
+  copyright: The Regents of the University of Minnesota and the METIS contributors.
+  spdx: Apache-2.0
+  url: https://github.com/KarypisLab/METIS
+  platforms: [macos, windows]
+  note: Graph partitioning and fill-reducing ordering used by Ceres's sparse solvers; bundled as a shared library. On Windows GKlib, its Apache-2.0 helper library, is linked into metis.dll rather than shipped separately.
+  # macOS takes METIS through Homebrew's Ceres; Windows through vcpkg's ceres[eigensparse].
+  # The Debian Ceres in the .deb is built against SuiteSparse instead, so no METIS there.
+
+- name: OpenBLAS
+  copyright: The OpenBLAS project contributors; based on GotoBLAS2 by Kazushige Goto.
+  spdx: BSD-3-Clause
+  url: https://www.openblas.net/
+  platforms: [macos]
+  note: BLAS and LAPACK implementation linked by Ceres and SuiteSparse on macOS, bundled with its gfortran runtime.
+
+- name: oneTBB
+  copyright: Intel Corporation and the oneAPI TBB contributors.
+  spdx: Apache-2.0
+  url: https://github.com/uxlfoundation/oneTBB
+  platforms: [macos]
+  note: Threading runtime linked by Homebrew's Ceres.
+
+- name: SuiteSparse
   copyright: Timothy A. Davis and the SuiteSparse contributors.
   spdx: BSD-3-Clause AND LGPL-2.1-or-later AND GPL-2.0-or-later
   url: https://people.engr.tamu.edu/davis/suitesparse.html
-  platforms: [linux, macos, windows]
-  note: Sparse solver components linked by Ceres; the exact set depends on how the platform's Ceres was built, and each component's text ships with it.
+  platforms: [linux, macos]
+  note: Sparse solver components linked by Ceres (CHOLMOD, SPQR, AMD, CAMD, COLAMD, CCOLAMD and the shared config); the exact set depends on how the platform's Ceres was built, and each component's text ships with it. The Windows Ceres is built against Eigen's sparse solvers and METIS instead, so SuiteSparse is not in the NSIS installer.
 
 - name: libjpeg-turbo
   copyright: The libjpeg-turbo project contributors; based on work by the Independent JPEG Group.
@@ -92,6 +115,48 @@
   url: https://libtiff.gitlab.io/libtiff/
   platforms: [linux, macos, windows]
 
+- name: liblzma (xz)
+  copyright: Lasse Collin, Jia Tan and the XZ Utils contributors.
+  spdx: 0BSD
+  url: https://tukaani.org/xz/
+  platforms: [macos, windows]
+  note: LZMA decompression for libtiff; ships as liblzma alongside it. The .deb takes it from the distribution.
+
+- name: zstd
+  copyright: Meta Platforms Inc. and the Zstandard contributors.
+  spdx: BSD-3-Clause
+  url: https://facebook.github.io/zstd/
+  platforms: [macos]
+  note: Zstandard decompression for libtiff; ships alongside it. The .deb takes it from the distribution.
+
+- name: libwebp
+  copyright: Google Inc. and the WebP project contributors.
+  spdx: BSD-3-Clause
+  url: https://developers.google.com/speed/webp/
+  platforms: [macos]
+  note: WebP decompression for libtiff; ships alongside it. The .deb takes it from the distribution.
+
+- name: SQLite
+  copyright: D. Richard Hipp and the SQLite contributors.
+  spdx: blessing
+  url: https://sqlite.org/
+  platforms: [windows]
+  note: Storage for PROJ's coordinate-system database, shipped as sqlite3.dll. macOS and the .deb use the system SQLite.
+
+- name: BLAS and LAPACK (reference implementation)
+  copyright: The University of Tennessee, the University of California Berkeley and the LAPACK contributors.
+  spdx: BSD-3-Clause
+  url: https://www.netlib.org/lapack/
+  platforms: [linux]
+  note: libblas3 and liblapack3, pulled in by the distribution's Ceres and SuiteSparse packages.
+
+- name: VulkanMemoryAllocator
+  copyright: Advanced Micro Devices, Inc. and the VulkanMemoryAllocator contributors.
+  spdx: MIT
+  url: https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+  platforms: [linux, macos, windows]
+  note: Header-only; its implementation is compiled into the GPU backend (engine/src/gpu/vulkan/vma_impl.cpp).
+
 - name: LLVM OpenMP runtime (libomp)
   copyright: The LLVM Project.
   spdx: Apache-2.0 WITH LLVM-exception
@@ -110,6 +175,13 @@
   url: https://gcc.gnu.org/
   platforms: [linux]
   note: Bundled in the AppImage; taken from the distribution for the .deb.
+
+- name: GNU Fortran runtime (libgfortran, libquadmath)
+  copyright: The GNU Project.
+  spdx: GPL-3.0-or-later WITH GCC-exception-3.1
+  url: https://gcc.gnu.org/
+  platforms: [linux, macos]
+  note: Run-time support for the Fortran-compiled BLAS/LAPACK kernels inside SuiteSparse and OpenBLAS; bundled with them.
 
 - name: Vulkan Loader
   copyright: The Khronos Group Inc. and contributors.
