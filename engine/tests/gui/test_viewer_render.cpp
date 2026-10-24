@@ -29,13 +29,14 @@
 #include <QSurfaceFormat>
 #include <QtGlobal>
 
-// QVulkanInstance exists only in a build whose Qt was configured with Vulkan. The Vulkan attempt
-// is compiled only where the header is there.
-#if __has_include(<QtGui/qvulkaninstance.h>)
-#define ALPHASHAPE_VIEWER_HAS_VULKAN 1
+// The Vulkan attempt is only compiled where this project would use it: the Linux lane, whose
+// xcb platform can create a QVulkanInstance and whose lavapipe does the rasterising. Windows and
+// macOS have their own native backend and no QVulkanInstance in the Qt build there.
+#if defined(Q_OS_LINUX)
+#define ALPHASHAPE_VIEWER_TRY_VULKAN 1
 #include <QVulkanInstance>
 #else
-#define ALPHASHAPE_VIEWER_HAS_VULKAN 0
+#define ALPHASHAPE_VIEWER_TRY_VULKAN 0
 #endif
 
 #include <rhi/qrhi.h>
@@ -63,7 +64,7 @@ struct Device {
 
     bool usable() const { return rhi != nullptr; }
 
-#if ALPHASHAPE_VIEWER_HAS_VULKAN
+#if ALPHASHAPE_VIEWER_TRY_VULKAN
     /// The Vulkan instance the QRhi borrows; it must outlive the device.
     std::unique_ptr<QVulkanInstance> vulkan_instance;
 #endif
@@ -98,7 +99,7 @@ Device make_device() {
         device.reason = QStringLiteral("D3D11 could not be initialised");
     }
 #else
-#if ALPHASHAPE_VIEWER_HAS_VULKAN
+#if ALPHASHAPE_VIEWER_TRY_VULKAN
     {
         // Vulkan first: the Linux CI lane runs this suite under Xvfb so the xcb platform can
         // create an instance, and lavapipe does the rasterising.
