@@ -9,6 +9,13 @@
 #
 # Everything here asserts against the installed tree, not the build tree. Any
 # failure throws, so the job fails with the message that explains what is wrong.
+#
+# Both install modes are installed side by side, because the failure they can
+# hide from each other is the one that matters most: an uninstaller that works
+# out its mode from the registry reads HKCU first, so a per-machine copy's
+# Uninstall.exe used to remove the per-user tree. That is only visible with both
+# installed, so the machine copy is removed first and the per-user copy is
+# re-exercised afterwards.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string] $Installer,
@@ -17,6 +24,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Native programs are read back as bytes. The engine writes UTF-8, so the
+# decoder must be UTF-8 as well or every non-ASCII path this script checks would
+# arrive as mojibake and the assertion would fail for the wrong reason.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Step([string] $message) { Write-Host "`n== $message" -ForegroundColor Cyan }
 function Fail([string] $message) { throw "alphashape smoke: $message" }
@@ -27,6 +39,31 @@ function Assert([bool] $condition, [string] $message) {
 
 function Assert-Present([string] $path, [string] $what) {
     Assert (Test-Path -LiteralPath $path) "$what is missing: $path"
+}
+
+function Read-RegistryPath([string] $key, [string] $name) {
+    # Under Set-StrictMode a missing property is an error, so the name is checked
+    # rather than indexed: an unset Path is a valid state (a fresh profile) and
+    # must read as empty, not abort the run.
+    if (-not (Test-Path -LiteralPath $key)) { return $null }
+    $item = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+    if (-not (@($item.PSObject.Properties.Name) -contains $name)) { return $null }
+    return [string] $item.$name
+}
+
+function Path-Elements([string] $value) {
+    if ($null -eq $value -or $value -eq '') { return @() }
+    return @($value -split ';' | Where-Object { $_ -ne '' })
+}
+
+function Path-Contains([string] $value, [string] $entry) {
+    if ($null -eq $value) { return $false }
+    $wanted = $entry.TrimEnd('\')
+    foreach ($element in (Path-Elements $value)) {
+        if ($element.TrimEnd('\') -eq $wanted) { return $true }
+    }
+    return $false
 }
 
 # A silent NSIS uninstaller copies itself to %TEMP%, relaunches from there and
@@ -52,6 +89,47 @@ function Wait-Gone([scriptblock] $condition, [string] $what, [int] $timeoutSecon
     Fail "$what still exists $timeoutSeconds s after the uninstaller finished"
 }
 
+function Invoke-Installer([string[]] $arguments) {
+    Write-Host "  > $installerName $($arguments -join ' ')"
+    $process = Start-Process -FilePath $installerPath -ArgumentList $arguments -Wait -PassThru
+    # NSIS exit codes: 0 success; 1 user abort; 2 the installer's own Abort.
+    if ($process.ExitCode -ne 0) {
+        Fail ("installer exited $($process.ExitCode) for: " + ($arguments -join ' '))
+    }
+}
+
+# The installed GUI is a Windows-subsystem binary, so it has no console of its
+# own: Windows gives such a process no standard handles unless they are passed
+# in, and a bare `& $gui` therefore captures nothing. Start-Process with an
+# explicit redirection hands it real handles (which the app must use instead of
+# adopting CONOUT$), and the exit code is read from the process object.
+function Invoke-Captured([string] $exe, [string[]] $arguments, [hashtable] $environment = @{}) {
+    $stdout = New-TemporaryFile
+    $stderr = New-TemporaryFile
+    $previous = @{}
+    foreach ($name in $environment.Keys) {
+        $previous[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $environment[$name])
+    }
+    try {
+        $process = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru `
+            -RedirectStandardOutput $stdout.FullName -RedirectStandardError $stderr.FullName `
+            -NoNewWindow
+        $out = @(Get-Content -LiteralPath $stdout.FullName -Encoding utf8 -ErrorAction SilentlyContinue)
+        $err = @(Get-Content -LiteralPath $stderr.FullName -Encoding utf8 -ErrorAction SilentlyContinue)
+    } finally {
+        foreach ($name in $environment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $previous[$name])
+        }
+        Remove-Item -LiteralPath $stdout.FullName, $stderr.FullName -Force -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Output   = $out
+        Errors   = $err
+    }
+}
+
 $installerPath = (Resolve-Path -LiteralPath $Installer).Path
 $installerName = Split-Path $installerPath -Leaf
 Step "installer"
@@ -69,224 +147,345 @@ Assert ($installerSizeMb -le $maxInstallerMb) `
 # ---- locations -------------------------------------------------------------------------------
 # Declared before any function uses them: Set-StrictMode makes a reference to an
 # unassigned variable an error, and Wait-Gone reports on both trees.
-$perUserDir = Join-Path $env:RUNNER_TEMP 'alphashape-per-user'
+#
+# The per-user directory deliberately contains characters outside the ANSI code
+# page. Everything from the installer's registry writes to the engine's PROJ data
+# search goes through those bytes, and an implementation that decoded them as
+# ANSI would either fail to find proj.db or report a mangled path -- neither of
+# which a plain "C:\Temp" install would ever show.
+$perUserDir = Join-Path $env:RUNNER_TEMP 'alphashape-Jörg-ü'
 $machineDir = Join-Path $env:RUNNER_TEMP 'alphashape-per-machine'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
 $appKey = 'HKCU:\Software\alphashape\alphashape'
+$machineKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
+$machineAppKey = 'HKLM:\Software\alphashape\alphashape'
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\alphashape'
+$machineStartMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\alphashape'
 
-# ---- per-user, silent, into a temporary directory -------------------------------------------
-if (Test-Path -LiteralPath $perUserDir) { Remove-Item -LiteralPath $perUserDir -Recurse -Force }
-$uninstallExe = Join-Path $perUserDir 'Uninstall.exe'
+$userPathKey = 'HKCU:\Environment'
+$machinePathKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
 
-function Invoke-Installer([string[]] $arguments) {
-    Write-Host "  > $installerName $($arguments -join ' ')"
-    $process = Start-Process -FilePath $installerPath -ArgumentList $arguments -Wait -PassThru
-    # NSIS exit codes: 0 success; 1 user abort; 2 the installer's own Abort.
-    if ($process.ExitCode -ne 0) {
-        Fail ("installer exited $($process.ExitCode) for: " + ($arguments -join ' '))
+# The sentinel proves the PATH edit is surgical: it must survive both the
+# installer's edit and the uninstaller's, and every other element must keep its
+# order.
+$sentinelEntry = 'C:\alphashape-smoke-sentinel'
+$originalUserPath = Read-RegistryPath $userPathKey 'Path'
+if ($null -eq $originalUserPath) { $originalUserPath = '' }
+$baselineUserPath = "$sentinelEntry;$originalUserPath"
+if ($baselineUserPath.EndsWith(';')) { $baselineUserPath = $baselineUserPath.Substring(0, $baselineUserPath.Length - 1) }
+Set-ItemProperty -LiteralPath $userPathKey -Name 'Path' -Value $baselineUserPath -Type ExpandString
+$originalMachinePath = Read-RegistryPath $machinePathKey 'Path'
+
+try {
+    # ---- per-user, silent, with PATH, into a non-ASCII directory -------------------------------
+    if (Test-Path -LiteralPath $perUserDir) { Remove-Item -LiteralPath $perUserDir -Recurse -Force }
+    $uninstallExe = Join-Path $perUserDir 'Uninstall.exe'
+
+    Step "per-user install (/S /CurrentUser /AddToPath)"
+    # /D= must be the last argument and unquoted; that is an NSIS rule, not a choice.
+    Invoke-Installer @('/S', '/CurrentUser', '/AddToPath', "/D=$perUserDir")
+    Assert-Present $uninstallExe 'the uninstaller'
+    Assert-Present (Join-Path $perUserDir 'bin\alphashape.exe') 'the GUI'
+    Assert-Present (Join-Path $perUserDir 'bin\alphashape-cli.exe') 'the CLI'
+    Write-Host "  installed $perUserDir"
+
+    Step "install layout"
+    $expected = @(
+        'bin\alphashape.exe',
+        'bin\alphashape-cli.exe',
+        'bin\platforms\qwindows.dll',
+        'bin\platforms\qoffscreen.dll',
+        'python\python-usage.txt',
+        'share\proj\proj.db',
+        'LICENSES\LICENSE',
+        'LICENSES\THIRD-PARTY-NOTICES.txt',
+        'LICENSES\Qt\LGPL-3.0-only.txt'
+    )
+    foreach ($relative in $expected) {
+        Assert-Present (Join-Path $perUserDir $relative) "installed file"
     }
-}
+    # The app-local runtime: without these the GUI would not start on a machine
+    # that has no Visual Studio installed, which is what a fresh runner is.
+    foreach ($dll in @('vcruntime140.dll', 'msvcp140.dll')) {
+        Assert-Present (Join-Path $perUserDir "bin\$dll") "app-local VC++ runtime"
+    }
+    Assert-Present (Join-Path $perUserDir 'bin\Qt6Core.dll') 'Qt (windeployqt output)'
+    Assert-Present (Join-Path $perUserDir 'bin\Qt6Widgets.dll') 'Qt Widgets (windeployqt output)'
+    Assert-Present (Join-Path $perUserDir 'python\vcruntime140.dll') 'VC++ runtime beside the module'
 
-Step "per-user install (/S /CurrentUser)"
-# /D= must be the last argument and unquoted; that is an NSIS rule, not a choice.
-Invoke-Installer @('/S', '/CurrentUser', "/D=$perUserDir")
-Assert-Present $uninstallExe 'the uninstaller'
-Assert-Present (Join-Path $perUserDir 'bin\alphashape.exe') 'the GUI'
-Assert-Present (Join-Path $perUserDir 'bin\alphashape-cli.exe') 'the CLI'
-Write-Host "  installed $perUserDir"
+    Step "licence texts"
+    # Qt is LGPL-3: the text ships because the DLLs do (LICENSES\Qt\LGPL-3.0-only.txt
+    # is checked with the layout above). Every vcpkg port whose DLL is in bin\
+    # contributes its own share/<port>/copyright, and libomp comes from LLVM.
+    foreach ($port in @('libjpeg-turbo', 'tiff', 'libpng', 'proj', 'ceres', 'libomp')) {
+        Assert-Present (Join-Path $perUserDir "LICENSES\third-party\$port.txt") `
+            "third-party licence text for $port"
+    }
+    $thirdParty = @(Get-ChildItem -LiteralPath (Join-Path $perUserDir 'LICENSES\third-party') -Filter '*.txt')
+    Assert ($thirdParty.Count -ge 8) "only $($thirdParty.Count) third-party licence texts shipped"
+    $empty = @($thirdParty | Where-Object { $_.Length -lt 200 })
+    Assert ($empty.Count -eq 0) ("licence texts too short to be a licence: " +
+        (($empty | ForEach-Object { $_.Name }) -join ', '))
+    Write-Host "  $($thirdParty.Count) third-party texts, all non-empty"
 
-Step "install layout"
-$expected = @(
-    'bin\alphashape.exe',
-    'bin\alphashape-cli.exe',
-    'bin\platforms\qwindows.dll',
-    'bin\platforms\qoffscreen.dll',
-    'python\python-usage.txt',
-    'share\proj\proj.db',
-    'LICENSES\LICENSE',
-    'LICENSES\THIRD-PARTY-NOTICES.txt'
-)
-foreach ($relative in $expected) {
-    Assert-Present (Join-Path $perUserDir $relative) "installed file"
-}
-# The app-local runtime: without these the GUI would not start on a machine
-# that has no Visual Studio installed, which is what a fresh runner is.
-foreach ($dll in @('vcruntime140.dll', 'msvcp140.dll')) {
-    Assert-Present (Join-Path $perUserDir "bin\$dll") "app-local VC++ runtime"
-}
-Assert-Present (Join-Path $perUserDir 'bin\Qt6Core.dll') 'Qt (windeployqt output)'
-Assert-Present (Join-Path $perUserDir 'bin\Qt6Widgets.dll') 'Qt Widgets (windeployqt output)'
-Assert-Present (Join-Path $perUserDir 'python\vcruntime140.dll') 'VC++ runtime beside the module'
+    # The notices must name the exact Qt in the payload. The template used to
+    # spell @QT_VERSION@, which CPack never defines, so the shipped file said
+    # "Qt " with no version at all; a version here means the substitution ran.
+    $notices = Get-Content -LiteralPath (Join-Path $perUserDir 'LICENSES\THIRD-PARTY-NOTICES.txt') -Raw
+    Assert ($notices -notmatch '@[A-Za-z_][A-Za-z0-9_]*@') 'the notices still contain an unsubstituted @placeholder@'
+    $noticeMatch = [regex]::Match($notices, '(?m)^Qt (6\.\d+\.\d+) ')
+    Assert ($noticeMatch.Success) 'the notices do not name the Qt version'
+    $qtFromNotices = $noticeMatch.Groups[1].Value
+    $qtFromBinary = (Get-Item -LiteralPath (Join-Path $perUserDir 'bin\Qt6Core.dll')).VersionInfo.FileVersion
+    Write-Host "  notices say Qt $qtFromNotices; Qt6Core.dll is $qtFromBinary"
+    Assert ($qtFromBinary.StartsWith($qtFromNotices)) `
+        "the notices say Qt $qtFromNotices but the shipped Qt6Core.dll is $qtFromBinary"
 
-Step "Add/Remove Programs entry"
-Assert (Test-Path $uninstallKey) "no uninstall registry key $uninstallKey"
-$entry = Get-ItemProperty -Path $uninstallKey
-Write-Host "  DisplayName    : $($entry.DisplayName)"
-Write-Host "  DisplayVersion : $($entry.DisplayVersion)"
-Write-Host "  InstallLocation: $($entry.InstallLocation)"
-Assert ($entry.DisplayName -like 'alphashape*') "unexpected DisplayName '$($entry.DisplayName)'"
-Assert ($entry.InstallLocation -eq $perUserDir) `
-    "InstallLocation is '$($entry.InstallLocation)', expected '$perUserDir'"
-Assert ($entry.UninstallString -like "*$uninstallExe*") "UninstallString does not name $uninstallExe"
+    Step "Add/Remove Programs entry"
+    Assert (Test-Path $uninstallKey) "no uninstall registry key $uninstallKey"
+    $displayName = Read-RegistryPath $uninstallKey 'DisplayName'
+    $displayVersion = Read-RegistryPath $uninstallKey 'DisplayVersion'
+    $installLocation = Read-RegistryPath $uninstallKey 'InstallLocation'
+    $uninstallString = Read-RegistryPath $uninstallKey 'UninstallString'
+    Write-Host "  DisplayName    : $displayName"
+    Write-Host "  DisplayVersion : $displayVersion"
+    Write-Host "  InstallLocation: $installLocation"
+    Assert ($displayName -like 'alphashape*') "unexpected DisplayName '$displayName'"
+    Assert ($installLocation -eq $perUserDir) `
+        "InstallLocation is '$installLocation', expected '$perUserDir'"
+    Assert ($uninstallString -like "*$uninstallExe*") "UninstallString does not name $uninstallExe"
+    $recordedMode = Read-RegistryPath $uninstallKey 'InstallMode'
+    Assert ($recordedMode -eq 'CurrentUser') `
+        "the uninstall key records InstallMode '$recordedMode', expected CurrentUser"
 
-Step "start menu shortcut"
-Assert-Present (Join-Path $startMenu 'alphashape.lnk') "Start menu shortcut"
+    Step "start menu shortcut"
+    Assert-Present (Join-Path $startMenu 'alphashape.lnk') "Start menu shortcut"
 
-Step "CLI"
-$cli = Join-Path $perUserDir 'bin\alphashape-cli.exe'
-$ErrorActionPreference = 'Continue'
-$tasks = & $cli --list-tasks
-$cliExit = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
-if ($cliExit -ne 0) { Fail "alphashape-cli --list-tasks exited $cliExit" }
-$tasks | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
-Assert ($tasks -contains 'AddPhotos') "AddPhotos is not in --list-tasks"
-Write-Host "  $($tasks.Count) tasks"
+    Step "PATH (per-user)"
+    $userPath = Read-RegistryPath $userPathKey 'Path'
+    Write-Host "  $userPath"
+    Assert (Path-Contains $userPath (Join-Path $perUserDir 'bin')) `
+        "$perUserDir\bin was not added to the per-user PATH"
+    Assert (Path-Contains $userPath $sentinelEntry) 'the PATH edit dropped an existing entry'
 
-Step "CLI resolves PROJ data from the install"
-$ErrorActionPreference = 'Continue'
-$projInfo = & $cli --proj-info 2>&1 | ForEach-Object { "$_" }
-$projExit = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
-if ($projExit -ne 0) {
-    $projInfo | ForEach-Object { Write-Host "  $_" }
-    Fail "alphashape-cli --proj-info exited $projExit; the install could not find proj.db"
-}
-$projInfo | ForEach-Object { Write-Host "  $_" }
-$expectedDb = Join-Path $perUserDir 'share\proj\proj.db'
-$reportedDb = ($projInfo | Where-Object { $_ -match '^proj database: ' }) -replace '^proj database: ', ''
-Assert ((Resolve-Path -LiteralPath $reportedDb).Path -eq (Resolve-Path -LiteralPath $expectedDb).Path) `
-    "PROJ database is '$reportedDb', expected the installed copy at '$expectedDb'"
+    Step "CLI"
+    $cli = Join-Path $perUserDir 'bin\alphashape-cli.exe'
+    $tasks = Invoke-Captured $cli @('--list-tasks')
+    $tasks.Output | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+    if ($tasks.ExitCode -ne 0) {
+        $tasks.Errors | ForEach-Object { Write-Host "  $_" }
+        Fail "alphashape-cli --list-tasks exited $($tasks.ExitCode)"
+    }
+    Assert ($tasks.Output -contains 'AddPhotos') "AddPhotos is not in --list-tasks"
+    Write-Host "  $($tasks.Output.Count) tasks"
 
-Step "GUI (offscreen)"
-$gui = Join-Path $perUserDir 'bin\alphashape.exe'
-$previousPlatform = $env:QT_QPA_PLATFORM
-$env:QT_QPA_PLATFORM = 'offscreen'
-try {
-    # `2>&1` on a native program turns stderr lines into ErrorRecords in
-    # PowerShell 7, and $ErrorActionPreference = 'Stop' would then abort on a
-    # warning the program printed while exiting 0. $ErrorActionPreference is
-    # relaxed for the call instead, and the exit code decides.
-    $ErrorActionPreference = 'Continue'
-    $guiOutput = & $gui --offscreen-smoke 2>&1
-    $guiExit = $LASTEXITCODE
-} finally {
-    $ErrorActionPreference = 'Stop'
-    $env:QT_QPA_PLATFORM = $previousPlatform
-}
-$guiOutput | ForEach-Object { Write-Host "  $_" }
-if ($guiExit -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $guiExit" }
-Assert (($guiOutput -join "`n") -match 'gui ready') "the GUI did not report 'gui ready'"
+    Step "CLI resolves PROJ data from a non-ASCII install path"
+    $projInfo = Invoke-Captured $cli @('--proj-info')
+    $projInfo.Output | ForEach-Object { Write-Host "  $_" }
+    if ($projInfo.ExitCode -ne 0) {
+        $projInfo.Errors | ForEach-Object { Write-Host "  $_" }
+        Fail ("alphashape-cli --proj-info exited $($projInfo.ExitCode); the install could not " +
+              'find proj.db from its own directory')
+    }
+    $expectedDb = Join-Path $perUserDir 'share\proj\proj.db'
+    $reportedDb = ($projInfo.Output | Where-Object { $_ -match '^proj database: ' }) -replace '^proj database: ', ''
+    Assert ($reportedDb) '--proj-info printed no database line'
+    # The bytes are UTF-8, so the non-ASCII directory must come back intact. A
+    # path decoded with the ANSI code page would not compare equal here.
+    Assert ($reportedDb.Contains('Jörg-ü')) `
+        "the reported PROJ database path lost its non-ASCII characters: '$reportedDb'"
+    Assert ((Resolve-Path -LiteralPath $reportedDb).Path -eq (Resolve-Path -LiteralPath $expectedDb).Path) `
+        "PROJ database is '$reportedDb', expected the installed copy at '$expectedDb'"
 
-$previousQt = $env:QT_QPA_PLATFORM
-$env:QT_QPA_PLATFORM = 'offscreen'
-try {
-    $version = & $gui --version 2>$null
-    $versionExit = $LASTEXITCODE
-} finally {
-    $env:QT_QPA_PLATFORM = $previousQt
-}
-if ($versionExit -ne 0) { Fail "alphashape.exe --version exited $versionExit" }
-Write-Host "  $version"
+    Step "GUI (offscreen)"
+    # The GUI is a Windows-subsystem binary now: no console window appears, and a
+    # console that started it is adopted only when the handles were not
+    # redirected. Start-Process -RedirectStandardOutput is exactly the redirected
+    # case, so this also proves the shim does not steal a caller's redirection.
+    $gui = Join-Path $perUserDir 'bin\alphashape.exe'
+    $smoke = Invoke-Captured $gui @('--offscreen-smoke') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $smoke.Output | ForEach-Object { Write-Host "  $_" }
+    $smoke.Errors | ForEach-Object { Write-Host "  $_" }
+    if ($smoke.ExitCode -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $($smoke.ExitCode)" }
+    Assert (($smoke.Output -join "`n") -match 'gui ready') "the GUI did not report 'gui ready'"
 
-Step "Python module"
-# The module ships under the ABI-tagged name CMake gives it
-# (alphashape.cp314-win_amd64.pyd), which Python still imports as `alphashape`.
-$pyd = Get-ChildItem (Join-Path $perUserDir 'python') -Filter 'alphashape*.pyd' |
-    Select-Object -First 1 -ExpandProperty FullName
-if (-not $pyd) { Fail "no alphashape*.pyd under $perUserDir\python" }
-if (-not $PythonVersion) {
-    # The .pyd's file name carries no ABI tag, so the only way to know which
-    # interpreter it was built for is to be told. CI passes the version it
-    # installed; a standalone run uses whatever python is on PATH and lets the
-    # import below be the test.
-    $PythonVersion = & python -c 'import sys; print(str(sys.version_info[0]) + "." + str(sys.version_info[1]))'
-    if ($LASTEXITCODE -ne 0) { Fail "python is not on PATH; pass -PythonVersion" }
-}
-Write-Host "  module      : $pyd"
-Write-Host "  interpreter : Python $PythonVersion"
-$env:PYTHONPATH = Join-Path $perUserDir 'python'
-$env:PYTHONHOME = $null
-$ErrorActionPreference = 'Continue'
-try {
-    $pythonCheck = & python -c @"
+    $version = Invoke-Captured $gui @('--version') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $version.Output | ForEach-Object { Write-Host "  $_" }
+    if ($version.ExitCode -ne 0) { Fail "alphashape.exe --version exited $($version.ExitCode)" }
+    Assert (($version.Output -join "`n") -match 'alphashape-gui \d') 'the GUI printed no version'
+
+    Step "Python module"
+    # The module ships under the ABI-tagged name CMake gives it
+    # (alphashape.cp312-win_amd64.pyd), which Python still imports as `alphashape`.
+    $pyd = Get-ChildItem (Join-Path $perUserDir 'python') -Filter 'alphashape*.pyd' |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $pyd) { Fail "no alphashape*.pyd under $perUserDir\python" }
+    if (-not $PythonVersion) {
+        # The .pyd's file name carries the ABI tag, but the patch level matters
+        # too, so CI passes the version it installed; a standalone run uses
+        # whatever python is on PATH and lets the import below be the test.
+        $PythonVersion = & python -c 'import sys; print(str(sys.version_info[0]) + "." + str(sys.version_info[1]))'
+        if ($LASTEXITCODE -ne 0) { Fail "python is not on PATH; pass -PythonVersion" }
+    }
+    Write-Host "  module      : $pyd"
+    Write-Host "  interpreter : Python $PythonVersion"
+    # The ABI tag in the file name must match the interpreter this script was
+    # told to use: they come from the same variable in CI, and a mismatch is the
+    # one thing the smoke job exists to catch.
+    $tagged = [regex]::Match($pyd, 'alphashape\.cp(\d+)').Groups[1].Value
+    $expectedTag = ($PythonVersion -split '\.')[0..1] -join ''
+    Assert ($tagged -eq $expectedTag) `
+        "the module is built for CPython $tagged but the smoke test expected $PythonVersion"
+
+    $env:PYTHONPATH = Join-Path $perUserDir 'python'
+    $env:PYTHONHOME = $null
+    try {
+        $pythonCheck = & python -c @"
 import sys, alphashape
 print("imported from", alphashape.__file__)
 tasks = alphashape.list_tasks()
 assert "AddPhotos" in tasks, "AddPhotos missing from the task list"
 print("python", sys.version.split()[0], "sees", len(tasks), "tasks")
 "@
-    $pythonExit = $LASTEXITCODE
-} finally {
-    $ErrorActionPreference = 'Stop'
-    Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
-}
-$pythonCheck | ForEach-Object { Write-Host "  $_" }
-if ($pythonExit -ne 0) { Fail "importing alphashape from $pyd failed" }
-Assert (($pythonCheck -join "`n") -match '\bpython\s+3\.') "the module did not report a Python version"
-# The import must have come from the install, not from a stray copy elsewhere.
-$importPath = ($pythonCheck | Where-Object { $_ -match '^imported from ' }) -replace '^imported from ', ''
-Assert ($importPath -like "$perUserDir\python\*") "alphashape was imported from '$importPath', not the install"
-
-Step "uninstall (per-user)"
-$uninstaller = Start-Process -FilePath $uninstallExe -ArgumentList '/S' -Wait -PassThru
-if ($uninstaller.ExitCode -ne 0) { Fail "uninstaller exited $($uninstaller.ExitCode)" }
-
-# The uninstaller removes the directory only when it is empty; a leftover file
-# means the install rule and the uninstall rule disagree.
-Wait-Gone { -not (Test-Path -LiteralPath $perUserDir) } "the install directory $perUserDir"
-Wait-Gone { -not (Test-Path $uninstallKey) } "the uninstall registry key $uninstallKey"
-Wait-Gone { -not (Test-Path $appKey) } "the application registry key $appKey"
-Wait-Gone { -not (Test-Path $startMenu) } "the Start menu folder $startMenu"
-Write-Host "  removed $perUserDir, both registry keys and the Start menu folder"
-
-# ---- per-machine, silent, into a temporary directory ------------------------------------------
-# The runner is elevated, so /AllUsers is available. The install goes to the
-# same temporary directory rather than %ProgramFiles% so nothing is left on the
-# image and the removal check stays exact; the mode (HKLM registration, the
-# per-machine default directory) is what is under test here.
-Step "per-machine install (/S /AllUsers)"
-# The installer is a 32-bit program and sets SetRegView 64, so its HKLM writes
-# land in the native (64-bit) view. This check runs from 64-bit PowerShell, which
-# reads that same view; without the SetRegView the key would be under
-# WOW6432Node and this lookup would (correctly) fail.
-$machineKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
-$machineAppKey = 'HKLM:\Software\alphashape\alphashape'
-if (Test-Path -LiteralPath $machineDir) { Remove-Item -LiteralPath $machineDir -Recurse -Force }
-
-Invoke-Installer @('/S', '/AllUsers', "/D=$machineDir")
-Assert-Present (Join-Path $machineDir 'bin\alphashape-cli.exe') 'the CLI (per-machine install)'
-if (-not (Test-Path $machineKey)) {
-    $wow = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
-    if (Test-Path $wow) {
-        Fail ('no machine-wide uninstall key at ' + $machineKey + ', but one is at ' +
-              ${wow} + ': the installer wrote through the 32-bit registry view ' +
-              '(missing SetRegView 64)')
+        $pythonExit = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     }
-    Fail "no machine-wide uninstall registry key $machineKey"
+    $pythonCheck | ForEach-Object { Write-Host "  $_" }
+    if ($pythonExit -ne 0) { Fail "importing alphashape from $pyd failed" }
+    Assert (($pythonCheck -join "`n") -match '\bpython\s+3\.') "the module did not report a Python version"
+    # The import must have come from the install, not from a stray copy elsewhere.
+    $importPath = ($pythonCheck | Where-Object { $_ -match '^imported from ' }) -replace '^imported from ', ''
+    Assert ($importPath -like "$perUserDir\python\*") "alphashape was imported from '$importPath', not the install"
+
+    # ---- per-machine, silent, with PATH, side by side with the per-user copy -------------------
+    # The runner is elevated, so /AllUsers is available. The install goes to a
+    # temporary directory rather than %ProgramFiles% so nothing is left on the
+    # image and the removal check stays exact; the mode (HKLM registration, the
+    # all-users PATH) is what is under test.
+    Step "per-machine install (/S /AllUsers /AddToPath)"
+    if (Test-Path -LiteralPath $machineDir) { Remove-Item -LiteralPath $machineDir -Recurse -Force }
+
+    Invoke-Installer @('/S', '/AllUsers', '/AddToPath', "/D=$machineDir")
+    Assert-Present (Join-Path $machineDir 'bin\alphashape-cli.exe') 'the CLI (per-machine install)'
+    Assert-Present (Join-Path $machineDir 'Uninstall.exe') 'the uninstaller (per-machine install)'
+    if (-not (Test-Path $machineKey)) {
+        $wow = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\alphashape'
+        if (Test-Path $wow) {
+            Fail ('no machine-wide uninstall key at ' + $machineKey + ', but one is at ' +
+                  ${wow} + ': the installer wrote through the 32-bit registry view ' +
+                  '(missing SetRegView 64)')
+        }
+        Fail "no machine-wide uninstall registry key $machineKey"
+    }
+    $machineEntryLocation = Read-RegistryPath $machineKey 'InstallLocation'
+    Write-Host "  DisplayName    : $(Read-RegistryPath $machineKey 'DisplayName')"
+    Write-Host "  InstallLocation: $machineEntryLocation"
+    Assert ($machineEntryLocation -eq $machineDir) `
+        "per-machine InstallLocation is '$machineEntryLocation', expected '$machineDir'"
+    $machineRecordedMode = Read-RegistryPath $machineKey 'InstallMode'
+    Assert ($machineRecordedMode -eq 'AllUsers') `
+        "the machine uninstall key records InstallMode '$machineRecordedMode', expected AllUsers"
+
+    Step "PATH (per-machine)"
+    $machinePath = Read-RegistryPath $machinePathKey 'Path'
+    Assert (Path-Contains $machinePath (Join-Path $machineDir 'bin')) `
+        "$machineDir\bin was not added to the machine PATH"
+    # The per-user entry must still be in HKCU: the two hives are edited
+    # independently, and an installer that wrote both modes to one hive shows it here.
+    Assert (Path-Contains (Read-RegistryPath $userPathKey 'Path') (Join-Path $perUserDir 'bin')) `
+        'the per-machine install removed the per-user PATH entry from HKCU'
+
+    Step "CLI (per-machine)"
+    $machineTasks = Invoke-Captured (Join-Path $machineDir 'bin\alphashape-cli.exe') @('--list-tasks')
+    if ($machineTasks.ExitCode -ne 0) {
+        $machineTasks.Errors | ForEach-Object { Write-Host "  $_" }
+        Fail "the per-machine CLI exited $($machineTasks.ExitCode)"
+    }
+    Assert ($machineTasks.Output -contains 'AddPhotos') "the per-machine CLI has no AddPhotos task"
+    $machineProj = Invoke-Captured (Join-Path $machineDir 'bin\alphashape-cli.exe') @('--proj-info')
+    if ($machineProj.ExitCode -ne 0) {
+        $machineProj.Output | ForEach-Object { Write-Host "  $_" }
+        Fail 'the per-machine CLI could not resolve its own proj.db'
+    }
+    $machineDb = ($machineProj.Output | Where-Object { $_ -match '^proj database: ' }) -replace '^proj database: ', ''
+    Assert ((Resolve-Path -LiteralPath $machineDb).Path -eq (Resolve-Path -LiteralPath (Join-Path $machineDir 'share\proj\proj.db')).Path) `
+        "the per-machine PROJ database is '$machineDb', not its own copy"
+
+    Step "uninstall (per-machine); the per-user copy must survive"
+    $machineUninstaller = Start-Process -FilePath (Join-Path $machineDir 'Uninstall.exe') `
+        -ArgumentList '/S' -Wait -PassThru
+    if ($machineUninstaller.ExitCode -ne 0) {
+        Fail "the per-machine uninstaller exited $($machineUninstaller.ExitCode)"
+    }
+    Wait-Gone { -not (Test-Path -LiteralPath $machineDir) } "the per-machine install directory"
+    Wait-Gone { -not (Test-Path $machineKey) } "the machine-wide uninstall key $machineKey"
+    Wait-Gone { -not (Test-Path $machineAppKey) } "the machine-wide application key $machineAppKey"
+    Wait-Gone { -not (Test-Path $machineStartMenu) } "the all-users Start menu folder $machineStartMenu"
+
+    # This is the multi-mode case the uninstaller used to get wrong: with both
+    # copies installed it read HKCU first, decided it was the per-user copy, and
+    # deleted the per-user tree while leaving its own behind. Every one of these
+    # assertions failed then.
+    Step "the per-user copy is intact after the machine uninstall"
+    Assert-Present (Join-Path $perUserDir 'bin\alphashape-cli.exe') 'the per-user CLI after the machine uninstall'
+    Assert-Present (Join-Path $perUserDir 'bin\alphashape.exe') 'the per-user GUI after the machine uninstall'
+    Assert-Present (Join-Path $perUserDir 'share\proj\proj.db') 'the per-user PROJ data after the machine uninstall'
+    Assert-Present (Join-Path $startMenu 'alphashape.lnk') 'the per-user Start menu shortcut after the machine uninstall'
+    Assert (Test-Path $uninstallKey) 'the per-user uninstall key after the machine uninstall'
+    $survivingLocation = Read-RegistryPath $uninstallKey 'InstallLocation'
+    Assert ($survivingLocation -eq $perUserDir) `
+        "the per-user InstallLocation became '$survivingLocation'"
+    Assert (Path-Contains (Read-RegistryPath $userPathKey 'Path') (Join-Path $perUserDir 'bin')) `
+        'the machine uninstall removed the per-user PATH entry'
+    Assert (-not (Path-Contains (Read-RegistryPath $machinePathKey 'Path') (Join-Path $machineDir 'bin'))) `
+        'the machine uninstall left its own PATH entry behind'
+
+    # The surviving copy must still work, not merely still exist.
+    $afterMachine = Invoke-Captured (Join-Path $perUserDir 'bin\alphashape-cli.exe') @('--proj-info')
+    if ($afterMachine.ExitCode -ne 0) {
+        $afterMachine.Output | ForEach-Object { Write-Host "  $_" }
+        Fail 'the per-user CLI stopped working after the machine copy was uninstalled'
+    }
+    Write-Host "  the per-user copy still runs"
+
+    Step "uninstall (per-user)"
+    $uninstaller = Start-Process -FilePath $uninstallExe -ArgumentList '/S' -Wait -PassThru
+    if ($uninstaller.ExitCode -ne 0) { Fail "uninstaller exited $($uninstaller.ExitCode)" }
+
+    # The uninstaller removes the directory only when it is empty; a leftover file
+    # means the install rule and the uninstall rule disagree.
+    Wait-Gone { -not (Test-Path -LiteralPath $perUserDir) } "the install directory $perUserDir"
+    Wait-Gone { -not (Test-Path $uninstallKey) } "the uninstall registry key $uninstallKey"
+    Wait-Gone { -not (Test-Path $appKey) } "the application registry key $appKey"
+    Wait-Gone { -not (Test-Path $startMenu) } "the Start menu folder $startMenu"
+    Write-Host "  removed $perUserDir, both registry keys and the Start menu folder"
+
+    Step "PATH restored"
+    $finalUserPath = Read-RegistryPath $userPathKey 'Path'
+    Write-Host "  $finalUserPath"
+    Assert (-not (Path-Contains $finalUserPath (Join-Path $perUserDir 'bin'))) `
+        'the per-user PATH entry survived the uninstall'
+    # Element by element, in order: "removed without altering other entries".
+    Assert (((Path-Elements $finalUserPath) -join ';') -eq ((Path-Elements $baselineUserPath) -join ';')) `
+        "PATH is '$finalUserPath', expected '$baselineUserPath' intact"
+
+    # The machine PATH was edited by the machine install only; it must be back to
+    # exactly what it was, with no residue of the temporary directory.
+    $finalMachinePath = Read-RegistryPath $machinePathKey 'Path'
+    Assert (((Path-Elements $finalMachinePath) -join ';') -eq ((Path-Elements $originalMachinePath) -join ';')) `
+        'the machine PATH did not return to its original value'
+
+    Write-Host "`nWindows installer smoke test passed" -ForegroundColor Green
+} finally {
+    # Leave the runner as it was found, whatever the outcome: a failed run must
+    # not poison a later one on a reused image.
+    if ($originalUserPath -ne '') {
+        Set-ItemProperty -LiteralPath $userPathKey -Name 'Path' -Value $originalUserPath -Type ExpandString
+    } else {
+        Remove-ItemProperty -LiteralPath $userPathKey -Name 'Path' -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $originalMachinePath) {
+        Set-ItemProperty -LiteralPath $machinePathKey -Name 'Path' -Value $originalMachinePath -Type ExpandString
+    }
 }
-$machineEntry = Get-ItemProperty -Path $machineKey
-Write-Host "  DisplayName    : $($machineEntry.DisplayName)"
-Write-Host "  InstallLocation: $($machineEntry.InstallLocation)"
-Assert ($machineEntry.InstallLocation -eq $machineDir) `
-    "per-machine InstallLocation is '$($machineEntry.InstallLocation)', expected '$machineDir'"
-
-$ErrorActionPreference = 'Continue'
-$machineTasks = & (Join-Path $machineDir 'bin\alphashape-cli.exe') --list-tasks
-$machineExit = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
-if ($machineExit -ne 0) { Fail "the per-machine CLI exited $machineExit" }
-Assert ($machineTasks -contains 'AddPhotos') "the per-machine CLI has no AddPhotos task"
-
-Step "uninstall (per-machine)"
-$machineUninstaller = Start-Process -FilePath (Join-Path $machineDir 'Uninstall.exe') `
-    -ArgumentList '/S' -Wait -PassThru
-if ($machineUninstaller.ExitCode -ne 0) {
-    Fail "the per-machine uninstaller exited $($machineUninstaller.ExitCode)"
-}
-Wait-Gone { -not (Test-Path -LiteralPath $machineDir) } "the per-machine install directory"
-Wait-Gone { -not (Test-Path $machineKey) } "the machine-wide uninstall key $machineKey"
-Wait-Gone { -not (Test-Path $machineAppKey) } "the machine-wide application key $machineAppKey"
-
-Write-Host "`nWindows installer smoke test passed" -ForegroundColor Green
