@@ -107,7 +107,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -258,7 +258,7 @@ jobs:
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -407,12 +407,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
         with:
           arch: x64
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -788,7 +788,7 @@ jobs:
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ || true
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -885,7 +885,7 @@ jobs:
             vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
@@ -978,7 +978,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Qt 6.8 (GUI)
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
           # Distro pythons are "externally managed"; aqtinstall must be allowed to install.
           PIP_BREAK_SYSTEM_PACKAGES: "1"
