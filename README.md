@@ -286,8 +286,8 @@ What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 ```
 engine/
   src/base      foundation: errors, logging, a portable RNG, the OpenMP helper, zip,
-                the platform layer (paths, env, temp files, processes, console) and a
-                voxel grid
+                the platform layer (paths, env, temp files, processes, consoles,
+                dynamically loaded libraries) and a voxel grid
   src/image     image types and codecs
   src/model     geometry: cameras, meshes, rasters, coordinate systems
   src/common    data model, task registry, commands (undo), project I/O, algorithms
