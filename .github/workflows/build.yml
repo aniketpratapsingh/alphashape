@@ -518,14 +518,22 @@ jobs:
           $installer | ForEach-Object {
             "installer: $($_.Name)  $([math]::Round($_.Length / 1MB, 1)) MB"
           }
+          # Flat, beside the .zip, so the artifact upload and every consumer
+          # have one directory to look in.
+          Copy-Item build/dist/*.exe dist/
+          Copy-Item build/dist/PYTHON-ABI.txt dist/
 
       - uses: actions/upload-artifact@v4
         if: inputs.package
         with:
           name: alphashape-windows-x86_64
+          # CPack writes the installer and PYTHON-ABI.txt into build/dist;
+          # copy them up so the artifact has one flat top level and every
+          # consumer can look for *.exe in one place.
           path: |
             dist/*.zip
-            build/dist/*
+            dist/*.exe
+            dist/PYTHON-ABI.txt
           if-no-files-found: error
 
   # The installer is attested here: SHA-256 for the download instructions in
@@ -610,7 +618,7 @@ jobs:
       - name: SHA-256
         shell: pwsh
         run: |
-          Get-ChildItem dist/*.exe -Recurse | ForEach-Object {
+          Get-ChildItem dist -Filter *.exe -Recurse | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Tee-Object -FilePath dist/SHA256SUMS.txt -Append
           }
@@ -672,7 +680,7 @@ jobs:
       - name: Install, run and uninstall
         shell: pwsh
         run: |
-          $installer = Get-ChildItem dist/*.exe -Recurse | Select-Object -First 1
+          $installer = Get-ChildItem dist -Filter *.exe -Recurse | Select-Object -First 1
           packaging/windows/smoke.ps1 -Installer $installer.FullName `
               -PythonVersion "${{ steps.abi.outputs.minor }}"
 
