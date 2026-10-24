@@ -3,7 +3,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include <QAction>
@@ -16,21 +18,29 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMetaObject>
 #include <QRegularExpression>
 #include <QStatusBar>
 #include <QStringList>
+#include <QToolButton>
 #include <QtTest/QTest>
 
+#include "apps/gui/export_controller.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
+#include "common/tasks/params.hpp"
+#include "common/tasks/registry.hpp"
 #include "harness.hpp"
+#include "hold_task.hpp"
 
 using namespace alphashape;
 using namespace alphashape::gui;
+using alphashape::gui::testing::Gate;
 using alphashape::gui::testing::GuiTest;
+using alphashape::gui::testing::HoldTask;
 using alphashape::gui::testing::pump;
 using alphashape::gui::testing::pump_until;
 
@@ -107,7 +117,7 @@ TEST_F(MainWindowTest, DefaultDockLayout) {
     EXPECT_EQ(window().dockWidgetArea(dock("dock.log")), Qt::BottomDockWidgetArea);
     EXPECT_TRUE(window().tabifiedDockWidgets(dock("dock.photos")).contains(dock("dock.log")));
 
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(viewport->objectName(), QStringLiteral("viewport"));
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Dark);
@@ -124,7 +134,7 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
     show_window();
     ASSERT_TRUE(action("action.view.theme.dark")->isChecked());
     trigger("action.view.theme.light");
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_EQ(app().theme().mode(), ThemeMode::Light);
     EXPECT_EQ(viewport->canvas_mode(), ThemeMode::Light);
@@ -137,7 +147,7 @@ TEST_F(MainWindowTest, ViewportFollowsTheThemeSwitch) {
 
 TEST_F(MainWindowTest, ViewportSceneFollowsTheDocument) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     EXPECT_TRUE(viewport->scene_is_empty());
 
@@ -259,12 +269,114 @@ TEST_F(MainWindowTest, NewSaveAsCloseOpenRoundTrip) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
+/// A window with a job held open: the registry must outlive the test body even when an
+/// assertion returns early, because the JobManager keeps the pointer until TearDown.
+class BusyWindowTest : public GuiTest {
+protected:
+    void TearDown() override {
+        gate_->open();
+        if (!pump_until([this]() { return !app().jobs().busy(); }, 15000)) {
+            app().jobs().cancel_all_and_wait();
+        }
+        app().jobs().set_registry(&builtin_registry());
+        GuiTest::TearDown();
+    }
+
+    std::shared_ptr<Gate> gate_ = std::make_shared<Gate>();
+    TaskRegistry registry_;
+};
+
+TEST_F(BusyWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
+    // require_idle() inside GuiApp throws when a job runs; the window asks FIRST, so a
+    // shortcut or a programmatic call reports it in the status bar instead of unwinding into
+    // the event loop.
+    show_window();
+    const QString project = make_engine_project(scratch("busy.psx"));
+    add_chunk(app(), "Mine");
+    ASSERT_TRUE(app().dirty());
+
+    auto started = std::make_shared<std::atomic<bool>>(false);
+    registry_.register_task(std::make_shared<HoldTask>(gate_, started));
+    app().jobs().set_registry(&registry_);
+    app().jobs().submit("HoldTask", Params{}, app().document().workspace().chunks().front()->id());
+    ASSERT_TRUE(pump_until([&]() { return started->load(); }, 15000));
+
+    int prompts = 0;
+    window().set_unsaved_handler([&](const QString&) {
+        ++prompts;
+        return UnsavedChoice::Discard;
+    });
+    window().set_open_path_handler([&]() { return project; });
+    window().set_save_path_handler([&](const QString&) { return scratch("busy_out.psx"); });
+
+    // Each refused, none threw, and none even reached its prompt or picker.
+    EXPECT_FALSE(window().new_project());
+    EXPECT_FALSE(window().open_project());
+    EXPECT_FALSE(window().open_project(project));
+    EXPECT_FALSE(window().close_project());
+    EXPECT_FALSE(window().save_project());
+    EXPECT_FALSE(window().save_project_as());
+    EXPECT_EQ(prompts, 0) << "no prompt is shown over a document the worker owns";
+    EXPECT_TRUE(window().statusBar()->currentMessage().contains(QStringLiteral("running")));
+    // The document is untouched.
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+    EXPECT_TRUE(app().dirty());
+
+    // Letting the job finish restores every operation (TearDown does the same if this fails).
+    gate_->open();
+    ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, 15000));
+    app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(window().new_project());
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
 TEST_F(MainWindowTest, OpensAProjectCreatedByTheEngine) {
     const QString path = make_engine_project(scratch("engine.psx"));
     ASSERT_TRUE(window().open_project(path));
     ASSERT_EQ(app().document().workspace().chunks().size(), 2U);
     EXPECT_EQ(app().document().workspace().chunks()[1]->label(), "Block B");
     EXPECT_FALSE(app().dirty());
+}
+
+TEST_F(MainWindowTest, TheRevealActionIsClearedWhenTheDocumentIsReplaced) {
+    show_window();
+    auto* reveal = action("action.export.reveal");
+    ASSERT_NE(reveal, nullptr);
+    auto* reveal_button = window().findChild<QToolButton*>(QStringLiteral("statusReveal"));
+    ASSERT_NE(reveal_button, nullptr);
+
+    // Stand in for a finished export through the controller's own signal, which is the path
+    // the status note is posted on; then replace the document the export belonged to.
+    const QString exported = scratch("site_model.ply");
+    ASSERT_TRUE(QMetaObject::invokeMethod(&window().exports(), "export_written",
+                                          Q_ARG(QString, QStringLiteral("ExportModel")),
+                                          Q_ARG(QString, exported)));
+    pump(20);
+    EXPECT_TRUE(reveal_button->isVisible());
+    // QAction::toolTip() falls back to the action text when none was set, so "no tip" reads as
+    // "the tip is just the label".
+    EXPECT_NE(reveal->toolTip(), reveal->text());
+
+    ASSERT_TRUE(window().new_project());
+    pump(20);
+    EXPECT_FALSE(reveal_button->isVisible()) << "the old export folder is no longer offered";
+    EXPECT_EQ(reveal->toolTip(), reveal->text()) << "the note's tip was cleared";
+}
+
+TEST_F(MainWindowTest, ClosingAProjectClearsTheRevealActionToo) {
+    show_window();
+    auto* reveal_button = window().findChild<QToolButton*>(QStringLiteral("statusReveal"));
+    ASSERT_NE(reveal_button, nullptr);
+    const QString exported = scratch("site_dem.tif");
+    ASSERT_TRUE(QMetaObject::invokeMethod(&window().exports(), "export_written",
+                                          Q_ARG(QString, QStringLiteral("ExportDem")),
+                                          Q_ARG(QString, exported)));
+    pump(20);
+    ASSERT_TRUE(reveal_button->isVisible());
+
+    ASSERT_TRUE(window().close_project());
+    pump(20);
+    EXPECT_FALSE(reveal_button->isVisible());
 }
 
 TEST_F(MainWindowTest, SaveWithoutAPathAsksWhereAndCancelKeepsTheDocumentDirty) {
@@ -600,7 +712,7 @@ TEST_F(MainWindowTest, AboutTextNamesTheVersionAndLicence) {
 
 TEST_F(MainWindowTest, ViewportShortcutsFitAndToggleTheProjection) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
 
     // A scene to frame: the point cloud gives the camera bounds, which fit() needs.
@@ -646,7 +758,7 @@ TEST_F(MainWindowTest, ViewportShortcutsFitAndToggleTheProjection) {
 
 TEST_F(MainWindowTest, ViewportSelectionHighlightsOnlyTheActiveChunksCamera) {
     show_window();
-    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ViewportWidget* viewport = window().viewport();
     ASSERT_NE(viewport, nullptr);
     auto* selection = window().findChild<WorkspaceSelection*>(QStringLiteral("selection.workspace"));
     ASSERT_NE(selection, nullptr);

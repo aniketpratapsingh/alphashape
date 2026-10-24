@@ -87,6 +87,11 @@ public:
     /// and alphashape::Error propagates. Marks the document clean and records `path` as recent.
     void save_document_as(const std::string& path);
 
+    /// True when the command line asked for a project at startup (--open / --new). The window
+    /// uses it to tell "the user asked for an empty project" from "no project is open yet" and
+    /// so whether the start screen belongs on screen.
+    bool project_requested() const { return project_requested_; }
+
     /// Window title fragment for the current document ("Untitled" when it has no path).
     /// Takes the shared lock itself: call it from the GUI thread outside read_document(),
     /// use document_title_of() for a document you already hold under the lock.
@@ -146,6 +151,8 @@ private:
     bool last_dirty_ = false;
 
     QStringList recent_;  ///< authoritative copy of the persisted recent-files list
+    /// The command line named a project (--open, or --new with or without a path).
+    bool project_requested_ = false;
     void store_recent_files();
     void require_idle(const char* what) const;
     void reset_dirty_tracking();

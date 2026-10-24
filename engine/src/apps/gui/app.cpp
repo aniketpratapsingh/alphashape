@@ -73,6 +73,7 @@ GuiApp::GuiApp(const Options& options, QObject* parent)
     } else if (options.new_project) {
         new_document(options.new_path);
     }
+    project_requested_ = options.open_path.has_value() || options.new_project;
 
     // Engine log lines may come from the worker thread; hand them to the GUI thread.
     g_log_owner = this;
