@@ -9,7 +9,6 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QDialog>
-#include <QDir>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -28,6 +27,7 @@
 #include <QWidget>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/drop_paths.hpp"
 #include "apps/gui/export_controller.hpp"
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/photos_pane.hpp"
@@ -163,6 +163,7 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     update_recent_menu();
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_title);
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_central_page);
+    connect(&app_, &GuiApp::document_replaced, this, [this]() { clear_export_note(); });
     // A chunk added through the command layer (the Workspace tree, a test) is a project open,
     // so the launcher must give way to the view.
     connect(&app_, &GuiApp::undo_changed, this, &MainWindow::update_central_page);
@@ -185,8 +186,15 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
     connect(&jobs, &JobManager::job_finished, this,
             [this](quint64 id, JobManager::State state, const QString& message) {
                 const std::optional<JobManager::Job> finished = app_.jobs().job(id);
-                on_job_finished(static_cast<int>(state), message,
-                                finished ? finished->task : QString());
+                // Whether an export already posted its own note is asked of the controller
+                // rather than inferred from the task name, so this does not depend on which of
+                // the two job_finished slots Qt runs first (export_controller_ is built by
+                // create_menus(), which is too late to rely on connection order).
+                const bool export_note =
+                    export_controller_ != nullptr && export_controller_->owns_job(id);
+                const QString task = finished ? finished->task : QString();
+                on_job_finished(static_cast<int>(state), message, export_note,
+                                task.startsWith(QStringLiteral("Export")));
             });
     update_job_ui();
 }
@@ -565,15 +573,18 @@ void MainWindow::on_job_progress(double percent, const QString& stage, qint64 et
     jobs_label_->setToolTip(eta_ms >= 0 ? tr("%1 remaining").arg(format_eta(eta_ms)) : stage);
 }
 
-void MainWindow::on_job_finished(int state, const QString& message, const QString& task) {
+void MainWindow::on_job_finished(int state, const QString& message, bool export_note,
+                                 bool export_task) {
     switch (static_cast<JobManager::State>(state)) {
         case JobManager::State::Failed:
             error_handler_(tr("Task failed"), message);
             break;
         case JobManager::State::Succeeded:
             // An export already posted its own note (file name + Reveal), which the generic
-            // "Task finished" would only wipe out.
-            if (!task.startsWith(QStringLiteral("Export"))) {
+            // "Task finished" would only wipe out. The controller answers for the jobs IT
+            // queued; the name test covers an export started another way (a future scripting
+            // path), so neither case loses the note.
+            if (!export_note && !export_task) {
                 statusBar()->showMessage(tr("Task finished"), 4000);
             }
             break;
@@ -603,6 +614,11 @@ bool MainWindow::confirm_discard() {
 }
 
 bool MainWindow::new_project() {
+    // The menu actions are disabled while a job runs, but a shortcut or a programmatic call is
+    // not: require_idle() inside GuiApp throws, and nothing may unwind out of a slot.
+    if (busy_refusal()) {
+        return false;
+    }
     if (!confirm_discard()) {
         return false;
     }
@@ -615,6 +631,9 @@ bool MainWindow::new_project() {
 }
 
 bool MainWindow::open_project() {
+    if (busy_refusal()) {
+        return false;  // do not even open a modal picker over a project the worker owns
+    }
     // Ask for the file first: cancelling the dialog must not prompt about unsaved changes.
     const QString path = open_path_handler_();
     if (path.isEmpty()) {
@@ -624,6 +643,9 @@ bool MainWindow::open_project() {
 }
 
 bool MainWindow::open_project(const QString& path) {
+    if (busy_refusal()) {
+        return false;
+    }
     if (!confirm_discard()) {
         return false;
     }
@@ -640,10 +662,19 @@ bool MainWindow::open_project(const QString& path) {
     return true;
 }
 
-bool MainWindow::save_project() {
+bool MainWindow::busy_refusal() {
     // The menu action is disabled while a job runs; a programmatic or shortcut call is not.
-    if (app_.jobs().busy()) {
-        statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+    // GuiApp's document operations call require_idle() and throw, so every slot that reaches
+    // one must ask first: a throw must never unwind into the Qt event loop.
+    if (!app_.jobs().busy()) {
+        return false;
+    }
+    statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+    return true;
+}
+
+bool MainWindow::save_project() {
+    if (busy_refusal()) {
         return false;
     }
     const QString current = app_.read_document(
@@ -662,8 +693,7 @@ bool MainWindow::save_project() {
 }
 
 bool MainWindow::save_project_as() {
-    if (app_.jobs().busy()) {
-        statusBar()->showMessage(tr("A task is running. Wait for it to finish first."), 4000);
+    if (busy_refusal()) {
         return false;
     }
     const auto current = app_.read_document([](const Document& document) {
@@ -690,6 +720,9 @@ bool MainWindow::save_project_as() {
 }
 
 bool MainWindow::close_project() {
+    if (busy_refusal()) {
+        return false;
+    }
     if (!confirm_discard()) {
         return false;
     }
@@ -752,6 +785,9 @@ bool MainWindow::new_project_from_photos(const QStringList& files) {
     if (files.isEmpty()) {
         return false;
     }
+    if (busy_refusal()) {
+        return false;
+    }
     if (!confirm_discard()) {
         return false;
     }
@@ -812,47 +848,61 @@ bool MainWindow::add_photos_to_active_chunk(const QStringList& files) {
 }
 
 bool MainWindow::handle_dropped_paths(const QStringList& paths) {
-    QStringList photos;
-    QStringList folders;
-    QStringList projects;
-    for (const QString& path : paths) {
-        const QFileInfo info(path);
-        if (info.isDir()) {
-            folders << path;
-        } else if (info.suffix().compare(QStringLiteral("psx"), Qt::CaseInsensitive) == 0) {
-            projects << path;
-        } else {
-            photos << path;
-        }
-    }
+    const DroppedPaths drop = classify_dropped_paths(paths);
+    const qsizetype ignored = static_cast<qsizetype>(paths.size()) -
+                              (drop.projects.size() + drop.images.size() + drop.folders.size());
+
     // A project file wins: dropping one project opens it. A drop that mixes a project with
-    // images is treated as photos only when there is exactly one and it is not a project.
-    if (!projects.isEmpty()) {
-        return open_project(projects.front());
-    }
-    if (!photos.isEmpty()) {
-        return new_project_from_photos(photos);
-    }
-    if (!folders.isEmpty()) {
-        // A folder is a folder of photos: list the images it holds, one level deep.
-        QStringList found;
-        for (const QString& folder : folders) {
-            const QDir dir(folder);
-            const QStringList filters = {QStringLiteral("*.jpg"), QStringLiteral("*.jpeg"),
-                                         QStringLiteral("*.png"), QStringLiteral("*.tif"),
-                                         QStringLiteral("*.tiff")};
-            const QStringList entries = dir.entryList(filters, QDir::Files, QDir::Name);
-            for (const QString& entry : entries) {
-                found << dir.absoluteFilePath(entry);
-            }
+    // images opens the project and IGNORES the rest, because replacing the document with a new
+    // photo project is the opposite of what "open this project" means.
+    if (!drop.projects.isEmpty()) {
+        const bool more = ignored > 0 || drop.images.size() + drop.projects.size() > 1;
+        const QString path = drop.projects.front();
+        // The note comes after the open: open_project() posts its own status message.
+        const bool opened = open_project(path);
+        if (opened && more) {
+            statusBar()->showMessage(
+                tr("Opening %1; the rest of the drop was ignored").arg(QFileInfo(path).fileName()),
+                4000);
         }
-        if (found.isEmpty()) {
+        return opened;
+    }
+
+    if (!drop.images.isEmpty() || !drop.folders.isEmpty()) {
+        QStringList photos = drop.images;
+        if (!drop.folders.isEmpty()) {
+            photos += images_in_directories(drop.folders);
+        }
+        if (photos.isEmpty()) {
             statusBar()->showMessage(tr("No images found in the dropped folder"), 4000);
             return false;
         }
-        return new_project_from_photos(found);
+        const bool started = new_project_from_photos(photos);
+        if (started && ignored > 0) {
+            // new_project_from_photos() posted "Adding N photos"; say what was left out too.
+            statusBar()->showMessage(
+                tr("Adding %1 photos; %2 other dropped file(s) ignored")
+                    .arg(static_cast<qlonglong>(photos.size()))
+                    .arg(static_cast<qlonglong>(ignored)),
+                4000);
+        }
+        return started;
     }
+
+    // Nothing usable: a drop of a PDF, say, does nothing. Say so rather than pretend.
+    statusBar()->showMessage(tr("Nothing to open: drop a project file or images"), 4000);
     return false;
+}
+
+void MainWindow::clear_export_note() {
+    // The Reveal action points at the folder of a file that belonged to the document that is
+    // being replaced: keeping it would offer to show an unrelated folder.
+    if (reveal_action_ == nullptr) {
+        return;
+    }
+    disconnect(reveal_action_, nullptr, this, nullptr);
+    reveal_action_->setToolTip(QString());
+    reveal_button_->setVisible(false);
 }
 
 void MainWindow::note_export_written(const QString& path) {

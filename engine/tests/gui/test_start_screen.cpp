@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -20,10 +21,14 @@
 #include <QMimeData>
 #include <QPalette>
 #include <QPushButton>
+#include <QStatusBar>
 #include <QStringList>
 #include <QUrl>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/command_line.hpp"
+#include "apps/gui/drop_paths.hpp"
+#include "apps/gui/image_files.hpp"
 #include "apps/gui/main_window.hpp"
 #include "apps/gui/start_screen.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
@@ -37,6 +42,7 @@
 
 using namespace alphashape;
 using namespace alphashape::gui;
+using alphashape::gui::testing::Gate;
 using alphashape::gui::testing::GuiTest;
 using alphashape::gui::testing::pump;
 using alphashape::gui::testing::pump_until;
@@ -115,14 +121,40 @@ TEST_F(StartScreenTest, EntryPointsStartHiddenAndTheListIsEmpty) {
 }
 
 TEST_F(StartScreenTest, NotShownWhenTheCommandLineOpensAProject) {
-    // The harness builds the window for an empty Options{}, so the observable contract here is
-    // the one the command line reaches too: with a project open, the viewport is the central
-    // page and the launcher stays away.
+    // The real startup path: Options carries --open <path>, GuiApp loads it, and MainWindow
+    // reads GuiApp::project_requested() to decide the initial central page.
     const QString path = make_project(scratch("opened.psx"));
-    ASSERT_TRUE(window().open_project(path));
+    Options options;
+    options.reset_settings = true;
+    options.open_path = path.toStdString();
+    rebuild_with(options);
+    ASSERT_EQ(app().document().path(), QFileInfo(path).absoluteFilePath().toStdString());
     show_window();
     EXPECT_FALSE(window().showing_start_screen());
+    EXPECT_EQ(window().central_page(), 0);
     EXPECT_TRUE(window().viewport()->isVisible());
+}
+
+TEST_F(StartScreenTest, NotShownWhenTheCommandLineAsksForANewProject) {
+    // --new is a request for an (empty) project, not for the launcher: the viewport shows even
+    // though the document has no path and no chunks yet.
+    Options options;
+    options.reset_settings = true;
+    options.new_project = true;
+    rebuild_with(options);
+    show_window();
+    EXPECT_FALSE(window().showing_start_screen());
+    EXPECT_EQ(window().central_page(), 0);
+    EXPECT_TRUE(window().viewport()->isVisible());
+}
+
+TEST_F(StartScreenTest, ShownWhenTheCommandLineAsksForNothing) {
+    Options options;
+    options.reset_settings = true;
+    rebuild_with(options);  // no --open, no --new
+    show_window();
+    EXPECT_TRUE(window().showing_start_screen());
+    EXPECT_EQ(window().central_page(), 1);
 }
 
 TEST_F(StartScreenTest, RecentListShowsEntriesAndMarksTheMissingOnes) {
@@ -130,6 +162,7 @@ TEST_F(StartScreenTest, RecentListShowsEntriesAndMarksTheMissingOnes) {
     app().add_recent_file(present);
     app().add_recent_file(scratch("gone.psx"));  // recorded, never created
     pump(20);
+    ASSERT_TRUE(window().start_screen()->wait_for_recent_checks()) << "the sweep finished";
 
     QListWidget* list = window().start_screen()->recent_list();
     ASSERT_NE(list, nullptr);
@@ -147,6 +180,52 @@ TEST_F(StartScreenTest, RecentListShowsEntriesAndMarksTheMissingOnes) {
     EXPECT_EQ(list->item(0)->foreground().color(),
               list->palette().color(QPalette::Disabled, QPalette::Text));
     EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(StartScreenTest, RowsAppearAtOnceAndAreOnlyGreyedWhenTheCheckReturns) {
+    // A probe that blocks until released: the point is what the list looks like WHILE the
+    // existence check is still running, which is the case a dead SMB/NFS path produces.
+    app().add_recent_file(scratch("slow.psx"));
+    auto gate = std::make_shared<Gate>();
+    auto asked = std::make_shared<std::atomic<bool>>(false);
+    window().start_screen()->set_exists_prober([gate, asked](const QString&) {
+        asked->store(true);
+        gate->wait(std::chrono::seconds(20));
+        return false;  // by the time it answers, the file is "gone"
+    });
+    window().start_screen()->reload();
+    QListWidget* list = window().start_screen()->recent_list();
+    ASSERT_EQ(list->count(), 1);
+    // The row is up immediately, and NOT greyed: the answer is not in yet.
+    EXPECT_FALSE(list->item(0)->text().contains(QStringLiteral("missing")));
+    EXPECT_FALSE(window().start_screen()->recent_missing(0));
+    EXPECT_TRUE(window().start_screen()->recent_checks_pending());
+
+    gate->open();
+    ASSERT_TRUE(window().start_screen()->wait_for_recent_checks());
+    EXPECT_TRUE(window().start_screen()->recent_missing(0));
+    EXPECT_TRUE(list->item(0)->text().contains(QStringLiteral("missing")));
+}
+
+TEST_F(StartScreenTest, AStaleSweepDoesNotOverwriteANewerOne) {
+    const QString first = make_project(scratch("one.psx"));
+    app().add_recent_file(first);
+    auto gate = std::make_shared<Gate>();
+    window().start_screen()->set_exists_prober([gate](const QString&) {
+        gate->wait(std::chrono::seconds(20));
+        return false;
+    });
+    window().start_screen()->reload();  // sweep 1, blocked
+    // A second reload starts sweep 2; release the first, then the second must win.
+    window().start_screen()->set_exists_prober([](const QString&) { return true; });
+    window().start_screen()->reload();
+    gate->open();
+    ASSERT_TRUE(window().start_screen()->wait_for_recent_checks());
+    pump(30);
+    // Sweep 1 said "missing", sweep 2 said "present": the newer answer is what is shown.
+    EXPECT_FALSE(window().start_screen()->recent_missing(0));
+    EXPECT_FALSE(window().start_screen()->recent_list()->item(0)->text().contains(
+        QStringLiteral("missing")));
 }
 
 TEST_F(StartScreenTest, CollectsRenderedDarkAndLight) {
@@ -286,6 +365,85 @@ TEST_F(StartScreenTest, DroppingImagesStartsANewProjectAndAddsThem) {
     ASSERT_TRUE(pump_until([&]() { return *state >= 0; }, kPumpTimeoutMs));
     EXPECT_EQ(*state, static_cast<int>(JobManager::State::Failed));
     EXPECT_FALSE(errors_.empty()) << "a failed import is reported through the error handler";
+}
+
+TEST_F(StartScreenTest, DroppingOnlyNonImageFilesDoesNothing) {
+    // A PDF is not a photo, not a project and not a folder: the drop is refused outright, so
+    // no "new project with these photos" is started from a file the engine cannot decode.
+    const QString pdf = scratch("report.pdf");
+    {
+        QFile file(pdf);
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+        file.write("%PDF-1.4");
+    }
+    show_window();
+    EXPECT_FALSE(window().start_screen()->drop_paths({pdf}));
+    pump(20);
+    EXPECT_TRUE(window().showing_start_screen());
+    EXPECT_TRUE(app().document().workspace().chunks().empty());
+    EXPECT_FALSE(app().jobs().busy());
+    // The window agrees: the same path dropped straight onto it is ignored too.
+    EXPECT_FALSE(window().handle_dropped_paths({pdf}));
+    EXPECT_TRUE(app().document().workspace().chunks().empty());
+}
+
+TEST_F(StartScreenTest, DroppingAProjectWithImagesOpensTheProjectAndSaysTheImagesWereIgnored) {
+    const QString project = make_project(scratch("mixed.psx"), "Mixed");
+    const QString image = scratch("extra.jpg");
+    {
+        QFile file(image);
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+        file.write("not really a jpeg");
+    }
+    show_window();
+    EXPECT_TRUE(window().start_screen()->drop_paths({image, project}));
+    pump(20);
+    EXPECT_EQ(app().document().path(), QFileInfo(project).absoluteFilePath().toStdString());
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U)
+        << "the images did not start a second project";
+    EXPECT_FALSE(window().showing_start_screen());
+    EXPECT_TRUE(window().statusBar()->currentMessage().contains(QStringLiteral("ignored")))
+        << window().statusBar()->currentMessage().toStdString();
+    EXPECT_FALSE(app().jobs().busy());
+}
+
+TEST_F(StartScreenTest, DroppingWithADirtyDocumentPromptsBeforeItIsReplaced) {
+    show_window();
+    ASSERT_TRUE(window().open_project(make_project(scratch("dirty_drop.psx"))));
+    app().execute(make_add_chunk_command(app().document().workspace(), "Extra", -1));
+    ASSERT_TRUE(app().dirty());
+
+    int prompts = 0;
+    window().set_unsaved_handler([&](const QString&) {
+        ++prompts;
+        return UnsavedChoice::Cancel;
+    });
+    const QString other = make_project(scratch("other.psx"), "Other");
+    EXPECT_FALSE(window().handle_dropped_paths({other}));
+    EXPECT_EQ(prompts, 1) << "the drop asked before replacing unsaved work";
+    EXPECT_EQ(app().document().workspace().chunks().size(), 2U);
+}
+
+TEST_F(StartScreenTest, DroppedFoldersAreScannedWithABound) {
+    const QString root = scratch("dropdir");
+    ASSERT_TRUE(QDir().mkpath(QDir(root).filePath(QStringLiteral("nested/deeper/past"))));
+    for (const QString& relative : {QStringLiteral("top.jpg"), QStringLiteral("nested/mid.png"),
+                                    QStringLiteral("nested/deeper/low.tif"),
+                                    QStringLiteral("nested/deeper/past/too_far.jpg")}) {
+        QFile file(QDir(root).filePath(relative));
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+        file.write("x");
+    }
+    // Depth 0 is the dropped folder itself; the bound is the deepest folder that is scanned.
+    const QStringList found = images_in_directories({root}, 2);
+    ASSERT_EQ(found.size(), 3U) << "a bound of 2 stops before the fourth level";
+    EXPECT_TRUE(found[0].endsWith(QStringLiteral("top.jpg")));
+    EXPECT_TRUE(found[1].endsWith(QStringLiteral("mid.png")));
+    EXPECT_TRUE(found[2].endsWith(QStringLiteral("low.tif")));
+    // The limit is a total cap across the whole scan.
+    EXPECT_EQ(images_in_directories({root}, 3, 2).size(), 2);
+    EXPECT_EQ(images_in_directories({root}).size(), 4) << "the default bound reaches them all";
+    EXPECT_TRUE(images_in_directories({scratch("no-such-folder")}).isEmpty());
 }
 
 TEST_F(StartScreenTest, AddPhotosButtonStartsAProjectAtOnce) {

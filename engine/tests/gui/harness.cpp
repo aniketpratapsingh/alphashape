@@ -115,6 +115,12 @@ void GuiTest::TearDown() {
 }
 
 void GuiTest::rebuild(bool reset_settings) {
+    Options options;
+    options.reset_settings = reset_settings;
+    rebuild_with(options);
+}
+
+void GuiTest::rebuild_with(const Options& startup) {
     window_.reset();
     app_.reset();
     // A file of this test's own (read by GuiApp through ALPHASHAPE_GUI_SETTINGS_FILE). QSettings'
@@ -122,9 +128,7 @@ void GuiTest::rebuild(bool reset_settings) {
     // would otherwise clear each other's settings: a neighbour's SetUp clear() wiped the layout
     // this test had just saved.
     qputenv("ALPHASHAPE_GUI_SETTINGS_FILE", settings_path().toLocal8Bit());
-    Options options;
-    options.reset_settings = reset_settings;
-    app_ = std::make_unique<GuiApp>(options);
+    app_ = std::make_unique<GuiApp>(startup);
     window_ = std::make_unique<MainWindow>(*app_);
 }
 

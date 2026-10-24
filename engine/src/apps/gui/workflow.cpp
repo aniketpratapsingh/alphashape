@@ -14,6 +14,7 @@
 #include <QMessageBox>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/image_files.hpp"
 #include "apps/gui/task_dialog.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
@@ -251,9 +252,8 @@ WorkflowController::WorkflowController(GuiApp& app, QMenu* menu, QWidget* dialog
         return dialog.params();
     };
     photos_handler_ = [this]() {
-        return QFileDialog::getOpenFileNames(
-            dialog_parent_, tr("Add Photos"), QString(),
-            tr("Images (*.jpg *.jpeg *.png *.tif *.tiff);;All files (*)"));
+        return QFileDialog::getOpenFileNames(dialog_parent_, tr("Add Photos"), QString(),
+                                             image_filter());
     };
     submit_handler_ = [this](const std::string& task, Params params, std::int32_t chunk_id) {
         app_.jobs().submit(task, std::move(params), chunk_id);

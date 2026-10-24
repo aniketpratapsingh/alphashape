@@ -1,16 +1,23 @@
 #include "apps/gui/start_screen.hpp"
 
+#include <atomic>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <utility>
 
 #include <QAbstractItemView>
 #include <QAction>
+#include <QBrush>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
 #include <QDragEnterEvent>
+#include <QDragLeaveEvent>
 #include <QDropEvent>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QMetaObject>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
@@ -23,12 +30,17 @@
 #include <QModelIndex>
 #include <QPalette>
 #include <QPushButton>
+#include <QRunnable>
 #include <QShowEvent>
+#include <QThread>
+#include <QThreadPool>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QtGlobal>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/drop_paths.hpp"
+#include "apps/gui/image_files.hpp"
 #include "apps/gui/theme/theme.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -68,9 +80,46 @@ QString project_in(const QString& directory) {
     return entries.isEmpty() ? QString() : dir.absoluteFilePath(entries.first());
 }
 
+/// The off-thread half of the recent-list existence sweep: one stat per entry, then a queued
+/// call back on the GUI thread. A QRunnable (not QThreadPool::start on a callable) because
+/// that overload is newer than the Qt 6.7 floor this target builds against.
+class ExistsSweep : public QRunnable {
+public:
+    using Apply = std::function<void(int, const QStringList&, const QList<bool>&)>;
+
+    ExistsSweep(int generation, QStringList paths, const StartScreen::ExistsProber& prober,
+                Apply apply)
+        : generation_(generation), paths_(std::move(paths)), prober_(prober),
+          apply_(std::move(apply)) {}
+
+    void run() override {
+        QList<bool> missing;
+        missing.reserve(paths_.size());
+        for (const QString& path : paths_) {
+            // A prober that throws must not take the pool down; treat it as "cannot tell" and
+            // leave the entry ungreyed (present) rather than claiming it is gone.
+            bool exists = true;
+            try {
+                exists = prober_(path);
+            } catch (...) {
+                exists = true;
+            }
+            missing.append(!exists);
+        }
+        apply_(generation_, paths_, missing);
+    }
+
+private:
+    int generation_;
+    QStringList paths_;
+    StartScreen::ExistsProber prober_;
+    Apply apply_;
+};
+
 }  // namespace
 
 StartScreen::StartScreen(GuiApp& app, QWidget* parent) : QWidget(parent), app_(app) {
+    exists_prober_ = [](const QString& path) { return QFileInfo::exists(path); };
     setObjectName(QStringLiteral("startScreen"));
     setAcceptDrops(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -79,9 +128,7 @@ StartScreen::StartScreen(GuiApp& app, QWidget* parent) : QWidget(parent), app_(a
     setAttribute(Qt::WA_StyledBackground, true);
 
     photos_handler_ = [this]() {
-        return QFileDialog::getOpenFileNames(
-            this, tr("Add Photos"), QString(),
-            tr("Images (*.jpg *.jpeg *.png *.tif *.tiff);;All files (*)"));
+        return QFileDialog::getOpenFileNames(this, tr("Add Photos"), QString(), image_filter());
     };
 
     build();
@@ -89,6 +136,13 @@ StartScreen::StartScreen(GuiApp& app, QWidget* parent) : QWidget(parent), app_(a
     // The "missing" rows take their grey from the palette, so a theme switch must re-apply it.
     connect(&app_.theme(), &Theme::changed, this, &StartScreen::reload);
     reload();
+}
+
+StartScreen::~StartScreen() {
+    // An outstanding sweep holds this pointer and the flag; clearing it under the GUI thread's
+    // own atomic store is enough — the queued lambda checks the flag on this same thread before
+    // it ever dereferences the pointer.
+    alive_->store(false);
 }
 
 // --- Construction ------------------------------------------------------------------------
@@ -207,22 +261,13 @@ void StartScreen::reload() {
         auto* item = new QListWidgetItem(QFileInfo(path).fileName(), recent_);
         item->setData(Qt::UserRole, path);
         item->setToolTip(path);
+        paint_recent_row(item, path);
     }
     // Restore the selection by path (the rows may have moved).
     for (int i = 0; i < recent_->count(); ++i) {
         if (recent_->item(i)->data(Qt::UserRole).toString() == selected && !selected.isEmpty()) {
             recent_->setCurrentRow(i);
             break;
-        }
-    }
-    for (int i = 0; i < recent_->count(); ++i) {
-        QListWidgetItem* item = recent_->item(i);
-        if (recent_missing(i)) {
-            // Greyed through the palette's disabled text colour, so the theme stays the source
-            // of the colour; the suffix says it in text for anyone who cannot see the contrast.
-            item->setForeground(palette().color(QPalette::Disabled, QPalette::Text));
-            item->setText(item->text() + tr("  (missing)"));
-            item->setToolTip(tr("%1\nThis project file is missing.").arg(item->toolTip()));
         }
     }
     recent_title_->setVisible(!paths.isEmpty());
@@ -232,6 +277,11 @@ void StartScreen::reload() {
     sample_path_ = find_sample_project().value_or(QString());
     sample_button_->setVisible(!sample_path_.isEmpty());
     set_actions_enabled(actions_enabled_);
+
+    // The rows are on screen now, un-greyed; whether any is gone is answered off the GUI thread,
+    // because a recent entry can name a stale network path and stat()ing it here would freeze
+    // the window for as long as the mount takes to time out.
+    start_recent_sweep(paths);
 }
 
 QStringList StartScreen::recent_paths() const {
@@ -245,7 +295,108 @@ QStringList StartScreen::recent_paths() const {
 
 bool StartScreen::recent_missing(int row) const {
     QListWidgetItem* item = recent_->item(row);
-    return item == nullptr || !project_exists(item->data(Qt::UserRole).toString());
+    if (item == nullptr) {
+        return true;
+    }
+    const QString path = item->data(Qt::UserRole).toString();
+    const auto known = known_recent_.constFind(path);
+    return known != known_recent_.constEnd() && *known;
+}
+
+void StartScreen::set_exists_prober(ExistsProber prober) {
+    exists_prober_ = prober ? std::move(prober)
+                            : ExistsProber([](const QString& path) { return QFileInfo::exists(path); });
+}
+
+bool StartScreen::wait_for_recent_checks(int timeout_ms) {
+    QElapsedTimer timer;
+    timer.start();
+    while (recent_checks_pending()) {
+        if (timer.elapsed() >= timeout_ms) {
+            return false;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(2);
+    }
+    return true;
+}
+
+void StartScreen::paint_recent_row(QListWidgetItem* item, const QString& path) {
+    if (item == nullptr) {
+        return;
+    }
+    const auto known = known_recent_.constFind(path);
+    if (known == known_recent_.constEnd() || !*known) {
+        // Unknown or present: the plain row. An unknown entry is NOT greyed — the answer is not
+        // in yet, and greying it would claim something we have not checked.
+        item->setForeground(QBrush());
+        item->setText(QFileInfo(path).fileName());
+        item->setToolTip(path);
+        return;
+    }
+    // Greyed through the palette's disabled text colour, so the theme stays the source of the
+    // colour; the suffix says it in text for anyone who cannot see the contrast.
+    item->setForeground(palette().color(QPalette::Disabled, QPalette::Text));
+    item->setText(QFileInfo(path).fileName() + tr("  (missing)"));
+    item->setToolTip(tr("%1\nThis project file is missing.").arg(path));
+}
+
+void StartScreen::start_recent_sweep(const QStringList& paths) {
+    if (paths.isEmpty()) {
+        return;
+    }
+    // Drop answers for entries that are no longer listed, so the map cannot grow forever.
+    for (auto it = known_recent_.begin(); it != known_recent_.end();) {
+        if (paths.contains(it.key())) {
+            ++it;
+        } else {
+            it = known_recent_.erase(it);
+        }
+    }
+
+    const int generation = ++sweep_generation_;
+    ++pending_sweeps_;
+    // The worker must not touch a QPointer: a widget's QPointer belongs to the GUI thread. It
+    // carries a plain flag instead, and the answer is posted to the application object (which
+    // lives until the program ends and runs on the GUI thread). The screen is read only inside
+    // that queued lambda, on the thread that can also destroy it.
+    StartScreen* self = this;
+    std::shared_ptr<std::atomic<bool>> alive = alive_;
+    auto apply = [self, alive](int sweep, const QStringList& swept, const QList<bool>& missing) {
+        QCoreApplication* target = QCoreApplication::instance();
+        if (target == nullptr || !alive->load()) {
+            return;  // shutting down, or the screen is already gone
+        }
+        QMetaObject::invokeMethod(
+            target,
+            [self, alive, sweep, swept, missing]() {
+                if (alive->load()) {
+                    self->apply_recent_sweep(sweep, swept, missing);
+                }
+            },
+            Qt::QueuedConnection);
+    };
+    QThreadPool::globalInstance()->start(
+        new ExistsSweep(generation, paths, exists_prober_, std::move(apply)));
+}
+
+void StartScreen::apply_recent_sweep(int generation, const QStringList& paths,
+                                     const QList<bool>& missing) {
+    if (pending_sweeps_ > 0) {
+        --pending_sweeps_;
+    }
+    // A newer reload superseded this sweep: its answers describe a list that is no longer shown.
+    if (generation != sweep_generation_) {
+        return;
+    }
+    for (qsizetype i = 0; i < paths.size() && i < missing.size(); ++i) {
+        known_recent_.insert(paths[i], missing[i]);
+    }
+    // Repaint from that stored state, every row: the tooltip and the "(missing)" suffix are
+    // built here, so it must not depend on what the row happened to carry before.
+    for (int row = 0; row < recent_->count(); ++row) {
+        paint_recent_row(recent_->item(row), recent_->item(row)->data(Qt::UserRole).toString());
+    }
 }
 
 void StartScreen::remove_recent(int row) {
@@ -263,8 +414,15 @@ void StartScreen::on_recent_clicked(QListWidgetItem* item) {
         return;
     }
     const QString path = item->data(Qt::UserRole).toString();
-    if (!project_exists(path)) {
+    if (recent_missing(recent_->row(item))) {
         return;  // the greyed entry is a record of a file that is gone; use Remove to drop it
+    }
+    // A click is a user action, and opening the file will stat it anyway: a path whose check is
+    // still outstanding is verified here rather than refused.
+    if (known_recent_.constFind(path) == known_recent_.constEnd() && !project_exists(path)) {
+        known_recent_.insert(path, true);
+        paint_recent_row(item, path);
+        return;
     }
     Q_EMIT open_path_requested(path);
 }
@@ -382,8 +540,25 @@ QStringList StartScreen::local_paths(const QMimeData* mime) {
     return paths;
 }
 
+namespace {
+
+/// Whether a drag carries anything the window can open or import. This is decided once, in
+/// dragEnter, and cached: a drag-MOVE event fires continuously while the cursor is over the
+/// widget, and a stat() per event would stall the cursor over a dead network path.
+bool has_usable_drop(const QStringList& paths) {
+    for (const QString& path : paths) {
+        if (is_project_path(path) || is_image_path(path) || QFileInfo(path).isDir()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 void StartScreen::dragEnterEvent(QDragEnterEvent* event) {
-    if (actions_enabled_ && !local_paths(event->mimeData()).isEmpty()) {
+    drag_accepts_ = actions_enabled_ && has_usable_drop(local_paths(event->mimeData()));
+    if (drag_accepts_) {
         event->acceptProposedAction();
         return;
     }
@@ -391,16 +566,25 @@ void StartScreen::dragEnterEvent(QDragEnterEvent* event) {
 }
 
 void StartScreen::dragMoveEvent(QDragMoveEvent* event) {
-    if (actions_enabled_ && !local_paths(event->mimeData()).isEmpty()) {
+    // The verdict from dragEnter: this event repeats tens of times a second.
+    if (drag_accepts_) {
         event->acceptProposedAction();
         return;
     }
     QWidget::dragMoveEvent(event);
 }
 
+void StartScreen::dragLeaveEvent(QDragLeaveEvent* event) {
+    drag_accepts_ = false;
+    QWidget::dragLeaveEvent(event);
+}
+
 void StartScreen::dropEvent(QDropEvent* event) {
     const QStringList paths = local_paths(event->mimeData());
-    if (!actions_enabled_ || paths.isEmpty()) {
+    // Re-decide at the drop: a path may have appeared or vanished since the drag started.
+    const bool usable = actions_enabled_ && has_usable_drop(paths);
+    drag_accepts_ = false;
+    if (!usable) {
         QWidget::dropEvent(event);
         return;
     }
@@ -409,7 +593,14 @@ void StartScreen::dropEvent(QDropEvent* event) {
 }
 
 bool StartScreen::drop_paths(const QStringList& paths) {
-    if (!actions_enabled_ || paths.isEmpty()) {
+    if (!actions_enabled_) {
+        return false;
+    }
+    // A project file that exists, an image, or a folder: the same verdict a real drop gets. A
+    // path that is gone, or is any other kind of file, is not something this window can act on.
+    // The whole drop is forwarded, as drag-and-drop does: MainWindow counts what it ignored and
+    // says so in the status bar.
+    if (classify_dropped_paths(paths).empty()) {
         return false;
     }
     Q_EMIT paths_dropped(paths);

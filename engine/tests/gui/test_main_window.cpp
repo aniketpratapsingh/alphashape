@@ -3,7 +3,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include <QAction>
@@ -16,21 +18,29 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMetaObject>
 #include <QRegularExpression>
 #include <QStatusBar>
 #include <QStringList>
+#include <QToolButton>
 #include <QtTest/QTest>
 
+#include "apps/gui/export_controller.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
+#include "common/tasks/params.hpp"
+#include "common/tasks/registry.hpp"
 #include "harness.hpp"
+#include "hold_task.hpp"
 
 using namespace alphashape;
 using namespace alphashape::gui;
+using alphashape::gui::testing::Gate;
 using alphashape::gui::testing::GuiTest;
+using alphashape::gui::testing::HoldTask;
 using alphashape::gui::testing::pump;
 using alphashape::gui::testing::pump_until;
 
@@ -259,12 +269,95 @@ TEST_F(MainWindowTest, NewSaveAsCloseOpenRoundTrip) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
+TEST_F(MainWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
+    // require_idle() inside GuiApp throws when a job runs; the window asks FIRST, so a
+    // shortcut or a programmatic call reports it in the status bar instead of unwinding into
+    // the event loop.
+    show_window();
+    const QString project = make_engine_project(scratch("busy.psx"));
+    add_chunk(app(), "Mine");
+    ASSERT_TRUE(app().dirty());
+
+    auto gate = std::make_shared<Gate>();
+    auto started = std::make_shared<std::atomic<bool>>(false);
+    TaskRegistry registry;
+    registry.register_task(std::make_shared<HoldTask>(gate, started));
+    app().jobs().set_registry(&registry);
+    app().jobs().submit("HoldTask", Params{}, app().document().workspace().chunks().front()->id());
+    ASSERT_TRUE(pump_until([&]() { return started->load(); }, 15000));
+
+    int prompts = 0;
+    window().set_unsaved_handler([&](const QString&) {
+        ++prompts;
+        return UnsavedChoice::Discard;
+    });
+    window().set_open_path_handler([&]() { return project; });
+    window().set_save_path_handler([&](const QString&) { return scratch("busy_out.psx"); });
+
+    // Each refused, none threw, and none even reached its prompt or picker.
+    EXPECT_FALSE(window().new_project());
+    EXPECT_FALSE(window().open_project());
+    EXPECT_FALSE(window().open_project(project));
+    EXPECT_FALSE(window().close_project());
+    EXPECT_FALSE(window().save_project());
+    EXPECT_FALSE(window().save_project_as());
+    EXPECT_EQ(prompts, 0) << "no prompt is shown over a document the worker owns";
+    EXPECT_TRUE(window().statusBar()->currentMessage().contains(QStringLiteral("running")));
+    // The document is untouched.
+    EXPECT_EQ(app().document().workspace().chunks().size(), 1U);
+    EXPECT_TRUE(app().dirty());
+
+    gate->open();
+    ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, 15000));
+    app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
 TEST_F(MainWindowTest, OpensAProjectCreatedByTheEngine) {
     const QString path = make_engine_project(scratch("engine.psx"));
     ASSERT_TRUE(window().open_project(path));
     ASSERT_EQ(app().document().workspace().chunks().size(), 2U);
     EXPECT_EQ(app().document().workspace().chunks()[1]->label(), "Block B");
     EXPECT_FALSE(app().dirty());
+}
+
+TEST_F(MainWindowTest, TheRevealActionIsClearedWhenTheDocumentIsReplaced) {
+    show_window();
+    auto* reveal = action("action.export.reveal");
+    ASSERT_NE(reveal, nullptr);
+    auto* reveal_button = window().findChild<QToolButton*>(QStringLiteral("statusReveal"));
+    ASSERT_NE(reveal_button, nullptr);
+
+    // Stand in for a finished export through the controller's own signal, which is the path
+    // the status note is posted on; then replace the document the export belonged to.
+    const QString exported = scratch("site_model.ply");
+    ASSERT_TRUE(QMetaObject::invokeMethod(&window().exports(), "export_written",
+                                          Q_ARG(QString, QStringLiteral("ExportModel")),
+                                          Q_ARG(QString, exported)));
+    pump(20);
+    EXPECT_TRUE(reveal_button->isVisible());
+    EXPECT_FALSE(reveal->toolTip().isEmpty());
+
+    ASSERT_TRUE(window().new_project());
+    pump(20);
+    EXPECT_FALSE(reveal_button->isVisible()) << "the old export folder is no longer offered";
+    EXPECT_TRUE(reveal->toolTip().isEmpty());
+}
+
+TEST_F(MainWindowTest, ClosingAProjectClearsTheRevealActionToo) {
+    show_window();
+    auto* reveal_button = window().findChild<QToolButton*>(QStringLiteral("statusReveal"));
+    ASSERT_NE(reveal_button, nullptr);
+    const QString exported = scratch("site_dem.tif");
+    ASSERT_TRUE(QMetaObject::invokeMethod(&window().exports(), "export_written",
+                                          Q_ARG(QString, QStringLiteral("ExportDem")),
+                                          Q_ARG(QString, exported)));
+    pump(20);
+    ASSERT_TRUE(reveal_button->isVisible());
+
+    ASSERT_TRUE(window().close_project());
+    pump(20);
+    EXPECT_FALSE(reveal_button->isVisible());
 }
 
 TEST_F(MainWindowTest, SaveWithoutAPathAsksWhereAndCancelKeepsTheDocumentDirty) {

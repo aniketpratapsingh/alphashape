@@ -83,6 +83,11 @@ public:
     bool save_project_as();
     bool close_project();
 
+    /// Act on a drag-and-drop of `paths`: a project file opens it (and wins over anything else
+    /// in the drop), images or folders start a new project with the images they hold, and
+    /// anything else is ignored with a note. False when there was nothing usable.
+    bool handle_dropped_paths(const QStringList& paths);
+
     // --- Layout ---
 
     /// Persist geometry and dock layout to the settings.
@@ -124,11 +129,15 @@ private:
     void update_recent_menu();
     void update_job_ui();
     void on_job_progress(double percent, const QString& stage, qint64 eta_ms);
-    /// `task` is the finished job's name; an export posts its own, more specific note, so the
-    /// generic "Task finished" would only overwrite it.
-    void on_job_finished(int state, const QString& message, const QString& task);
+    /// `export_note`: the export controller queued this job and posts its own, more specific
+    /// note (the generic "Task finished" would only overwrite it). `export_task`: the job's name
+    /// starts with "Export", which covers an export the controller did not queue.
+    void on_job_finished(int state, const QString& message, bool export_note, bool export_task);
     void show_about();
     void report_error(const QString& title, const std::exception& error);
+    /// True when a job owns the document: posts the "wait for it" note and asks the caller to
+    /// return false. Every operation that reaches a GuiApp document call must ask first.
+    bool busy_refusal();
     QAction* make_action(const QString& object_name, const QString& text,
                          const QKeySequence& shortcut = {});
 
@@ -142,12 +151,12 @@ private:
     /// Start a project from `files`: a new document with one chunk, then AddPhotos through the
     /// job manager (the same path the Workflow menu's AddPhotos uses).
     bool new_project_from_photos(const QStringList& files);
-    /// Handle a drop on the start screen: a project file opens it, anything else is photos.
-    bool handle_dropped_paths(const QStringList& paths);
     /// Run AddPhotos on the active chunk for `files`.
     bool add_photos_to_active_chunk(const QStringList& files);
     /// Status-bar note with a Reveal action after an export finished.
     void note_export_written(const QString& path);
+    /// Drop the Reveal button: the export it pointed at belonged to a document that is gone.
+    void clear_export_note();
 
     GuiApp& app_;
     UnsavedHandler unsaved_handler_;

@@ -17,12 +17,15 @@
 #include <QApplication>
 #include <QDialog>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QLineEdit>
 #include <QMenu>
 #include <QStatusBar>
 #include <QStringList>
 #include <QTimer>
+#include <QWidget>
 
 #include "apps/gui/export_controller.hpp"
 #include "apps/gui/main_window.hpp"
@@ -152,27 +155,30 @@ QString save_project(const QString& path) {
     return path;
 }
 
-/// Accept the real TaskDialog as soon as it is up, and count how often that happened. A dialog
-/// that refuses to accept (an invalid preset would be a bug) is rejected after a short grace
-/// period, so a broken preset fails the assertions instead of hanging the test.
+/// Accept the real TaskDialog as soon as it is up, and count how often that happened.
+///
+/// Event-driven rather than "wait then accept": the timer only acts on an ACTIVE MODAL widget,
+/// which is the same condition the dialog's own exec() loop is waiting on, so it cannot accept
+/// too early (before anything is up) and does not need a long fixed delay on a slow runner.
+/// The bound is wall-clock (10 s), and a dialog that is still up at the deadline is rejected so
+/// a broken preset fails the assertions instead of hanging the test.
 QTimer* accept_dialogs(QWidget* owner, std::shared_ptr<int> accepted) {
     auto* timer = new QTimer(owner);
     timer->setInterval(5);
-    auto attempts = std::make_shared<int>(0);
-    QObject::connect(timer, &QTimer::timeout, timer, [accepted, attempts]() {
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            auto* dialog = qobject_cast<QDialog*>(widget);
-            if (dialog != nullptr && dialog->objectName() == QStringLiteral("dialog.task") &&
-                dialog->isVisible()) {
-                if (*attempts < 100) {
-                    ++*attempts;
-                    dialog->accept();
-                    ++*accepted;
-                } else {
-                    dialog->reject();
-                }
-            }
+    auto elapsed = std::make_shared<QElapsedTimer>();
+    elapsed->start();
+    QObject::connect(timer, &QTimer::timeout, timer, [accepted, elapsed]() {
+        QWidget* modal = QApplication::activeModalWidget();
+        auto* dialog = qobject_cast<QDialog*>(modal);
+        if (dialog == nullptr || !dialog->isVisible()) {
+            return;  // nothing is modal yet: the dialog has not been shown
         }
+        if (elapsed->elapsed() > 10000) {
+            dialog->reject();  // gave it ten seconds: it will not accept, so do not hang
+            return;
+        }
+        dialog->accept();
+        ++*accepted;
     });
     timer->start();
     return timer;
@@ -480,6 +486,118 @@ TEST_F(ExportTest, SuggestPathUsesTheProjectFolderOrDocuments) {
     EXPECT_FALSE(ExportController::default_directory().isEmpty());
     // A task this menu does not offer has no step.
     EXPECT_FALSE(ExportController::find_step("BuildModel").has_value());
+}
+
+TEST_F(ExportTest, AChosenFormatRewritesTheExtension) {
+    give_model(chunk());
+    refresh();
+    QString path_seen;
+    exports().set_params_handler(
+        [](const std::string& task, const Presets&) -> std::optional<Params> {
+            Params params = make_params(builtin_registry().require(task));
+            // What the dialog hands back when the user picks OBJ in the format combo while the
+            // path still carries the suggested ".ply".
+            params.set("path", std::string("out/site_model.ply"));
+            params.set("format", std::string("obj"));
+            return params;
+        });
+    exports().set_submit_handler([&](const std::string&, Params params, std::int32_t)
+                                     -> std::optional<quint64> {
+        path_seen = QString::fromStdString(params.get_string("path"));
+        return std::nullopt;
+    });
+    ASSERT_TRUE(trigger("action.export.model"));
+    EXPECT_EQ(path_seen, QStringLiteral("out/site_model.obj"));
+
+    // The reverse (OBJ picked, PLY path typed) and case-insensitive agreement both hold.
+    exports().set_params_handler(
+        [](const std::string& task, const Presets&) -> std::optional<Params> {
+            Params params = make_params(builtin_registry().require(task));
+            params.set("path", std::string("out/site_model.OBJ"));
+            params.set("format", std::string("obj"));
+            return params;
+        });
+    ASSERT_TRUE(trigger("action.export.model"));
+    EXPECT_EQ(path_seen, QStringLiteral("out/site_model.OBJ")) << "same format, only case differs";
+}
+
+TEST_F(ExportTest, OverwritingAnExistingFileAsksAndNoAbortsTheExport) {
+    give_point_cloud(chunk());
+    refresh();
+    const QString existing = scratch("already_there.ply");
+    {
+        QFile file(existing);
+        ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+        file.write("previous export");
+    }
+    exports().set_params_handler(
+        [&](const std::string& task, const Presets&) -> std::optional<Params> {
+            Params params = make_params(builtin_registry().require(task));
+            params.set("path", existing.toStdString());
+            return params;
+        });
+
+    QString asked_about;
+    exports().set_confirm_replace_handler([&](const QString& path) {
+        asked_about = path;
+        return false;  // No: do not replace
+    });
+    ASSERT_TRUE(trigger("action.export.point_cloud"));
+    EXPECT_EQ(asked_about, existing) << "the question named the file that would be replaced";
+    EXPECT_TRUE(submitted_.empty()) << "No abandons the export before anything is queued";
+
+    // Yes: the same request goes through.
+    exports().set_confirm_replace_handler([&](const QString&) { return true; });
+    ASSERT_TRUE(trigger("action.export.point_cloud"));
+    ASSERT_EQ(submitted_.size(), 1U);
+    EXPECT_EQ(submitted_[0].params.get_string("path"), existing.toStdString());
+    EXPECT_TRUE(errors_.empty());
+}
+
+TEST_F(ExportTest, AFreshDestinationIsNotQuestioned) {
+    give_point_cloud(chunk());
+    refresh();
+    int asked = 0;
+    exports().set_confirm_replace_handler([&](const QString&) {
+        ++asked;
+        return true;
+    });
+    exports().set_params_handler(
+        [&](const std::string& task, const Presets&) -> std::optional<Params> {
+            Params params = make_params(builtin_registry().require(task));
+            params.set("path", scratch("brand_new.ply").toStdString());
+            return params;
+        });
+    ASSERT_TRUE(trigger("action.export.point_cloud"));
+    EXPECT_EQ(asked, 0) << "a file that does not exist is never questioned";
+    EXPECT_EQ(submitted_.size(), 1U);
+}
+
+TEST_F(ExportTest, TheGenericTaskFinishedNoteDoesNotOverwriteTheExportNote) {
+    // MainWindow asks the controller whether it queued the job, rather than inferring it from
+    // the task name; the answer must survive the controller's own slot running first or last.
+    EXPECT_FALSE(exports().owns_job(1));
+    const QString project = save_project(scratch("noted.psx"));
+    ASSERT_TRUE(window().open_project(project));
+    give_model(*app().document().active_chunk());
+    refresh();
+    exports().set_submit_handler([this](const std::string& task, Params params,
+                                        std::int32_t target) -> std::optional<quint64> {
+        return app().jobs().submit(task, std::move(params), target);
+    });
+    auto accepted = std::make_shared<int>(0);
+    QTimer* timer = accept_dialogs(&window(), accepted);
+    const bool ran = trigger("action.export.model");
+    timer->stop();
+    timer->deleteLater();
+    ASSERT_TRUE(ran);
+    ASSERT_TRUE(pump_until(
+        [&]() {
+            return window().statusBar()->currentMessage().contains(QStringLiteral("Exported"));
+        },
+        kPumpTimeoutMs));
+    // The export's own note is still what the strip says: the generic one did not replace it.
+    EXPECT_FALSE(window().statusBar()->currentMessage().contains(QStringLiteral("Task finished")));
 }
 
 TEST_F(ExportTest, ASubmitFailureIsReportedNotThrown) {

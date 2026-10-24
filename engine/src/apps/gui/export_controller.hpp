@@ -83,6 +83,16 @@ public:
     using ErrorHandler = std::function<void(const QString& title, const QString& message)>;
     void set_error_handler(ErrorHandler handler);
 
+    /// Asked before an export overwrites a file that already exists; false = do not write, and
+    /// the export is abandoned. Default: a Replace/Cancel question box.
+    ///
+    /// This is the last line of defence, not a duplicate of Qt's own: the dialog opens on a
+    /// suggested destination inside the project folder, so pressing OK twice in a row (or once
+    /// on a name typed to match an earlier export) lands on an existing file without the
+    /// browse step that would have made Qt ask.
+    using ConfirmReplaceHandler = std::function<bool(const QString& path)>;
+    void set_confirm_replace_handler(ConfirmReplaceHandler handler);
+
     QAction* action(const std::string& task) const;
 
     /// Why `task` cannot run now ("" = it can). A task this menu does not offer is never
@@ -92,6 +102,12 @@ public:
     /// Ask for parameters and submit `task`, as triggering its action does. False when the task
     /// is unavailable, the user cancelled, or the submission failed.
     bool run(const std::string& task);
+
+    /// True when `id` names a job this controller queued: its success posts the controller's
+    /// own status note, so the window's generic "Task finished" must not overwrite it. Asked by
+    /// MainWindow when it sees JobManager::job_finished, which makes the behaviour independent
+    /// of the order the two objects' slots run in.
+    bool owns_job(quint64 id) const;
 
     /// Recompute every action's enabled state and tooltip.
     void update_enabled();
@@ -117,8 +133,17 @@ private:
     ParamsHandler params_handler_;
     SubmitHandler submit_handler_;
     ErrorHandler error_handler_;
+    ConfirmReplaceHandler confirm_replace_handler_;
+    /// The Replace/Cancel question box; kept so set_confirm_replace_handler(nullptr) can
+    /// restore it instead of disabling the check.
+    ConfirmReplaceHandler default_confirm_replace_;
     /// Jobs this controller queued: id -> (task, destination the dialog accepted).
     std::vector<std::pair<quint64, std::pair<std::string, QString>>> pending_;
+    /// Every id this controller ever queued, oldest first, bounded. Kept after `pending_` drops
+    /// an entry so owns_job() answers the same before and after this controller's own
+    /// job_finished slot ran — MainWindow asks it from its own slot, in whatever order Qt
+    /// delivers the two.
+    std::vector<quint64> queued_ids_;
 };
 
 }  // namespace alphashape::gui

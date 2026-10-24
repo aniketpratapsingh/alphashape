@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QDialog>
 #include <QDir>
@@ -57,6 +58,30 @@ ExportSurvey survey(const Chunk& chunk) {
     found.has_elevation = !chunk.elevation().empty();
     found.has_orthomosaic = !chunk.orthomosaic().empty();
     return found;
+}
+
+/// The destination an export actually writes for `format` ("" when the task has no format
+/// parameter): a path whose extension names a DIFFERENT format has that extension replaced, and
+/// one with no extension gets `format`. Case-insensitive, so ".PLY" is already PLY.
+///
+/// Choosing OBJ in the dialog's format combo used to write "<title>_model.ply" — a PLY file
+/// container that the engine then filled with OBJ text. The extension is not cosmetic here: it
+/// is what the user will click on later.
+QString with_extension_for(const QString& path, const QString& format) {
+    if (path.isEmpty() || format.isEmpty()) {
+        return path;
+    }
+    const QFileInfo info(path);
+    const QString suffix = info.suffix();
+    if (suffix.isEmpty()) {
+        return path + QLatin1Char('.') + format;
+    }
+    if (suffix.compare(format, Qt::CaseInsensitive) == 0) {
+        return path;
+    }
+    QString replaced = path;
+    replaced.chop(suffix.size());
+    return replaced + format;
 }
 
 bool has_asset(const ExportSurvey& chunk, const ExportStep& step) {
@@ -144,6 +169,20 @@ ExportController::ExportController(GuiApp& app, QMenu* menu, QWidget* dialog_par
     error_handler_ = [this](const QString& title, const QString& message) {
         QMessageBox::critical(dialog_parent_, title, message);
     };
+    default_confirm_replace_ = [this](const QString& path) {
+        QMessageBox box(QMessageBox::Warning, tr("Replace file?"),
+                        tr("\"%1\" already exists.").arg(QFileInfo(path).fileName()),
+                        QMessageBox::Yes | QMessageBox::No, dialog_parent_);
+        box.setInformativeText(tr("Replacing it overwrites what is there now."));
+        // No is the default: a stray Return must not throw the file away.
+        box.setDefaultButton(QMessageBox::No);
+        // Name the affirmative button for what it does, rather than leaving a bare "Yes".
+        if (QAbstractButton* yes = box.button(QMessageBox::Yes)) {
+            yes->setText(tr("Replace"));
+        }
+        return box.exec() == QMessageBox::Yes;
+    };
+    confirm_replace_handler_ = default_confirm_replace_;
 
     for (const ExportStep& step : steps()) {
         if (builtin_registry().find(step.task) == nullptr) {
@@ -185,6 +224,11 @@ void ExportController::set_submit_handler(SubmitHandler handler) {
 }
 void ExportController::set_error_handler(ErrorHandler handler) {
     error_handler_ = std::move(handler);
+}
+void ExportController::set_confirm_replace_handler(ConfirmReplaceHandler handler) {
+    // An empty handler would silently turn the overwrite check off; restore the question
+    // instead, so there is no configuration in which an export overwrites without asking.
+    confirm_replace_handler_ = handler ? std::move(handler) : default_confirm_replace_;
 }
 
 QAction* ExportController::action(const std::string& task) const {
@@ -316,15 +360,34 @@ bool ExportController::run(const std::string& task) {
         if (!params) {
             return false;
         }
-        // A destination typed without an extension gets the task's own: "out" is never what the
-        // user meant for a PLY export, and the reveal action names the real file.
+        // The file the export will really write: the typed path with the CHOSEN format's
+        // extension (a missing one is appended, a different one is replaced), so the format
+        // combo and the file name cannot disagree.
         QString path = target->suggested;
         if (params->declares("path")) {
             path = QString::fromStdString(params->get_string("path"));
-            if (!path.isEmpty() && QFileInfo(path).suffix().isEmpty()) {
-                path += QLatin1Char('.');
-                path += step->suffix;
+            QString format = step->suffix;
+            if (params->declares("format")) {
+                const std::string chosen = params->get_string("format");
+                if (!chosen.empty()) {
+                    format = QString::fromStdString(chosen);
+                }
+            }
+            const QString resolved = with_extension_for(path, format);
+            if (resolved != path) {
+                path = resolved;
                 params->set("path", ParamValue(path.toStdString()));
+            }
+        }
+        // Overwriting silently is how an export eats the previous one: the dialog opens on a
+        // suggested name in the project folder, so OK twice in a row truncates the file the
+        // first OK wrote. Qt only asks when the user BROWSEd to an existing file. Never overwrite
+        // without asking: an unset handler still asks, through the default question box.
+        if (!path.isEmpty() && QFileInfo::exists(path)) {
+            const ConfirmReplaceHandler& ask =
+                confirm_replace_handler_ ? confirm_replace_handler_ : default_confirm_replace_;
+            if (!ask || !ask(path)) {
+                return false;
             }
         }
         if (!submit_handler_) {
@@ -336,11 +399,22 @@ bool ExportController::run(const std::string& task) {
             return false;
         }
         pending_.emplace_back(*id, std::make_pair(task, path));
+        queued_ids_.push_back(*id);
+        // A window session queues a handful of exports; the bound only keeps a very long
+        // session from growing the list.
+        constexpr std::size_t kMaxRemembered = 256;
+        if (queued_ids_.size() > kMaxRemembered) {
+            queued_ids_.erase(queued_ids_.begin());
+        }
         return true;
     } catch (const std::exception& error) {
         error_handler_(tr("Cannot start export"), QString::fromUtf8(error.what()));
         return false;
     }
+}
+
+bool ExportController::owns_job(quint64 id) const {
+    return std::find(queued_ids_.begin(), queued_ids_.end(), id) != queued_ids_.end();
 }
 
 void ExportController::on_job_finished(quint64 id) {
