@@ -5,6 +5,7 @@
 // of the colours. The sheets are generated from it by tools/theme/compile_qss.py and compiled
 // into the binary as Qt resources.
 
+#include <QColor>
 #include <QObject>
 #include <QPalette>
 #include <QString>
@@ -41,6 +42,13 @@ public:
 
     /// Palette for a mode, per qt-mapping.md section 1 (Active, Inactive and Disabled groups).
     static QPalette palette_for(ThemeMode mode);
+
+    /// Status colours (tokens status.success / warning / error) for a mode. Panes that paint
+    /// text by status (the Log console, the photo badges) take them from here so the tokens
+    /// stay the single source.
+    static QColor status_success(ThemeMode mode);
+    static QColor status_warning(ThemeMode mode);
+    static QColor status_error(ThemeMode mode);
 
     /// The compiled style sheet for a mode, read from the embedded resources.
     static QString style_sheet_for(ThemeMode mode);

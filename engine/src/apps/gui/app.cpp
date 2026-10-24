@@ -216,6 +216,19 @@ void GuiApp::redo() {
     publish_dirty();
 }
 
+void GuiApp::begin_macro(const std::string& name) {
+    require_idle("edit the project");
+    undo_stack_.begin_macro(name);
+}
+
+void GuiApp::end_macro() {
+    // Closing a macro never touches the document, so it is allowed even if a job started in
+    // between: the edits the group holds are already applied.
+    undo_stack_.end_macro();
+    Q_EMIT undo_changed();
+    publish_dirty();
+}
+
 QStringList GuiApp::recent_files() const {
     return recent_;
 }

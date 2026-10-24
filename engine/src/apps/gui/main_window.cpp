@@ -26,9 +26,12 @@
 #include <QWidget>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/log_pane.hpp"
+#include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/viewport_placeholder.hpp"
+#include "apps/gui/workflow.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
 #define ALPHASHAPE_GUI_VERSION "0.0.0"
@@ -182,15 +185,32 @@ void MainWindow::create_docks() {
     photos_dock_ = make_dock(this, QStringLiteral("dock.photos"), tr("Photos"), tr("Photos"));
     log_dock_ = make_dock(this, QStringLiteral("dock.log"), tr("Log"), tr("Log"));
 
-    // The Workspace tree and the Properties sheet replace their placeholders.
+    // The four panes replace their placeholders. The selection object is shared by all of them:
+    // the tree publishes what is selected, the Properties sheet describes it, and the Photos
+    // list mirrors camera selections both ways.
     selection_ = new WorkspaceSelection(this);
     selection_->setObjectName(QStringLiteral("selection.workspace"));
     workspace_pane_ = new WorkspacePane(app_, *selection_, workspace_dock_);
     properties_pane_ = new PropertiesPane(app_, *selection_, properties_dock_);
-    delete workspace_dock_->widget();
-    workspace_dock_->setWidget(workspace_pane_);
-    delete properties_dock_->widget();
-    properties_dock_->setWidget(properties_pane_);
+    photos_pane_ = new PhotosPane(app_, *selection_, photos_dock_);
+    log_pane_ = new LogPane(app_, log_dock_);
+
+    // Each pane replaces its placeholder widget (which existed so the dock had the right
+    // minimum size before the pane landed).
+    struct Pane {
+        QDockWidget* dock;
+        QWidget* widget;
+    };
+    const Pane panes[] = {
+        {workspace_dock_, workspace_pane_},
+        {properties_dock_, properties_pane_},
+        {photos_dock_, photos_pane_},
+        {log_dock_, log_pane_},
+    };
+    for (const Pane& pane : panes) {
+        delete pane.dock->widget();
+        pane.dock->setWidget(pane.widget);
+    }
 }
 
 void MainWindow::apply_default_layout() {
@@ -362,13 +382,10 @@ void MainWindow::create_menus() {
     view->addSeparator();
     view->addAction(act("action.view.reset_layout"));
 
-    // The Workflow menu is filled by the task actions work package; until then it holds one
-    // disabled entry so the menu is not an empty (and, on some platforms, hidden) stub.
-    QMenu* workflow = menu(QStringLiteral("menu.workflow"), tr("&Workflow"));
-    QAction* placeholder =
-        make_action(QStringLiteral("action.workflow.placeholder"), tr("(no workflow steps yet)"));
-    placeholder->setEnabled(false);
-    workflow->addAction(placeholder);
+    QMenu* workflow_menu = menu(QStringLiteral("menu.workflow"), tr("&Workflow"));
+    workflow_ = new WorkflowController(app_, workflow_menu, this);
+    workflow_->set_error_handler(
+        [this](const QString& title, const QString& message) { error_handler_(title, message); });
 
     QMenu* help = menu(QStringLiteral("menu.help"), tr("&Help"));
     help->addAction(act("action.help.about"));
