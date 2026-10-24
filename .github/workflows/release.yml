@@ -28,7 +28,7 @@ jobs:
     name: Verify tag
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
       - name: Tag matches the project version
@@ -64,17 +64,17 @@ jobs:
       # assets. The three platform artifacts are downloaded individually and
       # the Windows one is filtered, which is the smallest change that keeps
       # WP-29.8 free to restructure this job.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: alphashape-linux-*
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: alphashape-macos-*
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: alphashape-windows-x86_64
           path: dist-windows
