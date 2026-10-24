@@ -385,9 +385,10 @@ void PhotosPane::on_view_selection_changed() {
     if (syncing_) {
         return;
     }
-    // A model reset clears the view's selection from inside endResetModel(). That is the rebuild
-    // talking, not the user deselecting: publishing it would wipe the shared selection the tree
-    // (and with it the Properties sheet) is holding. The restore after the reset re-syncs instead.
+    // The reset that a rebuild performs drops the list's selection (QAbstractItemView::reset).
+    // That is the rebuild talking, not the user deselecting, so never publish it: the shared
+    // selection the tree and the Properties sheet read must survive, and the pane re-applies it
+    // from reset_completed().
     if (model_->resetting()) {
         return;
     }

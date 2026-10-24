@@ -155,10 +155,11 @@ public:
     void refresh();
     bool stale() const { return stale_; }
 
-    /// True from beginResetModel() to endResetModel(). A view's QItemSelectionModel clears its
-    /// selection inside that bracket and emits selectionChanged; a pane that mirrors the
-    /// selection into shared state must ignore those clears, because the model is being rebuilt
-    /// rather than the user deselecting.
+    /// True from beginResetModel() to endResetModel(). A reset clears the view's selection
+    /// (QAbstractItemView::reset -> QItemSelectionModel::reset), and a selection model that does
+    /// report it -- a proxy, or a Qt that stops blocking signals there -- would emit
+    /// selectionChanged mid-rebuild. A pane that mirrors the selection into shared state must
+    /// ignore those clears: the model is being rebuilt, the user did not deselect.
     bool resetting() const { return resetting_; }
 
     ThumbnailCache& thumbnails() { return *thumbnails_; }
@@ -166,8 +167,8 @@ public:
 Q_SIGNALS:
     /// A structural rebuild finished and the model is consistent again. Every reset (a finished
     /// job, an undo that changed the camera set, a filter change, a replaced document) ends with
-    /// this; a view's selection was cleared by the reset itself, so a pane re-applies the shared
-    /// selection here.
+    /// this. The reset dropped the view's row selection while the shared selection still names
+    /// the cameras, so a pane re-applies the shared selection here.
     void reset_completed();
 
 private:

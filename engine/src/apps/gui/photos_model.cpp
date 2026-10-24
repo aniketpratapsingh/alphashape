@@ -337,10 +337,10 @@ void PhotosModel::rebuild() {
     request_thumbnails();
 }
 
-// A reset makes every QItemSelectionModel watching this model clear itself and emit
-// selectionChanged from inside endResetModel(). resetting_ stays raised for the whole bracket
-// (the clear happens while end_reset() runs), so a pane can tell a "the model was rebuilt" clear
-// from a user deselecting and re-publish the shared selection afterwards.
+// A reset drops every selected index: the view rebuilds its index map from scratch
+// (QAbstractItemView::reset -> QItemSelectionModel::reset). Qt happens to block signals for that
+// clear today, but the clear is still a selection change caused by a rebuild rather than by the
+// user, so resetting_ stays raised for the whole bracket and a pane can tell the two apart.
 void PhotosModel::begin_reset() {
     resetting_ = true;
     beginResetModel();

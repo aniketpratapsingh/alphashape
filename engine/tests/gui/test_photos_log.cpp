@@ -314,11 +314,10 @@ TEST_F(PhotosPaneTest, MissingFilesReportNoPreviewInsteadOfWaiting) {
 }
 
 TEST_F(PhotosPaneTest, ModelResetKeepsTheSharedSelectionAndProperties) {
-    // The bug: a model reset clears the view's QItemSelectionModel, which emits selectionChanged.
-    // Mirrored blindly, that wiped the shared selection the tree had published, so the tree looked
-    // selected while the Properties sheet went blank. Select a camera in the tree, then rebuild the
-    // photos model both ways that reset it -- a finished job, and an undo that changes the camera
-    // set -- and the shared selection and the Properties sheet must be untouched.
+    // The bug: a photos model rebuild drops the list's row selection, and the pane mirrored every
+    // selection change back into the shared selection the tree and the Properties sheet read. So
+    // after a job finished (or an undo that changed the camera set) the tree looked selected while
+    // Properties went blank. A rebuild must leave both untouched.
     const BuiltChunk built = build_chunk(4, /*with_files=*/false);
     ASSERT_TRUE(tree().select(NodeRef{NodeKind::Camera, built.id, 1}));
     pump(10);
