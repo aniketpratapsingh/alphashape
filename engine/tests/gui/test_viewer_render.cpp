@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -290,6 +291,27 @@ int channel_distance(const QColor& a, const QColor& b) {
                      std::abs(a.blue() - b.blue())});
 }
 
+/// The shape of a scene's geometry: every count a full rebuild would change. Used to prove a
+/// restyle did not rebuild (or resize) anything.
+struct SceneLayout {
+    std::size_t mesh_vertices = 0;
+    std::size_t mesh_indices = 0;
+    std::size_t tie_points = 0;
+    std::size_t dense_points = 0;
+    std::size_t lines = 0;
+    int texture_width = 0;
+    int texture_height = 0;
+
+    bool operator==(const SceneLayout&) const = default;
+};
+
+SceneLayout layout_of(const Scene& scene) {
+    return SceneLayout{scene.mesh_vertices.size(),    scene.mesh_indices.size(),
+                       scene.tie_points.size(),       scene.dense_points.size(),
+                       scene.lines.size(),            scene.texture.width,
+                       scene.texture.height};
+}
+
 class ViewerRender : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -469,4 +491,91 @@ TEST_F(ViewerRender, RendererReleaseIsSafeToRepeat) {
     renderer.release();
     // The renderer is reusable after release.
     EXPECT_TRUE(renderer.ensure(device_.rhi.get(), target.pass(), 1)) << renderer.error().toStdString();
+}
+
+TEST_F(ViewerRender, PageUploadOutlivesTheSceneThatProducedIt) {
+    // The page is uploaded through a resource-update batch that QRhi applies after upload_scene()
+    // returned. Here the scene that carried the pixels is built inside a scope, moved into the
+    // renderer and then destroyed before the frame is recorded: the texture must still come out
+    // as it was built (white, for an untextured mesh) rather than as freed bytes. This is the
+    // lifetime the stack-wrapped 1x1 image used to get wrong.
+    OffscreenTarget target(device_.rhi.get(), QSize(64, 48));
+    ASSERT_TRUE(target.ok());
+    ViewportRenderer renderer;
+    ASSERT_TRUE(renderer.ensure(device_.rhi.get(), target.pass(), 1)) << renderer.error().toStdString();
+
+    CameraController camera;
+    camera.set_scene_bounds(Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(2.0));
+    camera.fit(1.3);
+
+    {
+        Scene scene = build_scene(make_quad_chunk(), scene_style_for(ThemeMode::Dark));
+        ASSERT_TRUE(scene.mesh_vertices.empty() == false);
+        renderer.set_scene(std::move(scene));
+    }
+    QRhiCommandBuffer* cb = nullptr;
+    ASSERT_EQ(device_.rhi->beginOffscreenFrame(&cb), QRhi::FrameOpSuccess);
+    renderer.render(cb, target.target(), camera, QSize(64, 48));
+    device_.rhi->endOffscreenFrame();
+    device_.rhi->finish();
+    EXPECT_EQ(renderer.stats().mesh_triangles, 2U);
+    EXPECT_FALSE(renderer.stats().textured);
+    EXPECT_TRUE(renderer.error().isEmpty()) << renderer.error().toStdString();
+}
+
+TEST_F(ViewerRender, RestyleReuploadsColoursWithoutRebuildingTheGeometry) {
+    OffscreenTarget target(device_.rhi.get(), QSize(64, 48));
+    ASSERT_TRUE(target.ok());
+    ViewportRenderer renderer;
+    ASSERT_TRUE(renderer.ensure(device_.rhi.get(), target.pass(), 1)) << renderer.error().toStdString();
+
+    CameraController camera;
+    camera.set_scene_bounds(Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(2.0));
+    camera.fit(1.3);
+
+    const SceneStyle dark = scene_style_for(ThemeMode::Dark);
+    renderer.set_scene(build_scene(make_quad_chunk(), dark));
+    const SceneLayout before = layout_of(renderer.scene());
+
+    QRhiCommandBuffer* cb = nullptr;
+    ASSERT_EQ(device_.rhi->beginOffscreenFrame(&cb), QRhi::FrameOpSuccess);
+    renderer.render(cb, target.target(), camera, QSize(64, 48));
+    device_.rhi->endOffscreenFrame();
+
+    // A theme switch is a restyle: same geometry, different colours, nothing re-uploaded whole.
+    const SceneStyle light = scene_style_for(ThemeMode::Light);
+    renderer.restyle(light, std::nullopt, ViewportRenderer::RestyleScope::Lines);
+    EXPECT_FALSE(renderer.upload_pending())
+        << "a restyle must not request a full scene upload";
+    EXPECT_EQ(layout_of(renderer.scene()), before) << "the geometry changed during a restyle";
+
+    ASSERT_EQ(device_.rhi->beginOffscreenFrame(&cb), QRhi::FrameOpSuccess);
+    renderer.render(cb, target.target(), camera, QSize(64, 48));
+    device_.rhi->endOffscreenFrame();
+    device_.rhi->finish();
+    EXPECT_EQ(renderer.stats().mesh_triangles, 2U);
+    EXPECT_TRUE(renderer.error().isEmpty()) << renderer.error().toStdString();
+}
+
+TEST_F(ViewerRender, RestyleIsSafeOnAnEmptyScene) {
+    // A theme switch before anything was built (or after a failed rebuild) must not crash or
+    // request an upload of geometry that is not there.
+    OffscreenTarget target(device_.rhi.get(), QSize(32, 32));
+    ASSERT_TRUE(target.ok());
+    ViewportRenderer renderer;
+    ASSERT_TRUE(renderer.ensure(device_.rhi.get(), target.pass(), 1)) << renderer.error().toStdString();
+    renderer.restyle(scene_style_for(ThemeMode::Light), std::nullopt,
+                     ViewportRenderer::RestyleScope::All);
+    EXPECT_TRUE(renderer.scene().empty());
+
+    CameraController camera;
+    camera.set_scene_bounds(Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(1.0));
+    camera.fit(1.0);
+    QRhiCommandBuffer* cb = nullptr;
+    ASSERT_EQ(device_.rhi->beginOffscreenFrame(&cb), QRhi::FrameOpSuccess);
+    renderer.render(cb, target.target(), camera, QSize(32, 32));
+    device_.rhi->endOffscreenFrame();
+    device_.rhi->finish();
+    EXPECT_EQ(renderer.stats().draws, 1);
+    EXPECT_TRUE(renderer.error().isEmpty()) << renderer.error().toStdString();
 }

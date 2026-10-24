@@ -114,6 +114,9 @@ TEST(ViewerScene, SyntheticChunkProducesTheExpectedCounts) {
     // pairs of vertices.
     EXPECT_EQ(scene.lines.size() % 2U, 0U);
     EXPECT_GE(scene.lines.size(), 2U * 8U);  // at least the two frustums
+    // Every line vertex carries its provenance, which the restyle path relies on.
+    EXPECT_EQ(scene.line_kinds.size(), scene.lines.size());
+    EXPECT_EQ(scene.line_cameras.size(), scene.lines.size());
     EXPECT_TRUE(scene.has_bounds);
     EXPECT_TRUE(scene.has_points());
     EXPECT_TRUE(scene.has_mesh());
@@ -330,8 +333,135 @@ TEST(ViewerScene, HighlightedCameraIsDrawnInTheActiveColour) {
     EXPECT_TRUE(saw_normal);
 }
 
-TEST(ViewerScene, StyleFollowsTheThemeTokens) {
+TEST(ViewerScene, OversizedTexturePageIsDownscaledForDisplay) {
+    // A page past the display cap is box-filtered down; its aspect stays and the budget holds.
+    Chunk chunk = make_synthetic_chunk();
+    Mesh& mesh = chunk.model();
+    mesh.uvs = {Eigen::Vector2f(0.0F, 0.0F), Eigen::Vector2f(1.0F, 0.0F),
+                Eigen::Vector2f(1.0F, 1.0F), Eigen::Vector2f(0.0F, 1.0F)};
+    mesh.uv_faces = {Eigen::Vector3i(0, 1, 2), Eigen::Vector3i(0, 2, 3)};
+    // Twice the cap wide, four rows tall: the widths exercise the cap without a 100 MB page.
+    Image& page = chunk.model_textures().emplace_back(SceneTexture::kMaxTextureSize * 2, 4, 3);
+    // One bright column, so the filter has something to average rather than a flat field.
+    for (int y = 0; y < page.height(); ++y) {
+        page.at(0, y, 0) = 255;
+    }
+
+    const Scene scene = build_scene(chunk, scene_style_for(ThemeMode::Dark));
+    ASSERT_TRUE(scene.has_texture());
+    EXPECT_EQ(scene.texture.width, SceneTexture::kMaxTextureSize);
+    EXPECT_EQ(scene.texture.height, 2);
+    EXPECT_LE(scene.texture.rgba.size(),
+              static_cast<std::size_t>(SceneTexture::kMaxTextureSize) *
+                  static_cast<std::size_t>(SceneTexture::kMaxTextureSize) * 4U);
+    // The box filter kept the bright first column's energy rather than dropping it.
+    EXPECT_GT(scene.texture.rgba[0], 0U);
+    EXPECT_EQ(scene.texture.rgba[1], 0U);
+}
+
+TEST(ViewerScene, TextureCapLeavesSmallPagesAtFullSize) {
+    Chunk chunk = make_synthetic_chunk();
+    Mesh& mesh = chunk.model();
+    mesh.uvs = {Eigen::Vector2f(0.0F, 0.0F), Eigen::Vector2f(1.0F, 0.0F),
+                Eigen::Vector2f(1.0F, 1.0F), Eigen::Vector2f(0.0F, 1.0F)};
+    mesh.uv_faces = {Eigen::Vector3i(0, 1, 2), Eigen::Vector3i(0, 2, 3)};
+    chunk.model_textures().emplace_back(SceneTexture::kMaxTextureSize, 37, 1);
+    const Scene scene = build_scene(chunk, scene_style_for(ThemeMode::Dark));
+    // Exactly at the cap: no resample, so the row count is untouched.
+    EXPECT_EQ(scene.texture.width, SceneTexture::kMaxTextureSize);
+    EXPECT_EQ(scene.texture.height, 37);
+}
+
+TEST(ViewerScene, RestyleRecoloursTheThemeGeometryWithoutTouchingIt) {
+    Chunk chunk = make_synthetic_chunk();
     const SceneStyle dark = scene_style_for(ThemeMode::Dark);
+    const SceneStyle light = scene_style_for(ThemeMode::Light);
+    Scene scene = build_scene(chunk, dark);
+    const std::size_t line_count = scene.lines.size();
+    const std::size_t tie_count = scene.tie_points.size();
+    const std::size_t vertex_count = scene.mesh_vertices.size();
+    ASSERT_GT(line_count, 0U);
+
+    // A grid vertex takes the style's grid colour after a restyle.
+    std::size_t grid_index = line_count;
+    for (std::size_t i = 0; i < scene.line_kinds.size(); ++i) {
+        if (scene.line_kinds[i] == LineKind::Grid) {
+            grid_index = i;
+            break;
+        }
+    }
+    ASSERT_LT(grid_index, line_count);
+    EXPECT_NEAR(static_cast<double>((scene.lines[grid_index].colour - dark.grid).norm()), 0.0,
+                1e-6);
+
+    scene.restyle(light, std::nullopt);
+    // Same geometry, new colours.
+    EXPECT_EQ(scene.lines.size(), line_count);
+    EXPECT_EQ(scene.tie_points.size(), tie_count);
+    EXPECT_EQ(scene.mesh_vertices.size(), vertex_count);
+    EXPECT_NEAR(static_cast<double>((scene.lines[grid_index].colour - light.grid).norm()), 0.0,
+                1e-6);
+    // Tie points carry no data colour, so a restyle repaints them too.
+    ASSERT_FALSE(scene.tie_points.empty());
+    EXPECT_NEAR(static_cast<double>((scene.tie_points[0].colour - light.tie_point).norm()), 0.0,
+                1e-6);
+    // The frustums took the light camera colour (nothing is highlighted).
+    bool saw_camera = false;
+    for (std::size_t i = 0; i < scene.line_kinds.size(); ++i) {
+        if (scene.line_kinds[i] == LineKind::Camera) {
+            EXPECT_NEAR(static_cast<double>((scene.lines[i].colour - light.camera).norm()), 0.0,
+                        1e-6);
+            saw_camera = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_camera);
+
+    // Highlighting one camera changes only that camera's frustum.
+    scene.restyle(light, std::int32_t{1});
+    std::size_t active = 0;
+    std::size_t normal = 0;
+    for (std::size_t i = 0; i < scene.line_kinds.size(); ++i) {
+        if (scene.line_kinds[i] != LineKind::Camera) {
+            continue;
+        }
+        if ((scene.lines[i].colour - light.camera_active).norm() < 1e-6F) {
+            ++active;
+        } else if ((scene.lines[i].colour - light.camera).norm() < 1e-6F) {
+            ++normal;
+        }
+    }
+    EXPECT_GT(active, 0U);
+    EXPECT_GT(normal, 0U);
+}
+
+TEST(ViewerScene, RestyleLeavesDataColoursAlone) {
+    // A cloud with its own colours keeps them through a theme switch; only the vertices whose
+    // colour came from the theme are rewritten.
+    Chunk chunk = make_synthetic_chunk();
+    const SceneStyle dark = scene_style_for(ThemeMode::Dark);
+    Scene scene = build_scene(chunk, dark);
+    ASSERT_FALSE(scene.dense_points.empty());
+    const Eigen::Vector3f data_colour = scene.dense_points[0].colour;
+    EXPECT_FALSE(scene.style_colours_points) << "the cloud carries colours of its own";
+
+    scene.restyle(scene_style_for(ThemeMode::Light), std::nullopt);
+    EXPECT_EQ(scene.dense_points[0].colour, data_colour);
+
+    // The uncoloured case does follow the style.
+    Chunk plain;
+    plain.point_cloud().points = {Eigen::Vector3d::Zero()};
+    Scene uncoloured = build_scene(plain, dark);
+    EXPECT_TRUE(uncoloured.style_colours_points);
+    uncoloured.restyle(scene_style_for(ThemeMode::Light), std::nullopt);
+    EXPECT_NEAR(static_cast<double>(
+                    (uncoloured.dense_points[0].colour - scene_style_for(ThemeMode::Light)
+                                                            .point_cloud)
+                        .norm()),
+                0.0, 1e-6);
+}
+
+TEST(ViewerScene, StyleFollowsTheThemeTokens) {    const SceneStyle dark = scene_style_for(ThemeMode::Dark);
     const SceneStyle light = scene_style_for(ThemeMode::Light);
     // The light canvas is lighter than the dark one (the tokens' own invariant).
     EXPECT_GT(light.background_bottom.x(), dark.background_bottom.x());

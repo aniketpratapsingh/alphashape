@@ -126,15 +126,53 @@ ViewportRenderer::ViewportRenderer() = default;
 
 ViewportRenderer::~ViewportRenderer() { release(); }
 
-void ViewportRenderer::set_scene(Scene scene) {
+void ViewportRenderer::set_scene(Scene&& scene) {
     scene_ = std::move(scene);
     upload_pending_ = true;
+    colours_pending_ = RestyleScope::None;
     // Size the per-scene buffers now: this is called from the GUI thread between frames, which
     // is the same point at which QRhiWidget re-creates its own colour texture on a resize.
     // Creating a resource while a frame is being recorded is what has to be avoided, not here.
     if (rhi_ != nullptr) {
         size_scene_buffers();
     }
+}
+
+void ViewportRenderer::restyle(const SceneStyle& style,
+                               std::optional<std::int32_t> highlight_camera,
+                               RestyleScope scope) {
+    // The restyle contract: same geometry, different colours. Nothing is rebuilt, so the scene
+    // keeps the arrays it was built with and only the theme-derived colours are rewritten.
+    scene_.restyle(style, highlight_camera);
+    if (!upload_pending_ && scope != RestyleScope::None) {
+        colours_pending_ = static_cast<RestyleScope>(static_cast<unsigned>(colours_pending_) |
+                                                     static_cast<unsigned>(scope));
+    }
+}
+
+void ViewportRenderer::upload_colours(QRhiResourceUpdateBatch* batch) {
+    // The vertex arrays stay in scene_ for as long as the batch is pending (QRhi copies them
+    // when the batch is submitted), so the streams are uploaded straight from them: no
+    // intermediate copy, no re-creation, and the positions travel with the colours they were
+    // already uploaded with.
+    const auto has = [this](RestyleScope scope) {
+        return (static_cast<unsigned>(colours_pending_) & static_cast<unsigned>(scope)) != 0U;
+    };
+    if (has(RestyleScope::Points)) {
+        if (dense_points_ != nullptr && !scene_.dense_points.empty()) {
+            batch->uploadStaticBuffer(dense_points_, scene_.dense_points.data());
+        }
+        if (tie_points_ != nullptr && !scene_.tie_points.empty()) {
+            batch->uploadStaticBuffer(tie_points_, scene_.tie_points.data());
+        }
+    }
+    if (has(RestyleScope::Lines) && lines_ != nullptr && !scene_.lines.empty()) {
+        batch->uploadStaticBuffer(lines_, scene_.lines.data());
+    }
+    if (has(RestyleScope::Mesh) && mesh_vertices_ != nullptr && !scene_.mesh_vertices.empty()) {
+        batch->uploadStaticBuffer(mesh_vertices_, scene_.mesh_vertices.data());
+    }
+    colours_pending_ = RestyleScope::None;
 }
 
 bool ViewportRenderer::size_scene_buffers() {
@@ -393,16 +431,24 @@ void ViewportRenderer::upload_scene(QRhiResourceUpdateBatch* batch) {
                 return;
             }
         }
+        // The image is owned by the renderer, not by a stack frame or the scene vector: the
+        // batch may be applied after this function returned, and a QImage wrapped around a
+        // buffer does not own it. A 1x1 white page stands in for an untextured mesh (the mesh
+        // pipeline samples unconditionally), and page_image_ is always RGBA8 so the upload has
+        // no format conversion to reorder first.
         if (scene_.texture.empty()) {
-            const std::uint8_t white[4] = {255, 255, 255, 255};
-            batch->uploadTexture(page_, QImage(white, 1, 1, QImage::Format_RGBA8888));
+            page_image_ = QImage(1, 1, QImage::Format_RGBA8888);
+            page_image_.fill(QColor(Qt::white));
         } else {
-            const QImage image(scene_.texture.rgba.data(), scene_.texture.width,
-                               scene_.texture.height, QImage::Format_RGBA8888);
-            batch->uploadTexture(page_, image);
+            page_image_ = QImage(scene_.texture.rgba.data(), scene_.texture.width,
+                                 scene_.texture.height, scene_.texture.width * 4,
+                                 QImage::Format_RGBA8888)
+                              .copy();
         }
+        batch->uploadTexture(page_, page_image_);
     }
     upload_pending_ = false;
+    colours_pending_ = RestyleScope::None;
 }
 
 void ViewportRenderer::render(QRhiCommandBuffer* cb, QRhiRenderTarget* target,
@@ -418,6 +464,8 @@ void ViewportRenderer::render(QRhiCommandBuffer* cb, QRhiRenderTarget* target,
     QRhiResourceUpdateBatch* batch = rhi_->nextResourceUpdateBatch();
     if (upload_pending_) {
         upload_scene(batch);
+    } else if (colours_pending_ != RestyleScope::None) {
+        upload_colours(batch);
     }
 
     // Clip <- world in one matrix: the backend's clip-space correction on the left of the camera

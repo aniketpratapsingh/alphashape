@@ -43,8 +43,9 @@ bool platform_has_rhi() {
 
 }  // namespace
 
-/// The render canvas. It holds no state of its own: the camera, the renderer and the scene live
-/// on the ViewportWidget, which outlives it (the canvas is a child).
+/// The render canvas. It holds no state of its own: the camera and the renderer live on the
+/// ViewportWidget (and the scene inside the renderer), which outlives it (the canvas is a
+/// child).
 ///
 /// No Q_OBJECT: it declares no signal or slot, and keeping moc out of this file keeps the RHI
 /// headers in exactly one translation unit.
@@ -72,6 +73,8 @@ public:
             return;
         }
         owner_.renderer_.render(cb, target, owner_.camera_, target->pixelSize());
+        // A frame that recorded a pass is proof the device works: clear a stale failure message.
+        owner_.on_render_succeeded();
     }
 
     void releaseResources() override { owner_.renderer_.release(); }
@@ -80,12 +83,16 @@ private:
     ViewportWidget& owner_;
 };
 
-std::optional<std::int32_t> selected_camera(const WorkspaceSelection* selection) {
+/// The camera the Workspace selection names, if it names one of the ACTIVE chunk's cameras.
+/// A camera node in another chunk would highlight an unrelated camera that happens to share the
+/// id, so a selection outside the active chunk highlights nothing.
+std::optional<std::int32_t> selected_camera(const WorkspaceSelection* selection,
+                                            std::int32_t active_chunk_id) {
     if (selection == nullptr) {
         return std::nullopt;
     }
     for (const NodeRef& ref : selection->items()) {
-        if (ref.kind == NodeKind::Camera) {
+        if (ref.kind == NodeKind::Camera && ref.chunk_id == active_chunk_id) {
             return ref.item_id;
         }
     }
@@ -101,6 +108,9 @@ ViewportWidget::ViewportWidget(GuiApp& app, Theme& theme, QWidget* parent)
     if (platform_has_rhi()) {
         canvas_ = new Canvas(*this);
         canvas_->setObjectName(QStringLiteral("viewport.canvas"));
+        // The canvas stays out of the focus chain: a click on it moves focus to the viewport
+        // (handle_mouse_press), which is the widget that owns the shortcuts. Its keys are
+        // forwarded here anyway, so nothing depends on which of the two holds focus.
         canvas_->installEventFilter(this);
         QObject::connect(canvas_, &QRhiWidget::renderFailed, this, [this]() {
             on_render_failed(tr("the graphics device could not be created"));
@@ -145,9 +155,33 @@ void ViewportWidget::set_selection(WorkspaceSelection* selection) {
     selection_ = selection;
     if (selection_ != nullptr) {
         QObject::connect(selection_, &WorkspaceSelection::changed, this,
-                         [this]() { rebuild_scene(); });
+                         [this]() { reselect_camera(); });
     }
     rebuild_scene();
+}
+
+void ViewportWidget::reselect_camera() {
+    // A selection change moves the highlight between frustums and nothing else: the geometry is
+    // the same scene, so restyle it and re-upload only the lines rather than rebuilding the
+    // scene (and re-reading the document) for a colour change.
+    if (app_.jobs().busy() || renderer_.scene().lines.empty()) {
+        // Nothing to restyle yet, or the document belongs to the worker: rebuild, which serves
+        // the change once the job is done.
+        rebuild_scene();
+        return;
+    }
+    const std::optional<std::int32_t> camera = selected_camera(selection_, active_chunk_id());
+    if (camera == last_highlight_) {
+        return;
+    }
+    last_highlight_ = camera;
+    renderer_.restyle(scene_style_for(mode_), camera, ViewportRenderer::RestyleScope::Lines);
+    request_frame();
+}
+
+std::int32_t ViewportWidget::active_chunk_id() const {
+    return app_.read_document(
+        [](const Document& document) { return document.active_chunk_id(); });
 }
 
 void ViewportWidget::rebuild_scene() {
@@ -160,14 +194,27 @@ void ViewportWidget::rebuild_scene() {
     BuildOptions options = options_;
     options.grid = show_grid_;
     options.axes = show_axes_;
-    options.highlight_camera = selected_camera(selection_);
     const SceneStyle style = scene_style_for(mode_);
-    scene_ = app_.read_document(
-        [&](const Document& document) { return build_scene(document, style, options); });
-    renderer_.set_scene(scene_);
+    // build_scene() copies the raw arrays while the shared lock is held; everything after this
+    // call (uploads, the renderer's own state) runs unlocked. Building off the GUI thread is the
+    // Phase 2 follow-up: it needs the build to run on the worker against the same locked
+    // snapshot, which the job manager does not provide yet.
+    Scene scene = app_.read_document([&](const Document& document) {
+        // The camera highlight is only meaningful within the active chunk (camera ids are per
+        // chunk), so it is resolved against the same snapshot the scene is built from.
+        options.highlight_camera = selected_camera(selection_, document.active_chunk_id());
+        return build_scene(document, style, options);
+    });
+    last_highlight_ = options.highlight_camera;
+    const bool had_bounds = scene.has_bounds;
+    const Eigen::Vector3d bounds_min = scene.bounds_min;
+    const Eigen::Vector3d bounds_max = scene.bounds_max;
+    // Moved into the renderer, which is the only owner: the widget reads the scene back through
+    // renderer_.scene(), so a rebuild never keeps a second copy alive.
+    renderer_.set_scene(std::move(scene));
     renderer_.set_background(style.background_bottom);
-    if (scene_.has_bounds) {
-        camera_.set_scene_bounds(scene_.bounds_min, scene_.bounds_max);
+    if (had_bounds) {
+        camera_.set_scene_bounds(bounds_min, bounds_max);
         if (fit_pending_) {
             fit_pending_ = false;
             fit_scene();
@@ -182,7 +229,27 @@ void ViewportWidget::refresh_scene() { rebuild_scene(); }
 
 void ViewportWidget::on_theme_changed(ThemeMode mode) {
     mode_ = mode;
-    rebuild_scene();
+    // The theme only changes colours. Everything that came from the tokens is rewritten in
+    // place and the affected vertex streams are re-uploaded; the geometry, the index buffer and
+    // the texture page stay on the GPU.
+    const SceneStyle style = scene_style_for(mode_);
+    const Scene& scene = renderer_.scene();
+    // The line stream is always restyled (grid, box and frustums are theme colours), and so are
+    // the tie points; the dense cloud and the mesh only when their colours came from the theme.
+    ViewportRenderer::RestyleScope scope = ViewportRenderer::RestyleScope::Lines;
+    const auto add = [&scope](ViewportRenderer::RestyleScope more) {
+        scope = static_cast<ViewportRenderer::RestyleScope>(
+            static_cast<unsigned>(scope) | static_cast<unsigned>(more));
+    };
+    if (!scene.tie_points.empty() || scene.style_colours_points) {
+        add(ViewportRenderer::RestyleScope::Points);
+    }
+    if (scene.style_colours_mesh) {
+        add(ViewportRenderer::RestyleScope::Mesh);
+    }
+    last_highlight_ = selected_camera(selection_, active_chunk_id());
+    renderer_.restyle(style, last_highlight_, scope);
+    renderer_.set_background(style.background_bottom);
     update_message();
     request_frame();
 }
@@ -191,6 +258,16 @@ void ViewportWidget::on_render_failed(const QString& reason) {
     render_error_ = reason;
     update_message();
     update();
+}
+
+void ViewportWidget::on_render_succeeded() {
+    // A frame went through: whatever the last failure said is no longer true (the device may
+    // have been re-created since, e.g. after a context loss). Only the notice is updated; no
+    // repaint is requested, because a frame is being recorded right now.
+    if (!render_error_.isEmpty()) {
+        render_error_.clear();
+        update_message();
+    }
 }
 
 void ViewportWidget::update_message() {
@@ -273,7 +350,10 @@ void ViewportWidget::handle_mouse_press(const QPoint& position, Qt::MouseButton 
     last_mouse_ = position;
     dragging_ = true;
     drag_button_ = button;
-    setFocus();
+    // Keep the keyboard with the view: a click that landed on the canvas forwards here from the
+    // event filter, but moving focus explicitly (rather than letting the canvas take it) means
+    // the shortcuts keep working whichever child received the press.
+    setFocus(Qt::MouseFocusReason);
 }
 
 void ViewportWidget::handle_mouse_move(const QPoint& position, Qt::MouseButtons buttons) {
@@ -316,6 +396,23 @@ void ViewportWidget::handle_key(int key) {
     }
 }
 
+void ViewportWidget::keyPressEvent(QKeyEvent* event) {
+    // The viewport is focusable in its own right (and takes focus on a click), so keys arrive
+    // here; the canvas forwards its keys through the event filter to the same handle_key(). One
+    // switch, two entry points.
+    switch (event->key()) {
+        case Qt::Key_F:
+        case Qt::Key_5:
+        case Qt::Key_P:
+            handle_key(event->key());
+            event->accept();
+            return;
+        default:
+            break;
+    }
+    QWidget::keyPressEvent(event);
+}
+
 bool ViewportWidget::eventFilter(QObject* watched, QEvent* event) {
     if (watched != canvas_) {
         return QWidget::eventFilter(watched, event);
@@ -344,8 +441,18 @@ bool ViewportWidget::eventFilter(QObject* watched, QEvent* event) {
             return true;
         }
         case QEvent::KeyPress: {
-            handle_key(static_cast<QKeyEvent*>(event)->key());
-            return true;
+            auto* key = static_cast<QKeyEvent*>(event);
+            switch (key->key()) {
+                case Qt::Key_F:
+                case Qt::Key_5:
+                case Qt::Key_P:
+                    handle_key(key->key());
+                    return true;
+                default:
+                    break;
+            }
+            // Anything else (Tab, mnemonics) goes on to the normal focus handling.
+            return false;
         }
         default:
             break;
@@ -356,11 +463,10 @@ bool ViewportWidget::eventFilter(QObject* watched, QEvent* event) {
 void ViewportWidget::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
     place_children();
-    // A resize changes the aspect the camera frames with; keep the scene fitted while it still
-    // fills exactly the way fit() left it.
-    if (camera_.has_scene()) {
-        request_frame();
-    }
+    // The camera derives its aspect from the canvas size on every frame, so the projection
+    // stays correct on a resize without any state of its own. The framing is deliberately NOT
+    // re-fit here: a resize must not throw away an orbit or a zoom the user chose.
+    request_frame();
 }
 
 void ViewportWidget::paintEvent(QPaintEvent*) {

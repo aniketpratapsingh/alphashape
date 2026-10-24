@@ -34,6 +34,7 @@
 #include "apps/gui/viewer/viewport_renderer.hpp"
 
 QT_BEGIN_NAMESPACE
+class QKeyEvent;
 class QLabel;
 class QPaintEvent;
 class QResizeEvent;
@@ -83,8 +84,10 @@ public:
     void set_selection(WorkspaceSelection* selection);
 
     /// True when the built scene has neither points nor a mesh (an empty or unaligned chunk).
-    bool scene_is_empty() const { return scene_.empty(); }
-    const Scene& scene() const { return scene_; }
+    bool scene_is_empty() const { return renderer_.scene().empty(); }
+    /// The scene the renderer holds. There is exactly one: the widget does not keep a second
+    /// copy, so a rebuild moves the fresh scene into the renderer instead of duplicating it.
+    const Scene& scene() const { return renderer_.scene(); }
 
     /// Rebuild the scene from the document now (a no-op while a job runs: it marks the scene
     /// stale instead). Call it when the document changed without a job.
@@ -102,15 +105,21 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
 
 private:
     /// The QRhiWidget canvas. Defined in the .cpp, the only file that needs the RHI headers.
     class Canvas;
 
     void rebuild_scene();
+    /// Update the camera highlight after the Workspace selection changed: a colour-only change,
+    /// so it restyles the existing scene instead of rebuilding it.
+    void reselect_camera();
+    std::int32_t active_chunk_id() const;
     void place_children();
     void update_message();
     void on_render_failed(const QString& reason);
+    void on_render_succeeded();
     void on_theme_changed(ThemeMode mode);
     void handle_mouse_press(const QPoint& position, Qt::MouseButton button);
     void handle_mouse_move(const QPoint& position, Qt::MouseButtons buttons);
@@ -123,8 +132,9 @@ private:
     ThemeMode mode_;
     CameraController camera_;
     ViewportRenderer renderer_;
-    Scene scene_;
     BuildOptions options_;
+    /// What the last build highlighted, so a selection change that alters nothing is a no-op.
+    std::optional<std::int32_t> last_highlight_;
 
     Canvas* canvas_ = nullptr;
     QLabel* message_ = nullptr;
@@ -141,7 +151,9 @@ private:
     Qt::MouseButton drag_button_ = Qt::NoButton;
 };
 
-/// The camera id the Workspace selection names, if it names one.
-std::optional<std::int32_t> selected_camera(const WorkspaceSelection* selection);
+/// The camera id (in the active chunk) the Workspace selection names, if it names one.
+/// A camera node belonging to a different chunk yields nullopt: ids are per chunk.
+std::optional<std::int32_t> selected_camera(const WorkspaceSelection* selection,
+                                            std::int32_t active_chunk_id);
 
 }  // namespace alphashape::gui

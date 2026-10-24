@@ -19,8 +19,10 @@
 #include <QRegularExpression>
 #include <QStatusBar>
 #include <QStringList>
+#include <QtTest/QTest>
 
 #include "apps/gui/viewer/viewport_widget.hpp"
+#include "apps/gui/workspace_model.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
@@ -592,4 +594,80 @@ TEST_F(MainWindowTest, AboutTextNamesTheVersionAndLicence) {
     EXPECT_TRUE(text.contains(QStringLiteral("General Public License")));
     EXPECT_TRUE(text.contains(QStringLiteral("github.com/aniketpratapsingh/alphashape")));
     EXPECT_TRUE(text.contains(QRegularExpression(QStringLiteral("\\d+\\.\\d+"))));
+}
+
+// --- viewport input -------------------------------------------------------------------
+
+TEST_F(MainWindowTest, ViewportShortcutsFitAndToggleTheProjection) {
+    show_window();
+    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ASSERT_NE(viewport, nullptr);
+
+    // A scene to frame: the point cloud gives the camera bounds, which fit() needs.
+    add_chunk(app(), "Block A");
+    const std::int32_t chunk_id = app().document().workspace().chunks().front()->id();
+    PointCloud cloud;
+    cloud.points = {Eigen::Vector3d(-5.0, -5.0, 0.0), Eigen::Vector3d(5.0, 5.0, 8.0)};
+    app().execute(make_add_asset_command(chunk_id, cloud, "Cloud"));
+    pump(20);
+
+    // Orbit and zoom away from the framed view, so "the camera changed" is unambiguous.
+    viewport->camera().orbit(120.0, 60.0);
+    viewport->camera().dolly(-6.0);  // negative steps move the eye away
+    const double yaw_before = viewport->camera().yaw();
+    const double distance_before = viewport->camera().distance();
+    ASSERT_FALSE(viewport->camera().orthographic());
+
+    // The viewport is focusable in its own right, so the shortcuts work whether the keyboard
+    // went to the viewport or to its RHI canvas (whose event filter forwards to the same
+    // handler). Offscreen has no canvas, so this exercises the widget's own key path; the
+    // canvas path is the same handle_key().
+    EXPECT_EQ(viewport->focusPolicy(), Qt::StrongFocus);
+    viewport->setFocus(Qt::MouseFocusReason);
+    pump(10);
+
+    // 5 / P: the projection toggles and the View menu's checkable entry follows.
+    QTest::keyClick(viewport, Qt::Key_5);
+    EXPECT_TRUE(viewport->camera().orthographic());
+    EXPECT_TRUE(action("action.view.orthographic")->isChecked());
+    QTest::keyClick(viewport, Qt::Key_P);
+    EXPECT_FALSE(viewport->camera().orthographic());
+    EXPECT_FALSE(action("action.view.orthographic")->isChecked());
+
+    // F: the camera frames the scene again, keeping the viewing direction it had.
+    QTest::keyClick(viewport, Qt::Key_F);
+    EXPECT_NEAR(viewport->camera().yaw(), yaw_before, 1e-9);
+    EXPECT_LT(viewport->camera().distance(), distance_before);
+    // The pivot moves to the centre of the scene's bounds.
+    EXPECT_NEAR(viewport->camera().pivot().x(), 0.0, 1e-9);
+    EXPECT_NEAR(viewport->camera().pivot().z(), 4.0, 1e-9);
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(MainWindowTest, ViewportSelectionHighlightsOnlyTheActiveChunksCamera) {
+    show_window();
+    auto* viewport = dynamic_cast<ViewportWidget*>(window().centralWidget());
+    ASSERT_NE(viewport, nullptr);
+    auto* selection = window().findChild<WorkspaceSelection*>(QStringLiteral("selection.workspace"));
+    ASSERT_NE(selection, nullptr);
+
+    // Two chunks, each with camera id 0: a camera ref is only meaningful together with its chunk.
+    add_chunk(app(), "Block A");
+    add_chunk(app(), "Block B");
+    const auto& chunks = app().document().workspace().chunks();
+    ASSERT_EQ(chunks.size(), 2U);
+    const std::int32_t first = chunks[0]->id();
+    const std::int32_t second = chunks[1]->id();
+    app().document().set_active_chunk_id(first);
+
+    EXPECT_EQ(selected_camera(nullptr, first), std::nullopt);
+    selection->set({NodeRef{NodeKind::Camera, first, 7}});
+    EXPECT_EQ(selected_camera(selection, first), std::optional<std::int32_t>(7));
+    // The same node in the other chunk is not the active chunk's camera.
+    EXPECT_EQ(selected_camera(selection, second), std::nullopt);
+
+    selection->set({NodeRef{NodeKind::Marker, first, 7}});
+    EXPECT_EQ(selected_camera(selection, first), std::nullopt);
+    selection->clear();
+    EXPECT_EQ(selected_camera(selection, first), std::nullopt);
 }
