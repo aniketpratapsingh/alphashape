@@ -20,11 +20,19 @@ The DMG must stay under 72 MB, which the CI packaging job enforces. Two things a
   `proj-data` collection (~760 MB of GeoTIFF/GTX grids). Copying every grid under a per-file size
   cap produced a 520 MB bundle, because nearly all of those grids are under 32 MB.
   `select-proj-data.py` ships `proj.db`, the licence/attribution text, every PROJJSON TIN grid
-  (a second kind of grid, under 3 MB in total), a fixed essentials list (EGM96, the continental
-  datum-shift grid) and then as many raster grids as fit the budget, smallest first: about 29 MB
-  instead of 491 MB, comparable to Ubuntu's `proj-data` package that the AppImage uses. A user who
-  needs an omitted national grid points `ALPHASHAPE_PROJ_DATA` at a full `proj-data` directory,
-  which outranks the bundle in the search order.
+  (a second kind of grid, under 3 MB in total), a fixed essentials list (one EGM96 variant and,
+  when the source has it, the `us_noaa_conus` datum-shift grid) and then as many raster grids as
+  fit a 16 MB budget, smallest first: about **29 MB** in the bundle. That is a different rule
+  from Ubuntu's `proj-data` package (about 8 MB, hand-picked for EPSG coverage), not a
+  comparable set — the budget is what decides here, so coverage grows with the byte cap rather
+  than with a curated country list. The script writes `Resources/share/proj/SELECTED.txt`, a
+  sorted manifest of what it copied, which `smoke-app.sh` checks the bundle against.
+  Large grids are deliberately absent: **EGM2008 is not bundled** (a single
+  `us_nga_egm08_25.tif` is 77 MB, more than the whole DMG budget), and neither are the large
+  national NTv2 grids. To use one, download the grid from `cdn.proj.org` into a directory that
+  also has `proj.db` — e.g. `curl -O https://cdn.proj.org/us_nga_egm08_25.tif` in
+  `/usr/local/share/proj` — and set `ALPHASHAPE_PROJ_DATA` to that directory; it outranks the
+  bundle in the search order.
 * **DMG compression is LZFSE.** `hdiutil`'s UDZO default is zlib level 1 (fastest). Measured on
   the code portion alone: UDZO 41.2 MB, UDZO at level 9 38.2 MB, ULFO (lzfse) 37.2 MB, UDBZ
   (bzip2) 35.9 MB but slow to mount. ULFO is the size/speed trade the script uses, with UDZO at

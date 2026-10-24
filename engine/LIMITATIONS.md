@@ -881,7 +881,11 @@ yet.
   the large national grids are therefore not in that archive; a transformation
   that needs one of them fails offline with PROJ's "File not found" unless
   `ALPHASHAPE_PROJ_DATA` points at a full `proj-data` directory, which always
-  outranks the bundled copy.
+  outranks the bundled copy. The macOS subset is budget-driven (16 MB of grids,
+  about 29 MB in total), not Ubuntu's hand-picked ~8 MB `proj-data` set, so do
+  not treat the two as equivalent; EGM2008 in particular is omitted — download
+  `us_nga_egm08_25.tif` from `cdn.proj.org` into a data directory and point
+  `ALPHASHAPE_PROJ_DATA` at it.
 - **Network access is off.** `proj_context_initialize()` forces
   `PROJ_NETWORK=OFF` and every thread context has network access and grid
   caching disabled. A transformation that needs an uninstalled grid fails with
