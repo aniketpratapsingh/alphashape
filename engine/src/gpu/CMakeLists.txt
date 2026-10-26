@@ -55,18 +55,25 @@ if(ALPHASHAPE_GPU)
         shaders/poisson_precond.comp
         shaders/poisson_axpy.comp)
     set(_spv_files "")
-    # pm_refine -- the kernel that does all of the per-pixel work -- is
-    # optimised. pm_init is the one kernel still exempt, on every platform: its
-    # optimised module returns a wrong random-plane normal on the Tesla T4 and
-    # the cause is not yet isolated, while the unoptimised module is correct
-    # everywhere. The exemption is not keyed on the device, because the shader is
-    # compiled and embedded at build time, not at device selection. See the note
-    # at rng_draw() in pm_math.glsl and the NVIDIA note in
-    # alphashape_add_shader. It is a single short dispatch per colour.
+    # pm_refine -- the kernel that does all of the per-pixel work -- is built with
+    # the size pipeline (-Os) rather than -O: it is exact against the CPU because
+    # the depth/plane-to-pixel chain is `precise`, and NoContraction inside its
+    # 49-sample x 32-neighbour cost loop makes the -O pipeline need more memory
+    # than a CI runner has (exit 137). See alphashape_add_shader for the full
+    # reasoning. pm_init is the one kernel with no optimiser at all, on every
+    # platform: its optimised module returns a wrong random-plane normal on the
+    # Tesla T4 and the cause is not yet isolated, while the unoptimised module is
+    # correct everywhere. The exemption is not keyed on the device, because the
+    # shader is compiled and embedded at build time, not at device selection. See
+    # the note at rng_draw() in pm_math.glsl. It is a single short dispatch per
+    # colour.
     set(_unoptimised_shaders shaders/pm_init.comp)
+    set(_size_optimised_shaders shaders/pm_refine.comp)
     foreach(_shader IN LISTS _shader_sources)
         if(_shader IN_LIST _unoptimised_shaders)
             alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}" NO_OPTIMIZE)
+        elseif(_shader IN_LIST _size_optimised_shaders)
+            alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}" OPTIMIZE_SIZE)
         else()
             alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}")
         endif()
