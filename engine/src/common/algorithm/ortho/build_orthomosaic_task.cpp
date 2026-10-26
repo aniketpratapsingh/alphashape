@@ -16,6 +16,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
+#include "base/platform/memory.hpp"
 #include "common/algorithm/elevation/dem_builder.hpp"
 #include "common/algorithm/elevation/interpolate.hpp"
 #include "common/algorithm/ortho/blend.hpp"
@@ -141,6 +142,12 @@ RasterGrid ortho_grid_for(const RasterGrid& extent, double resolution) {
 /// centres. The height component is not interpolated: the node records
 /// d(local z)/dh, and the query's own height (the DEM sample the orthorectifier
 /// just read) is applied exactly, so no vertical error is introduced at all.
+///
+/// MEMORY. The node count is the grid's corner lattice, i.e. about one node per
+/// output cell: at 28 M cells a Vector3d per node alone is 670 MB. The local
+/// offsets are therefore stored as float relative to `anchor` (the first node's
+/// exact position), which keeps them within the grid's own extent where a
+/// float's 24-bit mantissa is far finer than the millimetre this map promises.
 struct PlaneToLocalMap {
     int cols = 0;  ///< node columns (grid.width + 1)
     int rows = 0;  ///< node rows (grid.height + 1)
@@ -148,9 +155,10 @@ struct PlaneToLocalMap {
     double y0 = 0.0;
     double dx = 1.0;
     double dy = 1.0;
-    std::vector<Eigen::Vector3d> local;  ///< cols * rows, row-major
-    std::vector<double> height;          ///< plane height each node was mapped at
-    std::vector<double> vertical;        ///< d(local z)/dh at each node
+    Eigen::Vector3d anchor = Eigen::Vector3d::Zero();  ///< exact first-node local
+    std::vector<Eigen::Vector3f> local;  ///< cols * rows, relative to `anchor`
+    std::vector<float> height;           ///< plane height each node was mapped at
+    std::vector<float> vertical;         ///< d(local z)/dh at each node
 
     Eigen::Vector3d operator()(const Eigen::Vector3d& p) const {
         const double cf =
@@ -173,8 +181,10 @@ struct PlaneToLocalMap {
         const double w10 = fx * (1.0 - fy);
         const double w01 = (1.0 - fx) * fy;
         const double w11 = fx * fy;
-        Eigen::Vector3d out = w00 * local[i00] + w10 * local[i10] + w01 * local[i01] +
-                              w11 * local[i11];
+        const Eigen::Vector3f relative =
+            static_cast<float>(w00) * local[i00] + static_cast<float>(w10) * local[i10] +
+            static_cast<float>(w01) * local[i01] + static_cast<float>(w11) * local[i11];
+        Eigen::Vector3d out = anchor + relative.cast<double>();
         const double node_height =
             w00 * height[i00] + w10 * height[i10] + w01 * height[i01] + w11 * height[i11];
         const double scale =
@@ -206,7 +216,6 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     map->local.resize(nodes);
     map->height.resize(nodes);
     map->vertical.resize(nodes);
-
     // Nodes whose cell is nodata fall back to the raster's median valid height:
     // the node is only a control point for the interpolation, and the query
     // height is applied exactly on top.
@@ -214,6 +223,16 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     if (!std::isfinite(fallback)) {
         fallback = 0.0;
     }
+
+    // The float offsets are relative to this exact node, so their magnitude is
+    // the grid's own extent (metres) rather than a UTM ordinate in the millions.
+    // Set the anchor before the loop so the first node stores an exact zero.
+    double anchor_height = sample_grid(heights, nodata, map->x0, map->y0);
+    if (!std::isfinite(anchor_height) || anchor_height == static_cast<double>(nodata)) {
+        anchor_height = fallback;
+    }
+    map->anchor = frame.to_local(Eigen::Vector3d(map->x0, map->y0, anchor_height));
+    const Eigen::Vector3d anchor = map->anchor;
 
     for (int row = 0; row < map->rows; ++row) {
         for (int col = 0; col < map->cols; ++col) {
@@ -226,10 +245,11 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
             const std::size_t i =
                 static_cast<std::size_t>(row) * static_cast<std::size_t>(map->cols) +
                 static_cast<std::size_t>(col);
-            map->height[i] = h;
-            map->local[i] = frame.to_local(Eigen::Vector3d(x, y, h));
+            map->height[i] = static_cast<float>(h);
+            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(x, y, h));
+            map->local[i] = (local - anchor).cast<float>();
             const Eigen::Vector3d up = frame.to_local(Eigen::Vector3d(x, y, h + 1.0));
-            map->vertical[i] = up.z() - map->local[i].z();
+            map->vertical[i] = static_cast<float>(up.z() - local.z());
         }
     }
 
@@ -283,21 +303,24 @@ fs::path resolve_frame_path(const Document& document, const std::string& path) {
     return fs::path(document.path()).parent_path() / recorded;
 }
 
-/// One enabled camera with its decoded photograph, in chunk camera order.
+/// One enabled camera with a pose and a linked photograph. The photograph
+/// itself is NOT held here: decoding every frame up front costs
+/// cameras x image bytes (36 photos of 60 MP are ~6 GB), so the task decodes one
+/// inside the rectify loop and releases it before the next.
 struct CameraEntry {
     std::int32_t camera_id = -1;
     Calibration calibration;
     Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
     Eigen::Vector3d centre_local = Eigen::Vector3d::Zero();
-    std::size_t image_index = 0;
+    std::string image_path;  ///< resolved absolute path to the photograph
 };
 
-/// Decode every enabled camera that has a pose and a linked image. A camera
-/// without a linked frame is skipped (nothing to sample); one that advertises a
-/// pose but has no sensor is a hard error, as in BuildTexture.
-std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& chunk,
-                                         std::vector<Image>& images) {
+/// Collect every enabled camera that has a pose and a linked image (the paths
+/// only: see CameraEntry). A camera without a linked frame is skipped (nothing
+/// to sample); one that advertises a pose but has no sensor is a hard error, as
+/// in BuildTexture.
+std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& chunk) {
     std::unordered_map<std::int32_t, const Frame*> frame_of;
     for (const auto& frame : chunk.frames()) {
         if (frame->camera_id() >= 0) {
@@ -319,12 +342,6 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
             throw ValueError("BuildOrthomosaic: camera " + std::to_string(camera.id) +
                              " has no sensor");
         }
-        Image image =
-            read_image(resolve_frame_path(document, frame_it->second->path()).string());
-        if (image.empty()) {
-            throw ValueError("BuildOrthomosaic: camera " + std::to_string(camera.id) +
-                             " has an unreadable image");
-        }
         CameraEntry entry;
         entry.camera_id = camera.id;
         entry.calibration =
@@ -332,11 +349,104 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
         entry.R = camera.pose.block<3, 3>(0, 0);
         entry.t = camera.pose.block<3, 1>(0, 3);
         entry.centre_local = -entry.R.transpose() * entry.t;
-        entry.image_index = images.size();
-        images.push_back(std::move(image));
-        entries.push_back(entry);
+        entry.image_path = resolve_frame_path(document, frame_it->second->path()).string();
+        entries.push_back(std::move(entry));
     }
     return entries;
+}
+
+/// Bytes per output cell the FINE pipeline holds at its peak, over and above
+/// the orthomosaic itself:
+///
+///   * seam labels (int32)              4
+///   * seamline `best` (double)         8
+///   * seamline `any_valid` (u8)        1
+///   * fill_holes branch (float + u8)   5
+///
+/// The tiles are counted separately: they are cropped to the camera footprints,
+/// so their cost is a footprint area, not C x the grid.
+constexpr double kBytesPerCellFine = 18.0;
+
+/// Bytes per output-grid NODE in the plane->local map (float3 + 2 floats) when
+/// the chunk is georeferenced: about one node per output cell.
+constexpr double kBytesPerNodeMap = 20.0;
+
+/// Bytes per camera footprint cell in a rectified tile (rgb u8x3 + valid u8 +
+/// score float).
+constexpr double kBytesPerTileCell = 8.0;
+
+/// A coarse seamline pyramid level holds its tiles at 1/factor^2 of the fine
+/// area; the two configured levels (2x and 4x) therefore add 1/4 + 1/16 of the
+/// footprint.
+constexpr double kCoarseFootprintFraction = 0.25 + 0.0625;
+
+/// Estimates the peak memory BuildOrthomosaic needs, in bytes.
+///
+/// `footprint_cells` is the summed area of every camera's tile crop box (the
+/// rectified-tile cost); it is predicted from camera_footprint_bounds() before
+/// any tile is allocated.
+double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map) {
+    double bytes = static_cast<double>(cells) * kBytesPerCellFine;
+    bytes += footprint_cells * kBytesPerTileCell * (1.0 + kCoarseFootprintFraction);
+    if (has_node_map) {
+        bytes += static_cast<double>(cells) * kBytesPerNodeMap;
+    }
+    // The orthomosaic raster itself (RGBA u8) is one more byte per cell x 4.
+    bytes += static_cast<double>(cells) * 4.0;
+    return bytes;
+}
+
+/// The footprint area every camera's tile crop box will cover, padded the way
+/// the rectifier pads it (two cells, and the cell rounding on each edge). This
+/// is the same bound orthorectify() allocates against, so the guard's estimate
+/// cannot be smaller than the allocation that follows.
+double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
+                                 const RasterGrid& grid, const GeoRaster<float>& surface,
+                                 float surface_nodata, const elevation::SurfaceFrame& frame,
+                                 const std::function<Eigen::Vector3d(const Eigen::Vector3d&)>&
+                                     to_local) {
+    double lowest = std::numeric_limits<double>::infinity();
+    double highest = -std::numeric_limits<double>::infinity();
+    for (const float h : surface.data) {
+        if (h == surface_nodata || std::isnan(h)) {
+            continue;
+        }
+        lowest = std::min(lowest, static_cast<double>(h));
+        highest = std::max(highest, static_cast<double>(h));
+    }
+    if (!std::isfinite(lowest) || !std::isfinite(highest)) {
+        return static_cast<double>(grid.width) * static_cast<double>(grid.height);
+    }
+
+    const Eigen::Vector2d metres_per_unit =
+        frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
+    double total = 0.0;
+    for (const CameraEntry& entry : cameras) {
+        ortho::OrthoCamera camera;
+        camera.calibration = entry.calibration;
+        camera.R = entry.R;
+        camera.t = entry.t;
+        camera.plane_metres_per_unit = metres_per_unit;
+        double local_low = lowest;
+        double local_high = highest;
+        if (to_local) {
+            camera.plane_to_local = to_local;
+            camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                return frame.to_plane(p);
+            };
+            const Eigen::Vector3d mid = grid.pixel_center(grid.width / 2, grid.height / 2);
+            const Eigen::Vector3d lo =
+                to_local(Eigen::Vector3d(mid.x(), mid.y(), lowest));
+            const Eigen::Vector3d hi =
+                to_local(Eigen::Vector3d(mid.x(), mid.y(), highest));
+            local_low = std::min(lo.z(), hi.z());
+            local_high = std::max(lo.z(), hi.z());
+        }
+        const ortho::TileBounds bounds =
+            ortho::camera_footprint_bounds(grid, camera, local_low, local_high, 2);
+        total += static_cast<double>(bounds.width) * static_cast<double>(bounds.height);
+    }
+    return total;
 }
 
 }  // namespace
@@ -497,6 +607,22 @@ std::vector<Stage> BuildOrthomosaicTask::stages() const {
 
 void BuildOrthomosaicTask::apply(Document& document, Params& params,
                                  const Progress& progress) {
+    try {
+        run(document, params, progress);
+    } catch (const std::bad_alloc&) {
+        // The guard below rejects a run it can PREDICT will not fit; this catches
+        // the cases it cannot (a footprint far larger than the bound, another
+        // process eating the machine). Same advice, same style, and the previous
+        // orthomosaic is untouched because nothing was committed.
+        throw ValueError(
+            "BuildOrthomosaic ran out of memory. Set a coarser resolution (the "
+            "default follows the ground sample distance; try 2-4x that), or close "
+            "other applications and retry.");
+    }
+}
+
+void BuildOrthomosaicTask::run(Document& document, Params& params,
+                               const Progress& progress) {
     progress.update("initialize", 0.0);
     const ResolvedOptions options = resolve_options(params);
     const std::string asset_label = params.get_string("label");
@@ -529,9 +655,9 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
     }
     progress.update("initialize", 0.2);
 
-    // Every enabled camera with a pose and an image, decoded once.
-    std::vector<Image> images;
-    std::vector<CameraEntry> cameras = collect_cameras(document, *chunk, images);
+    // Every enabled camera with a pose and an image path; the photographs are
+    // decoded one at a time inside the rectify loop.
+    std::vector<CameraEntry> cameras = collect_cameras(document, *chunk);
     if (cameras.empty()) {
         throw ValueError("BuildOrthomosaic: no enabled camera with a pose and an image");
     }
@@ -727,6 +853,28 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
     const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
         make_plane_to_local(frame, grid, surface, surface_nodata);
 
+    // -- memory guard --------------------------------------------------------
+    // Refuse a run whose peak cannot fit BEFORE allocating anything: a bare
+    // std::bad_alloc half-way through rectification (after the grid, the node
+    // map and several tiles exist) leaves the OS thrashing and tells the user
+    // nothing. The estimate is per-cell anatomy plus the summed footprint boxes;
+    // the budget is 60% of physical RAM, overridable for tests.
+    const std::uint64_t cells = static_cast<std::uint64_t>(grid.width) *
+                                static_cast<std::uint64_t>(grid.height);
+    const double footprint_cells =
+        predicted_footprint_cells(cameras, grid, surface, surface_nodata, frame, to_local);
+    const double peak_bytes = estimate_peak_bytes(cells, footprint_cells, bool{to_local});
+    const std::uint64_t budget = platform::memory_budget_bytes();
+    if (budget != 0 && peak_bytes > static_cast<double>(budget)) {
+        throw ValueError(
+            "BuildOrthomosaic needs about " + platform::format_gb(peak_bytes) +
+            " at resolution " + std::to_string(resolution) + " m; this machine has " +
+            platform::format_gb(static_cast<double>(
+                platform::total_physical_memory_bytes())) +
+            ". Set a coarser resolution (e.g. " +
+            std::to_string(round_sig3(resolution * 4.0)) + " m).");
+    }
+
     // The ortho grid and the DEM share a plane: in a Geographic frame both are
     // in degrees, so heights divide by degrees. The orthorectifier's occlusion
     // march compares a ray against metre heights and needs the ground metric,
@@ -743,14 +891,28 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
             throw Error("BuildOrthomosaic cancelled");
         }
         const CameraEntry& entry = cameras[i];
+        // Decode this camera's photograph, rectify it, and drop it again: only
+        // one full-resolution frame is ever resident.
+        const Image image = read_image(entry.image_path);
+        if (image.empty()) {
+            throw ValueError("BuildOrthomosaic: camera " +
+                             std::to_string(entry.camera_id) + " has an unreadable image");
+        }
         ortho::OrthoCamera camera;
         camera.calibration = entry.calibration;
         camera.R = entry.R;
         camera.t = entry.t;
-        camera.image = &images[entry.image_index];
+        camera.image = &image;
         camera.plane_metres_per_unit = metres_per_unit;
         if (to_local) {
             camera.plane_to_local = to_local;
+            // The inverse the tile crop needs to place the footprint on the
+            // plane grid. Full-precision to_plane (not the bilinear map's
+            // inverse): the crop only has to be conservative, and this is the
+            // exact map the orthorectifier's own plane_to_local approximates.
+            camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                return frame.to_plane(p);
+            };
             camera.plane_centre = plane_centres[i];
         }
         tiles.push_back(ortho::orthorectify(surface, surface_nodata, grid, camera,

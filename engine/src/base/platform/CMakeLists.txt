@@ -6,6 +6,7 @@ add_library(alphashape_platform STATIC
     dynamic_library.cpp
     temp.cpp
     env.cpp
+    memory.cpp
     console.cpp
     process.cpp
     paths.cpp)

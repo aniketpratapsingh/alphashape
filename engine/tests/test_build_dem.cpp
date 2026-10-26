@@ -331,6 +331,98 @@ TEST(Dem, AutoResolutionIsPositiveAndNearSampleSpacing) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Extent robustness: a few far outliers cannot explode the grid
+// ---------------------------------------------------------------------------
+//
+// The owner's 8 GB laptop hit "bad allocation" on a 36-photo block at the OLD
+// 0.25 m ortho default, when the ortho had only ~0.2 M cells. The grid follows
+// the DEM, the DEM's extent followed raw sample min/max, and a handful of far
+// depth-map samples turned a 100 m block into a kilometres-wide grid. These
+// tests pin the robust bound: outliers must not change the extent materially,
+// while an outlier-free scene must keep the exact grid it always had.
+
+TEST(Dem, FarOutliersDoNotExplodeTheExtent) {
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -50.0, 50.0, -40.0, 40.0, 0.25);
+    const std::size_t clean_count = chunk.point_cloud().points.size();
+
+    // Baseline: the exact extent of the clean lattice.
+    Params baseline = dem_params("point_cloud", "enabled", 0.25, 0, "nearest", "none");
+    run_build_dem(document, baseline);
+    const RasterGrid clean_grid = chunk.elevation().raster.grid;
+    const double clean_x0 = clean_grid.origin_x;
+    const double clean_y0 = clean_grid.origin_y;
+
+    // Now inject 20 far points: 10 "at infinity" along a grazing ray and 10
+    // spurious close-range mismatches. 20 of ~128000 samples is 0.016%, inside
+    // the 0.5% discarded tail on each side.
+    PointCloud& cloud = chunk.point_cloud();
+    for (int i = 0; i < 10; ++i) {
+        const double angle = 2.0 * 3.14159265358979 * static_cast<double>(i) / 10.0;
+        cloud.points.push_back(Eigen::Vector3d(
+            5000.0 * std::cos(angle), 5000.0 * std::sin(angle),
+            aerial_fixture::truth_height(0.0, 0.0)));
+    }
+    for (int i = 0; i < 10; ++i) {
+        cloud.points.push_back(Eigen::Vector3d(
+            -3000.0 + 7.0 * static_cast<double>(i), -2500.0, 0.0));
+    }
+    ASSERT_GT(cloud.points.size(), clean_count);
+
+    Params dirty = dem_params("point_cloud", "enabled", 0.25, 0, "nearest", "none");
+    run_build_dem(document, dirty);
+    const RasterGrid dirty_grid = chunk.elevation().raster.grid;
+
+    const double clean_east =
+        clean_grid.origin_x + static_cast<double>(clean_grid.width) * clean_grid.pixel_size_x;
+    const double clean_south =
+        clean_grid.origin_y - static_cast<double>(clean_grid.height) * clean_grid.pixel_size_y;
+    const double dirty_east =
+        dirty_grid.origin_x + static_cast<double>(dirty_grid.width) * dirty_grid.pixel_size_x;
+    const double dirty_south =
+        dirty_grid.origin_y - static_cast<double>(dirty_grid.height) * dirty_grid.pixel_size_y;
+    std::printf("[Dem.FarOutliersDoNotExplodeTheExtent] clean=%dx%d dirty=%dx%d "
+                "dx=[%.2f,%.2f] dy=[%.2f,%.2f]\n",
+                clean_grid.width, clean_grid.height, dirty_grid.width, dirty_grid.height,
+                dirty_grid.origin_x - clean_x0, dirty_east - clean_east,
+                dirty_grid.origin_y - clean_y0, dirty_south - clean_south);
+
+    // The outliers sit kilometres away; without the robust bound the grid would
+    // be thousands of cells wider. A 3 m tolerance (12 cells at 0.25 m) allows
+    // the 2% margin plus the origin snapping.
+    EXPECT_LT(std::abs(dirty_grid.origin_x - clean_x0), 3.0);
+    EXPECT_LT(std::abs(dirty_east - clean_east), 3.0);
+    EXPECT_LT(std::abs(dirty_grid.origin_y - clean_y0), 3.0);
+    EXPECT_LT(std::abs(dirty_south - clean_south), 3.0);
+    // And the cell count is the same order, not 100x.
+    const double clean_cells =
+        static_cast<double>(clean_grid.width) * static_cast<double>(clean_grid.height);
+    const double dirty_cells =
+        static_cast<double>(dirty_grid.width) * static_cast<double>(dirty_grid.height);
+    EXPECT_LT(dirty_cells, 1.5 * clean_cells);
+}
+
+TEST(Dem, CleanCloudKeepsTheExactExtent) {
+    // The robust bound can only shrink the exact box, never grow it: an
+    // outlier-free cloud must produce byte-comparable grid metadata to the
+    // pre-robust code (origin exactly the outward-snapped minimum).
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -10.0, 10.0, -10.0, 10.0, 0.5);
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const RasterGrid& grid = chunk.elevation().raster.grid;
+    // origin_x = floor(-10 / 0.5) * 0.5 = -10, origin_y = ceil(10/0.5)*0.5 = 10,
+    // and 20 m / 0.5 m = 40 cells each way.
+    EXPECT_NEAR(grid.origin_x, -10.0, 1e-9);
+    EXPECT_NEAR(grid.origin_y, 10.0, 1e-9);
+    EXPECT_EQ(grid.width, 40);
+    EXPECT_EQ(grid.height, 40);
+}
+
+// ---------------------------------------------------------------------------
 // 5. Errors
 // ---------------------------------------------------------------------------
 

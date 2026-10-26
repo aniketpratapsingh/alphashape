@@ -23,3 +23,6 @@ engine/data/__pycache__/
 .ccache/
 dist/
 .vcpkg-bincache/
+
+# Scratch notes (never committed)
+NOTES-*.md

@@ -99,6 +99,12 @@ public:
     TargetType target_type() const override { return TargetType::Chunk; }
     std::vector<Stage> stages() const override;
     void apply(Document& document, Params& params, const Progress& progress) override;
+
+private:
+    /// The body of apply(): apply() is the thin wrapper that turns an unexpected
+    /// std::bad_alloc into the same actionable ValueError the memory guard
+    /// raises.
+    void run(Document& document, Params& params, const Progress& progress);
 };
 
 }  // namespace alphashape

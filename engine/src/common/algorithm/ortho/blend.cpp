@@ -13,6 +13,25 @@
 namespace alphashape::ortho {
 namespace {
 
+/// Read tile `tile`'s validity at output cell (col, row). A cropped tile is
+/// exactly "not valid" outside its box, which is the zero the full-grid layout
+/// used to hold there.
+bool tile_valid(const OrthoTile& tile, int col, int row) {
+    return tile.contains(col, row) && tile.valid[tile.index(col, row)] != 0;
+}
+
+/// The tile's colour at output cell (col, row), 0 outside its crop.
+std::uint8_t tile_rgb(const OrthoTile& tile, int col, int row, int channel) {
+    return tile.contains(col, row)
+               ? tile.rgb[tile.index(col, row) * 3 + static_cast<std::size_t>(channel)]
+               : std::uint8_t{0};
+}
+
+/// The tile's score at output cell (col, row), 0 outside its crop.
+float tile_score(const OrthoTile& tile, int col, int row) {
+    return tile.contains(col, row) ? tile.score[tile.index(col, row)] : 0.0F;
+}
+
 /// A single-channel float plane on the output grid (or a pyramid level of it).
 struct Plane {
     int w = 0;
@@ -247,12 +266,13 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                 continue;
             }
             const OrthoTile& tile = tiles[static_cast<std::size_t>(label)];
-            if (tile.valid[cell] == 0) {
+            const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+            const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
+            if (!tile_valid(tile, col, row)) {
                 continue;
             }
             for (int c = 0; c < 3; ++c) {
-                out.rgb[cell * 3 + static_cast<std::size_t>(c)] =
-                    tile.rgb[cell * 3 + static_cast<std::size_t>(c)];
+                out.rgb[cell * 3 + static_cast<std::size_t>(c)] = tile_rgb(tile, col, row, c);
             }
             out.valid[cell] = 1;
         }
@@ -261,16 +281,18 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
 
     if (mode == Blending::Average) {
         for (std::size_t cell = 0; cell < cells; ++cell) {
+            const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+            const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
             double weight_sum = 0.0;
             double acc[3] = {0.0, 0.0, 0.0};
             for (const OrthoTile& tile : tiles) {
-                if (tile.valid[cell] == 0) {
+                if (!tile_valid(tile, col, row)) {
                     continue;
                 }
-                const double w = std::max(static_cast<double>(tile.score[cell]), 1e-6);
+                const double w = std::max(static_cast<double>(tile_score(tile, col, row)), 1e-6);
                 weight_sum += w;
                 for (int c = 0; c < 3; ++c) {
-                    acc[c] += w * static_cast<double>(tile.rgb[cell * 3 + static_cast<std::size_t>(c)]);
+                    acc[c] += w * static_cast<double>(tile_rgb(tile, col, row, c));
                 }
             }
             if (weight_sum <= 0.0) {
@@ -291,9 +313,12 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     std::vector<char> used(tiles.size(), 0);
     for (std::size_t cell = 0; cell < cells; ++cell) {
         const std::int32_t label = out.labels[cell];
-        if (label >= 0 && label < static_cast<std::int32_t>(tiles.size()) &&
-            tiles[static_cast<std::size_t>(label)].valid[cell] != 0) {
-            used[static_cast<std::size_t>(label)] = 1;
+        if (label >= 0 && label < static_cast<std::int32_t>(tiles.size())) {
+            const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+            const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
+            if (tile_valid(tiles[static_cast<std::size_t>(label)], col, row)) {
+                used[static_cast<std::size_t>(label)] = 1;
+            }
         }
     }
 
@@ -315,6 +340,9 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         }
     }
 
+    // Reused across tiles, so the blend never holds one validity copy per camera.
+    std::vector<std::uint8_t> scratch_mask(cells, 0);
+
     for (std::size_t t = 0; t < tiles.size(); ++t) {
         if (used[t] == 0) {
             continue;
@@ -322,22 +350,35 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         const OrthoTile& tile = tiles[t];
 
         // Per-channel plane (the tile's colour over its valid area, zero
-        // elsewhere) and the binary label mask.
+        // elsewhere) and the binary label mask. Both are full-grid planes: the
+        // pyramid's blur reads across the tile's validity edge, so the plane
+        // cannot be cropped to the tile box without changing the result.
         std::vector<Plane> gauss_ch(3);
         for (int c = 0; c < 3; ++c) {
             gauss_ch[static_cast<std::size_t>(c)] = make_plane(width, height);
         }
         Plane mask = make_plane(width, height);
-        for (std::size_t cell = 0; cell < cells; ++cell) {
-            if (tile.valid[cell] == 0) {
-                continue;
-            }
-            for (int c = 0; c < 3; ++c) {
-                gauss_ch[static_cast<std::size_t>(c)].v[cell] =
-                    static_cast<float>(tile.rgb[cell * 3 + static_cast<std::size_t>(c)]);
-            }
-            if (out.labels[cell] == static_cast<std::int32_t>(t)) {
-                mask.v[cell] = 1.0F;
+        // One reusable validity mask for fill_invalid(): rewritten over the
+        // tile's crop each iteration and cleared afterwards, so the blend holds
+        // no per-tile full-grid copy at all.
+        std::vector<std::uint8_t>& tile_mask = scratch_mask;
+        for (int row = tile.y0; row < tile.y0 + tile.height; ++row) {
+            for (int col = tile.x0; col < tile.x0 + tile.width; ++col) {
+                const std::size_t buf = tile.index(col, row);
+                if (tile.valid[buf] == 0) {
+                    continue;
+                }
+                const std::size_t cell = static_cast<std::size_t>(row) *
+                                             static_cast<std::size_t>(width) +
+                                         static_cast<std::size_t>(col);
+                for (int c = 0; c < 3; ++c) {
+                    gauss_ch[static_cast<std::size_t>(c)].v[cell] = static_cast<float>(
+                        tile.rgb[buf * 3 + static_cast<std::size_t>(c)]);
+                }
+                tile_mask[cell] = 1;
+                if (out.labels[cell] == static_cast<std::int32_t>(t)) {
+                    mask.v[cell] = 1.0F;
+                }
             }
         }
 
@@ -347,7 +388,7 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
             // pyramid, so the coarse levels see no artificial zero step at the
             // validity edge (see fill_invalid).
             Plane filled = gauss_ch[static_cast<std::size_t>(c)];
-            fill_invalid(filled, tile.valid);
+            fill_invalid(filled, tile_mask);
             const std::vector<Plane> g_ch = gaussian_pyramid(std::move(filled), levels);
             const std::vector<Plane> lap = laplacian_pyramid(g_ch);
             for (int k = 0; k <= levels; ++k) {
@@ -358,6 +399,14 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                     acc.v[i] += l.v[i] * w.v[i];
                 }
             }
+        }
+        // Clear the reused mask: a stale 1 from this tile would look like real
+        // colour to the next tile's fill_invalid().
+        for (int row = tile.y0; row < tile.y0 + tile.height; ++row) {
+            std::fill_n(tile_mask.begin() + static_cast<std::ptrdiff_t>(
+                                                  static_cast<std::size_t>(row) *
+                                                  static_cast<std::size_t>(width)),
+                        tile.width, std::uint8_t{0});
         }
     }
 
@@ -380,9 +429,11 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
 
     // Copy the base level out and mark validity where any tile is valid.
     for (std::size_t cell = 0; cell < cells; ++cell) {
+        const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+        const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
         bool valid = false;
         for (const OrthoTile& tile : tiles) {
-            if (tile.valid[cell] != 0) {
+            if (tile_valid(tile, col, row)) {
                 valid = true;
                 break;
             }

@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include "base/utils/error.hpp"
+#include "base/platform/env.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
@@ -554,7 +555,72 @@ TEST(BuildOrthomosaic, Errors) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Export
+// 5. Memory guard
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Set ALPHASHAPE_MEMORY_BUDGET_MB for the lifetime of the object, restoring the
+/// previous value (or unsetting it) afterwards. The task reads the variable on
+/// every run, so nothing has to be restarted.
+class ScopedMemoryBudget {
+public:
+    explicit ScopedMemoryBudget(const std::string& megabytes) {
+        previous_ = platform::get_env("ALPHASHAPE_MEMORY_BUDGET_MB");
+        had_previous_ = !previous_.empty();
+        platform::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", megabytes);
+    }
+    ~ScopedMemoryBudget() {
+        platform::set_env("ALPHASHAPE_MEMORY_BUDGET_MB",
+                          had_previous_ ? previous_ : std::string());
+    }
+    ScopedMemoryBudget(const ScopedMemoryBudget&) = delete;
+    ScopedMemoryBudget& operator=(const ScopedMemoryBudget&) = delete;
+
+private:
+    std::string previous_;
+    bool had_previous_ = false;
+};
+
+}  // namespace
+
+TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+
+    // A 1 MB budget cannot hold any ortho of this scene: the guard must refuse
+    // before allocating, naming the resolution, the machine and an actionable
+    // coarser value.
+    ScopedMemoryBudget budget("1");
+    Params params = ortho_params("mosaic", "elevation", 0.05);
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("BuildOrthomosaic needs about"), std::string::npos)
+            << message;
+        EXPECT_NE(message.find("this machine has"), std::string::npos) << message;
+        EXPECT_NE(message.find("Set a coarser resolution"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "the guard did not refuse a 1 MB budget";
+    EXPECT_TRUE(chunk.orthomosaic().empty());  // nothing was committed
+}
+
+TEST(BuildOrthomosaic, MemoryGuardStillAllowsARealisticRun) {
+    // With a generous budget the fixture's 1 m ortho must go through: the guard
+    // is a floor, not a tax.
+    ScopedMemoryBudget budget("4096");
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    Params params = ortho_params("mosaic", "elevation", 1.0);
+    EXPECT_NO_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params));
+    EXPECT_FALSE(chunk.orthomosaic().empty());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Export
 // ---------------------------------------------------------------------------
 
 TEST(ExportOrthomosaic, WritesGeoTiff) {

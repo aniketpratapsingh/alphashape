@@ -236,15 +236,87 @@ struct PlaneBox {
     Eigen::Vector2d max = Eigen::Vector2d::Zero();
 };
 
-PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
-    PlaneBox box;
-    box.min = samples.front().p;
-    box.max = samples.front().p;
-    for (const PlaneSample& s : samples) {
-        box.min = box.min.cwiseMin(s.p);
-        box.max = box.max.cwiseMax(s.p);
+/// The plane-frame bounding box of the samples, made robust against outliers.
+///
+/// A raw min/max is wrong here: depth-map back-projection produces a tail of
+/// far samples (a mismatched far stereo point, a sky-keyed patch that fused at
+/// the infinity clamp, an oblique camera's grazing depth), and ONE of them at
+/// 10 km sets the grid extent. At the DEM's auto cell that is a grid of
+/// billions of cells -- the "bad allocation" an 8 GB laptop hits on a small
+/// block long before any ortho exists.
+///
+/// The box is therefore taken from the 0.5th-99.5th percentile of each axis
+/// (the samples' own spread, not a fixed metric margin), then widened by a
+/// margin of 2% of that robust extent on every side. Two guards keep the
+/// adjustment conservative:
+///
+///   * with fewer than kMinSamplesForRobustBox samples the percentile is not
+///     meaningful and the exact box is used (small synthetic scenes keep their
+///     historical grid);
+///   * the percentile box can only SHRINK the exact box, never grow it.
+constexpr std::size_t kMinSamplesForRobustBox = 1000;
+/// One-sided tail fraction discarded on each axis.
+constexpr double kExtentTailFraction = 0.005;
+/// Extra margin, as a fraction of the robust extent, on every side.
+constexpr double kExtentMarginFraction = 0.02;
+
+/// The `fraction` quantile of `values` (0..1), by nth_element. `values` is
+/// reordered.
+double quantile(std::vector<double>& values, double fraction) {
+    if (values.empty()) {
+        return 0.0;
     }
-    return box;
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    const std::size_t k = std::min(
+        values.size() - 1, static_cast<std::size_t>(clamped * static_cast<double>(values.size())));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(k),
+                     values.end());
+    return values[k];
+}
+
+PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
+    PlaneBox exact;
+    exact.min = samples.front().p;
+    exact.max = samples.front().p;
+    for (const PlaneSample& s : samples) {
+        exact.min = exact.min.cwiseMin(s.p);
+        exact.max = exact.max.cwiseMax(s.p);
+    }
+    if (samples.size() < kMinSamplesForRobustBox) {
+        return exact;
+    }
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(samples.size());
+    ys.reserve(samples.size());
+    for (const PlaneSample& s : samples) {
+        xs.push_back(s.p.x());
+        ys.push_back(s.p.y());
+    }
+    const double x_lo = quantile(xs, kExtentTailFraction);
+    const double x_hi = quantile(xs, 1.0 - kExtentTailFraction);
+    const double y_lo = quantile(ys, kExtentTailFraction);
+    const double y_hi = quantile(ys, 1.0 - kExtentTailFraction);
+
+    const double margin_x = kExtentMarginFraction * (x_hi - x_lo);
+    const double margin_y = kExtentMarginFraction * (y_hi - y_lo);
+
+    PlaneBox robust;
+    // Never widen past the exact box: an outlier-free cloud must come out with
+    // exactly the same grid it always had.
+    robust.min =
+        Eigen::Vector2d(std::max(exact.min.x(), x_lo - margin_x),
+                        std::max(exact.min.y(), y_lo - margin_y));
+    robust.max =
+        Eigen::Vector2d(std::min(exact.max.x(), x_hi + margin_x),
+                        std::min(exact.max.y(), y_hi + margin_y));
+    // A degenerate robust box (every sample on one line) would be worse than
+    // the exact one: fall back rather than produce a 1-cell DEM.
+    if (!(robust.max.x() > robust.min.x()) || !(robust.max.y() > robust.min.y())) {
+        return exact;
+    }
+    return robust;
 }
 
 PlaneBox vertices_box(const std::vector<Eigen::Vector3d>& vertices) {
