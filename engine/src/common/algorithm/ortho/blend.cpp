@@ -123,6 +123,17 @@ Plane resize(const Plane& in, int dw, int dh) {
     return out;
 }
 
+/// The cell count the deepest pyramid level must still hold. level_count()
+/// stops before a level would decimate below this, so a grid that can carry
+/// `levels` levels has min(width, height) >= kLevelMinCells << levels.
+constexpr int kLevelMinCells = 8;
+
+/// The deepest depth a PINNED run is honoured at. It is level_count()'s own cap,
+/// because that is the deepest depth any whole grid can have: a caller pinning
+/// more than that could only ever be asking for a shallower real grid's operator,
+/// and honouring it would pad a small window to an absurd plane.
+constexpr int kMaxPinnedLevels = 6;
+
 /// Number of pyramid levels: floor(log2(min(W,H)/8)), capped at 6.
 int level_count(int width, int height) {
     const int m = std::min(width, height);
@@ -176,6 +187,32 @@ std::vector<Plane> laplacian_pyramid(const std::vector<Plane>& gauss) {
     }
     laplacian.push_back(gauss.back());
     return laplacian;
+}
+
+/// Edge-replicate a plane's real `w` x `h` top-left region into the rest of its
+/// allocation (`p.w` x `p.h`).
+///
+/// A window at the OUTPUT border is narrower than the pyramid depth needs, so
+/// blend() pads it (see there). Replicating rather than leaving zeros makes every
+/// 5-tap tap that leaves the real region read the same value blur5()'s own clamp
+/// would, so a padded plane's blurs over the real region are the whole grid's:
+/// the whole grid clamps at the same border, so it reads that value too.
+void replicate_edges(Plane& p, int w, int h) {
+    if (w <= 0 || h <= 0 || w > p.w || h > p.h || (p.w == w && p.h == h)) {
+        return;
+    }
+    for (int row = 0; row < h; ++row) {
+        const float edge = p.at(w - 1, row);
+        for (int col = w; col < p.w; ++col) {
+            p.at(col, row) = edge;
+        }
+    }
+    for (int row = h; row < p.h; ++row) {
+        const std::size_t src = static_cast<std::size_t>(h - 1) * static_cast<std::size_t>(p.w);
+        const std::size_t dst = static_cast<std::size_t>(row) * static_cast<std::size_t>(p.w);
+        std::copy_n(p.v.begin() + static_cast<std::ptrdiff_t>(src), p.w,
+                    p.v.begin() + static_cast<std::ptrdiff_t>(dst));
+    }
 }
 
 /// Grow valid colour outward into the invalid cells of `p`, one ring per pass,
@@ -331,12 +368,26 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
 
     int levels = level_count(width, height);
     if (pyramid_levels >= 0) {
-        // A pinned depth must still be representable on this grid: a level
-        // larger than the grid itself would decimate to 1x1 and the collapse
-        // would then be a resize of a single sample, not the operator the
-        // whole grid applied.
-        levels = std::min(pyramid_levels, level_count(width, height));
+        // A pinned depth is applied AS GIVEN, even when this grid is too small
+        // to carry it (see the padding below). Clamping it down to the grid's
+        // own level_count() is what made an edge block -- a window truncated at
+        // the output border, e.g. 464 cells where the others are 1152 -- blend
+        // with one level less than every other block, which shows up as a
+        // systematic step where that block meets its neighbour.
+        levels = std::min(pyramid_levels, kMaxPinnedLevels);
     }
+
+    // A depth of `levels` decimates the finest plane down to
+    // ceil(size / 2^levels) cells, and level_count()'s own rule is that every
+    // level keeps at least kLevelMinCells across. A window smaller than that
+    // cannot carry the depth, so it is PADDED by edge-replicating its last
+    // row/column. That is not an approximation of the whole grid at an output
+    // border, it is exactly what blur5()'s own clamp does there: the whole grid
+    // has no cells past its border and its border taps read the border value,
+    // and so does a replica. The tint planes at levels 1..levels therefore come
+    // out identical to the whole grid's inside the real region.
+    const int pad_w = std::max(width, kLevelMinCells << levels);
+    const int pad_h = std::max(height, kLevelMinCells << levels);
 
     // Per-channel fused Laplacian pyramid. The masks partition the covered cells
     // (each covered cell has exactly one label), and the Gaussian operator keeps
@@ -348,8 +399,8 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     for (int c = 0; c < 3; ++c) {
         num[static_cast<std::size_t>(c)].reserve(static_cast<std::size_t>(levels) + 1);
         for (int k = 0; k <= levels; ++k) {
-            const int lw = std::max(1, (width + (1 << k) - 1) >> k);
-            const int lh = std::max(1, (height + (1 << k) - 1) >> k);
+            const int lw = std::max(1, (pad_w + (1 << k) - 1) >> k);
+            const int lh = std::max(1, (pad_h + (1 << k) - 1) >> k);
             num[static_cast<std::size_t>(c)].push_back(make_plane(lw, lh));
         }
     }
@@ -369,6 +420,25 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     // pyramid margins, which is the residual the block-wise test measures.
     const int fill_passes = pyramid_support_cells(levels);
 
+    /// The plane's real region edge-replicated out to the padded size.
+    const auto pad_plane = [pad_w, pad_h](Plane real) {
+        if (real.w == pad_w && real.h == pad_h) {
+            return real;
+        }
+        Plane padded = make_plane(pad_w, pad_h);
+        for (int row = 0; row < real.h; ++row) {
+            std::copy_n(real.v.begin() +
+                            static_cast<std::ptrdiff_t>(static_cast<std::size_t>(row) *
+                                                       static_cast<std::size_t>(real.w)),
+                        real.w,
+                        padded.v.begin() +
+                            static_cast<std::ptrdiff_t>(static_cast<std::size_t>(row) *
+                                                       static_cast<std::size_t>(pad_w)));
+        }
+        replicate_edges(padded, real.w, real.h);
+        return padded;
+    };
+
     // Reused across tiles, so the blend never holds one validity copy per camera.
     std::vector<std::uint8_t> scratch_mask(cells, 0);
 
@@ -379,9 +449,10 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         const OrthoTile& tile = tiles[t];
 
         // Per-channel plane (the tile's colour over its valid area, zero
-        // elsewhere) and the binary label mask. Both are full-grid planes: the
-        // pyramid's blur reads across the tile's validity edge, so the plane
-        // cannot be cropped to the tile box without changing the result.
+        // elsewhere) and the binary label mask, built at the REAL window size and
+        // padded afterwards. The pyramid's blur reads across the tile's validity
+        // edge, so the plane cannot be cropped to the tile box without changing
+        // the result.
         std::vector<Plane> gauss_ch(3);
         for (int c = 0; c < 3; ++c) {
             gauss_ch[static_cast<std::size_t>(c)] = make_plane(width, height);
@@ -411,14 +482,15 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
             }
         }
 
-        const std::vector<Plane> mask_pyr = weight_pyramid(std::move(mask), levels);
+        const std::vector<Plane> mask_pyr = weight_pyramid(pad_plane(std::move(mask)), levels);
         for (int c = 0; c < 3; ++c) {
             // Extend the tile's colour into its invalid region before the
             // pyramid, so the coarse levels see no artificial zero step at the
             // validity edge (see fill_invalid).
             Plane filled = gauss_ch[static_cast<std::size_t>(c)];
             fill_invalid(filled, tile_mask, fill_passes);
-            const std::vector<Plane> g_ch = gaussian_pyramid(std::move(filled), levels);
+            const std::vector<Plane> g_ch =
+                gaussian_pyramid(pad_plane(std::move(filled)), levels);
             const std::vector<Plane> lap = laplacian_pyramid(g_ch);
             for (int k = 0; k <= levels; ++k) {
                 Plane& acc = num[static_cast<std::size_t>(c)][static_cast<std::size_t>(k)];
@@ -459,7 +531,8 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         result[static_cast<std::size_t>(c)] = std::move(cur);
     }
 
-    // Copy the base level out and mark validity where any tile is valid.
+    // Copy the base level out (real cells only: the base plane may be padded)
+    // and mark validity where any tile is valid.
     for (std::size_t cell = 0; cell < cells; ++cell) {
         const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
         const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
@@ -473,8 +546,12 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         if (!valid) {
             continue;
         }
+        const std::size_t plane_cell = static_cast<std::size_t>(row) *
+                                           static_cast<std::size_t>(pad_w) +
+                                       static_cast<std::size_t>(col);
         for (int c = 0; c < 3; ++c) {
-            const double value = static_cast<double>(result[static_cast<std::size_t>(c)].v[cell]);
+            const double value =
+                static_cast<double>(result[static_cast<std::size_t>(c)].v[plane_cell]);
             out.rgb[cell * 3 + static_cast<std::size_t>(c)] =
                 static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
         }

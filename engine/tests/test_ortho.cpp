@@ -1227,5 +1227,131 @@ TEST(Ortho, PinnedPyramidDepthEqualsTheWholeGridBlend) {
     EXPECT_NE(shallow.rgb, automatic.rgb);
 }
 
+TEST(Ortho, NarrowWindowKeepsTheWholeGridPyramidDepth) {
+    // A window at the OUTPUT border can be narrower than the pyramid depth needs:
+    // a 512-cell block with a 320-cell margin asks for 1152 cells, but the last
+    // block of a grid that is k*512 + a small remainder is only remainder+320
+    // wide (384 here). blend() must still apply the WHOLE grid's depth to it --
+    // level_count() would stop one level early on such a window, and that one
+    // level is a visible step where the narrow block meets its neighbour.
+    //
+    // The check is direct: a narrow window's blend at the pinned depth must agree
+    // with the whole-grid blend at that depth over the window's real area, to the
+    // same tolerance as a full-size window (the blend is local, so the margin the
+    // window already carries makes it agree).
+    constexpr int kGrid = 1088;      // 2 * 512 + 64: a 64-cell last column
+    constexpr int kMargin = 320;
+    constexpr int kLastWidth = kGrid - 2 * 512 + kMargin;  // 384
+    // Where the two views meet, in GLOBAL columns: inside the last block's own
+    // part of its window, so the seam and its blend are what the output takes.
+    constexpr int kSeamCol = kGrid - 28;
+    ASSERT_EQ(kLastWidth, 384);
+    const int levels = ortho::pyramid_level_count(kGrid, kGrid);
+    ASSERT_EQ(levels, 6);
+    // The window's own automatic depth is one level short: this is the bug the
+    // padding exists to prevent.
+    EXPECT_LT(ortho::pyramid_level_count(kLastWidth, kGrid), levels);
+
+    // Two overlapping tiles of a smooth colour field, generated from the GLOBAL
+    // column so the window's copy of a cell is the same content as the whole
+    // grid's. Any disagreement is then the operator's, not the content's.
+    const auto make_tiles = [](int width, int height, int global_x0) {
+        std::vector<OrthoTile> made(2);
+        for (int t = 0; t < 2; ++t) {
+            OrthoTile& tile = made[static_cast<std::size_t>(t)];
+            tile.camera = t;
+            tile.x0 = 0;
+            tile.y0 = 0;
+            tile.width = width;
+            tile.height = height;
+            const std::size_t cells = static_cast<std::size_t>(width) *
+                                      static_cast<std::size_t>(height);
+            tile.rgb.resize(cells * 3);
+            tile.valid.assign(cells, 1);
+            tile.score.assign(cells, 1.0F);
+            for (int row = 0; row < height; ++row) {
+                for (int col = 0; col < width; ++col) {
+                    const std::size_t i = static_cast<std::size_t>(row) *
+                                              static_cast<std::size_t>(width) +
+                                          static_cast<std::size_t>(col);
+                    // A gradient over the whole grid: the seam between the two
+                    // views is a step worth measuring.
+                    const int global_col = global_x0 + col;
+                    const int base = 60 + (global_col * 80) / (kGrid - 1);
+                    for (int c = 0; c < 3; ++c) {
+                        tile.rgb[i * 3 + static_cast<std::size_t>(c)] =
+                            static_cast<std::uint8_t>(std::clamp(base + 3 * t + 2 * c, 0, 255));
+                    }
+                }
+            }
+        }
+        return made;
+    };
+
+    const std::vector<OrthoTile> whole_tiles = make_tiles(kGrid, kGrid, 0);
+    std::vector<std::int32_t> whole_labels(static_cast<std::size_t>(kGrid) * kGrid, 0);
+    for (int row = 0; row < kGrid; ++row) {
+        for (int col = 0; col < kGrid; ++col) {
+            whole_labels[static_cast<std::size_t>(row) * kGrid + static_cast<std::size_t>(col)] =
+                col < kSeamCol ? 0 : 1;
+        }
+    }
+    const ortho::OrthoMosaic reference =
+        ortho::blend(kGrid, kGrid, whole_tiles, whole_labels, Blending::Mosaic, levels);
+
+    // The narrow window: the last kLastWidth columns of the grid, pinned depth.
+    const int window_x0 = kGrid - kLastWidth;
+    const std::vector<OrthoTile> window_tiles = make_tiles(kLastWidth, kGrid, window_x0);
+    std::vector<std::int32_t> window_labels(static_cast<std::size_t>(kLastWidth) * kGrid, 0);
+    for (int row = 0; row < kGrid; ++row) {
+        for (int col = 0; col < kLastWidth; ++col) {
+            const int global_col = window_x0 + col;
+            window_labels[static_cast<std::size_t>(row) * kLastWidth +
+                          static_cast<std::size_t>(col)] = global_col < kSeamCol ? 0 : 1;
+        }
+    }
+    const ortho::OrthoMosaic window =
+        ortho::blend(kLastWidth, kGrid, window_tiles, window_labels, Blending::Mosaic, levels);
+
+    // Compare the window's BLOCK region only, i.e. everything at or past the
+    // margin. The first `kMargin` columns are the overlap a neighbouring block
+    // would own, where the window clamps at an edge the whole grid does not have;
+    // past it, the edge replication is exactly the clamp the whole grid applies
+    // at the shared output border, so the padded depth reproduces the whole
+    // grid's operator all the way to the border.
+    constexpr int kLastCompared = kLastWidth;
+    int worst = 0;
+    std::size_t compared = 0;
+    std::size_t within_one = 0;
+    for (int row = 0; row < kGrid; ++row) {
+        for (int col = kMargin; col < kLastCompared; ++col) {
+            const int global_col = window_x0 + col;
+            const std::size_t a = static_cast<std::size_t>(row) * kGrid +
+                                  static_cast<std::size_t>(global_col);
+            const std::size_t b = static_cast<std::size_t>(row) * kLastWidth +
+                                  static_cast<std::size_t>(col);
+            ++compared;
+            int diff = 0;
+            for (int c = 0; c < 3; ++c) {
+                diff = std::max(
+                    diff,
+                    std::abs(
+                        static_cast<int>(reference.rgb[a * 3 + static_cast<std::size_t>(c)]) -
+                        static_cast<int>(window.rgb[b * 3 + static_cast<std::size_t>(c)])));
+            }
+            worst = std::max(worst, diff);
+            within_one += diff <= 1 ? 1U : 0U;
+        }
+    }
+    std::printf("[Ortho.NarrowWindow] width=%d levels=%d compared=%zu within1=%zu worst=%d\n",
+                kLastWidth, levels, compared, within_one, worst);
+    ASSERT_GT(compared, 0U);
+    // Exact agreement on essentially every cell: the padding is the whole grid's
+    // own clamp, not an approximation of it.
+    EXPECT_GE(within_one * 1000, compared * 999U)
+        << "the padded window must apply the whole grid's pyramid depth";
+    EXPECT_LE(worst, 1);
+}
+
 }  // namespace
 }  // namespace alphashape
