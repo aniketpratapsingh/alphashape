@@ -940,6 +940,13 @@ jobs:
           echo "gtest skips in this lane: $(wc -l < skipped.txt)"
           head -40 skipped.txt
           grep -c 'vkCreateInstance failed' "$log" || true
+          # The benchmark-shaped tests print their measurements (speed-ups,
+          # coverage, accuracy) with a lowercase tag in brackets, rather than
+          # asserting on a value nobody can read afterwards. ctest hides a
+          # passing test's output, so surface those lines from the log: this is
+          # where the numbers in a PR's "measured" section come from.
+          echo "--- measurements in this lane ---"
+          grep -E '^\[[a-z][a-z0-9 _/-]*\]' "$log" || true
 
   macos-test:
     name: macOS test ${{ matrix.lane }}
