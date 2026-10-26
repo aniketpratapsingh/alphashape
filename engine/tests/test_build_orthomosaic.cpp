@@ -1348,6 +1348,35 @@ TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {
     EXPECT_EQ(forced.raster.grid, whole.raster.grid);
     EXPECT_EQ(forced.labels, whole.labels);
     EXPECT_EQ(forced.raster.data, whole.raster.data);
+
+    // The plane->local map must also agree: a forced block is the same block, so
+    // its map is built on the global lattice with the global anchor and its
+    // values are the whole grid's, bit for bit, at every node of the window.
+    if (std::optional<elevation::SurfaceFrame> frame = s.frame) {
+        const Elevation& dem = s.document.active_chunk()->elevation();
+        const double fallback = -9999.0;
+        const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> whole_map =
+            make_plane_to_local(*frame, dem.raster.grid, dem.raster, dem.nodata, fallback);
+        PlaneToLocalLattice lattice;
+        lattice.origin_x = dem.raster.grid.origin_x;
+        lattice.origin_y = dem.raster.grid.origin_y;
+        lattice.anchor = plane_to_local_anchor(*frame, dem.raster.grid, dem.raster,
+                                              dem.nodata, fallback);
+        const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> blocked_map =
+            make_plane_to_local(*frame, dem.raster.grid, dem.raster, dem.nodata, fallback,
+                                &lattice);
+        double worst = 0.0;
+        for (int row = 0; row < dem.raster.grid.height; row += 37) {
+            for (int col = 0; col < dem.raster.grid.width; col += 37) {
+                const Eigen::Vector2d c = dem.raster.grid.pixel_center(col, row);
+                const Eigen::Vector3d p(c.x(), c.y(),
+                                        static_cast<double>(dem.raster.at(col, row)));
+                worst = std::max(worst, (whole_map(p) - blocked_map(p)).norm());
+            }
+        }
+        std::printf("[BuildOrthomosaic.BlockWiseSingle] lattice worst=%.3e m\n", worst);
+        EXPECT_EQ(worst, 0.0) << "the shared lattice must reproduce the whole-grid map exactly";
+    }
 }
 
 TEST(BuildOrthomosaic, BlockWiseAverageAndDisabledMatchTheWholeGrid) {

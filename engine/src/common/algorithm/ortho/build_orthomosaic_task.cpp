@@ -270,9 +270,24 @@ struct PlaneToLocalMap {
 
 }  // namespace
 
+Eigen::Vector3d plane_to_local_anchor(const elevation::SurfaceFrame& frame,
+                                     const RasterGrid& grid,
+                                     const GeoRaster<float>& heights, float nodata,
+                                     double fallback_height) {
+    double h = sample_grid(heights, nodata, grid.origin_x, grid.origin_y);
+    if (!std::isfinite(h) || h == static_cast<double>(nodata)) {
+        h = std::isfinite(fallback_height) ? fallback_height : median_height(heights, nodata);
+    }
+    if (!std::isfinite(h)) {
+        h = 0.0;
+    }
+    return frame.to_local(Eigen::Vector3d(grid.origin_x, grid.origin_y, h));
+}
+
 std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     const elevation::SurfaceFrame& frame, const RasterGrid& grid,
-    const GeoRaster<float>& heights, float nodata, double fallback_height) {
+    const GeoRaster<float>& heights, float nodata, double fallback_height,
+    const PlaneToLocalLattice* lattice) {
     if (frame.is_local()) {
         return {};  // identity: the pose already lives in the plane frame
     }
@@ -303,17 +318,32 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     // The float offsets are relative to this exact node, so their magnitude is
     // the grid's own extent (metres) rather than a UTM ordinate in the millions.
     // Set the anchor before the loop so the first node stores an exact zero.
-    double anchor_height = sample_grid(heights, nodata, map->x0, map->y0);
-    if (!std::isfinite(anchor_height) || anchor_height == static_cast<double>(nodata)) {
-        anchor_height = fallback;
-    }
-    map->anchor = frame.to_local(Eigen::Vector3d(map->x0, map->y0, anchor_height));
+    //
+    // With a shared lattice the anchor is the GLOBAL first node, so a block's
+    // offsets are the same numbers the whole-grid map would store (a per-block
+    // anchor would differ in the last float bit and make a block's rectification
+    // differ from the whole grid's).
+    map->anchor = lattice != nullptr
+                      ? lattice->anchor
+                      : plane_to_local_anchor(frame, grid, heights, nodata, fallback);
     const Eigen::Vector3d anchor = map->anchor;
 
     for (int row = 0; row < map->rows; ++row) {
         for (int col = 0; col < map->cols; ++col) {
-            const double x = map->x0 + static_cast<double>(col) * map->dx;
-            const double y = map->y0 - static_cast<double>(row) * map->dy;
+            // Global node coordinates in the shared-lattice case: nodes are named
+            // by their integer position on the whole grid, so every block samples
+            // exactly the point the whole-grid map sampled there.
+            double x = 0.0;
+            double y = 0.0;
+            if (lattice != nullptr) {
+                x = lattice->origin_x +
+                    static_cast<double>(lattice->col_offset + col) * map->dx;
+                y = lattice->origin_y -
+                    static_cast<double>(lattice->row_offset + row) * map->dy;
+            } else {
+                x = map->x0 + static_cast<double>(col) * map->dx;
+                y = map->y0 - static_cast<double>(row) * map->dy;
+            }
             double h = sample_grid(heights, nodata, x, y);
             if (!std::isfinite(h) || h == static_cast<double>(nodata)) {
                 h = fallback;
@@ -1531,6 +1561,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // and handed to each block's map, instead of once per block.
     const double fallback_height = frame.is_local() ? 0.0 : median_height(surface, surface_nodata);
 
+    // The DEM's own valid height range, measured once and handed to every
+    // rectification: without it orthorectify() rescans the whole DEM for the
+    // footprint clip and the occlusion ceiling once per (block, camera).
+    ortho::OrthoSurfaceRange surface_range;
+    surface_range.lowest = heights.valid() ? heights.lowest : 0.0;
+    surface_range.highest = heights.valid() ? heights.highest : 0.0;
+
     // The ortho grid and the DEM share a plane: in a Geographic frame both are
     // in degrees, so heights divide by degrees. The orthorectifier's occlusion
     // march compares a ray against metre heights and needs the ground metric,
@@ -1558,6 +1595,20 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     }
 
     PhotoCache photos(plan.photo_cache_bytes);
+
+    // The whole-grid node lattice and anchor, computed once so every block's
+    // plane->local map reproduces the whole-grid map bit for bit inside its
+    // window. Without this a block would recompute node coordinates from its own
+    // origin, which differs from the global lattice in the last bit.
+    PlaneToLocalLattice lattice;
+    std::optional<PlaneToLocalLattice> block_lattice;
+    if (!frame.is_local() && plan.block_cells > 0) {
+        lattice.origin_x = grid.origin_x;
+        lattice.origin_y = grid.origin_y;
+        lattice.anchor = plane_to_local_anchor(frame, grid, surface, surface_nodata,
+                                              fallback_height);
+        block_lattice = lattice;
+    }
 
     const int columns = std::max(1, plan.columns);
     const int rows = std::max(1, plan.rows);
@@ -1593,8 +1644,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
             // Per-block plane->local map: the node lattice follows the block, so
             // a large output never carries the whole-grid map (20 B/cell).
+            if (block_lattice.has_value()) {
+                block_lattice->col_offset = wx0;
+                block_lattice->row_offset = wy0;
+            }
             const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
-                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height);
+                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
+                                    block_lattice.has_value() ? &*block_lattice : nullptr);
             const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
                 window.pixel_center(0, window.height / 2).y());
 
@@ -1660,7 +1716,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     camera.plane_centre = plane_centres[block_cameras[k]];
                 }
                 tiles.push_back(ortho::orthorectify(surface, surface_nodata, window, camera,
-                                                   static_cast<int>(k), occlusion_tolerance));
+                                                   static_cast<int>(k), occlusion_tolerance, true,
+                                                   &surface_range));
                 progress.update("rectify",
                                 (static_cast<double>(block_index) +
                                  static_cast<double>(k + 1) /

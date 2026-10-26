@@ -306,7 +306,8 @@ TileBounds camera_footprint_bounds(
 
 OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
-                       int camera_index, double occlusion_tolerance, bool crop) {
+                       int camera_index, double occlusion_tolerance, bool crop,
+                       const OrthoSurfaceRange* surface_range) {
     OrthoTile tile;
     tile.camera = camera_index;
     if (camera.image == nullptr || camera.image->empty() || dem.empty()) {
@@ -317,14 +318,22 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     // is the full grid, which is exactly the same data with the uncovered border
     // made explicit.
     if (crop) {
+        // The surface's own height range. A caller rectifying many cameras (or
+        // many blocks) passes it in so the whole DEM is scanned once instead of
+        // once per camera; on its own the routine measures it here.
         double lowest = std::numeric_limits<double>::infinity();
         double highest = -std::numeric_limits<double>::infinity();
-        for (const float h : dem.data) {
-            if (h == dem_nodata || std::isnan(h)) {
-                continue;
+        if (surface_range != nullptr) {
+            lowest = surface_range->lowest;
+            highest = surface_range->highest;
+        } else {
+            for (const float h : dem.data) {
+                if (h == dem_nodata || std::isnan(h)) {
+                    continue;
+                }
+                lowest = std::min(lowest, static_cast<double>(h));
+                highest = std::max(highest, static_cast<double>(h));
             }
-            lowest = std::min(lowest, static_cast<double>(h));
-            highest = std::max(highest, static_cast<double>(h));
         }
         // The pose acts in the chunk-local frame, so clip the rays against the
         // LOCAL height range. The DEM carries plane heights; when a plane->local
@@ -365,7 +374,8 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     const Image& image = *camera.image;
     const double iw = static_cast<double>(image.width());
     const double ih = static_cast<double>(image.height());
-    const double max_height = dem_max(dem, dem_nodata);
+    const double max_height =
+        surface_range != nullptr ? surface_range->highest : dem_max(dem, dem_nodata);
 
     // The occlusion march compares against DEM heights, so it must run in the
     // plane frame. When the pose lives in the chunk-local frame, the caller

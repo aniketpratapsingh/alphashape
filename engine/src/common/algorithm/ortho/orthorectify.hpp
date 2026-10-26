@@ -145,6 +145,15 @@ TileBounds camera_footprint_bounds(const RasterGrid& out_grid, const OrthoCamera
                                    double lowest_height, double highest_height,
                                    int margin_cells);
 
+/// The valid height range of the DEM, so a caller rectifying many cameras over
+/// the same surface does not rescan it once per camera (a block-wise run would
+/// otherwise walk the whole DEM, blocks x cameras times). Compute it with
+/// surface_height_range() and pass it to orthorectify().
+struct OrthoSurfaceRange {
+    double lowest = 0.0;
+    double highest = 0.0;
+};
+
 /// Rectify `camera` over `out_grid`. `dem` is sampled at output cell centres;
 /// `dem_nodata` marks missing samples. Cells whose ray is blocked by the DEM by
 /// more than `occlusion_tolerance` metres are left invalid.
@@ -152,9 +161,15 @@ TileBounds camera_footprint_bounds(const RasterGrid& out_grid, const OrthoCamera
 /// With `crop` (the default) the tile is allocated over its footprint only; see
 /// camera_footprint_bounds(). `crop == false` allocates the full output grid and
 /// is the reference behaviour the crop is verified against byte for byte.
+///
+/// `surface_range`, when given, is the DEM's own valid height range: the routine
+/// uses it instead of scanning `dem` for the footprint clip and the occlusion
+/// march's ceiling. The values must be the true min/max of the valid samples
+/// (a narrower range clips the footprint or stops the march early).
 OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
-                       int camera_index, double occlusion_tolerance, bool crop = true);
+                       int camera_index, double occlusion_tolerance, bool crop = true,
+                       const OrthoSurfaceRange* surface_range = nullptr);
 
 // -- test-only cost accounting ----------------------------------------------
 // The occlusion march's cost is invisible in a tile's contents: a 4x-finer

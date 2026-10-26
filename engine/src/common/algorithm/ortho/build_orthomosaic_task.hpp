@@ -90,10 +90,35 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
 /// the DEM's median valid height ONCE and pass it here, because recomputing the
 /// median per block would rescan the whole DEM for every block. NaN (the
 /// default) means "compute it from `heights`".
+///
+/// `lattice`, when given, makes a block's map reproduce the WHOLE grid's map bit
+/// for bit inside the block: the node coordinates are evaluated on the global
+/// lattice (not recomputed from the block's own origin, which differs in the
+/// last bit) and the float offsets share the global anchor, which is what the
+/// subtraction rounds against. Without it the map is self-consistent but its
+/// values can differ from a whole-grid map in the last float bit, which would
+/// make block-wise rectification differ from whole-grid rectification.
+struct PlaneToLocalLattice {
+    double origin_x = 0.0;   ///< global grid's outer top-left corner
+    double origin_y = 0.0;
+    int col_offset = 0;      ///< this block's first node, in global node columns
+    int row_offset = 0;
+    Eigen::Vector3d anchor = Eigen::Vector3d::Zero();  ///< global first-node local
+};
+
+/// The local position of a grid's first node at the height sampled there: the
+/// anchor every map over that grid shares. Block-wise callers compute it once on
+/// the WHOLE grid and put it in PlaneToLocalLattice.
+Eigen::Vector3d plane_to_local_anchor(const elevation::SurfaceFrame& frame,
+                                     const RasterGrid& grid,
+                                     const GeoRaster<float>& heights, float nodata,
+                                     double fallback_height);
+
 std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     const elevation::SurfaceFrame& frame, const RasterGrid& grid,
     const GeoRaster<float>& heights, float nodata,
-    double fallback_height = std::numeric_limits<double>::quiet_NaN());
+    double fallback_height = std::numeric_limits<double>::quiet_NaN(),
+    const PlaneToLocalLattice* lattice = nullptr);
 
 // -- block plan --------------------------------------------------------------
 //
