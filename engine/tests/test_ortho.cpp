@@ -1253,11 +1253,11 @@ TEST(Ortho, NarrowWindowHonoursThePinnedPyramidDepth) {
     const int auto_levels = ortho::pyramid_level_count(kLastWidth, kGrid);
     ASSERT_EQ(auto_levels, 5) << "the window's own depth must be the one the old clamp used";
 
-    // Two views of one ground: view 1 is a smooth ramp, view 0 is the same ramp
-    // with a narrow bright impulse. The seam between them is a visible step, and
-    // the impulse puts energy at every pyramid level, so the deepest level the
-    // operator carries genuinely changes the reconstruction.
-    const auto make_tiles = [](int width, int height, int global_x0) {
+    // Two views of one ground with a hard colour step between them. That is what
+    // the spline's finest level has to remove and its coarse levels must NOT: a
+    // step makes the reconstruction depend strongly on how deep the pyramid is,
+    // whereas a smooth field gives every depth the same answer.
+    const auto make_tiles = [](int width, int height) {
         std::vector<OrthoTile> made(2);
         for (int t = 0; t < 2; ++t) {
             OrthoTile& tile = made[static_cast<std::size_t>(t)];
@@ -1271,26 +1271,8 @@ TEST(Ortho, NarrowWindowHonoursThePinnedPyramidDepth) {
             tile.rgb.resize(cells * 3);
             tile.valid.assign(cells, 1);
             tile.score.assign(cells, 1.0F);
-            for (int row = 0; row < height; ++row) {
-                for (int col = 0; col < width; ++col) {
-                    const std::size_t i = static_cast<std::size_t>(row) *
-                                              static_cast<std::size_t>(width) +
-                                          static_cast<std::size_t>(col);
-                    const int global_col = global_x0 + col;
-                    int value = 40 + (global_col * 60) / (kGrid - 1);
-                    // An 8-cell bright strip is high-frequency content that the
-                    // coarse levels have to carry; where it lands differs between
-                    // depths.
-                    if (t == 0 && global_col >= kSeamCol - 160 &&
-                        global_col < kSeamCol - 152) {
-                        value = 230;
-                    }
-                    for (int c = 0; c < 3; ++c) {
-                        tile.rgb[i * 3 + static_cast<std::size_t>(c)] =
-                            static_cast<std::uint8_t>(std::clamp(value, 0, 255));
-                    }
-                }
-            }
+            const std::uint8_t value = t == 0 ? 60 : 150;
+            std::fill(tile.rgb.begin(), tile.rgb.end(), value);
         }
         return made;
     };
@@ -1306,13 +1288,13 @@ TEST(Ortho, NarrowWindowHonoursThePinnedPyramidDepth) {
         return labels;
     };
 
-    const std::vector<OrthoTile> whole_tiles = make_tiles(kGrid, kGrid, 0);
+    const std::vector<OrthoTile> whole_tiles = make_tiles(kGrid, kGrid);
     const std::vector<std::int32_t> whole_labels = labels_for(kGrid, 0);
     const ortho::OrthoMosaic reference =
         ortho::blend(kGrid, kGrid, whole_tiles, whole_labels, Blending::Mosaic, levels);
 
     const int window_x0 = kGrid - kLastWidth;
-    const std::vector<OrthoTile> window_tiles = make_tiles(kLastWidth, kGrid, window_x0);
+    const std::vector<OrthoTile> window_tiles = make_tiles(kLastWidth, kGrid);
     const std::vector<std::int32_t> window_labels = labels_for(kLastWidth, window_x0);
     const ortho::OrthoMosaic pinned = ortho::blend(kLastWidth, kGrid, window_tiles,
                                                    window_labels, Blending::Mosaic, levels);
@@ -1361,15 +1343,14 @@ TEST(Ortho, NarrowWindowHonoursThePinnedPyramidDepth) {
     std::printf("[Ortho.NarrowWindow] block interior compared=%zu within1=%zu worst=%d\n",
                 compared, within_one, worst);
     ASSERT_GT(compared, 0U);
-    // The window's block interior must still track the whole grid. It is not
-    // required to be bit-identical: the whole grid's deepest level is 17 cells
-    // across and the padded window's is 8, so the very coarsest detail is built
-    // from a different number of samples in each. What must NOT happen is the
-    // stale one-level-shallower operator, which the depth_differs check above
-    // rules out; and a gross disagreement (a visible step) must not appear either.
-    EXPECT_GE(within_one * 100, compared * 90U)
+    // The padded window's block interior must track the whole grid tightly. It is
+    // not required to be bit-identical -- the whole grid's deepest level is 17
+    // cells across and the padded window's is 8, so the coarsest detail is built
+    // from a different number of samples -- but a visible disagreement there would
+    // be exactly the border step this fix exists to remove.
+    EXPECT_GE(within_one * 100, compared * 99U)
         << "the padded window's block interior drifted from the whole grid";
-    EXPECT_LE(worst, 24) << "a gross disagreement inside the block";
+    EXPECT_LE(worst, 3) << "a gross disagreement inside the block";
 }
 
 }  // namespace
