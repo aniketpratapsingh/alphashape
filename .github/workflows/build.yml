@@ -1085,11 +1085,13 @@ jobs:
           # `$null -ne 0` is true, so a LASTEXITCODE test here fired on a
           # download that had in fact succeeded. The $ErrorActionPreference
           # 'Stop' below turns a failed download into a terminating error, and
-          # the size check catches a truncated one.
+          # the size floor catches a truncated body. Mesa 26.2.4's archive is
+          # 70,257,286 bytes; the SHA-256 is the real check, this only keeps a
+          # half-written file from reaching it.
           $ErrorActionPreference = 'Stop'
           Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
           if (-not (Test-Path -LiteralPath $archive) -or
-              (Get-Item -LiteralPath $archive).Length -lt 100MB) {
+              (Get-Item -LiteralPath $archive).Length -lt 60MB) {
             throw 'the Mesa archive did not download'
           }
           $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

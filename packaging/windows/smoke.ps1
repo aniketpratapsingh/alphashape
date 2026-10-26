@@ -361,10 +361,16 @@ try {
     if ($gpu.ExitCode -eq 0) {
         Assert ($gpuText -match 'gpu device \d+:') '--gpu-info exited 0 but listed no device'
     } else {
-        # No device on this machine: the reason must name Vulkan and must not be
-        # the loader's raw "module not found" text on its own.
+        # No device on this machine. The reason must be actionable: naming
+        # Vulkan is not enough on its own, because "vkCreateInstance failed
+        # with VkResult -9" also names nothing. The driver appears in every
+        # message the engine produces for this case -- the loader-missing one
+        # talks about the graphics driver, and VK_ERROR_INCOMPATIBLE_DRIVER
+        # says to install or update it.
         Assert ($gpuText -match 'gpu: unavailable ') '--gpu-info gave no reason line'
-        Assert ($gpuText -match 'Vulkan') 'the unavailability reason does not mention Vulkan'
+        Assert ($gpuText -match 'ulkan') 'the unavailability reason does not mention Vulkan'
+        Assert ($gpuText -match 'driver') 'the unavailability reason does not mention the driver'
+        Assert ($gpuText -notmatch 'disabled at build time') 'the GPU layer was compiled out'
     }
 
     Step "CLI resolves PROJ data from a non-ASCII install path"
