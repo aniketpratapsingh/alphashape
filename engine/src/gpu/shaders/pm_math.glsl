@@ -205,13 +205,40 @@ RngKey rng_key(U64 seed, uint pixel, U64 iteration, uint stream) {
     return key;
 }
 
-// The nth raw draw of a stream (n = 0 is the CPU's first next()). The chain is
-// walked in a plain local, starting from the key, so no state is carried across
-// a call boundary. Callers always pass a literal index, so the trip count folds
-// away at compile time.
+// The nth raw draw of a stream (n = 0 is the CPU's first next()).
+//
+// Written as straight-line calls with no loop and no index arithmetic, on
+// purpose. The previous version walked `for (i = 0; i <= index; ++i)`, and on a
+// Tesla T4 (driver 535) at -O it returned the *zeroth* draw for every index: the
+// optimiser lost the index-dependent trip count. The signature was
+// unmistakable - pm_init reported depth agreement 100.00% (that draw uses index
+// 0) and normal agreement 0.92% (built from draws 1 and 2, which came back as
+// draw 0). Three explicit functions leave no trip count to lose; callers must use
+// PM_DRAW_0/1/2 and never build an index at run time.
+U64 rng_draw0(RngKey key) { return splitmix64(key.state); }
+U64 rng_draw1(RngKey key) { return splitmix64(rng_draw0(key)); }
+U64 rng_draw2(RngKey key) { return splitmix64(rng_draw1(key)); }
+
+// Draw indices are part of the stream contract, not runtime data.
+#define PM_DRAW_0 0u
+#define PM_DRAW_1 1u
+#define PM_DRAW_2 2u
+
+// Dispatch on a *compile-time* index. `index` must be a literal at the call
+// site; anything else is a programming error, and the fallback keeps the result
+// defined (draw 0) rather than wrong in a way that looks like a bad normal.
 U64 rng_draw(RngKey key, uint index) {
-    U64 state = key.state;
-    for (uint i = 0u; i <= index; ++i) {
+    if (index == PM_DRAW_0) {
+        return rng_draw0(key);
+    }
+    if (index == PM_DRAW_1) {
+        return rng_draw1(key);
+    }
+    if (index == PM_DRAW_2) {
+        return rng_draw2(key);
+    }
+    U64 state = rng_draw2(key);
+    for (uint i = 3u; i <= index; ++i) {
         state = splitmix64(state);
     }
     return state;
@@ -255,17 +282,14 @@ vec3 random_unit_vector(RngKey key, uint index) {
 
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
 //
-// REMARK (open NVIDIA issue). pm_init is compiled with NO_OPTIMIZE because its
-// optimised module returns a wrong normal on a Tesla T4 (driver 535): 0.9% of
-// pixels agree with the CPU reference while the depths, which come from
-// random_depth() and pure arithmetic, are 100% exact. Everything else here is
-// also in pm_refine, which is correct at -O on the same GPU, and the draw
-// machinery is stateless (RngKey), so no state can be dropped. The operations
-// this function performs that random_depth() does not are sin/cos/sqrt/normalize
-// and the constant-folded cos(PM_CONE_HALF_ANGLE); a driver transcendental on
-// optimised input is the remaining suspect. Do not "fix" this by decorating the
-// trig `precise`: NoContraction there made glslc -O need tens of gigabytes for
-// pm_refine and the CI runner OOM-killed it. Diagnose on T4 hardware first.
+// This is where the Tesla T4 bug used to show. The optimised module reported
+// depth agreement 100.00% (drawn at index 0) and normal agreement 0.92% (built
+// from indices 1 and 2): every index returned draw 0, because the optimiser
+// collapsed the `for (i = 0; i <= index; ++i)` chain in rng_draw() into a fixed
+// trip count. The draws are written out longhand now. Do not reintroduce a loop
+// or a runtime index in that chain, and do not reach for `precise` on the trig
+// either -- NoContraction inside the cost loop made glslc -O need tens of
+// gigabytes for pm_refine and the CI runner OOM-killed it.
 vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
