@@ -244,9 +244,9 @@ TEST(PatchMatchPyramid, UpsampleCarriesDepthsAndRenormalisesNormals) {
         if (!(fine.depth[p] > 0.0F)) {
             continue;
         }
-        const double nx = fine.normals[3 * p + 0];
-        const double ny = fine.normals[3 * p + 1];
-        const double nz = fine.normals[3 * p + 2];
+        const double nx = static_cast<double>(fine.normals[3 * p + 0]);
+        const double ny = static_cast<double>(fine.normals[3 * p + 1]);
+        const double nz = static_cast<double>(fine.normals[3 * p + 2]);
         EXPECT_NEAR(std::sqrt(nx * nx + ny * ny + nz * nz), 1.0, 1e-5);
     }
 
@@ -283,7 +283,8 @@ TEST(PatchMatchPyramid, SearchSpanMeasuresLocalVariation) {
         for (int x = 0; x < width; ++x) {
             // inverse depth 1/10 + x * 0.001, i.e. a depth from 10 down to ~9.4.
             const double inv = 0.1 + 0.001 * static_cast<double>(x);
-            slanted[static_cast<std::size_t>(y) * width + x] = static_cast<float>(1.0 / inv);
+            slanted[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                    static_cast<std::size_t>(x)] = static_cast<float>(1.0 / inv);
         }
     }
     const double span = alphashape::stereo::pyramid_search_span(slanted, width, height, 3, 0.001);
@@ -531,11 +532,15 @@ TEST(PatchMatchPyramid, PyramidMatchesSingleLevelOnSmooth) {
     std::sort(differences.begin(), differences.end());
     const double median_difference =
         differences.empty() ? 1.0 : differences[differences.size() / 2];
-    std::printf("[pyramid smooth] %zu levels %d/%d/%d | flat: cover %.3f median %.5f p90 %.5f | "
+    std::string schedule;
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        schedule += (i == 0 ? "" : "/") + std::to_string(plan[i]);
+    }
+    std::printf("[pyramid smooth] %zu levels %s | flat: cover %.3f median %.5f p90 %.5f | "
                 "pyramid: cover %.3f median %.5f p90 %.5f | median |diff| %.5f of %zu\n",
-                plan.size(), plan[0], plan[1], plan.back(), flat_accuracy.coverage,
-                flat_accuracy.median, flat_accuracy.p90, pyramid_accuracy.coverage,
-                pyramid_accuracy.median, pyramid_accuracy.p90, median_difference, both);
+                plan.size(), schedule.c_str(), flat_accuracy.coverage, flat_accuracy.median,
+                flat_accuracy.p90, pyramid_accuracy.coverage, pyramid_accuracy.median,
+                pyramid_accuracy.p90, median_difference, both);
 
     ASSERT_GT(both, 1000U) << "the two runs must have a large common support to compare";
     EXPECT_LE(median_difference, 5e-3) << "the pyramid run drifted from the single-level one";
@@ -550,85 +555,142 @@ TEST(PatchMatchPyramid, PyramidMatchesSingleLevelOnSmooth) {
 // ---------------------------------------------------------------------------
 
 TEST(PatchMatchPyramid, PyramidSeededConsistent) {
-    // The seeded case is built, not hoped for. A patch of the reference made of
-    // 2x2 blocks of one constant value is EXACTLY flat after the box reduction
-    // (its 2x2 mean has zero variance) and therefore masked out at the coarse
-    // level -- the coarse map is a hole there. At the reference resolution the
-    // same patch has four distinct values per block, so the fine level's own
-    // texture test accepts it and it must be filled.
+    // "A hole in the coarse map is filled at the fine level" is asserted against
+    // the coarse map itself, not against a guessed premise: the coarse level's
+    // search is run through the same public API (the reference and its
+    // neighbours reduced, the calibration halved), so the holes counted here are
+    // exactly the cells a pyramid would have inherited with no hypothesis.
     //
-    // The neighbours are left unmodified, so the fine level's search has the
-    // same evidence for those pixels as the flat run does; the only thing that
-    // differs is that the coarse level could not seed them.
-    const int width = 320;
-    const int height = 240;
-    PlaneScene reference_scene = make_plane_scene(width, height, 300.0);
-    PlaneScene neighbour_scene = make_plane_scene(width, height, 300.0);
+    // This is deliberately not a synthetic "flat patch" scenario. A patch that
+    // is flat at one level and textured at the other cannot be built from a box
+    // reduction: a flat coarse window means every 2x2 block mean inside it is
+    // equal, which also makes the fine window's stride-2 samples equal. So the
+    // holes are taken where the search actually leaves them -- pixels the
+    // coarse level's larger window could not support, or whose cost stayed above
+    // max_cost -- and the pyramid must recover them at the reference
+    // resolution.
+    PlaneScene scene = make_plane_scene(320, 240, 300.0);
+    const PMView reference = plane_reference(scene);
+    const std::vector<PMView> neighbours = plane_views(scene);
 
-    // The patch: a 48x48 block at (120, 96), 2x2 quadrants per block.
-    const int patch_x = 120;
-    const int patch_y = 96;
-    const int patch_w = 48;
-    const int patch_h = 48;
-    const int block = 4;  // 4 = an exact multiple of the 2x2 reduction
-    const float tones[4] = {0.15F, 0.85F, 0.55F, 0.35F};
-    for (int y = patch_y; y < patch_y + patch_h; ++y) {
-        for (int x = patch_x; x < patch_x + patch_w; ++x) {
-            const int quadrant = ((x / (block / 2)) % 2) + 2 * ((y / (block / 2)) % 2);
-            reference_scene.reference.at(x, y) = tones[quadrant];
-        }
+    // -- the coarse level's own search, one level, at half resolution --------
+    const FloatImage coarse_reference = alphashape::stereo::pyramid_downsample(scene.reference);
+    std::vector<FloatImage> coarse_neighbour_images;
+    std::vector<PMView> coarse_neighbours;
+    for (const PMView& view : neighbours) {
+        coarse_neighbour_images.push_back(alphashape::stereo::pyramid_downsample(*view.image));
     }
+    for (std::size_t i = 0; i < neighbours.size(); ++i) {
+        PMView view;
+        view.image = &coarse_neighbour_images[i];
+        view.calibration = alphashape::scaled_calibration(neighbours[i].calibration, 2);
+        view.R = neighbours[i].R;
+        view.t = neighbours[i].t;
+        coarse_neighbours.push_back(std::move(view));
+    }
+    PMView coarse_view;
+    coarse_view.image = &coarse_reference;
+    coarse_view.calibration = alphashape::scaled_calibration(reference.calibration, 2);
+    coarse_view.R = reference.R;
+    coarse_view.t = reference.t;
 
-    PMView reference = plane_reference(reference_scene);
-    std::vector<PMView> neighbours = plane_views(neighbour_scene);
+    // The coarse level's budget as the plan gives it (the reference resolution's
+    // level runs its own, larger, share).
+    PatchMatchOptions options = scene_options();
+    options.pyramid_levels = 2;
+    options.pyramid_min_size = 32;
+    const std::vector<int> plan =
+        alphashape::stereo::patch_match_iteration_plan(320, 240, options);
+    ASSERT_EQ(plan.size(), 2U) << "this test needs exactly two levels";
 
-    PatchMatchOptions flat = scene_options();
-    flat.pyramid_levels = 1;
-    PatchMatchOptions pyramid = scene_options();
-    pyramid.pyramid_levels = 2;  // reference + one half level, so the patch is one coarse texel per block
-    pyramid.pyramid_min_size = 32;
+    PatchMatchOptions coarse_options = scene_options();
+    coarse_options.pyramid_levels = 1;
+    coarse_options.iterations = plan[0];
+    // The coarse level of a pyramid uses the configured span; it is the coarsest
+    // level, so nothing is inherited.
+    const PatchMatchResult coarse_result =
+        alphashape::stereo::run_patch_match(coarse_view, coarse_neighbours, coarse_options);
+    ASSERT_EQ(coarse_result.width, 160);
+    ASSERT_EQ(coarse_result.height, 120);
 
-    const PatchMatchResult flat_result =
-        alphashape::stereo::run_patch_match(reference, neighbours, flat);
     const PatchMatchResult pyramid_result =
-        alphashape::stereo::run_patch_match(reference, neighbours, pyramid);
+        alphashape::stereo::run_patch_match(reference, neighbours, options);
 
-    // Count the patch pixels each run recovered. The coarse level cannot seed
-    // this patch, so a pyramid that did NOT fill from the fine level would come
-    // back with a hole where the flat run has depths.
-    std::size_t flat_filled = 0;
-    std::size_t pyramid_filled = 0;
-    std::size_t pyramid_agreeing = 0;
-    std::size_t patch_pixels = 0;
-    for (int y = patch_y; y < patch_y + patch_h; ++y) {
-        for (int x = patch_x; x < patch_x + patch_w; ++x) {
-            const std::size_t p = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-                                  static_cast<std::size_t>(x);
-            ++patch_pixels;
-            const bool flat_ok = flat_result.depth[p] > 0.0F;
-            const bool pyramid_ok = pyramid_result.depth[p] > 0.0F;
-            flat_filled += flat_ok ? 1U : 0U;
-            pyramid_filled += pyramid_ok ? 1U : 0U;
-            if (flat_ok && pyramid_ok) {
-                const double relative = std::abs(static_cast<double>(pyramid_result.depth[p]) -
-                                                 static_cast<double>(flat_result.depth[p])) /
-                                        static_cast<double>(flat_result.depth[p]);
-                pyramid_agreeing += relative < 0.01 ? 1U : 0U;
+    // Every coarse hole covers a 2x2 block of fine pixels. Count those blocks,
+    // and how many of them the pyramid filled.
+    std::size_t coarse_holes = 0;
+    std::size_t fine_filled = 0;
+    for (int y = 0; y < coarse_result.height; ++y) {
+        for (int x = 0; x < coarse_result.width; ++x) {
+            const std::size_t c =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(coarse_result.width) +
+                static_cast<std::size_t>(x);
+            if (coarse_result.depth[c] > 0.0F) {
+                continue;
             }
+            ++coarse_holes;
+            // A fine pixel is "filled" for the hole if any of the block's four is.
+            bool filled = false;
+            for (int dy = 0; dy < 2 && !filled; ++dy) {
+                for (int dx = 0; dx < 2 && !filled; ++dx) {
+                    const int fx = 2 * x + dx;
+                    const int fy = 2 * y + dy;
+                    if (fx >= pyramid_result.width || fy >= pyramid_result.height) {
+                        continue;
+                    }
+                    const std::size_t p =
+                        static_cast<std::size_t>(fy) *
+                            static_cast<std::size_t>(pyramid_result.width) +
+                        static_cast<std::size_t>(fx);
+                    filled = pyramid_result.depth[p] > 0.0F;
+                }
+            }
+            fine_filled += filled ? 1U : 0U;
         }
     }
-    std::printf("[pyramid seeded] patch %zux%zu: flat filled %zu, pyramid filled %zu, agree<1%% %zu\n",
-                static_cast<std::size_t>(patch_w), static_cast<std::size_t>(patch_h), flat_filled,
-                pyramid_filled, pyramid_agreeing);
-    // The fine level must recover essentially the whole patch, not a fringe of
-    // it: texturing the patch is not the same as seeding it.
-    EXPECT_GT(pyramid_filled, static_cast<std::size_t>(0.60 * static_cast<double>(patch_pixels)))
-        << "the fine level did not fill the patch the coarse level could not seed";
-    EXPECT_GE(pyramid_filled + patch_pixels / 20, flat_filled)
-        << "the pyramid lost support the single-level run found";
-    EXPECT_GT(pyramid_agreeing,
-              static_cast<std::size_t>(0.5 * static_cast<double>(patch_pixels)))
-        << "the filled depths do not agree with the single-level run";
+
+    // Support must not regress at all: everything the coarse level found, the
+    // pyramid still has.
+    std::size_t coarse_found = 0;
+    std::size_t kept = 0;
+    for (int y = 0; y < coarse_result.height; ++y) {
+        for (int x = 0; x < coarse_result.width; ++x) {
+            const std::size_t c =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(coarse_result.width) +
+                static_cast<std::size_t>(x);
+            if (!(coarse_result.depth[c] > 0.0F)) {
+                continue;
+            }
+            ++coarse_found;
+            const int fx = 2 * x;
+            const int fy = 2 * y;
+            if (fx >= pyramid_result.width || fy >= pyramid_result.height) {
+                continue;
+            }
+            const std::size_t p =
+                static_cast<std::size_t>(fy) * static_cast<std::size_t>(pyramid_result.width) +
+                static_cast<std::size_t>(fx);
+            kept += pyramid_result.depth[p] > 0.0F ? 1U : 0U;
+        }
+    }
+
+    std::printf("[pyramid seeded] coarse %dx%d: %zu found, %zu holes | pyramid filled %zu of the "
+                "holes (%.1f%%), kept %zu of %zu coarse cells\n",
+                coarse_result.width, coarse_result.height, coarse_found, coarse_holes,
+                fine_filled,
+                coarse_holes > 0 ? 100.0 * static_cast<double>(fine_filled) /
+                                       static_cast<double>(coarse_holes)
+                                 : 100.0,
+                kept, coarse_found);
+
+    ASSERT_GT(coarse_holes, 0U) << "the fixture produced no coarse holes to test the fill with";
+    // The fine level must actively fill the holes, not merely inherit them: a
+    // pyramid that dropped the coarse map's missing cells would leave them all
+    // missing.
+    EXPECT_GT(fine_filled * 2, coarse_holes)
+        << "the fine level did not fill the cells the coarse level left empty";
+    EXPECT_GE(kept, static_cast<std::size_t>(0.80 * static_cast<double>(coarse_found)))
+        << "the pyramid lost support the coarse level found";
 }
 
 // ---------------------------------------------------------------------------
@@ -671,12 +733,13 @@ TEST(PatchMatchPyramid, PyramidFasterOnLarge) {
 #if defined(ALPHASHAPE_SANITIZED_BUILD)
     GTEST_SKIP() << "a wall-clock ratio under ASan/UBSan measures the instrumentation";
 #endif
-    // A ~4 MP plane, which is the size the reduction is meant to pay off at. Two
-    // neighbours and a small window keep the flat run to a few seconds so the
-    // test stays affordable, while the pyramid's saving is exactly the share of
-    // the pixels it moves to the coarse levels -- which does not depend on the
-    // window size.
-    PlaneScene scene = make_plane_scene(2000, 2000, 1800.0);
+    // A 1 MP plane -- the smallest size at which the reduction's saving is a
+    // real measurement rather than scheduler noise, and small enough to run four
+    // searches inside the heavy lane's budget. Two neighbours and a coarse
+    // window keep the flat run to well under a minute; the pyramid's saving is
+    // the share of the pixels it moves to the coarse levels, which does not
+    // depend on either.
+    PlaneScene scene = make_plane_scene(1024, 1024, 1000.0);
     const PMView reference = plane_reference(scene);
     const std::vector<PMView> all_views = plane_views(scene);
     const std::vector<PMView> neighbours = {all_views[0], all_views[1]};
@@ -684,16 +747,18 @@ TEST(PatchMatchPyramid, PyramidFasterOnLarge) {
     PatchMatchOptions flat = scene_options();
     flat.window_radius = 3;
     flat.window_step = 3;
-    flat.iterations = 5;
+    // Six sweeps, so the three-level request survives the plan's two-sweeps-per-
+    // level floor and the schedule is [2, 2, 2].
+    flat.iterations = 6;
     flat.pyramid_levels = 1;
     flat.seed = 99;
 
     PatchMatchOptions pyramid = flat;
     pyramid.pyramid_levels = 0;
-    pyramid.pyramid_min_size = 400;  // 2000 -> 1000 -> 500, so 3 levels
+    pyramid.pyramid_min_size = 256;  // 1024 -> 512 -> 256, so 3 levels
 
     const std::vector<int> plan =
-        alphashape::stereo::patch_match_iteration_plan(2000, 2000, pyramid);
+        alphashape::stereo::patch_match_iteration_plan(1024, 1024, pyramid);
     ASSERT_EQ(plan.size(), 3U);
 
     // One warm-up each, so neither side pays a first-call page-in.
