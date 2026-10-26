@@ -42,7 +42,13 @@ public:
         std::uint64_t id = 0;
         int queue = 0;
         bool pending = false;
-    };    /// Host-visible staging memory for device-local transfers. Fixed size; the
+        /// Set by abandon_slot(): the fence was never observed to signal, so it
+        /// must not be reset for a fresh submission. The slot is reclaimed (one
+        /// bounded wait) only when a later submit() finds the fence signalled.
+        bool abandoned = false;
+    };
+
+    /// Host-visible staging memory for device-local transfers. Fixed size; the
     /// offset is an explicit bounds-checked ring index.
     static constexpr std::size_t kStagingBytes = 64u * 1024u * 1024u;
 
@@ -169,9 +175,12 @@ private:
     /// this; a record_and_submit() failure and the destructor use the plain
     /// release and free_orphaned_pools() respectively.
     void release_slot_after_signal(Slot& slot);
-    /// Destroys every descriptor pool parked by an abandoned submission. Called
+    /// Destroys the descriptor pools parked by abandoned submissions. Called
     /// from ~VulkanBackend, after the device has been drained.
     void free_orphaned_pools();
+    /// Frees the pools parked on one queue, once a fence on that FIFO queue has
+    /// signalled (so it has drained past the abandoned submissions).
+    void free_orphaned_pools_for_queue(int queue);
     /// Gives up a slot whose fence will never signal (a device loss). The
     /// pending state and ticket go, so no later wait() spins on it and the ring
     /// is not left permanently full. The descriptor pool moves to

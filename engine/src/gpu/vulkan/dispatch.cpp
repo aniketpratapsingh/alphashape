@@ -354,10 +354,40 @@ void VulkanBackend::wait_fence(VkFence fence, std::uint64_t budget_ns) {
 }
 
 VulkanBackend::Slot* VulkanBackend::reserve_slot() {
+    const Functions& fns = instance_->fns;
     for (Slot& slot : slots_) {
-        if (!slot.pending) {
-            return &slot;
+        if (slot.pending) {
+            continue;
         }
+        if (slot.abandoned) {
+            // The submission that owned this fence was never observed to
+            // finish: its wait failed and the device was marked lost. The fence
+            // may still be unsignalled and the command buffer still in use, so
+            // neither may be reset yet -- vkResetFences and
+            // vkResetCommandBuffer are only valid once the work has completed,
+            // and resetting a pending command buffer wedges lavapipe.
+            //
+            // Poll with a short bounded wait rather than zero: the work has
+            // usually finished by now, but the host thread may simply have been
+            // slow. A slot whose fence still has not signalled is skipped, and
+            // with kMaxInFlight slots the ring keeps working. (Production never
+            // reaches here after a loss -- submit() refuses -- so this is the
+            // device-recovery path the tests use.)
+            constexpr std::uint64_t kReclaimNs = 1'000'000'000ULL;
+            if (slot.fence != VK_NULL_HANDLE) {
+                const VkResult signalled =
+                    fns.WaitForFences(device_handle_, 1, &slot.fence, VK_TRUE, kReclaimNs);
+                if (signalled != VK_SUCCESS) {
+                    continue;
+                }
+            }
+            slot.abandoned = false;
+            // The same FIFO argument as release_slot_after_signal: this queue
+            // has now drained past the abandoned submission, so the pool it
+            // parked can go.
+            free_orphaned_pools_for_queue(slot.queue);
+        }
+        return &slot;
     }
     return nullptr;
 }
@@ -384,22 +414,24 @@ void VulkanBackend::release_slot(Slot& slot) {
 
 void VulkanBackend::release_slot_after_signal(Slot& slot) {
     release_slot(slot);
-    // The fence that just signalled proves the FIFO queue has drained at least
-    // as far as this submission, so a pool parked by an *earlier* abandoned
+    // The fence that just signalled proves the FIFO queue drained at least as
+    // far as this submission, so a pool parked by an *earlier* abandoned
     // submission on the same queue is no longer referenced by anything the
-    // queue could still read. Pools abandoned on the other queue stay parked
-    // (cross-queue ordering is the caller's job, not this ring's), and pools
-    // parked by a submission that never reached the queue at all -- the
-    // record_and_submit() failure path, which does not call this -- are not
-    // covered by any fence, so only the destructor frees them.
-    if (!orphaned_pools_.empty()) {
-        for (auto entry = orphaned_pools_.begin(); entry != orphaned_pools_.end();) {
-            if (entry->second == slot.queue) {
-                instance_->fns.DestroyDescriptorPool(device_handle_, entry->first, nullptr);
-                entry = orphaned_pools_.erase(entry);
-            } else {
-                ++entry;
-            }
+    // queue could still read.
+    free_orphaned_pools_for_queue(slot.queue);
+}
+
+void VulkanBackend::free_orphaned_pools_for_queue(int queue) {
+    if (orphaned_pools_.empty()) {
+        return;
+    }
+    const Functions& fns = instance_->fns;
+    for (auto entry = orphaned_pools_.begin(); entry != orphaned_pools_.end();) {
+        if (entry->second == queue) {
+            fns.DestroyDescriptorPool(device_handle_, entry->first, nullptr);
+            entry = orphaned_pools_.erase(entry);
+        } else {
+            ++entry;
         }
     }
 }
@@ -416,17 +448,20 @@ void VulkanBackend::free_orphaned_pools() {
 }
 
 void VulkanBackend::abandon_slot(Slot& slot) {
-    // The fence is unsignalled and will stay that way (the device is lost). Drop
-    // the booking so no later wait() or destructor waits on it, but move the
-    // descriptor pool out of the slot: the abandoned submission may still
-    // reference it, so it must not be freed here, and leaving it in the slot
-    // would mean the next record_and_submit() overwrites the handle and leaks
-    // it. It is parked in orphaned_pools_ with its queue index, and freed by a
-    // later release_slot on that same queue or by ~VulkanBackend.
+    // The fence was never observed to signal. Drop the booking so no later
+    // wait() spins on it, but keep the slot marked abandoned: its fence and
+    // command buffer are still in use by work the driver may yet finish, and
+    // resetting either for a new submission is undefined behaviour (on lavapipe
+    // it wedges the device). reserve_slot() only reclaims it once the fence
+    // signals. The descriptor pool moves to orphaned_pools_ with its queue
+    // index: it may still be referenced, so it is freed by a later signalled
+    // fence on that queue, by a reclaim in reserve_slot(), or by
+    // ~VulkanBackend.
     if (slot.descriptor_pool != VK_NULL_HANDLE) {
         orphaned_pools_.emplace_back(slot.descriptor_pool, slot.queue);
         slot.descriptor_pool = VK_NULL_HANDLE;
     }
+    slot.abandoned = true;
     slot.pending = false;
     slot.id = 0;
 }

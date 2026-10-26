@@ -1763,11 +1763,16 @@ TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
     const std::size_t parked = detail::orphaned_pool_count(*context);
     ASSERT_EQ(parked, 1u) << "the abandoned submission's pool must be parked, not freed or lost";
 
-    // Recovering the device and completing one real submission proves the queue
-    // drained past the abandoned work, which is when the pool may be freed.
+    // Recovering the device and completing a real submission proves the queue
+    // drained past the abandoned work, which is when the pool may be freed. The
+    // reclaim is a bounded poll of the abandoned fence, so the very first
+    // submission can legitimately skip the slot if the driver has not signalled
+    // yet; a few more are allowed before the test calls it a leak.
     detail::reset_device_lost();
     ASSERT_FALSE(detail::device_lost());
-    ASSERT_NO_THROW(run(*context, {dispatch}));
+    for (int attempt = 0; attempt < 8 && detail::orphaned_pool_count(*context) != 0u; ++attempt) {
+        ASSERT_NO_THROW(run(*context, {dispatch}));
+    }
     EXPECT_EQ(detail::orphaned_pool_count(*context), 0u)
         << "the parked pool of an abandoned submission was never freed";
     EXPECT_EQ(detail::in_flight_count(*context), 0u);
