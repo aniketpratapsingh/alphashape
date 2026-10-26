@@ -1209,6 +1209,56 @@ TEST(OrthoBlockPlan, WholeGridWhenItFits) {
     EXPECT_FALSE(plan.coarsened);
 }
 
+TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
+    // The estimator itself, on the owner's exact parameters: 36 obliques of
+    // 4592x3056 at f ~ 3140 px from 59 m AGL over a 100 m site, planned at the
+    // 1.9 cm the photographs resolve (5264 x 5264 = 27.7 M cells, 28 M cells).
+    // The old run peaked at ~8 GB; the planned one must stay under 2 GB.
+    constexpr int kSide = 5264;           // 100 m / 0.019 m
+    constexpr double kPhotoCells = 4592.0 * 3056.0;
+    constexpr int kCameras = 36;
+    constexpr double kCells = static_cast<double>(kSide) * static_cast<double>(kSide);
+
+    OrthoBlockPlanInput input;
+    input.grid_width = kSide;
+    input.grid_height = kSide;
+    input.camera_count = kCameras;
+    input.photo_cells = kPhotoCells;
+    input.footprint_cells = kCameras * kCells;  // fully overlapping obliques
+    input.has_node_map = true;
+    input.budget_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;  // an 8 GB-target machine
+
+    const OrthoBlockPlan plan = plan_ortho_blocks(input);
+    std::printf("[OrthoBlockPlan.Estimator] block=%d margin=%d grid=%dx%d peak=%.2f GB "
+                "assembled=%.2f GB cache=%.2f GB\n",
+                plan.block_cells, plan.margin_cells, plan.columns, plan.rows,
+                plan.estimated_peak_bytes / 1e9, 8.0 * kCells / 1e9,
+                static_cast<double>(plan.photo_cache_bytes) / 1e9);
+    ASSERT_FALSE(plan.coarsened) << "the owner's case must complete at full resolution";
+    ASSERT_GT(plan.block_cells, 0);
+    EXPECT_LT(plan.estimated_peak_bytes, 2.0e9);
+
+    // The components add up: window + assembled output + cache.
+    const double assembled = 8.0 * kCells;  // rgba u8 + int32 label per cell
+    const double from_plan = plan.estimated_peak_bytes - assembled -
+                             static_cast<double>(plan.photo_cache_bytes);
+    EXPECT_GT(from_plan, 0.0);
+    EXPECT_LT(from_plan, plan.estimated_peak_bytes);  // one window, not the grid
+    // The window's own estimate is the same arithmetic the single-piece guard
+    // uses, applied to the block+margin cell count: nothing new is invented.
+    const double window_side = static_cast<double>(plan.block_cells + 2 * plan.margin_cells);
+    const std::uint64_t window_cells = static_cast<std::uint64_t>(window_side) *
+                                       static_cast<std::uint64_t>(window_side);
+    const double window_footprint = std::min(
+        input.footprint_cells,
+        static_cast<double>(kCameras) * static_cast<double>(window_cells));
+    const double expected = estimate_block_peak_bytes(
+        window_cells, window_footprint, true, kPhotoCells,
+        static_cast<std::uint64_t>(kSide) * static_cast<std::uint64_t>(kSide),
+        plan.photo_cache_bytes);
+    EXPECT_DOUBLE_EQ(expected, plan.estimated_peak_bytes);
+}
+
 TEST(OrthoBlockPlan, OwnerCaseFitsUnderTwoGigabytes) {
     // The reported dataset: 36 obliques, 28 M cells, 1.9 cm, which peaked at
     // ~8 GB before. An 8 GB budget must now plan blocks whose peak is well under

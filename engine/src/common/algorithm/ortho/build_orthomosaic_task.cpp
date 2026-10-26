@@ -596,8 +596,11 @@ constexpr double kBlockBudgetFraction = 0.5;
 /// At most this fraction of the budget goes to decoded photographs.
 constexpr double kPhotoCacheBudgetFraction = 0.15;
 /// The absolute ceiling on the decoded-photograph cache, whatever the machine's
-/// budget: beyond a handful of frames the reuse stops paying for the bytes.
-constexpr std::uint64_t kPhotoCacheMaxBytes = 512ULL * 1024ULL * 1024ULL;
+/// budget: beyond a handful of frames the reuse stops paying for the bytes, and
+/// the cache competes with the block side for the same limit -- a smaller cache
+/// buys a bigger block, which is the better trade (a block's margin overhead
+/// shrinks quadratically while a cache hit only saves a decode).
+constexpr std::uint64_t kPhotoCacheMaxBytes = 256ULL * 1024ULL * 1024ULL;
 /// The absolute per-block peak the automatic plan aims for. Half a budget could
 /// be 12 GB on a big workstation, which is not a bound anyone asked for; the
 /// owner's target (a 28 M-cell, 36-photo, 1.9 cm site) is under 2 GB, and a
@@ -838,14 +841,18 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         // its own share of the budget is capped so a huge machine does not trade
         // the memory saved by blocking back for cached frames.
         const double photo_bytes = 3.0 * std::max(1.0, input.photo_cells);
-        std::uint64_t cache = 0;
-        if (input.budget_bytes != 0) {
-            const double share = kPhotoCacheBudgetFraction *
-                                 static_cast<double>(input.budget_bytes);
-            const double flight = photo_bytes * static_cast<double>(input.camera_count);
-            cache = static_cast<std::uint64_t>(
-                std::min(share, std::min(flight, static_cast<double>(kPhotoCacheMaxBytes))));
-        }
+        // A byte limit on the cache, never 0 (0 means "unbounded" to PhotoCache,
+        // which is only right for the single-piece path that decodes one frame).
+        const double share = input.budget_bytes != 0
+                                 ? kPhotoCacheBudgetFraction *
+                                       static_cast<double>(input.budget_bytes)
+                                 : static_cast<double>(kPhotoCacheMaxBytes);
+        const double flight = photo_bytes * static_cast<double>(std::max(1, input.camera_count));
+        std::uint64_t cache = static_cast<std::uint64_t>(
+            std::min(share, std::min(flight, static_cast<double>(kPhotoCacheMaxBytes))));
+        // At least one frame: a cache smaller than the frame it is asked to hold
+        // would evict it immediately and make the miss path pointless.
+        cache = std::max(cache, static_cast<std::uint64_t>(std::ceil(photo_bytes)));
         out.photo_cache_bytes = cache;
         out.estimated_peak_bytes = estimate_block_peak_bytes(
             window_cells, window_footprint, input.has_node_map, input.photo_cells,
