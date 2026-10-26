@@ -19,12 +19,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "base/utils/error.hpp"
 #include "base/platform/env.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
@@ -587,6 +589,45 @@ private:
     bool had_previous_ = false;
 };
 
+/// Capture every log line emitted for the lifetime of the object, so a test can
+/// assert on a warning that is otherwise only visible on the console. The sink
+/// is process-wide, so the object must not outlive the test's own scope and no
+/// other test may run concurrently in this process (gtest runs one at a time).
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() {
+        previous_level_ = Log::level();
+        if (!Log::enabled(LogLevel::Trace)) {
+            Log::set_level(LogLevel::Trace);  // make sure Info/Warn are emitted
+        }
+        Log::set_sink([this](LogLevel level, const std::string& message) {
+            lines_.push_back({level, message});
+        });
+    }
+    ~ScopedLogCapture() {
+        Log::set_sink({});
+        Log::set_level(previous_level_);
+    }
+    ScopedLogCapture(const ScopedLogCapture&) = delete;
+    ScopedLogCapture& operator=(const ScopedLogCapture&) = delete;
+
+    /// Every captured line at `level`, joined by newline.
+    std::string text(LogLevel level) const {
+        std::string out;
+        for (const auto& [lvl, message] : lines_) {
+            if (lvl == level) {
+                out += message;
+                out += '\n';
+            }
+        }
+        return out;
+    }
+
+private:
+    std::vector<std::pair<LogLevel, std::string>> lines_;
+    LogLevel previous_level_ = LogLevel::Info;
+};
+
 }  // namespace
 
 TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
@@ -652,6 +693,71 @@ TEST(BuildOrthomosaic, MemoryGuardStillAllowsARealisticRun) {
     Params params = ortho_params("mosaic", "elevation", 1.0);
     EXPECT_NO_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params));
     EXPECT_FALSE(chunk.orthomosaic().empty());
+}
+
+TEST(BuildOrthomosaic, AutomaticResolutionIsCoarsenedToFitTheBudget) {
+    // The key behaviour change: with the DEFAULT resolution (0) a run that does
+    // not fit must be coarsened to the finest value that fits, complete, and say
+    // so at Warning -- not refused.
+    //
+    // The fixture's measured GSD is about 0.12 m (60 m above ground, f = 500 px);
+    // an 8 MB budget cannot hold that ortho (the 12 camera footprints alone are
+    // ~26 MB), so the automatic run must land clearly coarser than the GSD while
+    // still completing. No probe run is needed: the fixture's GSD is a scene
+    // constant, not something this test has to measure.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    ScopedMemoryBudget budget("8");
+    ScopedLogCapture capture;
+    Params params = ortho_params();  // resolution 0 = automatic
+    ASSERT_NO_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params));
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    EXPECT_FALSE(ortho == before) << "the coarsened run did not commit";
+    const double coarsened_cell = ortho.raster.grid.pixel_size_x;
+    std::printf("[BuildOrthomosaic.Coarsen] coarsened=%.4f\n", coarsened_cell);
+    EXPECT_TRUE(std::isfinite(coarsened_cell));
+    // The GSD default is ~0.12 m; the coarsened cell must be unmistakably above
+    // it, otherwise the budget was not the constraint.
+    EXPECT_GT(coarsened_cell, 0.25)
+        << "the automatic run was not coarsened at all";
+
+    // The warning names the GSD, the actual cell, the budget and how to override
+    // it.
+    const std::string warnings = capture.text(LogLevel::Warn);
+    EXPECT_NE(warnings.find("ground sample distance is"), std::string::npos) << warnings;
+    EXPECT_NE(warnings.find("building at"), std::string::npos) << warnings;
+    EXPECT_NE(warnings.find("Set resolution explicitly to override"), std::string::npos)
+        << warnings;
+    EXPECT_NE(warnings.find("budget"), std::string::npos) << warnings;
+}
+
+TEST(BuildOrthomosaic, ExplicitResolutionIsStillRefusedWhenItCannotFit) {
+    // An EXPLICIT cell is the user's decision: the task must not silently build
+    // at another scale. It keeps the existing actionable refusal.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    ScopedMemoryBudget budget("8");
+    Params params = ortho_params("mosaic", "elevation", 0.02);  // far finer than default
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("BuildOrthomosaic needs about"), std::string::npos) << message;
+        EXPECT_NE(message.find("at resolution 0.02"), std::string::npos) << message;
+        EXPECT_NE(message.find("Set a coarser resolution"), std::string::npos) << message;
+        // It must NOT have been silently coarsened into a different run.
+        EXPECT_EQ(message.find("building at"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "an explicit resolution that cannot fit was not refused";
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
 }
 
 // ---------------------------------------------------------------------------
