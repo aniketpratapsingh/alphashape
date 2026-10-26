@@ -55,7 +55,23 @@ if(ALPHASHAPE_GPU)
         shaders/poisson_precond.comp
         shaders/poisson_axpy.comp)
     set(_spv_files "")
-    # Kernels compiled without the SPIR-V optimiser; see alphashape_add_shader.
+    # Both PatchMatch search kernels are built without the SPIR-V optimiser, on
+    # every platform. An optimised module of either one returns different results
+    # on NVIDIA hardware: measured on a Tesla T4 (driver 535.161.07) against the
+    # same CPU reference, optimised pm_init reports 100.00% depth agreement but
+    # 0.92% normal agreement, and optimised pm_refine lands at 93.4% dense
+    # agreement where the unoptimised module is at 100.0%. The cause is not yet
+    # isolated; it is not the shaders' own undefined behaviour (that was found and
+    # fixed -- an out-of-range index in a dead branch, aggregate `inout` search
+    # state, and a mutable RNG cursor), because the same numbers came back after
+    # each of those fixes and with three different generator shapes. See the note
+    # at the top of pm_math.glsl for the measurements and what has been ruled out.
+    #
+    # The exemption is not keyed on the device: the shader is compiled and
+    # embedded when the engine is built, not when a device is selected, so it
+    # cannot be made conditional without shipping two modules. The cost of the
+    # unoptimised module is real but acceptable -- pm_refine ran the dense fixture
+    # in 4.26 s against the CPU's 32.49 s (7.62x) -- and accuracy outranks it.
     set(_unoptimised_shaders shaders/pm_init.comp shaders/pm_refine.comp)
     foreach(_shader IN LISTS _shader_sources)
         if(_shader IN_LIST _unoptimised_shaders)

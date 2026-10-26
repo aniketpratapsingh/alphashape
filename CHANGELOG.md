@@ -73,6 +73,38 @@ All notable changes to alphashape are recorded here. The format follows
 - **Build Orthomosaic no longer overflows its grid dimensions.** A resolution fine enough to need more than 2^31−1 output cells (or a non-finite one) is refused in double precision with the resolution, the extent, the cell count and "choose a coarser resolution", instead of casting an unbounded double to `int` and then sizing buffers from a negative length.
 - **Build Orthomosaic reports an exhausted allocation honestly.** A `std::length_error` (a buffer whose size exceeds the maximum the process can represent) is treated the same as `std::bad_alloc` and converted to the actionable memory message, instead of escaping as an internal error.
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
+- **The GPU PatchMatch shaders no longer rely on undefined behaviour.** Two
+  latent defects in the Vulkan kernels were fixed. A never-taken branch in
+  `keep_bindings_alive()` indexed `views[]`, `view_ints[]` and `offsets[]` by the
+  lane's pixel, but those buffers hold 24×, 4× and 2× the neighbour/window counts
+  — out of range for almost every image, and an out-of-range storage-buffer
+  access is undefined behaviour in Vulkan even in a branch the optimiser may
+  speculate over. It now reads element 0 of each. Search state was also threaded
+  through aggregate `inout` parameters, which glslang lowers to a Function-storage
+  pointer with a copy-back that inlining is least likely to preserve: the RNG is
+  now a stateless keyed stream (draw *n* = `splitmix64^(n+1)` of a key of seed,
+  pixel, iteration and stream, with a literal draw index at every call site), and
+  `Best` is passed and returned by value. `neighbour_cost()` also gained the
+  CPU's quorum early exit, so a neighbour that cannot reach 75% of the window
+  stops after a few samples instead of walking all 49.
+  **Speed is unchanged: both search kernels stay unoptimised.** `pm_init` and
+  `pm_refine` are still built without the SPIR-V optimiser, which is what they
+  were before, because an optimised module of either changes results on NVIDIA
+  hardware: on a Tesla T4 the optimised `pm_init` agrees with the CPU on 100.00%
+  of depths but 0.92% of normals, and optimised `pm_refine` on 93.4% of the dense
+  fixture, where the unoptimised modules are at 100%. The fix that would restore
+  that agreement — marking the whole chain from a candidate plane to the
+  projected pixel coordinate `precise`, because `sample_image()` floors that
+  coordinate and a fused multiply-add moves the sample a texel — makes `glslc`
+  need more memory than a CI runner has: it is OOM-killed at `-O`, at `-Os`, and
+  at `-O0`, so this toolchain cannot compile it at all. Two tests now hold the
+  line for a future attempt: `PatchMatchGpu.RefineSweepsMatchCpu` gates the
+  search kernel itself (≥99% against the CPU on hardware, which fails the 93.4%
+  regression; the existing `iterations = 0` test never reaches it), and
+  `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused TV-L1 mesh's
+  boundary-edge count is *equal* to the CPU's again — a discontinuous function of
+  that agreement — instead of tolerating a difference. See `LIMITATIONS.md` for
+  the measurements and what has been ruled out.
 
 ### Limitations
 
