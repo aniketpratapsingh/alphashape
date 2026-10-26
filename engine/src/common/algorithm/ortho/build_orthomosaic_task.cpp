@@ -851,15 +851,20 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             window_cells, window_footprint, input.has_node_map, input.photo_cells,
             output_cells, cache);
         // The mosaic pyramid depth every block applies: the whole grid's depth,
-        // never deeper than the margin can carry.
-        const int margin_levels = static_cast<int>(
-            std::floor(std::log2(static_cast<double>(std::max(1, out.margin_cells))))) - 1;
-        out.levels = std::max(0, margin_levels);
+        // never deeper than the margin can carry. pyramid_support_cells() is the
+        // exact reach of the blend at a depth, so admitting a level only when its
+        // support fits the margin is a hard bound, not a heuristic: the interior
+        // of every block is then blended by the same operator the whole grid
+        // would apply, up to the unavoidable edge effect of the finite window.
+        int depth = 0;
         if (width > 0 && height > 0) {
-            const int whole_levels = ortho::pyramid_level_count(
-                static_cast<int>(width), static_cast<int>(height));
-            out.levels = std::min(out.levels, whole_levels);
+            depth = ortho::pyramid_level_count(static_cast<int>(width),
+                                              static_cast<int>(height));
         }
+        while (depth > 0 && ortho::pyramid_support_cells(depth) > out.margin_cells) {
+            --depth;
+        }
+        out.levels = depth;
         return out;
     };
 

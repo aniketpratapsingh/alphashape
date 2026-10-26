@@ -29,6 +29,7 @@
 #include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
+#include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/core/document.hpp"
@@ -1247,15 +1248,37 @@ TEST(OrthoBlockPlan, CoarsensOnlyWhenTheMinimumBlockCannotFit) {
 }
 
 TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
-    // The margin must reach the blend pyramid's support at the deepest level the
-    // blend uses (6 levels at the level_count() cap), otherwise a block's interior
-    // would be blended with a shallower operator than the whole grid's.
+    // The margin must reach the blend pyramid's support at the depth the plan
+    // pins, otherwise a block's interior would be blended with a shallower
+    // operator than the whole grid's. The reach is computed, not guessed.
+    EXPECT_EQ(ortho::pyramid_support_cells(0), 0);
+    EXPECT_EQ(ortho::pyramid_support_cells(1), 2);
+    EXPECT_EQ(ortho::pyramid_support_cells(6), 126);
+    EXPECT_LE(ortho::pyramid_support_cells(6), 192);
+
     for (const int side : {512, 1024, 2048, 4096}) {
         const int margin = block_margin_cells(side);
-        std::printf("[OrthoBlockPlan.Margin] block=%d margin=%d\n", side, margin);
-        EXPECT_GE(margin, 16);
-        EXPECT_LE(margin, 192);
-        EXPECT_GE(margin, 1 << 6) << "must cover the 6-level pyramid at block " << side;
+        OrthoBlockPlanInput input;
+        input.grid_width = 5264;
+        input.grid_height = 5264;
+        input.camera_count = 36;
+        input.photo_cells = 4592.0 * 3056.0;
+        input.footprint_cells = 36.0 * 5264.0 * 5264.0;
+        input.has_node_map = true;
+        input.budget_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+        input.forced_block_cells = side;
+        const OrthoBlockPlan plan = plan_ortho_blocks(input);
+        std::printf("[OrthoBlockPlan.Margin] block=%d margin=%d levels=%d support=%d\n", side,
+                    plan.margin_cells, plan.levels, ortho::pyramid_support_cells(plan.levels));
+        EXPECT_EQ(plan.margin_cells, margin);
+        EXPECT_GE(plan.margin_cells, 16);
+        EXPECT_LE(plan.margin_cells, 192);
+        EXPECT_GE(plan.levels, 0);
+        EXPECT_LE(ortho::pyramid_support_cells(plan.levels), plan.margin_cells)
+            << "the pinned pyramid must fit inside the margin at block " << side;
+        // The whole grid's own depth for 5264 cells is 6 (the cap); the margin
+        // at 512 cells is 128 and still admits it.
+        EXPECT_EQ(plan.levels, 6) << "block " << side << " lost the whole grid's depth";
     }
     EXPECT_EQ(block_margin_cells(0), 0);
 }
@@ -1397,6 +1420,35 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
                 conflicts);
     EXPECT_GT(inherited, 0U) << "no margin label was inherited: the blocks are not overlapping";
     EXPECT_EQ(conflicts, 0U) << "an inherited seam label changed across a block border";
+}
+
+TEST(BuildOrthomosaic, BlockWiseFillHolesMatchesTheWholeGrid) {
+    // fill_holes runs ONCE on the assembled raster, not per block: its
+    // `interior_only` mode decides reachability from the output's own border,
+    // which a block cannot know. With it on, the blocked run must reproduce the
+    // single-piece coverage exactly (the same cells become opaque).
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("average", 0.25, 0, true, false));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.25, 256, true, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    std::size_t opaque_whole = 0;
+    std::size_t opaque_blocked = 0;
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < whole.raster.data.size(); i += 4) {
+        const bool a = whole.raster.data[i + 3] != 0;
+        const bool b = blocked.raster.data[i + 3] != 0;
+        opaque_whole += a ? 1U : 0U;
+        opaque_blocked += b ? 1U : 0U;
+        if (a != b) {
+            ++differ;
+        }
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseFill] opaque=%zu/%zu alpha-differ=%zu\n",
+                opaque_blocked, opaque_whole, differ);
+    EXPECT_EQ(differ, 0U) << "fill_holes must run on the assembled raster, not per block";
+    EXPECT_GT(opaque_whole, 10000U);
 }
 
 TEST(BuildOrthomosaic, BlockWiseMosaicMatchesWithInOneGreyLevel) {

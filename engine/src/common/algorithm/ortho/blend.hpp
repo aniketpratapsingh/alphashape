@@ -49,6 +49,13 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
 /// plan uses this to pin the depth at the whole grid's value.
 int pyramid_level_count(int width, int height);
 
+/// How far a blend at `levels` can read, in cells, from an output cell: the
+/// accumulated reach of the 5-tap blurs down the pyramid (level k reaches
+/// 2 * 2^k cells, so the sum is 2 * (2^levels - 1)). A block processed with
+/// `levels` needs at least this much margin for its interior to be blended with
+/// exactly the operator the whole grid would apply.
+int pyramid_support_cells(int levels);
+
 /// Parse a blending mode from its lower-case name: "mosaic", "average",
 /// "disabled". Throws ValueError on any other text.
 Blending parse_blending(const std::string& text);

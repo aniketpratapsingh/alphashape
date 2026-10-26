@@ -464,6 +464,19 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
 
 int pyramid_level_count(int width, int height) { return level_count(width, height); }
 
+int pyramid_support_cells(int levels) {
+    // Level k of the pyramid is a 5-tap Gaussian (radius 2) applied to a plane
+    // that is 2^k times decimated relative to the output, so one blur at level k
+    // moves information 2 * 2^k cells at output resolution. The Laplacian and the
+    // collapse mirror the same stencil, hence the factor of two over the sum of
+    // the per-level reaches.
+    if (levels <= 0) {
+        return 0;
+    }
+    const int capped = std::min(levels, 16);  // 2^16 cells is far past any grid
+    return 2 * ((1 << capped) - 1);
+}
+
 Blending parse_blending(const std::string& text) {
     if (text == "mosaic") {
         return Blending::Mosaic;
