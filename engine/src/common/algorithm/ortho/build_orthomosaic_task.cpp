@@ -51,6 +51,20 @@ double round_sig3(double v) {
     return std::round(v * scale) / scale;
 }
 
+/// Round UP to three significant figures (0.12334 -> 0.124). Used when a value
+/// is raised to bring an estimate DOWN: rounding to nearest could land back on
+/// the far side of the target and make the caller loop.
+double ceil_sig3(double v) {
+    if (!(v > 0.0) || !std::isfinite(v)) {
+        return v;
+    }
+    const double magnitude = std::floor(std::log10(v));
+    const double scale = std::pow(10.0, 2.0 - magnitude);
+    // The epsilon absorbs the float round trip in v * scale: an exact 17 that
+    // lands on 17.000000000000004 must not become 18.
+    return std::ceil(v * scale - 1e-9 * std::abs(v * scale)) / scale;
+}
+
 /// A short decimal for a message ("0.019", "12.3"), never scientific notation.
 std::string format_number(double v) {
     std::ostringstream out;
@@ -567,6 +581,28 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
                     std::max(stages.blend, stages.finalize));
 }
 
+/// The lowest and highest valid sample of a surface raster. Scanned once by the
+/// caller and passed down: the auto-coarsening search calls the estimator tens
+/// of times, and rescanning a 25 M-cell DEM on each one is a pointless cost.
+struct HeightRange {
+    double lowest = std::numeric_limits<double>::infinity();
+    double highest = -std::numeric_limits<double>::infinity();
+
+    bool valid() const { return std::isfinite(lowest) && std::isfinite(highest); }
+};
+
+HeightRange surface_height_range(const GeoRaster<float>& surface, float surface_nodata) {
+    HeightRange range;
+    for (const float h : surface.data) {
+        if (h == surface_nodata || std::isnan(h)) {
+            continue;
+        }
+        range.lowest = std::min(range.lowest, static_cast<double>(h));
+        range.highest = std::max(range.highest, static_cast<double>(h));
+    }
+    return range;
+}
+
 /// The footprint area every camera's tile crop box will cover, padded the way
 /// the rectifier pads it (two cells, and the cell rounding on each edge). This
 /// is the same bound orthorectify() allocates against, so the guard's estimate
@@ -580,20 +616,13 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
 /// from the exact transform by far less than the footprint's own 1% inflation and
 /// three-cell margin.
 double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
-                                 const RasterGrid& grid, const GeoRaster<float>& surface,
-                                 float surface_nodata, const elevation::SurfaceFrame& frame) {
-    double lowest = std::numeric_limits<double>::infinity();
-    double highest = -std::numeric_limits<double>::infinity();
-    for (const float h : surface.data) {
-        if (h == surface_nodata || std::isnan(h)) {
-            continue;
-        }
-        lowest = std::min(lowest, static_cast<double>(h));
-        highest = std::max(highest, static_cast<double>(h));
-    }
-    if (!std::isfinite(lowest) || !std::isfinite(highest)) {
+                                 const RasterGrid& grid, const HeightRange& heights,
+                                 const elevation::SurfaceFrame& frame) {
+    if (!heights.valid()) {
         return static_cast<double>(grid.width) * static_cast<double>(grid.height);
     }
+    const double lowest = heights.lowest;
+    const double highest = heights.highest;
 
     const Eigen::Vector2d metres_per_unit =
         frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
@@ -980,6 +1009,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         return cell;
     };
 
+    // What the photographs themselves resolve, in metres. Kept for the memory
+    // message: a run that has to be coarsened should say what it was aiming for.
+    double measured_gsd_metres = 0.0;
     double resolution = options.resolution;  // plane units; 0 = automatic
     if (!(resolution > 0.0)) {
         if (surface.empty() && options.surface != "model") {
@@ -989,6 +1021,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             const double plane_y = surface.grid.pixel_center(0, surface.grid.height / 2).y();
             const double gsd = measure_gsd_metres(surface, surface_nodata, plane_y);
             if (gsd > 0.0) {
+                measured_gsd_metres = gsd;
                 resolution = plane_resolution_for(gsd, surface);
             } else {
                 // No camera's principal axis reaches this DEM (a narrow
@@ -1061,6 +1094,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
     const std::uint64_t budget = platform::memory_budget_bytes();
     const double photo_cells = largest_photograph_cells(cameras);
+    const HeightRange heights = surface_height_range(surface, surface_nodata);
 
     // -- memory guard, BEFORE any cell-sized allocation ----------------------
     // Refuse (or, for the automatic cell, coarsen) a run whose peak cannot fit
@@ -1075,24 +1109,95 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // the surface's lowest and highest height) and allocates nothing.
     const auto peak_at = [&](const RasterGrid& candidate_grid) {
         const double footprint_cells =
-            predicted_footprint_cells(cameras, candidate_grid, surface, surface_nodata, frame);
+            predicted_footprint_cells(cameras, candidate_grid, heights, frame);
         const std::uint64_t cells = static_cast<std::uint64_t>(candidate_grid.width) *
                                     static_cast<std::uint64_t>(candidate_grid.height);
         return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells);
     };
+    const auto grid_at = [&surface](double cell) {
+        return ortho_grid_for(surface.grid, cell);
+    };
+
     RasterGrid grid = ortho_grid_for(surface.grid, resolution);
     const double default_peak = peak_at(grid);
     if (budget != 0 && default_peak > static_cast<double>(budget)) {
-        // Refuse: an automatic run that cannot fit gets the same actionable
-        // message an explicit one does. (The automatic path is coarsened in the
-        // next change; until then there is nothing else to do here.)
-        throw ValueError(
-            "BuildOrthomosaic needs about " + platform::format_gb(default_peak) +
-            " at resolution " + format_number(resolution) + " m; this machine has " +
-            platform::format_gb(static_cast<double>(
-                platform::total_physical_memory_bytes())) +
-            ". Set a coarser resolution (e.g. " +
-            format_number(round_sig3(resolution * 4.0)) + " m).");
+        if (options.resolution > 0.0) {
+            throw ValueError(
+                "BuildOrthomosaic needs about " + platform::format_gb(default_peak) +
+                " at resolution " + format_number(resolution) + " m; this machine has " +
+                platform::format_gb(static_cast<double>(
+                    platform::total_physical_memory_bytes())) +
+                ". Set a coarser resolution (e.g. " +
+                format_number(round_sig3(resolution * 4.0)) + " m).");
+        }
+
+        // Automatic cell: coarsen to the finest value that fits rather than
+        // refusing a run the user did not ask to be at a particular scale.
+        //
+        // The peak is monotone non-increasing in the cell size (a coarser cell
+        // means fewer output cells, and every grid-proportional and
+        // footprint-proportional term shrinks with it), so the finest fitting
+        // cell can be found by bisection:
+        //
+        //   1. bracket it -- double the cell until the estimate fits (coarsening
+        //      always ends at a 1x1 grid, whose estimate is tiny, so this
+        //      terminates unless even one cell's photograph does not fit);
+        //   2. bisect geometrically between the last too-fine and the last
+        //      fitting cell;
+        //   3. round the answer UP to three significant figures (rounding to
+        //      nearest could land back on the far side of the budget) and
+        //      re-check; nudge up 1% if the rounding lost the fit.
+        const double default_resolution = resolution;
+        double too_fine = resolution;  // known: does not fit
+        double fits = 0.0;             // known: fits
+        for (int step = 0; step < 48; ++step) {
+            const double trial = too_fine * 2.0;
+            if (!std::isfinite(trial)) {
+                break;
+            }
+            if (peak_at(grid_at(trial)) <= static_cast<double>(budget)) {
+                fits = trial;
+                break;
+            }
+            too_fine = trial;
+        }
+        if (!(fits > 0.0)) {
+            throw ValueError(
+                "BuildOrthomosaic cannot fit even the smallest ortho in this machine's "
+                "budget of " +
+                platform::format_gb(static_cast<double>(budget)) +
+                " (the decoded photographs alone need more). Close other applications "
+                "first, or free memory and retry.");
+        }
+        for (int step = 0; step < 60; ++step) {
+            const double mid = std::sqrt(too_fine * fits);  // geometric midpoint
+            if (!(mid > too_fine) || !(mid < fits)) {
+                break;
+            }
+            if (peak_at(grid_at(mid)) <= static_cast<double>(budget)) {
+                fits = mid;
+            } else {
+                too_fine = mid;
+            }
+        }
+        double chosen = ceil_sig3(fits);
+        for (int step = 0; step < 32 && peak_at(grid_at(chosen)) > static_cast<double>(budget);
+             ++step) {
+            chosen = ceil_sig3(chosen * 1.01);
+        }
+        grid = grid_at(chosen);
+        resolution = chosen;
+
+        log(LogLevel::Warn)
+            << "BuildOrthomosaic: ground sample distance is "
+            << format_number(measured_gsd_metres > 0.0 ? measured_gsd_metres
+                                                       : default_resolution)
+            << " m but a " << format_number(default_resolution)
+            << " m ortho needs ~" << platform::format_gb(default_peak) << " (budget "
+            << platform::format_gb(static_cast<double>(budget)) << "); building at "
+            << format_number(resolution)
+            << " m instead. Set resolution explicitly to override (needs more memory) "
+               "or free memory.";
     }
     progress.update("initialize", 1.0);
 
