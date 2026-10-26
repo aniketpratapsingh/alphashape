@@ -86,6 +86,33 @@ Ticket submit_async(Context& context, const std::vector<Dispatch>& dispatches,
 std::uint64_t validation_error_count();
 void add_validation_error();
 void note_gpu_failure(const std::string& what);
+
+/// The device stopped responding (a fence timed out, or the driver reported
+/// VK_ERROR_DEVICE_LOST). Marks the GPU unavailable for the rest of the
+/// process: every later with_fallback() runs its CPU branch, so a wedged
+/// device -- on a shared display GPU a hang can take the whole machine down --
+/// is never touched again. Logged exactly once, and unavailable_reason()
+/// reports it. Called from the backend, which then throws; the caller's
+/// with_fallback counts the failure.
+void note_device_lost(const std::string& detail);
+/// True once note_device_lost() has run.
+bool device_lost();
+/// The reason recorded by note_device_lost() (empty when the device is fine).
+std::string device_lost_reason();
+
+/// Test hook: makes the next fence wait behave as if the device stopped
+/// responding, without needing a real hang. Consumed by the backend's wait.
+void force_fence_timeout_once();
+/// Test hook: returns true once if a forced timeout is pending.
+bool consume_forced_fence_timeout();
+/// Test hook: clears the device-lost state so the rest of a test binary can use
+/// the device again. Production code never calls this.
+void reset_device_lost();
+/// Incremented each time the device transitions to lost (once per loss; a
+/// second note while already lost does not bump it, and a reset re-arms it so
+/// the next loss gets a fresh generation). Lets a backend tell one loss from a
+/// later, unrelated one when it shares a per-loss deadline.
+std::uint64_t device_lost_generation();
 bool backend_compiled_in();
 /// True when this context was created with validation and the layer is active.
 bool validation_active(const Context& context);
@@ -145,6 +172,8 @@ public:
 private:
     friend std::shared_ptr<Context> create_context(const ContextOptions& options);
     friend void run(Context& context, const std::vector<Dispatch>& dispatches);
+    friend void run_with_fence_budget(Context& context, const std::vector<Dispatch>& dispatches,
+                                      std::uint64_t fence_budget_ns);
     friend Ticket detail::submit_async(Context&, const std::vector<Dispatch>&, Submission);
     friend void wait(Context& context, Ticket ticket);
     friend std::uint32_t detail::in_flight_count(Context& context);
@@ -334,7 +363,103 @@ std::vector<std::uint8_t> push(const T& value) {
 /// Runs a list of dispatches in one command buffer, with compute->compute
 /// barriers between them, then waits. Throws gpu::Error on any failure.
 /// Equivalent to run_async(context, dispatches) followed by wait().
+///
+/// A submission is one GPU job. On a GPU shared with the display (Apple
+/// silicon, an integrated GPU) a job that runs for seconds starves the
+/// compositor -- on a 16 GB M1 that could hang the whole machine -- so a long
+/// iteration loop must go through run_batched().
 void run(Context& context, const std::vector<Dispatch>& dispatches);
+
+/// run() with an explicit fence budget for this submission; 0 means the default
+/// (5 s on hardware, 10 min on a CPU driver). A budget may only lengthen the
+/// default. Used by run_batched for an operation's calibrating first submission,
+/// whose duration is not yet known.
+void run_with_fence_budget(Context& context, const std::vector<Dispatch>& dispatches,
+                           std::uint64_t fence_budget_ns);
+
+/// Chooses how many algorithm steps one submission carries, targeting a wall
+/// clock duration rather than a dispatch count.
+///
+/// One step is the smallest unit that must stay in one command buffer (two
+/// dispatches for a Poisson CG iteration or a TV-L1 dual/primal pair, one for a
+/// PatchMatch sweep dispatch). The first submission is deliberately small; its
+/// measured duration then scales the step count towards `target_seconds`, so a
+/// fast device gets long submissions and a slow one short ones. Splitting is a
+/// scheduling change only: the dispatches run in the same order on the same
+/// data, so results are bit-identical to one unsplit submission.
+///
+/// ALPHASHAPE_GPU_MAX_BATCH=<positive integer> pins the steps per submission,
+/// which is how the split and unsplit paths are compared in the tests.
+class BatchLimiter {
+public:
+    static constexpr double kHardwareTargetSeconds = 0.08;
+    /// A CPU driver cannot starve a display, and every submission costs it more
+    /// than the work it carries, so it is given a generous target.
+    static constexpr double kSoftwareTargetSeconds = 4.0;
+    /// Fence budget for the calibrating first submission of an operation. Its
+    /// duration is not known yet -- a PathMatch pm_init pair is two whole-image
+    /// dispatches -- so it may legitimately run past the steady-state 5 s
+    /// hardware bound without being a hang. Later submissions are sized from
+    /// its measurement and keep the tight budget.
+    static constexpr std::uint64_t kCalibrationBudgetNs = 30'000'000'000ULL;
+
+    explicit BatchLimiter(std::size_t dispatches_per_step = 1, std::size_t initial_steps = 1,
+                          std::size_t max_steps = 1024);
+
+    /// Steps to put in the next submission, capped at `remaining_steps`.
+    std::size_t steps(std::size_t remaining_steps) const;
+    /// Records that a submission carrying `steps` steps took `seconds`; sizes
+    /// the next one so it lands near `target_seconds`. Ignored while the env
+    /// override pins the size, and when the measurement is unusable.
+    ///
+    /// Growth is rate-limited to 4x per measurement; shrink is not -- a
+    /// submission that overran the target is followed by at most
+    /// target/per_step steps, so the next job is immediately back inside the
+    /// budget instead of walking down over several measurements.
+    void observe(std::size_t steps, double seconds);
+
+    std::size_t dispatches_per_step() const { return per_step_; }
+    std::size_t steps_per_submission() const { return steps_; }
+    double target_seconds() const { return target_; }
+    void set_target_seconds(double seconds) { target_ = seconds; }
+    /// Measured wall clock of one step in the last bounded submission; 0 until
+    /// one has been measured. run_batched uses it to size the fence budget of
+    /// the next submission, so a device whose single step legitimately takes
+    /// longer than the steady-state budget is not declared a hang.
+    double last_seconds_per_step() const { return last_per_step_; }
+
+    /// Steps per submission pinned by ALPHASHAPE_GPU_MAX_BATCH; 0 when unset or
+    /// not a positive integer.
+    static std::size_t override_steps();
+
+private:
+    std::size_t per_step_;
+    std::size_t steps_;
+    std::size_t max_steps_;
+    /// Non-zero when ALPHASHAPE_GPU_MAX_BATCH pinned the size at construction;
+    /// a pinned limiter never adapts, so the test's split stays the split it
+    /// asked for however the device performs.
+    std::size_t pinned_ = 0;
+    double target_ = 0.0;
+    double last_per_step_ = 0.0;
+};
+
+/// Runs `dispatches` as one or more submissions sized by `limiter`.
+///
+/// `leading_dispatches` ride with the first submission (a start-of-solve pass)
+/// and `trailing_dispatches` with the last (a settle statistic that depends on
+/// the whole batch), so a caller never has to hand-split those. Returns the
+/// number of submissions issued.
+///
+/// The first submission is *calibrating*: its duration is not known until it
+/// has run, and it carries the one-off costs (pipeline compilation, and a
+/// PatchMatch pm_init pair), so it is given a generous fence budget instead of
+/// being declared a hang at the steady-state bound. Later submissions are sized
+/// from a measurement and keep the tight budget, lengthened only when a single
+/// step alone would outlast it.
+std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatches,
+                        BatchLimiter& limiter, std::size_t leading_dispatches = 0,
+                        std::size_t trailing_dispatches = 0);
 
 /// Which queue a submission goes to. Queue 1 is only honoured when the selected
 /// queue family exposes at least two queues; otherwise it falls back to queue 0
@@ -368,9 +493,12 @@ private:
 Ticket run_async(Context& context, const std::vector<Dispatch>& dispatches,
                  Submission submission = {});
 
-/// Blocks until the submission's fence signals. Every internal fence wait has a
-/// 5 s timeout (Error("gpu: fence timeout")). Waiting on a Ticket that has
-/// already been waited for is a no-op.
+/// Blocks until the submission's fence signals. The wait is sliced and bounded:
+/// a hardware device gets a few seconds per submission (submissions are bounded
+/// by run_batched, so a wait that long means the device hung), a CPU driver
+/// several minutes. A timeout or VK_ERROR_DEVICE_LOST throws gpu::Error and
+/// marks the device unavailable for the rest of the process.
+/// Waiting on a Ticket that has already been waited for is a no-op.
 void wait(Context& context, Ticket ticket);
 
 class Error : public alphashape::Error {

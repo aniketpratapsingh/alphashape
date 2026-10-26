@@ -16,6 +16,7 @@
 
 #include "base/utils/log.hpp"
 #include "base/utils/portable_rng.hpp"
+#include "base/platform/env.hpp"
 #include "common/algorithm/mesh/poisson_gpu.hpp"
 #include "common/algorithm/mesh/poisson_internal.hpp"
 #include "gpu/gpu.hpp"
@@ -1220,4 +1221,486 @@ TEST(Gpu, ImageDispatchValidationClean) {
     const std::vector<float> values = sample_image(*context, image, sampler, uv);
     EXPECT_EQ(values.size(), 64u);
     EXPECT_EQ(detail::validation_error_count(), before);
+}
+
+// ---------------------------------------------------------------------------
+// WP-31: bounded submissions -- a long dispatch chain is split across command
+// buffers so no single GPU job can starve the display and hang the machine.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Restores a variable on scope exit, so a test that pins the batch override
+/// cannot leak it into a sibling test in the same process.
+struct EnvGuard {
+    std::string name;
+    std::string previous;
+
+    explicit EnvGuard(const char* variable)
+        : name(variable), previous(alphashape::platform::get_env(variable)) {}
+    ~EnvGuard() { alphashape::platform::set_env(name.c_str(), previous); }
+};
+
+/// Same value in both, bit for bit (memcmp, not ==, so a -0.0/NaN difference
+/// cannot slip through).
+bool bit_identical(const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+/// Clears the device-lost state however the test exits. A test that wedges the
+/// device must not leave it wedged for its siblings when the whole binary runs
+/// in one process (the GPU lane drives the binary directly, not one ctest case
+/// per process).
+struct DeviceStateGuard {
+    ~DeviceStateGuard() {
+        alphashape::gpu::detail::reset_device_lost();
+        alphashape::gpu::set_enabled(true);
+    }
+};
+
+}  // namespace
+
+TEST(Gpu, BatchOverrideParses) {
+    {
+        EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        EXPECT_EQ(BatchLimiter::override_steps(), 0u) << "unset means adaptive";
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "7");
+        EXPECT_EQ(BatchLimiter::override_steps(), 7u);
+        // Rejected rather than silently misread: 0 would be an empty batch and
+        // "3x" would otherwise become 3.
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "0");
+        EXPECT_EQ(BatchLimiter::override_steps(), 0u);
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "3x");
+        EXPECT_EQ(BatchLimiter::override_steps(), 0u);
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "-2");
+        EXPECT_EQ(BatchLimiter::override_steps(), 0u);
+        // A pinned limiter does not adapt, even when the measurement would
+        // otherwise ask for a very different size.
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "3");
+        BatchLimiter pinned(2);
+        pinned.set_target_seconds(0.05);
+        EXPECT_EQ(pinned.steps_per_submission(), 3u);
+        pinned.observe(3, 10.0);
+        EXPECT_EQ(pinned.steps_per_submission(), 3u) << "an override must not be retimed";
+        pinned.observe(3, 1e-6);
+        EXPECT_EQ(pinned.steps_per_submission(), 3u) << "an override must not be retimed";
+    }
+}
+
+TEST(Gpu, BatchLimiterScalesTowardsTarget) {
+    // No device needed: the sizing rule is arithmetic.
+    {
+        EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1, /*max_steps=*/256);
+        limiter.set_target_seconds(0.05);
+        EXPECT_EQ(limiter.steps(1000), 1u);
+        // One step took 2 ms, so 50 ms wants 25 steps -- but a single probe may
+        // move at most 4x, so the next submission is 4.
+        limiter.observe(1, 0.002);
+        EXPECT_EQ(limiter.steps(1000), 4u);
+        // A second probe at 2 ms/step still climbs by at most 4x (4 -> 16).
+        limiter.observe(4, 0.008);
+        EXPECT_EQ(limiter.steps(1000), 16u);
+        // A slow device shrinks the batch immediately: 100 ms/step wants half a
+        // step, so the next submission carries one. Growth is rate-limited to
+        // 4x, but shrink is not -- a submission that already overran the target
+        // must be followed by one that fits it, or the display keeps being
+        // starved across several measurements.
+        limiter.observe(16, 1.6);
+        EXPECT_EQ(limiter.steps(1000), 1u);
+        // A probe that overshoots by a little still drops straight to the size
+        // that would have hit the target: 10 ms/step at a 50 ms target is 5, not
+        // the 8 that was measured.
+        limiter.observe(8, 0.08);
+        EXPECT_EQ(limiter.steps(1000), 5u);
+        // Growth from there is still capped at 4x, so a device that speeds up
+        // is not handed a multi-second job off one noisy measurement.
+        limiter.observe(5, 0.001);
+        EXPECT_EQ(limiter.steps(1000), 20u);
+        EXPECT_LE(limiter.steps(1000), 256u);
+        EXPECT_EQ(limiter.steps(3), 3u);
+        EXPECT_EQ(limiter.steps(0), 0u);
+    }
+}
+
+TEST(Gpu, BatchedRunIsBitIdenticalToUnsplit) {
+    REQUIRE_GPU();
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+
+    // A chain with a real cross-dispatch dependency: every chain_add reads what
+    // the previous one wrote, so a split that lost a barrier or reordered a
+    // dispatch would change the values.
+    constexpr std::size_t kCount = 1 << 16;
+    constexpr int kIterations = 40;
+
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    const auto build = [&](const Buffer& gpu_x, const Buffer& gpu_y) {
+        std::vector<Dispatch> dispatches;
+        dispatches.reserve(static_cast<std::size_t>(kIterations) * 2);
+        for (int it = 0; it < kIterations; ++it) {
+            Dispatch add;
+            add.kernel = "chain_add";
+            add.buffers = {&gpu_x};
+            add.push_constants = push(params);
+            add.groups = {groups_for(kCount, 256), 1, 1};
+            dispatches.push_back(std::move(add));
+            Dispatch scale;
+            scale.kernel = "chain_add";
+            scale.buffers = {&gpu_y};
+            scale.push_constants = push(params);
+            scale.groups = {groups_for(kCount, 256), 1, 1};
+            dispatches.push_back(std::move(scale));
+        }
+        return dispatches;
+    };
+
+    // Unsplit reference: one command buffer for everything.
+    const std::vector<float> source_x = random_floats(kCount, 61);
+    const std::vector<float> source_y = random_floats(kCount, 62);
+    Buffer unsplit_x = Buffer::of(*context, source_x);
+    Buffer unsplit_y = Buffer::of(*context, source_y);
+    ASSERT_NO_THROW(run(*context, build(unsplit_x, unsplit_y)));
+    const std::vector<float> reference_x = unsplit_x.read<float>(kCount);
+    const std::vector<float> reference_y = unsplit_y.read<float>(kCount);
+    ASSERT_FLOAT_EQ(reference_x[0], source_x[0] + static_cast<float>(kIterations))
+        << "sanity: every one of the " << kIterations << " chain_add steps ran";
+
+    // Split with the override pinned to one step per submission.
+    {
+        EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+        Buffer split_x = Buffer::of(*context, source_x);
+        Buffer split_y = Buffer::of(*context, source_y);
+        BatchLimiter limiter(/*dispatches_per_step=*/2);
+        EXPECT_EQ(limiter.steps_per_submission(), 1u);
+        const std::size_t submissions =
+            run_batched(*context, build(split_x, split_y), limiter);
+        EXPECT_EQ(submissions, static_cast<std::size_t>(kIterations))
+            << "one submission per two-dispatch step";
+        EXPECT_TRUE(bit_identical(split_x.read<float>(kCount), reference_x));
+        EXPECT_TRUE(bit_identical(split_y.read<float>(kCount), reference_y));
+    }
+
+    // Without the override the adaptive limiter must reach the same answer too
+    // (a different number of submissions, the same values).
+    {
+        EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        Buffer adaptive_x = Buffer::of(*context, source_x);
+        Buffer adaptive_y = Buffer::of(*context, source_y);
+        BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1);
+        const std::size_t submissions =
+            run_batched(*context, build(adaptive_x, adaptive_y), limiter);
+        EXPECT_GE(submissions, 1u);
+        EXPECT_TRUE(bit_identical(adaptive_x.read<float>(kCount), reference_x));
+        EXPECT_TRUE(bit_identical(adaptive_y.read<float>(kCount), reference_y));
+    }
+}
+
+TEST(Gpu, BatchedRunKeepsLeadingAndTrailingDispatches) {
+    REQUIRE_GPU();
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+
+    // Poisson-shaped work: a leading pass, whole steps, then a trailing pass.
+    // The accounting must not drop or double any of them.
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    const auto add_one = [&] {
+        Dispatch dispatch;
+        dispatch.kernel = "chain_add";
+        dispatch.buffers = {&buffer};
+        dispatch.push_constants = push(params);
+        dispatch.groups = {groups_for(kCount, 256), 1, 1};
+        return dispatch;
+    };
+
+    std::vector<Dispatch> dispatches;
+    dispatches.push_back(add_one());  // leading
+    for (int step = 0; step < 5; ++step) {
+        dispatches.push_back(add_one());
+        dispatches.push_back(add_one());
+    }
+    dispatches.push_back(add_one());  // trailing
+    const std::size_t total = dispatches.size();
+
+    EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+    BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1);
+    const std::size_t submissions =
+        run_batched(*context, dispatches, limiter, /*leading=*/1, /*trailing=*/1);
+    EXPECT_EQ(submissions, 5u) << "the leading dispatch rides with step 1, the trailing with "
+                                  "step 5";
+    const std::vector<float> result = buffer.read<float>(kCount);
+    EXPECT_FLOAT_EQ(result[0], static_cast<float>(total))
+        << "every dispatch must run exactly once";
+}
+
+TEST(Gpu, ForcedFenceTimeoutFallsBackAndDisablesGpu) {
+    REQUIRE_GPU();
+    // Restore the device however this test exits.
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+    ASSERT_FALSE(detail::device_lost());
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    const std::uint64_t failures_before = failure_count();
+    detail::force_fence_timeout_once();
+    EXPECT_THROW(run(*context, {dispatch}), Error) << "a fence timeout is a device failure";
+
+    // The device is now marked unavailable for the rest of the process...
+    EXPECT_TRUE(detail::device_lost());
+    EXPECT_FALSE(available());
+    EXPECT_NE(unavailable_reason().find("stopped responding"), std::string::npos)
+        << unavailable_reason();
+    EXPECT_FALSE(detail::device_lost_reason().empty());
+
+    // ...so the next operation takes its CPU branch without touching the
+    // device, and reports the CPU answer.
+    const int answer = with_fallback<int>(
+        "after a hang", [] { return 1; }, [] { return 2; });
+    EXPECT_EQ(answer, 2);
+    EXPECT_EQ(failure_count(), failures_before)
+        << "the fallback that never called the GPU is not a failure";
+
+    // The device-lost line is logged once: a second mark must not add a line
+    // (and must not overwrite the first reason).
+    std::string first_reason = detail::device_lost_reason();
+    detail::note_device_lost("a second, later failure");
+    EXPECT_EQ(detail::device_lost_reason(), first_reason);
+
+    // Leave the process usable for the tests that follow. Fresh buffers, so the
+    // work the hung submission did (it reached the queue before the wait was
+    // abandoned) cannot confuse the assertion.
+    detail::reset_device_lost();
+    EXPECT_TRUE(available());
+    EXPECT_EQ(unavailable_reason(), std::string());
+    std::vector<float> fresh_zeros(kCount, 0.0f);
+    Buffer fresh = Buffer::of(*context, fresh_zeros);
+    Dispatch replay = dispatch;
+    replay.buffers = {&fresh};
+    ASSERT_NO_THROW(run(*context, {replay}));
+    EXPECT_FLOAT_EQ(fresh.read<float>(1)[0], 1.0f);
+}
+
+TEST(Gpu, SiblingOperationFallsBackAfterDeviceLost) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+
+    // The production contract: after a hang, a LATER operation -- the sibling
+    // task the user runs next -- must be answered on the CPU through
+    // with_fallback, without touching the device and without a second failure.
+    std::vector<float> zeros(256, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{256};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {1, 1, 1};
+
+    detail::force_fence_timeout_once();
+    EXPECT_THROW(run(*context, {dispatch}), Error);
+    ASSERT_TRUE(detail::device_lost());
+
+    const std::uint64_t before = failure_count();
+    const std::string result = with_fallback<std::string>(
+        "sibling operation",
+        [&]() -> std::string {
+            // Reaching here would mean the layer tried the wedged device again.
+            ADD_FAILURE() << "with_fallback entered the GPU branch after a device loss";
+            return std::string("gpu");
+        },
+        [] { return std::string("cpu"); });
+    EXPECT_EQ(result, "cpu");
+    EXPECT_EQ(failure_count(), before)
+        << "declining to the CPU before any device call is not a counted failure";
+
+    // Every public way in reports the same reason.
+    EXPECT_FALSE(available());
+    const std::string reason = unavailable_reason();
+    EXPECT_NE(reason.find("GPU stopped responding"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("continuing on the CPU"), std::string::npos) << reason;
+
+    detail::reset_device_lost();
+    EXPECT_TRUE(available());
+    EXPECT_EQ(unavailable_reason(), std::string());
+}
+
+// Fix 1: after a forced loss, no submission reaches the device again. A thread
+// already inside run_batched must stop at its next submission, and a caller
+// that waits on a ticket must be told -- a silent success would hand back
+// buffers the queue never wrote.
+TEST(Gpu, SubmitAndWaitThrowAfterDeviceLost) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+    ASSERT_FALSE(detail::device_lost());
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // First: a ticket that is genuinely pending when the device is marked lost.
+    // Its wait must throw rather than report a completion that never happened.
+    // (Done before the forced timeout so no other submission is in flight when
+    // the loss is cleared again.)
+    {
+        const Ticket ticket = run_async(*context, {dispatch});
+        ASSERT_NE(ticket.id(), 0u);
+        detail::note_device_lost("test: ticket wait on a lost device");
+        try {
+            wait(*context, ticket);
+            ADD_FAILURE() << "wait() reported success on a lost device";
+        } catch (const Error& error) {
+            EXPECT_NE(std::string(error.what()).find("device lost"), std::string::npos)
+                << error.what();
+        }
+        // The slot was released by the failed wait, so a second wait is a no-op
+        // rather than a second throw (or a spin on an unsignalled fence).
+        EXPECT_EQ(detail::in_flight_count(*context), 0u)
+            << "a failed wait must not leave the slot pending";
+        EXPECT_NO_THROW(wait(*context, ticket));
+        detail::reset_device_lost();
+        ASSERT_FALSE(detail::device_lost());
+    }
+
+    // Now the production path: a fence timeout inside run().
+    detail::force_fence_timeout_once();
+    ASSERT_THROW(run(*context, {dispatch}), Error);
+    ASSERT_TRUE(detail::device_lost());
+    const std::string reason = detail::device_lost_reason();
+    ASSERT_FALSE(reason.empty());
+
+    // A new submission is refused outright, with the reason reported. This is
+    // what stops a thread inside run_batched at its next submission.
+    try {
+        (void)run_async(*context, {dispatch});
+        ADD_FAILURE() << "run_async succeeded on a lost device";
+    } catch (const Error& error) {
+        EXPECT_NE(std::string(error.what()).find("device lost"), std::string::npos)
+            << error.what();
+        EXPECT_NE(std::string(error.what()).find(reason), std::string::npos) << error.what();
+    }
+    EXPECT_THROW(run(*context, {dispatch}), Error) << "run() must not swallow the refusal";
+    {
+        BatchLimiter limiter(/*dispatches_per_step=*/1, /*initial_steps=*/1);
+        EXPECT_THROW(run_batched(*context, {dispatch, dispatch}, limiter), Error)
+            << "a loop already in flight must stop at its next submission";
+    }
+
+    // Restore for the tests that follow.
+    detail::reset_device_lost();
+    std::vector<float> fresh_zeros(kCount, 0.0f);
+    Buffer fresh = Buffer::of(*context, fresh_zeros);
+    Dispatch replay = dispatch;
+    replay.buffers = {&fresh};
+    ASSERT_NO_THROW(run(*context, {replay}));
+}
+
+// Fix 2 + 4: the buffers of a failed operation are destroyed during the unwind,
+// on a device that is marked lost. That must not throw from a destructor
+// (implicitly noexcept -> std::terminate) and must not take a bounded wait per
+// handle; the whole unwind shares a single post-loss drain deadline.
+TEST(Gpu, DestroyingBuffersAfterDeviceLostDoesNotTerminate) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+
+    // A separate buffer for the dispatch: the dozen below are destroyed during
+    // the measured unwind, and the dispatch must not point at them afterwards.
+    Buffer scratch = Buffer::of(*context, zeros);
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&scratch};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // A dozen more, so a per-handle drain would be obvious in the timing.
+    std::vector<Buffer> buffers;
+    buffers.reserve(12);
+    for (int i = 0; i < 12; ++i) {
+        buffers.push_back(Buffer::of(*context, zeros));
+    }
+
+    // Hold a second submission in flight, then lose the device, so the drain
+    // has a genuinely unsignalled fence to wait for.
+    const Ticket pending = run_async(*context, {dispatch});
+    detail::force_fence_timeout_once();
+    ASSERT_THROW(run(*context, {dispatch}), Error);
+    ASSERT_TRUE(detail::device_lost());
+    (void)pending;
+
+    const auto start = std::chrono::steady_clock::now();
+    // Scope destruction: this is the fallback unwind.
+    {
+        std::vector<Buffer> doomed = std::move(buffers);
+        EXPECT_NO_THROW(doomed.clear())
+            << "destroying buffers on a lost device must not throw";
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::printf("[gpu] destroying 12 buffers after a forced loss took %.3f s\n", seconds);
+    // The post-loss drain budget is 1 s for the whole unwind, not per buffer.
+    EXPECT_LT(seconds, 3.0)
+        << "the destructor drain is not sharing one deadline across the unwind";
+
+    // The device is still marked lost, and still refuses work.
+    EXPECT_TRUE(detail::device_lost());
+    EXPECT_THROW(run(*context, {dispatch}), Error);
+
+    detail::reset_device_lost();
+    EXPECT_TRUE(available());
 }

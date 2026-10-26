@@ -37,13 +37,13 @@ sections below give the engineering detail behind each item.
   loader and driver headers, which the current vcpkg recipe does not carry
   yet, so every Windows task runs on the CPU. Linux and macOS builds
   include it and fall back to the CPU when no suitable device is found.
-- **Long GPU steps can freeze an M1 Mac with 16 GB.** On a first-generation
-  Apple silicon Mac, Build Model (and possibly other long GPU steps) can
-  stall the display and force a restart, because the work shares the GPU with
-  the screen. Newer Macs were not affected in testing. Until this is fixed,
-  run the app with the GPU layer off on such a machine:
-  `ALPHASHAPE_GPU=0 /Applications/alphashape.app/Contents/MacOS/alphashape-gui`
-  (the tasks then run on the CPU), and save before long Build steps.
+- **Long GPU steps on a first-generation M1 (16 GB).** Build Model used to be
+  able to stall the display and force a restart on such a machine, because a
+  single long submission to the shared GPU starved WindowServer. The mesh and
+  stereo GPU loops now split their work into submissions of roughly 50-100 ms,
+  and a fence timeout or lost device falls back to the CPU for the rest of the
+  session, so the display is no longer starved. `ALPHASHAPE_GPU=0` still forces
+  the CPU if a specific machine proves unstable.
 - **The Python module is per interpreter.** A `.so`/`.pyd` is loadable only
   by the CPython minor version it was built against: 3.12 for the `.deb`
   (Ubuntu 24.04's system `python3`) and for the Windows installer (a pinned
@@ -231,12 +231,15 @@ sections below give the engineering detail behind each item.
   kernel ("Cannot select: ... anyext from i16"), so `tv_l1_fusion_device`
   declines software devices and takes the CPU path (the kernel stays
   hardware-only until that driver limitation changes).
-- **Submission model (WP-10.3):** `run_async` + `Ticket`/`wait` replace the
-  single synchronous path; `run` is `run_async` + `wait`. The ring is two
-  command pools with one fence per slot and a hard cap of `kMaxInFlight = 4`
-  un-waited submissions per context (the 5th throws `gpu::Error`). Fence waits
-  poll in 5 s slices with a 30 s total budget on hardware and 10 min on a CPU
-  driver. What is *not* verified:
+- **Submission model (WP-10.3, extended by WP-31):** `run_async` + `Ticket`/`wait`
+  replace the single synchronous path; `run` is `run_async` + `wait`. The ring is
+  two command pools with one fence per slot and a hard cap of
+  `kMaxInFlight = 4` un-waited submissions per context (the 5th throws
+  `gpu::Error`). Long iteration loops go through `run_batched`, which splits
+  them into submissions that each last roughly 50-100 ms. Fence waits poll in
+  1 s slices with a 5 s total budget on hardware and 10 min on a CPU driver;
+  a timeout or `VK_ERROR_DEVICE_LOST` marks the device unusable for the rest of
+  the process and the operation reruns on the CPU. What is *not* verified:
   - **Two queues:** a second compute queue is created only when the selected
     family reports `queueCount >= 2`, and is used only by
     `Submission{.queue = 1}`. Both validated drivers (MoltenVK on M1, llvmpipe)

@@ -59,6 +59,10 @@ struct TvFusionGpuProfile {
     double iterate_seconds = 0.0;
     double readback_seconds = 0.0;
     int batches = 0;
+    /// GPU submissions the iteration loop issued. Each batch is split so no
+    /// single submission runs longer than roughly 50-100 ms (gpu::run_batched),
+    /// so this is always at least the batch count.
+    int submissions = 0;
 };
 TvFusionGpuProfile tv_fusion_gpu_last_profile();
 
