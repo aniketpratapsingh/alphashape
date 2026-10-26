@@ -587,6 +587,10 @@ private:
 TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
+    // The fixture is shared between tests, so an earlier case may already have
+    // produced an orthomosaic. The contract is that a refused run leaves
+    // whatever was there untouched, not that nothing exists.
+    const Orthomosaic before = chunk.orthomosaic();
 
     // A 1 MB budget cannot hold any ortho of this scene: the guard must refuse
     // before allocating, naming the resolution, the machine and an actionable
@@ -605,7 +609,7 @@ TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
         EXPECT_NE(message.find("Set a coarser resolution"), std::string::npos) << message;
     }
     EXPECT_TRUE(threw) << "the guard did not refuse a 1 MB budget";
-    EXPECT_TRUE(chunk.orthomosaic().empty());  // nothing was committed
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
 }
 
 TEST(BuildOrthomosaic, MemoryGuardStillAllowsARealisticRun) {
