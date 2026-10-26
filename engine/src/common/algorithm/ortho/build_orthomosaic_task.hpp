@@ -34,8 +34,9 @@ struct FootprintCamera {
     double focal_px = 0.0;                             ///< focal length in pixels
 };
 
-/// Surface height (metres, NaN where unknown) at a horizontal position in the
-/// same metric plane frame as the cameras.
+/// Surface height in metres at a horizontal position in the same metric plane
+/// frame as the cameras. MUST return NaN (not a finite nodata sentinel) where
+/// the surface is unknown: the ray march treats every finite value as ground.
 using SurfaceHeight = std::function<double(double x, double y)>;
 
 /// The median ground sample distance (metres) the cameras see at their image

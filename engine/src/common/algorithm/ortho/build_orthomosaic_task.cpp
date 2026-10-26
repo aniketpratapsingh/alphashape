@@ -601,9 +601,13 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
         }
         const ortho::SurfaceHeight height =
             [&raster, nodata, origin, metres_per_unit](double x, double y) {
-                return sample_grid(raster, nodata,
-                                   origin.x() + x / metres_per_unit.x(),
-                                   origin.y() + y / metres_per_unit.y());
+                const double h = sample_grid(raster, nodata,
+                                             origin.x() + x / metres_per_unit.x(),
+                                             origin.y() + y / metres_per_unit.y());
+                // The raster's nodata sentinel is a finite number; the march
+                // needs NaN so "unknown" is never mistaken for ground.
+                return h == static_cast<double>(nodata) ? std::numeric_limits<double>::quiet_NaN()
+                                                        : h;
             };
         const double stride =
             std::max(raster.grid.pixel_size_x * metres_per_unit.x(),

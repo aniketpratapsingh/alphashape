@@ -796,10 +796,12 @@ TEST(OrthoAutoResolution, GeographicGridIsInDegreesNotMetres) {
     EXPECT_NEAR(metres_per_degree.y(), 111132.0, 500.0);
     EXPECT_NEAR(metres_per_degree.x(), 73500.0, 800.0);
 
-    // A 1 cm GSD becomes ~1 cm / metres-per-degree degrees, not 0.01 (metres in
-    // a degree grid) and not 1 (a bare metric fallback).
+    // A 1 cm GSD becomes ~1 cm / metres-per-degree degrees: a number three
+    // orders of magnitude below a degree, never 0.01 (a metre value used as a
+    // degree cell) and never 1 (a bare metric fallback).
     const double cell_degrees = 0.01 / std::max(metres_per_degree.x(), metres_per_degree.y());
-    EXPECT_NEAR(cell_degrees, 0.01 / 111132.0, 0.0005 * 0.01 / 111132.0);
+    const double expected = 0.01 / metres_per_degree.y();  // the larger component
+    EXPECT_NEAR(cell_degrees, expected, 1e-12);
     EXPECT_LT(cell_degrees, 1e-6);
 }
 
