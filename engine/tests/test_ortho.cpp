@@ -338,8 +338,10 @@ TEST(Ortho, CroppedTilesMatchFullGridExactly) {
         EXPECT_FALSE(crop.empty()) << "camera " << index << " covered nothing";
         EXPECT_LE(crop.x0 + crop.width, scene.grid.width);
         EXPECT_LE(crop.y0 + crop.height, scene.grid.height);
-        total_crop_cells += static_cast<std::size_t>(crop.width) * crop.height;
-        total_full_cells += static_cast<std::size_t>(full.width) * full.height;
+        total_crop_cells += static_cast<std::size_t>(crop.width) *
+                            static_cast<std::size_t>(crop.height);
+        total_full_cells += static_cast<std::size_t>(full.width) *
+                            static_cast<std::size_t>(full.height);
 
         for (int row = 0; row < scene.grid.height; ++row) {
             for (int col = 0; col < scene.grid.width; ++col) {
@@ -528,6 +530,10 @@ TEST(Seam, LabelsCoverInterior) {
             }
             if (covered) {
                 ++interior_covered;
+                const std::size_t cell =
+                    static_cast<std::size_t>(row) *
+                        static_cast<std::size_t>(scene.grid.width) +
+                    static_cast<std::size_t>(col);
                 if (labels[cell] >= 0) {
                     ++interior_labelled;
                 }
