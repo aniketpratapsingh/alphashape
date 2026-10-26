@@ -815,9 +815,16 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(plane_y);
         const double unit_m = std::max(metres_per_unit.x(), metres_per_unit.y());
         double cell = unit_m > 0.0 ? gsd_metres / unit_m : gsd_metres;
+        // Sanity floor only. The measured GSD is the ground truth the user asked
+        // for; the DEM cell is just a reminder that a grid far finer than the
+        // surface it resamples cannot add detail. A floor of a quarter cell
+        // (the old rule) overrode the measurement: a 1 m DEM forced a 0.25 m
+        // ortho even when the photographs resolved 0.4 m, quadrupling the run
+        // for no visible gain. An eighth of the DEM cell only catches a
+        // measurement that is wrong by an order of magnitude.
         if (!raster.empty()) {
-            cell = std::max(cell, 0.25 * std::max(raster.grid.pixel_size_x,
-                                                  raster.grid.pixel_size_y));
+            cell = std::max(cell, 0.125 * std::max(raster.grid.pixel_size_x,
+                                                   raster.grid.pixel_size_y));
         }
         return cell;
     };

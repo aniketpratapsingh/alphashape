@@ -172,8 +172,12 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
         const Eigen::Vector3d t = pose_translation(camera.pose);
         // The full-resolution focal length in pixels: the calibration below is
         // scaled to this map's resolution, so undo the downscale. depth *
-        // downscale / focal_px (the full-res focal) is the world footprint of
-        // one depth-map pixel, the natural automatic cell size here.
+        // downscale / focal_px (the full-res focal) is the pixel's size
+        // PERPENDICULAR to the optical axis; the ground footprint is that
+        // divided by cos(incidence), the same rule the orthomosaic's automatic
+        // resolution uses (ortho::median_ground_sample_distance). Without the
+        // cosine an oblique flight is over-sampled by 1/cos(i): a 60-degree
+        // camera asks for twice the cells its photographs resolve.
         const double full_focal = calibration.f * static_cast<double>(map.downscale);
         std::vector<double> footprints;
         footprints.reserve(pixels);
@@ -190,7 +194,8 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                                              static_cast<double>(j) + 0.5);
                 const Eigen::Vector3d ray = calibration.unproject(centre);
                 const Eigen::Vector3d p_cam = static_cast<double>(depth) * ray;
-                const Eigen::Vector3d plane = frame.to_plane(rt * (p_cam - t));
+                const Eigen::Vector3d local = rt * (p_cam - t);
+                const Eigen::Vector3d plane = frame.to_plane(local);
                 if (!std::isfinite(plane.x()) || !std::isfinite(plane.y()) ||
                     !std::isfinite(plane.z())) {
                     continue;
@@ -201,8 +206,17 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                 s.confidence = map.confidence.empty() ? 1.0F : map.confidence[idx];
                 result.samples.push_back(s);
                 if (full_focal > 1e-12) {
-                    footprints.push_back(static_cast<double>(depth) *
-                                         static_cast<double>(map.downscale) / full_focal);
+                    // Incidence against the plane frame's up (the vertical, the
+                    // normal a terrain model is written against), per pixel
+                    // rather than per camera, so the ray's own tilt is included.
+                    // A grazing ray loses incidence in the same 0.15 floor the
+                    // ortho rule uses rather than exploding the cell.
+                    const double cos_incidence = std::abs((rt * ray).z());
+                    if (cos_incidence > 0.15) {
+                        footprints.push_back(static_cast<double>(depth) *
+                                             static_cast<double>(map.downscale) /
+                                             (full_focal * cos_incidence));
+                    }
                 }
             }
         }

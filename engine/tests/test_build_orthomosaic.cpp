@@ -848,6 +848,93 @@ TEST(OrthoAutoResolution, ObliqueIsTwiceTheNadirFootprintAt45Degrees) {
     EXPECT_NEAR(gsd, 2.0 * nadir, 0.1 * 2.0 * nadir);
 }
 
+TEST(OrthoAutoResolution, DefaultFollowsTheMeasuredGsdNotAQuarterDemCell) {
+    // The default ortho cell must be the measured GROUND sample distance, not a
+    // fraction of the DEM cell. A 1 m DEM with photographs that resolve ~0.4 m
+    // used to come out at 0.25 m (a quarter of the DEM cell): four times the run
+    // for detail the imagery does not have. Here the focal length is lowered to
+    // 150 px so the analytic ground GSD is clearly above the new 1/8-cell sanity
+    // floor, and the DEM is forced to a 1 m cell while the cameras are unchanged.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+
+    // Work in the fixture's own LOCAL ENU frame (identity transform, epsg 0), so
+    // the synthetic DEM below is in the same metres as the poses and no UTM
+    // projection is involved in the comparison.
+    chunk.transform() = Transform::Identity();
+    chunk.crs().epsg = 0;
+
+    const double f_px = 150.0;
+    for (Sensor& sensor : chunk.sensors()) {
+        sensor.calibration =
+            Calibration::initial(CameraType::Frame, aerial_fixture::kImageWidth,
+                                 aerial_fixture::kImageHeight, f_px);
+    }
+
+    // A 1 m DEM over the fixture area, sampled from the analytic terrain. No
+    // camera's principal ray lands on the building, so the terrain alone is the
+    // surface the measurement sees.
+    constexpr double kCell = 1.0;
+    Elevation& elevation = chunk.elevation();
+    elevation.epsg = 0;
+    elevation.source = "depth_maps";
+    elevation.nodata = -32767.0F;
+    RasterGrid& grid = elevation.raster.grid;
+    grid.origin_x = aerial_fixture::kAreaX0;
+    grid.origin_y = aerial_fixture::kAreaY1;
+    grid.pixel_size_x = kCell;
+    grid.pixel_size_y = kCell;
+    grid.width = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaX1 - aerial_fixture::kAreaX0) / kCell));
+    grid.height = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaY1 - aerial_fixture::kAreaY0) / kCell));
+    elevation.raster.channels = 1;
+    elevation.raster.data.resize(static_cast<std::size_t>(grid.width) *
+                                 static_cast<std::size_t>(grid.height));
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            const Eigen::Vector2d c = grid.pixel_center(col, row);
+            elevation.raster.at(col, row) =
+                static_cast<float>(aerial_fixture::truth_height(c.x(), c.y()));
+        }
+    }
+
+    // The analytic ground GSD: slant range to the surface / (f * cos incidence),
+    // median over the cameras. This is the value the task's ray march estimates.
+    const std::vector<aerial_fixture::TruthPose> poses = aerial_fixture::load_truth();
+    std::vector<double> analytic;
+    analytic.reserve(poses.size());
+    for (const aerial_fixture::TruthPose& pose : poses) {
+        const Eigen::Vector3d direction = pose.R.transpose() * Eigen::Vector3d(0, 0, 1);
+        double s = 0.0;
+        Eigen::Vector3d hit = pose.centre;
+        for (; s < 500.0; s += 0.01) {
+            hit = pose.centre + s * direction;
+            if (hit.z() <= aerial_fixture::truth_height(hit.x(), hit.y())) {
+                break;
+            }
+        }
+        const double cos_incidence = std::abs(direction.z());
+        analytic.push_back((hit - pose.centre).norm() / (f_px * cos_incidence));
+    }
+    std::sort(analytic.begin(), analytic.end());
+    const double analytic_median = 0.5 * (analytic[analytic.size() / 2 - 1] +
+                                          analytic[analytic.size() / 2]);
+
+    Params params = ortho_params();  // resolution 0 = automatic
+    run_task(builtin_registry(), document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    const double cell = ortho.raster.grid.pixel_size_x;
+    std::printf("[OrthoAutoResolution.Default] cell=%.4f analytic=%.4f ratio=%.3f "
+                "(dem %.2f, quarter-cell would be %.3f)\n",
+                cell, analytic_median, cell / analytic_median, kCell, 0.25 * kCell);
+    EXPECT_NEAR(cell, analytic_median, 0.10 * analytic_median);
+    // And explicitly not the old quarter-DEM-cell floor, which is 35% below.
+    EXPECT_GT(cell, 1.2 * (0.25 * kCell));
+}
+
 TEST(OrthoAutoResolution, MedianOverTheFlightAndSlopeAwareFootprint) {
     // A mixed nadir/45-degree flight: the median is the middle order statistic,
     // here the nadir value (2 cameras nadir at 50 m, 1 oblique at 100 m so its
