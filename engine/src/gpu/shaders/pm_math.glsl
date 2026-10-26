@@ -18,6 +18,24 @@ const float PM_TWO_PI = 6.283185307179586;
 const float PM_CONE_HALF_ANGLE = 1.0471975511965976;  // pi / 3
 const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 
+// Why `precise` appears on selected expressions below and in pm_core.glsl.
+//
+// Under -O glslang/SPIRV-Tools is free to contract `a + b * u` into a fused
+// multiply-add, and NVIDIA hardware does so. The CPU reference in
+// patch_match.cpp computes every such expression in double as two separately
+// rounded operations, and this kernel's output is not smooth in those last bits:
+// sample_image() floors the projected coordinate, so a single-ulp difference
+// near an integer boundary reads a different texel, which changes a neighbour's
+// ZNCC, which flips the winner-take-all selection for the pixel. Measured on the
+// dense fixture: optimised pm_refine alone dropped GPU/CPU depth agreement from
+// 100% to 93.4% purely from that.
+//
+// `precise` is therefore applied to exactly the expressions that decide *which
+// texel is sampled* (the projected pixel, the window-plane depths, the
+// deterministic draw values) and not to the ZNCC accumulators, which use their
+// own precise declarations, or to the normals. That keeps the disassembly close
+// to the -O0 build where it matters and leaves the hot loops free to contract.
+
 layout(push_constant) uniform PmParams {
     uint width;
     uint height;
@@ -59,15 +77,23 @@ layout(binding = 13) buffer OutCost { float out_cost[]; };
 // interface variables, which would make the binding count differ per kernel.
 // This never-taken branch (pc.touch is always 0) keeps all 14 bindings in every
 // module, so one buffer list works for every dispatch.
-void keep_bindings_alive(int index) {
+//
+// Element 0 of every binding, deliberately: the branch is dead, but an
+// optimiser may speculatively hoist a load out of it, and an out-of-range
+// storage-buffer access is undefined behaviour in Vulkan. Indexing by the lane's
+// pixel was out of range for views/view_ints/offsets on every image wider than
+// the neighbour or window count (i.e. almost always), which is exactly the kind
+// of latent UB that behaves differently at -O0 and -O.
+void keep_bindings_alive() {
     if (pc.touch != 0u) {
-        float keep = ref_img[index] + nb_img[index] + views[index] + view_ints[index] +
-                     offsets[index] + state_active[index] + ref_windows[index] + bearings[index];
-        out_depth[index] = keep;
-        out_normals[index] = keep;
-        out_normals[index + 1] = keep;
-        out_normals[index + 2] = keep;
-        out_cost[index] = keep;
+        float keep = ref_img[0] + nb_img[0] + views[0] + view_ints[0] + offsets[0] +
+                     state_depth[0] + state_normal[0] + state_cost[0] + state_active[0] +
+                     ref_windows[0] + bearings[0];
+        out_depth[0] = keep;
+        out_normals[0] = keep;
+        out_normals[1] = keep;
+        out_normals[2] = keep;
+        out_cost[0] = keep;
     }
 }
 
@@ -146,11 +172,27 @@ U64 splitmix64(U64 x) {
     return u64_xor(x, u64_shr(x, 31u));
 }
 
-struct Rng {
-    U64 state;
+// A stream key, not a mutable cursor. The nth draw of a stream is
+// splitmix64^(n+1) of its key, so every draw is a pure function of
+// (key, draw index) with nothing carried between calls.
+//
+// This shape is deliberate. The first version carried the state in an `inout`
+// struct passed down through rng_next/random_unit_vector/random_cone_normal/
+// perturb_normal/random_depth. glslang lowers an `inout` aggregate parameter to
+// a pointer into Function storage with an explicit copy-in and copy-out, and the
+// copy-out is what the SPIR-V optimiser's inliner/scalar-replacement pass does
+// not always preserve. The failure was specific and reproducible: in pm_init the
+// depth draw (index 0) stayed correct while the two normal draws came back equal
+// to it, so every pixel got the right depth and a wrong normal (0.9% normal
+// agreement on the Tesla T4 at -O). A keyed stream cannot lose state because
+// there is no state to lose, and it also removes the whole class of
+// "two draws in one argument list" ordering hazards: the draw index is written
+// out at every call site.
+struct RngKey {
+    U64 state;  // already folded: seed, pixel, iteration and stream
 };
 
-Rng rng_stream(U64 seed, uint pixel, U64 iteration, uint stream) {
+RngKey rng_key(U64 seed, uint pixel, U64 iteration, uint stream) {
     U64 h = splitmix64(u64_add(seed, 0x7F4A7C15u, 0x9E3779B9u));
     // pixel * 0x100000001B3
     h = splitmix64(u64_xor(h, u64_mul(u64_from_u32(pixel), U64(0x000001B3u, 0x00000100u))));
@@ -158,19 +200,36 @@ Rng rng_stream(U64 seed, uint pixel, U64 iteration, uint stream) {
     h = splitmix64(u64_xor(h, u64_mul(iteration, U64(0x27D4EB4Fu, 0xC2B2AE3Du))));
     // stream * 0x9E3779B97F4A7C15
     h = splitmix64(u64_xor(h, u64_mul(U64(stream, 0u), U64(0x7F4A7C15u, 0x9E3779B9u))));
-    Rng rng;
-    rng.state = h;
-    return rng;
+    RngKey key;
+    key.state = h;
+    return key;
 }
 
-float rng_next(inout Rng rng) {
-    rng.state = splitmix64(rng.state);
-    // uniform01() = (bits >> 11) * 2^-53. The expression is written so the two
-    // operands never exceed 2^24 (exact in float32): the high 29 bits scaled by
-    // 2^-29 plus the remaining 24 bits scaled by 2^-53.
-    return float(rng.state.hi >> 3u) * (1.0 / 536870912.0) +
-           float((rng.state.hi & 7u) << 21u | (rng.state.lo >> 11u)) * (1.0 / 9007199254740992.0);
+// The nth raw draw of a stream (n = 0 is the CPU's first next()). The chain is
+// walked in a plain local, starting from the key, so no state is carried across
+// a call boundary. Callers always pass a literal index, so the trip count folds
+// away at compile time.
+U64 rng_draw(RngKey key, uint index) {
+    U64 state = key.state;
+    for (uint i = 0u; i <= index; ++i) {
+        state = splitmix64(state);
+    }
+    return state;
 }
+
+// 53-bit uniform in [0, 1) from one draw, identical to uniform01().
+float rng_uniform64(U64 bits) {
+    // (bits >> 11) * 2^-53. The expression is written so the two operands never
+    // exceed 2^24 (exact in float32): the high 29 bits scaled by 2^-29 plus the
+    // remaining 24 bits scaled by 2^-53.
+    precise float hi_part = float(bits.hi >> 3u) * (1.0 / 536870912.0);
+    precise float lo_part =
+        float((bits.hi & 7u) << 21u | (bits.lo >> 11u)) * (1.0 / 9007199254740992.0);
+    precise float result = hi_part + lo_part;
+    return result;
+}
+
+float rng_uniform(RngKey key, uint index) { return rng_uniform64(rng_draw(key, index)); }
 
 // Eigen's Vector3d::unitOrthogonal(), reproduced exactly: it picks the
 // (-y, x, 0) basis unless x and y are both negligible next to z, in which case
@@ -189,29 +248,29 @@ vec3 eigen_unit_orthogonal(vec3 v) {
 
 vec3 any_orthogonal(vec3 v) { return eigen_unit_orthogonal(v); }
 
-vec3 random_unit_vector(inout Rng rng) {
-    float z = 2.0 * rng_next(rng) - 1.0;
+vec3 random_unit_vector(RngKey key, uint index) {
+    float z = 2.0 * rng_uniform(key, index + 0u) - 1.0;
     float r = sqrt(max(0.0, 1.0 - z * z));
-    float phi = PM_TWO_PI * rng_next(rng);
+    float phi = PM_TWO_PI * rng_uniform(key, index + 1u);
     return vec3(r * cos(phi), r * sin(phi), z);
 }
 
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
-vec3 random_cone_normal(inout Rng rng, vec3 b_p) {
+vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
-    float ct = cos_min + (1.0 - cos_min) * rng_next(rng);
+    precise float ct = cos_min + (1.0 - cos_min) * rng_uniform(key, index + 0u);
     float st = sqrt(max(0.0, 1.0 - ct * ct));
-    float phi = PM_TWO_PI * rng_next(rng);
+    float phi = PM_TWO_PI * rng_uniform(key, index + 1u);
     vec3 u = any_orthogonal(axis);
     vec3 v = cross(axis, u);
     return normalize(st * cos(phi) * u + st * sin(phi) * v + ct * axis);
 }
 
 // n rotated by a random angle in [0, max_angle] about a random axis.
-vec3 perturb_normal(inout Rng rng, vec3 n, float max_angle) {
-    float angle = max_angle * rng_next(rng);
-    vec3 axis = random_unit_vector(rng);
+vec3 perturb_normal(RngKey key, uint index, vec3 n, float max_angle) {
+    precise float angle = max_angle * rng_uniform(key, index + 0u);
+    vec3 axis = random_unit_vector(key, index + 1u);
     if (abs(dot(axis, n)) > 0.999) {
         axis = any_orthogonal(n);
     }
@@ -221,10 +280,11 @@ vec3 perturb_normal(inout Rng rng, vec3 n, float max_angle) {
 }
 
 // Depth sampled uniformly in inverse depth over [depth_min, depth_max].
-float random_depth(inout Rng rng) {
+float random_depth(RngKey key, uint index) {
     float lo = 1.0 / pc.depth_max;
     float hi = 1.0 / pc.depth_min;
-    return 1.0 / (lo + (hi - lo) * rng_next(rng));
+    precise float inv = lo + (hi - lo) * rng_uniform(key, index + 0u);
+    return 1.0 / inv;
 }
 
 // The forward model of model/camera/calibration.hpp in float32 (Brown-Conrady
@@ -267,8 +327,11 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
         yd = ys * radial_scale + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys;
     }
     float f = fcx.x, cx = fcx.y, cy = fcx.z;
-    pixel = vec2(float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y,
-                 float(vh) * 0.5 + cy + yd * f);
+    // Same operation sequence as try_project_point(), no contraction: the
+    // sampler's floor() below turns a 1-ulp difference into a different texel.
+    precise float u = float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y;
+    precise float v = float(vh) * 0.5 + cy + yd * f;
+    pixel = vec2(u, v);
     return true;
 }
 
@@ -293,7 +356,11 @@ float sample_image(int image_base, int vw, int vh, float x, float y) {
     float v10 = nb_img[row_a + xb];
     float v01 = nb_img[row_b + xa];
     float v11 = nb_img[row_b + xb];
-    float top = v00 * (1.0 - ax) + v10 * ax;
-    float bottom = v01 * (1.0 - ax) + v11 * ax;
-    return top * (1.0 - ay) + bottom * ay;
+    // Orthogonal to the pixel grid, so these are the exact operation sequence of
+    // the CPU's sample_image() (`v00 * (1 - ax) + v10 * ax`); contracting them
+    // into an FMA would change the sampled value near zero weights.
+    precise float top = v00 * (1.0 - ax) + v10 * ax;
+    precise float bottom = v01 * (1.0 - ax) + v11 * ax;
+    precise float result = top * (1.0 - ay) + bottom * ay;
+    return result;
 }

@@ -55,14 +55,14 @@ if(ALPHASHAPE_GPU)
         shaders/poisson_precond.comp
         shaders/poisson_axpy.comp)
     set(_spv_files "")
-    # Kernels compiled without the SPIR-V optimiser; see alphashape_add_shader.
-    set(_unoptimised_shaders shaders/pm_init.comp shaders/pm_refine.comp)
+    # Every kernel is built with the SPIR-V optimiser. The PatchMatch search
+    # kernels used to be the exception, because their optimised SPIR-V produced a
+    # wrong random-plane normal on the NVIDIA Tesla T4; that was undefined
+    # behaviour in the shaders (a mutable RNG carried through `inout` parameters,
+    # an out-of-range index in a never-taken branch), not a driver bug, and is
+    # fixed in pm_math.glsl and pm_core.glsl. There is no NO_OPTIMIZE list.
     foreach(_shader IN LISTS _shader_sources)
-        if(_shader IN_LIST _unoptimised_shaders)
-            alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}" NO_OPTIMIZE)
-        else()
-            alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}")
-        endif()
+        alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}")
         get_filename_component(_name "${_shader}" NAME_WE)
         list(APPEND _spv_files "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_name}.spv")
     endforeach()

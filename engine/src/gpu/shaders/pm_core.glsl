@@ -79,8 +79,11 @@ bool window_is_textured(int pixel) {
         sq += v * v;
     }
     float inv = 1.0 / float(n);
-    float mean = sum * inv;
-    float var = max(0.0, sq - sum * mean);
+    // `sum * mean` is a contracted multiply-subtract candidate; the CPU computes
+    // `sq - sum * mean` as two rounded operations, and this test decides the
+    // texture mask, i.e. which pixels are searchable at all.
+    precise float mean = sum * inv;
+    precise float var = max(0.0, sq - sum * mean);
     return sqrt(var * inv) >= pc.min_texture;
 }
 
@@ -152,6 +155,14 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
         float depth_q = dq[k];
         if (!(depth_q > 0.0)) {
             continue;  // edge-on or behind the reference camera for every view
+        }
+        // Even if every remaining sample were valid, a window that has already
+        // lost too many cannot reach the quorum: stop early, as neighbour_cost()
+        // does on the CPU. A wide-baseline neighbour (most of a nadir grid) dies
+        // here after a handful of samples instead of walking the whole window.
+        if (valid + (n - k) < min_valid) {
+            valid_out = valid;
+            return PM_NO_MATCH_COST;
         }
         ivec2 off = s_offsets[k];
         int bi = ((y + off.y) * int(pc.width) + (x + off.x)) * 3;
@@ -228,6 +239,10 @@ float multiview_cost(int x, int y, float rho, vec3 plane_normal) {
         return PM_NO_MATCH_COST;
     }
     const int want = int(pc.best_k);
+    // Only best[0 .. filled-1] is ever read, and `filled` only grows by writing
+    // the slot first, so the array is fully defined where it is live. `want` is
+    // clamped to [1, n_neighbours] by the host, so best[want - 1] below is in
+    // range on every path.
     float best[PM_MAX_NEIGHBOURS];
     int filled = 0;
     int votes = 0;
@@ -277,16 +292,22 @@ struct Best {
 // Snap a hypothesis into a valid plane and evaluate it, as
 // evaluate_hypothesis(). A candidate equal to the incumbent reproduces its cost
 // and can never be strictly cheaper, so it is skipped.
-void evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, inout Best best) {
+//
+// Takes and returns `Best` by value rather than through `inout`: an aggregate
+// `inout` parameter is a Function-storage pointer that the caller has to copy
+// back after the call, and surviving a copy-back through a long inlined callee
+// (multiview_cost) is exactly what the optimiser did not do reliably for the RNG
+// state. A value parameter is a plain SSA value with nothing to copy back.
+Best evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, Best best) {
     if (!(depth > pc.depth_min && depth < pc.depth_max)) {
-        return;
+        return best;
     }
-    float nb = dot(n, b_p);
+    precise float nb = dot(n, b_p);
     if (nb >= -PM_FACING_EPS) {
-        return;
+        return best;
     }
     if (depth == best.depth && n == best.normal) {
-        return;
+        return best;
     }
     float cost = multiview_cost(x, y, depth * nb, n);
     if (cost < best.cost) {
@@ -294,6 +315,7 @@ void evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, inout Best
         best.depth = depth;
         best.normal = n;
     }
+    return best;
 }
 
 vec3 pixel_bearing(int pixel) {
@@ -301,20 +323,21 @@ vec3 pixel_bearing(int pixel) {
 }
 
 // Propagate pixel q's plane onto pixel p (as propagate()), reading q from the
-// state buffers of the previous half-sweep.
-void propagate(int x, int y, int q, vec3 b_p, inout Best best) {
+// state buffers of the previous half-sweep. Returns the updated `Best`, like
+// evaluate_hypothesis(): no aggregate `inout` anywhere in the search core.
+Best propagate(int x, int y, int q, vec3 b_p, Best best) {
     float qd = state_depth[q];
     if (!(qd > 0.0)) {
-        return;
+        return best;
     }
     vec3 n = vec3(state_normal[q * 3 + 0], state_normal[q * 3 + 1], state_normal[q * 3 + 2]);
     if (dot(n, n) < 1e-12) {
-        return;
+        return best;
     }
-    float rho_q = qd * dot(n, pixel_bearing(q));
-    float denom = dot(n, b_p);
+    precise float rho_q = qd * dot(n, pixel_bearing(q));
+    precise float denom = dot(n, b_p);
     if (denom >= -PM_FACING_EPS) {
-        return;
+        return best;
     }
-    evaluate_hypothesis(x, y, rho_q / denom, n, b_p, best);
+    return evaluate_hypothesis(x, y, rho_q / denom, n, b_p, best);
 }

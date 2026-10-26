@@ -9,6 +9,7 @@ All notable changes to alphashape are recorded here. The format follows
 ### Fixed
 
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
+- **Depth maps are several times faster.** The two PatchMatch search kernels were compiled without the SPIR-V optimiser as a workaround for a wrong random-plane normal on NVIDIA hardware. The real cause was undefined behaviour in the shaders, not the driver: the random-number generator carried its state in an aggregate `inout` parameter (the copy-back that the optimiser did not preserve), a never-taken branch indexed three buffers far out of range, and the `a + b * u` expressions whose rounding the match depends on were free to be contracted into fused multiply-adds. The generator is now a stateless keyed stream, the dead-branch index is in range, and those few scalar expressions are marked `precise`. Every GPU kernel is built optimised again on every backend.
 
 ## [0.1.0] - Unreleased
 

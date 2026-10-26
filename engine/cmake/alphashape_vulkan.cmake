@@ -149,11 +149,15 @@ endfunction()
 # alphashape_add_shader(<shader.comp> [NO_OPTIMIZE])
 #
 # Compiles one compute kernel to SPIR-V with glslc and validates it. NO_OPTIMIZE
-# skips the SPIR-V optimiser (glslc -O). The PatchMatch search kernels need it:
-# their optimised SPIR-V is miscompiled by the NVIDIA Vulkan driver (535 series,
-# Tesla T4), which returns a wrong random-plane normal for most pixels, while the
-# unoptimised module is executed correctly there and elsewhere. The driver runs
-# its own optimiser, so the unoptimised module costs no measurable speed.
+# skips the SPIR-V optimiser (glslc -O) and exists as a diagnosis switch: if a
+# kernel is wrong *only* optimised, the shader contains undefined behaviour the
+# optimiser is entitled to exploit, so compare the two builds before blaming the
+# driver. Nothing uses it today. (The PatchMatch search kernels did until their
+# own UB -- a mutable RNG threaded through `inout` parameters, and an
+# out-of-range index in a never-taken branch -- was fixed; see pm_math.glsl.
+# Note that skipping glslc -O is a real cost: the driver does not re-optimise a
+# module the way an offline optimise pass does, so -O0 SPIR-V runs several times
+# slower in the two hottest kernels in the pipeline.)
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
     if("NO_OPTIMIZE" IN_LIST ARGN)

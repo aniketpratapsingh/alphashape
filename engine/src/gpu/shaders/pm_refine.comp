@@ -41,40 +41,50 @@ void main() {
                        state_normal[pixel * 3 + 2]);
     best.cost = state_cost[pixel];
     if (!(best.depth > 0.0)) {
-        // No incumbent yet: seed from a fresh random plane.
-        Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
-        const float seed_depth = random_depth(rng);
-        const vec3 seed_normal = random_cone_normal(rng, b_p);
-        evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+        // No incumbent yet: seed from a fresh random plane. Draw indices are
+        // explicit (depth = 0, the cone normal = 1 and 2) so the stream can
+        // never be reordered by the optimiser, and they match the CPU's
+        // RngStream use order exactly.
+        const RngKey rng = rng_key(U64(pc.seed_lo, pc.seed_hi), uint(pixel),
+                                   U64(pc.iteration, pc.iteration_hi), 0u);
+        const float seed_depth = random_depth(rng, 0u);
+        const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
+        best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
     } else {
         for (int i = 0; i < 4; ++i) {
             ivec2 q = ivec2(x, y) + PM_ADJ[i];
             if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
                 continue;
             }
-            propagate(x, y, q.y * w + q.x, b_p, best);
+            best = propagate(x, y, q.y * w + q.x, b_p, best);
         }
         for (int i = 0; i < 4; ++i) {
             ivec2 q = ivec2(x, y) + PM_FAR[i];
             if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
                 continue;
             }
-            propagate(x, y, q.y * w + q.x, b_p, best);
+            best = propagate(x, y, q.y * w + q.x, b_p, best);
         }
         // Refinement: a fresh random plane, then the current plane perturbed in
-        // inverse depth and normal.
-        Rng rng = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 0u);
-        const float seed_depth = random_depth(rng);
-        const vec3 seed_normal = random_cone_normal(rng, b_p);
-        evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+        // inverse depth and normal. Streams 0/1/2 exist only to keep the three
+        // purposes independent, as on the CPU; the draw index restarts at 0 in
+        // each of them.
+        const U64 seed = U64(pc.seed_lo, pc.seed_hi);
+        const U64 iteration = U64(pc.iteration, pc.iteration_hi);
+        const RngKey rng = rng_key(seed, uint(pixel), iteration, 0u);
+        const float seed_depth = random_depth(rng, 0u);
+        const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
+        best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
 
-        Rng rng_d = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 1u);
+        const RngKey rng_d = rng_key(seed, uint(pixel), iteration, 1u);
         float inv_d = 1.0 / best.depth;
-        float perturbed_inv = inv_d + (2.0 * rng_next(rng_d) - 1.0) * pc.depth_delta;
+        // No contraction: a 1-ulp difference here lands on a different depth,
+        // which is exactly the kind of tie the CPU/GPU comparison is sensitive to.
+        precise float perturbed_inv = inv_d + (2.0 * rng_uniform(rng_d, 0u) - 1.0) * pc.depth_delta;
         if (perturbed_inv > 0.0) {
-            Rng rng_n = rng_stream(U64(pc.seed_lo, pc.seed_hi), uint(pixel), U64(pc.iteration, pc.iteration_hi), 2u);
-            vec3 perturbed = perturb_normal(rng_n, best.normal, pc.normal_angle);
-            evaluate_hypothesis(x, y, 1.0 / perturbed_inv, perturbed, b_p, best);
+            const RngKey rng_n = rng_key(seed, uint(pixel), iteration, 2u);
+            vec3 perturbed = perturb_normal(rng_n, 0u, best.normal, pc.normal_angle);
+            best = evaluate_hypothesis(x, y, 1.0 / perturbed_inv, perturbed, b_p, best);
         }
     }
     if (best.depth > 0.0) {
@@ -84,5 +94,5 @@ void main() {
         state_normal[pixel * 3 + 2] = best.normal.z;
         state_cost[pixel] = best.cost;
     }
-    keep_bindings_alive(pixel);
+    keep_bindings_alive();
 }
