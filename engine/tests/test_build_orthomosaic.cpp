@@ -19,17 +19,21 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "base/utils/error.hpp"
+#include "base/platform/env.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
 
 namespace alphashape {
@@ -336,7 +340,12 @@ TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     std::printf("[BuildOrthomosaic.MatchesTruthOrtho] auto resolution=%.6f (DEM %.3f)\n",
                 resolution, dem_grid.pixel_size_x);
     EXPECT_GT(resolution, 0.0);
-    EXPECT_GE(resolution, 0.25 * dem_grid.pixel_size_x - 1e-9);
+    // The automatic cell is the measured ground GSD, floored only by the DEM/8
+    // sanity check. For this fixture (0.25 m DEM, 60 m flight, f = 500) the
+    // measured GSD is ~0.116 m, well above that floor and coarser than the old
+    // quarter-DEM-cell clamp would have allowed.
+    EXPECT_GE(resolution, 0.125 * dem_grid.pixel_size_x - 1e-9);
+    EXPECT_NEAR(resolution, 0.116, 0.02);
     expect_grid_covers_dem(ortho.raster.grid, dem_grid, resolution);
 
     // Every label is a chunk camera id or -1.
@@ -553,7 +562,206 @@ TEST(BuildOrthomosaic, Errors) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Export
+// 5. Memory guard
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Set ALPHASHAPE_MEMORY_BUDGET_MB for the lifetime of the object, restoring the
+/// previous value (or unsetting it) afterwards. The task reads the variable on
+/// every run, so nothing has to be restarted.
+class ScopedMemoryBudget {
+public:
+    explicit ScopedMemoryBudget(const std::string& megabytes) {
+        previous_ = platform::get_env("ALPHASHAPE_MEMORY_BUDGET_MB");
+        had_previous_ = !previous_.empty();
+        platform::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", megabytes);
+    }
+    ~ScopedMemoryBudget() {
+        platform::set_env("ALPHASHAPE_MEMORY_BUDGET_MB",
+                          had_previous_ ? previous_ : std::string());
+    }
+    ScopedMemoryBudget(const ScopedMemoryBudget&) = delete;
+    ScopedMemoryBudget& operator=(const ScopedMemoryBudget&) = delete;
+
+private:
+    std::string previous_;
+    bool had_previous_ = false;
+};
+
+/// Capture every log line emitted for the lifetime of the object, so a test can
+/// assert on a warning that is otherwise only visible on the console. The sink
+/// is process-wide, so the object must not outlive the test's own scope and no
+/// other test may run concurrently in this process (gtest runs one at a time).
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() {
+        previous_level_ = Log::level();
+        if (!Log::enabled(LogLevel::Trace)) {
+            Log::set_level(LogLevel::Trace);  // make sure Info/Warn are emitted
+        }
+        Log::set_sink([this](LogLevel level, const std::string& message) {
+            lines_.push_back({level, message});
+        });
+    }
+    ~ScopedLogCapture() {
+        Log::set_sink({});
+        Log::set_level(previous_level_);
+    }
+    ScopedLogCapture(const ScopedLogCapture&) = delete;
+    ScopedLogCapture& operator=(const ScopedLogCapture&) = delete;
+
+    /// Every captured line at `level`, joined by newline.
+    std::string text(LogLevel level) const {
+        std::string out;
+        for (const auto& [lvl, message] : lines_) {
+            if (lvl == level) {
+                out += message;
+                out += '\n';
+            }
+        }
+        return out;
+    }
+
+private:
+    std::vector<std::pair<LogLevel, std::string>> lines_;
+    LogLevel previous_level_ = LogLevel::Info;
+};
+
+}  // namespace
+
+TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    // The fixture is shared between tests, so an earlier case may already have
+    // produced an orthomosaic. The contract is that a refused run leaves
+    // whatever was there untouched, not that nothing exists.
+    const Orthomosaic before = chunk.orthomosaic();
+
+    // A 1 MB budget cannot hold any ortho of this scene: the guard must refuse
+    // before allocating, naming the resolution, the machine and an actionable
+    // coarser value.
+    ScopedMemoryBudget budget("1");
+    Params params = ortho_params("mosaic", "elevation", 0.05);
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("BuildOrthomosaic needs about"), std::string::npos)
+            << message;
+        EXPECT_NE(message.find("this machine has"), std::string::npos) << message;
+        EXPECT_NE(message.find("Set a coarser resolution"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "the guard did not refuse a 1 MB budget";
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
+}
+
+TEST(BuildOrthomosaic, AbsurdResolutionIsRefusedBeforeItOverflows) {
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    // 1e-6 m over the fixture's ~120 x 90 m DEM is ~1.1e16 cells: both the
+    // per-side counts and the product overflow the grid's int dimensions, so
+    // the grid builder must reject in double precision, before anything is
+    // allocated. A generous memory budget must not let it through: the failure
+    // is representational, not a shortage.
+    ScopedMemoryBudget budget("65536");
+    Params params = ortho_params("mosaic", "elevation", 1e-6);
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("would need"), std::string::npos) << message;
+        EXPECT_NE(message.find("choose a coarser resolution"), std::string::npos) << message;
+        EXPECT_NE(message.find("cells (the limit is"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "a micrometre resolution was not refused";
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
+}
+
+TEST(BuildOrthomosaic, MemoryGuardStillAllowsARealisticRun) {
+    // With a generous budget the fixture's 1 m ortho must go through: the guard
+    // is a floor, not a tax.
+    ScopedMemoryBudget budget("4096");
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    Params params = ortho_params("mosaic", "elevation", 1.0);
+    EXPECT_NO_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params));
+    EXPECT_FALSE(chunk.orthomosaic().empty());
+}
+
+TEST(BuildOrthomosaic, AutomaticResolutionIsCoarsenedToFitTheBudget) {
+    // The key behaviour change: with the DEFAULT resolution (0) a run that does
+    // not fit must be coarsened to the finest value that fits, complete, and say
+    // so at Warning -- not refused.
+    //
+    // The fixture's measured GSD is about 0.12 m (60 m above ground, f = 500 px);
+    // an 8 MB budget cannot hold that ortho (the 12 camera footprints alone are
+    // ~26 MB), so the automatic run must land clearly coarser than the GSD while
+    // still completing. No probe run is needed: the fixture's GSD is a scene
+    // constant, not something this test has to measure.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    ScopedMemoryBudget budget("8");
+    ScopedLogCapture capture;
+    Params params = ortho_params();  // resolution 0 = automatic
+    ASSERT_NO_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params));
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    EXPECT_FALSE(ortho == before) << "the coarsened run did not commit";
+    const double coarsened_cell = ortho.raster.grid.pixel_size_x;
+    std::printf("[BuildOrthomosaic.Coarsen] coarsened=%.4f\n", coarsened_cell);
+    EXPECT_TRUE(std::isfinite(coarsened_cell));
+    // The GSD default is ~0.12 m; the coarsened cell must be unmistakably above
+    // it, otherwise the budget was not the constraint.
+    EXPECT_GT(coarsened_cell, 0.25)
+        << "the automatic run was not coarsened at all";
+
+    // The warning names the GSD, the actual cell, the budget and how to override
+    // it.
+    const std::string warnings = capture.text(LogLevel::Warn);
+    EXPECT_NE(warnings.find("ground sample distance is"), std::string::npos) << warnings;
+    EXPECT_NE(warnings.find("building at"), std::string::npos) << warnings;
+    EXPECT_NE(warnings.find("Set resolution explicitly to override"), std::string::npos)
+        << warnings;
+    EXPECT_NE(warnings.find("budget"), std::string::npos) << warnings;
+}
+
+TEST(BuildOrthomosaic, ExplicitResolutionIsStillRefusedWhenItCannotFit) {
+    // An EXPLICIT cell is the user's decision: the task must not silently build
+    // at another scale. It keeps the existing actionable refusal.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    ScopedMemoryBudget budget("8");
+    Params params = ortho_params("mosaic", "elevation", 0.02);  // far finer than default
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("BuildOrthomosaic needs about"), std::string::npos) << message;
+        EXPECT_NE(message.find("at resolution 0.02"), std::string::npos) << message;
+        EXPECT_NE(message.find("Set a coarser resolution"), std::string::npos) << message;
+        // It must NOT have been silently coarsened into a different run.
+        EXPECT_EQ(message.find("building at"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "an explicit resolution that cannot fit was not refused";
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
+}
+
+// ---------------------------------------------------------------------------
+// 6. Export
 // ---------------------------------------------------------------------------
 
 TEST(ExportOrthomosaic, WritesGeoTiff) {
@@ -689,6 +897,243 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     EXPECT_EQ(got.orthomosaic().epsg, chunk.orthomosaic().epsg);
     EXPECT_EQ(got.orthomosaic().surface, "elevation");
     EXPECT_EQ(got.orthomosaic().labels, chunk.orthomosaic().labels);
+}
+
+// ---------------------------------------------------------------------------
+// 9. The automatic-resolution rule: true ground sample distance
+// ---------------------------------------------------------------------------
+//
+// The default cell must follow the GSD a pixel actually covers on the ground,
+// not "camera height / focal". The two agree for a nadir camera over level
+// ground and differ by sec(incidence) for an oblique one, which is the case a
+// circular flight (the reporter's dataset) exercises. These cases measure the
+// shared helper against the analytic footprint, so a regression that reverts to
+// the nadir formula fails here even if the whole-scene test still passes.
+
+namespace {
+
+/// A flat, infinite ground plane at height 0 with a square metre stride.
+ortho::SurfaceHeight flat_ground() {
+    return [](double, double) { return 0.0; };
+}
+
+/// One camera at `centre` looking along `direction`, with focal length
+/// `focal_px`. `direction` is normalised by the rule itself.
+ortho::FootprintCamera make_footprint_camera(const Eigen::Vector3d& centre,
+                                             const Eigen::Vector3d& direction,
+                                             double focal_px) {
+    ortho::FootprintCamera camera;
+    camera.centre = centre;
+    camera.direction = direction;
+    camera.focal_px = focal_px;
+    return camera;
+}
+
+}  // namespace
+
+TEST(OrthoAutoResolution, NadirMatchesHeightOverFocal) {
+    // 50 m above level ground, f = 3000 px: one pixel covers 50/3000 m.
+    const double expected = 50.0 / 3000.0;
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Nadir] gsd=%.6f expected=%.6f\n", gsd, expected);
+    ASSERT_GT(gsd, 0.0);
+    // The rule rounds to three significant figures; allow that plus the march's
+    // one-stride landing error on a 50 m drop (stride 1 m here).
+    EXPECT_NEAR(gsd, expected, 0.1 * expected);
+}
+
+TEST(OrthoAutoResolution, ObliqueIsTwiceTheNadirFootprintAt45Degrees) {
+    // A 45-degree camera 50 m up: the principal ray lands 50 m out, the slant
+    // range is 50*sqrt(2), and the footprint along the line of sight is that
+    // range / focal / cos(45) = 2 * (50 / focal).
+    const double nadir = 50.0 / 3000.0;
+    const Eigen::Vector3d direction = Eigen::Vector3d(1.0, 0.0, -1.0).normalized();
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), direction, 3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Oblique45] gsd=%.6f nadir=%.6f ratio=%.4f\n", gsd, nadir,
+                gsd / nadir);
+    ASSERT_GT(gsd, 0.0);
+    EXPECT_NEAR(gsd, 2.0 * nadir, 0.1 * 2.0 * nadir);
+}
+
+TEST(OrthoAutoResolution, DefaultFollowsTheMeasuredGsdNotAQuarterDemCell) {
+    // The default ortho cell must be the measured GROUND sample distance, not a
+    // fraction of the DEM cell. A 1 m DEM with photographs that resolve ~0.4 m
+    // used to come out at 0.25 m (a quarter of the DEM cell): four times the run
+    // for detail the imagery does not have. Here the focal length is lowered to
+    // 150 px so the analytic ground GSD is clearly above the new 1/8-cell sanity
+    // floor, and the DEM is forced to a 1 m cell while the cameras are unchanged.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+
+    // Work in the fixture's own LOCAL ENU frame (identity transform, epsg 0), so
+    // the synthetic DEM below is in the same metres as the poses and no UTM
+    // projection is involved in the comparison.
+    chunk.transform() = Transform::Identity();
+    chunk.crs().epsg = 0;
+
+    const double f_px = 150.0;
+    for (Sensor& sensor : chunk.sensors()) {
+        sensor.calibration =
+            Calibration::initial(CameraType::Frame, aerial_fixture::kImageWidth,
+                                 aerial_fixture::kImageHeight, f_px);
+    }
+
+    // A 1 m DEM over the fixture area, sampled from the analytic terrain. No
+    // camera's principal ray lands on the building, so the terrain alone is the
+    // surface the measurement sees.
+    constexpr double kCell = 1.0;
+    Elevation& elevation = chunk.elevation();
+    elevation.epsg = 0;
+    elevation.source = "depth_maps";
+    elevation.nodata = -32767.0F;
+    RasterGrid& grid = elevation.raster.grid;
+    grid.origin_x = aerial_fixture::kAreaX0;
+    grid.origin_y = aerial_fixture::kAreaY1;
+    grid.pixel_size_x = kCell;
+    grid.pixel_size_y = kCell;
+    grid.width = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaX1 - aerial_fixture::kAreaX0) / kCell));
+    grid.height = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaY1 - aerial_fixture::kAreaY0) / kCell));
+    elevation.raster.channels = 1;
+    elevation.raster.data.resize(static_cast<std::size_t>(grid.width) *
+                                 static_cast<std::size_t>(grid.height));
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            const Eigen::Vector2d c = grid.pixel_center(col, row);
+            elevation.raster.at(col, row) =
+                static_cast<float>(aerial_fixture::truth_height(c.x(), c.y()));
+        }
+    }
+
+    // The analytic ground GSD: slant range to the surface / (f * cos incidence),
+    // median over the cameras. This is the value the task's ray march estimates.
+    const std::vector<aerial_fixture::TruthPose> poses = aerial_fixture::load_truth();
+    std::vector<double> analytic;
+    analytic.reserve(poses.size());
+    for (const aerial_fixture::TruthPose& pose : poses) {
+        const Eigen::Vector3d direction = pose.R.transpose() * Eigen::Vector3d(0, 0, 1);
+        double s = 0.0;
+        Eigen::Vector3d hit = pose.centre;
+        for (; s < 500.0; s += 0.01) {
+            hit = pose.centre + s * direction;
+            if (hit.z() <= aerial_fixture::truth_height(hit.x(), hit.y())) {
+                break;
+            }
+        }
+        const double cos_incidence = std::abs(direction.z());
+        analytic.push_back((hit - pose.centre).norm() / (f_px * cos_incidence));
+    }
+    std::sort(analytic.begin(), analytic.end());
+    const double analytic_median = 0.5 * (analytic[analytic.size() / 2 - 1] +
+                                          analytic[analytic.size() / 2]);
+
+    Params params = ortho_params();  // resolution 0 = automatic
+    run_task(builtin_registry(), document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    const double cell = ortho.raster.grid.pixel_size_x;
+    std::printf("[OrthoAutoResolution.Default] cell=%.4f analytic=%.4f ratio=%.3f "
+                "(dem %.2f, quarter-cell would be %.3f)\n",
+                cell, analytic_median, cell / analytic_median, kCell, 0.25 * kCell);
+    EXPECT_NEAR(cell, analytic_median, 0.10 * analytic_median);
+    // And explicitly not the old quarter-DEM-cell floor, which is 35% below.
+    EXPECT_GT(cell, 1.2 * (0.25 * kCell));
+}
+
+TEST(OrthoAutoResolution, MedianOverTheFlightFootprint) {
+    // A mixed nadir/45-degree flight: the median is the middle order statistic,
+    // here the nadir value (2 cameras nadir at 50 m, 1 oblique at 100 m so its
+    // footprint is also "2x", i.e. equal; use heights 50, 50 and 100 to make the
+    // nadir footprint the median).
+    const double nadir = 50.0 / 3000.0;
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(10, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(20, 0, 100), Eigen::Vector3d(0.3, 0.0, -1.0),
+                              3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Median] gsd=%.6f nadir=%.6f\n", gsd, nadir);
+    EXPECT_NEAR(gsd, nadir, 0.1 * nadir);
+}
+
+TEST(OrthoAutoResolution, UnusableCamerasContributeNothing) {
+    // A horizontal camera never reaches the ground; a camera with no focal has
+    // no footprint. Neither may poison the median.
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(1, 0, 0), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 0.0)};
+    EXPECT_DOUBLE_EQ(ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0), 0.0);
+    EXPECT_DOUBLE_EQ(ortho::median_ground_sample_distance({}, flat_ground(), 1.0), 0.0);
+}
+
+TEST(OrthoAutoResolution, GeographicGridIsInDegreesNotMetres) {
+    // The metric rule is expressed in metres; an EPSG:4326 grid's pixel size is
+    // in degrees. SurfaceFrame must therefore report the per-degree arc lengths
+    // so a metre GSD can be converted. Checked on a georeferenced chunk placed
+    // at 48.7 N (no photos needed: the frame only reads the transform).
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("geo");
+    document.set_active_chunk_id(chunk.id());
+    chunk.transform() = geo::enu_to_ecef(geo::Geodetic{9.2, 48.7, 300.0});
+    chunk.crs().epsg = 4326;
+
+    const elevation::SurfaceFrame geographic = elevation::SurfaceFrame::for_chunk(chunk, 4326);
+    ASSERT_EQ(geographic.epsg(), 4326);
+    const Eigen::Vector2d metres_per_degree = geographic.metres_per_plane_unit(48.7);
+    // One degree of latitude is ~111.1 km; of longitude ~73.5 km at 48.7 N.
+    EXPECT_NEAR(metres_per_degree.y(), 111132.0, 500.0);
+    EXPECT_NEAR(metres_per_degree.x(), 73500.0, 800.0);
+
+    // A 1 cm GSD becomes ~1 cm / metres-per-degree degrees: a number three
+    // orders of magnitude below a degree, never 0.01 (a metre value used as a
+    // degree cell) and never 1 (a bare metric fallback).
+    //
+    // The expectation is computed INDEPENDENTLY of the frame, from the WGS84
+    // meridian arc and the parallel radius at 48.7 N, so it is not the same
+    // expression the implementation evaluates:
+    //
+    //   meridian arc per degree  M(lat) * pi/180,
+    //   parallel arc per degree  N(lat) * cos(lat) * pi/180,
+    //   M = a(1-e^2)/w^(3/2), N = a/sqrt(w), w = 1 - e^2 sin^2(lat).
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kA = 6378137.0;
+    constexpr double kF = 1.0 / 298.257223563;
+    constexpr double kLatDeg = 48.7;
+    const double e2 = 2.0 * kF - kF * kF;
+    const double lat_rad = kLatDeg * kPi / 180.0;
+    const double sin_lat = std::sin(lat_rad);
+    const double w = 1.0 - e2 * sin_lat * sin_lat;
+    const double meridian_per_deg = kA * (1.0 - e2) / (w * std::sqrt(w)) * kPi / 180.0;
+    const double parallel_per_deg = kA / std::sqrt(w) * std::cos(lat_rad) * kPi / 180.0;
+    // The frame's own arc lengths must agree with those to well inside a metre,
+    // which is what makes the conversion below meaningful at all.
+    EXPECT_NEAR(metres_per_degree.y(), meridian_per_deg, 1.0);
+    EXPECT_NEAR(metres_per_degree.x(), parallel_per_deg, 1.0);
+
+    // The 1 cm cell is 0.01 divided by the LARGER arc length (the meridian, y),
+    // taken from the independent formula rather than the frame's accessor.
+    const double cell_degrees = 0.01 / std::max(metres_per_degree.x(), metres_per_degree.y());
+    const double expected_independent = 0.01 / meridian_per_deg;
+    EXPECT_NEAR(cell_degrees, expected_independent, 0.01 * expected_independent);
+    EXPECT_LT(cell_degrees, 1e-6);
+}
+
+TEST(OrthoAutoResolution, LocalAndUtmPlanesAreMetres) {
+    // Local/UTM frames must report exactly 1 m per plane unit on both axes, the
+    // identity the metric rule relies on.
+    Document local;
+    Chunk& chunk = local.workspace().add_chunk("local");
+    local.set_active_chunk_id(chunk.id());
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 0);
+    ASSERT_TRUE(frame.is_local());
+    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(0.0).x(), 1.0);
+    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(1234.0).y(), 1.0);
 }
 
 }  // namespace

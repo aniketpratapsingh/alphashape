@@ -147,7 +147,11 @@ Once the device is lost, every path refuses to touch it:
   its budget is *shared* across the whole unwind (1 s, not one slice per
   handle), so a failed operation with a dozen buffers still costs at most a
   second. `~VulkanBackend` skips its unbounded `vkDeviceWaitIdle` on a lost
-  device and uses the same bounded drain.
+  device and instead runs the drain *authoritatively*: a full budget rather than
+  the 1 s shared window, because nothing will wait again once the device is
+  destroyed. A loss *declared* by the test hook, or a timeout that raced
+  completion, leaves the driver's queue alive and still executing, so destroying
+  the device before that work finishes is a segfault inside the driver.
 
 ### Memory kinds per algorithm
 
