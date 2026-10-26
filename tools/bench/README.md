@@ -105,11 +105,19 @@ every Monday at 04:17 UTC and on demand.
    - writes the report to the job summary,
    - publishes the new baseline — but only when the run passed.
 
-Both datasets declare exactly one non-default parameter —
-`BuildDepthMaps downscale=8` — because their imagery is 20–24 MP per frame and the default
-downscale of 4 does not fit a weekly job on a shared CPU runner. The override is recorded
-in every metrics JSON and printed at the top of the report, so a tuned run is never
-mistaken for a default one. `DATASETS.md` gives the arithmetic.
+Both datasets are bounded in two ways, because 20–24 MP frames at the default dense
+settings do not fit a weekly job on a shared CPU runner — the first version of this
+benchmark spent over five hours in BuildDepthMaps and was cancelled:
+
+- **a 30-image block**, chosen as a contiguous spatial strip (nearest the flight's centre
+  by GPS where the images carry it) rather than a strided sample across the whole flight,
+  which would only just overlap and produce sparse depth maps for the wrong reason;
+- **`BuildDepthMaps downscale=8`**, which quarters the depth-map pixel count while leaving
+  the grid finer than the imagery's own ground sample distance.
+
+Both are recorded in every metrics JSON and printed at the top of the report, and every
+stage carries a 40-minute budget so an overrunning stage fails with its own name rather
+than waiting out the job. `DATASETS.md` gives the arithmetic.
 
 A run fails only on a **regression against the previous run of the same dataset**. It
 never fails on an absolute value: real-data results move with the scene, the season and

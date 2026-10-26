@@ -315,6 +315,23 @@ class MarkdownTest(unittest.TestCase):
         self.assertIn("no usable texture", text)
 
 
+class SubsetNoteTest(unittest.TestCase):
+    def test_a_subset_run_says_how_many_of_how_many(self):
+        current = metrics()
+        current["dataset_manifest"].update(
+            images=30, images_available=102,
+            image_selection={"mode": "gps-centred block", "first": "A.JPG", "last": "B.JPG"},
+        )
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("30 of 102", text)
+        self.assertIn("gps-centred block", text)
+        self.assertIn("A.JPG .. B.JPG", text)
+
+    def test_a_full_run_does_not_mention_a_subset(self):
+        text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertNotIn("Image block", text)
+
+
 class OverrideNoteTest(unittest.TestCase):
     def test_non_default_parameters_are_called_out(self):
         current = metrics()

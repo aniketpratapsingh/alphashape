@@ -301,6 +301,104 @@ def collect_images(dataset: dict, work: Path) -> list[Path]:
     return found
 
 
+def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], dict]:
+    """A contiguous block of ``limit`` images around the block's centroid.
+
+    Needed because the dense stage's cost is images x pixels, and this dataset is
+    102 frames at 20 MP: at any downscale that still resolves the 2.4 cm GSD, the
+    full set does not fit a weekly job on a shared CPU runner. A subset is the only
+    way to keep the run inside its budget without falling back to a resolution so
+    coarse that none of the metrics mean anything.
+
+    Contiguous, not strided: a drone flies a lawnmower pattern, so a run of
+    consecutive file names is a contiguous strip of the site with the overlap the
+    stereo stage needs. Striding across the whole flight would hand the engine
+    images that only just overlap, and the depth maps would be sparse for a reason
+    that has nothing to do with the code.
+
+    Chosen by GPS where the images carry it, so the strip is a real spatial block;
+    by file order otherwise. Deterministic either way, so two runs of the same
+    dataset select the same images.
+
+    Returns ``(images, selection)`` where ``selection`` records what was done, for
+    the report's provenance.
+    """
+    if limit is None or limit <= 0 or len(images) <= limit:
+        return images, {"requested": limit, "selected": len(images), "mode": "all"}
+
+    positions = _image_positions(images)
+    if positions is not None:
+        centre_lon = float(np_median([lon for lon, _ in positions]))
+        centre_lat = float(np_median([lat for _, lat in positions]))
+        order = sorted(
+            range(len(images)),
+            key=lambda index: (positions[index][0] - centre_lon) ** 2
+            + (positions[index][1] - centre_lat) ** 2,
+        )
+        chosen = sorted(order[:limit])
+    else:
+        start = max(0, (len(images) - limit) // 2)
+        chosen = list(range(start, start + limit))
+
+    selected = [images[index] for index in chosen]
+    return selected, {
+        "requested": limit,
+        "selected": len(selected),
+        "mode": "gps-centred block" if positions is not None else "middle file-order block",
+        "first": selected[0].name,
+        "last": selected[-1].name,
+    }
+
+
+def np_median(values: list[float]) -> float:
+    """Median of a list of floats, without pulling numpy in for one number."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def _image_positions(images: list[Path]) -> list[tuple[float, float]] | None:
+    """(longitude, latitude) per image from EXIF, or None when any is missing.
+
+    Reads only the EXIF block, and only the first and last few hundred bytes of
+    the file where Pillow can, so selecting a subset does not decode 102 full-size
+    JPEGs. A dataset without GPS gets None and the caller falls back to file order.
+    """
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - Pillow is in the workflow
+        return None
+
+    positions: list[tuple[float, float]] = []
+    for path in images:
+        try:
+            with Image.open(path) as image:
+                exif = image.getexif()
+                gps = exif.get_ifd(34853)
+        except Exception:  # noqa: BLE001 - an unreadable EXIF means "no position"
+            return None
+        lat = gps.get(2)
+        lat_ref = gps.get(1)
+        lon = gps.get(4)
+        lon_ref = gps.get(3)
+        if not lat or not lon:
+            return None
+        lat_value = _dms(lat) * (-1.0 if lat_ref in ("S", b"S") else 1.0)
+        lon_value = _dms(lon) * (-1.0 if lon_ref in ("W", b"W") else 1.0)
+        if lat_value == 0.0 and lon_value == 0.0:
+            return None
+        positions.append((lon_value, lat_value))
+    return positions
+
+
+def _dms(parts) -> float:
+    """Degrees from an EXIF (degrees, minutes, seconds) triple."""
+    degrees, minutes, seconds = (float(value) for value in parts[:3])
+    return degrees + minutes / 60.0 + seconds / 3600.0
+
+
 def reference_paths(dataset: dict, work: Path) -> dict:
     """Where each reference product landed, keyed by ``kind``.
 
@@ -324,13 +422,19 @@ def reference_paths(dataset: dict, work: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run_cli(args: list[str], *, log: Path | None = None) -> float:
+def run_cli(args: list[str], *, log: Path | None = None, timeout: float | None = None) -> float:
     """Run one CLI invocation, returning its wall time in seconds.
 
-    A non-zero exit is fatal: the benchmark is about a pipeline that works on
-    real photographs, so a stage that errors is a finding to fix, not a number to
-    record as zero. stderr goes to ``log`` when one is given, which is what makes
-    a CI failure diagnosable after the fact.
+    A non-zero exit is fatal: the benchmark is about a pipeline that works on real
+    photographs, so a stage that errors is a finding to fix, not a number to record
+    as zero. stderr goes to ``log`` when one is given, which is what makes a CI
+    failure diagnosable after the fact.
+
+    ``timeout`` is a hard per-stage ceiling. It exists so a stage that is far slower
+    than expected fails with the stage's own name instead of waiting out the whole
+    job's timeout and reporting nothing: the first version of this benchmark spent
+    five hours in BuildDepthMaps and produced no evidence at all, which is worse
+    than a clear failure.
     """
     cli = os.environ.get("ALPHASHAPE_CLI")
     if not cli:
@@ -338,12 +442,20 @@ def run_cli(args: list[str], *, log: Path | None = None) -> float:
     command = [cli, *args]
     print(f"  $ {' '.join(command)}")
     started = time.monotonic()
-    if log is not None:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        with open(log, "ab") as errlog:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=errlog)
-    else:
-        result = subprocess.run(command, stdout=subprocess.DEVNULL)
+    try:
+        if log is not None:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "ab") as errlog:
+                result = subprocess.run(
+                    command, stdout=subprocess.DEVNULL, stderr=errlog, timeout=timeout
+                )
+        else:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"alphashape-cli exceeded its {timeout:.0f} s budget: {' '.join(args)}"
+            + (f" (see {log})" if log else "")
+        ) from None
     elapsed = time.monotonic() - started
     if result.returncode != 0:
         raise SystemExit(
@@ -353,7 +465,12 @@ def run_cli(args: list[str], *, log: Path | None = None) -> float:
     return elapsed
 
 
-def run_pipeline(work: Path, images: list[Path], overrides: dict | None = None) -> dict:
+def run_pipeline(
+    work: Path,
+    images: list[Path],
+    overrides: dict | None = None,
+    stage_budget_s: float | None = None,
+) -> dict:
     """Create a project from ``images`` and run the pipeline, timing each stage.
 
     Every stage runs at the engine's DEFAULTS. ``overrides`` exists only for a
@@ -378,7 +495,7 @@ def run_pipeline(work: Path, images: list[Path], overrides: dict | None = None) 
         arguments = ["--project", str(project), "--task", task]
         for key, value in (overrides.get(task) or {}).items():
             arguments += ["--set", f"{key}={value}"]
-        stages[task] = _timed(run_cli, arguments, log=log)
+        stages[task] = _timed(run_cli, arguments, log=log, timeout=stage_budget_s)
     total = time.monotonic() - started
 
     products: dict[str, str] = {}
@@ -553,12 +670,13 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
     references = reference_paths(dataset, work)
 
     print("-- pipeline")
-    images = collect_images(dataset, work)
-    print(f"   {len(images)} images")
+    available = collect_images(dataset, work)
+    images, selection = select_subset(available, dataset.get("max_images"))
+    print(f"   {len(images)} of {len(available)} images ({selection['mode']})")
     overrides = dataset.get("param_overrides") or {}
     if overrides:
         print(f"   parameter overrides: {overrides}")
-    timing = run_pipeline(work, images, overrides)
+    timing = run_pipeline(work, images, overrides, dataset.get("stage_budget_s"))
 
     print("-- inspect")
     camera_stats = inspect_project(Path(timing["project"]))
@@ -595,6 +713,8 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         "flight": dataset["flight"],
         "nominal_gsd_m": dataset.get("nominal_gsd_m"),
         "images": len(images),
+        "images_available": len(available),
+        "image_selection": selection,
     }
     return result
 

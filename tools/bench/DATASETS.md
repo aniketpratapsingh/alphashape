@@ -57,13 +57,24 @@ does not come from a photogrammetry pipeline at all.
   is therefore at the same scale as the imagery, not coarser than it. The benchmark
   resamples both products onto a common grid before comparing, and reports that grid's
   pixel size, so the comparison scale is never implied.
-- **One parameter override: `BuildDepthMaps downscale=8`.** 102 images at 5472 x 3648 is
-  20 MP each; at the default downscale of 4 that is 127 million depth-map pixels, each
-  costing a multi-view PatchMatch search, which does not fit a weekly job's budget on a
-  shared CPU runner. Downscale 8 quarters it to 32 million, and the resulting 1.7 cm
-  depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is
-  recorded in every metrics JSON and printed at the top of the report, so a tuned run is
-  never mistaken for a default one.
+- **The run is a 30-image block, and `BuildDepthMaps downscale=8`.**
+  102 frames at 5472 x 3648 is 20 MP each, so the full set at the default downscale of 4
+  is 127 million depth-map pixels, each costing a multi-view PatchMatch search. The first
+  version of this benchmark ran it exactly that way and spent over five hours in
+  BuildDepthMaps before being cancelled — which is a finding in itself, and the reason
+  both limits exist.
+
+  Downscale 8 quarters the pixel count, and the resulting 1.7 cm depth grid is still
+  finer than the 2.4 cm GSD the imagery can justify. 30 images is the contiguous block
+  nearest the flight's centre by GPS: a real spatial strip with the overlap the stereo
+  stage needs. A strided sample of all 102 would only just overlap and would produce
+  sparse depth maps for a reason that has nothing to do with the code. The 30 are chosen
+  deterministically and named in the report.
+
+  Both are recorded in every metrics JSON and printed at the top of the report, so a
+  bounded run is never mistaken for a default one. Each stage also carries a 40-minute
+  budget: a stage that overruns fails with its own name rather than waiting out the job's
+  timeout and reporting nothing.
 - Why this one over the other candidates: it is the smallest member of the Comoros/Mayotte
   series whose publisher report shows a full reconstruction (102/102 images) on a compact
   site (0.048 km²) with a 2.4 cm GSD. Neighbouring records in the same series are 187,
@@ -123,11 +134,12 @@ does not come from a photogrammetry pipeline at all.
   alignment, then trimmed nearest-neighbour ICP. The fitted scale, the iteration count and
   the residual RMS are in the report, so a score that is really about the alignment is
   visible as one.
-- **One parameter override: `BuildDepthMaps downscale=8`.** 42 images at 6048 x 4032 is
-  24 MP each, so the default downscale of 4 is 64 million depth-map pixels over 42 views.
-  The accuracy tolerances (2/5/10 cm against the laser scan) are what decide whether the
-  result is good enough, not the depth-grid spacing, so this costs no information the
-  metric can use.
+- **The run is a 30-image block, and `BuildDepthMaps downscale=8`.** 42 frames at
+  6048 x 4032 is 24 MP each, so the default downscale of 4 is 64 million depth-map pixels
+  over 42 views. 30 of the 42 is still a 30-view dense reconstruction of the scene, and
+  the accuracy tolerances (2/5/10 cm against the laser scan) are what decide whether the
+  result is good enough — the downscale costs no information those tolerances can use.
+  Each stage also carries a 40-minute budget and both limits are printed in the report.
 
 ## Also surveyed, not chosen
 

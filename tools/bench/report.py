@@ -260,9 +260,21 @@ def markdown(
     if manifest.get("doi"):
         lines.append(f"| DOI | [{manifest['doi']}](https://doi.org/{manifest['doi']}) |")
     lines.append(f"| Flight | {manifest.get('flight') or '-'} |")
-    lines.append(f"| Images | {manifest.get('images') or '-'} |")
+    if manifest.get("images_available") and manifest.get("images_available") != manifest.get("images"):
+        selection = manifest.get("image_selection") or {}
+        lines.append(
+            f"| Images | {manifest['images']} of {manifest['images_available']} "
+            f"({selection.get('mode', 'subset')}) |"
+        )
+    else:
+        lines.append(f"| Images | {manifest.get('images') or '-'} |")
     if manifest.get("nominal_gsd_m"):
         lines.append(f"| Nominal GSD | {_fmt(manifest['nominal_gsd_m'])} m |")
+    selection = manifest.get("image_selection") or {}
+    if selection and selection.get("mode") not in (None, "all"):
+        lines.append(
+            f"| Image block | {selection.get('first')} .. {selection.get('last')} |"
+        )
     lines.append(
         f"| Licence | {licence.get('spdx', '-')}"
         + (f" — [terms]({licence['url']})" if licence.get("url") else "")
@@ -535,8 +547,14 @@ def comparison_png(current: dict, metrics_json_path: Path, destination: Path) ->
         if not reference.exists():
             return None
 
-        ours = metrics.read_geotiff(ortho_path)
-        theirs = metrics.read_geotiff(str(reference))
+        # Both reads are cell-bounded: a survey orthomosaic is hundreds of
+        # megapixels, and a thumbnail beside a crop does not need it at full size.
+        # The reference is additionally windowed to our extent, so only the part
+        # both products cover is read.
+        ours = metrics.read_geotiff(ortho_path, max_cells=1_000_000)
+        theirs = metrics.read_geotiff(
+            str(reference), bounds=ours.extent(), max_cells=1_000_000
+        )
         ox, oy, pixel, width, height = metrics.common_grid(ours, theirs, max_cells=1_000_000)
         a, a_valid = metrics.resample_to_grid(
             ours, origin_x=ox, origin_y=oy, pixel_size=pixel, width=width, height=height

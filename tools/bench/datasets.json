@@ -50,7 +50,10 @@
           "downscale": 8
         }
       },
-      "param_overrides_reason": "The survey is 102 images at 5472 x 3648 (20 MP). At the default downscale of 4 that is 127 million depth-map pixels, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters that to 32 million, and the resulting 1.7 cm depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is recorded in every metrics JSON and printed in the report, so a tuned run is never mistaken for a default one. It is the ONLY deviation from defaults."
+      "param_overrides_reason": "The survey is 102 images at 5472 x 3648 (20 MP). At the default downscale of 4 that is 127 million depth-map pixels, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters that to 32 million, and the resulting 1.7 cm depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is recorded in every metrics JSON and printed in the report, so a tuned run is never mistaken for a default one. It is the ONLY deviation from defaults.",
+      "max_images": 30,
+      "stage_budget_s": 2400,
+      "max_images_reason": "The dense stage costs images x pixels, and 102 frames at 20 MP does not fit a weekly job on a shared CPU runner: the first run of this benchmark spent over five hours in BuildDepthMaps and was cancelled. 30 images is the contiguous block nearest the flight's centre by GPS, which is a real spatial strip with the overlap the stereo stage needs \u2014 a strided sample across the whole flight would only just overlap and would produce sparse depth maps for a reason that has nothing to do with the code. The 30 are chosen deterministically and named in the report."
     },
     "terrestrial-laser": {
       "title": "ETH3D high-res multi-view training scene 'terrains'",
@@ -109,7 +112,10 @@
           "downscale": 8
         }
       },
-      "param_overrides_reason": "42 images at 6048 x 4032 (24 MP). At the default downscale of 4 that is 64 million depth-map pixels over 42 views, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters it to 16 million. Accuracy is still measured against the laser scan at 2/5/10 cm, so the tolerances \u2014 not the depth-grid spacing \u2014 decide whether the result is good enough. The override is recorded in every metrics JSON and printed in the report."
+      "param_overrides_reason": "42 images at 6048 x 4032 (24 MP). At the default downscale of 4 that is 64 million depth-map pixels over 42 views, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters it to 16 million. Accuracy is still measured against the laser scan at 2/5/10 cm, so the tolerances \u2014 not the depth-grid spacing \u2014 decide whether the result is good enough. The override is recorded in every metrics JSON and printed in the report.",
+      "max_images": 30,
+      "stage_budget_s": 2400,
+      "max_images_reason": "42 frames at 24 MP is 64 million depth-map pixels at downscale 8 over 42 views, which does not fit the weekly budget on a shared CPU runner. 30 of the 42 is enough for a 30-view dense reconstruction of the scene while leaving headroom; the selection is deterministic and named in the report."
     }
   }
 }

@@ -105,6 +105,69 @@ class ManifestTest(unittest.TestCase):
             os.unlink(path)
 
 
+class SubsetTest(unittest.TestCase):
+    def _images(self, tmp: Path, count: int) -> list[Path]:
+        paths = []
+        for index in range(count):
+            path = tmp / f"IMG_{index:04d}.JPG"
+            path.write_bytes(b"x")
+            paths.append(path)
+        return paths
+
+    def test_no_limit_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 10)
+            selected, info = run_bench.select_subset(images, None)
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(info["mode"], "all")
+
+    def test_a_limit_below_the_count_selects_a_middle_block(self):
+        # These files carry no readable EXIF, so the file-order fallback applies.
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 10)
+            selected, info = run_bench.select_subset(images, 4)
+            self.assertEqual(len(selected), 4)
+            self.assertIn("file-order", info["mode"])
+            # Contiguous: the names differ by the step they were taken in.
+            indices = [images.index(path) for path in selected]
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 4)))
+
+    def test_a_limit_above_the_count_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 5)
+            selected, _ = run_bench.select_subset(images, 50)
+            self.assertEqual(len(selected), 5)
+
+    def test_selection_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 12)
+            first, _ = run_bench.select_subset(images, 5)
+            second, _ = run_bench.select_subset(images, 5)
+            self.assertEqual(first, second)
+
+    def test_the_selection_records_its_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 12)
+            selected, info = run_bench.select_subset(images, 5)
+            self.assertEqual(info["first"], selected[0].name)
+            self.assertEqual(info["last"], selected[-1].name)
+            self.assertEqual(info["selected"], 5)
+
+    def test_dms_conversion(self):
+        self.assertAlmostEqual(run_bench._dms((11.0, 40.0, 7.5477)), 11.0 + 40.0 / 60 + 7.5477 / 3600)
+
+
+class MedianTest(unittest.TestCase):
+    def test_odd_count(self):
+        self.assertEqual(run_bench.np_median([3.0, 1.0, 2.0]), 2.0)
+
+    def test_even_count(self):
+        self.assertEqual(run_bench.np_median([4.0, 1.0, 3.0, 2.0]), 2.5)
+
+    def test_single_value(self):
+        self.assertEqual(run_bench.np_median([7.0]), 7.0)
+
+
 class VerifyTest(unittest.TestCase):
     def _remote(self, payload: bytes) -> run_bench.RemoteFile:
         return run_bench.RemoteFile(
