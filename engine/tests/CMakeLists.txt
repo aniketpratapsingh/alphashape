@@ -97,11 +97,12 @@ if(ALPHASHAPE_BUILD_CLI AND TARGET alphashape-cli)
     # Generator expressions are expanded at build time, but the separator is
     # known now: CMake writes a Windows path with backslashes, and a literal
     # "C:\...\alphashape-cli.exe" inside a C++ string is a minefield of
-    # escape sequences ("\a" is a bell, "\t" a tab). $<SHELL_PATH:...> rewrites
-    # the resolved path to the shell form, which is forward slashes on every
-    # platform and is accepted by CreateProcess on Windows.
+    # escape sequences (the GitHub runner's "D:\a\..." produced \a and \s and
+    # failed the build under -Werror). $<TO_CMAKE_PATH:...> rewrites the
+    # resolved path with forward slashes on every platform, and CreateProcess
+    # accepts them on Windows.
     target_compile_definitions(alphashape_tests PRIVATE
-        "ALPHASHAPE_CLI_EXE=\"$<SHELL_PATH:$<TARGET_FILE:alphashape-cli>>\"")
+        "ALPHASHAPE_CLI_EXE=\"$<TO_CMAKE_PATH:$<TARGET_FILE:alphashape-cli>>\"")
     add_dependencies(alphashape_tests alphashape-cli)
 endif()
 

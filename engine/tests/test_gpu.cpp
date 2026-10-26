@@ -445,6 +445,18 @@ TEST(Gpu, CommandLineReportsGpuStateWithoutAborting) {
         }
     }
     std::vector<std::string> argv{kCommandLinePath, "--gpu-info"};
+#if defined(_WIN32)
+    // CMake hands the path over with forward slashes (a Windows path in a C++
+    // string literal is a minefield: the runner's "D:\a\..." produced \a and
+    // \s and failed the build under -Werror). CreateProcess's own path
+    // resolution is the one place this tree does not rely on the CRT, so the
+    // separators are normalised here rather than hoping.
+    for (char& character : argv[0]) {
+        if (character == '/') {
+            character = '\\';
+        }
+    }
+#endif
     const alphashape::platform::ProcessResult result =
         alphashape::platform::run_process_capture(argv);
     ASSERT_TRUE(result.started) << result.output;
