@@ -11,6 +11,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include "base/utils/error.hpp"
 #include "common/algorithm/stereo/patch_match.hpp"
 #include "image/image.hpp"
 #include "model/camera/calibration.hpp"
@@ -453,6 +454,67 @@ TEST(PatchMatch, ThreadCountDeterminism) {
 #if defined(ALPHASHAPE_HAVE_OPENMP)
     omp_set_num_threads(omp_get_max_threads());
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// The per-sweep progress hook
+// ---------------------------------------------------------------------------
+
+TEST(PatchMatch, SweepHookReportsMonotoneFractions) {
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    const Scene scene =
+        build_scene(plane, default_scene(), /*distort=*/false, Eigen::Vector3d(0.0, 0.0, 10.0));
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions options = reduced_options(5.0, 20.0);  // 2 iterations -> 4 half-sweeps
+    std::vector<double> reported;
+    options.on_sweep = [&](double fraction) { reported.push_back(fraction); };
+
+    const PatchMatchResult with_hook =
+        alphashape::stereo::run_patch_match(views[0], neighbours, options);
+
+    // One report per half-sweep, strictly increasing, ending at 1.0.
+    ASSERT_EQ(reported.size(), 2U * static_cast<std::size_t>(options.iterations));
+    for (std::size_t i = 0; i < reported.size(); ++i) {
+        EXPECT_GT(reported[i], 0.0) << "report " << i;
+        EXPECT_LE(reported[i], 1.0) << "report " << i;
+        if (i > 0) {
+            EXPECT_GT(reported[i], reported[i - 1]) << "report " << i << " went backwards";
+        }
+    }
+    EXPECT_DOUBLE_EQ(reported.back(), 1.0);
+
+    // The hook changes nothing about the result: it is a report, not an input.
+    options.on_sweep = nullptr;
+    const PatchMatchResult without_hook =
+        alphashape::stereo::run_patch_match(views[0], neighbours, options);
+    EXPECT_EQ(with_hook.depth, without_hook.depth);
+    EXPECT_EQ(with_hook.normals, without_hook.normals);
+    EXPECT_EQ(with_hook.cost, without_hook.cost);
+}
+
+TEST(PatchMatch, AThrowingSweepHookStopsTheSearch) {
+    // A task's cancellation is a throw from the hook; the search must let it
+    // propagate at once rather than finish the remaining sweeps, and no result
+    // is produced (so no half-swept map can be mistaken for a finished one).
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    const Scene scene =
+        build_scene(plane, default_scene(), /*distort=*/false, Eigen::Vector3d(0.0, 0.0, 10.0));
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions options = options_for(5.0, 20.0);  // 6 iterations -> 12 half-sweeps
+    std::size_t reports = 0;
+    options.on_sweep = [&](double) {
+        ++reports;
+        if (reports == 1) {
+            throw alphashape::CancelledError("stop after one sweep");
+        }
+    };
+    EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, options),
+                 alphashape::CancelledError);
+    EXPECT_EQ(reports, 1U) << "the search kept sweeping after the hook threw";
 }
 
 // ---------------------------------------------------------------------------

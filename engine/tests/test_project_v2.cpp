@@ -673,9 +673,9 @@ TEST_F(ProjectV2, SidecarMagicsAreDistinct) {
     // Every entry that is not doc.xml is either a GeoTIFF, a PNG, or a
     // magic-tagged sidecar whose four-byte magic is one of the documented ones.
     // A mislabelled entry (a decoder reading a different layout) cannot pass.
-    const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "APC1",
-                                         "AMS2", "AOL1", "AMK1", "ASH1", "ATJ1",
-                                         "AFR1", "ATM1"};
+    const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "ADM2",
+                                         "APC1", "AMS2", "AOL1", "AMK1", "ASH1",
+                                         "ATJ1", "AFR1", "ATM1"};
     std::set<std::string> seen;
     std::size_t sidecars = 0;
     for (const ZipEntry& entry : archive.entries()) {

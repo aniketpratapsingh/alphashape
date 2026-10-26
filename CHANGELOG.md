@@ -6,6 +6,22 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
+  (or a cancel during filtering) stores the finished maps as a new depth-map
+  set before it stops, and `reuse_depth` (now on by default) skips their search
+  on the next run and filters them. Each map records a fingerprint of the
+  camera pose, sensor calibration and downscale it was built from, so a
+  re-alignment or a re-calibration rebuilds the stale maps instead of reusing
+  them. A map also records the filter mode it has been through, so changing
+  `filter_mode` filters rather than returns the weaker old result.
+- **Build Depth Maps reports progress inside one camera.** The search reports
+  after every refinement sweep on both the CPU and the GPU path, so the
+  progress bar moves during a long image and Cancel is honoured within one
+  sweep instead of after the current camera. Each finished camera logs its
+  index, resolution, device (GPU/CPU) and wall-clock time.
+
 ### Fixed
 
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.

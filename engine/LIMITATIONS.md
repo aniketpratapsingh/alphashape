@@ -94,8 +94,9 @@ sections below give the engineering detail behind each item.
 - **Depth maps are slow at fine settings.** Build Depth Maps runs the full
   search at the working resolution, with no coarse-to-fine pass. The default
   (`downscale` 4) is practical; `downscale` 2 has four times the pixels and
-  on 36 twelve-megapixel photos took days, not minutes. Finished maps are only
-  stored when the whole step completes, so cancelling discards the run.
+  on 36 twelve-megapixel photos took days, not minutes. A cancelled run keeps
+  the cameras it finished (see below) but cannot speed up the ones it did not,
+  and the cross-view filter has no coarse-to-fine pass either.
 - **Accuracy is unproven on real surveys.** Every end-to-end check runs on
   synthetic scenes with known geometry. The dense stage has not been
   measured against a real camera with real lens distortion, real GPS error
@@ -124,9 +125,22 @@ sections below give the engineering detail behind each item.
   and the reader refuses versions it does not know rather than guessing,
   but the layout may still change between 0.1.x releases. Export anything
   you would be sorry to lose.
-- **Depth maps are not invalidated by a re-alignment.** Building depth maps
-  again after re-running Align Cameras gives correct maps; the ones from
-  before are left in place and can be consumed by accident.
+- **A cancelled Build Depth Maps leaves an unfiltered set.** The cameras
+  finished before the cancel are stored as a new depth-map set so the work is
+  not lost (the run logs how many). Those maps are valid per camera but have
+  not been through the cross-view filter, so their confidence is empty and
+  they are only meant to be continued: re-run Build Depth Maps, which reuses
+  their search and filters them. Do not fuse them into a point cloud first.
+- **Depth maps are invalidated by a re-alignment, but the old set remains.**
+  Each map records a fingerprint of the camera pose, sensor calibration and
+  downscale it was built from, and Build Depth Maps reuses a map only when that
+  fingerprint still matches. Re-running Align Cameras (or editing a
+  calibration) therefore rebuilds the maps instead of consuming stale ones.
+  The superseded set is still listed in the chunk, so the project holds both
+  until it is removed explicitly.
+- **A cancelled run is not a crash-safe checkpoint.** Progress is kept on
+  cancellation, not on a crash or power loss: nothing is written to the project
+  file until the user saves. Saving after a cancelled run keeps the maps.
 - **Colour runs at 8 bits per channel end to end.** A 16-bit TIFF input is read and
   reduced to 8 bits, and GeoTIFF export writes 32-bit float elevations and 8-bit RGBA
   colour. There is no 16-bit colour pipeline and no 8-bit DEM export.
@@ -614,9 +628,12 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   untouched reproduces the same archive byte for byte
   (`ProjectV2.UntouchedChunkResaveIsByteStable`). Containers are written only
   when non-empty (`ProjectV2.EmptyContainersAreOmitted`), and every binary
-  entry is magic-tagged (`AKP1`, `AMT1`, `ATR2`, `ADM1`, `APC1`, `AMS1`/`AMS2`,
-  `AOL1`, `AMK1`, `ASH1`, `ATJ1`, `AFR1`, `ATM1`), so a decoder cannot be
-  pointed at the wrong layout silently.
+  entry is magic-tagged (`AKP1`, `AMT1`, `ATR2`, `ADM1`/`ADM2`, `APC1`,
+  `AMS1`/`AMS2`, `AOL1`, `AMK1`, `ASH1`, `ATJ1`, `AFR1`, `ATM1`), so a decoder
+  cannot be pointed at the wrong layout silently. Depth maps are written as
+  `ADM2` (per-map alignment fingerprint and filter mode); `ADM1` is still read,
+  its maps decode with fingerprint 0 ("unknown", so never reused) and filter
+  mode "mild".
 - **v2 is strict inside `<chunk>`.** An unknown *element* is an error (it catches
   writer/reader drift); unknown *attributes* are ignored, per §4.4.
 - **`ReadReport` is the reader's diagnostic channel (WP-11.4).**
