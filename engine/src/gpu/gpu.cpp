@@ -115,7 +115,7 @@ void note_gpu_failure(const std::string& what) {
     log(LogLevel::Warn) << "GPU processing failed, switching to CPU mode: " << what;
 }
 
-void note_device_lost(const std::string& detail) {
+void note_device_lost(const std::string& cause) {
     // Once only: a second timeout must not print a second line or race the
     // first reason out of the record.
     if (g_device_lost.exchange(true)) {
@@ -123,10 +123,10 @@ void note_device_lost(const std::string& detail) {
     }
     {
         std::lock_guard<std::mutex> lock(g_device_lost_mutex);
-        g_device_lost_detail = detail;
+        g_device_lost_detail = cause;
     }
     log(LogLevel::Warn) << "GPU stopped responding; continuing on the CPU ("
-                        << "device lost: " << detail << "). The GPU layer stays off for this "
+                        << "device lost: " << cause << "). The GPU layer stays off for this "
                         << "process.";
 }
 
@@ -164,8 +164,9 @@ bool enabled() {
 void set_enabled(bool enabled_value) {
     std::call_once(g_env_once, read_environment);
     // A lost device cannot be switched back on: the driver keeps its state, and
-    // resubmitting to a wedged GPU is exactly what this guards against. Tests
-    // clear it with detail::reset_device_lost().
+    // resubmitting to a wedged GPU is exactly what this guards against, so
+    // available()/default_context() keep declining regardless of this switch.
+    // Tests clear the lost state with detail::reset_device_lost().
     g_enabled = enabled_value;
 }
 
@@ -457,9 +458,8 @@ std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatche
     if (dispatches.empty()) {
         return 0;
     }
-    if (!context.backend_) {
-        throw Error("GPU work requested from an empty context");
-    }
+    // An unusable context is reported by run() (the dispatch path owns that
+    // check); every submission here goes through it.
     // Resolve the target once per call: 80 ms on hardware, generous on a CPU
     // driver, where submissions are cheap to outlive but expensive to make.
     if (!(limiter.target_seconds() > 0.0)) {
