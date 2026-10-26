@@ -41,9 +41,13 @@ sections below give the engineering detail behind each item.
   server, a bare CI runner) the app starts normally, `gpu::available()` is
   false, `--gpu-info` explains why, and every task runs on the CPU. The
   installer deliberately does not bundle a loader: a private `vulkan-1.dll`
-  would shadow the driver's own loader and could not see the driver's ICDs, and
-  Windows has no `LD_LIBRARY_PATH`-style override to recover from that. Install
-  or update the AMD/NVIDIA/Intel driver to enable GPU acceleration.
+  could not see the driver's ICDs. `vulkan-1.dll` is loaded by bare name with
+  `LOAD_LIBRARY_SEARCH_SYSTEM32`, so `System32` is the only place it is looked
+  for — a copy beside the executable is never picked up (that would be a DLL
+  planting hole). To use a loader from elsewhere, set
+  `ALPHASHAPE_VULKAN_LIBRARY` to its **absolute path**; a bare name in that
+  variable is resolved against `System32` like the default. Install or update
+  the AMD/NVIDIA/Intel driver to enable GPU acceleration.
 - **Long GPU steps can freeze an M1 Mac with 16 GB.** On a first-generation
   Apple silicon Mac, Build Model (and possibly other long GPU steps) can
   stall the display and force a restart, because the work shares the GPU with

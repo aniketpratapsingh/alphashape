@@ -322,11 +322,15 @@ const Loader* load_library(std::string* reason) {
         // Windows: vulkan-1.dll is the loader, and every graphics driver that
         // supports Vulkan installs one into System32. It is deliberately not
         // bundled with the installer -- a private copy would shadow the
-        // driver's loader and could not find the driver's ICDs, and the
-        // Windows loader has no LD_LIBRARY_PATH-style override to recover from
-        // that. LoadLibraryW resolves a bare name through the application
-        // directory, System32 and the PATH, which is exactly the search order
-        // a user expects.
+        // driver's loader and could not find the driver's ICDs. A bare name is
+        // loaded with LOAD_LIBRARY_SEARCH_SYSTEM32: the application directory,
+        // the current working directory and PATH are NOT searched, so System32
+        // is the only place this bare name can come from and a planted
+        // vulkan-1.dll beside the exe cannot hijack the load. A machine whose
+        // loader lives elsewhere is handled by the driver's own registration
+        // (the normal case), or by an absolute path in
+        // ALPHASHAPE_VULKAN_LIBRARY -- that override is subject to the same
+        // rule, so it must not be a bare name.
 #if defined(__APPLE__)
         candidates.emplace_back("libvulkan.1.dylib");
         candidates.emplace_back("libvulkan.dylib");

@@ -150,17 +150,22 @@ in order:
 Everything else is resolved through `vkGetInstanceProcAddr` into a function
 table. Any failure is reported through `unavailable_reason()` — never abort.
 
-On Windows the loader is opened by bare name, so `LoadLibraryW` searches the
-application directory, `System32` and `PATH` — the order the platform uses for
-any other system DLL. Windows ships no Vulkan runtime of its own: it arrives
-with the graphics driver. A machine without one therefore gets a false
-`available()` and a reason that says so, and every task runs on the CPU; it
-never fails to start. The installer deliberately does not ship `vulkan-1.dll`:
-a private copy would be found before the driver's loader (the application
-directory is searched first) and could not reach the driver's ICDs, and Windows
-has no `LD_LIBRARY_PATH`-style override to recover from that. The choice is
-therefore between "use the driver's loader" and "the GPU layer breaks on every
-machine that has a driver".
+On Windows a bare name is loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32`, so only
+`System32` is searched — not the application directory, not the current working
+directory, not `PATH`. That matters because plain `LoadLibraryW` searches the
+application directory first: a planted `vulkan-1.dll` dropped beside the
+executable (or in whatever directory the user happened to launch from) would be
+loaded instead of the driver's loader, which is classic DLL planting. The same
+rule applies to `$ALPHASHAPE_VULKAN_LIBRARY`: an override that names a
+different loader must be an **absolute path**, because a bare name there is
+resolved against `System32` too. `SetDefaultDllDirectories` is deliberately not
+called process-wide — Qt and the vcpkg runtime DLLs still need the application
+directory. Windows ships no Vulkan runtime of its own: it arrives with the
+graphics driver as `System32\vulkan-1.dll`. A machine without one therefore
+gets a false `available()` and a reason that says so, and every task runs on the
+CPU; it never fails to start. The installer deliberately does not ship
+`vulkan-1.dll`: a private copy could not reach the driver's ICDs, and the
+System32-only rule means it would not be picked up anyway.
 
 MoltenVK is a portability driver, so the instance enables
 `VK_KHR_portability_enumeration` (with the enumerate-portability flag) and the
