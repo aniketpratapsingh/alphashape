@@ -1596,6 +1596,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
     PhotoCache photos(plan.photo_cache_bytes);
 
+    // The global cell lattice: a window's cell (col, row) is global cell
+    // (col + wx0, row + wy0), and its centre is evaluated on the GLOBAL origin so
+    // a block reproduces the whole grid's samples bit for bit.
+    ortho::OrthoCellLattice cell_lattice;
+    cell_lattice.origin_x = grid.origin_x;
+    cell_lattice.origin_y = grid.origin_y;
+
     // The whole-grid node lattice and anchor, computed once so every block's
     // plane->local map reproduces the whole-grid map bit for bit inside its
     // window. Without this a block would recompute node coordinates from its own
@@ -1648,6 +1655,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 block_lattice->col_offset = wx0;
                 block_lattice->row_offset = wy0;
             }
+            cell_lattice.col_offset = wx0;
+            cell_lattice.row_offset = wy0;
             const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
                 make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
                                     block_lattice.has_value() ? &*block_lattice : nullptr);
@@ -1715,9 +1724,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     };
                     camera.plane_centre = plane_centres[block_cameras[k]];
                 }
-                tiles.push_back(ortho::orthorectify(surface, surface_nodata, window, camera,
-                                                   static_cast<int>(k), occlusion_tolerance, true,
-                                                   &surface_range));
+                tiles.push_back(ortho::orthorectify(
+                    surface, surface_nodata, window, camera, static_cast<int>(k),
+                    occlusion_tolerance, true, &surface_range,
+                    plan.block_cells > 0 ? &cell_lattice : nullptr));
                 progress.update("rectify",
                                 (static_cast<double>(block_index) +
                                  static_cast<double>(k + 1) /
@@ -1750,6 +1760,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                         if (cell_index >= block_index) {
                             continue;
                         }
+                        const std::size_t wc = static_cast<std::size_t>(row) *
+                                                   static_cast<std::size_t>(window.width) +
+                                               static_cast<std::size_t>(col);
                         const std::int32_t camera_id =
                             result.labels[static_cast<std::size_t>(gy) *
                                               static_cast<std::size_t>(grid.width) +
@@ -1767,10 +1780,19 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             }
                             tile_index = static_cast<std::int32_t>(
                                 std::distance(block_cameras.begin(), tile_it));
+                            // Only pin a camera that this window's tile actually
+                            // covers the cell with. A decision made on the whole
+                            // window the earlier block had is not automatically
+                            // renderable here (the window clip and the visibility
+                            // test can differ at the very edge), and a pin the
+                            // labeller would drop is better not applied at all.
+                            const ortho::OrthoTile& tile =
+                                tiles[static_cast<std::size_t>(tile_index)];
+                            if (!tile.contains(col, row) ||
+                                tile.valid[tile.index(col, row)] == 0) {
+                                continue;
+                            }
                         }
-                        const std::size_t wc = static_cast<std::size_t>(row) *
-                                                   static_cast<std::size_t>(window.width) +
-                                               static_cast<std::size_t>(col);
                         seed[wc] = tile_index;
                         frozen[wc] = 1;
                     }
@@ -1799,12 +1821,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     }
                     ++pinned_cells;
                     if (labels[wc] != seed[wc]) {
+                        // The pin is a hard constraint on a cell this window can
+                        // render, so this is an optimiser bug rather than a
+                        // legitimate drop. Restore the earlier block's decision:
+                        // the seam must not restart, and the cell is only in this
+                        // block's margin so its colour is not written either way.
                         ++pinned_changed;
-                        // The pin is a hard constraint, so this can only mean the
-                        // pinned tile does not cover the cell (dropped by
-                        // assign_seams) or an optimiser bug. Keep the earlier
-                        // block's decision either way: the committed output for
-                        // the cell is already written.
                         labels[wc] = seed[wc];
                     }
                 }

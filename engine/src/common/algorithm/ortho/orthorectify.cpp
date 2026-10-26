@@ -307,7 +307,8 @@ TileBounds camera_footprint_bounds(
 OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
                        int camera_index, double occlusion_tolerance, bool crop,
-                       const OrthoSurfaceRange* surface_range) {
+                       const OrthoSurfaceRange* surface_range,
+                       const OrthoCellLattice* lattice) {
     OrthoTile tile;
     tile.camera = camera_index;
     if (camera.image == nullptr || camera.image->empty() || dem.empty()) {
@@ -423,8 +424,19 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
 #endif
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {
+            // The cell centre. On a window, evaluate it on the PARENT lattice:
+            // the window's own origin differs from the parent's by up to one ulp,
+            // which over millions of cells flips a few bilinear samples.
             const Eigen::Vector2d centre_xy =
-                out_grid.pixel_center(col_start + col, row_start + row);
+                lattice != nullptr
+                    ? Eigen::Vector2d(
+                          lattice->origin_x +
+                              (static_cast<double>(lattice->col_offset + col_start + col) + 0.5) *
+                                  out_grid.pixel_size_x,
+                          lattice->origin_y -
+                              (static_cast<double>(lattice->row_offset + row_start + row) + 0.5) *
+                                  out_grid.pixel_size_y)
+                    : out_grid.pixel_center(col_start + col, row_start + row);
             const double x = centre_xy.x();
             const double y = centre_xy.y();
             const double z = sample_dem(dem, dem_nodata, x, y);

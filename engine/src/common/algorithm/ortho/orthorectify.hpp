@@ -145,6 +145,25 @@ TileBounds camera_footprint_bounds(const RasterGrid& out_grid, const OrthoCamera
                                    double lowest_height, double highest_height,
                                    int margin_cells);
 
+/// The parent grid's own cell lattice, for a grid that is a WINDOW on a larger
+/// one (a block). Cell (col, row) of the window is cell
+/// (col + col_offset, row + row_offset) of the parent, so its centre must be
+/// evaluated as
+///
+///     (origin_x + (col + col_offset + 0.5) * pixel_size_x, ...)
+///
+/// rather than from the window's own origin. The two differ by up to one ulp of
+/// the double: enough, over millions of cells, to flip a handful of bilinear
+/// samples and make a blocked ortho differ from the whole-grid one by one grey
+/// level. Evaluating on the parent lattice makes the window reproduce the global
+/// result bit for bit.
+struct OrthoCellLattice {
+    double origin_x = 0.0;  ///< the PARENT grid's outer top-left corner
+    double origin_y = 0.0;
+    int col_offset = 0;     ///< the window's first cell, in parent columns
+    int row_offset = 0;
+};
+
 /// The valid height range of the DEM, so a caller rectifying many cameras over
 /// the same surface does not rescan it once per camera (a block-wise run would
 /// otherwise walk the whole DEM, blocks x cameras times). Compute it with
@@ -166,10 +185,15 @@ struct OrthoSurfaceRange {
 /// uses it instead of scanning `dem` for the footprint clip and the occlusion
 /// march's ceiling. The values must be the true min/max of the valid samples
 /// (a narrower range clips the footprint or stops the march early).
+///
+/// `lattice`, when given, says `out_grid` is a window on a larger grid: cell
+/// centres are then evaluated on the parent lattice (see OrthoCellLattice), which
+/// is what makes a block reproduce the whole grid's cells bit for bit.
 OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
                        int camera_index, double occlusion_tolerance, bool crop = true,
-                       const OrthoSurfaceRange* surface_range = nullptr);
+                       const OrthoSurfaceRange* surface_range = nullptr,
+                       const OrthoCellLattice* lattice = nullptr);
 
 // -- test-only cost accounting ----------------------------------------------
 // The occlusion march's cost is invisible in a tile's contents: a 4x-finer

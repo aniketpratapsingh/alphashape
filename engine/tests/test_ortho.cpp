@@ -1021,6 +1021,75 @@ TEST(Ortho, FullPipelineTiming) {
     }
 }
 
+// -- 6a. a window on the global grid reproduces it bit for bit ----------------
+
+TEST(Ortho, WindowGridReproducesTheWholeGridTiles) {
+    // A block is a WINDOW on the output grid. Rectifying a camera into a window
+    // must give exactly the whole grid's samples for the cells it holds: same
+    // cell centres (the parent lattice, not the window's own origin), same crop
+    // but clipped to the window. This is what makes a blocked ortho identical to
+    // an unblocked one where the blocking cannot legitimately change anything.
+    const Scene scene = make_scene();
+    const std::vector<OrthoTile> whole = rectify_all(scene, 0.25);
+    const int w = scene.grid.width;
+    const int h = scene.grid.height;
+    constexpr int kMargin = 40;
+    constexpr int kBlock = 120;
+    // A window in the middle of the grid, not touching its border.
+    const int wx0 = 100;
+    const int wy0 = 80;
+    RasterGrid window;
+    window.origin_x = scene.grid.origin_x + static_cast<double>(wx0) * scene.grid.pixel_size_x;
+    window.origin_y = scene.grid.origin_y - static_cast<double>(wy0) * scene.grid.pixel_size_y;
+    window.pixel_size_x = scene.grid.pixel_size_x;
+    window.pixel_size_y = scene.grid.pixel_size_y;
+    window.width = kBlock + 2 * kMargin;
+    window.height = kBlock + 2 * kMargin;
+
+    ortho::OrthoSurfaceRange range;
+    range.lowest = 1e30;
+    range.highest = -1e30;
+    for (const float v : scene.dem.data) {
+        range.lowest = std::min(range.lowest, static_cast<double>(v));
+        range.highest = std::max(range.highest, static_cast<double>(v));
+    }
+    ortho::OrthoCellLattice lattice;
+    lattice.origin_x = scene.grid.origin_x;
+    lattice.origin_y = scene.grid.origin_y;
+    lattice.col_offset = wx0;
+    lattice.row_offset = wy0;
+
+    std::size_t checked = 0;
+    std::size_t differing = 0;
+    for (std::size_t t = 0; t < scene.cameras.size(); ++t) {
+        const OrthoTile in_window = orthorectify(
+            scene.dem, scene.nodata, window, scene.cameras[t], static_cast<int>(t), 0.25, true,
+            &range, &lattice);
+        const OrthoTile& reference = whole[t];
+        for (int row = wy0; row < wy0 + window.height && row < h; ++row) {
+            for (int col = wx0; col < wx0 + window.width && col < w; ++col) {
+                const bool in_ref = reference.contains(col, row);
+                const bool in_win = in_window.contains(col, row);
+                if (!in_ref || !in_win) {
+                    continue;  // crop edges differ; only shared cells are compared
+                }
+                ++checked;
+                const std::size_t a = reference.index(col, row);
+                const std::size_t b = in_window.index(col, row);
+                if (reference.valid[a] != in_window.valid[b] ||
+                    reference.score[a] != in_window.score[b] || reference.rgb[a * 3] != in_window.rgb[b * 3] ||
+                    reference.rgb[a * 3 + 1] != in_window.rgb[b * 3 + 1] ||
+                    reference.rgb[a * 3 + 2] != in_window.rgb[b * 3 + 2]) {
+                    ++differing;
+                }
+            }
+        }
+    }
+    std::printf("[Ortho.WindowGrid] shared cells=%zu differing=%zu\n", checked, differing);
+    EXPECT_GT(checked, 100000U);
+    EXPECT_EQ(differing, 0U) << "a window must reproduce the whole grid's samples exactly";
+}
+
 // -- 6. pinned labels (block-wise seam continuity) ----------------------------
 
 TEST(Seam, PinnedLabelsAreHonouredAndUnpinnedCellsStillOptimise) {
