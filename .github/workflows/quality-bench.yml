@@ -62,6 +62,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Install the plan dependencies
+        # The manifest commands need nothing, but the metrics tests below do, and
+        # installing once here keeps the matrix and hash steps free of a separate
+        # Python setup.
+        run: python3 -m pip install --disable-pip-version-check numpy
+
       - name: Resolve datasets and cache key
         id: plan
         env:
@@ -89,9 +95,6 @@ jobs:
           # dataset invalidates the cached downloads instead of reusing a stale tree.
           key=$(python3 tools/bench/run_bench.py --manifest-hash)
           echo "cache-key=bench-data-$key" >> "$GITHUB_OUTPUT"
-
-      - name: Install test dependencies
-        run: pip install --disable-pip-version-check numpy
 
       - name: Metrics and report unit tests
         # Stdlib + numpy only, and they finish in well under a second, so a broken

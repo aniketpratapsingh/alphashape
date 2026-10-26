@@ -48,10 +48,14 @@ MANIFEST = HERE / "datasets.json"
 # The bench is a set of scripts, not an installed package: ``metrics`` is a
 # sibling module, and putting its directory on the path is what lets the file run
 # both as ``python3 tools/bench/run_bench.py`` and under the test discovery.
+#
+# ``metrics`` itself is imported where it is used, not here: it needs numpy, and the
+# manifest commands (--list, --list-datasets, --manifest-hash) are what a bare
+# checkout and the workflow's plan job run first. Importing it at module scope made
+# those fail on a machine without numpy, which is a needless prerequisite for
+# printing a URL.
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
-
-import metrics  # noqa: E402 - after the path setup above
 
 # The pipeline, in the order the README documents it. Defaults only: the point of
 # a benchmark is to measure what a user gets without tuning, so a run that needs a
@@ -564,6 +568,8 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         print(f"   {camera_stats['error']}")
 
     print("-- metrics")
+    import metrics  # noqa: PLC0415 - see the note at the top on why this is late
+
     spec = metrics.DatasetSpec(
         name=dataset_name,
         images=[str(p) for p in images],
@@ -606,8 +612,6 @@ def _reprojection(work: Path, project: Path) -> dict:
     The binaries are read straight out of the project archive so this works on a
     machine with no Python bindings built.
     """
-    import struct  # noqa: PLC0415
-
     import numpy as np  # noqa: PLC0415
 
     base = project.with_suffix("")
