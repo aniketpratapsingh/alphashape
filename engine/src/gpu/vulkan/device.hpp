@@ -6,6 +6,7 @@
 #include "gpu/vulkan/vk_headers.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -57,6 +58,8 @@ public:
     std::shared_ptr<SamplerHandle> create_sampler(Filter filter, AddressMode address) override;
     bool image_sampling_supported(Format format) override;
     void run(const std::vector<DispatchRequest>& dispatches) override;
+    void run_with_fence_budget(const std::vector<DispatchRequest>& dispatches,
+                               std::uint64_t fence_budget_ns) override;
     std::uint64_t submit(const std::vector<DispatchRequest>& dispatches, int queue,
                          bool block_when_full) override;
     void wait(std::uint64_t ticket) override;
@@ -97,8 +100,16 @@ public:
                          void* download_dst);
     /// Waits for every outstanding submission's fence (host access to buffers
     /// must not race with in-flight GPU work). Does not release the slots: they
-    /// stay counted as un-waited until wait() is called for them.
+    /// stay counted as un-waited until wait() is called for them. Throws
+    /// gpu::Error once the device is lost: a host copy must not read a buffer
+    /// the queue never finished writing.
     void wait_all_pending();
+    /// The destructor form of wait_all_pending(): never throws, spends one
+    /// shared deadline on the whole drain rather than one slice per fence, and
+    /// marks the device lost when the drain does not complete. Destructors are
+    /// implicitly noexcept, so throwing from one would be std::terminate.
+    /// Returns true when every fence signalled.
+    bool wait_all_pending_noexcept();
     /// VkFormat for a public Format (used by the image path and capability
     /// queries).
     VkFormat vk_format(Format format) const;
@@ -126,15 +137,32 @@ private:
     /// Records and submits `dispatches` into `slot`. Caller holds mutex_ and has
     /// reserved the slot. Throws gpu::Error on any failure (slot is released).
     void record_and_submit(Slot& slot, const std::vector<DispatchRequest>& dispatches);
-    /// Waits for one fence in bounded 5 s slices; throws Error("gpu: fence
-    /// timeout").
-    void wait_fence(VkFence fence);
+    /// Waits for one fence in bounded slices under the default budget; throws
+    /// Error("gpu: fence timeout"), and throws "device lost" without waiting on
+    /// a device already marked lost. `budget_ns` overrides the device default
+    /// (0 keeps it).
+    void wait_fence(VkFence fence, std::uint64_t budget_ns = 0);
+    /// One bounded, never-throwing wait used by the destructor drain. Returns
+    /// true when the fence signalled.
+    bool wait_fence_noexcept(VkFence fence, std::uint64_t timeout_ns) noexcept;
+    /// True once the device is unusable: a real loss, or a drain that failed.
+    bool lost() const;
+    /// Drains every fence this backend owns with one shared deadline; the
+    /// throwing and noexcept variants share it. Returns false when a fence did
+    /// not signal inside the budget.
+    bool drain_pending(std::uint64_t budget_ns, bool allow_throw);
     /// Reserves the next free slot; returns nullptr when kMaxInFlight are
     /// outstanding (the caller decides throw-or-drain).
     Slot* reserve_slot();
     /// Ticket id of the oldest pending submission (0 when none).
     std::uint64_t oldest_pending_id();
     void release_slot(Slot& slot);
+    /// Gives up a slot whose fence will never signal (a device loss). The
+    /// pending state and ticket go, so no later wait() spins on it and the ring
+    /// is not left permanently full, but the descriptor pool is kept until the
+    /// next successful use: the queue may still reference it, and nothing is
+    /// submitted to a lost device anyway.
+    void abandon_slot(Slot& slot);
     void ensure_staging();
     /// Creates the image-copy command pool, buffer and fence on first use.
     void ensure_image_transfer();
@@ -172,6 +200,14 @@ private:
     VkCommandPool image_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer image_commands_ = VK_NULL_HANDLE;
     VkFence image_fence_ = VK_NULL_HANDLE;
+
+    // Post-loss destructor drain: one deadline shared by every buffer that the
+    // same failed operation destroys, so the fallback unwind is bounded in
+    // total rather than per handle. Keyed to the loss generation so a later,
+    // unrelated loss arms a fresh window. Guarded by mutex_.
+    bool lost_drain_started_ = false;
+    std::uint64_t lost_drain_generation_ = 0;
+    std::chrono::steady_clock::time_point lost_drain_deadline_{};
 
     // Samplers are immutable and cached per (filter, address). The key packs
     // the two enums into one integer; the value is the shared handle.

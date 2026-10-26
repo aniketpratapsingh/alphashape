@@ -93,6 +93,12 @@ public:
     /// Format capability check; false makes callers fall back or skip.
     virtual bool image_sampling_supported(Format format) = 0;
     virtual void run(const std::vector<DispatchRequest>& dispatches) = 0;
+    /// run() with an explicit fence budget for this submission (0 keeps the
+    /// device default). The first submission of a batched operation is
+    /// calibrated from its own duration, so it is allowed a generous budget
+    /// instead of being declared a hang at the steady-state bound.
+    virtual void run_with_fence_budget(const std::vector<DispatchRequest>& dispatches,
+                                       std::uint64_t fence_budget_ns) = 0;
     /// Records and submits without waiting; returns the ticket id. When
     /// `block_when_full` is false (run_async) a full ring throws gpu::Error;
     /// when true (the synchronous path) the oldest pending submission is waited

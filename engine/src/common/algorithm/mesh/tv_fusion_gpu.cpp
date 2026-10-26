@@ -297,14 +297,22 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
     const std::vector<const g::Buffer*> delta_buffers = {&g_u, &g_previous, &g_delta};
     const std::vector<const g::Buffer*> reduce_buffers = {&g_delta, &g_partials};
 
-    // One gpu::run per batch: the batch's dual/primal pairs, then the settle
-    // statistic (delta against the pre-batch iterate, reduce to partials). The
-    // host reads the partials and sums them in double.
+    // One gpu::run_batched per batch: the batch's dual/primal pairs, then the
+    // settle statistic (delta against the pre-batch iterate, reduce to
+    // partials). The batch's iterations a step (a dual/primal pair) each;
+    // run_batched decides how many steps one submission carries, timing the
+    // first one and scaling towards ~50-100 ms, so no single submission can
+    // monopolise a GPU shared with the display. The delta/reduce pair always
+    // rides with the last submission: it reads the whole batch's output.
     profile.upload_seconds = seconds_since(upload_start);
     const auto iterate_start = std::chrono::steady_clock::now();
     int remaining = std::max(0, options.iterations);
     std::uint32_t batch = kFirstBatch;
     double movement = 0.0;
+    // Persistent across batches: the measured per-step cost of this problem
+    // carries over, so only the first batch pays the timing probe.
+    g::BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1,
+                            /*max_steps=*/kMaxBatch);
     while (remaining > 0) {
         const std::uint32_t count = std::min<std::uint32_t>(
             batch, static_cast<std::uint32_t>(remaining));
@@ -322,7 +330,9 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
         dispatches.push_back(dispatch_for("tvl1_delta", delta_buffers, params, point_groups));
         dispatches.push_back(
             dispatch_for("tvl1_reduce", reduce_buffers, params, reduce_launch));
-        g::run(*context, dispatches);
+        profile.submissions += static_cast<int>(
+            g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/2));
+        ++profile.batches;
         movement = total_delta(g_partials.read<float>(group_count)) /
                    static_cast<double>(voxels);
         if (Log::enabled(LogLevel::Debug)) {
@@ -330,7 +340,6 @@ VolumeResult run_gpu(const detail::TvFusionSetup& setup, const TvFusionOptions& 
                                  << " iterations, mean |du| " << movement;
         }
         remaining -= static_cast<int>(count);
-        ++profile.batches;
         if (remaining <= 0 || movement <= kSettleTolerance) {
             break;
         }
