@@ -116,7 +116,9 @@ benchmark spent over five hours in BuildDepthMaps and was cancelled:
   20–24 MP per frame the default is 20 000+ keypoints per image, and the resulting matching
   ran the first working CI attempt out of memory at 97%;
 - **`BuildDepthMaps downscale=8`**, which quarters the depth-map pixel count while leaving
-  the grid finer than the imagery's own ground sample distance.
+  the grid finer than the imagery's own ground sample distance;
+- **`BuildOrthomosaic resolution=0.05`** on the aerial set, because a 2.4 cm mosaic of a
+  0.048 km² site is 83 million cells to rectify and seam and overran the stage budget.
 
 Both are recorded in every metrics JSON and printed at the top of the report, and every
 stage carries a 40-minute budget so an overrunning stage fails with its own name rather

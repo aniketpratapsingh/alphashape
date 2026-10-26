@@ -78,10 +78,17 @@ does not come from a photogrammetry pipeline at all.
   still several thousand well-distributed keypoints for a 30-image block with heavy
   overlap.
 
-  All of this is recorded in every metrics JSON and printed at the top of the report, so
-  a bounded run is never mistaken for a default one. Each stage also carries a 40-minute
-  budget: a stage that overruns fails with its own name rather than waiting out the job's
-  timeout and reporting nothing.
+  `BuildOrthomosaic resolution=0.05` is the fourth. The site is 0.048 km², so a 2.4 cm
+  mosaic is 83 million cells to rectify and seam; that overran the stage budget on the
+  first attempt that got that far, while matching, alignment, depth maps, the dense cloud
+  and the DEM had all already succeeded. 5 cm is 19 million cells and an ordinary
+  orthomosaic deliverable, and the effective-resolution metric is reported against this
+  nominal, so "did the mosaic get softer" stays a valid run-over-run signal.
+
+  All of this is recorded in every metrics JSON and printed at the top of the report, so a
+  bounded run is never mistaken for a default one. Each stage also carries a budget
+  (40 minutes, 60 for the orthomosaic): a stage that overruns fails with its own name
+  rather than waiting out the job's timeout and reporting nothing.
 - Why this one over the other candidates: it is the smallest member of the Comoros/Mayotte
   series whose publisher report shows a full reconstruction (102/102 images) on a compact
   site (0.048 km²) with a 2.4 cm GSD. Neighbouring records in the same series are 187,

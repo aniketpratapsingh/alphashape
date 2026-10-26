@@ -500,6 +500,7 @@ def run_pipeline(
     images: list[Path],
     overrides: dict | None = None,
     stage_budget_s: float | None = None,
+    stage_budgets: dict | None = None,
 ) -> dict:
     """Create a project from ``images`` and run the pipeline, timing each stage.
 
@@ -530,7 +531,10 @@ def run_pipeline(
         arguments = ["--project", str(project), "--task", task]
         for key, value in (overrides.get(task) or {}).items():
             arguments += ["--set", f"{key}={value}"]
-        stages[task] = _timed(run_cli, arguments, log=log, timeout=stage_budget_s)
+        budget = None
+        if stage_budget_s:
+            budget = float(stage_budgets.get(task, stage_budget_s)) if stage_budgets else stage_budget_s
+        stages[task] = _timed(run_cli, arguments, log=log, timeout=budget)
     total = time.monotonic() - started
 
     products: dict[str, str] = {}
@@ -711,7 +715,10 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
     overrides = dataset.get("param_overrides") or {}
     if overrides:
         print(f"   parameter overrides: {overrides}")
-    timing = run_pipeline(work, images, overrides, dataset.get("stage_budget_s"))
+    timing = run_pipeline(
+        work, images, overrides,
+        dataset.get("stage_budget_s"), dataset.get("stage_budgets"),
+    )
 
     print("-- inspect")
     camera_stats = inspect_project(Path(timing["project"]))
