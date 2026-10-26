@@ -8,6 +8,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Build Orthomosaic processes the output in blocks, so a full-resolution ortho
+  fits in memory.** A run whose whole-grid estimate fits the machine's budget
+  still builds as one piece, byte for byte as before; a larger one is split into
+  square blocks with a margin, each block rectifying only the cameras whose
+  footprint reaches it and writing only its interior into the assembled output.
+  Seams stay continuous across block borders (the margin an earlier block decided
+  is pinned as a hard constraint, in raster order) and mosaic blending pins the
+  pyramid depth to the whole grid's, so block interiors blend with the same
+  operator. Photographs are decoded through a byte-bounded LRU cache, progress is
+  reported per block and Cancel is honoured between blocks. The reported
+  36-photo, 4592x3056, 1.9 cm case over a 100 m site (28 M cells, ~8 GB before)
+  is planned under 2 GB; the estimator now plans per block and only coarsens the
+  resolution when even a 512-cell block cannot fit. `block_size` overrides the
+  block side (0 = automatic).
 - **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
   (including one during filtering) stores the finished maps before it stops,
   and `reuse_depth` (now on by default) skips their search on the next run and

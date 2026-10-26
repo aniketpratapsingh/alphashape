@@ -1717,6 +1717,40 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             labels = ortho::assign_seams(window.width, window.height, tiles, seam_options,
                                         frozen.empty() ? nullptr : &seed,
                                         frozen.empty() ? nullptr : &frozen);
+
+            // Blocks run in raster order and the overlap is pinned, so every
+            // inherited cell must still carry the label the earlier block
+            // decided. A change here would be a seam restarting at a block
+            // border, which is exactly what the pin exists to prevent.
+            std::size_t pinned_cells = 0;
+            std::size_t pinned_changed = 0;
+            if (!frozen.empty()) {
+                for (std::size_t wc = 0; wc < frozen.size(); ++wc) {
+                    if (frozen[wc] == 0) {
+                        continue;
+                    }
+                    ++pinned_cells;
+                    if (labels[wc] != seed[wc]) {
+                        ++pinned_changed;
+                        // The pin is a hard constraint, so this can only mean the
+                        // pinned tile does not cover the cell (dropped by
+                        // assign_seams) or an optimiser bug. Keep the earlier
+                        // block's decision either way: the committed output for
+                        // the cell is already written.
+                        labels[wc] = seed[wc];
+                    }
+                }
+            }
+            if (pinned_changed != 0) {
+                log(LogLevel::Warn) << "BuildOrthomosaic: block " << block_index << " changed "
+                                    << pinned_changed << " of " << pinned_cells
+                                    << " inherited seam labels";
+            }
+            if (Log::enabled(LogLevel::Info)) {
+                log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="
+                                    << pinned_cells << " conflicts=" << pinned_changed
+                                    << " cameras=" << block_cameras.size();
+            }
             progress.update("seamlines",
                             static_cast<double>(block_index + 1) /
                                 static_cast<double>(total_blocks));

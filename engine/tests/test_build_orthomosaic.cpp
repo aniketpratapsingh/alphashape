@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1319,7 +1320,9 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     OrthoSetup& s = setup();
     const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, true, true));
     ASSERT_FALSE(whole.empty());
+    ScopedLogCapture capture;
     const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.25, 256, true, true));
+    const std::string warnings = capture.text(LogLevel::Info);
     ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
 
     std::size_t covered_whole = 0;
@@ -1364,9 +1367,36 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     EXPECT_EQ(covered_blocked, covered_whole);
     EXPECT_EQ(labelled_blocked, labelled_whole);
     EXPECT_GT(across_labelled, 0U);
-    // The margin is what keeps the seam from restarting: the vast majority of
-    // border-adjacent labelled pairs still share a camera.
-    EXPECT_LT(across, across_labelled / 20) << "seams restarted at block borders";
+    // The exact pinning contract (an overlap cell keeps the label an earlier
+    // block decided) is asserted at the seamlines level, where it is directly
+    // observable (Seam.PinnedLabelsAreHonoured...). Here the assembled product
+    // only shows the borders: a seam may legitimately sit ON a border, so this
+    // bounds how often one does rather than demanding zero.
+    EXPECT_LT(across, across_labelled / 4) << "seams restarted at block borders";
+
+    // Determinism: the blocked path is thread-count independent like the rest.
+    const Orthomosaic again = run_ortho(s, block_params("mosaic", 0.25, 256, true, true));
+    EXPECT_EQ(again.raster.data, blocked.raster.data);
+    EXPECT_EQ(again.labels, blocked.labels);
+
+    // The pin contract itself: no block may report a changed inherited label,
+    // and the blocked run must actually pin a meaningful part of each overlap.
+    std::size_t inherited = 0;
+    std::size_t conflicts = 0;
+    std::size_t from = 0;
+    while ((from = warnings.find("pinned=", from)) != std::string::npos) {
+        const std::size_t conflicts_at = warnings.find("conflicts=", from);
+        if (conflicts_at == std::string::npos) {
+            break;
+        }
+        inherited += std::strtoul(warnings.c_str() + from + 7, nullptr, 10);
+        conflicts += std::strtoul(warnings.c_str() + conflicts_at + 10, nullptr, 10);
+        from = conflicts_at + 10;
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseSeams] inherited=%zu conflicts=%zu\n", inherited,
+                conflicts);
+    EXPECT_GT(inherited, 0U) << "no margin label was inherited: the blocks are not overlapping";
+    EXPECT_EQ(conflicts, 0U) << "an inherited seam label changed across a block border";
 }
 
 TEST(BuildOrthomosaic, BlockWiseMosaicMatchesWithInOneGreyLevel) {

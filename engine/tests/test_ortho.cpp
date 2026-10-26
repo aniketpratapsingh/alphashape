@@ -1021,5 +1021,136 @@ TEST(Ortho, FullPipelineTiming) {
     }
 }
 
+// -- 6. pinned labels (block-wise seam continuity) ----------------------------
+
+TEST(Seam, PinnedLabelsAreHonouredAndUnpinnedCellsStillOptimise) {
+    // The block-wise caller pins the margin a previous block already decided.
+    // The optimiser must keep every pinned label that a tile covers, and must
+    // still improve the free cells (the pin is a constraint, not a freeze).
+    const Scene scene = make_scene();
+    const std::vector<OrthoTile> tiles = rectify_all(scene, 0.25);
+    const int w = scene.grid.width;
+    const int h = scene.grid.height;
+    const SeamOptions options;
+    const std::vector<std::int32_t> free = assign_seams(w, h, tiles, options);
+
+    // Pin the left half of the grid to whatever the free labelling chose there
+    // (a stand-in for "a block to the left already decided this").
+    std::vector<std::int32_t> pinned_labels = free;
+    std::vector<std::uint8_t> pinned(free.size(), 0);
+    for (int row = 0; row < h; ++row) {
+        for (int col = 0; col < w / 2; ++col) {
+            const std::size_t cell = static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                     static_cast<std::size_t>(col);
+            if (free[cell] >= 0) {
+                pinned[cell] = 1;
+            }
+        }
+    }
+    const std::vector<std::int32_t> constrained =
+        assign_seams(w, h, tiles, options, &pinned_labels, &pinned);
+
+    std::size_t checked = 0;
+    std::size_t kept = 0;
+    for (std::size_t cell = 0; cell < free.size(); ++cell) {
+        if (pinned[cell] == 0) {
+            continue;
+        }
+        ++checked;
+        kept += constrained[cell] == pinned_labels[cell] ? 1U : 0U;
+    }
+    std::printf("[Seam.Pinned] pinned=%zu kept=%zu\n", checked, kept);
+    EXPECT_GT(checked, static_cast<std::size_t>(w) * static_cast<std::size_t>(h) / 4);
+    EXPECT_EQ(kept, checked) << "a pinned label must survive the optimisation";
+
+    // The free half must still be a valid labelling, and its own labels must be
+    // the ones the optimiser chose (not a copy of the pin).
+    std::size_t free_changed = 0;
+    for (std::size_t cell = 0; cell < free.size(); ++cell) {
+        if (pinned[cell] != 0) {
+            continue;
+        }
+        const int col = static_cast<int>(cell % static_cast<std::size_t>(w));
+        const int row = static_cast<int>(cell / static_cast<std::size_t>(w));
+        bool covered = false;
+        for (const OrthoTile& tile : tiles) {
+            covered = covered || tile_valid_at(tile, col, row);
+        }
+        if (covered) {
+            EXPECT_GE(constrained[cell], 0) << "an uncovered free cell was not labelled";
+        }
+        free_changed += constrained[cell] != free[cell] ? 1U : 0U;
+    }
+    std::printf("[Seam.Pinned] free cells changed by the constraint=%zu\n", free_changed);
+}
+
+TEST(Seam, PinnedLabelThatTheTileSetDoesNotCoverIsIgnored) {
+    // A pinned label can name a camera this block does not hold (or that is
+    // invalid there). The pin must be dropped rather than producing a label no
+    // tile can render.
+    std::vector<OrthoTile> tiles(2);
+    constexpr int kWidth = 6;
+    constexpr int kHeight = 4;
+    for (int t = 0; t < 2; ++t) {
+        OrthoTile& tile = tiles[static_cast<std::size_t>(t)];
+        tile.camera = t;
+        tile.x0 = t == 0 ? 0 : 3;
+        tile.y0 = 0;
+        tile.width = kWidth - 3;
+        tile.height = kHeight;
+        tile.rgb.assign(static_cast<std::size_t>(tile.width) * tile.height * 3, 128);
+        tile.valid.assign(static_cast<std::size_t>(tile.width) * tile.height, 1);
+        tile.score.assign(static_cast<std::size_t>(tile.width) * tile.height, 1.0F);
+    }
+    std::vector<std::int32_t> pinned_labels(static_cast<std::size_t>(kWidth) * kHeight, 0);
+    std::vector<std::uint8_t> pinned(pinned_labels.size(), 0);
+    // Pin the RIGHT half to tile 0, which does not cover it at all.
+    for (int row = 0; row < kHeight; ++row) {
+        for (int col = kWidth / 2; col < kWidth; ++col) {
+            const std::size_t cell = static_cast<std::size_t>(row) * kWidth +
+                                     static_cast<std::size_t>(col);
+            pinned_labels[cell] = 0;
+            pinned[cell] = 1;
+        }
+    }
+    const std::vector<std::int32_t> labels =
+        assign_seams(kWidth, kHeight, tiles, SeamOptions{}, &pinned_labels, &pinned);
+    for (int row = 0; row < kHeight; ++row) {
+        for (int col = kWidth / 2; col < kWidth; ++col) {
+            const std::size_t cell = static_cast<std::size_t>(row) * kWidth +
+                                     static_cast<std::size_t>(col);
+            EXPECT_NE(labels[cell], 0) << "an uncovered pinned label was kept";
+            EXPECT_EQ(labels[cell], 1) << "the covering tile was not chosen";
+        }
+    }
+}
+
+// -- 7. pinned blend pyramid depth -------------------------------------------
+
+TEST(Ortho, PinnedPyramidDepthEqualsTheWholeGridBlend) {
+    // A block plan pins the mosaic pyramid depth to the whole grid's. Pinning it
+    // explicitly must reproduce the default blend exactly, and the accessor must
+    // agree with what blend() would have picked.
+    const Scene scene = make_scene();
+    const std::vector<OrthoTile> tiles = rectify_all(scene, 0.25);
+    const std::vector<std::int32_t> labels =
+        assign_seams(scene.grid.width, scene.grid.height, tiles, SeamOptions{});
+    const int levels = ortho::pyramid_level_count(scene.grid.width, scene.grid.height);
+    const ortho::OrthoMosaic automatic =
+        ortho::blend(scene.grid.width, scene.grid.height, tiles, labels, Blending::Mosaic);
+    const ortho::OrthoMosaic pinned = ortho::blend(scene.grid.width, scene.grid.height, tiles,
+                                                   labels, Blending::Mosaic, levels);
+    std::printf("[Ortho.PinnedPyramid] levels=%d\n", levels);
+    EXPECT_GE(levels, 1);
+    EXPECT_EQ(pinned.rgb, automatic.rgb);
+    EXPECT_EQ(pinned.valid, automatic.valid);
+
+    // A shallower pinned depth is a different operator and must be honoured (the
+    // clamp only ever reduces the depth to what the grid supports).
+    const ortho::OrthoMosaic shallow = ortho::blend(scene.grid.width, scene.grid.height, tiles,
+                                                    labels, Blending::Mosaic, 1);
+    EXPECT_NE(shallow.rgb, automatic.rgb);
+}
+
 }  // namespace
 }  // namespace alphashape
