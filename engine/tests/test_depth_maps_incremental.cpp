@@ -26,6 +26,7 @@
 #include "common/algorithm/stereo/view_selection.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
+#include "common/io/sidecars.hpp"
 #include "common/tasks/registry.hpp"
 
 #include "dense_fixture.hpp"
@@ -245,36 +246,68 @@ TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
     run_depth_maps(document, kDownscale, /*reuse=*/true);
     EXPECT_EQ(depth_map_search_count(), 0U) << "an unchanged chunk rebuilt maps it could reuse";
 
-    // Move one camera, as a re-alignment would, and the map for that camera is
-    // rebuilt while every other map is still reused.
+    // Move one camera, as a re-alignment would, and that camera's map is rebuilt
+    // while every other map is still reused. Which camera is moved does not
+    // matter -- neighbours are symmetric here -- but the map must NOT be reused.
     std::vector<DepthMap> before = document.active_chunk()->depth_maps();
     Camera& moved = document.active_chunk()->cameras().front();
     moved.pose(0, 3) += 0.25;
     const std::int32_t moved_id = moved.id;
+    const std::uint64_t moved_fingerprint = [&] {
+        const auto old = std::find_if(before.begin(), before.end(),
+                                      [&](const DepthMap& m) { return m.camera_id == moved_id; });
+        return old != before.end() ? old->alignment_fingerprint : 0U;
+    }();
+    ASSERT_NE(moved_fingerprint, 0U);
 
     reset_depth_map_search_count();
     run_depth_maps(document, kDownscale, /*reuse=*/true);
+    // Forcing the camera's own map to be rebuilt also forces its neighbours'
+    // boundaries to be re-filtered, but their SEARCH must be reused.
     EXPECT_EQ(depth_map_search_count(), 1U)
         << "a re-aligned camera must rebuild exactly its own map";
 
-    // Exactly the moved camera's map was replaced with a different one.
     const Chunk& after = *document.active_chunk();
     ASSERT_EQ(after.depth_maps().size(), map_count);
     bool saw_moved = false;
     for (const DepthMap& map : after.depth_maps()) {
+        if (map.camera_id != moved_id) {
+            continue;
+        }
+        saw_moved = true;
+        EXPECT_NE(map.alignment_fingerprint, moved_fingerprint)
+            << "the moved camera kept the old fingerprint";
+        EXPECT_NE(map.alignment_fingerprint, 0U);
+    }
+    EXPECT_TRUE(saw_moved) << "the moved camera has no map";
+    // Every other camera still carries the fingerprint it had: they were reused.
+    for (const DepthMap& map : after.depth_maps()) {
+        if (map.camera_id == moved_id) {
+            continue;
+        }
         const auto old = std::find_if(before.begin(), before.end(),
                                       [&](const DepthMap& m) { return m.camera_id == map.camera_id; });
         ASSERT_NE(old, before.end());
-        if (map.camera_id == moved_id) {
-            saw_moved = true;
-            EXPECT_NE(map.alignment_fingerprint, old->alignment_fingerprint)
-                << "the moved camera kept the old fingerprint";
-        } else {
-            EXPECT_EQ(map.alignment_fingerprint, old->alignment_fingerprint)
-                << "camera " << map.camera_id << " was rebuilt after an unrelated move";
-        }
+        EXPECT_EQ(map.alignment_fingerprint, old->alignment_fingerprint)
+            << "camera " << map.camera_id << " was rebuilt after an unrelated move";
     }
-    EXPECT_TRUE(saw_moved);
+}
+
+TEST(DepthMapsReuse, RecalibrationInvalidatesTheMaps) {
+    // The sensor's calibration is part of the fingerprint too: a re-calibration
+    // changes every camera on that sensor, so none of their maps may be reused.
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kDownscale, /*reuse=*/true);
+    const std::size_t map_count = chunk.depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    document.active_chunk()->sensors().front().calibration.f *= 1.01;
+
+    reset_depth_map_search_count();
+    run_depth_maps(document, kDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "a re-calibrated sensor must rebuild every map it produced";
 }
 
 TEST(DepthMapsReuse, FingerprintIsZeroForAMapWithNoRecordedAlignment) {
@@ -342,6 +375,81 @@ TEST(DepthMapsReuse, ReuseDepthDefaultsToTrue) {
     const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
     const Params defaults = make_params(entry);
     EXPECT_TRUE(defaults.get_bool("reuse_depth"));
+}
+
+// ---------------------------------------------------------------------------
+// 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsSidecar, Adm2RoundTripsFingerprintAndFilterMode) {
+    DepthMap map;
+    map.camera_id = 3;
+    map.width = 2;
+    map.height = 2;
+    map.downscale = 4;
+    map.depths = {1.0F, 2.0F, -1.0F, 4.0F};
+    map.normals = {0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
+    map.confidence = {0.0F, 1.0F, 0.0F, 2.0F};
+    map.alignment_fingerprint = 0xFEEDFACE12345678ULL;
+    map.filter_mode = 3;  // aggressive
+
+    const std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
+    ASSERT_GE(bytes.size(), 4U);
+    EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 4), "ADM2");
+    const std::vector<DepthMap> back = docxml::sidecar::decode_depth_maps(bytes);
+    ASSERT_EQ(back.size(), 1U);
+    EXPECT_EQ(back.front(), map);
+
+    // An unfiltered map (a cancel checkpoint) keeps its -1 through the file.
+    map.filter_mode = -1;
+    const std::vector<DepthMap> unfiltered =
+        docxml::sidecar::decode_depth_maps(docxml::sidecar::encode_depth_maps({map}));
+    ASSERT_EQ(unfiltered.size(), 1U);
+    EXPECT_EQ(unfiltered.front().filter_mode, -1);
+    EXPECT_EQ(unfiltered.front().alignment_fingerprint, 0xFEEDFACE12345678ULL);
+}
+
+TEST(DepthMapsSidecar, Adm1IsReadWithUnknownFingerprintAndMildFilter) {
+    // The pre-fingerprint record: u32 count, then per map four i32s, two u8
+    // flags and the pixel blocks. Hand-built so the layout is stated here rather
+    // than taken from a writer that might be changed with it.
+    std::vector<std::uint8_t> bytes = {'A', 'D', 'M', '1'};
+    docxml::sidecar::put_u32(bytes, 1);
+    docxml::sidecar::put_i32(bytes, /*camera_id=*/7);
+    docxml::sidecar::put_i32(bytes, /*width=*/2);
+    docxml::sidecar::put_i32(bytes, /*height=*/2);
+    docxml::sidecar::put_i32(bytes, /*downscale=*/2);
+    bytes.push_back(0);  // has_normals
+    bytes.push_back(0);  // has_confidence
+    for (const float d : {5.0F, 6.0F, -1.0F, 7.0F}) {
+        docxml::sidecar::put_f32(bytes, d);
+    }
+
+    const std::vector<DepthMap> maps = docxml::sidecar::decode_depth_maps(bytes);
+    ASSERT_EQ(maps.size(), 1U);
+    const DepthMap& map = maps.front();
+    EXPECT_EQ(map.camera_id, 7);
+    EXPECT_EQ(map.downscale, 2);
+    EXPECT_EQ(map.depths, (std::vector<float>{5.0F, 6.0F, -1.0F, 7.0F}));
+    // "Unknown" alignment: a later run must not treat an old map as current.
+    EXPECT_EQ(map.alignment_fingerprint, 0U);
+    // A pre-ADM2 project stored only finished sets, filtered with the default.
+    EXPECT_EQ(map.filter_mode, 1);
+}
+
+TEST(DepthMapsSidecar, Adm2RejectsAnUnknownFilterMode) {
+    DepthMap map;
+    map.width = 1;
+    map.height = 1;
+    map.depths = {1.0F};
+    map.filter_mode = 1;
+    std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
+    // The filter-mode byte is the last of the three flags of the first (and only)
+    // record: 4 magic + 4 count + 8 fingerprint + 16 four i32s + 2 flags.
+    const std::size_t mode_at = 4 + 4 + 8 + 16 + 2;
+    ASSERT_LT(mode_at, bytes.size());
+    bytes[mode_at] = 9;
+    EXPECT_THROW(docxml::sidecar::decode_depth_maps(bytes), ProjectIOError);
 }
 
 }  // namespace
