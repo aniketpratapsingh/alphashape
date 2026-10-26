@@ -535,8 +535,8 @@ TEST(PoissonGpu, DeviceHangFallsBackToCpuAndDisablesGpu) {
             gpu::detail::reset_device_lost();
             gpu::set_enabled(true);
         }
-    } guard;
-    (void)guard;
+    } state_guard;
+    (void)state_guard;
 
     const PointCloud cloud = fibonacci_sphere(3000);
     PoissonOptions options;

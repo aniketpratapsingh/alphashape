@@ -1248,6 +1248,17 @@ bool bit_identical(const std::vector<float>& a, const std::vector<float>& b) {
            (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
 }
 
+/// Clears the device-lost state however the test exits. A test that wedges the
+/// device must not leave it wedged for its siblings when the whole binary runs
+/// in one process (the GPU lane drives the binary directly, not one ctest case
+/// per process).
+struct DeviceStateGuard {
+    ~DeviceStateGuard() {
+        alphashape::gpu::detail::reset_device_lost();
+        alphashape::gpu::set_enabled(true);
+    }
+};
+
 }  // namespace
 
 TEST(Gpu, BatchOverrideParses) {
@@ -1427,6 +1438,9 @@ TEST(Gpu, BatchedRunKeepsLeadingAndTrailingDispatches) {
 
 TEST(Gpu, ForcedFenceTimeoutFallsBackAndDisablesGpu) {
     REQUIRE_GPU();
+    // Restore the device however this test exits.
+    DeviceStateGuard state_guard;
+    (void)state_guard;
     auto context = default_context();
     ASSERT_NE(context, nullptr);
     ASSERT_FALSE(detail::device_lost());
@@ -1485,6 +1499,8 @@ TEST(Gpu, ForcedFenceTimeoutFallsBackAndDisablesGpu) {
 
 TEST(Gpu, SiblingOperationFallsBackAfterDeviceLost) {
     REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
     auto context = default_context();
     ASSERT_NE(context, nullptr);
 
