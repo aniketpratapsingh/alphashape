@@ -460,7 +460,10 @@ class AccuracyCompletenessTest(unittest.TestCase):
         rng = np.random.default_rng(6)
         reference = rng.random((300, 3)) * 0.5
         shifted = reference + np.array([0.03, 0.0, 0.0])
-        result = metrics.accuracy_completeness(shifted, reference, [0.02, 0.05, 0.10])
+        # register=False: this test is about the score itself, not the alignment.
+        result = metrics.accuracy_completeness(
+            shifted, reference, [0.02, 0.05, 0.10], register=False
+        )
         self.assertLess(result["accuracy"]["0.02"], 0.2)
         self.assertAlmostEqual(result["accuracy"]["0.05"], 1.0)
         self.assertAlmostEqual(result["accuracy_median_m"], 0.03, delta=0.01)
@@ -473,7 +476,9 @@ class AccuracyCompletenessTest(unittest.TestCase):
         reference = np.stack(np.meshgrid(np.linspace(0, 1, 5), np.linspace(0, 1, 5),
                                          np.linspace(0, 1, 5)), axis=-1).reshape(-1, 3)
         shifted = reference + 0.05
-        result = metrics.accuracy_completeness(shifted, reference, [0.10])
+        # register=False: with registration on, the whole point is that such a
+        # shift gets removed, which the registration tests cover.
+        result = metrics.accuracy_completeness(shifted, reference, [0.10], register=False)
         self.assertAlmostEqual(result["accuracy"]["0.1"], 1.0)
         self.assertAlmostEqual(result["completeness"]["0.1"], 1.0)
 
@@ -490,6 +495,135 @@ class AccuracyCompletenessTest(unittest.TestCase):
         a = metrics.accuracy_completeness(sparse, reference, [0.01])
         b = metrics.accuracy_completeness(dense, reference, [0.01])
         self.assertEqual(a["accuracy"]["0.01"], b["accuracy"]["0.01"])
+
+
+class UmeyamaTest(unittest.TestCase):
+    @staticmethod
+    def _cloud(n=200, seed=31):
+        rng = np.random.default_rng(seed)
+        return rng.random((n, 3)) * 2.0
+
+    def test_a_known_similarity_is_recovered(self):
+        source = self._cloud()
+        angle = 0.4
+        rotation = np.array([
+            [math.cos(angle), -math.sin(angle), 0.0],
+            [math.sin(angle), math.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        scale = 2.5
+        translation = np.array([1.0, -2.0, 0.5])
+        target = scale * (source @ rotation.T) + translation
+
+        got_scale, got_rotation, got_translation = metrics.umeyama_similarity(source, target)
+        self.assertAlmostEqual(got_scale, scale, places=9)
+        np.testing.assert_allclose(got_rotation, rotation, atol=1e-9)
+        np.testing.assert_allclose(got_translation, translation, atol=1e-9)
+
+    def test_a_reflection_is_not_returned(self):
+        # A mirrored point set has no proper rotation that maps it onto itself, so
+        # the fit must still come out with det(R) = +1 rather than a reflection.
+        source = self._cloud()
+        target = source * np.array([1.0, 1.0, -1.0])
+        _, rotation, _ = metrics.umeyama_similarity(source, target)
+        self.assertAlmostEqual(float(np.linalg.det(rotation)), 1.0, places=9)
+
+    def test_identity_input_gives_the_identity(self):
+        source = self._cloud()
+        scale, rotation, translation = metrics.umeyama_similarity(source, source)
+        self.assertAlmostEqual(scale, 1.0, places=9)
+        np.testing.assert_allclose(rotation, np.eye(3), atol=1e-9)
+        np.testing.assert_allclose(translation, np.zeros(3), atol=1e-9)
+
+    def test_two_points_are_rejected(self):
+        with self.assertRaises(ValueError):
+            metrics.umeyama_similarity(np.zeros((2, 3)), np.zeros((2, 3)))
+
+    def test_a_degenerate_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            metrics.umeyama_similarity(np.ones((5, 3)), np.zeros((5, 3)))
+
+    def test_mismatched_shapes_are_rejected(self):
+        with self.assertRaises(ValueError):
+            metrics.umeyama_similarity(np.zeros((4, 3)), np.zeros((5, 3)))
+
+
+class ApplySimilarityTest(unittest.TestCase):
+    def test_the_transform_is_scale_rotate_translate(self):
+        points = np.array([[1.0, 0.0, 0.0]])
+        rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        got = metrics.apply_similarity(2.0, rotation, np.array([0.0, 0.0, 5.0]), points)
+        np.testing.assert_allclose(got, [[0.0, 2.0, 5.0]])
+
+    def test_an_empty_cloud_stays_empty(self):
+        got = metrics.apply_similarity(1.0, np.eye(3), np.zeros(3), np.zeros((0, 3)))
+        self.assertEqual(got.shape, (0, 3))
+
+
+class RegisterCloudsTest(unittest.TestCase):
+    def test_a_translated_and_scaled_copy_is_registered_back(self):
+        rng = np.random.default_rng(41)
+        source = rng.random((400, 3))
+        target = 3.0 * source + np.array([5.0, -1.0, 2.0])
+        aligned, info = metrics.register_clouds(source, target, voxel=0.02)
+        self.assertTrue(info["converged"])
+        self.assertAlmostEqual(info["scale"], 3.0, places=2)
+        # After the fit the two clouds sit on top of each other.
+        residual = metrics.nn_distances(aligned, metrics.voxel_downsample(target, 0.02))
+        self.assertLess(float(np.median(residual)), 0.05)
+
+    def test_two_clouds_already_aligned_stay_put(self):
+        rng = np.random.default_rng(42)
+        source = rng.random((300, 3))
+        aligned, info = metrics.register_clouds(source, source, voxel=0.02)
+        self.assertAlmostEqual(info["scale"], 1.0, places=3)
+        np.testing.assert_allclose(aligned, source, atol=1e-6)
+
+    def test_an_empty_cloud_is_reported_not_raised(self):
+        aligned, info = metrics.register_clouds(np.zeros((0, 3)), np.ones((10, 3)), voxel=0.1)
+        self.assertEqual(aligned.shape, (0, 3))
+        self.assertFalse(info["converged"])
+
+    def test_a_tiny_cloud_is_reported_not_raised(self):
+        aligned, info = metrics.register_clouds(
+            np.array([[0.0, 0.0, 0.0]]), np.ones((10, 3)), voxel=0.1
+        )
+        self.assertFalse(info["converged"])
+        self.assertIn("reason", info)
+
+
+class AccuracyCompletenessRegistrationTest(unittest.TestCase):
+    def test_registration_removes_an_arbitrary_frame_difference(self):
+        rng = np.random.default_rng(51)
+        reference = rng.random((400, 3)) * 2.0
+        # The reconstruction lives in its own frame: scaled, rotated, translated.
+        angle = 0.7
+        rotation = np.array([
+            [math.cos(angle), -math.sin(angle), 0.0],
+            [math.sin(angle), math.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        reconstruction = 0.4 * (reference @ rotation.T) + np.array([10.0, 4.0, -3.0])
+
+        without = metrics.accuracy_completeness(
+            reconstruction, reference, [0.05], register=False
+        )
+        with_registration = metrics.accuracy_completeness(
+            reconstruction, reference, [0.05], register=True
+        )
+        self.assertLess(without["accuracy"]["0.05"], 0.1)
+        self.assertGreater(with_registration["accuracy"]["0.05"], 0.9)
+        self.assertIn("alignment", with_registration)
+        self.assertAlmostEqual(with_registration["alignment"]["scale"], 2.5, places=2)
+
+    def test_registration_does_not_manufacture_a_perfect_score(self):
+        # A reference deliberately missing half its surface: the reconstruction
+        # cannot score full completeness no matter how well it is registered.
+        rng = np.random.default_rng(52)
+        reference = rng.random((400, 3))
+        half = reference[reference[:, 0] < 0.5]
+        result = metrics.accuracy_completeness(half, reference, [0.05])
+        self.assertLess(result["completeness"]["0.05"], 0.8)
 
 
 class DemDifferenceTest(unittest.TestCase):

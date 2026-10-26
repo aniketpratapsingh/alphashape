@@ -721,6 +721,7 @@ def accuracy_completeness(
     tolerances: Sequence[float],
     *,
     voxel: float = 0.01,
+    register: bool = True,
 ) -> dict:
     """ETH3D-style accuracy and completeness at each tolerance.
 
@@ -728,9 +729,17 @@ def accuracy_completeness(
     ``tolerance`` of a reference point; completeness is the converse. Each
     direction also gets its median and 90th percentile distance, because a
     fraction alone hides how far the misses are.
+
+    ``register`` fits a similarity from the reconstruction to the reference first.
+    It defaults on because the two clouds are in unrelated frames — the
+    reconstruction's own, and the scanner's — and scoring distance across that
+    difference would measure the frames, not the geometry. The fit is reported, so
+    a run that only scores well because it collapsed onto the reference is visible.
     """
-    rec = voxel_downsample(np.asarray(reconstructed, dtype=np.float64), voxel)
-    ref = voxel_downsample(np.asarray(reference, dtype=np.float64), voxel)
+    rec_raw = np.asarray(reconstructed, dtype=np.float64)
+    ref_raw = np.asarray(reference, dtype=np.float64)
+    rec = voxel_downsample(rec_raw, voxel)
+    ref = voxel_downsample(ref_raw, voxel)
     result: dict = {"reconstructed": int(rec.shape[0]), "reference": int(ref.shape[0])}
     if rec.size == 0 or ref.size == 0:
         result["accuracy"] = {f"{tol:g}": 0.0 for tol in tolerances}
@@ -738,8 +747,14 @@ def accuracy_completeness(
         result["f_score_5cm"] = 0.0
         return result
 
-    to_ref = nn_distances(rec, ref)
-    to_rec = nn_distances(ref, rec)
+    registered = ref_raw
+    if register:
+        rec_raw, alignment = register_clouds(rec_raw, ref_raw, voxel=voxel)
+        result["alignment"] = alignment
+        rec = voxel_downsample(rec_raw, voxel)
+
+    to_ref = nn_distances(rec, registered)
+    to_rec = nn_distances(registered, rec)
     accuracy = {f"{tol:g}": float(np.mean(to_ref <= tol)) for tol in tolerances}
     completeness = {f"{tol:g}": float(np.mean(to_rec <= tol)) for tol in tolerances}
     result.update(
@@ -752,6 +767,208 @@ def accuracy_completeness(
         f_score_5cm=_f_score(accuracy, completeness, 0.05),
     )
     return result
+
+
+def umeyama_similarity(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Closed-form similarity (scale, rotation, translation) mapping source -> target.
+
+    Umeyama's least-squares solution. ``target ~= scale * R @ source + t``.
+
+    Needed because a reconstruction lives in its own frame — the engine's chunk
+    coordinates, or the ENU frame it georeferenced itself into — while a laser
+    reference lives in the scanner's. Scoring distance without first removing that
+    arbitrary similarity would measure the frame difference, not the geometry. Every
+    MVS benchmark does the same registration step before scoring; this is it.
+
+    Throws ValueError for fewer than three correspondences (a similarity has seven
+    degrees of freedom and three points give nine equations) or a degenerate
+    (collinear) configuration, where the rotation is not determined.
+    """
+    src = np.asarray(source, dtype=np.float64)
+    dst = np.asarray(target, dtype=np.float64)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError(f"umeyama_similarity needs matching (n, 3) arrays, got {src.shape} and {dst.shape}")
+    n = src.shape[0]
+    if n < 3:
+        raise ValueError("umeyama_similarity needs at least three correspondences")
+
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    covariance = (dst_c.T @ src_c) / n
+    u, d, vt = np.linalg.svd(covariance)
+
+    # Reflection guard: with det(U) * det(V) < 0 the raw SVD gives a reflection,
+    # which is not a rotation. Flipping the last singular direction is Umeyama's
+    # correction and is what makes the result a proper rotation.
+    sign = np.ones(3)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        sign[2] = -1.0
+    rotation = u @ np.diag(sign) @ vt
+
+    source_variance = float(np.mean(np.sum(src_c * src_c, axis=1)))
+    if source_variance <= 1e-15:
+        raise ValueError("umeyama_similarity: the source points are all the same point")
+    scale = float(np.sum(d * sign) / source_variance)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"umeyama_similarity: degenerate scale {scale!r}")
+    translation = mu_dst - scale * (rotation @ mu_src)
+    return scale, rotation, translation
+
+
+def apply_similarity(scale: float, rotation: np.ndarray, translation: np.ndarray,
+                     points: np.ndarray) -> np.ndarray:
+    """``scale * R @ p + t`` for every row of ``points``."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0:
+        return pts.reshape(0, 3)
+    return scale * (pts @ rotation.T) + translation
+
+
+def _pca_frame(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(centroid, axes, spread) of a cloud, axes ordered by decreasing spread.
+
+    The eigenvectors of the covariance, with each axis orientated so that the
+    projection of the cloud onto it is positive-skewed. That sign convention is
+    what makes two runs of the same scene produce the same frame; without it an
+    eigenvector's sign is arbitrary and a PCA alignment would flip the scene.
+    """
+    centroid = points.mean(axis=0)
+    centred = points - centroid
+    covariance = centred.T @ centred / max(points.shape[0], 1)
+    values, vectors = np.linalg.eigh(covariance)
+    order = np.argsort(values)[::-1]
+    values = values[order]
+    vectors = vectors[:, order]
+    for axis in range(3):
+        projection = centred @ vectors[:, axis]
+        if np.sum(projection ** 3) < 0.0:
+            vectors[:, axis] = -vectors[:, axis]
+    return centroid, vectors, np.sqrt(np.maximum(values, 0.0))
+
+
+def pca_align(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """A similarity that puts ``source`` in ``target``'s principal-axis frame.
+
+    The coarse initialisation ICP needs. Two clouds of the same scene have almost
+    the same principal axes, so rotating one onto the other is a good starting
+    guess even when their frames are unrelated — where nearest-neighbour ICP from
+    an identity rotation is not, because at a large offset the nearest neighbour
+    of most points is simply the wrong point.
+
+    The eigenvector signs are fixed by :func:`_pca_frame`, so the rotation is a
+    proper rotation (det = +1) by construction rather than by a reflection guard.
+    Scale comes from the ratio of the clouds' RMS spreads, which is the right
+    statistic for a similarity whose scale is unknown.
+    """
+    src_centre, src_axes, src_spread = _pca_frame(source)
+    dst_centre, dst_axes, dst_spread = _pca_frame(target)
+    # source -> its own frame -> target's frame
+    rotation = dst_axes @ src_axes.T
+    if np.linalg.det(rotation) < 0.0:
+        # A mirrored axis set: flip the least-significant axis of the SOURCE frame
+        # so the result stays a rotation rather than becoming a reflection.
+        flipped = src_axes.copy()
+        flipped[:, 2] = -flipped[:, 2]
+        rotation = dst_axes @ flipped.T
+
+    src_rms = float(np.sqrt(np.mean(src_spread ** 2)))
+    dst_rms = float(np.sqrt(np.mean(dst_spread ** 2)))
+    scale = (dst_rms / src_rms) if src_rms > 1e-12 else 1.0
+    translation = dst_centre - scale * (rotation @ src_centre)
+    return scale, rotation, translation
+
+
+def register_clouds(
+    source: np.ndarray,
+    target: np.ndarray,
+    *,
+    voxel: float,
+    iterations: int = 20,
+    trim_start: float = 1.0,
+    trim_end: float = 0.7,
+) -> tuple[np.ndarray, dict]:
+    """Iterative similarity ICP of ``source`` onto ``target``.
+
+    Two stages, because one does not work on two clouds in unrelated frames:
+
+    1. **Coarse** — :func:`pca_align` puts the source in the target's principal-axis
+       frame. This is what makes the first nearest-neighbour pairing meaningful.
+    2. **Fine** — alternate nearest-neighbour correspondence with a closed-form
+       similarity fit, keeping the closest ``trim`` fraction of pairs. The trim
+       starts at every pair and tightens towards ``trim_end``: early rounds need
+       all the data to settle the coarse error, later rounds want to exclude the
+       pairs that come from genuinely different geometry (a face only one cloud
+       saw), which would otherwise hold the fit off.
+
+    A similarity rather than a rigid transform, because an SfM reconstruction has no
+    metric scale until it is georeferenced and the reference scenes here carry no
+    GPS, so the scale ratio between the two clouds is unknown and has to be fitted.
+
+    Returns ``(aligned_source, report)``. The report carries the fitted scale, the
+    RMS of the surviving pairs and whether the fit stopped moving; a run that only
+    scores well because it collapsed onto the reference is visible in there.
+    """
+    src = np.asarray(source, dtype=np.float64)
+    dst = np.asarray(target, dtype=np.float64)
+    if src.size == 0 or dst.size == 0:
+        return src.reshape(-1, 3), {"converged": False, "reason": "empty cloud"}
+
+    moving = voxel_downsample(src, voxel)
+    ref = voxel_downsample(dst, voxel)
+    if moving.shape[0] < 10 or ref.shape[0] < 10:
+        return src, {"converged": False, "reason": "too few points after voxel normalisation"}
+
+    scale, rotation, translation = pca_align(moving, ref)
+    report: dict = {"coarse_scale": scale, "iterations": 0, "converged": False}
+    previous_rms = math.inf
+
+    for step in range(1, iterations + 1):
+        aligned = apply_similarity(scale, rotation, translation, moving)
+        distances = nn_distances(aligned, ref)
+        indices = _nn_indices(aligned, ref)
+
+        # Tighten the trim linearly over the run.
+        fraction = trim_start + (trim_end - trim_start) * (step - 1) / max(iterations - 1, 1)
+        keep = max(3, int(round(fraction * moving.shape[0])))
+        order = np.argsort(distances)[:keep]
+
+        try:
+            scale, rotation, translation = umeyama_similarity(
+                moving[order], ref[indices[order]]
+            )
+        except ValueError as exc:
+            report["reason"] = str(exc)
+            break
+
+        aligned = apply_similarity(scale, rotation, translation, moving)
+        rms = float(np.sqrt(np.mean(nn_distances(aligned, ref)[order] ** 2)))
+        report.update(iterations=step, rms_m=rms, scale=scale, kept=int(order.size))
+
+        if abs(previous_rms - rms) <= 1e-5 * max(rms, 1.0):
+            report["converged"] = True
+            break
+        previous_rms = rms
+
+    aligned_all = apply_similarity(scale, rotation, translation, src)
+    report["scale"] = scale
+    report.setdefault("rms_m", None)
+    return aligned_all, report
+
+
+def _nn_indices(query: np.ndarray, target: np.ndarray, *, chunk: int = 1 << 18) -> np.ndarray:
+    """Index of the nearest target point for each query point (see nn_distances)."""
+    q = np.ascontiguousarray(query, dtype=np.float64)
+    t = np.ascontiguousarray(target, dtype=np.float64)
+    t_norm = np.einsum("ij,ij->i", t, t)
+    out = np.empty(q.shape[0], dtype=np.int64)
+    for start in range(0, q.shape[0], chunk):
+        block = q[start:start + chunk]
+        d2 = t_norm[None, :] - 2.0 * (block @ t.T)
+        out[start:start + chunk] = d2.argmin(axis=1)
+    return out
 
 
 def _f_score(accuracy: dict, completeness: dict, tolerance: float) -> float:

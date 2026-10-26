@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "comment": "Datasets the quality benchmark downloads at run time. Nothing here is committed to the repository: each entry names the publisher's own URL, the SHA-256 of every file, and the reference products. See DATASETS.md for why each was chosen and what was rejected.",
+  "datasets": {
+    "aerial-nadir": {
+      "title": "Bandamaji, Grande Comore (Comoros) drone survey, 2023-06-26",
+      "publisher": "Zenodo record 8436963 (G2OI project)",
+      "doi": "10.5281/zenodo.8436963",
+      "flight": "nadir",
+      "licence": {
+        "spdx": "CC-BY-4.0",
+        "name": "Creative Commons Attribution 4.0 International",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "redistribution": "allowed with attribution; this benchmark downloads only"
+      },
+      "images_archive": {
+        "path": "images.zip",
+        "url": "https://zenodo.org/api/records/8436963/files/DCIM.zip/content",
+        "sha256": "27f56c37eae4e9df009877680b7eaee9a77fe443169362c3a21f2ae04346a43b",
+        "bytes": 969067420,
+        "extract_glob": "*.JPG"
+      },
+      "reference_files": [
+        {
+          "path": "reference/ortho.tif",
+          "url": "https://zenodo.org/api/records/8436963/files/PROCESSED_DATA.zip/content",
+          "sha256": "PLACEHOLDER_PROCESSED",
+          "bytes": 1256606405,
+          "archive_member": "PHOTOGRAMMETRY/odm_orthophoto/odm_orthophoto.tif",
+          "kind": "orthomosaic",
+          "publisher_settings": "OpenDroneMap: orthophoto-resolution=1, dem-resolution=2.0, dsm=true, auto-boundary=true"
+        },
+        {
+          "path": "reference/dem.tif",
+          "url": null,
+          "sha256": null,
+          "bytes": null,
+          "archive_member": "PHOTOGRAMMETRY/odm_dem/dsm.tif",
+          "kind": "dsm",
+          "from_archive": "reference/ortho.tif"
+        }
+      ],
+      "nominal_gsd_m": 0.024,
+      "expected_images": 102,
+      "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2."
+    },
+    "terrestrial-laser": {
+      "title": "ETH3D high-res multi-view training scene 'terrains'",
+      "publisher": "ETH Zurich, Computer Vision and Geometry Group (Schops et al., CVPR 2017)",
+      "doi": null,
+      "flight": "oblique handheld DSLR (ground-truth geometry reference, not a drone flight)",
+      "licence": {
+        "spdx": "CC-BY-NC-SA-4.0",
+        "name": "Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International",
+        "url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+        "redistribution": "not allowed; the benchmark downloads inside the CI job only and never commits or publishes the data"
+      },
+      "images_archive": {
+        "path": "images.7z",
+        "url": "https://www.eth3d.net/data/terrains_dslr_jpg.7z",
+        "sha256": "12439ea4f997eb3dc3692c40dae1903c61222d44c0ffe2492bbd47cdd872216a",
+        "bytes": 357963793,
+        "extract_glob": "terrains/images/dslr_images/*.JPG"
+      },
+      "reference_files": [
+        {
+          "path": "reference/laser.7z",
+          "url": "https://www.eth3d.net/data/terrains_dslr_scan_eval.7z",
+          "sha256": "5770b66a49aa249c880272c4cab2e701800f30eee876c8c1215b49ad42293b2c",
+          "bytes": 150051099,
+          "archive_member": "terrains/dslr_scan_eval/scan1.ply",
+          "kind": "laser_point_cloud"
+        },
+        {
+          "path": "reference/laser_alignment.mlp",
+          "url": null,
+          "sha256": null,
+          "bytes": null,
+          "archive_member": "terrains/dslr_scan_eval/scan_alignment.mlp",
+          "kind": "laser_alignment",
+          "from_archive": "reference/laser.7z"
+        },
+        {
+          "path": "reference/laser2.ply",
+          "url": null,
+          "sha256": null,
+          "bytes": null,
+          "archive_member": "terrains/dslr_scan_eval/scan2.ply",
+          "kind": "laser_point_cloud"
+        }
+      ],
+      "nominal_gsd_m": null,
+      "expected_images": 42,
+      "notes": "The scan_eval archive holds the laser scans already aligned into the image frame, so it is used instead of the 1.9 GB full ground-truth bundle. ETH3D's own evaluator scores accuracy and completeness at 2/5/10 cm; this benchmark reports the same tolerances."
+    }
+  }
+}
