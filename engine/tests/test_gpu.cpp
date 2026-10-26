@@ -1304,12 +1304,22 @@ TEST(Gpu, BatchLimiterScalesTowardsTarget) {
         // A second probe at 2 ms/step still climbs by at most 4x (4 -> 16).
         limiter.observe(4, 0.008);
         EXPECT_EQ(limiter.steps(1000), 16u);
-        // A slow device shrinks the batch again: 100 ms/step wants half a step,
-        // floored at one, but one probe may drop only 4x (16 -> 4).
+        // A slow device shrinks the batch immediately: 100 ms/step wants half a
+        // step, so the next submission carries one. Growth is rate-limited to
+        // 4x, but shrink is not -- a submission that already overran the target
+        // must be followed by one that fits it, or the display keeps being
+        // starved across several measurements.
         limiter.observe(16, 1.6);
-        EXPECT_EQ(limiter.steps(1000), 4u);
-        // The cap and the remaining work both clamp.
-        limiter.observe(4, 1e-9);
+        EXPECT_EQ(limiter.steps(1000), 1u);
+        // A probe that overshoots by a little still drops straight to the size
+        // that would have hit the target: 10 ms/step at a 50 ms target is 5, not
+        // the 8 that was measured.
+        limiter.observe(8, 0.08);
+        EXPECT_EQ(limiter.steps(1000), 5u);
+        // Growth from there is still capped at 4x, so a device that speeds up
+        // is not handed a multi-second job off one noisy measurement.
+        limiter.observe(5, 0.001);
+        EXPECT_EQ(limiter.steps(1000), 20u);
         EXPECT_LE(limiter.steps(1000), 256u);
         EXPECT_EQ(limiter.steps(3), 3u);
         EXPECT_EQ(limiter.steps(0), 0u);
@@ -1547,4 +1557,150 @@ TEST(Gpu, SiblingOperationFallsBackAfterDeviceLost) {
     detail::reset_device_lost();
     EXPECT_TRUE(available());
     EXPECT_EQ(unavailable_reason(), std::string());
+}
+
+// Fix 1: after a forced loss, no submission reaches the device again. A thread
+// already inside run_batched must stop at its next submission, and a caller
+// that waits on a ticket must be told -- a silent success would hand back
+// buffers the queue never wrote.
+TEST(Gpu, SubmitAndWaitThrowAfterDeviceLost) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+    ASSERT_FALSE(detail::device_lost());
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // First: a ticket that is genuinely pending when the device is marked lost.
+    // Its wait must throw rather than report a completion that never happened.
+    // (Done before the forced timeout so no other submission is in flight when
+    // the loss is cleared again.)
+    {
+        const Ticket ticket = run_async(*context, {dispatch});
+        ASSERT_NE(ticket.id(), 0u);
+        detail::note_device_lost("test: ticket wait on a lost device");
+        try {
+            wait(*context, ticket);
+            ADD_FAILURE() << "wait() reported success on a lost device";
+        } catch (const Error& error) {
+            EXPECT_NE(std::string(error.what()).find("device lost"), std::string::npos)
+                << error.what();
+        }
+        // The slot was released by the failed wait, so a second wait is a no-op
+        // rather than a second throw (or a spin on an unsignalled fence).
+        EXPECT_EQ(detail::in_flight_count(*context), 0u)
+            << "a failed wait must not leave the slot pending";
+        EXPECT_NO_THROW(wait(*context, ticket));
+        detail::reset_device_lost();
+        ASSERT_FALSE(detail::device_lost());
+    }
+
+    // Now the production path: a fence timeout inside run().
+    detail::force_fence_timeout_once();
+    ASSERT_THROW(run(*context, {dispatch}), Error);
+    ASSERT_TRUE(detail::device_lost());
+    const std::string reason = detail::device_lost_reason();
+    ASSERT_FALSE(reason.empty());
+
+    // A new submission is refused outright, with the reason reported. This is
+    // what stops a thread inside run_batched at its next submission.
+    try {
+        (void)run_async(*context, {dispatch});
+        ADD_FAILURE() << "run_async succeeded on a lost device";
+    } catch (const Error& error) {
+        EXPECT_NE(std::string(error.what()).find("device lost"), std::string::npos)
+            << error.what();
+        EXPECT_NE(std::string(error.what()).find(reason), std::string::npos) << error.what();
+    }
+    EXPECT_THROW(run(*context, {dispatch}), Error) << "run() must not swallow the refusal";
+    {
+        BatchLimiter limiter(/*dispatches_per_step=*/1, /*initial_steps=*/1);
+        EXPECT_THROW(run_batched(*context, {dispatch, dispatch}, limiter), Error)
+            << "a loop already in flight must stop at its next submission";
+    }
+
+    // Restore for the tests that follow.
+    detail::reset_device_lost();
+    std::vector<float> fresh_zeros(kCount, 0.0f);
+    Buffer fresh = Buffer::of(*context, fresh_zeros);
+    Dispatch replay = dispatch;
+    replay.buffers = {&fresh};
+    ASSERT_NO_THROW(run(*context, {replay}));
+}
+
+// Fix 2 + 4: the buffers of a failed operation are destroyed during the unwind,
+// on a device that is marked lost. That must not throw from a destructor
+// (implicitly noexcept -> std::terminate) and must not take a bounded wait per
+// handle; the whole unwind shares a single post-loss drain deadline.
+TEST(Gpu, DestroyingBuffersAfterDeviceLostDoesNotTerminate) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+
+    // A separate buffer for the dispatch: the dozen below are destroyed during
+    // the measured unwind, and the dispatch must not point at them afterwards.
+    Buffer scratch = Buffer::of(*context, zeros);
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&scratch};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // A dozen more, so a per-handle drain would be obvious in the timing.
+    std::vector<Buffer> buffers;
+    buffers.reserve(12);
+    for (int i = 0; i < 12; ++i) {
+        buffers.push_back(Buffer::of(*context, zeros));
+    }
+
+    // Hold a second submission in flight, then lose the device, so the drain
+    // has a genuinely unsignalled fence to wait for.
+    const Ticket pending = run_async(*context, {dispatch});
+    detail::force_fence_timeout_once();
+    ASSERT_THROW(run(*context, {dispatch}), Error);
+    ASSERT_TRUE(detail::device_lost());
+    (void)pending;
+
+    const auto start = std::chrono::steady_clock::now();
+    // Scope destruction: this is the fallback unwind.
+    {
+        std::vector<Buffer> doomed = std::move(buffers);
+        EXPECT_NO_THROW(doomed.clear())
+            << "destroying buffers on a lost device must not throw";
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::printf("[gpu] destroying 12 buffers after a forced loss took %.3f s\n", seconds);
+    // The post-loss drain budget is 1 s for the whole unwind, not per buffer.
+    EXPECT_LT(seconds, 3.0)
+        << "the destructor drain is not sharing one deadline across the unwind";
+
+    // The device is still marked lost, and still refuses work.
+    EXPECT_TRUE(detail::device_lost());
+    EXPECT_THROW(run(*context, {dispatch}), Error);
+
+    detail::reset_device_lost();
+    EXPECT_TRUE(available());
 }

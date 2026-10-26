@@ -70,13 +70,35 @@ names and dispatches.
   single GPU job runs longer than roughly 50–100 ms. `BatchLimiter` holds the
   policy: one "step" is the smallest unit that must stay in one command buffer
   (two dispatches for a Poisson CG iteration or a TV-L1 dual/primal pair, one
-  for a PatchMatch half-sweep). The first submission carries one step; its
+  for a PatchMatch sweep dispatch). The first submission carries one step; its
   measured wall clock then scales the step count towards 80 ms (4 s on a CPU
-  driver), moving at most 4× per measurement so a noisy probe cannot produce a
-  multi-second job. A split is a scheduling change only: the same dispatches
-  run in the same order with the same barriers, so the result is bit-identical
-  to one unsplit `run()`. `ALPHASHAPE_GPU_MAX_BATCH=<n>` pins the steps per
-  submission, which is how the tests compare the two paths.
+  driver). Growth is limited to 4× per measurement so a noisy probe cannot
+  produce a multi-second job; **shrink is not** — a submission that overran the
+  target is followed immediately by one sized to fit it (`target / per_step`),
+  because walking down 4× at a time keeps overrunning the display budget
+  meanwhile. A split is a scheduling change only: the same dispatches run in the
+  same order with the same barriers, so the result is bit-identical to one
+  unsplit `run()`. `ALPHASHAPE_GPU_MAX_BATCH=<n>` pins the steps per submission,
+  which is how the tests compare the two paths.
+
+  The first submission of an operation is *calibrating*: its duration is not
+  yet known and it carries the one-off costs (pipeline compilation, and a
+  PatchMatch `pm_init` pair), so it runs under a 30 s fence budget instead of the
+  steady-state 5 s. A slow one is logged once and the batch is then sized from
+  its measurement — it is not treated as a hang. A later submission whose single
+  step alone would outlast the tight budget keeps the tight floor but gets a
+  wait sized from that measurement, since no split can go below one step.
+
+- Row bands (PatchMatch). At a large image size one `pm_init`/`pm_refine`
+  dispatch is itself a multi-second job, which the per-submission batcher cannot
+  split because a half-sweep must see what the previous one wrote. A half-sweep
+  is therefore issued as one dispatch per band of tile rows
+  (`ALPHASHAPE_GPU_MAX_BAND_PIXELS`, default 250k pixels). Banding is
+  bit-identical: the tile grid is shifted by whole tiles (`pc.row_offset`), so
+  the checkerboard colour a lane owns does not change, and every propagation
+  offset is odd, so a band only ever reads the opposite colour — which no band of
+  the same half-sweep writes.
+
 - `with_fallback(what, gpu_fn, cpu_fn)` — runs the CPU function when the layer
   is disabled or the GPU lambda throws; logs
   `GPU processing failed, switching to CPU mode: <what>` and bumps
@@ -105,6 +127,27 @@ goes through `run_batched` and the fence wait is short:
 - `detail::force_fence_timeout_once()` is the test hook that produces the
   timeout path without a real hang; `detail::reset_device_lost()` clears the
   state so the rest of a test binary can use the device.
+
+Once the device is lost, every path refuses to touch it:
+
+- `submit` throws `gpu::Error` before any Vulkan call, so a thread already
+  inside `run_batched` stops at its next submission rather than feeding a wedged
+  queue.
+- `wait_fence` throws instead of returning success, so `gpu::wait(ticket)` and
+  `run` never report a completion that did not happen. A slot whose wait threw
+  is *abandoned* (its ticket and pending state are cleared) but its descriptor
+  pool is kept — the queue may still reference it — so no later wait or
+  destructor spins on an unsignalled fence.
+- Host copies (`upload`/`download`/image transfers) throw from
+  `wait_all_pending()` rather than read memory the queue never finished writing.
+- **Destructors** use `wait_all_pending_noexcept()` instead. A destructor is
+  implicitly `noexcept`, so the throwing drain would be `std::terminate` on
+  exactly the lost-device unwind this exists for. The noexcept drain
+  bounded-waits, swallows the failure and marks the device lost. After a loss
+  its budget is *shared* across the whole unwind (1 s, not one slice per
+  handle), so a failed operation with a dozen buffers still costs at most a
+  second. `~VulkanBackend` skips its unbounded `vkDeviceWaitIdle` on a lost
+  device and uses the same bounded drain.
 
 ### Memory kinds per algorithm
 

@@ -693,7 +693,8 @@ TEST(PoissonGpu, TimingAgainstCpu) {
     std::printf("[poisson gpu timing] submissions per iteration: %.4f (%.1f iterations per "
                 "submission, 2 dispatches per iteration)\n",
                 submissions_per_iteration,
-                submissions_per_iteration > 0.0 ? 1.0 / submissions_per_iteration : 0.0);    RecordProperty("gpu_seconds", gpu_seconds);
+                submissions_per_iteration > 0.0 ? 1.0 / submissions_per_iteration : 0.0);
+    RecordProperty("gpu_seconds", gpu_seconds);
     RecordProperty("cpu_seconds", cpu_seconds);
     RecordProperty("speedup", speedup);
     RecordProperty("submissions_per_iteration", submissions_per_iteration);
@@ -703,13 +704,47 @@ TEST(PoissonGpu, TimingAgainstCpu) {
     // carries one or more complete iterations and there can never be more
     // submissions than iterations. How many iterations one submission carries
     // is adaptive (gpu::run_batched targets ~80 ms, 4 s on a CPU driver), so the
-    // exact ratio is a property of the device, not of the code under test; the
-    // ratio is printed rather than pinned.
+    // exact ratio is a property of the device and is printed, not pinned.
     EXPECT_GT(gpu_stats.iterations, 0);
     EXPECT_LE(submissions_per_iteration, 1.0)
         << "CG iterations are not being batched into submissions";
     EXPECT_LE(submissions, gpu_stats.iterations)
         << "each submission must carry at least one whole iteration";
+
+    // What *is* device-independent is the count under a pinned batch: with one
+    // step per submission every submission carries exactly one whole CG
+    // iteration (the start-of-solve preconditioner rides with the first by
+    // `leading_dispatches`), so the submissions must equal the iterations. A
+    // regression that dropped a batch, stopped splitting, or lost the refinement
+    // rounds shows up here as an exact mismatch -- something the adaptive ratio
+    // above can never catch, because it is a property of the device.
+    {
+        const std::uint64_t failures_before = gpu::failure_count();
+        int pinned_submissions = 0;
+        int pinned_iterations = 0;
+        {
+            struct ClearOverride {
+                ~ClearOverride() { alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", ""); }
+            } clear;
+            (void)clear;
+            ASSERT_TRUE(alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1"))
+                << "could not set ALPHASHAPE_GPU_MAX_BATCH";
+            meshing::detail::PoissonCgStats pinned_stats;
+            (void)meshing::poisson_solve_device(system, options, pinned_stats);
+            pinned_submissions = meshing::poisson_gpu_last_submissions();
+            pinned_iterations = pinned_stats.iterations;
+        }
+        EXPECT_EQ(gpu::failure_count(), failures_before)
+            << "the pinned run must not have fallen back";
+        EXPECT_GT(pinned_submissions, 1) << "128^3 needs more than one CG iteration";
+        // One pinned step per submission is one submission per CG iteration:
+        // every submission must carry exactly one whole iteration. (The
+        // iteration count itself is compared against the pinned solve, not the
+        // adaptive one, because a coarse batch can only stop on a batch
+        // boundary.)
+        EXPECT_EQ(pinned_submissions, pinned_iterations)
+            << "one pinned step per submission must be one submission per CG iteration";
+    }
 
     // The solve must agree regardless of where it ran.
     EXPECT_LE(relative_l2(gpu, cpu), 0.05);
