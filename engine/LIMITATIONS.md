@@ -91,6 +91,11 @@ sections below give the engineering detail behind each item.
   `set_marker_position`). Scale bars exist in the data model and the
   commands, but have no Python binding yet. No interface for either is in
   this release.
+- **Depth maps are slow at fine settings.** Build Depth Maps runs the full
+  search at the working resolution, with no coarse-to-fine pass. The default
+  (`downscale` 4) is practical; `downscale` 2 has four times the pixels and
+  on 36 twelve-megapixel photos took days, not minutes. Finished maps are only
+  stored when the whole step completes, so cancelling discards the run.
 - **Accuracy is unproven on real surveys.** Every end-to-end check runs on
   synthetic scenes with known geometry. The dense stage has not been
   measured against a real camera with real lens distortion, real GPS error
