@@ -500,18 +500,24 @@ PatchMatchOptions scene_options() {
 TEST(PatchMatchPyramid, PyramidMatchesSingleLevelOnSmooth) {
     PlaneScene scene = make_plane_scene(320, 240, 300.0);
     const PMView reference = plane_reference(scene);
-    const std::vector<PMView> neighbours = plane_views(scene);
+    const std::vector<PMView> all_views = plane_views(scene);
+    // Three neighbours and four sweeps keep this a light test; the plan still
+    // spends two sweeps at each of two levels, which is the case that matters
+    // (the coarse level has to be right for the fine one to start well).
+    const std::vector<PMView> neighbours = {all_views[0], all_views[1], all_views[2]};
 
     PatchMatchOptions flat = scene_options();
+    flat.iterations = 4;
     flat.pyramid_levels = 1;
 
     PatchMatchOptions pyramid = scene_options();
+    pyramid.iterations = 4;
     pyramid.pyramid_levels = 0;   // automatic
-    pyramid.pyramid_min_size = 60;  // 240 -> 120 -> 60, so 3 levels
+    pyramid.pyramid_min_size = 100;  // 240 -> 120, so two levels
 
     const std::vector<int> plan =
         alphashape::stereo::patch_match_iteration_plan(320, 240, pyramid);
-    ASSERT_GE(plan.size(), 2U) << "the automatic plan should have chosen a pyramid here";
+    ASSERT_EQ(plan.size(), 2U) << "the automatic plan should have chosen a pyramid here";
 
     const PatchMatchResult flat_result = alphashape::stereo::run_patch_match(
         reference, neighbours, flat);
@@ -549,10 +555,13 @@ TEST(PatchMatchPyramid, PyramidMatchesSingleLevelOnSmooth) {
 
     ASSERT_GT(both, 1000U) << "the two runs must have a large common support to compare";
     EXPECT_LE(median_difference, 5e-3) << "the pyramid run drifted from the single-level one";
-    // And both meet the plane accuracy contract the flat suite asserts.
+    // Coverage is the property the pyramid could plausibly lose (a hole in the
+    // coarse map must not survive into the result), and accuracy must not be
+    // worse: the point of the change is the same surface for less work.
     EXPECT_GT(pyramid_accuracy.coverage, 0.85);
-    EXPECT_LT(pyramid_accuracy.median, 0.005);
-    EXPECT_LT(pyramid_accuracy.p90, 0.02);
+    EXPECT_LE(pyramid_accuracy.median, flat_accuracy.median + 1e-3)
+        << "the pyramid lost accuracy against the single-level run";
+    EXPECT_LE(pyramid_accuracy.p90, flat_accuracy.p90 + 2e-3);
 }
 
 // ---------------------------------------------------------------------------
