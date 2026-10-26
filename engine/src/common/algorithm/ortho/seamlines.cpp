@@ -16,14 +16,27 @@ constexpr double kFlowEps = 1e-11;    // capacities below this are zero
 constexpr double kForbid = 1e9;       // "this label cannot be taken here"
 
 /// A per-tile field on one grid. `score`, `rgb` and `valid` point at the owning
-/// storage (the tiles themselves at full resolution, a block-mean copy on a
-/// coarse level); `best` is the highest score of any tile valid at the cell.
+/// storage (the tiles' cropped buffers at full resolution, a block-mean copy on
+/// a coarse level); `best` is the highest score of any tile valid at the cell.
+///
+/// The tile buffers are CROPPED to the camera footprint, so every read of tile
+/// `t` at cell (col, row) is translated through `x0/y0` and the tile's own
+/// `stride`. A cell outside the crop reads as invalid without touching the
+/// buffer, which is exactly the "not covered" case the full-grid layout padded
+/// with zeros.
 struct Field {
     int width = 0;
     int height = 0;
     std::vector<const float*> score;
     std::vector<const std::uint8_t*> rgb;
     std::vector<const std::uint8_t*> valid;
+    /// Tile crop boxes and buffer row strides, in FIELD cells (a coarse level
+    /// scales them down with its own grid).
+    std::vector<int> x0;
+    std::vector<int> y0;
+    std::vector<int> tile_width;
+    std::vector<int> tile_height;
+    std::vector<int> stride;
     std::vector<double> best;
     std::vector<std::uint8_t> any_valid;
     std::vector<std::size_t> parity[2];
@@ -32,6 +45,32 @@ struct Field {
         return static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     }
     std::size_t tiles() const { return score.size(); }
+
+    /// True when tile `t` holds field cell (col, row).
+    bool has(std::size_t t, int col, int row) const {
+        return col >= x0[t] && col < x0[t] + tile_width[t] && row >= y0[t] &&
+               row < y0[t] + tile_height[t];
+    }
+
+    /// Linear index of field cell (col, row) in tile `t`'s buffers; the caller
+    /// must have established has(t, col, row).
+    std::size_t index(std::size_t t, int col, int row) const {
+        return static_cast<std::size_t>(row - y0[t]) * static_cast<std::size_t>(stride[t]) +
+               static_cast<std::size_t>(col - x0[t]);
+    }
+
+    /// Tile `t`'s validity at field cell (col, row), false when out of crop.
+    bool valid_at(std::size_t t, int col, int row) const {
+        return has(t, col, row) && valid[t][index(t, col, row)] != 0;
+    }
+
+    float score_at(std::size_t t, int col, int row) const {
+        return score[t][index(t, col, row)];
+    }
+
+    const std::uint8_t* rgb_at(std::size_t t, int col, int row) const {
+        return rgb[t] + index(t, col, row) * 3;
+    }
 };
 
 /// Fill `best`, `any_valid` and the checkerboard parity lists from the tiles.
@@ -40,14 +79,27 @@ void finalize(Field& field) {
     field.best.assign(cells, 0.0);
     field.any_valid.assign(cells, 0);
     for (std::size_t t = 0; t < field.tiles(); ++t) {
+        const int tw = field.tile_width[t];
+        const int th = field.tile_height[t];
         const std::uint8_t* valid = field.valid[t];
         const float* score = field.score[t];
-        for (std::size_t cell = 0; cell < cells; ++cell) {
-            if (valid[cell] == 0) {
-                continue;
+        const int stride = field.stride[t];
+        for (int row = 0; row < th; ++row) {
+            const std::size_t cell_row =
+                static_cast<std::size_t>(field.y0[t] + row) *
+                static_cast<std::size_t>(field.width);
+            const std::size_t buf_row = static_cast<std::size_t>(row) *
+                                        static_cast<std::size_t>(stride);
+            for (int col = 0; col < tw; ++col) {
+                const std::size_t b = buf_row + static_cast<std::size_t>(col);
+                if (valid[b] == 0) {
+                    continue;
+                }
+                const std::size_t cell =
+                    cell_row + static_cast<std::size_t>(field.x0[t] + col);
+                field.any_valid[cell] = 1;
+                field.best[cell] = std::max(field.best[cell], static_cast<double>(score[b]));
             }
-            field.any_valid[cell] = 1;
-            field.best[cell] = std::max(field.best[cell], static_cast<double>(score[cell]));
         }
     }
     field.parity[0].clear();
@@ -63,37 +115,50 @@ void finalize(Field& field) {
 
 /// True when `label` covers `cell`.
 bool covers(const Field& field, int label, std::size_t cell) {
-    return label >= 0 && field.valid[static_cast<std::size_t>(label)][cell] != 0;
+    if (label < 0) {
+        return false;
+    }
+    const int col = static_cast<int>(cell % static_cast<std::size_t>(field.width));
+    const int row = static_cast<int>(cell / static_cast<std::size_t>(field.width));
+    return field.valid_at(static_cast<std::size_t>(label), col, row);
 }
 
-/// The data cost of label `label` at `cell`: the score shortfall against the
-/// best tile there, scaled by data_weight. -1 is free where no tile covers the
-/// cell; a tile that does not cover the cell is forbidden.
-double data_cost(const Field& field, int label, std::size_t cell, const SeamOptions& options) {
+/// The data cost of label `label` at field cell (col, row): the score shortfall
+/// against the best tile there, scaled by data_weight. -1 is free where no tile
+/// covers the cell; a tile that does not cover the cell is forbidden.
+double data_cost_at(const Field& field, int label, std::size_t cell, int col, int row,
+                    const SeamOptions& options) {
     if (label < 0) {
         return field.any_valid[cell] != 0 ? kForbid : 0.0;
     }
     const std::size_t t = static_cast<std::size_t>(label);
-    if (field.valid[t][cell] == 0) {
+    if (!field.valid_at(t, col, row)) {
         return kForbid;
     }
-    const double shortfall = field.best[cell] - static_cast<double>(field.score[t][cell]);
+    const double shortfall = field.best[cell] - static_cast<double>(field.score_at(t, col, row));
     return options.data_weight * std::max(0.0, shortfall);
 }
 
+/// The same, addressed by a linear cell index.
+double data_cost(const Field& field, int label, std::size_t cell, const SeamOptions& options) {
+    const int col = static_cast<int>(cell % static_cast<std::size_t>(field.width));
+    const int row = static_cast<int>(cell / static_cast<std::size_t>(field.width));
+    return data_cost_at(field, label, cell, col, row, options);
+}
+
 /// Sum of the per-channel absolute colour differences the two tiles show at
-/// `cell`, or 0 when either does not cover it (nothing to compare).
-double colour_sum(const Field& field, int a, int b, std::size_t cell) {
+/// field cell (col, row), or 0 when either does not cover it.
+double colour_sum_at(const Field& field, int a, int b, int col, int row) {
     if (a < 0 || b < 0) {
         return 0.0;
     }
     const std::size_t ta = static_cast<std::size_t>(a);
     const std::size_t tb = static_cast<std::size_t>(b);
-    if (field.valid[ta][cell] == 0 || field.valid[tb][cell] == 0) {
+    if (!field.valid_at(ta, col, row) || !field.valid_at(tb, col, row)) {
         return 0.0;
     }
-    const std::uint8_t* pa = field.rgb[ta] + cell * 3;
-    const std::uint8_t* pb = field.rgb[tb] + cell * 3;
+    const std::uint8_t* pa = field.rgb_at(ta, col, row);
+    const std::uint8_t* pb = field.rgb_at(tb, col, row);
     double sum = 0.0;
     for (int c = 0; c < 3; ++c) {
         sum += std::abs(static_cast<int>(pa[c]) - static_cast<int>(pb[c]));
@@ -105,25 +170,42 @@ double colour_sum(const Field& field, int a, int b, std::size_t cell) {
 /// labels agree or either is the empty label, else the mean per-channel grey
 /// disagreement over the two ends (sum of channel differences / 255, in [0, 3])
 /// scaled by seam_weight, plus the constant `smoothness` change penalty.
+double seam_cost_at(const Field& field, int a, int b, int pcol, int prow, int qcol, int qrow,
+                    const SeamOptions& options) {
+    if (a == b || a < 0 || b < 0) {
+        return 0.0;
+    }
+    const double disagreement =
+        (colour_sum_at(field, a, b, pcol, prow) + colour_sum_at(field, a, b, qcol, qrow)) /
+        kGreyRange;
+    return options.seam_weight * disagreement + options.smoothness;
+}
+
+/// The linear-cell form of seam_cost_at(), for the callers that only have cell
+/// indices (the alpha-expansion graph and the energy report).
 double seam_cost(const Field& field, int a, int b, std::size_t p, std::size_t q,
                  const SeamOptions& options) {
     if (a == b || a < 0 || b < 0) {
         return 0.0;
     }
-    const double disagreement =
-        (colour_sum(field, a, b, p) + colour_sum(field, a, b, q)) / kGreyRange;
-    return options.seam_weight * disagreement + options.smoothness;
+    const int pcol = static_cast<int>(p % static_cast<std::size_t>(field.width));
+    const int prow = static_cast<int>(p / static_cast<std::size_t>(field.width));
+    const int qcol = static_cast<int>(q % static_cast<std::size_t>(field.width));
+    const int qrow = static_cast<int>(q / static_cast<std::size_t>(field.width));
+    return seam_cost_at(field, a, b, pcol, prow, qcol, qrow, options);
 }
 
 /// The score-argmax label at one cell, or -1 when nothing covers it.
 int argmax_at(const Field& field, std::size_t cell) {
+    const int col = static_cast<int>(cell % static_cast<std::size_t>(field.width));
+    const int row = static_cast<int>(cell / static_cast<std::size_t>(field.width));
     int best_label = -1;
     double best = 0.0;
     for (std::size_t t = 0; t < field.tiles(); ++t) {
-        if (field.valid[t][cell] == 0) {
+        if (!field.valid_at(t, col, row)) {
             continue;
         }
-        const double score = static_cast<double>(field.score[t][cell]);
+        const double score = static_cast<double>(field.score_at(t, col, row));
         if (best_label < 0 || score > best) {
             best = score;
             best_label = static_cast<int>(t);
@@ -344,9 +426,16 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
     const int width = field.width;
     const int height = field.height;
     const std::size_t cells = field.cells();
+    if (field.tile_width[static_cast<std::size_t>(alpha)] <= 0) {
+        return false;  // the tile covers nothing
+    }
+    const std::size_t alpha_cells =
+        static_cast<std::size_t>(field.tile_width[static_cast<std::size_t>(alpha)]) *
+        static_cast<std::size_t>(field.tile_height[static_cast<std::size_t>(alpha)]);
     const bool alpha_covers_any =
         std::any_of(field.valid[static_cast<std::size_t>(alpha)],
-                    field.valid[static_cast<std::size_t>(alpha)] + cells,
+                    field.valid[static_cast<std::size_t>(alpha)] +
+                        static_cast<std::ptrdiff_t>(alpha_cells),
                     [](std::uint8_t v) { return v != 0; });
     if (!alpha_covers_any) {
         return false;
@@ -491,24 +580,32 @@ void icm_sweep(const Field& field, std::vector<std::int32_t>& labels,
             }
 
             const int current = labels[cell];
-            const double current_data = data_cost(field, current, cell, options);
+            const double current_data = data_cost_at(field, current, cell, col, row, options);
             double current_seam[4] = {0.0, 0.0, 0.0, 0.0};
             for (int n = 0; n < neighbour_count; ++n) {
-                current_seam[n] = seam_cost(field, current, labels[neighbours[n]], cell,
-                                            neighbours[n], options);
+                const int ncol =
+                    static_cast<int>(neighbours[n] % static_cast<std::size_t>(width));
+                const int nrow =
+                    static_cast<int>(neighbours[n] / static_cast<std::size_t>(width));
+                current_seam[n] = seam_cost_at(field, current, labels[neighbours[n]], col, row,
+                                               ncol, nrow, options);
             }
 
             int best_label = current;
             double best_delta = 0.0;  // keep the current label on ties
             for (std::size_t t = 0; t < field.tiles(); ++t) {
                 const int label = static_cast<int>(t);
-                if (field.valid[t][cell] == 0) {
+                if (!field.valid_at(t, col, row)) {
                     continue;  // a label must cover the cell
                 }
-                double delta = data_cost(field, label, cell, options) - current_data;
+                double delta = data_cost_at(field, label, cell, col, row, options) - current_data;
                 for (int n = 0; n < neighbour_count; ++n) {
-                    delta += seam_cost(field, label, labels[neighbours[n]], cell, neighbours[n],
-                                       options) -
+                    const int ncol =
+                        static_cast<int>(neighbours[n] % static_cast<std::size_t>(width));
+                    const int nrow =
+                        static_cast<int>(neighbours[n] / static_cast<std::size_t>(width));
+                    delta += seam_cost_at(field, label, labels[neighbours[n]], col, row, ncol,
+                                          nrow, options) -
                              current_seam[n];
                 }
                 if (delta < best_delta) {
@@ -522,7 +619,9 @@ void icm_sweep(const Field& field, std::vector<std::int32_t>& labels,
 }
 
 /// A block-mean copy of the tiles at `factor` x coarser resolution, owning its
-/// storage.
+/// storage. Like the fine level, each tile's coarse buffer covers only its own
+/// crop box (scaled down), so a large flight does not pay C x "all coarse
+/// cells" at every pyramid level.
 struct Coarse {
     std::vector<std::vector<std::uint8_t>> rgb;
     std::vector<std::vector<float>> score;
@@ -534,35 +633,71 @@ void build_coarse(Coarse& coarse, const std::vector<OrthoTile>& tiles, int width
                   int factor) {
     const int cw = (width + factor - 1) / factor;
     const int ch = (height + factor - 1) / factor;
-    const std::size_t cells = static_cast<std::size_t>(cw) * static_cast<std::size_t>(ch);
     const std::size_t tile_count = tiles.size();
-    coarse.rgb.assign(tile_count, std::vector<std::uint8_t>(cells * 3, 0));
-    coarse.score.assign(tile_count, std::vector<float>(cells, 0.0F));
-    coarse.valid.assign(tile_count, std::vector<std::uint8_t>(cells, 0));
+    coarse.rgb.resize(tile_count);
+    coarse.score.resize(tile_count);
+    coarse.valid.resize(tile_count);
 
-    for (int brow = 0; brow < ch; ++brow) {
-        for (int bcol = 0; bcol < cw; ++bcol) {
-            const std::size_t cell =
-                static_cast<std::size_t>(brow) * static_cast<std::size_t>(cw) +
-                static_cast<std::size_t>(bcol);
-            for (std::size_t t = 0; t < tile_count; ++t) {
-                const OrthoTile& tile = tiles[t];
+    coarse.field.width = cw;
+    coarse.field.height = ch;
+    coarse.field.score.resize(tile_count);
+    coarse.field.rgb.resize(tile_count);
+    coarse.field.valid.resize(tile_count);
+    coarse.field.x0.resize(tile_count);
+    coarse.field.y0.resize(tile_count);
+    coarse.field.tile_width.resize(tile_count);
+    coarse.field.tile_height.resize(tile_count);
+    coarse.field.stride.resize(tile_count);
+
+    for (std::size_t t = 0; t < tile_count; ++t) {
+        const OrthoTile& tile = tiles[t];
+        if (tile.empty()) {
+            coarse.field.x0[t] = 0;
+            coarse.field.y0[t] = 0;
+            coarse.field.tile_width[t] = 0;
+            coarse.field.tile_height[t] = 0;
+            coarse.field.stride[t] = 0;
+            coarse.field.score[t] = nullptr;
+            coarse.field.rgb[t] = nullptr;
+            coarse.field.valid[t] = nullptr;
+            continue;
+        }
+        // The tile's crop box, in coarse cells (a coarse cell covers the block of
+        // fine cells it starts at, so floor on the origin and ceil on the far
+        // edge keeps every fine cell the tile holds inside the coarse box).
+        const int tx0 = tile.x0 / factor;
+        const int ty0 = tile.y0 / factor;
+        const int tx1 = (tile.x0 + tile.width + factor - 1) / factor;
+        const int ty1 = (tile.y0 + tile.height + factor - 1) / factor;
+        const int bw = std::max(0, tx1 - tx0);
+        const int bh = std::max(0, ty1 - ty0);
+        const std::size_t cells = static_cast<std::size_t>(bw) * static_cast<std::size_t>(bh);
+        coarse.rgb[t].assign(cells * 3, 0);
+        coarse.score[t].assign(cells, 0.0F);
+        coarse.valid[t].assign(cells, 0);
+
+        for (int brow = 0; brow < bh; ++brow) {
+            for (int bcol = 0; bcol < bw; ++bcol) {
+                const std::size_t cell =
+                    static_cast<std::size_t>(brow) * static_cast<std::size_t>(bw) +
+                    static_cast<std::size_t>(bcol);
                 double srgb[3] = {0.0, 0.0, 0.0};
                 double sscore = 0.0;
                 int count = 0;
                 for (int dr = 0; dr < factor; ++dr) {
-                    const int row = brow * factor + dr;
+                    const int row = (ty0 + brow) * factor + dr;
                     if (row >= height) {
                         break;
                     }
                     for (int dc = 0; dc < factor; ++dc) {
-                        const int col = bcol * factor + dc;
+                        const int col = (tx0 + bcol) * factor + dc;
                         if (col >= width) {
                             break;
                         }
-                        const std::size_t fine =
-                            static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
-                            static_cast<std::size_t>(col);
+                        if (!tile.contains(col, row)) {
+                            continue;
+                        }
+                        const std::size_t fine = tile.index(col, row);
                         if (tile.valid[fine] == 0) {
                             continue;
                         }
@@ -586,14 +721,12 @@ void build_coarse(Coarse& coarse, const std::vector<OrthoTile>& tiles, int width
                 coarse.valid[t][cell] = 1;
             }
         }
-    }
 
-    coarse.field.width = cw;
-    coarse.field.height = ch;
-    coarse.field.score.resize(tile_count);
-    coarse.field.rgb.resize(tile_count);
-    coarse.field.valid.resize(tile_count);
-    for (std::size_t t = 0; t < tile_count; ++t) {
+        coarse.field.x0[t] = tx0;
+        coarse.field.y0[t] = ty0;
+        coarse.field.tile_width[t] = bw;
+        coarse.field.tile_height[t] = bh;
+        coarse.field.stride[t] = bw;  // the tile's own buffer width
         coarse.field.score[t] = coarse.score[t].data();
         coarse.field.rgb[t] = coarse.rgb[t].data();
         coarse.field.valid[t] = coarse.valid[t].data();
@@ -636,10 +769,21 @@ Field fine_field(const std::vector<OrthoTile>& tiles, int width, int height) {
     field.score.resize(tile_count);
     field.rgb.resize(tile_count);
     field.valid.resize(tile_count);
+    field.x0.resize(tile_count);
+    field.y0.resize(tile_count);
+    field.tile_width.resize(tile_count);
+    field.tile_height.resize(tile_count);
+    field.stride.resize(tile_count);
     for (std::size_t t = 0; t < tile_count; ++t) {
-        field.score[t] = tiles[t].score.data();
-        field.rgb[t] = tiles[t].rgb.data();
-        field.valid[t] = tiles[t].valid.data();
+        const OrthoTile& tile = tiles[t];
+        field.x0[t] = tile.x0;
+        field.y0[t] = tile.y0;
+        field.tile_width[t] = tile.width;
+        field.tile_height[t] = tile.height;
+        field.stride[t] = tile.width;
+        field.score[t] = tile.score.data();
+        field.rgb[t] = tile.rgb.data();
+        field.valid[t] = tile.valid.data();
     }
     finalize(field);
     return field;
@@ -700,21 +844,23 @@ double energy(int width, int height, const std::vector<OrthoTile>& tiles,
                 static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
                 static_cast<std::size_t>(col);
             const int label = labels[cell];
-            total += data_cost(field, label, cell, options);
+            total += data_cost_at(field, label, cell, col, row, options);
             if (label < 0) {
                 continue;  // no valid tile here: no seam contributes
             }
             // Count each unordered neighbour pair once (right and down).
             if (col + 1 < width) {
-                const std::size_t q = cell + 1;
-                if (labels[q] != label) {
-                    total += seam_cost(field, label, labels[q], cell, q, options);
+                const int q_label = labels[cell + 1];
+                if (q_label != label) {
+                    total += seam_cost_at(field, label, q_label, col, row, col + 1, row,
+                                          options);
                 }
             }
             if (row + 1 < height) {
-                const std::size_t q = cell + static_cast<std::size_t>(width);
-                if (labels[q] != label) {
-                    total += seam_cost(field, label, labels[q], cell, q, options);
+                const int q_label = labels[cell + static_cast<std::size_t>(width)];
+                if (q_label != label) {
+                    total += seam_cost_at(field, label, q_label, col, row, col, row + 1,
+                                          options);
                 }
             }
         }

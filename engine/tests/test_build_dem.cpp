@@ -331,6 +331,99 @@ TEST(Dem, AutoResolutionIsPositiveAndNearSampleSpacing) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Extent robustness: a few far outliers cannot explode the grid
+// ---------------------------------------------------------------------------
+//
+// The owner's 8 GB laptop hit "bad allocation" on a 36-photo block at the OLD
+// 0.25 m ortho default, when the ortho had only ~0.2 M cells. The grid follows
+// the DEM, the DEM's extent followed raw sample min/max, and a handful of far
+// depth-map samples turned a 100 m block into a kilometres-wide grid. These
+// tests pin the robust bound: outliers must not change the extent materially,
+// while an outlier-free scene must keep the exact grid it always had.
+
+TEST(Dem, FarOutliersDoNotExplodeTheExtent) {
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -50.0, 50.0, -40.0, 40.0, 0.25);
+    const std::size_t clean_count = chunk.point_cloud().points.size();
+
+    // Baseline: the exact extent of the clean lattice.
+    Params baseline = dem_params("point_cloud", "enabled", 0.25, 0, "nearest", "none");
+    run_build_dem(document, baseline);
+    const RasterGrid clean_grid = chunk.elevation().raster.grid;
+    const double clean_x0 = clean_grid.origin_x;
+    const double clean_y0 = clean_grid.origin_y;
+
+    // Now inject 20 far points: 10 "at infinity" along a grazing ray and 10
+    // spurious close-range mismatches. 20 of ~128000 samples is 0.016%, inside
+    // the 0.5% discarded tail on each side.
+    PointCloud& cloud = chunk.point_cloud();
+    for (int i = 0; i < 10; ++i) {
+        const double angle = 2.0 * 3.14159265358979 * static_cast<double>(i) / 10.0;
+        cloud.points.push_back(Eigen::Vector3d(
+            5000.0 * std::cos(angle), 5000.0 * std::sin(angle),
+            aerial_fixture::truth_height(0.0, 0.0)));
+    }
+    for (int i = 0; i < 10; ++i) {
+        cloud.points.push_back(Eigen::Vector3d(
+            -3000.0 + 7.0 * static_cast<double>(i), -2500.0, 0.0));
+    }
+    ASSERT_GT(cloud.points.size(), clean_count);
+
+    Params dirty = dem_params("point_cloud", "enabled", 0.25, 0, "nearest", "none");
+    run_build_dem(document, dirty);
+    const RasterGrid dirty_grid = chunk.elevation().raster.grid;
+
+    const double clean_east =
+        clean_grid.origin_x + static_cast<double>(clean_grid.width) * clean_grid.pixel_size_x;
+    const double clean_south =
+        clean_grid.origin_y - static_cast<double>(clean_grid.height) * clean_grid.pixel_size_y;
+    const double dirty_east =
+        dirty_grid.origin_x + static_cast<double>(dirty_grid.width) * dirty_grid.pixel_size_x;
+    const double dirty_south =
+        dirty_grid.origin_y - static_cast<double>(dirty_grid.height) * dirty_grid.pixel_size_y;
+    std::printf("[Dem.FarOutliersDoNotExplodeTheExtent] clean=%dx%d dirty=%dx%d "
+                "dx=[%.2f,%.2f] dy=[%.2f,%.2f]\n",
+                clean_grid.width, clean_grid.height, dirty_grid.width, dirty_grid.height,
+                dirty_grid.origin_x - clean_x0, dirty_east - clean_east,
+                dirty_grid.origin_y - clean_y0, dirty_south - clean_south);
+
+    // The outliers sit kilometres away; without the robust bound the grid would
+    // be thousands of cells wider. A 6 m tolerance allows the 3% core margin
+    // (3 m on a 100 m block) plus the origin snapping to the 0.25 m cell.
+    constexpr double kExtentTolerance = 6.0;
+    EXPECT_LT(std::abs(dirty_grid.origin_x - clean_x0), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_east - clean_east), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_grid.origin_y - clean_y0), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_south - clean_south), kExtentTolerance);
+    // And the cell count is the same order, not 100x.
+    const double clean_cells =
+        static_cast<double>(clean_grid.width) * static_cast<double>(clean_grid.height);
+    const double dirty_cells =
+        static_cast<double>(dirty_grid.width) * static_cast<double>(dirty_grid.height);
+    EXPECT_LT(dirty_cells, 1.5 * clean_cells);
+}
+
+TEST(Dem, CleanCloudKeepsTheExactExtent) {
+    // The robust bound can only shrink the exact box, never grow it: an
+    // outlier-free cloud must produce byte-comparable grid metadata to the
+    // pre-robust code (origin exactly the outward-snapped minimum).
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -10.0, 10.0, -10.0, 10.0, 0.5);
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const RasterGrid& grid = chunk.elevation().raster.grid;
+    // origin_x = floor(-10 / 0.5) * 0.5 = -10, origin_y = ceil(10/0.5)*0.5 = 10,
+    // and 20 m / 0.5 m = 40 cells each way.
+    EXPECT_NEAR(grid.origin_x, -10.0, 1e-9);
+    EXPECT_NEAR(grid.origin_y, 10.0, 1e-9);
+    EXPECT_EQ(grid.width, 40);
+    EXPECT_EQ(grid.height, 40);
+}
+
+// ---------------------------------------------------------------------------
 // 5. Errors
 // ---------------------------------------------------------------------------
 
@@ -753,6 +846,54 @@ TEST(ExportDem, EmptyElevationThrows) {
     Params params = make_params(builtin_registry().require("ExportDem"));
     params.set("path", ParamValue{platform::unique_temp_path("alphashape_unused_dem_", ".tif")});
     EXPECT_THROW(run_task(builtin_registry(), document, "ExportDem", params), Error);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Automatic resolution on a Geographic (EPSG:4326) grid
+// ---------------------------------------------------------------------------
+//
+// The depth-map GSD the automatic rule measures is a GROUND distance in
+// metres, but an EPSG:4326 grid's pixel size is in degrees. The rule must
+// convert with the frame's metres-per-degree at the surface's own latitude: a
+// value left in metres would make the DEM ~111000x too coarse per degree, and a
+// value divided by the wrong constant would be just as wrong.
+
+TEST(DemAutoResolution, GeographicDepthMapCellIsInDegrees) {
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    add_synthetic_tie_points(chunk);
+
+    Params depth = make_params(builtin_registry().require("BuildDepthMaps"));
+    depth.set("downscale", ParamValue{std::int64_t{1}});
+    depth.set("filter_mode", ParamValue{std::string("mild")});
+    run_task(builtin_registry(), document, "BuildDepthMaps", depth);
+    ASSERT_FALSE(chunk.depth_maps().empty());
+
+    // Ask for the automatic cell in the chunk's own geographic CRS: the DEM is
+    // written in degrees.
+    Params dem = dem_params("depth_maps", "enabled", 0.0, 4326, "nearest", "none");
+    run_build_dem(document, dem);
+    const Elevation& elevation = chunk.elevation();
+    ASSERT_FALSE(elevation.empty());
+    ASSERT_EQ(elevation.epsg, 4326);
+
+    const double cell_deg = elevation.raster.grid.pixel_size_x;
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 4326);
+    const Eigen::Vector2d metres_per_degree = frame.metres_per_plane_unit(
+        elevation.raster.grid.pixel_center(0, elevation.raster.grid.height / 2).y());
+    const double cell_metres =
+        cell_deg * std::max(metres_per_degree.x(), metres_per_degree.y());
+    std::printf("[DemAutoResolution.Geographic] cell=%.9f deg = %.4f m (m/deg %.1f, %.1f)\n",
+                cell_deg, cell_metres, metres_per_degree.x(), metres_per_degree.y());
+
+    // The 12-camera nadir block at 60 m with f = 500 covers ~0.12 m per pixel.
+    // The converted cell must be a plausible ground distance of that order:
+    // never a metre value reinterpreted as degrees (~111 km per pixel), and
+    // never a degree value left unconverted (~1e-7 m per pixel).
+    EXPECT_GT(cell_deg, 0.0);
+    EXPECT_LT(cell_deg, 1e-4) << "a degree cell for this block is ~1e-6 deg";
+    EXPECT_GT(cell_metres, 0.01);
+    EXPECT_LT(cell_metres, 5.0);
 }
 
 }  // namespace

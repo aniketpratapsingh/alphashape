@@ -82,8 +82,11 @@ void BuildDemTask::declare_params(Params& params) const {
     params.declare(interpolation);
 
     ParamSpec resolution{"resolution", ParamType::Float, 0.0,
-                         "Cell size in projection units. 0 selects an automatic value from the "
-                         "source's sample spacing."};
+                         "Cell size in projection units. 0 selects the automatic value from "
+                         "the source's sample spacing: the median depth-map ground sample "
+                         "distance in metres (converted to degrees for a geographic CRS), the "
+                         "median mesh edge for the model source, or the point spacing for a "
+                         "point cloud."};
     resolution.minimum = 0.0;
     params.declare(resolution);
 

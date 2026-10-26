@@ -437,8 +437,6 @@ HoleFillReport fill_holes(int width, int height, std::vector<float>& values,
         if (max_x >= 0) {
             const int bw = max_x - min_x + 1;
             const int bh = max_y - min_y + 1;
-            const std::size_t bsz = static_cast<std::size_t>(bw) *
-                                    static_cast<std::size_t>(bh);
             // One accumulator per band of source rows. The band layout is
             // fixed (BANDS independent of the thread count), each non-empty
             // band owns a contiguous slice of the accumulator array, and bands
@@ -478,92 +476,144 @@ HoleFillReport fill_holes(int width, int height, std::vector<float>& values,
             }
 
             const std::size_t slots = static_cast<std::size_t>(nslots);
-            std::vector<double> sums(slots * bsz, 0.0);
-            std::vector<std::int32_t> counts(slots * bsz, 0);
+
+            // MEMORY. The accumulators are `slots x (hole bbox)` cells: with 64
+            // bands over a full-frame hole that is 12 bytes x 64 x the whole
+            // grid -- tens of GB on a large orthomosaic. The target grid is
+            // therefore processed in horizontal BANDS: only the rows of the
+            // current band are accumulated, so the working set is
+            // slots x bw x band_rows, capped at kSibsonBandBudgetBytes.
+            //
+            // Determinism and exactness are preserved by construction: within a
+            // target band every source still scatters into its own slot in the
+            // same (band, row, col) order as before, and the per-target merge
+            // still runs slots in band order, so every sum is bit-identical to
+            // the unbanded algorithm.
+            constexpr std::size_t kSibsonBandBudgetBytes = 64u * 1024u * 1024u;
+            constexpr std::size_t kBytesPerCell = sizeof(double) + sizeof(std::int32_t);
+            const std::size_t per_row = slots * static_cast<std::size_t>(bw) * kBytesPerCell;
+            std::size_t band_rows = per_row > 0 ? kSibsonBandBudgetBytes / per_row : 0;
+            if (band_rows < 1) {
+                band_rows = 1;  // one band row is the floor; nothing else fits
+            }
+            if (band_rows > static_cast<std::size_t>(bh)) {
+                band_rows = static_cast<std::size_t>(bh);
+            }
+
+            // The largest scatter radius, so a target band only reads the source
+            // rows that can reach it.
+            int max_radius = 0;
+            for (std::size_t i = 0; i < total; ++i) {
+                if (is_source[i] == 0) continue;
+                const double d = static_cast<double>(edt.distance[i]);
+                if (!std::isfinite(d)) continue;
+                const int ri = isqrt(static_cast<double>(
+                    static_cast<std::int64_t>(std::llround(d * d))));
+                if (ri > max_radius) max_radius = ri;
+            }
+
+            std::vector<double> sums(slots * static_cast<std::size_t>(bw) * band_rows, 0.0);
+            std::vector<std::int32_t> counts(sums.size(), 0);
+
+            for (std::size_t band_lo = 0; band_lo < static_cast<std::size_t>(bh);
+                 band_lo += band_rows) {
+                const int tlo = min_y + static_cast<int>(band_lo);
+                const int thi = std::min(max_y + 1, tlo + static_cast<int>(band_rows));
+                const std::size_t rows =
+                    static_cast<std::size_t>(std::max(0, thi - tlo));
+                const std::size_t bsz = static_cast<std::size_t>(bw) * rows;
+                std::fill(sums.begin(), sums.end(), 0.0);
+                std::fill(counts.begin(), counts.end(), 0);
+
+                // Only source rows whose scatter ball can reach this band.
+                const int src_lo = std::max(0, tlo - max_radius);
+                const int src_hi = std::min(H, thi + max_radius);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int b = 0; b < nbands; ++b) {
-                const int slot = band_slot[static_cast<std::size_t>(b)];
-                if (slot < 0) continue;
-                double* const sbuf = sums.data() +
-                                     static_cast<std::size_t>(slot) * bsz;
-                std::int32_t* const cbuf = counts.data() +
-                                           static_cast<std::size_t>(slot) * bsz;
-                for (int py = band_start[static_cast<std::size_t>(b)];
-                     py < band_end[static_cast<std::size_t>(b)]; ++py) {
-                    const std::size_t pbase = static_cast<std::size_t>(py) *
-                                              static_cast<std::size_t>(W);
-                    for (int px = 0; px < W; ++px) {
-                        const std::size_t pi = pbase +
-                                               static_cast<std::size_t>(px);
-                        if (is_source[pi] == 0) continue;
-                        const std::int32_t s = edt.site[pi];
-                        if (s < 0) continue;
-                        const double d = static_cast<double>(edt.distance[pi]);
-                        if (!std::isfinite(d)) continue;
-                        // r^2 is an exact integer (the EDT stores sqrt of one).
-                        const std::int64_t r2 =
-                            static_cast<std::int64_t>(std::llround(d * d));
-                        const int ri = isqrt(static_cast<double>(r2));
-                        const double f = static_cast<double>(
-                            values[static_cast<std::size_t>(s)]);
-                        const int ylo = std::max(min_y, py - ri);
-                        const int yhi = std::min(max_y, py + ri);
-                        const int xlo = std::max(min_x, px - ri);
-                        const int xhi = std::min(max_x, px + ri);
-                        for (int qy = ylo; qy <= yhi; ++qy) {
-                            const std::int64_t dy = qy - py;
-                            const std::int64_t dy2 = dy * dy;
-                            double* const srow = sbuf +
-                                static_cast<std::size_t>(qy - min_y) *
-                                    static_cast<std::size_t>(bw);
-                            std::int32_t* const crow = cbuf +
-                                static_cast<std::size_t>(qy - min_y) *
-                                    static_cast<std::size_t>(bw);
-                            for (int qx = xlo; qx <= xhi; ++qx) {
-                                const std::int64_t dx = qx - px;
-                                // Strict interior of the ball: a cell exactly on
-                                // the sphere lies on the boundary of the site's
-                                // cell and is not stolen from it.
-                                if (dx * dx + dy2 >= r2) continue;
-                                const std::size_t bidx = static_cast<std::size_t>(
-                                    qx - min_x);
-                                srow[bidx] += f;
-                                ++crow[bidx];
+                for (int b = 0; b < nbands; ++b) {
+                    const int slot = band_slot[static_cast<std::size_t>(b)];
+                    if (slot < 0) continue;
+                    double* const sbuf =
+                        sums.data() + static_cast<std::size_t>(slot) * bsz;
+                    std::int32_t* const cbuf =
+                        counts.data() + static_cast<std::size_t>(slot) * bsz;
+                    for (int py = std::max(band_start[static_cast<std::size_t>(b)], src_lo);
+                         py < std::min(band_end[static_cast<std::size_t>(b)], src_hi); ++py) {
+                        const std::size_t pbase = static_cast<std::size_t>(py) *
+                                                  static_cast<std::size_t>(W);
+                        for (int px = 0; px < W; ++px) {
+                            const std::size_t pi = pbase +
+                                                   static_cast<std::size_t>(px);
+                            if (is_source[pi] == 0) continue;
+                            const std::int32_t s = edt.site[pi];
+                            if (s < 0) continue;
+                            const double d = static_cast<double>(edt.distance[pi]);
+                            if (!std::isfinite(d)) continue;
+                            // r^2 is an exact integer (the EDT stores sqrt of one).
+                            const std::int64_t r2 =
+                                static_cast<std::int64_t>(std::llround(d * d));
+                            const int ri = isqrt(static_cast<double>(r2));
+                            const double f = static_cast<double>(
+                                values[static_cast<std::size_t>(s)]);
+                            const int ylo = std::max(tlo, py - ri);
+                            const int yhi = std::min(thi - 1, py + ri);
+                            const int xlo = std::max(min_x, px - ri);
+                            const int xhi = std::min(max_x, px + ri);
+                            if (ylo > yhi) continue;
+                            for (int qy = ylo; qy <= yhi; ++qy) {
+                                const std::int64_t dy = qy - py;
+                                const std::int64_t dy2 = dy * dy;
+                                double* const srow = sbuf +
+                                    static_cast<std::size_t>(qy - tlo) *
+                                        static_cast<std::size_t>(bw);
+                                std::int32_t* const crow = cbuf +
+                                    static_cast<std::size_t>(qy - tlo) *
+                                        static_cast<std::size_t>(bw);
+                                for (int qx = xlo; qx <= xhi; ++qx) {
+                                    const std::int64_t dx = qx - px;
+                                    // Strict interior of the ball: a cell exactly on
+                                    // the sphere lies on the boundary of the site's
+                                    // cell and is not stolen from it.
+                                    if (dx * dx + dy2 >= r2) continue;
+                                    const std::size_t bidx = static_cast<std::size_t>(
+                                        qx - min_x);
+                                    srow[bidx] += f;
+                                    ++crow[bidx];
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Merge in fixed band order, then divide. A target always receives
-            // its own vote (0 < r(p)^2 for a hole cell), so no count is zero.
-            for (int y = min_y; y <= max_y; ++y) {
-                const std::size_t base = static_cast<std::size_t>(y) *
-                                         static_cast<std::size_t>(W);
-                const std::size_t brow =
-                    static_cast<std::size_t>(y - min_y) *
-                    static_cast<std::size_t>(bw);
-                for (int x = min_x; x <= max_x; ++x) {
-                    const std::size_t i = base + static_cast<std::size_t>(x);
-                    if (fill[i] == 0) continue;
-                    const std::size_t bidx =
-                        brow + static_cast<std::size_t>(x - min_x);
-                    double sum = 0.0;
-                    std::int64_t cnt = 0;
-                    for (int b = 0; b < nbands; ++b) {
-                        const int slot = band_slot[static_cast<std::size_t>(b)];
-                        if (slot < 0) continue;
-                        const std::size_t o =
-                            static_cast<std::size_t>(slot) * bsz + bidx;
-                        sum += sums[o];
-                        cnt += static_cast<std::int64_t>(counts[o]);
-                    }
-                    if (cnt > 0) {
-                        result[i] =
-                            static_cast<float>(sum / static_cast<double>(cnt));
+                // Merge in fixed band order, then divide. A target always receives
+                // its own vote (0 < r(p)^2 for a hole cell), so no count is zero.
+                for (int y = tlo; y < thi; ++y) {
+                    const std::size_t base = static_cast<std::size_t>(y) *
+                                             static_cast<std::size_t>(W);
+                    const std::size_t brow =
+                        static_cast<std::size_t>(y - tlo) *
+                        static_cast<std::size_t>(bw);
+                    for (int x = min_x; x <= max_x; ++x) {
+                        const std::size_t i = base + static_cast<std::size_t>(x);
+                        if (fill[i] == 0) continue;
+                        const std::size_t bidx =
+                            brow + static_cast<std::size_t>(x - min_x);
+                        double sum = 0.0;
+                        std::int64_t cnt = 0;
+                        for (int b = 0; b < nbands; ++b) {
+                            const int slot = band_slot[static_cast<std::size_t>(b)];
+                            if (slot < 0) continue;
+                            const std::size_t o =
+                                static_cast<std::size_t>(slot) * bsz + bidx;
+                            sum += sums[o];
+                            cnt += static_cast<std::int64_t>(counts[o]);
+                        }
+                        if (cnt > 0) {
+                            result[i] =
+                                static_cast<float>(sum / static_cast<double>(cnt));
+                        }
                     }
                 }
             }

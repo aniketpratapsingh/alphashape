@@ -180,7 +180,7 @@ bool VulkanBackend::wait_fence_noexcept(VkFence fence, std::uint64_t timeout_ns)
     }
 }
 
-bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
+bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw, bool authoritative) {
     // One shared deadline for the whole drain (a wall clock instant, not a
     // slice per fence): after a loss every fence is unsignalled, and paying a
     // bounded slice per slot per buffer is what made the fallback unwind slow.
@@ -197,7 +197,7 @@ bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
         // the test-level reset) disarms the window, so the next genuine loss
         // gets its own full budget.
         lost_drain_started_ = false;
-    } else if (!allow_throw) {
+    } else if (!allow_throw && !authoritative) {
         // The no-throw drain runs from destructors during a fallback unwind,
         // where one slice per buffer would multiply the cost: the post-loss
         // budget is shared by the whole backend, keyed to the loss that armed
@@ -205,6 +205,11 @@ bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
         // immediately -- so an operation that destroys a dozen buffers still
         // costs at most one second in total. A different loss (the generation
         // moved on) arms a fresh window.
+        //
+        // An authoritative drain (~VulkanBackend) opts out. Nothing will wait
+        // again once the device is destroyed, so the cheap shared window would
+        // only cap the one drain that has to succeed. It still cannot hang: the
+        // budget is finite and every fence wait is bounded.
         const std::uint64_t generation = device_lost_generation();
         const auto now = std::chrono::steady_clock::now();
         if (!lost_drain_started_ || lost_drain_generation_ != generation) {
@@ -881,19 +886,25 @@ void VulkanBackend::wait_all_pending() {
     // The slots stay pending: they are owned by their tickets until wait().
 }
 
-bool VulkanBackend::wait_all_pending_noexcept() {
+bool VulkanBackend::wait_all_pending_noexcept(std::uint64_t budget_ns) {
     // Destructor path: a throw here is std::terminate (destructors are
     // implicitly noexcept). drain_pending bounds the drain, and once the device
     // is lost the budget is *shared* across the whole fallback unwind (see
     // kPostLossDrainNs), so destroying a dozen buffers after a hang costs one
     // second in total rather than one bound per handle.
+    //
+    // budget_ns != 0 is ~VulkanBackend's teardown drain: nothing will wait
+    // again, so it is authoritative and the cheap shared window does not cap it.
     constexpr std::uint64_t kHealthyDrainBudgetNs = 5'000'000'000ULL;
     constexpr std::uint64_t kSoftwareDrainBudgetNs = 600'000'000'000ULL;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
+        const bool authoritative = budget_ns != 0;
         const std::uint64_t budget =
-            device_.info.software ? kSoftwareDrainBudgetNs : kHealthyDrainBudgetNs;
-        return drain_pending(budget, /*allow_throw=*/false);
+            authoritative ? budget_ns
+                          : (device_.info.software ? kSoftwareDrainBudgetNs
+                                                   : kHealthyDrainBudgetNs);
+        return drain_pending(budget, /*allow_throw=*/false, authoritative);
     } catch (...) {
         // Defensive only: nothing under the lock is expected to throw here, and
         // a failure is reported by the fence drain itself (device marked lost).
