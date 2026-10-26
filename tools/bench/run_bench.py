@@ -790,6 +790,8 @@ def _reprojection(work: Path, project: Path) -> dict:
     """
     import numpy as np  # noqa: PLC0415
 
+    import metrics  # noqa: PLC0415 - late for the reason in the module note
+
     base = project.with_suffix("")
     bundle = base.parent / f"{base.name}.files" / "project.zip"
     try:

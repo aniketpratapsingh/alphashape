@@ -365,6 +365,72 @@ class ProjectInspectionTest(unittest.TestCase):
         self.assertIn("error", stats)
 
 
+class ReprojectionTest(unittest.TestCase):
+    """The tie-point reprojection metric, end to end through the project archive.
+
+    This path had no test and shipped a NameError that only a full CI pipeline run
+    found, after the whole pipeline had succeeded. It is exercised here on a
+    synthetic project whose answer is exact: a point straight down each camera's
+    optical axis must reproject to its principal point.
+    """
+
+    def _project(self, tmp: Path, *, point=(0.0, 0.0, 10.0), camera_x=0.0) -> Path:
+        project = tmp / "site.psx"
+        project.write_text("alphashape-project 2\nfiles=site.files/project.zip\n")
+        bundle = tmp / "site.files" / "project.zip"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <document version="2">
+          <chunks>
+            <chunk id="1" label="c">
+              <sensors><sensor id="0" label="s" width="100" height="100">
+                <calibration type="Frame" width="100" height="100" f="50" cx="0" cy="0"
+                  b1="0" b2="0" k1="0" k2="0" k3="0" k4="0" p1="0" p2="0"/>
+              </sensor></sensors>
+              <cameras>
+                <camera id="0" sensor_id="0" enabled="true"
+                  transform="1 0 0 {-camera_x} 0 1 0 0 0 0 1 0 0 0 0 1"/>
+              </cameras>
+              <tie_points><tracks count="1"/></tie_points>
+            </chunk>
+          </chunks>
+        </document>"""
+        tracks = b"ATR2" + struct.pack("<I", 1)
+        tracks += struct.pack("<I", 1) + struct.pack("<iI", 0, 0)
+        tracks += b"\x01" + struct.pack("<ddd", *point)
+        keypoints = b"AKP1" + struct.pack("<I", 1) + struct.pack("<ffff", 50.0, 50.0, 1.0, 0.0)
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("doc.xml", xml)
+            archive.writestr("chunks/1/tie_points/tracks.bin", tracks)
+            archive.writestr("chunks/1/tie_points/camera_0.kpt", keypoints)
+        return project
+
+    def test_a_point_on_the_optical_axis_reprojects_to_the_principal_point(self):
+        # The camera sits at x = +10 looking along +Z in its own frame, so a point
+        # at (10, 0, 10) is 10 units straight in front of it: pixel (50, 50).
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp), point=(10.0, 0.0, 10.0), camera_x=10.0)
+            stats = run_bench._reprojection(Path(tmp), project)
+        self.assertNotIn("skipped", stats)
+        self.assertEqual(stats["pairs"], 1)
+        self.assertLess(stats["rms_px"], 1e-6)
+        self.assertEqual(stats["tracks"], 1)
+
+    def test_the_metric_reports_a_mismatch_as_an_error(self):
+        # The keypoint says (50, 50); this camera puts the point at (70, 50).
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp), point=(4.0, 0.0, 10.0), camera_x=0.0)
+            stats = run_bench._reprojection(Path(tmp), project)
+        self.assertAlmostEqual(stats["rms_px"], 20.0, places=6)
+
+    def test_a_project_without_tracks_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "site.psx"
+            project.write_text("x")
+            stats = run_bench._reprojection(Path(tmp), project)
+        self.assertIn("skipped", stats)
+
+
 class SidecarDecodeTest(unittest.TestCase):
     def test_tracks_round_trip(self):
         payload = b"ATR2" + struct.pack("<I", 2)
