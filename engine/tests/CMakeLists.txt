@@ -89,6 +89,22 @@ target_link_libraries(alphashape_tests PRIVATE
 target_compile_definitions(alphashape_tests PRIVATE
     ALPHASHAPE_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
+# The GPU suite starts the real CLI once, to prove that a build with the GPU
+# layer compiled in cannot fail to load when no Vulkan runtime is installed (the
+# process either lists a device or explains why it cannot). Defined only when the
+# CLI exists; the test skips itself otherwise.
+if(ALPHASHAPE_BUILD_CLI AND TARGET alphashape-cli)
+    # Generator expressions are expanded at build time, but the separator is
+    # known now: CMake writes a Windows path with backslashes, and a literal
+    # "C:\...\alphashape-cli.exe" inside a C++ string is a minefield of
+    # escape sequences ("\a" is a bell, "\t" a tab). $<SHELL_PATH:...> rewrites
+    # the resolved path to the shell form, which is forward slashes on every
+    # platform and is accepted by CreateProcess on Windows.
+    target_compile_definitions(alphashape_tests PRIVATE
+        "ALPHASHAPE_CLI_EXE=\"$<SHELL_PATH:$<TARGET_FILE:alphashape-cli>>\"")
+    add_dependencies(alphashape_tests alphashape-cli)
+endif()
+
 # tests/make_v1_fixture.cpp -- regenerates tests/fixtures/v1_project.zip.
 # Deliberately not part of the test binary: the fixture is checked in, and this
 # target only exists so changing tests/v1_fixture.hpp can be followed by a

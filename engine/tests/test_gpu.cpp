@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <random>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include <Eigen/Core>
 
+#include "base/platform/process.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/portable_rng.hpp"
 #include "common/algorithm/mesh/poisson_gpu.hpp"
@@ -24,6 +26,15 @@
 namespace {
 
 using namespace alphashape::gpu;
+
+// Path to the CLI binary, from tests/CMakeLists.txt. Empty when the CLI is not
+// built, which the one test that needs it skips on.
+constexpr const char* kCommandLinePath =
+#if defined(ALPHASHAPE_CLI_EXE)
+    ALPHASHAPE_CLI_EXE;
+#else
+    "";
+#endif
 
 // Every device test reports why it is skipped rather than silently passing.
 #define REQUIRE_GPU()                                       \
@@ -392,11 +403,66 @@ TEST(Gpu, MissingLibraryIsReportedNotFatal) {
         GTEST_SKIP() << "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
     }
     std::string reason;
-    const bool loaded = detail::try_load_library(
-        "/nonexistent/alphashape/libNopeVulkan.dylib", &reason);
+    // Spelled per platform so the assertion below is about our own message and
+    // not about a path separator that happens to be unrepresentable.
+#if defined(_WIN32)
+    const std::string missing = "Z:\\nonexistent\\alphashape\\nope-vulkan-1.dll";
+#elif defined(__APPLE__)
+    const std::string missing = "/nonexistent/alphashape/libNopeVulkan.dylib";
+#else
+    const std::string missing = "/nonexistent/alphashape/libNopeVulkan.so.1";
+#endif
+    const bool loaded = detail::try_load_library(missing, &reason);
     EXPECT_FALSE(loaded);
     EXPECT_FALSE(reason.empty());
-    EXPECT_NE(reason.find("libNopeVulkan"), std::string::npos);
+    EXPECT_NE(reason.find("NopeVulkan"), std::string::npos) << reason;
+}
+
+// The Windows failure mode this exists for: a build with the GPU layer compiled
+// in, started on a machine with no Vulkan runtime, must run on the CPU rather
+// than fail to load a DLL. It runs the real CLI in a child process because a
+// missing DLL is decided by the loader before main() in the failing case, which
+// no in-process assertion can observe.
+//
+// The child may legitimately find a device (the CI lanes install lavapipe);
+// what is asserted is the contract either way: the process starts, prints a
+// device line or an explained "unavailable", and never claims the layer was
+// left out of the build.
+TEST(Gpu, CommandLineReportsGpuStateWithoutAborting) {
+    if (!detail::backend_compiled_in()) {
+        GTEST_SKIP() << "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
+    }
+    if (std::string(kCommandLinePath).empty()) {
+        GTEST_SKIP() << "the CLI was not part of this build (ALPHASHAPE_BUILD_CLI=OFF)";
+    }
+    // The path is baked at build time; a build tree moved to a different
+    // absolute path (a fork's runner, a relocated unpack) is an environment
+    // difference, not a product defect, so it skips rather than fails.
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(kCommandLinePath, error)) {
+            GTEST_SKIP() << "no alphashape-cli at " << kCommandLinePath;
+        }
+    }
+    std::vector<std::string> argv{kCommandLinePath, "--gpu-info"};
+    const alphashape::platform::ProcessResult result =
+        alphashape::platform::run_process_capture(argv);
+    ASSERT_TRUE(result.started) << result.output;
+    // 0 = at least one device listed, 1 = explained as unavailable. Anything
+    // else is a crash, an unhandled exception, or a usage error.
+    EXPECT_TRUE(result.exit_code == 0 || result.exit_code == 1)
+        << "exit " << result.exit_code << ": " << result.output;
+    EXPECT_EQ(result.output.find("disabled at build time"), std::string::npos)
+        << "the build reports the GPU layer as compiled out: " << result.output;
+    if (result.exit_code == 0) {
+        EXPECT_NE(result.output.find("gpu device 0:"), std::string::npos) << result.output;
+    } else {
+        EXPECT_NE(result.output.find("gpu: unavailable"), std::string::npos) << result.output;
+        // A bare "LoadLibrary failed" is not enough for a user to act on.
+        // "ulkan" matches both the capitalised prose on Windows and the
+        // lowercase soname in the POSIX dlopen error.
+        EXPECT_NE(result.output.find("ulkan"), std::string::npos) << result.output;
+    }
 }
 
 TEST(Gpu, ValidationModeReportsNoErrors) {

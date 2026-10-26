@@ -399,7 +399,7 @@ jobs:
         run: packaging/macos/smoke-app.sh dist/*.dmg engine/data
 
   windows:
-    name: Windows x86-64 (clang-cl, CPU only)
+    name: Windows x86-64 (clang-cl, lavapipe)
     runs-on: windows-2022
     timeout-minutes: 120
     continue-on-error: ${{ !inputs.windows-required }}
@@ -412,7 +412,17 @@ jobs:
       # step installs pybind11's headers into the setup-python interpreter
       # instead (`pip install pybind11`), which is the one the installer is
       # supposed to carry a module for.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
+      #
+      # The Vulkan entries are what the GPU layer is built against:
+      #   vulkan-headers          <vulkan/vulkan_core.h> (VK_NO_PROTOTYPES: nothing links a loader)
+      #   vulkan-memory-allocator  <vma/vk_mem_alloc.h>
+      #   shaderc                  glslc.exe, in tools\shaderc
+      #   spirv-tools[tools]       spirv-val.exe, in tools\spirv-tools
+      # vulkan-loader is deliberately absent: the installer must not ship
+      # vulkan-1.dll (it would shadow the driver's own loader and could not find
+      # the driver's ICDs), and nothing links against it. The test lanes install
+      # it separately, because a Windows runner image has no Vulkan runtime.
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib vulkan-headers vulkan-memory-allocator shaderc spirv-tools[tools]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -431,6 +441,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
             $env:VCPKG_PACKAGES.Split(' ')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The loader is a *test* dependency and the four test lanes each
+          # restore this binary cache read-only, so it is built once here rather
+          # than four times in parallel. Nothing links it and no payload ships
+          # it: the installer excludes it by name, and the .zip below drops it.
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows vulkan-loader
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
@@ -462,12 +478,27 @@ jobs:
           # The Python module and the installer are configured later, in the
           # Package step: this configuration is what the test lanes unpack, so it
           # stays exactly what it always was.
+          #
+          # ALPHASHAPE_GPU=ON is explicit rather than left to the option's
+          # default so a missing Vulkan piece is a configuration failure instead
+          # of a quiet CPU-only build. engine/cmake/alphashape_vulkan.cmake finds
+          # the vcpkg headers through the toolchain and glslc/spirv-val under
+          # installed/x64-windows/tools/<port>.
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows -DALPHASHAPE_WARNINGS_AS_ERRORS=ON `
-            -DALPHASHAPE_BUILD_PYTHON=OFF -DALPHASHAPE_GPU=OFF `
+            -DALPHASHAPE_BUILD_PYTHON=OFF -DALPHASHAPE_GPU=ON `
             -DALPHASHAPE_BUILD_GUI=ON "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A missing Vulkan tool silently turns the GPU layer off; refuse that in
+          # CI, exactly as the Linux and macOS jobs do.
+          $config = "build/src/gpu/generated/gpu/gpu_config.hpp"
+          if (-not (Test-Path -LiteralPath $config)) { throw "$config was not generated" }
+          if (-not (Select-String -LiteralPath $config -Pattern 'ALPHASHAPE_GPU_HAS_VULKAN 1' -Quiet)) {
+            Get-Content $config | Write-Host
+            throw 'ALPHASHAPE_GPU_HAS_VULKAN is not 1: the Vulkan headers or the shader tools were not found'
+          }
 
       - name: Build
         shell: pwsh
@@ -513,7 +544,13 @@ jobs:
           $name = "alphashape-${{ inputs.version }}-windows-x86_64"
           New-Item -ItemType Directory -Force -Path "dist\$name" | Out-Null
           Copy-Item build\src\apps\cli\alphashape-cli.exe "dist\$name\"
-          Copy-Item "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" "dist\$name\"
+          # Everything the build needs at run time, minus the two DLLs that are
+          # only there for the shader tools and the test lanes. vulkan-1.dll in
+          # particular must not travel: the app opens the driver's own loader by
+          # name, and a copy beside the .exe would be found first.
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" |
+            Where-Object { $_.Name -notin @('vulkan-1.dll', 'SPIRV-Tools-shared.dll') } |
+            Copy-Item -Destination "dist\$name\"
           Copy-Item "C:\Program Files\LLVM\bin\libomp.dll" "dist\$name\" -ErrorAction SilentlyContinue
           Copy-Item README.md, LICENSE, engine\LIMITATIONS.md "dist\$name\"
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\$name.zip"
@@ -670,6 +707,15 @@ jobs:
           $paths | Where-Object { $_ -like 'bin/Qt6*' } | Select-Object -First 6
           if ($dlls.Count -lt 20) {
             throw "only $($dlls.Count) DLLs in the payload; Qt or the vcpkg runtime did not deploy"
+          }
+          # The GPU layer loads the system loader rather than shipping one: a
+          # private vulkan-1.dll would shadow the driver's own loader and could
+          # not see the driver's ICDs, and Windows has no rpath-style override
+          # to recover from that. A machine without a Vulkan driver must start
+          # the app and fall back to the CPU, which windows-package-smoke
+          # asserts with --gpu-info.
+          if ($paths | Where-Object { $_ -like 'bin/vulkan-1.dll' }) {
+            throw 'bin/vulkan-1.dll is in the payload; the installer must use the driver-provided loader'
           }
           foreach ($required in 'bin/platforms/qwindows.dll', 'bin/platforms/qoffscreen.dll',
                                 'bin/alphashape.exe', 'bin/alphashape-cli.exe',
@@ -981,7 +1027,12 @@ jobs:
       # step installs pybind11's headers into the setup-python interpreter
       # instead (`pip install pybind11`), which is the one the installer is
       # supposed to carry a module for.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib
+      #
+      # vulkan-loader is here and *only* here: the shard needs a real
+      # vulkan-1.dll to talk to the lavapipe ICD installed below, while the
+      # installer must not ship one (the build job's list omits it, and
+      # windows-package asserts bin\vulkan-1.dll is absent from the payload).
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib vulkan-loader
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1002,6 +1053,57 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
             $env:VCPKG_PACKAGES.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # A hosted Windows runner has no Vulkan runtime and no Vulkan driver, so
+      # the GPU suites would all skip. Linux runs them on llvmpipe; this is the
+      # same thing for Windows: Mesa's lavapipe (VK_PHYSICAL_DEVICE_TYPE_CPU),
+      # which the tests recognise as a software device and therefore run the
+      # correctness assertions against while skipping the speed-up ones.
+      #
+      # pal1000/mesa-dist-win is the de-facto prebuilt Mesa for Windows. The
+      # DLL is Mesa under the MIT licence (see engine/LIMITATIONS.md); it is a
+      # test-only dependency and appears in no installer. The archive is pinned
+      # by URL and its SHA-256 is checked, so an upstream re-upload cannot
+      # change what CI executes.
+      - name: Install a software Vulkan driver (Mesa lavapipe)
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+            foreach ($candidate in 'C:\Program Files\7-Zip\7z.exe',
+                                   'C:\Program Files (x86)\7-Zip\7z.exe') {
+              if (Test-Path -LiteralPath $candidate) { $sevenZip = $candidate; break }
+            }
+          }
+          if (-not $sevenZip) { throw '7z.exe not found on the runner image' }
+
+          $url = 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z'
+          $expected = '351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695'
+          $archive = Join-Path $env:RUNNER_TEMP 'mesa.7z'
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+          if ($LASTEXITCODE -ne 0) { throw 'downloading the Mesa archive failed' }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Mesa archive SHA-256 is $actual, expected $expected; refusing to use it"
+          }
+
+          # The ICD manifest names '.\vulkan_lvp.dll', so the DLL and the JSON
+          # must stay in one directory.
+          $dest = Join-Path $env:RUNNER_TEMP 'mesa'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          & $sevenZip e $archive 'x64/vulkan_lvp.dll' 'x64/lvp_icd.x86_64.json' "-o$dest" -y
+          if ($LASTEXITCODE -ne 0) { throw 'extracting lavapipe from the Mesa archive failed' }
+          foreach ($file in 'vulkan_lvp.dll', 'lvp_icd.x86_64.json') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dest $file))) {
+              throw "$file did not come out of the Mesa archive"
+            }
+          }
+
+          # VK_DRIVER_FILES pins the loader to this driver: without it the
+          # loader would scan the registry and find nothing, because the runner
+          # has no GPU driver installed at all.
+          "VK_DRIVER_FILES=$dest\lvp_icd.x86_64.json" >> $env:GITHUB_ENV
+          "ALPHASHAPE_MESA_DIR=$dest" >> $env:GITHUB_ENV
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
@@ -1030,6 +1132,26 @@ jobs:
         run: |
           & "$env:SystemRoot\System32\tar.exe" -xzf build.tar.gz
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Proves the loader/driver wiring before the whole suite depends on it:
+      # without this, a broken ICD path shows up as every GPU test skipping, and
+      # a skipped test is green.
+      - name: GPU device is visible
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:ALPHASHAPE_MESA_DIR;$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          $cli = "build\src\apps\cli\alphashape-cli.exe"
+          if (-not (Test-Path -LiteralPath $cli)) { throw "$cli is not in the build tree" }
+          $output = & $cli --gpu-info 2>&1
+          $output | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "alphashape-cli --gpu-info exited $LASTEXITCODE" }
+          $text = ($output -join "`n")
+          if ($text -notmatch 'gpu device 0:') { throw 'no Vulkan device was enumerated' }
+          # lavapipe identifies itself as a software device, which is what the
+          # correctness tests key on; if it came back as hardware the timing
+          # assertions would run against a CPU and could fail for the wrong
+          # reason.
+          if ($text -notmatch 'software') { throw "expected a software device, got: $text" }
 
       - name: Select tests
         shell: pwsh

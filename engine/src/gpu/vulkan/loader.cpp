@@ -318,6 +318,15 @@ const Loader* load_library(std::string* reason) {
         // Platform sonames, in the order the platform's own loader would try.
         // On Linux the unversioned libvulkan.so is only present with the
         // development package, hence the versioned name comes first.
+        //
+        // Windows: vulkan-1.dll is the loader, and every graphics driver that
+        // supports Vulkan installs one into System32. It is deliberately not
+        // bundled with the installer -- a private copy would shadow the
+        // driver's loader and could not find the driver's ICDs, and the
+        // Windows loader has no LD_LIBRARY_PATH-style override to recover from
+        // that. LoadLibraryW resolves a bare name through the application
+        // directory, System32 and the PATH, which is exactly the search order
+        // a user expects.
 #if defined(__APPLE__)
         candidates.emplace_back("libvulkan.1.dylib");
         candidates.emplace_back("libvulkan.dylib");
@@ -359,6 +368,16 @@ const Loader* load_library(std::string* reason) {
         }
         if (!g_loader.loaded) {
             g_reason = last_reason;
+#if defined(_WIN32)
+            // A bare "LoadLibrary 'vulkan-1.dll' failed" reads like a defect in
+            // the program. It is not: Windows ships no Vulkan runtime of its
+            // own, it arrives with the graphics driver. Say so, because this
+            // string is what the app and `alphashape-cli --gpu-info` show a
+            // user whose machine has none.
+            g_reason += " (no Vulkan runtime found; Windows installs vulkan-1.dll with the "
+                        "graphics driver, so install or update the GPU driver to enable "
+                        "GPU acceleration -- every task runs on the CPU meanwhile)";
+#endif
         }
     }
     if (!g_loader.loaded) {

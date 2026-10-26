@@ -204,8 +204,27 @@ else()
                     "build would fail to start on a machine without LLVM installed")
 endif()
 
+# vcpkg's build-time-only ports can leave a DLL in the same bin directory that
+# nothing the application starts links. They are excluded by name rather than
+# by "whatever vcpkg happens to install", because the glob has to keep working
+# for the ports that are real runtime dependencies.
+#
+#   SPIRV-Tools-shared.dll  the shader *tool* port builds it beside spirv-val;
+#                           the engine embeds SPIR-V at build time and never
+#                           loads the library at run time.
+#   vulkan-1.dll            the Vulkan loader. Windows supplies one with the
+#                           graphics driver, and a private copy would be found
+#                           first (the application directory precedes System32
+#                           in the DLL search order) and could not see the
+#                           driver's ICDs. The engine opens it by name at run
+#                           time and falls back to the CPU when it is absent.
+set(ALPHASHAPE_TOOL_ONLY_DLL_PATTERNS
+    FILES_MATCHING PATTERN "*.dll"
+    PATTERN "SPIRV-Tools-shared.dll" EXCLUDE
+    PATTERN "vulkan-1.dll" EXCLUDE)
+
 install(DIRECTORY "${ALPHASHAPE_RUNTIME_DLL_DIR}/" DESTINATION bin COMPONENT core
-        FILES_MATCHING PATTERN "*.dll")
+        ${ALPHASHAPE_TOOL_ONLY_DLL_PATTERNS})
 install(FILES ${ALPHASHAPE_VC_RUNTIME_DLLS} DESTINATION bin COMPONENT core)
 if(ALPHASHAPE_LIBOMP_DLL)
     install(FILES "${ALPHASHAPE_LIBOMP_DLL}" DESTINATION bin COMPONENT core)
@@ -215,7 +234,7 @@ endif()
 if(ALPHASHAPE_BUILD_PYTHON AND TARGET alphashape_python)
     install(DIRECTORY "${ALPHASHAPE_RUNTIME_DLL_DIR}/"
             DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR} COMPONENT python
-            FILES_MATCHING PATTERN "*.dll")
+            ${ALPHASHAPE_TOOL_ONLY_DLL_PATTERNS})
     install(FILES ${ALPHASHAPE_VC_RUNTIME_DLLS}
             DESTINATION ${ALPHASHAPE_WINDOWS_PYTHON_DIR} COMPONENT python)
     if(ALPHASHAPE_LIBOMP_DLL)

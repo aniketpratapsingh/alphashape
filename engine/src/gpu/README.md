@@ -138,15 +138,29 @@ exceeds either fails at pipeline or image creation with `gpu::Error`, which
 
 ## Loading and ICD selection
 
-Nothing links `libvulkan`. `vulkan/loader.cpp` `dlopen`s, in order:
+Nothing links a Vulkan loader, on any platform. `vulkan/loader.cpp` `dlopen`s,
+in order:
 
 1. `$ALPHASHAPE_VULKAN_LIBRARY` (escape hatch for a different SDK),
-2. the SDK loader baked at configure time (`libvulkan.1.dylib`),
-3. `libvulkan.1.dylib`,
-4. `libvulkan.dylib`.
+2. the loader baked at configure time, when there is one (`libvulkan.1.dylib`
+   from the macOS SDK; empty on Linux and Windows),
+3. the platform soname: `libvulkan.1.dylib` / `libvulkan.dylib` on macOS,
+   `libvulkan.so.1` / `libvulkan.so` on Linux, `vulkan-1.dll` on Windows.
 
 Everything else is resolved through `vkGetInstanceProcAddr` into a function
 table. Any failure is reported through `unavailable_reason()` — never abort.
+
+On Windows the loader is opened by bare name, so `LoadLibraryW` searches the
+application directory, `System32` and `PATH` — the order the platform uses for
+any other system DLL. Windows ships no Vulkan runtime of its own: it arrives
+with the graphics driver. A machine without one therefore gets a false
+`available()` and a reason that says so, and every task runs on the CPU; it
+never fails to start. The installer deliberately does not ship `vulkan-1.dll`:
+a private copy would be found before the driver's loader (the application
+directory is searched first) and could not reach the driver's ICDs, and Windows
+has no `LD_LIBRARY_PATH`-style override to recover from that. The choice is
+therefore between "use the driver's loader" and "the GPU layer breaks on every
+machine that has a driver".
 
 MoltenVK is a portability driver, so the instance enables
 `VK_KHR_portability_enumeration` (with the enumerate-portability flag) and the
@@ -173,6 +187,13 @@ layer actually loaded; the debug-utils messenger counts errors, and
   and `vk_mem_alloc.h` are found, otherwise OFF with a STATUS message. With
   `OFF` the full API still exists: `available()` is false, every call reports
   the build-time reason, and tests skip.
+- Under vcpkg (Windows), the headers come from the `vulkan-headers` and
+  `vulkan-memory-allocator` ports and the tools from `shaderc` (glslc) and
+  `spirv-tools[tools]` (spirv-val). Those ports install the tools under
+  `<installed>/<triplet>/tools/<port>/` rather than `bin`, which is not on
+  `PATH`, so `cmake/alphashape_vulkan.cmake` probes that directory. `vulkan-loader`
+  is not a build dependency: nothing links it. It is installed only in the
+  Windows test lanes, which need a real loader to talk to the lavapipe ICD.
 
 `src/gpu/shaders/*.comp` are compiled by `glslc --target-env=vulkan1.2 -O` and
 validated by `spirv-val` at build time, then embedded into a generated `.cpp`
