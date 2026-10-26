@@ -45,7 +45,10 @@ namespace alphashape::stereo {
 ///     and prefers at least two, so it may reduce this count further. The number
 ///     of iterations actually used is the length of that plan.
 ///
-/// Throws ValueError for a non-positive `min_size` or a negative `levels`.
+/// Throws ValueError for a negative `levels`, or for a non-positive `min_size`
+/// when a pyramid is actually requested (`levels` != 1). `levels == 1` returns 1
+/// without consulting `min_size`: a single-level run has no halving to stop, so
+/// it neither needs nor is required to define the floor.
 int pyramid_level_count(int width, int height, int levels, int min_size, int window_radius);
 
 /// Iterations per level, coarsest first, summing to `iterations`.

@@ -45,23 +45,28 @@ int geometry_level_cap(int width, int height, int window_radius) {
 }  // namespace
 
 int pyramid_level_count(int width, int height, int levels, int min_size, int window_radius) {
-    if (min_size <= 0) {
-        throw ValueError("stereo::pyramid_level_count: min_size must be positive");
-    }
     if (levels < 0) {
         throw ValueError("stereo::pyramid_level_count: levels must be non-negative");
     }
     if (window_radius < 0) {
         throw ValueError("stereo::pyramid_level_count: window_radius must be non-negative");
     }
+    // An explicit single level does not consult min_size at all: there is no
+    // halving to stop, so a caller asking for one level is not required to
+    // supply (or even define) the floor an automatic pyramid needs. Checked
+    // before min_size so `levels == 1, min_size == 0` is a valid request, which
+    // is exactly what run_patch_match's own validation allows.
+    if (levels == 1) {
+        return 1;  // explicit single level: the pre-pyramid behaviour
+    }
+    if (min_size <= 0) {
+        throw ValueError("stereo::pyramid_level_count: min_size must be positive");
+    }
     if (width <= 0 || height <= 0) {
         return 1;
     }
 
     const int cap = geometry_level_cap(width, height, window_radius);
-    if (levels == 1) {
-        return 1;  // explicit single level: the pre-pyramid behaviour
-    }
 
     int wanted = 1;
     if (levels == 0) {
