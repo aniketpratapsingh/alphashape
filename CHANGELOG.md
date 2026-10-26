@@ -11,16 +11,24 @@ All notable changes to alphashape are recorded here. The format follows
 - **The orthomosaic's default cell is the ground sample distance the photographs actually resolve.** `BuildOrthomosaic` measures each camera's footprint on the DEM (median of slant range / (focal × cos incidence) over the enabled cameras) and uses that for the output grid instead of a fixed fraction of the DEM cell, so an oblique flight correctly comes out at about twice the nadir footprint. The measurement assumes level ground at the DEM median height: the incidence term is the vertical, not the local surface normal, so it does not follow a slope. A Geographic (EPSG:4326) grid gets the result converted to degrees at the surface's latitude.
 - **`BuildDem`'s automatic cell applies the same incidence correction**, so an oblique flight's DEM is no longer over-sampled by 1/cos(incidence).
 - Orthomosaic memory is bounded before allocation: per-camera tiles are cropped to their footprints, photographs are decoded one at a time, and a run whose estimated peak exceeds 60 % of physical RAM (`ALPHASHAPE_MEMORY_BUDGET_MB` overrides for tests) is refused with a message naming a coarser resolution.
+- **On a low-memory machine the orthomosaic's default resolution is coarsened automatically.** With `resolution` left at 0, a run whose estimate does not fit the memory budget is built at the finest cell that does fit (three significant figures), and a Warning reports the measured ground sample distance, the estimate, the budget and the chosen cell. An explicitly set `resolution` is never changed: it is still refused with an actionable message.
 
 ### Changed
 
-- The occlusion ray march steps at half a **DEM** cell rather than half the larger of the ortho and DEM cells, and each ray is capped at 4096 samples. Asking for an ortho 4× finer than the DEM no longer multiplies the march cost per unit area by 16. Occluders thinner than about one DEM cell can still be missed.
+- The occlusion ray march steps at half a **DEM** cell rather than half the larger of the ortho and DEM cells. Its stop is now metric and exact — the ray ends when it rises above the tallest DEM sample — instead of a fixed 4096-sample cap, which could drop a genuine occluder on a long slope viewed at a grazing angle. Asking for an ortho 4× finer than the DEM no longer multiplies the march cost per unit area. Occluders thinner than about one DEM cell can still be missed.
+- The orthomosaic memory estimate is now per stage (rectify, seams — including the alpha-expansion push-relabel graph — blend and finalize), reporting the largest stage rather than a sum of unrelated ones, and the guard runs **before** any grid-sized allocation, including the plane→local node map that used to be built first.
+- `BuildDem`'s robust extent clipping now applies from 200 samples instead of 1000, so a small block is protected too, and it logs an Info line naming the axis, the pre-clip and clipped extents in metres, and how many far samples were ignored.
 - `BuildDem` and `BuildOrthomosaic` no longer clamp an automatic resolution to a quarter of the DEM cell. The measured GSD stands, with only an eighth-of-a-cell sanity floor.
 
 ### Fixed
 
 - **Build Orthomosaic no longer overflows its grid dimensions.** A resolution fine enough to need more than 2^31−1 output cells (or a non-finite one) is refused in double precision with the resolution, the extent, the cell count and "choose a coarser resolution", instead of casting an unbounded double to `int` and then sizing buffers from a negative length.
+- **Build Orthomosaic reports an exhausted allocation honestly.** A `std::length_error` (a buffer whose size exceeds the maximum the process can represent) is treated the same as `std::bad_alloc` and converted to the actionable memory message, instead of escaping as an internal error.
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
+
+### Limitations
+
+- A full-resolution orthomosaic of a very large site on a low-memory machine is not possible yet: the output grid is still held in one piece, so the automatic cell is coarsened (with a Warning) or an explicit cell is refused. Block-wise processing — building the ortho in overlapping memory-bounded blocks at full resolution — is planned. See `engine/LIMITATIONS.md`.
 
 ## [0.1.0] - Unreleased
 
