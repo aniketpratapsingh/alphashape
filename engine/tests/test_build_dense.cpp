@@ -1052,6 +1052,65 @@ TEST(DepthMapsCancel, KeepsPointCloudAndOtherProducts) {
         << "a cancel changed the point cloud";
 }
 
+TEST(DepthMapsCancel, RepeatedCancelsMergeIntoOnePartialSet) {
+    // Cancelling twice, then finishing, leaves exactly ONE depth-map set: the
+    // first cancel writes a partial set, the second merges into it, and the
+    // successful run completes (replaces) it rather than appending beside it.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 3U);
+
+    const auto run_cancelled_after_two = [&] {
+        CancellingProgress cancel;
+        const double two_cameras = 2.0 / static_cast<double>(camera_count);
+        cancel.when = [two_cameras](const std::string& stage, double fraction) {
+            return stage == "buildDepthMaps" && fraction >= two_cameras;
+        };
+        Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                              cancel.progress()),
+                     CancelledError);
+    };
+
+    run_cancelled_after_two();
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U);
+    // Marked partial: this is the set a later run resumes from.
+    const DepthMapsAsset& first = document.active_chunk()->depth_map_sets().front();
+    ASSERT_NE(first.meta.find("status"), nullptr);
+    EXPECT_EQ(*first.meta.find("status"), "partial");
+    const std::int32_t partial_id = first.id;
+    const std::size_t maps_after_first = first.data->size();
+    ASSERT_GT(maps_after_first, 0U);
+
+    run_cancelled_after_two();
+    // Still ONE set, and it still carries at least what the first cancel kept:
+    // the second cancel merged into the partial set instead of appending.
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U)
+        << "a second cancel appended a second set";
+    EXPECT_EQ(document.active_chunk()->depth_map_sets().front().id, partial_id);
+    EXPECT_GE(document.active_chunk()->depth_map_sets().front().data->size(), maps_after_first);
+
+    // Finish normally (reuse on, so it resumes from the partial set).
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const Chunk& after = *document.active_chunk();
+    ASSERT_EQ(after.depth_map_sets().size(), 1U)
+        << "a completed run must replace the partial set it resumed from";
+    const DepthMapsAsset& finished = after.depth_map_sets().front();
+    EXPECT_EQ(finished.id, partial_id);
+    EXPECT_EQ(finished.meta.find("status"), nullptr)
+        << "the completed set is not a resume target";
+    EXPECT_FALSE(finished.data->empty());
+    // Every map went through the filter this time.
+    for (const DepthMap& map : *finished.data) {
+        EXPECT_GE(map.filter_mode, 0) << "camera " << map.camera_id;
+    }
+    // And the reuse actually paid off: the run only searched the cameras the
+    // cancels had not finished.
+    EXPECT_LT(depth_map_search_count(), after.depth_maps().size());
+}
+
 // ---------------------------------------------------------------------------
 // 2. A cancel inside one camera works: the sweep hook polls between sweeps
 // ---------------------------------------------------------------------------

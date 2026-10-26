@@ -10,11 +10,11 @@
 //
 // INCREMENTAL. A camera's search is hours of work at downscale 2, so the run is
 // checkpointed in this task's own terms: every finished map stays staged, and a
-// cancellation stores the maps finished so far as a new depth-map asset before
-// rethrowing CancelledError. Those maps are unfiltered (no cross-view pass has
-// run yet) but complete per camera, carry their alignment fingerprint, and are
-// reused by the next run with `reuse_depth` — which then filters them properly
-// against the neighbourhood that finally exists.
+// cancellation stores the maps finished so far before rethrowing CancelledError.
+// Those maps are unfiltered (no cross-view pass has run yet) but complete per
+// camera, carry their alignment fingerprint, and are reused by the next run with
+// `reuse_depth` — which then filters them properly against the neighbourhood
+// that finally exists.
 //
 // REUSE. `reuse_depth` (default on) skips the PatchMatch search for a camera
 // whose existing map matches BOTH the working downscale and the camera's
@@ -32,10 +32,11 @@
 // rather than after the current camera.
 //
 // Everything else is committed with a single assignment. A finished run appends
-// a NEW depth-map asset and makes it active, and drops every point cloud (each
-// was fused from maps that are no longer active). A CANCELLED run commits depth
-// maps only: point clouds and every other product are left untouched. Images
-// are decoded once and cached for the task's lifetime, keyed by camera id.
+// a NEW depth-map asset and makes it active (or completes the "partial" set it
+// resumed from), and drops every point cloud (each was fused from maps that are
+// no longer active). A CANCELLED run commits depth maps only: point clouds and
+// every other product are left untouched. Images are decoded once and cached
+// for the task's lifetime, keyed by camera id.
 
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
 
@@ -74,6 +75,14 @@ namespace alphashape {
 namespace {
 
 constexpr int kMaxNeighborsExclusive = 256;
+
+/// Set metadata marking a depth-map set a CANCELLED run left behind: every map
+/// in it is per-camera complete but has not been through the cross-view filter.
+/// It is how a later run recognises the set to merge into (further cancels) or
+/// to replace (on success) instead of appending yet another set. Persisted with
+/// the asset's <meta>, so it survives a save/load.
+constexpr const char* kPartialStatusKey = "status";
+constexpr const char* kPartialStatusValue = "partial";
 
 /// Resolve a frame's recorded path against the document's directory (the same
 /// rule AddPhotos/DetectFeatures use). A document with no path (unsaved, in
@@ -470,39 +479,83 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     std::vector<std::string> errors(neighbourhoods.size());
     std::atomic<bool> self_checked{false};
 
-    // Checkpoint the maps finished so far into the chunk as a new depth-map
-    // asset, then rethrow. Called only on cancellation, when those maps are
-    // valid per camera but have not been through the cross-view filter (their
-    // filter_mode is still -1). A cancelled run that finished nothing leaves the
+    // A set an EARLIER run left behind when it was cancelled: its maps are
+    // per-camera complete but unfiltered. Resuming from it means the next
+    // checkpoint must MERGE into it and a successful run must REPLACE it,
+    // rather than piling up a new set per cancel. -1 means "this run started
+    // from no partial set" and a cancel simply appends one.
+    const std::int32_t resumed_partial_id = [&]() -> std::int32_t {
+        const DepthMapsAsset* active =
+            find_asset(chunk->depth_map_sets(), chunk->active_depth_maps_id());
+        if (active == nullptr) {
+            return -1;
+        }
+        const std::string* status = active->meta.find(kPartialStatusKey);
+        return status != nullptr && *status == kPartialStatusValue ? active->id : -1;
+    }();
+    // The current partial set's id, updated as this run checkpoints: -1 until
+    // this run writes one.
+    std::int32_t partial_id = resumed_partial_id;
+
+    // Checkpoint the maps finished so far into the chunk, then rethrow. Called
+    // only on cancellation. A cancelled run that finished nothing leaves the
     // chunk untouched, so "cancel" on the first camera is still a no-op.
     //
     // WHAT A CANCEL COMMITS: depth maps, and nothing else. Every other product
     // (point clouds, models, DEMs, orthomosaics, earlier depth-map sets) is
-    // left exactly as it was. A cancel is not a statement that those products
+    // left exactly as it was: a cancel is not a statement that those products
     // are stale, and destroying hours of unrelated work would make the Cancel
-    // button dangerous. A SUCCESSFUL run still drops the point clouds, because
-    // it replaces the maps they were fused from (see the commit block below).
-    // Keeping the finished maps is the deliberate exception to "a task that
-    // throws leaves the document as it found it": the alternative is discarding
-    // hours of completed work. The set is labelled and carries fingerprints, so
-    // a later run can use it and cannot mistake a stale map for a current one.
+    // button dangerous. (A SUCCESSFUL run still drops the point clouds, because
+    // it replaces the maps they were fused from; see the commit block below.)
+    //
+    // REPEATED CANCELS: the checkpoint merges into the set the run resumed
+    // from, or into the set this run already wrote, and marks it "partial".
+    // Without that, cancelling N times would leave N nearly-identical sets.
     const auto checkpoint_and_throw = [&](const std::string& message) {
         if (built.empty()) {
             throw CancelledError(message);
         }
         Chunk staged = std::move(*chunk);
-        DepthMapsAsset& set = staged.add_depth_maps(params.get_string("label"));
-        // A copy, not the staged vector: `built` is still alive in the frame
-        // that logs how many were kept, after the chunk has been reassigned.
-        *set.data = built;
+        // Union of the previous partial set (if any) and this run's maps, keyed
+        // by camera. This run's copies win: a reused map came from that very
+        // set, and a fresh search is newer than anything parked there.
+        std::unordered_map<std::int32_t, DepthMap> merged;
+        const DepthMapsAsset* previous = find_asset(staged.depth_map_sets(), partial_id);
+        if (previous != nullptr && previous->data != nullptr) {
+            for (const DepthMap& map : *previous->data) {
+                merged.emplace(map.camera_id, map);
+            }
+        }
+        for (const DepthMap& map : built) {
+            merged[map.camera_id] = map;
+        }
+        std::vector<DepthMap> combined;
+        combined.reserve(merged.size());
+        for (auto& entry : merged) {
+            combined.push_back(std::move(entry.second));
+        }
+        std::sort(combined.begin(), combined.end(), [](const DepthMap& a, const DepthMap& b) {
+            return a.camera_id < b.camera_id;
+        });
+
+        DepthMapsAsset* target = find_asset(staged.depth_map_sets(), partial_id);
+        if (target == nullptr) {
+            target = &staged.add_depth_maps(params.get_string("label"));
+            partial_id = target->id;
+        }
+        const std::size_t kept = combined.size();
+        const std::string label = target->label;
+        const std::int32_t target_id = target->id;
+        *target->data = std::move(combined);
+        target->meta.set(kPartialStatusKey, kPartialStatusValue);
+        staged.set_active_depth_maps_id(target->id);
         *chunk = std::move(staged);
-        // The reuse lookup of a LATER run reads the active set only, so the new
+        // The reuse lookup of a LATER run reads the active set only, so this
         // partial set is exactly what it should continue from; earlier sets
         // stay in the chunk for inspection, as they do after a completed run.
         log(LogLevel::Info) << "BuildDepthMaps: cancelled after " << built.size() << " of "
-                            << neighbourhoods.size() << " cameras; kept them as asset "
-                            << chunk->active_depth_maps_id() << " ("
-                            << chunk->depth_map_sets().back().label
+                            << neighbourhoods.size() << " cameras; kept " << kept
+                            << " map(s) as asset " << target_id << " (" << label
                             << "), unfiltered. Re-run with reuse_depth to continue.";
         throw CancelledError(message);
     };
@@ -711,13 +764,35 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // -- commit atomically ---------------------------------------------------
     progress.update("finalize", 0.0);
     Chunk staged = std::move(*chunk);
-    // Each run appends a NEW depth-map set; earlier sets are kept.
-    DepthMapsAsset& set = staged.add_depth_maps(params.get_string("label"));
-    *set.data = std::move(filtered);
+    std::string written_label;
+    DepthMapsAsset* set = find_asset(staged.depth_map_sets(), partial_id);
+    if (set != nullptr) {
+        // This run RESUMED from a partial set a cancelled run left behind. A
+        // successful run completes that set rather than adding a second one
+        // beside it: the partial set and its replacement describe the same
+        // cameras, and keeping both would leave the tree with two overlapping
+        // sets after a few cancels. The maps are replaced wholesale (the run
+        // holds every camera the partial set had, now filtered), and the
+        // partial marker is cleared so the set is no longer a resume target.
+        set->data->clear();
+        *set->data = std::move(filtered);
+        set->meta.items.erase(
+            std::remove_if(set->meta.items.begin(), set->meta.items.end(),
+                           [](const auto& item) { return item.first == kPartialStatusKey; }),
+            set->meta.items.end());
+        staged.set_active_depth_maps_id(set->id);
+    } else {
+        // No partial set to complete: append a NEW depth-map set; earlier sets
+        // are kept.
+        DepthMapsAsset& added = staged.add_depth_maps(params.get_string("label"));
+        *added.data = std::move(filtered);
+        set = &added;
+    }
+    written_label = set->label;
     // Every point cloud is derived from depth maps, so the ones already in the
     // chunk no longer describe the active maps. Drop them rather than leave a
-    // cloud that looks current but was fused from different maps. This is
-    // SUCCESS-only: a cancelled run keeps them, see checkpoint_and_throw.
+    // cloud that looks current but was fused from different maps. (This is
+    // SUCCESS-only: a cancelled run keeps them, see checkpoint_and_throw.)
     staged.point_clouds().clear();
     staged.set_active_point_cloud_id(-1);
     *chunk = std::move(staged);
@@ -727,8 +802,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         log(LogLevel::Info) << "BuildDepthMaps: " << chunk->depth_maps().size() << " of "
                             << chunk->cameras().size() << " cameras at downscale " << downscale
                             << ", filter " << stereo::to_string(filter_mode) << " -> asset "
-                            << chunk->active_depth_maps_id() << " '"
-                            << chunk->depth_map_sets().back().label << "'";
+                            << chunk->active_depth_maps_id() << " '" << written_label << "'";
     }
 }
 
