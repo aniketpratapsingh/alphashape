@@ -1098,9 +1098,11 @@ TEST(Seam, PinnedLabelThatTheTileSetDoesNotCoverIsIgnored) {
         tile.y0 = 0;
         tile.width = kWidth - 3;
         tile.height = kHeight;
-        tile.rgb.assign(static_cast<std::size_t>(tile.width) * tile.height * 3, 128);
-        tile.valid.assign(static_cast<std::size_t>(tile.width) * tile.height, 1);
-        tile.score.assign(static_cast<std::size_t>(tile.width) * tile.height, 1.0F);
+        const std::size_t cells = static_cast<std::size_t>(tile.width) *
+                                  static_cast<std::size_t>(tile.height);
+        tile.rgb.assign(cells * 3, 128);
+        tile.valid.assign(cells, 1);
+        tile.score.assign(cells, 1.0F);
     }
     std::vector<std::int32_t> pinned_labels(static_cast<std::size_t>(kWidth) * kHeight, 0);
     std::vector<std::uint8_t> pinned(pinned_labels.size(), 0);

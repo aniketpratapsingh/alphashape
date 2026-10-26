@@ -1420,7 +1420,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         //   3. round the answer UP to three significant figures (rounding to
         //      nearest could land back on the far side of the budget) and
         //      re-check; nudge up 1% if the rounding lost the fit.
-        const auto fits_at = [&](double cell) { return !plan_at(grid_at(cell)).coarsened; };
         const double default_resolution = resolution;
         double too_fine = resolution;  // known: does not fit
         double fits = 0.0;             // known: fits
