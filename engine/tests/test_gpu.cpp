@@ -403,19 +403,22 @@ TEST(Gpu, MissingLibraryIsReportedNotFatal) {
         GTEST_SKIP() << "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
     }
     std::string reason;
-    // Spelled per platform so the assertion below is about our own message and
-    // not about a path separator that happens to be unrepresentable.
+    // A file name that exists nowhere, spelled per platform. The sentinel is
+    // the same token on every platform so the assertion below is about the
+    // message quoting the path, not about the platform's naming convention.
 #if defined(_WIN32)
-    const std::string missing = "Z:\\nonexistent\\alphashape\\nope-vulkan-1.dll";
+    const std::string missing = "Z:\\nonexistent\\alphashape\\nopeNopeVulkan-1.dll";
 #elif defined(__APPLE__)
-    const std::string missing = "/nonexistent/alphashape/libNopeVulkan.dylib";
+    const std::string missing = "/nonexistent/alphashape/nopeNopeVulkan.1.dylib";
 #else
-    const std::string missing = "/nonexistent/alphashape/libNopeVulkan.so.1";
+    const std::string missing = "/nonexistent/alphashape/nopeNopeVulkan.so.1";
 #endif
     const bool loaded = detail::try_load_library(missing, &reason);
     EXPECT_FALSE(loaded);
     EXPECT_FALSE(reason.empty());
-    EXPECT_NE(reason.find("NopeVulkan"), std::string::npos) << reason;
+    // The reason has to name the path that was tried; a bare "the module could
+    // not be found" leaves a user with nothing to check.
+    EXPECT_NE(reason.find("nopeNopeVulkan"), std::string::npos) << reason;
 }
 
 // The Windows failure mode this exists for: a build with the GPU layer compiled
