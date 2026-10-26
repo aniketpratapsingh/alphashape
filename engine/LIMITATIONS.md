@@ -234,21 +234,43 @@ sections below give the engineering detail behind each item.
   `VK_KHR_portability_enumeration` and the device enables
   `VK_KHR_portability_subset`; both are probed and enabled only when advertised,
   so the non-portability path runs on Linux and Windows.
-- **`pm_init` is built without the SPIR-V optimiser on NVIDIA hardware.** It is
+- **`pm_init` is built without the SPIR-V optimiser on every platform.** It is
   the only kernel that is: `pm_refine`, which does all of the per-pixel work, is
-  optimised. On a Tesla T4 with driver 535.161.07 the optimised `pm_init` module
-  returns a wrong random-plane normal — 0.92% of pixels match the CPU reference
-  while the depths drawn from the same stream are 100% exact — and the
-  unoptimised module is correct there and elsewhere. Three generator shapes were
-  tried (mutable state, keyed stream with a loop, keyed stream with straight-line
-  draws) and the figure did not move, so it is not state loss or draw order; the
-  shaders' own undefined behaviour was found and fixed separately (an
-  out-of-range index in a dead branch, aggregate `inout` search state,
-  contractible expressions in front of `floor()`). `pm_refine` is correct at `-O`
-  on that same GPU in the same run. The remaining difference is not yet
-  explained, and the ruled-out list is recorded at `rng_draw()` in `pm_math.glsl`
-  so the next attempt starts from there. The cost is small: one short dispatch
-  per colour.
+  optimised everywhere. On a Tesla T4 with driver 535.161.07 the optimised
+  `pm_init` module returns a wrong random-plane normal — 0.92% of pixels match
+  the CPU reference while the depths drawn from the same stream are 100% exact —
+  and the unoptimised module is correct there and elsewhere. Three generator
+  shapes were tried (mutable state, keyed stream with a loop, keyed stream with
+  straight-line draws) and the figure did not move, so it is not state loss or
+  draw order; the shaders' own undefined behaviour was found and fixed separately
+  (an out-of-range index in a dead branch, aggregate `inout` search state,
+  contractible expressions in front of `floor()`). `pm_refine` is exact at `-O`
+  on that same GPU in the same run, so the remaining difference is not the shared
+  cost core. It is not yet explained, and the ruled-out list is recorded at
+  `rng_draw()` in `pm_math.glsl` so the next attempt starts from there. The cost
+  is small: one short dispatch per colour.
+  The exemption is unconditional rather than keyed on NVIDIA because the shader
+  is compiled and embedded when the engine is built, not when a device is
+  selected, and because the unoptimised module is correct everywhere while the
+  optimised one is known to be wrong on hardware we cannot test from a macOS or
+  lavapipe lane. Making it conditional would also mean shipping two modules.
+- **GPU PatchMatch's depth search is exact against the CPU, and is tested as
+  such.** Both implementations draw the same hypotheses from the same keyed
+  stream and evaluate the same ZNCC cost, so they agree bit for bit as long as no
+  expression on the path from a hypothesis to a sampled texel is contracted into
+  a fused multiply-add. Getting that path wrong is not a rounding nuisance: a
+  single ulp moves `sample_image()`'s `floor()` to a neighbouring texel, which
+  changes a ZNCC, which flips the winner-take-all selection for that pixel. On
+  the Tesla T4, marking only the final projected coordinates `precise` left
+  optimised `pm_refine` at 93.4% dense agreement; marking the whole chain — the
+  facing dot, `rho = depth * nb`, the candidate depth, the camera-frame point and
+  the projection's internals — restores 100.0%. `PatchMatchGpu.RefineSweepsMatchCpu`
+  gates it at ≥99.9% on hardware, and `TvFusionGpu.BuildModelMeetsCpuBounds`
+  asserts the fused mesh's boundary-edge count is *equal*, which is a
+  discontinuous function of that agreement and the sharpest available check.
+  The guarantee is about the refiner's arithmetic, not about other drivers'
+  transcendental functions: agreement is exact on the drivers tested, and the
+  test's floor leaves room for a driver whose `sin`/`cos` round differently.
 - **What Linux/llvmpipe and Windows/lavapipe do and do not validate:** they do
   validate the loader path with a system loader and a system ICD, instance/device
   creation, the whole dispatch/buffer/barrier/validation-layer surface, and the

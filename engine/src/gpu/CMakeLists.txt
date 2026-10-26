@@ -56,9 +56,13 @@ if(ALPHASHAPE_GPU)
         shaders/poisson_axpy.comp)
     set(_spv_files "")
     # pm_refine -- the kernel that does all of the per-pixel work -- is
-    # optimised again. pm_init is the one kernel still exempt; see the NVIDIA
-    # note in alphashape_add_shader and the analysis at rng_draw() in
-    # pm_math.glsl. It is a single short dispatch per colour.
+    # optimised. pm_init is the one kernel still exempt, on every platform: its
+    # optimised module returns a wrong random-plane normal on the Tesla T4 and
+    # the cause is not yet isolated, while the unoptimised module is correct
+    # everywhere. The exemption is not keyed on the device, because the shader is
+    # compiled and embedded at build time, not at device selection. See the note
+    # at rng_draw() in pm_math.glsl and the NVIDIA note in
+    # alphashape_add_shader. It is a single short dispatch per colour.
     set(_unoptimised_shaders shaders/pm_init.comp)
     foreach(_shader IN LISTS _shader_sources)
         if(_shader IN_LIST _unoptimised_shaders)

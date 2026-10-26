@@ -199,10 +199,13 @@ endfunction()
 # on this list for a wrong random-plane normal on an NVIDIA Tesla T4. Two causes
 # were found and fixed (an out-of-range index in a dead branch, and aggregate
 # `inout` search state), which was enough for pm_refine -- the kernel that does
-# all the work -- to be correct at -O on that GPU. pm_init still is not, and the
+# all the work -- to be exact at -O on that GPU. pm_init still is not, and the
 # remaining difference is not yet explained; see the OPEN ISSUE at rng_draw() in
 # pm_math.glsl, which records exactly what has been ruled out so the next
-# diagnosis starts from there instead of from the beginning.
+# diagnosis starts from there instead of from the beginning. That one kernel is
+# built unoptimised on every platform: the module is compiled and embedded when
+# the engine is built, not when a device is chosen, and the unoptimised module is
+# correct everywhere. The cost is one short dispatch per colour.
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
     if("NO_OPTIMIZE" IN_LIST ARGN)
