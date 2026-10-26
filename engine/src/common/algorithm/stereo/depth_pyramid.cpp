@@ -292,13 +292,18 @@ double pyramid_search_span(const std::vector<float>& depth, int width, int heigh
     // the full median for a smooth map, and the stride keeps the work bounded
     // and, being a pure function of the geometry, deterministic.
     const std::size_t interior = si(x1 - x0 + 1) * si(y1 - y0 + 1);
+    // Sample at most ~200k windows: the median of a systematic sample is as
+    // stable as the full median for a smooth map, and the cap keeps the cost
+    // below the sweeps it exists to save. `stride` is an int (it is used as a
+    // step on int coordinates), so the division is done in std::size_t.
+    constexpr std::size_t kMaxWindows = 200000;
     int stride = 1;
-    while (interior / (si(stride) * si(stride)) > 200000) {
+    while (interior / (si(stride) * si(stride)) > kMaxWindows) {
         ++stride;
     }
 
     std::vector<double> spreads;
-    spreads.reserve(interior / (si(stride) * si(stride)) + 1);
+    spreads.reserve(interior / (si(stride) * si(stride)) + si(1));
     for (int y = y0; y <= y1; y += stride) {
         for (int x = x0; x <= x1; x += stride) {
             if (!(depth[si(y) * si(width) + si(x)] > 0.0F)) {
