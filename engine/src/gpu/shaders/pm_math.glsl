@@ -222,11 +222,9 @@ float rng_uniform64(U64 bits) {
     // (bits >> 11) * 2^-53. The expression is written so the two operands never
     // exceed 2^24 (exact in float32): the high 29 bits scaled by 2^-29 plus the
     // remaining 24 bits scaled by 2^-53.
-    precise float hi_part = float(bits.hi >> 3u) * (1.0 / 536870912.0);
-    precise float lo_part =
-        float((bits.hi & 7u) << 21u | (bits.lo >> 11u)) * (1.0 / 9007199254740992.0);
-    precise float result = hi_part + lo_part;
-    return result;
+    float hi_part = float(bits.hi >> 3u) * (1.0 / 536870912.0);
+    float lo_part = float((bits.hi & 7u) << 21u | (bits.lo >> 11u)) * (1.0 / 9007199254740992.0);
+    return hi_part + lo_part;
 }
 
 float rng_uniform(RngKey key, uint index) { return rng_uniform64(rng_draw(key, index)); }
@@ -259,7 +257,7 @@ vec3 random_unit_vector(RngKey key, uint index) {
 vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
-    precise float ct = cos_min + (1.0 - cos_min) * rng_uniform(key, index + 0u);
+    float ct = cos_min + (1.0 - cos_min) * rng_uniform(key, index + 0u);
     float st = sqrt(max(0.0, 1.0 - ct * ct));
     float phi = PM_TWO_PI * rng_uniform(key, index + 1u);
     vec3 u = any_orthogonal(axis);
@@ -269,7 +267,7 @@ vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
 
 // n rotated by a random angle in [0, max_angle] about a random axis.
 vec3 perturb_normal(RngKey key, uint index, vec3 n, float max_angle) {
-    precise float angle = max_angle * rng_uniform(key, index + 0u);
+    float angle = max_angle * rng_uniform(key, index + 0u);
     vec3 axis = random_unit_vector(key, index + 1u);
     if (abs(dot(axis, n)) > 0.999) {
         axis = any_orthogonal(n);
@@ -283,7 +281,7 @@ vec3 perturb_normal(RngKey key, uint index, vec3 n, float max_angle) {
 float random_depth(RngKey key, uint index) {
     float lo = 1.0 / pc.depth_max;
     float hi = 1.0 / pc.depth_min;
-    precise float inv = lo + (hi - lo) * rng_uniform(key, index + 0u);
+    float inv = lo + (hi - lo) * rng_uniform(key, index + 0u);
     return 1.0 / inv;
 }
 
@@ -356,11 +354,13 @@ float sample_image(int image_base, int vw, int vh, float x, float y) {
     float v10 = nb_img[row_a + xb];
     float v01 = nb_img[row_b + xa];
     float v11 = nb_img[row_b + xb];
-    // Orthogonal to the pixel grid, so these are the exact operation sequence of
-    // the CPU's sample_image() (`v00 * (1 - ax) + v10 * ax`); contracting them
-    // into an FMA would change the sampled value near zero weights.
-    precise float top = v00 * (1.0 - ax) + v10 * ax;
-    precise float bottom = v01 * (1.0 - ax) + v11 * ax;
-    precise float result = top * (1.0 - ay) + bottom * ay;
-    return result;
+    // Deliberately NOT `precise`: this runs once per window sample per
+    // neighbour (49 x 32 in the worst case), and NoContraction there is what
+    // made glslc -O blow past the memory of a CI runner. Contracting this mix
+    // perturbs the sampled value in its last bit only; it does not move the
+    // sample to another texel, which is the effect that actually flips a match
+    // (see project_point below).
+    float top = v00 * (1.0 - ax) + v10 * ax;
+    float bottom = v01 * (1.0 - ax) + v11 * ax;
+    return top * (1.0 - ay) + bottom * ay;
 }

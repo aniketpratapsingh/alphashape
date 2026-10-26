@@ -79,11 +79,8 @@ bool window_is_textured(int pixel) {
         sq += v * v;
     }
     float inv = 1.0 / float(n);
-    // `sum * mean` is a contracted multiply-subtract candidate; the CPU computes
-    // `sq - sum * mean` as two rounded operations, and this test decides the
-    // texture mask, i.e. which pixels are searchable at all.
-    precise float mean = sum * inv;
-    precise float var = max(0.0, sq - sum * mean);
+    float mean = sum * inv;
+    float var = max(0.0, sq - sum * mean);
     return sqrt(var * inv) >= pc.min_texture;
 }
 
@@ -157,9 +154,10 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
             continue;  // edge-on or behind the reference camera for every view
         }
         // Even if every remaining sample were valid, a window that has already
-        // lost too many cannot reach the quorum: stop early, as neighbour_cost()
-        // does on the CPU. A wide-baseline neighbour (most of a nadir grid) dies
-        // here after a handful of samples instead of walking the whole window.
+        // lost too many cannot reach the quorum: stop early, as the CPU does.
+        // Apart from skipping work for views that cannot see the pixel (most of
+        // a nadir grid), this shortens the loop the optimiser has to reason
+        // about, which matters when it is building the module at -O.
         if (valid + (n - k) < min_valid) {
             valid_out = valid;
             return PM_NO_MATCH_COST;
@@ -302,7 +300,7 @@ Best evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, Best best)
     if (!(depth > pc.depth_min && depth < pc.depth_max)) {
         return best;
     }
-    precise float nb = dot(n, b_p);
+    float nb = dot(n, b_p);
     if (nb >= -PM_FACING_EPS) {
         return best;
     }
@@ -322,33 +320,22 @@ vec3 pixel_bearing(int pixel) {
     return vec3(bearings[pixel * 3 + 0], bearings[pixel * 3 + 1], bearings[pixel * 3 + 2]);
 }
 
-// Transfer pixel q's plane onto pixel p's bearing (as propagate()), reading q
-// from the state buffers of the previous half-sweep. Returns false when q has no
-// usable plane, or when that plane faces away at p, so the caller drops the
-// candidate. Deliberately does not evaluate: the caller collects all of a
-// pixel's candidates first, so that evaluate_hypothesis() -- and with it the
-// whole multiview_cost() loop -- has exactly one call site in the kernel.
-//
-// That single call site is not a stylistic choice. pm_refine has nine to eleven
-// candidates per pixel; as separate call sites the optimiser inlined a full copy
-// of the 32-neighbour x 49-sample cost loop for each one, which made glslc -O
-// need tens of gigabytes and get OOM-killed on a CI runner (exit 137). Batch
-// them and the module stays small while the evaluation order is unchanged.
-bool propagate_plane(int q, vec3 b_p, out float depth_out, out vec3 normal_out) {
+// Propagate pixel q's plane onto pixel p (as propagate()), reading q from the
+// state buffers of the previous half-sweep. Returns the updated `Best`, like
+// evaluate_hypothesis(): no aggregate `inout` anywhere in the search core.
+Best propagate(int x, int y, int q, vec3 b_p, Best best) {
     float qd = state_depth[q];
     if (!(qd > 0.0)) {
-        return false;
+        return best;
     }
     vec3 n = vec3(state_normal[q * 3 + 0], state_normal[q * 3 + 1], state_normal[q * 3 + 2]);
     if (dot(n, n) < 1e-12) {
-        return false;
+        return best;
     }
-    precise float rho_q = qd * dot(n, pixel_bearing(q));
-    precise float denom = dot(n, b_p);
+    float rho_q = qd * dot(n, pixel_bearing(q));
+    float denom = dot(n, b_p);
     if (denom >= -PM_FACING_EPS) {
-        return false;
+        return best;
     }
-    depth_out = rho_q / denom;
-    normal_out = n;
-    return true;
+    return evaluate_hypothesis(x, y, rho_q / denom, n, b_p, best);
 }
