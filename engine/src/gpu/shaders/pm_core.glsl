@@ -26,8 +26,19 @@ shared ivec2 s_offsets[PM_MAX_SAMPLES];
 // workgroup's 8x16 tile. A tile's first pixel has colour (origin.x + origin.y) &
 // 1; within the tile the column parity flips with the row, so the 64
 // same-colour pixels are four per row over sixteen rows.
+//
+// pc.row_offset shifts the tile grid down by whole tiles, so one half-sweep can
+// be issued as several row bands: at a large image size one dispatch would
+// otherwise run for seconds on a GPU shared with the display. The shift is a
+// multiple of PM_TILE_Y, so (origin.x + origin.y) & 1 -- and therefore which
+// colour each lane owns -- is unchanged: a band's workgroup covers exactly the
+// pixels the full dispatch's workgroup of the same index covers. Combined with
+// the red-black fixed-point property (every propagation source is the opposite
+// colour, i.e. a pixel this half-sweep does not write), banding is a pure
+// scheduling change and the result is bit-identical.
 ivec2 lane_pixel(int lane) {
-    ivec2 origin = ivec2(int(gl_WorkGroupID.x) * PM_TILE_X, int(gl_WorkGroupID.y) * PM_TILE_Y);
+    ivec2 origin = ivec2(int(gl_WorkGroupID.x) * PM_TILE_X,
+                         int(gl_WorkGroupID.y) * PM_TILE_Y + int(pc.row_offset));
     int local_parity = (int(pc.colour) ^ ((origin.x + origin.y) & 1));
     int ly = lane / (PM_TILE_X / 2);
     int ordinal = lane % (PM_TILE_X / 2);

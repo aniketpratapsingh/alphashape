@@ -15,6 +15,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
+#include "base/platform/env.hpp"
 #include "gpu/gpu.hpp"
 #include "image/image.hpp"
 #include "model/camera/calibration.hpp"
@@ -93,13 +94,46 @@ struct PmParams {
     std::uint32_t seed_lo;
     std::uint32_t seed_hi;
     std::uint32_t touch;
+    std::uint32_t row_offset;
 };
 
-static_assert(sizeof(PmParams) == 76, "PmParams must match the GLSL push-constant size");
+static_assert(sizeof(PmParams) == 80, "PmParams must match the GLSL push-constant size");
 static_assert(offsetof(PmParams, depth_min) == 32, "PmParams layout drifted");
 static_assert(offsetof(PmParams, radius) == 60, "PmParams layout drifted");
 static_assert(offsetof(PmParams, seed_lo) == 64, "PmParams layout drifted");
 static_assert(offsetof(PmParams, touch) == 72, "PmParams layout drifted");
+static_assert(offsetof(PmParams, row_offset) == 76, "PmParams layout drifted");
+
+/// Largest pixel count one half-sweep dispatch should cover. A pm_init or
+/// pm_refine over a whole large image is a single multi-second dispatch, which
+/// on a GPU shared with the display starves the compositor and can hang the
+/// machine (#28); the per-submission batcher cannot help, because one half-sweep
+/// must see the state the previous one wrote. Whole tile rows are therefore
+/// issued as separate dispatches in the same submission.
+///
+/// Bit-identical by construction: pm_init and pm_refine write only pixels of
+/// their own checkerboard colour and read only the opposite colour (all four
+/// adjacent and all four distance-3 offsets flip the parity), so a band's
+/// sources are never written by any band of the same half-sweep. The tile grid
+/// is shifted by whole tiles, so (origin.x + origin.y) & 1 -- which colour a lane
+/// owns -- is unchanged, and every barrier a split adds is the same
+/// compute->compute dependency the unsplit command buffer already has.
+///
+/// ALPHASHAPE_GPU_MAX_BAND_PIXELS pins the target (tests use a tiny value to
+/// force many bands and compare against the unsplit path); an empty or
+/// non-numeric value keeps the default.
+constexpr std::size_t kDefaultBandPixels = 250'000;
+
+std::size_t band_pixel_target() {
+    const std::string text = platform::get_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+    if (!text.empty() && text.find_first_not_of("0123456789") == std::string::npos) {
+        const unsigned long long value = std::strtoull(text.c_str(), nullptr, 10);
+        if (value > 0) {
+            return static_cast<std::size_t>(value);
+        }
+    }
+    return kDefaultBandPixels;
+}
 
 /// Window offsets, identical to the CPU's construction (multiples of
 /// window_step in [-r, r] including both endpoints and the centre).
@@ -352,10 +386,27 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         static_cast<std::uint32_t>((width + kTileX - 1) / kTileX),
         static_cast<std::uint32_t>((height + kTileY - 1) / kTileY), 1};
 
+    // One half-sweep is one dispatch per row band: a whole large image in one
+    // dispatch is a multi-second job that starves the display GPU (#28), and the
+    // per-submission batcher cannot split it because a half-sweep has to see
+    // what the previous one wrote. Bands are bit-identical (see
+    // band_pixel_target): a band is a shift of the tile grid by whole tiles, and
+    // every propagation source is the opposite colour, so no band reads what
+    // another band of the same half-sweep writes.
+    const std::size_t band_pixels = band_pixel_target();
+    const std::uint32_t rows_per_band = [&] {
+        // Whole tiles, so the colour a lane owns never changes.
+        const std::size_t rows = std::max<std::size_t>(band_pixels / static_cast<std::size_t>(width), 1);
+        const std::size_t tiles = std::max<std::size_t>(rows / kTileY, 1);
+        return static_cast<std::uint32_t>(tiles * kTileY);
+    }();
+
     // Initialise both colours (the CPU's initial random hypothesis, plus the
     // texture mask), then the red-black sweeps.
     std::vector<g::Dispatch> dispatches;
-    dispatches.reserve(static_cast<std::size_t>(2 + 2 * options.iterations + 1));
+    const std::size_t bands =
+        (static_cast<std::size_t>(height) + rows_per_band - 1) / rows_per_band;
+    dispatches.reserve((static_cast<std::size_t>(2 + 2 * options.iterations)) * bands + 1);
     const auto make_dispatch = [&](const char* kernel) {
         g::Dispatch dispatch;
         dispatch.kernel = kernel;
@@ -364,12 +415,30 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         dispatch.groups = groups;
         return dispatch;
     };
+    // A half-sweep: one dispatch per band of rows, in ascending order.
+    const auto push_half_sweep = [&](const char* kernel) {
+        if (bands <= 1) {
+            params.row_offset = 0;
+            dispatches.push_back(make_dispatch(kernel));
+            return;
+        }
+        for (std::size_t band = 0; band < bands; ++band) {
+            const std::size_t row = band * rows_per_band;
+            params.row_offset = static_cast<std::uint32_t>(row);
+            g::Dispatch dispatch = make_dispatch(kernel);
+            dispatch.groups[1] = static_cast<std::uint32_t>(
+                (std::min(static_cast<std::size_t>(height), row + rows_per_band) - row +
+                 kTileY - 1) /
+                kTileY);
+            dispatches.push_back(std::move(dispatch));
+        }
+    };
 
     for (std::uint32_t colour = 0; colour < 2; ++colour) {
         params.colour = colour;
         params.iteration = kNoIteration;
         params.iteration_hi = kNoIteration;
-        dispatches.push_back(make_dispatch("pm_init"));
+        push_half_sweep("pm_init");
     }
     params.depth_delta = inv_span * 0.5F;
     params.normal_angle = static_cast<float>(1.0471975511965976 * 0.5);
@@ -382,12 +451,14 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         params.normal_angle = static_cast<float>(1.0471975511965976 * static_cast<double>(s));
         for (std::uint32_t colour = 0; colour < 2; ++colour) {
             params.colour = colour;
-            dispatches.push_back(make_dispatch("pm_refine"));
+            push_half_sweep("pm_refine");
         }
     }
 
-    // Finalise with the grouped 1D layout (256 wide).
+    // Finalise with the grouped 1D layout (256 wide). It indexes by pixel, not
+    // by lane, so it is never banded; row_offset stays 0.
     params.max_cost = static_cast<float>(options.max_cost);
+    params.row_offset = 0;
     g::Dispatch finalize;
     finalize.kernel = "pm_finalize";
     finalize.buffers = buffers;
@@ -400,12 +471,15 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // time on the weak AMD test box, which puts a single all-sweeps submission
     // past amdgpu's 10 s job timeout and cancels the context (device lost ->
     // CPU fallback). On a GPU shared with the display (Apple silicon) a job
-    // that long starves the compositor and can hang the machine. Each
-    // half-sweep is one step; the first submission carries two (the two
-    // pm_init colours) and the limiter then scales the step count towards the
-    // device's target duration, so a slow device gets short jobs and a fast one
-    // keeps the GPU saturated. The barriers a split adds are the same ones
-    // gpu::run already inserts between dispatches, so the result is identical.
+    // that long starves the compositor and can hang the machine. One dispatch
+    // is now one step -- a quarter-sweep row band on a large image, a whole
+    // half-sweep otherwise -- because a band writes pixels no other band of the
+    // same half-sweep reads, so it is independently schedulable. The first
+    // submission carries two (the two pm_init dispatches, exactly the old
+    // behaviour when nothing is banded) and the limiter then scales towards the
+    // device's target duration. The barriers a split adds are the same ones
+    // gpu::run already inserts between dispatches, and neither a band split nor
+    // a submission split changes any pixel's inputs, so the result is identical.
     g::BatchLimiter limiter(/*dispatches_per_step=*/1, /*initial_steps=*/2);
     g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/1);
 

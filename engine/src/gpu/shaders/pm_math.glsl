@@ -38,6 +38,7 @@ layout(push_constant) uniform PmParams {
     uint seed_lo;       // PatchMatchOptions::seed, low word
     uint seed_hi;       // PatchMatchOptions::seed, high word
     uint touch;         // always 0: keeps every binding alive through -O
+    uint row_offset;    // first output row of this dispatch's row band
 } pc;
 
 layout(binding = 0) buffer RefImage { float ref_img[]; };
