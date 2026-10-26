@@ -272,7 +272,7 @@ struct PlaneToLocalMap {
 
 std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     const elevation::SurfaceFrame& frame, const RasterGrid& grid,
-    const GeoRaster<float>& heights, float nodata) {
+    const GeoRaster<float>& heights, float nodata, double fallback_height) {
     if (frame.is_local()) {
         return {};  // identity: the pose already lives in the plane frame
     }
@@ -292,7 +292,10 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     // Nodes whose cell is nodata fall back to the raster's median valid height:
     // the node is only a control point for the interpolation, and the query
     // height is applied exactly on top.
-    double fallback = median_height(heights, nodata);
+    double fallback = fallback_height;
+    if (!std::isfinite(fallback)) {
+        fallback = median_height(heights, nodata);
+    }
     if (!std::isfinite(fallback)) {
         fallback = 0.0;
     }
@@ -517,9 +520,7 @@ constexpr double kSeamGraphCellFraction = 0.25;
 
 /// Bytes per camera footprint cell in a rectified tile (rgb u8x3 + valid u8 +
 /// score float).
-constexpr double kBytesPerTileCell = 8.0;
-
-/// A coarse seamline pyramid level holds its tiles at 1/factor^2 of the fine
+constexpr double kBytesPerTileCell = 8.0;/// A coarse seamline pyramid level holds its tiles at 1/factor^2 of the fine
 /// area; the two configured levels (2x and 4x) therefore add 1/4 + 1/16 of the
 /// footprint. The coarse levels also build their own Field (best/any_valid/
 /// parity at the coarse cell count) and their own label vector.
@@ -580,6 +581,28 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
     return std::max(std::max(stages.rectify, stages.seams),
                     std::max(stages.blend, stages.finalize));
 }
+
+/// The largest block side the plan considers (cells).
+constexpr int kMaxBlockCells = 4096;
+/// The smallest block side the plan considers (cells). Below this the
+/// per-block overhead (margin, one photograph, the seam field's fixed cost)
+/// dominates and further shrinking buys almost nothing.
+constexpr int kMinBlockCells = 512;
+/// A block's estimate must stay inside this fraction of the budget. The rest of
+/// the budget holds the assembled output (8 B/cell of the OUTPUT grid), the
+/// decoded-photograph cache and the rest of the process (the document, the DEM,
+/// the plane->local map's own pool).
+constexpr double kBlockBudgetFraction = 0.5;
+/// At most this fraction of the budget goes to decoded photographs.
+constexpr double kPhotoCacheBudgetFraction = 0.15;
+/// The absolute ceiling on the decoded-photograph cache, whatever the machine's
+/// budget: beyond a handful of frames the reuse stops paying for the bytes.
+constexpr std::uint64_t kPhotoCacheMaxBytes = 512ULL * 1024ULL * 1024ULL;
+/// The absolute per-block peak the automatic plan aims for. Half a budget could
+/// be 12 GB on a big workstation, which is not a bound anyone asked for; the
+/// owner's target (a 28 M-cell, 36-photo, 1.9 cm site) is under 2 GB, and a
+/// 1024-cell block with a 192-cell margin meets it with room to spare.
+constexpr double kBlockPeakTargetBytes = 1.5e9;
 
 /// The lowest and highest valid sample of a surface raster. Scanned once by the
 /// caller and passed down: the auto-coarsening search calls the estimator tens
@@ -674,7 +697,226 @@ double largest_photograph_cells(const std::vector<CameraEntry>& cameras) {
     return largest;
 }
 
+/// An LRU cache of decoded photographs, bounded by BYTES.
+///
+/// A block decodes every camera that reaches it; consecutive blocks share most
+/// of those cameras, so reusing the decode is the difference between one decode
+/// per (block, camera) pair and one per camera. The cache is bounded by the
+/// plan's share of the memory budget, so it can never be the reason a run does
+/// not fit. Least-recently-used entries are dropped first, and the entry just
+/// handed out is always kept (a single photograph larger than the whole cache
+/// still works: it stays the only entry).
+class PhotoCache {
+public:
+    explicit PhotoCache(std::uint64_t budget_bytes) : budget_(budget_bytes) {}
+
+    /// The decoded photograph for `slot`, decoding (and caching) it on a miss.
+    /// Returns an empty image when the file cannot be read; the caller turns
+    /// that into the same ValueError the uncached path raises.
+    const Image& get(std::size_t slot, const std::string& path) {
+        const auto found = index_.find(slot);
+        if (found != index_.end()) {
+            ++hits_;
+            entries_[found->second].last = ++clock_;
+            return entries_[found->second].image;
+        }
+        ++misses_;
+        Image image = read_image(path);
+        if (image.empty()) {
+            static const Image kEmpty;
+            return kEmpty;
+        }
+        const std::uint64_t bytes = static_cast<std::uint64_t>(image.size_bytes());
+        evict_for(bytes);
+        entries_.push_back(Entry{slot, bytes, ++clock_, std::move(image)});
+        index_.emplace(slot, entries_.size() - 1);
+        used_ += bytes;
+        return entries_.back().image;
+    }
+
+private:
+    struct Entry {
+        std::size_t slot = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t last = 0;
+        Image image;
+    };
+
+    /// Drop least-recently-used entries until `incoming` more bytes fit. The
+    /// entry being inserted is not in `entries_` yet, so a cache of exactly one
+    /// frame's bytes always holds the frame the caller is using.
+    void evict_for(std::uint64_t incoming) {
+        while (budget_ > 0 && !entries_.empty() && used_ + incoming > budget_) {
+            std::size_t victim = 0;
+            for (std::size_t i = 1; i < entries_.size(); ++i) {
+                if (entries_[i].last < entries_[victim].last) {
+                    victim = i;
+                }
+            }
+            used_ -= entries_[victim].bytes;
+            index_.erase(entries_[victim].slot);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(victim));
+            for (std::size_t i = victim; i < entries_.size(); ++i) {
+                index_[entries_[i].slot] = i;
+            }
+        }
+    }
+
+    std::uint64_t budget_ = 0;  ///< 0 = unbounded (the whole-grid path)
+    std::uint64_t used_ = 0;
+    std::uint64_t clock_ = 0;
+    std::size_t hits_ = 0;
+    std::size_t misses_ = 0;
+    std::vector<Entry> entries_;
+    std::unordered_map<std::size_t, std::size_t> index_;
+};
+
 }  // namespace
+
+// -- block plan --------------------------------------------------------------
+
+int block_margin_cells(int block_cells) {
+    // A quarter of the side, clamped to [16, 192]. The upper bound is the mosaic
+    // blend's reach: its pyramid stops at 6 levels (the level_count() cap), and
+    // two 5-tap blurs per reduce and expand touch about 2 * 2^levels cells, so
+    // 128 cells of margin hold the whole pyramid support at full depth. The
+    // extra headroom absorbs the block plan's rounding and the seam labeller's
+    // own 4x coarse level.
+    if (block_cells <= 0) {
+        return 0;
+    }
+    return std::clamp(block_cells / 4, 16, 192);
+}
+
+double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
+                                 bool has_node_map, double photo_cells,
+                                 std::uint64_t output_cells,
+                                 std::uint64_t photo_cache_bytes) {
+    // The window's stages are the estimator the whole-grid path already uses,
+    // with the window's (block + margin) cell count and its own footprint. The
+    // assembled output raster (RGBA, 4 B) plus its seam labels (int32, 4 B) is
+    // resident from the first block on and grows to the full output grid.
+    const double window = estimate_peak_bytes(window_cells, window_footprint_cells, has_node_map,
+                                              photo_cells);
+    const double assembled = static_cast<double>(output_cells) *
+                             (kBytesPerCellGridLabels + 4.0 /* result RGBA */);
+    return window + assembled + static_cast<double>(photo_cache_bytes);
+}
+
+OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
+    const std::uint64_t width = static_cast<std::uint64_t>(std::max(0, input.grid_width));
+    const std::uint64_t height = static_cast<std::uint64_t>(std::max(0, input.grid_height));
+    const std::uint64_t output_cells = width * height;
+
+    OrthoBlockPlan plan;
+
+    /// Everything about one candidate block side, so the override, the search
+    /// and the "even the minimum does not fit" fallback all agree.
+    const auto plan_for_side = [&](int side) {
+        OrthoBlockPlan out;
+        out.block_cells = side;
+        out.margin_cells = block_margin_cells(side);
+        const std::uint64_t step = static_cast<std::uint64_t>(std::max(1, side));
+        out.columns = std::max(1, static_cast<int>((width + step - 1) / step));
+        out.rows = std::max(1, static_cast<int>((height + step - 1) / step));
+        const std::uint64_t window_w =
+            std::min<std::uint64_t>(width, static_cast<std::uint64_t>(side + 2 * out.margin_cells));
+        const std::uint64_t window_h =
+            std::min<std::uint64_t>(height, static_cast<std::uint64_t>(side + 2 * out.margin_cells));
+        const std::uint64_t window_cells = std::max<std::uint64_t>(1, window_w * window_h);
+        // A window sees every camera whose crop box touches it. Clipping never
+        // grows a box, so the window's footprint is at most the whole grid's AND
+        // at most one window per camera; the smaller bound keeps a fully
+        // overlapping oblique flight (every camera sees the whole site) honest
+        // without overstating a sparse one.
+        const double by_cameras =
+            static_cast<double>(std::max(1, input.camera_count)) *
+            static_cast<double>(window_cells);
+        const double window_footprint =
+            std::max(1.0, std::min(input.footprint_cells, by_cameras));
+        // A decoded-photograph cache can only ever hold the whole flight, and
+        // its own share of the budget is capped so a huge machine does not trade
+        // the memory saved by blocking back for cached frames.
+        const double photo_bytes = 3.0 * std::max(1.0, input.photo_cells);
+        std::uint64_t cache = 0;
+        if (input.budget_bytes != 0) {
+            const double share = kPhotoCacheBudgetFraction *
+                                 static_cast<double>(input.budget_bytes);
+            const double flight = photo_bytes * static_cast<double>(input.camera_count);
+            cache = static_cast<std::uint64_t>(
+                std::min(share, std::min(flight, static_cast<double>(kPhotoCacheMaxBytes))));
+        }
+        out.photo_cache_bytes = cache;
+        out.estimated_peak_bytes = estimate_block_peak_bytes(
+            window_cells, window_footprint, input.has_node_map, input.photo_cells,
+            output_cells, cache);
+        // The mosaic pyramid depth every block applies: the whole grid's depth,
+        // never deeper than the margin can carry.
+        const int margin_levels = static_cast<int>(
+            std::floor(std::log2(static_cast<double>(std::max(1, out.margin_cells))))) - 1;
+        out.levels = std::max(0, margin_levels);
+        if (width > 0 && height > 0) {
+            const int whole_levels = ortho::pyramid_level_count(
+                static_cast<int>(width), static_cast<int>(height));
+            out.levels = std::min(out.levels, whole_levels);
+        }
+        return out;
+    };
+
+    // One piece: the whole grid fits the budget, so keep exactly the previous
+    // behaviour (one block, no margin, no photo cache, no re-indexing) and the
+    // output stays byte-identical. This is the path every small raster takes.
+    if (input.forced_block_cells <= 0 && input.budget_bytes == 0) {
+        plan.block_cells = 0;
+        plan.levels = -1;
+        // Exactly one decoded frame resident, as the single-piece code has
+        // always held: the cache reuses it across the one block only.
+        plan.photo_cache_bytes =
+            static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
+        plan.estimated_peak_bytes =
+            estimate_peak_bytes(output_cells, input.footprint_cells, input.has_node_map,
+                                input.photo_cells);
+        return plan;
+    }
+    if (input.forced_block_cells <= 0) {
+        const double whole = estimate_peak_bytes(output_cells, input.footprint_cells,
+                                                 input.has_node_map, input.photo_cells);
+        if (whole <= static_cast<double>(input.budget_bytes)) {
+            plan.block_cells = 0;
+            plan.levels = -1;
+            plan.photo_cache_bytes =
+                static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
+            plan.estimated_peak_bytes = whole;
+            return plan;
+        }
+    }
+
+    if (input.forced_block_cells > 0) {
+        // An explicit override is honoured as given (a test or an expert knob);
+        // the margin, the pyramid depth and the estimate still follow the same
+        // rules so the result is well defined.
+        return plan_for_side(input.forced_block_cells);
+    }
+
+    // Automatic: the largest side whose estimate stays inside the smaller of
+    // half the budget and the absolute per-block target. The target is what
+    // keeps the owner's 28 M-cell / 36-photo case under 2 GB on a machine whose
+    // budget would otherwise allow much bigger blocks.
+    const double limit = std::min(kBlockBudgetFraction * static_cast<double>(input.budget_bytes),
+                                  kBlockPeakTargetBytes);
+    for (int side = kMaxBlockCells; side >= kMinBlockCells; side /= 2) {
+        OrthoBlockPlan candidate = plan_for_side(side);
+        if (candidate.estimated_peak_bytes <= limit) {
+            return candidate;
+        }
+    }
+
+    // Even the smallest block does not fit at this resolution: the caller falls
+    // back to coarsening the cell (the estimator's last resort).
+    plan = plan_for_side(kMinBlockCells);
+    plan.coarsened = true;
+    return plan;
+}
 
 namespace ortho {
 namespace {
@@ -823,6 +1065,15 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new orthomosaic asset. Empty selects "
                     "\"Orthomosaic <n>\". Each run creates a new asset."});
+
+    ParamSpec block_size{"block_size", ParamType::Int, std::int64_t{0},
+                         "Side of one processing block in output cells. 0 chooses the largest "
+                         "power-of-two side (512..4096) whose estimated peak fits half the "
+                         "memory budget, and processes the whole grid in one piece when even "
+                         "that fits. The result is the same product either way; this exists "
+                         "to bound memory on very large sites."};
+    block_size.minimum = std::int64_t{0};
+    params.declare(block_size);
 }
 
 std::vector<Stage> BuildOrthomosaicTask::stages() const {
@@ -1118,13 +1369,35 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         return ortho_grid_for(surface.grid, cell);
     };
 
+    // -- block plan for a candidate grid -------------------------------------
+    // The block layout is what actually bounds memory now, so the guard asks
+    // the planner rather than comparing the whole-grid peak with the budget:
+    // a grid that does not fit in one piece is fine as long as a minimum block
+    // of it does. Only a grid where even that fails falls back to coarsening.
+    const auto plan_at = [&](const RasterGrid& candidate_grid) {
+        OrthoBlockPlanInput input;
+        input.grid_width = candidate_grid.width;
+        input.grid_height = candidate_grid.height;
+        input.footprint_cells = predicted_footprint_cells(cameras, candidate_grid, heights, frame);
+        input.photo_cells = photo_cells;
+        input.camera_count = static_cast<int>(cameras.size());
+        input.has_node_map = !frame.is_local();
+        input.budget_bytes = budget;
+        input.forced_block_cells = 0;
+        return plan_ortho_blocks(input);
+    };
+
     RasterGrid grid = ortho_grid_for(surface.grid, resolution);
+    const OrthoBlockPlan default_plan = plan_at(grid);
+    // For the human-readable diagnostics: what the whole grid in one piece
+    // would have needed. The planner's own figure is the blocked peak.
     const double default_peak = peak_at(grid);
-    if (budget != 0 && default_peak > static_cast<double>(budget)) {
+    if (budget != 0 && default_plan.coarsened) {
         if (options.resolution > 0.0) {
             throw ValueError(
                 "BuildOrthomosaic needs about " + platform::format_gb(default_peak) +
-                " at resolution " + format_number(resolution) + " m; this machine has " +
+                " at resolution " + format_number(resolution) +
+                " m even in " + std::to_string(kMinBlockCells) + "-cell blocks; this machine has " +
                 platform::format_gb(static_cast<double>(
                     platform::total_physical_memory_bytes())) +
                 ". Set a coarser resolution (e.g. " +
@@ -1134,12 +1407,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         // Automatic cell: coarsen to the finest value that fits rather than
         // refusing a run the user did not ask to be at a particular scale.
         //
-        // The peak is monotone non-increasing in the cell size (a coarser cell
-        // means fewer output cells, and every grid-proportional and
+        // The planner's verdict is monotone non-increasing in the cell size (a
+        // coarser cell means fewer output cells, and every grid-proportional and
         // footprint-proportional term shrinks with it), so the finest fitting
         // cell can be found by bisection:
         //
-        //   1. bracket it -- double the cell until the estimate fits (coarsening
+        //   1. bracket it -- double the cell until a minimum block fits (coarsening
         //      always ends at a 1x1 grid, whose estimate is tiny, so this
         //      terminates unless even one cell's photograph does not fit);
         //   2. bisect geometrically between the last too-fine and the last
@@ -1147,6 +1420,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         //   3. round the answer UP to three significant figures (rounding to
         //      nearest could land back on the far side of the budget) and
         //      re-check; nudge up 1% if the rounding lost the fit.
+        const auto fits_at = [&](double cell) { return !plan_at(grid_at(cell)).coarsened; };
         const double default_resolution = resolution;
         double too_fine = resolution;  // known: does not fit
         double fits = 0.0;             // known: fits
@@ -1155,7 +1429,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             if (!std::isfinite(trial)) {
                 break;
             }
-            if (peak_at(grid_at(trial)) <= static_cast<double>(budget)) {
+            if (!plan_at(grid_at(trial)).coarsened) {
                 fits = trial;
                 break;
             }
@@ -1174,7 +1448,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             if (!(mid > too_fine) || !(mid < fits)) {
                 break;
             }
-            if (peak_at(grid_at(mid)) <= static_cast<double>(budget)) {
+            if (!plan_at(grid_at(mid)).coarsened) {
                 fits = mid;
             } else {
                 too_fine = mid;
@@ -1186,7 +1460,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         double chosen = ceil_sig3(fits);
         bool fits_after_rounding = false;
         for (int step = 0; step < 64; ++step) {
-            if (peak_at(grid_at(chosen)) <= static_cast<double>(budget)) {
+            if (!plan_at(grid_at(chosen)).coarsened) {
                 fits_after_rounding = true;
                 break;
             }
@@ -1215,122 +1489,291 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     }
     progress.update("initialize", 1.0);
 
-    // -- rectification -------------------------------------------------------
-    // plane_to_local is built once and shared by every camera: the map is a
-    // property of the grid, not of the view. For a Local frame it is empty and
-    // the pose is already in the plane frame. This is the first allocation that
-    // scales with the grid, and it happens only after the guard above.
-    const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
-        make_plane_to_local(frame, grid, surface, surface_nodata);
+    // -- block layout --------------------------------------------------------
+    // A run whose whole grid fits keeps the previous single-piece behaviour. A
+    // larger one is processed block by block: each block rectifies only the
+    // cameras whose footprint reaches it, into block+margin buffers, and only
+    // the block's interior is copied into the assembled output.
+    //
+    // The layout is re-planned on the FINAL grid (the guard above may have
+    // coarsened it) so the estimate and the margin match what actually runs.
+    OrthoBlockPlanInput plan_input;
+    plan_input.grid_width = grid.width;
+    plan_input.grid_height = grid.height;
+    plan_input.footprint_cells = predicted_footprint_cells(cameras, grid, heights, frame);
+    plan_input.photo_cells = photo_cells;
+    plan_input.camera_count = static_cast<int>(cameras.size());
+    plan_input.has_node_map = !frame.is_local();
+    plan_input.budget_bytes = budget;
+    plan_input.forced_block_cells =
+        static_cast<int>(std::max<std::int64_t>(0, params.get_int("block_size")));
+    OrthoBlockPlan plan = plan_ortho_blocks(plan_input);
+    if (plan.block_cells > 0) {
+        log(LogLevel::Info) << "BuildOrthomosaic: processing in " << plan.columns << "x"
+                            << plan.rows << " blocks of " << plan.block_cells << " (+"
+                            << plan.margin_cells << " margin, mosaic levels " << plan.levels
+                            << "), predicted peak ~"
+                            << platform::format_gb(plan.estimated_peak_bytes);
+    }
+
+    // The plane->local fallback height is a whole-DEM median: scanned once here
+    // and handed to each block's map, instead of once per block.
+    const double fallback_height = frame.is_local() ? 0.0 : median_height(surface, surface_nodata);
 
     // The ortho grid and the DEM share a plane: in a Geographic frame both are
     // in degrees, so heights divide by degrees. The orthorectifier's occlusion
     // march compares a ray against metre heights and needs the ground metric,
     // which is why it is handed the frame's metres-per-unit explicitly.
-    const Eigen::Vector2d metres_per_unit =
-        frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
     const double occlusion_tolerance =
         kOcclusionToleranceCells * surface.grid.pixel_size_x *
-        std::max(metres_per_unit.x(), metres_per_unit.y());
-    std::vector<ortho::OrthoTile> tiles;
-    tiles.reserve(cameras.size());
-    for (std::size_t i = 0; i < cameras.size(); ++i) {
-        if (progress.is_cancelled()) {
-            throw Error("BuildOrthomosaic cancelled");
-        }
-        const CameraEntry& entry = cameras[i];
-        // Decode this camera's photograph, rectify it, and drop it again: only
-        // one full-resolution frame is ever resident.
-        const Image image = read_image(entry.image_path);
-        if (image.empty()) {
-            throw ValueError("BuildOrthomosaic: camera " +
-                             std::to_string(entry.camera_id) + " has an unreadable image");
-        }
-        ortho::OrthoCamera camera;
-        camera.calibration = entry.calibration;
-        camera.R = entry.R;
-        camera.t = entry.t;
-        camera.image = &image;
-        camera.plane_metres_per_unit = metres_per_unit;
-        if (to_local) {
-            camera.plane_to_local = to_local;
-            // The inverse the tile crop needs to place the footprint on the
-            // plane grid. Full-precision to_plane (not the bilinear map's
-            // inverse): the crop only has to be conservative, and this is the
-            // exact map the orthorectifier's own plane_to_local approximates.
-            camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
-                return frame.to_plane(p);
-            };
-            camera.plane_centre = plane_centres[i];
-        }
-        tiles.push_back(ortho::orthorectify(surface, surface_nodata, grid, camera,
-                                           static_cast<int>(tiles.size()),
-                                           occlusion_tolerance));
-        progress.update("rectify",
-                        static_cast<double>(i + 1) / static_cast<double>(cameras.size()));
-    }
-    if (Log::enabled(LogLevel::Info)) {
-        std::size_t valid_total = 0;
-        for (const ortho::OrthoTile& tile : tiles) {
-            for (const std::uint8_t v : tile.valid) {
-                valid_total += v != 0 ? 1U : 0U;
-            }
-        }
-        log(LogLevel::Info) << "BuildOrthomosaic: rectified " << tiles.size()
-                            << " cameras, " << valid_total << " valid tile cells";
-    }
+        std::max(frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y()).x(),
+                 frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y()).y());
 
-    // -- seamlines -----------------------------------------------------------
-    std::vector<std::int32_t> labels;
-    if (options.refine_seamlines) {
-        labels = ortho::assign_seams(grid.width, grid.height, tiles, ortho::SeamOptions{});
-    } else {
-        ortho::SeamOptions argmax_only;
-        argmax_only.iterations = 0;
-        labels = ortho::assign_seams(grid.width, grid.height, tiles, argmax_only);
-    }
-    progress.update("seamlines", 1.0);
-
-    // -- blend ---------------------------------------------------------------
-    const ortho::OrthoMosaic mosaic =
-        ortho::blend(grid.width, grid.height, tiles, labels, options.blending);
-    progress.update("blend", 1.0);
-
-    // -- finalize ------------------------------------------------------------
-    // The blend's labels index `tiles`, which is camera order. Map them to the
-    // chunk camera ids so the container means the same thing as Chunk::cameras().
+    // The assembled product, written block by block. RGBA + labels is the only
+    // grid-sized object the blocked path ever holds, and it is allocated at the
+    // FIRST block's copy: the single-piece path then has exactly the previous
+    // allocation order (mosaic alive, then the result), so its peak and bytes
+    // are unchanged.
     Orthomosaic result;
     result.raster.grid = grid;
     result.raster.channels = 4;
-    result.raster.data.resize(static_cast<std::size_t>(grid.width) *
-                              static_cast<std::size_t>(grid.height) * 4U);
-    for (std::size_t i = 0; i < mosaic.labels.size(); ++i) {
-        const std::int32_t label = mosaic.labels[i];
-        result.labels.push_back(label >= 0 ? cameras[static_cast<std::size_t>(label)].camera_id
-                                           : -1);
-        result.raster.data[i * 4 + 0] = mosaic.rgb[i * 3 + 0];
-        result.raster.data[i * 4 + 1] = mosaic.rgb[i * 3 + 1];
-        result.raster.data[i * 4 + 2] = mosaic.rgb[i * 3 + 2];
-        result.raster.data[i * 4 + 3] = mosaic.valid[i] != 0 ? 255 : 0;
+    const std::size_t output_cells =
+        static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height);
+
+    std::unordered_map<std::int32_t, std::size_t> camera_slot;
+    camera_slot.reserve(cameras.size());
+    for (std::size_t i = 0; i < cameras.size(); ++i) {
+        camera_slot.emplace(cameras[i].camera_id, i);
+    }
+
+    PhotoCache photos(plan.photo_cache_bytes);
+
+    const int columns = std::max(1, plan.columns);
+    const int rows = std::max(1, plan.rows);
+    const int total_blocks = columns * rows;
+    int block_index = 0;
+
+    for (int br = 0; br < rows; ++br) {
+        for (int bc = 0; bc < columns; ++bc, ++block_index) {
+            if (progress.is_cancelled()) {
+                throw Error("BuildOrthomosaic cancelled");
+            }
+            const int side = plan.block_cells > 0 ? plan.block_cells : std::max(grid.width, grid.height);
+            const int bx0 = bc * side;
+            const int by0 = br * side;
+            const int bx1 = std::min(grid.width, bx0 + side);
+            const int by1 = std::min(grid.height, by0 + side);
+            if (bx0 >= bx1 || by0 >= by1) {
+                continue;
+            }
+            const int margin = plan.block_cells > 0 ? plan.margin_cells : 0;
+            const int wx0 = std::max(0, bx0 - margin);
+            const int wy0 = std::max(0, by0 - margin);
+            const int wx1 = std::min(grid.width, bx1 + margin);
+            const int wy1 = std::min(grid.height, by1 + margin);
+
+            RasterGrid window;
+            window.pixel_size_x = grid.pixel_size_x;
+            window.pixel_size_y = grid.pixel_size_y;
+            window.origin_x = grid.origin_x + static_cast<double>(wx0) * grid.pixel_size_x;
+            window.origin_y = grid.origin_y - static_cast<double>(wy0) * grid.pixel_size_y;
+            window.width = wx1 - wx0;
+            window.height = wy1 - wy0;
+
+            // Per-block plane->local map: the node lattice follows the block, so
+            // a large output never carries the whole-grid map (20 B/cell).
+            const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
+                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height);
+            const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
+                window.pixel_center(0, window.height / 2).y());
+
+            // Cameras whose footprint reaches this window. Skipping the others
+            // is what makes a block cheap: their tiles would be empty anyway.
+            std::vector<std::size_t> block_cameras;
+            block_cameras.reserve(cameras.size());
+            for (std::size_t i = 0; i < cameras.size(); ++i) {
+                const CameraEntry& entry = cameras[i];
+                ortho::OrthoCamera probe;
+                probe.calibration = entry.calibration;
+                probe.R = entry.R;
+                probe.t = entry.t;
+                probe.plane_metres_per_unit = metres_per_unit;
+                double local_low = heights.lowest;
+                double local_high = heights.highest;
+                if (to_local) {
+                    probe.plane_to_local = to_local;
+                    probe.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                        return frame.to_plane(p);
+                    };
+                    const Eigen::Vector2d mid =
+                        window.pixel_center(window.width / 2, window.height / 2);
+                    const Eigen::Vector3d lo =
+                        frame.to_local(Eigen::Vector3d(mid.x(), mid.y(), heights.lowest));
+                    const Eigen::Vector3d hi =
+                        frame.to_local(Eigen::Vector3d(mid.x(), mid.y(), heights.highest));
+                    local_low = std::min(lo.z(), hi.z());
+                    local_high = std::max(lo.z(), hi.z());
+                }
+                const ortho::TileBounds bounds = ortho::camera_footprint_bounds(
+                    window, probe, local_low, local_high, 2);
+                if (bounds.width <= 0 || bounds.height <= 0) {
+                    continue;  // does not reach this window
+                }
+                block_cameras.push_back(i);
+            }
+
+            std::vector<ortho::OrthoTile> tiles;
+            tiles.reserve(block_cameras.size());
+            for (std::size_t k = 0; k < block_cameras.size(); ++k) {
+                if (progress.is_cancelled()) {
+                    throw Error("BuildOrthomosaic cancelled");
+                }
+                const CameraEntry& entry = cameras[block_cameras[k]];
+                const Image& image = photos.get(block_cameras[k], entry.image_path);
+                if (image.empty()) {
+                    throw ValueError("BuildOrthomosaic: camera " +
+                                     std::to_string(entry.camera_id) +
+                                     " has an unreadable image");
+                }
+                ortho::OrthoCamera camera;
+                camera.calibration = entry.calibration;
+                camera.R = entry.R;
+                camera.t = entry.t;
+                camera.image = &image;
+                camera.plane_metres_per_unit = metres_per_unit;
+                if (to_local) {
+                    camera.plane_to_local = to_local;
+                    camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                        return frame.to_plane(p);
+                    };
+                    camera.plane_centre = plane_centres[block_cameras[k]];
+                }
+                tiles.push_back(ortho::orthorectify(surface, surface_nodata, window, camera,
+                                                   static_cast<int>(k), occlusion_tolerance));
+                progress.update("rectify",
+                                (static_cast<double>(block_index) +
+                                 static_cast<double>(k + 1) /
+                                     static_cast<double>(block_cameras.size())) /
+                                    static_cast<double>(total_blocks));
+            }
+
+            // -- seam continuity ---------------------------------------------
+            // Blocks run in raster order, so every cell above this block or to
+            // its left is already decided. Those labels are pinned: the margin
+            // keeps the seam paths continuous across a block border instead of
+            // letting the neighbouring block re-decide the overlap.
+            std::vector<std::int32_t> seed;
+            std::vector<std::uint8_t> frozen;
+            if (plan.block_cells > 0) {
+                const std::size_t window_cells =
+                    static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
+                seed.assign(window_cells, -1);
+                frozen.assign(window_cells, 0);
+                for (int row = 0; row < window.height; ++row) {
+                    for (int col = 0; col < window.width; ++col) {
+                        const int gx = wx0 + col;
+                        const int gy = wy0 + row;
+                        // Decided already iff the cell's own block precedes this
+                        // one in raster order. The right and bottom margin
+                        // belongs to later blocks and stays free.
+                        const int cell_block_col = gx / side;
+                        const int cell_block_row = gy / side;
+                        const int cell_index = cell_block_row * columns + cell_block_col;
+                        if (cell_index >= block_index) {
+                            continue;
+                        }
+                        const std::int32_t camera_id =
+                            result.labels[static_cast<std::size_t>(gy) *
+                                              static_cast<std::size_t>(grid.width) +
+                                          static_cast<std::size_t>(gx)];
+                        std::int32_t tile_index = -1;
+                        if (camera_id >= 0) {
+                            const auto it = camera_slot.find(camera_id);
+                            if (it == camera_slot.end()) {
+                                continue;
+                            }
+                            const auto tile_it = std::find(block_cameras.begin(),
+                                                           block_cameras.end(), it->second);
+                            if (tile_it == block_cameras.end()) {
+                                continue;
+                            }
+                            tile_index = static_cast<std::int32_t>(
+                                std::distance(block_cameras.begin(), tile_it));
+                        }
+                        const std::size_t wc = static_cast<std::size_t>(row) *
+                                                   static_cast<std::size_t>(window.width) +
+                                               static_cast<std::size_t>(col);
+                        seed[wc] = tile_index;
+                        frozen[wc] = 1;
+                    }
+                }
+            }
+
+            std::vector<std::int32_t> labels;
+            ortho::SeamOptions seam_options;
+            if (!options.refine_seamlines) {
+                seam_options.iterations = 0;
+            }
+            labels = ortho::assign_seams(window.width, window.height, tiles, seam_options,
+                                        frozen.empty() ? nullptr : &seed,
+                                        frozen.empty() ? nullptr : &frozen);
+            progress.update("seamlines",
+                            static_cast<double>(block_index + 1) /
+                                static_cast<double>(total_blocks));
+
+            const ortho::OrthoMosaic mosaic = ortho::blend(
+                window.width, window.height, tiles, labels, options.blending, plan.levels);
+            progress.update("blend", static_cast<double>(block_index + 1) /
+                                         static_cast<double>(total_blocks));
+
+            // Copy the interior only: the margin exists to make the seams and
+            // the blend continuous, it is not part of this block's output.
+            if (result.raster.data.empty()) {
+                result.raster.data.assign(output_cells * 4U, 0);
+                result.labels.assign(output_cells, -1);
+            }
+            for (int row = by0; row < by1; ++row) {
+                const std::size_t window_row =
+                    static_cast<std::size_t>(row - wy0) * static_cast<std::size_t>(window.width);
+                const std::size_t output_row =
+                    static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width);
+                for (int col = bx0; col < bx1; ++col) {
+                    const std::size_t wc = window_row + static_cast<std::size_t>(col - wx0);
+                    const std::size_t oc = output_row + static_cast<std::size_t>(col);
+                    const std::int32_t label = mosaic.labels[wc];
+                    result.labels[oc] =
+                        label >= 0 ? cameras[block_cameras[static_cast<std::size_t>(label)]]
+                                         .camera_id
+                                   : -1;
+                    result.raster.data[oc * 4 + 0] = mosaic.rgb[wc * 3 + 0];
+                    result.raster.data[oc * 4 + 1] = mosaic.rgb[wc * 3 + 1];
+                    result.raster.data[oc * 4 + 2] = mosaic.rgb[wc * 3 + 2];
+                    result.raster.data[oc * 4 + 3] = mosaic.valid[wc] != 0 ? 255 : 0;
+                }
+            }
+        }
     }
 
     if (options.fill_holes) {
         // Fill interior nodata holes in each colour channel from the
-        // surroundings. Natural-neighbour keeps the colour smooth across the
-        // seams the hole borders. Filled cells become opaque, otherwise the
-        // option would be invisible in any RGBA export.
+        // surroundings, ONCE on the assembled raster: `interior_only` decides
+        // reachability from the output's own border, which a block cannot know.
+        // Natural-neighbour keeps the colour smooth across the seams the hole
+        // borders. Filled cells become opaque, otherwise the option would be
+        // invisible in any RGBA export.
         elevation::HoleFillOptions fill;
         fill.method = elevation::HoleFill::NaturalNeighbour;
         fill.interior_only = true;
         for (int channel = 0; channel < 3; ++channel) {
-            std::vector<float> values(mosaic.labels.size(), 0.0F);
-            std::vector<std::uint8_t> channel_valid(mosaic.labels.size(), 0);
-            for (std::size_t i = 0; i < mosaic.labels.size(); ++i) {
-                values[i] = static_cast<float>(mosaic.rgb[i * 3 + static_cast<std::size_t>(channel)]);
-                channel_valid[i] = mosaic.valid[i];
+            std::vector<float> values(output_cells, 0.0F);
+            std::vector<std::uint8_t> channel_valid(output_cells, 0);
+            for (std::size_t i = 0; i < output_cells; ++i) {
+                values[i] = static_cast<float>(result.raster.data[i * 4 +
+                                                                  static_cast<std::size_t>(channel)]);
+                channel_valid[i] = result.raster.data[i * 4 + 3] != 0 ? 1 : 0;
             }
             elevation::fill_holes(grid.width, grid.height, values, channel_valid, fill);
-            for (std::size_t i = 0; i < mosaic.labels.size(); ++i) {
+            for (std::size_t i = 0; i < output_cells; ++i) {
                 if (channel_valid[i] != 0) {
                     const float c = std::clamp(values[i], 0.0F, 255.0F);
                     result.raster.data[i * 4 + static_cast<std::size_t>(channel)] =
@@ -1346,13 +1789,15 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
     if (Log::enabled(LogLevel::Info)) {
         std::size_t covered = 0;
-        for (const std::uint8_t a : mosaic.valid) {
-            covered += a != 0 ? 1U : 0U;
+        for (std::size_t i = 0; i < output_cells; ++i) {
+            covered += result.raster.data[i * 4 + 3] != 0 ? 1U : 0U;
         }
         log(LogLevel::Info) << "BuildOrthomosaic: " << grid.width << "x" << grid.height
                             << " cells at " << format_number(resolution) << " m, " << covered
                             << " covered, blending " << params.get_string("blending_mode")
-                            << ", epsg " << result.epsg;
+                            << ", blocks " << columns << "x" << rows << " of "
+                            << plan.block_cells << " (+" << plan.margin_cells
+                            << " margin), epsg " << result.epsg;
     }
     // Each run APPENDS a new orthomosaic asset and makes it active, so an
     // earlier orthomosaic is never overwritten.

@@ -36,8 +36,18 @@ struct OrthoMosaic {
 };
 
 /// Blend `tiles` according to `labels` (one label per cell, -1 = none).
+///
+/// `pyramid_levels` pins the mosaic blend's pyramid depth: -1 (the default) picks
+/// the depth from the grid, as before. Block-wise callers pass one value derived
+/// from the WHOLE output grid so every block applies the same multiresolution
+/// operator instead of a shallower one of its own.
 OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
-                  const std::vector<std::int32_t>& labels, Blending mode);
+                  const std::vector<std::int32_t>& labels, Blending mode,
+                  int pyramid_levels = -1);
+
+/// The pyramid depth blend() would pick for a `width` x `height` grid. A block
+/// plan uses this to pin the depth at the whole grid's value.
+int pyramid_level_count(int width, int height);
 
 /// Parse a blending mode from its lower-case name: "mosaic", "average",
 /// "disabled". Throws ValueError on any other text.

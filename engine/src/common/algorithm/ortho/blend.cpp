@@ -245,7 +245,8 @@ void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid) {
 }  // namespace
 
 OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
-                  const std::vector<std::int32_t>& labels, Blending mode) {
+                  const std::vector<std::int32_t>& labels, Blending mode,
+                  int pyramid_levels) {
     OrthoMosaic out;
     out.width = width;
     out.height = height;
@@ -322,7 +323,14 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         }
     }
 
-    const int levels = level_count(width, height);
+    int levels = level_count(width, height);
+    if (pyramid_levels >= 0) {
+        // A pinned depth must still be representable on this grid: a level
+        // larger than the grid itself would decimate to 1x1 and the collapse
+        // would then be a resize of a single sample, not the operator the
+        // whole grid applied.
+        levels = std::min(pyramid_levels, level_count(width, height));
+    }
 
     // Per-channel fused Laplacian pyramid. The masks partition the covered cells
     // (each covered cell has exactly one label), and the Gaussian operator keeps
@@ -453,6 +461,8 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     }
     return out;
 }
+
+int pyramid_level_count(int width, int height) { return level_count(width, height); }
 
 Blending parse_blending(const std::string& text) {
     if (text == "mosaic") {

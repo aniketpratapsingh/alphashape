@@ -74,9 +74,18 @@ struct SeamOptions {
 
 /// Label per output cell: the index of the winning tile, or -1 where no tile is
 /// valid. Deterministic; independent of the thread count.
-std::vector<std::int32_t> assign_seams(int width, int height,
-                                       const std::vector<OrthoTile>& tiles,
-                                       const SeamOptions& options);
+///
+/// `pinned_labels` / `pinned` (both or neither) fix part of the labelling: where
+/// `pinned[i]` is non-zero, cell `i` keeps `pinned_labels[i]` and the optimiser
+/// may not change it (the label carries an infinite data cost against every
+/// other label, and the pair terms against it are still charged). Block-wise
+/// callers pass the margin cells a previously processed block already decided,
+/// which is what keeps seams continuous across block borders. A pinned label
+/// that this tile set does not cover falls back to the per-cell argmax.
+std::vector<std::int32_t> assign_seams(
+    int width, int height, const std::vector<OrthoTile>& tiles, const SeamOptions& options,
+    const std::vector<std::int32_t>* pinned_labels = nullptr,
+    const std::vector<std::uint8_t>* pinned = nullptr);
 
 /// The energy of a labelling under `options` (used by tests and callers to
 /// compare two labellings). Invalid labels contribute nothing where no tile is

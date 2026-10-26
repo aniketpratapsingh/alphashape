@@ -13,6 +13,7 @@
 // Python API; the implementation (true orthorectification with a DEM occlusion
 // test) is ours.
 
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -84,9 +85,93 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
 ///
 /// `heights` must be the DEM whose grid `grid` follows; `nodata` marks missing
 /// samples at the nodes (their height falls back to the first valid sample).
+///
+/// `fallback_height` overrides the nodata fallback: block-wise callers compute
+/// the DEM's median valid height ONCE and pass it here, because recomputing the
+/// median per block would rescan the whole DEM for every block. NaN (the
+/// default) means "compute it from `heights`".
 std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     const elevation::SurfaceFrame& frame, const RasterGrid& grid,
-    const GeoRaster<float>& heights, float nodata);
+    const GeoRaster<float>& heights, float nodata,
+    double fallback_height = std::numeric_limits<double>::quiet_NaN());
+
+// -- block plan --------------------------------------------------------------
+//
+// A full-resolution ortho over a large site does not fit in memory as one
+// piece: the rectified tiles alone are "footprint x 8 B/cell", and a flight of
+// fully overlapping obliques makes the footprint a large multiple of the grid.
+// The task therefore processes the output grid in square blocks, each with a
+// margin of cells that overlaps its neighbours, and keeps only one block's
+// tiles, seam field and blend planes alive at a time. The assembled result
+// (RGBA + seam labels, 8 B/cell) is the only grid-sized object.
+//
+// Small rasters take exactly the old path: when the whole grid already fits the
+// budget the plan asks for ONE block, and the block loop degenerates to the
+// previous whole-grid code (no margin, no re-indexing of cells).
+
+/// What build_orthomosaic_task passes to plan_ortho_blocks().
+struct OrthoBlockPlanInput {
+    int grid_width = 0;
+    int grid_height = 0;
+    /// Summed area of every camera's tile crop box over the WHOLE grid (what
+    /// predicted_footprint_cells() returns).
+    double footprint_cells = 0.0;
+    /// Pixels of the largest photograph (3 bytes each when decoded).
+    double photo_cells = 0.0;
+    int camera_count = 0;
+    /// True when the chunk is georeferenced (the plane->local node map exists).
+    bool has_node_map = false;
+    /// The task's byte budget; 0 means "no limit" (one block).
+    std::uint64_t budget_bytes = 0;
+    /// Expert/test override: process in blocks of this side (0 = automatic).
+    int forced_block_cells = 0;
+};
+
+/// The block layout a run will use, with the peak it is planned for.
+struct OrthoBlockPlan {
+    /// Side of a block in cells; 0 means "process the whole grid in one piece".
+    int block_cells = 0;
+    /// Overlap kept around every block, on each side, in cells.
+    int margin_cells = 0;
+    int columns = 1;
+    int rows = 1;
+    /// The mosaic blend's pyramid depth. Pinned to the WHOLE grid's depth (or
+    /// as deep as the margin supports) and shared by every block, so all blocks
+    /// apply the same operator; -1 would let each block pick its own.
+    int levels = 0;
+    /// LRU capacity for decoded photographs. A share of the budget, so the
+    /// cache can never be the reason a run does not fit.
+    std::uint64_t photo_cache_bytes = 0;
+    /// The predicted peak of the planned layout (window peak + assembled
+    /// output + photo cache), in bytes.
+    double estimated_peak_bytes = 0.0;
+    /// True when even the smallest block does not fit the budget: the caller
+    /// then falls back to the last-resort resolution coarsening.
+    bool coarsened = false;
+};
+
+/// The margin a block of `block_cells` cells is processed with. A quarter of
+/// the side, at least 16 and at most 192 cells: the mosaic blend's pyramid
+/// reaches 2 * 2^levels cells (128 at the capped 6 levels), and a coarse-enough
+/// margin also covers the seam labeller's multi-scale reach.
+int block_margin_cells(int block_cells);
+
+/// The predicted peak of one block, in bytes:
+/// the window's own estimate (estimate_peak_bytes() on the block+margin grid)
+/// plus the assembled output raster and label field (8 B per OUTPUT cell) plus
+/// the photo cache. The window and output terms are disjoint: only one window
+/// is alive, and the assembled raster grows while the windows come and go.
+double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
+                                 bool has_node_map, double photo_cells,
+                                 std::uint64_t output_cells,
+                                 std::uint64_t photo_cache_bytes);
+
+/// Choose the block layout for a run. One block when the whole grid fits the
+/// budget (identical behaviour for small rasters); otherwise the largest block
+/// side from 4096 down to 512 whose estimate stays inside a quarter of the
+/// budget -- the rest of the budget has to hold the assembled output, the photo
+/// cache and the rest of the process.
+OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input);
 
 /// Build the chunk's orthomosaic from its DEM (surface_data = "elevation") or
 /// from a DSM derived from Chunk::model() (surface_data = "model"). Throws
