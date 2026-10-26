@@ -229,6 +229,25 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new depth-map set. Empty selects \"Depth Maps <n>\". Each "
                     "run creates a new set."});
+
+    // Coarse-to-fine search (WP-17.14). Automatic is the default because it is
+    // what makes the stage faster: the coarse levels decide the basin at a
+    // quarter of the pixels each, and the reference-resolution level only has to
+    // refine. 1 restores the pre-pyramid search exactly.
+    ParamSpec pyramid_levels{"pyramid_levels", ParamType::Int, std::int64_t{0},
+                             "Coarse-to-fine depth-search levels: 0 = automatic (halve until the "
+                             "shorter side reaches pyramid_min_size), 1 = a single level at the "
+                             "working resolution (no pyramid), N = exactly N levels."};
+    pyramid_levels.minimum = std::int64_t{0};
+    pyramid_levels.maximum = std::int64_t{8};
+    params.declare(pyramid_levels);
+
+    ParamSpec pyramid_min_size{"pyramid_min_size", ParamType::Int, std::int64_t{256},
+                               "Shortest side, in pixels, an automatic pyramid stops shrinking "
+                               "at. Ignored when pyramid_levels is not 0."};
+    pyramid_min_size.minimum = std::int64_t{32};
+    pyramid_min_size.maximum = std::int64_t{8192};
+    params.declare(pyramid_min_size);
 }
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
@@ -242,6 +261,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const std::string filter_mode_text = params.get_string("filter_mode");
     const std::int64_t max_neighbors = params.get_int("max_neighbors");
     const bool reuse_depth = params.get_bool("reuse_depth");
+    const std::int64_t pyramid_levels_value = params.get_int("pyramid_levels");
+    const std::int64_t pyramid_min_size = params.get_int("pyramid_min_size");
 
     if (downscale_value <= 0) {
         throw ValueError("Downscale must be positive");
@@ -255,6 +276,15 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     }
     if (max_neighbors < 1 || max_neighbors >= kMaxNeighborsExclusive) {
         throw ValueError("max_neighbors must be in [1, 256)");
+    }
+    // The search's own validation also rejects these, but a task must name a bad
+    // parameter before it touches the chunk (and before it looks at 300 photos
+    // to decide it cannot use them).
+    if (pyramid_levels_value < 0 || pyramid_levels_value > 8) {
+        throw ValueError("pyramid_levels must be in [0, 8]");
+    }
+    if (pyramid_min_size < 32 || pyramid_min_size > 8192) {
+        throw ValueError("pyramid_min_size must be in [32, 8192]");
     }
     const stereo::FilterMode filter_mode = stereo::parse_filter_mode(filter_mode_text);
 
@@ -316,6 +346,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const int kWindowRadius = stereo::PatchMatchOptions{}.window_radius;
     const int kWindowStep = stereo::PatchMatchOptions{}.window_step;
     const int kIterations = stereo::PatchMatchOptions{}.iterations;
+    const int kPyramidLevels = static_cast<int>(pyramid_levels_value);
+    const int kPyramidMinSize = static_cast<int>(pyramid_min_size);
 
     // The geometry AND neighbourhood a depth map for this camera at this
     // downscale must have been built from to be reusable. Computed once per
@@ -337,6 +369,34 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         context.window_step = kWindowStep;
         context.iterations = kIterations;
         context.seed = seed_for_camera(camera_id);
+        // The number of levels this camera's search runs at, resolved from the
+        // request and the working image size -- the same plan the search itself
+        // uses. A pyramid run and a flat run are different maps, so the level
+        // count is part of the map's identity; a single-level run folds nothing
+        // (see depth_map_fingerprint), so a project built before the pyramid
+        // existed still matches it. The working resolution is what the search
+        // sees, so the sensor size is divided by the same downscale the task
+        // loads at.
+        context.pyramid_levels = [&] {
+            stereo::PatchMatchOptions pyramid_options;
+            pyramid_options.pyramid_levels = kPyramidLevels;
+            pyramid_options.pyramid_min_size = kPyramidMinSize;
+            pyramid_options.iterations = kIterations;
+            pyramid_options.window_radius = kWindowRadius;
+            const std::int32_t sensor_id = camera.sensor_id;
+            if (sensor_id < 0 ||
+                sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
+                return 1;
+            }
+            const Sensor& sensor = chunk->sensors()[static_cast<std::size_t>(sensor_id)];
+            const int width = sensor.width / downscale;
+            const int height = sensor.height / downscale;
+            if (width <= 0 || height <= 0) {
+                return 1;
+            }
+            return static_cast<int>(
+                stereo::patch_match_iteration_plan(width, height, pyramid_options).size());
+        }();
         const auto hood_it = hood_of.find(camera_id);
         if (hood_it != hood_of.end()) {
             const stereo::ViewNeighbourhood& hood = *hood_it->second;
@@ -637,6 +697,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             options.depth_min = neighbours.depth_min;
             options.depth_max = neighbours.depth_max;
             options.seed = seed_for_camera(hood.camera_id);
+            options.pyramid_levels = kPyramidLevels;
+            options.pyramid_min_size = kPyramidMinSize;
             options.on_sweep = sweep_progress;
 
             log_device_once();

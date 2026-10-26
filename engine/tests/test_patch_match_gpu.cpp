@@ -345,6 +345,9 @@ PatchMatchOptions plane_options() {
     options.iterations = 6;
     options.max_cost = 0.5;
     options.seed = 12345;
+    // One level: these tests calibrate against the pre-pyramid search. The
+    // pyramid has its own agreement test (PyramidAgreesWithCpu).
+    options.pyramid_levels = 1;
     return options;
 }
 
@@ -613,6 +616,9 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
     options.depth_min = hood.depth_min;
     options.depth_max = hood.depth_max;
     options.seed = 7;
+    // Single level: this test's 0.90 floor was calibrated on the flat search,
+    // and PyramidAgreesWithCpu is the pyramid's own gate.
+    options.pyramid_levels = 1;
 
     const PatchMatchResult gpu_result =
         stereo::run_patch_match_device(reference, neighbours, options);
@@ -652,6 +658,9 @@ TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
     options.seed = 7;
     options.iterations = 0;
     options.max_cost = 3.0;  // keep every initialised pixel
+    // Zero sweeps is a single random initialisation at the reference
+    // resolution; the pyramid would seed the fine level from a coarse one.
+    options.pyramid_levels = 1;
 
     const PatchMatchResult gpu_result =
         stereo::run_patch_match_device(reference, neighbours, options);
@@ -736,6 +745,10 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
     // directly comparable with DenseFixtureAccuracy's, which is the measurement
     // the floor above is calibrated against.
     options.iterations = 6;
+    // The gate measures pm_refine, so it runs the search it has always run: one
+    // level at the reference resolution. The pyramid is gated separately by
+    // PyramidAgreesWithCpu.
+    options.pyramid_levels = 1;
 
     const std::shared_ptr<gpu::Context> context = gpu::default_context();
     const bool software = context != nullptr && gpu::is_software_device(context->info());
@@ -779,6 +792,86 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
         << " comparable pixels; a fused multiply-add on the depth/plane-to-pixel path (see the "
            "note at the top of pm_math.glsl) is the usual cause";
     EXPECT_GT(normal_fraction, software ? 0.90 : 0.99);
+}
+
+// The RefineSweepsMatchCpu floor above is calibrated at pyramid_levels=1, which
+// is the search it has always measured. Pin that here so a later change to the
+// default cannot quietly move the gate's meaning -- the pyramid has its own gate
+// (PyramidAgreesWithCpu) with a bound of its own.
+TEST(PatchMatchGpu, RefineSweepsGateRunsSingleLevel) {
+    const PatchMatchOptions defaults;
+    EXPECT_EQ(defaults.pyramid_levels, 0) << "the shipped default is automatic";
+    PatchMatchOptions single;
+    single.pyramid_levels = 1;
+    EXPECT_EQ(single.pyramid_levels, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Coarse-to-fine on the GPU: agreement with the CPU at the pyramid default
+// ---------------------------------------------------------------------------
+
+/// The pyramid default (automatic levels) on the dense fixture, against the
+/// CPU's own pyramid run over the same inputs. The two paths build their level
+/// plans from the same `patch_match_iteration_plan`, apply the same
+/// `pyramid_upsample` to the carried map and search from the same
+/// `pyramid_search_span`, so what differs is only the kernel arithmetic -- the
+/// same precision difference RefineSweepsMatchCpu measures, now on the whole
+/// pyramid rather than on one level.
+///
+/// It is a separate test rather than a second assertion in RefineSweepsMatchCpu
+/// because that one is the calibrated NVIDIA regression gate for pm_refine: if
+/// the pyramid also failed there, a real kernel regression and a
+/// coarse-to-fine bookkeeping bug would arrive as one indistinguishable number.
+TEST(PatchMatchGpu, PyramidAgreesWithCpu) {
+    REQUIRE_GPU_PM();
+    const auto inputs = dense_inputs(2);
+    const stereo::ViewNeighbourhood& hood = inputs->neighbourhoods.front();
+    std::vector<PMView> neighbours;
+    for (const std::int32_t id : hood.neighbours) {
+        neighbours.push_back(inputs->view(id));
+    }
+    const PMView reference = inputs->view(hood.camera_id);
+
+    PatchMatchOptions options;
+    options.depth_min = hood.depth_min;
+    options.depth_max = hood.depth_max;
+    options.seed = 7;
+    options.iterations = 6;
+    // Automatic: 240x180 at the 256 default floor is already one level, so ask
+    // for a pyramid explicitly with a floor that the fixture can reach.
+    options.pyramid_levels = 0;
+    options.pyramid_min_size = 64;
+
+    const std::vector<int> plan =
+        stereo::patch_match_iteration_plan(reference.image->width(),
+                                           reference.image->height(), options);
+    ASSERT_GE(plan.size(), 2U) << "the fixture must exercise a real pyramid";
+
+    const std::shared_ptr<gpu::Context> context = gpu::default_context();
+    const bool software = context != nullptr && gpu::is_software_device(context->info());
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result = stereo::run_patch_match(reference, neighbours, options);
+    ASSERT_EQ(gpu_result.depth.size(), cpu_result.depth.size());
+
+    const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
+    const std::size_t gpu_valid = valid_pixels(gpu_result);
+    const std::size_t cpu_valid = valid_pixels(cpu_result);
+    std::printf("[gpu pyramid] camera %d, %zu levels: agree<1%% %.2f%% of %zu | valid gpu %zu "
+                "cpu %zu | %s\n",
+                hood.camera_id, plan.size(), 100.0 * agreement.fraction, agreement.both, gpu_valid,
+                cpu_valid, software ? "software device" : "hardware device");
+
+    ASSERT_GT(agreement.both, 1000U);
+    // The same shape of bound as RefineSweepsMatchCpu, one notch looser: a
+    // pyramid runs the level plan twice (once per path) and a hole in the coarse
+    // map is a different random plane on each, so a handful more pixels land on
+    // a different local minimum. A real port regression moves this by tens of
+    // percent, not by one.
+    EXPECT_GT(agreement.fraction, software ? 0.88 : 0.98);
+    EXPECT_NEAR(static_cast<double>(gpu_valid), static_cast<double>(cpu_valid),
+                0.05 * static_cast<double>(cpu_valid));
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1045,9 @@ TEST(PatchMatchGpu, AerialBlockValidFractionMatchesCpu) {
         options.depth_min = hood.depth_min;
         options.depth_max = hood.depth_max;
         options.seed = 11;
+        // Single level: this test's figures are the flat search's, and the
+        // aerial block's 0.90 agreement floor was calibrated against them.
+        options.pyramid_levels = 1;
 
         const double gpu_seconds = time_seconds(
             [&] { return stereo::run_patch_match_device(reference, neighbours, options); });
@@ -994,6 +1090,9 @@ TEST(PatchMatchGpu, TimingAgainstCpu) {
     options.depth_min = hood.depth_min;
     options.depth_max = hood.depth_max;
     options.seed = 3;
+    // Single level, so the reported ratio stays the pm_refine figure
+    // LIMITATIONS.md documents.
+    options.pyramid_levels = 1;
 
     // Warm the device so pipeline compilation is not charged to the benchmark.
     ASSERT_TRUE(stereo::patch_match_gpu_would_run(reference, neighbours, options));

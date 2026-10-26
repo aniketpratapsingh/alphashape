@@ -317,6 +317,9 @@ PatchMatchOptions options_for(double dmin, double dmax) {
     options.iterations = 6;
     options.max_cost = 0.5;
     options.seed = 12345;
+    // One level: these tests pin the single-level search they were written
+    // against. The pyramid is covered by test_patch_match_pyramid.cpp.
+    options.pyramid_levels = 1;
     return options;
 }
 

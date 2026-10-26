@@ -16,6 +16,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/platform/env.hpp"
+#include "common/algorithm/stereo/depth_pyramid.hpp"
 #include "gpu/gpu.hpp"
 #include "image/image.hpp"
 #include "model/camera/calibration.hpp"
@@ -95,14 +96,20 @@ struct PmParams {
     std::uint32_t seed_hi;
     std::uint32_t touch;
     std::uint32_t row_offset;
+    /// 0 = seed each pixel from a fresh random plane (the coarsest level's
+    /// initialisation, and the pre-pyramid behaviour); 1 = seed from the
+    /// inherited (depth, normal) already in the state buffers, which is how a
+    /// finer pyramid level starts from the upsampled coarse map.
+    std::uint32_t seed_mode;
 };
 
-static_assert(sizeof(PmParams) == 80, "PmParams must match the GLSL push-constant size");
+static_assert(sizeof(PmParams) == 84, "PmParams must match the GLSL push-constant size");
 static_assert(offsetof(PmParams, depth_min) == 32, "PmParams layout drifted");
 static_assert(offsetof(PmParams, radius) == 60, "PmParams layout drifted");
 static_assert(offsetof(PmParams, seed_lo) == 64, "PmParams layout drifted");
 static_assert(offsetof(PmParams, touch) == 72, "PmParams layout drifted");
 static_assert(offsetof(PmParams, row_offset) == 76, "PmParams layout drifted");
+static_assert(offsetof(PmParams, seed_mode) == 80, "PmParams layout drifted");
 
 /// Largest pixel count one half-sweep dispatch should cover. A pm_init or
 /// pm_refine over a whole large image is a single multi-second dispatch, which
@@ -201,6 +208,12 @@ void validate_inputs(const PMView& reference, const std::vector<PMView>& neighbo
     if (options.best_k < 0) {
         throw ValueError("stereo::run_patch_match: best_k must be non-negative");
     }
+    if (options.pyramid_levels < 0) {
+        throw ValueError("stereo::run_patch_match: pyramid_levels must be non-negative");
+    }
+    if (options.pyramid_levels != 1 && options.pyramid_min_size <= 0) {
+        throw ValueError("stereo::run_patch_match: pyramid_min_size must be positive");
+    }
 }
 
 /// True when one image and its neighbour list fit the kernel limits.
@@ -223,17 +236,32 @@ bool fits_kernel_limits(const PMView& reference, const std::vector<PMView>& neig
            reference.image->height() > 2 * options.window_radius;
 }
 
-/// The GPU run. Throws gpu::Error on any device failure; the caller wraps it in
-/// with_fallback.
-PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& neighbours,
-                         const PatchMatchOptions& options) {
-    const std::shared_ptr<g::Context> context = g::default_context();
-    if (!context) {
-        throw g::Error("no GPU context");
-    }
-    if (g_force_failure.exchange(false)) {
-        throw g::Error("forced failure (test hook)");
-    }
+/// One level of the GPU search: everything the dispatches need, with the
+/// reference and neighbours already reduced to this level.
+struct GpuLevel {
+    const PMView* reference = nullptr;
+    const std::vector<PMView>* neighbours = nullptr;
+    std::uint64_t seed = 1;
+    int iterations = 0;
+    /// The plane inherited from the level beneath, at this level's resolution.
+    /// Null for the coarsest level, which seeds from fresh random planes.
+    const DepthHypotheses* warm = nullptr;
+    /// The inverse-depth radius the sweep perturbations start from: the
+    /// configured span at the coarsest level, the local variation of the
+    /// inherited map above it.
+    float span = 0.0F;
+    /// Where this level sits in the whole run's progress: the fraction already
+    /// complete when it starts, and the share of the total its sweeps take.
+    double progress_base = 0.0;
+    double progress_scale = 1.0;
+};
+
+/// The GPU run of one level. Throws gpu::Error on any device failure; the
+/// caller wraps the whole pyramid in with_fallback.
+PatchMatchResult run_gpu_level(const std::shared_ptr<g::Context>& context, const GpuLevel& level,
+                               const PatchMatchOptions& options, double& reported) {
+    const PMView& reference = *level.reference;
+    const std::vector<PMView>& neighbours = *level.neighbours;
 
     const FloatImage& ref_image = *reference.image;
     const int width = ref_image.width();
@@ -335,14 +363,26 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // the texture mask rejects is never written and must read as "no depth".
     // The read-only inputs and the three outputs follow `kind`; see
     // working_memory() for why that is host-visible by default.
+    //
+    // A warm-started level starts from the inherited map instead of the empty
+    // initial state: pm_init reads it back (seed_mode 1) and evaluates each
+    // inherited plane at this level's geometry. Pixels the coarse level left as
+    // holes keep depth -1 and fall through to the random draw, which is how the
+    // fine level fills a hole the coarse one could not.
     const g::MemoryKind kind = working_memory();
     g::Buffer g_ref = g::Buffer::of(*context, ref_image.pixels(), kind);
     g::Buffer g_nb = g::Buffer::of(*context, neighbour_images, kind);
     g::Buffer g_views = g::Buffer::of(*context, view_params, kind);
     g::Buffer g_view_ints = g::Buffer::of(*context, view_ints, kind);
     g::Buffer g_offsets = g::Buffer::of(*context, offsets, kind);
-    const std::vector<float> initial_depth(count, -1.0F);
-    const std::vector<float> initial_normal(count * 3, 0.0F);
+    std::vector<float> initial_depth(count, -1.0F);
+    std::vector<float> initial_normal(count * 3, 0.0F);
+    if (level.warm != nullptr) {
+        initial_depth = level.warm->depth;
+        initial_normal = level.warm->normals;
+        initial_depth.resize(count, -1.0F);
+        initial_normal.resize(count * 3, 0.0F);
+    }
     const std::vector<float> initial_cost(count, 2.0F);
     const std::vector<std::uint32_t> initial_active(count, 0U);
     g::Buffer g_depth = g::Buffer::of(*context, initial_depth, kind);
@@ -365,6 +405,12 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     const float depth_min = static_cast<float>(options.depth_min);
     const float depth_max = static_cast<float>(options.depth_max);
     const float inv_span = 1.0F / depth_min - 1.0F / depth_max;
+    // The per-iteration perturbation radius. The coarsest level uses the
+    // configured inverse-depth span (the pre-pyramid behaviour); a warm-started
+    // level uses the local variation of its inherited map, which the CPU does
+    // with pyramid_search_span -- the host computes it once per level so the two
+    // paths search from the same radius.
+    const float span = level.warm != nullptr ? level.span : inv_span;
 
     PmParams params{};
     params.width = static_cast<std::uint32_t>(width);
@@ -372,8 +418,8 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     params.n_neighbours = static_cast<std::uint32_t>(n_neighbours);
     params.n_samples = static_cast<std::uint32_t>(n_samples);
     params.best_k = static_cast<std::uint32_t>(best_k);
-    params.seed_lo = static_cast<std::uint32_t>(options.seed & 0xFFFFFFFFULL);
-    params.seed_hi = static_cast<std::uint32_t>(options.seed >> 32);
+    params.seed_lo = static_cast<std::uint32_t>(level.seed & 0xFFFFFFFFULL);
+    params.seed_hi = static_cast<std::uint32_t>(level.seed >> 32);
     params.depth_min = depth_min;
     params.depth_max = depth_max;
     params.inv_span = inv_span;
@@ -381,6 +427,7 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     params.max_cost = static_cast<float>(options.max_cost);
     params.radius = radius;
     params.touch = 0;
+    params.seed_mode = level.warm != nullptr ? 1U : 0U;
 
     const std::array<std::uint32_t, 3> groups{
         static_cast<std::uint32_t>((width + kTileX - 1) / kTileX),
@@ -411,7 +458,7 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     std::vector<double> dispatch_fraction;
     const std::size_t bands =
         (static_cast<std::size_t>(height) + rows_per_band - 1) / rows_per_band;
-    dispatches.reserve((static_cast<std::size_t>(2 + 2 * options.iterations)) * bands + 1);
+    dispatches.reserve((static_cast<std::size_t>(2 + 2 * level.iterations)) * bands + 1);
     dispatch_fraction.reserve(dispatches.capacity());
     const auto make_dispatch = [&](const char* kernel) {
         g::Dispatch dispatch;
@@ -449,20 +496,23 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         params.iteration_hi = kNoIteration;
         push_half_sweep("pm_init", 0.0);
     }
-    params.depth_delta = inv_span * 0.5F;
+    params.depth_delta = span * 0.5F;
     params.normal_angle = static_cast<float>(1.0471975511965976 * 0.5);
 
-    const double sweeps_total = static_cast<double>(std::max(2 * options.iterations, 1));
-    for (int it = 0; it < options.iterations; ++it) {
+    const double sweeps_total = static_cast<double>(std::max(2 * level.iterations, 1));
+    for (int it = 0; it < level.iterations; ++it) {
         const float s = static_cast<float>(std::pow(0.5, static_cast<double>(it) + 1.0));
         params.iteration = static_cast<std::uint32_t>(it);
         params.iteration_hi = 0U;
-        params.depth_delta = inv_span * s;
+        params.depth_delta = span * s;
         params.normal_angle = static_cast<float>(1.0471975511965976 * static_cast<double>(s));
         for (std::uint32_t colour = 0; colour < 2; ++colour) {
             params.colour = colour;
             const double done = static_cast<double>(2 * it + static_cast<int>(colour) + 1);
-            push_half_sweep("pm_refine", done / sweeps_total);
+            // The fraction of the WHOLE run, so a pyramid's progress is monotone
+            // across level boundaries just as the CPU's is.
+            const double fraction = level.progress_base + level.progress_scale * done / sweeps_total;
+            push_half_sweep("pm_refine", fraction);
         }
     }
 
@@ -476,7 +526,9 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     finalize.push_constants = g::push(params);
     finalize.groups = {static_cast<std::uint32_t>((count + 255) / 256), 1, 1};
     dispatches.push_back(finalize);
-    dispatch_fraction.resize(dispatches.size(), 1.0);
+    // The finalise dispatch closes this level, which on the last level is the
+    // end of the whole run.
+    dispatch_fraction.resize(dispatches.size(), level.progress_base + level.progress_scale);
 
     // Submit in bounded chunks rather than one command buffer for the whole
     // solve. A pixel-heavy reference (480x360, 7 neighbours) is ~15 s of GPU
@@ -498,7 +550,6 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // fraction that is. Only a fraction that advanced is reported, so a banded
     // image does not tick the bar once per band within one half-sweep.
     const SweepProgress on_sweep = options.on_sweep;
-    double reported = 0.0;
     const auto on_submission = on_sweep
         ? std::function<void(std::size_t, std::size_t)>(
               [&](std::size_t done, std::size_t total) {
@@ -515,9 +566,6 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         : std::function<void(std::size_t, std::size_t)>();
     g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/1,
                    on_submission);
-    if (on_sweep && reported < 1.0) {
-        on_sweep(1.0);
-    }
 
     PatchMatchResult result;
     result.width = width;
@@ -525,6 +573,123 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     result.depth = g_out_depth.read<float>(count);
     result.normals = g_out_normals.read<float>(count * 3);
     result.cost = g_out_cost.read<float>(count);
+    return result;
+}
+
+/// The whole run: one GPU level per pyramid level, coarsest first, with the
+/// inherited map upsampled on the HOST between levels. The host hop is
+/// deliberate: PatchMatch's working set is host-visible by design (see
+/// working_memory()), so the map being carried is already host memory, and
+/// pyramid_upsample() is a single linear pass a device dispatch would not beat.
+/// It also keeps the kernels untouched apart from pm_init's seed_mode branch.
+PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& neighbours,
+                         const PatchMatchOptions& options) {
+    const std::shared_ptr<g::Context> context = g::default_context();
+    if (!context) {
+        throw g::Error("no GPU context");
+    }
+    if (g_force_failure.exchange(false)) {
+        throw g::Error("forced failure (test hook)");
+    }
+
+    const int width = reference.image->width();
+    const int height = reference.image->height();
+    const std::vector<int> iterations_by_level = patch_match_iteration_plan(width, height, options);
+    const int level_count = static_cast<int>(iterations_by_level.size());
+
+    int total_sweeps = 0;
+    for (const int iterations : iterations_by_level) {
+        total_sweeps += 2 * std::max(iterations, 0);
+    }
+    int done_before = 0;
+    double reported = 0.0;
+
+    DepthPyramid pyramid;
+    pyramid.reference = reference.image;
+    pyramid.calibrations.push_back(reference.calibration);
+    if (level_count > 1) {
+        pyramid = build_depth_pyramid(*reference.image, reference.calibration, level_count);
+    }
+    std::vector<std::vector<FloatImage>> reduced_neighbours(static_cast<std::size_t>(level_count - 1));
+    for (int from_finest = 1; from_finest < level_count; ++from_finest) {
+        std::vector<FloatImage>& level_images =
+            reduced_neighbours[static_cast<std::size_t>(from_finest - 1)];
+        level_images.reserve(neighbours.size());
+        for (std::size_t i = 0; i < neighbours.size(); ++i) {
+            const FloatImage& source =
+                from_finest == 1
+                    ? *neighbours[i].image
+                    : reduced_neighbours[static_cast<std::size_t>(from_finest - 2)][i];
+            level_images.push_back(pyramid_downsample(source));
+        }
+    }
+
+    DepthHypotheses inherited;
+    PatchMatchResult result;
+    for (int level = 0; level < level_count; ++level) {
+        const int from_finest = level_count - 1 - level;
+        const int iterations = iterations_by_level[static_cast<std::size_t>(level)];
+
+        PMView level_reference;
+        level_reference.calibration = pyramid.calibration_from_finest(from_finest);
+        level_reference.R = reference.R;
+        level_reference.t = reference.t;
+        level_reference.image = &pyramid.image(level);
+
+        std::vector<PMView> level_neighbours;
+        level_neighbours.reserve(neighbours.size());
+        for (std::size_t i = 0; i < neighbours.size(); ++i) {
+            PMView view;
+            view.calibration = scaled_calibration(neighbours[i].calibration, 1 << from_finest);
+            view.R = neighbours[i].R;
+            view.t = neighbours[i].t;
+            view.image = from_finest == 0
+                             ? neighbours[i].image
+                             : &reduced_neighbours[static_cast<std::size_t>(from_finest - 1)][i];
+            level_neighbours.push_back(std::move(view));
+        }
+
+        const double configured_span = 1.0 / options.depth_min - 1.0 / options.depth_max;
+        GpuLevel gpu_level;
+        gpu_level.reference = &level_reference;
+        gpu_level.neighbours = &level_neighbours;
+        gpu_level.seed = pyramid_level_seed(options.seed, from_finest);
+        gpu_level.iterations = iterations;
+        gpu_level.warm = level > 0 && inherited.width > 0 ? &inherited : nullptr;
+        // The CPU computes the warm span on the same inherited map with the same
+        // function, so both paths search from the same radius and their results
+        // stay comparable.
+        gpu_level.span = static_cast<float>(
+            level > 0 && inherited.width > 0
+                ? std::min(configured_span,
+                           pyramid_search_span(inherited.depth, inherited.width, inherited.height,
+                                               options.window_radius, configured_span / 64.0))
+                : configured_span);
+        gpu_level.progress_base = total_sweeps > 0
+                                      ? static_cast<double>(done_before) /
+                                            static_cast<double>(total_sweeps)
+                                      : 0.0;
+        gpu_level.progress_scale =
+            total_sweeps > 0 ? 1.0 / static_cast<double>(total_sweeps) : 1.0;
+
+        result = run_gpu_level(context, gpu_level, options, reported);
+        done_before += 2 * std::max(iterations, 0);
+
+        if (level + 1 < level_count) {
+            const int next_from_finest = level_count - 2 - level;
+            const Calibration& next_calibration =
+                pyramid.calibration_from_finest(next_from_finest);
+            DepthHypotheses coarse;
+            coarse.width = result.width;
+            coarse.height = result.height;
+            coarse.depth = std::move(result.depth);
+            coarse.normals = std::move(result.normals);
+            inherited = pyramid_upsample(coarse, next_calibration.width, next_calibration.height);
+        }
+    }
+    if (options.on_sweep && reported < 1.0) {
+        options.on_sweep(1.0);
+    }
     return result;
 }
 

@@ -337,6 +337,13 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
         h = fold_int(h, context->window_radius);
         h = fold_int(h, context->window_step);
         h = fold_int(h, context->iterations);
+        // Coarse-to-fine: only a pyramid run is a different map from a flat one.
+        // A map built before the pyramid existed has no record here (0), and a
+        // run that resolves to one level is the very same search, so neither
+        // may invalidate a stored map.
+        if (context->pyramid_levels > 1) {
+            h = fold_int(h, context->pyramid_levels);
+        }
         h = fold_int(h, static_cast<std::int64_t>(context->seed));
     }
 
