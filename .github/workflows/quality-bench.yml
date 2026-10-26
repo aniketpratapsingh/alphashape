@@ -14,6 +14,13 @@ on:
     # Monday 04:17 UTC: off the top of the hour, so it does not queue behind the
     # nightly build that starts at 20:30 UTC and can still be running.
     - cron: "17 4 * * 1"
+  # A change to the benchmark itself exercises it on the branch that changed it.
+  # Two limits keep that affordable: it only fires for the bench's own files, and
+  # it runs the primary dataset only. The schedule is what covers every dataset.
+  push:
+    paths:
+      - ".github/workflows/quality-bench.yml"
+      - "tools/bench/**"
   workflow_dispatch:
     inputs:
       dataset:
@@ -59,8 +66,14 @@ jobs:
         id: plan
         env:
           REQUESTED: ${{ github.event.inputs.dataset }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ -z "$REQUESTED" ] || [ "$REQUESTED" = "all" ]; then
+          if [ "$EVENT" = "push" ]; then
+            # A push is the bench proving itself on the branch that changed it, not
+            # a scheduled survey: one dataset is enough evidence and a fraction of
+            # the runner time.
+            names="aerial-nadir"
+          elif [ -z "$REQUESTED" ] || [ "$REQUESTED" = "all" ]; then
             names=$(python3 tools/bench/run_bench.py --list-datasets | cut -f1)
           else
             names="$REQUESTED"
