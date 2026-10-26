@@ -51,6 +51,14 @@ double round_sig3(double v) {
     return std::round(v * scale) / scale;
 }
 
+/// A short decimal for a message ("0.019", "12.3"), never scientific notation.
+std::string format_number(double v) {
+    std::ostringstream out;
+    out.precision(3);
+    out << v;
+    return out.str();
+}
+
 double median_of(std::vector<double> values) {
     if (values.empty()) {
         return 0.0;
@@ -1051,39 +1059,50 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                          "resolution explicitly");
     }
 
-    const RasterGrid grid = ortho_grid_for(surface.grid, resolution);
+    const std::uint64_t budget = platform::memory_budget_bytes();
+    const double photo_cells = largest_photograph_cells(cameras);
+
+    // -- memory guard, BEFORE any cell-sized allocation ----------------------
+    // Refuse (or, for the automatic cell, coarsen) a run whose peak cannot fit
+    // before allocating anything: a bare std::bad_alloc half-way through
+    // rectification -- after the node map, the tiles and several grid-sized
+    // buffers exist -- leaves the OS thrashing and tells the user nothing. The
+    // estimate is the per-stage anatomy above plus the summed footprint boxes.
+    //
+    // The plane->local node map is itself cells * 20 B, so the estimate has to be
+    // produced WITHOUT building it: `predicted_footprint_cells` evaluates the
+    // exact frame transform at the two points it needs (the grid's mid column at
+    // the surface's lowest and highest height) and allocates nothing.
+    const auto peak_at = [&](const RasterGrid& candidate_grid) {
+        const double footprint_cells =
+            predicted_footprint_cells(cameras, candidate_grid, surface, surface_nodata, frame);
+        const std::uint64_t cells = static_cast<std::uint64_t>(candidate_grid.width) *
+                                    static_cast<std::uint64_t>(candidate_grid.height);
+        return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells);
+    };
+    RasterGrid grid = ortho_grid_for(surface.grid, resolution);
+    const double default_peak = peak_at(grid);
+    if (budget != 0 && default_peak > static_cast<double>(budget)) {
+        // Refuse: an automatic run that cannot fit gets the same actionable
+        // message an explicit one does. (The automatic path is coarsened in the
+        // next change; until then there is nothing else to do here.)
+        throw ValueError(
+            "BuildOrthomosaic needs about " + platform::format_gb(default_peak) +
+            " at resolution " + format_number(resolution) + " m; this machine has " +
+            platform::format_gb(static_cast<double>(
+                platform::total_physical_memory_bytes())) +
+            ". Set a coarser resolution (e.g. " +
+            format_number(round_sig3(resolution * 4.0)) + " m).");
+    }
     progress.update("initialize", 1.0);
 
     // -- rectification -------------------------------------------------------
     // plane_to_local is built once and shared by every camera: the map is a
     // property of the grid, not of the view. For a Local frame it is empty and
-    // the pose is already in the plane frame.
+    // the pose is already in the plane frame. This is the first allocation that
+    // scales with the grid, and it happens only after the guard above.
     const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
         make_plane_to_local(frame, grid, surface, surface_nodata);
-
-    // -- memory guard --------------------------------------------------------
-    // Refuse a run whose peak cannot fit BEFORE allocating anything: a bare
-    // std::bad_alloc half-way through rectification (after the grid, the node
-    // map and several tiles exist) leaves the OS thrashing and tells the user
-    // nothing. The estimate is per-cell anatomy plus the summed footprint boxes;
-    // the budget is 60% of physical RAM, overridable for tests.
-    const std::uint64_t cells = static_cast<std::uint64_t>(grid.width) *
-                                static_cast<std::uint64_t>(grid.height);
-    const double footprint_cells =
-        predicted_footprint_cells(cameras, grid, surface, surface_nodata, frame);
-    const double photo_cells = largest_photograph_cells(cameras);
-    const double peak_bytes =
-        estimate_peak_bytes(cells, footprint_cells, bool{to_local}, photo_cells);
-    const std::uint64_t budget = platform::memory_budget_bytes();
-    if (budget != 0 && peak_bytes > static_cast<double>(budget)) {
-        throw ValueError(
-            "BuildOrthomosaic needs about " + platform::format_gb(peak_bytes) +
-            " at resolution " + std::to_string(resolution) + " m; this machine has " +
-            platform::format_gb(static_cast<double>(
-                platform::total_physical_memory_bytes())) +
-            ". Set a coarser resolution (e.g. " +
-            std::to_string(round_sig3(resolution * 4.0)) + " m).");
-    }
 
     // The ortho grid and the DEM share a plane: in a Geographic frame both are
     // in degrees, so heights divide by degrees. The orthorectifier's occlusion
@@ -1212,7 +1231,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             covered += a != 0 ? 1U : 0U;
         }
         log(LogLevel::Info) << "BuildOrthomosaic: " << grid.width << "x" << grid.height
-                            << " cells at " << resolution << " m, " << covered
+                            << " cells at " << format_number(resolution) << " m, " << covered
                             << " covered, blending " << params.get_string("blending_mode")
                             << ", epsg " << result.epsg;
     }
