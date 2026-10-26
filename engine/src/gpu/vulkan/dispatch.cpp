@@ -224,7 +224,7 @@ bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
         // Each fence gets its own full budget: a wait that fails is a device
         // failure and throws, so there is nothing to share a deadline with.
         for (const Slot& slot : slots_) {
-            if (slot.pending) {
+            if (slot.fence != VK_NULL_HANDLE) {
                 wait_fence(slot.fence);
             }
         }
@@ -261,8 +261,13 @@ bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
             drained = false;
         }
     };
+    // Every slot that owns a fence, not just the pending ones: a slot whose wait
+    // threw was abandoned (its ticket cleared, so nothing will ever wait it
+    // again), yet the queue may still be reading its buffers -- and the unwind
+    // destroying those buffers is exactly why this drain runs. A signalled fence
+    // returns immediately, so including the idle slots costs nothing.
     for (const Slot& slot : slots_) {
-        if (slot.pending) {
+        if (slot.fence != VK_NULL_HANDLE) {
             wait_one(slot.fence);
         }
     }
