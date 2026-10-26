@@ -146,6 +146,11 @@ struct OrthoBlockPlanInput {
     int camera_count = 0;
     /// True when the chunk is georeferenced (the plane->local node map exists).
     bool has_node_map = false;
+    /// True when the run will fill holes on the assembled raster. The fill stage
+    /// is a real candidate for the blocked run's peak only when it runs, so the
+    /// plan must know: estimating it for a fill_holes=false run would coarsen a
+    /// grid that actually fits.
+    bool fill_holes = true;
     /// The task's byte budget; 0 means "no limit" (one block).
     std::uint64_t budget_bytes = 0;
     /// Expert/test override: process in blocks of this side (0 = automatic).
@@ -164,11 +169,18 @@ struct OrthoBlockPlan {
     /// as deep as the margin supports) and shared by every block, so all blocks
     /// apply the same operator; -1 would let each block pick its own.
     int levels = 0;
-    /// LRU capacity for decoded photographs. A share of the budget, so the
-    /// cache can never be the reason a run does not fit.
+    /// LRU capacity for decoded photographs. A share of what the block plan
+    /// leaves over, so the cache can never be the reason a run does not fit.
     std::uint64_t photo_cache_bytes = 0;
-    /// The predicted peak of the planned layout (window peak + assembled
-    /// output + photo cache), in bytes.
+    /// The predicted peak of one block's window stages plus the assembled
+    /// output raster, in bytes (the block loop's own high-water mark).
+    double estimated_window_bytes = 0.0;
+    /// The predicted peak of the assembled-grid fill_holes stage that runs after
+    /// the last block, in bytes. fill_holes=true makes this a real candidate for
+    /// the run's maximum; a run with it off never reaches it.
+    double estimated_fill_bytes = 0.0;
+    /// The predicted peak of the planned layout: whichever of the two above is
+    /// larger, plus the photo cache, in bytes.
     double estimated_peak_bytes = 0.0;
     /// True when even the smallest block does not fit the budget: the caller
     /// then falls back to the last-resort resolution coarsening.
@@ -184,20 +196,25 @@ struct OrthoBlockPlan {
 int block_margin_cells(int block_cells, int pyramid_levels);
 
 /// The predicted peak of one block, in bytes:
-/// the window's own estimate (estimate_peak_bytes() on the block+margin grid)
-/// plus the assembled output raster and label field (8 B per OUTPUT cell) plus
-/// the photo cache. The window and output terms are disjoint: only one window
-/// is alive, and the assembled raster grows while the windows come and go.
+/// max(window stages + assembled output raster/labels (8 B per OUTPUT cell),
+///     assembled-grid fill_holes)
+/// plus the photo cache. The window and the assembled raster are disjoint from
+/// the fill stage in TIME (fill runs after the last block), so the two are a
+/// maximum, not a sum; only the cache is alive through both.
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
-                                 std::uint64_t photo_cache_bytes);
+                                 std::uint64_t photo_cache_bytes, bool fill_holes = true);
+/// The peak of the assembled-grid fill_holes stage alone (labels + RGBA + one
+/// channel's float plane, validity mask, EDT and banded Sibson accumulators).
+double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);
 
 /// Choose the block layout for a run. One block when the whole grid fits the
-/// budget (identical behaviour for small rasters); otherwise the largest block
-/// side from 4096 down to 512 whose estimate stays inside a quarter of the
-/// budget -- the rest of the budget has to hold the assembled output, the photo
-/// cache and the rest of the process.
+/// budget (identical behaviour for small rasters); otherwise the LARGEST block
+/// side from 4096 down to 512 whose estimate fits the budget. The budget
+/// (platform::memory_budget_bytes) already reserves headroom for the rest of the
+/// process, so there is no second fraction on top: a machine with the RAM does
+/// fewer, bigger blocks, which shrinks the margin overhead quadratically.
 OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input);
 
 /// Build the chunk's orthomosaic from its DEM (surface_data = "elevation") or

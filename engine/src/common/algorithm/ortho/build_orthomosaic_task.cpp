@@ -618,13 +618,6 @@ constexpr int kMaxBlockCells = 4096;
 /// per-block overhead (margin, one photograph, the seam field's fixed cost)
 /// dominates and further shrinking buys almost nothing.
 constexpr int kMinBlockCells = 512;
-/// A block's estimate must stay inside this fraction of the budget. The rest of
-/// the budget holds the assembled output (8 B/cell of the OUTPUT grid), the
-/// decoded-photograph cache and the rest of the process (the document, the DEM,
-/// the plane->local map's own pool).
-constexpr double kBlockBudgetFraction = 0.5;
-/// At most this fraction of the budget goes to decoded photographs.
-constexpr double kPhotoCacheBudgetFraction = 0.15;
 /// Extra margin cells beyond the blend pyramid's support. The pyramid's edge
 /// blurs clamp at the window border, so a cell exactly at the support distance
 /// still sees a slightly different neighbourhood; a small slack takes the
@@ -634,17 +627,27 @@ constexpr int kBlockMarginSlack = 16;
 /// level, so a window origin that is not a multiple of 2^levels shifts every
 /// coarse level by part of a cell against the whole grid's.
 constexpr int kBlockMarginAlignment = 64;
+/// The fraction of what the block plan leaves over that decoded photographs may
+/// use. Applied to the REMAINDER, not to the whole budget: the blocks come first
+/// (a smaller cache buys a bigger block, which is the better trade, since a
+/// block's margin overhead grows with its perimeter while a cache hit only saves
+/// one decode). Half the remainder is the point where the cache stops competing
+/// with the block's own peak and still holds a real flight's worth of frames.
+constexpr double kPhotoCacheBudgetFraction = 0.5;
 /// The absolute ceiling on the decoded-photograph cache, whatever the machine's
-/// budget: beyond a handful of frames the reuse stops paying for the bytes, and
-/// the cache competes with the block side for the same limit -- a smaller cache
-/// buys a bigger block, which is the better trade (a block's margin overhead
-/// shrinks quadratically while a cache hit only saves a decode).
-constexpr std::uint64_t kPhotoCacheMaxBytes = 256ULL * 1024ULL * 1024ULL;
-/// The absolute per-block peak the automatic plan aims for. Half a budget could
-/// be 12 GB on a big workstation, which is not a bound anyone asked for; the
-/// owner's target (a 28 M-cell, 36-photo, 1.9 cm site) is under 2 GB, and a
-/// 1024-cell block with a 192-cell margin meets it with room to spare.
-constexpr double kBlockPeakTargetBytes = 1.5e9;
+/// budget: beyond a couple of gigabytes the reuse stops paying for the bytes.
+constexpr std::uint64_t kPhotoCacheMaxBytes = 2048ULL * 1024ULL * 1024ULL;
+
+/// fill_holes()'s per-cell residency on the ASSEMBLED grid, on top of the
+/// assembled labels (4 B) and RGBA (4 B) that are already alive: the same figure
+/// kBytesPerCellFinalize's third component already models for the single-piece
+/// path, i.e. one channel's float values + validity mask + EDT distance/sites +
+/// blocked/fill/is_source flags + result float plane. The Sibson accumulators are
+/// banded under kSibsonBandBudgetBytes, so they are a fixed term, not per cell.
+constexpr double kBytesPerCellFillHoles = 21.0;
+/// The banded Sibson accumulator ceiling (64 MiB of sums + counts in
+/// fill_holes) plus room for its band bookkeeping and the EDT's own scratch.
+constexpr double kFillHolesFixedBytes = 96.0 * 1024.0 * 1024.0;
 
 /// The lowest and highest valid sample of a surface raster. Scanned once by the
 /// caller and passed down: the auto-coarsening search calls the estimator tens
@@ -776,6 +779,25 @@ public:
         return entries_.back().image;
     }
 
+    /// Photographs actually decoded, i.e. the decodes a run paid for.
+    std::size_t misses() const { return misses_; }
+    /// Cache lookups served without a decode.
+    std::size_t hits() const { return hits_; }
+    /// The byte capacity this cache was sized to.
+    std::uint64_t budget_bytes() const { return budget_; }
+
+    /// Mark `slot` most-recently-used when it is already cached, so the frames a
+    /// following block will need survive the decodes this one does not share.
+    /// A miss stays a miss: touching must not decode anything early, or a
+    /// prefetch would pay for frames the run may never reach.
+    void touch(std::size_t slot) {
+        const auto found = index_.find(slot);
+        if (found == index_.end()) {
+            return;
+        }
+        entries_[found->second].last = ++clock_;
+    }
+
 private:
     struct Entry {
         std::size_t slot = 0;
@@ -852,10 +874,22 @@ int block_margin_cells(int block_cells, int pyramid_levels) {
     return std::max(kBlockMarginAlignment, aligned);
 }
 
+/// The peak of the fill_holes stage that runs ONCE on the assembled raster after
+/// the last block (fill_holes=true). It is a first-class part of a blocked run's
+/// peak, not an afterthought: the assembled labels and RGBA stay alive while one
+/// channel's float plane, validity mask, EDT and Sibson accumulators are built,
+/// and on a big grid that is several hundred megabytes.
+double estimate_fill_holes_peak_bytes(std::uint64_t output_cells) {
+    const double cells = static_cast<double>(output_cells);
+    return cells * (kBytesPerCellGridLabels + 4.0 /* result RGBA */ +
+                    kBytesPerCellFillHoles) +
+           kFillHolesFixedBytes;
+}
+
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
-                                 std::uint64_t photo_cache_bytes) {
+                                 std::uint64_t photo_cache_bytes, bool fill_holes) {
     // The window's stages are the estimator the whole-grid path already uses,
     // with the window's (block + margin) cell count and its own footprint. The
     // assembled output raster (RGBA, 4 B) plus its seam labels (int32, 4 B) is
@@ -864,7 +898,13 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
                                               photo_cells);
     const double assembled = static_cast<double>(output_cells) *
                              (kBytesPerCellGridLabels + 4.0 /* result RGBA */);
-    return window + assembled + static_cast<double>(photo_cache_bytes);
+    const double staged = window + assembled;
+    // fill_holes runs after the last block on the assembled grid, so its own
+    // peak is a separate candidate for the run's maximum, not a summand.
+    const double filled =
+        fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+    // The photo cache is alive through all of it.
+    return std::max(staged, filled) + static_cast<double>(photo_cache_bytes);
 }
 
 OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
@@ -909,26 +949,37 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             static_cast<double>(window_cells);
         const double window_footprint =
             std::max(1.0, std::min(input.footprint_cells, by_cameras));
-        // A decoded-photograph cache can only ever hold the whole flight, and
-        // its own share of the budget is capped so a huge machine does not trade
-        // the memory saved by blocking back for cached frames.
+
+        // The fixed part: one window's stages plus the assembled raster, and the
+        // assembled-grid fill_holes that runs after the last block. Whichever is
+        // larger is the block's own peak; the cache comes on top of the larger.
+        const double staged =
+            estimate_peak_bytes(window_cells, window_footprint, input.has_node_map,
+                                input.photo_cells) +
+            static_cast<double>(output_cells) * (kBytesPerCellGridLabels + 4.0);
+        const double filled =
+            input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+        const double fixed = std::max(staged, filled);
+        out.estimated_window_bytes = staged;
+        out.estimated_fill_bytes = filled;
+
+        // What is left of the budget may go to decoded photographs, up to half of
+        // it (the rest is headroom for the process and the document), never more
+        // than the whole flight, and never above the absolute cap. At least one
+        // frame: a cache smaller than the frame it is asked to hold would evict it
+        // immediately and make the miss path pointless.
         const double photo_bytes = 3.0 * std::max(1.0, input.photo_cells);
-        // A byte limit on the cache, never 0 (0 means "unbounded" to PhotoCache,
-        // which is only right for the single-piece path that decodes one frame).
-        const double share = input.budget_bytes != 0
-                                 ? kPhotoCacheBudgetFraction *
-                                       static_cast<double>(input.budget_bytes)
-                                 : static_cast<double>(kPhotoCacheMaxBytes);
         const double flight = photo_bytes * static_cast<double>(std::max(1, input.camera_count));
+        const double remaining =
+            input.budget_bytes != 0
+                ? std::max(0.0, static_cast<double>(input.budget_bytes) - fixed)
+                : static_cast<double>(kPhotoCacheMaxBytes);
+        const double share = kPhotoCacheBudgetFraction * remaining;
         std::uint64_t cache = static_cast<std::uint64_t>(
             std::min(share, std::min(flight, static_cast<double>(kPhotoCacheMaxBytes))));
-        // At least one frame: a cache smaller than the frame it is asked to hold
-        // would evict it immediately and make the miss path pointless.
         cache = std::max(cache, static_cast<std::uint64_t>(std::ceil(photo_bytes)));
         out.photo_cache_bytes = cache;
-        out.estimated_peak_bytes = estimate_block_peak_bytes(
-            window_cells, window_footprint, input.has_node_map, input.photo_cells,
-            output_cells, cache);
+        out.estimated_peak_bytes = fixed + static_cast<double>(cache);
         return out;
     };
 
@@ -945,6 +996,9 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         plan.estimated_peak_bytes =
             estimate_peak_bytes(output_cells, input.footprint_cells, input.has_node_map,
                                 input.photo_cells);
+        plan.estimated_window_bytes = plan.estimated_peak_bytes;
+        plan.estimated_fill_bytes =
+            input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
         return plan;
     }
     if (input.forced_block_cells <= 0) {
@@ -956,6 +1010,9 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             plan.photo_cache_bytes =
                 static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
             plan.estimated_peak_bytes = whole;
+            plan.estimated_window_bytes = whole;
+            plan.estimated_fill_bytes =
+                input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
             return plan;
         }
     }
@@ -967,15 +1024,14 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         return plan_for_side(input.forced_block_cells);
     }
 
-    // Automatic: the largest side whose estimate stays inside the smaller of
-    // half the budget and the absolute per-block target. The target is what
-    // keeps the owner's 28 M-cell / 36-photo case under 2 GB on a machine whose
-    // budget would otherwise allow much bigger blocks.
-    const double limit = std::min(kBlockBudgetFraction * static_cast<double>(input.budget_bytes),
-                                  kBlockPeakTargetBytes);
+    // Automatic: the LARGEST side whose estimate fits the budget. The budget
+    // (platform::memory_budget_bytes) already reserves headroom for the rest of
+    // the process, so no further fraction is taken here: a machine with the RAM
+    // does fewer, bigger blocks, which is strictly better -- a block's margin
+    // overhead grows with its perimeter while its interior grows with its area.
     for (int side = kMaxBlockCells; side >= kMinBlockCells; side /= 2) {
         OrthoBlockPlan candidate = plan_for_side(side);
-        if (candidate.estimated_peak_bytes <= limit) {
+        if (candidate.estimated_peak_bytes <= static_cast<double>(input.budget_bytes)) {
             return candidate;
         }
     }
@@ -1451,6 +1507,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.photo_cells = photo_cells;
         input.camera_count = static_cast<int>(cameras.size());
         input.has_node_map = !frame.is_local();
+        input.fill_holes = options.fill_holes;
         input.budget_bytes = budget;
         input.forced_block_cells = 0;
         return plan_ortho_blocks(input);
@@ -1572,6 +1629,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     plan_input.photo_cells = photo_cells;
     plan_input.camera_count = static_cast<int>(cameras.size());
     plan_input.has_node_map = !frame.is_local();
+    plan_input.fill_holes = options.fill_holes;
     plan_input.budget_bytes = budget;
     plan_input.forced_block_cells =
         static_cast<int>(std::max<std::int64_t>(0, params.get_int("block_size")));
@@ -1649,51 +1707,39 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const int total_blocks = columns * rows;
     int block_index = 0;
 
-    for (int br = 0; br < rows; ++br) {
-        for (int bc = 0; bc < columns; ++bc, ++block_index) {
-            if (progress.is_cancelled()) {
-                throw Error("BuildOrthomosaic cancelled");
-            }
-            const int side = plan.block_cells > 0 ? plan.block_cells : std::max(grid.width, grid.height);
-            const int bx0 = bc * side;
-            const int by0 = br * side;
-            const int bx1 = std::min(grid.width, bx0 + side);
-            const int by1 = std::min(grid.height, by0 + side);
-            if (bx0 >= bx1 || by0 >= by1) {
-                continue;
-            }
-            const int margin = plan.block_cells > 0 ? plan.margin_cells : 0;
-            const int wx0 = std::max(0, bx0 - margin);
-            const int wy0 = std::max(0, by0 - margin);
-            const int wx1 = std::min(grid.width, bx1 + margin);
-            const int wy1 = std::min(grid.height, by1 + margin);
+    // The block's window grid, built from its own cell range. Used for the block
+    // being processed and (cheaply) for the next one, so the photograph cache
+    // knows which decoded frames the following block will still need.
+    struct BlockWindow {
+        RasterGrid grid;
+        int x0 = 0;  ///< first window column, in output-grid columns
+        int y0 = 0;
+    };
+    const auto window_grid_for = [&grid](int bx0, int by0, int bx1, int by1, int margin) {
+        BlockWindow block;
+        block.x0 = std::max(0, bx0 - margin);
+        block.y0 = std::max(0, by0 - margin);
+        const int wx1 = std::min(grid.width, bx1 + margin);
+        const int wy1 = std::min(grid.height, by1 + margin);
+        RasterGrid& window = block.grid;
+        window.pixel_size_x = grid.pixel_size_x;
+        window.pixel_size_y = grid.pixel_size_y;
+        window.origin_x = grid.origin_x + static_cast<double>(block.x0) * grid.pixel_size_x;
+        window.origin_y = grid.origin_y - static_cast<double>(block.y0) * grid.pixel_size_y;
+        window.width = wx1 - block.x0;
+        window.height = wy1 - block.y0;
+        return block;
+    };
 
-            RasterGrid window;
-            window.pixel_size_x = grid.pixel_size_x;
-            window.pixel_size_y = grid.pixel_size_y;
-            window.origin_x = grid.origin_x + static_cast<double>(wx0) * grid.pixel_size_x;
-            window.origin_y = grid.origin_y - static_cast<double>(wy0) * grid.pixel_size_y;
-            window.width = wx1 - wx0;
-            window.height = wy1 - wy0;
-
-            // Per-block plane->local map: the node lattice follows the block, so
-            // a large output never carries the whole-grid map (20 B/cell).
-            if (block_lattice.has_value()) {
-                block_lattice->col_offset = wx0;
-                block_lattice->row_offset = wy0;
-            }
-            cell_lattice.col_offset = wx0;
-            cell_lattice.row_offset = wy0;
-            const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
-                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
-                                    block_lattice.has_value() ? &*block_lattice : nullptr);
-            const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
-                window.pixel_center(0, window.height / 2).y());
-
-            // Cameras whose footprint reaches this window. Skipping the others
-            // is what makes a block cheap: their tiles would be empty anyway.
-            std::vector<std::size_t> block_cameras;
-            block_cameras.reserve(cameras.size());
+    // Cameras whose footprint reaches `window`. Skipping the others is what
+    // makes a block cheap: their tiles would be empty anyway.
+    const auto cameras_reaching =
+        [&cameras, &heights, &frame](const RasterGrid& window,
+                                     const std::function<Eigen::Vector3d(const Eigen::Vector3d&)>&
+                                         to_local,
+                                     const Eigen::Vector2d& metres_per_unit) {
+            std::vector<std::size_t> reaching;
+            reaching.reserve(cameras.size());
             for (std::size_t i = 0; i < cameras.size(); ++i) {
                 const CameraEntry& entry = cameras[i];
                 ortho::OrthoCamera probe;
@@ -1722,7 +1768,78 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 if (bounds.width <= 0 || bounds.height <= 0) {
                     continue;  // does not reach this window
                 }
-                block_cameras.push_back(i);
+                reaching.push_back(i);
+            }
+            return reaching;
+        };
+
+    for (int br = 0; br < rows; ++br) {
+        for (int bc = 0; bc < columns; ++bc, ++block_index) {
+            if (progress.is_cancelled()) {
+                throw Error("BuildOrthomosaic cancelled");
+            }
+            const int side = plan.block_cells > 0 ? plan.block_cells : std::max(grid.width, grid.height);
+            const int bx0 = bc * side;
+            const int by0 = br * side;
+            const int bx1 = std::min(grid.width, bx0 + side);
+            const int by1 = std::min(grid.height, by0 + side);
+            if (bx0 >= bx1 || by0 >= by1) {
+                continue;
+            }
+            const int margin = plan.block_cells > 0 ? plan.margin_cells : 0;
+            const BlockWindow block_window = window_grid_for(bx0, by0, bx1, by1, margin);
+            const RasterGrid& window = block_window.grid;
+            const int wx0 = block_window.x0;
+            const int wy0 = block_window.y0;
+
+            // Per-block plane->local map: the node lattice follows the block, so
+            // a large output never carries the whole-grid map (20 B/cell).
+            if (block_lattice.has_value()) {
+                block_lattice->col_offset = wx0;
+                block_lattice->row_offset = wy0;
+            }
+            cell_lattice.col_offset = wx0;
+            cell_lattice.row_offset = wy0;
+            const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
+                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
+                                    block_lattice.has_value() ? &*block_lattice : nullptr);
+            const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
+                window.pixel_center(0, window.height / 2).y());
+
+            // Cameras whose footprint reaches this window. Skipping the others
+            // is what makes a block cheap: their tiles would be empty anyway.
+            const std::vector<std::size_t> block_cameras =
+                cameras_reaching(window, to_local, metres_per_unit);
+
+            // Keep the frames the NEXT block will want (raster order: the block
+            // to the right, or the first block of the next row) near the head of
+            // the LRU, so this block's decodes evict frames that are already done
+            // with rather than ones the run is about to need again.
+            //
+            // The footprint probe reuses THIS block's plane->local map rather
+            // than building the next window's: a prefetch is only an ordering
+            // hint, so a map clamped to the neighbouring grid is close enough,
+            // and building a second block-sized node map (20 B/cell, the largest
+            // single object in the plan) beside this one would cost exactly the
+            // memory the blocking exists to save.
+            if (photos.budget_bytes() != 0) {
+                int next_bc = bc + 1;
+                int next_br = br;
+                if (next_bc >= columns) {
+                    next_bc = 0;
+                    ++next_br;
+                }
+                if (next_br < rows) {
+                    const int nx0 = next_bc * side;
+                    const int ny0 = next_br * side;
+                    const BlockWindow next_window =
+                        window_grid_for(nx0, ny0, std::min(grid.width, nx0 + side),
+                                        std::min(grid.height, ny0 + side), margin);
+                    for (const std::size_t slot :
+                         cameras_reaching(next_window.grid, to_local, metres_per_unit)) {
+                        photos.touch(slot);
+                    }
+                }
             }
 
             std::vector<ortho::OrthoTile> tiles;
@@ -1767,6 +1884,16 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             // its left is already decided. Those labels are pinned: the margin
             // keeps the seam paths continuous across a block border instead of
             // letting the neighbouring block re-decide the overlap.
+            //
+            // Only an INNER BAND of the overlap is pinned, not the whole margin.
+            // What continuity needs is the cell just outside the border: this
+            // block's first output column is decided against its left neighbour,
+            // so pinning one band of margin beside the block carries the earlier
+            // block's decision across. The rest of the margin is at the WINDOW
+            // edge, where a cell sees only half its neighbourhood, so anything
+            // decided there is a boundary artefact; leaving it free keeps the
+            // optimiser's context intact, and those cells are never written to
+            // the output (only this block's own region is copied out).
             std::vector<std::int32_t> seed;
             std::vector<std::uint8_t> frozen;
             if (plan.block_cells > 0) {
@@ -1774,6 +1901,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
                 seed.assign(window_cells, -1);
                 frozen.assign(window_cells, 0);
+                // The pinned band around a decided region: keep it to the part of
+                // the margin the seam optimiser itself operates over, so its own
+                // multi-scale pass still has free cells to work in.
+                const int pin_band = std::max(1, ortho::pyramid_support_cells(plan.levels));
                 for (int row = 0; row < window.height; ++row) {
                     for (int col = 0; col < window.width; ++col) {
                         const int gx = wx0 + col;
@@ -1785,6 +1916,16 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                         const int cell_block_row = gy / side;
                         const int cell_index = cell_block_row * columns + cell_block_col;
                         if (cell_index >= block_index) {
+                            continue;
+                        }
+                        // Distance to this block's own region, in cells. Only the
+                        // band nearest it is pinned; beyond that the optimiser is
+                        // free again so it can carry a seam across the border
+                        // rather than inherit wherever the previous window's edge
+                        // happened to put one.
+                        const int dx = std::max(0, std::max(bx0 - gx, gx - (bx1 - 1)));
+                        const int dy = std::max(0, std::max(by0 - gy, gy - (by1 - 1)));
+                        if (std::max(dx, dy) > pin_band) {
                             continue;
                         }
                         const std::size_t wc = static_cast<std::size_t>(row) *
@@ -1949,6 +2090,14 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             << ", blocks " << columns << "x" << rows << " of "
                             << plan.block_cells << " (+" << plan.margin_cells
                             << " margin), epsg " << result.epsg;
+        // Decode accounting: a cache too small for the flight shows up here as
+        // decodes well above the camera count, which is the number to watch if a
+        // future change to the plan or the block order starts thrashing.
+        log(LogLevel::Info) << "BuildOrthomosaic: photographs decoded " << photos.misses()
+                            << " of " << (photos.hits() + photos.misses())
+                            << " (cache " << platform::format_gb(
+                                   static_cast<double>(photos.budget_bytes()))
+                            << ", " << cameras.size() << " cameras)";
     }
     // Each run APPENDS a new orthomosaic asset and makes it active, so an
     // earlier orthomosaic is never overwritten.
