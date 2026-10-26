@@ -537,8 +537,12 @@ TEST(Ortho, OcclusionCostDoesNotFollowTheOutputGrid) {
     // coarse run, never multiplied by the 4x finer cell.
     EXPECT_LT(fine_per_cell, 1.5 * coarse_per_cell + 1.0);
     EXPECT_GT(fine_per_cell, 0.5 * coarse_per_cell);
-    // And bounded outright by the per-ray cap, whatever the geometry.
-    EXPECT_LE(fine_per_cell, 4096.0);
+    // The march now stops at a METRIC bound (the ray's height reaching the DEM's
+    // tallest sample), so the count is bounded by the scene's relief over the
+    // stride -- far below any per-ray sample budget. The old fixed 4096 cap was
+    // a geometry assumption; the count staying under it here means the height
+    // bound, not a cap, is what ends the march.
+    EXPECT_LT(fine_per_cell, 4096.0);
 }
 
 // -- 3. seamlines ------------------------------------------------------------

@@ -112,14 +112,17 @@ bool blocked(const GeoRaster<float>& dem, float nodata, double tol, double x, do
     return surface != static_cast<double>(nodata) && surface > z + tol;
 }
 
-/// The most DEM samples one occlusion ray may take, whatever its geometry.
-/// A march is bounded by the DEM's own height range (below), but a ray that
-/// stays under the tallest sample for a very long way -- a near-horizontal view
-/// of a tall wall -- must still terminate. At half a DEM cell per sample this
-/// spans 2048 DEM cells laterally, far beyond any occluder a height field can
-/// resolve; hitting it only loses occlusion for grazing rays that leave the
-/// grid edge anyway.
-constexpr std::size_t kMaxOcclusionSamplesPerRay = 4096;
+/// A safety stop against a pathological (or NaN-driven) loop, NOT a geometric
+/// bound. The march's real bound is metric: it stops as soon as the ray climbs
+/// above `dem_max + tol`, at which height occlusion is impossible. How far that
+/// takes is a property of the scene, not of the output grid, which is what the
+/// per-output-cell cost contract relies on (see the comment at the march).
+///
+/// The previous fixed cap of 4096 samples was an implicit geometry assumption:
+/// 4096 half-DEM-cell steps do not always reach the crest of a long slope viewed
+/// at a grazing angle, so a genuine occluder could be dropped. The cap is now
+/// only what turns "this ray never got above the terrain" into a finite loop.
+constexpr std::size_t kMaxOcclusionSamplesPerRay = 1000000;
 
 /// DEM samples taken by the occlusion march since the last reset. Test-only:
 /// the cost contract (samples per output cell must not follow the output grid)
@@ -432,16 +435,30 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             const Eigen::Vector3d dir = to_cam / distance;
 
             // -- occlusion: march from P toward the camera centre -----------
-            // Two independent bounds make the cost per output cell a constant:
-            // the ray stops as soon as it climbs above the tallest DEM sample
-            // (occlusion is then impossible), and it stops after
-            // kMaxOcclusionSamplesPerRay samples whatever the geometry. The
-            // step is a half DEM cell, so neither bound depends on how fine the
-            // output grid is.
+            // The stop is METRIC and exact: a ray can only be blocked while it
+            // is at or below the tallest DEM sample, so it terminates at the
+            // point where its height reaches `max_height + tolerance`
+            // (pz = P.z + dir.z * s, solved for s). That bound comes from the
+            // DEM's own statistics, so it is a property of the scene and not of
+            // the output grid -- the per-output-cell cost stays constant however
+            // fine the ortho is. When the ray is not climbing (dir.z <= 0) or
+            // the DEM has no valid sample, the ray end at `distance` is the only
+            // bound. kMaxOcclusionSamplesPerRay is then purely a guard against a
+            // NaN-driven loop that never advances.
+            double march_end = distance;
+            if (dir.z() > 0.0 && std::isfinite(max_height)) {
+                const double rise =
+                    (max_height + occlusion_tolerance) - P.z();
+                if (rise <= 0.0) {
+                    march_end = 0.0;  // already above every sample: no occluder
+                } else {
+                    march_end = std::min(march_end, rise / dir.z());
+                }
+            }
             bool occluded = false;
             std::size_t samples = 0;
             for (double s = step;
-                 s < distance && samples < kMaxOcclusionSamplesPerRay; s += step) {
+                 s <= march_end && samples < kMaxOcclusionSamplesPerRay; s += step) {
                 ++samples;
                 // Step in metres, then map back to plane units for the DEM read.
                 const double px = P.x() + dir.x() * s / mx;
