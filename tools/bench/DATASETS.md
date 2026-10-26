@@ -71,8 +71,15 @@ does not come from a photogrammetry pipeline at all.
   sparse depth maps for a reason that has nothing to do with the code. The 30 are chosen
   deterministically and named in the report.
 
-  Both are recorded in every metrics JSON and printed at the top of the report, so a
-  bounded run is never mistaken for a default one. Each stage also carries a 40-minute
+  `MatchPhotos keypoint_limit_per_mpx=250` (from 1000) is the second measured limit: at
+  20 MP per frame the default density is 20 000 keypoints and 1.26 MB of 63-byte
+  descriptors per image, and the resulting exhaustive matching ran the next CI attempt
+  out of memory at 97% of the match stage. 250 per megapixel is 5 000 per image, which is
+  still several thousand well-distributed keypoints for a 30-image block with heavy
+  overlap.
+
+  All of this is recorded in every metrics JSON and printed at the top of the report, so
+  a bounded run is never mistaken for a default one. Each stage also carries a 40-minute
   budget: a stage that overruns fails with its own name rather than waiting out the job's
   timeout and reporting nothing.
 - Why this one over the other candidates: it is the smallest member of the Comoros/Mayotte
@@ -134,12 +141,14 @@ does not come from a photogrammetry pipeline at all.
   alignment, then trimmed nearest-neighbour ICP. The fitted scale, the iteration count and
   the residual RMS are in the report, so a score that is really about the alignment is
   visible as one.
-- **The run is a 30-image block, and `BuildDepthMaps downscale=8`.** 42 frames at
-  6048 x 4032 is 24 MP each, so the default downscale of 4 is 64 million depth-map pixels
-  over 42 views. 30 of the 42 is still a 30-view dense reconstruction of the scene, and
+- **The run is a 30-image block, with `MatchPhotos keypoint_limit_per_mpx=250` and
+  `BuildDepthMaps downscale=8`.** 42 frames at 6048 x 4032 is 24 MP each: the default
+  downscale of 4 is 64 million depth-map pixels over 42 views, and the default keypoint
+  density is 24 000 keypoints per image. The same two measured limits as the aerial set
+  apply, for the same reason. 30 of the 42 is still a 30-view dense reconstruction, and
   the accuracy tolerances (2/5/10 cm against the laser scan) are what decide whether the
-  result is good enough — the downscale costs no information those tolerances can use.
-  Each stage also carries a 40-minute budget and both limits are printed in the report.
+  result is good enough — neither limit costs information those tolerances can measure.
+  Each stage also carries a 40-minute budget and every limit is printed in the report.
 
 ## Also surveyed, not chosen
 

@@ -218,10 +218,22 @@ jobs:
           ALPHASHAPE_CLI: ${{ github.workspace }}/build/bench/bin/alphashape-cli
         run: |
           mkdir -p build/bench
+          set +e
           python3 tools/bench/run_bench.py \
             --dataset "${{ matrix.dataset }}" \
             --work build/bench \
-            --json "build/bench/metrics-${{ matrix.dataset }}.json"
+            --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # A failed stage must not leave its reason only in an artifact: print
+            # the CLI's own last lines here, where the run page shows them.
+            echo "::group::CLI log tail"
+            tail -n 60 build/bench/cli.log 2>/dev/null || echo "(no cli.log)"
+            echo "::endgroup::"
+            echo "::error::the benchmark failed; see the log above"
+            exit "$status"
+          fi
 
       # The baseline is the metrics JSON from the last SUCCESSFUL run of this
       # workflow on the default branch. Artifacts are per-run, so the run has to be

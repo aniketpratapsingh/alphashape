@@ -458,11 +458,41 @@ def run_cli(args: list[str], *, log: Path | None = None, timeout: float | None =
         ) from None
     elapsed = time.monotonic() - started
     if result.returncode != 0:
-        raise SystemExit(
-            f"alphashape-cli exited {result.returncode}: {' '.join(args)}"
-            + (f" (see {log})" if log else "")
-        )
+        raise SystemExit(_failure_message(result.returncode, args, log))
     return elapsed
+
+
+def _failure_message(returncode: int, args: list[str], log: Path | None) -> str:
+    """What to print when a stage fails.
+
+    The reason matters more than the fact. A negative return code is a signal, and
+    a signal of 9 on a CI runner means the kernel killed the process — almost always
+    for memory — which no amount of reading a truncated progress log would reveal.
+    So the signal case is named explicitly, and the last few non-progress lines of
+    stderr are included because the CLI's error message is the one line that says
+    what actually went wrong.
+    """
+    if returncode < 0:
+        signal_number = -returncode
+        name = {9: "SIGKILL (out of memory?)", 15: "SIGTERM", 11: "SIGSEGV"}.get(
+            signal_number, f"signal {signal_number}"
+        )
+        head = f"alphashape-cli was killed by {name}"
+    else:
+        head = f"alphashape-cli exited {returncode}"
+    message = f"{head}: {' '.join(args)}"
+    if log is not None and log.exists():
+        lines = [line for line in _tail(log, 40) if not _is_progress(line)]
+        if lines:
+            message += "\n  last output:\n    " + "\n    ".join(lines[-6:])
+        message += f"\n  full log: {log}"
+    return message
+
+
+def _is_progress(line: str) -> bool:
+    """True for the CLI's ``[stage] NN%`` progress lines."""
+    stripped = line.strip()
+    return stripped.startswith("[") and stripped.endswith("%") and "]" in stripped
 
 
 def run_pipeline(
@@ -489,6 +519,11 @@ def run_pipeline(
     overrides = overrides or {}
 
     started = time.monotonic()
+    # The log is truncated per RUN, not per stage: it is one run's evidence, and a
+    # stale log from a previous attempt would bury this one's error.
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"")
+
     stages["AddPhotos"] = _timed(run_cli, ["--new", str(project), "--add-images",
                                            *[str(p) for p in images]], log=log)
     for task in PIPELINE:

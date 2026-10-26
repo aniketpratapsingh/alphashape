@@ -46,11 +46,14 @@
       "expected_images": 102,
       "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2. Its ortho and DSM are both at 2.19 cm/px (the record quotes 1 and 2.0, which OpenDroneMap reads in centimetres), so the reference matches the imagery resolution rather than being coarser than it.",
       "param_overrides": {
+        "MatchPhotos": {
+          "keypoint_limit_per_mpx": 250
+        },
         "BuildDepthMaps": {
           "downscale": 8
         }
       },
-      "param_overrides_reason": "The survey is 102 images at 5472 x 3648 (20 MP). At the default downscale of 4 that is 127 million depth-map pixels, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters that to 32 million, and the resulting 1.7 cm depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is recorded in every metrics JSON and printed in the report, so a tuned run is never mistaken for a default one. It is the ONLY deviation from defaults.",
+      "param_overrides_reason": "30 images at 5472 x 3648 is 20 MP each. At the default keypoint density (1000 per megapixel) that is 20 000 keypoints per image and 1.26 MB of 63-byte descriptors per image, and the exhaustive matching over the selected pairs is what ran the first CI attempt out of memory at 97% of the match stage. 250 per megapixel is 5 000 per image, still several thousand well-distributed keypoints for a 30-image block with heavy overlap. downscale=8 quarters the depth-map pixel count and leaves a 1.7 cm depth grid, still finer than the 2.4 cm GSD the imagery can justify. Both are recorded in every metrics JSON and printed in the report.",
       "max_images": 30,
       "stage_budget_s": 2400,
       "max_images_reason": "The dense stage costs images x pixels, and 102 frames at 20 MP does not fit a weekly job on a shared CPU runner: the first run of this benchmark spent over five hours in BuildDepthMaps and was cancelled. 30 images is the contiguous block nearest the flight's centre by GPS, which is a real spatial strip with the overlap the stereo stage needs \u2014 a strided sample across the whole flight would only just overlap and would produce sparse depth maps for a reason that has nothing to do with the code. The 30 are chosen deterministically and named in the report."
@@ -108,11 +111,14 @@
       "expected_images": 42,
       "notes": "The scan_eval archive holds the laser scan already aligned into the image frame, which is why it is used instead of the 1.9 GB full ground-truth bundle. The reconstruction is registered onto the scan by similarity ICP before scoring, because an SfM model has no metric scale and these images carry no GPS. ETH3D scores accuracy and completeness at 2/5/10 cm; this benchmark uses the same tolerances.",
       "param_overrides": {
+        "MatchPhotos": {
+          "keypoint_limit_per_mpx": 250
+        },
         "BuildDepthMaps": {
           "downscale": 8
         }
       },
-      "param_overrides_reason": "42 images at 6048 x 4032 (24 MP). At the default downscale of 4 that is 64 million depth-map pixels over 42 views, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters it to 16 million. Accuracy is still measured against the laser scan at 2/5/10 cm, so the tolerances \u2014 not the depth-grid spacing \u2014 decide whether the result is good enough. The override is recorded in every metrics JSON and printed in the report.",
+      "param_overrides_reason": "30 images at 6048 x 4032 is 24 MP each; the same keypoint and depth-map budgets as the aerial set apply, for the same measured reason (the first CI attempt was killed during matching). The accuracy tolerances of 2/5/10 cm against the laser scan are what decide whether the result is good enough, so the downscale costs nothing those tolerances can measure.",
       "max_images": 30,
       "stage_budget_s": 2400,
       "max_images_reason": "42 frames at 24 MP is 64 million depth-map pixels at downscale 8 over 42 views, which does not fit the weekly budget on a shared CPU runner. 30 of the 42 is enough for a 30-view dense reconstruction of the scene while leaving headroom; the selection is deterministic and named in the report."
