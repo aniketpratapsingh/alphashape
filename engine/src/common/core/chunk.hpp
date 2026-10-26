@@ -87,6 +87,16 @@ struct DepthMap {
     /// Empty, or width * height: per-pixel confidence / support weight.
     std::vector<float> confidence;
 
+    /// The cross-view filter this map has been through: -1 when it has not been
+    /// filtered at all (a map checkpointed by a cancelled run, or one that
+    /// never reached the filter stage), otherwise the FilterMode's enumerator
+    /// (0 disabled, 1 mild, 2 moderate, 3 aggressive). A map is reused as-is
+    /// only when this already equals the mode the run asked for; anything else
+    /// is filtered again, because the filter is not idempotent (each repetition
+    /// erodes support at the boundaries) and because a run that asked for
+    /// "aggressive" must not silently return "mild" maps.
+    int filter_mode = -1;
+
     /// Hash of the camera pose, the sensor calibration and the downscale this
     /// map was derived from: see depth_map_fingerprint(). A later
     /// BuildDepthMaps run reuses a map only when this matches the chunk's
@@ -99,7 +109,7 @@ struct DepthMap {
         return camera_id == other.camera_id && width == other.width &&
                height == other.height && downscale == other.downscale &&
                depths == other.depths && normals == other.normals &&
-               confidence == other.confidence &&
+               confidence == other.confidence && filter_mode == other.filter_mode &&
                alignment_fingerprint == other.alignment_fingerprint;
     }
 };

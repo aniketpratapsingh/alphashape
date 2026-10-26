@@ -166,7 +166,9 @@ TEST_F(TaskDialogTest, LastUsedValuesAreRememberedAndResetRestoresDefaults) {
         ASSERT_NE(downscale, nullptr);
         EXPECT_EQ(downscale->value(), 4);
         downscale->setValue(8);
-        qobject_cast<QCheckBox*>(dialog.editor("reuse_depth"))->setChecked(true);
+        // reuse_depth defaults to true, so remember the non-default value to
+        // prove the setting is carried over.
+        qobject_cast<QCheckBox*>(dialog.editor("reuse_depth"))->setChecked(false);
         qobject_cast<QComboBox*>(dialog.editor("filter_mode"))->setCurrentText("aggressive");
         dialog.accept();
         ASSERT_EQ(dialog.result(), QDialog::Accepted);
@@ -175,15 +177,17 @@ TEST_F(TaskDialogTest, LastUsedValuesAreRememberedAndResetRestoresDefaults) {
     {
         TaskDialog again("BuildDepthMaps", registry(), store());
         EXPECT_EQ(qobject_cast<QSpinBox*>(again.editor("downscale"))->value(), 8);
-        EXPECT_TRUE(qobject_cast<QCheckBox*>(again.editor("reuse_depth"))->isChecked());
+        EXPECT_FALSE(qobject_cast<QCheckBox*>(again.editor("reuse_depth"))->isChecked());
         const Params remembered = again.params();
         EXPECT_EQ(remembered.get_int("downscale"), 8);
-        EXPECT_TRUE(remembered.get_bool("reuse_depth"));
+        EXPECT_FALSE(remembered.get_bool("reuse_depth"));
         EXPECT_EQ(remembered.get_string("filter_mode"), "aggressive");
 
         again.reset_to_defaults();
         EXPECT_EQ(qobject_cast<QSpinBox*>(again.editor("downscale"))->value(), 4);
-        EXPECT_FALSE(qobject_cast<QCheckBox*>(again.editor("reuse_depth"))->isChecked());
+        // reuse_depth defaults to true: a map is reused only when its downscale
+        // and its alignment fingerprint both match, so the default is safe.
+        EXPECT_TRUE(qobject_cast<QCheckBox*>(again.editor("reuse_depth"))->isChecked());
         EXPECT_EQ(again.params().get_int("downscale"), 4);
         EXPECT_EQ(again.params().get_string("filter_mode"), "mild");
         again.accept();

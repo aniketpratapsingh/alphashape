@@ -8,15 +8,37 @@
 // stereo::filter_depth_map cross-checks the map against its neighbours, leaving
 // the retained count as the pixel's confidence.
 //
-// Everything is staged, then committed with a single assignment: a NEW depth-map
-// asset is appended and made active, and every point cloud is dropped (each was
-// fused from maps that are no longer active). Images are decoded once and cached
-// for the task's lifetime, keyed by camera id.
+// INCREMENTAL. A camera's search is hours of work at downscale 2, so the run is
+// checkpointed in this task's own terms: every finished map stays staged, and a
+// cancellation stores the maps finished so far as a new depth-map asset before
+// rethrowing CancelledError. Those maps are unfiltered (no cross-view pass has
+// run yet) but complete per camera, carry their alignment fingerprint, and are
+// reused by the next run with `reuse_depth` — which then filters them properly
+// against the neighbourhood that finally exists.
+//
+// REUSE. `reuse_depth` (default on) skips the PatchMatch search for a camera
+// whose existing map matches BOTH the working downscale and the camera's
+// current geometry: depth_map_fingerprint() over the pose, the sensor
+// calibration and the downscale. Re-aligning cameras or re-calibrating a sensor
+// therefore invalidates the stale maps instead of silently consuming them. A
+// map with fingerprint 0 (saved by a build that did not record one) is never
+// reused.
+//
+// Progress inside one camera comes from stereo::PatchMatchOptions::on_sweep,
+// which the CPU and GPU paths both call after every refinement half-sweep; the
+// hook also polls for cancellation, so Cancel takes effect within one sweep
+// rather than after the current camera.
+//
+// Everything else is committed with a single assignment: a NEW depth-map asset
+// is appended and made active, and every point cloud is dropped (each was fused
+// from maps that are no longer active). Images are decoded once and cached for
+// the task's lifetime, keyed by camera id.
 
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -151,7 +173,16 @@ void log_self_check(const stereo::PatchMatchResult& gpu_result,
                         << both << " pixels valid in both";
 }
 
+/// Counts PatchMatch searches started by this task (test hook). Deliberately
+/// not per-task-instance: the tests drive a task through the registry and need
+/// to count across several apply() calls.
+std::atomic<std::uint64_t> g_search_count{0};
+
 }  // namespace
+
+std::uint64_t depth_map_search_count() { return g_search_count.load(); }
+
+void reset_depth_map_search_count() { g_search_count.store(0); }
 
 void BuildDepthMapsTask::declare_params(Params& params) const {
     // Defaults follow Metashape's public Python API.
@@ -175,9 +206,14 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     max_neighbors.maximum = static_cast<std::int64_t>(kMaxNeighborsExclusive) - 1;
     params.declare(max_neighbors);
 
-    params.declare({"reuse_depth", ParamType::Bool, false,
-                    "Keep existing depth maps whose downscale matches for cameras that still "
-                    "have usable neighbours."});
+    // On by default: a finished map is expensive, and a re-run after a cancel
+    // should continue rather than start over. Only a map whose downscale AND
+    // alignment fingerprint match is reused, so the default cannot consume a
+    // stale map after a re-alignment.
+    params.declare({"reuse_depth", ParamType::Bool, true,
+                    "Reuse existing depth maps for cameras whose map was built at this "
+                    "downscale and against the current camera alignment and calibration. A "
+                    "map from before a re-alignment is rebuilt rather than reused."});
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new depth-map set. Empty selects \"Depth Maps <n>\". Each "
                     "run creates a new set."});
@@ -185,8 +221,7 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
     return {Stage{"initialize", 0}, Stage{"buildDepthMaps", 0}, Stage{"filterDepthMaps", 0},
-            Stage{"finalize", 0}};
-}
+            Stage{"finalize", 0}};}
 
 void BuildDepthMapsTask::apply(Document& document, Params& params, const Progress& progress) {
     // -- validate every parameter before touching the chunk ------------------
@@ -255,6 +290,20 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         camera_by_id[camera.id] = &camera;
     }
 
+    // The geometry a depth map for this camera at this downscale must have been
+    // built from to be reusable. Computed once per camera for the reuse test and
+    // stamped on every map this run produces.
+    const auto fingerprint_of = [&](std::int32_t camera_id) -> std::uint64_t {
+        const Camera& camera = *camera_by_id.at(camera_id);
+        if (camera.sensor_id < 0 ||
+            camera.sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
+            return 0;  // no sensor: nothing can be reused, and the mismatch is caught in load()
+        }
+        return depth_map_fingerprint(camera, chunk->sensors()[static_cast<std::size_t>(
+                                                 camera.sensor_id)],
+                                     downscale);
+    };
+
     // Existing maps by camera id, for reuse_depth. Read through a CONST view: the
     // non-const accessor would lazily create an empty set on a chunk with none.
     const Chunk& source = *chunk;
@@ -264,6 +313,23 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             existing.emplace(map.camera_id, &map);
         }
     }
+    // A map's SEARCH is reusable only when it was built at this downscale from
+    // this geometry, and its stored depths are still the raw search output:
+    // filter_mode -1 (never filtered, e.g. checkpointed by a cancelled run) or
+    // exactly the mode this run asks for. A map filtered at another strength
+    // holds post-filter depths, and the filter does not invert, so its search
+    // is repeated rather than re-filtered into something it never was.
+    //
+    // Fingerprint 0 means "unknown" (a project saved before the field existed),
+    // which never matches, so an old project's maps are rebuilt once and carry a
+    // fingerprint from then on.
+    const int requested_mode = static_cast<int>(filter_mode);
+    const auto reusable = [&](const DepthMap& map) {
+        return reuse_depth && map.downscale == downscale &&
+               map.alignment_fingerprint != 0 &&
+               map.alignment_fingerprint == fingerprint_of(map.camera_id) &&
+               (map.filter_mode < 0 || map.filter_mode == requested_mode);
+    };
     progress.update("initialize", 1.0);
 
     // -- build depth maps (sequential over cameras) --------------------------
@@ -323,23 +389,84 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         return out;
     };
 
+    // Maps finished so far, keyed by camera id. Kept ordered by the
+    // neighbourhood order so the committed set is deterministic.
     std::vector<DepthMap> built;
     built.reserve(neighbourhoods.size());
     std::vector<std::string> errors(neighbourhoods.size());
     std::atomic<bool> self_checked{false};
 
+    // Checkpoint the maps finished so far into the chunk as a new depth-map
+    // asset, then rethrow. Called only on cancellation, when those maps are
+    // valid per camera but have not been through the cross-view filter (see
+    // DepthMap::filtered). A cancelled run that finished nothing leaves the
+    // chunk untouched, so "cancel" on the first camera is still a no-op.
+    //
+    // This is the ONLY commit a cancelled run makes. A task that throws is
+    // normally expected to leave the document as it found it; keeping finished
+    // maps is the deliberate exception, because the alternative is discarding
+    // hours of completed work. The set is labelled and carries fingerprints, so
+    // a later run can use it and cannot mistake a stale map for a current one.
+    const auto checkpoint_and_throw = [&](const std::string& message) {
+        if (built.empty()) {
+            throw CancelledError(message);
+        }
+        Chunk staged = std::move(*chunk);
+        DepthMapsAsset& set = staged.add_depth_maps(params.get_string("label"));
+        // A copy, not the staged vector: `built` is still alive in the frame
+        // that logs how many were kept, after the chunk has been reassigned.
+        *set.data = built;
+        // A point cloud is derived from the whole set, so the maps just stored
+        // do not describe it. Drop it here for the same reason the completed
+        // path does.
+        staged.point_clouds().clear();
+        staged.set_active_point_cloud_id(-1);
+        *chunk = std::move(staged);
+        // The reuse lookup of a LATER run reads the active set only, so the new
+        // partial set is exactly what it should continue from; earlier sets
+        // stay in the chunk for inspection, as they do after a completed run.
+        log(LogLevel::Info) << "BuildDepthMaps: cancelled after " << built.size() << " of "
+                            << neighbourhoods.size() << " cameras; kept them as asset "
+                            << chunk->active_depth_maps_id() << " ("
+                            << chunk->depth_map_sets().back().label
+                            << "), unfiltered. Re-run with reuse_depth to continue.";
+        throw CancelledError(message);
+    };
+
+    // Progress within one camera: the search reports 0..1 of ITSELF per sweep;
+    // scale that into the camera's slice of the build stage and poll the cancel
+    // flag on every tick, so Cancel takes effect inside one sweep rather than
+    // after the current camera (which can be hours at downscale 2).
+    const double camera_count = static_cast<double>(neighbourhoods.size());
+    std::size_t current_index = 0;
+    const auto sweep_progress = [&](double fraction) {
+        progress.update("buildDepthMaps",
+                        (static_cast<double>(current_index) + std::clamp(fraction, 0.0, 1.0)) /
+                            camera_count);
+        if (progress.is_cancelled()) {
+            throw CancelledError("BuildDepthMaps was cancelled");
+        }
+    };
+
     progress.update("buildDepthMaps", 0.0);
     for (std::size_t i = 0; i < neighbourhoods.size(); ++i) {
+        current_index = i;
         const stereo::ViewNeighbourhood& hood = neighbourhoods[i];
         try {
-            // Reuse an existing map of the right resolution when asked to.
+            // Reuse an existing map built at this downscale from this geometry.
+            // Its search is skipped; filtering still runs unless it was already
+            // filtered, so a map checkpointed by an earlier cancelled run gets
+            // the cross-view pass it never had.
             if (reuse_depth) {
                 const auto kept = existing.find(hood.camera_id);
-                if (kept != existing.end() && kept->second->downscale == downscale) {
+                if (kept != existing.end() && reusable(*kept->second)) {
                     built.push_back(*kept->second);
                     progress.update("buildDepthMaps",
-                                    static_cast<double>(i + 1) /
-                                        static_cast<double>(neighbourhoods.size()));
+                                    (static_cast<double>(i) + 1.0) / camera_count);
+                    if (progress.is_cancelled()) {
+                        // A reused map is still progress worth keeping.
+                        checkpoint_and_throw("BuildDepthMaps was cancelled");
+                    }
                     continue;
                 }
             }
@@ -357,13 +484,22 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             options.depth_min = neighbours.depth_min;
             options.depth_max = neighbours.depth_max;
             options.seed = seed_for_camera(hood.camera_id);
+            options.on_sweep = sweep_progress;
 
             log_device_once();
 
+            const auto started = std::chrono::steady_clock::now();
             // GPU when available and enabled, CPU otherwise or after a device
-            // failure (with_fallback logs and counts it once per image).
+            // failure (with_fallback logs and counts it once). The device is
+            // recorded before the run, because a fallback mid-run is the only
+            // case where the answer differs from patch_match_gpu_would_run.
+            const bool gpu_path =
+                stereo::patch_match_gpu_would_run(reference, neighbours.views, options);
+            g_search_count.fetch_add(1);
             const stereo::PatchMatchResult result =
                 stereo::run_patch_match_device(reference, neighbours.views, options);
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
             if (self_check_enabled() && !self_checked.exchange(true)) {
                 const stereo::PatchMatchResult cpu_result =
@@ -378,14 +514,27 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             map.downscale = downscale;
             map.depths.assign(result.depth.begin(), result.depth.end());
             map.normals.assign(result.normals.begin(), result.normals.end());
+            map.alignment_fingerprint = fingerprint_of(hood.camera_id);
+            // A PatchMatch result is not a final map: the cross-view filter is
+            // still to run, so no mode is recorded yet.
+            map.filter_mode = -1;
+            if (Log::enabled(LogLevel::Info)) {
+                log(LogLevel::Info) << "depth map " << (i + 1) << "/" << neighbourhoods.size()
+                                    << ": camera " << hood.camera_id << ", " << map.width << "x"
+                                    << map.height << ", " << (gpu_path ? "GPU" : "CPU") << ", "
+                                    << seconds << " s";
+            }
             built.push_back(std::move(map));
+        } catch (const CancelledError&) {
+            // Keep what finished: those maps are valid and labelled with their
+            // downscale and fingerprint, so a re-run skips them.
+            checkpoint_and_throw("BuildDepthMaps was cancelled");
         } catch (const std::exception& e) {
             errors[i] = "camera " + std::to_string(hood.camera_id) + ": " + e.what();
         }
-        progress.update("buildDepthMaps",
-                        static_cast<double>(i + 1) / static_cast<double>(neighbourhoods.size()));
+        progress.update("buildDepthMaps", (static_cast<double>(i) + 1.0) / camera_count);
         if (progress.is_cancelled()) {
-            throw CancelledError("BuildDepthMaps was cancelled");
+            checkpoint_and_throw("BuildDepthMaps was cancelled");
         }
     }
     for (const std::string& error : errors) {
@@ -409,11 +558,22 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
 
     std::vector<DepthMap> filtered;
     filtered.reserve(built.size());
-    const std::size_t camera_count = built.size();
+    const std::size_t staged_count = built.size();
 
     progress.update("filterDepthMaps", 0.0);
     for (std::size_t i = 0; i < built.size(); ++i) {
         const DepthMap& map = built[i];
+        // A reused map already filtered with the mode this run asked for is
+        // final: running the pass again is not idempotent (it erodes support at
+        // the boundaries). Only a map checkpointed unfiltered (mode -1) reaches
+        // this loop otherwise, and it is filtered now.
+        if (map.filter_mode == requested_mode) {
+            filtered.push_back(map);
+            progress.update("filterDepthMaps",
+                            (static_cast<double>(i) + 1.0) /
+                                static_cast<double>(staged_count));
+            continue;
+        }
         const auto hood_it = hood_by_id.find(map.camera_id);
         if (hood_it == hood_by_id.end()) {
             filtered.push_back(map);
@@ -462,9 +622,14 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                                 << "% after " << stereo::to_string(filter_mode) << " filtering";
         }
         progress.update("filterDepthMaps",
-                        static_cast<double>(i + 1) / static_cast<double>(camera_count));
+                        static_cast<double>(i + 1) / static_cast<double>(staged_count));
         if (progress.is_cancelled()) {
-            throw CancelledError("BuildDepthMaps was cancelled");
+            // The searches are all done, which is the expensive part, so keep
+            // them: `built` is the unfiltered set at this point, and the next
+            // run filters it. (Filtering cannot be resumed in place: the pass
+            // reads neighbour maps, so replacing one mid-loop would make later
+            // maps filter against filtered neighbours.)
+            checkpoint_and_throw("BuildDepthMaps was cancelled");
         }
     }
     progress.update("filterDepthMaps", 1.0);
