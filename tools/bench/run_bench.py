@@ -530,7 +530,7 @@ def run_pipeline(
     for task in PIPELINE:
         arguments = ["--project", str(project), "--task", task]
         for key, value in (overrides.get(task) or {}).items():
-            arguments += ["--set", f"{key}={value}"]
+            arguments += ["--set", f"{key}={cli_value(value)}"]
         budget = None
         if stage_budget_s:
             budget = float(stage_budgets.get(task, stage_budget_s)) if stage_budgets else stage_budget_s
@@ -576,6 +576,20 @@ def peak_rss_mb() -> float | None:
         return usage.ru_maxrss / 1024
     except (ImportError, AttributeError):  # pragma: no cover - non-POSIX
         return None
+
+
+def cli_value(value) -> str:
+    """Render a manifest override the way the CLI's --set parser reads it.
+
+    The parser accepts exactly ``true``/``false``/``1``/``0`` for a bool — not
+    Python's ``True``/``False``, which is what an f-string on a JSON-loaded value
+    produces. Getting that wrong is a one-line bug that costs a full pipeline run
+    before it surfaces, so the conversion lives here with a test rather than
+    inline in the argument loop.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _timed(function, *args, **kwargs):

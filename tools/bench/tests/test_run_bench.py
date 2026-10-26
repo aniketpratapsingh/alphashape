@@ -467,6 +467,20 @@ class CommandLineTest(unittest.TestCase):
                 run_bench.main(["--dataset", "no-such-dataset", "--list"])
 
 
+class CliValueTest(unittest.TestCase):
+    def test_a_bool_becomes_lowercase(self):
+        # The CLI's parser accepts only lowercase true/false for a Bool parameter.
+        self.assertEqual(run_bench.cli_value(True), "true")
+        self.assertEqual(run_bench.cli_value(False), "false")
+
+    def test_a_number_is_rendered_plainly(self):
+        self.assertEqual(run_bench.cli_value(8), "8")
+        self.assertEqual(run_bench.cli_value(0.05), "0.05")
+
+    def test_a_string_passes_through(self):
+        self.assertEqual(run_bench.cli_value("source"), "source")
+
+
 class PipelineShapeTest(unittest.TestCase):
     def test_the_pipeline_order_matches_the_documented_one(self):
         # A missing or reordered stage is a silent score change, so the order the
