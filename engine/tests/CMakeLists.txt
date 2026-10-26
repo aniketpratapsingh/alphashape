@@ -94,15 +94,13 @@ target_compile_definitions(alphashape_tests PRIVATE
 # process either lists a device or explains why it cannot). Defined only when the
 # CLI exists; the test skips itself otherwise.
 if(ALPHASHAPE_BUILD_CLI AND TARGET alphashape-cli)
-    # Generator expressions are expanded at build time, but the separator is
-    # known now: CMake writes a Windows path with backslashes, and a literal
-    # "C:\...\alphashape-cli.exe" inside a C++ string is a minefield of
-    # escape sequences (the GitHub runner's "D:\a\..." produced \a and \s and
-    # failed the build under -Werror). $<TO_CMAKE_PATH:...> rewrites the
-    # resolved path with forward slashes on every platform, and CreateProcess
-    # accepts them on Windows.
+    # $<TARGET_FILE:...> expands to a forward-slash path on every platform (the
+    # GUI suites bake $<TARGET_FILE:alphashape-gui> the same way), so the
+    # literal has no backslashes to misread as escapes. $<SHELL_PATH:...> is
+    # the wrong tool here: it produces the native cmd form, and the GitHub
+    # runner's D:\a\... turned into \a and \s and failed under -Werror.
     target_compile_definitions(alphashape_tests PRIVATE
-        "ALPHASHAPE_CLI_EXE=\"$<TO_CMAKE_PATH:$<TARGET_FILE:alphashape-cli>>\"")
+        "ALPHASHAPE_CLI_EXE=\"$<TARGET_FILE:alphashape-cli>\"")
     add_dependencies(alphashape_tests alphashape-cli)
 endif()
 
