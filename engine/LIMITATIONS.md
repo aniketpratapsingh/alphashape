@@ -37,6 +37,13 @@ sections below give the engineering detail behind each item.
   loader and driver headers, which the current vcpkg recipe does not carry
   yet, so every Windows task runs on the CPU. Linux and macOS builds
   include it and fall back to the CPU when no suitable device is found.
+- **Long GPU steps can freeze an M1 Mac with 16 GB.** On a first-generation
+  Apple silicon Mac, Build Model (and possibly other long GPU steps) can
+  stall the display and force a restart, because the work shares the GPU with
+  the screen. Newer Macs were not affected in testing. Until this is fixed,
+  run the app with the GPU layer off on such a machine:
+  `ALPHASHAPE_GPU=0 /Applications/alphashape.app/Contents/MacOS/alphashape-gui`
+  (the tasks then run on the CPU), and save before long Build steps.
 - **The Python module is per interpreter.** A `.so`/`.pyd` is loadable only
   by the CPython minor version it was built against: 3.12 for the `.deb`
   (Ubuntu 24.04's system `python3`) and for the Windows installer (a pinned
