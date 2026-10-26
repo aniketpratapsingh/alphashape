@@ -1011,6 +1011,47 @@ TEST(DepthMapsCancel, CancelBeforeAnyCameraLeavesTheChunkUnchanged) {
         << "a cancel that finished nothing must not append an empty set";
 }
 
+TEST(DepthMapsCancel, KeepsPointCloudAndOtherProducts) {
+    // A cancel keeps the depth maps it finished and touches NOTHING else. The
+    // point cloud (and every other derived product) is only dropped by a
+    // SUCCESSFUL run, which replaces the maps it was fused from; a cancel is not
+    // a statement that those products are stale, so destroying them would make
+    // Cancel dangerous.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    run_build_point_cloud(document);
+    ASSERT_FALSE(document.active_chunk()->point_cloud().points.empty());
+    const std::int32_t cloud_id = document.active_chunk()->active_point_cloud_id();
+    ASSERT_GE(cloud_id, 0);
+    const PointCloud cloud_before = document.active_chunk()->point_cloud();
+
+    // A NEW run that is cancelled after two cameras. It rebuilds (reuse=false),
+    // so the cancel has fresh maps to keep.
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 2U);
+    CancellingProgress cancel;
+    const double two_cameras = 2.0 / static_cast<double>(camera_count);
+    cancel.when = [two_cameras](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= two_cameras;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/false);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+
+    const Chunk& after = *document.active_chunk();
+    // The finished maps are there.
+    EXPECT_FALSE(after.depth_maps().empty());
+    // The point cloud is untouched: same set, same active id, same points.
+    ASSERT_EQ(after.point_clouds().size(), 1U)
+        << "a cancel must not drop other products";
+    EXPECT_EQ(after.active_point_cloud_id(), cloud_id);
+    EXPECT_TRUE(after.point_cloud().points == cloud_before.points)
+        << "a cancel changed the point cloud";
+}
+
 // ---------------------------------------------------------------------------
 // 2. A cancel inside one camera works: the sweep hook polls between sweeps
 // ---------------------------------------------------------------------------

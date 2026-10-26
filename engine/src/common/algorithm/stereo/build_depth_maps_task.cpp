@@ -31,10 +31,11 @@
 // hook also polls for cancellation, so Cancel takes effect within one sweep
 // rather than after the current camera.
 //
-// Everything else is committed with a single assignment: a NEW depth-map asset
-// is appended and made active, and every point cloud is dropped (each was fused
-// from maps that are no longer active). Images are decoded once and cached for
-// the task's lifetime, keyed by camera id.
+// Everything else is committed with a single assignment. A finished run appends
+// a NEW depth-map asset and makes it active, and drops every point cloud (each
+// was fused from maps that are no longer active). A CANCELLED run commits depth
+// maps only: point clouds and every other product are left untouched. Images
+// are decoded once and cached for the task's lifetime, keyed by camera id.
 
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
 
@@ -475,9 +476,14 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // filter_mode is still -1). A cancelled run that finished nothing leaves the
     // chunk untouched, so "cancel" on the first camera is still a no-op.
     //
-    // This is the ONLY commit a cancelled run makes. A task that throws is
-    // normally expected to leave the document as it found it; keeping finished
-    // maps is the deliberate exception, because the alternative is discarding
+    // WHAT A CANCEL COMMITS: depth maps, and nothing else. Every other product
+    // (point clouds, models, DEMs, orthomosaics, earlier depth-map sets) is
+    // left exactly as it was. A cancel is not a statement that those products
+    // are stale, and destroying hours of unrelated work would make the Cancel
+    // button dangerous. A SUCCESSFUL run still drops the point clouds, because
+    // it replaces the maps they were fused from (see the commit block below).
+    // Keeping the finished maps is the deliberate exception to "a task that
+    // throws leaves the document as it found it": the alternative is discarding
     // hours of completed work. The set is labelled and carries fingerprints, so
     // a later run can use it and cannot mistake a stale map for a current one.
     const auto checkpoint_and_throw = [&](const std::string& message) {
@@ -489,11 +495,6 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // A copy, not the staged vector: `built` is still alive in the frame
         // that logs how many were kept, after the chunk has been reassigned.
         *set.data = built;
-        // A point cloud is derived from the whole set, so the maps just stored
-        // do not describe it. Drop it here for the same reason the completed
-        // path does.
-        staged.point_clouds().clear();
-        staged.set_active_point_cloud_id(-1);
         *chunk = std::move(staged);
         // The reuse lookup of a LATER run reads the active set only, so the new
         // partial set is exactly what it should continue from; earlier sets
@@ -715,7 +716,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     *set.data = std::move(filtered);
     // Every point cloud is derived from depth maps, so the ones already in the
     // chunk no longer describe the active maps. Drop them rather than leave a
-    // cloud that looks current but was fused from different maps.
+    // cloud that looks current but was fused from different maps. This is
+    // SUCCESS-only: a cancelled run keeps them, see checkpoint_and_throw.
     staged.point_clouds().clear();
     staged.set_active_point_cloud_id(-1);
     *chunk = std::move(staged);
