@@ -1718,7 +1718,7 @@ TEST(BuildOrthomosaic, BlockWiseDefaultMosaicHasNoBlockGrid) {
 
     const int w = blocked.raster.grid.width;
     const int h = blocked.raster.grid.height;
-    const auto near_border = [kBlock, w, h](int col, int row) {
+    const auto near_border = [w, h](int col, int row) {
         // Within two cells of any interior block border.
         constexpr int kNear = 2;
         const int col_mod = col % kBlock;
