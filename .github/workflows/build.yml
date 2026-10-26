@@ -1080,8 +1080,18 @@ jobs:
           $url = 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z'
           $expected = '351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695'
           $archive = Join-Path $env:RUNNER_TEMP 'mesa.7z'
+          # Invoke-WebRequest is a cmdlet, not a native program: it sets no
+          # $LASTEXITCODE. A fresh pwsh session leaves that variable $null, and
+          # `$null -ne 0` is true, so a LASTEXITCODE test here fired on a
+          # download that had in fact succeeded. The $ErrorActionPreference
+          # 'Stop' below turns a failed download into a terminating error, and
+          # the size check catches a truncated one.
+          $ErrorActionPreference = 'Stop'
           Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
-          if ($LASTEXITCODE -ne 0) { throw 'downloading the Mesa archive failed' }
+          if (-not (Test-Path -LiteralPath $archive) -or
+              (Get-Item -LiteralPath $archive).Length -lt 100MB) {
+            throw 'the Mesa archive did not download'
+          }
           $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) {
             throw "Mesa archive SHA-256 is $actual, expected $expected; refusing to use it"
@@ -1101,8 +1111,13 @@ jobs:
 
           # VK_DRIVER_FILES pins the loader to this driver: without it the
           # loader would scan the registry and find nothing, because the runner
-          # has no GPU driver installed at all.
+          # has no GPU driver installed at all. The DLL is beside the manifest
+          # and the manifest names it relatively, so the extraction directory
+          # alone is enough -- it does not have to be on PATH.
           "VK_DRIVER_FILES=$dest\lvp_icd.x86_64.json" >> $env:GITHUB_ENV
+          # VK_ICD_FILENAMES is the older spelling. Mesa's own docs and the
+          # Linux lane set both; a loader reads either.
+          "VK_ICD_FILENAMES=$dest\lvp_icd.x86_64.json" >> $env:GITHUB_ENV
           "ALPHASHAPE_MESA_DIR=$dest" >> $env:GITHUB_ENV
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
