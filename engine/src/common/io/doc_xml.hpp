@@ -30,9 +30,10 @@
 // different paths. See sidecars.hpp for the layouts.
 //
 // READER. version == 1 loads through the v1 reader exactly as before;
-// version == 2 loads through the v2 reader (which is strict about unknown
-// elements inside <chunk>); a missing version or one newer than
-// Document::kFormatVersion raises ProjectIOError.
+// version == 2 or 3 loads through the v2 reader (which is strict about unknown
+// elements inside <chunk>; v3 differs only in the depth-map sidecar encoding,
+// ADM1 -> ADM2, which the codec keys off its own magic); a missing version or
+// one newer than Document::kFormatVersion raises ProjectIOError.
 
 #include <memory>
 #include <string>
@@ -61,8 +62,8 @@ struct ReadReport {
 
 /// Write doc.xml and every binary sidecar into `archive`.
 ///
-/// Only the current format (Document::kFormatVersion, v2) can be written; a
-/// different `version` raises ProjectIOError rather than silently writing v2.
+/// Only the current format (Document::kFormatVersion, v3) can be written; a
+/// different `version` raises ProjectIOError rather than silently upgrading.
 /// Throws ProjectIOError for content the format cannot represent, rather than
 /// silently dropping it.
 void write_document(const Document& document, ZipArchive& archive,
