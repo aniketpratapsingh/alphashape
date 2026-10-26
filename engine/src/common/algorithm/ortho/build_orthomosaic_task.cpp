@@ -1180,10 +1180,24 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 too_fine = mid;
             }
         }
+        // Round up, then make sure the rounding did not put it back over the
+        // budget. Each nudge is at least 1% coarser, so this always terminates
+        // long before the cap; the cap is only a guard.
         double chosen = ceil_sig3(fits);
-        for (int step = 0; step < 32 && peak_at(grid_at(chosen)) > static_cast<double>(budget);
-             ++step) {
+        bool fits_after_rounding = false;
+        for (int step = 0; step < 64; ++step) {
+            if (peak_at(grid_at(chosen)) <= static_cast<double>(budget)) {
+                fits_after_rounding = true;
+                break;
+            }
             chosen = ceil_sig3(chosen * 1.01);
+        }
+        if (!fits_after_rounding) {
+            throw ValueError(
+                "BuildOrthomosaic could not settle on a resolution that fits this "
+                "machine's budget of " +
+                platform::format_gb(static_cast<double>(budget)) +
+                ". Set a resolution explicitly, or close other applications and retry.");
         }
         grid = grid_at(chosen);
         resolution = chosen;
