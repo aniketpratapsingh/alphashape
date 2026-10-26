@@ -462,9 +462,18 @@ private:
 /// being declared a hang at the steady-state bound. Later submissions are sized
 /// from a measurement and keep the tight budget, lengthened only when a single
 /// step alone would outlast it.
+///
+/// `on_submission` — when non-empty — is called after every submission with
+/// (dispatches finished, dispatches total), i.e. how much of the operation has
+/// actually run. It is the hook a caller uses to report intra-operation
+/// progress and to cancel a long solve: it runs on the caller's thread between
+/// submissions, and an exception it throws propagates out of run_batched
+/// (nothing is submitted afterwards; the dispatches already run stay run).
 std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatches,
                         BatchLimiter& limiter, std::size_t leading_dispatches = 0,
-                        std::size_t trailing_dispatches = 0);
+                        std::size_t trailing_dispatches = 0,
+                        const std::function<void(std::size_t done, std::size_t total)>&
+                            on_submission = nullptr);
 
 /// Which queue a submission goes to. Queue 1 is only honoured when the selected
 /// queue family exposes at least two queues; otherwise it falls back to queue 0
@@ -533,7 +542,11 @@ bool try_load_library(const std::string& path, std::string* reason);
 }  // namespace detail
 
 /// Runs gpu_fn when the layer is available, otherwise cpu_fn. Any exception
-/// from gpu_fn is logged, counted, and answered by cpu_fn.
+/// from gpu_fn is logged, counted, and answered by cpu_fn -- except a
+/// CancelledError, which is the caller's own request to stop and is rethrown.
+/// A cancelled operation must not be retried on the CPU: the CPU run would
+/// ignore the cancellation until its own hook fires, and a cancel is not a
+/// device failure to count.
 template <class R>
 R with_fallback(const char* what, const std::function<R()>& gpu_fn,
                 const std::function<R()>& cpu_fn) {
@@ -542,6 +555,8 @@ R with_fallback(const char* what, const std::function<R()>& gpu_fn,
     }
     try {
         return gpu_fn();
+    } catch (const CancelledError&) {
+        throw;
     } catch (const std::exception& error) {
         detail::note_gpu_failure(std::string(what) + ": " + error.what());
     } catch (...) {

@@ -87,13 +87,90 @@ struct DepthMap {
     /// Empty, or width * height: per-pixel confidence / support weight.
     std::vector<float> confidence;
 
+    /// The cross-view filter this map has been through: -1 when it has not been
+    /// filtered at all (a map checkpointed by a cancelled run, or one that
+    /// never reached the filter stage), otherwise the FilterMode's enumerator
+    /// (0 disabled, 1 mild, 2 moderate, 3 aggressive). A map is reused as-is
+    /// only when this already equals the mode the run asked for; anything else
+    /// is filtered again, because the filter is not idempotent (each repetition
+    /// erodes support at the boundaries) and because a run that asked for
+    /// "aggressive" must not silently return "mild" maps.
+    int filter_mode = -1;
+
+    /// Hash of everything this map was derived from: the reference camera's
+    /// pose and the sensor calibration, the downscale, AND the whole
+    /// neighbourhood (neighbour ids, their poses and calibrations, the depth
+    /// range, the reference image file and the PatchMatch settings). See
+    /// depth_map_fingerprint(). A later BuildDepthMaps run reuses a map only
+    /// when this matches the chunk's current geometry, so re-aligning ANY
+    /// camera invalidates every map that used it as a neighbour, and a
+    /// re-calibration invalidates every map on that sensor. 0 means "unknown"
+    /// — written by a build that did not record one — and such a map is never
+    /// reused.
+    std::uint64_t alignment_fingerprint = 0;
+
     bool operator==(const DepthMap& other) const {
         return camera_id == other.camera_id && width == other.width &&
                height == other.height && downscale == other.downscale &&
                depths == other.depths && normals == other.normals &&
-               confidence == other.confidence;
+               confidence == other.confidence && filter_mode == other.filter_mode &&
+               alignment_fingerprint == other.alignment_fingerprint;
     }
 };
+
+/// Deterministic hash of everything a depth map depends on besides the image
+/// pixels: the camera's world->camera pose, the sensor calibration and the
+/// working downscale; and, through the optional `context`, the whole
+/// NEIGHBOURHOOD the map was estimated from — the neighbour camera ids (sorted),
+/// each neighbour's pose and calibration, the depth range, the reference image
+/// the pixels came from and the PatchMatch settings that shape the result.
+///
+/// A map is a function of its reference camera AND its neighbourhood: moving a
+/// camera changes every map that used it as a neighbour, not only its own. Two
+/// runs that would produce the same map have the same fingerprint; a
+/// re-aligned camera, a re-calibrated sensor, a different neighbour set or a
+/// different search configuration does not. Never returns 0, which is reserved
+/// for "no fingerprint recorded".
+///
+/// `context` is null for a bare "camera identity" hash (the older, narrower
+/// fingerprint); TaskDepthMapFingerprint in build_depth_maps_task.hpp is what
+/// the task actually stamps, because only the task knows the neighbourhood.
+struct DepthMapFingerprintContext {
+    int max_neighbors = 0;
+    /// Neighbour camera ids, sorted ascending. Order matters to the caller but
+    /// NOT to the hash: it sorts its own copy so a select_views tie ordering
+    /// cannot masquerade as a geometric change.
+    std::vector<std::int32_t> neighbour_ids;
+    /// Sorted parallel data for `neighbour_ids`: pose (16 doubles row-major) and
+    /// the sensor calibration. Same order, same size.
+    std::vector<Transform> neighbour_poses;
+    std::vector<Calibration> neighbour_calibrations;
+    double depth_min = 0.0;
+    double depth_max = 0.0;
+    /// Resolved reference-image path (empty when unknown), with size and mtime
+    /// when cheap: 0 means "not stat-able" and is folded as 0, consistently.
+    std::string image_path;
+    std::uint64_t image_size = 0;
+    std::int64_t image_mtime = 0;
+    int window_radius = 0;
+    int window_step = 0;
+    int iterations = 0;
+    std::uint64_t seed = 0;
+};
+
+std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, int downscale,
+                                    const DepthMapFingerprintContext* context = nullptr);
+
+/// Fold one more value into a fingerprint built by depth_map_fingerprint(): the
+/// same splitmix64 mixing the fingerprint itself uses, so a caller that knows
+/// extra inputs (the task's neighbourhood) can extend it portably and
+/// reproducibly across platforms. Exposed for that one use; not a general hash.
+std::uint64_t depth_map_fingerprint_fold_double(std::uint64_t h, double value);
+std::uint64_t depth_map_fingerprint_fold_int(std::uint64_t h, std::int64_t value);
+std::uint64_t depth_map_fingerprint_fold_string(std::uint64_t h, const std::string& text);
+/// The seed depth_map_fingerprint() starts from, for a caller that builds one
+/// itself (the task folds in a chunk's camera geometry before the per-map part).
+std::uint64_t depth_map_fingerprint_seed();
 
 // PointCloud and Mesh are declared in `alphashape_model` (model/mesh/) and
 // included above, so the meshing library can consume geometry without

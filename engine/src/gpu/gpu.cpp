@@ -488,7 +488,8 @@ void BatchLimiter::observe(std::size_t steps_done, double seconds) {
 
 std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatches,
                         BatchLimiter& limiter, std::size_t leading_dispatches,
-                        std::size_t trailing_dispatches) {
+                        std::size_t trailing_dispatches,
+                        const std::function<void(std::size_t, std::size_t)>& on_submission) {
     if (dispatches.empty()) {
         return 0;
     }
@@ -555,6 +556,12 @@ std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatche
         }
         run_with_fence_budget(context, slice, budget_ns);
         ++submissions;
+        // Report after the fence: `end` dispatches have actually finished. A
+        // hook that throws (a cancellation) propagates and stops the operation
+        // here -- everything already submitted stays run, nothing new follows.
+        if (on_submission) {
+            on_submission(end, dispatches.size());
+        }
     };
 
     std::size_t steps_done = 0;

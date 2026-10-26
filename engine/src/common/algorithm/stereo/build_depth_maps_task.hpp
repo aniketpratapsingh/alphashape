@@ -18,10 +18,35 @@
 // Every image is decoded once and cached for the task's lifetime, keyed by
 // camera id. A camera with no neighbourhood gets no depth map.
 //
-// Commit. A NEW depth-map asset is appended and made active, so an earlier set
-// is never overwritten; every point cloud in the chunk is dropped, because each
-// was derived from maps that are no longer the active ones. Cameras left
-// without a neighbourhood simply have no map. `label` names the new set.
+// Cancellation. A finished camera's map is staged immediately; when the task is
+// cancelled, the maps finished so far are committed before CancelledError is
+// rethrown. Those maps are complete per camera and carry their alignment
+// fingerprint, so the next run with `reuse_depth` (on by default) skips their
+// search and filters them. A cancel inside one camera takes effect within one
+// PatchMatch sweep, because the sweep hook polls the cancellation flag.
+//
+// A cancel commits ONLY depth maps: every other product in the chunk (point
+// clouds, models, DEMs, orthomosaics, earlier depth-map sets) is left exactly
+// as it was. Repeated cancels do not accumulate sets: the first writes one
+// marked "partial", later ones merge into it, and a run that finally completes
+// replaces it in place.
+//
+// Reuse. A map is reused only when its downscale AND its alignment fingerprint
+// match the chunk's current geometry AND NEIGHBOURHOOD: the reference camera's
+// pose and the sensor calibration, the neighbour cameras' ids, poses and
+// calibrations, the depth range, the reference image file and the PatchMatch
+// settings. Moving one camera therefore rebuilds every map that had it as a
+// neighbour, not only its own, so a re-alignment or re-calibration never reuses
+// a map the change invalidated.
+//
+// Commit. A new depth-map asset is appended and made active (or the partial set
+// this run resumed from is completed in place), so an earlier completed set is
+// never overwritten. On SUCCESS every point cloud in the chunk is dropped,
+// because each was derived from maps that are no longer the active ones; a
+// cancellation leaves them alone. Cameras left without a neighbourhood simply
+// have no map. `label` names the new set.
+
+#include <cstdint>
 
 #include "common/tasks/task.hpp"
 
@@ -35,5 +60,14 @@ public:
     std::vector<Stage> stages() const override;
     void apply(Document& document, Params& params, const Progress& progress) override;
 };
+
+/// Test hook: how many PatchMatch searches BuildDepthMaps has STARTED in this
+/// process. A reused map is not counted, so the difference across two runs is
+/// exactly the number of cameras whose search was repeated — the timing-free way
+/// to assert that reuse works.
+std::uint64_t depth_map_search_count();
+
+/// Test hook: reset depth_map_search_count() to 0.
+void reset_depth_map_search_count();
 
 }  // namespace alphashape

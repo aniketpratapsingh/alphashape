@@ -377,6 +377,34 @@ TEST(Gpu, FallbackWhenDisabled) {
     set_enabled(true);
 }
 
+TEST(Gpu, CancelledErrorIsRethrownNotRetriedOnTheCpu) {
+    // A CancelledError is the CALLER's request to stop, not a GPU failure. A
+    // CPU retry would ignore the cancellation (the CPU run has not seen the
+    // flag the GPU run reacted to) and repeat the whole operation, so
+    // with_fallback must rethrow it and must NOT count it as a failure.
+    if (!available()) {
+        // The enabled branch is only entered with a device; without one the
+        // catch block this case is about is unreachable by design.
+        GTEST_SKIP() << "no GPU device: " << unavailable_reason();
+    }
+    const std::uint64_t baseline = failure_count();
+    const bool was_enabled = enabled();
+    set_enabled(true);
+    bool cpu_called = false;
+    EXPECT_THROW(
+        with_fallback<int>(
+            "cancelled test",
+            []() -> int { throw alphashape::CancelledError("user cancelled"); },
+            [&cpu_called] {
+                cpu_called = true;
+                return 5;
+            }),
+        alphashape::CancelledError);
+    EXPECT_FALSE(cpu_called) << "a CancelledError must not fall back to the CPU";
+    EXPECT_EQ(failure_count(), baseline) << "a cancellation is not a GPU failure";
+    set_enabled(was_enabled);
+}
+
 TEST(Gpu, FallbackWhenGpuThrows) {
     if (!available()) {
         // Without a device (GPU=OFF or no driver) the GPU lambda is never

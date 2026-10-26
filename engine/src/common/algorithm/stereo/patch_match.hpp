@@ -7,6 +7,7 @@
 // normal, and the final cost.
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include <Eigen/Core>
@@ -23,6 +24,13 @@ struct PMView {
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
 };
 
+/// Called at the end of every refinement sweep with the fraction of the search
+/// finished (0..1), so a front end can move a progress bar inside one camera
+/// and a caller can cancel between sweeps. The hook may throw (a task's
+/// CancelledError); both the CPU and the GPU implementation let it propagate
+/// unchanged, which discards the half-swept map.
+using SweepProgress = std::function<void(double fraction)>;
+
 struct PatchMatchOptions {
     double depth_min = 0.0;
     double depth_max = 0.0;
@@ -33,6 +41,9 @@ struct PatchMatchOptions {
     double max_cost = 0.5;       // final pixels with cost above this get depth -1
     double min_texture_stddev = 1.0 / 255.0;  // skip windows flatter than this (intensity 0..1)
     std::uint64_t seed = 1;
+    /// Optional per-sweep progress. Not part of a map's identity and never
+    /// persisted; empty means "report nothing".
+    SweepProgress on_sweep;
 };
 
 struct PatchMatchResult {

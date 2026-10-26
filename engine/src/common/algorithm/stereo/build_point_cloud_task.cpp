@@ -102,6 +102,10 @@ void BuildPointCloudTask::apply(Document& document, Params& params, const Progre
 
     std::vector<stereo::FusionInput> inputs;
     inputs.reserve(source.depth_maps().size());
+    // Maps with no confidence buffer: never cross-view filtered, so the
+    // min_confidence filter has nothing to judge them by. Counted so the task
+    // can say so instead of quietly behaving one way or the other.
+    std::size_t unfiltered_maps = 0;
     for (const DepthMap& map : source.depth_maps()) {
         const auto camera_it = camera_by_id.find(map.camera_id);
         if (camera_it == camera_by_id.end()) {
@@ -124,6 +128,9 @@ void BuildPointCloudTask::apply(Document& document, Params& params, const Progre
             map.downscale);
         input.R = pose_R(camera.pose);
         input.t = pose_t(camera.pose);
+        if (map.confidence.empty()) {
+            ++unfiltered_maps;
+        }
 
         if (point_colors) {
             const auto frame_it = frame_of.find(map.camera_id);
@@ -142,6 +149,18 @@ void BuildPointCloudTask::apply(Document& document, Params& params, const Progre
     }
     if (inputs.empty()) {
         throw ValueError("No depth maps");
+    }
+    // An unfiltered map has no confidence buffer, so min_confidence cannot
+    // judge it. Rather than silently drop all of its points (a filter that
+    // rejected nothing measured and everything unmeasured), say so and let the
+    // fusion treat it as passing.
+    if (unfiltered_maps > 0U) {
+        log(LogLevel::Warn) << "BuildPointCloud: " << unfiltered_maps << " of "
+                            << inputs.size()
+                            << " depth map(s) have no confidence (never cross-view filtered); "
+                            << (min_confidence > 0.0
+                                    ? "they are treated as passing min_confidence"
+                                    : "they are fused as usual");
     }
     progress.update("validate", 1.0);
 

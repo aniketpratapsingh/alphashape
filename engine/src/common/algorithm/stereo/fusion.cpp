@@ -238,8 +238,17 @@ PointCloud fuse_depth_maps(const std::vector<FusionInput>& inputs, const FusionO
                 if (!(depth > 0.0F)) {  // -1 sentinel and 0 both mean "no depth"
                     continue;
                 }
-                const float conf = map.confidence.empty() ? 0.0F : map.confidence[idx];
-                if (conf < options.min_confidence) {
+                // An UNFILTERED map carries no confidence buffer at all (a map
+                // checkpointed by a cancelled BuildDepthMaps, or a map that was
+                // never cross-view filtered). Treating that as confidence 0
+                // would silently drop every point of it under any
+                // min_confidence > 0, which is not what "unfiltered" means: the
+                // absence of a measurement is not a failing measurement. Such a
+                // map passes the filter untouched; BuildPointCloud logs a
+                // warning so the caller knows the filter could not judge it.
+                const bool unfiltered = map.confidence.empty();
+                const float conf = unfiltered ? 0.0F : map.confidence[idx];
+                if (!unfiltered && conf < options.min_confidence) {
                     continue;
                 }
 
