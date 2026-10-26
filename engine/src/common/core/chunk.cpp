@@ -1,8 +1,11 @@
 #include "common/core/chunk.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "common/core/frame.hpp"
 
@@ -245,8 +248,43 @@ typename Slot::value_type& payload_of(Slot& slot) {
 
 }  // namespace
 
-std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, int downscale) {
-    std::uint64_t h = 0x243F6A8885A308D3ULL;  // pi's digits: an arbitrary non-zero seed
+std::uint64_t depth_map_fingerprint_seed() { return 0x243F6A8885A308D3ULL; }
+
+std::uint64_t depth_map_fingerprint_fold_double(std::uint64_t h, double value) {
+    return fold_double(h, value);
+}
+
+std::uint64_t depth_map_fingerprint_fold_int(std::uint64_t h, std::int64_t value) {
+    return fold_int(h, value);
+}
+
+std::uint64_t depth_map_fingerprint_fold_string(std::uint64_t h, const std::string& text) {
+    // Length first, then the bytes: without the length "ab"+"c" and "a"+"bc"
+    // would collide, which for a path pair is a real (if unlikely) confusion.
+    h = fold_int(h, static_cast<std::int64_t>(text.size()));
+    for (const char c : text) {
+        h = mix64(h ^ static_cast<std::uint64_t>(static_cast<unsigned char>(c)));
+    }
+    return h;
+}
+
+namespace {
+
+void fold_calibration(std::uint64_t& h, const Calibration& cal) {
+    h = fold_int(h, static_cast<std::int64_t>(cal.type));
+    h = fold_int(h, cal.width);
+    h = fold_int(h, cal.height);
+    for (const double value : {cal.f, cal.cx, cal.cy, cal.b1, cal.b2, cal.k1, cal.k2, cal.k3,
+                               cal.k4, cal.p1, cal.p2}) {
+        h = fold_double(h, value);
+    }
+}
+
+}  // namespace
+
+std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, int downscale,
+                                    const DepthMapFingerprintContext* context) {
+    std::uint64_t h = depth_map_fingerprint_seed();  // pi's digits: an arbitrary non-zero seed
     // The pose, row-major. A re-alignment changes it, so a map built before the
     // re-alignment stops matching.
     for (int r = 0; r < 4; ++r) {
@@ -257,15 +295,51 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
     // The calibration the map was derived from, and the reduction factor: the
     // same pose with a different lens, or at a different working resolution, is
     // a different map.
-    const Calibration& cal = sensor.calibration;
-    h = fold_int(h, static_cast<std::int64_t>(cal.type));
-    h = fold_int(h, cal.width);
-    h = fold_int(h, cal.height);
-    for (const double value : {cal.f, cal.cx, cal.cy, cal.b1, cal.b2, cal.k1, cal.k2, cal.k3,
-                               cal.k4, cal.p1, cal.p2}) {
-        h = fold_double(h, value);
-    }
+    fold_calibration(h, sensor.calibration);
     h = fold_int(h, downscale);
+
+    if (context != nullptr) {
+        // The NEIGHBOURHOOD: a depth map is estimated against the neighbours, so
+        // moving any one of them changes this map as much as moving the
+        // reference does. Ids and poses are folded in sorted-by-id order so the
+        // hash depends on the SET, not on select_views' tie ordering.
+        std::vector<std::size_t> order(context->neighbour_ids.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            return context->neighbour_ids[a] < context->neighbour_ids[b];
+        });
+        h = fold_int(h, context->max_neighbors);
+        h = fold_int(h, static_cast<std::int64_t>(context->neighbour_ids.size()));
+        for (const std::size_t i : order) {
+            h = fold_int(h, context->neighbour_ids[i]);
+            if (i < context->neighbour_poses.size()) {
+                const Transform& pose = context->neighbour_poses[i];
+                for (int r = 0; r < 4; ++r) {
+                    for (int c = 0; c < 4; ++c) {
+                        h = fold_double(h, pose(r, c));
+                    }
+                }
+            }
+            if (i < context->neighbour_calibrations.size()) {
+                fold_calibration(h, context->neighbour_calibrations[i]);
+            }
+        }
+        h = fold_double(h, context->depth_min);
+        h = fold_double(h, context->depth_max);
+        // The pixels themselves: the resolved path, plus size/mtime when they
+        // were stat-able (0 when not, which hashes consistently either way).
+        h = depth_map_fingerprint_fold_string(h, context->image_path);
+        h = fold_int(h, static_cast<std::int64_t>(context->image_size));
+        h = fold_int(h, context->image_mtime);
+        // The search configuration that produces the result.
+        h = fold_int(h, context->window_radius);
+        h = fold_int(h, context->window_step);
+        h = fold_int(h, context->iterations);
+        h = fold_int(h, static_cast<std::int64_t>(context->seed));
+    }
+
     // mix64 is a bijection on 64 bits and the seed is non-zero, but a single
     // final mix keeps the guarantee local: fold_int() already mixed, so only the
     // impossible all-zero state needs excluding. Remap it rather than return it,

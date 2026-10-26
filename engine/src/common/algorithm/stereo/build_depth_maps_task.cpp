@@ -18,11 +18,13 @@
 //
 // REUSE. `reuse_depth` (default on) skips the PatchMatch search for a camera
 // whose existing map matches BOTH the working downscale and the camera's
-// current geometry: depth_map_fingerprint() over the pose, the sensor
-// calibration and the downscale. Re-aligning cameras or re-calibrating a sensor
-// therefore invalidates the stale maps instead of silently consuming them. A
-// map with fingerprint 0 (saved by a build that did not record one) is never
-// reused.
+// current geometry AND neighbourhood: depth_map_fingerprint() over the pose,
+// the sensor calibration and the downscale, extended with the neighbour ids,
+// their poses and calibrations, the depth range, the reference image file and
+// the PatchMatch options. Re-aligning a camera, re-calibrating a sensor or
+// changing max_neighbors therefore invalidates every affected map instead of
+// silently consuming stale ones. A map with fingerprint 0 (saved by a build
+// that did not record one) is never reused.
 //
 // Progress inside one camera comes from stereo::PatchMatchOptions::on_sweep,
 // which the CPU and GPU paths both call after every refinement half-sweep; the
@@ -291,18 +293,88 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         camera_by_id[camera.id] = &camera;
     }
 
-    // The geometry a depth map for this camera at this downscale must have been
-    // built from to be reusable. Computed once per camera for the reuse test and
-    // stamped on every map this run produces.
+    // The neighbourhood of every camera, for the fingerprint AND for the reuse
+    // test that reads it. select_views above already produced it in camera
+    // order; index by id so a map can be fingerprinted where it is stamped.
+    std::unordered_map<std::int32_t, const stereo::ViewNeighbourhood*> hood_of;
+    for (const stereo::ViewNeighbourhood& hood : neighbourhoods) {
+        hood_of[hood.camera_id] = &hood;
+    }
+
+    // The PatchMatch options every map of this run is searched with. Fixed here
+    // rather than inline so the fingerprint stamps exactly what ran.
+    const int kWindowRadius = stereo::PatchMatchOptions{}.window_radius;
+    const int kWindowStep = stereo::PatchMatchOptions{}.window_step;
+    const int kIterations = stereo::PatchMatchOptions{}.iterations;
+
+    // The geometry AND neighbourhood a depth map for this camera at this
+    // downscale must have been built from to be reusable. Computed once per
+    // camera for the reuse test and stamped on every map this run produces.
+    //
+    // It deliberately covers the WHOLE neighbourhood: moving a neighbour
+    // changes this camera's map (the search compares against that neighbour's
+    // pixels), so a re-alignment must invalidate every map that had the moved
+    // camera as a neighbour, not just the moved camera's own map.
     const auto fingerprint_of = [&](std::int32_t camera_id) -> std::uint64_t {
         const Camera& camera = *camera_by_id.at(camera_id);
         if (camera.sensor_id < 0 ||
             camera.sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
             return 0;  // no sensor: nothing can be reused, and the mismatch is caught in load()
         }
-        return depth_map_fingerprint(camera, chunk->sensors()[static_cast<std::size_t>(
-                                                 camera.sensor_id)],
-                                     downscale);
+        DepthMapFingerprintContext context;
+        context.max_neighbors = static_cast<int>(max_neighbors);
+        context.window_radius = kWindowRadius;
+        context.window_step = kWindowStep;
+        context.iterations = kIterations;
+        context.seed = seed_for_camera(camera_id);
+        const auto hood_it = hood_of.find(camera_id);
+        if (hood_it != hood_of.end()) {
+            const stereo::ViewNeighbourhood& hood = *hood_it->second;
+            context.depth_min = hood.depth_min;
+            context.depth_max = hood.depth_max;
+            context.neighbour_ids = hood.neighbours;
+            context.neighbour_poses.reserve(hood.neighbours.size());
+            context.neighbour_calibrations.reserve(hood.neighbours.size());
+            for (const std::int32_t id : hood.neighbours) {
+                const auto nb = camera_by_id.find(id);
+                if (nb == camera_by_id.end()) {
+                    continue;
+                }
+                context.neighbour_poses.push_back(nb->second->pose);
+                const std::int32_t sensor_id = nb->second->sensor_id;
+                // A neighbour with no sensor is a broken chunk; the same
+                // condition is caught in load(). Hash a default calibration so
+                // the fingerprint stays a function of the model, not of a throw.
+                context.neighbour_calibrations.push_back(
+                    sensor_id >= 0 &&
+                            sensor_id < static_cast<std::int32_t>(chunk->sensors().size())
+                        ? chunk->sensors()[static_cast<std::size_t>(sensor_id)].calibration
+                        : Calibration{});
+            }
+        }
+        // The reference image, resolved the way load() will resolve it. Absent
+        // frames are caught in load(); an unresolvable path hashes as empty.
+        const auto frame_it = frame_of.find(camera_id);
+        if (frame_it != frame_of.end()) {
+            const std::filesystem::path path = resolve_frame_path(document, frame_it->second->path());
+            context.image_path = path.string();
+            // Size and mtime are a cheap, portable proxy for "the pixels are the
+            // same file". Failing to stat is not an error: the map is still a
+            // function of the path, and 0/0 hashes consistently.
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(path, ec);
+            if (!ec) {
+                context.image_size = static_cast<std::uint64_t>(size);
+            }
+            ec.clear();
+            const auto mtime = std::filesystem::last_write_time(path, ec);
+            if (!ec) {
+                context.image_mtime = static_cast<std::int64_t>(mtime.time_since_epoch().count());
+            }
+        }
+        return depth_map_fingerprint(camera,
+                                     chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)],
+                                     downscale, &context);
     };
 
     // Existing maps by camera id, for reuse_depth. Read through a CONST view: the

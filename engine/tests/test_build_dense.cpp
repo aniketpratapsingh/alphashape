@@ -25,8 +25,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <functional>
 #include <fstream>
+#include <functional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -848,6 +849,17 @@ std::size_t depth_camera_count(const Chunk& chunk) {
     return stereo::select_views(chunk, {}).size();
 }
 
+/// The neighbourhoods the task itself will see at the DEFAULT max_neighbors.
+/// The fingerprint covers the whole neighbourhood, so a test asserting how many
+/// maps a moved camera invalidates has to derive that count from these rather
+/// than assume "the moved camera's own map only".
+std::vector<stereo::ViewNeighbourhood> task_neighbourhoods(const Chunk& chunk) {
+    const Params defaults = make_params(builtin_registry().require("BuildDepthMaps"));
+    stereo::ViewSelectionOptions selection;
+    selection.max_neighbors = static_cast<int>(defaults.get_int("max_neighbors"));
+    return stereo::select_views(chunk, selection);
+}
+
 Params reuse_params(int downscale, bool reuse, const std::string& filter = "mild") {
     Params params = depth_params(downscale, filter);
     params.set("reuse_depth", ParamValue{reuse});
@@ -915,6 +927,7 @@ using incremental::depth_camera_count;
 using incremental::kIncrementalDownscale;
 using incremental::reuse_params;
 using incremental::run_depth_maps;
+using incremental::task_neighbourhoods;
 using incremental::valid_pixels;
 
 // ---------------------------------------------------------------------------
@@ -1054,9 +1067,10 @@ TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
     run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
     EXPECT_EQ(depth_map_search_count(), 0U) << "an unchanged chunk rebuilt maps it could reuse";
 
-    // Move one camera, as a re-alignment would, and that camera's map is rebuilt
-    // while every other map is still reused. Which camera is moved does not
-    // matter -- neighbours are symmetric here -- but the map must NOT be reused.
+    // Move one camera, as a re-alignment would. A depth map is a function of the
+    // reference camera AND its neighbourhood, so moving B must rebuild the map
+    // of B itself AND every camera that used B as a neighbour. Which cameras
+    // those are is read from the same selection the task uses, not assumed.
     std::vector<DepthMap> before = document.active_chunk()->depth_maps();
     Camera& moved = document.active_chunk()->cameras().front();
     moved.pose(0, 3) += 0.25;
@@ -1068,12 +1082,29 @@ TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
     }();
     ASSERT_NE(moved_fingerprint, 0U);
 
+    // The neighbourhoods as they now stand. Every reference whose own pose
+    // changed, or whose neighbour list contains the moved camera, must re-search.
+    std::set<std::int32_t> must_rebuild;
+    const std::vector<stereo::ViewNeighbourhood> after_hoods =
+        incremental::task_neighbourhoods(*document.active_chunk());
+    for (const stereo::ViewNeighbourhood& hood : after_hoods) {
+        if (hood.camera_id == moved_id) {
+            must_rebuild.insert(hood.camera_id);
+            continue;
+        }
+        if (std::find(hood.neighbours.begin(), hood.neighbours.end(), moved_id) !=
+            hood.neighbours.end()) {
+            must_rebuild.insert(hood.camera_id);
+        }
+    }
+    ASSERT_GT(must_rebuild.size(), 1U)
+        << "the fixture should give the moved camera at least one neighbour";
+
     reset_depth_map_search_count();
     run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
-    // Forcing the camera's own map to be rebuilt also forces its neighbours'
-    // boundaries to be re-filtered, but their SEARCH must be reused.
-    EXPECT_EQ(depth_map_search_count(), 1U)
-        << "a re-aligned camera must rebuild exactly its own map";
+    EXPECT_EQ(depth_map_search_count(), must_rebuild.size())
+        << "moving camera " << moved_id << " must rebuild its own map and every map that "
+        << "used it as a neighbour (" << must_rebuild.size() << " maps)";
 
     const Chunk& after = *document.active_chunk();
     ASSERT_EQ(after.depth_maps().size(), map_count);
@@ -1088,9 +1119,16 @@ TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
         EXPECT_NE(map.alignment_fingerprint, 0U);
     }
     EXPECT_TRUE(saw_moved) << "the moved camera has no map";
-    // Every other camera still carries the fingerprint it had: they were reused.
+    // Every map that must NOT rebuild still carries its old fingerprint.
     for (const DepthMap& map : after.depth_maps()) {
-        if (map.camera_id == moved_id) {
+        if (must_rebuild.count(map.camera_id) != 0U) {
+            const auto old = std::find_if(before.begin(), before.end(),
+                                          [&](const DepthMap& m) {
+                                              return m.camera_id == map.camera_id;
+                                          });
+            ASSERT_NE(old, before.end());
+            EXPECT_NE(map.alignment_fingerprint, old->alignment_fingerprint)
+                << "camera " << map.camera_id << " kept a stale fingerprint";
             continue;
         }
         const auto old = std::find_if(before.begin(), before.end(),
@@ -1099,6 +1137,23 @@ TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
         EXPECT_EQ(map.alignment_fingerprint, old->alignment_fingerprint)
             << "camera " << map.camera_id << " was rebuilt after an unrelated move";
     }
+}
+
+TEST(DepthMapsReuse, ChangingMaxNeighborsRebuildsEveryMap) {
+    // max_neighbors changes which neighbours enter the search (and is hashed in
+    // its own right), so no map may be reused across a change of it -- even
+    // when the selected set happens to be identical.
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t map_count = document.active_chunk()->depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    reset_depth_map_search_count();
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    params.set("max_neighbors", ParamValue{std::int64_t{3}});
+    run_task(builtin_registry(), document, "BuildDepthMaps", params);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "changing max_neighbors must rebuild every map";
 }
 
 TEST(DepthMapsReuse, RecalibrationInvalidatesTheMaps) {
@@ -1131,6 +1186,101 @@ TEST(DepthMapsReuse, FingerprintIsZeroForAMapWithNoRecordedAlignment) {
     EXPECT_NE(fs, depth_map_fingerprint(chunk.cameras().front(), chunk.sensors().front(),
                                         kIncrementalDownscale / 2))
         << "the downscale must be part of the fingerprint";
+}
+
+TEST(DepthMapsReuse, FingerprintCoversTheNeighbourhood) {
+    // The task stamps a fingerprint that includes the neighbourhood. The bare
+    // camera hash is the fallback for callers without one; the context form must
+    // change with EVERY input that changes the map.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    const Camera& camera = chunk.cameras().front();
+    const Sensor& sensor = chunk.sensors().front();
+
+    DepthMapFingerprintContext base;
+    base.max_neighbors = 16;
+    base.neighbour_ids = {1, 2};
+    base.neighbour_poses = {chunk.cameras()[1].pose, chunk.cameras()[2].pose};
+    base.neighbour_calibrations = {sensor.calibration, sensor.calibration};
+    base.depth_min = 5.0;
+    base.depth_max = 40.0;
+    base.image_path = "photos/a.jpg";
+    base.image_size = 1234;
+    base.image_mtime = 5678;
+    base.window_radius = 5;
+    base.window_step = 2;
+    base.iterations = 6;
+    base.seed = 42;
+
+    const std::uint64_t h = depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &base);
+
+    // A bare hash (no context) is a different value: the context contributes.
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale));
+    // Same inputs -> same hash.
+    EXPECT_EQ(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &base));
+
+    // Neighbour id set: order-insensitive (a tie in select_views must not
+    // masquerade as a change), but sensitive to membership.
+    DepthMapFingerprintContext reordered = base;
+    std::swap(reordered.neighbour_ids[0], reordered.neighbour_ids[1]);
+    std::swap(reordered.neighbour_poses[0], reordered.neighbour_poses[1]);
+    std::swap(reordered.neighbour_calibrations[0], reordered.neighbour_calibrations[1]);
+    // Sorting happens inside, so a reordered-but-equal set hashes identically.
+    EXPECT_EQ(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &reordered));
+
+    DepthMapFingerprintContext fewer = base;
+    fewer.neighbour_ids.pop_back();
+    fewer.neighbour_poses.pop_back();
+    fewer.neighbour_calibrations.pop_back();
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &fewer));
+
+    // A moved neighbour changes the reference's fingerprint.
+    DepthMapFingerprintContext moved = base;
+    moved.neighbour_poses[0](0, 3) += 0.5;
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &moved));
+
+    // A re-calibrated neighbour does too.
+    DepthMapFingerprintContext recal = base;
+    recal.neighbour_calibrations[1].f *= 1.02;
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &recal));
+
+    // Each scalar field is load-bearing.
+    const auto changed = [&](const DepthMapFingerprintContext& other) {
+        return depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &other);
+    };
+    DepthMapFingerprintContext c = base;
+    c.max_neighbors = 8;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.depth_min += 0.25;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.depth_max -= 0.25;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_path = "photos/b.jpg";
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_size += 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_mtime += 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.window_radius = 4;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.window_step = 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.iterations = 8;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.seed += 1;
+    EXPECT_NE(h, changed(c));
+
+    // Never the "unknown" sentinel, whatever the input.
+    EXPECT_NE(h, 0U);
 }
 
 // ---------------------------------------------------------------------------
