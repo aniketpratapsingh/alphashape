@@ -510,6 +510,30 @@ TEST(BuildDenseClear, RebuildClearsPointCloud) {
     EXPECT_FALSE(document.active_chunk()->depth_maps().empty());
 }
 
+TEST(BuildDenseClear, UnfilteredMapsSurviveMinConfidence) {
+    // A cancel checkpoint stores maps with no confidence. BuildPointCloud must
+    // not silently drop all of their points when min_confidence > 0: the
+    // absence of a confidence measurement is not a failing measurement. The
+    // task warns instead (unobservable from here) and the fusion passes them.
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    // Fabricate the post-cancel state: maps with depths but no confidence.
+    run_build_depth_maps(document, /*downscale=*/4, "mild");
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    for (DepthMap& map : chunk.depth_maps()) {
+        map.confidence.clear();
+        map.filter_mode = -1;
+    }
+    ASSERT_TRUE(std::all_of(chunk.depth_maps().begin(), chunk.depth_maps().end(),
+                            [](const DepthMap& m) { return m.confidence.empty(); }));
+
+    Params params = make_params(builtin_registry().require("BuildPointCloud"));
+    params.set("min_confidence", ParamValue{1.5});
+    run_task(builtin_registry(), document, "BuildPointCloud", params);
+    EXPECT_FALSE(document.active_chunk()->point_cloud().points.empty())
+        << "min_confidence dropped every point of an unfiltered map";
+}
+
 // ---------------------------------------------------------------------------
 // 4. Round-trip after both tasks
 // ---------------------------------------------------------------------------
