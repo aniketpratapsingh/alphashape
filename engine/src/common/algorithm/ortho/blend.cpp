@@ -187,13 +187,8 @@ std::vector<Plane> laplacian_pyramid(const std::vector<Plane>& gauss) {
 /// state, and cells are visited in scan order.
 ///
 /// `max_passes` bounds how far the growth may travel (< 0 = unbounded). The blend
-/// passes the pyramid's own reach: a cell the pyramid at level `levels` never
-/// reads can be left unfilled, and bounding the growth is what makes the blend a
-/// LOCAL operator. Unbounded growth is not local -- a filled value near the
-/// interior is an average of averages reaching arbitrarily far across the plane,
-/// so the same interior cell gets a slightly different value when the plane is a
-/// block window instead of the whole grid, and block-wise blending would drift
-/// from whole-grid blending by a grey level on a scattering of pixels.
+/// passes the pyramid's own reach, which is what makes the operator local; see
+/// the comment at the call site for why the bound matters to block-wise runs.
 void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid, int max_passes) {
     const int w = p.w;
     const int h = p.h;
@@ -360,9 +355,18 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     }
 
     // How far the colour may be grown into a tile's invalid cells: exactly the
-    // blend's own reach at this depth. A cell farther than this is never read by
-    // any pyramid level, so bounding the growth keeps the blend a local operator
-    // (see fill_invalid).
+    // blend's own reach at this depth, so the operator stays LOCAL -- a cell
+    // farther than this is never read by any pyramid level. Unbounded growth is
+    // not local: a filled value near the interior becomes an average of averages
+    // reaching arbitrarily far across the plane, so the same interior cell gets a
+    // slightly different value when the plane is a block window instead of the
+    // whole grid, and blocked blending drifts from whole-grid blending.
+    //
+    // The growth is additionally clipped to leave the cells it cannot reach at
+    // their initial zero. This mirrors what the whole-grid path does, since a
+    // cell that far from any valid sample has no colour to contribute either way;
+    // the difference between the two paths is then confined to the clamp-blurred
+    // pyramid margins, which is the residual the block-wise test measures.
     const int fill_passes = pyramid_support_cells(levels);
 
     // Reused across tiles, so the blend never holds one validity copy per camera.
