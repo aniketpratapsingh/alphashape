@@ -1346,11 +1346,56 @@ TEST(Ortho, NarrowWindowKeepsTheWholeGridPyramidDepth) {
     std::printf("[Ortho.NarrowWindow] width=%d levels=%d compared=%zu within1=%zu worst=%d\n",
                 kLastWidth, levels, compared, within_one, worst);
     ASSERT_GT(compared, 0U);
-    // Exact agreement on essentially every cell: the padding is the whole grid's
-    // own clamp, not an approximation of it.
-    EXPECT_GE(within_one * 1000, compared * 999U)
+    // Agreement within a grey level or two everywhere. The comparison is not
+    // expected bit-exact: the whole grid's pyramid is 1088 wide and the window's
+    // 512, so at the far end the window's coarse levels are built from
+    // edge-replicated cells while the whole grid clamps; that difference decays
+    // with the level and stays well under a grey level except at the very last
+    // column. What the test is FOR is the depth: at the window's own auto depth
+    // (5 levels) the coarsest level is a different size entirely and the two
+    // blends disagree grossly across the whole window.
+    EXPECT_GE(within_one * 100, compared * 99U)
         << "the padded window must apply the whole grid's pyramid depth";
-    EXPECT_LE(worst, 1);
+    EXPECT_LE(worst, 3) << "a gross disagreement means a shallower operator was applied";
+
+    // The test is only meaningful if the OLD behaviour -- clamping the pinned
+    // depth to the window's own level_count() -- really does disagree. Prove it
+    // here, so a future change that silently reintroduces the clamp cannot make
+    // this test pass for the wrong reason.
+    const int shallow_levels = ortho::pyramid_level_count(kLastWidth, kGrid);
+    ASSERT_LT(shallow_levels, levels);
+    const ortho::OrthoMosaic shallow = ortho::blend(kLastWidth, kGrid, window_tiles,
+                                                    window_labels, Blending::Mosaic,
+                                                    shallow_levels);
+    int shallow_worst = 0;
+    std::size_t shallow_within_one = 0;
+    for (int row = 0; row < kGrid; ++row) {
+        for (int col = kMargin; col < kLastCompared; ++col) {
+            const int global_col = window_x0 + col;
+            const std::size_t a = static_cast<std::size_t>(row) * kGrid +
+                                  static_cast<std::size_t>(global_col);
+            const std::size_t b = static_cast<std::size_t>(row) * kLastWidth +
+                                  static_cast<std::size_t>(col);
+            int diff = 0;
+            for (int c = 0; c < 3; ++c) {
+                diff = std::max(
+                    diff,
+                    std::abs(
+                        static_cast<int>(reference.rgb[a * 3 + static_cast<std::size_t>(c)]) -
+                        static_cast<int>(shallow.rgb[b * 3 + static_cast<std::size_t>(c)])));
+            }
+            shallow_worst = std::max(shallow_worst, diff);
+            shallow_within_one += diff <= 1 ? 1U : 0U;
+        }
+    }
+    std::printf("[Ortho.NarrowWindow] shallow depth %d: within1=%zu worst=%d "
+                "(pinned %d: within1=%zu worst=%d)\n",
+                shallow_levels, shallow_within_one, shallow_worst, levels, within_one, worst);
+    // The padded run must agree with the whole grid strictly more often than the
+    // clamped one would; otherwise this test would not be testing the fix.
+    EXPECT_GT(within_one, shallow_within_one)
+        << "the clamped depth must be measurably worse";
+    EXPECT_GE(shallow_worst, worst);
 }
 
 }  // namespace
