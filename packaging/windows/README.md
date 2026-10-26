@@ -43,10 +43,15 @@ LICENSES\Fonts\                the bundled fonts' OFL texts
 `LICENSES\third-party\` is filled at configure time from vcpkg's
 `share/<port>/copyright`, one file per port, so a runtime DLL cannot be added
 without its licence text; `libomp.txt` comes from the LLVM install beside
-clang-cl. Qt's LGPL-3.0 text is not optional: `alphashape_windows_install.cmake`
-fails the configure if neither the Qt install nor the vendored copy under
-`packaging/licenses/` supplies it, and the shipped
-`LICENSES\THIRD-PARTY-NOTICES.txt` names the exact Qt version in the payload.
+clang-cl. The glob is deliberately not narrowed to the ports that ship a DLL:
+it also picks up the build-only ports the GPU toolchain pulls in
+(`vulkan-headers`, `vulkan-memory-allocator`, `shaderc`, `spirv-tools`, …).
+Shipping those texts costs a few kilobytes and is harmless — an extra notice is
+never a compliance problem, a missing one is. Qt's LGPL-3.0 text is not
+optional: `alphashape_windows_install.cmake` fails the configure if neither the
+Qt install nor the vendored copy under `packaging/licenses/` supplies it, and
+the shipped `LICENSES\THIRD-PARTY-NOTICES.txt` names the exact Qt version in
+the payload.
 
 The GUI is a Windows-subsystem binary, so no console window opens beside it. A
 console that started it is adopted (`AttachConsole(ATTACH_PARENT_PROCESS)`), so

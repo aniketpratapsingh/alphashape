@@ -4,6 +4,13 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
+// In every SDK this project builds against (Windows 10+ / KB2533623), but a
+// build configured with an older NTDDI_VERSION would fail to compile without
+// this rather than fall back to the vulnerable search order.
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
 #else
 #include <dlfcn.h>
 #endif
@@ -77,16 +84,29 @@ DynamicLibrary DynamicLibrary::open(const std::string& path, std::string* error)
         }
         return DynamicLibrary();
     }
-    // A bare name ("vulkan-1.dll") must go through the search path; a path with
-    // a directory in it is loaded from there with its own dependencies beside
-    // it. Detect the difference rather than guessing: the SDK's vulkan-1.dll
-    // sits next to nothing it needs, but a relocated copy beside the CLI does.
+    // Two deliberately different rules:
+    //
+    //   * A bare name ("vulkan-1.dll") is a system component, so it is loaded
+    //     from System32 only. Plain LoadLibraryW would search the application
+    //     directory and the current working directory first, so a planted
+    //     vulkan-1.dll beside the exe (or in whatever directory the user
+    //     happened to start us in) would win -- classic DLL planting, and it
+    //     would also shadow the graphics driver's loader. This covers the
+    //     ALPHASHAPE_VULKAN_LIBRARY override as well: an override that names a
+    //     different loader must be an absolute path, because a bare name is
+    //     always resolved against System32.
+    //   * A path with a directory in it is loaded from there with its own
+    //     dependencies beside it (the SDK's or a relocated loader's layout).
+    //
+    // SetDefaultDllDirectories is deliberately not called process-wide: Qt and
+    // the vcpkg runtime DLLs still have to resolve out of the application
+    // directory.
     const bool has_directory = path.find('\\') != std::string::npos || path.find('/') != std::string::npos;
     HMODULE module = nullptr;
     if (has_directory) {
         module = ::LoadLibraryExW(wide.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     } else {
-        module = ::LoadLibraryW(wide.c_str());
+        module = ::LoadLibraryExW(wide.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (module == nullptr) {
         if (error != nullptr) {

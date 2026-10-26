@@ -140,7 +140,19 @@ std::shared_ptr<Instance> create_instance(bool validation) {
 
     const VkResult created = instance->fns.CreateInstance(&create_info, nullptr, &instance->handle);
     if (created != VK_SUCCESS) {
-        throw Error("vkCreateInstance failed with VkResult " + std::to_string(created));
+        // VK_ERROR_INCOMPATIBLE_DRIVER here is the ordinary "this machine has
+        // the loader but no Vulkan driver" answer: Windows installs vulkan-1.dll
+        // with the graphics driver, and a machine whose driver predates Vulkan
+        // leaves the loader with no ICD to enumerate. It has to read as an
+        // explanation rather than as an engine defect, because it is what
+        // `--gpu-info` and the GUI's task tooltips show.
+        std::string message =
+            "vkCreateInstance failed with VkResult " + std::to_string(created);
+        if (created == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            message += ": no compatible Vulkan driver was found (VK_ERROR_INCOMPATIBLE_DRIVER); "
+                       "install or update the graphics driver to enable GPU acceleration";
+        }
+        throw Error(message);
     }
     // The loader returns instance-level commands only once the instance exists.
     if (!resolve_instance(instance->fns.GetInstanceProcAddr, instance->handle, &instance->fns,

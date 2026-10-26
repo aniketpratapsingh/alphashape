@@ -33,10 +33,21 @@ sections below give the engineering detail behind each item.
   minimum macOS version is whatever the packaging script stamps for the
   current runner. Linux is x86-64 only, built against Ubuntu 24.04's glibc;
   the Windows build is x86-64 only.
-- **GPU acceleration is off in the Windows build.** It needs the Vulkan
-  loader and driver headers, which the current vcpkg recipe does not carry
-  yet, so every Windows task runs on the CPU. Linux and macOS builds
-  include it and fall back to the CPU when no suitable device is found.
+- **Windows GPU acceleration needs a Vulkan driver.** The Windows build compiles
+  the Vulkan GPU layer in (`ALPHASHAPE_GPU=ON`, `ALPHASHAPE_GPU_HAS_VULKAN 1`,
+  against vcpkg's `vulkan-headers`), and it finds the loader at run time:
+  nothing links `vulkan-1.dll`. Windows itself ships no Vulkan runtime — it
+  arrives with the graphics driver — so on a machine without one (a VM, a
+  server, a bare CI runner) the app starts normally, `gpu::available()` is
+  false, `--gpu-info` explains why, and every task runs on the CPU. The
+  installer deliberately does not bundle a loader: a private `vulkan-1.dll`
+  could not see the driver's ICDs. `vulkan-1.dll` is loaded by bare name with
+  `LOAD_LIBRARY_SEARCH_SYSTEM32`, so `System32` is the only place it is looked
+  for — a copy beside the executable is never picked up (that would be a DLL
+  planting hole). To use a loader from elsewhere, set
+  `ALPHASHAPE_VULKAN_LIBRARY` to its **absolute path**; a bare name in that
+  variable is resolved against `System32` like the default. Install or update
+  the AMD/NVIDIA/Intel driver to enable GPU acceleration.
 - **Long GPU steps on a first-generation M1 (16 GB).** Build Model used to be
   able to stall the display and force a restart on such a machine, because a
   single long submission to the shared GPU starved WindowServer. The mesh and
@@ -213,29 +224,35 @@ sections below give the engineering detail behind each item.
   algorithm ports, GPU PatchMatch (below) and the GPU Poisson solve (below).
   The five original test kernels (saxpy, reduce_sum, 3×3 box filter,
   chain_add, image_sample_test) remain test kernels.
-- **One backend:** Vulkan via MoltenVK. There is no OpenCL or Metal path; on
-  hosts where MoltenVK cannot load, `gpu::available()` is false and every
-  caller must go through `with_fallback` (or not use the layer at all).
-- **Two validated drivers, neither a discrete GPU:** the device tests were
-  exercised on an Apple M1 with MoltenVK (Vulkan SDK 1.4.363.0) and on x86-64
-  Ubuntu 24.04 with Mesa's llvmpipe (a CPU implementation of Vulkan 1.4).
-  Behaviour on hardware Vulkan drivers (AMD/Intel/NVIDIA) is unverified.
+- **One backend:** Vulkan via the platform loader and driver (MoltenVK on
+  macOS, the graphics driver on Windows, the distribution ICDs on Linux).
+  There is no OpenCL or Metal path; on hosts where no Vulkan loader or driver
+  can be loaded, `gpu::available()` is false and every caller must go through
+  `with_fallback` (or not use the layer at all).
+- **Validated drivers, and which are not:** the device tests run on an Apple M1
+  with MoltenVK (Vulkan SDK 1.4.363.0), on x86-64 Ubuntu 24.04 and Windows Server
+  2022 with Mesa's CPU Vulkan driver (llvmpipe / lavapipe), and — the only
+  hardware lane — on an NVIDIA Tesla T4's Linux Vulkan driver (GitLab CI).
+  AMD and Intel hardware drivers and Windows hardware drivers are unverified:
+  the Windows CI lane has no GPU, so it exercises lavapipe there.
   MoltenVK is a portability driver: the instance enables
   `VK_KHR_portability_enumeration` and the device enables
   `VK_KHR_portability_subset`; both are probed and enabled only when advertised,
-  so the non-portability path runs on Linux.
-- **What Linux/llvmpipe does and does not validate:** it does validate the
-  loader path with a system loader and system ICDs, instance/device creation,
-  the whole dispatch/buffer/barrier/validation-layer surface, and the
+  so the non-portability path runs on Linux and Windows.
+- **What Linux/llvmpipe and Windows/lavapipe do and do not validate:** they do
+  validate the loader path with a system loader and a system ICD, instance/device
+  creation, the whole dispatch/buffer/barrier/validation-layer surface, and the
   correctness of every ported kernel (GPU PatchMatch and the GPU Poisson solve
-  are checked against their CPU references there). It does NOT validate
-  performance at all: llvmpipe is the CPU, so no speed-up statement transfers,
-  and the timing/speed-up tests skip themselves via `gpu::is_software_device`.
+  are checked against their CPU references there). They do NOT validate
+  performance at all: llvmpipe and lavapipe are the CPU, so no speed-up statement
+  transfers, and the timing/speed-up tests skip themselves via
+  `gpu::is_software_device`.
   It also cannot validate anything fp16: llvmpipe's LLVM 20 backend aborts the
   process on the `packHalf2x16`/`unpackHalf2x16` pattern in the TV-L1 dual
   kernel ("Cannot select: ... anyext from i16"), so `tv_l1_fusion_device`
   declines software devices and takes the CPU path (the kernel stays
-  hardware-only until that driver limitation changes).
+  hardware-only until that driver limitation changes). lavapipe is the same
+  gallium driver, so the same decline applies on Windows.
 - **Submission model (WP-10.3, extended by WP-31):** `run_async` + `Ticket`/`wait`
   replace the single synchronous path; `run` is `run_async` + `wait`. The ring is
   two command pools with one fence per slot and a hard cap of
