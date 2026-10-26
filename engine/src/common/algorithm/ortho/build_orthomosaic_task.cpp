@@ -648,12 +648,16 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
             const double gsd = measure_gsd_metres(surface, surface_nodata, plane_y);
             if (gsd > 0.0) {
                 resolution = plane_resolution_for(gsd, surface);
+            } else {
+                // No camera's principal axis reaches this DEM (a narrow
+                // reconstruction strip, say). The DEM's own cell is the honest
+                // fallback: it is in the right units and is no coarser than the
+                // surface the ortho resamples.
+                resolution = std::max(surface.grid.pixel_size_x, surface.grid.pixel_size_y);
             }
         }
-        // No measurable GSD (no DEM yet, or no usable camera): the surface's own
-        // cell takes over below. A bare metric literal here would be wrong in a
-        // degree-based frame and coarse relative to the imagery, the exact bug
-        // this rule exists to avoid.
+        // A model-only run still has no surface here; its measured cell is
+        // resolved below once the DSM exists.
     }
 
     if (options.surface == "model") {
