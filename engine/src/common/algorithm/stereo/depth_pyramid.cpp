@@ -126,7 +126,12 @@ std::uint64_t pyramid_level_seed(std::uint64_t seed, int level_from_finest) {
         return seed;
     }
     std::uint64_t h = splitmix64(seed);
-    h = splitmix64(h ^ (static_cast<std::uint64_t>(level_from_finest) * 0xC2B2AE3D27D4EB4FULL));
+    // The literal is narrowed to std::uint64_t explicitly: on Linux that is
+    // `unsigned long` and the suffix makes the literal `unsigned long long`, so
+    // the product would otherwise widen and trip -Wsign-conversion.
+    const std::uint64_t level_mix = static_cast<std::uint64_t>(level_from_finest) *
+                                    static_cast<std::uint64_t>(0xC2B2AE3D27D4EB4FULL);
+    h = splitmix64(h ^ level_mix);
     return splitmix64(h);
 }
 

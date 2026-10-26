@@ -989,17 +989,27 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
     }
     // Neighbour images below the reference resolution, indexed
     // [level_from_finest - 1][camera]. Each entry is the previous level reduced
-    // once more, the same chain the reference pyramid follows, so a level's
-    // neighbour and reference sizes agree even when the halvings truncate.
+    // once more -- the same chain the reference pyramid follows -- and its
+    // calibration is folded the same way, one halving at a time. Both matter
+    // when a size truncates: floor(floor(W/2)/2) equals floor(W/4), but the
+    // principal-point formula's `- W/2 * 0.5` term does not, so a one-shot
+    // scaled_calibration(W, 4) can differ from two halvings by a quarter pixel.
     std::vector<std::vector<FloatImage>> reduced_neighbours(si(level_count - 1));
+    std::vector<std::vector<Calibration>> reduced_calibrations(si(level_count - 1));
     for (int from_finest = 1; from_finest < level_count; ++from_finest) {
         std::vector<FloatImage>& level_images = reduced_neighbours[si(from_finest - 1)];
+        std::vector<Calibration>& level_calibrations = reduced_calibrations[si(from_finest - 1)];
         level_images.reserve(neighbours.size());
+        level_calibrations.reserve(neighbours.size());
         for (std::size_t i = 0; i < neighbours.size(); ++i) {
             const FloatImage& source =
                 from_finest == 1 ? *neighbours[i].image
                                  : reduced_neighbours[si(from_finest - 2)][i];
+            const Calibration source_calibration =
+                from_finest == 1 ? neighbours[i].calibration
+                                 : reduced_calibrations[si(from_finest - 2)][i];
             level_images.push_back(pyramid_downsample(source));
+            level_calibrations.push_back(scaled_calibration(source_calibration, 2));
         }
     }
 
@@ -1020,7 +1030,9 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
         level_neighbours.reserve(neighbours.size());
         for (std::size_t i = 0; i < neighbours.size(); ++i) {
             PMView view;
-            view.calibration = scaled_calibration(neighbours[i].calibration, 1 << from_finest);
+            view.calibration = from_finest == 0
+                                   ? neighbours[i].calibration
+                                   : reduced_calibrations[si(from_finest - 1)][i];
             view.R = neighbours[i].R;
             view.t = neighbours[i].t;
             view.image = from_finest == 0 ? neighbours[i].image

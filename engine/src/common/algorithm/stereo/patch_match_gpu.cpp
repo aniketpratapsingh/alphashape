@@ -610,17 +610,31 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     if (level_count > 1) {
         pyramid = build_depth_pyramid(*reference.image, reference.calibration, level_count);
     }
+    // Neighbour images and calibrations below the reference resolution,
+    // reduced one halving at a time from the level above -- the same chain the
+    // reference pyramid follows, so truncating sizes and the principal-point
+    // formula stay consistent between a level's reference and its neighbours.
     std::vector<std::vector<FloatImage>> reduced_neighbours(static_cast<std::size_t>(level_count - 1));
+    std::vector<std::vector<Calibration>> reduced_calibrations(
+        static_cast<std::size_t>(level_count - 1));
     for (int from_finest = 1; from_finest < level_count; ++from_finest) {
         std::vector<FloatImage>& level_images =
             reduced_neighbours[static_cast<std::size_t>(from_finest - 1)];
+        std::vector<Calibration>& level_calibrations =
+            reduced_calibrations[static_cast<std::size_t>(from_finest - 1)];
         level_images.reserve(neighbours.size());
+        level_calibrations.reserve(neighbours.size());
         for (std::size_t i = 0; i < neighbours.size(); ++i) {
             const FloatImage& source =
                 from_finest == 1
                     ? *neighbours[i].image
                     : reduced_neighbours[static_cast<std::size_t>(from_finest - 2)][i];
+            const Calibration source_calibration =
+                from_finest == 1
+                    ? neighbours[i].calibration
+                    : reduced_calibrations[static_cast<std::size_t>(from_finest - 2)][i];
             level_images.push_back(pyramid_downsample(source));
+            level_calibrations.push_back(scaled_calibration(source_calibration, 2));
         }
     }
 
@@ -640,7 +654,10 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         level_neighbours.reserve(neighbours.size());
         for (std::size_t i = 0; i < neighbours.size(); ++i) {
             PMView view;
-            view.calibration = scaled_calibration(neighbours[i].calibration, 1 << from_finest);
+            view.calibration =
+                from_finest == 0
+                    ? neighbours[i].calibration
+                    : reduced_calibrations[static_cast<std::size_t>(from_finest - 1)][i];
             view.R = neighbours[i].R;
             view.t = neighbours[i].t;
             view.image = from_finest == 0

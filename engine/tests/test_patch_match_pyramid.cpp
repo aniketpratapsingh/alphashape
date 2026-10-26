@@ -231,11 +231,16 @@ TEST(PatchMatchPyramid, UpsampleCarriesDepthsAndRenormalisesNormals) {
     // Fine x samples coarse at x/2 - 0.25: x=0 -> -0.25 (clamped to 0), so the
     // left edge is the left coarse value.
     EXPECT_NEAR(fine.depth[0], 10.0, 1e-4);
+    // Fine x samples coarse at (x - 0.5) / 2, the bearing identity above:
+    // x=0 -> -0.25 (clamped to the left edge), so the left edge is the left
+    // coarse value.
+    EXPECT_NEAR(fine.depth[0], 10.0, 1e-4);
     // x=2 sits at coarse 0.75, between 0 and 1 -- but 1 is a hole, so only the
     // valid tap contributes and the value stays at the neighbour's, not diluted.
     EXPECT_NEAR(fine.depth[2], 10.0, 1e-4);
-    EXPECT_NEAR(fine.depth[3], 10.0, 1e-4);
-    // x=4 sits at coarse 1.75, between the hole and 20, so it must be 20.
+    // x=3 sits at coarse 1.25, past the hole and on the way to 20, so it is 20.
+    EXPECT_NEAR(fine.depth[3], 20.0, 1e-4);
+    // x=4 sits at coarse 1.75, past the hole: 20.
     EXPECT_NEAR(fine.depth[4], 20.0, 1e-4);
     EXPECT_NEAR(fine.depth[5], 20.0, 1e-4);
 
