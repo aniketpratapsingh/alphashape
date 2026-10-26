@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -13,6 +14,7 @@
 #include <Eigen/Core>
 
 #include "base/utils/error.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -275,9 +277,11 @@ struct PlaneBox {
 ///      extent instead of growing to the outlier's distance.
 ///
 /// Small sample sets skip the analysis entirely: a percentile is meaningless
-/// below kMinSamplesForRobustBox and the synthetic test scenes must keep their
-/// historical grid.
-constexpr std::size_t kMinSamplesForRobustBox = 1000;
+/// below kMinSamplesForRobustBox, and a set that small cannot move the extent
+/// far anyway. The threshold is deliberately low: the outlier tail is what
+/// breaks a small block, and a 200-sample block is already enough for a 0.5th
+/// percentile to be a real observation rather than a single sample.
+constexpr std::size_t kMinSamplesForRobustBox = 200;
 /// One-sided tail fraction used to define the inlier core.
 constexpr double kExtentTailFraction = 0.005;
 /// Exact extent / core extent above which an axis is treated as outlier-poisoned.
@@ -299,27 +303,42 @@ double quantile(std::vector<double>& values, double fraction) {
     return values[k];
 }
 
+/// What a robust box did to one axis, so the caller can tell the user.
+struct ClipReport {
+    bool x_clipped = false;
+    bool y_clipped = false;
+    double x_low = 0.0, x_high = 0.0;  ///< the exact (pre-clip) extent
+    double y_low = 0.0, y_high = 0.0;
+    std::size_t far_samples_x = 0;  ///< samples outside the clipped x range
+    std::size_t far_samples_y = 0;
+};
+
 /// Clamp one axis of `box` to its core when the exact extent is outlier-poisoned.
-void clip_axis(double core_lo, double core_hi, double* lo, double* hi) {
+/// Returns true when it clipped, and reports the pre-clip extent.
+bool clip_axis(double core_lo, double core_hi, double* lo, double* hi) {
     const double core = core_hi - core_lo;
     if (!(core > 0.0) || !std::isfinite(core)) {
-        return;  // a degenerate core says nothing; leave the exact bound alone
+        return false;  // a degenerate core says nothing; leave the exact bound alone
     }
     const double margin = kOutlierMarginFraction * core;
+    bool clipped = false;
     if (*lo < core_lo) {
         // Only engage when the low tail is more than "a bit" outside the core.
         if ((core_hi - *lo) > kOutlierExtentRatio * core) {
             *lo = core_lo - margin;
+            clipped = true;
         }
     }
     if (*hi > core_hi) {
         if ((*hi - core_lo) > kOutlierExtentRatio * core) {
             *hi = core_hi + margin;
+            clipped = true;
         }
     }
+    return clipped;
 }
 
-PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
+PlaneBox samples_box(const std::vector<PlaneSample>& samples, ClipReport* report = nullptr) {
     PlaneBox box;
     box.min = samples.front().p;
     box.max = samples.front().p;
@@ -330,6 +349,13 @@ PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
     if (samples.size() < kMinSamplesForRobustBox) {
         return box;
     }
+
+    ClipReport local;
+    // Record the exact extent before clipping, for the log line.
+    local.x_low = box.min.x();
+    local.x_high = box.max.x();
+    local.y_low = box.min.y();
+    local.y_high = box.max.y();
 
     std::vector<double> xs;
     std::vector<double> ys;
@@ -344,14 +370,22 @@ PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
     const double y_lo = quantile(ys, kExtentTailFraction);
     const double y_hi = quantile(ys, 1.0 - kExtentTailFraction);
 
-    clip_axis(x_lo, x_hi, &box.min.x(), &box.max.x());
-    clip_axis(y_lo, y_hi, &box.min.y(), &box.max.y());
+    local.x_clipped = clip_axis(x_lo, x_hi, &box.min.x(), &box.max.x());
+    local.y_clipped = clip_axis(y_lo, y_hi, &box.min.y(), &box.max.y());
 
     // A clipped box must still be non-empty; an all-collinear cloud can make the
     // core degenerate and that has already been rejected above, but guard the
     // final result anyway so the grid can never come out inverted.
     if (!(box.max.x() > box.min.x()) || !(box.max.y() > box.min.y())) {
         return box;
+    }
+    if (report != nullptr && (local.x_clipped || local.y_clipped)) {
+        // How many samples the clip actually discarded, per axis.
+        for (const PlaneSample& s : samples) {
+            local.far_samples_x += (s.p.x() < box.min.x() || s.p.x() > box.max.x()) ? 1U : 0U;
+            local.far_samples_y += (s.p.y() < box.min.y() || s.p.y() > box.max.y()) ? 1U : 0U;
+        }
+        *report = local;
     }
     return box;
 }
@@ -579,8 +613,39 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     }
 
     // -- resolve the cell size and the grid ----------------------------------
-    const PlaneBox box = source == Source::Model ? vertices_box(model.plane_vertices)
-                                                 : samples_box(samples);
+    ClipReport clip;
+    const PlaneBox box = source == Source::Model
+                             ? vertices_box(model.plane_vertices)
+                             : samples_box(samples, &clip);
+    // Tell the user when the robust box dropped a far tail: the grid they get
+    // then covers the surveyed block, not the outlier, and they should know the
+    // extent changed. Reported in metres (a Geographic plane is in degrees).
+    if (Log::enabled(LogLevel::Info) && (clip.x_clipped || clip.y_clipped)) {
+        const double plane_y = 0.5 * (clip.y_low + clip.y_high);
+        const Eigen::Vector2d metres_per_unit =
+            frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                             : frame.metres_per_plane_unit(plane_y);
+        const double mx = metres_per_unit.x() > 0.0 ? metres_per_unit.x() : 1.0;
+        const double my = metres_per_unit.y() > 0.0 ? metres_per_unit.y() : 1.0;
+        const auto span = [](double lo, double hi, double m) {
+            std::ostringstream out;
+            out.precision(6);
+            out << (hi - lo) * m;
+            return out.str();
+        };
+        if (clip.x_clipped) {
+            log(LogLevel::Info)
+                << "BuildDem: DEM extent clipped from " << span(clip.x_low, clip.x_high, mx)
+                << " to " << span(box.min.x(), box.max.x(), mx) << " m on x: "
+                << clip.far_samples_x << " far samples ignored";
+        }
+        if (clip.y_clipped) {
+            log(LogLevel::Info)
+                << "BuildDem: DEM extent clipped from " << span(clip.y_low, clip.y_high, my)
+                << " to " << span(box.min.y(), box.max.y(), my) << " m on y: "
+                << clip.far_samples_y << " far samples ignored";
+        }
+    }
     double resolution = options.resolution;
     if (!(resolution > 0.0)) {
         if (source == Source::Model) {
