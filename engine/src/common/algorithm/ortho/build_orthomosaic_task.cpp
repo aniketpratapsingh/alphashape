@@ -832,7 +832,14 @@ int block_margin_cells(int block_cells, int pyramid_levels) {
         return 0;
     }
     const int levels = std::max(0, pyramid_levels);
-    const int needed = ortho::pyramid_support_cells(levels) + kBlockMarginSlack;
+    // TWO supports, not one. The margin must cover (a) the pyramid READ: a level-0
+    // cell the pyramid touches reads up to `support` cells away, and (b) the
+    // FILL growth: those cells may themselves be invalid in this tile and take
+    // their colour from a chain of filled neighbours reaching `support` cells
+    // further out again. One support would leave the second hop clipped at the
+    // window border, which is exactly the difference the blocked-vs-whole-grid
+    // blend showed.
+    const int needed = 2 * ortho::pyramid_support_cells(levels) + kBlockMarginSlack;
     // Round UP to a multiple of kBlockMarginAlignment. That is not cosmetic: the
     // blend's pyramid decimates by two per level, so a window whose origin is not
     // a multiple of 2^levels has its coarse levels offset by a fraction of a
