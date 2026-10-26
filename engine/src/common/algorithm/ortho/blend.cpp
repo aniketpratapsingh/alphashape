@@ -400,13 +400,16 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                 }
             }
         }
-        // Clear the reused mask: a stale 1 from this tile would look like real
-        // colour to the next tile's fill_invalid().
+        // Clear the reused mask over the same crop it was written across: a
+        // stale 1 from this tile would look like real colour to the next tile's
+        // fill_invalid().
         for (int row = tile.y0; row < tile.y0 + tile.height; ++row) {
-            std::fill_n(tile_mask.begin() + static_cast<std::ptrdiff_t>(
-                                                  static_cast<std::size_t>(row) *
-                                                  static_cast<std::size_t>(width)),
-                        tile.width, std::uint8_t{0});
+            const std::ptrdiff_t start =
+                static_cast<std::ptrdiff_t>(static_cast<std::size_t>(row) *
+                                            static_cast<std::size_t>(width) +
+                                            static_cast<std::size_t>(tile.x0));
+            std::fill_n(tile_mask.begin() + start, static_cast<std::ptrdiff_t>(tile.width),
+                        std::uint8_t{0});
         }
     }
 
