@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -27,6 +28,7 @@
 #include "aerial_fixture.hpp"
 #include "dense_fixture.hpp"
 
+#include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/stereo/patch_match.hpp"
 #include "common/algorithm/stereo/patch_match_gpu.hpp"
@@ -441,6 +443,110 @@ TEST(PatchMatchGpu, DeterministicRunToRun) {
     EXPECT_EQ(first.depth, second.depth);
     EXPECT_EQ(first.normals, second.normals);
     EXPECT_EQ(first.cost, second.cost);
+}
+
+// Splitting is a scheduling change, not an algorithmic one: a submission
+// boundary only adds the same compute->compute barrier the unsplit command
+// buffer already carries between dispatches, and a row band writes no pixel
+// another band of the same half-sweep reads (every propagation offset is odd, so
+// a source is always the opposite colour). Both splits are therefore compared
+// bit for bit against the unsplit run, with memcmp rather than == so a -0.0/NaN
+// difference cannot slip through.
+TEST(PatchMatchGpu, SplitSubmissionsAreBitIdentical) {
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(128, 96, 150.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+    PatchMatchOptions options = plane_options();
+    // Keep the per-call cost low but leave several sweeps to schedule.
+    options.iterations = 4;
+
+    struct EnvGuard {
+        const char* name;
+        std::string previous;
+        explicit EnvGuard(const char* variable)
+            : name(variable), previous(alphashape::platform::get_env(variable)) {}
+        ~EnvGuard() { alphashape::platform::set_env(name, previous); }
+    };
+    const auto identical = [](const std::vector<float>& a, const std::vector<float>& b) {
+        return a.size() == b.size() &&
+               (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+    };
+    const auto expect_identical = [&](const PatchMatchResult& split,
+                                      const PatchMatchResult& reference_run,
+                                      const char* what) {
+        EXPECT_EQ(split.width, reference_run.width);
+        EXPECT_EQ(split.height, reference_run.height);
+        EXPECT_TRUE(identical(split.depth, reference_run.depth))
+            << what << " changed depth values";
+        EXPECT_TRUE(identical(split.normals, reference_run.normals))
+            << what << " changed normals";
+        EXPECT_TRUE(identical(split.cost, reference_run.cost)) << what << " changed costs";
+    };
+
+    // Unsplit reference: one submission per half-sweep, no row bands.
+    PatchMatchResult unsplit;
+    {
+        EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+        EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        // A band target far above the image keeps every half-sweep in one
+        // dispatch, whatever the default is.
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "100000000");
+        unsplit = stereo::run_patch_match_device(reference, neighbours, options);
+    }
+    ASSERT_FALSE(unsplit.depth.empty());
+    ASSERT_GT(valid_pixels(unsplit), 0u);
+
+    // Maximum splitting: one step per submission.
+    {
+        EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+        EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "100000000");
+        expect_identical(
+            stereo::run_patch_match_device(reference, neighbours, options), unsplit,
+            "ALPHASHAPE_GPU_MAX_BATCH=1");
+    }
+
+    // Maximum row banding: a target below one tile row, so every half-sweep is
+    // split into one dispatch per 16-row tile band.
+    {
+        EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+        EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "1");
+        expect_identical(
+            stereo::run_patch_match_device(reference, neighbours, options), unsplit,
+            "ALPHASHAPE_GPU_MAX_BAND_PIXELS=1");
+    }
+
+    // Both at once -- the shape a slow device takes: maximum banding and one
+    // step per submission.
+    {
+        EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+        EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "1");
+        expect_identical(
+            stereo::run_patch_match_device(reference, neighbours, options), unsplit,
+            "maximum splitting and maximum banding");
+    }
+
+    // The adaptive limiter (no override) must reach the same answer too.
+    {
+        EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+        EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "1");
+        expect_identical(
+            stereo::run_patch_match_device(reference, neighbours, options), unsplit,
+            "the adaptive limiter with banding");
+    }
 }
 
 // ---------------------------------------------------------------------------

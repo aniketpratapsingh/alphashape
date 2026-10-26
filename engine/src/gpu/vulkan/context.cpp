@@ -147,7 +147,15 @@ VulkanBackend::~VulkanBackend() {
     if (device_handle_ != VK_NULL_HANDLE) {
         const Functions& fns = instance_->fns;
         // Command pools and fences may only go once no submission is running.
-        fns.DeviceWaitIdle(device_handle_);
+        // vkDeviceWaitIdle is unbounded, so on a lost device it is skipped
+        // entirely -- the driver never finishes the abandoned submissions and
+        // the call would block the fallback unwind forever. The bounded fence
+        // drain below covers the same requirement in that case.
+        if (!lost()) {
+            fns.DeviceWaitIdle(device_handle_);
+        } else {
+            (void)wait_all_pending_noexcept();
+        }
         // Cached samplers are owned by this backend; a Sampler handle that
         // outlives it holds a dangling pointer only if it also outlives the
         // context, which is a caller error (the layer's handles are borrowed).
@@ -460,9 +468,12 @@ VulkanImage::VulkanImage(VulkanBackend* backend, VkImage image, VmaAllocation al
 VulkanImage::~VulkanImage() {
     if (image_ != VK_NULL_HANDLE) {
         const Functions& fns = backend_->fns();
-        // A dispatch submitted before the last reference dropped may still
-        // read the image; every fence is waited for before the handle goes.
-        backend_->wait_all_pending();
+        // A dispatch submitted before the last reference dropped may still read
+        // the image; every fence is waited for before the handle goes. The
+        // noexcept drain is what a destructor may call: the throwing one would
+        // terminate the process when the device is lost, which is exactly the
+        // case this unwind runs in.
+        (void)backend_->wait_all_pending_noexcept();
         fns.DestroyImageView(backend_->device(), view_, nullptr);
         vmaDestroyImage(backend_->allocator(), image_, allocation_);
     }
@@ -524,6 +535,14 @@ VulkanBuffer::VulkanBuffer(VulkanBackend* backend, VkBuffer buffer, VmaAllocatio
 
 VulkanBuffer::~VulkanBuffer() {
     if (buffer_ != VK_NULL_HANDLE) {
+        // A submission may still read or write this memory -- including one
+        // whose fence wait threw (a device-lost report), which unwinds the
+        // caller straight into this destructor. Freeing while the queue still
+        // references the range is a use-after-free the driver punishes with a
+        // segfault, so drain first. The catch: a destructor is implicitly
+        // noexcept, so the throwing drain would be std::terminate on exactly
+        // the lost-device path this exists for.
+        (void)backend_->wait_all_pending_noexcept();
         vmaDestroyBuffer(backend_->allocator(), buffer_, allocation_);
     }
 }

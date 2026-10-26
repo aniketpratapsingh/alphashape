@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -34,6 +35,7 @@
 #include <Eigen/Geometry>
 #include <gtest/gtest.h>
 
+#include "base/platform/env.hpp"
 #include "base/utils/portable_rng.hpp"
 #include "test_rng_helpers.hpp"
 
@@ -656,6 +658,68 @@ TEST(TvFusionGpu, DeterministicRunToRun) {
         ASSERT_EQ(first.field.data[i], second.field.data[i]) << "voxel " << i;
     }
     EXPECT_EQ(first.observed, second.observed);
+}
+
+TEST(TvFusionGpu, SplitSubmissionsAreBitIdentical) {
+    // The iteration loop is split across submissions so no single GPU job can
+    // starve a display. The split is a scheduling change: the same dual/primal
+    // dispatches in the same order, so the field must be identical bit for bit.
+    REQUIRE_GPU_TV();
+    SoftDeclineGuard guard;
+    SphereScene scene = sphere_scene();
+    scene.options.max_resolution = 32;
+    scene.options.iterations = 24;
+    const Eigen::Vector3d box_min(-1.5, -1.5, -1.5);
+    const Eigen::Vector3d box_max(1.5, 1.5, 1.5);
+
+    // A software device declines to the CPU before constructing a limiter, so
+    // there is nothing to split; the bounds of the other tests cover that path.
+    if (software_device_active()) {
+        GTEST_SKIP() << "software device declines to the CPU before any submission";
+    }
+
+    // Unsplit reference: the cap is pinned at or above the algorithm's own
+    // batch size, so every batch is a single submission.
+    std::vector<float> unsplit;
+    int unsplit_submissions = 0;
+    ASSERT_TRUE(alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "64"));
+    try {
+        unsplit = tv_l1_fusion_device(scene.views, box_min, box_max, scene.options).field.data;
+        unsplit_submissions = tv_fusion_gpu_last_profile().submissions;
+    } catch (...) {
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        throw;
+    }
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+
+    std::vector<float> split;
+    int split_submissions = 0;
+    int split_batches = 0;
+    ASSERT_TRUE(alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1"));
+    try {
+        split = tv_l1_fusion_device(scene.views, box_min, box_max, scene.options).field.data;
+        split_submissions = tv_fusion_gpu_last_profile().submissions;
+        split_batches = tv_fusion_gpu_last_profile().batches;
+    } catch (...) {
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        throw;
+    }
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+
+    std::printf("[tv gpu split] unsplit %d submission(s) | one step per submission: %d "
+                "submission(s) across %d batch(es)\n",
+                unsplit_submissions, split_submissions, split_batches);
+    ASSERT_EQ(split.size(), unsplit.size());
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < split.size(); ++i) {
+        if (std::memcmp(&split[i], &unsplit[i], sizeof(float)) != 0) {
+            ++mismatches;
+        }
+    }
+    EXPECT_EQ(mismatches, 0u) << "the split changed " << mismatches << " of " << split.size()
+                              << " voxels";
+    EXPECT_GT(split_submissions, unsplit_submissions)
+        << "one step per submission must need more submissions than an unsplit batch";
 }
 
 // ---------------------------------------------------------------------------
