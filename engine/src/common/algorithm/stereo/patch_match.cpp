@@ -744,6 +744,14 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
     const int adj[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     const int far3[4][2] = {{-3, 0}, {3, 0}, {0, -3}, {0, 3}};
 
+    // Every completed half-sweep is 1/(2 * iterations) of the search, so the
+    // fraction a caller sees is monotone and reaches 1.0 only after the last
+    // one. A hook that throws (the task's cancel) propagates out of the sweep
+    // loop: the partial result is never returned, which is what makes a
+    // cancelled map distinguishable from a finished one.
+    const double sweeps_total = static_cast<double>(std::max(2 * options.iterations, 1));
+    double sweeps_done = 0.0;
+
     for (int it = 0; it < options.iterations; ++it) {
         const double s = std::pow(0.5, static_cast<double>(it) + 1.0);
         const double depth_delta = inv_span * s;
@@ -861,10 +869,19 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                     }
                 }
             }
+            if (options.on_sweep) {
+                sweeps_done += 1.0;
+                options.on_sweep(sweeps_done / sweeps_total);
+            }
         }
     }
 
     // ---- Finalisation ------------------------------------------------------
+    // A zero-iteration search has no sweeps to report, so the caller still gets
+    // one "finished" tick rather than a progress bar that never leaves 0.
+    if (options.on_sweep && options.iterations == 0) {
+        options.on_sweep(1.0);
+    }
     for (std::size_t p = 0; p < count; ++p) {
         if (result.depth[p] <= 0.0F || static_cast<double>(result.cost[p]) > options.max_cost) {
             result.depth[p] = -1.0F;

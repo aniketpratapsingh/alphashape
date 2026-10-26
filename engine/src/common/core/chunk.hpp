@@ -87,13 +87,29 @@ struct DepthMap {
     /// Empty, or width * height: per-pixel confidence / support weight.
     std::vector<float> confidence;
 
+    /// Hash of the camera pose, the sensor calibration and the downscale this
+    /// map was derived from: see depth_map_fingerprint(). A later
+    /// BuildDepthMaps run reuses a map only when this matches the chunk's
+    /// current geometry, so re-aligning cameras or re-calibrating a sensor
+    /// invalidates the stale maps. 0 means "unknown" — written by a build that
+    /// did not record one — and such a map is never reused.
+    std::uint64_t alignment_fingerprint = 0;
+
     bool operator==(const DepthMap& other) const {
         return camera_id == other.camera_id && width == other.width &&
                height == other.height && downscale == other.downscale &&
                depths == other.depths && normals == other.normals &&
-               confidence == other.confidence;
+               confidence == other.confidence &&
+               alignment_fingerprint == other.alignment_fingerprint;
     }
 };
+
+/// Deterministic hash of everything a depth map depends on besides the image
+/// pixels: the camera's world->camera pose, the sensor calibration and the
+/// working downscale. Two runs that would produce the same map have the same
+/// fingerprint; a re-aligned camera or a re-calibrated sensor does not. Never
+/// returns 0, which is reserved for "no fingerprint recorded".
+std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, int downscale);
 
 // PointCloud and Mesh are declared in `alphashape_model` (model/mesh/) and
 // included above, so the meshing library can consume geometry without

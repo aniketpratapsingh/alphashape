@@ -86,7 +86,11 @@ private:
 constexpr char kKptMagic[4] = {'A', 'K', 'P', '1'};
 constexpr char kMatchesMagic[4] = {'A', 'M', 'T', '1'};
 constexpr char kTracksMagic[4] = {'A', 'T', 'R', '2'};
-constexpr char kDepthMapsMagic[4] = {'A', 'D', 'M', '1'};
+constexpr char kDepthMapsMagic[4] = {'A', 'D', 'M', '1'};   // legacy, read-only
+/// Depth maps with the per-map alignment fingerprint. Doc.xml v1 and v2 both
+/// point at the same encoding; "ADM1" is still read, with every fingerprint
+/// reported as 0 (unknown), so an old project's maps are never reused.
+constexpr char kDepthMapsMagic2[4] = {'A', 'D', 'M', '2'};  // current
 constexpr char kPointCloudMagic[4] = {'A', 'P', 'C', '1'};
 constexpr char kMeshMagic[4] = {'A', 'M', 'S', '1'};   // legacy, read-only
 constexpr char kMeshMagic2[4] = {'A', 'M', 'S', '2'};  // current

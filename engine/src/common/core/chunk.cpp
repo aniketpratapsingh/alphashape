@@ -1,12 +1,37 @@
 #include "common/core/chunk.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 #include "common/core/frame.hpp"
 
 namespace alphashape {
 
 namespace {
+
+/// splitmix64's finaliser: a bijection on 64 bits with good avalanche, used to
+/// fold one more value into a running fingerprint.
+std::uint64_t mix64(std::uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+/// Fold one double in by its exact IEEE-754 bit pattern. The project writer
+/// emits %.17g, which round-trips every finite double, so a pose read back from
+/// a project hashes identically to the one it was written from — and any real
+/// change of value changes the bits.
+std::uint64_t fold_double(std::uint64_t h, double v) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &v, sizeof bits);
+    return mix64(h ^ bits);
+}
+
+std::uint64_t fold_int(std::uint64_t h, std::int64_t v) {
+    return mix64(h ^ static_cast<std::uint64_t>(v));
+}
 
 /// "<Kind> <n>" with the smallest n >= 1 not already used as an exact label in
 /// `existing`. Keeps labels stable when assets are added and removed.
@@ -219,6 +244,34 @@ typename Slot::value_type& payload_of(Slot& slot) {
 }
 
 }  // namespace
+
+std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, int downscale) {
+    std::uint64_t h = 0x243F6A8885A308D3ULL;  // pi's digits: an arbitrary non-zero seed
+    // The pose, row-major. A re-alignment changes it, so a map built before the
+    // re-alignment stops matching.
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            h = fold_double(h, camera.pose(r, c));
+        }
+    }
+    // The calibration the map was derived from, and the reduction factor: the
+    // same pose with a different lens, or at a different working resolution, is
+    // a different map.
+    const Calibration& cal = sensor.calibration;
+    h = fold_int(h, static_cast<std::int64_t>(cal.type));
+    h = fold_int(h, cal.width);
+    h = fold_int(h, cal.height);
+    for (const double value : {cal.f, cal.cx, cal.cy, cal.b1, cal.b2, cal.k1, cal.k2, cal.k3,
+                               cal.k4, cal.p1, cal.p2}) {
+        h = fold_double(h, value);
+    }
+    h = fold_int(h, downscale);
+    // mix64 is a bijection on 64 bits and the seed is non-zero, but a single
+    // final mix keeps the guarantee local: fold_int() already mixed, so only the
+    // impossible all-zero state needs excluding. Remap it rather than return it,
+    // because 0 is the "unknown" sentinel.
+    return h == 0 ? 1 : h;
+}
 
 std::vector<DepthMap>& Chunk::depth_maps() {
     if (depth_map_sets_.empty()) {
