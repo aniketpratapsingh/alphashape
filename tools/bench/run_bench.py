@@ -349,24 +349,32 @@ def run_cli(args: list[str], *, log: Path | None = None) -> float:
     return elapsed
 
 
-def run_pipeline(work: Path, images: list[Path]) -> dict:
+def run_pipeline(work: Path, images: list[Path], overrides: dict | None = None) -> dict:
     """Create a project from ``images`` and run the pipeline, timing each stage.
 
-    Peak RSS is taken from ``/proc/self/status`` on Linux or ``ru_maxrss`` from
-    ``getrusage``: the CLI is a short-lived child, so the reliable figure is the
-    child's own reported peak, read through ``wait4``. Where neither is available
-    the field is ``None`` rather than a guess.
+    Every stage runs at the engine's DEFAULTS. ``overrides`` exists only for a
+    dataset that cannot fit the job budget at full resolution, and whatever it
+    contains is recorded in the returned dict so the report can say the run was not
+    at defaults. That honesty is the point: a tuned run and a default run are not
+    comparable, and the metric history would silently mix them otherwise.
+
+    Peak RSS is the child's own reported peak via ``getrusage(RUSAGE_CHILDREN)``,
+    since the CLI is a short-lived process; it is ``None`` where the platform does
+    not report it rather than a guess.
     """
     project = work / "site.psx"
     log = work / "cli.log"
     stages: dict[str, float] = {}
+    overrides = overrides or {}
 
     started = time.monotonic()
-    stage_log_start = log.stat().st_size if log.exists() else 0
     stages["AddPhotos"] = _timed(run_cli, ["--new", str(project), "--add-images",
                                            *[str(p) for p in images]], log=log)
     for task in PIPELINE:
-        stages[task] = _timed(run_cli, ["--project", str(project), "--task", task], log=log)
+        arguments = ["--project", str(project), "--task", task]
+        for key, value in (overrides.get(task) or {}).items():
+            arguments += ["--set", f"{key}={value}"]
+        stages[task] = _timed(run_cli, arguments, log=log)
     total = time.monotonic() - started
 
     products: dict[str, str] = {}
@@ -390,6 +398,8 @@ def run_pipeline(work: Path, images: list[Path]) -> dict:
         "peak_rss_mb": peak_rss_mb(),
         "log_bytes": log.stat().st_size if log.exists() else 0,
         "log_tail": _tail(log, 20),
+        # Non-empty means this run was NOT at defaults; the report prints it.
+        "param_overrides": overrides,
     }
 
 
@@ -541,7 +551,10 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
     print("-- pipeline")
     images = collect_images(dataset, work)
     print(f"   {len(images)} images")
-    timing = run_pipeline(work, images)
+    overrides = dataset.get("param_overrides") or {}
+    if overrides:
+        print(f"   parameter overrides: {overrides}")
+    timing = run_pipeline(work, images, overrides)
 
     print("-- inspect")
     camera_stats = inspect_project(Path(timing["project"]))

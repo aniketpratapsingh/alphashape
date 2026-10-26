@@ -105,6 +105,12 @@ every Monday at 04:17 UTC and on demand.
    - writes the report to the job summary,
    - publishes the new baseline — but only when the run passed.
 
+Both datasets declare exactly one non-default parameter —
+`BuildDepthMaps downscale=8` — because their imagery is 20–24 MP per frame and the default
+downscale of 4 does not fit a weekly job on a shared CPU runner. The override is recorded
+in every metrics JSON and printed at the top of the report, so a tuned run is never
+mistaken for a default one. `DATASETS.md` gives the arithmetic.
+
 A run fails only on a **regression against the previous run of the same dataset**. It
 never fails on an absolute value: real-data results move with the scene, the season and
 the publisher's own processing, so an absolute gate would go red for reasons no commit

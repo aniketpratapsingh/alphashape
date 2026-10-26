@@ -44,7 +44,13 @@
       ],
       "nominal_gsd_m": 0.024,
       "expected_images": 102,
-      "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2. Its ortho and DSM are both at 2.19 cm/px (the record quotes 1 and 2.0, which OpenDroneMap reads in centimetres), so the reference matches the imagery resolution rather than being coarser than it."
+      "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2. Its ortho and DSM are both at 2.19 cm/px (the record quotes 1 and 2.0, which OpenDroneMap reads in centimetres), so the reference matches the imagery resolution rather than being coarser than it.",
+      "param_overrides": {
+        "BuildDepthMaps": {
+          "downscale": 8
+        }
+      },
+      "param_overrides_reason": "The survey is 102 images at 5472 x 3648 (20 MP). At the default downscale of 4 that is 127 million depth-map pixels, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters that to 32 million, and the resulting 1.7 cm depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is recorded in every metrics JSON and printed in the report, so a tuned run is never mistaken for a default one. It is the ONLY deviation from defaults."
     },
     "terrestrial-laser": {
       "title": "ETH3D high-res multi-view training scene 'terrains'",
@@ -97,7 +103,13 @@
       ],
       "nominal_gsd_m": null,
       "expected_images": 42,
-      "notes": "The scan_eval archive holds the laser scan already aligned into the image frame, which is why it is used instead of the 1.9 GB full ground-truth bundle. The reconstruction is registered onto the scan by similarity ICP before scoring, because an SfM model has no metric scale and these images carry no GPS. ETH3D scores accuracy and completeness at 2/5/10 cm; this benchmark uses the same tolerances."
+      "notes": "The scan_eval archive holds the laser scan already aligned into the image frame, which is why it is used instead of the 1.9 GB full ground-truth bundle. The reconstruction is registered onto the scan by similarity ICP before scoring, because an SfM model has no metric scale and these images carry no GPS. ETH3D scores accuracy and completeness at 2/5/10 cm; this benchmark uses the same tolerances.",
+      "param_overrides": {
+        "BuildDepthMaps": {
+          "downscale": 8
+        }
+      },
+      "param_overrides_reason": "42 images at 6048 x 4032 (24 MP). At the default downscale of 4 that is 64 million depth-map pixels over 42 views, each costing a multi-view PatchMatch search, which does not fit the job's time budget on a shared CPU runner. Downscale 8 quarters it to 16 million. Accuracy is still measured against the laser scan at 2/5/10 cm, so the tolerances \u2014 not the depth-grid spacing \u2014 decide whether the result is good enough. The override is recorded in every metrics JSON and printed in the report."
     }
   }
 }

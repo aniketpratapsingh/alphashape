@@ -315,6 +315,19 @@ class MarkdownTest(unittest.TestCase):
         self.assertIn("no usable texture", text)
 
 
+class OverrideNoteTest(unittest.TestCase):
+    def test_non_default_parameters_are_called_out(self):
+        current = metrics()
+        current["timing"]["param_overrides"] = {"BuildDepthMaps": {"downscale": 8}}
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Not at defaults", text)
+        self.assertIn("downscale=8", text)
+
+    def test_a_default_run_says_nothing_about_overrides(self):
+        text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertNotIn("Not at defaults", text)
+
+
 class FormatTest(unittest.TestCase):
     def test_none_is_a_dash(self):
         self.assertEqual(report._fmt(None), "-")

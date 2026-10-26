@@ -14,7 +14,7 @@ and a byte budget; a mismatch fails the run rather than producing a silently wro
 | Dataset | Images | Reference products | Licence | Role |
 |---|---|---|---|---|
 | `aerial-nadir` (Zenodo 8436963, Bandamaji, Comoros) | 102 nadir JPEG | Orthomosaic + DSM GeoTIFF + dense cloud (LAZ), all from the publisher's own ODM run | CC BY 4.0 | primary aerial |
-| `terrestrial-laser` (ETH3D `terrains`, high-res multi-view training) | 42 DSLR JPEG | Laser-scan point cloud (`scan_clean`), evaluation scan, occlusion masks, depth maps, COLMAP poses | CC BY-NC-SA 4.0 | ground-truth geometry |
+| `terrestrial-laser` (ETH3D `terrains`, high-res multi-view training) | 42 DSLR JPEG | Laser-scan point cloud, registered into the image frame (the `scan_eval` archive) | CC BY-NC-SA 4.0 | ground-truth geometry |
 
 The Comoros survey is the primary aerial set. Its publisher ran OpenDroneMap on the
 images it publishes and released the orthomosaic, the DSM and the dense cloud beside
@@ -52,9 +52,18 @@ does not come from a photogrammetry pipeline at all.
     nominal GSD and the reconstruction rate in the report's provenance block.
 - Publisher settings, quoted from the record (they are the reproducibility contract):
   `orthophoto-resolution=1`, `dem-resolution=2.0`, `dsm=true`, `auto-boundary=true`.
-  The reference is therefore a 1 m/px ortho and a 2 m DSM, both coarser than the imagery.
-  The benchmark resamples our products onto the reference grid before comparing, so the
-  reference's own resolution, not ours, sets the comparison scale.
+  OpenDroneMap reads those two numbers as centimetres, and the files confirm it: both
+  the ortho and the DSM come out at **2.19 cm/px** (11754 x 20163 cells). The reference
+  is therefore at the same scale as the imagery, not coarser than it. The benchmark
+  resamples both products onto a common grid before comparing, and reports that grid's
+  pixel size, so the comparison scale is never implied.
+- **One parameter override: `BuildDepthMaps downscale=8`.** 102 images at 5472 x 3648 is
+  20 MP each; at the default downscale of 4 that is 127 million depth-map pixels, each
+  costing a multi-view PatchMatch search, which does not fit a weekly job's budget on a
+  shared CPU runner. Downscale 8 quarters it to 32 million, and the resulting 1.7 cm
+  depth grid is still finer than the 2.4 cm GSD the imagery can justify. The override is
+  recorded in every metrics JSON and printed at the top of the report, so a tuned run is
+  never mistaken for a default one.
 - Why this one over the other candidates: it is the smallest member of the Comoros/Mayotte
   series whose publisher report shows a full reconstruction (102/102 images) on a compact
   site (0.048 km²) with a 2.4 cm GSD. Neighbouring records in the same series are 187,
@@ -87,9 +96,17 @@ does not come from a photogrammetry pipeline at all.
   - `terrains_dslr_scan_eval.7z` — the scan/pose alignment (`scan_alignment.mlp`) that
     places the laser scan in the image frame, plus the per-image masks. Without this the
     two clouds live in different coordinate systems and any distance is meaningless.
-  - `terrains_dslr_occlusion.7z` — the occlusion masks. ETH3D scores accuracy only on
-    points the laser could actually see; ignoring the masks would punish correct
-    reconstruction of surfaces the scanner was blind to. The benchmark applies them.
+  - `terrains_dslr_occlusion.7z` — the occlusion masks. ETH3D's evaluator uses these to
+    score accuracy only on points the laser could actually see.
+
+    **This benchmark does not use them yet.** Applying them needs a ray test from each
+    scanner position against the reference surface, which the evaluator does across the
+    full scan; the work is straightforward but is not in this version. The consequence is
+    known and stated rather than hidden: accuracy is scored over the whole cloud, so a
+    correct reconstruction of a region the scanner was blind to counts as an error, and
+    the reported accuracy is therefore a lower bound. Completeness is unaffected — every
+    reference point genuinely should be reconstructed. The manifest does not download
+    the occlusion archive, so a run does not pay for a file it does not read.
 - Accuracy/completeness follow ETH3D's own definition as implemented by
   `ETH3D/multi-view-evaluation`: accuracy is the fraction of reconstructed points within
   a tolerance of the reference surface, completeness the fraction of reference points
@@ -97,8 +114,20 @@ does not come from a photogrammetry pipeline at all.
   requested tolerances. This benchmark reports them at 2, 5 and 10 cm.
 - ETH3D also ships COLMAP poses (`images.txt`, `cameras.txt`) inside the ground-truth
   archive. The benchmark does **not** feed those to the engine: the pipeline must align the
-  images itself, and using the published poses would measure only the dense stage. They are
-  used solely to report a reference reprojection figure for context.
+  images itself, and using the published poses would measure only the dense stage.
+- **Registration before scoring.** A reconstruction lives in its own frame, and an SfM
+  model has no metric scale until it is georeferenced — these images carry no GPS at all
+  (only the `GPSVersionID` tag). Comparing distances across that difference would measure
+  the frames, not the geometry. The benchmark therefore fits a similarity from the
+  reconstruction to the scan first: principal axes plus a yaw search for a coarse
+  alignment, then trimmed nearest-neighbour ICP. The fitted scale, the iteration count and
+  the residual RMS are in the report, so a score that is really about the alignment is
+  visible as one.
+- **One parameter override: `BuildDepthMaps downscale=8`.** 42 images at 6048 x 4032 is
+  24 MP each, so the default downscale of 4 is 64 million depth-map pixels over 42 views.
+  The accuracy tolerances (2/5/10 cm against the laser scan) are what decide whether the
+  result is good enough, not the depth-grid spacing, so this costs no information the
+  metric can use.
 
 ## Also surveyed, not chosen
 

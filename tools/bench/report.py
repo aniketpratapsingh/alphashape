@@ -283,6 +283,18 @@ def markdown(
     if timing.get("total_s") is not None:
         lines.append(f"| **total** | **{_fmt(timing['total_s'])}** |")
     lines.append("")
+
+    # A run that used non-default parameters is not comparable with one that did
+    # not, so it is called out above the numbers rather than left in the log.
+    overrides = timing.get("param_overrides") or {}
+    if overrides:
+        rendered = "; ".join(
+            f"`{task}` " + ", ".join(f"`{key}={value}`" for key, value in values.items())
+            for task, values in overrides.items()
+        )
+        lines.append(f"**Not at defaults:** {rendered}. Results are comparable with other")
+        lines.append("runs of this dataset, not with runs at the engine's defaults.")
+        lines.append("")
     if timing.get("peak_rss_mb") is not None:
         lines.append(f"Peak resident memory: **{_fmt(timing['peak_rss_mb'])} MB**")
         lines.append("")

@@ -1,0 +1,302 @@
+name: Quality benchmark
+
+# Weekly real-data quality benchmark on public datasets. Downloads imagery and the
+# publisher's own reference products, runs the CLI pipeline at default settings, and
+# records reference-free and reference-based metrics. Fails only on a regression against
+# the previous run of the SAME dataset, never on an absolute value.
+#
+# The datasets are NOT committed. Each is fetched from its publisher at run time and
+# verified against tools/bench/datasets.json (URL, SHA-256, byte count). Licences differ
+# per dataset and are recorded in tools/bench/DATASETS.md; none are redistributed here.
+
+on:
+  schedule:
+    # Monday 04:17 UTC: off the top of the hour, so it does not queue behind the
+    # nightly build that starts at 20:30 UTC and can still be running.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset to run (see tools/bench/datasets.json)"
+        type: choice
+        default: aerial-nadir
+        options:
+          - aerial-nadir
+          - terrestrial-laser
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}
+  cancel-in-progress: false
+
+env:
+  # The bench is CPU-only on purpose: a shared runner's software Vulkan device is
+  # slower than the CPU lanes and would make the timings incomparable between runs.
+  ALPHASHAPE_GPU: "0"
+  # No performance assertions anywhere in this job: it measures, it does not gate
+  # on speed. The regression gate is the metrics verdict.
+  ALPHASHAPE_PERF_ASSERTS: "0"
+  OMP_NUM_THREADS: "4"
+  OMP_WAIT_POLICY: passive
+
+jobs:
+  # Resolve the dataset list once so the matrix and the cache key agree. A scheduled
+  # run does every dataset; a manual run honours the input.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      datasets: ${{ steps.plan.outputs.datasets }}
+      cache-key: ${{ steps.plan.outputs.cache-key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve datasets and cache key
+        id: plan
+        env:
+          REQUESTED: ${{ github.event.inputs.dataset }}
+        run: |
+          if [ -z "$REQUESTED" ] || [ "$REQUESTED" = "all" ]; then
+            names=$(python3 tools/bench/run_bench.py --list-datasets | cut -f1)
+          else
+            names="$REQUESTED"
+          fi
+          echo "running: $(echo "$names" | tr '\n' ' ')"
+          matrix=$(printf '%s\n' $names | python3 -c '
+          import json, sys
+          names = [line.strip() for line in sys.stdin if line.strip()]
+          print(json.dumps({"dataset": names}))
+          ')
+          echo "datasets=$matrix" >> "$GITHUB_OUTPUT"
+          # The cache key follows the manifest CONTENT so a corrected hash or a new
+          # dataset invalidates the cached downloads instead of reusing a stale tree.
+          key=$(python3 tools/bench/run_bench.py --manifest-hash)
+          echo "cache-key=bench-data-$key" >> "$GITHUB_OUTPUT"
+
+      - name: Install test dependencies
+        run: pip install --disable-pip-version-check numpy
+
+      - name: Metrics and report unit tests
+        # Stdlib + numpy only, and they finish in well under a second, so a broken
+        # metric is caught before the engine is built or a dataset is downloaded.
+        run: python3 -m unittest discover -s tools/bench/tests -v
+
+  build:
+    name: Build CLI
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Only the CLI is built: no GUI, no Python bindings, no Vulkan. Reusing
+      # build.yml would compile the GUI and the Python module for Windows and macOS
+      # as well, which is an hour of runner time for a binary the bench never
+      # touches. The configure flags below are the ones build.yml uses for Linux,
+      # minus everything the bench does not need.
+      - name: Install build dependencies
+        run: |
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          apt_retry update
+          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev \
+            libpng-dev libtiff-dev
+
+      - name: Restore the compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        with:
+          path: .ccache
+          key: bench-ccache-${{ github.sha }}
+          restore-keys: |
+            bench-ccache-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_BUILD_TESTS=OFF \
+            -DALPHASHAPE_BUILD_PYTHON=OFF \
+            -DALPHASHAPE_BUILD_GUI=OFF \
+            -DALPHASHAPE_GPU=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build the CLI
+        run: cmake --build build --target alphashape-cli --parallel 4
+
+      - name: Smoke the binary
+        # A binary that cannot even list its tasks would fail every dataset for the
+        # same reason; catching it here keeps the bench matrix from repeating it.
+        run: |
+          build/src/apps/cli/alphashape-cli --list-tasks
+          build/src/apps/cli/alphashape-cli --proj-info
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+        with:
+          name: bench-cli
+          path: build/src/apps/cli/alphashape-cli
+          retention-days: 1
+          if-no-files-found: error
+
+  bench:
+    name: Bench ${{ matrix.dataset }}
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    # The whole pipeline over ~100 real photographs, plus the download, has to fit
+    # here; the job fails rather than running past the limit. 330 minutes is the
+    # ceiling the workflow is allowed (under 6 h) and leaves headroom over the
+    # measured need for both datasets at the downscale each declares.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.datasets) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The CLI comes from the build job as a single file, so there is no build tree
+      # to unpack and no absolute-path dependence between the two jobs.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.0
+        with:
+          name: bench-cli
+          path: build/bench/bin
+
+      - name: Install runtime dependencies
+        run: |
+          apt_retry() { for i in 1 2 3 4; do sudo timeout 180 apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@" && return 0; echo "apt attempt $i failed or timed out"; done; return 1; }
+          apt_retry update
+          # Runtime libraries for the CLI, 7-Zip for the ETH3D archives, and the
+          # Python stack below for the metrics.
+          apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data \
+            libtiff6 libjpeg-turbo8 libpng16-16t64 p7zip-full
+
+      - name: Install the metrics dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --break-system-packages \
+            numpy rasterio Pillow 'laspy[lazrs]'
+
+      - name: Smoke the binary
+        run: |
+          cli="$PWD/build/bench/bin/alphashape-cli"
+          chmod +x "$cli"
+          "$cli" --list-tasks
+          "$cli" --proj-info
+
+      # The downloads are the slowest part of a weekly run and are identical between
+      # runs of the same manifest, so they are cached by manifest hash. A cache miss
+      # re-downloads; a corrupt entry fails the SHA-256 check and is re-fetched.
+      - name: Restore the dataset cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        with:
+          path: build/bench/cache
+          key: ${{ needs.plan.outputs.cache-key }}-${{ matrix.dataset }}
+          restore-keys: |
+            ${{ needs.plan.outputs.cache-key }}-
+
+      - name: Show the dataset
+        run: python3 tools/bench/run_bench.py --dataset "${{ matrix.dataset }}" --list
+
+      - name: Run the benchmark
+        env:
+          ALPHASHAPE_CLI: ${{ github.workspace }}/build/bench/bin/alphashape-cli
+        run: |
+          mkdir -p build/bench
+          python3 tools/bench/run_bench.py \
+            --dataset "${{ matrix.dataset }}" \
+            --work build/bench \
+            --json "build/bench/metrics-${{ matrix.dataset }}.json"
+
+      # The baseline is the metrics JSON from the last SUCCESSFUL run of this
+      # workflow on the default branch. Artifacts are per-run, so the run has to be
+      # located first; `gh run list` filters on the workflow and the conclusion,
+      # which is what makes "last good result" the definition rather than "last
+      # result". A miss (first run, expired artifact, a brand-new dataset) is not an
+      # error: the report says "first run" and the verdict passes.
+      - name: Restore the previous run
+        id: baseline
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATASET: ${{ matrix.dataset }}
+        run: |
+          mkdir -p build/bench/previous
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow quality-bench.yml \
+                     --branch "${{ github.event.repository.default_branch }}" \
+                     --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "no previous successful run"
+            exit 0
+          fi
+          echo "previous successful run: $run_id"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "bench-baseline-$DATASET" --dir build/bench/previous || true
+
+      - name: Find the baseline
+        id: baseline-path
+        run: |
+          prev="build/bench/previous/metrics-${{ matrix.dataset }}.json"
+          if [ -s "$prev" ]; then
+            echo "path=$prev" >> "$GITHUB_OUTPUT"
+            echo "using baseline $prev"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "no baseline; this is a first run"
+          fi
+
+      - name: Report
+        id: report
+        env:
+          BASELINE: ${{ steps.baseline-path.outputs.path }}
+        run: |
+          args=(--current "build/bench/metrics-${{ matrix.dataset }}.json"
+                --out "build/bench/report-${{ matrix.dataset }}.md"
+                --png "build/bench/compare-${{ matrix.dataset }}.png"
+                --fail-on-regression)
+          if [ -n "$BASELINE" ]; then args+=(--previous "$BASELINE"); fi
+          # A regression fails the job, but the report must still be uploaded and
+          # written to the summary: the value of a red run is the evidence in it.
+          set +e
+          python3 tools/bench/report.py "${args[@]}"
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Job summary
+        if: always()
+        run: |
+          report="build/bench/report-${{ matrix.dataset }}.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+        with:
+          name: bench-report-${{ matrix.dataset }}
+          path: |
+            build/bench/report-${{ matrix.dataset }}.md
+            build/bench/metrics-${{ matrix.dataset }}.json
+            build/bench/compare-${{ matrix.dataset }}.png
+            build/bench/cli.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # A successful run replaces the baseline the next week compares against. A
+      # failing run does NOT: the baseline stays at the last good result, so a
+      # regression keeps failing until it is fixed rather than being silently
+      # adopted as the new normal.
+      - name: Publish the new baseline
+        if: steps.report.outputs.status == '0'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+        with:
+          name: bench-baseline-${{ matrix.dataset }}
+          path: build/bench/metrics-${{ matrix.dataset }}.json
+          retention-days: 365
+          if-no-files-found: error
+
+      - name: Fail on regression
+        if: steps.report.outputs.status != '0'
+        run: |
+          echo "::error::the benchmark regressed against the previous run; see the report artifact"
+          exit 1
