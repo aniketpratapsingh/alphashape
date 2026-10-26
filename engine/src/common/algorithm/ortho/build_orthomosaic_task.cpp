@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -112,22 +113,65 @@ double median_height(const GeoRaster<float>& raster, float nodata) {
     return median_of(std::move(heights));
 }
 
+/// The largest cell count an output grid may have. RasterGrid holds int
+/// dimensions, so a single side above this (or a product above it) would
+/// overflow the cast, silently producing a negative size that later code sizes
+/// buffers and loops with. A resolution that asks for more cells than this is a
+/// mistake by orders of magnitude, not a run anyone wants.
+constexpr double kMaxGridCells = 2147483647.0;  // INT_MAX
+
+/// A compact human-readable cell count: "1e+16", not "10000000000000000".
+std::string format_cells(double cells) {
+    std::ostringstream out;
+    out.precision(3);
+    out << cells;
+    return out.str();
+}
+
 /// The north-up grid covering `extent` at `resolution`, its origin snapped
 /// outward to a multiple of the resolution (row 0 northernmost).
+///
+/// The cell counts are derived in double and validated BEFORE the cast to int:
+/// at a micrometre resolution over a 100 m extent the quotient is 1e8 per side
+/// and 1e16 cells, and casting an unbounded double is undefined behaviour that
+/// sails straight into a negative RasterGrid size. Anything above kMaxGridCells
+/// is refused here, with the same actionable wording the memory guard uses.
 RasterGrid ortho_grid_for(const RasterGrid& extent, double resolution) {
-    RasterGrid grid;
-    grid.pixel_size_x = resolution;
-    grid.pixel_size_y = resolution;
-    grid.origin_x = std::floor(extent.origin_x / resolution) * resolution;
-    grid.origin_y = std::ceil(extent.origin_y / resolution) * resolution;
+    if (!(resolution > 0.0) || !std::isfinite(resolution)) {
+        throw ValueError("BuildOrthomosaic: resolution must be a positive finite number "
+                         "(got " +
+                         std::to_string(resolution) + " m)");
+    }
     const double east =
         extent.origin_x + static_cast<double>(extent.width) * extent.pixel_size_x;
     const double south =
         extent.origin_y - static_cast<double>(extent.height) * extent.pixel_size_y;
-    grid.width =
-        std::max(1, static_cast<int>(std::ceil((east - grid.origin_x) / resolution)));
-    grid.height =
-        std::max(1, static_cast<int>(std::ceil((grid.origin_y - south) / resolution)));
+    const double origin_x = std::floor(extent.origin_x / resolution) * resolution;
+    const double origin_y = std::ceil(extent.origin_y / resolution) * resolution;
+    const double span_x = east - origin_x;
+    const double span_y = origin_y - south;
+    const double cols = std::ceil(span_x / resolution);
+    const double rows = std::ceil(span_y / resolution);
+    const double cells = cols * rows;
+
+    // NaN fails every comparison, so each quotient is checked for finiteness
+    // explicitly: a non-finite extent must not reach the cast either.
+    if (!std::isfinite(span_x) || !std::isfinite(span_y) || !std::isfinite(cells) ||
+        !(cells <= kMaxGridCells) || !(cols <= kMaxGridCells) || !(rows <= kMaxGridCells)) {
+        throw ValueError(
+            "BuildOrthomosaic: a resolution of " + std::to_string(resolution) + " m over a " +
+            format_cells(span_x) + " x " + format_cells(span_y) + " m extent would need " +
+            format_cells(cells) + " cells (the limit is " + format_cells(kMaxGridCells) +
+            "); choose a coarser resolution.");
+    }
+
+    RasterGrid grid;
+    grid.pixel_size_x = resolution;
+    grid.pixel_size_y = resolution;
+    grid.origin_x = origin_x;
+    grid.origin_y = origin_y;
+    grid.width = std::max(1, static_cast<int>(cols));
+    grid.height = std::max(1, static_cast<int>(rows));
     return grid;
 }
 

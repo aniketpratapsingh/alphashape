@@ -612,6 +612,32 @@ TEST(BuildOrthomosaic, MemoryGuardRefusesAnImpossibleResolution) {
     EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
 }
 
+TEST(BuildOrthomosaic, AbsurdResolutionIsRefusedBeforeItOverflows) {
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic before = chunk.orthomosaic();
+
+    // 1e-6 m over the fixture's ~120 x 90 m DEM is ~1.1e16 cells: both the
+    // per-side counts and the product overflow the grid's int dimensions, so
+    // the grid builder must reject in double precision, before anything is
+    // allocated. A generous memory budget must not let it through: the failure
+    // is representational, not a shortage.
+    ScopedMemoryBudget budget("65536");
+    Params params = ortho_params("mosaic", "elevation", 1e-6);
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("would need"), std::string::npos) << message;
+        EXPECT_NE(message.find("choose a coarser resolution"), std::string::npos) << message;
+        EXPECT_NE(message.find("cells (the limit is"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw) << "a micrometre resolution was not refused";
+    EXPECT_TRUE(chunk.orthomosaic() == before);  // nothing was committed
+}
+
 TEST(BuildOrthomosaic, MemoryGuardStillAllowsARealisticRun) {
     // With a generous budget the fixture's 1 m ortho must go through: the guard
     // is a floor, not a tax.
