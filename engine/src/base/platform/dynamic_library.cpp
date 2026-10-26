@@ -4,6 +4,13 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
+// In every SDK this project builds against (Windows 10+ / KB2533623), but a
+// build configured with an older NTDDI_VERSION would fail to compile without
+// this rather than fall back to the vulnerable search order.
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
 #else
 #include <dlfcn.h>
 #endif

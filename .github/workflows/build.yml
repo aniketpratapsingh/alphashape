@@ -1032,6 +1032,9 @@ jobs:
       # vulkan-1.dll to talk to the lavapipe ICD installed below, while the
       # installer must not ship one (the build job's list omits it, and
       # windows-package asserts bin\vulkan-1.dll is absent from the payload).
+      # Note that PATH is not enough to make it load: bare names resolve
+      # against System32 only (DLL planting), so the step after the vcpkg
+      # install points ALPHASHAPE_VULKAN_LIBRARY at the absolute path.
       VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib vulkan-loader
     steps:
       - uses: actions/checkout@v7
@@ -1053,6 +1056,20 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows `
             $env:VCPKG_PACKAGES.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # The engine opens a bare "vulkan-1.dll" with
+          # LOAD_LIBRARY_SEARCH_SYSTEM32, so it is only ever taken from
+          # System32 -- the application directory, the cwd and PATH are not
+          # searched, because searching them is a DLL-planting hole. A hosted
+          # runner has no System32\vulkan-1.dll, so the engine has to be told
+          # where vcpkg's copy is: an absolute path, which the loader opens with
+          # LOAD_WITH_ALTERED_SEARCH_PATH. Without this line every GPU suite
+          # would skip (a skipped test is green, so the lane would silently stop
+          # covering the GPU layer).
+          $loader = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\vulkan-1.dll'
+          if (-not (Test-Path -LiteralPath $loader)) { throw "$loader is missing; vcpkg did not install vulkan-loader" }
+          "ALPHASHAPE_VULKAN_LIBRARY=$loader" >> $env:GITHUB_ENV
+          Write-Host "ALPHASHAPE_VULKAN_LIBRARY=$loader"
 
       # A hosted Windows runner has no Vulkan runtime and no Vulkan driver, so
       # the GPU suites would all skip. Linux runs them on llvmpipe; this is the
