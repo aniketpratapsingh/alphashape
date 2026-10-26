@@ -692,6 +692,89 @@ TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
     EXPECT_GT(static_cast<double>(cost_ok) / n, 0.99);
 }
 
+// The refine kernel's own gate. InitialPlanesMatchCpu runs with iterations = 0,
+// so it only exercises pm_init and pm_finalize; a regression inside the descent
+// half-sweep (pm_refine) is invisible to it. This test runs real sweeps on the
+// same dense fixture and compares the result with the CPU reference.
+//
+// The strict bound is 99.9% and not a looser "same quality" one because
+// pm_refine's result is *stable* across implementations: both sides draw the
+// same hypotheses from the same keyed stream and evaluate the same cost, so the
+// only legitimate source of disagreement is rounding. What breaks that is a
+// stray fused multiply-add on the depth/plane-to-pixel path: it moves floor() to
+// a neighbouring texel and flips a winner. That is not hypothetical -- it is
+// exactly what optimised pm_refine did on the Tesla T4 before the projection
+// chain was marked `precise` (93.4% agreement, 85.6% before the shader defects
+// were fixed, 100.0% with the whole chain marked), and DenseFixtureAccuracy at
+// its 0.90 floor did not notice.
+//
+// A software device gets a looser bound: llvmpipe/lavapipe is not the reference
+// the regression appeared on, and its own transcendental implementations are a
+// separate variable. The hardware lanes -- the T4 in particular -- get the tight
+// one, which is where a refine regression must fail.
+TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
+    REQUIRE_GPU_PM();
+    const auto inputs = dense_inputs(2);
+    const stereo::ViewNeighbourhood& hood = inputs->neighbourhoods.front();
+    std::vector<PMView> neighbours;
+    for (const std::int32_t id : hood.neighbours) {
+        neighbours.push_back(inputs->view(id));
+    }
+    const PMView reference = inputs->view(hood.camera_id);
+    PatchMatchOptions options;
+    options.depth_min = hood.depth_min;
+    options.depth_max = hood.depth_max;
+    options.seed = 7;
+    // Explicit, so this test cannot silently turn into a second
+    // InitialPlanesMatchCpu if the default ever changes.
+    options.iterations = 4;
+
+    const std::shared_ptr<gpu::Context> context = gpu::default_context();
+    const bool software = context != nullptr && gpu::is_software_device(context->info());
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result = stereo::run_patch_match(reference, neighbours, options);
+    ASSERT_EQ(gpu_result.depth.size(), cpu_result.depth.size());
+
+    const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
+    // Normals are scored only where the depths already agree, so a wrong search
+    // cannot hide behind a normal that happens to be close.
+    std::size_t normal_ok = 0;
+    for (std::size_t i = 0; i < gpu_result.depth.size(); ++i) {
+        if (!(gpu_result.depth[i] > 0.0F) || !(cpu_result.depth[i] > 0.0F)) {
+            continue;
+        }
+        const double cpu_depth = static_cast<double>(cpu_result.depth[i]);
+        if (std::abs(static_cast<double>(gpu_result.depth[i]) - cpu_depth) / cpu_depth >= 0.01) {
+            continue;
+        }
+        double dot = 0.0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            dot += static_cast<double>(gpu_result.normals[3 * i + k]) *
+                   static_cast<double>(cpu_result.normals[3 * i + k]);
+        }
+        if (dot > 1.0 - 1e-4) {
+            ++normal_ok;
+        }
+    }
+    const double both = static_cast<double>(std::max<std::size_t>(agreement.both, 1));
+    const double normal_fraction = static_cast<double>(normal_ok) / both;
+    std::printf("[gpu refine] camera %d, %d sweeps: agree<1%% %.2f%% of %zu | normals %.2f%% of "
+                "the depth-agreeing pixels | %s\n",
+                hood.camera_id, options.iterations, 100.0 * agreement.fraction, agreement.both,
+                100.0 * normal_fraction, software ? "software device" : "hardware device");
+
+    ASSERT_GT(agreement.both, 1000U);
+    const double depth_floor = software ? 0.90 : 0.999;
+    EXPECT_GT(agreement.fraction, depth_floor)
+        << "pm_refine disagrees with the CPU on " << agreement.both
+        << " comparable pixels; a fused multiply-add on the depth/plane-to-pixel path (see the "
+           "note at the top of pm_math.glsl) is the usual cause";
+    const double normal_floor = software ? 0.90 : 0.999;
+    EXPECT_GT(normal_fraction, normal_floor);
+}
+
 // ---------------------------------------------------------------------------
 // 7. Fused-cloud accuracy: the same contract as BuildDenseTruthPoses
 // ---------------------------------------------------------------------------
