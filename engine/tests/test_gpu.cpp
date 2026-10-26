@@ -1784,10 +1784,15 @@ TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
 // handle; the whole unwind shares a single post-loss drain deadline.
 // Regression for the teardown window: the per-handle drain after a loss shares
 // one 1 s deadline across the whole fallback unwind, and ~VulkanBackend used to
-// inherit that window. On a *simulated* loss the driver is still alive, so a
-// submission that legitimately takes longer than a second was abandoned mid
-// execution and the device was then destroyed underneath lavapipe's worker
-// thread. The teardown drain must get its own full budget.
+// inherit that window. A loss *declared* by the test hook -- or a timeout that
+// raced completion -- leaves the driver and its queue alive, so the teardown
+// drain is the last chance to wait before the device goes, and it must not be
+// capped by a window that only exists to keep an unwind cheap.
+//
+// The observable contract: with work still queued, the shared window already
+// spent, and the device marked lost, tearing the backend down must return
+// cleanly. A drain that gave up would destroy the device (and the command pools
+// and fences) under lavapipe's live queue.
 TEST(Gpu, TeardownDrainIsNotCappedByTheSharedUnwindWindow) {
     REQUIRE_GPU();
     DeviceStateGuard state_guard;
@@ -1801,6 +1806,9 @@ TEST(Gpu, TeardownDrainIsNotCappedByTheSharedUnwindWindow) {
     constexpr std::size_t kCount = 4096;
     std::vector<float> zeros(kCount, 0.0f);
     Buffer buffer = Buffer::of(*context, zeros);
+    // Allocated before the loss: Buffer::of uploads, and an upload on a lost
+    // device throws by design.
+    Buffer doomed = Buffer::of(*context, zeros);
     struct Params {
         std::uint32_t n;
     };
@@ -1819,18 +1827,13 @@ TEST(Gpu, TeardownDrainIsNotCappedByTheSharedUnwindWindow) {
     detail::note_device_lost("test: teardown with work still queued");
     ASSERT_TRUE(detail::device_lost());
 
-    // Release every buffer while the device is still up: one of them performs
-    // the per-handle drain, which is what arms (and, being 1 s, spends) the
-    // shared post-loss window an unwind would use.
-    {
-        Buffer doomed = Buffer::of(*context, zeros);
-        doomed = Buffer();
-    }
+    // Spend the shared post-loss window the way an unwind does: a per-handle
+    // destructor drain. After this the cheap window is armed and used.
+    doomed = Buffer();
     buffer = Buffer();
 
-    // The teardown must still bring the backend down cleanly and return. If it
-    // inherited the spent 1 s window it would give up on the queued work and
-    // tear the device down while lavapipe's worker thread was still reading it.
+    // Now the teardown. This must drain on its own full budget and return; it
+    // must not throw (destructors are noexcept) and must not fault.
     context.reset();
     SUCCEED() << "backend torn down after a loss with queued work";
 
