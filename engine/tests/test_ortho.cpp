@@ -105,6 +105,35 @@ bool interior(const RasterGrid& grid, int col, int row) {
     return c.x() >= -52.0 && c.x() <= 52.0 && c.y() >= -38.0 && c.y() <= 38.0;
 }
 
+// -- cropped-tile accessors -------------------------------------------------
+// A tile holds only its camera's footprint box; a cell outside it is exactly
+// "not covered", which is what the full-grid layout used to hold as 0.
+
+bool tile_valid_at(const OrthoTile& tile, int col, int row) {
+    return tile.contains(col, row) && tile.valid[tile.index(col, row)] != 0;
+}
+
+std::uint8_t tile_rgb_at(const OrthoTile& tile, int col, int row, int channel) {
+    return tile.contains(col, row)
+               ? tile.rgb[tile.index(col, row) * 3 + static_cast<std::size_t>(channel)]
+               : std::uint8_t{0};
+}
+
+/// The same two, addressed by a linear cell index on a grid `width` wide.
+bool tile_valid_cell(const OrthoTile& tile, std::size_t cell, int width) {
+    return tile_valid_at(tile, static_cast<int>(cell % static_cast<std::size_t>(width)),
+                         static_cast<int>(cell / static_cast<std::size_t>(width)));
+}
+
+/// Per-channel colour of a tile at a linear cell index, 0 where uncovered.
+void tile_rgb_cell(const OrthoTile& tile, std::size_t cell, int width, std::uint8_t out[3]) {
+    const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+    const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
+    for (int c = 0; c < 3; ++c) {
+        out[c] = tile_rgb_at(tile, col, row, c);
+    }
+}
+
 bool in_building(const RasterGrid& grid, int col, int row) {
     const Eigen::Vector2d c = grid.pixel_center(col, row);
     return c.x() >= aerial_fixture::kBuildX0 && c.x() <= aerial_fixture::kBuildX1 &&
@@ -158,9 +187,37 @@ double mean_abs_diff(const Image& truth, const std::vector<std::uint8_t>& rgb,
     return count == 0 ? 0.0 : sum / (3.0 * static_cast<double>(count));
 }
 
+/// The same comparison for a CROPPED tile: cells outside its box are not
+/// covered, so they are skipped exactly as `valid == 0` cells are.
+double mean_abs_diff(const Image& truth, const OrthoTile& tile, const RasterGrid& grid,
+                     bool interior_only) {
+    double sum = 0.0;
+    std::size_t count = 0;
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            if (interior_only && !interior(grid, col, row)) {
+                continue;
+            }
+            if (!tile_valid_at(tile, col, row)) {
+                continue;
+            }
+            const std::size_t cell = tile.index(col, row);
+            for (int c = 0; c < 3; ++c) {
+                const int tc = truth.channels() >= 3 ? c : 0;
+                const double d = std::abs(
+                    static_cast<double>(tile.rgb[cell * 3 + static_cast<std::size_t>(c)]) -
+                    static_cast<double>(truth.at(col, row, tc)));
+                sum += d;
+            }
+            ++count;
+        }
+    }
+    return count == 0 ? 0.0 : sum / (3.0 * static_cast<double>(count));
+}
+
 /// Mean absolute RGB difference over the building footprint only.
-double mean_abs_diff_footprint(const Image& truth, const std::vector<std::uint8_t>& rgb,
-                               const std::vector<std::uint8_t>& valid, const RasterGrid& grid) {
+double mean_abs_diff_footprint(const Image& truth, const OrthoTile& tile,
+                               const RasterGrid& grid) {
     double sum = 0.0;
     std::size_t count = 0;
     for (int row = 0; row < grid.height; ++row) {
@@ -168,14 +225,13 @@ double mean_abs_diff_footprint(const Image& truth, const std::vector<std::uint8_
             if (!in_building(grid, col, row)) {
                 continue;
             }
-            const std::size_t cell = static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width) +
-                                     static_cast<std::size_t>(col);
-            if (!valid.empty() && valid[cell] == 0) {
+            if (!tile_valid_at(tile, col, row)) {
                 continue;
             }
+            const std::size_t cell = tile.index(col, row);
             for (int c = 0; c < 3; ++c) {
                 const int tc = truth.channels() >= 3 ? c : 0;
-                sum += std::abs(static_cast<double>(rgb[cell * 3 + static_cast<std::size_t>(c)]) -
+                sum += std::abs(static_cast<double>(tile.rgb[cell * 3 + static_cast<std::size_t>(c)]) -
                                 static_cast<double>(truth.at(col, row, tc)));
             }
             ++count;
@@ -253,6 +309,103 @@ double seam_jump(const ortho::OrthoMosaic& mosaic) {
     return count == 0 ? 0.0 : sum / static_cast<double>(count);
 }
 
+// -- 0. memory: cropped tiles are byte-identical to the full-grid reference ----
+
+/// The crop is a pure storage optimisation: expanding a cropped tile back onto
+/// the full grid must reproduce the uncropped reference exactly, cell for cell.
+/// The reference path is `crop == false`, which is the pre-crop code.
+TEST(Ortho, CroppedTilesMatchFullGridExactly) {
+    const Scene scene = make_scene();
+    // Both a plain plane-frame camera (no map) and every camera in the flight
+    // are exercised, so the crop is checked against obliques too.
+    std::vector<int> indices{central_camera(scene), 0, 6, 11};
+    double worst_rgb = 0.0;
+    std::size_t mismatched = 0;
+    std::size_t total_crop_cells = 0;
+    std::size_t total_full_cells = 0;
+    for (const int index : indices) {
+        const OrthoTile full = orthorectify(scene.dem, scene.nodata, scene.grid,
+                                            scene.cameras[static_cast<std::size_t>(index)],
+                                            index, 0.5, /*crop=*/false);
+        const OrthoTile crop = orthorectify(scene.dem, scene.nodata, scene.grid,
+                                            scene.cameras[static_cast<std::size_t>(index)],
+                                            index, 0.5, /*crop=*/true);
+        // The reference holds the whole grid.
+        EXPECT_EQ(full.width, scene.grid.width);
+        EXPECT_EQ(full.height, scene.grid.height);
+        EXPECT_EQ(full.x0, 0);
+        EXPECT_EQ(full.y0, 0);
+        EXPECT_FALSE(crop.empty()) << "camera " << index << " covered nothing";
+        EXPECT_LE(crop.x0 + crop.width, scene.grid.width);
+        EXPECT_LE(crop.y0 + crop.height, scene.grid.height);
+        total_crop_cells += static_cast<std::size_t>(crop.width) *
+                            static_cast<std::size_t>(crop.height);
+        total_full_cells += static_cast<std::size_t>(full.width) *
+                            static_cast<std::size_t>(full.height);
+
+        for (int row = 0; row < scene.grid.height; ++row) {
+            for (int col = 0; col < scene.grid.width; ++col) {
+                const std::size_t fc = static_cast<std::size_t>(row) *
+                                           static_cast<std::size_t>(scene.grid.width) +
+                                       static_cast<std::size_t>(col);
+                const bool full_valid = full.valid[fc] != 0;
+                const bool crop_valid = tile_valid_at(crop, col, row);
+                if (full_valid != crop_valid) {
+                    ++mismatched;
+                    continue;
+                }
+                if (!full_valid) {
+                    continue;
+                }
+                const std::size_t cc = crop.index(col, row);
+                EXPECT_EQ(full.score[fc], crop.score[cc]);
+                for (int c = 0; c < 3; ++c) {
+                    const std::size_t fo = fc * 3 + static_cast<std::size_t>(c);
+                    const std::size_t co = cc * 3 + static_cast<std::size_t>(c);
+                    worst_rgb = std::max(
+                        worst_rgb,
+                        std::abs(static_cast<double>(full.rgb[fo]) -
+                                 static_cast<double>(crop.rgb[co])));
+                }
+            }
+        }
+    }
+    std::printf("[Ortho.CroppedTilesMatchFullGridExactly] crop_cells=%zu full_cells=%zu "
+                "mismatched=%zu worst_rgb=%.0f\n",
+                total_crop_cells, total_full_cells, mismatched, worst_rgb);
+    // Every camera's covered cell agrees: no valid flag and no colour may differ.
+    EXPECT_EQ(mismatched, 0U);
+    EXPECT_EQ(worst_rgb, 0.0);
+    // And the crop actually saves memory: the whole point of the change.
+    EXPECT_LT(total_crop_cells, total_full_cells);
+}
+
+TEST(Ortho, CropBoxBoundsEveryVisibleCell) {
+    // The footprint bound must never cut off a cell the rectifier would have
+    // coloured. Crop is 2-cell padded plus a 1% inflation precisely so that
+    // "the box misses a valid cell" cannot happen; assert it directly.
+    const Scene scene = make_scene();
+    for (std::size_t i = 0; i < scene.cameras.size(); ++i) {
+        const OrthoTile crop = orthorectify(scene.dem, scene.nodata, scene.grid,
+                                            scene.cameras[i], static_cast<int>(i), 0.5);
+        const OrthoTile full = orthorectify(scene.dem, scene.nodata, scene.grid,
+                                            scene.cameras[i], static_cast<int>(i), 0.5,
+                                            /*crop=*/false);
+        std::size_t outside = 0;
+        for (int row = 0; row < scene.grid.height; ++row) {
+            for (int col = 0; col < scene.grid.width; ++col) {
+                const std::size_t fc = static_cast<std::size_t>(row) *
+                                           static_cast<std::size_t>(scene.grid.width) +
+                                       static_cast<std::size_t>(col);
+                if (full.valid[fc] != 0 && !crop.contains(col, row)) {
+                    ++outside;
+                }
+            }
+        }
+        EXPECT_EQ(outside, 0U) << "camera " << i << " has coloured cells outside its crop";
+    }
+}
+
 // -- 1. rectification --------------------------------------------------------
 
 TEST(Ortho, RectifyMatchesTruth) {
@@ -265,14 +418,17 @@ TEST(Ortho, RectifyMatchesTruth) {
     std::size_t valid_interior = 0;
     for (int row = 0; row < scene.grid.height; ++row) {
         for (int col = 0; col < scene.grid.width; ++col) {
-            const std::size_t cell = static_cast<std::size_t>(row) * static_cast<std::size_t>(scene.grid.width) +
-                                     static_cast<std::size_t>(col);
-            if (interior(scene.grid, col, row) && tile.valid[cell] != 0) {
+            if (interior(scene.grid, col, row) && tile_valid_at(tile, col, row)) {
                 ++valid_interior;
             }
         }
     }
-    const double error = mean_abs_diff(scene.truth, tile.rgb, tile.valid, scene.grid, true);
+    // The cropped tile is a strict subset of the grid: it must not be empty and
+    // must not exceed it.
+    EXPECT_FALSE(tile.empty());
+    EXPECT_LE(tile.x0 + tile.width, scene.grid.width);
+    EXPECT_LE(tile.y0 + tile.height, scene.grid.height);
+    const double error = mean_abs_diff(scene.truth, tile, scene.grid, true);
     std::printf("[Ortho.RectifyMatchesTruth] camera=%d valid_interior=%zu mean_abs_diff=%.3f\n",
                 index, valid_interior, error);
     EXPECT_GT(valid_interior, static_cast<std::size_t>(scene.grid.width * scene.grid.height / 8));
@@ -308,16 +464,13 @@ TEST(Ortho, OcclusionHidesBehindBuilding) {
             if (in_building(scene.grid, col, row)) {
                 continue;  // only the ground outside the footprint
             }
-            const std::size_t cell =
-                static_cast<std::size_t>(row) * static_cast<std::size_t>(scene.grid.width) +
-                static_cast<std::size_t>(col);
-            if (true_tile.valid[cell] != 0 || flat_tile.valid[cell] == 0) {
+            if (tile_valid_at(true_tile, col, row) || !tile_valid_at(flat_tile, col, row)) {
                 continue;  // not visible-and-then-hidden
             }
             ++occluded;
-            if (true_tile.rgb[cell * 3 + 0] == roof[0] &&
-                true_tile.rgb[cell * 3 + 1] == roof[1] &&
-                true_tile.rgb[cell * 3 + 2] == roof[2]) {
+            if (tile_rgb_at(true_tile, col, row, 0) == roof[0] &&
+                tile_rgb_at(true_tile, col, row, 1) == roof[1] &&
+                tile_rgb_at(true_tile, col, row, 2) == roof[2]) {
                 ++occluded_roof_coloured;
             }
         }
@@ -331,14 +484,65 @@ TEST(Ortho, OcclusionHidesBehindBuilding) {
     // Relief displacement. On bare terrain the footprint cells project the
     // ground and disagree strongly with the truth roof; on the true DEM they
     // land on the roof and agree.
-    const double true_err =
-        mean_abs_diff_footprint(scene.truth, true_tile.rgb, true_tile.valid, scene.grid);
-    const double flat_err =
-        mean_abs_diff_footprint(scene.truth, flat_tile.rgb, flat_tile.valid, scene.grid);
+    const double true_err = mean_abs_diff_footprint(scene.truth, true_tile, scene.grid);
+    const double flat_err = mean_abs_diff_footprint(scene.truth, flat_tile, scene.grid);
     std::printf("[Ortho.OcclusionHidesBehindBuilding] footprint_err true=%.3f flat=%.3f "
                 "ratio=%.2f\n",
                 true_err, flat_err, true_err > 0.0 ? flat_err / true_err : 0.0);
     EXPECT_GT(flat_err, 2.0 * true_err);
+}
+
+TEST(Ortho, OcclusionCostDoesNotFollowTheOutputGrid) {
+    const Scene scene = make_scene();
+    constexpr int kIndex = 6;
+    constexpr double kTolerance = 0.1;
+    // The fixture DEM is a 0.25 m grid. A 4x-finer ortho grid over the same
+    // extent has 16x the output cells; the march step is half a DEM cell in
+    // both runs, so the DEM samples per output cell must stay put. The old
+    // step of 0.5 * max(output cell, DEM cell) scaled the march with whatever
+    // grid the user asked for, which is the cost this guards.
+    constexpr int kFactor = 4;
+    RasterGrid fine = scene.grid;
+    fine.pixel_size_x = scene.grid.pixel_size_x / kFactor;
+    fine.pixel_size_y = scene.grid.pixel_size_y / kFactor;
+    fine.width = scene.grid.width * kFactor;
+    fine.height = scene.grid.height * kFactor;
+    ASSERT_DOUBLE_EQ(fine.pixel_size_x * kFactor, scene.grid.pixel_size_x);
+
+    ortho::reset_occlusion_sample_count();
+    const OrthoTile coarse_tile =
+        orthorectify(scene.dem, scene.nodata, scene.grid, scene.cameras[kIndex], kIndex,
+                     kTolerance);
+    const double coarse_samples = static_cast<double>(ortho::occlusion_sample_count());
+
+    ortho::reset_occlusion_sample_count();
+    const OrthoTile fine_tile =
+        orthorectify(scene.dem, scene.nodata, fine, scene.cameras[kIndex], kIndex, kTolerance);
+    const double fine_samples = static_cast<double>(ortho::occlusion_sample_count());
+
+    const double coarse_cells =
+        static_cast<double>(coarse_tile.width) * static_cast<double>(coarse_tile.height);
+    const double fine_cells =
+        static_cast<double>(fine_tile.width) * static_cast<double>(fine_tile.height);
+    ASSERT_GT(coarse_cells, 0.0);
+    ASSERT_GT(fine_cells, 0.0);
+    const double coarse_per_cell = coarse_samples / coarse_cells;
+    const double fine_per_cell = fine_samples / fine_cells;
+    std::printf("[Ortho.OcclusionCost] coarse=%.2f fine=%.2f samples/cell, cells %.0f -> "
+                "%.0f (x%.1f)\n",
+                coarse_per_cell, fine_per_cell, coarse_cells, fine_cells,
+                fine_cells / coarse_cells);
+    EXPECT_GT(coarse_per_cell, 0.0);
+    // Independent of the output resolution: within a stride's rounding of the
+    // coarse run, never multiplied by the 4x finer cell.
+    EXPECT_LT(fine_per_cell, 1.5 * coarse_per_cell + 1.0);
+    EXPECT_GT(fine_per_cell, 0.5 * coarse_per_cell);
+    // The march now stops at a METRIC bound (the ray's height reaching the DEM's
+    // tallest sample), so the count is bounded by the scene's relief over the
+    // stride -- far below any per-ray sample budget. The old fixed 4096 cap was
+    // a geometry assumption; the count staying under it here means the height
+    // bound, not a cap, is what ends the march.
+    EXPECT_LT(fine_per_cell, 4096.0);
 }
 
 // -- 3. seamlines ------------------------------------------------------------
@@ -370,18 +574,19 @@ TEST(Seam, LabelsCoverInterior) {
                 continue;
             }
             ++interior_total;
-            const std::size_t cell =
-                static_cast<std::size_t>(row) * static_cast<std::size_t>(scene.grid.width) +
-                static_cast<std::size_t>(col);
             bool covered = false;
             for (const OrthoTile& tile : tiles) {
-                if (tile.valid[cell] != 0) {
+                if (tile_valid_at(tile, col, row)) {
                     covered = true;
                     break;
                 }
             }
             if (covered) {
                 ++interior_covered;
+                const std::size_t cell =
+                    static_cast<std::size_t>(row) *
+                        static_cast<std::size_t>(scene.grid.width) +
+                    static_cast<std::size_t>(col);
                 if (labels[cell] >= 0) {
                     ++interior_labelled;
                 }
@@ -434,6 +639,10 @@ TEST(Seam, OptimumOnSmallGrid) {
         return static_cast<int>((state >> 16) & 0xFF);
     };
     for (OrthoTile& tile : tiles) {
+        tile.x0 = 0;
+        tile.y0 = 0;
+        tile.width = kWidth;
+        tile.height = kHeight;
         tile.rgb.assign(cells * 3, 0);
         tile.valid.assign(cells, 0);
         tile.score.assign(cells, 0.0F);
@@ -474,7 +683,7 @@ TEST(Seam, OptimumOnSmallGrid) {
     std::vector<int> choices(cells, 0);
     for (std::size_t cell = 0; cell < cells; ++cell) {
         for (std::size_t t = 0; t < tiles.size(); ++t) {
-            choices[cell] += tiles[t].valid[cell] != 0 ? 1 : 0;
+            choices[cell] += tile_valid_cell(tiles[t], cell, kWidth) ? 1 : 0;
         }
     }
     std::vector<std::int32_t> current(cells, -1);
@@ -496,7 +705,7 @@ TEST(Seam, OptimumOnSmallGrid) {
             int seen = 0;
             current[cell] = -1;
             for (std::size_t t = 0; t < tiles.size(); ++t) {
-                if (tiles[t].valid[cell] == 0) {
+                if (!tile_valid_cell(tiles[t], cell, kWidth)) {
                     continue;
                 }
                 if (seen == pick) {
@@ -534,7 +743,7 @@ TEST(Seam, OptimumOnSmallGrid) {
             int seen = 0;
             current[cell] = -1;
             for (std::size_t t = 0; t < tiles.size(); ++t) {
-                if (tiles[t].valid[cell] == 0) {
+                if (!tile_valid_cell(tiles[t], cell, kWidth)) {
                     continue;
                 }
                 if (seen == pick) {
@@ -554,19 +763,25 @@ TEST(Seam, OptimumOnSmallGrid) {
 
 /// The mean per-channel grey difference (over the 255 range) the two labelled
 /// tiles show at `cell`, or 0 when either does not cover it.
-double label_disagreement(const std::vector<OrthoTile>& tiles, int a, int b, std::size_t cell) {
+double label_disagreement(const std::vector<OrthoTile>& tiles, int a, int b, std::size_t cell,
+                          int width) {
     if (a < 0 || b < 0) {
         return 0.0;
     }
+    const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+    const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
     const OrthoTile& ta = tiles[static_cast<std::size_t>(a)];
     const OrthoTile& tb = tiles[static_cast<std::size_t>(b)];
-    if (ta.valid[cell] == 0 || tb.valid[cell] == 0) {
+    if (!tile_valid_at(ta, col, row) || !tile_valid_at(tb, col, row)) {
         return 0.0;
     }
+    std::uint8_t ca[3];
+    std::uint8_t cb[3];
+    tile_rgb_cell(ta, cell, width, ca);
+    tile_rgb_cell(tb, cell, width, cb);
     double sum = 0.0;
     for (int c = 0; c < 3; ++c) {
-        sum += std::abs(static_cast<int>(ta.rgb[cell * 3 + static_cast<std::size_t>(c)]) -
-                        static_cast<int>(tb.rgb[cell * 3 + static_cast<std::size_t>(c)]));
+        sum += std::abs(static_cast<int>(ca[c]) - static_cast<int>(cb[c]));
     }
     return sum / (3.0 * 255.0);
 }
@@ -609,8 +824,8 @@ SeamStats seam_stats(const Scene& scene, const std::vector<OrthoTile>& tiles,
                     continue;
                 }
                 ++stats.seams;
-                const double d = 0.5 * (label_disagreement(tiles, la, lb, cell) +
-                                        label_disagreement(tiles, la, lb, q));
+                const double d = 0.5 * (label_disagreement(tiles, la, lb, cell, w) +
+                                        label_disagreement(tiles, la, lb, q, w));
                 if (d * 255.0 > 30.0) {
                     ++stats.disagreeing;
                 }
@@ -676,7 +891,7 @@ TEST(Seam, DisagreementAvoidance) {
                 static_cast<std::size_t>(row) * static_cast<std::size_t>(scene.grid.width) +
                 static_cast<std::size_t>(col);
             for (std::size_t t = 0; t < tiles.size(); ++t) {
-                roof_covered[t] += tiles[t].valid[cell] != 0 ? 1 : 0;
+                roof_covered[t] += tile_valid_cell(tiles[t], cell, scene.grid.width) ? 1 : 0;
             }
         }
     }

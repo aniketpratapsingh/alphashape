@@ -1,5 +1,6 @@
 #include "common/algorithm/elevation/surface_frame.hpp"
 
+#include <cmath>
 #include <string>
 
 #include <Eigen/LU>
@@ -69,6 +70,23 @@ Eigen::Vector3d SurfaceFrame::to_local(const Eigen::Vector3d& plane) const {
     const Eigen::Vector4d ecef_h(ecef.x(), ecef.y(), ecef.z(), 1.0);
     const Eigen::Vector4d local = to_local_ * ecef_h;
     return local.head<3>();
+}
+
+Eigen::Vector2d SurfaceFrame::metres_per_plane_unit(double plane_y) const {
+    if (projection_.kind != geo::ProjectionKind::Geographic) {
+        // Local and UTM planes are metric (UTM's point scale is ~0.9996 and the
+        // difference is immaterial for a cell size).
+        return Eigen::Vector2d(1.0, 1.0);
+    }
+    // WGS84 radii of curvature, the same constants geodesy.cpp uses.
+    constexpr double kDeg2Rad = 3.14159265358979323846 / 180.0;
+    const double e2 = 2.0 * geo::kWgs84F - geo::kWgs84F * geo::kWgs84F;
+    const double sin_lat = std::sin(plane_y * kDeg2Rad);
+    const double w = 1.0 - e2 * sin_lat * sin_lat;
+    const double prime_vertical = geo::kWgs84A / std::sqrt(w);
+    const double meridian = geo::kWgs84A * (1.0 - e2) / (w * std::sqrt(w));
+    const double cos_lat = std::cos(plane_y * kDeg2Rad);
+    return Eigen::Vector2d(prime_vertical * cos_lat * kDeg2Rad, meridian * kDeg2Rad);
 }
 
 }  // namespace alphashape::elevation

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -13,6 +14,7 @@
 #include <Eigen/Core>
 
 #include "base/utils/error.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -172,8 +174,12 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
         const Eigen::Vector3d t = pose_translation(camera.pose);
         // The full-resolution focal length in pixels: the calibration below is
         // scaled to this map's resolution, so undo the downscale. depth *
-        // downscale / focal_px (the full-res focal) is the world footprint of
-        // one depth-map pixel, the natural automatic cell size here.
+        // downscale / focal_px (the full-res focal) is the pixel's size
+        // PERPENDICULAR to the optical axis; the ground footprint is that
+        // divided by cos(incidence), the same rule the orthomosaic's automatic
+        // resolution uses (ortho::median_ground_sample_distance). Without the
+        // cosine an oblique flight is over-sampled by 1/cos(i): a 60-degree
+        // camera asks for twice the cells its photographs resolve.
         const double full_focal = calibration.f * static_cast<double>(map.downscale);
         std::vector<double> footprints;
         footprints.reserve(pixels);
@@ -190,7 +196,8 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                                              static_cast<double>(j) + 0.5);
                 const Eigen::Vector3d ray = calibration.unproject(centre);
                 const Eigen::Vector3d p_cam = static_cast<double>(depth) * ray;
-                const Eigen::Vector3d plane = frame.to_plane(rt * (p_cam - t));
+                const Eigen::Vector3d local = rt * (p_cam - t);
+                const Eigen::Vector3d plane = frame.to_plane(local);
                 if (!std::isfinite(plane.x()) || !std::isfinite(plane.y()) ||
                     !std::isfinite(plane.z())) {
                     continue;
@@ -201,8 +208,17 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                 s.confidence = map.confidence.empty() ? 1.0F : map.confidence[idx];
                 result.samples.push_back(s);
                 if (full_focal > 1e-12) {
-                    footprints.push_back(static_cast<double>(depth) *
-                                         static_cast<double>(map.downscale) / full_focal);
+                    // Incidence against the plane frame's up (the vertical, the
+                    // normal a terrain model is written against), per pixel
+                    // rather than per camera, so the ray's own tilt is included.
+                    // A grazing ray loses incidence in the same 0.15 floor the
+                    // ortho rule uses rather than exploding the cell.
+                    const double cos_incidence = std::abs((rt * ray).z());
+                    if (cos_incidence > 0.15) {
+                        footprints.push_back(static_cast<double>(depth) *
+                                             static_cast<double>(map.downscale) /
+                                             (full_focal * cos_incidence));
+                    }
                 }
             }
         }
@@ -236,13 +252,140 @@ struct PlaneBox {
     Eigen::Vector2d max = Eigen::Vector2d::Zero();
 };
 
-PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
+/// The plane-frame bounding box of the samples, made robust against outliers.
+///
+/// A raw min/max is wrong here: depth-map back-projection produces a tail of
+/// far samples (a mismatched far stereo point, a sky-keyed patch that fused at
+/// the infinity clamp, an oblique camera's grazing depth), and ONE of them at
+/// 10 km sets the grid extent. At the DEM's auto cell that is a grid of
+/// billions of cells -- the "bad allocation" an 8 GB laptop hits on a small
+/// block long before any ortho exists.
+///
+/// The test is a comparison, not a blind trim, so a genuine extent is never
+/// narrowed:
+///
+///   1. the exact box (min/max) and the 0.5th-99.5th percentile box (the
+///      "core", which a handful of far samples cannot move);
+///   2. if the exact extent on an axis is at most kOutlierExtentRatio times the
+///      core extent, there are no outliers worth handling and the EXACT bound
+///      is kept -- an ordinary lattice therefore produces exactly the grid it
+///      always did;
+///   3. otherwise the axis is clipped to the core plus kOutlierMarginFraction
+///      of the core extent on each side. On a real block the clipped box still
+///      contains the whole surveyed area (the discarded samples lie beyond it
+///      by construction), and the grid stays a modest multiple of the real
+///      extent instead of growing to the outlier's distance.
+///
+/// Small sample sets skip the analysis entirely: a percentile is meaningless
+/// below kMinSamplesForRobustBox, and a set that small cannot move the extent
+/// far anyway. The threshold is deliberately low: the outlier tail is what
+/// breaks a small block, and a 200-sample block is already enough for a 0.5th
+/// percentile to be a real observation rather than a single sample.
+constexpr std::size_t kMinSamplesForRobustBox = 200;
+/// One-sided tail fraction used to define the inlier core.
+constexpr double kExtentTailFraction = 0.005;
+/// Exact extent / core extent above which an axis is treated as outlier-poisoned.
+constexpr double kOutlierExtentRatio = 2.0;
+/// Margin added outside the core when clipping, as a fraction of the core extent.
+constexpr double kOutlierMarginFraction = 0.03;
+
+/// The `fraction` quantile of `values` (0..1), by nth_element. `values` is
+/// reordered.
+double quantile(std::vector<double>& values, double fraction) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    const std::size_t k = std::min(
+        values.size() - 1, static_cast<std::size_t>(clamped * static_cast<double>(values.size())));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(k),
+                     values.end());
+    return values[k];
+}
+
+/// What a robust box did to one axis, so the caller can tell the user.
+struct ClipReport {
+    bool x_clipped = false;
+    bool y_clipped = false;
+    double x_low = 0.0, x_high = 0.0;  ///< the exact (pre-clip) extent
+    double y_low = 0.0, y_high = 0.0;
+    std::size_t far_samples_x = 0;  ///< samples outside the clipped x range
+    std::size_t far_samples_y = 0;
+};
+
+/// Clamp one axis of `box` to its core when the exact extent is outlier-poisoned.
+/// Returns true when it clipped, and reports the pre-clip extent.
+bool clip_axis(double core_lo, double core_hi, double* lo, double* hi) {
+    const double core = core_hi - core_lo;
+    if (!(core > 0.0) || !std::isfinite(core)) {
+        return false;  // a degenerate core says nothing; leave the exact bound alone
+    }
+    const double margin = kOutlierMarginFraction * core;
+    bool clipped = false;
+    if (*lo < core_lo) {
+        // Only engage when the low tail is more than "a bit" outside the core.
+        if ((core_hi - *lo) > kOutlierExtentRatio * core) {
+            *lo = core_lo - margin;
+            clipped = true;
+        }
+    }
+    if (*hi > core_hi) {
+        if ((*hi - core_lo) > kOutlierExtentRatio * core) {
+            *hi = core_hi + margin;
+            clipped = true;
+        }
+    }
+    return clipped;
+}
+
+PlaneBox samples_box(const std::vector<PlaneSample>& samples, ClipReport* report = nullptr) {
     PlaneBox box;
     box.min = samples.front().p;
     box.max = samples.front().p;
     for (const PlaneSample& s : samples) {
         box.min = box.min.cwiseMin(s.p);
         box.max = box.max.cwiseMax(s.p);
+    }
+    if (samples.size() < kMinSamplesForRobustBox) {
+        return box;
+    }
+
+    ClipReport local;
+    // Record the exact extent before clipping, for the log line.
+    local.x_low = box.min.x();
+    local.x_high = box.max.x();
+    local.y_low = box.min.y();
+    local.y_high = box.max.y();
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(samples.size());
+    ys.reserve(samples.size());
+    for (const PlaneSample& s : samples) {
+        xs.push_back(s.p.x());
+        ys.push_back(s.p.y());
+    }
+    const double x_lo = quantile(xs, kExtentTailFraction);
+    const double x_hi = quantile(xs, 1.0 - kExtentTailFraction);
+    const double y_lo = quantile(ys, kExtentTailFraction);
+    const double y_hi = quantile(ys, 1.0 - kExtentTailFraction);
+
+    local.x_clipped = clip_axis(x_lo, x_hi, &box.min.x(), &box.max.x());
+    local.y_clipped = clip_axis(y_lo, y_hi, &box.min.y(), &box.max.y());
+
+    // A clipped box must still be non-empty; an all-collinear cloud can make the
+    // core degenerate and that has already been rejected above, but guard the
+    // final result anyway so the grid can never come out inverted.
+    if (!(box.max.x() > box.min.x()) || !(box.max.y() > box.min.y())) {
+        return box;
+    }
+    if (report != nullptr && (local.x_clipped || local.y_clipped)) {
+        // How many samples the clip actually discarded, per axis.
+        for (const PlaneSample& s : samples) {
+            local.far_samples_x += (s.p.x() < box.min.x() || s.p.x() > box.max.x()) ? 1U : 0U;
+            local.far_samples_y += (s.p.y() < box.min.y() || s.p.y() > box.max.y()) ? 1U : 0U;
+        }
+        *report = local;
     }
     return box;
 }
@@ -470,18 +613,65 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     }
 
     // -- resolve the cell size and the grid ----------------------------------
+    ClipReport clip;
+    const PlaneBox box = source == Source::Model
+                             ? vertices_box(model.plane_vertices)
+                             : samples_box(samples, &clip);
+    // Tell the user when the robust box dropped a far tail: the grid they get
+    // then covers the surveyed block, not the outlier, and they should know the
+    // extent changed. Reported in metres (a Geographic plane is in degrees).
+    if (Log::enabled(LogLevel::Info) && (clip.x_clipped || clip.y_clipped)) {
+        const double plane_y = 0.5 * (clip.y_low + clip.y_high);
+        const Eigen::Vector2d metres_per_unit =
+            frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                             : frame.metres_per_plane_unit(plane_y);
+        const double mx = metres_per_unit.x() > 0.0 ? metres_per_unit.x() : 1.0;
+        const double my = metres_per_unit.y() > 0.0 ? metres_per_unit.y() : 1.0;
+        const auto span = [](double lo, double hi, double m) {
+            std::ostringstream out;
+            out.precision(6);
+            out << (hi - lo) * m;
+            return out.str();
+        };
+        if (clip.x_clipped) {
+            log(LogLevel::Info)
+                << "BuildDem: DEM extent clipped from " << span(clip.x_low, clip.x_high, mx)
+                << " to " << span(box.min.x(), box.max.x(), mx) << " m on x: "
+                << clip.far_samples_x << " far samples ignored";
+        }
+        if (clip.y_clipped) {
+            log(LogLevel::Info)
+                << "BuildDem: DEM extent clipped from " << span(clip.y_low, clip.y_high, my)
+                << " to " << span(box.min.y(), box.max.y(), my) << " m on y: "
+                << clip.far_samples_y << " far samples ignored";
+        }
+    }
     double resolution = options.resolution;
     if (!(resolution > 0.0)) {
-        resolution = source == Source::Model ? auto_resolution_model(model)
-                                             : auto_resolution(samples, per_map_gsd);
+        if (source == Source::Model) {
+            resolution = auto_resolution_model(model);  // already in plane units
+        } else {
+            resolution = auto_resolution(samples, per_map_gsd);
+            // The depth-map GSD is a GROUND distance in metres, while the plane
+            // it has to be expressed in is degrees for EPSG:4326. Convert with
+            // the arc lengths at the surface's own latitude, otherwise the cell
+            // would be ~100000x too small. The point-cloud fallback is already a
+            // plane-unit spacing (sqrt(plane area / N)) and needs no conversion.
+            if (!per_map_gsd.empty() && !frame.is_local()) {
+                const double plane_y = 0.5 * (box.max.y() + box.min.y());
+                const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(plane_y);
+                const double unit_m =
+                    std::max(metres_per_unit.x(), metres_per_unit.y());
+                if (unit_m > 0.0) {
+                    resolution /= unit_m;
+                }
+            }
+        }
     }
     if (!(resolution > 0.0) || !std::isfinite(resolution)) {
         throw ValueError("build_dem: cannot derive a cell size from the " + source_label +
                          " source; pass an explicit resolution");
     }
-
-    const PlaneBox box = source == Source::Model ? vertices_box(model.plane_vertices)
-                                                 : samples_box(samples);
     const RasterGrid grid = frame_grid(box, resolution);
     const std::size_t count =
         static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height);
@@ -540,8 +730,19 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     std::vector<std::uint8_t> final_valid = filled_valid;
     if (options.tgv && source != Source::Model) {
         // Heights are scaled so one cell step is one unit, which makes the
-        // regulariser's slopes dimensionless (see tgv_denoise.hpp).
-        const double cell_size = grid.pixel_size_x;
+        // regulariser's slopes dimensionless (see tgv_denoise.hpp). A
+        // Geographic grid's pixel size is in degrees, so the cell has to be
+        // converted to metres first; dividing metre heights by degrees would
+        // make the data term meaningless and flatten the surface.
+        const double plane_y = 0.5 * (grid.pixel_center(0, grid.height / 2).y() +
+                                      grid.pixel_center(0, 0).y());
+        const Eigen::Vector2d metres_per_unit =
+            frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                             : frame.metres_per_plane_unit(plane_y);
+        double cell_size = grid.pixel_size_x * metres_per_unit.x();
+        if (!(cell_size > 0.0) || !std::isfinite(cell_size)) {
+            cell_size = grid.pixel_size_x;  // degenerate frame: keep the old rule
+        }
         std::vector<float> f(count, 0.0F);
         std::vector<float> u(count, 0.0F);
         // The data term is the hole-filled surface: observed cells carry their
