@@ -175,11 +175,13 @@ struct OrthoBlockPlan {
     bool coarsened = false;
 };
 
-/// The margin a block of `block_cells` cells is processed with. A quarter of
-/// the side, at least 16 and at most 192 cells: the mosaic blend's pyramid
-/// reaches 2 * 2^levels cells (128 at the capped 6 levels), and a coarse-enough
-/// margin also covers the seam labeller's multi-scale reach.
-int block_margin_cells(int block_cells);
+/// The margin a block of `block_cells` cells is processed with, at the mosaic
+/// pyramid depth `pyramid_levels` the plan pins. It is the blend's own support
+/// (126 cells at the 6-level cap) plus a small slack, NOT a fraction of the
+/// block: the margin is what makes a block's interior identical to the whole
+/// grid's there, so it is set by the operators that read across cells. Returns 0
+/// for a non-positive block side.
+int block_margin_cells(int block_cells, int pyramid_levels);
 
 /// The predicted peak of one block, in bytes:
 /// the window's own estimate (estimate_peak_bytes() on the block+margin grid)

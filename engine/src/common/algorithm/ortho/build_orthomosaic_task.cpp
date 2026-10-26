@@ -625,6 +625,11 @@ constexpr int kMinBlockCells = 512;
 constexpr double kBlockBudgetFraction = 0.5;
 /// At most this fraction of the budget goes to decoded photographs.
 constexpr double kPhotoCacheBudgetFraction = 0.15;
+/// Extra margin cells beyond the blend pyramid's support. The pyramid's edge
+/// blurs clamp at the window border, so a cell exactly at the support distance
+/// still sees a slightly different neighbourhood; a small slack takes the
+/// interior out of that region.
+constexpr int kBlockMarginSlack = 16;
 /// The absolute ceiling on the decoded-photograph cache, whatever the machine's
 /// budget: beyond a handful of frames the reuse stops paying for the bytes, and
 /// the cache competes with the block side for the same limit -- a smaller cache
@@ -808,17 +813,22 @@ private:
 
 // -- block plan --------------------------------------------------------------
 
-int block_margin_cells(int block_cells) {
-    // A quarter of the side, clamped to [16, 192]. The upper bound is the mosaic
-    // blend's reach: its pyramid stops at 6 levels (the level_count() cap), and
-    // two 5-tap blurs per reduce and expand touch about 2 * 2^levels cells, so
-    // 128 cells of margin hold the whole pyramid support at full depth. The
-    // extra headroom absorbs the block plan's rounding and the seam labeller's
-    // own 4x coarse level.
+int block_margin_cells(int block_cells, int pyramid_levels) {
+    // The margin exists to make a block's interior identical to the whole grid's
+    // there, so its size is set by the operators that read across cells, not by
+    // the block size:
+    //   * the mosaic blend at `pyramid_levels` reads pyramid_support_cells()
+    //     cells (126 at the 6-level cap), plus kBlockMarginSlack for the
+    //     edge-clamped blurs;
+    //   * the seam labeller's own multi-scale pass bottoms out at its 4x level,
+    //     whose 5-tap blurs and alpha-expansion stay well inside that.
+    // A block must be at least twice the margin for the interior to be the
+    // majority of the window; below that the caller should use a bigger block.
     if (block_cells <= 0) {
         return 0;
     }
-    return std::clamp(block_cells / 4, 16, 192);
+    const int levels = std::max(0, pyramid_levels);
+    return ortho::pyramid_support_cells(levels) + kBlockMarginSlack;
 }
 
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
@@ -848,7 +858,18 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
     const auto plan_for_side = [&](int side) {
         OrthoBlockPlan out;
         out.block_cells = side;
-        out.margin_cells = block_margin_cells(side);
+        // The margin must cover the mosaic pyramid's support at the depth every
+        // block applies: that depth is the WHOLE grid's, so all blocks use the
+        // same operator (a shallower pyramid leaves a visible step at its next
+        // scale). The margin is therefore raised to the support plus a slack for
+        // the edge-clamped blurs, never the depth lowered to a smaller margin.
+        int depth = 0;
+        if (width > 0 && height > 0) {
+            depth = ortho::pyramid_level_count(static_cast<int>(width),
+                                              static_cast<int>(height));
+        }
+        out.levels = depth;
+        out.margin_cells = block_margin_cells(side, depth);
         const std::uint64_t step = static_cast<std::uint64_t>(std::max(1, side));
         out.columns = std::max(1, static_cast<int>((width + step - 1) / step));
         out.rows = std::max(1, static_cast<int>((height + step - 1) / step));
@@ -887,21 +908,6 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         out.estimated_peak_bytes = estimate_block_peak_bytes(
             window_cells, window_footprint, input.has_node_map, input.photo_cells,
             output_cells, cache);
-        // The mosaic pyramid depth every block applies: the whole grid's depth,
-        // never deeper than the margin can carry. pyramid_support_cells() is the
-        // exact reach of the blend at a depth, so admitting a level only when its
-        // support fits the margin is a hard bound, not a heuristic: the interior
-        // of every block is then blended by the same operator the whole grid
-        // would apply, up to the unavoidable edge effect of the finite window.
-        int depth = 0;
-        if (width > 0 && height > 0) {
-            depth = ortho::pyramid_level_count(static_cast<int>(width),
-                                              static_cast<int>(height));
-        }
-        while (depth > 0 && ortho::pyramid_support_cells(depth) > out.margin_cells) {
-            --depth;
-        }
-        out.levels = depth;
         return out;
     };
 

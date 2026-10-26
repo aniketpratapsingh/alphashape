@@ -1202,7 +1202,7 @@ TEST(OrthoBlockPlan, WholeGridWhenItFits) {
     std::printf("[OrthoBlockPlan.WholeGrid] block=%d margin=%d peak=%.1f MB\n", plan.block_cells,
                 plan.margin_cells, plan.estimated_peak_bytes / 1e6);
     EXPECT_EQ(plan.block_cells, 0) << "a fitting grid must not be split";
-    EXPECT_EQ(plan.margin_cells, 0);
+    EXPECT_EQ(plan.margin_cells, 0) << "one piece needs no margin";
     EXPECT_EQ(plan.columns, 1);
     EXPECT_EQ(plan.rows, 1);
     EXPECT_EQ(plan.levels, -1) << "the single piece keeps the grid's own pyramid depth";
@@ -1306,8 +1306,15 @@ TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
     EXPECT_EQ(ortho::pyramid_support_cells(6), 126);
     EXPECT_LE(ortho::pyramid_support_cells(6), 192);
 
+    // The margin is the operator's reach, not a fraction of the block.
+    EXPECT_EQ(block_margin_cells(1024, 6), ortho::pyramid_support_cells(6) + 16);
+    EXPECT_EQ(block_margin_cells(4096, 0), 16);
+    EXPECT_EQ(block_margin_cells(0, 6), 0);
+
     for (const int side : {512, 1024, 2048, 4096}) {
-        const int margin = block_margin_cells(side);
+        const int margin = block_margin_cells(side, 6);
+        EXPECT_GE(margin, 16);
+        EXPECT_GE(margin, 2 * ortho::pyramid_support_cells(0));
         OrthoBlockPlanInput input;
         input.grid_width = 5264;
         input.grid_height = 5264;
@@ -1320,17 +1327,16 @@ TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
         const OrthoBlockPlan plan = plan_ortho_blocks(input);
         std::printf("[OrthoBlockPlan.Margin] block=%d margin=%d levels=%d support=%d\n", side,
                     plan.margin_cells, plan.levels, ortho::pyramid_support_cells(plan.levels));
-        EXPECT_EQ(plan.margin_cells, margin);
+        EXPECT_GE(plan.margin_cells, margin);
         EXPECT_GE(plan.margin_cells, 16);
-        EXPECT_LE(plan.margin_cells, 192);
         EXPECT_GE(plan.levels, 0);
         EXPECT_LE(ortho::pyramid_support_cells(plan.levels), plan.margin_cells)
             << "the pinned pyramid must fit inside the margin at block " << side;
-        // The whole grid's own depth for 5264 cells is 6 (the cap); the margin
-        // at 512 cells is 128 and still admits it.
+        // Every block applies the WHOLE grid's depth: 6 at the level_count() cap
+        // for 5264 cells. Lowering it per block would change the operator.
         EXPECT_EQ(plan.levels, 6) << "block " << side << " lost the whole grid's depth";
     }
-    EXPECT_EQ(block_margin_cells(0), 0);
+    EXPECT_EQ(block_margin_cells(0, 6), 0);
 }
 
 TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {
@@ -1532,12 +1538,15 @@ TEST(BuildOrthomosaic, BlockWiseFillHolesMatchesTheWholeGrid) {
 
 TEST(BuildOrthomosaic, BlockWiseMosaicMatchesWithInOneGreyLevel) {
     // The multiresolution spline is a local operator up to its pyramid support,
-    // which the margin covers. Block-wise and whole-grid outputs must therefore
-    // agree within one grey level on essentially every pixel.
+    // which the margin covers. With the seam labelling held fixed (the per-cell
+    // argmax, refine_seamlines off) block-wise and whole-grid outputs must
+    // therefore agree within one grey level on essentially every pixel. Seam
+    // refinement is a global optimisation over block+margin and legitimately
+    // moves seams, so it is tested separately (BlockWiseSeamsStayContinuous...).
     OrthoSetup& s = setup();
-    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, false, true));
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, false, false));
     ASSERT_FALSE(whole.empty());
-    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.25, 256, false, true));
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.25, 256, false, false));
     ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
 
     std::size_t pixels = 0;

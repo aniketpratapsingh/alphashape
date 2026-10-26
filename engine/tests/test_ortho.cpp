@@ -1068,14 +1068,18 @@ TEST(Ortho, WindowGridReproducesTheWholeGridTiles) {
         const OrthoTile& reference = whole[t];
         for (int row = wy0; row < wy0 + window.height && row < h; ++row) {
             for (int col = wx0; col < wx0 + window.width && col < w; ++col) {
+                // The window's tiles are addressed in WINDOW cells, so the crop
+                // box it reports is relative to (wx0, wy0).
+                const int wcol = col - wx0;
+                const int wrow = row - wy0;
                 const bool in_ref = reference.contains(col, row);
-                const bool in_win = in_window.contains(col, row);
+                const bool in_win = in_window.contains(wcol, wrow);
                 if (!in_ref || !in_win) {
                     continue;  // crop edges differ; only shared cells are compared
                 }
                 ++checked;
                 const std::size_t a = reference.index(col, row);
-                const std::size_t b = in_window.index(col, row);
+                const std::size_t b = in_window.index(wcol, wrow);
                 if (reference.valid[a] != in_window.valid[b] ||
                     reference.score[a] != in_window.score[b] || reference.rgb[a * 3] != in_window.rgb[b * 3] ||
                     reference.rgb[a * 3 + 1] != in_window.rgb[b * 3 + 1] ||
