@@ -552,6 +552,94 @@ TEST(PatchMatchGpu, SplitSubmissionsAreBitIdentical) {
     }
 }
 
+TEST(PatchMatchGpu, SweepProgressReportsMonotoneFractions) {
+    // The hook must describe the WHOLE search, not one level of it: a level's
+    // share is its own half-sweeps over the run's, spent across that level's
+    // sweeps. Getting the scale wrong is silent -- the bar simply never gets
+    // far -- so the shape is pinned here rather than eyeballed: with 1 / the
+    // run's sweep count used as the level's share, the progress was divided by
+    // the sweep count a second time and a finished level reported 1/12 of the
+    // progress it had actually made.
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(96, 72, 100.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    neighbours.resize(1);  // the progress values do not depend on the count
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    const auto progress_of = [&](PatchMatchOptions options) {
+        std::vector<double> reported;
+        options.on_sweep = [&](double fraction) { reported.push_back(fraction); };
+        stereo::run_patch_match_device(reference, neighbours, options);
+        return reported;
+    };
+    const auto expect_shape = [](const std::vector<double>& reported, const char* what) {
+        ASSERT_GE(reported.size(), 2U) << what << ": the hook must report more than the final tick";
+        for (std::size_t i = 0; i < reported.size(); ++i) {
+            EXPECT_GE(reported[i], 0.0) << what << " report " << i;
+            EXPECT_LE(reported[i], 1.0) << what << " report " << i;
+            if (i > 0) {
+                EXPECT_GE(reported[i], reported[i - 1])
+                    << what << " report " << i << " went backwards (" << reported[i - 1]
+                    << " -> " << reported[i] << ")";
+            }
+        }
+        EXPECT_DOUBLE_EQ(reported.back(), 1.0) << what << " did not finish at 1.0";
+    };
+
+    // A single level with six iterations is twelve half-sweeps, so the last
+    // report before the final tick has 11/12 behind it. Anything much below that
+    // means the level's share was scaled down again.
+    PatchMatchOptions single = plane_options();
+    single.pyramid_levels = 1;
+    single.iterations = 6;
+    single.window_radius = 3;
+    single.window_step = 3;
+    const std::vector<double> single_reported = progress_of(single);
+    expect_shape(single_reported, "single level");
+    ASSERT_GE(single_reported.size(), 2U);
+    EXPECT_GE(single_reported[single_reported.size() - 2], 0.8)
+        << "last pre-final report was " << single_reported[single_reported.size() - 2]
+        << "; the sweeps lower a single-level run reports are 1/12 apart";
+
+    // Enough sweeps that the second-to-last report is within 1% of the end: the
+    // bar must get there from the SWEEPS, not from a single trailing tick.
+    PatchMatchOptions long_run = single;
+    long_run.iterations = 60;  // 120 half-sweeps, so the pre-final report is 119/120
+    const std::vector<double> long_reported = progress_of(long_run);
+    expect_shape(long_reported, "long run");
+    ASSERT_GE(long_reported.size(), 2U);
+    EXPECT_GE(long_reported[long_reported.size() - 2], 0.99)
+        << "last pre-final report was " << long_reported[long_reported.size() - 2];
+
+    // A pyramid must be monotone ACROSS level boundaries, and each level must
+    // spend its own share rather than restarting at its base.
+    PatchMatchOptions pyramid = single;
+    pyramid.iterations = 6;
+    pyramid.pyramid_levels = 2;
+    const std::vector<int> plan =
+        stereo::patch_match_iteration_plan(scene.reference.width(), scene.reference.height(),
+                                           pyramid);
+    ASSERT_EQ(plan.size(), 2U) << "the two-level request should survive here";
+    const std::vector<double> pyramid_reported = progress_of(pyramid);
+    expect_shape(pyramid_reported, "two levels");
+    // The coarse level owns 2 * plan[0] of the 2 * (plan[0] + plan[1]) sweeps, so
+    // some report must land between its start and its end, and none may dip
+    // below the finest level's floor.
+    const double coarse_share =
+        static_cast<double>(2 * plan[0]) / static_cast<double>(2 * (plan[0] + plan[1]));
+    bool coarse_reported = false;
+    for (const double value : pyramid_reported) {
+        if (value > 0.0 && value <= coarse_share + 1e-12) {
+            coarse_reported = true;
+        }
+    }
+    EXPECT_TRUE(coarse_reported) << "the coarse level reported no progress of its own";
+}
+
 // ---------------------------------------------------------------------------
 // 5. Fallback semantics
 // ---------------------------------------------------------------------------

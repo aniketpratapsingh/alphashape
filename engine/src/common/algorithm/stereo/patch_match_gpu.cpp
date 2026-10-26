@@ -677,12 +677,21 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
                            pyramid_search_span(inherited.depth, inherited.width, inherited.height,
                                                options.window_radius, configured_span / 64.0))
                 : configured_span);
+        // This level's share of the WHOLE run: the level's own half-sweeps over
+        // the run's. run_gpu_level() spreads that share over the level's sweeps
+        // (`base + scale * done / sweeps_total`, sweeps_total being this level's
+        // own count), so a level contributes exactly local_sweeps / total_sweeps
+        // and the levels together add up to 1.0. A scale of 1 / total_sweeps
+        // would divide the level's progress by the run's sweep count a second
+        // time, leaving the bar at a fraction of the share it should show.
         gpu_level.progress_base = total_sweeps > 0
                                       ? static_cast<double>(done_before) /
                                             static_cast<double>(total_sweeps)
                                       : 0.0;
         gpu_level.progress_scale =
-            total_sweeps > 0 ? 1.0 / static_cast<double>(total_sweeps) : 1.0;
+            total_sweeps > 0 ? static_cast<double>(2 * std::max(iterations, 0)) /
+                                   static_cast<double>(total_sweeps)
+                             : 1.0;
 
         result = run_gpu_level(context, gpu_level, options, reported);
         done_before += 2 * std::max(iterations, 0);

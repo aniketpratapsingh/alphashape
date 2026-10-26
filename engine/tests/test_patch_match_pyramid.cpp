@@ -213,6 +213,110 @@ TEST(PatchMatchPyramid, BuiltPyramidIsConsistentWithItsCalibrations) {
                  alphashape::ValueError);
 }
 
+TEST(PatchMatchPyramid, OddSizesKeepTheBearingIdentityAtEveryLevel) {
+    // The identity "coarse pixel j is the bearing of fine 2j + 0.5" is what makes
+    // the depth carry exact, and it has to keep holding when the halved sizes
+    // TRUNCATE: 101x77 -> 50x38 -> 25x19 is the case where a one-shot
+    // scaled_calibration(full, 4) would differ from two halvings by a quarter
+    // pixel, so the level-by-level chain is the one that must be pinned.
+    const int width = 101;
+    const int height = 77;
+    Calibration calibration =
+        Calibration::initial(alphashape::CameraType::Frame, width, height, 140.0);
+    calibration.cx = 3.75;  // off-centre, so a naive halving of the principal point fails
+    calibration.cy = -2.125;
+    const FloatImage reference(width, height, 0.5F);
+
+    const alphashape::stereo::DepthPyramid pyramid =
+        alphashape::stereo::build_depth_pyramid(reference, calibration, 3);
+    ASSERT_EQ(pyramid.levels(), 3);
+    // The sizes truncate as the box reduction does.
+    EXPECT_EQ(pyramid.calibration_from_finest(0).width, 101);
+    EXPECT_EQ(pyramid.calibration_from_finest(1).width, 50);
+    EXPECT_EQ(pyramid.calibration_from_finest(2).width, 25);
+    EXPECT_EQ(pyramid.calibration_from_finest(0).height, 77);
+    EXPECT_EQ(pyramid.calibration_from_finest(1).height, 38);
+    EXPECT_EQ(pyramid.calibration_from_finest(2).height, 19);
+
+    // Every level pair, including the coarse pair (levels 2 and 1, i.e. a level
+    // two steps from the reference), and EVERY pixel of the coarse level rather
+    // than a corner: the principal point error a one-shot scaling would introduce
+    // grows with x and y.
+    //
+    // The bearing to compare is fine INDEX 2j + 0.5 -- the midpoint of the two
+    // fine pixels the coarse one covers -- and unproject takes a continuous
+    // coordinate, where fine index i is the centre i + 0.5. So the pixel
+    // coordinate is (2j + 0.5) + 0.5 = 2j + 1.0.
+    for (int from_finest = 2; from_finest >= 1; --from_finest) {
+        const Calibration coarse = pyramid.calibration_from_finest(from_finest);
+        const Calibration fine = pyramid.calibration_from_finest(from_finest - 1);
+        for (int y = 0; y < coarse.height; ++y) {
+            for (int x = 0; x < coarse.width; ++x) {
+                const Eigen::Vector3d b_coarse = coarse.unproject(
+                    Eigen::Vector2d(static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5));
+                const Eigen::Vector3d b_fine = fine.unproject(
+                    Eigen::Vector2d(static_cast<double>(2 * x) + 1.0,
+                                    static_cast<double>(2 * y) + 1.0));
+                EXPECT_LT((b_coarse - b_fine).norm(), 1e-9)
+                    << "from_finest " << from_finest << " pixel " << x << "," << y;
+            }
+        }
+    }
+
+    // And the upsample mapping is the same identity read backwards: fine pixel i
+    // samples the coarse map at continuous coarse coordinate (i - 0.5) / 2, i.e.
+    // i/2 - 0.25, which is the continuation of the bearing above. Checked
+    // against a coarse map that is linear in the coarse x coordinate, so a wrong
+    // offset shows up as a wrong value rather than as an interpolation tolerance.
+    DepthHypotheses coarse_map;
+    coarse_map.width = 25;  // the level-2 size of the chain above
+    coarse_map.height = 19;
+    coarse_map.depth.assign(static_cast<std::size_t>(coarse_map.width) * coarse_map.height, 0.0F);
+    coarse_map.normals.assign(
+        3 * static_cast<std::size_t>(coarse_map.width) * coarse_map.height, 0.0F);
+    for (int y = 0; y < coarse_map.height; ++y) {
+        for (int x = 0; x < coarse_map.width; ++x) {
+            const std::size_t p = static_cast<std::size_t>(y) * coarse_map.width + x;
+            coarse_map.depth[p] = 10.0F + static_cast<float>(x);
+            coarse_map.normals[3 * p + 2] = 1.0F;
+        }
+    }
+    const DepthHypotheses fine_map = alphashape::stereo::pyramid_upsample(coarse_map, 50, 38);
+    for (int i = 0; i < 50; ++i) {
+        // Interior only: the edge clamps the sample, which is a deliberate
+        // different behaviour (see pyramid_upsample).
+        if (i < 2 || i > 47) {
+            continue;
+        }
+        const double coarse_x = 0.5 * static_cast<double>(i) - 0.25;
+        const double expected = 10.0 + coarse_x;
+        EXPECT_NEAR(fine_map.depth[static_cast<std::size_t>(i)], expected, 1e-4)
+            << "fine x " << i << " should sample coarse " << coarse_x;
+    }
+}
+
+TEST(PatchMatchPyramid, SingleLevelDoesNotNeedAMinSize) {
+    // run_patch_match's own validation accepts `pyramid_levels == 1` with
+    // `pyramid_min_size == 0` (there is no halving to stop), so the level count
+    // must accept it too rather than contradicting the search it plans for.
+    EXPECT_EQ(alphashape::stereo::pyramid_level_count(1600, 1200, 1, 0, 5), 1);
+    EXPECT_EQ(alphashape::stereo::pyramid_level_count(1600, 1200, 1, -5, 5), 1);
+    // A pyramid still has to say where it stops.
+    EXPECT_THROW(alphashape::stereo::pyramid_level_count(1600, 1200, 0, 0, 5),
+                 alphashape::ValueError);
+    EXPECT_THROW(alphashape::stereo::pyramid_level_count(1600, 1200, 3, 0, 5),
+                 alphashape::ValueError);
+    // And the plan for such a run is a single level, which is what the search
+    // then executes.
+    PatchMatchOptions options;
+    options.pyramid_levels = 1;
+    options.pyramid_min_size = 0;
+    options.iterations = 6;
+    const std::vector<int> plan =
+        alphashape::stereo::patch_match_iteration_plan(1600, 1200, options);
+    EXPECT_EQ(plan, std::vector<int>({6}));
+}
+
 TEST(PatchMatchPyramid, UpsampleCarriesDepthsAndRenormalisesNormals) {
     // A coarse map with one hole in it. The fine map must interpolate the
     // visible taps only: the cell sitting on the hole must not be dragged toward
@@ -705,6 +809,92 @@ TEST(PatchMatchPyramid, PyramidSeededConsistent) {
         << "the fine level did not fill the cells the coarse level left empty";
     EXPECT_GE(kept, static_cast<std::size_t>(0.80 * static_cast<double>(coarse_found)))
         << "the pyramid lost support the coarse level found";
+}
+
+// ---------------------------------------------------------------------------
+// Progress: the hook describes the whole pyramid, not one level of it
+// ---------------------------------------------------------------------------
+
+TEST(PatchMatchPyramid, SweepProgressReportsMonotoneFractions) {
+    // A level's share of the bar is its own half-sweeps over the run's, spent
+    // across that level's sweeps; the fraction therefore has to be monotone
+    // ACROSS level boundaries and reach the end from the sweeps rather than from
+    // a single trailing tick. A hook that scaled by the wrong denominator would
+    // still be monotone, just permanently far behind, so the values are pinned.
+    PlaneScene scene = make_plane_scene(96, 72, 100.0);
+    const PMView reference = plane_reference(scene);
+    const std::vector<PMView> all_views = plane_views(scene);
+    const std::vector<PMView> neighbours = {all_views[0]};
+
+    const auto progress_of = [&](PatchMatchOptions options) {
+        std::vector<double> reported;
+        options.on_sweep = [&](double fraction) { reported.push_back(fraction); };
+        const PatchMatchResult result =
+            alphashape::stereo::run_patch_match(reference, neighbours, options);
+        EXPECT_FALSE(result.depth.empty()) << "the hook must not disturb the search";
+        return reported;
+    };
+    const auto expect_shape = [](const std::vector<double>& reported, const char* what) {
+        ASSERT_GE(reported.size(), 2U) << what << ": the hook must report more than one tick";
+        for (std::size_t i = 0; i < reported.size(); ++i) {
+            EXPECT_GE(reported[i], 0.0) << what << " report " << i;
+            EXPECT_LE(reported[i], 1.0) << what << " report " << i;
+            if (i > 0) {
+                EXPECT_GE(reported[i], reported[i - 1])
+                    << what << " report " << i << " went backwards (" << reported[i - 1]
+                    << " -> " << reported[i] << ")";
+            }
+        }
+        EXPECT_DOUBLE_EQ(reported.back(), 1.0) << what << " did not finish at 1.0";
+    };
+
+    PatchMatchOptions options = scene_options();
+    options.window_radius = 3;
+    options.window_step = 3;
+
+    // A single level with six iterations is twelve half-sweeps, so the last
+    // report has 11/12 behind it. Well below that means the sweeps were divided
+    // by the wrong count.
+    options.pyramid_levels = 1;
+    options.iterations = 6;
+    const std::vector<double> single = progress_of(options);
+    expect_shape(single, "single level");
+    ASSERT_EQ(single.size(), 12U) << "one report per half-sweep of the only level";
+    EXPECT_GE(single[single.size() - 2], 0.8)
+        << "last report before 1.0 was " << single[single.size() - 2];
+
+    // Enough sweeps that the second-to-last report is within 1% of the end.
+    options.iterations = 60;
+    const std::vector<double> long_run = progress_of(options);
+    expect_shape(long_run, "long run");
+    ASSERT_EQ(long_run.size(), 120U);
+    EXPECT_GE(long_run[long_run.size() - 2], 0.99)
+        << "last report before 1.0 was " << long_run[long_run.size() - 2];
+
+    // A pyramid reports across its levels: still monotone, still ending at 1.0,
+    // and the coarse level spends its own share rather than jumping straight to
+    // its base being visible only at the boundary.
+    PatchMatchOptions pyramid = options;
+    pyramid.iterations = 6;
+    pyramid.pyramid_levels = 2;
+    const std::vector<int> plan =
+        alphashape::stereo::patch_match_iteration_plan(scene.reference.width(),
+                                                       scene.reference.height(), pyramid);
+    ASSERT_EQ(plan.size(), 2U) << "the two-level request should survive here";
+    const std::vector<double> multi = progress_of(pyramid);
+    expect_shape(multi, "two levels");
+    EXPECT_EQ(multi.size(), 12U) << "one report per half-sweep over the whole pyramid";
+    const double coarse_share =
+        static_cast<double>(2 * plan[0]) / static_cast<double>(2 * (plan[0] + plan[1]));
+    // The coarse level must have reported somewhere strictly inside its share --
+    // not only the 0 it starts at and not only its boundary value.
+    bool coarse_interior = false;
+    for (const double value : multi) {
+        if (value > 0.0 && value < coarse_share - 1e-12) {
+            coarse_interior = true;
+        }
+    }
+    EXPECT_TRUE(coarse_interior) << "the coarse level reported no progress of its own";
 }
 
 // ---------------------------------------------------------------------------
