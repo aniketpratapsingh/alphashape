@@ -88,21 +88,23 @@ bool window_is_textured(int pixel) {
 // CPU's validity rule: a sample is skipped when the plane is edge-on or behind
 // the reference camera.
 //
-// `rho`, `nb` and the returned depth are `precise`: this is the first link of
-// the chain that ends at the projected pixel coordinate (see the note at the top
-// of pm_math.glsl). The quotient feeds x_n below, x_n feeds the camera model, and
-// the camera model feeds floor(). A contracted `d * nb` here moves that floor()
-// exactly as surely as a contracted `+` would. `precise` is transitive in GLSL,
-// so qualifying the local that holds the quotient also stops `dot()` above it
-// from contracting.
+// `nb` is precise because it is a dot product: `a.x*b.x + a.y*b.y + a.z*b.z` is
+// two multiply-adds, and the optimiser fuses both. This is the first link of the
+// chain that ends at the projected pixel coordinate (see the note at the top of
+// pm_math.glsl) and it runs once per window sample per candidate, so it is also
+// the mark that has to earn its keep.
+//
+// The returned depth does not need one: `rho / nb` is a division, and a division
+// has no fused form, so it is already evaluated exactly as written. Nor does the
+// `dq[]` array that stores it: what matters is that the *definition* of the value
+// was not contracted, and that is decided here, not at the store.
 float candidate_depth(int x, int y, int k, float rho, vec3 n) {
     ivec2 off = s_offsets[k];
     int b = ((y + off.y) * int(pc.width) + (x + off.x)) * 3;
     vec3 bearing = vec3(bearings[b + 0], bearings[b + 1], bearings[b + 2]);
     precise float nb = dot(n, bearing);
     if (nb < -PM_FACING_EPS && rho / nb > 0.0) {
-        precise float d = rho / nb;
-        return d;
+        return rho / nb;
     }
     return 0.0;
 }
@@ -175,10 +177,9 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
         int bi = ((y + off.y) * int(pc.width) + (x + off.x)) * 3;
         vec3 bq = vec3(bearings[bi + 0], bearings[bi + 1], bearings[bi + 2]);
         // X_n = depth_q * (M b_q) + c (the CPU's `depth_q * mb[k] + view.c`).
-        // precise: it fuses with itself (three dots, a vector scale and a vector
-        // add) and it is the camera-frame point the projection below consumes --
-        // the last stage before the projected coordinate. The dots M*b_q are
-        // covered as part of the initialiser.
+        // Every term here is a multiply-add: the three row dots, the scale by
+        // depth_q and the add of c. One mark on the result covers them all, and
+        // it is the last stage before the projection below feeds floor().
         precise vec3 x_n =
             depth_q * vec3(v.m[0] * bq.x + v.m[1] * bq.y + v.m[2] * bq.z,
                            v.m[3] * bq.x + v.m[4] * bq.y + v.m[5] * bq.z,
@@ -313,9 +314,9 @@ struct Best {
 // state. A value parameter is a plain SSA value with nothing to copy back.
 //
 // `nb` and `rho` are precise: they are the head of the depth/plane-to-pixel
-// chain (see the note at the top of pm_math.glsl). rho goes into
-// multiview_cost() -> candidate_depth(), whose quotient becomes a camera-frame
-// coordinate before floor() sees it, so this `depth * nb` may not become an FMA.
+// chain (see the note at the top of pm_math.glsl). `nb` is a dot; `rho` is a
+// scale that then lands on the plane depth, whose quotient becomes a
+// camera-frame coordinate before floor() sees it.
 Best evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, Best best) {
     if (!(depth > pc.depth_min && depth < pc.depth_max)) {
         return best;
@@ -341,27 +342,39 @@ vec3 pixel_bearing(int pixel) {
     return vec3(bearings[pixel * 3 + 0], bearings[pixel * 3 + 1], bearings[pixel * 3 + 2]);
 }
 
-// Propagate pixel q's plane onto pixel p (as propagate()), reading q from the
-// state buffers of the previous half-sweep. Returns the updated `Best`, like
-// evaluate_hypothesis(): no aggregate `inout` anywhere in the search core.
+// Transfer pixel q's plane onto pixel p's bearing (as propagate()), reading q
+// from the state buffers of the previous half-sweep. Returns false when q has no
+// usable plane, or when that plane faces away at p, so the caller drops the
+// candidate. Deliberately does not evaluate: the caller collects all of a
+// pixel's candidates first, so that evaluate_hypothesis() -- and with it the
+// whole multiview_cost() loop -- has exactly one call site in the kernel.
 //
-// precise on rho_q, denom and the transferred depth: another entry point to the
-// depth-to-pixel chain, and `1 / depth` later in pm_refine() divides a depth
-// this produced.
-Best propagate(int x, int y, int q, vec3 b_p, Best best) {
+// That single call site is not a stylistic choice. pm_refine has nine to eleven
+// candidates per pixel; as separate call sites the optimiser inlined a full copy
+// of the 32-neighbour x 49-sample cost loop for each, which made glslc -O need
+// tens of gigabytes and get OOM-killed on a CI runner (exit 137), and once the
+// cost core carried its `precise` marks it also pushed a single-lane compile
+// past fifteen minutes. Batch them and the module stays small while the
+// evaluation order is unchanged.
+//
+// precise on rho_q and denom only: both are dots (chained multiply-adds) and
+// rho_q is another entry point to the depth-to-pixel chain. The quotient needs
+// no mark -- a division has no fused form.
+bool propagate_plane(int q, vec3 b_p, out float depth_out, out vec3 normal_out) {
     float qd = state_depth[q];
     if (!(qd > 0.0)) {
-        return best;
+        return false;
     }
     vec3 n = vec3(state_normal[q * 3 + 0], state_normal[q * 3 + 1], state_normal[q * 3 + 2]);
     if (dot(n, n) < 1e-12) {
-        return best;
+        return false;
     }
     precise float rho_q = qd * dot(n, pixel_bearing(q));
     precise float denom = dot(n, b_p);
     if (denom >= -PM_FACING_EPS) {
-        return best;
+        return false;
     }
-    precise float depth_p = rho_q / denom;
-    return evaluate_hypothesis(x, y, depth_p, n, b_p, best);
+    depth_out = rho_q / denom;
+    normal_out = n;
+    return true;
 }
