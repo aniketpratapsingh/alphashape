@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace alphashape::ortho {
@@ -110,7 +112,29 @@ bool blocked(const GeoRaster<float>& dem, float nodata, double tol, double x, do
     return surface != static_cast<double>(nodata) && surface > z + tol;
 }
 
+/// The most DEM samples one occlusion ray may take, whatever its geometry.
+/// A march is bounded by the DEM's own height range (below), but a ray that
+/// stays under the tallest sample for a very long way -- a near-horizontal view
+/// of a tall wall -- must still terminate. At half a DEM cell per sample this
+/// spans 2048 DEM cells laterally, far beyond any occluder a height field can
+/// resolve; hitting it only loses occlusion for grazing rays that leave the
+/// grid edge anyway.
+constexpr std::size_t kMaxOcclusionSamplesPerRay = 4096;
+
+/// DEM samples taken by the occlusion march since the last reset. Test-only:
+/// the cost contract (samples per output cell must not follow the output grid)
+/// is otherwise unobservable from a tile's contents.
+std::atomic<std::uint64_t> g_occlusion_samples{0};
+
 }  // namespace
+
+std::uint64_t occlusion_sample_count() {
+    return g_occlusion_samples.load(std::memory_order_relaxed);
+}
+
+void reset_occlusion_sample_count() {
+    g_occlusion_samples.store(0, std::memory_order_relaxed);
+}
 
 TileBounds camera_footprint_bounds(
     const RasterGrid& out_grid, const OrthoCamera& camera, double lowest_height,
@@ -348,11 +372,13 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
         camera.plane_to_local && camera.plane_centre.has_value() ? *camera.plane_centre
                                                                  : camera.centre();
 
-    // The march step is bounded below by the DEM cell: sampling the height
+    // The march step is the DEM cell, NOT the output cell: sampling the height
     // field finer than its own resolution cannot reveal an occluder that a
-    // half-cell step would miss. A user asking for an ortho finer than the DEM
-    // (the normal case) therefore does not pay for a march proportional to the
-    // ortho cell.
+    // half-DEM-cell step would miss, so a user asking for an ortho finer than
+    // the DEM (the normal case) does not pay for a march proportional to the
+    // ortho cell. Taking the max with the output cell here used to make a
+    // 4x-finer ortho walk 4x more samples per output cell, i.e. 16x the work
+    // per unit area.
     //
     // When the plane frame is a Geographic one its x/y are degrees while the
     // DEM heights are metres; the march direction and the step are then built
@@ -362,7 +388,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     const double my = camera.plane_metres_per_unit.y();
     const bool metric_march = mx != 1.0 || my != 1.0;
     const double step =
-        0.5 * std::max(out_grid.pixel_size_x, dem.grid.pixel_size_x) *
+        0.5 * std::max(dem.grid.pixel_size_x, dem.grid.pixel_size_y) *
         (metric_march ? std::max(mx, my) : 1.0);
     const double min_dim = static_cast<double>(std::min(image.width(), image.height()));
     const double taper_span = 0.1 * min_dim;
@@ -378,8 +404,9 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     // is bit-identical for any thread count. The inner work (a DEM sample, an
     // occlusion march, a projection and a bilinear image read) dominates the
     // stage, and a full ortho rectifies every camera over the same grid.
+    std::uint64_t march_samples = 0;  // test-only cost accounting (see the header)
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) reduction(+ : march_samples)
 #endif
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {
@@ -405,8 +432,17 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             const Eigen::Vector3d dir = to_cam / distance;
 
             // -- occlusion: march from P toward the camera centre -----------
+            // Two independent bounds make the cost per output cell a constant:
+            // the ray stops as soon as it climbs above the tallest DEM sample
+            // (occlusion is then impossible), and it stops after
+            // kMaxOcclusionSamplesPerRay samples whatever the geometry. The
+            // step is a half DEM cell, so neither bound depends on how fine the
+            // output grid is.
             bool occluded = false;
-            for (double s = step; s < distance; s += step) {
+            std::size_t samples = 0;
+            for (double s = step;
+                 s < distance && samples < kMaxOcclusionSamplesPerRay; s += step) {
+                ++samples;
                 // Step in metres, then map back to plane units for the DEM read.
                 const double px = P.x() + dir.x() * s / mx;
                 const double py = P.y() + dir.y() * s / my;
@@ -419,6 +455,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                     break;
                 }
             }
+            march_samples += samples;
             if (occluded) {
                 continue;
             }
@@ -462,6 +499,9 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             tile.score[cell] = static_cast<float>(score);
         }
     }
+    // One atomic per tile, not per cell: the counter is test-only, but the
+    // rectifier is on the task's hot path and must not pay for it.
+    g_occlusion_samples.fetch_add(march_samples, std::memory_order_relaxed);
     return tile;
 }
 

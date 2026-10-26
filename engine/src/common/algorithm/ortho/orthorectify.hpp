@@ -156,4 +156,16 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
                        int camera_index, double occlusion_tolerance, bool crop = true);
 
+// -- test-only cost accounting ----------------------------------------------
+// The occlusion march's cost is invisible in a tile's contents: a 4x-finer
+// output grid must not multiply the DEM samples per output cell, but the tile
+// looks the same either way. These accessors expose a process-wide counter so
+// a test can assert the bound. They are not part of the production contract.
+
+/// DEM samples taken by occlusion marches since the last reset (all threads).
+std::uint64_t occlusion_sample_count();
+
+/// Zero the counter. Call before the run being measured.
+void reset_occlusion_sample_count();
+
 }  // namespace alphashape::ortho

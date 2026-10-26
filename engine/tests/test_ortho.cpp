@@ -492,6 +492,55 @@ TEST(Ortho, OcclusionHidesBehindBuilding) {
     EXPECT_GT(flat_err, 2.0 * true_err);
 }
 
+TEST(Ortho, OcclusionCostDoesNotFollowTheOutputGrid) {
+    const Scene scene = make_scene();
+    constexpr int kIndex = 6;
+    constexpr double kTolerance = 0.1;
+    // The fixture DEM is a 0.25 m grid. A 4x-finer ortho grid over the same
+    // extent has 16x the output cells; the march step is half a DEM cell in
+    // both runs, so the DEM samples per output cell must stay put. The old
+    // step of 0.5 * max(output cell, DEM cell) scaled the march with whatever
+    // grid the user asked for, which is the cost this guards.
+    constexpr int kFactor = 4;
+    RasterGrid fine = scene.grid;
+    fine.pixel_size_x = scene.grid.pixel_size_x / kFactor;
+    fine.pixel_size_y = scene.grid.pixel_size_y / kFactor;
+    fine.width = scene.grid.width * kFactor;
+    fine.height = scene.grid.height * kFactor;
+    ASSERT_DOUBLE_EQ(fine.pixel_size_x * kFactor, scene.grid.pixel_size_x);
+
+    ortho::reset_occlusion_sample_count();
+    const OrthoTile coarse_tile =
+        orthorectify(scene.dem, scene.nodata, scene.grid, scene.cameras[kIndex], kIndex,
+                     kTolerance);
+    const double coarse_samples = static_cast<double>(ortho::occlusion_sample_count());
+
+    ortho::reset_occlusion_sample_count();
+    const OrthoTile fine_tile =
+        orthorectify(scene.dem, scene.nodata, fine, scene.cameras[kIndex], kIndex, kTolerance);
+    const double fine_samples = static_cast<double>(ortho::occlusion_sample_count());
+
+    const double coarse_cells =
+        static_cast<double>(coarse_tile.width) * static_cast<double>(coarse_tile.height);
+    const double fine_cells =
+        static_cast<double>(fine_tile.width) * static_cast<double>(fine_tile.height);
+    ASSERT_GT(coarse_cells, 0.0);
+    ASSERT_GT(fine_cells, 0.0);
+    const double coarse_per_cell = coarse_samples / coarse_cells;
+    const double fine_per_cell = fine_samples / fine_cells;
+    std::printf("[Ortho.OcclusionCost] coarse=%.2f fine=%.2f samples/cell, cells %.0f -> "
+                "%.0f (x%.1f)\n",
+                coarse_per_cell, fine_per_cell, coarse_cells, fine_cells,
+                fine_cells / coarse_cells);
+    EXPECT_GT(coarse_per_cell, 0.0);
+    // Independent of the output resolution: within a stride's rounding of the
+    // coarse run, never multiplied by the 4x finer cell.
+    EXPECT_LT(fine_per_cell, 1.5 * coarse_per_cell + 1.0);
+    EXPECT_GT(fine_per_cell, 0.5 * coarse_per_cell);
+    // And bounded outright by the per-ray cap, whatever the geometry.
+    EXPECT_LE(fine_per_cell, 4096.0);
+}
+
 // -- 3. seamlines ------------------------------------------------------------
 
 /// Rectify every camera onto the grid (the expensive shared step).
