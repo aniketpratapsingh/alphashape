@@ -116,12 +116,17 @@ public:
     /// gpu::Error once the device is lost: a host copy must not read a buffer
     /// the queue never finished writing.
     void wait_all_pending();
-    /// The destructor form of wait_all_pending(): never throws, spends one
-    /// shared deadline on the whole drain rather than one slice per fence, and
-    /// marks the device lost when the drain does not complete. Destructors are
-    /// implicitly noexcept, so throwing from one would be std::terminate.
-    /// Returns true when every fence signalled.
-    bool wait_all_pending_noexcept();
+    /// The destructor form of wait_all_pending(): never throws, and marks the
+    /// device lost when the drain does not complete. Destructors are implicitly
+    /// noexcept, so throwing from one would be std::terminate. Returns true
+    /// when every fence signalled.
+    ///
+    /// budget_ns == 0 is the per-handle form a buffer/image destructor uses: it
+    /// spends one shared post-loss deadline on the whole fallback unwind rather
+    /// than one slice per fence. ~VulkanBackend passes an explicit full budget,
+    /// which makes the drain authoritative: nothing will wait again, so the
+    /// cheap shared window must not cap the one drain that has to succeed.
+    bool wait_all_pending_noexcept(std::uint64_t budget_ns = 0);
     /// VkFormat for a public Format (used by the image path and capability
     /// queries).
     VkFormat vk_format(Format format) const;
@@ -162,7 +167,11 @@ private:
     /// Drains every fence this backend owns with one shared deadline; the
     /// throwing and noexcept variants share it. Returns false when a fence did
     /// not signal inside the budget.
-    bool drain_pending(std::uint64_t budget_ns, bool allow_throw);
+    ///
+    /// `authoritative` is the teardown drain: nothing will ever wait again, so
+    /// the cheap shared post-loss window (which exists only to keep a fallback
+    /// unwind fast) does not apply and the caller's budget is honoured in full.
+    bool drain_pending(std::uint64_t budget_ns, bool allow_throw, bool authoritative = false);
     /// Reserves the next free slot; returns nullptr when kMaxInFlight are
     /// outstanding (the caller decides throw-or-drain).
     Slot* reserve_slot();

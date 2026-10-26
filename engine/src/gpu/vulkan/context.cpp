@@ -183,13 +183,21 @@ VulkanBackend::~VulkanBackend() {
         const Functions& fns = instance_->fns;
         // Command pools and fences may only go once no submission is running.
         // vkDeviceWaitIdle is unbounded, so on a lost device it is skipped
-        // entirely -- the driver never finishes the abandoned submissions and
-        // the call would block the fallback unwind forever. The bounded fence
-        // drain below covers the same requirement in that case.
+        // entirely -- a genuinely wedged driver never finishes the abandoned
+        // submissions and the call would block the fallback unwind forever.
+        // The bounded fence drain below covers the same requirement in that
+        // case, and it gets a full budget rather than the 1 s shared post-loss
+        // window: this is the last chance to wait. A *simulated* loss (the test
+        // hook, or a timeout that raced completion) leaves the driver's queue
+        // alive and still executing, and destroying the device underneath it is
+        // a segfault inside the driver's worker thread.
         if (!lost()) {
             fns.DeviceWaitIdle(device_handle_);
         } else {
-            (void)wait_all_pending_noexcept();
+            constexpr std::uint64_t kFinalDrainBudgetNs = 5'000'000'000ULL;
+            constexpr std::uint64_t kSoftwareFinalDrainBudgetNs = 600'000'000'000ULL;
+            (void)wait_all_pending_noexcept(device_.info.software ? kSoftwareFinalDrainBudgetNs
+                                                                  : kFinalDrainBudgetNs);
         }
         // Cached samplers are owned by this backend; a Sampler handle that
         // outlives it holds a dangling pointer only if it also outlives the
