@@ -413,6 +413,19 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                map.alignment_fingerprint == fingerprint_of(map.camera_id) &&
                (map.filter_mode < 0 || map.filter_mode == requested_mode);
     };
+    // "This map still describes the current chunk", independent of whether this
+    // run IS reusing maps (`reuse_depth` may be off). A checkpoint may carry
+    // forward a map it did not search this time, but never one the current
+    // geometry has invalidated: a partial set written before a re-alignment must
+    // not resurrect those maps when a later cancel merges into it. Also requires
+    // the camera to still exist and still be in this run's neighbourhood.
+    const auto still_current = [&](const DepthMap& map) {
+        return map.downscale == downscale && map.alignment_fingerprint != 0 &&
+               map.filter_mode < 0 &&
+               camera_by_id.find(map.camera_id) != camera_by_id.end() &&
+               hood_of.find(map.camera_id) != hood_of.end() &&
+               map.alignment_fingerprint == fingerprint_of(map.camera_id);
+    };
     progress.update("initialize", 1.0);
 
     // -- build depth maps (sequential over cameras) --------------------------
@@ -519,11 +532,18 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // Union of the previous partial set (if any) and this run's maps, keyed
         // by camera. This run's copies win: a reused map came from that very
         // set, and a fresh search is newer than anything parked there.
+        //
+        // Only previous maps that are still CURRENT are carried over: a partial
+        // set written before a re-alignment must not be merged back into a set
+        // produced after it, or the cancel would resurrect maps the whole
+        // fingerprint exists to invalidate.
         std::unordered_map<std::int32_t, DepthMap> merged;
         const DepthMapsAsset* previous = find_asset(staged.depth_map_sets(), partial_id);
         if (previous != nullptr && previous->data != nullptr) {
             for (const DepthMap& map : *previous->data) {
-                merged.emplace(map.camera_id, map);
+                if (still_current(map)) {
+                    merged.emplace(map.camera_id, map);
+                }
             }
         }
         for (const DepthMap& map : built) {

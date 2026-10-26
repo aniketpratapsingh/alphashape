@@ -1139,6 +1139,55 @@ TEST(DepthMapsCancel, RepeatedCancelsMergeIntoOnePartialSet) {
 // 2. A cancel inside one camera works: the sweep hook polls between sweeps
 // ---------------------------------------------------------------------------
 
+TEST(DepthMapsCancel, PartialSetDoesNotResurrectStaleMapsAfterRealignment) {
+    // A partial set carries what an interrupted run finished. If the cameras are
+    // re-aligned afterwards, a later cancel must NOT merge the now-stale maps
+    // back into the set: the fingerprint exists precisely to invalidate them.
+    Document document = aligned_document(seq_files(6));
+    Chunk& chunk = *document.active_chunk();
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 2U);
+
+    CancellingProgress cancel;
+    const double one_camera = 1.0 / static_cast<double>(camera_count);
+    cancel.when = [one_camera](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= one_camera;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+    ASSERT_EQ(chunk.depth_map_sets().size(), 1U);
+    ASSERT_FALSE(chunk.depth_map_sets().front().data->empty());
+    const std::uint64_t stale_fingerprint =
+        chunk.depth_map_sets().front().data->front().alignment_fingerprint;
+    ASSERT_NE(stale_fingerprint, 0U);
+
+    // Re-align: every camera moves.
+    for (Camera& camera : document.active_chunk()->cameras()) {
+        camera.pose(0, 3) += 0.1;
+    }
+
+    // Cancel again after one camera of the NEW geometry.
+    CancellingProgress second;
+    second.when = [one_camera](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= one_camera;
+    };
+    Params again = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", again,
+                          second.progress()),
+                 CancelledError);
+
+    // The merged set holds only maps from the CURRENT geometry.
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U);
+    const std::vector<DepthMap>& kept = document.active_chunk()->depth_maps();
+    ASSERT_FALSE(kept.empty());
+    for (const DepthMap& map : kept) {
+        EXPECT_NE(map.alignment_fingerprint, stale_fingerprint)
+            << "camera " << map.camera_id << " resurrected a pre-alignment map";
+    }
+}
+
 TEST(DepthMapsCancel, CancelInsideOneCameraStopsAtASweepBoundary) {
     Document document = aligned_document(seq_files());
     Chunk& chunk = *document.active_chunk();
