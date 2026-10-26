@@ -172,6 +172,8 @@ public:
 private:
     friend std::shared_ptr<Context> create_context(const ContextOptions& options);
     friend void run(Context& context, const std::vector<Dispatch>& dispatches);
+    friend void run_with_fence_budget(Context& context, const std::vector<Dispatch>& dispatches,
+                                      std::uint64_t fence_budget_ns);
     friend Ticket detail::submit_async(Context&, const std::vector<Dispatch>&, Submission);
     friend void wait(Context& context, Ticket ticket);
     friend std::uint32_t detail::in_flight_count(Context& context);
