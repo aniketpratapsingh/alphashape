@@ -982,7 +982,10 @@ TEST(DepthMapsCancel, KeepsFinishedMapsAndSkipsThemOnRerun) {
 
     // The maps finished before the cancel are in the chunk, as a new set, with
     // their downscale and a fingerprint (they are reusable, not dead weight).
-    const std::vector<DepthMap>& kept = chunk.depth_maps();
+    // A COPY: the re-run below completes this very set in place (the partial
+    // set is replaced, not appended beside), so a reference would observe the
+    // new contents and cannot be compared against.
+    const std::vector<DepthMap> kept = chunk.depth_maps();
     ASSERT_FALSE(kept.empty()) << "a cancel threw the finished maps away";
     const std::size_t first_run_searches = depth_map_search_count();
     ASSERT_GE(first_run_searches, kept.size());

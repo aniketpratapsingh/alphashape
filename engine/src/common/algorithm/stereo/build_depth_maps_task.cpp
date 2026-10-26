@@ -584,13 +584,19 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // scale that into the camera's slice of the build stage and poll the cancel
     // flag on every tick, so Cancel takes effect inside one sweep rather than
     // after the current camera (which can be hours at downscale 2).
+    //
+    // The final 1.0 report is NOT a cancellation point even when the user has
+    // already asked to stop: the search has finished at that moment, so throwing
+    // here would discard a completed camera's map and send the caller into the
+    // checkpoint with nothing new to keep. The poll right after the camera is
+    // stored catches the same request one instant later and keeps the map.
     const double camera_count = static_cast<double>(neighbourhoods.size());
     std::size_t current_index = 0;
     const auto sweep_progress = [&](double fraction) {
+        const double clamped = std::clamp(fraction, 0.0, 1.0);
         progress.update("buildDepthMaps",
-                        (static_cast<double>(current_index) + std::clamp(fraction, 0.0, 1.0)) /
-                            camera_count);
-        if (progress.is_cancelled()) {
+                        (static_cast<double>(current_index) + clamped) / camera_count);
+        if (clamped < 1.0 && progress.is_cancelled()) {
             throw CancelledError("BuildDepthMaps was cancelled");
         }
     };
