@@ -30,11 +30,41 @@ const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 // dense fixture: optimised pm_refine alone dropped GPU/CPU depth agreement from
 // 100% to 93.4% purely from that.
 //
-// `precise` is therefore applied to exactly the expressions that decide *which
-// texel is sampled* (the projected pixel, the window-plane depths, the
-// deterministic draw values) and not to the ZNCC accumulators, which use their
-// own precise declarations, or to the normals. That keeps the disassembly close
-// to the -O0 build where it matters and leaves the hot loops free to contract.
+// `precise` is therefore applied to the whole *chain* that decides which texel
+// is sampled, not just to its last two statements. Declaring only the projected
+// pixel `precise` is not enough: that stops the final `+` from folding into an
+// FMA but leaves the operands free to be contracted in their own defining
+// expressions, and a single differing bit anywhere on the path moves the
+// floor() just the same. `precise` propagates into an initialiser, so one
+// declaration per stage covers the expression that computes it:
+//
+//   nb = dot(n, b_p), rho = depth * nb     pm_core.glsl evaluate_hypothesis()
+//   depth_q = rho / nb                     pm_core.glsl candidate_depth()
+//   x_n = depth_q * (M b_q) + c            pm_core.glsl neighbour_cost()
+//   xs, ys = x/z, xd, yd = distortion(...) project_point(), below
+//   u, v = ... + xd * (f + b.x) + yd * b.y project_point(), below
+//
+// Measured on the Tesla T4: with only u and v marked, optimised pm_refine still
+// landed at 93.4% dense agreement and the TV mesh at 1276 vs 1268 boundary
+// edges. The whole chain above is what restores exactness.
+//
+// Everything off that chain -- the ZNCC accumulators (which have their own
+// precise declarations), the normals and the bilinear weights -- stays free to
+// contract, which is what keeps the 49 x 32 cost loop affordable to optimise.
+// Marking the loop itself is not an option: NoContraction there made glslc -O
+// need tens of gigabytes and CI OOM-killed the shader build (exit 137).
+//
+// The *draws* (rng_uniform64's split sum, random_depth's inverse-depth lerp,
+// random_cone_normal's trig) are deliberately left contractible, even though they
+// are upstream of rho. They sit outside the loop -- once per candidate, not once
+// per sample -- so they are not what keeps the optimizer's live set small, and
+// marking them was tried: it was part of the set that made glslc -O need tens of
+// gigabytes. `precise` is also a much weaker guarantee for them than it looks:
+// they already evaluate a double formula in float32, so a last-bit difference
+// from the CPU is inherent, and NoContraction does not change that. What
+// `precise` buys is the *absence* of a difference the CPU does not have, which is
+// what the chain above needed -- a contraction the CPU's separate rounding rules
+// out, sitting immediately in front of floor().
 
 layout(push_constant) uniform PmParams {
     uint width;
@@ -336,8 +366,12 @@ float random_depth(RngKey key, uint index) {
 // Returns false exactly where the CPU model does (Frame z <= 0, Fisheye origin).
 bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 radial,
                    vec2 tangential, out vec2 pixel) {
-    float xs = 0.0;
-    float ys = 0.0;
+    // precise from the first normalised-plane coordinate on: see the note at the
+    // top of this file. Every operation that *consumes* a precise value is also
+    // non-contractible, so declaring xs/ys here covers the whole camera model
+    // below them, and `p_cam` arrives precise from neighbour_cost()'s x_n.
+    precise float xs = 0.0;
+    precise float ys = 0.0;
     if (type == 0) {
         if (!(p_cam.z > 0.0)) {
             return false;
@@ -345,28 +379,28 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
         xs = p_cam.x / p_cam.z;
         ys = p_cam.y / p_cam.z;
     } else {
-        float r3d = sqrt(p_cam.x * p_cam.x + p_cam.y * p_cam.y);
+        precise float r3d = sqrt(p_cam.x * p_cam.x + p_cam.y * p_cam.y);
         if (r3d == 0.0) {
             if (p_cam.z == 0.0) {
                 return false;
             }
         } else {
-            float theta = atan(r3d, p_cam.z);
-            float scale = theta / r3d;
+            precise float theta = atan(r3d, p_cam.z);
+            precise float scale = theta / r3d;
             xs = p_cam.x * scale;
             ys = p_cam.y * scale;
         }
     }
     float k1 = radial.x, k2 = radial.y, k3 = radial.z, k4 = radial.w;
     float p1 = tangential.x, p2 = tangential.y;
-    float xd = xs;
-    float yd = ys;
+    precise float xd = xs;
+    precise float yd = ys;
     if (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || k4 != 0.0 || p1 != 0.0 || p2 != 0.0) {
-        float r2 = xs * xs + ys * ys;
-        float r4 = r2 * r2;
-        float r6 = r4 * r2;
-        float r8 = r4 * r4;
-        float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+        precise float r2 = xs * xs + ys * ys;
+        precise float r4 = r2 * r2;
+        precise float r6 = r4 * r2;
+        precise float r8 = r4 * r4;
+        precise float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
         xd = xs * radial_scale + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys;
         yd = ys * radial_scale + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys;
     }
