@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 #include "gpu/gpu_config.hpp"
 #include "gpu/vulkan/backend.hpp"
@@ -397,21 +398,24 @@ BatchLimiter::BatchLimiter(std::size_t dispatches_per_step, std::size_t initial_
 }
 
 std::size_t BatchLimiter::override_steps() {
-    const char* text = std::getenv("ALPHASHAPE_GPU_MAX_BATCH");
-    if (text == nullptr || *text == '\0') {
+    // platform::get_env, not std::getenv: on Windows the CRT keeps its own copy
+    // of the environment, so a value a caller (or a test) set with
+    // SetEnvironmentVariable would be invisible to getenv.
+    const std::string text = platform::get_env("ALPHASHAPE_GPU_MAX_BATCH");
+    if (text.empty()) {
         return 0;
     }
     // Strict parse. strtoull accepts a leading sign and leading whitespace, and
     // "-2" would wrap to a huge positive size: an override that silently became
     // something else would hide itself, so anything but plain digits is ignored
     // (adaptive), never guessed at.
-    for (const char* digit = text; *digit != '\0'; ++digit) {
-        if (*digit < '0' || *digit > '9') {
+    for (const char character : text) {
+        if (character < '0' || character > '9') {
             return 0;
         }
     }
     char* end = nullptr;
-    const unsigned long long value = std::strtoull(text, &end, 10);
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
     if (end == nullptr || *end != '\0' || value == 0 ||
         value > std::numeric_limits<std::size_t>::max()) {
         return 0;
@@ -443,6 +447,8 @@ void BatchLimiter::observe(std::size_t steps_done, double seconds) {
     // Aim at the target, but move at most 4x per measurement so one noisy first
     // submission (or a pipeline compilation charged to it) cannot jump to a
     // multi-second batch.
+    // per_step is the measured cost of one step, so target_ / per_step is the
+    // step count that would fill the target.
     const double ideal = target_ / per_step;
     const double lowest = static_cast<double>(steps_done) / 4.0;
     const double highest = static_cast<double>(steps_done) * 4.0;
