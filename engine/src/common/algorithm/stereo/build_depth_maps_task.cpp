@@ -221,7 +221,8 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
     return {Stage{"initialize", 0}, Stage{"buildDepthMaps", 0}, Stage{"filterDepthMaps", 0},
-            Stage{"finalize", 0}};}
+            Stage{"finalize", 0}};
+}
 
 void BuildDepthMapsTask::apply(Document& document, Params& params, const Progress& progress) {
     // -- validate every parameter before touching the chunk ------------------
@@ -389,8 +390,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         return out;
     };
 
-    // Maps finished so far, keyed by camera id. Kept ordered by the
-    // neighbourhood order so the committed set is deterministic.
+    // Maps finished so far, in neighbourhood order so the committed set is
+    // deterministic.
     std::vector<DepthMap> built;
     built.reserve(neighbourhoods.size());
     std::vector<std::string> errors(neighbourhoods.size());
@@ -398,8 +399,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
 
     // Checkpoint the maps finished so far into the chunk as a new depth-map
     // asset, then rethrow. Called only on cancellation, when those maps are
-    // valid per camera but have not been through the cross-view filter (see
-    // DepthMap::filtered). A cancelled run that finished nothing leaves the
+    // valid per camera but have not been through the cross-view filter (their
+    // filter_mode is still -1). A cancelled run that finished nothing leaves the
     // chunk untouched, so "cancel" on the first camera is still a no-op.
     //
     // This is the ONLY commit a cancelled run makes. A task that throws is
@@ -455,8 +456,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         try {
             // Reuse an existing map built at this downscale from this geometry.
             // Its search is skipped; filtering still runs unless it was already
-            // filtered, so a map checkpointed by an earlier cancelled run gets
-            // the cross-view pass it never had.
+            // filtered with the requested mode, so a map checkpointed by an
+            // earlier cancelled run gets the cross-view pass it never had.
             if (reuse_depth) {
                 const auto kept = existing.find(hood.camera_id);
                 if (kept != existing.end() && reusable(*kept->second)) {
