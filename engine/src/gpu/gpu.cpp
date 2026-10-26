@@ -387,7 +387,10 @@ BatchLimiter::BatchLimiter(std::size_t dispatches_per_step, std::size_t initial_
     : per_step_(std::max<std::size_t>(dispatches_per_step, 1)),
       steps_(std::max<std::size_t>(initial_steps, 1)),
       max_steps_(std::max<std::size_t>(max_steps, 1)) {
+    // Pin before the first submission and never adapt: an override is a
+    // contract with the caller (and with a test), not a starting point.
     if (const std::size_t forced = override_steps(); forced != 0) {
+        pinned_ = forced;
         steps_ = std::min(forced, max_steps_);
     }
 }
@@ -423,6 +426,12 @@ std::size_t BatchLimiter::steps(std::size_t remaining_steps) const {
 }
 
 void BatchLimiter::observe(std::size_t steps_done, double seconds) {
+    if (pinned_ != 0) {
+        // A pinned size does not adapt, so the caller's split stays identical
+        // however fast or slow the device turns out to be.
+        steps_ = std::min(pinned_, max_steps_);
+        return;
+    }
     if (steps_done == 0 || !(seconds > 0.0) || !(target_ > 0.0)) {
         return;
     }
@@ -438,11 +447,8 @@ void BatchLimiter::observe(std::size_t steps_done, double seconds) {
     const double highest = static_cast<double>(steps_done) * 4.0;
     const double scaled = std::min(std::max(ideal, lowest), highest);
     const double rounded = std::floor(scaled + 0.5);
-    std::size_t next = rounded < 1.0 ? 1U : static_cast<std::size_t>(rounded);
+    const std::size_t next = rounded < 1.0 ? 1U : static_cast<std::size_t>(rounded);
     steps_ = std::min(next, max_steps_);
-    if (const std::size_t forced = override_steps(); forced != 0) {
-        steps_ = std::min(forced, max_steps_);
-    }
 }
 
 std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatches,

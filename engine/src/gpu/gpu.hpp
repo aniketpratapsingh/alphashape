@@ -406,6 +406,10 @@ private:
     std::size_t per_step_;
     std::size_t steps_;
     std::size_t max_steps_;
+    /// Non-zero when ALPHASHAPE_GPU_MAX_BATCH pinned the size at construction;
+    /// a pinned limiter never adapts, so the test's split stays the split it
+    /// asked for however the device performs.
+    std::size_t pinned_ = 0;
     double target_ = 0.0;
 };
 
