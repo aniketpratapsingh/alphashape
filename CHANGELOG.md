@@ -95,5 +95,24 @@ output yet.
   metre heights; all three now convert through the frame's metres-per-degree at the model's
   latitude. An orthomosaic built in degrees also used to step the occlusion test by ~1e-6
   per iteration.
+- BuildOrthomosaic's memory is now proportional to the imagery, not to cameras x grid. The
+  ortho default following the ground sample distance made a 2 cm ortho of a 36-photo block
+  28 million cells instead of ~0.2 million, and at that size the old layout needed ~12 GB:
+  every camera's rectified tile was allocated on the whole output grid (8 bytes per cell)
+  and all of them stayed resident through seamline optimisation and blending. Each tile is
+  now cropped to that camera's own footprint box, photographs are decoded one at a time
+  instead of all up front, the projection node map stores float offsets, and the hole-fill
+  accumulator runs in bounded row bands. The result is byte-identical to before.
+- BuildOrthomosaic refuses a run it cannot fit instead of dying with "bad allocation": it
+  estimates the peak before allocating anything and raises a ValueError naming the memory
+  needed, the machine's RAM and a coarser resolution to try. The budget is 60% of physical
+  memory (override with `ALPHASHAPE_MEMORY_BUDGET_MB`); an allocation that still fails is
+  reported the same way.
+- The DEM's extent is robust against far samples. It used the raw min/max over every
+  depth-map point, so a handful of far mismatches could turn a 100 m block into a
+  kilometres-wide grid -- the actual cause of the "bad allocation" an 8 GB laptop hit at the
+  old 0.25 m ortho default, before any ortho existed. An axis whose extent exceeds twice the
+  0.5th-99.5th percentile core is now clipped to that core plus 3%; an ordinary,
+  outlier-free sample set keeps exactly the grid it always had.
 
 [0.1.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.1.0

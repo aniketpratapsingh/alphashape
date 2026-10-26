@@ -245,20 +245,31 @@ struct PlaneBox {
 /// billions of cells -- the "bad allocation" an 8 GB laptop hits on a small
 /// block long before any ortho exists.
 ///
-/// The box is therefore taken from the 0.5th-99.5th percentile of each axis
-/// (the samples' own spread, not a fixed metric margin), then widened by a
-/// margin of 2% of that robust extent on every side. Two guards keep the
-/// adjustment conservative:
+/// The test is a comparison, not a blind trim, so a genuine extent is never
+/// narrowed:
 ///
-///   * with fewer than kMinSamplesForRobustBox samples the percentile is not
-///     meaningful and the exact box is used (small synthetic scenes keep their
-///     historical grid);
-///   * the percentile box can only SHRINK the exact box, never grow it.
+///   1. the exact box (min/max) and the 0.5th-99.5th percentile box (the
+///      "core", which a handful of far samples cannot move);
+///   2. if the exact extent on an axis is at most kOutlierExtentRatio times the
+///      core extent, there are no outliers worth handling and the EXACT bound
+///      is kept -- an ordinary lattice therefore produces exactly the grid it
+///      always did;
+///   3. otherwise the axis is clipped to the core plus kOutlierMarginFraction
+///      of the core extent on each side. On a real block the clipped box still
+///      contains the whole surveyed area (the discarded samples lie beyond it
+///      by construction), and the grid stays a modest multiple of the real
+///      extent instead of growing to the outlier's distance.
+///
+/// Small sample sets skip the analysis entirely: a percentile is meaningless
+/// below kMinSamplesForRobustBox and the synthetic test scenes must keep their
+/// historical grid.
 constexpr std::size_t kMinSamplesForRobustBox = 1000;
-/// One-sided tail fraction discarded on each axis.
+/// One-sided tail fraction used to define the inlier core.
 constexpr double kExtentTailFraction = 0.005;
-/// Extra margin, as a fraction of the robust extent, on every side.
-constexpr double kExtentMarginFraction = 0.02;
+/// Exact extent / core extent above which an axis is treated as outlier-poisoned.
+constexpr double kOutlierExtentRatio = 2.0;
+/// Margin added outside the core when clipping, as a fraction of the core extent.
+constexpr double kOutlierMarginFraction = 0.03;
 
 /// The `fraction` quantile of `values` (0..1), by nth_element. `values` is
 /// reordered.
@@ -274,16 +285,36 @@ double quantile(std::vector<double>& values, double fraction) {
     return values[k];
 }
 
+/// Clamp one axis of `box` to its core when the exact extent is outlier-poisoned.
+void clip_axis(double core_lo, double core_hi, double* lo, double* hi) {
+    const double core = core_hi - core_lo;
+    if (!(core > 0.0) || !std::isfinite(core)) {
+        return;  // a degenerate core says nothing; leave the exact bound alone
+    }
+    const double margin = kOutlierMarginFraction * core;
+    if (*lo < core_lo) {
+        // Only engage when the low tail is more than "a bit" outside the core.
+        if ((core_hi - *lo) > kOutlierExtentRatio * core) {
+            *lo = core_lo - margin;
+        }
+    }
+    if (*hi > core_hi) {
+        if ((*hi - core_lo) > kOutlierExtentRatio * core) {
+            *hi = core_hi + margin;
+        }
+    }
+}
+
 PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
-    PlaneBox exact;
-    exact.min = samples.front().p;
-    exact.max = samples.front().p;
+    PlaneBox box;
+    box.min = samples.front().p;
+    box.max = samples.front().p;
     for (const PlaneSample& s : samples) {
-        exact.min = exact.min.cwiseMin(s.p);
-        exact.max = exact.max.cwiseMax(s.p);
+        box.min = box.min.cwiseMin(s.p);
+        box.max = box.max.cwiseMax(s.p);
     }
     if (samples.size() < kMinSamplesForRobustBox) {
-        return exact;
+        return box;
     }
 
     std::vector<double> xs;
@@ -299,24 +330,16 @@ PlaneBox samples_box(const std::vector<PlaneSample>& samples) {
     const double y_lo = quantile(ys, kExtentTailFraction);
     const double y_hi = quantile(ys, 1.0 - kExtentTailFraction);
 
-    const double margin_x = kExtentMarginFraction * (x_hi - x_lo);
-    const double margin_y = kExtentMarginFraction * (y_hi - y_lo);
+    clip_axis(x_lo, x_hi, &box.min.x(), &box.max.x());
+    clip_axis(y_lo, y_hi, &box.min.y(), &box.max.y());
 
-    PlaneBox robust;
-    // Never widen past the exact box: an outlier-free cloud must come out with
-    // exactly the same grid it always had.
-    robust.min =
-        Eigen::Vector2d(std::max(exact.min.x(), x_lo - margin_x),
-                        std::max(exact.min.y(), y_lo - margin_y));
-    robust.max =
-        Eigen::Vector2d(std::min(exact.max.x(), x_hi + margin_x),
-                        std::min(exact.max.y(), y_hi + margin_y));
-    // A degenerate robust box (every sample on one line) would be worse than
-    // the exact one: fall back rather than produce a 1-cell DEM.
-    if (!(robust.max.x() > robust.min.x()) || !(robust.max.y() > robust.min.y())) {
-        return exact;
+    // A clipped box must still be non-empty; an all-collinear cloud can make the
+    // core degenerate and that has already been rejected above, but guard the
+    // final result anyway so the grid can never come out inverted.
+    if (!(box.max.x() > box.min.x()) || !(box.max.y() > box.min.y())) {
+        return box;
     }
-    return robust;
+    return box;
 }
 
 PlaneBox vertices_box(const std::vector<Eigen::Vector3d>& vertices) {

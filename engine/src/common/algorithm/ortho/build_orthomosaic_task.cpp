@@ -184,7 +184,7 @@ struct PlaneToLocalMap {
         const Eigen::Vector3f relative =
             static_cast<float>(w00) * local[i00] + static_cast<float>(w10) * local[i10] +
             static_cast<float>(w01) * local[i01] + static_cast<float>(w11) * local[i11];
-        Eigen::Vector3d out = anchor + relative.cast<double>();
+        Eigen::Vector3d out = (relative.cast<double>() + anchor);
         const double node_height =
             w00 * height[i00] + w10 * height[i10] + w01 * height[i01] + w11 * height[i11];
         const double scale =
@@ -355,17 +355,21 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
     return entries;
 }
 
-/// Bytes per output cell the FINE pipeline holds at its peak, over and above
-/// the orthomosaic itself:
+/// Bytes per output cell the fine pipeline holds at its PEAK, stage by stage
+/// (the stages are sequential, so the peak is the largest one, not the sum):
 ///
-///   * seam labels (int32)              4
-///   * seamline `best` (double)         8
-///   * seamline `any_valid` (u8)        1
-///   * fill_holes branch (float + u8)   5
+///   * seamlines: labels int32 (4) + `best` double (8) + `any_valid` u8 (1) +
+///     the two checkerboard parity lists of size_t (8)         = 21
+///   * blend mosaic: labels (4) + out.rgb (3) + out.valid (1) + the three
+///     accumulator pyramids at sum(1/4^k)*4B (16) + their collapse result (12)
+///     + one tile's Gaussian/Laplacian/mask planes (~20)        = 56
+///   * finalize: mosaic (4) + result RGBA (4) + fill_holes' per-channel
+///     float+u8 pair, EDT and masks (~19)                       = 27
 ///
-/// The tiles are counted separately: they are cropped to the camera footprints,
-/// so their cost is a footprint area, not C x the grid.
-constexpr double kBytesPerCellFine = 18.0;
+/// 56 B/cell is the blend stage, i.e. the peak. The tiles are counted
+/// separately: they are cropped to the camera footprints, so their cost is a
+/// footprint area, not C x the grid.
+constexpr double kBytesPerCellFine = 56.0;
 
 /// Bytes per output-grid NODE in the plane->local map (float3 + 2 floats) when
 /// the chunk is georeferenced: about one node per output cell.
@@ -386,14 +390,19 @@ constexpr double kCoarseFootprintFraction = 0.25 + 0.0625;
 /// rectified-tile cost); it is predicted from camera_footprint_bounds() before
 /// any tile is allocated.
 double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map) {
-    double bytes = static_cast<double>(cells) * kBytesPerCellFine;
-    bytes += footprint_cells * kBytesPerTileCell * (1.0 + kCoarseFootprintFraction);
-    if (has_node_map) {
-        bytes += static_cast<double>(cells) * kBytesPerNodeMap;
-    }
-    // The orthomosaic raster itself (RGBA u8) is one more byte per cell x 4.
-    bytes += static_cast<double>(cells) * 4.0;
-    return bytes;
+    // The tile set is resident throughout the seam and blend stages, so it adds
+    // to whichever stage is the peak.
+    const double tiles =
+        footprint_cells * kBytesPerTileCell * (1.0 + kCoarseFootprintFraction);
+    // The plane->local node map is built before rectification and released with
+    // the task's locals at the end, so it also overlaps every stage.
+    const double node_map =
+        has_node_map ? static_cast<double>(cells) * kBytesPerNodeMap : 0.0;
+    // The blend stage (everything full-grid) is the peak; the final RGBA raster
+    // and the mosaic exist together during finalize, which the per-cell figure
+    // already covers.
+    const double stage = static_cast<double>(cells) * kBytesPerCellFine;
+    return tiles + node_map + stage;
 }
 
 /// The footprint area every camera's tile crop box will cover, padded the way

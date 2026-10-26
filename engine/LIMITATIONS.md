@@ -175,10 +175,10 @@ sections below give the engineering detail behind each item.
 - **Hole filling (natural neighbour):** this is the grid-based approximation (Park et al. 2006), not an exact Delaunay/Sibson interpolator. The ring of filled cells right next to the data gets few samples, so a small step can appear there: up to ~3× the local slope × one cell, about 1.5% of range on the test plane. Cost grows with the area of the largest hole (it scales with r²). IDW's neighbour set can slightly exceed the requested k.
 - **BuildDem:**
   - Coverage follows multi-view overlap. On the aerial block, interior-only fill ("enabled") covers 87% of the area: the missing 12% is seen by only one camera. "extrapolated" covers 100%, at 2.5 cm median / 11 cm p90 error in the extrapolated cells, against 1.1 / 3.6 cm in observed cells.
-  - The DEM covers the bounding box of the source data and ignores `chunk.region()`.
+  - The DEM covers the bounding box of the source data and ignores `chunk.region()`. The box is robust to far samples (an axis more than twice its 0.5th-99.5th percentile core is clipped to that core plus 3%), so a few outlier depth points cannot blow the grid up; genuine extents under that ratio are kept exactly.
   - Per-cell aggregation is the median (point cloud and depth maps) or the max (mesh); there is no point-class filtering.
   - TGV uses DEM-specific weights (α1 = 0.2, α0 = 0.4) and treats interpolated cells as unit-weight data. On the aerial scene it gives no measurable gain over no smoothing (p90 0.0293 vs 0.0296 m); the generic defaults smeared metre-scale steps.
-- **Orthomosaic core:** the whole output grid is held in memory as one piece (no tiling or streaming). Twelve 480×360 cameras take ~3.4 s, so large orthos need tiling. No colour correction or gain levelling between cameras. Occlusion uses a fixed half-cell ray-march step, not an exact grid traversal, so very thin occluders can be missed. Mosaic blending is slightly less faithful than hard seams on the synthetic scene (7.4 vs 7.0 mean error) in exchange for less visible seams.
+- **Orthomosaic core:** the output grid is held in memory as one piece at the blend stage (no tiling or streaming of the final mosaic), but the per-camera tiles are cropped to their footprints and photographs are decoded one at a time. Twelve 480×360 cameras take ~3.4 s, so very large orthos still want tiling. No colour correction or gain levelling between cameras. Occlusion uses a fixed half-cell ray-march step, not an exact grid traversal, so very thin occluders can be missed. Mosaic blending is slightly less faithful than hard seams on the synthetic scene (7.4 vs 7.0 mean error) in exchange for less visible seams.
 - **Seamlines:**
   - Multi-scale alpha-expansion with single-threaded push-relabel max-flow. Deterministic, but the seam stage does not use multiple cores.
   - The cost weights (data 0.02, seam 2.0, smoothness 0.30) were tuned on the synthetic block only.
@@ -191,6 +191,7 @@ sections below give the engineering detail behind each item.
   - The occlusion step is half of max(ortho cell, DEM cell), so occluders thinner than about one DEM cell can be missed.
   - `fill_holes` fills only interior holes (natural-neighbour colour, made opaque); it does not inpaint texture.
   - No ghosting filter, colour correction or manual seamline editing.
+  - Peak memory is roughly "output cells × 22 bytes + summed camera footprint × 9 bytes". A run whose estimate exceeds 60% of physical RAM (or `ALPHASHAPE_MEMORY_BUDGET_MB`) is refused with a message naming a coarser resolution, rather than attempting the allocation.
   - Ortho from a mesh surface is less complete (91% coverage, error 15 vs 10–11 grey levels) because the DSM is rasterised from the mesh at ortho resolution.
 - **Validation scene:** the aerial test scene is synthetic: 12 photos with no lighting or shadows, no lens distortion, and exact GPS. Its outer edges (about 1 m at y = ±45) are not seen by any camera. Accuracy on real imagery is not yet measured.
 - Heights are ellipsoidal (WGS84). No geoid model, so DEM heights are not orthometric ("above sea level").

@@ -389,12 +389,13 @@ TEST(Dem, FarOutliersDoNotExplodeTheExtent) {
                 dirty_grid.origin_y - clean_y0, dirty_south - clean_south);
 
     // The outliers sit kilometres away; without the robust bound the grid would
-    // be thousands of cells wider. A 3 m tolerance (12 cells at 0.25 m) allows
-    // the 2% margin plus the origin snapping.
-    EXPECT_LT(std::abs(dirty_grid.origin_x - clean_x0), 3.0);
-    EXPECT_LT(std::abs(dirty_east - clean_east), 3.0);
-    EXPECT_LT(std::abs(dirty_grid.origin_y - clean_y0), 3.0);
-    EXPECT_LT(std::abs(dirty_south - clean_south), 3.0);
+    // be thousands of cells wider. A 6 m tolerance allows the 3% core margin
+    // (3 m on a 100 m block) plus the origin snapping to the 0.25 m cell.
+    constexpr double kExtentTolerance = 6.0;
+    EXPECT_LT(std::abs(dirty_grid.origin_x - clean_x0), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_east - clean_east), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_grid.origin_y - clean_y0), kExtentTolerance);
+    EXPECT_LT(std::abs(dirty_south - clean_south), kExtentTolerance);
     // And the cell count is the same order, not 100x.
     const double clean_cells =
         static_cast<double>(clean_grid.width) * static_cast<double>(clean_grid.height);

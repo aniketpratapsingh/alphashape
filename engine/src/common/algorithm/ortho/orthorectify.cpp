@@ -147,15 +147,24 @@ TileBounds camera_footprint_bounds(
     }
 
     const Eigen::Vector3d centre = camera.centre();
-    // The grid's own diagonal bounds how far a visible ground point can be from
-    // the camera. Anything beyond that cannot land on the grid, so clipping the
-    // border rays there loses nothing.
-    const double mx = camera.plane_metres_per_unit.x();
-    const double my = camera.plane_metres_per_unit.y();
-    const double grid_diagonal =
-        std::hypot(static_cast<double>(out_grid.width) * out_grid.pixel_size_x * mx,
-                   static_cast<double>(out_grid.height) * out_grid.pixel_size_y * my);
-    const double reach = grid_diagonal + std::abs(centre.z() - lowest_height) + 1.0;
+    // The farthest any on-grid ground point can be from the optical centre: the
+    // largest corner distance from the camera's own position on the grid, plus
+    // the vertical relief. Clipping each border ray there keeps a near-horizontal
+    // border ray (a wide-angle or fisheye edge) from producing an unbounded
+    // intersection without losing anything that could be on the grid.
+    const Eigen::Vector3d centre_plane =
+        camera.local_to_plane ? camera.local_to_plane(centre) : centre;
+    const double east = out_grid.origin_x +
+                        static_cast<double>(out_grid.width) * out_grid.pixel_size_x;
+    const double south =
+        out_grid.origin_y - static_cast<double>(out_grid.height) * out_grid.pixel_size_y;
+    double reach = std::abs(centre.z() - lowest_height) + 1.0;
+    for (const double x : {out_grid.origin_x, east}) {
+        for (const double y : {out_grid.origin_y, south}) {
+            reach = std::max(reach, std::hypot(x - centre_plane.x(), y - centre_plane.y()));
+        }
+    }
+    reach += std::abs(centre.z() - highest_height) + 1.0;
 
     const TileBounds none;  // zero size: nothing accumulated yet
     double min_x = std::numeric_limits<double>::infinity();

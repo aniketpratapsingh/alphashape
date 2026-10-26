@@ -134,27 +134,6 @@ void tile_rgb_cell(const OrthoTile& tile, std::size_t cell, int width, std::uint
     }
 }
 
-/// A tile laid out over the whole grid from a full-grid buffer pair: the
-/// pre-crop representation, used by the synthetic seamline scenes.
-::testing::AssertionResult fill_full_grid_tile(OrthoTile& tile, int width, int height,
-                                               const std::vector<std::uint8_t>& valid,
-                                               const std::vector<float>& score,
-                                               const std::vector<std::uint8_t>& rgb) {
-    if (valid.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) ||
-        score.size() != valid.size() || rgb.size() != valid.size() * 3) {
-        return ::testing::AssertionFailure() << "tile buffers do not match " << width << "x"
-                                             << height;
-    }
-    tile.x0 = 0;
-    tile.y0 = 0;
-    tile.width = width;
-    tile.height = height;
-    tile.valid = valid;
-    tile.score = score;
-    tile.rgb = rgb;
-    return ::testing::AssertionSuccess();
-}
-
 bool in_building(const RasterGrid& grid, int col, int row) {
     const Eigen::Vector2d c = grid.pixel_center(col, row);
     return c.x() >= aerial_fixture::kBuildX0 && c.x() <= aerial_fixture::kBuildX1 &&
