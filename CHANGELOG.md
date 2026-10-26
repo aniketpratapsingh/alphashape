@@ -6,8 +6,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The orthomosaic's default cell is the ground sample distance the photographs actually resolve.** `BuildOrthomosaic` measures each camera's footprint on the DEM (median of slant range / (focal × cos incidence) over the enabled cameras) and uses that for the output grid instead of a fixed fraction of the DEM cell, so an oblique flight correctly comes out at about twice the nadir footprint. The measurement assumes level ground at the DEM median height: the incidence term is the vertical, not the local surface normal, so it does not follow a slope. A Geographic (EPSG:4326) grid gets the result converted to degrees at the surface's latitude.
+- **`BuildDem`'s automatic cell applies the same incidence correction**, so an oblique flight's DEM is no longer over-sampled by 1/cos(incidence).
+- Orthomosaic memory is bounded before allocation: per-camera tiles are cropped to their footprints, photographs are decoded one at a time, and a run whose estimated peak exceeds 60 % of physical RAM (`ALPHASHAPE_MEMORY_BUDGET_MB` overrides for tests) is refused with a message naming a coarser resolution.
+
+### Changed
+
+- The occlusion ray march steps at half a **DEM** cell rather than half the larger of the ortho and DEM cells, and each ray is capped at 4096 samples. Asking for an ortho 4× finer than the DEM no longer multiplies the march cost per unit area by 16. Occluders thinner than about one DEM cell can still be missed.
+- `BuildDem` and `BuildOrthomosaic` no longer clamp an automatic resolution to a quarter of the DEM cell. The measured GSD stands, with only an eighth-of-a-cell sanity floor.
+
 ### Fixed
 
+- **Build Orthomosaic no longer overflows its grid dimensions.** A resolution fine enough to need more than 2^31−1 output cells (or a non-finite one) is refused in double precision with the resolution, the extent, the cell count and "choose a coarser resolution", instead of casting an unbounded double to `int` and then sizing buffers from a negative length.
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
 
 ## [0.1.0] - Unreleased

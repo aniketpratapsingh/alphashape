@@ -746,9 +746,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // The default is the true ground sample distance at each camera's image
     // centre on the surface: slant range / (focal_px * cos incidence), the
     // median over the enabled cameras, in metres. It is then converted into the
-    // frame's own plane units (a Geographic grid is in degrees) and floored at a
-    // quarter of the surface cell, so the ortho is never finer than the surface
-    // it is resampled from.
+    // frame's own plane units (a Geographic grid is in degrees) and floored at
+    // only ONE EIGHTH of the surface cell, as a sanity check on the measurement.
+    // The floor is deliberately not a meaningful fraction of the DEM: the
+    // measured GSD is what the user's photographs actually resolve, and a
+    // quarter-cell floor overrode it whenever the DEM was coarser than the
+    // imagery (a 1 m DEM forced a 0.25 m ortho from 0.4 m pixels).
     //
     // Measuring each camera's footprint on the surface (rather than using
     // "camera height / focal") is what makes an oblique flight come out right:

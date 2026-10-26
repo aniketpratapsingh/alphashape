@@ -338,7 +338,12 @@ TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     std::printf("[BuildOrthomosaic.MatchesTruthOrtho] auto resolution=%.6f (DEM %.3f)\n",
                 resolution, dem_grid.pixel_size_x);
     EXPECT_GT(resolution, 0.0);
-    EXPECT_GE(resolution, 0.25 * dem_grid.pixel_size_x - 1e-9);
+    // The automatic cell is the measured ground GSD, floored only by the DEM/8
+    // sanity check. For this fixture (0.25 m DEM, 60 m flight, f = 500) the
+    // measured GSD is ~0.116 m, well above that floor and coarser than the old
+    // quarter-DEM-cell clamp would have allowed.
+    EXPECT_GE(resolution, 0.125 * dem_grid.pixel_size_x - 1e-9);
+    EXPECT_NEAR(resolution, 0.116, 0.02);
     expect_grid_covers_dem(ortho.raster.grid, dem_grid, resolution);
 
     // Every label is a chunk camera id or -1.
@@ -935,7 +940,7 @@ TEST(OrthoAutoResolution, DefaultFollowsTheMeasuredGsdNotAQuarterDemCell) {
     EXPECT_GT(cell, 1.2 * (0.25 * kCell));
 }
 
-TEST(OrthoAutoResolution, MedianOverTheFlightAndSlopeAwareFootprint) {
+TEST(OrthoAutoResolution, MedianOverTheFlightFootprint) {
     // A mixed nadir/45-degree flight: the median is the middle order statistic,
     // here the nadir value (2 cameras nadir at 50 m, 1 oblique at 100 m so its
     // footprint is also "2x", i.e. equal; use heights 50, 50 and 100 to make the

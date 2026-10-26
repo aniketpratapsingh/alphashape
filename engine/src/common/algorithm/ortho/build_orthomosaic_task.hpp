@@ -48,12 +48,14 @@ using SurfaceHeight = std::function<double(double x, double y)>;
 ///     gsd = slant_range / (focal_px * cos(incidence))
 ///
 /// i.e. the pixel's size perpendicular to the optical axis (slant_range /
-/// focal_px) projected onto the terrain along the surface normal (taken as
-/// vertical, the plane frame's up). A nadir camera over level ground therefore
-/// gives height / focal_px, the classic formula; a 45-degree oblique over level
-/// ground gives 2 * height / focal_px, because an image pixel spans
-/// `height / focal_px` across the image and `height / (focal_px cos 45)` along
-/// the line of sight, so the footprint grows by sec(incidence) on that axis.
+/// focal_px) projected onto the ground. The projection uses the VERTICAL
+/// (|direction.z|, the plane frame's up), not the local surface normal: the
+/// footprint therefore assumes level ground at the DEM's median height and does
+/// not follow a slope. A nadir camera over level ground gives height / focal_px,
+/// the classic formula; a 45-degree oblique over level ground gives
+/// 2 * height / focal_px, because an image pixel spans `height / focal_px`
+/// across the image and `height / (focal_px cos 45)` along the line of sight, so
+/// the footprint grows by sec(incidence) on that axis.
 ///
 /// `stride_metres` is the marching step; a surface cell (or one metre) is ample.
 /// `lowest_surface_metres` is the smallest height the surface takes (pass NaN to
