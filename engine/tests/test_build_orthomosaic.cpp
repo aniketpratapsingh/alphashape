@@ -1347,10 +1347,10 @@ TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {
     // run: the window is clipped to the whole grid, nothing is pinned, and the
     // output must be byte-identical to the default (unblocked) path.
     OrthoSetup& s = setup();
-    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, true, true));
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, true, true));
     ASSERT_FALSE(whole.empty());
     const Orthomosaic forced =
-        run_ortho(s, block_params("mosaic", 0.25, 4096, true, true));
+        run_ortho(s, block_params("mosaic", 0.125, 4096, true, true));
 
     std::printf("[BuildOrthomosaic.BlockWiseSingle] grid=%dx%d levels default\n",
                 whole.raster.grid.width, whole.raster.grid.height);
@@ -1394,9 +1394,9 @@ TEST(BuildOrthomosaic, BlockWiseAverageAndDisabledMatchTheWholeGrid) {
     // is the per-cell argmax and cannot differ by optimisation order.
     OrthoSetup& s = setup();
     for (const char* mode : {"average", "disabled"}) {
-        const Orthomosaic whole = run_ortho(s, block_params(mode, 0.25, 0, false, false));
+        const Orthomosaic whole = run_ortho(s, block_params(mode, 0.125, 0, false, false));
         ASSERT_FALSE(whole.empty()) << mode;
-        const Orthomosaic blocked = run_ortho(s, block_params(mode, 0.25, 256, false, false));
+        const Orthomosaic blocked = run_ortho(s, block_params(mode, 0.125, 512, false, false));
         ASSERT_EQ(blocked.raster.grid, whole.raster.grid) << mode;
         ASSERT_EQ(blocked.raster.data.size(), whole.raster.data.size()) << mode;
 
@@ -1429,10 +1429,10 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     // the cells a later block inherits from an earlier one keep their labels,
     // which is what makes the seams continuous instead of restarting per block.
     OrthoSetup& s = setup();
-    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, true, true));
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, true, true));
     ASSERT_FALSE(whole.empty());
     ScopedLogCapture capture;
-    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.25, 256, true, true));
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, 512, true, true));
     const std::string warnings = capture.text(LogLevel::Info);
     ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
 
@@ -1452,7 +1452,7 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     // blocks; a continuous seam means the labels agree there where both are
     // labelled (a seam may legitimately run ALONG a border, so this is a
     // diagnostic, not a hard zero).
-    constexpr int kBlock = 256;
+    constexpr int kBlock = 512;
     const int w = blocked.raster.grid.width;
     const int h = blocked.raster.grid.height;
     std::size_t across = 0;
@@ -1486,7 +1486,7 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     EXPECT_LT(across, across_labelled / 4) << "seams restarted at block borders";
 
     // Determinism: the blocked path is thread-count independent like the rest.
-    const Orthomosaic again = run_ortho(s, block_params("mosaic", 0.25, 256, true, true));
+    const Orthomosaic again = run_ortho(s, block_params("mosaic", 0.125, 512, true, true));
     EXPECT_EQ(again.raster.data, blocked.raster.data);
     EXPECT_EQ(again.labels, blocked.labels);
 
@@ -1516,9 +1516,9 @@ TEST(BuildOrthomosaic, BlockWiseFillHolesMatchesTheWholeGrid) {
     // which a block cannot know. With it on, the blocked run must reproduce the
     // single-piece coverage exactly (the same cells become opaque).
     OrthoSetup& s = setup();
-    const Orthomosaic whole = run_ortho(s, block_params("average", 0.25, 0, true, false));
+    const Orthomosaic whole = run_ortho(s, block_params("average", 0.125, 0, true, false));
     ASSERT_FALSE(whole.empty());
-    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.25, 256, true, false));
+    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.125, 512, true, false));
     ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
 
     std::size_t opaque_whole = 0;
@@ -1547,9 +1547,9 @@ TEST(BuildOrthomosaic, BlockWiseMosaicMatchesWithInOneGreyLevel) {
     // refinement is a global optimisation over block+margin and legitimately
     // moves seams, so it is tested separately (BlockWiseSeamsStayContinuous...).
     OrthoSetup& s = setup();
-    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.25, 0, false, false));
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, false, false));
     ASSERT_FALSE(whole.empty());
-    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.25, 256, false, false));
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, 512, false, false));
     ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
 
     std::size_t pixels = 0;
