@@ -987,9 +987,34 @@ TEST(OrthoAutoResolution, GeographicGridIsInDegreesNotMetres) {
     // A 1 cm GSD becomes ~1 cm / metres-per-degree degrees: a number three
     // orders of magnitude below a degree, never 0.01 (a metre value used as a
     // degree cell) and never 1 (a bare metric fallback).
+    //
+    // The expectation is computed INDEPENDENTLY of the frame, from the WGS84
+    // meridian arc and the parallel radius at 48.7 N, so it is not the same
+    // expression the implementation evaluates:
+    //
+    //   meridian arc per degree  M(lat) * pi/180,
+    //   parallel arc per degree  N(lat) * cos(lat) * pi/180,
+    //   M = a(1-e^2)/w^(3/2), N = a/sqrt(w), w = 1 - e^2 sin^2(lat).
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kA = 6378137.0;
+    constexpr double kF = 1.0 / 298.257223563;
+    constexpr double kLatDeg = 48.7;
+    const double e2 = 2.0 * kF - kF * kF;
+    const double lat_rad = kLatDeg * kPi / 180.0;
+    const double sin_lat = std::sin(lat_rad);
+    const double w = 1.0 - e2 * sin_lat * sin_lat;
+    const double meridian_per_deg = kA * (1.0 - e2) / (w * std::sqrt(w)) * kPi / 180.0;
+    const double parallel_per_deg = kA / std::sqrt(w) * std::cos(lat_rad) * kPi / 180.0;
+    // The frame's own arc lengths must agree with those to well inside a metre,
+    // which is what makes the conversion below meaningful at all.
+    EXPECT_NEAR(metres_per_degree.y(), meridian_per_deg, 1.0);
+    EXPECT_NEAR(metres_per_degree.x(), parallel_per_deg, 1.0);
+
+    // The 1 cm cell is 0.01 divided by the LARGER arc length (the meridian, y),
+    // taken from the independent formula rather than the frame's accessor.
     const double cell_degrees = 0.01 / std::max(metres_per_degree.x(), metres_per_degree.y());
-    const double expected = 0.01 / metres_per_degree.y();  // the larger component
-    EXPECT_NEAR(cell_degrees, expected, 1e-12);
+    const double expected_independent = 0.01 / meridian_per_deg;
+    EXPECT_NEAR(cell_degrees, expected_independent, 0.01 * expected_independent);
     EXPECT_LT(cell_degrees, 1e-6);
 }
 
