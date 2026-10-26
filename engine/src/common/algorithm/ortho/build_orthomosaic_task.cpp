@@ -968,12 +968,16 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         // than the whole flight, and never above the absolute cap. At least one
         // frame: a cache smaller than the frame it is asked to hold would evict it
         // immediately and make the miss path pointless.
+        //
+        // An UNKNOWN budget (0) gets one frame, not the cap: the budget is
+        // unknown precisely when the platform could not report physical memory,
+        // which is the worst possible moment to reserve gigabytes for a cache.
         const double photo_bytes = 3.0 * std::max(1.0, input.photo_cells);
         const double flight = photo_bytes * static_cast<double>(std::max(1, input.camera_count));
         const double remaining =
             input.budget_bytes != 0
                 ? std::max(0.0, static_cast<double>(input.budget_bytes) - fixed)
-                : static_cast<double>(kPhotoCacheMaxBytes);
+                : 0.0;
         const double share = kPhotoCacheBudgetFraction * remaining;
         std::uint64_t cache = static_cast<std::uint64_t>(
             std::min(share, std::min(flight, static_cast<double>(kPhotoCacheMaxBytes))));
