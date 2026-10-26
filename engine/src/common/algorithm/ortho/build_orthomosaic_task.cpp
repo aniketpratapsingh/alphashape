@@ -406,25 +406,92 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
     return entries;
 }
 
-/// Bytes per output cell the fine pipeline holds at its PEAK, stage by stage
-/// (the stages are sequential, so the peak is the largest one, not the sum):
-///
-///   * seamlines: labels int32 (4) + `best` double (8) + `any_valid` u8 (1) +
-///     the two checkerboard parity lists of size_t (8)         = 21
-///   * blend mosaic: labels (4) + out.rgb (3) + out.valid (1) + the three
-///     accumulator pyramids at sum(1/4^k)*4B (16) + their collapse result (12)
-///     + one tile's Gaussian/Laplacian/mask planes (~20)        = 56
-///   * finalize: mosaic (4) + result RGBA (4) + fill_holes' per-channel
-///     float+u8 pair, EDT and masks (~19)                       = 27
-///
-/// 56 B/cell is the blend stage, i.e. the peak. The tiles are counted
-/// separately: they are cropped to the camera footprints, so their cost is a
-/// footprint area, not C x the grid.
-constexpr double kBytesPerCellFine = 56.0;
+// -- per-stage memory model ------------------------------------------------
+//
+// Everything below is bytes PER OUTPUT CELL. The stages run one after another,
+// so the peak is the largest stage, never the sum of unrelated stages. Only
+// what is genuinely resident in each stage is counted there.
 
-/// Bytes per output-grid NODE in the plane->local map (float3 + 2 floats) when
-/// the chunk is georeferenced: about one node per output cell.
+/// Resident throughout every stage once `initialize` finishes:
+///   * the output grid's seam labels, int32            = 4
+///   * the plane->local node map, (grid+1)^2 nodes of float3 + 2 floats,
+///     i.e. 20 B/node ~ 20 B/cell (georeferenced chunks only)
+constexpr double kBytesPerCellGridLabels = 4.0;
 constexpr double kBytesPerNodeMap = 20.0;
+
+/// Rectify stage. Tiles are cropped to their footprints, so this stage's cost
+/// is a footprint area plus one decoded photograph; only the grid labels are
+/// full-grid (and they are not allocated yet at that point).
+///
+/// Seam stage, full-grid part (`assign_seams` fine level):
+///   * labels int32 (the caller's, counted above)                = -
+///   * `best` double                                             = 8
+///   * `any_valid` u8                                            = 1
+///   * the two checkerboard parity lists, size_t per cell        = 8
+///   * the alpha-expansion graph (see kSeamGraphBytesPerNode)
+constexpr double kBytesPerCellSeamField = 8.0 + 1.0 + 8.0;
+
+/// Blend stage, full-grid part (`ortho::blend`, Mosaic):
+///   * out.rgb u8x3                                              = 3
+///   * out.valid u8                                              = 1
+///   * out.labels int32 (a copy of the caller's labels)           = 4
+///   * the three per-channel accumulator pyramids, sum(1/4^k) of
+///     a float plane, i.e. 3 * 4 / (1 - 1/4)                      = 16
+///   * one tile's Gaussian/Laplacian/mask planes at the same
+///     geometric series, about 3 planes at ~1.33 * 4 B            = 16
+///   * the collapse's resize/up sources, another ~2 planes        = 11
+///   * `scratch_mask` u8                                          = 1
+constexpr double kBytesPerCellBlend = 3.0 + 1.0 + 4.0 + 16.0 + 16.0 + 11.0 + 1.0;
+
+/// Finalize stage, full-grid part. The old code built `result.raster` (RGBA
+/// u8 = 4 B/cell) while the blend mosaic (rgb+valid+labels = 8 B/cell) was
+/// still alive, then `fill_holes` ran one channel at a time:
+///   * result RGBA u8                                            = 4
+///   * mosaic rgb u8x3 + valid u8 + labels int32                 = 8
+///   * fill_holes per channel: float values (4) + u8 mask (1)
+///     + NearestSites distance float (4) + site int32 (4)
+///     + blocked u8 (1) + fill u8 (1) + result float (4)
+///     + is_source u8 (1) + one band of Sibson accumulators
+///       (bounded by kSibsonBandBudgetBytes, well under 1 B/cell
+///       for any grid large enough to be interesting)              ~21
+constexpr double kBytesPerCellFinalize = 4.0 + 8.0 + 21.0;
+
+/// Seam stage's extra: the push-relabel graph `expand_alpha` builds for ONE
+/// alpha move (`MaxFlow` in seamlines.cpp).
+///
+/// Nodes are the cells not already carrying alpha, i.e. up to one node per
+/// cell of the level being solved, plus source and sink. Per node, from the
+/// members' actual element types:
+///   head_    int     4
+///   height_  int     4
+///   current_ int     4
+///   excess_  double  8
+///   seen_    char    1
+///                                                          = 21
+/// Edges: `add_edge` pushes two directed entries, so one graph edge is 2 x
+/// (to_ int 4 + cap_ double 8 + next_ int 4) = 32 B. Each cell contributes two
+/// unary edges (to alpha / keep) plus at most two pair edges shared with its
+/// right and lower neighbours; the pair term emits one directed edge for the
+/// shifted constant, one for `q keeps` and one for `q -> p`, so 3 + at most 2 =
+/// 5 edges per cell in the worst case. 5 x 32 = 160.
+///
+/// `node` (int per cell, the cell -> node map) is another 4.
+///
+/// 21 + 160 + 4 = 185 B per NODE. The edge vectors are NOT reserved (their final
+/// size depends on how many cells already carry alpha), so a 1.5x factor covers
+/// the reallocation transient while the old and the new buffer are both alive:
+/// 277.5 B per node.
+///
+/// WHERE IT RUNS. `assign_seams` calls alpha_expansion only on its COARSE
+/// pyramid levels (default coarse_levels = 2, i.e. 2x and 4x, so 1/4 and 1/16 of
+/// the fine cells); the full-resolution grid is finished by the ICM polish,
+/// which allocates no graph. The seam stage's graph therefore peaks at the 2x
+/// level. Should a future caller solve the fine grid with alpha-expansion
+/// (coarse_levels = 0), the graph would be 4x this figure -- which is exactly
+/// why the estimate keeps the coarse-level assumption visible here.
+constexpr double kSeamGraphBytesPerNode = 1.5 * (21.0 + 5.0 * 32.0 + 4.0);
+/// The coarsest-so-fine level alpha_expansion actually solves: the 2x level.
+constexpr double kSeamGraphCellFraction = 0.25;
 
 /// Bytes per camera footprint cell in a rectified tile (rgb u8x3 + valid u8 +
 /// score float).
@@ -432,39 +499,81 @@ constexpr double kBytesPerTileCell = 8.0;
 
 /// A coarse seamline pyramid level holds its tiles at 1/factor^2 of the fine
 /// area; the two configured levels (2x and 4x) therefore add 1/4 + 1/16 of the
-/// footprint.
+/// footprint. The coarse levels also build their own Field (best/any_valid/
+/// parity at the coarse cell count) and their own label vector.
 constexpr double kCoarseFootprintFraction = 0.25 + 0.0625;
+constexpr double kCoarseFieldBytesPerCell = kBytesPerCellSeamField + kBytesPerCellGridLabels;
 
-/// Estimates the peak memory BuildOrthomosaic needs, in bytes.
+/// Per-stage full-grid byte totals.
+struct StageBytes {
+    double rectify = 0.0;
+    double seams = 0.0;
+    double blend = 0.0;
+    double finalize = 0.0;
+};
+
+/// The peak memory BuildOrthomosaic needs, in bytes.
 ///
 /// `footprint_cells` is the summed area of every camera's tile crop box (the
 /// rectified-tile cost); it is predicted from camera_footprint_bounds() before
-/// any tile is allocated.
-double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map) {
-    // The tile set is resident throughout the seam and blend stages, so it adds
-    // to whichever stage is the peak.
+/// any tile is allocated. `has_node_map` adds the plane->local map, which is
+/// built first and lives until the task ends.
+///
+/// The formula, stage by stage (each stage's residency is what is listed in
+/// its comment above; the peak is their maximum, not their sum):
+///
+///   rectify  = tiles (footprint, +coarse levels) + ONE decoded photograph
+///   seams    = labels + node map + seam field + seam graph
+///              + tiles (resident: the coarse levels read them) + coarse field
+///   blend    = labels + node map + blend planes + tiles (read per cell)
+///   finalize = labels + node map + result RGBA + live mosaic + fill_holes
+///
+/// The decoded photograph exists only inside the rectify loop, so it is counted
+/// there and nowhere else: it is released before the seam stage starts.
+double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map,
+                           double photo_cells) {
+    const double grid = static_cast<double>(cells);
+    const double node_map = has_node_map ? grid * kBytesPerNodeMap : 0.0;
+    // The tile set is resident through rectify, seams and blend.
     const double tiles =
         footprint_cells * kBytesPerTileCell * (1.0 + kCoarseFootprintFraction);
-    // The plane->local node map is built before rectification and released with
-    // the task's locals at the end, so it also overlaps every stage.
-    const double node_map =
-        has_node_map ? static_cast<double>(cells) * kBytesPerNodeMap : 0.0;
-    // The blend stage (everything full-grid) is the peak; the final RGBA raster
-    // and the mosaic exist together during finalize, which the per-cell figure
-    // already covers.
-    const double stage = static_cast<double>(cells) * kBytesPerCellFine;
-    return tiles + node_map + stage;
+    // One decoded photograph, 3 channels of u8, is resident while its tile is
+    // built. The image is dropped before the next camera decodes.
+    const double photo = photo_cells * 3.0;
+
+    StageBytes stages;
+    stages.rectify = tiles + photo;
+    // The seam stage carries the tiles (its coarse levels read them), the fine
+    // Field (best/any_valid/parity) and the push-relabel graph for the 2x
+    // level's alpha moves. Both coarse levels add their own Field and labels at
+    // 1/4 and 1/16 of the fine cell count.
+    const double coarse = grid * kCoarseFieldBytesPerCell * (1.0 / 4.0 + 1.0 / 16.0);
+    const double seam_graph = grid * kSeamGraphBytesPerNode * kSeamGraphCellFraction;
+    stages.seams = grid * kBytesPerCellGridLabels + node_map +
+                   grid * kBytesPerCellSeamField + seam_graph + tiles + coarse;
+    stages.blend =
+        grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellBlend + tiles;
+    stages.finalize =
+        grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellFinalize;
+    return std::max(std::max(stages.rectify, stages.seams),
+                    std::max(stages.blend, stages.finalize));
 }
 
 /// The footprint area every camera's tile crop box will cover, padded the way
 /// the rectifier pads it (two cells, and the cell rounding on each edge). This
 /// is the same bound orthorectify() allocates against, so the guard's estimate
 /// cannot be smaller than the allocation that follows.
+///
+/// It must run BEFORE the plane->local node map is allocated (that map is
+/// itself `cells * 20 B`, the largest single grid-proportional object here), so
+/// it takes no map: it evaluates the exact frame transform at the grid's mid
+/// column and the surface's lowest/highest height and uses those two local
+/// heights for `camera_footprint_bounds`. The node map it stands in for differs
+/// from the exact transform by far less than the footprint's own 1% inflation and
+/// three-cell margin.
 double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
                                  const RasterGrid& grid, const GeoRaster<float>& surface,
-                                 float surface_nodata, const elevation::SurfaceFrame& frame,
-                                 const std::function<Eigen::Vector3d(const Eigen::Vector3d&)>&
-                                     to_local) {
+                                 float surface_nodata, const elevation::SurfaceFrame& frame) {
     double lowest = std::numeric_limits<double>::infinity();
     double highest = -std::numeric_limits<double>::infinity();
     for (const float h : surface.data) {
@@ -480,6 +589,9 @@ double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
 
     const Eigen::Vector2d metres_per_unit =
         frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
+    const bool mapped = !frame.is_local();
+    // `frame` is captured by reference; this lambda allocates nothing.
+    const auto to_local = [&frame](const Eigen::Vector3d& p) { return frame.to_local(p); };
     double total = 0.0;
     for (const CameraEntry& entry : cameras) {
         ortho::OrthoCamera camera;
@@ -489,7 +601,7 @@ double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
         camera.plane_metres_per_unit = metres_per_unit;
         double local_low = lowest;
         double local_high = highest;
-        if (to_local) {
+        if (mapped) {
             camera.plane_to_local = to_local;
             camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
                 return frame.to_plane(p);
@@ -507,6 +619,22 @@ double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
         total += static_cast<double>(bounds.width) * static_cast<double>(bounds.height);
     }
     return total;
+}
+
+/// The source pixel count of the largest photograph, i.e. what ONE decoded
+/// frame costs (3 bytes per pixel). Taken from the calibration, which carries
+/// the sensor dimensions, so no image has to be decoded to know it; a camera
+/// with no recorded sensor size falls back to 1 so the term never vanishes.
+double largest_photograph_cells(const std::vector<CameraEntry>& cameras) {
+    double largest = 1.0;
+    for (const CameraEntry& entry : cameras) {
+        const double pixels = static_cast<double>(entry.calibration.width) *
+                              static_cast<double>(entry.calibration.height);
+        if (std::isfinite(pixels) && pixels > 0.0) {
+            largest = std::max(largest, pixels);
+        }
+    }
+    return largest;
 }
 
 }  // namespace
@@ -942,8 +1070,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const std::uint64_t cells = static_cast<std::uint64_t>(grid.width) *
                                 static_cast<std::uint64_t>(grid.height);
     const double footprint_cells =
-        predicted_footprint_cells(cameras, grid, surface, surface_nodata, frame, to_local);
-    const double peak_bytes = estimate_peak_bytes(cells, footprint_cells, bool{to_local});
+        predicted_footprint_cells(cameras, grid, surface, surface_nodata, frame);
+    const double photo_cells = largest_photograph_cells(cameras);
+    const double peak_bytes =
+        estimate_peak_bytes(cells, footprint_cells, bool{to_local}, photo_cells);
     const std::uint64_t budget = platform::memory_budget_bytes();
     if (budget != 0 && peak_bytes > static_cast<double>(budget)) {
         throw ValueError(
