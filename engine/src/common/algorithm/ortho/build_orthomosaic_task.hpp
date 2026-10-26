@@ -14,6 +14,8 @@
 // test) is ours.
 
 #include <functional>
+#include <limits>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -22,6 +24,50 @@
 #include "model/raster/geo_raster.hpp"
 
 namespace alphashape {
+namespace ortho {
+
+/// One camera's principal axis for the automatic-resolution rule, expressed in
+/// a METRIC plane frame (x east, y north, z up, all metres).
+struct FootprintCamera {
+    Eigen::Vector3d centre = Eigen::Vector3d::Zero();  ///< optical centre, metres
+    Eigen::Vector3d direction = Eigen::Vector3d(0, 0, -1);  ///< principal axis
+    double focal_px = 0.0;                             ///< focal length in pixels
+};
+
+/// Surface height (metres, NaN where unknown) at a horizontal position in the
+/// same metric plane frame as the cameras.
+using SurfaceHeight = std::function<double(double x, double y)>;
+
+/// The median ground sample distance (metres) the cameras see at their image
+/// centres on the surface sampled by `height`.
+///
+/// For each camera the principal ray is intersected with the surface and the
+/// footprint is taken as
+///
+///     gsd = slant_range / (focal_px * cos(incidence))
+///
+/// i.e. the pixel's size perpendicular to the optical axis (slant_range /
+/// focal_px) projected onto the terrain along the surface normal (taken as
+/// vertical, the plane frame's up). A nadir camera over level ground therefore
+/// gives height / focal_px, the classic formula; a 45-degree oblique over level
+/// ground gives 2 * height / focal_px, because an image pixel spans
+/// `height / focal_px` across the image and `height / (focal_px cos 45)` along
+/// the line of sight, so the footprint grows by sec(incidence) on that axis.
+///
+/// `stride_metres` is the marching step; a surface cell (or one metre) is ample.
+/// `lowest_surface_metres` is the smallest height the surface takes (pass NaN to
+/// let the routine probe around the camera instead); it bounds the ray march, so
+/// a camera on a ridge above a valley still finds the ground.
+/// A camera whose principal axis does not reach the surface, or that looks
+/// nearly horizontally along it (cos(incidence) < 0.15), contributes nothing.
+/// Returns 0 when no camera contributes; the caller then falls back to the
+/// surface's own cell.
+double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras,
+                                     const SurfaceHeight& height, double stride_metres,
+                                     double lowest_surface_metres = std::numeric_limits<
+                                         double>::quiet_NaN());
+
+}  // namespace ortho
 
 /// Build the plane-frame -> chunk-local map the orthorectifier applies before
 /// the chunk-local camera pose.

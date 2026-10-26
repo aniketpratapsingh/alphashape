@@ -186,7 +186,7 @@ sections below give the engineering detail behind each item.
   - The full 12-camera ortho (rectify + seams + blend) takes ~4.5 s against a 5 s test budget, so the test can be flaky on a loaded machine.
 - **BuildOrthomosaic:**
   - No reprojection: `projection` must equal the DEM's EPSG, otherwise it fails with "reproject the DEM first".
-  - Auto resolution assumes a metric plane (UTM/local), not EPSG:4326.
+  - The automatic resolution is the true ground sample distance measured at each camera's image centre on the surface (slant range / focal / cos incidence, median over the enabled cameras). It is correct for an oblique flight (a 45-degree camera yields about twice the nadir footprint) and for a non-level surface at those camera centres; it does not model the change in footprint across a slanted surface within one image. A Geographic (EPSG:4326) grid gets the metric result converted to degrees at the surface's latitude.
   - Mosaic blending is ~3× slower than average/disabled (28 s vs 9 s for a 1025×779 ortho of 12 images), with everything in memory.
   - The occlusion step is half of max(ortho cell, DEM cell), so occluders thinner than about one DEM cell can be missed.
   - `fill_holes` fills only interior holes (natural-neighbour colour, made opaque); it does not inpaint texture.

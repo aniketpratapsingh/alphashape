@@ -755,5 +755,53 @@ TEST(ExportDem, EmptyElevationThrows) {
     EXPECT_THROW(run_task(builtin_registry(), document, "ExportDem", params), Error);
 }
 
+// ---------------------------------------------------------------------------
+// 8. Automatic resolution on a Geographic (EPSG:4326) grid
+// ---------------------------------------------------------------------------
+//
+// The depth-map GSD the automatic rule measures is a GROUND distance in
+// metres, but an EPSG:4326 grid's pixel size is in degrees. The rule must
+// convert with the frame's metres-per-degree at the surface's own latitude: a
+// value left in metres would make the DEM ~111000x too coarse per degree, and a
+// value divided by the wrong constant would be just as wrong.
+
+TEST(DemAutoResolution, GeographicDepthMapCellIsInDegrees) {
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    add_synthetic_tie_points(chunk);
+
+    Params depth = make_params(builtin_registry().require("BuildDepthMaps"));
+    depth.set("downscale", ParamValue{std::int64_t{1}});
+    depth.set("filter_mode", ParamValue{std::string("mild")});
+    run_task(builtin_registry(), document, "BuildDepthMaps", depth);
+    ASSERT_FALSE(chunk.depth_maps().empty());
+
+    // Ask for the automatic cell in the chunk's own geographic CRS: the DEM is
+    // written in degrees.
+    Params dem = dem_params("depth_maps", "enabled", 0.0, 4326, "nearest", "none");
+    run_build_dem(document, dem);
+    const Elevation& elevation = chunk.elevation();
+    ASSERT_FALSE(elevation.empty());
+    ASSERT_EQ(elevation.epsg, 4326);
+
+    const double cell_deg = elevation.raster.grid.pixel_size_x;
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 4326);
+    const Eigen::Vector2d metres_per_degree = frame.metres_per_plane_unit(
+        elevation.raster.grid.pixel_center(0, elevation.raster.grid.height / 2).y());
+    const double cell_metres =
+        cell_deg * std::max(metres_per_degree.x(), metres_per_degree.y());
+    std::printf("[DemAutoResolution.Geographic] cell=%.9f deg = %.4f m (m/deg %.1f, %.1f)\n",
+                cell_deg, cell_metres, metres_per_degree.x(), metres_per_degree.y());
+
+    // The 12-camera nadir block at 60 m with f = 500 covers ~0.12 m per pixel.
+    // The converted cell must be a plausible ground distance of that order:
+    // never a metre value reinterpreted as degrees (~111 km per pixel), and
+    // never a degree value left unconverted (~1e-7 m per pixel).
+    EXPECT_GT(cell_deg, 0.0);
+    EXPECT_LT(cell_deg, 1e-4) << "a degree cell for this block is ~1e-6 deg";
+    EXPECT_GT(cell_metres, 0.01);
+    EXPECT_LT(cell_metres, 5.0);
+}
+
 }  // namespace
 }  // namespace alphashape

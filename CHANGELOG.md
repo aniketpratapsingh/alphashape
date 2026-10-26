@@ -78,4 +78,22 @@ the installers are unsigned, the macOS build is Apple silicon only, GPU accelera
 off in the Windows build, and there is no georeferencing, marker editing or tiled-model
 output yet.
 
+### Fixed
+
+- The default orthomosaic resolution now follows the true ground sample distance instead of
+  falling back to a 0.25 m cell. On a 36-photo oblique building flight (Sony NEX-5,
+  16 mm, true GSD 1.9 cm) the automatic ortho was ~25 cm per pixel, 13x coarser than the
+  imagery, because the measured footprint was dropped whenever the DEM's own cell was
+  coarse (a decimated mesh's median edge, or a sparse point cloud's spacing) and the
+  hard-coded 0.25 m literal took over. The rule now measures each camera's footprint on
+  the surface at its image centre (slant range / focal / cos incidence), so an oblique
+  flight is no longer under-estimated by up to 2x, and the cell falls back to the DEM's
+  own cell rather than a metric literal.
+- Automatic DEM and ortho cells are expressed in the output CRS's units. On an EPSG:4326
+  (geographic) grid the depth-map ground sample distance and the TGV height scaling were
+  applied as if the pixel size were metres, and the occlusion march mixed degree steps with
+  metre heights; all three now convert through the frame's metres-per-degree at the model's
+  latitude. An orthomosaic built in degrees also used to step the occlusion test by ~1e-6
+  per iteration.
+
 [0.1.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.1.0

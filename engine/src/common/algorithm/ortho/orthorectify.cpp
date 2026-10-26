@@ -148,7 +148,17 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     // half-cell step would miss. A user asking for an ortho finer than the DEM
     // (the normal case) therefore does not pay for a march proportional to the
     // ortho cell.
-    const double step = 0.5 * std::max(out_grid.pixel_size_x, dem.grid.pixel_size_x);
+    //
+    // When the plane frame is a Geographic one its x/y are degrees while the
+    // DEM heights are metres; the march direction and the step are then built
+    // in metres (mx, my scale the horizontal axes) so the ray stays a straight
+    // line in real space and the step means the same thing on both.
+    const double mx = camera.plane_metres_per_unit.x();
+    const double my = camera.plane_metres_per_unit.y();
+    const bool metric_march = mx != 1.0 || my != 1.0;
+    const double step =
+        0.5 * std::max(out_grid.pixel_size_x, dem.grid.pixel_size_x) *
+        (metric_march ? std::max(mx, my) : 1.0);
     const double min_dim = static_cast<double>(std::min(image.width(), image.height()));
     const double taper_span = 0.1 * min_dim;
     const double epsilon = 1e-6;
@@ -170,7 +180,12 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                 continue;  // no ground here
             }
             const Eigen::Vector3d P(x, y, z);
-            const Eigen::Vector3d to_cam = centre - P;
+            // Compute the ray in metres when the plane is geographic: the x/y
+            // components of `to_cam` and `to_local` (below) are degrees there.
+            const Eigen::Vector3d to_cam =
+                metric_march ? Eigen::Vector3d((centre.x() - x) * mx, (centre.y() - y) * my,
+                                               centre.z() - z)
+                             : centre - P;
             const double distance = to_cam.norm();
             if (distance <= 0.0) {
                 continue;
@@ -180,8 +195,9 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             // -- occlusion: march from P toward the camera centre -----------
             bool occluded = false;
             for (double s = step; s < distance; s += step) {
-                const double px = P.x() + dir.x() * s;
-                const double py = P.y() + dir.y() * s;
+                // Step in metres, then map back to plane units for the DEM read.
+                const double px = P.x() + dir.x() * s / mx;
+                const double py = P.y() + dir.y() * s / my;
                 const double pz = P.z() + dir.z() * s;
                 if (pz > max_height + occlusion_tolerance) {
                     break;  // above every surface sample: cannot be occluded

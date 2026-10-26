@@ -5,7 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -336,42 +339,115 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
     return entries;
 }
 
-/// Automatic ortho resolution: the median ground sample distance of the enabled
-/// cameras, (camera height above the DEM median) / focal_px, rounded to three
-/// significant figures and never finer than a quarter of the DEM cell.
+}  // namespace
+
+namespace ortho {
+namespace {
+
+/// Where the ray `origin + s * direction` first meets `height`, or nullopt.
 ///
-/// Returns 0 when nothing can be measured; the caller then falls back to the
-/// DEM cell itself.
-double auto_resolution(const std::vector<CameraEntry>& cameras,
-                       const std::vector<double>& plane_centres_z, const RasterGrid& grid,
-                       double dem_median_height) {
+/// The march steps down the ray in strides of `stride_metres`, comparing against
+/// the height sampled at each point: cheap, accurate to one stride, far below
+/// the tolerance a cell size needs. A ray that starts inside the terrain (an
+/// oblique camera on a slope) is accepted at once.
+std::optional<Eigen::Vector3d> march_to_surface(const SurfaceHeight& height,
+                                                const Eigen::Vector3d& origin,
+                                                const Eigen::Vector3d& direction,
+                                                double stride_metres,
+                                                double lowest_surface_metres) {
+    if (!(stride_metres > 0.0) || !std::isfinite(stride_metres)) {
+        return std::nullopt;
+    }
+    double lowest = lowest_surface_metres;
+    if (!std::isfinite(lowest)) {
+        // Probe the surface around the camera's ground track. A mapping camera
+        // points down, so the surface is below it: `drop` is how far the ray can
+        // fall before it is certainly past the terrain.
+        lowest = origin.z();
+        bool probed = false;
+        for (const double dx : {-1.0, 0.0, 1.0}) {
+            for (const double dy : {-1.0, 0.0, 1.0}) {
+                const double h = height(origin.x() + dx * stride_metres,
+                                        origin.y() + dy * stride_metres);
+                if (std::isfinite(h)) {
+                    lowest = std::min(lowest, h);
+                    probed = true;
+                }
+            }
+        }
+        if (!probed) {
+            return std::nullopt;  // nothing sampled below the camera
+        }
+    }
+    const double drop = std::max(0.0, origin.z() - lowest);
+    // sec(incidence) is capped at 1 / 0.15 below, so the ray can travel at most
+    // ~6.7 * drop; 8 + one stride is a safe bound and keeps the loop finite when
+    // the ray leaves the surface entirely.
+    const double limit = 8.0 * drop + stride_metres;
+
+    for (double s = 0.0; s <= limit; s += stride_metres) {
+        const Eigen::Vector3d p = origin + s * direction;
+        const double ground = height(p.x(), p.y());
+        if (!std::isfinite(ground)) {
+            continue;  // off the DEM or a hole: keep marching
+        }
+        if (p.z() <= ground) {
+            return p;  // reached the surface
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras,
+                                     const SurfaceHeight& height, double stride_metres,
+                                     double lowest_surface_metres) {
+    if (!height) {
+        return 0.0;
+    }
     std::vector<double> gsds;
     gsds.reserve(cameras.size());
-    for (std::size_t i = 0; i < cameras.size(); ++i) {
-        const CameraEntry& camera = cameras[i];
-        if (!(camera.calibration.f > 0.0)) {
+    for (const FootprintCamera& camera : cameras) {
+        if (!(camera.focal_px > 0.0)) {
             continue;
         }
-        // Camera height above the plane's median surface. Both are plane-frame
-        // metres: camera centres converted by SurfaceFrame::to_plane, the
-        // surface read from the DEM. (A geographic frame would need a
-        // degrees-to-metres scale; BuildDem never writes one here, a documented
-        // limitation.)
-        const double height = plane_centres_z[i] - dem_median_height;
-        if (!(height > 0.0)) {
+        const Eigen::Vector3d direction = camera.direction.normalized();
+        const std::optional<Eigen::Vector3d> hit =
+            march_to_surface(height, camera.centre, direction, stride_metres,
+                             lowest_surface_metres);
+        if (!hit.has_value()) {
             continue;
         }
-        gsds.push_back(height / camera.calibration.f);
+        // Slant range from the optical centre to the ground point.
+        const double range = (*hit - camera.centre).norm();
+        if (!(range > 0.0)) {
+            continue;
+        }
+        // The image pixel's linear size perpendicular to the optical axis.
+        const double per_pixel = range / camera.focal_px;
+        // Incidence: the angle between the looking direction and the surface
+        // normal (the plane frame's up). The gravity-aligned vertical is the
+        // normal a terrain model is written against, and using it keeps the
+        // measurement independent of how noisy a local DEM gradient would be.
+        const double cos_incidence = std::abs(direction.z());
+        if (!(cos_incidence > 0.15)) {
+            continue;  // grazing: the footprint is unbounded
+        }
+        // The footprint grows by sec(incidence) along the line of sight; a cell
+        // that has to hold one ground sample per pixel must cover that axis.
+        const double gsd = per_pixel / cos_incidence;
+        if (std::isfinite(gsd) && gsd > 0.0) {
+            gsds.push_back(gsd);
+        }
     }
     if (gsds.empty()) {
         return 0.0;
     }
-    const double resolution = round_sig3(median_of(std::move(gsds)));
-    const double floor_resolution = 0.25 * grid.pixel_size_x;
-    return std::max(resolution, floor_resolution);
+    return round_sig3(median_of(std::move(gsds)));
 }
 
-}  // namespace
+}  // namespace ortho
 
 void BuildOrthomosaicTask::declare_params(Params& params) const {
     // Names follow Metashape's public buildOrthomosaic() Python API;
@@ -396,9 +472,10 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
                     "best-score camera, seams visible where the score steps."});
 
     ParamSpec resolution{"resolution", ParamType::Float, 0.0,
-                         "Output cell size in projection units. 0 selects the median camera "
-                         "ground sample distance (3 significant figures), never finer than DEM "
-                         "cell / 4."};
+                         "Output cell size in projection units. 0 selects the true ground "
+                         "sample distance seen at each camera's image centre (median over "
+                         "the enabled cameras, oblique flights included), in the DEM's own "
+                         "units and never finer than DEM cell / 4."};
     resolution.minimum = 0.0;
     params.declare(resolution);
 
@@ -473,33 +550,106 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
     GeoRaster<float> surface = dem.raster;
     float surface_nodata = dem.nodata;
 
-    // Camera centres in the plane frame (needed for the automatic resolution;
-    // cheap either way and also the rigorous source of the march target). For
-    // a Local frame to_plane is the identity.
+    // Camera centres in the plane frame (cheap, and the rigorous source of the
+    // occlusion march target). For a Local frame to_plane is the identity.
     std::vector<Eigen::Vector3d> plane_centres;
-    std::vector<double> plane_centres_z;
     plane_centres.reserve(cameras.size());
-    plane_centres_z.reserve(cameras.size());
     for (const CameraEntry& camera : cameras) {
         plane_centres.push_back(frame.to_plane(camera.centre_local));
-        plane_centres_z.push_back(plane_centres.back().z());
     }
 
-    double resolution = options.resolution;
+    // -- the automatic output cell -------------------------------------------
+    // The default is the true ground sample distance at each camera's image
+    // centre on the surface: slant range / (focal_px * cos incidence), the
+    // median over the enabled cameras, in metres. It is then converted into the
+    // frame's own plane units (a Geographic grid is in degrees) and floored at a
+    // quarter of the surface cell, so the ortho is never finer than the surface
+    // it is resampled from.
+    //
+    // Measuring each camera's footprint on the surface (rather than using
+    // "camera height / focal") is what makes an oblique flight come out right:
+    // a 45-degree camera photographs a footprint about twice as long along the
+    // line of sight as a nadir one at the same height.
+    const auto measure_gsd_metres = [&](const GeoRaster<float>& raster, float nodata,
+                                        double plane_y) {
+        if (raster.empty()) {
+            return 0.0;
+        }
+        const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(plane_y);
+        if (!(metres_per_unit.x() > 0.0) || !(metres_per_unit.y() > 0.0)) {
+            return 0.0;
+        }
+        // Work in metres relative to the first camera HORIZONTALLY, so a UTM
+        // northing in the millions does not cost precision in the ray march.
+        // The vertical stays absolute: it is a height above the surface, not a
+        // large offset, and the surface sampler returns the same datum.
+        const Eigen::Vector3d origin = plane_centres.front();
+        std::vector<ortho::FootprintCamera> metric;
+        metric.reserve(cameras.size());
+        for (std::size_t i = 0; i < cameras.size(); ++i) {
+            const Eigen::Vector3d offset = plane_centres[i] - origin;
+            ortho::FootprintCamera camera;
+            camera.centre = Eigen::Vector3d(offset.x() * metres_per_unit.x(),
+                                            offset.y() * metres_per_unit.y(),
+                                            plane_centres[i].z());
+            // R^T (0,0,1) is the camera's viewing axis in the chunk-local frame,
+            // which is metric: use it unchanged. (The plane's horizontal scale
+            // applies to POSITIONS, not to this local-frame direction.)
+            camera.direction = cameras[i].R.transpose() * Eigen::Vector3d(0, 0, 1);
+            camera.focal_px = cameras[i].calibration.f;
+            metric.push_back(camera);
+        }
+        const ortho::SurfaceHeight height =
+            [&raster, nodata, origin, metres_per_unit](double x, double y) {
+                return sample_grid(raster, nodata,
+                                   origin.x() + x / metres_per_unit.x(),
+                                   origin.y() + y / metres_per_unit.y());
+            };
+        const double stride =
+            std::max(raster.grid.pixel_size_x * metres_per_unit.x(),
+                     raster.grid.pixel_size_y * metres_per_unit.y());
+        // The true surface minimum bounds the ray march, so a camera on a ridge
+        // above a valley still finds the ground.
+        double lowest = std::numeric_limits<double>::quiet_NaN();
+        for (const float h : raster.data) {
+            if (h != nodata && std::isfinite(h)) {
+                lowest = std::isfinite(lowest) ? std::min(lowest, static_cast<double>(h))
+                                               : static_cast<double>(h);
+            }
+        }
+        return ortho::median_ground_sample_distance(metric, height, stride, lowest);
+    };
+    const auto plane_resolution_for = [&frame](double gsd_metres,
+                                               const GeoRaster<float>& raster) {
+        const double plane_y = raster.empty()
+                                   ? 0.0
+                                   : raster.grid.pixel_center(0, raster.grid.height / 2).y();
+        const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(plane_y);
+        const double unit_m = std::max(metres_per_unit.x(), metres_per_unit.y());
+        double cell = unit_m > 0.0 ? gsd_metres / unit_m : gsd_metres;
+        if (!raster.empty()) {
+            cell = std::max(cell, 0.25 * std::max(raster.grid.pixel_size_x,
+                                                  raster.grid.pixel_size_y));
+        }
+        return cell;
+    };
+
+    double resolution = options.resolution;  // plane units; 0 = automatic
     if (!(resolution > 0.0)) {
-        // surface "model" may run without a DEM; its DSM cell takes over below,
-        // after the model check it needs anyway.
         if (surface.empty() && options.surface != "model") {
             throw ValueError("BuildOrthomosaic: the chunk has no elevation model");
         }
         if (!surface.empty()) {
-            const double median_surface = median_height(surface, surface_nodata);
-            resolution =
-                auto_resolution(cameras, plane_centres_z, surface.grid, median_surface);
+            const double plane_y = surface.grid.pixel_center(0, surface.grid.height / 2).y();
+            const double gsd = measure_gsd_metres(surface, surface_nodata, plane_y);
+            if (gsd > 0.0) {
+                resolution = plane_resolution_for(gsd, surface);
+            }
         }
-        if (!(resolution > 0.0)) {
-            resolution = 0.25;  // replaced by the model DSM's cell below
-        }
+        // No measurable GSD (no DEM yet, or no usable camera): the surface's own
+        // cell takes over below. A bare metric literal here would be wrong in a
+        // degree-based frame and coarse relative to the imagery, the exact bug
+        // this rule exists to avoid.
     }
 
     if (options.surface == "model") {
@@ -513,20 +663,50 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
         elevation::DemOptions dsm_options;
         dsm_options.source = "model";
         dsm_options.interpolation = "enabled";
+        // Without a DEM the mesh has to be rasterised before a footprint can be
+        // measured on it; rasterise coarsely first, measure, then rebuild at the
+        // measured cell. The DSM's own automatic cell (the median mesh edge) is
+        // the natural provisional value.
         dsm_options.resolution = resolution;
         dsm_options.epsg = epsg;
         dsm_options.tgv = false;  // a rasterised mesh needs no smoothing
-        const Elevation dsm =
+        Elevation dsm =
             elevation::build_dem(*chunk, dsm_options, [&](double fraction) {
                 progress.update("initialize", 0.5 + 0.2 * fraction);
             });
-        // With no DEM, the ortho grid follows the DSM the mesh produced; its
-        // cell stands in for the DEM cell in the auto-resolution floor.
-        if (dem.empty()) {
+        if (!(resolution > 0.0)) {
+            // Automatic cell on the mesh surface alone.
+            const double gsd = measure_gsd_metres(dsm.raster, dsm.nodata,
+                                                 dsm.raster.grid.pixel_center(
+                                                     0, dsm.raster.grid.height / 2)
+                                                     .y());
+            if (gsd > 0.0) {
+                const double cell = plane_resolution_for(gsd, dsm.raster);
+                if (std::abs(cell / dsm.raster.grid.pixel_size_x - 1.0) > 0.05) {
+                    dsm_options.resolution = cell;
+                    dsm = elevation::build_dem(*chunk, dsm_options, [&](double fraction) {
+                        progress.update("initialize", 0.7 + 0.1 * fraction);
+                    });
+                }
+                resolution = cell;
+            }
+        }
+        // With no DEM, the ortho grid follows the DSM the mesh produced: its cell
+        // is the measured one when the footprint could be resolved, or the
+        // builder's own automatic value (median mesh edge) when it could not.
+        if (!(resolution > 0.0)) {
             resolution = dsm.raster.grid.pixel_size_x;
         }
         surface = dsm.raster;
         surface_nodata = dsm.nodata;
+    }
+
+    if (!(resolution > 0.0)) {
+        // Nothing measurable and no surface cell to fall back on. This is only
+        // reachable from a Local frame with an empty DEM, which the checks above
+        // reject; guard against a non-positive grid rather than divide by zero.
+        throw ValueError("BuildOrthomosaic: cannot derive an output resolution; pass "
+                         "resolution explicitly");
     }
 
     const RasterGrid grid = ortho_grid_for(surface.grid, resolution);
@@ -539,7 +719,15 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
     const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
         make_plane_to_local(frame, grid, surface, surface_nodata);
 
-    const double occlusion_tolerance = kOcclusionToleranceCells * surface.grid.pixel_size_x;
+    // The ortho grid and the DEM share a plane: in a Geographic frame both are
+    // in degrees, so heights divide by degrees. The orthorectifier's occlusion
+    // march compares a ray against metre heights and needs the ground metric,
+    // which is why it is handed the frame's metres-per-unit explicitly.
+    const Eigen::Vector2d metres_per_unit =
+        frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
+    const double occlusion_tolerance =
+        kOcclusionToleranceCells * surface.grid.pixel_size_x *
+        std::max(metres_per_unit.x(), metres_per_unit.y());
     std::vector<ortho::OrthoTile> tiles;
     tiles.reserve(cameras.size());
     for (std::size_t i = 0; i < cameras.size(); ++i) {
@@ -552,6 +740,7 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
         camera.R = entry.R;
         camera.t = entry.t;
         camera.image = &images[entry.image_index];
+        camera.plane_metres_per_unit = metres_per_unit;
         if (to_local) {
             camera.plane_to_local = to_local;
             camera.plane_centre = plane_centres[i];

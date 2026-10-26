@@ -30,6 +30,7 @@
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
 
 namespace alphashape {
@@ -689,6 +690,129 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     EXPECT_EQ(got.orthomosaic().epsg, chunk.orthomosaic().epsg);
     EXPECT_EQ(got.orthomosaic().surface, "elevation");
     EXPECT_EQ(got.orthomosaic().labels, chunk.orthomosaic().labels);
+}
+
+// ---------------------------------------------------------------------------
+// 9. The automatic-resolution rule: true ground sample distance
+// ---------------------------------------------------------------------------
+//
+// The default cell must follow the GSD a pixel actually covers on the ground,
+// not "camera height / focal". The two agree for a nadir camera over level
+// ground and differ by sec(incidence) for an oblique one, which is the case a
+// circular flight (the reporter's dataset) exercises. These cases measure the
+// shared helper against the analytic footprint, so a regression that reverts to
+// the nadir formula fails here even if the whole-scene test still passes.
+
+namespace {
+
+/// A flat, infinite ground plane at height 0 with a square metre stride.
+ortho::SurfaceHeight flat_ground() {
+    return [](double, double) { return 0.0; };
+}
+
+/// One camera at `centre` looking along `direction`, with focal length
+/// `focal_px`. `direction` is normalised by the rule itself.
+ortho::FootprintCamera make_footprint_camera(const Eigen::Vector3d& centre,
+                                             const Eigen::Vector3d& direction,
+                                             double focal_px) {
+    ortho::FootprintCamera camera;
+    camera.centre = centre;
+    camera.direction = direction;
+    camera.focal_px = focal_px;
+    return camera;
+}
+
+}  // namespace
+
+TEST(OrthoAutoResolution, NadirMatchesHeightOverFocal) {
+    // 50 m above level ground, f = 3000 px: one pixel covers 50/3000 m.
+    const double expected = 50.0 / 3000.0;
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Nadir] gsd=%.6f expected=%.6f\n", gsd, expected);
+    ASSERT_GT(gsd, 0.0);
+    // The rule rounds to three significant figures; allow that plus the march's
+    // one-stride landing error on a 50 m drop (stride 1 m here).
+    EXPECT_NEAR(gsd, expected, 0.1 * expected);
+}
+
+TEST(OrthoAutoResolution, ObliqueIsTwiceTheNadirFootprintAt45Degrees) {
+    // A 45-degree camera 50 m up: the principal ray lands 50 m out, the slant
+    // range is 50*sqrt(2), and the footprint along the line of sight is that
+    // range / focal / cos(45) = 2 * (50 / focal).
+    const double nadir = 50.0 / 3000.0;
+    const Eigen::Vector3d direction = Eigen::Vector3d(1.0, 0.0, -1.0).normalized();
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), direction, 3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Oblique45] gsd=%.6f nadir=%.6f ratio=%.4f\n", gsd, nadir,
+                gsd / nadir);
+    ASSERT_GT(gsd, 0.0);
+    EXPECT_NEAR(gsd, 2.0 * nadir, 0.1 * 2.0 * nadir);
+}
+
+TEST(OrthoAutoResolution, MedianOverTheFlightAndSlopeAwareFootprint) {
+    // A mixed nadir/45-degree flight: the median is the middle order statistic,
+    // here the nadir value (2 cameras nadir at 50 m, 1 oblique at 100 m so its
+    // footprint is also "2x", i.e. equal; use heights 50, 50 and 100 to make the
+    // nadir footprint the median).
+    const double nadir = 50.0 / 3000.0;
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(10, 0, 50), Eigen::Vector3d(0, 0, -1), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(20, 0, 100), Eigen::Vector3d(0.3, 0.0, -1.0),
+                              3000.0)};
+    const double gsd = ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0);
+    std::printf("[OrthoAutoResolution.Median] gsd=%.6f nadir=%.6f\n", gsd, nadir);
+    EXPECT_NEAR(gsd, nadir, 0.1 * nadir);
+}
+
+TEST(OrthoAutoResolution, UnusableCamerasContributeNothing) {
+    // A horizontal camera never reaches the ground; a camera with no focal has
+    // no footprint. Neither may poison the median.
+    std::vector<ortho::FootprintCamera> cameras = {
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(1, 0, 0), 3000.0),
+        make_footprint_camera(Eigen::Vector3d(0, 0, 50), Eigen::Vector3d(0, 0, -1), 0.0)};
+    EXPECT_DOUBLE_EQ(ortho::median_ground_sample_distance(cameras, flat_ground(), 1.0), 0.0);
+    EXPECT_DOUBLE_EQ(ortho::median_ground_sample_distance({}, flat_ground(), 1.0), 0.0);
+}
+
+TEST(OrthoAutoResolution, GeographicGridIsInDegreesNotMetres) {
+    // The metric rule is expressed in metres; an EPSG:4326 grid's pixel size is
+    // in degrees. SurfaceFrame must therefore report the per-degree arc lengths
+    // so a metre GSD can be converted. Checked on a georeferenced chunk placed
+    // at 48.7 N (no photos needed: the frame only reads the transform).
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("geo");
+    document.set_active_chunk_id(chunk.id());
+    chunk.transform() = geo::enu_to_ecef(geo::Geodetic{9.2, 48.7, 300.0});
+    chunk.crs().epsg = 4326;
+
+    const elevation::SurfaceFrame geographic = elevation::SurfaceFrame::for_chunk(chunk, 4326);
+    ASSERT_EQ(geographic.epsg(), 4326);
+    const Eigen::Vector2d metres_per_degree = geographic.metres_per_plane_unit(48.7);
+    // One degree of latitude is ~111.1 km; of longitude ~73.5 km at 48.7 N.
+    EXPECT_NEAR(metres_per_degree.y(), 111132.0, 500.0);
+    EXPECT_NEAR(metres_per_degree.x(), 73500.0, 800.0);
+
+    // A 1 cm GSD becomes ~1 cm / metres-per-degree degrees, not 0.01 (metres in
+    // a degree grid) and not 1 (a bare metric fallback).
+    const double cell_degrees = 0.01 / std::max(metres_per_degree.x(), metres_per_degree.y());
+    EXPECT_NEAR(cell_degrees, 0.01 / 111132.0, 0.0005 * 0.01 / 111132.0);
+    EXPECT_LT(cell_degrees, 1e-6);
+}
+
+TEST(OrthoAutoResolution, LocalAndUtmPlanesAreMetres) {
+    // Local/UTM frames must report exactly 1 m per plane unit on both axes, the
+    // identity the metric rule relies on.
+    Document local;
+    Chunk& chunk = local.workspace().add_chunk("local");
+    local.set_active_chunk_id(chunk.id());
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 0);
+    ASSERT_TRUE(frame.is_local());
+    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(0.0).x(), 1.0);
+    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(1234.0).y(), 1.0);
 }
 
 }  // namespace

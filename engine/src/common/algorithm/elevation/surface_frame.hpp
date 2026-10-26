@@ -50,6 +50,20 @@ public:
     /// EPSG code of the projection (0 when Local).
     int epsg() const { return projection_.epsg(); }
 
+    /// Ground metres per plane unit along x (east) and y (north) at the plane
+    /// ordinate `plane_y` (northing for a UTM/local plane, latitude in degrees
+    /// for a Geographic one). Local and UTM planes are metric, so both
+    /// components are exactly 1. A Geographic plane is in degrees, so the
+    /// components are the WGS84 arc lengths of one degree of longitude
+    /// (prime-vertical radius times cos(latitude)) and latitude (meridian
+    /// radius) at that ordinate.
+    ///
+    /// This is what turns a metric ground sample distance into the units an
+    /// output grid is expressed in: dividing by the larger component gives a
+    /// plane-unit cell that is never coarser than the metric size on either
+    /// axis.
+    Eigen::Vector2d metres_per_plane_unit(double plane_y) const;
+
     /// True when the frame is the Local identity (unreferenced chunk).
     bool is_local() const { return projection_.kind == geo::ProjectionKind::Local; }
 

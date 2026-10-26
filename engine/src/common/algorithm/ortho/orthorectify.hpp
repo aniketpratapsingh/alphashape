@@ -64,6 +64,14 @@ struct OrthoCamera {
     /// `plane_to_local` is set; otherwise the march target is `centre()`.
     std::optional<Eigen::Vector3d> plane_centre;
 
+    /// Ground metres per plane unit on each horizontal axis of the plane frame
+    /// (1, 1) for a metric plane, the per-degree arc lengths for a Geographic
+    /// one). The occlusion march needs this: it compares a metric ray against
+    /// DEM heights, so its geometry has to be solved in metres even when the
+    /// grid's x/y are degrees. Only consulted together with `plane_centre`
+    /// (otherwise the pose and the grid are already in the same units).
+    Eigen::Vector2d plane_metres_per_unit = Eigen::Vector2d(1.0, 1.0);
+
     /// The optical centre in the frame R, t act in (chunk-local when
     /// plane_to_local is set, plane frame otherwise): X = -R^T t.
     Eigen::Vector3d centre() const { return -R.transpose() * t; }

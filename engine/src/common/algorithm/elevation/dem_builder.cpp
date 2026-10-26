@@ -470,18 +470,34 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     }
 
     // -- resolve the cell size and the grid ----------------------------------
+    const PlaneBox box = source == Source::Model ? vertices_box(model.plane_vertices)
+                                                 : samples_box(samples);
     double resolution = options.resolution;
     if (!(resolution > 0.0)) {
-        resolution = source == Source::Model ? auto_resolution_model(model)
-                                             : auto_resolution(samples, per_map_gsd);
+        if (source == Source::Model) {
+            resolution = auto_resolution_model(model);  // already in plane units
+        } else {
+            resolution = auto_resolution(samples, per_map_gsd);
+            // The depth-map GSD is a GROUND distance in metres, while the plane
+            // it has to be expressed in is degrees for EPSG:4326. Convert with
+            // the arc lengths at the surface's own latitude, otherwise the cell
+            // would be ~100000x too small. The point-cloud fallback is already a
+            // plane-unit spacing (sqrt(plane area / N)) and needs no conversion.
+            if (!per_map_gsd.empty() && !frame.is_local()) {
+                const double plane_y = 0.5 * (box.max.y() + box.min.y());
+                const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(plane_y);
+                const double unit_m =
+                    std::max(metres_per_unit.x(), metres_per_unit.y());
+                if (unit_m > 0.0) {
+                    resolution /= unit_m;
+                }
+            }
+        }
     }
     if (!(resolution > 0.0) || !std::isfinite(resolution)) {
         throw ValueError("build_dem: cannot derive a cell size from the " + source_label +
                          " source; pass an explicit resolution");
     }
-
-    const PlaneBox box = source == Source::Model ? vertices_box(model.plane_vertices)
-                                                 : samples_box(samples);
     const RasterGrid grid = frame_grid(box, resolution);
     const std::size_t count =
         static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height);
@@ -540,8 +556,19 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     std::vector<std::uint8_t> final_valid = filled_valid;
     if (options.tgv && source != Source::Model) {
         // Heights are scaled so one cell step is one unit, which makes the
-        // regulariser's slopes dimensionless (see tgv_denoise.hpp).
-        const double cell_size = grid.pixel_size_x;
+        // regulariser's slopes dimensionless (see tgv_denoise.hpp). A
+        // Geographic grid's pixel size is in degrees, so the cell has to be
+        // converted to metres first; dividing metre heights by degrees would
+        // make the data term meaningless and flatten the surface.
+        const double plane_y = 0.5 * (grid.pixel_center(0, grid.height / 2).y() +
+                                      grid.pixel_center(0, 0).y());
+        const Eigen::Vector2d metres_per_unit =
+            frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                             : frame.metres_per_plane_unit(plane_y);
+        double cell_size = grid.pixel_size_x * metres_per_unit.x();
+        if (!(cell_size > 0.0) || !std::isfinite(cell_size)) {
+            cell_size = grid.pixel_size_x;  // degenerate frame: keep the old rule
+        }
         std::vector<float> f(count, 0.0F);
         std::vector<float> u(count, 0.0F);
         // The data term is the hole-filled surface: observed cells carry their
