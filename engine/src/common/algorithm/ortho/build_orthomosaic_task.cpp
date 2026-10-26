@@ -8,8 +8,10 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -665,6 +667,11 @@ std::vector<Stage> BuildOrthomosaicTask::stages() const {
 
 void BuildOrthomosaicTask::apply(Document& document, Params& params,
                                  const Progress& progress) {
+    // std::length_error is what a vector whose size exceeds max_size() throws
+    // (and what an impossible resize throws before it ever asks for memory), so
+    // it belongs to the same "this run cannot fit" story as bad_alloc: both mean
+    // the request outgrew what this process can hold, not that the document is
+    // malformed. Catch them together.
     try {
         run(document, params, progress);
     } catch (const std::bad_alloc&) {
@@ -672,6 +679,11 @@ void BuildOrthomosaicTask::apply(Document& document, Params& params,
         // the cases it cannot (a footprint far larger than the bound, another
         // process eating the machine). Same advice, same style, and the previous
         // orthomosaic is untouched because nothing was committed.
+        throw ValueError(
+            "BuildOrthomosaic ran out of memory. Set a coarser resolution (the "
+            "default follows the ground sample distance; try 2-4x that), or close "
+            "other applications and retry.");
+    } catch (const std::length_error&) {
         throw ValueError(
             "BuildOrthomosaic ran out of memory. Set a coarser resolution (the "
             "default follows the ground sample distance; try 2-4x that), or close "
