@@ -946,7 +946,7 @@ jobs:
           # passing test's output, so surface those lines from the log: this is
           # where the numbers in a PR's "measured" section come from.
           echo "--- measurements in this lane ---"
-          grep -E '^\[[a-z][a-z0-9 _/-]*\]' "$log" || true
+          grep -E '\[[a-z][a-z0-9 _/-]*\]' "$log" || true
 
   macos-test:
     name: macOS test ${{ matrix.lane }}
@@ -1015,6 +1015,14 @@ jobs:
           while IFS= read -r line; do args+=("$line"); done < ctest-args.txt
           # --repeat until-pass:2 absorbs MoltenVK "device lost" flakes on the paravirtual GPU.
           ctest --test-dir build --parallel 3 --timeout 3600 --repeat until-pass:2 "${args[@]}"
+
+      # ctest hides a passing test's output, so the numbers the benchmark-shaped
+      # tests print (GPU speed-ups, coverage, accuracy) would be readable only on
+      # a failure. Print the bracket-tagged lines instead.
+      - name: Measurements
+        if: always()
+        run: |
+          grep -E '\[[a-z][a-z0-9 _/-]*\]' build/Testing/Temporary/LastTest.log || true
 
   windows-test:
     name: Windows test ${{ matrix.lane }}
@@ -1270,6 +1278,16 @@ jobs:
           $ctestArgs = Get-Content ctest-args.txt
           # --repeat until-pass:2: a few tests assert wall-clock bounds that a busy shared runner can miss.
           ctest --test-dir build --parallel 4 --timeout 3600 --repeat until-pass:2 @ctestArgs
+
+      # ctest hides a passing test's output, so the numbers the benchmark-shaped
+      # tests print (GPU speed-ups, coverage, accuracy) would be readable only on
+      # a failure. Print the bracket-tagged lines instead.
+      - name: Measurements
+        if: always()
+        shell: pwsh
+        run: |
+          Select-String -Path build\Testing\Temporary\LastTest.log -Pattern '\[[a-z][a-z0-9 _/-]*\]' |
+            ForEach-Object { $_.Line }
 
   # The lanes must together run every test exactly once; fails if a lane was dropped or overlaps.
   shard-coverage:
