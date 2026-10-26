@@ -630,6 +630,10 @@ constexpr double kPhotoCacheBudgetFraction = 0.15;
 /// still sees a slightly different neighbourhood; a small slack takes the
 /// interior out of that region.
 constexpr int kBlockMarginSlack = 16;
+/// The margin is rounded up to this multiple. The blend's pyramid halves per
+/// level, so a window origin that is not a multiple of 2^levels shifts every
+/// coarse level by part of a cell against the whole grid's.
+constexpr int kBlockMarginAlignment = 64;
 /// The absolute ceiling on the decoded-photograph cache, whatever the machine's
 /// budget: beyond a handful of frames the reuse stops paying for the bytes, and
 /// the cache competes with the block side for the same limit -- a smaller cache
@@ -828,7 +832,17 @@ int block_margin_cells(int block_cells, int pyramid_levels) {
         return 0;
     }
     const int levels = std::max(0, pyramid_levels);
-    return ortho::pyramid_support_cells(levels) + kBlockMarginSlack;
+    const int needed = ortho::pyramid_support_cells(levels) + kBlockMarginSlack;
+    // Round UP to a multiple of kBlockMarginAlignment. That is not cosmetic: the
+    // blend's pyramid decimates by two per level, so a window whose origin is not
+    // a multiple of 2^levels has its coarse levels offset by a fraction of a
+    // cell relative to the whole grid's, and a block's coarse-level samples would
+    // then be interpolations BETWEEN global ones rather than equal to them.
+    // Block origins are multiples of the block side (a power of two >= 512), so
+    // an aligned margin makes every window origin a multiple of 64 as well.
+    const int aligned = ((needed + kBlockMarginAlignment - 1) / kBlockMarginAlignment) *
+                        kBlockMarginAlignment;
+    return std::max(kBlockMarginAlignment, aligned);
 }
 
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,

@@ -1306,9 +1306,12 @@ TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
     EXPECT_EQ(ortho::pyramid_support_cells(6), 126);
     EXPECT_LE(ortho::pyramid_support_cells(6), 192);
 
-    // The margin is the operator's reach, not a fraction of the block.
-    EXPECT_EQ(block_margin_cells(1024, 6), ortho::pyramid_support_cells(6) + 16);
-    EXPECT_EQ(block_margin_cells(4096, 0), 16);
+    // The margin is the operator's reach, rounded up to a pyramid-alignment
+    // multiple (see block_margin_cells), never a fraction of the block.
+    const int expected = ((ortho::pyramid_support_cells(6) + 16 + 63) / 64) * 64;
+    EXPECT_EQ(block_margin_cells(1024, 6), expected);
+    EXPECT_EQ(expected % 64, 0) << "block origins must stay on the pyramid lattice";
+    EXPECT_EQ(block_margin_cells(4096, 0), 64);
     EXPECT_EQ(block_margin_cells(0, 6), 0);
 
     for (const int side : {512, 1024, 2048, 4096}) {
