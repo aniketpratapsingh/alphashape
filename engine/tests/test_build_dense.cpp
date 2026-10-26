@@ -1172,6 +1172,41 @@ TEST(DepthMapsCancel, CancelInsideOneCameraStopsAtASweepBoundary) {
     EXPECT_FALSE(document.active_chunk()->depth_maps().empty());
 }
 
+TEST(DepthMapsCancel, CancelDuringFilterKeepsTheMaps) {
+    // Every search is done by the time the filter stage starts, and the filter
+    // is cheap. A cancel there must keep the maps (unfiltered), not throw the
+    // expensive part away.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+
+    CancellingProgress cancel;
+    cancel.when = [](const std::string& stage, double fraction) {
+        return stage == "filterDepthMaps" && fraction > 0.0;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+    ASSERT_TRUE(cancel.saw_fraction_in("filterDepthMaps", 0.0, 1.0))
+        << "the cancel did not land in the filter stage";
+
+    const std::vector<DepthMap>& kept = chunk.depth_maps();
+    ASSERT_FALSE(kept.empty()) << "a cancel during filtering threw the maps away";
+    EXPECT_EQ(kept.size(), depth_camera_count(chunk)) << "the whole search completed";
+    for (const DepthMap& map : kept) {
+        EXPECT_EQ(map.filter_mode, -1) << "camera " << map.camera_id;
+        EXPECT_GT(valid_pixels({map}), 0U);
+    }
+
+    // And the re-run filters them without searching again.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), 0U) << "the kept maps were searched again";
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        EXPECT_GE(map.filter_mode, 0) << "camera " << map.camera_id;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Re-alignment invalidates reuse
 // ---------------------------------------------------------------------------
