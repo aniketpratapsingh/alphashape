@@ -1,6 +1,7 @@
 #include "gpu/vulkan/device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -135,26 +136,169 @@ const Pipeline& VulkanBackend::pipeline_for(const KernelEntry& kernel) {
     return inserted.first->second;
 }
 
-void VulkanBackend::wait_fence(VkFence fence) {
-    const Functions& fns = instance_->fns;
-    // A fence that is already known to be abandoned is only ever waited from
-    // cleanup (a host copy draining the ring, a buffer handle being destroyed).
-    // One short bounded attempt: a genuine device loss never signals and costs
-    // one slice, while a driver that was merely declared lost (the test hook, or
-    // a timeout that raced completion) still finishes the work -- and freeing
-    // memory a running queue still reads would be a use-after-free.
-    const auto drain = [&](VkFence pending) {
-        constexpr std::uint64_t kCleanupSliceNs = 200'000'000ULL;
-        (void)fns.WaitForFences(device_handle_, 1, &pending, VK_TRUE, kCleanupSliceNs);
+bool VulkanBackend::lost() const { return device_lost(); }
+
+bool VulkanBackend::wait_fence_noexcept(VkFence fence, std::uint64_t timeout_ns) noexcept {
+    if (fence == VK_NULL_HANDLE) {
+        return true;
+    }
+    // This deliberately waits even when the device is already marked lost. A
+    // declared loss (the test hook, or a timeout that raced completion) may
+    // still have the work in the queue, and the caller is about to free memory
+    // it reads: freeing a range the queue still references is a use-after-free
+    // the driver punishes with a segfault. The *cost* is bounded instead -- the
+    // shared post-loss deadline in drain_pending means only the first drain
+    // after a loss pays, and every later one returns at once.
+    //
+    // Poll in short slices so a fence that is merely slow still completes
+    // inside the budget instead of being declared a hang on its first slice.
+    constexpr std::uint64_t kPollNs = 20'000'000ULL;
+    std::uint64_t waited = 0;
+    while (true) {
+        const std::uint64_t left = waited >= timeout_ns ? 0 : timeout_ns - waited;
+        if (left == 0) {
+            note_device_lost("no fence signal within the destructor drain deadline");
+            return false;
+        }
+        const std::uint64_t slice = std::min(left, kPollNs);
+        const VkResult result =
+            instance_->fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, slice);
+        if (result == VK_SUCCESS) {
+            return true;
+        }
+        if (result == VK_TIMEOUT) {
+            waited += slice;
+            continue;
+        }
+        // A destructor cannot throw (implicit noexcept -> std::terminate), so
+        // the failure is recorded instead: the backend stays marked lost and no
+        // later operation touches the device again.
+        note_device_lost(result == VK_ERROR_DEVICE_LOST
+                             ? "VK_ERROR_DEVICE_LOST while draining fences in a destructor"
+                             : "fence wait failed while draining fences in a destructor");
+        return false;
+    }
+}
+
+bool VulkanBackend::drain_pending(std::uint64_t budget_ns, bool allow_throw) {
+    // One shared deadline for the whole drain (a wall clock instant, not a
+    // slice per fence): after a loss every fence is unsignalled, and paying a
+    // bounded slice per slot per buffer is what made the fallback unwind slow.
+    // The slots stay pending (their tickets own them) -- only the waiting is
+    // bounded here.
+    //
+    // A throwing drain uses the per-fence fence budget (budget_ns == 0 means
+    // "the device default", which wait_fence applies). A no-throw drain is the
+    // destructor path and is bounded by `budget_ns`, further capped by the
+    // shared post-loss window below.
+    constexpr std::uint64_t kPostLossDrainNs = 1'000'000'000ULL;
+    if (!device_lost()) {
+        // A healthy drain (the normal host-copy path, or a device restored by
+        // the test-level reset) disarms the window, so the next genuine loss
+        // gets its own full budget.
+        lost_drain_started_ = false;
+    } else if (!allow_throw) {
+        // The no-throw drain runs from destructors during a fallback unwind,
+        // where one slice per buffer would multiply the cost: the post-loss
+        // budget is shared by the whole backend, keyed to the loss that armed
+        // it. The first drain after a loss pays it, every later one returns
+        // immediately -- so an operation that destroys a dozen buffers still
+        // costs at most one second in total. A different loss (the generation
+        // moved on) arms a fresh window.
+        const std::uint64_t generation = device_lost_generation();
+        const auto now = std::chrono::steady_clock::now();
+        if (!lost_drain_started_ || lost_drain_generation_ != generation) {
+            lost_drain_started_ = true;
+            lost_drain_generation_ = generation;
+            lost_drain_deadline_ = now + std::chrono::nanoseconds(kPostLossDrainNs);
+        }
+        if (now >= lost_drain_deadline_) {
+            return false;
+        }
+        const std::uint64_t left = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(lost_drain_deadline_ - now)
+                .count());
+        budget_ns = budget_ns == 0 ? left : std::min(budget_ns, left);
+    }
+    if (allow_throw) {
+        // Each fence gets its own full budget: a wait that fails is a device
+        // failure and throws, so there is nothing to share a deadline with.
+        for (const Slot& slot : slots_) {
+            if (slot.pending) {
+                wait_fence(slot.fence);
+            }
+        }
+        for (VkFence fence : {transfer_fence_, image_fence_}) {
+            if (fence != VK_NULL_HANDLE) {
+                wait_fence(fence);
+            }
+        }
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(budget_ns);
+    const auto remaining_ns = [&]() -> std::uint64_t {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count());
     };
-    if (device_lost()) {
-        drain(fence);
-        return;
+    bool drained = true;
+    const auto wait_one = [&](VkFence fence) {
+        if (fence == VK_NULL_HANDLE) {
+            return;
+        }
+        const std::uint64_t left = remaining_ns();
+        if (left == 0) {
+            // The shared deadline is gone. Do not issue a zero-length wait (it
+            // would report a loss for a fence that may still signal); the
+            // device is marked lost below, once.
+            drained = false;
+            return;
+        }
+        if (!wait_fence_noexcept(fence, left)) {
+            drained = false;
+        }
+    };
+    for (const Slot& slot : slots_) {
+        if (slot.pending) {
+            wait_one(slot.fence);
+        }
+    }
+    // Transfers live outside the ring: a copy that threw a fence timeout left
+    // its submission queued, and the unwind is about to free what it targets.
+    for (VkFence fence : {transfer_fence_, image_fence_}) {
+        if (fence != VK_NULL_HANDLE) {
+            wait_one(fence);
+        }
+    }
+    if (!drained && !lost()) {
+        // The shared deadline ran out before every fence signalled: record it
+        // so no later operation touches the device. (A fence that reported a
+        // loss has already logged the precise reason, and note_device_lost only
+        // records the first one.)
+        note_device_lost("fence drain did not complete");
+    }
+    return drained;
+}
+
+void VulkanBackend::wait_fence(VkFence fence, std::uint64_t budget_ns) {
+    const Functions& fns = instance_->fns;
+    // The device is already gone. Waiting on it never returns and its fences
+    // never signal, so report the failure rather than return success: a caller
+    // that saw a throw must never be handed buffers the queue never finished
+    // writing, and the ring's slot bookkeeping assumes the work ran.
+    if (lost()) {
+        throw Error("gpu: device lost (" + device_lost_reason() + ")");
     }
     // Test hook: behave exactly like a wedged device without hanging the suite.
+    // Mark first so this precise reason wins over the generic drain message; the
+    // drain then refuses every fence without touching Vulkan, which is exactly
+    // what a genuinely wedged device costs.
     if (consume_forced_fence_timeout()) {
-        drain(fence);
         note_device_lost("forced fence timeout (test hook)");
+        drain_pending(200'000'000ULL, /*allow_throw=*/false);
         throw Error("gpu: fence timeout (forced by test hook)");
     }
     // Fence waits poll in one-second slices and are bounded, so a wedged device
@@ -166,15 +310,19 @@ void VulkanBackend::wait_fence(VkFence fence) {
     // can freeze -- so the hardware budget is 5 s, not the old 30 s. A CPU
     // driver (llvmpipe) runs the "device" in host threads; it cannot starve a
     // display and one Poisson step can legitimately take minutes, so software
-    // keeps the generous 10 min budget.
+    // keeps the generous 10 min budget. A caller-supplied budget may only
+    // lengthen it: run_batched's calibrating submission is the one place whose
+    // duration is not yet known.
     constexpr std::uint64_t kSliceNs = 1'000'000'000ULL;
     constexpr std::uint64_t kHardwareBudgetNs = 5'000'000'000ULL;
     constexpr std::uint64_t kSoftwareBudgetNs = 600'000'000'000ULL;
-    const std::uint64_t budget_ns =
+    const std::uint64_t default_budget_ns =
         device_.info.software ? kSoftwareBudgetNs : kHardwareBudgetNs;
+    const std::uint64_t effective_budget_ns =
+        budget_ns == 0 ? default_budget_ns : std::max(budget_ns, default_budget_ns);
     std::uint64_t waited_ns = 0;
-    while (waited_ns < budget_ns) {
-        const std::uint64_t slice_ns = std::min(kSliceNs, budget_ns - waited_ns);
+    while (waited_ns < effective_budget_ns) {
+        const std::uint64_t slice_ns = std::min(kSliceNs, effective_budget_ns - waited_ns);
         const VkResult result = fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, slice_ns);
         if (result == VK_SUCCESS) {
             return;
@@ -191,11 +339,12 @@ void VulkanBackend::wait_fence(VkFence fence) {
     }
     // A timeout is a device failure, not a slow device: mark the GPU lost so
     // every later call takes its CPU branch, and let with_fallback rerun this
-    // operation on the CPU. Drain once first: the unwind frees the batch's
-    // buffers, and a queue still reading them would fault.
-    drain(fence);
+    // operation on the CPU. Mark first, then give the outstanding fences one
+    // shared bounded drain: the unwind frees this batch's buffers, and a queue
+    // still reading them would fault.
     note_device_lost("no fence signal within " +
-                     std::to_string(budget_ns / 1'000'000'000ULL) + " s");
+                     std::to_string(effective_budget_ns / 1'000'000'000ULL) + " s");
+    drain_pending(200'000'000ULL, /*allow_throw=*/false);
     throw Error("gpu: fence timeout");
 }
 
@@ -224,6 +373,16 @@ void VulkanBackend::release_slot(Slot& slot) {
         fns.DestroyDescriptorPool(device_handle_, slot.descriptor_pool, nullptr);
         slot.descriptor_pool = VK_NULL_HANDLE;
     }
+    slot.pending = false;
+    slot.id = 0;
+}
+
+void VulkanBackend::abandon_slot(Slot& slot) {
+    // The fence is unsignalled and will stay that way (the device is lost). Drop
+    // the booking so no later wait() or destructor waits on it, but keep the
+    // descriptor pool: the abandoned submission may still reference it, and
+    // nothing is submitted to a lost device to reuse the slot. It is freed by
+    // ~VulkanBackend (or by a release_slot on a restored device).
     slot.pending = false;
     slot.id = 0;
 }
@@ -427,6 +586,15 @@ std::uint64_t VulkanBackend::submit(const std::vector<DispatchRequest>& dispatch
     if (dispatches.empty()) {
         return 0;
     }
+    // The device stopped responding earlier in this process. Refuse before
+    // touching Vulkan: resubmitting to a wedged GPU is what the whole
+    // device-lost path exists to prevent, and on a shared display GPU the
+    // second hang is the one that takes the machine down. A thread already
+    // inside run_batched stops here, at its next submission.
+    if (lost()) {
+        throw Error("gpu: device lost (" + device_lost_reason() +
+                    "); refusing to submit more work");
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     // Validate every dispatch against its kernel's reflected interface before
     // touching Vulkan, so a bad call is a clean gpu::Error.
@@ -585,12 +753,19 @@ void VulkanBackend::wait(std::uint64_t ticket) {
     // The fence wait runs under the submission mutex: a slot must not be
     // recycled (and its fence reset for a new submission) while another thread
     // is still waiting on it, and a single queue serialises the work anyway.
-    // On a wait failure the slot stays pending, so it is never reused while its
-    // fence is unsignalled.
     std::lock_guard<std::mutex> lock(mutex_);
     for (Slot& slot : slots_) {
         if (slot.pending && slot.id == ticket) {
-            wait_fence(slot.fence);
+            try {
+                wait_fence(slot.fence);
+            } catch (...) {
+                // A failed wait is a device failure: the fence will never
+                // signal, so the slot is abandoned rather than held forever.
+                // Nothing else can submit to a lost device, so no later
+                // wait()/destructor spins on it.
+                abandon_slot(slot);
+                throw;
+            }
             release_slot(slot);
             return;
         }
@@ -610,34 +785,50 @@ std::uint32_t VulkanBackend::in_flight() const {
 }
 
 void VulkanBackend::wait_all_pending() {
-    // Called from the host-copy paths (upload/download/staging). Holding the
+    // Called from the host-copy paths (upload/download/staging), which are
+    // about to touch memory the queue may still be writing. Holding the
     // submission mutex keeps slots from being recycled while their fences are
     // waited on; the transfer mutex is always taken before this one, so the
     // order transfer_mutex_ -> mutex_ is consistent with run()/wait().
     std::lock_guard<std::mutex> lock(mutex_);
-    for (const Slot& slot : slots_) {
-        if (slot.pending && slot.fence != VK_NULL_HANDLE) {
-            wait_fence(slot.fence);
-        }
+    // A lost device's fences never signal: throw instead of returning, because
+    // the caller would otherwise read (or overwrite) a buffer the queue never
+    // finished with. Nothing is submitted after a loss, so the samples the copy
+    // is about to take would be garbage either way.
+    if (lost()) {
+        throw Error("gpu: device lost (" + device_lost_reason() + ")");
     }
+    drain_pending(0, /*allow_throw=*/true);
     // The slots stay pending: they are owned by their tickets until wait().
-    if (device_lost()) {
-        // A transfer that threw a fence timeout left its copy submitted and its
-        // fence unsignalled. The unwind is about to free the buffers that copy
-        // targets, so give both transfer fences one bounded drain here (they are
-        // not slots, so the loop above misses them). Nothing new is submitted
-        // after a device loss, so reading them without transfer_mutex_ is safe.
-        const Functions& fns = instance_->fns;
-        constexpr std::uint64_t kCleanupSliceNs = 200'000'000ULL;
-        for (VkFence fence : {transfer_fence_, image_fence_}) {
-            if (fence != VK_NULL_HANDLE) {
-                (void)fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, kCleanupSliceNs);
-            }
-        }
+}
+
+bool VulkanBackend::wait_all_pending_noexcept() {
+    // Destructor path: a throw here is std::terminate (destructors are
+    // implicitly noexcept). drain_pending bounds the drain, and once the device
+    // is lost the budget is *shared* across the whole fallback unwind (see
+    // kPostLossDrainNs), so destroying a dozen buffers after a hang costs one
+    // second in total rather than one bound per handle.
+    constexpr std::uint64_t kHealthyDrainBudgetNs = 5'000'000'000ULL;
+    constexpr std::uint64_t kSoftwareDrainBudgetNs = 600'000'000'000ULL;
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::uint64_t budget =
+            device_.info.software ? kSoftwareDrainBudgetNs : kHealthyDrainBudgetNs;
+        return drain_pending(budget, /*allow_throw=*/false);
+    } catch (...) {
+        // Defensive only: nothing under the lock is expected to throw here, and
+        // a failure is reported by the fence drain itself (device marked lost).
+        note_device_lost("exception while draining fences in a destructor");
+        return false;
     }
 }
 
 void VulkanBackend::run(const std::vector<DispatchRequest>& dispatches) {
+    run_with_fence_budget(dispatches, 0);
+}
+
+void VulkanBackend::run_with_fence_budget(const std::vector<DispatchRequest>& dispatches,
+                                          std::uint64_t fence_budget_ns) {
     if (dispatches.empty()) {
         return;
     }
@@ -645,7 +836,26 @@ void VulkanBackend::run(const std::vector<DispatchRequest>& dispatches) {
     // rejecting a full ring: run() is documented to wait, and under
     // concurrency a run_async from another thread may hold every slot.
     const std::uint64_t ticket = submit(dispatches, 0, true);
-    wait(ticket);
+    if (fence_budget_ns == 0) {
+        wait(ticket);
+        return;
+    }
+    // One submission with a caller-chosen fence budget. The wait below mirrors
+    // wait(), including abandoning the slot on failure, so the ring accounting
+    // is unchanged -- only the fence budget differs.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (Slot& slot : slots_) {
+        if (slot.pending && slot.id == ticket) {
+            try {
+                wait_fence(slot.fence, fence_budget_ns);
+            } catch (...) {
+                abandon_slot(slot);
+                throw;
+            }
+            release_slot(slot);
+            return;
+        }
+    }
 }
 
 }  // namespace alphashape::gpu::detail

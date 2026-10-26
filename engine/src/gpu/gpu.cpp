@@ -43,6 +43,9 @@ std::atomic<std::uint64_t> g_validation_errors{0};
 std::atomic<bool> g_device_lost{false};
 std::mutex g_device_lost_mutex;
 std::string g_device_lost_detail;
+/// Counts losses (and test-level resets), so a per-loss deadline can be tied to
+/// the loss that armed it rather than to wall-clock time alone.
+std::atomic<std::uint64_t> g_device_lost_generation{0};
 /// Test hook: the next fence wait reports a timeout instead of waiting.
 std::atomic<bool> g_forced_fence_timeout{false};
 
@@ -122,6 +125,7 @@ void note_device_lost(const std::string& cause) {
     if (g_device_lost.exchange(true)) {
         return;
     }
+    g_device_lost_generation.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(g_device_lost_mutex);
         g_device_lost_detail = cause;
@@ -138,11 +142,17 @@ std::string device_lost_reason() {
     return g_device_lost_detail;
 }
 
-void force_fence_timeout_once() { g_forced_fence_timeout.store(true); }
+std::uint64_t device_lost_generation() { return g_device_lost_generation.load(); }
 
+void force_fence_timeout_once() { g_forced_fence_timeout.store(true); }
 bool consume_forced_fence_timeout() { return g_forced_fence_timeout.exchange(false); }
 
 void reset_device_lost() {
+    // Re-arm the generation: the next loss is a new one, even though the counter
+    // is monotonic (a stale generation must never compare equal again).
+    if (g_device_lost.load()) {
+        g_device_lost_generation.fetch_add(1);
+    }
     g_device_lost.store(false);
     {
         std::lock_guard<std::mutex> lock(g_device_lost_mutex);
@@ -372,6 +382,11 @@ std::vector<detail::DispatchRequest> requests_for(const std::vector<Dispatch>& d
 }  // namespace
 
 void run(Context& context, const std::vector<Dispatch>& dispatches) {
+    run_with_fence_budget(context, dispatches, 0);
+}
+
+void run_with_fence_budget(Context& context, const std::vector<Dispatch>& dispatches,
+                           std::uint64_t fence_budget_ns) {
     if (dispatches.empty()) {
         return;
     }
@@ -381,7 +396,11 @@ void run(Context& context, const std::vector<Dispatch>& dispatches) {
     // The synchronous path never fails on a full ring: the backend drains the
     // oldest pending submission instead (run == run_async + wait, and run is
     // documented to wait, not to reject under concurrency).
-    context.backend_->run(requests_for(dispatches));
+    if (fence_budget_ns == 0) {
+        context.backend_->run(requests_for(dispatches));
+        return;
+    }
+    context.backend_->run_with_fence_budget(requests_for(dispatches), fence_budget_ns);
 }
 
 BatchLimiter::BatchLimiter(std::size_t dispatches_per_step, std::size_t initial_steps,
@@ -444,16 +463,25 @@ void BatchLimiter::observe(std::size_t steps_done, double seconds) {
     if (!(per_step > 0.0)) {
         return;
     }
+    last_per_step_ = per_step;
     // Aim at the target, but move at most 4x per measurement so one noisy first
     // submission (or a pipeline compilation charged to it) cannot jump to a
     // multi-second batch.
     // per_step is the measured cost of one step, so target_ / per_step is the
     // step count that would fill the target.
+    //
+    // Growth is rate-limited (4x); shrink is not. A submission that already
+    // overran the target must be followed by a batch of at most the size that
+    // would have hit it (target / per_step), never anything larger: the next
+    // submission is the second chance to stay inside the display GPU's budget,
+    // and climbing down from 16 to 4 steps over several measurements keeps
+    // overrunning it meanwhile.
     const double ideal = target_ / per_step;
-    const double lowest = static_cast<double>(steps_done) / 4.0;
     const double highest = static_cast<double>(steps_done) * 4.0;
-    const double scaled = std::min(std::max(ideal, lowest), highest);
-    const double rounded = std::floor(scaled + 0.5);
+    const double scaled = ideal < static_cast<double>(steps_done)
+                              ? ideal
+                              : std::min(ideal, highest);
+    const double rounded = std::floor(std::max(scaled, 1.0) + 0.5);
     const std::size_t next = rounded < 1.0 ? 1U : static_cast<std::size_t>(rounded);
     steps_ = std::min(next, max_steps_);
 }
@@ -481,14 +509,51 @@ std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatche
     const std::size_t body_end = dispatches.size() - trail;
     const std::size_t body_steps = (body_end - lead) / per_step;
     std::size_t submissions = 0;
-
-    const auto submit_range = [&](std::size_t begin, std::size_t end) {
+    // The very first submission of an operation is the calibrating one: its
+    // duration is unknown until it has run, and it carries the one-off costs
+    // (pipeline compilation on a cold cache, and a PatchMatch pm_init pair that
+    // initialises the state the sweeps read). A step can legitimately exceed the
+    // steady-state 5 s fence budget at a large image size without being a hang,
+    // so the calibrating submission gets the generous budget. Every later
+    // submission is sized from a measurement; its budget accounts for a single
+    // step that is legitimately slow (see below).
+    bool calibrated = false;
+    const auto submit_range = [&](std::size_t begin, std::size_t end, std::size_t steps_here) {
         if (end <= begin) {
             return;
         }
-        run(context, std::vector<Dispatch>(
-                         dispatches.begin() + static_cast<std::ptrdiff_t>(begin),
-                         dispatches.begin() + static_cast<std::ptrdiff_t>(end)));
+        std::vector<Dispatch> slice(
+            dispatches.begin() + static_cast<std::ptrdiff_t>(begin),
+            dispatches.begin() + static_cast<std::ptrdiff_t>(end));
+        // A calibrated submission is sized to hit the target, which is far below
+        // any fence budget, so the default applies. The exception is a device
+        // (or an operation size) where one step alone outlasts the 5 s hardware
+        // budget: no split can shrink below one step, so the wait must be sized
+        // from the measurement rather than the target. The default budget stays
+        // a hard floor -- this only ever lengthens the wait -- and a step this
+        // slow is logged once, because it means the display is being starved
+        // whatever the batching does.
+        std::uint64_t budget_ns = BatchLimiter::kCalibrationBudgetNs;
+        if (calibrated) {
+            constexpr double kHeadroom = 4.0;
+            const double measured = limiter.last_seconds_per_step();
+            const double expected = static_cast<double>(steps_here) * measured * kHeadroom;
+            constexpr double kHardwareOversizedStepSeconds = 5.0;
+            if (expected <= kHardwareOversizedStepSeconds) {
+                budget_ns = 0;
+            } else {
+                budget_ns = static_cast<std::uint64_t>(expected * 1e9);
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true)) {
+                    log(LogLevel::Warn)
+                        << "GPU: a single batched step takes " << measured
+                        << " s, longer than the bounded submission budget; it cannot be split "
+                           "further, so the wait is sized from the measurement and the display "
+                           "may stutter";
+                }
+            }
+        }
+        run_with_fence_budget(context, slice, budget_ns);
         ++submissions;
     };
 
@@ -504,15 +569,32 @@ std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatche
         cursor = lead + (steps_done + steps_here) * per_step;
         const std::size_t end = last ? dispatches.size() : cursor;
         const auto start = std::chrono::steady_clock::now();
-        submit_range(begin, end);
+        const bool was_calibrating = !calibrated;
+        submit_range(begin, end, steps_here);
+        calibrated = true;
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (was_calibrating) {
+            // A slow calibrating submission is expected (cold pipelines, and a
+            // PatchMatch pm_init) and is what the generous budget is for; it is
+            // not a hang. Say so once, because the next batch is sized to be
+            // quick and the remaining work will then take as long as it takes.
+            constexpr double kSteadyStateBudgetSeconds = 5.0;
+            if (seconds > kSteadyStateBudgetSeconds) {
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true)) {
+                    log(LogLevel::Warn) << "GPU: the first batched submission took " << seconds
+                                        << " s; it is treated as slow, not as a hang, and the "
+                                           "next batch is sized from its measurement";
+                }
+            }
+        }
         limiter.observe(steps_here, seconds);
         steps_done += steps_here;
     }
     // No whole steps at all (leading/trailing work only): one submission.
     if (submissions == 0) {
-        submit_range(0, dispatches.size());
+        submit_range(0, dispatches.size(), std::max<std::size_t>(body_steps, 1));
     }
     return submissions;
 }
