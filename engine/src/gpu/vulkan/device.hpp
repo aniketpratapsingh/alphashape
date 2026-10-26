@@ -14,6 +14,7 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "gpu/vulkan/backend.hpp"
@@ -64,6 +65,11 @@ public:
                          bool block_when_full) override;
     void wait(std::uint64_t ticket) override;
     std::uint32_t in_flight() const override;
+    std::size_t orphaned_pool_count() const override {
+        // A test hook, but it reads state the submission mutex protects.
+        std::lock_guard<std::mutex> lock(mutex_);
+        return orphaned_pools_.size();
+    }
 
     VkDevice device() const { return device_handle_; }
     /// The queue a Submission's index resolves to (0 when out of range).
@@ -157,11 +163,21 @@ private:
     /// Ticket id of the oldest pending submission (0 when none).
     std::uint64_t oldest_pending_id();
     void release_slot(Slot& slot);
+    /// release_slot plus freeing the pools parked by *earlier* abandoned
+    /// submissions on this slot's queue: the fence that just signalled proves
+    /// the FIFO queue drained past them. Only the fence-signalled paths call
+    /// this; a record_and_submit() failure and the destructor use the plain
+    /// release and free_orphaned_pools() respectively.
+    void release_slot_after_signal(Slot& slot);
+    /// Destroys every descriptor pool parked by an abandoned submission. Called
+    /// from ~VulkanBackend, after the device has been drained.
+    void free_orphaned_pools();
     /// Gives up a slot whose fence will never signal (a device loss). The
     /// pending state and ticket go, so no later wait() spins on it and the ring
-    /// is not left permanently full, but the descriptor pool is kept until the
-    /// next successful use: the queue may still reference it, and nothing is
-    /// submitted to a lost device anyway.
+    /// is not left permanently full. The descriptor pool moves to
+    /// orphaned_pools_ rather than being freed or left in the slot: the queue
+    /// may still reference it, and leaving it here would let the next
+    /// record_and_submit() overwrite the handle and leak it.
     void abandon_slot(Slot& slot);
     void ensure_staging();
     /// Creates the image-copy command pool, buffer and fence on first use.
@@ -182,6 +198,13 @@ private:
     // Two command pools (rings); four slots index them by parity.
     std::array<VkCommandPool, 2> command_pools_{VK_NULL_HANDLE, VK_NULL_HANDLE};
     std::array<Slot, kMaxInFlight> slots_{};
+    // Descriptor pools owned by submissions that were abandoned (a fence
+    // timeout or a lost device) and so never released normally, paired with the
+    // queue they were submitted on. They must not be destroyed while the
+    // abandoned submission might still reference them, so they wait here for
+    // the next release on the same queue -- a FIFO queue that signalled a later
+    // fence has drained past them -- or for ~VulkanBackend.
+    std::vector<std::pair<VkDescriptorPool, int>> orphaned_pools_;
     std::uint64_t next_ticket_ = 1;
 
     // Staging ring, created on first device-local transfer.

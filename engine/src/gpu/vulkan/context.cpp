@@ -215,6 +215,11 @@ VulkanBackend::~VulkanBackend() {
             }
             slot.pending = false;
         }
+        // Pools parked by abandoned submissions. The device was drained above
+        // (or is lost, in which case the driver reclaims everything at
+        // vkDestroyDevice), so nothing can still reference them.
+        free_orphaned_pools();
+
         if (transfer_fence_ != VK_NULL_HANDLE) {
             fns.DestroyFence(device_handle_, transfer_fence_, nullptr);
             transfer_fence_ = VK_NULL_HANDLE;

@@ -1722,6 +1722,57 @@ TEST(Gpu, SubmitAndWaitThrowAfterDeviceLost) {
     ASSERT_NO_THROW(run(*context, {replay}));
 }
 
+// The descriptor pool of an abandoned submission must not be leaked. It cannot
+// be freed when the slot is abandoned (the queue may still reference it), so it
+// is parked until a fence actually signals -- which proves the FIFO queue has
+// drained past it -- and must then be destroyed. Before that parking existed
+// the pool was left in the slot and the next submission overwrote the handle,
+// leaking it; LeakSanitizer found exactly that on the lost-device paths.
+TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+    ASSERT_FALSE(detail::device_lost());
+    ASSERT_EQ(detail::orphaned_pool_count(*context), 0u)
+        << "a clean context starts with no parked pools";
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // Abandon one slot: the ticket's wait fails, which is the production path
+    // that used to leak.
+    {
+        const Ticket ticket = run_async(*context, {dispatch});
+        ASSERT_NE(ticket.id(), 0u);
+        detail::note_device_lost("test: abandon a slot to check the pool accounting");
+        EXPECT_THROW(wait(*context, ticket), Error);
+    }
+    ASSERT_EQ(detail::in_flight_count(*context), 0u) << "the abandoned slot must not stay pending";
+    const std::size_t parked = detail::orphaned_pool_count(*context);
+    ASSERT_EQ(parked, 1u) << "the abandoned submission's pool must be parked, not freed or lost";
+
+    // Recovering the device and completing one real submission proves the queue
+    // drained past the abandoned work, which is when the pool may be freed.
+    detail::reset_device_lost();
+    ASSERT_FALSE(detail::device_lost());
+    ASSERT_NO_THROW(run(*context, {dispatch}));
+    EXPECT_EQ(detail::orphaned_pool_count(*context), 0u)
+        << "the parked pool of an abandoned submission was never freed";
+    EXPECT_EQ(detail::in_flight_count(*context), 0u);
+}
+
 // Fix 2 + 4: the buffers of a failed operation are destroyed during the unwind,
 // on a device that is marked lost. That must not throw from a destructor
 // (implicitly noexcept -> std::terminate) and must not take a bounded wait per

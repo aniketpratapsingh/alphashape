@@ -110,6 +110,9 @@ public:
     virtual void wait(std::uint64_t ticket) = 0;
     /// Un-waited submissions on this backend.
     virtual std::uint32_t in_flight() const = 0;
+    /// Descriptor pools currently parked by abandoned submissions (test hook).
+    /// A leak in that path shows up as this count never dropping again.
+    virtual std::size_t orphaned_pool_count() const = 0;
 };
 
 /// Creates a backend. Throws gpu::Error with a descriptive message.
