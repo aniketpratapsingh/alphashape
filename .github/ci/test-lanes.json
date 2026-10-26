@@ -8,6 +8,7 @@
     { "name": "dem-plane", "tests": ["BuildDemPipeline.AerialDepthMapsToDem", "BuildOrthomosaic.PlaneToLocalIsExact", "DemAutoResolution.GeographicDepthMapCellIsInDegrees"] },
     { "name": "errors-dense-model", "tests": ["BuildOrthomosaic.Errors", "FullPipelineDenseNoWorseThanSfm.DenseStaysAtLeastAsAccurateAsSfm", "BuildModelEndToEnd.MatchesTheSceneOnTruthPoses"] },
     { "name": "texture-python", "tests": ["BuildTextureEndToEnd.BakesTheSceneOnTruthPoses", "BuildTextureDiagnostics.GroundsTheSeenTexelCoverageGap", "BuildDenseTruthPoses.DenseOnTruthPosesMatchesScene", "python_dem_ortho", "python_mesh", "python_parity"] },
+    { "name": "depth-pyramid", "tests": ["PatchMatchPyramid.PyramidFasterOnLarge"] },
     { "name": "gui-e2e", "tests": ["GuiPipelineEndToEnd.BuildsSavesAndReopensTheSampleProject"] }
   ]
 }
