@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -33,6 +35,15 @@ std::string g_attempted_reason;
 
 std::atomic<std::uint64_t> g_failure_count{0};
 std::atomic<std::uint64_t> g_validation_errors{0};
+
+/// Set once the device has stopped responding. Not a user switch (that is
+/// g_enabled): a lost device stays unavailable for the life of the process, so
+/// a shared display GPU is never submitted to again after a hang.
+std::atomic<bool> g_device_lost{false};
+std::mutex g_device_lost_mutex;
+std::string g_device_lost_detail;
+/// Test hook: the next fence wait reports a timeout instead of waiting.
+std::atomic<bool> g_forced_fence_timeout{false};
 
 void read_environment() {
     const char* value = std::getenv("ALPHASHAPE_GPU");
@@ -94,7 +105,49 @@ namespace detail {
 
 void note_gpu_failure(const std::string& what) {
     g_failure_count.fetch_add(1);
+    if (g_device_lost.load()) {
+        // The device-lost line (logged once, by note_device_lost) already says
+        // why the GPU is off; a second "switching to CPU" line per operation
+        // would just repeat it.
+        log(LogLevel::Debug) << "GPU operation fell back to the CPU: " << what;
+        return;
+    }
     log(LogLevel::Warn) << "GPU processing failed, switching to CPU mode: " << what;
+}
+
+void note_device_lost(const std::string& detail) {
+    // Once only: a second timeout must not print a second line or race the
+    // first reason out of the record.
+    if (g_device_lost.exchange(true)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_device_lost_mutex);
+        g_device_lost_detail = detail;
+    }
+    log(LogLevel::Warn) << "GPU stopped responding; continuing on the CPU ("
+                        << "device lost: " << detail << "). The GPU layer stays off for this "
+                        << "process.";
+}
+
+bool device_lost() { return g_device_lost.load(); }
+
+std::string device_lost_reason() {
+    std::lock_guard<std::mutex> lock(g_device_lost_mutex);
+    return g_device_lost_detail;
+}
+
+void force_fence_timeout_once() { g_forced_fence_timeout.store(true); }
+
+bool consume_forced_fence_timeout() { return g_forced_fence_timeout.exchange(false); }
+
+void reset_device_lost() {
+    g_device_lost.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_device_lost_mutex);
+        g_device_lost_detail.clear();
+    }
+    g_forced_fence_timeout.store(false);
 }
 
 std::uint64_t validation_error_count() { return g_validation_errors.load(); }
@@ -110,11 +163,17 @@ bool enabled() {
 
 void set_enabled(bool enabled_value) {
     std::call_once(g_env_once, read_environment);
+    // A lost device cannot be switched back on: the driver keeps its state, and
+    // resubmitting to a wedged GPU is exactly what this guards against. Tests
+    // clear it with detail::reset_device_lost().
     g_enabled = enabled_value;
 }
 
 bool available() {
     if (!enabled()) {
+        return false;
+    }
+    if (detail::device_lost()) {
         return false;
     }
     return default_context() != nullptr;
@@ -124,6 +183,9 @@ std::string unavailable_reason() {
     std::call_once(g_env_once, read_environment);
     if (!g_enabled) {
         return "GPU layer disabled (ALPHASHAPE_GPU=0 or set_enabled(false))";
+    }
+    if (detail::device_lost()) {
+        return "GPU stopped responding; continuing on the CPU";
     }
     if (!detail::kCompiledIn) {
         return "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
@@ -137,7 +199,7 @@ std::string unavailable_reason() {
 
 std::shared_ptr<Context> default_context() {
     std::call_once(g_env_once, read_environment);
-    if (!g_enabled) {
+    if (!g_enabled || detail::device_lost()) {
         return nullptr;
     }
     std::call_once(g_default_once, [] { g_default_context = init_default_context(); });
@@ -318,6 +380,129 @@ void run(Context& context, const std::vector<Dispatch>& dispatches) {
     // oldest pending submission instead (run == run_async + wait, and run is
     // documented to wait, not to reject under concurrency).
     context.backend_->run(requests_for(dispatches));
+}
+
+BatchLimiter::BatchLimiter(std::size_t dispatches_per_step, std::size_t initial_steps,
+                           std::size_t max_steps)
+    : per_step_(std::max<std::size_t>(dispatches_per_step, 1)),
+      steps_(std::max<std::size_t>(initial_steps, 1)),
+      max_steps_(std::max<std::size_t>(max_steps, 1)) {
+    if (const std::size_t forced = override_steps(); forced != 0) {
+        steps_ = std::min(forced, max_steps_);
+    }
+}
+
+std::size_t BatchLimiter::override_steps() {
+    const char* text = std::getenv("ALPHASHAPE_GPU_MAX_BATCH");
+    if (text == nullptr || *text == '\0') {
+        return 0;
+    }
+    // Strict parse. strtoull accepts a leading sign and leading whitespace, and
+    // "-2" would wrap to a huge positive size: an override that silently became
+    // something else would hide itself, so anything but plain digits is ignored
+    // (adaptive), never guessed at.
+    for (const char* digit = text; *digit != '\0'; ++digit) {
+        if (*digit < '0' || *digit > '9') {
+            return 0;
+        }
+    }
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == nullptr || *end != '\0' || value == 0 ||
+        value > std::numeric_limits<std::size_t>::max()) {
+        return 0;
+    }
+    return static_cast<std::size_t>(value);
+}
+
+std::size_t BatchLimiter::steps(std::size_t remaining_steps) const {
+    if (remaining_steps == 0) {
+        return 0;
+    }
+    return std::min(steps_, remaining_steps);
+}
+
+void BatchLimiter::observe(std::size_t steps_done, double seconds) {
+    if (steps_done == 0 || !(seconds > 0.0) || !(target_ > 0.0)) {
+        return;
+    }
+    const double per_step = seconds / static_cast<double>(steps_done);
+    if (!(per_step > 0.0)) {
+        return;
+    }
+    // Aim at the target, but move at most 4x per measurement so one noisy first
+    // submission (or a pipeline compilation charged to it) cannot jump to a
+    // multi-second batch.
+    const double ideal = target_ / per_step;
+    const double lowest = static_cast<double>(steps_done) / 4.0;
+    const double highest = static_cast<double>(steps_done) * 4.0;
+    const double scaled = std::min(std::max(ideal, lowest), highest);
+    const double rounded = std::floor(scaled + 0.5);
+    std::size_t next = rounded < 1.0 ? 1U : static_cast<std::size_t>(rounded);
+    steps_ = std::min(next, max_steps_);
+    if (const std::size_t forced = override_steps(); forced != 0) {
+        steps_ = std::min(forced, max_steps_);
+    }
+}
+
+std::size_t run_batched(Context& context, const std::vector<Dispatch>& dispatches,
+                        BatchLimiter& limiter, std::size_t leading_dispatches,
+                        std::size_t trailing_dispatches) {
+    if (dispatches.empty()) {
+        return 0;
+    }
+    if (!context.backend_) {
+        throw Error("GPU work requested from an empty context");
+    }
+    // Resolve the target once per call: 80 ms on hardware, generous on a CPU
+    // driver, where submissions are cheap to outlive but expensive to make.
+    if (!(limiter.target_seconds() > 0.0)) {
+        limiter.set_target_seconds(is_software_device(context.info())
+                                       ? BatchLimiter::kSoftwareTargetSeconds
+                                       : BatchLimiter::kHardwareTargetSeconds);
+    }
+    const std::size_t per_step = limiter.dispatches_per_step();
+    // Leading and trailing dispatches are outside the step arithmetic; clamp
+    // them so a caller cannot make the split skip anything.
+    const std::size_t lead = std::min(leading_dispatches, dispatches.size());
+    const std::size_t trail = std::min(trailing_dispatches, dispatches.size() - lead);
+    const std::size_t body_end = dispatches.size() - trail;
+    const std::size_t body_steps = (body_end - lead) / per_step;
+    std::size_t submissions = 0;
+
+    const auto submit_range = [&](std::size_t begin, std::size_t end) {
+        if (end <= begin) {
+            return;
+        }
+        run(context, std::vector<Dispatch>(
+                         dispatches.begin() + static_cast<std::ptrdiff_t>(begin),
+                         dispatches.begin() + static_cast<std::ptrdiff_t>(end)));
+        ++submissions;
+    };
+
+    std::size_t steps_done = 0;
+    std::size_t cursor = lead;
+    while (steps_done < body_steps) {
+        const std::size_t steps_here = limiter.steps(body_steps - steps_done);
+        const bool last = steps_done + steps_here == body_steps;
+        // The first submission carries the leading dispatches; the last one
+        // carries everything after the body (the settle statistic, or a
+        // malformed tail), so neither pays an extra round trip.
+        const std::size_t begin = steps_done == 0 ? 0 : cursor;
+        cursor = lead + (steps_done + steps_here) * per_step;
+        const std::size_t end = last ? dispatches.size() : cursor;
+        const auto start = std::chrono::steady_clock::now();
+        submit_range(begin, end);
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        limiter.observe(steps_here, seconds);
+        steps_done += steps_here;
+    }
+    // No whole steps at all (leading/trailing work only): one submission.
+    if (submissions == 0) {
+        submit_range(0, dispatches.size());
+    }
+    return submissions;
 }
 
 Ticket run_async(Context& context, const std::vector<Dispatch>& dispatches,

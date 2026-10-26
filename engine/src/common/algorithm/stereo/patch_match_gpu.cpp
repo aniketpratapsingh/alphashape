@@ -399,18 +399,15 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // solve. A pixel-heavy reference (480x360, 7 neighbours) is ~15 s of GPU
     // time on the weak AMD test box, which puts a single all-sweeps submission
     // past amdgpu's 10 s job timeout and cancels the context (device lost ->
-    // CPU fallback). Two dispatches per submission
-    // keeps every job short and leaves the GPU saturated (measured 7.8x vs
-    // 1.0x on the RADV STONEY iGPU). The barriers at chunk boundaries are the
-    // same ones gpu::run already inserts between dispatches, so the result is
-    // identical.
-    constexpr std::size_t kDispatchesPerSubmission = 2;
-    for (std::size_t begin = 0; begin < dispatches.size(); begin += kDispatchesPerSubmission) {
-        const std::size_t end = std::min(dispatches.size(), begin + kDispatchesPerSubmission);
-        g::run(*context,
-               std::vector<g::Dispatch>(dispatches.begin() + static_cast<std::ptrdiff_t>(begin),
-                                        dispatches.begin() + static_cast<std::ptrdiff_t>(end)));
-    }
+    // CPU fallback). On a GPU shared with the display (Apple silicon) a job
+    // that long starves the compositor and can hang the machine. Each
+    // half-sweep is one step; the first submission carries two (the two
+    // pm_init colours) and the limiter then scales the step count towards the
+    // device's target duration, so a slow device gets short jobs and a fast one
+    // keeps the GPU saturated. The barriers a split adds are the same ones
+    // gpu::run already inserts between dispatches, so the result is identical.
+    g::BatchLimiter limiter(/*dispatches_per_step=*/1, /*initial_steps=*/2);
+    g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/1);
 
     PatchMatchResult result;
     result.width = width;

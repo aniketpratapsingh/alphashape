@@ -137,26 +137,56 @@ const Pipeline& VulkanBackend::pipeline_for(const KernelEntry& kernel) {
 
 void VulkanBackend::wait_fence(VkFence fence) {
     const Functions& fns = instance_->fns;
-    // Fence waits poll in 5 s slices and are bounded, so a wedged device raises
-    // Error("gpu: fence timeout") instead of hanging. Hardware gets a 30 s total
-    // budget; a CPU driver (llvmpipe) legitimately takes minutes for a large
-    // Poisson batch, and a false timeout there would turn a slow-but-correct
-    // device into a silent CPU fallback (see README "Fence timeout").
-    constexpr std::uint64_t kSliceNs = 5'000'000'000ULL;
-    const int slices = device_.info.software ? 120 : 6;
-    for (int slice = 0; slice < slices; ++slice) {
-        const VkResult result = fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, kSliceNs);
+    // Once the device is gone its fences never signal and nothing it was given
+    // will complete. The original failure has already thrown out of the
+    // operation that hit it; everything left is cleanup -- a buffer handle
+    // being destroyed, a host copy draining the ring -- and those must not
+    // block for the budget again or throw out of a destructor.
+    if (device_lost()) {
+        return;
+    }
+    // Test hook: behave exactly like a wedged device without hanging the suite.
+    if (consume_forced_fence_timeout()) {
+        note_device_lost("forced fence timeout (test hook)");
+        throw Error("gpu: fence timeout (forced by test hook)");
+    }
+    // Fence waits poll in one-second slices and are bounded, so a wedged device
+    // raises Error instead of hanging. The budget is small now that every long
+    // loop splits its submissions (gpu::run_batched): a submission is meant to
+    // run for tens of milliseconds, so a wait of seconds already means the
+    // device hung. On a shared display GPU (Apple silicon, an iGPU) waiting
+    // longer does not help -- the compositor is already starved and the machine
+    // can freeze -- so the hardware budget is 5 s, not the old 30 s. A CPU
+    // driver (llvmpipe) runs the "device" in host threads; it cannot starve a
+    // display and one Poisson step can legitimately take minutes, so software
+    // keeps the generous 10 min budget.
+    constexpr std::uint64_t kSliceNs = 1'000'000'000ULL;
+    constexpr std::uint64_t kHardwareBudgetNs = 5'000'000'000ULL;
+    constexpr std::uint64_t kSoftwareBudgetNs = 600'000'000'000ULL;
+    const std::uint64_t budget_ns =
+        device_.info.software ? kSoftwareBudgetNs : kHardwareBudgetNs;
+    std::uint64_t waited_ns = 0;
+    while (waited_ns < budget_ns) {
+        const std::uint64_t slice_ns = std::min(kSliceNs, budget_ns - waited_ns);
+        const VkResult result = fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, slice_ns);
         if (result == VK_SUCCESS) {
             return;
         }
         if (result == VK_TIMEOUT) {
+            waited_ns += slice_ns;
             continue;
         }
         if (result == VK_ERROR_DEVICE_LOST) {
+            note_device_lost("VK_ERROR_DEVICE_LOST while waiting for GPU completion");
             throw Error("Vulkan device lost while waiting for GPU completion");
         }
         throw Error(vk_result_string("vkWaitForFences", result));
     }
+    // A timeout is a device failure, not a slow device: mark the GPU lost so
+    // every later call takes its CPU branch, and let with_fallback rerun this
+    // operation on the CPU.
+    note_device_lost("no fence signal within " +
+                     std::to_string(budget_ns / 1'000'000'000ULL) + " s");
     throw Error("gpu: fence timeout");
 }
 
@@ -251,9 +281,14 @@ void VulkanBackend::record_and_submit(Slot& slot,
         const DispatchRequest& dispatch = dispatches[index];
         const Pipeline& pipeline = pipeline_for(*dispatch.kernel);
 
-        if (index != 0) {
-            // Storage-buffer writes from the previous dispatch must be visible
-            // to the next one.
+        {
+            // Storage-buffer writes from the previous dispatch -- or from the
+            // previous submission, when a long loop was split across command
+            // buffers (gpu::run_batched) -- must be visible to this one. The
+            // barrier is issued unconditionally, including at index 0: the
+            // first dispatch of a split submission needs the same dependency
+            // the unsplit command buffer gets for free from its predecessor's
+            // barrier, and a barrier with no prior writes is a no-op.
             VkMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
             barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -371,6 +406,9 @@ void VulkanBackend::record_and_submit(Slot& slot,
     submit.pCommandBuffers = &slot.command_buffer;
     result = fns.QueueSubmit(queue(slot.queue), 1, &submit, slot.fence);
     if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            note_device_lost("VK_ERROR_DEVICE_LOST from vkQueueSubmit");
+        }
         throw Error(vk_result_string("vkQueueSubmit", result));
     }
 }

@@ -64,19 +64,47 @@ names and dispatches.
   exposes at least two queues; otherwise it logs once and falls back to queue 0.
   There is no automatic splitting between queues. Cross-queue ordering is the
   caller's job via `wait`.
+- `run_batched(context, dispatches, limiter, leading = 0, trailing = 0)` — the
+  entry point for any iteration loop. It splits the dispatch list across
+  several submissions, waiting on each fence before submitting the next, so no
+  single GPU job runs longer than roughly 50–100 ms. `BatchLimiter` holds the
+  policy: one "step" is the smallest unit that must stay in one command buffer
+  (two dispatches for a Poisson CG iteration or a TV-L1 dual/primal pair, one
+  for a PatchMatch half-sweep). The first submission carries one step; its
+  measured wall clock then scales the step count towards 80 ms (4 s on a CPU
+  driver), moving at most 4× per measurement so a noisy probe cannot produce a
+  multi-second job. A split is a scheduling change only: the same dispatches
+  run in the same order with the same barriers, so the result is bit-identical
+  to one unsplit `run()`. `ALPHASHAPE_GPU_MAX_BATCH=<n>` pins the steps per
+  submission, which is how the tests compare the two paths.
 - `with_fallback(what, gpu_fn, cpu_fn)` — runs the CPU function when the layer
   is disabled or the GPU lambda throws; logs
   `GPU processing failed, switching to CPU mode: <what>` and bumps
   `failure_count()`.
 - `compare(gpu, cpu)` — golden self-check helper (mean/max absolute error).
 
-### Fence timeout
+### Fence timeout and device loss
 
-Every fence wait is sliced into 5 s polls and bounded: a wedged device raises
-`gpu::Error("gpu: fence timeout")` instead of hanging. The total budget is 30 s
-on hardware and 10 min on a CPU driver, because llvmpipe legitimately takes
-minutes for a large Poisson batch and a false timeout there would turn a
-slow-but-correct device into a silent CPU fallback.
+A GPU that shares its silicon with the display (Apple silicon, an integrated
+GPU, a desktop whose monitor is on the compute card) cannot be handed a
+multi-second job: the compositor is starved while it runs and the system can
+hang or reset. That is what froze a 16 GB M1 in Build Model, so every long loop
+goes through `run_batched` and the fence wait is short:
+
+- Hardware: a submission is expected to run for tens of milliseconds, so the
+  wait is 5 s in 1 s polls. A timeout, or `VK_ERROR_DEVICE_LOST`, is a *device
+  failure*: the layer records it once ("GPU stopped responding; continuing on
+  the CPU"), marks the device unusable for the rest of the process (so no later
+  `with_fallback` ever submits again) and throws, which makes the caller rerun
+  that operation on the CPU. `unavailable_reason()` reports the same sentence
+  afterwards.
+- A CPU driver (llvmpipe, lavapipe) cannot starve a display and one Poisson step
+  legitimately takes minutes, so software keeps a 10 min budget and a 4 s batch
+  target; a false timeout there would turn a slow-but-correct device into a
+  silent CPU fallback.
+- `detail::force_fence_timeout_once()` is the test hook that produces the
+  timeout path without a real hang; `detail::reset_device_lost()` clears the
+  state so the rest of a test binary can use the device.
 
 ### Memory kinds per algorithm
 

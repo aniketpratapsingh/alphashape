@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
+#include "base/platform/env.hpp"
 #include "common/algorithm/mesh/build_model_task.hpp"
 #include "model/mesh/marching_tetrahedra.hpp"
 #include "common/algorithm/mesh/poisson.hpp"
@@ -463,6 +465,114 @@ TEST(PoissonGpu, ForcedFailureFallsBackAndCounts) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Bounded submissions: the CG batches are split so no single submission
+// can starve a display GPU, and the split must not change the answer.
+// ---------------------------------------------------------------------------
+
+TEST(PoissonGpu, SplitSubmissionsAreBitIdentical) {
+    REQUIRE_GPU_POISSON();
+    const PointCloud cloud = fibonacci_sphere(6000);
+    PoissonOptions options;
+    options.max_resolution = 32;
+    const meshing::detail::PoissonSystem system =
+        meshing::detail::assemble_poisson_system(cloud, -kBox, kBox, options);
+
+    // The override is read when a BatchLimiter is constructed, so each solve
+    // sets it first and the sibling tests see it cleared again.
+    const auto solve_with_batch = [&](const char* override, int* submissions_out) {
+        std::vector<double> solution;
+        meshing::detail::PoissonCgStats stats;
+        if (!alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", override)) {
+            ADD_FAILURE() << "could not set ALPHASHAPE_GPU_MAX_BATCH";
+            return solution;
+        }
+        try {
+            solution = meshing::poisson_solve_device(system, options, stats);
+            if (submissions_out != nullptr) {
+                *submissions_out = meshing::poisson_gpu_last_submissions();
+            }
+        } catch (...) {
+            alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+            throw;
+        }
+        alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
+        return solution;
+    };
+
+    // 32 iterations per submission -- the largest batch the solver assembles,
+    // so each batch is one command buffer (the unsplit path)...
+    int coarse_submissions = 0;
+    const std::vector<double> coarse = solve_with_batch("32", &coarse_submissions);
+    // ...against one CG iteration per submission, which is the most split the
+    // loop can be -- and the shape every submission takes on a slow device.
+    int fine_submissions = 0;
+    const std::vector<double> fine = solve_with_batch("1", &fine_submissions);
+
+    std::printf("[poisson gpu split] 64 iterations/submission: %d submission(s) | one "
+                "iteration/submission: %d submission(s)\n",
+                coarse_submissions, fine_submissions);
+
+    ASSERT_EQ(fine.size(), coarse.size());
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < fine.size(); ++i) {
+        if (std::memcmp(&fine[i], &coarse[i], sizeof(double)) != 0) {
+            ++mismatches;
+        }
+    }
+    EXPECT_EQ(mismatches, 0u)
+        << "splitting the CG into one-iteration submissions changed " << mismatches
+        << " of " << fine.size() << " voxels";
+    EXPECT_GT(fine_submissions, coarse_submissions)
+        << "the fine split must issue more submissions than the coarse one";
+}
+
+TEST(PoissonGpu, DeviceHangFallsBackToCpuAndDisablesGpu) {
+    REQUIRE_GPU_POISSON();
+    // The test deliberately wedges the device; restore it however the test
+    // exits so the rest of the binary can still use the GPU.
+    struct DeviceStateGuard {
+        ~DeviceStateGuard() {
+            gpu::detail::reset_device_lost();
+            gpu::set_enabled(true);
+        }
+    } guard;
+    (void)guard;
+
+    const PointCloud cloud = fibonacci_sphere(3000);
+    PoissonOptions options;
+    options.max_resolution = 24;
+    const meshing::detail::PoissonSystem system =
+        meshing::detail::assemble_poisson_system(cloud, -kBox, kBox, options);
+
+    // A fence timeout is treated as a device failure: this operation reruns on
+    // the CPU, and every later one takes the CPU branch without a device call.
+    // The timeout may land on the buffer staging copies before the first CG
+    // submission -- both are inside the solve, so either way the solve falls
+    // back.
+    const std::uint64_t failures_before = gpu::failure_count();
+    gpu::detail::force_fence_timeout_once();
+    meshing::detail::PoissonCgStats fallback_stats;
+    const std::vector<double> fallback =
+        meshing::poisson_solve_with_fallback(system, options, fallback_stats);
+    EXPECT_TRUE(gpu::detail::device_lost());
+    EXPECT_EQ(gpu::failure_count(), failures_before + 1);
+    EXPECT_FALSE(gpu::available());
+    EXPECT_NE(gpu::unavailable_reason().find("stopped responding"), std::string::npos);
+
+    meshing::detail::PoissonCgStats cpu_stats;
+    const std::vector<double> cpu =
+        meshing::poisson_cpu_solve(system, options.tolerance, options.max_iterations, cpu_stats);
+    EXPECT_EQ(fallback, cpu) << "the hung solve must return the CPU's answer, bit for bit";
+
+    // A second call is answered on the CPU without counting a new failure.
+    meshing::detail::PoissonCgStats second_stats;
+    const std::vector<double> second =
+        meshing::poisson_solve_with_fallback(system, options, second_stats);
+    EXPECT_EQ(second, cpu);
+    EXPECT_EQ(gpu::failure_count(), failures_before + 1);
+}
+
+// ---------------------------------------------------------------------------
 // 5. End to end: BuildModel from the filtered point cloud, GPU solve on
 // ---------------------------------------------------------------------------
 
@@ -583,18 +693,23 @@ TEST(PoissonGpu, TimingAgainstCpu) {
     std::printf("[poisson gpu timing] submissions per iteration: %.4f (%.1f iterations per "
                 "submission, 2 dispatches per iteration)\n",
                 submissions_per_iteration,
-                submissions_per_iteration > 0.0 ? 1.0 / submissions_per_iteration : 0.0);
-    RecordProperty("gpu_seconds", gpu_seconds);
+                submissions_per_iteration > 0.0 ? 1.0 / submissions_per_iteration : 0.0);    RecordProperty("gpu_seconds", gpu_seconds);
     RecordProperty("cpu_seconds", cpu_seconds);
     RecordProperty("speedup", speedup);
     RecordProperty("submissions_per_iteration", submissions_per_iteration);
 
-    // Batching is a property of the submission scheme, not of the device: a
-    // whole CG iteration is two dispatches and a submission carries a batch of
-    // them, so this must hold on llvmpipe too.
+    // Batching is a property of the submission scheme, not of the device: the
+    // split happens at whole CG iteration boundaries, so a submission always
+    // carries one or more complete iterations and there can never be more
+    // submissions than iterations. How many iterations one submission carries
+    // is adaptive (gpu::run_batched targets ~80 ms, 4 s on a CPU driver), so the
+    // exact ratio is a property of the device, not of the code under test; the
+    // ratio is printed rather than pinned.
     EXPECT_GT(gpu_stats.iterations, 0);
-    EXPECT_LE(submissions_per_iteration, 1.0 / 20.0)
+    EXPECT_LE(submissions_per_iteration, 1.0)
         << "CG iterations are not being batched into submissions";
+    EXPECT_LE(submissions, gpu_stats.iterations)
+        << "each submission must carry at least one whole iteration";
 
     // The solve must agree regardless of where it ran.
     EXPECT_LE(relative_l2(gpu, cpu), 0.05);

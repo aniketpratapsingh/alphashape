@@ -30,14 +30,18 @@
 // digits, so the solve cannot reach a 1e-6 relative residual on its own; it
 // converges to the point where each batch stops improving.
 //
-// SUBMISSIONS. A whole CG iteration is TWO dispatches and one submission can
-// carry a batch of kIterationsPerBatch of them (the reference is 32):
+// SUBMISSIONS. A whole CG iteration is TWO dispatches:
 //   1. poisson_spmv  -- p_k = z + beta p_{k-1}, q = A p_k, pq = sum(p_k.q),
 //                       alpha = rho / pq         (fused, one 3D dispatch)
 //   2. poisson_axpy  -- x += alpha p_k, r -= alpha q, rr = sum(r.r),
 //                       rz = sum(r.z), beta = rz / rho, rho <- rz   (fused)
-// so the measured cost is 2 dispatches per iteration and 1 submission per batch
-// (about 1/32 of an iteration; the timing test prints the measured ratio). The
+// One CG iteration is one "step" for gpu::run_batched, which times the first
+// submission and sizes the rest so one submission lasts about 80 ms: a single
+// command buffer for hundreds of iterations would starve a GPU shared with the
+// display on a slow machine and can hang the whole system (a 16 GB M1 froze in
+// Build Model that way). The residual inspection between batches still happens
+// once per batch of up to kMaxIterationsPerBatch iterations -- the batching
+// bound is the convergence check, and the submission bound is the display. The
 // batch read-back is the 2 * groups float partials (64 KB at 128^3), not a
 // vector of the size of the grid.
 //
@@ -55,8 +59,11 @@ namespace {
 namespace g = alphashape::gpu;
 
 constexpr std::uint32_t kLocalSize = 256;
-/// CG iterations per submission batch.
-constexpr int kIterationsPerBatch = 32;
+/// Upper bound on CG iterations assembled between two host-side residual
+/// inspections. Within a batch gpu::run_batched splits the work into
+/// submissions that each last roughly 50-100 ms, so this bounds the convergence
+/// check's granularity, not the length of a GPU job.
+constexpr int kMaxIterationsPerBatch = 32;
 /// Refinement rounds allowed when float32 stalls above the tolerance.
 constexpr int kMaxRefinements = 6;
 /// A batch must reduce the residual at least this much, or float32 has hit its
@@ -374,6 +381,15 @@ std::vector<double> poisson_solve_device(const detail::PoissonSystem& system,
     int submissions = 0;
     int refinements = 0;
     bool refined = false;
+    // One CG iteration is two dispatches and a submission carries a batch of
+    // them. The batch size is timed rather than fixed: the first submission is
+    // a single iteration, whose duration then scales the batch towards ~80 ms,
+    // so a slow device cannot be handed a multi-second job (on a GPU shared
+    // with the display that starves the compositor and can hang the machine).
+    // The limiter persists across refinement rounds, so the measured cost of
+    // this problem carries over.
+    g::BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1,
+                            /*max_steps=*/kMaxIterationsPerBatch);
     for (int round = 0; round <= kMaxRefinements; ++round) {
         // The inner solve always starts from zero with r = current residual.
         state.x.upload(std::vector<float>(n, 0.0F).data(), n * sizeof(float));
@@ -389,13 +405,14 @@ std::vector<double> poisson_solve_device(const detail::PoissonSystem& system,
         bool parity = false;
         double previous = residual_norm;
         while (inner < options.max_iterations - stats.iterations) {
-            const int batch = std::min(kIterationsPerBatch,
+            const int batch = std::min(kMaxIterationsPerBatch,
                                        options.max_iterations - stats.iterations - inner);
             if (batch <= 0) {
                 break;
             }
-            g::run(*context, build_batch(system, state, batch, inner == 0, parity));
-            ++submissions;
+            submissions += static_cast<int>(g::run_batched(
+                *context, build_batch(system, state, batch, inner == 0, parity), limiter,
+                /*leading_dispatches=*/inner == 0 ? 1 : 0));
             inner += batch;
             // The workgroup partials -- not the float combine the last workgroup
             // folded them into -- are read back and re-summed in double on the
