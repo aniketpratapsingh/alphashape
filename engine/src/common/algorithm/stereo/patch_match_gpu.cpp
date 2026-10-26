@@ -631,11 +631,12 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
             reduced_neighbours.reserve(neighbours.size());
             reduced_calibrations.reserve(neighbours.size());
             for (std::size_t i = 0; i < neighbours.size(); ++i) {
-                FloatImage reduced;
-                Calibration reduced_calibration = neighbours[i].calibration;
-                for (int halvings = 0; halvings < from_finest; ++halvings) {
-                    reduced = halvings == 0 ? pyramid_downsample(*neighbours[i].image)
-                                            : pyramid_downsample(reduced);
+                // from_finest >= 1 here, so the first halving always reads the
+                // original and each later one reads the level above it.
+                FloatImage reduced = pyramid_downsample(*neighbours[i].image);
+                Calibration reduced_calibration = scaled_calibration(neighbours[i].calibration, 2);
+                for (int halvings = 1; halvings < from_finest; ++halvings) {
+                    reduced = pyramid_downsample(reduced);
                     reduced_calibration = scaled_calibration(reduced_calibration, 2);
                 }
                 reduced_neighbours.push_back(std::move(reduced));

@@ -897,6 +897,41 @@ TEST(PatchMatchPyramid, SweepProgressReportsMonotoneFractions) {
     EXPECT_TRUE(coarse_interior) << "the coarse level reported no progress of its own";
 }
 
+TEST(PatchMatchPyramid, SingleLevelSearchNeedsNoMinSize) {
+    // The end-to-end half of SingleLevelDoesNotNeedAMinSize: the search itself
+    // must accept a single-level run with no floor and produce the flat result,
+    // rather than reaching a throw from the plan it asked for.
+    PlaneScene scene = make_plane_scene(96, 72, 100.0);
+    const PMView reference = plane_reference(scene);
+    const std::vector<PMView> all_views = plane_views(scene);
+    const std::vector<PMView> neighbours = {all_views[0]};
+
+    PatchMatchOptions options = scene_options();
+    options.window_radius = 3;
+    options.window_step = 3;
+    options.iterations = 2;
+    options.pyramid_levels = 1;
+    options.pyramid_min_size = 0;
+    EXPECT_NO_THROW({
+        const PatchMatchResult result =
+            alphashape::stereo::run_patch_match(reference, neighbours, options);
+        EXPECT_EQ(result.width, 96);
+        EXPECT_EQ(result.height, 72);
+    });
+
+    // And it really is the flat search: the same options with a defined floor
+    // resolve to the same single level and produce the same map.
+    PatchMatchOptions with_floor = options;
+    with_floor.pyramid_min_size = 256;
+    const PatchMatchResult no_floor =
+        alphashape::stereo::run_patch_match(reference, neighbours, options);
+    const PatchMatchResult floor_run =
+        alphashape::stereo::run_patch_match(reference, neighbours, with_floor);
+    EXPECT_EQ(no_floor.depth, floor_run.depth);
+    EXPECT_EQ(no_floor.normals, floor_run.normals);
+    EXPECT_EQ(no_floor.cost, floor_run.cost);
+}
+
 // ---------------------------------------------------------------------------
 // Determinism
 // ---------------------------------------------------------------------------

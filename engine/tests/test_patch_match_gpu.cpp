@@ -570,6 +570,22 @@ TEST(PatchMatchGpu, SweepProgressReportsMonotoneFractions) {
     reference.R = scene.rotations[0];
     reference.t = scene.translations[0];
 
+    // One dispatch per submission, so every half-sweep's milestone is reported
+    // regardless of how fast this device is. The adaptive limiter is free to
+    // batch several sweeps into one submission, which is correct for the bar but
+    // would make the exact values below depend on the machine.
+    struct EnvGuard {
+        const char* name;
+        std::string previous;
+        explicit EnvGuard(const char* variable)
+            : name(variable), previous(alphashape::platform::get_env(variable)) {}
+        ~EnvGuard() { alphashape::platform::set_env(name, previous); }
+    };
+    EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+    EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "100000000");
+
     const auto progress_of = [&](PatchMatchOptions options) {
         std::vector<double> reported;
         options.on_sweep = [&](double fraction) { reported.push_back(fraction); };
@@ -577,7 +593,8 @@ TEST(PatchMatchGpu, SweepProgressReportsMonotoneFractions) {
         return reported;
     };
     const auto expect_shape = [](const std::vector<double>& reported, const char* what) {
-        ASSERT_GE(reported.size(), 2U) << what << ": the hook must report more than the final tick";
+        ASSERT_GE(reported.size(), 2U)
+            << what << ": the hook must report more than the final tick";
         for (std::size_t i = 0; i < reported.size(); ++i) {
             EXPECT_GE(reported[i], 0.0) << what << " report " << i;
             EXPECT_LE(reported[i], 1.0) << what << " report " << i;
@@ -627,13 +644,13 @@ TEST(PatchMatchGpu, SweepProgressReportsMonotoneFractions) {
     const std::vector<double> pyramid_reported = progress_of(pyramid);
     expect_shape(pyramid_reported, "two levels");
     // The coarse level owns 2 * plan[0] of the 2 * (plan[0] + plan[1]) sweeps, so
-    // some report must land between its start and its end, and none may dip
-    // below the finest level's floor.
+    // some report must land strictly inside its share -- not only the 0 it
+    // starts at and not only the boundary value.
     const double coarse_share =
         static_cast<double>(2 * plan[0]) / static_cast<double>(2 * (plan[0] + plan[1]));
     bool coarse_reported = false;
     for (const double value : pyramid_reported) {
-        if (value > 0.0 && value <= coarse_share + 1e-12) {
+        if (value > 0.0 && value < coarse_share - 1e-12) {
             coarse_reported = true;
         }
     }
