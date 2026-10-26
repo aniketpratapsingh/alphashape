@@ -152,22 +152,13 @@ endfunction()
 # skips the SPIR-V optimiser (glslc -O).
 #
 # First try the optimised build: if a kernel is wrong *only* optimised it is
-# usually undefined behaviour the optimiser may exploit, so compare the two
-# builds before blaming the driver. Skipping -O is a real cost -- the driver does
-# not re-optimise a module the way an offline pass does -- so it is the last
-# resort, not a default.
-#
-# One kernel is on it: pm_init. Its optimised module returns a wrong
-# random-plane normal on an NVIDIA Tesla T4 (driver 535), and only there. The
-# shader's undefined behaviour has been fixed (a mutable RNG threaded through
-# `inout` parameters is now a stateless keyed stream; a never-taken branch no
-# longer indexes three buffers out of range), and pm_refine -- which shares the
-# entire cost core and every one of those fixes -- is correct at -O on the same
-# GPU. What pm_init has that pm_refine does not is the initial hypothesis, and
-# the only non-arithmetic operations in it are sin/cos in the cone normal, so the
-# remaining suspect is a driver transcendental on optimised input. pm_init is one
-# short dispatch per colour and pm_refine does all the work, so the search is
-# still optimised where it matters.
+# usually undefined behaviour the optimiser may exploit, or an assumption the
+# shader makes that is not one Vulkan gives. Both PatchMatch search kernels were
+# on this list for a wrong random-plane normal on an NVIDIA Tesla T4; the causes
+# were shader-side (an out-of-range index in a dead branch, aggregate `inout`
+# search state, and a random-draw chain whose run-time trip count the optimiser
+# collapsed) and are fixed, so the flag is unused. It is kept because it is the
+# first thing to reach for when diagnosing this class of failure.
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
     if("NO_OPTIMIZE" IN_LIST ARGN)
