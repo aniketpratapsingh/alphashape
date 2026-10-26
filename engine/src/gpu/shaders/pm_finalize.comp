@@ -25,5 +25,5 @@ void main() {
     out_normals[pixel * 3 + 1] = n.y;
     out_normals[pixel * 3 + 2] = n.z;
     out_cost[pixel] = state_cost[pixel];
-    keep_bindings_alive(pixel);
+    keep_bindings_alive();
 }

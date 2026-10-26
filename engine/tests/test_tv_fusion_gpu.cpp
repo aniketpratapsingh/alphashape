@@ -975,9 +975,18 @@ TEST(TvFusionGpu, BuildModelMeetsCpuBounds) {
     EXPECT_EQ(gpu.nonmanifold_edges, 0U);
     // The dense fixture's surface is clipped by the volume border, so the
     // extracted mesh has genuine boundary edges (test_build_model asserts
-    // non-manifold edges only). The device mesh must have the same count as
-    // the CPU's, not zero.
-    EXPECT_EQ(gpu.boundary_edges, cpu.boundary_edges);
+    // non-manifold edges only). What this guards is "the device mesh is exactly
+    // the CPU's surface, with the same open rim". It is an exact count on purpose:
+    // the two documents' depth maps come from the GPU and the CPU PatchMatch, and
+    // those are exact against each other (see PatchMatchGpu.RefineSweepsMatchCpu),
+    // so mesh topology - a discontinuous function of the depth map - is exact too.
+    // When this last drifted it was a real defect, not tolerance: a fused
+    // multiply-add in the shader's depth/plane-to-pixel path moved a fraction of a
+    // percent of the samples to a neighbouring texel (93.4% pixel agreement on a
+    // Tesla T4), and the count moved from 1272 to 1286. A tolerance here would
+    // have hidden that. Keep it exact; fix the shader instead.
+    EXPECT_EQ(gpu.boundary_edges, cpu.boundary_edges)
+        << "boundary edges gpu " << gpu.boundary_edges << " cpu " << cpu.boundary_edges;
     // ...and the GPU mesh lands where the CPU's does.
     EXPECT_LT(gpu.median_voxels, cpu.median_voxels + 0.05);
     EXPECT_LT(gpu.p90_voxels, cpu.p90_voxels + 0.1);

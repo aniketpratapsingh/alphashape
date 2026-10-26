@@ -253,6 +253,64 @@ sections below give the engineering detail behind each item.
   `VK_KHR_portability_enumeration` and the device enables
   `VK_KHR_portability_subset`; both are probed and enabled only when advertised,
   so the non-portability path runs on Linux and Windows.
+- **Both PatchMatch search kernels are built without the SPIR-V optimiser on
+  every platform, so the GPU depth search is not faster than it was.** `pm_init`
+  and `pm_refine` are the only kernels built this way; every other kernel takes
+  `glslc -O`. An optimised module of either changes results on NVIDIA hardware.
+  Measured on a Tesla T4 with driver 535.161.07 against the same CPU reference:
+  optimised `pm_init` reports 100.00% depth agreement but **0.92% normal
+  agreement**, and optimised `pm_refine` reports **93.4% dense agreement** and a
+  fused TV-L1 mesh with 1276 boundary edges against the CPU's 1268. The
+  unoptimised modules are at 100.00% / 100.0% / 1286 and equal, which is what
+  `main` measured and what ships.
+  What has been ruled out, so the next attempt starts from there rather than from
+  the beginning (also recorded at the top of `pm_math.glsl`): it is not the
+  shaders' own undefined behaviour — an out-of-range index in a never-taken
+  branch, aggregate `inout` search state, a mutable RNG cursor and a
+  fixed-trip-count draw loop were all found and fixed, and the 0.92% did not move
+  after any of them, nor across three different generator shapes; not the shared
+  cost core, because `pm_init`'s depths, drawn from that same stream at index 0,
+  are 100% exact while its normals, drawn at indices 1 and 2, are not. Contraction
+  is a separate, also-unresolved factor: see the next two bullets.
+  The exemption cannot be keyed on the device: a kernel is compiled and embedded
+  when the engine is built, not when a device is selected, and shipping both
+  modules would double the shader build. The cost is real and deliberate —
+  `[gpu timing]` on the T4 is 4.26 s against the CPU's 32.49 s (7.62x) — and
+  accuracy outranks it. Diagnosing further needs T4 hardware and `spirv-dis` of
+  both modules.
+- **The fix that would make an optimised module agree with the CPU does not
+  compile here.** `sample_image()` floors the projected coordinate, and the CPU
+  computes the chain from a candidate plane to that coordinate in double as
+  separately rounded operations, so a single fused multiply-add moves the sample
+  to a neighbouring texel, changes a ZNCC and flips the winner-take-all selection.
+  On the Tesla T4, optimised `pm_refine` with only the final coordinates marked
+  `precise` is at 93.4% dense agreement. Marking every fuse-capable step of the
+  chain — the facing dot, `rho = depth * nb`, the candidate-level bearing dot, the
+  camera-frame point, `r2`/`radial_scale`/`xd`/`yd` in the distortion polynomial,
+  the final `u`/`v`, and the inverse-depth perturbation — is what the arithmetic
+  needs, and it is what `glslc` cannot build: it is OOM-killed (exit 137 at about
+  7 GB) on a macOS and a Linux runner at `-O`, at `-Os`, **and at `-O0`**. The
+  last of those is the decisive measurement: with no optimiser flag at all,
+  NoContraction along that chain alone exceeds a runner's memory. So this
+  toolchain cannot produce an exact optimised PatchMatch module at all, and
+  without the chain the optimised module is the 93.4% one. Nothing is marked
+  `precise` beyond the four ZNCC accumulator declarations that shipped before,
+  because at `-O0` a mark changes no arithmetic and only risks the build.
+- **GPU PatchMatch's depth search is exact against the CPU, and is tested as
+  such.** Both implementations draw the same hypotheses from the same keyed
+  stream and evaluate the same ZNCC cost, and the unoptimised modules agree bit
+  for bit: 100.0% on the dense fixture and on all three aerial cameras, and the
+  fused TV-L1 mesh comes out with the CPU's exact boundary-edge count.
+  `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel at ≥99% on
+  hardware (the older `Iterations = 0` test never reached it; the floor fails the
+  93.4% regression but not the 99.8–99.9% that ordinary last-digit rounding
+  already produces on the plane and distorted fixtures), and
+  `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused mesh's boundary-edge
+  count is *equal*, which is a discontinuous function of that agreement and the
+  sharpest available check. The guarantee is about the refiner's arithmetic, not
+  about other drivers' transcendental functions: agreement is exact on the
+  drivers tested, and the test's floor leaves room for a driver whose `sin`/`cos`
+  round differently.
 - **What Linux/llvmpipe and Windows/lavapipe do and do not validate:** they do
   validate the loader path with a system loader and a system ICD, instance/device
   creation, the whole dispatch/buffer/barrier/validation-layer surface, and the
