@@ -70,23 +70,24 @@ All notable changes to alphashape are recorded here. The format follows
   pointer with a copy-back that inlining is least likely to preserve: the RNG is
   now a stateless keyed stream (draw *n* = `splitmix64^(n+1)` of a key of seed,
   pixel, iteration and stream, with a literal draw index at every call site), and
-  `Best` is passed and returned by value. On top of that, the whole chain from a
-  candidate plane to the projected pixel coordinate is marked `precise`, not just
-  its last two statements: `sample_image()` floors that coordinate, so a single
-  fused multiply-add — which the CPU's separate double rounding rules out — moves
-  the sample to a neighbouring texel, changes a ZNCC and flips the winner-take-all
-  selection. Marking only the coordinates had left the Tesla T4 at 93.4% dense
-  agreement.
+  `Best` is passed and returned by value. `neighbour_cost()` also gained the
+  CPU's quorum early exit, so a neighbour that cannot reach 75% of the window
+  stops after a few samples instead of walking all 49.
   **Speed is unchanged: both search kernels stay unoptimised.** `pm_init` and
-  `pm_refine` are still built without the SPIR-V optimiser, because an optimised
-  module of either still changes results on that GPU (93.4% dense agreement for
-  `pm_refine`, 0.92% normal agreement for `pm_init`) and making the projection
-  chain exact also makes `glslc -O` need more memory than a CI runner has. The
-  shaders are now correct enough that a future optimised build is a hardware-lane
-  question rather than a UB question, and two tests hold that line:
-  `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel itself (≥99%
-  against the CPU on hardware; the existing `iterations = 0` test never reaches
-  it), and `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused TV-L1 mesh's
+  `pm_refine` are still built without the SPIR-V optimiser, which is what they
+  were before, because an optimised module of either changes results on NVIDIA
+  hardware: on a Tesla T4 the optimised `pm_init` agrees with the CPU on 100.00%
+  of depths but 0.92% of normals, and optimised `pm_refine` on 93.4% of the dense
+  fixture, where the unoptimised modules are at 100%. The fix that would restore
+  that agreement — marking the whole chain from a candidate plane to the
+  projected pixel coordinate `precise`, because `sample_image()` floors that
+  coordinate and a fused multiply-add moves the sample a texel — makes `glslc`
+  need more memory than a CI runner has: it is OOM-killed at `-O`, at `-Os`, and
+  at `-O0`, so this toolchain cannot compile it at all. Two tests now hold the
+  line for a future attempt: `PatchMatchGpu.RefineSweepsMatchCpu` gates the
+  search kernel itself (≥99% against the CPU on hardware, which fails the 93.4%
+  regression; the existing `iterations = 0` test never reaches it), and
+  `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused TV-L1 mesh's
   boundary-edge count is *equal* to the CPU's again — a discontinuous function of
   that agreement — instead of tolerating a difference. See `LIMITATIONS.md` for
   the measurements and what has been ruled out.

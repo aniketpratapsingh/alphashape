@@ -18,99 +18,52 @@ const float PM_TWO_PI = 6.283185307179586;
 const float PM_CONE_HALF_ANGLE = 1.0471975511965976;  // pi / 3
 const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 
-// Why `precise` appears on selected expressions below and in pm_core.glsl.
+// Why there is no `precise` in this file, and why both search kernels ship at -O0.
 //
-// These kernels are built without the SPIR-V optimiser (see the CMakeLists and
-// alphashape_add_shader), so nothing here is currently contracted. The marks are
-// kept because they encode a property of the algorithm that must survive if a
-// kernel is ever optimised again, and because they cost nothing at -O0: under -O
-// glslang/SPIRV-Tools is free to contract `a + b * u` into a fused multiply-add,
-// and NVIDIA hardware does so.
+// The shaders are built without the SPIR-V optimiser, so nothing here is
+// contracted and a `precise` decorator would be a no-op. It is also not free: a
+// NoContraction chain along the depth-to-pixel path (the facing dot, `rho`, the
+// candidate bearing dot, the camera-frame point, the distortion polynomial, the
+// projected coordinate) makes glslc need more memory than a CI runner has and it
+// is OOM-killed -- measured at -O, at -Os, and at -O0. The -O0 case is the
+// decisive one: with no optimiser flag at all, glslang still dies on it on a 7 GB
+// macOS runner (exit 137), so the chain cannot be compiled by this toolchain at
+// any level. pm_core.glsl keeps only the four `precise` declarations that were
+// already in the shipped file, on the ZNCC accumulators, where the marks are
+// cheap and were never the problem.
 //
-// The CPU reference in patch_match.cpp computes every such expression in double
-// as two separately rounded operations, and this kernel's output is not smooth in
-// those last bits: sample_image() floors the projected coordinate, so a single-ulp
-// difference near an integer boundary reads a different texel, which changes a
-// neighbour's ZNCC, which flips the winner-take-all selection for the pixel.
-// Measured on the dense fixture: optimised pm_refine alone dropped GPU/CPU depth
-// agreement from 100% to 93.4% purely from that, and marking only the final
-// projected coordinates did not restore it.
+// That matters because `precise` is the only way the search kernel agrees with
+// the CPU once it is optimised. sample_image() floors the projected coordinate,
+// the CPU computes that chain in double as separately rounded operations, and a
+// single fused multiply-add moves the sample to a neighbouring texel, which
+// changes a ZNCC and flips the winner-take-all selection. Measured on a Tesla T4
+// (driver 535.161.07) against the same CPU reference, same dense fixture:
 //
-// `precise` is therefore applied along the whole *chain* that decides which texel
-// is sampled, not just to its last two statements. Declaring only the projected
-// pixel `precise` is not enough: that stops the final `+` from folding into an
-// FMA but leaves the operands free to be contracted in their own defining
-// expressions, and a single differing bit anywhere on the path moves the
-// floor() just the same. The marks, in data-flow order:
+//   pm_refine at -O0 : 100.0% dense agreement, aerial 100.0%   <- main, ships
+//   pm_refine at -O  :  93.4% dense agreement                  <- wrong
+//   pm_init   at -O0 : depth 100.00% normal 100.00%            <- main, ships
+//   pm_init   at -O  : depth 100.00% normal  0.92%             <- wrong
 //
-//   nb = dot(n, b_p), rho = depth * nb     pm_core.glsl evaluate_hypothesis()
-//   nb = dot(n, b_q), depth_q = rho / nb   pm_core.glsl candidate_depth()
-//   x_n = depth_q * (M b_q) + c            pm_core.glsl neighbour_cost()
-//   rho_q, denom; depth_p = rho_q / denom  pm_core.glsl propagate()
-//   xd, yd, r2, radial_scale, u, v         project_point(), below
-//   perturbed_inv                          pm_refine.comp
+// So an optimised module is wrong on NVIDIA and an exact optimised module does not
+// compile: two independent blockers, either of which is enough to keep the
+// unoptimised module. Not speed, per the project's rule that accuracy wins, and
+// the cost is modest -- pm_refine runs the dense fixture in 4.26 s against the
+// CPU's 32.49 s (7.62x).
 //
-// The rule is "mark the expression, not the variable's uses", so only operations
-// that *have* a fused form are marked: a dot, an `a + b * c`, a scale-then-add.
-// Divisions, `sqrt` and plain multiplies are already exact as written, and
-// marking them would only enlarge the set of expressions an optimiser must keep
-// non-reassociable -- which is what made this kernel expensive to compile.
-// `precise` propagates into an initialiser, so one declaration per stage covers
-// the expression that computes it, and a value stored through `out` or an array
-// carries its non-contracted definition with it.
+// What has been ruled out at the T4's wrong normal (also in LIMITATIONS.md), so a
+// future attempt starts from there rather than from the beginning: it is not the
+// shaders' own undefined behaviour -- the out-of-range branch, the aggregate
+// `inout` state and the mutable RNG cursor were all found and fixed and the 0.92%
+// did not move -- nor state loss or draw order (a mutable cursor, a keyed stream
+// with a loop, and straight-line keyed draws all give 0.92%), nor the shared cost
+// core, since pm_init's depths, drawn from that same stream at index 0, are 100%
+// exact while its normals, drawn at indices 1 and 2, are not. Diagnosing further
+// needs T4 hardware and spirv-dis of both modules.
 //
-// Everything off that chain -- the ZNCC accumulators (which have their own
-// precise declarations), the normals and the bilinear weights -- stays free to
-// contract, which is what keeps the 49 x 32 cost loop affordable to optimise.
-//
-// The *draws* (rng_uniform64's split sum, random_depth's inverse-depth lerp,
-// random_cone_normal's trig) are deliberately left contractible, even though they
-// are upstream of rho. `precise` is a much weaker guarantee for them than it
-// looks: they already evaluate a double formula in float32, so a last-bit
-// difference from the CPU is inherent to the algorithm and NoContraction does not
-// change that. What `precise` buys is the *absence* of a difference the CPU does
-// not have -- a contraction its separate rounding rules out -- and that is what
-// the chain above needed, sitting immediately in front of floor().
-//
-// MEASUREMENTS AND THE OPEN ISSUE (why both search kernels are built -O0).
-// The chain above is what makes the *arithmetic* exact. It does not make the
-// optimised module match the CPU on NVIDIA, and that is why the shaders are
-// shipped unoptimised. On a Tesla T4 (driver 535.161.07), against the same CPU
-// reference, over this branch's history:
-//
-//   pm_init  at -O   : depth 100.00%  normal  0.92%  cost  31.81%   <- wrong
-//   pm_init  at -O0  : depth 100.00%  normal 100.00%  cost 100.00%   <- correct
-//   pm_refine at -O  : dense agreement 93.4% (with only u/v marked):
-//                      85.6% before the shader defects were fixed
-//   pm_refine at -O0 : dense agreement 100.0%, aerial 100.0%         <- main
-//
-// A deeper problem sits behind those numbers: with `precise` on the whole chain the
-// -O pipeline does not finish at all. glslc needs tens of gigabytes for pm_refine
-// and a CI runner OOM-kills it (exit 137: 7 GB macOS runner, and the GitLab T4
-// lane). NoContraction inside the 49-sample x 32-neighbour cost loop is what
-// stops the optimiser reassociating, and that is where the memory goes. -Os does
-// not help: it was tried and is killed the same way.
-//
-// So the accurate chain and an optimised module are mutually exclusive with this
-// toolchain, and the measured fallback -- -O on pm_refine with no contraction --
-// is 93.4%, not the 100.0% main has. Building both kernels at -O0 is therefore
-// the only configuration that is correct on every lane, and it is what ships.
-// That was confirmed the hard way: the mutable RNG cursor, stateless keyed
-// streams with a loop, and straight-line keyed draws all produced the same
-// 0.92%, so the difference is not state, draw order or the shaders' own undefined
-// behaviour (all three of which were found and fixed independently). It is not
-// the shared cost core either: pm_init's depths, drawn from that same stream at
-// index 0, are 100% exact while its normals, drawn at indices 1 and 2, are not.
-// Diagnosing further needs T4 hardware and spirv-dis of both modules.
-//
-// What this means for a future attempt: an optimised module changes results on
-// NVIDIA, so it cannot be enabled without a hardware lane that gates it. The
-// `PatchMatchGpu.RefineSweepsMatchCpu` test exists for exactly that, at a 99%
-// floor on hardware -- loose enough not to assert bit-identity of another
-// library's sin/cos, tight enough that the 93.4% regression fails it -- and
-// `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused mesh's boundary-edge
-// count is equal, a discontinuous function of that agreement and the sharpest
-// available check.
+// The gate for a future optimised build is in place: PatchMatchGpu.
+// RefineSweepsMatchCpu fails at 93.4% and passes at 100.0%, and
+// TvFusionGpu.BuildModelMeetsCpuBounds requires the fused mesh's boundary-edge
+// count to equal the CPU's, which is a discontinuous function of that agreement.
 
 layout(push_constant) uniform PmParams {
     uint width;
@@ -401,12 +354,6 @@ float random_depth(RngKey key, uint index) {
 // Returns false exactly where the CPU model does (Frame z <= 0, Fisheye origin).
 bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 radial,
                    vec2 tangential, out vec2 pixel) {
-    // See the note at the top of this file. Only the operations that *can* be
-    // contracted into a fused multiply-add are marked: a division, a sqrt and a
-    // plain multiply have no fused form, so their values are already exact as
-    // written and marking them would only enlarge the set of expressions the
-    // optimiser must keep non-reassociable. That set is what makes glslc -O
-    // expensive, and this function runs once per window sample per candidate.
     float xs = 0.0;
     float ys = 0.0;
     if (type == 0) {
@@ -416,8 +363,7 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
         xs = p_cam.x / p_cam.z;
         ys = p_cam.y / p_cam.z;
     } else {
-        // The only fusable expression on the fisheye path is this sum.
-        precise float r3d = sqrt(p_cam.x * p_cam.x + p_cam.y * p_cam.y);
+        float r3d = sqrt(p_cam.x * p_cam.x + p_cam.y * p_cam.y);
         if (r3d == 0.0) {
             if (p_cam.z == 0.0) {
                 return false;
@@ -431,28 +377,20 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
     }
     float k1 = radial.x, k2 = radial.y, k3 = radial.z, k4 = radial.w;
     float p1 = tangential.x, p2 = tangential.y;
-    // Declared precise, so both the copy and the polynomial assignment below are
-    // non-contractible: the undistorted copy is exact either way, the polynomial
-    // is a chain of multiply-adds.
-    precise float xd = xs;
-    precise float yd = ys;
+    float xd = xs;
+    float yd = ys;
     if (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || k4 != 0.0 || p1 != 0.0 || p2 != 0.0) {
-        // r2 and radial_scale are sums of products (fusable); r4/r6/r8 are plain
-        // multiplies and need no mark.
-        precise float r2 = xs * xs + ys * ys;
+        float r2 = xs * xs + ys * ys;
         float r4 = r2 * r2;
         float r6 = r4 * r2;
         float r8 = r4 * r4;
-        precise float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+        float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
         xd = xs * radial_scale + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys;
         yd = ys * radial_scale + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys;
     }
     float f = fcx.x, cx = fcx.y, cy = fcx.z;
-    // Same operation sequence as try_project_point(), no contraction: the
-    // sampler's floor() below turns a 1-ulp difference into a different texel.
-    precise float u = float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y;
-    precise float v = float(vh) * 0.5 + cy + yd * f;
-    pixel = vec2(u, v);
+    pixel = vec2(float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y,
+                 float(vh) * 0.5 + cy + yd * f);
     return true;
 }
 
@@ -477,12 +415,9 @@ float sample_image(int image_base, int vw, int vh, float x, float y) {
     float v10 = nb_img[row_a + xb];
     float v01 = nb_img[row_b + xa];
     float v11 = nb_img[row_b + xb];
-    // Deliberately NOT `precise`: this runs once per window sample per
-    // neighbour (49 x 32 in the worst case), and NoContraction there is what
-    // made glslc -O blow past the memory of a CI runner. Contracting this mix
-    // perturbs the sampled value in its last bit only; it does not move the
-    // sample to another texel, which is the effect that actually flips a match
-    // (see project_point below).
+    // Not marked, for the same reason nothing in this file is: the kernel is
+    // built at -O0, and NoContraction here (49 x 32 in the worst case) is what
+    // makes glslc exceed a CI runner's memory when a kernel is optimised.
     float top = v00 * (1.0 - ax) + v10 * ax;
     float bottom = v01 * (1.0 - ax) + v11 * ax;
     return top * (1.0 - ay) + bottom * ay;

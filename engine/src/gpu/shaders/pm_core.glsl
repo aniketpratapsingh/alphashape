@@ -87,22 +87,11 @@ bool window_is_textured(int pixel) {
 // Plane depth at window sample k for a candidate plane (rho, n), with the
 // CPU's validity rule: a sample is skipped when the plane is edge-on or behind
 // the reference camera.
-//
-// `nb` is precise because it is a dot product: `a.x*b.x + a.y*b.y + a.z*b.z` is
-// two multiply-adds, and the optimiser fuses both. This is the first link of the
-// chain that ends at the projected pixel coordinate (see the note at the top of
-// pm_math.glsl) and it runs once per window sample per candidate, so it is also
-// the mark that has to earn its keep.
-//
-// The returned depth does not need one: `rho / nb` is a division, and a division
-// has no fused form, so it is already evaluated exactly as written. Nor does the
-// `dq[]` array that stores it: what matters is that the *definition* of the value
-// was not contracted, and that is decided here, not at the store.
 float candidate_depth(int x, int y, int k, float rho, vec3 n) {
     ivec2 off = s_offsets[k];
     int b = ((y + off.y) * int(pc.width) + (x + off.x)) * 3;
     vec3 bearing = vec3(bearings[b + 0], bearings[b + 1], bearings[b + 2]);
-    precise float nb = dot(n, bearing);
+    float nb = dot(n, bearing);
     if (nb < -PM_FACING_EPS && rho / nb > 0.0) {
         return rho / nb;
     }
@@ -177,14 +166,10 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
         int bi = ((y + off.y) * int(pc.width) + (x + off.x)) * 3;
         vec3 bq = vec3(bearings[bi + 0], bearings[bi + 1], bearings[bi + 2]);
         // X_n = depth_q * (M b_q) + c (the CPU's `depth_q * mb[k] + view.c`).
-        // Every term here is a multiply-add: the three row dots, the scale by
-        // depth_q and the add of c. One mark on the result covers them all, and
-        // it is the last stage before the projection below feeds floor().
-        precise vec3 x_n =
-            depth_q * vec3(v.m[0] * bq.x + v.m[1] * bq.y + v.m[2] * bq.z,
-                           v.m[3] * bq.x + v.m[4] * bq.y + v.m[5] * bq.z,
-                           v.m[6] * bq.x + v.m[7] * bq.y + v.m[8] * bq.z) +
-            v.c;
+        vec3 x_n = depth_q * vec3(v.m[0] * bq.x + v.m[1] * bq.y + v.m[2] * bq.z,
+                                  v.m[3] * bq.x + v.m[4] * bq.y + v.m[5] * bq.z,
+                                  v.m[6] * bq.x + v.m[7] * bq.y + v.m[8] * bq.z) +
+                   v.c;
         if (!(x_n.z > PM_CAMERA_Z_EPS)) {
             continue;
         }
@@ -309,27 +294,21 @@ struct Best {
 //
 // Takes and returns `Best` by value rather than through `inout`: an aggregate
 // `inout` parameter is a Function-storage pointer that the caller has to copy
-// back after the call, and surviving a copy-back through a long inlined callee
-// (multiview_cost) is exactly what the optimiser did not do reliably for the RNG
-// state. A value parameter is a plain SSA value with nothing to copy back.
-//
-// `nb` and `rho` are precise: they are the head of the depth/plane-to-pixel
-// chain (see the note at the top of pm_math.glsl). `nb` is a dot; `rho` is a
-// scale that then lands on the plane depth, whose quotient becomes a
-// camera-frame coordinate before floor() sees it.
+// back after the call, which is undefined behaviour territory and exactly the
+// shape the optimiser is least likely to preserve. A value parameter is a plain
+// SSA value with nothing to copy back.
 Best evaluate_hypothesis(int x, int y, float depth, vec3 n, vec3 b_p, Best best) {
     if (!(depth > pc.depth_min && depth < pc.depth_max)) {
         return best;
     }
-    precise float nb = dot(n, b_p);
+    float nb = dot(n, b_p);
     if (nb >= -PM_FACING_EPS) {
         return best;
     }
     if (depth == best.depth && n == best.normal) {
         return best;
     }
-    precise float rho = depth * nb;
-    float cost = multiview_cost(x, y, rho, n);
+    float cost = multiview_cost(x, y, depth * nb, n);
     if (cost < best.cost) {
         best.cost = cost;
         best.depth = depth;
@@ -345,10 +324,6 @@ vec3 pixel_bearing(int pixel) {
 // Propagate pixel q's plane onto pixel p (as propagate()), reading q from the
 // state buffers of the previous half-sweep. Returns the updated `Best`, like
 // evaluate_hypothesis(): no aggregate `inout` anywhere in the search core.
-//
-// precise on rho_q and denom only: both are dots (chained multiply-adds) and
-// rho_q is another entry point to the depth-to-pixel chain. The quotient needs
-// no mark -- a division has no fused form.
 Best propagate(int x, int y, int q, vec3 b_p, Best best) {
     float qd = state_depth[q];
     if (!(qd > 0.0)) {
@@ -358,8 +333,8 @@ Best propagate(int x, int y, int q, vec3 b_p, Best best) {
     if (dot(n, n) < 1e-12) {
         return best;
     }
-    precise float rho_q = qd * dot(n, pixel_bearing(q));
-    precise float denom = dot(n, b_p);
+    float rho_q = qd * dot(n, pixel_bearing(q));
+    float denom = dot(n, b_p);
     if (denom >= -PM_FACING_EPS) {
         return best;
     }

@@ -76,10 +76,7 @@ void main() {
 
         const RngKey rng_d = rng_key(seed, uint(pixel), iteration, 1u);
         float inv_d = 1.0 / best.depth;
-        // `a + b * c` is a fused multiply-add candidate and this value *is* a
-        // depth hypothesis, i.e. the head of the depth-to-pixel chain.
-        precise float perturbed_inv =
-            inv_d + (2.0 * rng_uniform(rng_d, 0u) - 1.0) * pc.depth_delta;
+        float perturbed_inv = inv_d + (2.0 * rng_uniform(rng_d, 0u) - 1.0) * pc.depth_delta;
         if (perturbed_inv > 0.0) {
             const RngKey rng_n = rng_key(seed, uint(pixel), iteration, 2u);
             vec3 perturbed = perturb_normal(rng_n, 0u, best.normal, pc.normal_angle);

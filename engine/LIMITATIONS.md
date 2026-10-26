@@ -270,43 +270,41 @@ sections below give the engineering detail behind each item.
   fixed-trip-count draw loop were all found and fixed, and the 0.92% did not move
   after any of them, nor across three different generator shapes; not the shared
   cost core, because `pm_init`'s depths, drawn from that same stream at index 0,
-  are 100% exact while its normals, drawn at indices 1 and 2, are not; and not
-  floating-point contraction alone, because the projected-pixel chain is marked
-  `precise` (next bullet) and the optimised module still disagrees.
+  are 100% exact while its normals, drawn at indices 1 and 2, are not. Contraction
+  is a separate, also-unresolved factor: see the next two bullets.
   The exemption cannot be keyed on the device: a kernel is compiled and embedded
   when the engine is built, not when a device is selected, and shipping both
   modules would double the shader build. The cost is real and deliberate —
   `[gpu timing]` on the T4 is 4.26 s against the CPU's 32.49 s (7.62x) — and
   accuracy outranks it. Diagnosing further needs T4 hardware and `spirv-dis` of
   both modules.
-- **An optimised PatchMatch module cannot be enabled without the memory problem
-  being solved too.** Making the depth-to-pixel chain exact needs `precise`
-  (SPIR-V `NoContraction`), and `NoContraction` inside `pm_refine`'s
-  49-sample × 32-neighbour cost loop stops the `-O` pipeline reassociating: glslc
-  needs tens of gigabytes and a CI runner OOM-kills it (exit 137 at about 7 GB on
-  the macOS and GitLab lanes; one module took over 15 minutes on a 16 GB Mac).
-  `-Os` is not an escape hatch — it was tried on this branch and is killed the
-  same way. So with this toolchain an exact optimised kernel and a build that
-  completes are mutually exclusive, and the measured fallback to `-O` without
-  contraction is 93.4%, not the 100.0% `main` has.
+- **The fix that would make an optimised module agree with the CPU does not
+  compile here.** `sample_image()` floors the projected coordinate, and the CPU
+  computes the chain from a candidate plane to that coordinate in double as
+  separately rounded operations, so a single fused multiply-add moves the sample
+  to a neighbouring texel, changes a ZNCC and flips the winner-take-all selection.
+  On the Tesla T4, optimised `pm_refine` with only the final coordinates marked
+  `precise` is at 93.4% dense agreement. Marking every fuse-capable step of the
+  chain — the facing dot, `rho = depth * nb`, the candidate-level bearing dot, the
+  camera-frame point, `r2`/`radial_scale`/`xd`/`yd` in the distortion polynomial,
+  the final `u`/`v`, and the inverse-depth perturbation — is what the arithmetic
+  needs, and it is what `glslc` cannot build: it is OOM-killed (exit 137 at about
+  7 GB) on a macOS and a Linux runner at `-O`, at `-Os`, **and at `-O0`**. The
+  last of those is the decisive measurement: with no optimiser flag at all,
+  NoContraction along that chain alone exceeds a runner's memory. So this
+  toolchain cannot produce an exact optimised PatchMatch module at all, and
+  without the chain the optimised module is the 93.4% one. Nothing is marked
+  `precise` beyond the four ZNCC accumulator declarations that shipped before,
+  because at `-O0` a mark changes no arithmetic and only risks the build.
 - **GPU PatchMatch's depth search is exact against the CPU, and is tested as
   such.** Both implementations draw the same hypotheses from the same keyed
-  stream and evaluate the same ZNCC cost, so they agree bit for bit as long as no
-  expression on the path from a hypothesis to a sampled texel is contracted into
-  a fused multiply-add. Getting that path wrong is not a rounding nuisance: a
-  single ulp moves `sample_image()`'s `floor()` to a neighbouring texel, which
-  changes a ZNCC, which flips the winner-take-all selection for that pixel. On
-  the Tesla T4, marking only the final projected coordinates `precise` left
-  optimised `pm_refine` at 93.4% dense agreement. Every *fuse-capable* step of
-  the chain is therefore marked — the facing dot, `rho = depth * nb`, the
-  candidate-level bearing dot, the camera-frame point,
-  `r2`/`radial_scale`/`xd`/`yd` in the distortion polynomial, the final `u`/`v`,
-  and the inverse-depth perturbation — so that the guarantee survives if a kernel
-  is ever optimised again. `precise` is deliberately not put on divisions, `sqrt`
-  or plain multiplies: they have no fused form, so it would change nothing but the
-  size of the set the optimiser must keep non-reassociable.
+  stream and evaluate the same ZNCC cost, and the unoptimised modules agree bit
+  for bit: 100.0% on the dense fixture and on all three aerial cameras, and the
+  fused TV-L1 mesh comes out with the CPU's exact boundary-edge count.
   `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel at ≥99% on
-  hardware (the older `Iterations = 0` test never reached it), and
+  hardware (the older `Iterations = 0` test never reached it; the floor fails the
+  93.4% regression but not the 99.8–99.9% that ordinary last-digit rounding
+  already produces on the plane and distorted fixtures), and
   `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused mesh's boundary-edge
   count is *equal*, which is a discontinuous function of that agreement and the
   sharpest available check. The guarantee is about the refiner's arithmetic, not
