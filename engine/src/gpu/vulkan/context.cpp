@@ -31,7 +31,42 @@ bool has_device_extension(VkPhysicalDevice device, const Functions& fns, const c
 }
 
 std::string vk_result_string(const char* call, VkResult result) {
-    return std::string(call) + " failed with VkResult " + std::to_string(result);
+    // The number alone ("VkResult -9") names nothing a user can act on. The two
+    // results a machine without a usable driver actually produces are spelled
+    // out; every other code keeps the numeric form, which is what a bug report
+    // needs.
+    const char* meaning = nullptr;
+    switch (result) {
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            // What vkCreateInstance returns when the loader found no ICD at all,
+            // and what vkCreateDevice returns when a physical device rejects
+            // the requested features.
+            meaning = "no compatible Vulkan driver (VK_ERROR_INCOMPATIBLE_DRIVER)";
+            break;
+        case VK_ERROR_INITIALIZATION_FAILED:
+            meaning = "driver initialisation failed (VK_ERROR_INITIALIZATION_FAILED)";
+            break;
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+            meaning = "a required extension is not present (VK_ERROR_EXTENSION_NOT_PRESENT)";
+            break;
+        case VK_ERROR_DEVICE_LOST:
+            meaning = "device lost (VK_ERROR_DEVICE_LOST)";
+            break;
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+            meaning = "out of device memory (VK_ERROR_OUT_OF_DEVICE_MEMORY)";
+            break;
+        case VK_ERROR_OUT_OF_HOST_MEMORY:
+            meaning = "out of host memory (VK_ERROR_OUT_OF_HOST_MEMORY)";
+            break;
+        default:
+            break;
+    }
+    std::string text = std::string(call) + " failed with VkResult " + std::to_string(result);
+    if (meaning != nullptr) {
+        text += ": ";
+        text += meaning;
+    }
+    return text;
 }
 
 }  // namespace
@@ -180,6 +215,11 @@ VulkanBackend::~VulkanBackend() {
             }
             slot.pending = false;
         }
+        // Pools parked by abandoned submissions. The device was drained above
+        // (or is lost, in which case the driver reclaims everything at
+        // vkDestroyDevice), so nothing can still reference them.
+        free_orphaned_pools();
+
         if (transfer_fence_ != VK_NULL_HANDLE) {
             fns.DestroyFence(device_handle_, transfer_fence_, nullptr);
             transfer_fence_ = VK_NULL_HANDLE;
