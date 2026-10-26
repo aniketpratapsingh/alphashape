@@ -1135,6 +1135,23 @@ jobs:
           "VK_ICD_FILENAMES=$manifest" >> $env:GITHUB_ENV
           "ALPHASHAPE_MESA_DIR=$dest" >> $env:GITHUB_ENV
 
+          # GitHub's Windows runners run as a high-integrity (elevated)
+          # process, and the Vulkan loader deliberately ignores *every*
+          # environment variable when it detects that -- the check is
+          # loader_secure_getenv() in loader_environment.c, and its log line
+          # reads "Loader is running with elevated permissions. Environment
+          # variable VK_DRIVER_FILES will be ignored". The variables above are
+          # therefore set for the non-elevated case (a developer's machine) and
+          # the registry is what actually makes CI see the driver:
+          # HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\Drivers is the machine
+          # wide ICD registration the loader reads whatever the integrity
+          # level. Value data is REG_DWORD 0 ("not disabled"), as the LunarG
+          # installer writes it.
+          $drivers = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+          New-Item -Path $drivers -Force | Out-Null
+          New-ItemProperty -Path $drivers -Name $manifest -PropertyType DWord -Value 0 -Force | Out-Null
+          Get-ItemProperty -Path $drivers | Format-List | Out-Host
+
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
       - uses: actions/setup-python@v7
@@ -1180,8 +1197,10 @@ jobs:
             # "the manifest pointed at a path that does not exist".
             Write-Host "--- VK_DRIVER_FILES: $env:VK_DRIVER_FILES"
             Get-Content -LiteralPath $env:VK_DRIVER_FILES -ErrorAction SilentlyContinue | Write-Host
-            $icdDir = $env:ALPHASHAPE_MESA_DIR
-            Get-ChildItem -LiteralPath $icdDir -ErrorAction SilentlyContinue |
+            Write-Host '--- HKLM\SOFTWARE\Khronos\Vulkan\Drivers'
+            Get-ItemProperty -Path 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers' -ErrorAction SilentlyContinue |
+              Format-List | Out-Host
+            Get-ChildItem -LiteralPath $env:ALPHASHAPE_MESA_DIR -ErrorAction SilentlyContinue |
               Select-Object Name, Length | Format-Table | Out-Host
             # A second run with the loader's debug output on, which the normal
             # path keeps quiet.
