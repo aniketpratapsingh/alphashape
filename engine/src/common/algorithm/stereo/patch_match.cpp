@@ -32,6 +32,14 @@
 // half-sweep reads only pixels of the other colour, and every random draw is a
 // pure function of (seed, pixel, iteration, stream), the result is independent
 // of the OpenMP thread count and bit-identical run to run.
+//
+// Coarse to fine. run_patch_match() runs the search above once per level of a
+// depth pyramid, coarsest first, and hands each finer level the plane the level
+// beneath found (depth_pyramid.hpp). Every level is the same code path -- the
+// same window, the same cost, the same draw schedule -- with its own image
+// resolution, its own stream key and its own budget; the only additions are the
+// warm-start evaluation at init and the per-level perturbation radius, both
+// described where they happen.
 
 namespace alphashape::stereo {
 namespace {
