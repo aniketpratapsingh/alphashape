@@ -185,7 +185,16 @@ std::vector<Plane> laplacian_pyramid(const std::vector<Plane>& gauss) {
 /// the real colour outward keeps the multiscale decomposition free of that
 /// artificial step. Deterministic: each pass only reads the previous pass's
 /// state, and cells are visited in scan order.
-void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid) {
+///
+/// `max_passes` bounds how far the growth may travel (< 0 = unbounded). The blend
+/// passes the pyramid's own reach: a cell the pyramid at level `levels` never
+/// reads can be left unfilled, and bounding the growth is what makes the blend a
+/// LOCAL operator. Unbounded growth is not local -- a filled value near the
+/// interior is an average of averages reaching arbitrarily far across the plane,
+/// so the same interior cell gets a slightly different value when the plane is a
+/// block window instead of the whole grid, and block-wise blending would drift
+/// from whole-grid blending by a grey level on a scattering of pixels.
+void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid, int max_passes) {
     const int w = p.w;
     const int h = p.h;
     std::vector<std::uint8_t> known(valid.begin(), valid.end());
@@ -196,7 +205,9 @@ void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid) {
             ++remaining;
         }
     }
-    while (remaining > 0) {
+    int passes = 0;
+    while (remaining > 0 && (max_passes < 0 || passes < max_passes)) {
+        ++passes;
         bool progressed = false;
         for (int row = 0; row < h; ++row) {
             for (int col = 0; col < w; ++col) {
@@ -348,6 +359,12 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         }
     }
 
+    // How far the colour may be grown into a tile's invalid cells: exactly the
+    // blend's own reach at this depth. A cell farther than this is never read by
+    // any pyramid level, so bounding the growth keeps the blend a local operator
+    // (see fill_invalid).
+    const int fill_passes = pyramid_support_cells(levels);
+
     // Reused across tiles, so the blend never holds one validity copy per camera.
     std::vector<std::uint8_t> scratch_mask(cells, 0);
 
@@ -396,7 +413,7 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
             // pyramid, so the coarse levels see no artificial zero step at the
             // validity edge (see fill_invalid).
             Plane filled = gauss_ch[static_cast<std::size_t>(c)];
-            fill_invalid(filled, tile_mask);
+            fill_invalid(filled, tile_mask, fill_passes);
             const std::vector<Plane> g_ch = gaussian_pyramid(std::move(filled), levels);
             const std::vector<Plane> lap = laplacian_pyramid(g_ch);
             for (int k = 0; k <= levels; ++k) {
