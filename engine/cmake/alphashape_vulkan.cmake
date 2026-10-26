@@ -149,15 +149,25 @@ endfunction()
 # alphashape_add_shader(<shader.comp> [NO_OPTIMIZE])
 #
 # Compiles one compute kernel to SPIR-V with glslc and validates it. NO_OPTIMIZE
-# skips the SPIR-V optimiser (glslc -O) and exists as a diagnosis switch: if a
-# kernel is wrong *only* optimised, the shader contains undefined behaviour the
-# optimiser is entitled to exploit, so compare the two builds before blaming the
-# driver. Nothing uses it today. (The PatchMatch search kernels did until their
-# own UB -- a mutable RNG threaded through `inout` parameters, and an
-# out-of-range index in a never-taken branch -- was fixed; see pm_math.glsl.
-# Note that skipping glslc -O is a real cost: the driver does not re-optimise a
-# module the way an offline optimise pass does, so -O0 SPIR-V runs several times
-# slower in the two hottest kernels in the pipeline.)
+# skips the SPIR-V optimiser (glslc -O).
+#
+# First try the optimised build: if a kernel is wrong *only* optimised it is
+# usually undefined behaviour the optimiser may exploit, so compare the two
+# builds before blaming the driver. Skipping -O is a real cost -- the driver does
+# not re-optimise a module the way an offline pass does -- so it is the last
+# resort, not a default.
+#
+# One kernel is on it: pm_init. Its optimised module returns a wrong
+# random-plane normal on an NVIDIA Tesla T4 (driver 535), and only there. The
+# shader's undefined behaviour has been fixed (a mutable RNG threaded through
+# `inout` parameters is now a stateless keyed stream; a never-taken branch no
+# longer indexes three buffers out of range), and pm_refine -- which shares the
+# entire cost core and every one of those fixes -- is correct at -O on the same
+# GPU. What pm_init has that pm_refine does not is the initial hypothesis, and
+# the only non-arithmetic operations in it are sin/cos in the cone normal, so the
+# remaining suspect is a driver transcendental on optimised input. pm_init is one
+# short dispatch per colour and pm_refine does all the work, so the search is
+# still optimised where it matters.
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
     if("NO_OPTIMIZE" IN_LIST ARGN)

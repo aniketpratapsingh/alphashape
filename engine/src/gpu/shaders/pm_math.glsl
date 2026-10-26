@@ -254,6 +254,18 @@ vec3 random_unit_vector(RngKey key, uint index) {
 }
 
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
+//
+// REMARK (open NVIDIA issue). pm_init is compiled with NO_OPTIMIZE because its
+// optimised module returns a wrong normal on a Tesla T4 (driver 535): 0.9% of
+// pixels agree with the CPU reference while the depths, which come from
+// random_depth() and pure arithmetic, are 100% exact. Everything else here is
+// also in pm_refine, which is correct at -O on the same GPU, and the draw
+// machinery is stateless (RngKey), so no state can be dropped. The operations
+// this function performs that random_depth() does not are sin/cos/sqrt/normalize
+// and the constant-folded cos(PM_CONE_HALF_ANGLE); a driver transcendental on
+// optimised input is the remaining suspect. Do not "fix" this by decorating the
+// trig `precise`: NoContraction there made glslc -O need tens of gigabytes for
+// pm_refine and the CI runner OOM-killed it. Diagnose on T4 hardware first.
 vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
