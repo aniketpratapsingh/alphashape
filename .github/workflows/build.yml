@@ -1099,8 +1099,13 @@ jobs:
             throw "Mesa archive SHA-256 is $actual, expected $expected; refusing to use it"
           }
 
-          # The ICD manifest names '.\vulkan_lvp.dll', so the DLL and the JSON
-          # must stay in one directory.
+          # The ICD manifest names '.\vulkan_lvp.dll', i.e. a path relative to
+          # the *process working directory*, not to the manifest. The CLI runs
+          # from the repository root, so the loader would look for
+          # vulkan_lvp.dll there, fail to open it, and answer
+          # VK_ERROR_INCOMPATIBLE_DRIVER -- which reads exactly like "this
+          # machine has no driver", hiding the real cause. The manifest is
+          # rewritten with an absolute path instead.
           $dest = Join-Path $env:RUNNER_TEMP 'mesa'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           & $sevenZip e $archive 'x64/vulkan_lvp.dll' 'x64/lvp_icd.x86_64.json' "-o$dest" -y
@@ -1111,15 +1116,23 @@ jobs:
             }
           }
 
+          $manifest = Join-Path $dest 'lvp_icd.x86_64.json'
+          $icd = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          # ConvertTo-Json escapes backslashes itself, so the path goes in
+          # exactly as the filesystem spells it. (Pre-escaping here would write
+          # "D:\\\\a\\\\..." and the loader would look for a directory that does
+          # not exist.)
+          $icd.ICD.library_path = Join-Path $dest 'vulkan_lvp.dll'
+          $icd | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8
+          Get-Content -LiteralPath $manifest | Write-Host
+
           # VK_DRIVER_FILES pins the loader to this driver: without it the
           # loader would scan the registry and find nothing, because the runner
-          # has no GPU driver installed at all. The DLL is beside the manifest
-          # and the manifest names it relatively, so the extraction directory
-          # alone is enough -- it does not have to be on PATH.
-          "VK_DRIVER_FILES=$dest\lvp_icd.x86_64.json" >> $env:GITHUB_ENV
+          # has no GPU driver installed at all.
+          "VK_DRIVER_FILES=$manifest" >> $env:GITHUB_ENV
           # VK_ICD_FILENAMES is the older spelling. Mesa's own docs and the
           # Linux lane set both; a loader reads either.
-          "VK_ICD_FILENAMES=$dest\lvp_icd.x86_64.json" >> $env:GITHUB_ENV
+          "VK_ICD_FILENAMES=$manifest" >> $env:GITHUB_ENV
           "ALPHASHAPE_MESA_DIR=$dest" >> $env:GITHUB_ENV
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
@@ -1161,7 +1174,21 @@ jobs:
           if (-not (Test-Path -LiteralPath $cli)) { throw "$cli is not in the build tree" }
           $output = & $cli --gpu-info 2>&1
           $output | Write-Host
-          if ($LASTEXITCODE -ne 0) { throw "alphashape-cli --gpu-info exited $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) {
+            # The loader's own diagnostics are the only thing that says *why* it
+            # rejected the ICD; the CLI's reason cannot tell "no driver" from
+            # "the manifest pointed at a path that does not exist".
+            Write-Host "--- VK_DRIVER_FILES: $env:VK_DRIVER_FILES"
+            Get-Content -LiteralPath $env:VK_DRIVER_FILES -ErrorAction SilentlyContinue | Write-Host
+            $icdDir = $env:ALPHASHAPE_MESA_DIR
+            Get-ChildItem -LiteralPath $icdDir -ErrorAction SilentlyContinue |
+              Select-Object Name, Length | Format-Table | Out-Host
+            # A second run with the loader's debug output on, which the normal
+            # path keeps quiet.
+            $env:VK_LOADER_DEBUG = 'all'
+            & $cli --gpu-info 2>&1 | Select-Object -Last 40 | Write-Host
+            throw "alphashape-cli --gpu-info exited $LASTEXITCODE"
+          }
           $text = ($output -join "`n")
           if ($text -notmatch 'gpu device 0:') { throw 'no Vulkan device was enumerated' }
           # lavapipe identifies itself as a software device, which is what the
