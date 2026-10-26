@@ -1072,7 +1072,7 @@ TEST(DepthMapsCancel, KeepsPointCloudAndOtherProducts) {
     ASSERT_EQ(after.point_clouds().size(), 1U)
         << "a cancel must not drop other products";
     EXPECT_EQ(after.active_point_cloud_id(), cloud_id);
-    EXPECT_TRUE(after.point_cloud().points == cloud_before.points)
+    EXPECT_TRUE(after.point_cloud() == cloud_before)
         << "a cancel changed the point cloud";
 }
 
