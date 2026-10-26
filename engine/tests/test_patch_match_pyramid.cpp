@@ -271,12 +271,15 @@ TEST(PatchMatchPyramid, OddSizesKeepTheBearingIdentityAtEveryLevel) {
     DepthHypotheses coarse_map;
     coarse_map.width = 25;  // the level-2 size of the chain above
     coarse_map.height = 19;
-    coarse_map.depth.assign(static_cast<std::size_t>(coarse_map.width) * coarse_map.height, 0.0F);
-    coarse_map.normals.assign(
-        3 * static_cast<std::size_t>(coarse_map.width) * coarse_map.height, 0.0F);
+    const std::size_t coarse_cells = static_cast<std::size_t>(coarse_map.width) *
+                                     static_cast<std::size_t>(coarse_map.height);
+    coarse_map.depth.assign(coarse_cells, 0.0F);
+    coarse_map.normals.assign(3 * coarse_cells, 0.0F);
     for (int y = 0; y < coarse_map.height; ++y) {
         for (int x = 0; x < coarse_map.width; ++x) {
-            const std::size_t p = static_cast<std::size_t>(y) * coarse_map.width + x;
+            const std::size_t p = static_cast<std::size_t>(y) *
+                                      static_cast<std::size_t>(coarse_map.width) +
+                                  static_cast<std::size_t>(x);
             coarse_map.depth[p] = 10.0F + static_cast<float>(x);
             coarse_map.normals[3 * p + 2] = 1.0F;
         }
@@ -821,7 +824,9 @@ TEST(PatchMatchPyramid, SweepProgressReportsMonotoneFractions) {
     // ACROSS level boundaries and reach the end from the sweeps rather than from
     // a single trailing tick. A hook that scaled by the wrong denominator would
     // still be monotone, just permanently far behind, so the values are pinned.
-    PlaneScene scene = make_plane_scene(96, 72, 100.0);
+    // A small scene: the values this test asserts are the schedule, and the
+    // long run below sweeps 120 times, which has to stay cheap under ASan.
+    PlaneScene scene = make_plane_scene(64, 48, 80.0);
     const PMView reference = plane_reference(scene);
     const std::vector<PMView> all_views = plane_views(scene);
     const std::vector<PMView> neighbours = {all_views[0]};
