@@ -35,8 +35,8 @@ All notable changes to alphashape are recorded here. The format follows
   so the project version is bumped: an older 0.1.0 build refuses such a project
   with its clear "newer than this build supports" message instead of failing
   deep inside the sidecar decoder with "depth map file: bad header". Version 2
-  projects still open, their ADM1 maps decoding as unfiltered-unknown (never
-  reused, "mild" filter).
+  projects still open: their ADM1 maps read with fingerprint 0 ("unknown", so
+  never reused) and the "mild" filter a pre-ADM2 project could only have run.
 - **BuildPointCloud and unfiltered depth maps.** A map with no confidence (one
   a cancelled Build Depth Maps checkpointed) now logs a warning and is fused
   rather than silently dropped when `min_confidence > 0`: the absence of a
