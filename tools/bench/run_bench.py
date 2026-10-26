@@ -106,12 +106,17 @@ def manifest_hash(manifest: dict) -> str:
 
 
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
-    """Every (destination path, remote file) pair a dataset needs, deduplicated.
+    """Every (cache file name, remote file) pair a dataset needs, deduplicated.
 
-    The images archive and the reference (or references) are separate downloads;
-    some datasets serve several reference members out of one archive, which the
-    caller extracts from a single download rather than fetching the archive once
-    per member.
+    ``download`` is the name the file takes in the cache, and its extension is what
+    decides how it is unpacked. It is deliberately independent of the extracted
+    path: a reference unzips to ``reference/ortho.tif`` but arrives as
+    ``processed.zip``, and naming the cache file after the extracted path would make
+    the archive look like a GeoTIFF.
+
+    Several reference members can come out of one archive; that archive appears
+    once here and the caller extracts each member from it, rather than fetching it
+    again per member.
     """
     out: list[tuple[str, RemoteFile]] = []
     seen: set[str] = set()
@@ -119,7 +124,7 @@ def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
     images = dataset["images_archive"]
     out.append(
         (
-            images["path"],
+            images["download"],
             RemoteFile(images["url"], images["sha256"], int(images["bytes"])),
         )
     )
@@ -132,7 +137,7 @@ def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
         seen.add(url)
         out.append(
             (
-                reference["path"],
+                reference["download"],
                 RemoteFile(url, reference["sha256"], int(reference["bytes"])),
             )
         )
@@ -150,9 +155,9 @@ def describe(dataset: dict) -> str:
     if dataset.get("doi"):
         lines.append(f"  doi:       {dataset['doi']}")
     total = 0
-    for path, remote in downloads_for(dataset):
+    for name, remote in downloads_for(dataset):
         total += remote.bytes
-        lines.append(f"  download:  {path} <- {remote.url}")
+        lines.append(f"  download:  {name} <- {remote.url}")
         lines.append(f"             {remote.bytes:,} bytes, sha256 {remote.sha256}")
     lines.append(f"  total download: {total / 1e6:.1f} MB")
     references = [ref["kind"] for ref in dataset["reference_files"]]
@@ -292,16 +297,20 @@ def collect_images(dataset: dict, work: Path) -> list[Path]:
 
 
 def reference_paths(dataset: dict, work: Path) -> dict:
-    """Where each reference product landed, keyed by ``kind``."""
+    """Where each reference product landed, keyed by ``kind``.
+
+    A kind that appears more than once (ETH3D ships two laser scans for the same
+    scene) becomes a list, so the caller can score against either or both.
+    """
     out: dict = {}
     for reference in dataset["reference_files"]:
-        destination = work / reference["path"]
-        if reference.get("kind") in out:
-            # Several members of one kind (two laser scans) become a list.
-            existing = out[reference["kind"]]
-            out[reference["kind"]] = existing + [str(destination)] if isinstance(existing, list) else [existing, str(destination)]
+        destination = str(work / reference["path"])
+        kind = reference["kind"]
+        if kind in out:
+            existing = out[kind]
+            out[kind] = existing + [destination] if isinstance(existing, list) else [existing, destination]
         else:
-            out[reference["kind"]] = str(destination)
+            out[kind] = destination
     return out
 
 
@@ -485,28 +494,29 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         download(remote, cache / Path(path).name)
 
     print("-- extract")
-    archive = cache / Path(dataset["images_archive"]["path"]).name
+    archive = cache / dataset["images_archive"]["download"]
     image_root = work / "images"
     if not any(image_root.rglob("*")):
         extract_archive(archive, image_root)
     else:
         print(f"  cached   {image_root}")
 
-    # References: one extraction per source archive, then the named members.
-    by_file: dict[str, list[str]] = {}
+    # References: one extraction per download, then the named members. Keyed by the
+    # cache file name so a single archive that supplies several members (two laser
+    # scans, both GeoTIFFs from one ODM run) is unpacked once.
+    by_download: dict[str, list[str]] = {}
     for reference in dataset["reference_files"]:
-        source = reference.get("from_archive")
-        if source is None:
-            by_file.setdefault(reference["path"], [])
-        else:
-            by_file.setdefault(source, []).append(reference["archive_member"])
+        source = reference.get("from_archive") or reference["download"]
+        by_download.setdefault(source, [])
+        if reference.get("archive_member"):
+            by_download[source].append(reference["archive_member"])
 
-    for path, members in by_file.items():
-        destination = work / "reference_raw" / Path(path).stem
+    for name, members in by_download.items():
+        destination = work / "reference_raw" / Path(name).stem
         if destination.exists() and any(destination.rglob("*")):
             print(f"  cached   {destination}")
             continue
-        extract_archive(cache / Path(path).name, destination, members=members or None)
+        extract_archive(cache / name, destination, members=members or None)
 
     # Promote the reference members to their manifest paths.
     reference_root = work / "reference"
@@ -515,7 +525,8 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         if target.exists():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        source_root = work / "reference_raw" / Path(reference.get("from_archive") or reference["path"]).stem
+        archive_name = reference.get("from_archive") or reference["download"]
+        source_root = work / "reference_raw" / Path(archive_name).stem
         member = reference.get("archive_member")
         if member is None:
             found = next(iter(source_root.rglob("*")))
@@ -544,7 +555,7 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         images=[str(p) for p in images],
         ortho_reference=references.get("orthomosaic"),
         dem_reference=references.get("dsm"),
-        laser_reference=_first(references.get("laser_point_cloud")),
+        laser_reference=references.get("laser_point_cloud"),
         nominal_gsd_m=dataset.get("nominal_gsd_m"),
         licence=dataset["licence"],
     )
@@ -566,13 +577,6 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
         "images": len(images),
     }
     return result
-
-
-def _first(value):
-    """The first element of a kind that may be a single path or a list."""
-    if value is None:
-        return None
-    return value[0] if isinstance(value, list) else value
 
 
 def _reprojection(work: Path, project: Path) -> dict:

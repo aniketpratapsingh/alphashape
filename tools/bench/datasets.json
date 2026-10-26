@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "comment": "Datasets the quality benchmark downloads at run time. Nothing here is committed to the repository: each entry names the publisher's own URL, the SHA-256 of every file, and the reference products. See DATASETS.md for why each was chosen and what was rejected.",
+  "comment": "Datasets the quality benchmark downloads at run time. Nothing here is committed to the repository: each entry names the publisher's own URL, the SHA-256 and exact byte count of every download, and the reference products. A file whose bytes, hash and licence are not all recorded does not belong here. See DATASETS.md for why each was chosen and what was rejected.",
   "datasets": {
     "aerial-nadir": {
       "title": "Bandamaji, Grande Comore (Comoros) drone survey, 2023-06-26",
@@ -14,7 +14,7 @@
         "redistribution": "allowed with attribution; this benchmark downloads only"
       },
       "images_archive": {
-        "path": "images.zip",
+        "download": "images.zip",
         "url": "https://zenodo.org/api/records/8436963/files/DCIM.zip/content",
         "sha256": "27f56c37eae4e9df009877680b7eaee9a77fe443169362c3a21f2ae04346a43b",
         "bytes": 969067420,
@@ -23,26 +23,28 @@
       "reference_files": [
         {
           "path": "reference/ortho.tif",
+          "download": "processed.zip",
           "url": "https://zenodo.org/api/records/8436963/files/PROCESSED_DATA.zip/content",
-          "sha256": "PLACEHOLDER_PROCESSED",
+          "sha256": "58578873595191bb33325d487963c173e5a5405cb6057a408f023abaa28a5147",
           "bytes": 1256606405,
-          "archive_member": "PHOTOGRAMMETRY/odm_orthophoto/odm_orthophoto.tif",
+          "archive_member": "odm_orthophoto/odm_orthophoto.tif",
           "kind": "orthomosaic",
-          "publisher_settings": "OpenDroneMap: orthophoto-resolution=1, dem-resolution=2.0, dsm=true, auto-boundary=true"
+          "publisher_settings": "OpenDroneMap: orthophoto-resolution=1 cm, dem-resolution=2.0 cm, dsm=true, auto-boundary=true"
         },
         {
           "path": "reference/dem.tif",
+          "download": null,
           "url": null,
           "sha256": null,
           "bytes": null,
-          "archive_member": "PHOTOGRAMMETRY/odm_dem/dsm.tif",
-          "kind": "dsm",
-          "from_archive": "reference/ortho.tif"
+          "archive_member": "odm_dem/dsm.tif",
+          "from_archive": "processed.zip",
+          "kind": "dsm"
         }
       ],
       "nominal_gsd_m": 0.024,
       "expected_images": 102,
-      "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2."
+      "notes": "The publisher states OpenDroneMap reconstructed 102 of 102 images at a 2.4 cm GSD over 0.048 km^2. Its ortho and DSM are both at 2.19 cm/px (the record quotes 1 and 2.0, which OpenDroneMap reads in centimetres), so the reference matches the imagery resolution rather than being coarser than it."
     },
     "terrestrial-laser": {
       "title": "ETH3D high-res multi-view training scene 'terrains'",
@@ -56,7 +58,7 @@
         "redistribution": "not allowed; the benchmark downloads inside the CI job only and never commits or publishes the data"
       },
       "images_archive": {
-        "path": "images.7z",
+        "download": "images.7z",
         "url": "https://www.eth3d.net/data/terrains_dslr_jpg.7z",
         "sha256": "12439ea4f997eb3dc3692c40dae1903c61222d44c0ffe2492bbd47cdd872216a",
         "bytes": 357963793,
@@ -64,7 +66,8 @@
       },
       "reference_files": [
         {
-          "path": "reference/laser.7z",
+          "path": "reference/laser_scan1.ply",
+          "download": "scan_eval.7z",
           "url": "https://www.eth3d.net/data/terrains_dslr_scan_eval.7z",
           "sha256": "5770b66a49aa249c880272c4cab2e701800f30eee876c8c1215b49ad42293b2c",
           "bytes": 150051099,
@@ -72,26 +75,29 @@
           "kind": "laser_point_cloud"
         },
         {
-          "path": "reference/laser_alignment.mlp",
-          "url": null,
-          "sha256": null,
-          "bytes": null,
-          "archive_member": "terrains/dslr_scan_eval/scan_alignment.mlp",
-          "kind": "laser_alignment",
-          "from_archive": "reference/laser.7z"
-        },
-        {
-          "path": "reference/laser2.ply",
+          "path": "reference/laser_scan2.ply",
+          "download": null,
           "url": null,
           "sha256": null,
           "bytes": null,
           "archive_member": "terrains/dslr_scan_eval/scan2.ply",
+          "from_archive": "scan_eval.7z",
           "kind": "laser_point_cloud"
+        },
+        {
+          "path": "reference/scan_alignment.mlp",
+          "download": null,
+          "url": null,
+          "sha256": null,
+          "bytes": null,
+          "archive_member": "terrains/dslr_scan_eval/scan_alignment.mlp",
+          "from_archive": "scan_eval.7z",
+          "kind": "laser_alignment"
         }
       ],
       "nominal_gsd_m": null,
       "expected_images": 42,
-      "notes": "The scan_eval archive holds the laser scans already aligned into the image frame, so it is used instead of the 1.9 GB full ground-truth bundle. ETH3D's own evaluator scores accuracy and completeness at 2/5/10 cm; this benchmark reports the same tolerances."
+      "notes": "The scan_eval archive holds the laser scan already aligned into the image frame, which is why it is used instead of the 1.9 GB full ground-truth bundle. The reconstruction is registered onto the scan by similarity ICP before scoring, because an SfM model has no metric scale and these images carry no GPS. ETH3D scores accuracy and completeness at 2/5/10 cm; this benchmark uses the same tolerances."
     }
   }
 }

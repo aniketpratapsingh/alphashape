@@ -685,18 +685,41 @@ def voxel_downsample(points: np.ndarray, voxel: float) -> np.ndarray:
     return pts[np.sort(first)]
 
 
-def nn_distances(query: np.ndarray, target: np.ndarray, *, chunk: int = 1 << 18) -> np.ndarray:
+# How many (query, target) pairs one brute-force block may hold. The distance
+# matrix is assembled per block, so this is what bounds the peak memory: without a
+# bound scaled to the target count, a 200k x 200k comparison would ask for
+# 200k * 200k * 8 bytes and be killed by the OOM killer instead of finishing. At
+# 4 M pairs a block is 32 MB of float64, which stays well inside a CI runner.
+_NN_BLOCK_PAIRS = 4_000_000
+
+
+def _kdtree(points: np.ndarray):
+    """A scipy cKDTree for ``points``, or None when scipy is not installed.
+
+    scipy is not a dependency of the unit tests, which must run with numpy alone;
+    where it is present (it comes with rasterio in the workflow) the tree makes a
+    large comparison an order of magnitude cheaper, which is the difference between
+    a registration that fits the job timeout and one that does not.
+    """
+    try:
+        from scipy.spatial import cKDTree  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - exercised only without scipy
+        return None
+    return cKDTree(points)
+
+
+def nn_distances(query: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Distance from each query point to its nearest target point.
 
-    Brute force in chunks, using |q-t|^2 = |q|^2 + |t|^2 - 2 q.t. The |q|^2 term
-    is constant within a row and does not move the argmin, so it is added back
-    only for the winning column rather than for the whole distance matrix — which
-    is what keeps the intermediate at one row per query instead of one row per
-    (query, target) pair.
+    A kd-tree where scipy is available, otherwise brute force. The brute-force path
+    uses |q-t|^2 = |q|^2 + |t|^2 - 2 q.t, assembles one block of the (query, target)
+    matrix at a time and adds the |q|^2 term back only for the winning column, which
+    is what keeps the intermediate at ``_NN_BLOCK_PAIRS`` entries regardless of how
+    many points the clouds hold.
 
-    A kd-tree is asymptotically better, but scipy is not a dependency of the unit
-    tests, and after voxel-normalisation the clouds are tens of thousands of
-    points, where this is fast and completely predictable.
+    Both paths return the same numbers to floating-point tolerance; the unit tests
+    cover the brute-force path (scipy is not required to run them) and a separate
+    case checks that a small chunk gives the same answer as a large one.
     """
     q = np.ascontiguousarray(query, dtype=np.float64)
     t = np.ascontiguousarray(target, dtype=np.float64)
@@ -704,14 +727,21 @@ def nn_distances(query: np.ndarray, target: np.ndarray, *, chunk: int = 1 << 18)
         return np.zeros(0, dtype=np.float64)
     if t.size == 0:
         return np.full(q.shape[0], np.inf)
+
+    tree = _kdtree(t)
+    if tree is not None:
+        distance, _ = tree.query(q, k=1, workers=-1)
+        return np.asarray(distance, dtype=np.float64)
+
     t_norm = np.einsum("ij,ij->i", t, t)
+    rows = max(1, min(q.shape[0], _NN_BLOCK_PAIRS // max(t.shape[0], 1)))
     out = np.empty(q.shape[0], dtype=np.float64)
-    for start in range(0, q.shape[0], chunk):
-        block = q[start:start + chunk]
+    for start in range(0, q.shape[0], rows):
+        block = q[start:start + rows]
         d2 = t_norm[None, :] - 2.0 * (block @ t.T)
         nearest = d2.argmin(axis=1)
         best = d2[np.arange(block.shape[0]), nearest] + np.einsum("ij,ij->i", block, block)
-        out[start:start + chunk] = np.sqrt(np.maximum(best, 0.0))
+        out[start:start + rows] = np.sqrt(np.maximum(best, 0.0))
     return out
 
 
@@ -849,36 +879,122 @@ def _pca_frame(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return centroid, vectors, np.sqrt(np.maximum(values, 0.0))
 
 
-def pca_align(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    """A similarity that puts ``source`` in ``target``'s principal-axis frame.
+def _proper_axis_rotations() -> list[np.ndarray]:
+    """The 24 proper rotations that permute the three coordinate axes.
 
-    The coarse initialisation ICP needs. Two clouds of the same scene have almost
-    the same principal axes, so rotating one onto the other is a good starting
-    guess even when their frames are unrelated — where nearest-neighbour ICP from
-    an identity rotation is not, because at a large offset the nearest neighbour
-    of most points is simply the wrong point.
-
-    The eigenvector signs are fixed by :func:`_pca_frame`, so the rotation is a
-    proper rotation (det = +1) by construction rather than by a reflection guard.
-    Scale comes from the ratio of the clouds' RMS spreads, which is the right
-    statistic for a similarity whose scale is unknown.
+    All signed permutation matrices with determinant +1. Used to enumerate the
+    ambiguity in a PCA frame: an eigenvector's sign and the order of two
+    near-equal eigenvalues are both arbitrary, so the PCA rotation is only
+    determined up to one of these.
     """
-    src_centre, src_axes, src_spread = _pca_frame(source)
-    dst_centre, dst_axes, dst_spread = _pca_frame(target)
-    # source -> its own frame -> target's frame
-    rotation = dst_axes @ src_axes.T
-    if np.linalg.det(rotation) < 0.0:
-        # A mirrored axis set: flip the least-significant axis of the SOURCE frame
-        # so the result stays a rotation rather than becoming a reflection.
-        flipped = src_axes.copy()
-        flipped[:, 2] = -flipped[:, 2]
-        rotation = dst_axes @ flipped.T
+    rotations: list[np.ndarray] = []
+    for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+        for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)):
+            matrix = np.zeros((3, 3))
+            for row, (col, sign) in enumerate(zip(perm, signs)):
+                matrix[row, col] = sign
+            if np.linalg.det(matrix) > 0:
+                rotations.append(matrix)
+    return rotations
 
-    src_rms = float(np.sqrt(np.mean(src_spread ** 2)))
-    dst_rms = float(np.sqrt(np.mean(dst_spread ** 2)))
+
+def _axis_angle(axis: int, angle: float) -> np.ndarray:
+    """Rotation by ``angle`` radians about coordinate axis ``axis``."""
+    c, s = math.cos(angle), math.sin(angle)
+    if axis == 0:
+        return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+    if axis == 1:
+        return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def pca_align(
+    source: np.ndarray,
+    target: np.ndarray,
+    *,
+    yaw_steps: int = 24,
+    ranking_points: int = 400,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """The best coarse similarity between two clouds, by principal axes + yaw search.
+
+    The initialisation a nearest-neighbour ICP needs. A nearest-neighbour ICP from
+    an identity rotation does not work across unrelated frames: at a large offset
+    most points' nearest neighbour is simply the wrong point, and the fit settles
+    into that wrong pairing.
+
+    Principal axes alone are not enough either, and this is the part that took
+    measurement to get right. An eigenvector's sign is arbitrary, and two
+    near-equal eigenvalues can come out in either order — and a height field is
+    nearly planar, so its two horizontal spreads ARE nearly equal. For a footprint
+    close to square they are equal to within a few per cent, which leaves the
+    rotation about the vertical axis completely undetermined by PCA. A variant that
+    only permuted the axes converged to the wrong yaw on exactly such a scene.
+
+    So the search is: the 24 proper axis permutations of the PCA frame, times
+    ``yaw_steps`` rotations about the best-determined (largest-variance) axis. The
+    candidates are ranked by median nearest-neighbour distance on a small
+    ``ranking_points`` subsample, which is what keeps 24 x 24 candidates affordable
+    — the ranking only has to pick a starting point for the ICP that follows, not
+    produce the final fit.
+    """
+    centroid, axes, spread = _pca_frame(source)
+    target_centroid, target_axes, target_spread = _pca_frame(target)
+
+    src_rms = float(np.sqrt(np.mean(spread ** 2)))
+    dst_rms = float(np.sqrt(np.mean(target_spread ** 2)))
     scale = (dst_rms / src_rms) if src_rms > 1e-12 else 1.0
-    translation = dst_centre - scale * (rotation @ src_centre)
-    return scale, rotation, translation
+
+    base_rotation = target_axes @ axes.T
+    centred = (source - centroid) * scale
+
+    # A small, evenly strided subsample ranks the candidates. Striding keeps the
+    # spread of the sample representative, where taking the first N points of a
+    # row-major cloud would sample one corner.
+    def subsample(points: np.ndarray) -> np.ndarray:
+        if points.shape[0] <= ranking_points:
+            return points
+        stride = int(math.ceil(points.shape[0] / ranking_points))
+        return points[::stride][:ranking_points]
+
+    moving_small = subsample(source - centroid)
+    reference_small = subsample(voxel_downsample(target, max(dst_rms / 50.0, 1e-6)))
+
+    # The yaw search has to run about the TARGET's largest-variance axis expressed in
+    # world coordinates — not about an axis of the PCA frame, which is an arbitrary
+    # basis. Rotating about the wrong axis cannot reach the true orientation at all,
+    # however finely it is stepped: measured on a square-footprint height field, a
+    # frame-axis search converged to a 90 degree error that no number of steps
+    # removed.
+    principal = target_axes[:, 0]
+
+    def yaw_about_principal(angle: float) -> np.ndarray:
+        """Rotation by ``angle`` about the target's principal axis (Rodrigues)."""
+        c, s = math.cos(angle), math.sin(angle)
+        skew = np.array([[0.0, -principal[2], principal[1]],
+                         [principal[2], 0.0, -principal[0]],
+                         [-principal[1], principal[0], 0.0]])
+        return c * np.eye(3) + s * skew + (1.0 - c) * np.outer(principal, principal)
+
+    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    for permutation in _proper_axis_rotations():
+        for step in range(yaw_steps):
+            angle = 2.0 * math.pi * step / yaw_steps
+            rotation = yaw_about_principal(angle) @ base_rotation @ permutation
+            moved = (moving_small * scale) @ rotation.T + target_centroid
+            distance = float(np.median(nn_distances(moved, reference_small)))
+            if best is None or distance < best[0]:
+                best = (distance, rotation, target_centroid - rotation @ (centroid * scale))
+
+    assert best is not None
+    return scale, best[1], best[2]
+
+
+def _stride_cap(points: np.ndarray, limit: int) -> np.ndarray:
+    """Evenly strided subset of at most ``limit`` rows, order preserved."""
+    if points.shape[0] <= limit:
+        return points
+    stride = int(math.ceil(points.shape[0] / limit))
+    return points[::stride]
 
 
 def register_clouds(
@@ -921,6 +1037,14 @@ def register_clouds(
     if moving.shape[0] < 10 or ref.shape[0] < 10:
         return src, {"converged": False, "reason": "too few points after voxel normalisation"}
 
+    # A hard ceiling on what the ICP itself works with. Voxel normalisation usually
+    # brings a survey cloud down to tens of thousands of points; a cloud that stays
+    # huge means the voxel is fine relative to a scene much larger than the
+    # tolerance being measured, in which case striding is harmless (the points are
+    # still spread over the whole scene) and keeps the run inside its time budget.
+    moving = _stride_cap(moving, 60_000)
+    ref = _stride_cap(ref, 60_000)
+
     scale, rotation, translation = pca_align(moving, ref)
     report: dict = {"coarse_scale": scale, "iterations": 0, "converged": False}
     previous_rms = math.inf
@@ -947,7 +1071,11 @@ def register_clouds(
         rms = float(np.sqrt(np.mean(nn_distances(aligned, ref)[order] ** 2)))
         report.update(iterations=step, rms_m=rms, scale=scale, kept=int(order.size))
 
-        if abs(previous_rms - rms) <= 1e-5 * max(rms, 1.0):
+        # Converged when the RMS stopped improving by more than a part in 10^4.
+        # Reported, not required: a cloud pair whose overlap keeps changing shape as
+        # the trim tightens can improve slowly all the way to the iteration cap, and
+        # the RMS in the report is what says whether the fit is any good.
+        if abs(previous_rms - rms) <= 1e-4 * max(rms, 1.0):
             report["converged"] = True
             break
         previous_rms = rms
@@ -958,16 +1086,27 @@ def register_clouds(
     return aligned_all, report
 
 
-def _nn_indices(query: np.ndarray, target: np.ndarray, *, chunk: int = 1 << 18) -> np.ndarray:
+def _nn_indices(query: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Index of the nearest target point for each query point (see nn_distances)."""
     q = np.ascontiguousarray(query, dtype=np.float64)
     t = np.ascontiguousarray(target, dtype=np.float64)
+    if q.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    if t.size == 0:
+        raise ValueError("_nn_indices needs a non-empty target")
+
+    tree = _kdtree(t)
+    if tree is not None:
+        _, index = tree.query(q, k=1, workers=-1)
+        return np.asarray(index, dtype=np.int64)
+
     t_norm = np.einsum("ij,ij->i", t, t)
+    rows = max(1, min(q.shape[0], _NN_BLOCK_PAIRS // max(t.shape[0], 1)))
     out = np.empty(q.shape[0], dtype=np.int64)
-    for start in range(0, q.shape[0], chunk):
-        block = q[start:start + chunk]
+    for start in range(0, q.shape[0], rows):
+        block = q[start:start + rows]
         d2 = t_norm[None, :] - 2.0 * (block @ t.T)
-        out[start:start + chunk] = d2.argmin(axis=1)
+        out[start:start + rows] = d2.argmin(axis=1)
     return out
 
 
@@ -1119,30 +1258,96 @@ def reprojection_stats(observed: np.ndarray, projected: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def read_geotiff(path: str) -> Raster:
-    """Read a GeoTIFF's bands into a ``Raster``.
+def read_geotiff(
+    path: str,
+    *,
+    bounds: tuple[float, float, float, float] | None = None,
+    max_cells: int = 4_000_000,
+    resampling: str = "average",
+) -> Raster:
+    """Read a GeoTIFF into a ``Raster``, optionally only a window of it.
 
-    rasterio is imported here rather than at module scope so the unit tests import
-    nothing beyond numpy. Bands stack into (height, width, bands); one band stays
-    2-D.
+    A reference orthomosaic from a real survey can be hundreds of megapixels at a
+    couple of centimetres: 11754 x 20163 cells and 484 MB on disk for the aerial
+    dataset here. Loading that whole, twice, to compare it with ours would spend
+    more time and memory on the comparison than on the pipeline. ``bounds`` limits
+    the read to a world-coordinate box, and ``max_cells`` downsamples what is left
+    by an integer factor, which keeps every kept cell aligned with the source grid.
+
+    ``resampling="average"`` for continuous data, ``"nearest"`` for anything
+    categorical. rasterio does the decimation in its own block reads, so the full
+    raster is never held in memory.
+
+    A window that covers nothing raises ValueError rather than returning an empty
+    raster, so a caller that got the CRS wrong finds out here.
     """
     import rasterio  # noqa: PLC0415 - deliberately lazy
 
     with rasterio.open(path) as src:
-        data = src.read()
-        nodata = src.nodata
         transform = src.transform
+        window = None
+        if bounds is not None:
+            from rasterio.windows import from_bounds  # noqa: PLC0415
+
+            window = from_bounds(*bounds, transform=src.transform)
+            # Snap to whole pixels: rasterio rejects a fractional window when the
+            # decimation below is applied.
+            window = window.round_offsets().round_lengths()
+            if window.width <= 0 or window.height <= 0:
+                raise ValueError(f"{path}: the requested bounds do not overlap the raster")
+            window = window.intersection(_full_window(src))
+
+        width = int(window.width) if window is not None else src.width
+        height = int(window.height) if window is not None else src.height
+        stride = 1
+        while (width // stride) * (height // stride) > max_cells and stride < 64:
+            stride *= 2
+
+        kwargs = {}
+        if window is not None:
+            kwargs["window"] = window
+        if stride > 1:
+            kwargs["out_shape"] = (
+                src.count,
+                max(1, height // stride),
+                max(1, width // stride),
+            )
+            kwargs["resampling"] = (
+                rasterio.enums.Resampling.nearest
+                if resampling == "nearest"
+                else rasterio.enums.Resampling.average
+            )
+        data = src.read(**kwargs)
+        nodata = src.nodata
         epsg = src.crs.to_epsg() if src.crs else None
+        if window is not None:
+            window_transform = src.window_transform(window)
+            origin_x = float(window_transform.c)
+            origin_y = float(window_transform.f)
+            pixel_x = float(window_transform.a) * stride
+            pixel_y = float(-window_transform.e) * stride
+        else:
+            origin_x = float(transform.c)
+            origin_y = float(transform.f)
+            pixel_x = float(transform.a) * stride
+            pixel_y = float(-transform.e) * stride
+
     payload = data[0] if data.shape[0] == 1 else np.moveaxis(data, 0, 2)
     return Raster(
         data=payload,
-        origin_x=float(transform.c),
-        origin_y=float(transform.f),
-        pixel_size_x=float(transform.a),
-        pixel_size_y=float(-transform.e),
+        origin_x=origin_x,
+        origin_y=origin_y,
+        pixel_size_x=pixel_x,
+        pixel_size_y=pixel_y,
         nodata=None if nodata is None else float(nodata),
         epsg=epsg,
     )
+
+
+def _full_window(src):
+    from rasterio.windows import Window  # noqa: PLC0415
+
+    return Window(0, 0, src.width, src.height)
 
 
 def read_geotiff_grid(path: str) -> dict:
@@ -1303,6 +1508,25 @@ def read_las_points(path: str, *, max_points: int | None = None) -> np.ndarray:
     return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 3))
 
 
+def read_reference_cloud(path: str, *, max_points: int | None = None) -> np.ndarray:
+    """A reference point cloud, by content rather than by extension.
+
+    ETH3D ships LAS/PLY scans and an ODM run ships LAZ; a publisher may also name a
+    PLY ``.ply`` but a LAZ ``.laz`` inconsistently. Looking at the first bytes is
+    the one check that cannot be fooled by a name.
+    """
+    with open(path, "rb") as handle:
+        magic = handle.read(4)
+    if magic[:3] == b"ply":
+        return read_ply_points(path, max_points=max_points)
+    if magic == b"LASF":
+        return read_las_points(path, max_points=max_points)
+    # A compressed LAZ also starts with LASF (it is a LAS with compressed point
+    # data), so reaching here means neither. Let laspy produce its own error: it
+    # gives a better message than a guess would.
+    return read_las_points(path, max_points=max_points)
+
+
 def read_obj_triangles(path: str, *, max_faces: int | None = None) -> np.ndarray:
     """``(n, 3, 3)`` triangle corners from a Wavefront OBJ.
 
@@ -1428,9 +1652,18 @@ def dem_metrics(dem: Raster, *, reference: Raster | None = None) -> dict:
     return out
 
 
-def compare_dem_to_reference(ours: Raster, reference: Raster) -> dict:
-    """Resample both DEMs to a common grid and report ΔZ."""
-    ox, oy, pixel, width, height = common_grid(ours, reference)
+def compare_dem_to_reference(
+    ours: Raster, reference: Raster, *, max_cells: int = 4_000_000
+) -> dict:
+    """Resample both DEMs to a common grid and report ΔZ.
+
+    ``max_cells`` bounds the comparison grid. A reference DSM from a real survey is
+    hundreds of megapixels; comparing it cell for cell would be slower than the
+    pipeline that produced our own product. Coarsening both sides by the same
+    integer factor changes the ΔZ statistics by far less than the reconstruction's
+    own error, and the reported ``grid_pixel_m`` says exactly what was compared.
+    """
+    ox, oy, pixel, width, height = common_grid(ours, reference, max_cells=max_cells)
     a, a_valid = resample_to_grid(
         ours, origin_x=ox, origin_y=oy, pixel_size=pixel, width=width, height=height
     )
@@ -1448,7 +1681,9 @@ def compare_dem_to_reference(ours: Raster, reference: Raster) -> dict:
     return stats
 
 
-def compare_ortho_to_reference(ours: Raster, reference: Raster) -> dict:
+def compare_ortho_to_reference(
+    ours: Raster, reference: Raster, *, max_cells: int = 2_000_000
+) -> dict:
     """Horizontal offset and overlap against a reference orthomosaic.
 
     The reference is another pipeline's mosaic of the same photographs, so it is
@@ -1456,8 +1691,12 @@ def compare_ortho_to_reference(ours: Raster, reference: Raster) -> dict:
     correlation on luminance gives the residual plan-view offset in metres; a
     nonzero value means our georeferencing disagrees with the publisher's, not
     that one is wrong, which is why the report labels it "vs reference".
+
+    ``max_cells`` bounds the comparison grid: phase correlation is an FFT, so its
+    cost is superlinear in the cell count and a 1200 px grid resolves the offset to
+    well under a pixel anyway. The reported ``grid_pixel_m`` says what was used.
     """
-    ox, oy, pixel, width, height = common_grid(ours, reference)
+    ox, oy, pixel, width, height = common_grid(ours, reference, max_cells=max_cells)
     a, a_valid = resample_to_grid(
         ours, origin_x=ox, origin_y=oy, pixel_size=pixel, width=width, height=height
     )
@@ -1565,15 +1804,18 @@ def evaluate(
     )
 
     # -- reference: orthomosaic ---------------------------------------------
+    # The reference is read through a window over OUR extent, not whole. A survey
+    # orthomosaic is hundreds of megapixels and only the part both products cover
+    # can be compared; reading the rest would dominate the run's memory and time
+    # for no information.
     if spec.ortho_reference is None:
         result["reference_based"]["ortho"] = {"skipped": "dataset has no ortho reference"}
     elif ortho is None:
         result["reference_based"]["ortho"] = {"skipped": "no orthomosaic produced"}
     else:
         try:
-            result["reference_based"]["ortho"] = compare_ortho_to_reference(
-                ortho, read_geotiff(spec.ortho_reference)
-            )
+            reference = read_geotiff(spec.ortho_reference, bounds=ortho.extent())
+            result["reference_based"]["ortho"] = compare_ortho_to_reference(ortho, reference)
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["ortho"] = {"skipped": f"reference unusable: {exc}"}
 
@@ -1584,23 +1826,33 @@ def evaluate(
         result["reference_based"]["dem"] = {"skipped": "no DEM produced"}
     else:
         try:
-            result["reference_based"]["dem"] = compare_dem_to_reference(
-                dem, read_geotiff(spec.dem_reference)
-            )
+            # "nearest" here: a DSM compared cell for cell must not have heights
+            # averaged across a building edge before the difference is taken.
+            reference = read_geotiff(spec.dem_reference, bounds=dem.extent())
+            result["reference_based"]["dem"] = compare_dem_to_reference(dem, reference)
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["dem"] = {"skipped": f"reference unusable: {exc}"}
 
     # -- reference: laser point cloud ---------------------------------------
-    if spec.laser_reference is None:
+    if not spec.laser_reference:
         result["reference_based"]["cloud"] = {"skipped": "dataset has no laser reference"}
     elif not cloud_path:
         result["reference_based"]["cloud"] = {"skipped": "no point cloud produced"}
     else:
         try:
             ours = read_ply_points(cloud_path, max_points=400_000)
-            reference = read_las_points(spec.laser_reference, max_points=400_000)
+            # A scene can carry more than one scan (ETH3D's terrains has two, of
+            # different parts of the site). Scoring against the union is the right
+            # thing: the reconstruction covers both, and against one scan alone the
+            # other half would count as neither accurate nor complete.
+            references = spec.laser_reference
+            if isinstance(references, str):
+                references = [references]
+            clouds = [read_reference_cloud(path, max_points=400_000) for path in references]
+            reference = np.concatenate(clouds, axis=0) if len(clouds) > 1 else clouds[0]
             stats = accuracy_completeness(ours, reference, list(tolerances))
             stats["tolerances_m"] = list(tolerances)
+            stats["scans"] = len(clouds)
             result["reference_based"]["cloud"] = stats
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["cloud"] = {"skipped": f"reference unusable: {exc}"}

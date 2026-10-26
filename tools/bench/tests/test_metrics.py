@@ -425,13 +425,26 @@ class NearestNeighbourTest(unittest.TestCase):
         target = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
         np.testing.assert_allclose(metrics.nn_distances(query, target), [0.5])
 
-    def test_beyond_the_chunk_size_is_the_same_as_within_it(self):
+    def test_a_small_block_gives_the_same_answer_as_a_large_one(self):
+        # The block size is a memory bound, not part of the maths: a run split into
+        # many small blocks must produce the same distances as one big block. The
+        # limit is patched rather than passed, because it has to apply to the
+        # internal calls in register_clouds too.
         rng = np.random.default_rng(9)
         query = rng.random((50, 3))
         target = rng.random((80, 3))
-        small = metrics.nn_distances(query, target, chunk=7)
-        large = metrics.nn_distances(query, target, chunk=1 << 18)
+        original = metrics._NN_BLOCK_PAIRS
+        try:
+            metrics._NN_BLOCK_PAIRS = 80  # one row per block
+            small = metrics.nn_distances(query, target)
+            small_index = metrics._nn_indices(query, target)
+            metrics._NN_BLOCK_PAIRS = 1 << 20
+            large = metrics.nn_distances(query, target)
+            large_index = metrics._nn_indices(query, target)
+        finally:
+            metrics._NN_BLOCK_PAIRS = original
         np.testing.assert_allclose(small, large, atol=1e-12)
+        np.testing.assert_array_equal(small_index, large_index)
 
     def test_an_empty_query_gives_an_empty_result(self):
         self.assertEqual(metrics.nn_distances(np.zeros((0, 3)), np.zeros((3, 3))).size, 0)

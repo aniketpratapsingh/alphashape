@@ -408,6 +408,19 @@ def markdown(
                 f"completeness {_fmt(cloud.get('completeness_median_m'))} m; "
                 f"F-score @5 cm {_fmt(cloud.get('f_score_5cm'))}."
             )
+            # The registration has to be visible: it is a fitted similarity, so a
+            # scale that is nowhere near the expected one (or an RMS that never
+            # settled) says the score is about the alignment rather than the
+            # reconstruction.
+            alignment = cloud.get("alignment")
+            if isinstance(alignment, dict):
+                lines.append("")
+                lines.append(
+                    f"Registered by similarity ICP: scale {_fmt(alignment.get('scale'))}, "
+                    f"{alignment.get('iterations')} iterations, "
+                    f"RMS {_fmt(alignment.get('rms_m'))} m, "
+                    f"{'converged' if alignment.get('converged') else 'stopped at the iteration cap'}."
+                )
         lines.append("")
 
     # -- regressions -------------------------------------------------------
