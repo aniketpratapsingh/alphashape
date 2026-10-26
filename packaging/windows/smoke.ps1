@@ -337,6 +337,42 @@ try {
     Assert ($tasks.Output -contains 'AddPhotos') "AddPhotos is not in --list-tasks"
     Write-Host "  $($tasks.Output.Count) tasks"
 
+    Step "GPU layer loads without a Vulkan runtime"
+    # This runner has no Vulkan loader and no Vulkan driver, which is the case
+    # the build must survive: the GPU layer is compiled in, the loader is found
+    # at run time (never linked), and its absence must read as "run on the CPU"
+    # rather than as a missing-DLL failure at launch.
+    #
+    # --gpu-info exits 0 when it lists a device and 1 when it explains why it
+    # cannot, so a non-zero exit is expected here; what must hold is that the
+    # process started and printed a recognisable answer.
+    $gpu = Invoke-Captured $cli @('--gpu-info')
+    $gpu.Output | ForEach-Object { Write-Host "  $_" }
+    Write-Host "  exit: $($gpu.ExitCode)"
+    $gpuText = (@($gpu.Output) + @($gpu.Errors)) -join "`n"
+    if ($gpu.ExitCode -ne 0 -and $gpu.ExitCode -ne 1) {
+        Fail ("alphashape-cli --gpu-info exited $($gpu.ExitCode); the GPU layer must not " +
+              'abort the process when no Vulkan runtime is installed')
+    }
+    if ($gpuText -match 'disabled at build time') {
+        Fail ('the installed build reports "GPU support disabled at build time"; this ' +
+              'installer is supposed to ship the Vulkan GPU layer')
+    }
+    if ($gpu.ExitCode -eq 0) {
+        Assert ($gpuText -match 'gpu device \d+:') '--gpu-info exited 0 but listed no device'
+    } else {
+        # No device on this machine. The reason must be actionable: naming
+        # Vulkan is not enough on its own, because "vkCreateInstance failed
+        # with VkResult -9" also names nothing. The driver appears in every
+        # message the engine produces for this case -- the loader-missing one
+        # talks about the graphics driver, and VK_ERROR_INCOMPATIBLE_DRIVER
+        # says to install or update it.
+        Assert ($gpuText -match 'gpu: unavailable ') '--gpu-info gave no reason line'
+        Assert ($gpuText -match 'ulkan') 'the unavailability reason does not mention Vulkan'
+        Assert ($gpuText -match 'driver') 'the unavailability reason does not mention the driver'
+        Assert ($gpuText -notmatch 'disabled at build time') 'the GPU layer was compiled out'
+    }
+
     Step "CLI resolves PROJ data from a non-ASCII install path"
     $projInfo = Invoke-Captured $cli @('--proj-info')
     $projInfo.Output | ForEach-Object { Write-Host "  $_" }

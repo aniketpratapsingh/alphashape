@@ -261,10 +261,21 @@ sudo apt install build-essential cmake ninja-build libeigen3-dev libceres-dev li
 brew install cmake ninja eigen ceres-solver proj libtiff libpng jpeg-turbo googletest pybind11 \
   libomp molten-vk vulkan-loader vulkan-headers shaderc spirv-tools
 
+# Windows (vcpkg)
+vcpkg install eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib \
+  vulkan-headers vulkan-memory-allocator shaderc spirv-tools[tools]
+
 cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+On Windows the Vulkan headers and the shader tools come from vcpkg, which keeps
+the GPU layer on by default; `vulkan-loader` is not needed to *build* (nothing
+links a loader — the backend opens `vulkan-1.dll` at run time), only to run the
+GPU tests against a software driver. A machine without a Vulkan driver (any
+Windows VM, or a host whose GPU driver predates Vulkan) still runs the app: the
+GPU layer reports why it is unavailable and every task falls back to the CPU.
 
 The desktop app is opt-in: add `-DALPHASHAPE_BUILD_GUI=ON` and put a Qt 6.8 kit on
 `CMAKE_PREFIX_PATH`. Windows (clang-cl + vcpkg) is described in

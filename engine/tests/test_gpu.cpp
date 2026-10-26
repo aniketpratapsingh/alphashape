@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <random>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include <Eigen/Core>
 
+#include "base/platform/process.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/portable_rng.hpp"
 #include "base/platform/env.hpp"
@@ -25,6 +27,15 @@
 namespace {
 
 using namespace alphashape::gpu;
+
+// Path to the CLI binary, from tests/CMakeLists.txt. Empty when the CLI is not
+// built, which the one test that needs it skips on.
+constexpr const char* kCommandLinePath =
+#if defined(ALPHASHAPE_CLI_EXE)
+    ALPHASHAPE_CLI_EXE;
+#else
+    "";
+#endif
 
 // Every device test reports why it is skipped rather than silently passing.
 #define REQUIRE_GPU()                                       \
@@ -393,11 +404,81 @@ TEST(Gpu, MissingLibraryIsReportedNotFatal) {
         GTEST_SKIP() << "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
     }
     std::string reason;
-    const bool loaded = detail::try_load_library(
-        "/nonexistent/alphashape/libNopeVulkan.dylib", &reason);
+    // A file name that exists nowhere, spelled per platform. The sentinel is
+    // the same token on every platform so the assertion below is about the
+    // message quoting the path, not about the platform's naming convention.
+#if defined(_WIN32)
+    const std::string missing = "Z:\\nonexistent\\alphashape\\nopeNopeVulkan-1.dll";
+#elif defined(__APPLE__)
+    const std::string missing = "/nonexistent/alphashape/nopeNopeVulkan.1.dylib";
+#else
+    const std::string missing = "/nonexistent/alphashape/nopeNopeVulkan.so.1";
+#endif
+    const bool loaded = detail::try_load_library(missing, &reason);
     EXPECT_FALSE(loaded);
     EXPECT_FALSE(reason.empty());
-    EXPECT_NE(reason.find("libNopeVulkan"), std::string::npos);
+    // The reason has to name the path that was tried; a bare "the module could
+    // not be found" leaves a user with nothing to check.
+    EXPECT_NE(reason.find("nopeNopeVulkan"), std::string::npos) << reason;
+}
+
+// The Windows failure mode this exists for: a build with the GPU layer compiled
+// in, started on a machine with no Vulkan runtime, must run on the CPU rather
+// than fail to load a DLL. It runs the real CLI in a child process because a
+// missing DLL is decided by the loader before main() in the failing case, which
+// no in-process assertion can observe.
+//
+// The child may legitimately find a device (the CI lanes install lavapipe);
+// what is asserted is the contract either way: the process starts, prints a
+// device line or an explained "unavailable", and never claims the layer was
+// left out of the build.
+TEST(Gpu, CommandLineReportsGpuStateWithoutAborting) {
+    if (!detail::backend_compiled_in()) {
+        GTEST_SKIP() << "GPU support disabled at build time (ALPHASHAPE_GPU=OFF)";
+    }
+    if (std::string(kCommandLinePath).empty()) {
+        GTEST_SKIP() << "the CLI was not part of this build (ALPHASHAPE_BUILD_CLI=OFF)";
+    }
+    // The path is baked at build time; a build tree moved to a different
+    // absolute path (a fork's runner, a relocated unpack) is an environment
+    // difference, not a product defect, so it skips rather than fails.
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(kCommandLinePath, error)) {
+            GTEST_SKIP() << "no alphashape-cli at " << kCommandLinePath;
+        }
+    }
+    std::vector<std::string> argv{kCommandLinePath, "--gpu-info"};
+#if defined(_WIN32)
+    // CMake hands the path over with forward slashes (a Windows path in a C++
+    // string literal is a minefield: the runner's "D:\a\..." produced \a and
+    // \s and failed the build under -Werror). CreateProcess's own path
+    // resolution is the one place this tree does not rely on the CRT, so the
+    // separators are normalised here rather than hoping.
+    for (char& character : argv[0]) {
+        if (character == '/') {
+            character = '\\';
+        }
+    }
+#endif
+    const alphashape::platform::ProcessResult result =
+        alphashape::platform::run_process_capture(argv);
+    ASSERT_TRUE(result.started) << result.output;
+    // 0 = at least one device listed, 1 = explained as unavailable. Anything
+    // else is a crash, an unhandled exception, or a usage error.
+    EXPECT_TRUE(result.exit_code == 0 || result.exit_code == 1)
+        << "exit " << result.exit_code << ": " << result.output;
+    EXPECT_EQ(result.output.find("disabled at build time"), std::string::npos)
+        << "the build reports the GPU layer as compiled out: " << result.output;
+    if (result.exit_code == 0) {
+        EXPECT_NE(result.output.find("gpu device 0:"), std::string::npos) << result.output;
+    } else {
+        EXPECT_NE(result.output.find("gpu: unavailable"), std::string::npos) << result.output;
+        // A bare "LoadLibrary failed" is not enough for a user to act on.
+        // "ulkan" matches both the capitalised prose on Windows and the
+        // lowercase soname in the POSIX dlopen error.
+        EXPECT_NE(result.output.find("ulkan"), std::string::npos) << result.output;
+    }
 }
 
 TEST(Gpu, ValidationModeReportsNoErrors) {
@@ -1639,6 +1720,62 @@ TEST(Gpu, SubmitAndWaitThrowAfterDeviceLost) {
     Dispatch replay = dispatch;
     replay.buffers = {&fresh};
     ASSERT_NO_THROW(run(*context, {replay}));
+}
+
+// The descriptor pool of an abandoned submission must not be leaked. It cannot
+// be freed when the slot is abandoned (the queue may still reference it), so it
+// is parked until a fence actually signals -- which proves the FIFO queue has
+// drained past it -- and must then be destroyed. Before that parking existed
+// the pool was left in the slot and the next submission overwrote the handle,
+// leaking it; LeakSanitizer found exactly that on the lost-device paths.
+TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+    auto context = default_context();
+    ASSERT_NE(context, nullptr);
+    ASSERT_FALSE(detail::device_lost());
+    ASSERT_EQ(detail::orphaned_pool_count(*context), 0u)
+        << "a clean context starts with no parked pools";
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // Abandon one slot: the ticket's wait fails, which is the production path
+    // that used to leak.
+    {
+        const Ticket ticket = run_async(*context, {dispatch});
+        ASSERT_NE(ticket.id(), 0u);
+        detail::note_device_lost("test: abandon a slot to check the pool accounting");
+        EXPECT_THROW(wait(*context, ticket), Error);
+    }
+    ASSERT_EQ(detail::in_flight_count(*context), 0u) << "the abandoned slot must not stay pending";
+    const std::size_t parked = detail::orphaned_pool_count(*context);
+    ASSERT_EQ(parked, 1u) << "the abandoned submission's pool must be parked, not freed or lost";
+
+    // Recovering the device and completing a real submission proves the queue
+    // drained past the abandoned work, which is when the pool may be freed. The
+    // reclaim is a bounded poll of the abandoned fence, so the very first
+    // submission can legitimately skip the slot if the driver has not signalled
+    // yet; a few more are allowed before the test calls it a leak.
+    detail::reset_device_lost();
+    ASSERT_FALSE(detail::device_lost());
+    for (int attempt = 0; attempt < 8 && detail::orphaned_pool_count(*context) != 0u; ++attempt) {
+        ASSERT_NO_THROW(run(*context, {dispatch}));
+    }
+    EXPECT_EQ(detail::orphaned_pool_count(*context), 0u)
+        << "the parked pool of an abandoned submission was never freed";
+    EXPECT_EQ(detail::in_flight_count(*context), 0u);
 }
 
 // Fix 2 + 4: the buffers of a failed operation are destroyed during the unwind,
