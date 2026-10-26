@@ -180,6 +180,12 @@ DepthMap filter_depth_map(const DepthView& reference, const std::vector<DepthVie
     out.width = width;
     out.height = height;
     out.downscale = src.downscale;
+    // Filtering changes the values, never the geometry they were estimated
+    // against, so the fingerprint carries through unchanged and a filtered map
+    // stays reusable by a later run. The output records WHICH mode produced it,
+    // so a later run reuses it only when it asked for the same strength.
+    out.alignment_fingerprint = src.alignment_fingerprint;
+    out.filter_mode = static_cast<int>(options.mode);
 
     // Output arrays are always full-size: the caller asked for a filtered copy.
     out.depths.assign(pixels, -1.0f);

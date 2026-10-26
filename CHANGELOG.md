@@ -8,6 +8,26 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
+  (including one during filtering) stores the finished maps before it stops,
+  and `reuse_depth` (now on by default) skips their search on the next run and
+  filters them. A cancel commits only depth maps: point clouds, models, DEMs,
+  orthomosaics and earlier depth-map sets are left untouched. Repeated cancels
+  merge into one set marked "partial" instead of piling up a set per cancel, and
+  the run that finally completes replaces it in place.
+- **Depth-map reuse is keyed on the whole neighbourhood.** Each map records a
+  fingerprint of the reference camera's pose and calibration, the downscale,
+  `max_neighbors`, the neighbour cameras' ids, poses and calibrations, the depth
+  range, the reference image file and the PatchMatch settings, so moving one
+  camera rebuilds every map that had it as a neighbour, not only its own map,
+  and changing `max_neighbors` rebuilds every map. A map also records the filter
+  mode it has been through, so changing `filter_mode` filters rather than
+  returns the weaker old result.
+- **Build Depth Maps reports progress inside one camera.** The search reports
+  after every refinement sweep on both the CPU and the GPU path, so the
+  progress bar moves during a long image and Cancel is honoured within one
+  sweep instead of after the current camera. Each finished camera logs its
+  index, resolution, device (GPU/CPU) and wall-clock time.
 - **The orthomosaic's default cell is the ground sample distance the photographs actually resolve.** `BuildOrthomosaic` measures each camera's footprint on the DEM (median of slant range / (focal × cos incidence) over the enabled cameras) and uses that for the output grid instead of a fixed fraction of the DEM cell, so an oblique flight correctly comes out at about twice the nadir footprint. The measurement assumes level ground at the DEM median height: the incidence term is the vertical, not the local surface normal, so it does not follow a slope. A Geographic (EPSG:4326) grid gets the result converted to degrees at the surface's latitude.
 - **`BuildDem`'s automatic cell applies the same incidence correction**, so an oblique flight's DEM is no longer over-sampled by 1/cos(incidence).
 - Orthomosaic memory is bounded before allocation: per-camera tiles are cropped to their footprints, photographs are decoded one at a time, and a run whose estimated peak exceeds 60 % of physical RAM (`ALPHASHAPE_MEMORY_BUDGET_MB` overrides for tests) is refused with a message naming a coarser resolution.
@@ -15,6 +35,16 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **Project format version 3.** The depth-map sidecar moved from ADM1 to ADM2,
+  so the project version is bumped: an older 0.1.0 build refuses such a project
+  with its clear "newer than this build supports" message instead of failing
+  deep inside the sidecar decoder with "depth map file: bad header". Version 2
+  projects still open: their ADM1 maps read with fingerprint 0 ("unknown", so
+  never reused) and the "mild" filter a pre-ADM2 project could only have run.
+- **BuildPointCloud and unfiltered depth maps.** A map with no confidence (one
+  a cancelled Build Depth Maps checkpointed) now logs a warning and is fused
+  rather than silently dropped when `min_confidence > 0`: the absence of a
+  measurement is not a failing measurement.
 - The occlusion ray march steps at half a **DEM** cell rather than half the larger of the ortho and DEM cells. Its stop is now metric and exact — the ray ends when it rises above the tallest DEM sample — instead of a fixed 4096-sample cap, which could drop a genuine occluder on a long slope viewed at a grazing angle. Asking for an ortho 4× finer than the DEM no longer multiplies the march cost per unit area. Occluders thinner than about one DEM cell can still be missed.
 - The orthomosaic memory estimate is now per stage (rectify, seams — including the alpha-expansion push-relabel graph — blend and finalize), reporting the largest stage rather than a sum of unrelated ones, and the guard runs **before** any grid-sized allocation, including the plane→local node map that used to be built first.
 - `BuildDem`'s robust extent clipping now applies from 200 samples instead of 1000, so a small block is protected too, and it logs an Info line naming the axis, the pre-clip and clipped extents in metres, and how many far samples were ignored.

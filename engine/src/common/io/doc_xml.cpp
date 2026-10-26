@@ -10,10 +10,13 @@ namespace alphashape {
 
 // doc.xml is a versioned container. This file is only the dispatcher:
 //
-//   write            -> always format v2 (Document::kFormatVersion)
+//   write            -> always the current format (Document::kFormatVersion)
 //   read version 1   -> doc_xml_v1.cpp (the pre-M11 layout, read verbatim)
 //   read version 2   -> doc_xml_v2.cpp
-//   read version > 2 -> ProjectIOError ("newer than this build supports")
+//   read version 3   -> doc_xml_v2.cpp (v3 changed only the depth-map sidecar,
+//                       ADM1 -> ADM2, which decode_depth_maps dispatches on its
+//                       own magic; the XML vocabulary is v2's)
+//   read version > 3 -> ProjectIOError ("newer than this build supports")
 //   read version 0 or missing -> ProjectIOError
 //
 // The shared machinery (XML tree and parser, escaping, numeric formatting,
@@ -62,7 +65,9 @@ std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* r
         if (version == 1) {
             return docxml::read_v1(root, archive, report);
         }
-        if (version == 2) {
+        // v2 and v3 share the reader: v3 is a sidecar-encoding bump only (ADM1
+        // -> ADM2 for depth maps), and the codec keys off its own magic.
+        if (version == 2 || version == 3) {
             return docxml::read_v2(root, archive, report);
         }
     } catch (const ProjectIOError&) {

@@ -329,6 +329,50 @@ TEST(Fusion, MinConfidenceFiltersLowConfidencePixels) {
     }
 }
 
+TEST(Fusion, UnfilteredMapIsNotDroppedByMinConfidence) {
+    // A map with no confidence buffer was never cross-view filtered: there is
+    // no measurement to compare against min_confidence. Treating the absence of
+    // a measurement as confidence 0 would silently discard every point of an
+    // expensive map, so an unfiltered map passes the filter untouched. The
+    // caller (BuildPointCloud) warns that the filter could not judge it.
+    const Calibration cal = map_calibration();
+    const DepthMap map = make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 0);
+    ASSERT_TRUE(map.confidence.empty());
+
+    FusionInput in;
+    in.map = &map;
+    in.calibration = cal;
+
+    FusionOptions options;
+    options.min_confidence = 2.0F;  // a threshold no real confidence would pass
+    const PointCloud cloud = fuse_depth_maps({in}, options);
+    EXPECT_GT(cloud.points.size(), 0U)
+        << "an unfiltered map must not be dropped by min_confidence";
+
+    // It is the same cloud as with the filter off: the threshold did not touch
+    // it, rather than letting a filtered subset through.
+    FusionOptions off;
+    off.min_confidence = 0.0F;
+    EXPECT_EQ(cloud.points.size(), fuse_depth_maps({in}, off).points.size());
+}
+
+TEST(Fusion, MinConfidenceStillFiltersAFilteredMap) {
+    // The control for the case above: a map that DOES carry confidence is
+    // filtered exactly as before.
+    const Calibration cal = map_calibration();
+    DepthMap map = make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 0);
+    map.confidence.assign(map.depths.size(), 0.5F);
+
+    FusionInput in;
+    in.map = &map;
+    in.calibration = cal;
+
+    FusionOptions options;
+    options.min_confidence = 2.0F;
+    EXPECT_TRUE(fuse_depth_maps({in}, options).points.empty())
+        << "a filtered map must still respect min_confidence";
+}
+
 TEST(Fusion, DoublingVoxelSizeReducesPointCount) {
     const Calibration cal = map_calibration();
     const Matrix3d R = rot(0.05, 0.1, 0.0);

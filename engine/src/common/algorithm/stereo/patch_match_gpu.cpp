@@ -404,9 +404,15 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // Initialise both colours (the CPU's initial random hypothesis, plus the
     // texture mask), then the red-black sweeps.
     std::vector<g::Dispatch> dispatches;
+    // The search fraction after each dispatch has finished. The hook reports
+    // the same schedule as the CPU's SweepProgress: the init pair is not
+    // reported (0), each refinement half-sweep adds 1/(2 * iterations), and the
+    // finalise dispatch reports 1.
+    std::vector<double> dispatch_fraction;
     const std::size_t bands =
         (static_cast<std::size_t>(height) + rows_per_band - 1) / rows_per_band;
     dispatches.reserve((static_cast<std::size_t>(2 + 2 * options.iterations)) * bands + 1);
+    dispatch_fraction.reserve(dispatches.capacity());
     const auto make_dispatch = [&](const char* kernel) {
         g::Dispatch dispatch;
         dispatch.kernel = kernel;
@@ -415,34 +421,38 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         dispatch.groups = groups;
         return dispatch;
     };
-    // A half-sweep: one dispatch per band of rows, in ascending order.
-    const auto push_half_sweep = [&](const char* kernel) {
+    // A half-sweep: one dispatch per band of rows, in ascending order. Only the
+    // last band's completion advances the reported fraction, so a banded image
+    // reports the same milestones as an unbanded one.
+    const auto push_half_sweep = [&](const char* kernel, double fraction) {
         if (bands <= 1) {
             params.row_offset = 0;
             dispatches.push_back(make_dispatch(kernel));
-            return;
+        } else {
+            for (std::size_t band = 0; band < bands; ++band) {
+                const std::size_t row = band * rows_per_band;
+                params.row_offset = static_cast<std::uint32_t>(row);
+                g::Dispatch dispatch = make_dispatch(kernel);
+                dispatch.groups[1] = static_cast<std::uint32_t>(
+                    (std::min(static_cast<std::size_t>(height), row + rows_per_band) - row +
+                     kTileY - 1) /
+                    kTileY);
+                dispatches.push_back(std::move(dispatch));
+            }
         }
-        for (std::size_t band = 0; band < bands; ++band) {
-            const std::size_t row = band * rows_per_band;
-            params.row_offset = static_cast<std::uint32_t>(row);
-            g::Dispatch dispatch = make_dispatch(kernel);
-            dispatch.groups[1] = static_cast<std::uint32_t>(
-                (std::min(static_cast<std::size_t>(height), row + rows_per_band) - row +
-                 kTileY - 1) /
-                kTileY);
-            dispatches.push_back(std::move(dispatch));
-        }
+        dispatch_fraction.resize(dispatches.size(), fraction);
     };
 
     for (std::uint32_t colour = 0; colour < 2; ++colour) {
         params.colour = colour;
         params.iteration = kNoIteration;
         params.iteration_hi = kNoIteration;
-        push_half_sweep("pm_init");
+        push_half_sweep("pm_init", 0.0);
     }
     params.depth_delta = inv_span * 0.5F;
     params.normal_angle = static_cast<float>(1.0471975511965976 * 0.5);
 
+    const double sweeps_total = static_cast<double>(std::max(2 * options.iterations, 1));
     for (int it = 0; it < options.iterations; ++it) {
         const float s = static_cast<float>(std::pow(0.5, static_cast<double>(it) + 1.0));
         params.iteration = static_cast<std::uint32_t>(it);
@@ -451,7 +461,8 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
         params.normal_angle = static_cast<float>(1.0471975511965976 * static_cast<double>(s));
         for (std::uint32_t colour = 0; colour < 2; ++colour) {
             params.colour = colour;
-            push_half_sweep("pm_refine");
+            const double done = static_cast<double>(2 * it + static_cast<int>(colour) + 1);
+            push_half_sweep("pm_refine", done / sweeps_total);
         }
     }
 
@@ -465,6 +476,7 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     finalize.push_constants = g::push(params);
     finalize.groups = {static_cast<std::uint32_t>((count + 255) / 256), 1, 1};
     dispatches.push_back(finalize);
+    dispatch_fraction.resize(dispatches.size(), 1.0);
 
     // Submit in bounded chunks rather than one command buffer for the whole
     // solve. A pixel-heavy reference (480x360, 7 neighbours) is ~15 s of GPU
@@ -481,7 +493,31 @@ PatchMatchResult run_gpu(const PMView& reference, const std::vector<PMView>& nei
     // gpu::run already inserts between dispatches, and neither a band split nor
     // a submission split changes any pixel's inputs, so the result is identical.
     g::BatchLimiter limiter(/*dispatches_per_step=*/1, /*initial_steps=*/2);
-    g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/1);
+    // The caller's per-sweep hook, driven by the batcher: after each submission
+    // `done` dispatches have run, and dispatch_fraction says what search
+    // fraction that is. Only a fraction that advanced is reported, so a banded
+    // image does not tick the bar once per band within one half-sweep.
+    const SweepProgress on_sweep = options.on_sweep;
+    double reported = 0.0;
+    const auto on_submission = on_sweep
+        ? std::function<void(std::size_t, std::size_t)>(
+              [&](std::size_t done, std::size_t total) {
+                  if (total == 0 || done == 0) {
+                      return;
+                  }
+                  const double fraction =
+                      dispatch_fraction[std::min(done, dispatch_fraction.size()) - 1];
+                  if (fraction > reported) {
+                      reported = fraction;
+                      on_sweep(fraction);
+                  }
+              })
+        : std::function<void(std::size_t, std::size_t)>();
+    g::run_batched(*context, dispatches, limiter, /*leading=*/0, /*trailing=*/1,
+                   on_submission);
+    if (on_sweep && reported < 1.0) {
+        on_sweep(1.0);
+    }
 
     PatchMatchResult result;
     result.width = width;

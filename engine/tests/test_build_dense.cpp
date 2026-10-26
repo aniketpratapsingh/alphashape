@@ -26,9 +26,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -40,8 +43,11 @@
 #include "common/algorithm/sfm/absolute_pose.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
+#include "common/algorithm/stereo/build_depth_maps_task.hpp"
+#include "common/algorithm/stereo/view_selection.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
+#include "common/io/sidecars.hpp"
 #include "common/tasks/registry.hpp"
 
 namespace alphashape {
@@ -504,6 +510,30 @@ TEST(BuildDenseClear, RebuildClearsPointCloud) {
     EXPECT_FALSE(document.active_chunk()->depth_maps().empty());
 }
 
+TEST(BuildDenseClear, UnfilteredMapsSurviveMinConfidence) {
+    // A cancel checkpoint stores maps with no confidence. BuildPointCloud must
+    // not silently drop all of their points when min_confidence > 0: the
+    // absence of a confidence measurement is not a failing measurement. The
+    // task warns instead (unobservable from here) and the fusion passes them.
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    // Fabricate the post-cancel state: maps with depths but no confidence.
+    run_build_depth_maps(document, /*downscale=*/4, "mild");
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    for (DepthMap& map : chunk.depth_maps()) {
+        map.confidence.clear();
+        map.filter_mode = -1;
+    }
+    ASSERT_TRUE(std::all_of(chunk.depth_maps().begin(), chunk.depth_maps().end(),
+                            [](const DepthMap& m) { return m.confidence.empty(); }));
+
+    Params params = make_params(builtin_registry().require("BuildPointCloud"));
+    params.set("min_confidence", ParamValue{1.5});
+    run_task(builtin_registry(), document, "BuildPointCloud", params);
+    EXPECT_FALSE(document.active_chunk()->point_cloud().points.empty())
+        << "min_confidence dropped every point of an unfiltered map";
+}
+
 // ---------------------------------------------------------------------------
 // 4. Round-trip after both tasks
 // ---------------------------------------------------------------------------
@@ -814,6 +844,781 @@ TEST(BuildDenseOptions, PointColoursAndConfidenceToggles) {
     const PointCloud& no_colour = document.active_chunk()->point_cloud();
     EXPECT_TRUE(no_colour.colours.empty());
     EXPECT_EQ(no_colour.confidence.size(), no_colour.points.size());
+}
+
+
+// ---------------------------------------------------------------------------
+// 7. Incremental persistence: a cancel keeps the maps it finished, reuse is
+//    gated on the alignment fingerprint, and the search reports per sweep.
+//
+//    The scene is the same seq_0..7 fixture, on the SfM poses: these cases are
+//    about bookkeeping, not accuracy, so the exact depth values do not matter
+//    and downscale 8 keeps every run to a few seconds.
+//
+//    Search counting is timing-free: BuildDepthMapsTask exposes
+//    depth_map_search_count(), incremented once per PatchMatch call actually
+//    started. A reused map starts none, so the difference between two runs is
+//    exactly the number of cameras whose search was repeated.
+// ---------------------------------------------------------------------------
+
+namespace incremental {
+
+constexpr int kIncrementalDownscale = 8;  // 480x360 fixtures; maps come out 60x45
+
+/// How many cameras BuildDepthMaps will process, i.e. the denominator its
+/// progress fractions use. Read from view selection rather than assumed: a
+/// camera with no usable neighbourhood gets no map, so this is not simply the
+/// camera count.
+std::size_t depth_camera_count(const Chunk& chunk) {
+    return stereo::select_views(chunk, {}).size();
+}
+
+/// The neighbourhoods the task itself will see at the DEFAULT max_neighbors.
+/// The fingerprint covers the whole neighbourhood, so a test asserting how many
+/// maps a moved camera invalidates has to derive that count from these rather
+/// than assume "the moved camera's own map only".
+std::vector<stereo::ViewNeighbourhood> task_neighbourhoods(const Chunk& chunk) {
+    const Params defaults = make_params(builtin_registry().require("BuildDepthMaps"));
+    stereo::ViewSelectionOptions selection;
+    selection.max_neighbors = static_cast<int>(defaults.get_int("max_neighbors"));
+    return stereo::select_views(chunk, selection);
+}
+
+Params reuse_params(int downscale, bool reuse, const std::string& filter = "mild") {
+    Params params = depth_params(downscale, filter);
+    params.set("reuse_depth", ParamValue{reuse});
+    return params;
+}
+
+/// run_task needs an lvalue Params, so every plain run goes through here.
+void run_depth_maps(Document& document, int downscale, bool reuse,
+                    const std::string& filter = "mild") {
+    Params params = reuse_params(downscale, reuse, filter);
+    run_task(builtin_registry(), document, "BuildDepthMaps", params);
+}
+
+/// A Progress that records every report and cancels from the first report its
+/// predicate accepts. The task reports per camera AND per PatchMatch sweep
+/// inside a camera, so a threshold on the buildDepthMaps fraction lands exactly
+/// on a camera boundary or inside one, which is the difference the cases need
+/// to make. The flag latches: once set the task must stop, and a progress source
+/// that un-set it would only mask a task that was not polling.
+struct CancellingProgress {
+    std::function<bool(const std::string& stage, double fraction)> when;
+    bool cancel = false;
+    std::vector<std::string> stages;
+    std::vector<double> fractions;
+
+    Progress progress() {
+        Progress out;
+        out.report = [this](const std::string& stage, double fraction) {
+            stages.push_back(stage);
+            fractions.push_back(fraction);
+            if (when && !cancel && when(stage, fraction)) {
+                cancel = true;
+            }
+        };
+        out.cancelled = [this]() { return cancel; };
+        return out;
+    }
+
+    bool saw_fraction_in(const std::string& stage, double lo, double hi) const {
+        for (std::size_t i = 0; i < stages.size(); ++i) {
+            if (stages[i] == stage && fractions[i] > lo && fractions[i] < hi) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+std::size_t valid_pixels(const std::vector<DepthMap>& maps) {
+    std::size_t n = 0;
+    for (const DepthMap& map : maps) {
+        for (const float d : map.depths) {
+            if (d > 0.0F) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+}  // namespace incremental
+
+using incremental::CancellingProgress;
+using incremental::depth_camera_count;
+using incremental::kIncrementalDownscale;
+using incremental::reuse_params;
+using incremental::run_depth_maps;
+using incremental::task_neighbourhoods;
+using incremental::valid_pixels;
+
+// ---------------------------------------------------------------------------
+// 1. A cancel keeps the maps finished so far
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsCancel, KeepsFinishedMapsAndSkipsThemOnRerun) {
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+
+    // Cancel the moment the second camera is finished. The task reports
+    // (i + 1) / cameras at each camera boundary, so 2 / cameras is reached
+    // exactly then and never inside a camera (a sweep reports (i + f) / cameras
+    // with f < 1).
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 2U);
+
+    reset_depth_map_search_count();
+    CancellingProgress cancel;
+    const double two_cameras = 2.0 / static_cast<double>(camera_count);
+    cancel.when = [two_cameras](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= two_cameras;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+
+    // The maps finished before the cancel are in the chunk, as a new set, with
+    // their downscale and a fingerprint (they are reusable, not dead weight).
+    // A COPY: the re-run below completes this very set in place (the partial
+    // set is replaced, not appended beside), so a reference would observe the
+    // new contents and cannot be compared against.
+    const std::vector<DepthMap> kept = chunk.depth_maps();
+    ASSERT_FALSE(kept.empty()) << "a cancel threw the finished maps away";
+    const std::size_t first_run_searches = depth_map_search_count();
+    ASSERT_GE(first_run_searches, kept.size());
+    for (const DepthMap& map : kept) {
+        EXPECT_EQ(map.downscale, kIncrementalDownscale);
+        EXPECT_NE(map.alignment_fingerprint, 0U);
+        // Nothing was filtered yet: the run stopped during the build stage.
+        EXPECT_EQ(map.filter_mode, -1);
+    }
+    EXPECT_FALSE(chunk.depth_map_sets().empty());
+    EXPECT_EQ(chunk.active_depth_maps_id(), chunk.depth_map_sets().back().id);
+
+    // A second run with reuse skips the kept cameras' search entirely.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t second_run_searches = depth_map_search_count();
+
+    const Chunk& after = *document.active_chunk();
+    ASSERT_FALSE(after.depth_maps().empty());
+    EXPECT_GT(after.depth_maps().size(), kept.size())
+        << "the re-run did not add the remaining cameras";
+    // Every camera the first run finished is skipped, so the re-run searches
+    // exactly the remaining ones.
+    EXPECT_EQ(second_run_searches + kept.size(), after.depth_maps().size())
+        << "reused " << (after.depth_maps().size() - second_run_searches) << " of "
+        << after.depth_maps().size() << " maps (expected the " << kept.size()
+        << " kept by the cancelled run)";
+
+    // The kept maps come through the filter this time.
+    for (const DepthMap& map : after.depth_maps()) {
+        EXPECT_GE(map.filter_mode, 0) << "camera " << map.camera_id << " was never filtered";
+        EXPECT_GT(valid_pixels({map}), 0U);
+    }
+}
+
+TEST(DepthMapsCancel, CancelBeforeAnyCameraLeavesTheChunkUnchanged) {
+    Document document = aligned_document(seq_files(4));
+    const Chunk before = *document.active_chunk();
+
+    // Cancel from the very first report, so nothing finishes: the first poll
+    // the task makes is inside the first camera's first sweep.
+    CancellingProgress cancel;
+    cancel.when = [](const std::string&, double) { return true; };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+
+    EXPECT_TRUE(*document.active_chunk() == before)
+        << "a cancel that finished nothing must not append an empty set";
+}
+
+TEST(DepthMapsCancel, KeepsPointCloudAndOtherProducts) {
+    // A cancel keeps the depth maps it finished and touches NOTHING else. The
+    // point cloud (and every other derived product) is only dropped by a
+    // SUCCESSFUL run, which replaces the maps it was fused from; a cancel is not
+    // a statement that those products are stale, so destroying them would make
+    // Cancel dangerous.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    run_build_point_cloud(document);
+    ASSERT_FALSE(document.active_chunk()->point_cloud().points.empty());
+    const std::int32_t cloud_id = document.active_chunk()->active_point_cloud_id();
+    ASSERT_GE(cloud_id, 0);
+    const PointCloud cloud_before = document.active_chunk()->point_cloud();
+
+    // A NEW run that is cancelled after two cameras. It rebuilds (reuse=false),
+    // so the cancel has fresh maps to keep.
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 2U);
+    CancellingProgress cancel;
+    const double two_cameras = 2.0 / static_cast<double>(camera_count);
+    cancel.when = [two_cameras](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= two_cameras;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/false);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+
+    const Chunk& after = *document.active_chunk();
+    // The finished maps are there.
+    EXPECT_FALSE(after.depth_maps().empty());
+    // The point cloud is untouched: same set, same active id, same points.
+    ASSERT_EQ(after.point_clouds().size(), 1U)
+        << "a cancel must not drop other products";
+    EXPECT_EQ(after.active_point_cloud_id(), cloud_id);
+    EXPECT_TRUE(after.point_cloud() == cloud_before)
+        << "a cancel changed the point cloud";
+}
+
+TEST(DepthMapsCancel, RepeatedCancelsMergeIntoOnePartialSet) {
+    // Cancelling twice, then finishing, leaves exactly ONE depth-map set: the
+    // first cancel writes a partial set, the second merges into it, and the
+    // successful run completes (replaces) it rather than appending beside it.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 3U);
+
+    const auto run_cancelled_after_two = [&] {
+        CancellingProgress cancel;
+        const double two_cameras = 2.0 / static_cast<double>(camera_count);
+        cancel.when = [two_cameras](const std::string& stage, double fraction) {
+            return stage == "buildDepthMaps" && fraction >= two_cameras;
+        };
+        Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                              cancel.progress()),
+                     CancelledError);
+    };
+
+    run_cancelled_after_two();
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U);
+    // Marked partial: this is the set a later run resumes from.
+    const DepthMapsAsset& first = document.active_chunk()->depth_map_sets().front();
+    ASSERT_NE(first.meta.find("status"), nullptr);
+    EXPECT_EQ(*first.meta.find("status"), "partial");
+    const std::int32_t partial_id = first.id;
+    const std::size_t maps_after_first = first.data->size();
+    ASSERT_GT(maps_after_first, 0U);
+
+    run_cancelled_after_two();
+    // Still ONE set, and it still carries at least what the first cancel kept:
+    // the second cancel merged into the partial set instead of appending.
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U)
+        << "a second cancel appended a second set";
+    EXPECT_EQ(document.active_chunk()->depth_map_sets().front().id, partial_id);
+    EXPECT_GE(document.active_chunk()->depth_map_sets().front().data->size(), maps_after_first);
+
+    // Finish normally (reuse on, so it resumes from the partial set).
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const Chunk& after = *document.active_chunk();
+    ASSERT_EQ(after.depth_map_sets().size(), 1U)
+        << "a completed run must replace the partial set it resumed from";
+    const DepthMapsAsset& finished = after.depth_map_sets().front();
+    EXPECT_EQ(finished.id, partial_id);
+    EXPECT_EQ(finished.meta.find("status"), nullptr)
+        << "the completed set is not a resume target";
+    EXPECT_FALSE(finished.data->empty());
+    // Every map went through the filter this time.
+    for (const DepthMap& map : *finished.data) {
+        EXPECT_GE(map.filter_mode, 0) << "camera " << map.camera_id;
+    }
+    // And the reuse actually paid off: the run only searched the cameras the
+    // cancels had not finished.
+    EXPECT_LT(depth_map_search_count(), after.depth_maps().size());
+}
+
+// ---------------------------------------------------------------------------
+// 2. A cancel inside one camera works: the sweep hook polls between sweeps
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsCancel, PartialSetDoesNotResurrectStaleMapsAfterRealignment) {
+    // A partial set carries what an interrupted run finished. If the cameras are
+    // re-aligned afterwards, a later cancel must NOT merge the now-stale maps
+    // back into the set: the fingerprint exists precisely to invalidate them.
+    Document document = aligned_document(seq_files(6));
+    Chunk& chunk = *document.active_chunk();
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 2U);
+
+    CancellingProgress cancel;
+    const double one_camera = 1.0 / static_cast<double>(camera_count);
+    cancel.when = [one_camera](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= one_camera;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+    ASSERT_EQ(chunk.depth_map_sets().size(), 1U);
+    ASSERT_FALSE(chunk.depth_map_sets().front().data->empty());
+    const std::uint64_t stale_fingerprint =
+        chunk.depth_map_sets().front().data->front().alignment_fingerprint;
+    ASSERT_NE(stale_fingerprint, 0U);
+
+    // Re-align: every camera moves.
+    for (Camera& camera : document.active_chunk()->cameras()) {
+        camera.pose(0, 3) += 0.1;
+    }
+
+    // Cancel again after one camera of the NEW geometry.
+    CancellingProgress second;
+    second.when = [one_camera](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction >= one_camera;
+    };
+    Params again = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", again,
+                          second.progress()),
+                 CancelledError);
+
+    // The merged set holds only maps from the CURRENT geometry.
+    ASSERT_EQ(document.active_chunk()->depth_map_sets().size(), 1U);
+    const std::vector<DepthMap>& kept = document.active_chunk()->depth_maps();
+    ASSERT_FALSE(kept.empty());
+    for (const DepthMap& map : kept) {
+        EXPECT_NE(map.alignment_fingerprint, stale_fingerprint)
+            << "camera " << map.camera_id << " resurrected a pre-alignment map";
+    }
+}
+
+TEST(DepthMapsCancel, CancelInsideOneCameraStopsAtASweepBoundary) {
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+
+    // A report strictly inside the FIRST camera's slice of the build stage. Only
+    // the per-sweep hook can produce one -- the per-camera report is 0 or
+    // 1 / cameras -- so reaching it proves the bar moves during a single image,
+    // and cancelling there proves the search polls between sweeps.
+    const std::size_t camera_count = depth_camera_count(chunk);
+    ASSERT_GT(camera_count, 1U);
+
+    CancellingProgress cancel;
+    const double one_camera = 1.0 / static_cast<double>(camera_count);
+    cancel.when = [one_camera](const std::string& stage, double fraction) {
+        return stage == "buildDepthMaps" && fraction > 0.0 && fraction < one_camera;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+
+    // Mid-camera, so nothing was finished: the chunk is untouched (a half-swept
+    // map is not a map) and the build stage reported intermediate fractions,
+    // which is what proves the search ticked inside the camera.
+    EXPECT_TRUE(cancel.saw_fraction_in("buildDepthMaps", 0.0, one_camera))
+        << "the progress bar never moved inside the first camera";
+    EXPECT_TRUE(chunk.depth_map_sets().empty()) << "a partial camera must not be stored";
+
+    // The re-run completes normally.
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_FALSE(document.active_chunk()->depth_maps().empty());
+}
+
+TEST(DepthMapsCancel, CancelDuringFilterKeepsTheMaps) {
+    // Every search is done by the time the filter stage starts, and the filter
+    // is cheap. A cancel there must keep the maps (unfiltered), not throw the
+    // expensive part away.
+    Document document = aligned_document(seq_files());
+    Chunk& chunk = *document.active_chunk();
+
+    CancellingProgress cancel;
+    cancel.when = [](const std::string& stage, double fraction) {
+        return stage == "filterDepthMaps" && fraction > 0.0;
+    };
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params,
+                          cancel.progress()),
+                 CancelledError);
+    ASSERT_TRUE(cancel.saw_fraction_in("filterDepthMaps", 0.0, 1.0))
+        << "the cancel did not land in the filter stage";
+
+    const std::vector<DepthMap>& kept = chunk.depth_maps();
+    ASSERT_FALSE(kept.empty()) << "a cancel during filtering threw the maps away";
+    EXPECT_EQ(kept.size(), depth_camera_count(chunk)) << "the whole search completed";
+    for (const DepthMap& map : kept) {
+        EXPECT_EQ(map.filter_mode, -1) << "camera " << map.camera_id;
+        EXPECT_GT(valid_pixels({map}), 0U);
+    }
+
+    // And the re-run filters them without searching again.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), 0U) << "the kept maps were searched again";
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        EXPECT_GE(map.filter_mode, 0) << "camera " << map.camera_id;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Re-alignment invalidates reuse
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsReuse, ReAlignmentInvalidatesTheMaps) {
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    const std::size_t map_count = chunk.depth_maps().size();
+    for (const DepthMap& map : chunk.depth_maps()) {
+        ASSERT_GE(map.filter_mode, 0);
+    }
+
+    // A no-op re-run reuses everything.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), 0U) << "an unchanged chunk rebuilt maps it could reuse";
+
+    // Move one camera, as a re-alignment would. A depth map is a function of the
+    // reference camera AND its neighbourhood, so moving B must rebuild the map
+    // of B itself AND every camera that used B as a neighbour. Which cameras
+    // those are is read from the same selection the task uses, not assumed.
+    std::vector<DepthMap> before = document.active_chunk()->depth_maps();
+    Camera& moved = document.active_chunk()->cameras().front();
+    moved.pose(0, 3) += 0.25;
+    const std::int32_t moved_id = moved.id;
+    const std::uint64_t moved_fingerprint = [&] {
+        const auto old = std::find_if(before.begin(), before.end(),
+                                      [&](const DepthMap& m) { return m.camera_id == moved_id; });
+        return old != before.end() ? old->alignment_fingerprint : 0U;
+    }();
+    ASSERT_NE(moved_fingerprint, 0U);
+
+    // The neighbourhoods as they now stand. Every reference whose own pose
+    // changed, or whose neighbour list contains the moved camera, must re-search.
+    std::set<std::int32_t> must_rebuild;
+    const std::vector<stereo::ViewNeighbourhood> after_hoods =
+        incremental::task_neighbourhoods(*document.active_chunk());
+    for (const stereo::ViewNeighbourhood& hood : after_hoods) {
+        if (hood.camera_id == moved_id) {
+            must_rebuild.insert(hood.camera_id);
+            continue;
+        }
+        if (std::find(hood.neighbours.begin(), hood.neighbours.end(), moved_id) !=
+            hood.neighbours.end()) {
+            must_rebuild.insert(hood.camera_id);
+        }
+    }
+    ASSERT_GT(must_rebuild.size(), 1U)
+        << "the fixture should give the moved camera at least one neighbour";
+
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), must_rebuild.size())
+        << "moving camera " << moved_id << " must rebuild its own map and every map that "
+        << "used it as a neighbour (" << must_rebuild.size() << " maps)";
+
+    const Chunk& after = *document.active_chunk();
+    ASSERT_EQ(after.depth_maps().size(), map_count);
+    bool saw_moved = false;
+    for (const DepthMap& map : after.depth_maps()) {
+        if (map.camera_id != moved_id) {
+            continue;
+        }
+        saw_moved = true;
+        EXPECT_NE(map.alignment_fingerprint, moved_fingerprint)
+            << "the moved camera kept the old fingerprint";
+        EXPECT_NE(map.alignment_fingerprint, 0U);
+    }
+    EXPECT_TRUE(saw_moved) << "the moved camera has no map";
+    // Every map that must NOT rebuild still carries its old fingerprint.
+    for (const DepthMap& map : after.depth_maps()) {
+        if (must_rebuild.count(map.camera_id) != 0U) {
+            const auto old = std::find_if(before.begin(), before.end(),
+                                          [&](const DepthMap& m) {
+                                              return m.camera_id == map.camera_id;
+                                          });
+            ASSERT_NE(old, before.end());
+            EXPECT_NE(map.alignment_fingerprint, old->alignment_fingerprint)
+                << "camera " << map.camera_id << " kept a stale fingerprint";
+            continue;
+        }
+        const auto old = std::find_if(before.begin(), before.end(),
+                                      [&](const DepthMap& m) { return m.camera_id == map.camera_id; });
+        ASSERT_NE(old, before.end());
+        EXPECT_EQ(map.alignment_fingerprint, old->alignment_fingerprint)
+            << "camera " << map.camera_id << " was rebuilt after an unrelated move";
+    }
+}
+
+TEST(DepthMapsReuse, ChangingMaxNeighborsRebuildsEveryMap) {
+    // max_neighbors changes which neighbours enter the search (and is hashed in
+    // its own right), so no map may be reused across a change of it -- even
+    // when the selected set happens to be identical.
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t map_count = document.active_chunk()->depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    reset_depth_map_search_count();
+    Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    params.set("max_neighbors", ParamValue{std::int64_t{3}});
+    run_task(builtin_registry(), document, "BuildDepthMaps", params);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "changing max_neighbors must rebuild every map";
+}
+
+TEST(DepthMapsReuse, RecalibrationInvalidatesTheMaps) {
+    // The sensor's calibration is part of the fingerprint too: a re-calibration
+    // changes every camera on that sensor, so none of their maps may be reused.
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t map_count = chunk.depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    document.active_chunk()->sensors().front().calibration.f *= 1.01;
+
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "a re-calibrated sensor must rebuild every map it produced";
+}
+
+TEST(DepthMapsReuse, FingerprintIsZeroForAMapWithNoRecordedAlignment) {
+    // The fingerprint of a camera before alignment differs from the aligned one,
+    // and the "unknown" sentinel 0 never matches a computed hash.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    ASSERT_FALSE(chunk.cameras().empty());
+    ASSERT_FALSE(chunk.sensors().empty());
+    const std::uint64_t fs = depth_map_fingerprint(chunk.cameras().front(), chunk.sensors().front(),
+                                                   kIncrementalDownscale);
+    EXPECT_NE(fs, 0U);
+    EXPECT_NE(fs, depth_map_fingerprint(chunk.cameras().front(), chunk.sensors().front(),
+                                        kIncrementalDownscale / 2))
+        << "the downscale must be part of the fingerprint";
+}
+
+TEST(DepthMapsReuse, FingerprintCoversTheNeighbourhood) {
+    // The task stamps a fingerprint that includes the neighbourhood. The bare
+    // camera hash is the fallback for callers without one; the context form must
+    // change with EVERY input that changes the map.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    const Camera& camera = chunk.cameras().front();
+    const Sensor& sensor = chunk.sensors().front();
+
+    DepthMapFingerprintContext base;
+    base.max_neighbors = 16;
+    base.neighbour_ids = {1, 2};
+    base.neighbour_poses = {chunk.cameras()[1].pose, chunk.cameras()[2].pose};
+    base.neighbour_calibrations = {sensor.calibration, sensor.calibration};
+    base.depth_min = 5.0;
+    base.depth_max = 40.0;
+    base.image_path = "photos/a.jpg";
+    base.image_size = 1234;
+    base.image_mtime = 5678;
+    base.window_radius = 5;
+    base.window_step = 2;
+    base.iterations = 6;
+    base.seed = 42;
+
+    const std::uint64_t h = depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &base);
+
+    // A bare hash (no context) is a different value: the context contributes.
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale));
+    // Same inputs -> same hash.
+    EXPECT_EQ(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &base));
+
+    // Neighbour id set: order-insensitive (a tie in select_views must not
+    // masquerade as a change), but sensitive to membership.
+    DepthMapFingerprintContext reordered = base;
+    std::swap(reordered.neighbour_ids[0], reordered.neighbour_ids[1]);
+    std::swap(reordered.neighbour_poses[0], reordered.neighbour_poses[1]);
+    std::swap(reordered.neighbour_calibrations[0], reordered.neighbour_calibrations[1]);
+    // Sorting happens inside, so a reordered-but-equal set hashes identically.
+    EXPECT_EQ(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &reordered));
+
+    DepthMapFingerprintContext fewer = base;
+    fewer.neighbour_ids.pop_back();
+    fewer.neighbour_poses.pop_back();
+    fewer.neighbour_calibrations.pop_back();
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &fewer));
+
+    // A moved neighbour changes the reference's fingerprint.
+    DepthMapFingerprintContext moved = base;
+    moved.neighbour_poses[0](0, 3) += 0.5;
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &moved));
+
+    // A re-calibrated neighbour does too.
+    DepthMapFingerprintContext recal = base;
+    recal.neighbour_calibrations[1].f *= 1.02;
+    EXPECT_NE(h, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &recal));
+
+    // Each scalar field is load-bearing.
+    const auto changed = [&](const DepthMapFingerprintContext& other) {
+        return depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &other);
+    };
+    DepthMapFingerprintContext c = base;
+    c.max_neighbors = 8;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.depth_min += 0.25;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.depth_max -= 0.25;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_path = "photos/b.jpg";
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_size += 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.image_mtime += 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.window_radius = 4;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.window_step = 1;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.iterations = 8;
+    EXPECT_NE(h, changed(c));
+    c = base;
+    c.seed += 1;
+    EXPECT_NE(h, changed(c));
+
+    // Never the "unknown" sentinel, whatever the input.
+    EXPECT_NE(h, 0U);
+}
+
+// ---------------------------------------------------------------------------
+// 4. The fingerprint round-trips through the project file
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsReuse, FingerprintAndFilterModeSurviveASave) {
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const Chunk before = *document.active_chunk();
+    ASSERT_FALSE(before.depth_maps().empty());
+
+    TempDir dir("alphashape_depth_fingerprint");
+    const std::string project = dir.file("proj.psx");
+    document.set_path(project);
+    ProjectIO::save(document, project);
+    auto reloaded = ProjectIO::load(project);
+
+    ASSERT_NE(reloaded->active_chunk(), nullptr);
+    EXPECT_TRUE(*reloaded->active_chunk() == before);
+    for (const DepthMap& map : reloaded->active_chunk()->depth_maps()) {
+        EXPECT_NE(map.alignment_fingerprint, 0U) << "camera " << map.camera_id;
+        EXPECT_EQ(map.filter_mode, 1) << "camera " << map.camera_id;
+    }
+
+    // And the reloaded project still reuses them: nothing to rebuild.
+    reset_depth_map_search_count();
+    run_depth_maps(*reloaded, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), 0U)
+        << "a saved and reloaded map must still be reusable";
+}
+
+// ---------------------------------------------------------------------------
+// 5. reuse_depth=false rebuilds everything, and the parameter default is on
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsReuse, DisablingReuseRebuildsEveryMap) {
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t map_count = document.active_chunk()->depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/false);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "reuse_depth=false must rebuild every camera";
+}
+
+TEST(DepthMapsReuse, ReuseDepthDefaultsToTrue) {
+    const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
+    const Params defaults = make_params(entry);
+    EXPECT_TRUE(defaults.get_bool("reuse_depth"));
+}
+
+// ---------------------------------------------------------------------------
+// 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
+// ---------------------------------------------------------------------------
+
+TEST(DepthMapsSidecar, Adm2RoundTripsFingerprintAndFilterMode) {
+    DepthMap map;
+    map.camera_id = 3;
+    map.width = 2;
+    map.height = 2;
+    map.downscale = 4;
+    map.depths = {1.0F, 2.0F, -1.0F, 4.0F};
+    map.normals = {0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
+    map.confidence = {0.0F, 1.0F, 0.0F, 2.0F};
+    map.alignment_fingerprint = 0xFEEDFACE12345678ULL;
+    map.filter_mode = 3;  // aggressive
+
+    const std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
+    ASSERT_GE(bytes.size(), 4U);
+    EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 4), "ADM2");
+    const std::vector<DepthMap> back = docxml::sidecar::decode_depth_maps(bytes);
+    ASSERT_EQ(back.size(), 1U);
+    EXPECT_EQ(back.front(), map);
+
+    // An unfiltered map (a cancel checkpoint) keeps its -1 through the file.
+    map.filter_mode = -1;
+    const std::vector<DepthMap> unfiltered =
+        docxml::sidecar::decode_depth_maps(docxml::sidecar::encode_depth_maps({map}));
+    ASSERT_EQ(unfiltered.size(), 1U);
+    EXPECT_EQ(unfiltered.front().filter_mode, -1);
+    EXPECT_EQ(unfiltered.front().alignment_fingerprint, 0xFEEDFACE12345678ULL);
+}
+
+TEST(DepthMapsSidecar, Adm1IsReadWithUnknownFingerprintAndMildFilter) {
+    // The pre-fingerprint record: u32 count, then per map four i32s, two u8
+    // flags and the pixel blocks. Hand-built so the layout is stated here rather
+    // than taken from a writer that might be changed with it.
+    std::vector<std::uint8_t> bytes = {'A', 'D', 'M', '1'};
+    docxml::sidecar::put_u32(bytes, 1);
+    docxml::sidecar::put_i32(bytes, /*camera_id=*/7);
+    docxml::sidecar::put_i32(bytes, /*width=*/2);
+    docxml::sidecar::put_i32(bytes, /*height=*/2);
+    docxml::sidecar::put_i32(bytes, /*downscale=*/2);
+    bytes.push_back(0);  // has_normals
+    bytes.push_back(0);  // has_confidence
+    for (const float d : {5.0F, 6.0F, -1.0F, 7.0F}) {
+        docxml::sidecar::put_f32(bytes, d);
+    }
+
+    const std::vector<DepthMap> maps = docxml::sidecar::decode_depth_maps(bytes);
+    ASSERT_EQ(maps.size(), 1U);
+    const DepthMap& map = maps.front();
+    EXPECT_EQ(map.camera_id, 7);
+    EXPECT_EQ(map.downscale, 2);
+    EXPECT_EQ(map.depths, (std::vector<float>{5.0F, 6.0F, -1.0F, 7.0F}));
+    // "Unknown" alignment: a later run must not treat an old map as current.
+    EXPECT_EQ(map.alignment_fingerprint, 0U);
+    // A pre-ADM2 project stored only finished sets, filtered with the default.
+    EXPECT_EQ(map.filter_mode, 1);
+}
+
+TEST(DepthMapsSidecar, Adm2RejectsAnUnknownFilterMode) {
+    DepthMap map;
+    map.width = 1;
+    map.height = 1;
+    map.depths = {1.0F};
+    map.filter_mode = 1;
+    std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
+    // The filter-mode byte is the last of the three flags of the first (and only)
+    // record: 4 magic + 4 count + 8 fingerprint + 16 four i32s + 2 flags.
+    const std::size_t mode_at = 4 + 4 + 8 + 16 + 2;
+    ASSERT_LT(mode_at, bytes.size());
+    bytes[mode_at] = 9;
+    EXPECT_THROW(docxml::sidecar::decode_depth_maps(bytes), ProjectIOError);
 }
 
 }  // namespace alphashape

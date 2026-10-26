@@ -127,10 +127,34 @@ void write_tie_points(const Chunk& chunk, docxml::XmlNode& node, ZipArchive& arc
 
 /// Dense products, mesh with texture pages, DEM and orthomosaic -- each written
 /// only when non-empty, exactly the pre-M11 conditionals.
+
+/// The depth-map encoding that shipped with v1 ("ADM1"): four i32s, two u8
+/// flags, then the pixel blocks, with no alignment fingerprint. v1 projects in
+/// the field carry this exact layout, so the fixture must too; the current
+/// encoder writes "ADM2" and would break the byte comparison. The decoder in
+/// common/io/sidecars.hpp still reads "ADM1".
+std::vector<std::uint8_t> encode_legacy_depth_maps(const std::vector<DepthMap>& maps) {
+    std::vector<std::uint8_t> out(docxml::sidecar::kDepthMapsMagic,
+                                  docxml::sidecar::kDepthMapsMagic + 4);
+    docxml::sidecar::put_u32(out, static_cast<std::uint32_t>(maps.size()));
+    for (const DepthMap& map : maps) {
+        docxml::sidecar::put_i32(out, map.camera_id);
+        docxml::sidecar::put_i32(out, map.width);
+        docxml::sidecar::put_i32(out, map.height);
+        docxml::sidecar::put_i32(out, map.downscale);
+        out.push_back(map.normals.empty() ? 0U : 1U);
+        out.push_back(map.confidence.empty() ? 0U : 1U);
+        for (const float d : map.depths) docxml::sidecar::put_f32(out, d);
+        for (const float n : map.normals) docxml::sidecar::put_f32(out, n);
+        for (const float c : map.confidence) docxml::sidecar::put_f32(out, c);
+    }
+    return out;
+}
+
 void write_assets(const Chunk& chunk, docxml::XmlNode& node, ZipArchive& archive) {
     const std::vector<DepthMap>& depth_maps = chunk.depth_maps();
     if (!depth_maps.empty()) {
-        archive.add(kDepthMapsEntry, docxml::sidecar::encode_depth_maps(depth_maps));
+        archive.add(kDepthMapsEntry, encode_legacy_depth_maps(depth_maps));
         docxml::XmlNode& e = docxml::add_child(node, "depth_maps");
         docxml::set_attr(e, "count", std::to_string(depth_maps.size()));
         docxml::set_attr(e, "path", kDepthMapsEntry);

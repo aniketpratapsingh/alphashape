@@ -358,27 +358,36 @@ std::vector<Track> decode_tracks(const std::vector<std::uint8_t>& in) {
 }
 
 // ---------------------------------------------------------------------------
-// Depth maps: "ADM1", u32 map count, then per map i32 camera_id, i32 width,
-// i32 height, i32 downscale, u8 has_normals, u8 has_confidence, width*height
-// f32 depths and, for each set flag, 3*width*height f32 normals and
-// width*height f32 confidence.
+// Depth maps. Current "ADM2": u32 map count, then per map u64
+// alignment_fingerprint, i32 camera_id, i32 width, i32 height, i32 downscale,
+// u8 has_normals, u8 has_confidence, u8 filter_mode (255 = never filtered),
+// width*height f32 depths and, for each set flag, 3*width*height f32 normals and
+// width*height f32 confidence. Read-only legacy "ADM1" is the same record
+// without the fingerprint and the filter mode; its maps decode with fingerprint
+// 0 (the "unknown" sentinel, so they are never reused) and filter_mode 1 (a
+// pre-ADM2 project only ever stored finished sets, filtered "mild" by default).
 // ---------------------------------------------------------------------------
 constexpr std::uint8_t kCloudHasNormals = 1U << 0U;
 constexpr std::uint8_t kCloudHasColours = 1U << 1U;
 constexpr std::uint8_t kCloudHasConfidence = 1U << 2U;
 
 std::vector<std::uint8_t> encode_depth_maps(const std::vector<DepthMap>& maps) {
-    std::vector<std::uint8_t> out = with_magic(kDepthMapsMagic);
+    std::vector<std::uint8_t> out = with_magic(kDepthMapsMagic2);
     put_u32(out, static_cast<std::uint32_t>(maps.size()));
     for (const DepthMap& map : maps) {
         const bool has_normals = !map.normals.empty();
         const bool has_confidence = !map.confidence.empty();
+        put_u64(out, map.alignment_fingerprint);
         put_i32(out, map.camera_id);
         put_i32(out, map.width);
         put_i32(out, map.height);
         put_i32(out, map.downscale);
         out.push_back(has_normals ? 1U : 0U);
         out.push_back(has_confidence ? 1U : 0U);
+        // filter_mode: -1 (never filtered) is stored as 255, the four modes as
+        // themselves, so a re-run can tell an unfiltered map from a filtered one
+        // and from a map filtered with a different strength.
+        out.push_back(static_cast<std::uint8_t>(map.filter_mode < 0 ? 255 : map.filter_mode));
         for (const float d : map.depths) put_f32(out, d);
         if (has_normals) {
             for (const float n : map.normals) put_f32(out, n);
@@ -391,16 +400,26 @@ std::vector<std::uint8_t> encode_depth_maps(const std::vector<DepthMap>& maps) {
 }
 
 std::vector<DepthMap> decode_depth_maps(const std::vector<std::uint8_t>& in) {
-    if (!magic_is(in, kDepthMapsMagic) || in.size() < 8) {
+    const bool current = magic_is(in, kDepthMapsMagic2);
+    if ((!current && !magic_is(in, kDepthMapsMagic)) || in.size() < 8) {
         throw ProjectIOError("depth map file: bad header");
     }
+    // The per-map fixed part: four i32s, two or three u8 flags, and in ADM2 a
+    // leading u64.
+    const std::uint64_t head_bytes = current ? 27 : 18;
     ByteReader r(in, 4, "depth map file");
-    // Each map is at least four i32s plus two u8 flags: 18 bytes.
-    const std::uint32_t count = r.count(18);
+    const std::uint32_t count = r.count(head_bytes);
     std::vector<DepthMap> out;
     out.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         DepthMap map;
+        if (current) {
+            map.alignment_fingerprint = r.u64();
+        } else {
+            // A pre-ADM2 project stored only finished, filtered sets, and its
+            // default filter mode was "mild".
+            map.filter_mode = 1;
+        }
         map.camera_id = r.i32();
         map.width = r.i32();
         map.height = r.i32();
@@ -415,6 +434,13 @@ std::vector<DepthMap> decode_depth_maps(const std::vector<std::uint8_t>& in) {
         const std::uint8_t has_confidence = r.u8();
         if (has_normals > 1 || has_confidence > 1) {
             throw ProjectIOError("depth map file: a flag is not 0 or 1");
+        }
+        if (current) {
+            const std::uint8_t mode = r.u8();
+            if (mode != 255U && mode > 3U) {
+                throw ProjectIOError("depth map file: unknown filter mode");
+            }
+            map.filter_mode = mode == 255U ? -1 : static_cast<int>(mode);
         }
         const std::uint64_t pixels =
             static_cast<std::uint64_t>(map.width) * static_cast<std::uint64_t>(map.height);

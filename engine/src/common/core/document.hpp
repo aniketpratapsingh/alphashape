@@ -103,7 +103,15 @@ public:
     /// reader detects an older file. Version 2 is the M11 layout (every
     /// container, all assets, per-chunk archive paths); version 1 files are
     /// still read exactly as before (see common/io/doc_xml.cpp).
-    static constexpr int kFormatVersion = 2;
+    ///
+    /// Version 3 (depth-map persistence) changed the depth-map sidecar from
+    /// ADM1 to ADM2, which adds a per-map alignment fingerprint and filter
+    /// mode. The XML vocabulary is otherwise v2's, and a v3 reader reads a v2
+    /// project unchanged (its depth maps decode from ADM1). The version is
+    /// still bumped so an OLDER build given a v3 project fails with the clear
+    /// "newer than this build supports" message rather than the opaque
+    /// "depth map file: bad header" its ADM2-less decoder would produce.
+    static constexpr int kFormatVersion = 3;
 
 private:
     std::string path_;
