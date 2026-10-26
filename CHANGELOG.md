@@ -13,14 +13,27 @@ All notable changes to alphashape are recorded here. The format follows
   still builds as one piece, byte for byte as before; a larger one is split into
   square blocks with a margin, each block rectifying only the cameras whose
   footprint reaches it and writing only its interior into the assembled output.
-  Seams stay continuous across block borders (the margin an earlier block decided
-  is pinned as a hard constraint, in raster order) and mosaic blending pins the
-  pyramid depth to the whole grid's, so block interiors blend with the same
-  operator. Photographs are decoded through a byte-bounded LRU cache, progress is
-  reported per block and Cancel is honoured between blocks. The reported
-  36-photo, 4592x3056, 1.9 cm case over a 100 m site (28 M cells, ~8 GB before)
-  is planned under 2 GB; the estimator now plans per block and only coarsens the
-  resolution when even a 512-cell block cannot fit. `block_size` overrides the
+  Seams stay continuous across block borders: the margin an earlier block decided
+  is pinned as a hard constraint, in raster order, out to the blend pyramid's
+  reach (cells nearer the border stay free so the optimiser keeps its full
+  window context instead of inheriting a window-edge artefact). Mosaic blending
+  applies the whole grid's pyramid depth to every block, edge-padding a window
+  too narrow to carry that depth, so an edge block does not blend with a
+  shallower operator than its neighbours. Photographs are decoded through a
+  byte-bounded LRU cache sized from what the block plan leaves over, with the
+  next block's frames kept at the head of the LRU, and the decode count is
+  logged at Info. Progress is reported per block and Cancel is honoured between
+  blocks.
+- **The orthomosaic block plan takes the largest block the machine can carry.**
+  It walks 4096 → 512 cells and takes the first side whose peak (one window's
+  stages plus the assembled output raster, the assembled-grid `fill_holes` and
+  the photo cache) fits `platform::memory_budget_bytes`, which already reserves
+  headroom. A machine with the RAM does fewer, bigger blocks instead of being
+  held to a fixed absolute target. The reported 36-photo, 4592x3056, 1.9 cm case
+  over a 100 m site (28 M cells, ~8 GB before) plans at 2048-cell blocks (3x3)
+  for a ~5.3 GB peak on an 8 GB machine, at 1024-cell blocks for a ~2.5 GB peak
+  on a 4 GB budget, and as one piece on a 16 GB one. The resolution is only
+  coarsened when even a 512-cell block cannot fit. `block_size` overrides the
   block side (0 = automatic).
 - **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
   (including one during filtering) stores the finished maps before it stops,
