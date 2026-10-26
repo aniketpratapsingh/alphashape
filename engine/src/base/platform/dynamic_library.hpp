@@ -5,9 +5,13 @@
 // failing to start.
 //
 // POSIX: dlopen(RTLD_NOW | RTLD_LOCAL) / dlsym / dlclose.
-// Windows: LoadLibraryExW with LOAD_WITH_ALTERED_SEARCH_PATH, so a loader
-// resolved next to the executable wins over a stale one in the system
-// directories; GetProcAddress / FreeLibrary.
+// Windows: a path containing a directory loads with
+// LOAD_WITH_ALTERED_SEARCH_PATH, so its dependencies resolve beside it; a bare
+// name is treated as a system component and loads with
+// LOAD_LIBRARY_SEARCH_SYSTEM32, so neither the application directory nor the
+// current working directory is ever searched for it (no DLL planting). An
+// alternative loader named by bare name is therefore resolved against System32
+// only -- pass an absolute path for a private one. GetProcAddress / FreeLibrary.
 //
 // The handle is an opaque void* so no caller needs the platform header. A
 // null handle is never valid.
@@ -26,10 +30,9 @@ public:
     DynamicLibrary(DynamicLibrary&& other) noexcept;
     DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
-    /// Opens `path` (a UTF-8 path, or a bare library name so the platform's own
-    /// search applies). On failure returns "" — the path form is more useful
-    /// than a name that may then be searched again. An error message is
-    /// written to *error when it is non-null.
+    /// Opens `path`: a UTF-8 path, or a bare library name (Windows: System32
+    /// only; POSIX: the platform's own search). On failure returns a closed
+    /// handle with *error set when it is non-null.
     static DynamicLibrary open(const std::string& path, std::string* error);
 
     /// Resolves one symbol. Returns nullptr when the library is closed or the

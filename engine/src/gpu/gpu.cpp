@@ -725,6 +725,10 @@ std::uint32_t in_flight_count(Context& context) {
     return context.backend_ ? context.backend_->in_flight() : 0;
 }
 
+std::size_t orphaned_pool_count(Context& context) {
+    return context.backend_ ? context.backend_->orphaned_pool_count() : 0;
+}
+
 const BufferHandle* BufferAccess::handle(const Buffer& buffer) {
     return buffer.handle_.get();
 }

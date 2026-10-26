@@ -118,6 +118,10 @@ bool backend_compiled_in();
 bool validation_active(const Context& context);
 /// Un-waited submissions currently outstanding on this context (test hook).
 std::uint32_t in_flight_count(Context& context);
+/// Descriptor pools parked by abandoned submissions on this context (test
+/// hook). They are freed by the next successful release_slot or by the
+/// backend's destructor, so a count that keeps growing is a leak.
+std::size_t orphaned_pool_count(Context& context);
 /// Hard cap on un-waited async submissions per context; never grows.
 constexpr std::uint32_t kMaxInFlight = 4;
 }  // namespace detail
@@ -177,6 +181,7 @@ private:
     friend Ticket detail::submit_async(Context&, const std::vector<Dispatch>&, Submission);
     friend void wait(Context& context, Ticket ticket);
     friend std::uint32_t detail::in_flight_count(Context& context);
+    friend std::size_t detail::orphaned_pool_count(Context& context);
     friend Buffer detail::make_buffer(Context&, const void*, std::size_t);
     friend Buffer detail::make_buffer(Context&, const void*, std::size_t, MemoryKind);
     friend Image2D detail::make_image(Context&, int, int, Format, const void*);

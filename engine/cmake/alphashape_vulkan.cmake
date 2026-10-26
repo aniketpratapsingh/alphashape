@@ -1,13 +1,22 @@
 # ---------------------------------------------------------------------------
 # Vulkan discovery, shader compilation and SPIR-V embedding.
 #
-# Two supported layouts:
+# Three supported layouts:
 #   * macOS: nothing is installed system-wide. The SDK lives in the source
 #     tree's sibling tools/ directory, so the default is resolved relative to
 #     the project and the tree stays relocatable.
 #   * Linux: distribution packages (Vulkan headers in /usr/include, glslc and
 #     spirv-val on PATH, the loader and its ICDs in the system directories).
 #     Nothing is baked into the binary; the runtime loader finds the driver.
+#   * Windows: vcpkg ports (vulkan-headers, vulkan-memory-allocator, shaderc,
+#     spirv-tools[tools]). The headers arrive through the toolchain's
+#     CMAKE_PREFIX_PATH; the tools land in <installed>/<triplet>/tools/<port>/,
+#     which is not on PATH, so those directories are probed as hints.
+#
+# No layout links a loader. The backend dlopen()s vulkan-1.dll /
+# libvulkan.so.1 / libvulkan.1.dylib at run time and resolves every entry
+# point through vkGetInstanceProcAddr, so a machine without a Vulkan runtime
+# starts normally and reports the CPU fallback (see src/gpu/vulkan/loader.cpp).
 #
 # The SDK default is therefore only consulted on Apple hosts.
 # ---------------------------------------------------------------------------
@@ -24,6 +33,24 @@ if(ALPHASHAPE_VULKAN_SDK)
     # Collapse "engine/../tools/..." so the baked paths read cleanly and a
     # symlinked reference tree still resolves.
     get_filename_component(ALPHASHAPE_VULKAN_SDK "${ALPHASHAPE_VULKAN_SDK}" REALPATH)
+endif()
+
+# Where a vcpkg install keeps the shader tools. The ports copy their binaries
+# into <installed>/<triplet>/tools/<port>/ (vcpkg_copy_tools) rather than into
+# <installed>/<triplet>/bin, and no runner puts that on PATH, so find_program()
+# needs the directories as hints or the whole GPU layer silently switches off
+# with "Vulkan SDK or shader tools not found in ''".
+#
+# Only probed when the toolchain is in play (VCPKG_INSTALLED_DIR is set by
+# scripts/buildsystems/vcpkg.cmake), so a distribution install keeps using
+# whatever is on PATH.
+set(ALPHASHAPE_VULKAN_TOOL_HINTS "")
+if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+    foreach(_port shaderc glslang spirv-tools)
+        list(APPEND ALPHASHAPE_VULKAN_TOOL_HINTS
+             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/${_port}")
+    endforeach()
+    unset(_port)
 endif()
 
 # Derived from the SDK root, so changing ALPHASHAPE_VULKAN_SDK moves them too.
@@ -49,7 +76,10 @@ endforeach()
 # is already defined, and the cache entries for the final variables always are.
 if(NOT ALPHASHAPE_VULKAN_SDK)
     if(NOT ALPHASHAPE_VULKAN_GLSLC)
-        find_program(ALPHASHAPE_VULKAN_GLSLC_PROBE NAMES glslc)
+        # NAMES carries the bare name first, then the Windows spelling: vcpkg's
+        # shaderc port installs glslc.exe.
+        find_program(ALPHASHAPE_VULKAN_GLSLC_PROBE NAMES glslc glslc.exe
+                     HINTS ${ALPHASHAPE_VULKAN_TOOL_HINTS})
         if(ALPHASHAPE_VULKAN_GLSLC_PROBE AND
            NOT ALPHASHAPE_VULKAN_GLSLC_PROBE MATCHES "-NOTFOUND$")
             set(ALPHASHAPE_VULKAN_GLSLC "${ALPHASHAPE_VULKAN_GLSLC_PROBE}" CACHE FILEPATH
@@ -57,7 +87,8 @@ if(NOT ALPHASHAPE_VULKAN_SDK)
         endif()
     endif()
     if(NOT ALPHASHAPE_VULKAN_SPIRV_VAL)
-        find_program(ALPHASHAPE_VULKAN_SPIRV_VAL_PROBE NAMES spirv-val)
+        find_program(ALPHASHAPE_VULKAN_SPIRV_VAL_PROBE NAMES spirv-val spirv-val.exe
+                     HINTS ${ALPHASHAPE_VULKAN_TOOL_HINTS})
         if(ALPHASHAPE_VULKAN_SPIRV_VAL_PROBE AND
            NOT ALPHASHAPE_VULKAN_SPIRV_VAL_PROBE MATCHES "-NOTFOUND$")
             set(ALPHASHAPE_VULKAN_SPIRV_VAL "${ALPHASHAPE_VULKAN_SPIRV_VAL_PROBE}" CACHE FILEPATH
@@ -89,12 +120,23 @@ elseif(ALPHASHAPE_VULKAN_SDK)
 else()
     # find_path() skips a variable that already exists in the cache, and the
     # entry above always does, so the probe uses its own name.
-    find_path(ALPHASHAPE_VULKAN_SYSTEM_INCLUDE_DIR vulkan/vulkan_core.h)
+    #
+    # HINTS names the vcpkg tree explicitly: CMAKE_PREFIX_PATH already carries
+    # it, but a caller that replaces CMAKE_PREFIX_PATH (the GUI's Qt kit does)
+    # would otherwise lose the headers that are installed.
+    set(_alphashape_vulkan_include_hints "")
+    if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+        list(APPEND _alphashape_vulkan_include_hints
+             "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
+    endif()
+    find_path(ALPHASHAPE_VULKAN_SYSTEM_INCLUDE_DIR vulkan/vulkan_core.h
+              HINTS ${_alphashape_vulkan_include_hints})
     if(ALPHASHAPE_VULKAN_SYSTEM_INCLUDE_DIR AND
        NOT ALPHASHAPE_VULKAN_SYSTEM_INCLUDE_DIR MATCHES "-NOTFOUND$")
         set(ALPHASHAPE_VULKAN_INCLUDE_DIR "${ALPHASHAPE_VULKAN_SYSTEM_INCLUDE_DIR}"
             CACHE PATH "Directory containing vulkan/vulkan_core.h" FORCE)
     endif()
+    unset(_alphashape_vulkan_include_hints)
 endif()
 
 # Loader library and ICD manifest to bake in. Only meaningful with an SDK

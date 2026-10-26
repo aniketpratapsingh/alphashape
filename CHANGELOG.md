@@ -6,6 +6,10 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Windows: no DLL planting on the Vulkan loader.** A bare `vulkan-1.dll` is now loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32`, so it only ever comes from `System32`. Plain `LoadLibraryW` searched the application directory and the current working directory first, so a planted copy beside the executable (or in whatever directory the app was started from) would have been loaded instead of the driver's loader. `ALPHASHAPE_VULKAN_LIBRARY` obeys the same rule: name an alternative loader by absolute path.
+
 ### Fixed
 
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
@@ -77,11 +81,30 @@ line or Python.
 - The command line and the Python module ship inside the macOS app and the Windows
   installer; the AppImage runs the command line through `alphashape-*.AppImage cli`.
 
+**Windows GPU acceleration**
+
+- The Windows build now compiles the Vulkan GPU layer in, like the Linux and macOS
+  builds. The Vulkan headers and the shader tools (`glslc`, `spirv-val`) come from
+  vcpkg, and the configuration fails loudly rather than quietly dropping back to a
+  CPU-only build.
+- Nothing links a Vulkan loader on any platform: the backend opens
+  `vulkan-1.dll` / `libvulkan.so.1` / `libvulkan.1.dylib` at run time. On a Windows
+  machine without a Vulkan driver (a VM, a server, a driver that predates Vulkan)
+  the application starts normally, reports why GPU acceleration is unavailable,
+  and runs every task on the CPU. The installer deliberately does not bundle a
+  loader; a private `vulkan-1.dll` would shadow the driver's own loader and could
+  not see the driver's ICDs.
+- The Windows test lanes run the GPU suites against Mesa's lavapipe software
+  driver, the same arrangement Linux uses with llvmpipe. Correctness assertions
+  run; the timing and speed-up assertions skip themselves on a software device,
+  and the TV-L1 fusion port keeps declining software devices (its fp16 kernel
+  cannot be compiled by the gallium LLVM backend).
+
 ### Known limitations
 
 See [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md). The short version for this release:
-the installers are unsigned, the macOS build is Apple silicon only, GPU acceleration is
-off in the Windows build, and there is no georeferencing, marker editing or tiled-model
-output yet.
+the installers are unsigned, the macOS build is Apple silicon only, Windows GPU
+acceleration needs a Vulkan-capable graphics driver (the app falls back to the CPU
+without one), and there is no georeferencing, marker editing or tiled-model output yet.
 
 [0.1.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.1.0

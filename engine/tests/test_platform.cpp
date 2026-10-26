@@ -3,7 +3,9 @@
 //
 // These are the WP-29.1 acceptance tests (M29 §4.2). They must pass on every
 // platform, so nothing here names a POSIX or Win32 API -- that is the point of
-// the layer they exercise.
+// the layer they exercise. The one exception is the Windows-only DLL search
+// order test, which has to plant a file and ask the loader where a module came
+// from: that behaviour is only observable through the Win32 API itself.
 
 #include <algorithm>
 #include <cstddef>
@@ -13,6 +15,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+
+#include <cwchar>  // _wcsnicmp
+#endif
 
 #include <gtest/gtest.h>
 
@@ -126,6 +134,233 @@ TEST(Platform, DynamicLibraryOpenFailureIsReported) {
     EXPECT_FALSE(error.empty());
     EXPECT_NE(error.find("alphashape_no_such_library_12345"), std::string::npos) << error;
 }
+
+#if defined(_WIN32)
+namespace {
+
+/// Restores the process working directory when the test leaves scope: the
+/// search-order test has to chdir, and a leaked cwd would silently change the
+/// meaning of every later test in this binary.
+class ScopedWorkingDirectory {
+public:
+    explicit ScopedWorkingDirectory(const std::filesystem::path& next) {
+        std::error_code ec;
+        previous_ = std::filesystem::current_path(ec);
+        if (!ec) {
+            std::filesystem::current_path(next, ec);
+            changed_ = !ec;
+        }
+    }
+    ~ScopedWorkingDirectory() { restore(); }
+    ScopedWorkingDirectory(const ScopedWorkingDirectory&) = delete;
+    ScopedWorkingDirectory& operator=(const ScopedWorkingDirectory&) = delete;
+
+    bool changed() const { return changed_; }
+
+    /// Puts the previous directory back. Called explicitly where the temp dir
+    /// has to be removed inside the test: Windows cannot delete the process's
+    /// current directory.
+    void restore() {
+        if (!changed_) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::current_path(previous_, ec);
+        changed_ = false;
+    }
+
+private:
+    std::filesystem::path previous_;
+    bool changed_ = false;
+};
+
+std::wstring system_directory() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const UINT length = ::GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
+        if (length == 0) {
+            return std::wstring();
+        }
+        if (length < static_cast<UINT>(buffer.size())) {
+            buffer.resize(length);
+            return buffer;
+        }
+        buffer.assign(static_cast<std::size_t>(length) + 1, L'\0');
+    }
+    return std::wstring();
+}
+
+/// The path of a loaded module, via GetModuleFileNameW with a growing buffer.
+/// It truncates silently when the buffer is too small, so a full buffer means
+/// "grow and ask again".
+std::wstring module_file_name(HMODULE module) {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const DWORD length =
+            ::GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return std::wstring();
+        }
+        if (length < static_cast<DWORD>(buffer.size()) - 1) {
+            buffer.resize(length);
+            return buffer;
+        }
+        buffer.assign(buffer.size() * 2, L'\0');
+    }
+    return std::wstring();
+}
+
+/// Case-insensitive "is `path` inside `directory`". Windows paths compare
+/// case-insensitively, and these are ASCII system paths, so the CRT's ordinal
+/// comparison in the C locale is enough and needs no extra API declaration.
+bool path_is_under(const std::wstring& path, const std::wstring& directory) {
+    if (path.size() < directory.size()) {
+        return false;
+    }
+    if (::_wcsnicmp(path.c_str(), directory.c_str(), directory.size()) != 0) {
+        return false;
+    }
+    if (path.size() == directory.size()) {
+        return true;
+    }
+    const wchar_t next = path[directory.size()];
+    return next == L'\\' || next == L'/';
+}
+
+}  // namespace
+
+TEST(Platform, DynamicLibraryBareNameIgnoresAPlantedCopyInTheWorkingDirectory) {
+    // The DLL-planting regression. Plain LoadLibraryW searches the application
+    // directory, System32, the Windows directory, the current working
+    // directory and PATH, in that order -- so a `vulkan-1.dll` beside the .exe,
+    // or in whatever directory the process was started in, is loaded instead of
+    // the graphics driver's loader. A bare name must therefore be loaded from
+    // System32 only.
+    //
+    // The planted file is a *valid, loadable* DLL (a copy of a System32 DLL
+    // under a new name), not a garbage file: garbage fails to load under the
+    // old code too, so the test would pass without proving anything. With a
+    // loadable copy in the cwd the two behaviours differ sharply:
+    //
+    //   * System32 has no vulkan-1.dll (a driverless machine, a bare runner):
+    //     the open must FAIL. The old code returned a module -- the planted
+    //     one.
+    //   * System32 has one: the module that comes back must be the System32
+    //     one, never the planted copy.
+    const std::wstring system32 = system_directory();
+    ASSERT_FALSE(system32.empty()) << "GetSystemDirectoryW failed";
+
+    const std::string dirname = plat::unique_temp_path("alphashape_dllplant_", "");
+    const fs::path dir = plat::path_from_utf8(dirname);
+    ASSERT_TRUE(fs::create_directories(dir)) << dirname;
+
+    std::error_code ec;
+    const fs::path system_loader = fs::path(system32) / L"vulkan-1.dll";
+    const bool system_has_loader = fs::exists(system_loader, ec);
+
+    // Plant a copy of a System32 DLL under the hijacked name, and prove the
+    // copy is loadable before relying on it: a file that cannot load would make
+    // the negative assertion below pass against the vulnerable code too, and
+    // the test would prove nothing. Several candidates are tried because a
+    // renamed DLL can be refused for reasons of its own (an embedded
+    // side-by-side manifest, a DllMain that needs its real name).
+    //
+    // The loadability probe uses a *different* file name in the same directory,
+    // so nothing it maps can be mistaken for the planted module afterwards.
+    const fs::path planted = dir / plat::path_from_utf8("vulkan-1.dll");
+    bool planted_loads = false;
+    int probe_index = 0;
+    for (const wchar_t* source : {L"version.dll", L"winmm.dll", L"wtsapi32.dll", L"userenv.dll"}) {
+        const fs::path candidate = fs::path(system32) / source;
+        ec.clear();
+        if (!fs::exists(candidate, ec)) {
+            continue;
+        }
+        ++probe_index;
+        const fs::path probe_copy = dir / plat::path_from_utf8(
+                                              "alphashape_dllprobe_" + std::to_string(probe_index) +
+                                              ".dll");
+        ec.clear();
+        fs::copy_file(candidate, probe_copy, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            continue;
+        }
+        std::string probe_error;
+        {
+            plat::DynamicLibrary probe =
+                plat::DynamicLibrary::open(plat::path_to_utf8(probe_copy), &probe_error);
+            if (probe.is_open()) {
+                planted_loads = true;
+            }
+        }
+        std::error_code remove_error_probe;
+        fs::remove(probe_copy, remove_error_probe);
+        if (!planted_loads) {
+            continue;
+        }
+        ec.clear();
+        fs::copy_file(candidate, planted, fs::copy_options::overwrite_existing, ec);
+        planted_loads = !ec;
+        if (planted_loads) {
+            break;
+        }
+    }
+    if (!planted_loads) {
+        std::error_code cleanup_error;
+        fs::remove_all(dir, cleanup_error);
+        GTEST_SKIP() << "no System32 DLL could be planted as a loadable standalone image, so the "
+                        "hijack this test guards against cannot be reproduced on this host";
+    }
+
+    ScopedWorkingDirectory cwd(dir);
+    ASSERT_TRUE(cwd.changed()) << "could not make " << plat::path_to_utf8(dir) << " the cwd";
+
+    {
+        std::string error;
+        plat::DynamicLibrary lib = plat::DynamicLibrary::open("vulkan-1.dll", &error);
+
+        if (!system_has_loader) {
+            // Nothing in System32 to find, so the only correct answer is a
+            // clean, explained failure: the loadable `vulkan-1.dll` one
+            // directory away must not be picked up.
+            EXPECT_FALSE(lib.is_open())
+                << "a bare name loaded the copy in the working directory ("
+                << plat::path_to_utf8(planted)
+                << "); bare names must resolve against System32 only";
+            EXPECT_FALSE(error.empty());
+            EXPECT_NE(error.find("vulkan-1.dll"), std::string::npos) << error;
+            // Asked by full path, GetModuleHandleW answers only for a module
+            // mapped from that exact path, so this catches the planted module
+            // without being confused by anything else in the process.
+            EXPECT_EQ(::GetModuleHandleW(planted.c_str()), nullptr)
+                << "the planted DLL was mapped into this process";
+        } else {
+            ASSERT_TRUE(lib.is_open())
+                << "System32 has vulkan-1.dll but it was not opened: " << error;
+            // A module carries only its base name whether it came from System32
+            // or from the cwd, so the path is what tells them apart: ask by the
+            // shared base name, then read where that module actually lives.
+            const HMODULE module = ::GetModuleHandleW(L"vulkan-1.dll");
+            ASSERT_NE(module, nullptr) << "the opened module is not named vulkan-1.dll";
+            const std::wstring loaded_path = module_file_name(module);
+            ASSERT_FALSE(loaded_path.empty()) << "GetModuleFileNameW failed";
+            EXPECT_TRUE(path_is_under(loaded_path, system32))
+                << "loaded '" << plat::to_utf8(loaded_path) << "', expected it under '"
+                << plat::to_utf8(system32) << "'";
+            EXPECT_FALSE(path_is_under(loaded_path, dir.wstring()))
+                << "the copy planted in the working directory was loaded: "
+                << plat::to_utf8(loaded_path);
+        }
+    }
+
+    // The working directory has to be restored before the temp dir can be
+    // removed: Windows refuses to delete the process's current directory.
+    cwd.restore();
+    std::error_code remove_error;
+    fs::remove_all(dir, remove_error);
+    EXPECT_FALSE(remove_error) << remove_error.message();
+}
+#endif  // _WIN32
 
 TEST(Platform, DynamicLibraryMoveKeepsOneHandle) {
     const std::string library =

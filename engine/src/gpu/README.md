@@ -209,15 +209,34 @@ exceeds either fails at pipeline or image creation with `gpu::Error`, which
 
 ## Loading and ICD selection
 
-Nothing links `libvulkan`. `vulkan/loader.cpp` `dlopen`s, in order:
+Nothing links a Vulkan loader, on any platform. `vulkan/loader.cpp` `dlopen`s,
+in order:
 
 1. `$ALPHASHAPE_VULKAN_LIBRARY` (escape hatch for a different SDK),
-2. the SDK loader baked at configure time (`libvulkan.1.dylib`),
-3. `libvulkan.1.dylib`,
-4. `libvulkan.dylib`.
+2. the loader baked at configure time, when there is one (`libvulkan.1.dylib`
+   from the macOS SDK; empty on Linux and Windows),
+3. the platform soname: `libvulkan.1.dylib` / `libvulkan.dylib` on macOS,
+   `libvulkan.so.1` / `libvulkan.so` on Linux, `vulkan-1.dll` on Windows.
 
 Everything else is resolved through `vkGetInstanceProcAddr` into a function
 table. Any failure is reported through `unavailable_reason()` — never abort.
+
+On Windows a bare name is loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32`, so only
+`System32` is searched — not the application directory, not the current working
+directory, not `PATH`. That matters because plain `LoadLibraryW` searches the
+application directory first: a planted `vulkan-1.dll` dropped beside the
+executable (or in whatever directory the user happened to launch from) would be
+loaded instead of the driver's loader, which is classic DLL planting. The same
+rule applies to `$ALPHASHAPE_VULKAN_LIBRARY`: an override that names a
+different loader must be an **absolute path**, because a bare name there is
+resolved against `System32` too. `SetDefaultDllDirectories` is deliberately not
+called process-wide — Qt and the vcpkg runtime DLLs still need the application
+directory. Windows ships no Vulkan runtime of its own: it arrives with the
+graphics driver as `System32\vulkan-1.dll`. A machine without one therefore
+gets a false `available()` and a reason that says so, and every task runs on the
+CPU; it never fails to start. The installer deliberately does not ship
+`vulkan-1.dll`: a private copy could not reach the driver's ICDs, and the
+System32-only rule means it would not be picked up anyway.
 
 MoltenVK is a portability driver, so the instance enables
 `VK_KHR_portability_enumeration` (with the enumerate-portability flag) and the
@@ -244,6 +263,13 @@ layer actually loaded; the debug-utils messenger counts errors, and
   and `vk_mem_alloc.h` are found, otherwise OFF with a STATUS message. With
   `OFF` the full API still exists: `available()` is false, every call reports
   the build-time reason, and tests skip.
+- Under vcpkg (Windows), the headers come from the `vulkan-headers` and
+  `vulkan-memory-allocator` ports and the tools from `shaderc` (glslc) and
+  `spirv-tools[tools]` (spirv-val). Those ports install the tools under
+  `<installed>/<triplet>/tools/<port>/` rather than `bin`, which is not on
+  `PATH`, so `cmake/alphashape_vulkan.cmake` probes that directory. `vulkan-loader`
+  is not a build dependency: nothing links it. It is installed only in the
+  Windows test lanes, which need a real loader to talk to the lavapipe ICD.
 
 `src/gpu/shaders/*.comp` are compiled by `glslc --target-env=vulkan1.2 -O` and
 validated by `spirv-val` at build time, then embedded into a generated `.cpp`
