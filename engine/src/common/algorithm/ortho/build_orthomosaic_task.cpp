@@ -185,11 +185,16 @@ struct PlaneToLocalMap {
             static_cast<float>(w00) * local[i00] + static_cast<float>(w10) * local[i10] +
             static_cast<float>(w01) * local[i01] + static_cast<float>(w11) * local[i11];
         Eigen::Vector3d out = (relative.cast<double>() + anchor);
-        const double node_height =
-            w00 * height[i00] + w10 * height[i10] + w01 * height[i01] + w11 * height[i11];
-        const double scale =
-            w00 * vertical[i00] + w10 * vertical[i10] + w01 * vertical[i01] +
-            w11 * vertical[i11];
+        // height/vertical are stored as float (see the struct comment): cast them
+        // up explicitly rather than let -Wdouble-promotion reject the sum.
+        const double node_height = w00 * static_cast<double>(height[i00]) +
+                                   w10 * static_cast<double>(height[i10]) +
+                                   w01 * static_cast<double>(height[i01]) +
+                                   w11 * static_cast<double>(height[i11]);
+        const double scale = w00 * static_cast<double>(vertical[i00]) +
+                             w10 * static_cast<double>(vertical[i10]) +
+                             w01 * static_cast<double>(vertical[i01]) +
+                             w11 * static_cast<double>(vertical[i11]);
         out.z() += (p.z() - node_height) * scale;
         return out;
     }
