@@ -975,23 +975,17 @@ TEST(TvFusionGpu, BuildModelMeetsCpuBounds) {
     EXPECT_EQ(gpu.nonmanifold_edges, 0U);
     // The dense fixture's surface is clipped by the volume border, so the
     // extracted mesh has genuine boundary edges (test_build_model asserts
-    // non-manifold edges only). What this guards is "the device mesh is the same
-    // surface, with its real open rim, not a degenerate one" - not bit-identical
-    // topology, which it cannot be: the two documents' depth maps come from the
-    // GPU and the CPU search, and the GPU layer documents those as agreeing in
-    // quality and near-agreement, not bit for bit. Mesh topology is a
-    // discontinuous function of a depth map - an isovalue crossing one more
-    // voxel adds or removes a pocket of boundary edges - so the count moves by a
-    // handful of edges when a fraction of a percent of pixels land elsewhere
-    // under fused multiply-add. Measured on a Tesla T4 at 93.4% pixel agreement:
-    // 8 of 1272, 0.6%. The bound still fails a zero count, a missing rim, or a
-    // mesh of some other surface.
-    const double boundary_relative =
-        std::abs(static_cast<double>(gpu.boundary_edges) -
-                 static_cast<double>(cpu.boundary_edges)) /
-        static_cast<double>(std::max<std::size_t>(cpu.boundary_edges, 1));
-    EXPECT_GT(cpu.boundary_edges, 0U);
-    EXPECT_LT(boundary_relative, 0.02)
+    // non-manifold edges only). What this guards is "the device mesh is exactly
+    // the CPU's surface, with the same open rim". It is an exact count on purpose:
+    // the two documents' depth maps come from the GPU and the CPU PatchMatch, and
+    // those are exact against each other (see PatchMatchGpu.RefineSweepsMatchCpu),
+    // so mesh topology - a discontinuous function of the depth map - is exact too.
+    // When this last drifted it was a real defect, not tolerance: a fused
+    // multiply-add in the shader's depth/plane-to-pixel path moved a fraction of a
+    // percent of the samples to a neighbouring texel (93.4% pixel agreement on a
+    // Tesla T4), and the count moved from 1272 to 1286. A tolerance here would
+    // have hidden that. Keep it exact; fix the shader instead.
+    EXPECT_EQ(gpu.boundary_edges, cpu.boundary_edges)
         << "boundary edges gpu " << gpu.boundary_edges << " cpu " << cpu.boundary_edges;
     // ...and the GPU mesh lands where the CPU's does.
     EXPECT_LT(gpu.median_voxels, cpu.median_voxels + 0.05);
