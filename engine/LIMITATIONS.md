@@ -219,6 +219,21 @@ sections below give the engineering detail behind each item.
   `VK_KHR_portability_enumeration` and the device enables
   `VK_KHR_portability_subset`; both are probed and enabled only when advertised,
   so the non-portability path runs on Linux.
+- **`pm_init` is built without the SPIR-V optimiser on NVIDIA hardware.** It is
+  the only kernel that is: `pm_refine`, which does all of the per-pixel work, is
+  optimised. On a Tesla T4 with driver 535.161.07 the optimised `pm_init` module
+  returns a wrong random-plane normal — 0.92% of pixels match the CPU reference
+  while the depths drawn from the same stream are 100% exact — and the
+  unoptimised module is correct there and elsewhere. Three generator shapes were
+  tried (mutable state, keyed stream with a loop, keyed stream with straight-line
+  draws) and the figure did not move, so it is not state loss or draw order; the
+  shaders' own undefined behaviour was found and fixed separately (an
+  out-of-range index in a dead branch, aggregate `inout` search state,
+  contractible expressions in front of `floor()`). `pm_refine` is correct at `-O`
+  on that same GPU in the same run. The remaining difference is not yet
+  explained, and the ruled-out list is recorded at `rng_draw()` in `pm_math.glsl`
+  so the next attempt starts from there. The cost is small: one short dispatch
+  per colour.
 - **What Linux/llvmpipe does and does not validate:** it does validate the
   loader path with a system loader and system ICDs, instance/device creation,
   the whole dispatch/buffer/barrier/validation-layer surface, and the

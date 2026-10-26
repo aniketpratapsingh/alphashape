@@ -153,12 +153,14 @@ endfunction()
 #
 # First try the optimised build: if a kernel is wrong *only* optimised it is
 # usually undefined behaviour the optimiser may exploit, or an assumption the
-# shader makes that is not one Vulkan gives. Both PatchMatch search kernels were
-# on this list for a wrong random-plane normal on an NVIDIA Tesla T4; the causes
-# were shader-side (an out-of-range index in a dead branch, aggregate `inout`
-# search state, and a random-draw chain whose run-time trip count the optimiser
-# collapsed) and are fixed, so the flag is unused. It is kept because it is the
-# first thing to reach for when diagnosing this class of failure.
+# shader makes that is not one Vulkan gives. The PatchMatch search kernels were
+# on this list for a wrong random-plane normal on an NVIDIA Tesla T4. Two causes
+# were found and fixed (an out-of-range index in a dead branch, and aggregate
+# `inout` search state), which was enough for pm_refine -- the kernel that does
+# all the work -- to be correct at -O on that GPU. pm_init still is not, and the
+# remaining difference is not yet explained; see the OPEN ISSUE at rng_draw() in
+# pm_math.glsl, which records exactly what has been ruled out so the next
+# diagnosis starts from there instead of from the beginning.
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
     if("NO_OPTIMIZE" IN_LIST ARGN)

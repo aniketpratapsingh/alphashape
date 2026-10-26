@@ -55,14 +55,17 @@ if(ALPHASHAPE_GPU)
         shaders/poisson_precond.comp
         shaders/poisson_axpy.comp)
     set(_spv_files "")
-    # Every kernel is built with the SPIR-V optimiser, including the two
-    # PatchMatch search kernels. They were the exception because their optimised
-    # modules returned a wrong initial normal on a Tesla T4; the cause was the
-    # keyed RNG's index-dependent draw chain, which that driver's optimiser
-    # collapsed so that draws 1 and 2 returned draw 0. The draws are
-    # straight-line now (see pm_math.glsl), so there is no NO_OPTIMIZE list.
+    # pm_refine -- the kernel that does all of the per-pixel work -- is
+    # optimised again. pm_init is the one kernel still exempt; see the NVIDIA
+    # note in alphashape_add_shader and the analysis at rng_draw() in
+    # pm_math.glsl. It is a single short dispatch per colour.
+    set(_unoptimised_shaders shaders/pm_init.comp)
     foreach(_shader IN LISTS _shader_sources)
-        alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}")
+        if(_shader IN_LIST _unoptimised_shaders)
+            alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}" NO_OPTIMIZE)
+        else()
+            alphashape_add_shader("${CMAKE_CURRENT_SOURCE_DIR}/${_shader}")
+        endif()
         get_filename_component(_name "${_shader}" NAME_WE)
         list(APPEND _spv_files "${CMAKE_CURRENT_BINARY_DIR}/shaders/${_name}.spv")
     endforeach()

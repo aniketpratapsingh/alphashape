@@ -207,14 +207,26 @@ RngKey rng_key(U64 seed, uint pixel, U64 iteration, uint stream) {
 
 // The nth raw draw of a stream (n = 0 is the CPU's first next()).
 //
-// Written as straight-line calls with no loop and no index arithmetic, on
-// purpose. The previous version walked `for (i = 0; i <= index; ++i)`, and on a
-// Tesla T4 (driver 535) at -O it returned the *zeroth* draw for every index: the
-// optimiser lost the index-dependent trip count. The signature was
-// unmistakable - pm_init reported depth agreement 100.00% (that draw uses index
-// 0) and normal agreement 0.92% (built from draws 1 and 2, which came back as
-// draw 0). Three explicit functions leave no trip count to lose; callers must use
-// PM_DRAW_0/1/2 and never build an index at run time.
+// Written as straight-line calls rather than a `for (i = 0; i <= index; ++i)`
+// chain, so no run-time trip count exists for an optimiser to get wrong.
+//
+// OPEN ISSUE, and the reason pm_init is still built with NO_OPTIMIZE. On a Tesla
+// T4 (driver 535.161.07) the optimised pm_init reports depth agreement 100.00%
+// and normal agreement 0.92% against the CPU: depth is drawn at index 0, the
+// normal is built from indices 1 and 2. Every index behaves as index 0. This was
+// true for the original mutable-`inout` generator, for the keyed generator with
+// the loop below, and for these straight-line draws, so it is NOT state loss and
+// NOT the loop shape. pm_refine uses the identical rng_uniform() calls with the
+// same indices and is correct at -O on that GPU in the same run, so the
+// difference must be in how pm_init's module is optimised, not in this code.
+// Everything else about pm_init at -O is correct (depths exact, cost exact for
+// the pixels whose normal happened to match).
+//
+// Do not "fix" this by marking the trig or these draws `precise`: NoContraction
+// in the cost loop made glslc -O need tens of gigabytes and CI OOM-killed it.
+// Diagnosing further needs T4 hardware and spirv-dis of both modules; until then
+// pm_init alone stays unoptimised, which costs one short dispatch per colour.
+// Callers must use PM_DRAW_0/1/2 and never build an index at run time.
 U64 rng_draw0(RngKey key) { return splitmix64(key.state); }
 U64 rng_draw1(RngKey key) { return splitmix64(rng_draw0(key)); }
 U64 rng_draw2(RngKey key) { return splitmix64(rng_draw1(key)); }
@@ -282,14 +294,12 @@ vec3 random_unit_vector(RngKey key, uint index) {
 
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
 //
-// This is where the Tesla T4 bug used to show. The optimised module reported
-// depth agreement 100.00% (drawn at index 0) and normal agreement 0.92% (built
-// from indices 1 and 2): every index returned draw 0, because the optimiser
-// collapsed the `for (i = 0; i <= index; ++i)` chain in rng_draw() into a fixed
-// trip count. The draws are written out longhand now. Do not reintroduce a loop
-// or a runtime index in that chain, and do not reach for `precise` on the trig
-// either -- NoContraction inside the cost loop made glslc -O need tens of
-// gigabytes for pm_refine and the CI runner OOM-killed it.
+// This is where the unresolved T4 difference shows: the optimised pm_init module
+// reports normal agreement 0.92% while the depths drawn from the same stream are
+// exact. See the OPEN ISSUE note at rng_draw(); it is not a draw-order or
+// state-loss problem (three different generator shapes produced the same number).
+// Do not reach for `precise` on the trig to chase it -- NoContraction inside the
+// cost loop made glslc -O need tens of gigabytes and CI OOM-killed it.
 vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
