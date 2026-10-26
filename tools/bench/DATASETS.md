@@ -78,12 +78,19 @@ does not come from a photogrammetry pipeline at all.
   still several thousand well-distributed keypoints for a 30-image block with heavy
   overlap.
 
-  `BuildOrthomosaic resolution=0.05` is the fourth. The site is 0.048 km², so a 2.4 cm
-  mosaic is 83 million cells to rectify and seam; that overran the stage budget on the
-  first attempt that got that far, while matching, alignment, depth maps, the dense cloud
-  and the DEM had all already succeeded. 5 cm is 19 million cells and an ordinary
-  orthomosaic deliverable, and the effective-resolution metric is reported against this
-  nominal, so "did the mosaic get softer" stays a valid run-over-run signal.
+  `BuildOrthomosaic resolution=0.10 refine_seamlines=false` is the fourth. The site is
+  0.048 km², so a 2.4 cm mosaic is 83 million cells and even 5 cm is 19 million: each
+  cell carries a label, and the seam search is an alpha-expansion over the 30 camera
+  labels, so the refined search is cells × labels × expansion passes × pyramid levels ×
+  iterations. At 2.4 cm that is 20 billion label operations, which overran the stage
+  budget twice — once at 2.4 cm and once at 5 cm — while matching, alignment, depth maps,
+  the dense cloud and the DEM had all already succeeded.
+
+  At 10 cm the mosaic is 4.8 million cells and the argmax labelling keeps the cost linear
+  in cells; the trade is visible seams where a camera's score steps, which is exactly what
+  the side-by-side comparison image is for. 10 cm is also an ordinary orthomosaic
+  deliverable for a site this size. The effective-resolution metric is reported against
+  this nominal, so "did the mosaic get softer" stays a valid run-over-run signal.
 
   All of this is recorded in every metrics JSON and printed at the top of the report, so a
   bounded run is never mistaken for a default one. Each stage also carries a budget
