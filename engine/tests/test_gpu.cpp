@@ -1782,6 +1782,65 @@ TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
 // on a device that is marked lost. That must not throw from a destructor
 // (implicitly noexcept -> std::terminate) and must not take a bounded wait per
 // handle; the whole unwind shares a single post-loss drain deadline.
+// Regression for the teardown window: the per-handle drain after a loss shares
+// one 1 s deadline across the whole fallback unwind, and ~VulkanBackend used to
+// inherit that window. A loss *declared* by the test hook -- or a timeout that
+// raced completion -- leaves the driver and its queue alive, so the teardown
+// drain is the last chance to wait before the device goes, and it must not be
+// capped by a window that only exists to keep an unwind cheap.
+//
+// The observable contract: with work still queued, the shared window already
+// spent, and the device marked lost, tearing the backend down must return
+// cleanly. A drain that gave up would destroy the device (and the command pools
+// and fences) under lavapipe's live queue.
+TEST(Gpu, TeardownDrainIsNotCappedByTheSharedUnwindWindow) {
+    REQUIRE_GPU();
+    DeviceStateGuard state_guard;
+    (void)state_guard;
+
+    // Its own context, so the teardown under test is this one's and no earlier
+    // test's drain has already burned the shared window.
+    auto context = create_context(ContextOptions{});
+    ASSERT_NE(context, nullptr);
+
+    constexpr std::size_t kCount = 4096;
+    std::vector<float> zeros(kCount, 0.0f);
+    Buffer buffer = Buffer::of(*context, zeros);
+    // Allocated before the loss: Buffer::of uploads, and an upload on a lost
+    // device throws by design.
+    Buffer doomed = Buffer::of(*context, zeros);
+    struct Params {
+        std::uint32_t n;
+    };
+    const Params params{static_cast<std::uint32_t>(kCount)};
+    Dispatch dispatch;
+    dispatch.kernel = "chain_add";
+    dispatch.buffers = {&buffer};
+    dispatch.push_constants = push(params);
+    dispatch.groups = {groups_for(kCount, 256), 1, 1};
+
+    // Leave work queued, then lose the device while it is still running. This
+    // is the state the forced-timeout tests reach: the fence is unsignalled but
+    // the driver is healthy and will finish.
+    const Ticket pending = run_async(*context, {dispatch});
+    ASSERT_NE(pending.id(), 0u);
+    detail::note_device_lost("test: teardown with work still queued");
+    ASSERT_TRUE(detail::device_lost());
+
+    // Spend the shared post-loss window the way an unwind does: a per-handle
+    // destructor drain. After this the cheap window is armed and used.
+    doomed = Buffer();
+    buffer = Buffer();
+
+    // Now the teardown. This must drain on its own full budget and return; it
+    // must not throw (destructors are noexcept) and must not fault.
+    context.reset();
+    SUCCEED() << "backend torn down after a loss with queued work";
+
+    // Clear the flag for sibling tests.
+    detail::reset_device_lost();
+}
+
 TEST(Gpu, DestroyingBuffersAfterDeviceLostDoesNotTerminate) {
     REQUIRE_GPU();
     DeviceStateGuard state_guard;
