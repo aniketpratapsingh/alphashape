@@ -443,7 +443,7 @@ double predicted_footprint_cells(const std::vector<CameraEntry>& cameras,
             camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
                 return frame.to_plane(p);
             };
-            const Eigen::Vector3d mid = grid.pixel_center(grid.width / 2, grid.height / 2);
+            const Eigen::Vector2d mid = grid.pixel_center(grid.width / 2, grid.height / 2);
             const Eigen::Vector3d lo =
                 to_local(Eigen::Vector3d(mid.x(), mid.y(), lowest));
             const Eigen::Vector3d hi =

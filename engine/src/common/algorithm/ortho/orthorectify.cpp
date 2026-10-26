@@ -307,7 +307,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
         double local_low = lowest;
         double local_high = highest;
         if (camera.plane_to_local && std::isfinite(lowest) && std::isfinite(highest)) {
-            const Eigen::Vector3d mid = out_grid.pixel_center(out_grid.width / 2,
+            const Eigen::Vector2d mid = out_grid.pixel_center(out_grid.width / 2,
                                                               out_grid.height / 2);
             const Eigen::Vector3d lo = camera.plane_to_local(Eigen::Vector3d(mid.x(), mid.y(), lowest));
             const Eigen::Vector3d hi = camera.plane_to_local(Eigen::Vector3d(mid.x(), mid.y(), highest));
