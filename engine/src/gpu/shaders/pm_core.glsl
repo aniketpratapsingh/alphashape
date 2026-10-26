@@ -342,39 +342,26 @@ vec3 pixel_bearing(int pixel) {
     return vec3(bearings[pixel * 3 + 0], bearings[pixel * 3 + 1], bearings[pixel * 3 + 2]);
 }
 
-// Transfer pixel q's plane onto pixel p's bearing (as propagate()), reading q
-// from the state buffers of the previous half-sweep. Returns false when q has no
-// usable plane, or when that plane faces away at p, so the caller drops the
-// candidate. Deliberately does not evaluate: the caller collects all of a
-// pixel's candidates first, so that evaluate_hypothesis() -- and with it the
-// whole multiview_cost() loop -- has exactly one call site in the kernel.
-//
-// That single call site is not a stylistic choice. pm_refine has nine to eleven
-// candidates per pixel; as separate call sites the optimiser inlined a full copy
-// of the 32-neighbour x 49-sample cost loop for each, which made glslc -O need
-// tens of gigabytes and get OOM-killed on a CI runner (exit 137), and once the
-// cost core carried its `precise` marks it also pushed a single-lane compile
-// past fifteen minutes. Batch them and the module stays small while the
-// evaluation order is unchanged.
+// Propagate pixel q's plane onto pixel p (as propagate()), reading q from the
+// state buffers of the previous half-sweep. Returns the updated `Best`, like
+// evaluate_hypothesis(): no aggregate `inout` anywhere in the search core.
 //
 // precise on rho_q and denom only: both are dots (chained multiply-adds) and
 // rho_q is another entry point to the depth-to-pixel chain. The quotient needs
 // no mark -- a division has no fused form.
-bool propagate_plane(int q, vec3 b_p, out float depth_out, out vec3 normal_out) {
+Best propagate(int x, int y, int q, vec3 b_p, Best best) {
     float qd = state_depth[q];
     if (!(qd > 0.0)) {
-        return false;
+        return best;
     }
     vec3 n = vec3(state_normal[q * 3 + 0], state_normal[q * 3 + 1], state_normal[q * 3 + 2]);
     if (dot(n, n) < 1e-12) {
-        return false;
+        return best;
     }
     precise float rho_q = qd * dot(n, pixel_bearing(q));
     precise float denom = dot(n, b_p);
     if (denom >= -PM_FACING_EPS) {
-        return false;
+        return best;
     }
-    depth_out = rho_q / denom;
-    normal_out = n;
-    return true;
+    return evaluate_hypothesis(x, y, rho_q / denom, n, b_p, best);
 }

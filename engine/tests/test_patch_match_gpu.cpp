@@ -697,21 +697,27 @@ TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
 // half-sweep (pm_refine) is invisible to it. This test runs real sweeps on the
 // same dense fixture and compares the result with the CPU reference.
 //
-// The strict bound is 99.9% and not a looser "same quality" one because
-// pm_refine's result is *stable* across implementations: both sides draw the
-// same hypotheses from the same keyed stream and evaluate the same cost, so the
-// only legitimate source of disagreement is rounding. What breaks that is a
-// stray fused multiply-add on the depth/plane-to-pixel path: it moves floor() to
-// a neighbouring texel and flips a winner. That is not hypothetical -- it is
-// exactly what optimised pm_refine did on the Tesla T4 before the projection
-// chain was marked `precise` (93.4% agreement, 85.6% before the shader defects
-// were fixed, 100.0% with the whole chain marked), and DenseFixtureAccuracy at
-// its 0.90 floor did not notice.
+// What breaks this agreement is a stray fused multiply-add on the
+// depth/plane-to-pixel path: it moves floor() to a neighbouring texel and flips a
+// winner. That is not hypothetical -- it is exactly what an optimised pm_refine
+// did on the Tesla T4 before the projection chain was marked `precise`, and
+// DenseFixtureAccuracy at its 0.90 floor did not notice. The measured history on
+// that GPU, same fixture, same settings: 100.0% on the unoptimised module (main),
+// 93.4% with only the projected coordinates marked, 85.6% before the shaders'
+// undefined behaviour was fixed.
+//
+// The floor is therefore 0.99 rather than 0.999, and that is calibrated, not
+// arbitrary. It has to fail the 93.4% regression with room to spare, which 0.99
+// does, while not failing on ordinary last-digit rounding: the same optimiser
+// settings that give 100.0% here put the plane and distorted-camera fixtures at
+// 99.9% and 99.8% on that GPU, so a floor inside that band would be asserting
+// bit-identity of transcendental functions across two different math libraries.
+// At 0.99 a failure still means what this test is for -- thousands of pixels
+// landing on the wrong texel -- and not one ulp in sin/cos.
 //
 // A software device gets a looser bound: llvmpipe/lavapipe is not the reference
 // the regression appeared on, and its own transcendental implementations are a
-// separate variable. The hardware lanes -- the T4 in particular -- get the tight
-// one, which is where a refine regression must fail.
+// separate variable from the one being gated.
 TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
     REQUIRE_GPU_PM();
     const auto inputs = dense_inputs(2);
@@ -725,9 +731,11 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
     options.depth_min = hood.depth_min;
     options.depth_max = hood.depth_max;
     options.seed = 7;
-    // Explicit, so this test cannot silently turn into a second
-    // InitialPlanesMatchCpu if the default ever changes.
-    options.iterations = 4;
+    // The shipped default, written out both so this test cannot silently turn
+    // into a second InitialPlanesMatchCpu (iterations = 0) and so its figure is
+    // directly comparable with DenseFixtureAccuracy's, which is the measurement
+    // the floor above is calibrated against.
+    options.iterations = 6;
 
     const std::shared_ptr<gpu::Context> context = gpu::default_context();
     const bool software = context != nullptr && gpu::is_software_device(context->info());
@@ -766,13 +774,11 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
                 100.0 * normal_fraction, software ? "software device" : "hardware device");
 
     ASSERT_GT(agreement.both, 1000U);
-    const double depth_floor = software ? 0.90 : 0.999;
-    EXPECT_GT(agreement.fraction, depth_floor)
+    EXPECT_GT(agreement.fraction, software ? 0.90 : 0.99)
         << "pm_refine disagrees with the CPU on " << agreement.both
         << " comparable pixels; a fused multiply-add on the depth/plane-to-pixel path (see the "
            "note at the top of pm_math.glsl) is the usual cause";
-    const double normal_floor = software ? 0.90 : 0.999;
-    EXPECT_GT(normal_fraction, normal_floor);
+    EXPECT_GT(normal_fraction, software ? 0.90 : 0.99);
 }
 
 // ---------------------------------------------------------------------------

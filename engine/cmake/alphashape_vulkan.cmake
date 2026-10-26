@@ -188,43 +188,32 @@ function(alphashape_vulkan_job_pools)
     set_property(GLOBAL PROPERTY JOB_POOLS alphashape_shader_pool=1)
 endfunction()
 
-# alphashape_add_shader(<shader.comp> [NO_OPTIMIZE] [OPTIMIZE_SIZE])
+# alphashape_add_shader(<shader.comp> [NO_OPTIMIZE])
 #
 # Compiles one compute kernel to SPIR-V with glslc and validates it.
 #   (default)        glslc -O   -- the performance pipeline
-#   OPTIMIZE_SIZE    glslc -Os  -- the size pipeline (see below)
 #   NO_OPTIMIZE      no optimiser at all
 #
 # First try the optimised build: if a kernel is wrong *only* optimised it is
 # usually undefined behaviour the optimiser may exploit, or an assumption the
 # shader makes that is not one Vulkan gives. The PatchMatch search kernels were
-# on this list for a wrong random-plane normal on an NVIDIA Tesla T4. Two causes
-# were found and fixed (an out-of-range index in a dead branch, and aggregate
-# `inout` search state), which was enough for pm_refine -- the kernel that does
-# all the work -- to be exact against the CPU at -O. pm_init still is not, and
-# the remaining difference is not yet explained; see the OPEN ISSUE at rng_draw()
-# in pm_math.glsl, which records exactly what has been ruled out so the next
-# diagnosis starts from there instead of from the beginning. That one kernel is
-# built unoptimised on every platform: the module is compiled and embedded when
-# the engine is built, not when a device is chosen, and the unoptimised module is
-# correct everywhere. The cost is one short dispatch per colour.
-#
-# OPTIMIZE_SIZE exists for pm_refine. Making it exact against the CPU needs
-# `precise` (SPIR-V NoContraction) along the whole depth/plane-to-pixel chain,
-# and NoContraction inside the 49-sample x 32-neighbour cost loop stops the -O
-# pipeline reassociating: glslc then needs tens of gigabytes to optimise one
-# module and a CI runner kills it (exit 137 at about 7 GB). The -Os pipeline does
-# not run the aggressive unrolling/reassociation passes, so it stays inside a
-# runner's memory while still honouring NoContraction and still doing the
-# cheap wins (dead code, constant folding, single-use inlining). That is a
-# smaller win than -O but a real one, and accuracy wins over the last few per
-# cent: a slightly slower kernel that agrees with the CPU bit for bit beats a
-# faster one that moves 6.6% of a depth map.
+# on this list for a wrong random-plane normal on an NVIDIA Tesla T4, and the
+# shaders' real undefined behaviour was found and fixed that way: an out-of-range
+# index in a never-taken branch, aggregate `inout` search state, and a mutable RNG
+# cursor whose straight-line replacement still did not change the result. Two
+# kernels remain on the list, both on every platform, and the difference is not
+# yet explained: on the T4 the optimised modules report normal agreement 0.92%
+# (pm_init, with the depths from the same stream 100% exact) and dense agreement
+# 93.4% (pm_refine), where the unoptimised modules are correct. The measurements
+# and the ruled-out list are at the top of pm_math.glsl so the next diagnosis
+# starts from there rather than from the beginning. The exemption cannot be keyed
+# on the device: a module is compiled and embedded when the engine is built.
+# NO_OPTIMIZE is therefore also the supported way to ship a kernel the optimiser
+# is known to change; it costs real speed (the NV driver does not re-optimise a
+# -O0 module) and that trade is made deliberately, for accuracy.
 function(alphashape_add_shader shader)
     set(_opt_flag -O)
-    if("OPTIMIZE_SIZE" IN_LIST ARGN)
-        set(_opt_flag -Os)
-    elseif("NO_OPTIMIZE" IN_LIST ARGN)
+    if("NO_OPTIMIZE" IN_LIST ARGN)
         set(_opt_flag "")
     endif()
     get_filename_component(_name "${shader}" NAME_WE)

@@ -253,38 +253,42 @@ sections below give the engineering detail behind each item.
   `VK_KHR_portability_enumeration` and the device enables
   `VK_KHR_portability_subset`; both are probed and enabled only when advertised,
   so the non-portability path runs on Linux and Windows.
-- **`pm_init` is built without the SPIR-V optimiser on every platform.** It is
-  the only kernel that is: `pm_refine`, which does all of the per-pixel work, is
-  built with the optimiser's size pipeline (see the next bullet). On a Tesla T4
-  with driver 535.161.07 the optimised `pm_init` module returns a wrong
-  random-plane normal — 0.92% of pixels match the CPU reference while the depths
-  drawn from the same stream are 100% exact — and the unoptimised module is
-  correct there and elsewhere. Three generator shapes were tried (mutable state,
-  keyed stream with a loop, keyed stream with straight-line draws) and the figure
-  did not move, so it is not state loss or draw order; the shaders' own undefined
-  behaviour was found and fixed separately (an out-of-range index in a dead
-  branch, aggregate `inout` search state, contractible expressions in front of
-  `floor()`). `pm_refine` is exact on that same GPU in the same run, so the
-  remaining difference is not the shared cost core. It is not yet explained, and
-  the ruled-out list is recorded at `rng_draw()` in `pm_math.glsl` so the next
-  attempt starts from there. The cost is small: one short dispatch per colour.
-  The exemption is unconditional rather than keyed on NVIDIA because the shader
-  is compiled and embedded when the engine is built, not when a device is
-  selected, and because the unoptimised module is correct everywhere while the
-  optimised one is known to be wrong on hardware we cannot test from a macOS or
-  lavapipe lane. Making it conditional would also mean shipping two modules.
-- **`pm_refine` is built with `glslc -Os`, not `-O`.** Making it exact against
-  the CPU (next bullet) requires `precise` along the whole depth-to-pixel chain,
-  and SPIR-V NoContraction inside its 49-sample × 32-neighbour cost loop stops the
-  `-O` pipeline's reassociation and unrolling: glslc needs tens of gigabytes and a
-  CI runner kills it (exit 137 at about 7 GB, and a single module took over 15
-  minutes on a 16 GB Mac, both measured). The `-Os` pipeline skips those passes,
-  so it compiles inside a runner's memory while still honouring NoContraction and
-  still doing dead-code elimination, constant folding and single-use inlining.
-  The speed-up is therefore smaller than the full pipeline would give — the
-  figures are in the tests' `[gpu timing]` lines, not a claim here — and accuracy
-  was preferred over it: a slower kernel that agrees with the CPU bit for bit
-  beats a faster one that moves 6.6% of a depth map.
+- **Both PatchMatch search kernels are built without the SPIR-V optimiser on
+  every platform, so the GPU depth search is not faster than it was.** `pm_init`
+  and `pm_refine` are the only kernels built this way; every other kernel takes
+  `glslc -O`. An optimised module of either changes results on NVIDIA hardware.
+  Measured on a Tesla T4 with driver 535.161.07 against the same CPU reference:
+  optimised `pm_init` reports 100.00% depth agreement but **0.92% normal
+  agreement**, and optimised `pm_refine` reports **93.4% dense agreement** and a
+  fused TV-L1 mesh with 1276 boundary edges against the CPU's 1268. The
+  unoptimised modules are at 100.00% / 100.0% / 1286 and equal, which is what
+  `main` measured and what ships.
+  What has been ruled out, so the next attempt starts from there rather than from
+  the beginning (also recorded at the top of `pm_math.glsl`): it is not the
+  shaders' own undefined behaviour — an out-of-range index in a never-taken
+  branch, aggregate `inout` search state, a mutable RNG cursor and a
+  fixed-trip-count draw loop were all found and fixed, and the 0.92% did not move
+  after any of them, nor across three different generator shapes; not the shared
+  cost core, because `pm_init`'s depths, drawn from that same stream at index 0,
+  are 100% exact while its normals, drawn at indices 1 and 2, are not; and not
+  floating-point contraction alone, because the projected-pixel chain is marked
+  `precise` (next bullet) and the optimised module still disagrees.
+  The exemption cannot be keyed on the device: a kernel is compiled and embedded
+  when the engine is built, not when a device is selected, and shipping both
+  modules would double the shader build. The cost is real and deliberate —
+  `[gpu timing]` on the T4 is 4.26 s against the CPU's 32.49 s (7.62x) — and
+  accuracy outranks it. Diagnosing further needs T4 hardware and `spirv-dis` of
+  both modules.
+- **An optimised PatchMatch module cannot be enabled without the memory problem
+  being solved too.** Making the depth-to-pixel chain exact needs `precise`
+  (SPIR-V `NoContraction`), and `NoContraction` inside `pm_refine`'s
+  49-sample × 32-neighbour cost loop stops the `-O` pipeline reassociating: glslc
+  needs tens of gigabytes and a CI runner OOM-kills it (exit 137 at about 7 GB on
+  the macOS and GitLab lanes; one module took over 15 minutes on a 16 GB Mac).
+  `-Os` is not an escape hatch — it was tried on this branch and is killed the
+  same way. So with this toolchain an exact optimised kernel and a build that
+  completes are mutually exclusive, and the measured fallback to `-O` without
+  contraction is 93.4%, not the 100.0% `main` has.
 - **GPU PatchMatch's depth search is exact against the CPU, and is tested as
   such.** Both implementations draw the same hypotheses from the same keyed
   stream and evaluate the same ZNCC cost, so they agree bit for bit as long as no
@@ -293,14 +297,15 @@ sections below give the engineering detail behind each item.
   single ulp moves `sample_image()`'s `floor()` to a neighbouring texel, which
   changes a ZNCC, which flips the winner-take-all selection for that pixel. On
   the Tesla T4, marking only the final projected coordinates `precise` left
-  optimised `pm_refine` at 93.4% dense agreement; marking every *fuse-capable*
-  step of the chain — the facing dot, `rho = depth * nb`, the candidate-level
-  bearing dot, the camera-frame point, `r2`/`radial_scale`/`xd`/`yd` in the
-  distortion polynomial, the final `u`/`v`, and the inverse-depth perturbation —
-  restores 100.0%. `precise` is deliberately not put on divisions, `sqrt` or
-  plain multiplies: they have no fused form, so it would change nothing but the
+  optimised `pm_refine` at 93.4% dense agreement. Every *fuse-capable* step of
+  the chain is therefore marked — the facing dot, `rho = depth * nb`, the
+  candidate-level bearing dot, the camera-frame point,
+  `r2`/`radial_scale`/`xd`/`yd` in the distortion polynomial, the final `u`/`v`,
+  and the inverse-depth perturbation — so that the guarantee survives if a kernel
+  is ever optimised again. `precise` is deliberately not put on divisions, `sqrt`
+  or plain multiplies: they have no fused form, so it would change nothing but the
   size of the set the optimiser must keep non-reassociable.
-  `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel at ≥99.9% on
+  `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel at ≥99% on
   hardware (the older `Iterations = 0` test never reached it), and
   `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused mesh's boundary-edge
   count is *equal*, which is a discontinuous function of that agreement and the

@@ -14,12 +14,6 @@ layout(local_size_x = PM_LANES) in;
 const ivec2 PM_ADJ[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 const ivec2 PM_FAR[4] = ivec2[4](ivec2(-3, 0), ivec2(3, 0), ivec2(0, -3), ivec2(0, 3));
 
-// Candidate slots, in the CPU's evaluation order: 8 propagation sources, the
-// fresh random plane, then the perturbed incumbent. A pixel with no incumbent
-// yet evaluates only the fresh plane.
-const int PM_PROPAGATIONS = 8;
-const int PM_FRESH = 8;
-
 void main() {
     // Staged before any early return: every lane of the workgroup must reach
     // the shared-memory barrier.
@@ -46,76 +40,52 @@ void main() {
     best.normal = vec3(state_normal[pixel * 3 + 0], state_normal[pixel * 3 + 1],
                        state_normal[pixel * 3 + 2]);
     best.cost = state_cost[pixel];
-    const bool has_incumbent = best.depth > 0.0;
-
-    // Every random draw this pixel needs, taken once. Indices are literal (the
-    // fresh plane's depth/ct/phi, then the inverse-depth delta, then the normal
-    // rotation) so the keyed stream cannot be reordered, and they match the
-    // CPU's RngStream use order exactly.
-    const U64 seed = U64(pc.seed_lo, pc.seed_hi);
-    const U64 iteration = U64(pc.iteration, pc.iteration_hi);
-    const RngKey rng = rng_key(seed, uint(pixel), iteration, 0u);
-    const RngKey rng_d = rng_key(seed, uint(pixel), iteration, 1u);
-    const RngKey rng_n = rng_key(seed, uint(pixel), iteration, 2u);
-    const float fresh_depth = random_depth(rng, 0u);
-    const vec3 fresh_normal = random_cone_normal(rng, 1u, b_p);
-
-    // The candidates are walked in the CPU's exact order through ONE
-    // evaluate_hypothesis() call site. The call-site count is deliberate: as
-    // nine to eleven separate calls the optimiser inlined a full copy of the
-    // 32-neighbour x 49-sample cost loop for each, which made glslc -O need tens
-    // of gigabytes and get OOM-killed on a CI runner (exit 137), and it also
-    // made the compile take many minutes per lane once the cost core carried its
-    // `precise` marks. One site keeps the module small; the sequence of cost
-    // evaluations, and therefore the winner, is unchanged.
-    const int count = has_incumbent ? PM_FRESH + 2 : 1;
-    for (int i = 0; i < count; ++i) {
-        float depth = 0.0;
-        vec3 normal = vec3(0.0, 0.0, -1.0);
-        bool usable = false;
-        if (!has_incumbent) {
-            // No incumbent yet: seed from the fresh random plane only.
-            depth = fresh_depth;
-            normal = fresh_normal;
-            usable = true;
-        } else if (i < PM_PROPAGATIONS) {
-            // 4 adjacent, then 4 distance-3 sources (all of the opposite
-            // colour). The offset is picked in its own branch so the array index
-            // is in range on every path, even if an optimiser speculates it.
-            ivec2 offset = ivec2(0);
-            if (i < 4) {
-                offset = PM_ADJ[i];
-            } else {
-                offset = PM_FAR[i - 4];
+    if (!(best.depth > 0.0)) {
+        // No incumbent yet: seed from a fresh random plane. The draw indices are
+        // literal (depth 0, cone normal 1 and 2) so the keyed stream cannot be
+        // reordered, and they match the CPU's RngStream use order exactly.
+        const RngKey rng = rng_key(U64(pc.seed_lo, pc.seed_hi), uint(pixel),
+                                   U64(pc.iteration, pc.iteration_hi), 0u);
+        const float seed_depth = random_depth(rng, 0u);
+        const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
+        best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            ivec2 q = ivec2(x, y) + PM_ADJ[i];
+            if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
+                continue;
             }
-            ivec2 q = ivec2(x, y) + offset;
-            if (q.x >= 0 && q.x < w && q.y >= 0 && q.y < h) {
-                usable = propagate_plane(q.y * w + q.x, b_p, depth, normal);
-            }
-        } else if (i == PM_FRESH) {
-            depth = fresh_depth;
-            normal = fresh_normal;
-            usable = true;
-        } else {
-            // Perturb the *current* incumbent in inverse depth and in normal.
-            // This depends on the winner of the candidates above, so it is
-            // computed inside the loop rather than batched up front.
-            float inv_d = 1.0 / best.depth;
-            // `a + b * c` is a fused multiply-add candidate and this value *is*
-            // a depth hypothesis, i.e. the head of the depth-to-pixel chain.
-            precise float perturbed_inv =
-                inv_d + (2.0 * rng_uniform(rng_d, 0u) - 1.0) * pc.depth_delta;
-            if (perturbed_inv > 0.0) {
-                depth = 1.0 / perturbed_inv;
-                normal = perturb_normal(rng_n, 0u, best.normal, pc.normal_angle);
-                usable = true;
-            }
+            best = propagate(x, y, q.y * w + q.x, b_p, best);
         }
-        if (usable) {
-            best = evaluate_hypothesis(x, y, depth, normal, b_p, best);
+        for (int i = 0; i < 4; ++i) {
+            ivec2 q = ivec2(x, y) + PM_FAR[i];
+            if (q.x < 0 || q.x >= w || q.y < 0 || q.y >= h) {
+                continue;
+            }
+            best = propagate(x, y, q.y * w + q.x, b_p, best);
+        }
+        // Refinement: a fresh random plane, then the current plane perturbed in
+        // inverse depth and normal. Streams 0/1/2 keep the three purposes
+        // independent, as on the CPU, and each restarts at draw index 0.
+        const U64 seed = U64(pc.seed_lo, pc.seed_hi);
+        const U64 iteration = U64(pc.iteration, pc.iteration_hi);
+        const RngKey rng = rng_key(seed, uint(pixel), iteration, 0u);
+        const float seed_depth = random_depth(rng, 0u);
+        const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
+        best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+
+        const RngKey rng_d = rng_key(seed, uint(pixel), iteration, 1u);
+        float inv_d = 1.0 / best.depth;
+        // `a + b * c` is a fused multiply-add candidate and this value *is* a
+        // depth hypothesis, i.e. the head of the depth-to-pixel chain.
+        precise float perturbed_inv =
+            inv_d + (2.0 * rng_uniform(rng_d, 0u) - 1.0) * pc.depth_delta;
+        if (perturbed_inv > 0.0) {
+            const RngKey rng_n = rng_key(seed, uint(pixel), iteration, 2u);
+            vec3 perturbed = perturb_normal(rng_n, 0u, best.normal, pc.normal_angle);
+            best = evaluate_hypothesis(x, y, 1.0 / perturbed_inv, perturbed, b_p, best);
         }
     }
-
     if (best.depth > 0.0) {
         state_depth[pixel] = best.depth;
         state_normal[pixel * 3 + 0] = best.normal.x;

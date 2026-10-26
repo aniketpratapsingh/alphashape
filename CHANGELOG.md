@@ -59,7 +59,37 @@ All notable changes to alphashape are recorded here. The format follows
 - **Build Orthomosaic no longer overflows its grid dimensions.** A resolution fine enough to need more than 2^31−1 output cells (or a non-finite one) is refused in double precision with the resolution, the extent, the cell count and "choose a coarser resolution", instead of casting an unbounded double to `int` and then sizing buffers from a negative length.
 - **Build Orthomosaic reports an exhausted allocation honestly.** A `std::length_error` (a buffer whose size exceeds the maximum the process can represent) is treated the same as `std::bad_alloc` and converted to the actionable memory message, instead of escaping as an internal error.
 - **Build Model no longer freezes a 16 GB M1.** Long GPU iteration loops (TV-L1 fusion, screened Poisson, PatchMatch) are now split into submissions sized to about 50–100 ms, and a fence timeout or device loss falls back to the CPU for the rest of the session instead of leaving the display starved.
-- **Depth maps are faster, with GPU/CPU results exact again.** The main PatchMatch search kernel (`pm_refine`, which does all the per-pixel work) was built without the SPIR-V optimiser as a workaround for wrong results on NVIDIA hardware. It is built optimised again — with the size pipeline rather than the full one, because the fix that makes it exact needs `precise` (no fused multiply-adds) through the whole cost loop's projection, which the full pipeline cannot compile in a runner's memory — after fixing real defects in the shaders: a never-taken branch indexed three buffers far out of range (undefined behaviour in Vulkan), search state was threaded through aggregate `inout` parameters, and — the accuracy half of this entry — the whole chain from a candidate plane to the projected pixel coordinate is now excluded from fused multiply-adds, not just its last two statements. The CPU reference computes that chain in double as separately rounded operations, and only one bit of difference is enough: `sample_image()` floors the coordinate, so a neighbouring texel is read, a ZNCC changes and the winner-take-all selection flips. Marking only the coordinates had left the Tesla T4 at 93.4% dense agreement; the full chain brings it back to 100.0%, and the fused TV-L1 mesh back to the CPU's exact boundary-edge count — which is now asserted again instead of tolerated. A new test (`PatchMatchGpu.RefineSweepsMatchCpu`) gates the search kernel itself, which the existing `iterations = 0` test does not reach. `pm_init` — one short dispatch per colour — stays unoptimised on every platform, where its optimised module returns a wrong initial normal on that GPU for reasons not yet isolated.
+- **The GPU PatchMatch shaders no longer rely on undefined behaviour.** Two
+  latent defects in the Vulkan kernels were fixed. A never-taken branch in
+  `keep_bindings_alive()` indexed `views[]`, `view_ints[]` and `offsets[]` by the
+  lane's pixel, but those buffers hold 24×, 4× and 2× the neighbour/window counts
+  — out of range for almost every image, and an out-of-range storage-buffer
+  access is undefined behaviour in Vulkan even in a branch the optimiser may
+  speculate over. It now reads element 0 of each. Search state was also threaded
+  through aggregate `inout` parameters, which glslang lowers to a Function-storage
+  pointer with a copy-back that inlining is least likely to preserve: the RNG is
+  now a stateless keyed stream (draw *n* = `splitmix64^(n+1)` of a key of seed,
+  pixel, iteration and stream, with a literal draw index at every call site), and
+  `Best` is passed and returned by value. On top of that, the whole chain from a
+  candidate plane to the projected pixel coordinate is marked `precise`, not just
+  its last two statements: `sample_image()` floors that coordinate, so a single
+  fused multiply-add — which the CPU's separate double rounding rules out — moves
+  the sample to a neighbouring texel, changes a ZNCC and flips the winner-take-all
+  selection. Marking only the coordinates had left the Tesla T4 at 93.4% dense
+  agreement.
+  **Speed is unchanged: both search kernels stay unoptimised.** `pm_init` and
+  `pm_refine` are still built without the SPIR-V optimiser, because an optimised
+  module of either still changes results on that GPU (93.4% dense agreement for
+  `pm_refine`, 0.92% normal agreement for `pm_init`) and making the projection
+  chain exact also makes `glslc -O` need more memory than a CI runner has. The
+  shaders are now correct enough that a future optimised build is a hardware-lane
+  question rather than a UB question, and two tests hold that line:
+  `PatchMatchGpu.RefineSweepsMatchCpu` gates the search kernel itself (≥99%
+  against the CPU on hardware; the existing `iterations = 0` test never reaches
+  it), and `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused TV-L1 mesh's
+  boundary-edge count is *equal* to the CPU's again — a discontinuous function of
+  that agreement — instead of tolerating a difference. See `LIMITATIONS.md` for
+  the measurements and what has been ruled out.
 
 ### Limitations
 

@@ -20,15 +20,21 @@ const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 
 // Why `precise` appears on selected expressions below and in pm_core.glsl.
 //
-// Under -O glslang/SPIRV-Tools is free to contract `a + b * u` into a fused
-// multiply-add, and NVIDIA hardware does so. The CPU reference in
-// patch_match.cpp computes every such expression in double as two separately
-// rounded operations, and this kernel's output is not smooth in those last bits:
-// sample_image() floors the projected coordinate, so a single-ulp difference
-// near an integer boundary reads a different texel, which changes a neighbour's
-// ZNCC, which flips the winner-take-all selection for the pixel. Measured on the
-// dense fixture: optimised pm_refine alone dropped GPU/CPU depth agreement from
-// 100% to 93.4% purely from that.
+// These kernels are built without the SPIR-V optimiser (see the CMakeLists and
+// alphashape_add_shader), so nothing here is currently contracted. The marks are
+// kept because they encode a property of the algorithm that must survive if a
+// kernel is ever optimised again, and because they cost nothing at -O0: under -O
+// glslang/SPIRV-Tools is free to contract `a + b * u` into a fused multiply-add,
+// and NVIDIA hardware does so.
+//
+// The CPU reference in patch_match.cpp computes every such expression in double
+// as two separately rounded operations, and this kernel's output is not smooth in
+// those last bits: sample_image() floors the projected coordinate, so a single-ulp
+// difference near an integer boundary reads a different texel, which changes a
+// neighbour's ZNCC, which flips the winner-take-all selection for the pixel.
+// Measured on the dense fixture: optimised pm_refine alone dropped GPU/CPU depth
+// agreement from 100% to 93.4% purely from that, and marking only the final
+// projected coordinates did not restore it.
 //
 // `precise` is therefore applied along the whole *chain* that decides which texel
 // is sampled, not just to its last two statements. Declaring only the projected
@@ -40,28 +46,22 @@ const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 //   nb = dot(n, b_p), rho = depth * nb     pm_core.glsl evaluate_hypothesis()
 //   nb = dot(n, b_q), depth_q = rho / nb   pm_core.glsl candidate_depth()
 //   x_n = depth_q * (M b_q) + c            pm_core.glsl neighbour_cost()
-//   rho_q, denom; depth_p = rho_q / denom  pm_core.glsl propagate_plane()
+//   rho_q, denom; depth_p = rho_q / denom  pm_core.glsl propagate()
 //   xd, yd, r2, radial_scale, u, v         project_point(), below
 //   perturbed_inv                          pm_refine.comp
 //
 // The rule is "mark the expression, not the variable's uses", so only operations
 // that *have* a fused form are marked: a dot, an `a + b * c`, a scale-then-add.
 // Divisions, `sqrt` and plain multiplies are already exact as written, and
-// marking them would only enlarge the set of expressions the optimiser must keep
-// non-reassociable -- which is what makes this kernel expensive to compile.
+// marking them would only enlarge the set of expressions an optimiser must keep
+// non-reassociable -- which is what made this kernel expensive to compile.
 // `precise` propagates into an initialiser, so one declaration per stage covers
 // the expression that computes it, and a value stored through `out` or an array
 // carries its non-contracted definition with it.
 //
-// Measured on the Tesla T4: with only u and v marked, optimised pm_refine landed
-// at 93.4% dense agreement and the TV mesh at 1276 vs 1268 boundary edges. The
-// chain above is what restores exactness.
-//
 // Everything off that chain -- the ZNCC accumulators (which have their own
 // precise declarations), the normals and the bilinear weights -- stays free to
 // contract, which is what keeps the 49 x 32 cost loop affordable to optimise.
-// Marking the loop itself is not an option: NoContraction there made glslc -O
-// need tens of gigabytes and CI OOM-killed the shader build (exit 137).
 //
 // The *draws* (rng_uniform64's split sum, random_depth's inverse-depth lerp,
 // random_cone_normal's trig) are deliberately left contractible, even though they
@@ -70,8 +70,47 @@ const float PM_MAX_NORMAL_ANGLE = 1.0471975511965976; // pi / 3
 // difference from the CPU is inherent to the algorithm and NoContraction does not
 // change that. What `precise` buys is the *absence* of a difference the CPU does
 // not have -- a contraction its separate rounding rules out -- and that is what
-// the chain above needed, sitting immediately in front of floor(). Marking the
-// draws was also part of the set that made glslc -O need tens of gigabytes.
+// the chain above needed, sitting immediately in front of floor().
+//
+// MEASUREMENTS AND THE OPEN ISSUE (why both search kernels are built -O0).
+// The chain above is what makes the *arithmetic* exact. It does not make the
+// optimised module match the CPU on NVIDIA, and that is why the shaders are
+// shipped unoptimised. On a Tesla T4 (driver 535.161.07), against the same CPU
+// reference, over this branch's history:
+//
+//   pm_init  at -O   : depth 100.00%  normal  0.92%  cost  31.81%   <- wrong
+//   pm_init  at -O0  : depth 100.00%  normal 100.00%  cost 100.00%   <- correct
+//   pm_refine at -O  : dense agreement 93.4% (with only u/v marked):
+//                      85.6% before the shader defects were fixed
+//   pm_refine at -O0 : dense agreement 100.0%, aerial 100.0%         <- main
+//
+// A deeper problem sits behind those numbers: with `precise` on the whole chain the
+// -O pipeline does not finish at all. glslc needs tens of gigabytes for pm_refine
+// and a CI runner OOM-kills it (exit 137: 7 GB macOS runner, and the GitLab T4
+// lane). NoContraction inside the 49-sample x 32-neighbour cost loop is what
+// stops the optimiser reassociating, and that is where the memory goes. -Os does
+// not help: it was tried and is killed the same way.
+//
+// So the accurate chain and an optimised module are mutually exclusive with this
+// toolchain, and the measured fallback -- -O on pm_refine with no contraction --
+// is 93.4%, not the 100.0% main has. Building both kernels at -O0 is therefore
+// the only configuration that is correct on every lane, and it is what ships.
+// That was confirmed the hard way: the mutable RNG cursor, stateless keyed
+// streams with a loop, and straight-line keyed draws all produced the same
+// 0.92%, so the difference is not state, draw order or the shaders' own undefined
+// behaviour (all three of which were found and fixed independently). It is not
+// the shared cost core either: pm_init's depths, drawn from that same stream at
+// index 0, are 100% exact while its normals, drawn at indices 1 and 2, are not.
+// Diagnosing further needs T4 hardware and spirv-dis of both modules.
+//
+// What this means for a future attempt: an optimised module changes results on
+// NVIDIA, so it cannot be enabled without a hardware lane that gates it. The
+// `PatchMatchGpu.RefineSweepsMatchCpu` test exists for exactly that, at a 99%
+// floor on hardware -- loose enough not to assert bit-identity of another
+// library's sin/cos, tight enough that the 93.4% regression fails it -- and
+// `TvFusionGpu.BuildModelMeetsCpuBounds` asserts the fused mesh's boundary-edge
+// count is equal, a discontinuous function of that agreement and the sharpest
+// available check.
 
 layout(push_constant) uniform PmParams {
     uint width;
@@ -217,14 +256,12 @@ U64 splitmix64(U64 x) {
 // struct passed down through rng_next/random_unit_vector/random_cone_normal/
 // perturb_normal/random_depth. glslang lowers an `inout` aggregate parameter to
 // a pointer into Function storage with an explicit copy-in and copy-out, and the
-// copy-out is what the SPIR-V optimiser's inliner/scalar-replacement pass does
-// not always preserve. The failure was specific and reproducible: in pm_init the
-// depth draw (index 0) stayed correct while the two normal draws came back equal
-// to it, so every pixel got the right depth and a wrong normal (0.9% normal
-// agreement on the Tesla T4 at -O). A keyed stream cannot lose state because
-// there is no state to lose, and it also removes the whole class of
-// "two draws in one argument list" ordering hazards: the draw index is written
-// out at every call site.
+// copy-out is the part an inliner/scalar-replacement pass is least likely to
+// preserve -- undefined behaviour the optimiser is entitled to exploit. That was
+// fixed on its own merits, not because it explained the NVIDIA numbers: with the
+// keyed stream the T4 figure did not move (see the OPEN ISSUE below). The keyed
+// form also removes the whole class of "two draws in one argument list"
+// ordering hazards, since the draw index is written out at every call site.
 struct RngKey {
     U64 state;  // already folded: seed, pixel, iteration and stream
 };
@@ -245,24 +282,14 @@ RngKey rng_key(U64 seed, uint pixel, U64 iteration, uint stream) {
 // The nth raw draw of a stream (n = 0 is the CPU's first next()).
 //
 // Written as straight-line calls rather than a `for (i = 0; i <= index; ++i)`
-// chain, so no run-time trip count exists for an optimiser to get wrong.
+// chain, so no run-time trip count exists for an optimiser to get wrong. That is
+// a correctness improvement in its own right -- a fixed-trip-count loop returning
+// one value for every index is exactly the shape an aggressive optimiser can get
+// wrong -- but it was NOT the cause of the NVIDIA difference: the straight-line
+// form and the loop form produced the same 0.92% normal agreement on the T4, as
+// did the mutable-`inout` generator before them. See the OPEN ISSUE at the top of
+// this file for the measurements and the ruled-out list.
 //
-// OPEN ISSUE, and the reason pm_init is still built with NO_OPTIMIZE. On a Tesla
-// T4 (driver 535.161.07) the optimised pm_init reports depth agreement 100.00%
-// and normal agreement 0.92% against the CPU: depth is drawn at index 0, the
-// normal is built from indices 1 and 2. Every index behaves as index 0. This was
-// true for the original mutable-`inout` generator, for the keyed generator with
-// the loop below, and for these straight-line draws, so it is NOT state loss and
-// NOT the loop shape. pm_refine uses the identical rng_uniform() calls with the
-// same indices and is correct at -O on that GPU in the same run, so the
-// difference must be in how pm_init's module is optimised, not in this code.
-// Everything else about pm_init at -O is correct (depths exact, cost exact for
-// the pixels whose normal happened to match).
-//
-// Do not "fix" this by marking the trig or these draws `precise`: NoContraction
-// in the cost loop made glslc -O need tens of gigabytes and CI OOM-killed it.
-// Diagnosing further needs T4 hardware and spirv-dis of both modules; until then
-// pm_init alone stays unoptimised, which costs one short dispatch per colour.
 // Callers must use PM_DRAW_0/1/2 and never build an index at run time.
 U64 rng_draw0(RngKey key) { return splitmix64(key.state); }
 U64 rng_draw1(RngKey key) { return splitmix64(rng_draw0(key)); }
@@ -331,12 +358,13 @@ vec3 random_unit_vector(RngKey key, uint index) {
 
 // Unit normal inside the 60-degree cone about -b_p: it faces the reference camera.
 //
-// This is where the unresolved T4 difference shows: the optimised pm_init module
-// reports normal agreement 0.92% while the depths drawn from the same stream are
-// exact. See the OPEN ISSUE note at rng_draw(); it is not a draw-order or
-// state-loss problem (three different generator shapes produced the same number).
-// Do not reach for `precise` on the trig to chase it -- NoContraction inside the
-// cost loop made glslc -O need tens of gigabytes and CI OOM-killed it.
+// This is where the unresolved NVIDIA difference shows: the optimised pm_init
+// module reports normal agreement 0.92% on a Tesla T4 while the depths drawn from
+// the same stream are exact. See the OPEN ISSUE at the top of this file; it is not
+// a draw-order or state-loss problem (three different generator shapes produced
+// the same number). Do not reach for `precise` on the trig to chase it:
+// NoContraction in the cost loop makes glslc -O need tens of gigabytes and CI
+// OOM-kills it, which is the other half of why both kernels ship at -O0.
 vec3 random_cone_normal(RngKey key, uint index, vec3 b_p) {
     vec3 axis = normalize(-b_p);
     float cos_min = cos(PM_CONE_HALF_ANGLE);
