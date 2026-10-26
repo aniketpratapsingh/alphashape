@@ -1352,20 +1352,22 @@ TEST(Gpu, BatchedRunIsBitIdenticalToUnsplit) {
     };
 
     // Unsplit reference: one command buffer for everything.
-    Buffer unsplit_x = Buffer::of(*context, random_floats(kCount, 61));
-    Buffer unsplit_y = Buffer::of(*context, random_floats(kCount, 62));
-    const std::vector<Dispatch> unsplit = build(unsplit_x, unsplit_y);
-    ASSERT_NO_THROW(run(*context, unsplit));
+    const std::vector<float> source_x = random_floats(kCount, 61);
+    const std::vector<float> source_y = random_floats(kCount, 62);
+    Buffer unsplit_x = Buffer::of(*context, source_x);
+    Buffer unsplit_y = Buffer::of(*context, source_y);
+    ASSERT_NO_THROW(run(*context, build(unsplit_x, unsplit_y)));
     const std::vector<float> reference_x = unsplit_x.read<float>(kCount);
     const std::vector<float> reference_y = unsplit_y.read<float>(kCount);
-    ASSERT_EQ(reference_x[0], static_cast<float>(kIterations)) << "sanity: the chain ran";
+    ASSERT_FLOAT_EQ(reference_x[0], source_x[0] + static_cast<float>(kIterations))
+        << "sanity: every one of the " << kIterations << " chain_add steps ran";
 
     // Split with the override pinned to one step per submission.
     {
         EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
         alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
-        Buffer split_x = Buffer::of(*context, random_floats(kCount, 61));
-        Buffer split_y = Buffer::of(*context, random_floats(kCount, 62));
+        Buffer split_x = Buffer::of(*context, source_x);
+        Buffer split_y = Buffer::of(*context, source_y);
         BatchLimiter limiter(/*dispatches_per_step=*/2);
         EXPECT_EQ(limiter.steps_per_submission(), 1u);
         const std::size_t submissions =
@@ -1381,8 +1383,8 @@ TEST(Gpu, BatchedRunIsBitIdenticalToUnsplit) {
     {
         EnvGuard guard("ALPHASHAPE_GPU_MAX_BATCH");
         alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "");
-        Buffer adaptive_x = Buffer::of(*context, random_floats(kCount, 61));
-        Buffer adaptive_y = Buffer::of(*context, random_floats(kCount, 62));
+        Buffer adaptive_x = Buffer::of(*context, source_x);
+        Buffer adaptive_y = Buffer::of(*context, source_y);
         BatchLimiter limiter(/*dispatches_per_step=*/2, /*initial_steps=*/1);
         const std::size_t submissions =
             run_batched(*context, build(adaptive_x, adaptive_y), limiter);

@@ -524,6 +524,12 @@ VulkanBuffer::VulkanBuffer(VulkanBackend* backend, VkBuffer buffer, VmaAllocatio
 
 VulkanBuffer::~VulkanBuffer() {
     if (buffer_ != VK_NULL_HANDLE) {
+        // A submission may still read or write this memory -- including one
+        // whose fence wait threw (a device-lost report), which unwinds the
+        // caller straight into this destructor. Freeing while the queue still
+        // references the range is a use-after-free the driver punishes with a
+        // segfault, so drain first, exactly as ~VulkanImage does.
+        backend_->wait_all_pending();
         vmaDestroyBuffer(backend_->allocator(), buffer_, allocation_);
     }
 }

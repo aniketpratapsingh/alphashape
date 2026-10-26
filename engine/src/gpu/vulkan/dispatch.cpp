@@ -137,16 +137,23 @@ const Pipeline& VulkanBackend::pipeline_for(const KernelEntry& kernel) {
 
 void VulkanBackend::wait_fence(VkFence fence) {
     const Functions& fns = instance_->fns;
-    // Once the device is gone its fences never signal and nothing it was given
-    // will complete. The original failure has already thrown out of the
-    // operation that hit it; everything left is cleanup -- a buffer handle
-    // being destroyed, a host copy draining the ring -- and those must not
-    // block for the budget again or throw out of a destructor.
+    // A fence that is already known to be abandoned is only ever waited from
+    // cleanup (a host copy draining the ring, a buffer handle being destroyed).
+    // One short bounded attempt: a genuine device loss never signals and costs
+    // one slice, while a driver that was merely declared lost (the test hook, or
+    // a timeout that raced completion) still finishes the work -- and freeing
+    // memory a running queue still reads would be a use-after-free.
+    const auto drain = [&](VkFence pending) {
+        constexpr std::uint64_t kCleanupSliceNs = 200'000'000ULL;
+        (void)fns.WaitForFences(device_handle_, 1, &pending, VK_TRUE, kCleanupSliceNs);
+    };
     if (device_lost()) {
+        drain(fence);
         return;
     }
     // Test hook: behave exactly like a wedged device without hanging the suite.
     if (consume_forced_fence_timeout()) {
+        drain(fence);
         note_device_lost("forced fence timeout (test hook)");
         throw Error("gpu: fence timeout (forced by test hook)");
     }
@@ -184,7 +191,9 @@ void VulkanBackend::wait_fence(VkFence fence) {
     }
     // A timeout is a device failure, not a slow device: mark the GPU lost so
     // every later call takes its CPU branch, and let with_fallback rerun this
-    // operation on the CPU.
+    // operation on the CPU. Drain once first: the unwind frees the batch's
+    // buffers, and a queue still reading them would fault.
+    drain(fence);
     note_device_lost("no fence signal within " +
                      std::to_string(budget_ns / 1'000'000'000ULL) + " s");
     throw Error("gpu: fence timeout");
@@ -612,6 +621,20 @@ void VulkanBackend::wait_all_pending() {
         }
     }
     // The slots stay pending: they are owned by their tickets until wait().
+    if (device_lost()) {
+        // A transfer that threw a fence timeout left its copy submitted and its
+        // fence unsignalled. The unwind is about to free the buffers that copy
+        // targets, so give both transfer fences one bounded drain here (they are
+        // not slots, so the loop above misses them). Nothing new is submitted
+        // after a device loss, so reading them without transfer_mutex_ is safe.
+        const Functions& fns = instance_->fns;
+        constexpr std::uint64_t kCleanupSliceNs = 200'000'000ULL;
+        for (VkFence fence : {transfer_fence_, image_fence_}) {
+            if (fence != VK_NULL_HANDLE) {
+                (void)fns.WaitForFences(device_handle_, 1, &fence, VK_TRUE, kCleanupSliceNs);
+            }
+        }
+    }
 }
 
 void VulkanBackend::run(const std::vector<DispatchRequest>& dispatches) {
