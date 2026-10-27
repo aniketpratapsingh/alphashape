@@ -16,7 +16,7 @@
       "absolute": 25.0
     },
     "reference_free.ortho.effective_resolution_ratio": {
-      "absolute": 0.2
+      "relative": 0.15
     },
     "reference_free.ortho.gradient_energy": {
       "relative": 0.1

@@ -166,6 +166,11 @@ def regressions(
             entry = {}
         if is_fraction(path):
             limit = float(entry.get("relative", default_relative)) * abs(before)
+        elif "relative" in entry:
+            # A metric that is not a fraction of a total can still be gated
+            # proportionally — a resolution ratio is dimensionless, so "15% worse
+            # than last time" is the meaningful tolerance, not "0.15 coarser".
+            limit = float(entry["relative"]) * abs(before)
         else:
             limit = float(entry.get("absolute", default_absolute))
         # A zero threshold means "report it, never fail on it": a metric with no
@@ -330,10 +335,28 @@ def markdown(
         lines.append(f"| Hole area | {_fmt(ortho.get('hole_area_m2'))} m2 |")
         lines.append(f"| Hole fraction | {_fmt(ortho.get('hole_fraction'))} |")
         lines.append(f"| Largest hole | {_fmt(ortho.get('largest_hole_m2'))} m2 |")
-        lines.append(f"| Effective GSD | {_fmt(ortho.get('effective_gsd_m'))} m |")
-        lines.append(f"| Effective/nominal | {_fmt(ortho.get('effective_resolution_ratio'))} |")
-        if ortho.get("textured") is False:
-            lines.append("| Textured | _no usable texture; resolution not scored_ |")
+        # The ratio is what is gated: effective resolution divided by the mosaic's
+        # OWN cell size. The absolute metres follow from it and the cell size, so a
+        # change in the resolution this run asked for does not move the ratio.
+        unmeasured = (
+            ortho.get("effective_measured") is False
+            or ortho.get("textured") is False
+            or ortho.get("effective_resolution_ratio") is None
+        )
+        if unmeasured:
+            lines.append(
+                "| Effective resolution | _unmeasured — "
+                f"{ortho.get('effective_unmeasured_reason') or 'no usable texture'}_ |"
+            )
+        else:
+            lines.append(
+                f"| Effective resolution | {_fmt(ortho.get('effective_resolution_ratio'))} x cell size |"
+            )
+            if ortho.get("effective_gsd_m") is not None:
+                lines.append(
+                    f"| Effective GSD | {_fmt(ortho.get('effective_gsd_m'))} m "
+                    f"(cell {_fmt(ortho.get('pixel_size_m'))} m) |"
+                )
         if ortho.get("epsg") is not None:
             lines.append(f"| EPSG | {ortho['epsg']} |")
     lines.append("")

@@ -34,6 +34,10 @@ on:
 
 permissions:
   contents: read
+  # The baseline is an artifact from the last SUCCESSFUL run of this workflow, so
+  # the bench job has to list runs and download their artifacts with `gh`. Without
+  # `actions: read` those calls are refused and the regression gate can never fire.
+  actions: read
 
 concurrency:
   group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}
@@ -260,26 +264,54 @@ jobs:
       # workflow on the default branch. Artifacts are per-run, so the run has to be
       # located first; `gh run list` filters on the workflow and the conclusion,
       # which is what makes "last good result" the definition rather than "last
-      # result". A miss (first run, expired artifact, a brand-new dataset) is not an
-      # error: the report says "first run" and the verdict passes.
+      # result".
+      #
+      # Two different "no baseline" cases must NOT be conflated: a genuinely first
+      # run (nothing listed) is fine and the report says "first run", while an API
+      # or permission error means the regression gate has been silently disabled —
+      # which is worse than a red job, because every later run would pass on no
+      # evidence. The download is therefore allowed to be missing (a brand-new
+      # dataset has no artifact yet) but a failure of `gh` itself fails the job.
       - name: Restore the previous run
         id: baseline
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           DATASET: ${{ matrix.dataset }}
         run: |
           mkdir -p build/bench/previous
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow quality-bench.yml \
-                     --branch "${{ github.event.repository.default_branch }}" \
-                     --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-          if [ -z "$run_id" ]; then
-            echo "no previous successful run"
+          # A listing failure is fatal: it can only be a bad token, a missing
+          # permission or a broken API, and all three mean "no gate".
+          if ! runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow quality-bench.yml \
+                        --branch "${{ github.event.repository.default_branch }}" \
+                        --status success --limit 1 --json databaseId \
+                        --jq '.[0].databaseId // empty' 2>&1); then
+            echo "::error::cannot list previous runs; the regression gate is disabled"
+            echo "$runs"
+            exit 1
+          fi
+          if [ -z "$runs" ]; then
+            echo "no previous successful run: this is the first run, not an error"
             exit 0
           fi
+          run_id="$runs"
           echo "previous successful run: $run_id"
-          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-            --name "bench-baseline-$DATASET" --dir build/bench/previous || true
+          # "artifact not found" on an older successful run is legitimate (a new
+          # dataset, or an expiry older than the retention below). Any other
+          # failure is not: a 401/403/5xx here has to surface.
+          if ! err=$(gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                       --name "bench-baseline-$DATASET" --dir build/bench/previous 2>&1); then
+            case "$err" in
+              *"no valid artifacts found"*|*"artifact"*"not found"*|*"HTTP 404"*)
+                echo "that run has no bench-baseline-$DATASET artifact; treating as a first run"
+                echo "::notice::no baseline artifact in run $run_id"
+                ;;
+              *)
+                echo "::error::cannot download the baseline from run $run_id"
+                echo "$err"
+                exit 1
+                ;;
+            esac
+          fi
 
       - name: Find the baseline
         id: baseline-path
@@ -335,13 +367,19 @@ jobs:
       # failing run does NOT: the baseline stays at the last good result, so a
       # regression keeps failing until it is fixed rather than being silently
       # adopted as the new normal.
+      #
+      # 90 days is the maximum this repository's artifact policy allows (a larger
+      # value is silently capped), and it is also the limit on how far back the
+      # baseline can reach. A gap longer than 90 days — the workflow disabled, or
+      # three months of failures — leaves no artifact to find, and the next run
+      # restarts the baseline with a "first run" report rather than failing.
       - name: Publish the new baseline
         if: steps.report.outputs.status == '0'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
         with:
           name: bench-baseline-${{ matrix.dataset }}
           path: build/bench/metrics-${{ matrix.dataset }}.json
-          retention-days: 365
+          retention-days: 90
           if-no-files-found: error
 
       - name: Fail on regression

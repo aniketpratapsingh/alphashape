@@ -508,8 +508,8 @@ def _box_blur(img: np.ndarray, radius: int) -> np.ndarray:
 
 def mtf50_effective_gsd(
     image: np.ndarray,
-    nominal_gsd_m: float,
     *,
+    pixel_size_m: float,
     valid: np.ndarray | None = None,
     max_blur_radius: int = 12,
 ) -> dict:
@@ -520,14 +520,27 @@ def mtf50_effective_gsd(
     sharpness a genuinely half-resolution image would have. That is the
     "MTF50-equivalent" resolution ratio the bench reports.
 
-    It is cheap, monotone, and needs no detectable edge — a mosaic rarely has a
-    clean slanted edge anywhere, and the same scene compared run over run is all
-    this metric has to support. ``ratio`` is effective/nominal (1.0 = the mosaic
-    carries its nominal resolution, 2.0 = it behaves twice as coarse).
+    ``pixel_size_m`` is the ground size of ONE PIXEL OF ``image`` — the mosaic's
+    own cell size, because the crop is taken at full resolution (no striding).
+    The result is therefore measured in metres on the ground:
 
-    ``textured`` is False when the scene has no usable texture (no energy, or
-    energy rising under more blur); a ratio is then reported as 0 rather than a
-    meaningless number.
+      * ``ratio`` = effective resolution / the mosaic's cell size, dimensionless
+        and independent of what the mosaic was asked to produce. This is the
+        quantity to gate.
+      * ``effective_gsd_m`` = the same thing in metres (``pixel_size_m * ratio``).
+
+    An earlier version multiplied the dataset's NOMINAL flight GSD by the ratio,
+    which described neither image: the mosaic cell (0.1 m) and the imagery
+    (0.024 m) are different grids, so the number was off by a factor of four with
+    no way to see it. Deriving both from the crop's own pixel size removes the
+    dataset from the arithmetic entirely.
+
+    ``measured`` is False — and ``ratio``/``effective_gsd_m`` are None — when the
+    scene carries no usable texture, and also when the blur search hit its cap
+    without halving the energy. The second case used to return the cap as if it
+    were a measurement; on a very soft mosaic it silently under-reported the
+    effective GSD. An unmeasured metric is excluded from the regression gate
+    rather than compared against a number it never computed.
     """
     img = np.asarray(image, dtype=np.float64)
     if img.ndim == 3:
@@ -535,9 +548,22 @@ def mtf50_effective_gsd(
     if valid is not None:
         img = np.where(valid, img, 0.0)
 
+    def unmeasured(reason: str, textured: bool) -> dict:
+        return {
+            "ratio": None,
+            "effective_gsd_m": None,
+            "textured": textured,
+            "measured": False,
+            "reason": reason,
+            "attack_px": None,
+        }
+
+    if not math.isfinite(pixel_size_m) or pixel_size_m <= 0.0:
+        raise ValueError("mtf50_effective_gsd needs a positive pixel size in metres")
+
     base = gradient_energy(img)
     if base <= 0.0:
-        return {"ratio": 0.0, "effective_gsd_m": 0.0, "textured": False, "attack_px": 0.0}
+        return unmeasured("no gradient energy: the scene has no usable texture", False)
 
     target = base * 0.5
     previous = base
@@ -552,20 +578,20 @@ def mtf50_effective_gsd(
             attack *= math.sqrt(3.0)
             return {
                 "ratio": attack,
-                "effective_gsd_m": nominal_gsd_m * attack,
+                "effective_gsd_m": pixel_size_m * attack,
                 "textured": True,
+                "measured": True,
+                "reason": None,
                 "attack_px": attack,
             }
         if energy > previous + 1e-12:
-            return {"ratio": 0.0, "effective_gsd_m": 0.0, "textured": False, "attack_px": 0.0}
+            return unmeasured("gradient energy rises under blur: no reliable half-energy point", False)
         previous = energy
 
-    return {
-        "ratio": float(max_blur_radius),
-        "effective_gsd_m": nominal_gsd_m * max_blur_radius,
-        "textured": True,
-        "attack_px": float(max_blur_radius),
-    }
+    return unmeasured(
+        f"blur search hit its {max_blur_radius} px cap without halving the energy",
+        True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1583,12 +1609,18 @@ def read_obj_triangles(path: str, *, max_faces: int | None = None) -> np.ndarray
 # ---------------------------------------------------------------------------
 
 
-def ortho_metrics(ortho: Raster, *, nominal_gsd_m: float, texture_max_side: int = 1024) -> dict:
+def ortho_metrics(ortho: Raster, *, texture_max_side: int = 1024) -> dict:
     """Coverage, holes inside the hull, and effective resolution of a mosaic.
 
     The alpha channel (band 3, when present) is the engine's "this cell came from
     an image" flag, so validity is read from it rather than guessed from colour: a
     black pixel is a legitimate measurement of a black roof.
+
+    Effective resolution is measured on a FULL-RESOLUTION window of the mosaic and
+    reported against the mosaic's own cell size. It is deliberately not related to
+    the dataset's nominal flight GSD: the mosaic cell and the imagery are different
+    grids, and mixing them made the metric depend on a number that describes
+    neither product.
     """
     if ortho.bands >= 4:
         validity = ortho.band(3) > 0
@@ -1605,7 +1637,11 @@ def ortho_metrics(ortho: Raster, *, nominal_gsd_m: float, texture_max_side: int 
     hole_pixel_area = pixel_area * stride * stride
 
     texture = _texture_crop(ortho, validity, texture_max_side)
-    resolution = mtf50_effective_gsd(texture["image"], nominal_gsd_m, valid=texture["valid"])
+    # One pixel of the crop is one cell of the mosaic: the window is taken at full
+    # resolution, so no stride enters the metres-per-pixel conversion.
+    resolution = mtf50_effective_gsd(
+        texture["image"], pixel_size_m=ortho.pixel_size_x, valid=texture["valid"]
+    )
 
     return {
         "width": ortho.width,
@@ -1619,25 +1655,54 @@ def ortho_metrics(ortho: Raster, *, nominal_gsd_m: float, texture_max_side: int 
         "hole_area_m2": holes["area_px"] * hole_pixel_area,
         "hole_fraction": holes["fraction"],
         "largest_hole_m2": holes["largest_px"] * hole_pixel_area,
-        "gradient_energy": float(gradient_energy(texture["image"], valid=texture["valid"])),
-        "effective_gsd_m": resolution["effective_gsd_m"],
+        "gradient_energy": float(gradient_energy(texture["image"], valid=texture["valid"])) if texture["samples"] > 1 else 0.0,
+        # Effective resolution relative to the mosaic's own cell. None when the
+        # scene has no usable texture or the blur search never reached its half
+        # point; the regression gate excludes an unmeasured value.
         "effective_resolution_ratio": resolution["ratio"],
+        "effective_gsd_m": resolution["effective_gsd_m"],
+        "effective_measured": resolution["measured"],
+        "effective_unmeasured_reason": resolution["reason"],
         "textured": resolution["textured"],
         "texture_samples": texture["samples"],
+        "texture_window_px": texture.get("window"),
         "epsg": ortho.epsg,
     }
 
 
 def _texture_crop(ortho: Raster, validity: np.ndarray, max_side: int) -> dict:
-    """RGB float crop of the covered area, at most ``max_side`` on a side."""
+    """A FULL-RESOLUTION window of the covered area, at most ``max_side`` a side.
+
+    No striding: the effective-resolution metric converts its measured blur from
+    pixels to metres through the mosaic's cell size, so a strided crop would
+    silently multiply the answer by the stride. A window of at most
+    ``max_side`` x ``max_side`` of the ORIGINAL grid keeps the pixel-to-metre
+    conversion exact and bounds the memory (1024 x 1024 x RGB is 25 MB).
+
+    The window is centred on the centroid of the covered cells rather than on the
+    bounding box, so a mosaic with a large empty corner still measures a textured
+    interior.
+    """
     rows, cols = np.nonzero(validity)
     if rows.size == 0:
-        return {"image": np.zeros((1, 1)), "valid": np.ones((1, 1), dtype=bool), "samples": 1}
-    r0, r1 = int(rows.min()), int(rows.max()) + 1
-    c0, c1 = int(cols.min()), int(cols.max()) + 1
-    stride = max(1, int(math.ceil(max(r1 - r0, c1 - c0) / max_side)))
+        return {
+            "image": np.zeros((1, 1)),
+            "valid": np.ones((1, 1), dtype=bool),
+            "samples": 1,
+            "window": None,
+        }
+    rows_centre = int(round(float(rows.mean())))
+    cols_centre = int(round(float(cols.mean())))
+    half = max_side // 2
+    r0 = max(0, min(rows_centre - half, max(0, ortho.height - max_side)))
+    c0 = max(0, min(cols_centre - half, max(0, ortho.width - max_side)))
+    r1 = min(ortho.height, r0 + max_side)
+    c1 = min(ortho.width, c0 + max_side)
+    r0 = max(0, r1 - max_side)
+    c0 = max(0, c1 - max_side)
+
     rgb = np.stack(
-        [ortho.band(ch)[r0:r1:stride, c0:c1:stride] for ch in range(min(3, ortho.bands))],
+        [ortho.band(ch)[r0:r1, c0:c1] for ch in range(min(3, ortho.bands))],
         axis=2,
     ).astype(np.float64)
     # Normalise to [0, 1] by the actual peak: uint8 is the norm, but a 16-bit
@@ -1647,8 +1712,9 @@ def _texture_crop(ortho: Raster, validity: np.ndarray, max_side: int) -> dict:
         rgb /= 255.0 if peak <= 255.0 else peak
     return {
         "image": rgb,
-        "valid": validity[r0:r1:stride, c0:c1:stride],
+        "valid": validity[r0:r1, c0:c1],
         "samples": int(rgb.shape[0] * rgb.shape[1]),
+        "window": [int(c0), int(r0), int(c1 - c0), int(r1 - r0)],
     }
 
 
@@ -1806,8 +1872,9 @@ def evaluate(
         except Exception as exc:  # noqa: BLE001 - reported, never fatal
             result["reference_free"]["ortho"] = {"skipped": f"orthomosaic unreadable: {exc}"}
     if ortho is not None:
-        gsd = spec.nominal_gsd_m or ortho.pixel_size_x
-        result["reference_free"]["ortho"] = ortho_metrics(ortho, nominal_gsd_m=gsd)
+        # The effective-resolution metric reads the mosaic's own cell size inside
+        # ortho_metrics; the nominal flight GSD is provenance only.
+        result["reference_free"]["ortho"] = ortho_metrics(ortho)
     elif "ortho" not in result["reference_free"]:
         result["reference_free"]["ortho"] = {"skipped": "no orthomosaic produced"}
 

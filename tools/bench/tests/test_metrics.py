@@ -308,7 +308,7 @@ class MtfTest(unittest.TestCase):
     def test_a_sharp_random_image_reports_a_ratio_near_one(self):
         rng = np.random.default_rng(7)
         image = rng.random((128, 128))
-        result = metrics.mtf50_effective_gsd(image, nominal_gsd_m=0.02)
+        result = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
         self.assertTrue(result["textured"])
         # White noise has almost no spatial correlation, so any blur halves its
         # gradient energy immediately: the ratio stays under two.
@@ -318,21 +318,40 @@ class MtfTest(unittest.TestCase):
     def test_a_pre_blurred_image_reports_a_larger_ratio(self):
         rng = np.random.default_rng(11)
         image = rng.random((128, 128))
-        sharp = metrics.mtf50_effective_gsd(image, nominal_gsd_m=0.02)
-        soft = metrics.mtf50_effective_gsd(metrics._box_blur(image, 2), nominal_gsd_m=0.02)
+        sharp = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
+        soft = metrics.mtf50_effective_gsd(metrics._box_blur(image, 2), pixel_size_m=0.02)
         self.assertGreater(soft["ratio"], sharp["ratio"])
 
-    def test_effective_gsd_scales_with_the_nominal(self):
+    def test_effective_gsd_is_the_cell_size_times_the_ratio(self):
         rng = np.random.default_rng(3)
         image = rng.random((64, 64))
-        one = metrics.mtf50_effective_gsd(image, nominal_gsd_m=0.01)
-        two = metrics.mtf50_effective_gsd(image, nominal_gsd_m=0.02)
+        one = metrics.mtf50_effective_gsd(image, pixel_size_m=0.01)
+        two = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
+        # The ratio is a property of the image alone; only the metre conversion
+        # follows the cell size.
+        self.assertAlmostEqual(two["ratio"], one["ratio"], places=12)
         self.assertAlmostEqual(two["effective_gsd_m"], 2.0 * one["effective_gsd_m"], places=12)
 
     def test_a_flat_image_is_not_textured(self):
-        result = metrics.mtf50_effective_gsd(np.full((32, 32), 0.25), nominal_gsd_m=0.02)
+        result = metrics.mtf50_effective_gsd(np.full((32, 32), 0.25), pixel_size_m=0.02)
         self.assertFalse(result["textured"])
-        self.assertEqual(result["ratio"], 0.0)
+        self.assertFalse(result["measured"])
+        self.assertIsNone(result["ratio"])
+
+    def test_a_search_that_never_halves_is_unmeasured_not_capped(self):
+        # A very smooth image whose energy only falls a little under the whole
+        # search: the answer is "no half-energy point inside the cap", never the
+        # cap itself dressed up as a measurement.
+        image = np.tile(np.arange(64, dtype=np.float64), (64, 1))
+        result = metrics.mtf50_effective_gsd(image, pixel_size_m=0.05, max_blur_radius=2)
+        self.assertFalse(result["measured"])
+        self.assertIsNone(result["ratio"])
+        self.assertIsNone(result["effective_gsd_m"])
+        self.assertIn("cap", result["reason"])
+
+    def test_a_non_positive_pixel_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            metrics.mtf50_effective_gsd(np.ones((8, 8)), pixel_size_m=0.0)
 
 
 class PhaseCorrelationTest(unittest.TestCase):
@@ -971,22 +990,18 @@ class OrthoMetricsTest(unittest.TestCase):
         return metrics.Raster(data, 0.0, float(size), 0.05, 0.05)
 
     def test_full_coverage_reports_one(self):
-        result = metrics.ortho_metrics(self._ortho(), nominal_gsd_m=0.05)
+        result = metrics.ortho_metrics(self._ortho())
         self.assertAlmostEqual(result["covered_fraction"], 1.0)
         self.assertEqual(result["holes_inside_hull"], 0)
 
     def test_an_interior_hole_is_counted_with_its_area(self):
-        result = metrics.ortho_metrics(
-            self._ortho(64, alpha_hole=[(20, 30, 20, 30)]), nominal_gsd_m=0.05
-        )
+        result = metrics.ortho_metrics(self._ortho(64, alpha_hole=[(20, 30, 20, 30)]))
         self.assertAlmostEqual(result["covered_fraction"], (64 * 64 - 100) / (64 * 64))
         self.assertGreaterEqual(result["holes_inside_hull"], 1)
         self.assertGreater(result["hole_area_m2"], 0.0)
 
     def test_a_border_gap_is_not_a_hole(self):
-        result = metrics.ortho_metrics(
-            self._ortho(64, alpha_hole=[(0, 64, 0, 4)]), nominal_gsd_m=0.05
-        )
+        result = metrics.ortho_metrics(self._ortho(64, alpha_hole=[(0, 64, 0, 4)]))
         self.assertEqual(result["holes_inside_hull"], 0)
 
     def test_the_alpha_channel_not_the_colour_decides_coverage(self):
@@ -994,13 +1009,39 @@ class OrthoMetricsTest(unittest.TestCase):
         # surface, not a gap.
         ortho = self._ortho(32)
         ortho.data[8:16, 8:16, :3] = 0
-        result = metrics.ortho_metrics(ortho, nominal_gsd_m=0.05)
+        result = metrics.ortho_metrics(ortho)
         self.assertAlmostEqual(result["covered_fraction"], 1.0)
 
-    def test_effective_resolution_is_reported(self):
-        result = metrics.ortho_metrics(self._ortho(), nominal_gsd_m=0.05)
-        self.assertTrue(result["textured"])
+    def test_effective_resolution_is_reported_against_the_mosaic_cell(self):
+        # The metric must not depend on a dataset's nominal GSD: 0.05 m cells mean
+        # effective_gsd_m = 0.05 * ratio, whatever the imagery's own GSD was.
+        result = metrics.ortho_metrics(self._ortho())
+        self.assertTrue(result["effective_measured"])
         self.assertGreater(result["effective_gsd_m"], 0.0)
+        self.assertAlmostEqual(
+            result["effective_gsd_m"],
+            0.05 * result["effective_resolution_ratio"],
+            places=12,
+        )
+
+    def test_an_untextured_mosaic_is_unmeasured_not_zero(self):
+        flat = np.zeros((64, 64, 4), dtype=np.uint8)
+        flat[:, :, 3] = 255
+        ortho = metrics.Raster(flat, 0.0, 64.0, 0.05, 0.05)
+        result = metrics.ortho_metrics(ortho)
+        self.assertFalse(result["effective_measured"])
+        self.assertIsNone(result["effective_resolution_ratio"])
+        self.assertIsNone(result["effective_gsd_m"])
+
+    def test_the_texture_window_is_taken_at_full_resolution(self):
+        # A 3000 x 3000 mosaic with a 1024 cap must give a 1024-square window whose
+        # pixels are still the mosaic's own cells (no stride).
+        ortho = metrics.Raster(
+            np.full((3000, 3000, 4), 200, dtype=np.uint8), 0.0, 3000.0, 0.1, 0.1
+        )
+        texture = metrics._texture_crop(ortho, np.ones((3000, 3000), dtype=bool), 1024)
+        self.assertEqual(texture["samples"], 1024 * 1024)
+        self.assertEqual(texture["window"][2:], [1024, 1024])
 
 
 class DemMetricsTest(unittest.TestCase):

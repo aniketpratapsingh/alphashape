@@ -207,6 +207,38 @@ class RegressionTest(unittest.TestCase):
         bad, _ = report.regressions(current, previous, thresholds())
         self.assertNotIn("reference_based.dem.median_m", [r["metric"] for r in bad])
 
+    def test_a_relative_tolerance_gates_a_dimensionless_ratio(self):
+        # effective_resolution_ratio is dimensionless: the policy gates "15% worse
+        # than last time", not "0.15 coarser".
+        policy = thresholds()
+        policy["tolerances"]["reference_free.ortho.effective_resolution_ratio"] = {"relative": 0.15}
+        previous = metrics()
+        previous["reference_free"]["ortho"]["effective_resolution_ratio"] = 1.0
+
+        current = metrics()
+        current["reference_free"]["ortho"]["effective_resolution_ratio"] = 1.14
+        bad, _ = report.regressions(current, previous, policy)
+        self.assertEqual(bad, [])
+
+        current = metrics()
+        current["reference_free"]["ortho"]["effective_resolution_ratio"] = 1.30
+        bad, _ = report.regressions(current, previous, policy)
+        self.assertIn("reference_free.ortho.effective_resolution_ratio",
+                      [r["metric"] for r in bad])
+
+    def test_an_unmeasured_effective_resolution_never_enters_the_gate(self):
+        # A None ratio disappears in flatten(), so the metric cannot be compared;
+        # this test is the contract that keeps a "could not measure" from reading
+        # as a regression.
+        policy = thresholds()
+        policy["tolerances"]["reference_free.ortho.effective_resolution_ratio"] = {"relative": 0.15}
+        previous = metrics()
+        previous["reference_free"]["ortho"]["effective_resolution_ratio"] = 1.0
+        current = metrics()
+        current["reference_free"]["ortho"]["effective_resolution_ratio"] = None
+        bad, _ = report.regressions(current, previous, policy)
+        self.assertEqual(bad, [])
+
     def test_a_falling_f_score_is_a_regression(self):
         previous = metrics()
         current = metrics()
@@ -311,8 +343,18 @@ class MarkdownTest(unittest.TestCase):
     def test_an_untextured_mosaic_is_called_out(self):
         current = metrics()
         current["reference_free"]["ortho"]["textured"] = False
+        current["reference_free"]["ortho"]["effective_measured"] = False
+        current["reference_free"]["ortho"]["effective_resolution_ratio"] = None
+        current["reference_free"]["ortho"]["effective_gsd_m"] = None
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("no usable texture", text)
+        self.assertIn("unmeasured", text)
+
+    def test_the_effective_resolution_is_reported_against_the_cell(self):
+        text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("1.200 x cell size", text)
+        self.assertIn("cell 0.02 m", text)
+        self.assertNotIn("Effective/nominal", text)
 
 
 class ReprojectionReportingTest(unittest.TestCase):

@@ -21,8 +21,8 @@ only when the publisher ships a matching reference product.
 |---|---|
 | Ortho covered fraction | share of the mosaic's grid that came from an image |
 | Holes inside the convex hull | gaps inside the surveyed area, with their count and area in m² |
-| Effective GSD | how much resolution the mosaic actually carries, as a ratio to the nominal GSD (a matched-blur MTF50-equivalent) |
-| Gradient energy | raw sharpness, the quantity the effective GSD is derived from |
+| Effective resolution | how much resolution the mosaic actually carries, as a multiple of the mosaic's own cell size (a matched-blur MTF50-equivalent measured on a full-resolution window) |
+| Gradient energy | raw sharpness, the quantity the effective resolution is derived from |
 | DEM nodata fraction | share of DEM cells with no measurement |
 | Cameras aligned | aligned / total cameras in the saved project |
 | Reprojection RMS | the engine's own bundle-adjustment RMS, parsed from its `AlignCameras` output, plus an independent re-projection from the saved project (see below) |
