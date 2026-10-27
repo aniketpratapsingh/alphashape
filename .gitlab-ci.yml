@@ -29,13 +29,14 @@ variables:
   # of overlapping patterns runs each test once).
   GPU_TEST_FILTER: "*Gpu*:PatchMatch*:BuildDense*:BuildModel*:FullPipelineDense*:BuildTexture*:BuildDemPipeline*:BuildOrthomosaic*"
 
+# Packages go through the same installer the GitHub workflows use: it rotates mirrors when the
+# configured one stalls and refreshes only the Ubuntu sources. The runners here are containers
+# (root, no actions/cache), so it takes the network path directly.
 .deps: &deps
-  - apt-get update -qq
-  - >
-    apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build ccache curl
+  - .github/ci/apt-install.sh build-essential cmake ninja-build ccache curl
     ca-certificates libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
     libpng-dev libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools
-    vulkan-tools libxext6 libx11-6 libegl1 >/dev/null
+    vulkan-tools libxext6 libx11-6 libegl1
 
 build:
   stage: build
