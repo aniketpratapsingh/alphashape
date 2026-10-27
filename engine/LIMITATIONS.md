@@ -102,12 +102,20 @@ sections below give the engineering detail behind each item.
   `set_marker_position`). Scale bars exist in the data model and the
   commands, but have no Python binding yet. No interface for either is in
   this release.
-- **Depth maps are slow at fine settings.** Build Depth Maps runs the full
-  search at the working resolution, with no coarse-to-fine pass. The default
-  (`downscale` 4) is practical; `downscale` 2 has four times the pixels and
-  on 36 twelve-megapixel photos took days, not minutes. A cancelled run keeps
-  the cameras it finished (see below) but cannot speed up the ones it did not,
-  and the cross-view filter has no coarse-to-fine pass either.
+- **Depth maps are slow at fine settings.** The search is coarse-to-fine (see
+  below), which moves most of the sweeps to reduced resolutions, but the
+  reference-resolution level still runs over every pixel and the default
+  (`downscale` 4) is the practical setting: `downscale` 2 has four times the
+  pixels. A cancelled run keeps the cameras it finished (see below) but cannot
+  speed up the ones it did not, and the cross-view filter has no coarse-to-fine
+  pass either.
+- **The coarse-to-fine search is a speed trade, not an accuracy claim.** The
+  pyramid's levels inherit a plane from the level beneath and refine it, so a
+  scene whose correct depth is outside what the coarse level could represent
+  (very thin structure, a surface seen only at the finest level) is found only
+  if the fine level's own random draws reach it. The tests bound the difference
+  against a flat single-level run rather than proving equality, and
+  `pyramid_levels = 1` restores the flat search exactly.
 - **Accuracy is unproven on real surveys.** Every end-to-end check runs on
   synthetic scenes with known geometry. The dense stage has not been
   measured against a real camera with real lens distortion, real GPS error
@@ -166,8 +174,13 @@ sections below give the engineering detail behind each item.
 - Re-aligning cameras does not invalidate existing depth maps.
 - *(Fixed in M9.)* The multi-view cost counted neighbours that could not see a pixel as failed matches, which erased most pixels on low-overlap (nadir grid) blocks. Per-camera coverage on the aerial block rose from 26–54% to 74–95%.
 - Ground seen by only one camera gets no depth: there is no single-view or shape-from-shading fallback.
-- Census matching cost and coarse-to-fine (multi-resolution) PatchMatch are not
-  built.
+- Census matching cost is not built.
+- **Coarse-to-fine (multi-resolution) PatchMatch is built** (WP-17.14): the
+  search runs at up to `pyramid_levels` reduced resolutions and each finer
+  level starts from the plane the level beneath found. It is on by default
+  (`pyramid_levels = 0`, automatic to a 256 px shortest side); 1 restores the
+  single-level search. See the coarse-to-fine items in the 0.1.0 release
+  section for its limits.
 - Full-pipeline accuracy on the 8-image arc is limited by alignment (0.2 px
   feature noise on a short baseline), not by stereo.
 

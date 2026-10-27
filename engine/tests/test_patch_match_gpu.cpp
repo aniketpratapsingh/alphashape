@@ -345,6 +345,9 @@ PatchMatchOptions plane_options() {
     options.iterations = 6;
     options.max_cost = 0.5;
     options.seed = 12345;
+    // One level: these tests calibrate against the pre-pyramid search. The
+    // pyramid has its own agreement test (PyramidAgreesWithCpu).
+    options.pyramid_levels = 1;
     return options;
 }
 
@@ -549,6 +552,111 @@ TEST(PatchMatchGpu, SplitSubmissionsAreBitIdentical) {
     }
 }
 
+TEST(PatchMatchGpu, SweepProgressReportsMonotoneFractions) {
+    // The hook must describe the WHOLE search, not one level of it: a level's
+    // share is its own half-sweeps over the run's, spent across that level's
+    // sweeps. Getting the scale wrong is silent -- the bar simply never gets
+    // far -- so the shape is pinned here rather than eyeballed: with 1 / the
+    // run's sweep count used as the level's share, the progress was divided by
+    // the sweep count a second time and a finished level reported 1/12 of the
+    // progress it had actually made.
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(96, 72, 100.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    neighbours.resize(1);  // the progress values do not depend on the count
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    // One dispatch per submission, so every half-sweep's milestone is reported
+    // regardless of how fast this device is. The adaptive limiter is free to
+    // batch several sweeps into one submission, which is correct for the bar but
+    // would make the exact values below depend on the machine.
+    struct EnvGuard {
+        const char* name;
+        std::string previous;
+        explicit EnvGuard(const char* variable)
+            : name(variable), previous(alphashape::platform::get_env(variable)) {}
+        ~EnvGuard() { alphashape::platform::set_env(name, previous); }
+    };
+    EnvGuard batch("ALPHASHAPE_GPU_MAX_BATCH");
+    EnvGuard band("ALPHASHAPE_GPU_MAX_BAND_PIXELS");
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BATCH", "1");
+    alphashape::platform::set_env("ALPHASHAPE_GPU_MAX_BAND_PIXELS", "100000000");
+
+    const auto progress_of = [&](PatchMatchOptions options) {
+        std::vector<double> reported;
+        options.on_sweep = [&](double fraction) { reported.push_back(fraction); };
+        stereo::run_patch_match_device(reference, neighbours, options);
+        return reported;
+    };
+    const auto expect_shape = [](const std::vector<double>& reported, const char* what) {
+        ASSERT_GE(reported.size(), 2U)
+            << what << ": the hook must report more than the final tick";
+        for (std::size_t i = 0; i < reported.size(); ++i) {
+            EXPECT_GE(reported[i], 0.0) << what << " report " << i;
+            EXPECT_LE(reported[i], 1.0) << what << " report " << i;
+            if (i > 0) {
+                EXPECT_GE(reported[i], reported[i - 1])
+                    << what << " report " << i << " went backwards (" << reported[i - 1]
+                    << " -> " << reported[i] << ")";
+            }
+        }
+        EXPECT_DOUBLE_EQ(reported.back(), 1.0) << what << " did not finish at 1.0";
+    };
+
+    // A single level with six iterations is twelve half-sweeps, so the last
+    // report before the final tick has 11/12 behind it. Anything much below that
+    // means the level's share was scaled down again.
+    PatchMatchOptions single = plane_options();
+    single.pyramid_levels = 1;
+    single.iterations = 6;
+    single.window_radius = 3;
+    single.window_step = 3;
+    const std::vector<double> single_reported = progress_of(single);
+    expect_shape(single_reported, "single level");
+    ASSERT_GE(single_reported.size(), 2U);
+    EXPECT_GE(single_reported[single_reported.size() - 2], 0.8)
+        << "last pre-final report was " << single_reported[single_reported.size() - 2]
+        << "; the sweeps lower a single-level run reports are 1/12 apart";
+
+    // Enough sweeps that the second-to-last report is within 1% of the end: the
+    // bar must get there from the SWEEPS, not from a single trailing tick.
+    PatchMatchOptions long_run = single;
+    long_run.iterations = 60;  // 120 half-sweeps, so the pre-final report is 119/120
+    const std::vector<double> long_reported = progress_of(long_run);
+    expect_shape(long_reported, "long run");
+    ASSERT_GE(long_reported.size(), 2U);
+    EXPECT_GE(long_reported[long_reported.size() - 2], 0.99)
+        << "last pre-final report was " << long_reported[long_reported.size() - 2];
+
+    // A pyramid must be monotone ACROSS level boundaries, and each level must
+    // spend its own share rather than restarting at its base.
+    PatchMatchOptions pyramid = single;
+    pyramid.iterations = 6;
+    pyramid.pyramid_levels = 2;
+    const std::vector<int> plan =
+        stereo::patch_match_iteration_plan(scene.reference.width(), scene.reference.height(),
+                                           pyramid);
+    ASSERT_EQ(plan.size(), 2U) << "the two-level request should survive here";
+    const std::vector<double> pyramid_reported = progress_of(pyramid);
+    expect_shape(pyramid_reported, "two levels");
+    // The coarse level owns 2 * plan[0] of the 2 * (plan[0] + plan[1]) sweeps, so
+    // some report must land strictly inside its share -- not only the 0 it
+    // starts at and not only the boundary value.
+    const double coarse_share =
+        static_cast<double>(2 * plan[0]) / static_cast<double>(2 * (plan[0] + plan[1]));
+    bool coarse_reported = false;
+    for (const double value : pyramid_reported) {
+        if (value > 0.0 && value < coarse_share - 1e-12) {
+            coarse_reported = true;
+        }
+    }
+    EXPECT_TRUE(coarse_reported) << "the coarse level reported no progress of its own";
+}
+
 // ---------------------------------------------------------------------------
 // 5. Fallback semantics
 // ---------------------------------------------------------------------------
@@ -613,6 +721,9 @@ TEST(PatchMatchGpu, DenseFixtureAccuracy) {
     options.depth_min = hood.depth_min;
     options.depth_max = hood.depth_max;
     options.seed = 7;
+    // Single level: this test's 0.90 floor was calibrated on the flat search,
+    // and PyramidAgreesWithCpu is the pyramid's own gate.
+    options.pyramid_levels = 1;
 
     const PatchMatchResult gpu_result =
         stereo::run_patch_match_device(reference, neighbours, options);
@@ -652,6 +763,9 @@ TEST(PatchMatchGpu, InitialPlanesMatchCpu) {
     options.seed = 7;
     options.iterations = 0;
     options.max_cost = 3.0;  // keep every initialised pixel
+    // Zero sweeps is a single random initialisation at the reference
+    // resolution; the pyramid would seed the fine level from a coarse one.
+    options.pyramid_levels = 1;
 
     const PatchMatchResult gpu_result =
         stereo::run_patch_match_device(reference, neighbours, options);
@@ -736,6 +850,10 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
     // directly comparable with DenseFixtureAccuracy's, which is the measurement
     // the floor above is calibrated against.
     options.iterations = 6;
+    // The gate measures pm_refine, so it runs the search it has always run: one
+    // level at the reference resolution. The pyramid is gated separately by
+    // PyramidAgreesWithCpu.
+    options.pyramid_levels = 1;
 
     const std::shared_ptr<gpu::Context> context = gpu::default_context();
     const bool software = context != nullptr && gpu::is_software_device(context->info());
@@ -779,6 +897,86 @@ TEST(PatchMatchGpu, RefineSweepsMatchCpu) {
         << " comparable pixels; a fused multiply-add on the depth/plane-to-pixel path (see the "
            "note at the top of pm_math.glsl) is the usual cause";
     EXPECT_GT(normal_fraction, software ? 0.90 : 0.99);
+}
+
+// The RefineSweepsMatchCpu floor above is calibrated at pyramid_levels=1, which
+// is the search it has always measured. Pin that here so a later change to the
+// default cannot quietly move the gate's meaning -- the pyramid has its own gate
+// (PyramidAgreesWithCpu) with a bound of its own.
+TEST(PatchMatchGpu, RefineSweepsGateRunsSingleLevel) {
+    const PatchMatchOptions defaults;
+    EXPECT_EQ(defaults.pyramid_levels, 0) << "the shipped default is automatic";
+    PatchMatchOptions single;
+    single.pyramid_levels = 1;
+    EXPECT_EQ(single.pyramid_levels, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Coarse-to-fine on the GPU: agreement with the CPU at the pyramid default
+// ---------------------------------------------------------------------------
+
+/// The pyramid default (automatic levels) on the dense fixture, against the
+/// CPU's own pyramid run over the same inputs. The two paths build their level
+/// plans from the same `patch_match_iteration_plan`, apply the same
+/// `pyramid_upsample` to the carried map and search from the same
+/// `pyramid_search_span`, so what differs is only the kernel arithmetic -- the
+/// same precision difference RefineSweepsMatchCpu measures, now on the whole
+/// pyramid rather than on one level.
+///
+/// It is a separate test rather than a second assertion in RefineSweepsMatchCpu
+/// because that one is the calibrated NVIDIA regression gate for pm_refine: if
+/// the pyramid also failed there, a real kernel regression and a
+/// coarse-to-fine bookkeeping bug would arrive as one indistinguishable number.
+TEST(PatchMatchGpu, PyramidAgreesWithCpu) {
+    REQUIRE_GPU_PM();
+    const auto inputs = dense_inputs(2);
+    const stereo::ViewNeighbourhood& hood = inputs->neighbourhoods.front();
+    std::vector<PMView> neighbours;
+    for (const std::int32_t id : hood.neighbours) {
+        neighbours.push_back(inputs->view(id));
+    }
+    const PMView reference = inputs->view(hood.camera_id);
+
+    PatchMatchOptions options;
+    options.depth_min = hood.depth_min;
+    options.depth_max = hood.depth_max;
+    options.seed = 7;
+    options.iterations = 6;
+    // Automatic: 240x180 at the 256 default floor is already one level, so ask
+    // for a pyramid explicitly with a floor that the fixture can reach.
+    options.pyramid_levels = 0;
+    options.pyramid_min_size = 64;
+
+    const std::vector<int> plan =
+        stereo::patch_match_iteration_plan(reference.image->width(),
+                                           reference.image->height(), options);
+    ASSERT_GE(plan.size(), 2U) << "the fixture must exercise a real pyramid";
+
+    const std::shared_ptr<gpu::Context> context = gpu::default_context();
+    const bool software = context != nullptr && gpu::is_software_device(context->info());
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result = stereo::run_patch_match(reference, neighbours, options);
+    ASSERT_EQ(gpu_result.depth.size(), cpu_result.depth.size());
+
+    const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
+    const std::size_t gpu_valid = valid_pixels(gpu_result);
+    const std::size_t cpu_valid = valid_pixels(cpu_result);
+    std::printf("[gpu pyramid] camera %d, %zu levels: agree<1%% %.2f%% of %zu | valid gpu %zu "
+                "cpu %zu | %s\n",
+                hood.camera_id, plan.size(), 100.0 * agreement.fraction, agreement.both, gpu_valid,
+                cpu_valid, software ? "software device" : "hardware device");
+
+    ASSERT_GT(agreement.both, 1000U);
+    // The same shape of bound as RefineSweepsMatchCpu, one notch looser: a
+    // pyramid runs the level plan twice (once per path) and a hole in the coarse
+    // map is a different random plane on each, so a handful more pixels land on
+    // a different local minimum. A real port regression moves this by tens of
+    // percent, not by one.
+    EXPECT_GT(agreement.fraction, software ? 0.88 : 0.98);
+    EXPECT_NEAR(static_cast<double>(gpu_valid), static_cast<double>(cpu_valid),
+                0.05 * static_cast<double>(cpu_valid));
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1150,9 @@ TEST(PatchMatchGpu, AerialBlockValidFractionMatchesCpu) {
         options.depth_min = hood.depth_min;
         options.depth_max = hood.depth_max;
         options.seed = 11;
+        // Single level: this test's figures are the flat search's, and the
+        // aerial block's 0.90 agreement floor was calibrated against them.
+        options.pyramid_levels = 1;
 
         const double gpu_seconds = time_seconds(
             [&] { return stereo::run_patch_match_device(reference, neighbours, options); });
@@ -994,6 +1195,9 @@ TEST(PatchMatchGpu, TimingAgainstCpu) {
     options.depth_min = hood.depth_min;
     options.depth_max = hood.depth_max;
     options.seed = 3;
+    // Single level, so the reported ratio stays the pm_refine figure
+    // LIMITATIONS.md documents.
+    options.pyramid_levels = 1;
 
     // Warm the device so pipeline compilation is not charged to the benchmark.
     ASSERT_TRUE(stereo::patch_match_gpu_would_run(reference, neighbours, options));

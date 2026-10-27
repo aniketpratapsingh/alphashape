@@ -35,6 +35,7 @@ add_executable(alphashape_tests
     test_fusion.cpp
     test_depth_filter.cpp
     test_patch_match.cpp
+    test_patch_match_pyramid.cpp
     test_patch_match_gpu.cpp
     test_build_dense.cpp
     test_voxel_grid.cpp

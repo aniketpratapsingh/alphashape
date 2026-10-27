@@ -8,6 +8,26 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Build Depth Maps searches coarse to fine.** The PatchMatch search now runs
+  first on a reduced copy of each camera's block and starts every finer level
+  from the level beneath, instead of spending the whole budget at the working
+  resolution. The transfer needs no rescaling: halving a calibration also halves
+  the focal length and re-expresses the principal point about the halved image
+  centre, so a coarse pixel's bearing is the bearing of the fine coordinate
+  between the two pixels it covers, and depth along a bearing and a
+  camera-frame normal are the same numbers at both levels. Depths and normals
+  are therefore carried bilinearly (a coarse hole is excluded from the
+  interpolation rather than averaged in as a hole), the random search at a
+  finer level starts from the measured local depth variation instead of the
+  full configured range, and the iteration budget is split so the finest level
+  takes 40 % and the coarse levels — which hold a quarter of the pixels each —
+  take the rest. Two new `BuildDepthMaps` parameters control it:
+  `pyramid_levels` (0 = automatic, 1 = a single level at the working
+  resolution, N = exactly N) and `pyramid_min_size` (the shortest side an
+  automatic pyramid stops shrinking at, 256 px by default). The depth-map
+  fingerprint records the level count the run actually used, so a map built
+  before this change is still reused by a single-level run and rebuilt by a
+  pyramid run. The CPU and the GPU path both implement it from the same plan.
 - **Build Orthomosaic processes the output in blocks, so a full-resolution ortho
   fits in memory.** A run whose whole-grid estimate fits the machine's budget
   still builds as one piece, byte for byte as before; a larger one is split into

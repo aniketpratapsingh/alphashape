@@ -31,18 +31,35 @@ void main() {
     }
     state_active[pixel] = 1u;
     vec3 b_p = pixel_bearing(pixel);
-    // Draw order matches the CPU's RngStream use: depth first, then the cone
-    // normal (two draws). The indices are explicit here so the stream cannot be
-    // reordered by an optimiser that folds two calls into one argument list.
-    const RngKey rng = rng_key(U64(pc.seed_lo, pc.seed_hi), uint(pixel),
-                               U64(pc.iteration, pc.iteration_hi), 0u);
     Best best;
     best.depth = -1.0;
     best.normal = vec3(0.0, 0.0, -1.0);
     best.cost = 3.402823466e+38;
-    const float seed_depth = random_depth(rng, 0u);
-    const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
-    best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+    if (pc.seed_mode == 1u) {
+        // Coarse-to-fine: start from the plane the coarser level handed down,
+        // which the host upsampled into the state buffers. It is evaluated at
+        // THIS level's geometry, because a cost is only comparable within one
+        // level, and the evaluation is what rejects an inherited plane whose
+        // normal no longer faces the reference. A pixel with no inherited plane
+        // (a hole in the coarse map) falls through to the random draw.
+        float inherited_depth = state_depth[pixel];
+        vec3 inherited = vec3(state_normal[pixel * 3 + 0], state_normal[pixel * 3 + 1],
+                              state_normal[pixel * 3 + 2]);
+        if (inherited_depth > 0.0 && dot(inherited, inherited) > 1e-12) {
+            best = evaluate_hypothesis(x, y, inherited_depth, normalize(inherited), b_p, best);
+        }
+    }
+    if (!(best.depth > 0.0)) {
+        // Draw order matches the CPU's RngStream use: depth first, then the cone
+        // normal (two draws). The indices are explicit here so the stream cannot
+        // be reordered by an optimiser that folds two calls into one argument
+        // list.
+        const RngKey rng = rng_key(U64(pc.seed_lo, pc.seed_hi), uint(pixel),
+                                   U64(pc.iteration, pc.iteration_hi), 0u);
+        const float seed_depth = random_depth(rng, 0u);
+        const vec3 seed_normal = random_cone_normal(rng, 1u, b_p);
+        best = evaluate_hypothesis(x, y, seed_depth, seed_normal, b_p, best);
+    }
     if (best.depth > 0.0) {
         state_depth[pixel] = best.depth;
         state_normal[pixel * 3 + 0] = best.normal.x;

@@ -86,6 +86,7 @@ layout(push_constant) uniform PmParams {
     uint seed_hi;       // PatchMatchOptions::seed, high word
     uint touch;         // always 0: keeps every binding alive through -O
     uint row_offset;    // first output row of this dispatch's row band
+    uint seed_mode;     // 0 = random initial planes, 1 = seed from the state buffers
 } pc;
 
 layout(binding = 0) buffer RefImage { float ref_img[]; };

@@ -155,6 +155,12 @@ struct DepthMapFingerprintContext {
     int window_radius = 0;
     int window_step = 0;
     int iterations = 0;
+    /// Coarse-to-fine: the number of levels the map's search actually ran at,
+    /// resolved from the request and the working image size (1 = no pyramid).
+    /// Folded only when it exceeds 1, so a map built before the pyramid existed
+    /// -- which recorded nothing here (0), i.e. the flat search -- is still
+    /// reused by a run that resolves to a single level.
+    int pyramid_levels = 1;
     std::uint64_t seed = 0;
 };
 

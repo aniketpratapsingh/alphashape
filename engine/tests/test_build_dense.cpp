@@ -1494,6 +1494,66 @@ TEST(DepthMapsReuse, FingerprintCoversTheNeighbourhood) {
     EXPECT_NE(h, 0U);
 }
 
+TEST(DepthMapsReuse, FingerprintCoversThePyramidLevelCount) {
+    // The number of levels a map was searched at is part of its identity -- a
+    // pyramid run and a flat run are different maps -- with one deliberate
+    // exception: a single-level run folds nothing, so a map built before the
+    // pyramid existed (which recorded no level count, i.e. the flat search) is
+    // still reused by a run that resolves to one level. Both directions are
+    // pinned here because getting it backwards is silent: either every old
+    // project is rebuilt on first open, or a pyramid map is served to a flat run.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    ASSERT_FALSE(chunk.cameras().empty());
+    ASSERT_FALSE(chunk.sensors().empty());
+    const Camera& camera = chunk.cameras().front();
+    const Sensor& sensor = chunk.sensors().front();
+
+    DepthMapFingerprintContext context;
+    context.max_neighbors = 16;
+    context.neighbour_ids = {1, 2};
+    context.neighbour_poses = {chunk.cameras()[1].pose, chunk.cameras()[2].pose};
+    context.neighbour_calibrations = {sensor.calibration, sensor.calibration};
+    context.depth_min = 5.0;
+    context.depth_max = 40.0;
+    context.image_path = "photos/a.jpg";
+    context.image_size = 1234;
+    context.image_mtime = 5678;
+    context.window_radius = 5;
+    context.window_step = 2;
+    context.iterations = 6;
+    context.seed = 42;
+
+    context.pyramid_levels = 1;
+    const std::uint64_t single =
+        depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &context);
+    // A pyramid_levels=1 run keeps matching its own map: same inputs, same hash.
+    EXPECT_EQ(single, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &context));
+    // A stored map with no level count (0, what a project saved before the field
+    // existed carries) IS a single-level map, so the new run must reuse it.
+    DepthMapFingerprintContext legacy = context;
+    legacy.pyramid_levels = 0;
+    EXPECT_EQ(single, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &legacy))
+        << "a map with no recorded level count must still match a single-level run";
+
+    // A three-level run must NOT be reused by, or reuse, any of the above.
+    DepthMapFingerprintContext pyramid = context;
+    pyramid.pyramid_levels = 3;
+    const std::uint64_t three =
+        depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &pyramid);
+    EXPECT_NE(three, single) << "a pyramid map was matched to a single-level run";
+    EXPECT_NE(three, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &legacy))
+        << "a pyramid map was matched to a map with no recorded level count";
+    // Two levels is its own identity too, and stable.
+    DepthMapFingerprintContext two = context;
+    two.pyramid_levels = 2;
+    const std::uint64_t two_hash =
+        depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &two);
+    EXPECT_NE(two_hash, single);
+    EXPECT_NE(two_hash, three);
+    EXPECT_EQ(two_hash, depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &two));
+}
+
 // ---------------------------------------------------------------------------
 // 4. The fingerprint round-trips through the project file
 // ---------------------------------------------------------------------------

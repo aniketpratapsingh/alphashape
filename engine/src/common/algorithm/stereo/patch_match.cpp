@@ -11,6 +11,7 @@
 #include <Eigen/Geometry>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/stereo/depth_pyramid.hpp"
 #include "image/image.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -31,6 +32,14 @@
 // half-sweep reads only pixels of the other colour, and every random draw is a
 // pure function of (seed, pixel, iteration, stream), the result is independent
 // of the OpenMP thread count and bit-identical run to run.
+//
+// Coarse to fine. run_patch_match() runs the search above once per level of a
+// depth pyramid, coarsest first, and hands each finer level the plane the level
+// beneath found (depth_pyramid.hpp). Every level is the same code path -- the
+// same window, the same cost, the same draw schedule -- with its own image
+// resolution, its own stream key and its own budget; the only additions are the
+// warm-start evaluation at init and the per-level perturbation radius, both
+// described where they happen.
 
 namespace alphashape::stereo {
 namespace {
@@ -510,47 +519,36 @@ void propagate(const CostContext& ctx, WindowCache& wc, int qx, int qy, double d
     evaluate_hypothesis(ctx, wc, depth_p, n, depth_min, depth_max, b_p, best);
 }
 
-}  // namespace
+/// Everything one level of a pyramid search needs. The search core below is
+/// level-agnostic: it is handed a reference and a neighbour list already
+/// reduced to this level, its own seed and budget, and (for every level but the
+/// coarsest) the hypotheses upsampled from the level beneath.
+struct LevelPlan {
+    const PMView* reference = nullptr;
+    const std::vector<PMView>* neighbours = nullptr;
+    std::uint64_t seed = 1;
+    int iterations = 0;
+    /// Warm-start hypotheses at this level's resolution, or null for the
+    /// coarsest level's random initialisation (the pre-pyramid behaviour).
+    const DepthHypotheses* warm = nullptr;
+    /// The inverse-depth radius the per-iteration perturbation starts from.
+    /// The coarsest level uses the configured range's span, as before; a
+    /// warm-started level uses the local variation of its inherited map, so its
+    /// first sweeps search around the inherited plane instead of far from it.
+    double span = 0.0;
+    /// Called after every completed half-sweep with (done, total) counted in
+    /// this level's own sweeps, so a caller can map them onto the whole
+    /// pyramid's. May throw (a task's cancellation); the throw propagates and
+    /// the partial level is discarded.
+    std::function<void(int, int)> on_sweeps;
+};
 
-PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMView>& neighbours,
-                                 const PatchMatchOptions& options) {
-    // ---- Validation --------------------------------------------------------
-    if (reference.image == nullptr) {
-        throw ValueError("stereo::run_patch_match: reference image is null");
-    }
-    if (reference.image->width() != reference.calibration.width ||
-        reference.image->height() != reference.calibration.height) {
-        throw ValueError("stereo::run_patch_match: reference calibration does not match image size");
-    }
-    if (neighbours.empty()) {
-        throw ValueError("stereo::run_patch_match: no neighbour views");
-    }
-    for (std::size_t i = 0; i < neighbours.size(); ++i) {
-        if (neighbours[i].image == nullptr) {
-            throw ValueError("stereo::run_patch_match: neighbour image is null");
-        }
-        if (neighbours[i].image->width() != neighbours[i].calibration.width ||
-            neighbours[i].image->height() != neighbours[i].calibration.height) {
-            throw ValueError(
-                "stereo::run_patch_match: neighbour calibration does not match image size");
-        }
-    }
-    if (!(options.depth_min > 0.0) || !(options.depth_max > options.depth_min)) {
-        throw ValueError("stereo::run_patch_match: depth range must satisfy 0 < min < max");
-    }
-    if (options.window_radius < 0) {
-        throw ValueError("stereo::run_patch_match: window_radius must be non-negative");
-    }
-    if (options.window_step < 1) {
-        throw ValueError("stereo::run_patch_match: window_step must be at least 1");
-    }
-    if (options.iterations < 0) {
-        throw ValueError("stereo::run_patch_match: iterations must be non-negative");
-    }
-    if (options.best_k < 0) {
-        throw ValueError("stereo::run_patch_match: best_k must be non-negative");
-    }
-
+/// The red-black search at one level. `plan.reference` and `plan.neighbours`
+/// must be consistent (calibrations matching their images) and the options
+/// validated; run_patch_match() does both once for the whole pyramid.
+PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& options) {
+    const PMView& reference = *plan.reference;
+    const std::vector<PMView>& neighbours = *plan.neighbours;
     const int width = reference.image->width();
     const int height = reference.image->height();
     const std::size_t count = si(width) * si(height);
@@ -669,7 +667,7 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
 
     const double depth_min = options.depth_min;
     const double depth_max = options.depth_max;
-    const double inv_span = 1.0 / depth_min - 1.0 / depth_max;  // inverse-depth range
+    int sweeps_done = 0;
 
     PatchMatchResult result;
     result.width = width;
@@ -719,11 +717,37 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                 }
                 active[p] = 1;
                 const Eigen::Vector3d& b_p = bearings[p];
-                RngStream rng(options.seed, static_cast<std::int64_t>(p), kInitIteration, 0);
-                const double depth = random_depth(rng, depth_min, depth_max);
-                const Eigen::Vector3d normal = random_cone_normal(rng, b_p);
                 best = Best{};
-                evaluate_hypothesis(ctx, local, depth, normal, depth_min, depth_max, b_p, best);
+                // Warm start: the plane inherited from the level beneath, at this
+                // level's geometry. It is evaluated here (rather than carrying
+                // the coarse level's cost over) because a cost is only
+                // comparable within one level: the window is a different size in
+                // scene terms, so a coarse cost would rank the inherited plane
+                // against nothing. The evaluation also rejects an inherited
+                // plane whose normal no longer faces the reference, which leaves
+                // the fresh random draw below to seed that pixel.
+                if (plan.warm != nullptr) {
+                    const std::size_t base = p * 3;
+                    const Eigen::Vector3d inherited(
+                        static_cast<double>(plan.warm->normals[base + 0]),
+                        static_cast<double>(plan.warm->normals[base + 1]),
+                        static_cast<double>(plan.warm->normals[base + 2]));
+                    if (inherited.squaredNorm() > 1e-12) {
+                        evaluate_hypothesis(ctx, local, static_cast<double>(plan.warm->depth[p]),
+                                            inherited.normalized(), depth_min, depth_max, b_p,
+                                            best);
+                    }
+                }
+                // The coarsest level's initialisation, unchanged: one random
+                // depth then one random cone normal, drawn in that order so the
+                // keyed stream is not reordered (see the sweep loop's note).
+                if (best.depth <= 0.0) {
+                    RngStream rng(plan.seed, static_cast<std::int64_t>(p), kInitIteration, 0);
+                    const double depth = random_depth(rng, depth_min, depth_max);
+                    const Eigen::Vector3d normal = random_cone_normal(rng, b_p);
+                    evaluate_hypothesis(ctx, local, depth, normal, depth_min, depth_max, b_p,
+                                        best);
+                }
                 if (best.depth > 0.0) {
                     result.depth[p] = static_cast<float>(best.depth);
                     const std::size_t base = p * 3;
@@ -739,22 +763,17 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
     // ---- Red-black sweeps --------------------------------------------------
     // Refinement schedule: at iteration `it` the perturbation scale is
     //     s = 0.5^(it+1)          (0.5 at the first iteration, halving after)
-    // the depth is perturbed in inverse depth by +/- inv_span * s, and the
-    // normal by a random rotation of up to 60 degrees * s.
+    // the depth is perturbed in inverse depth by +/- plan.span * s, and the
+    // normal by a random rotation of up to 60 degrees * s. plan.span is the
+    // configured inverse-depth span at the coarsest level and the local
+    // variation of the inherited map at a warm-started one.
     const int adj[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     const int far3[4][2] = {{-3, 0}, {3, 0}, {0, -3}, {0, 3}};
 
-    // Every completed half-sweep is 1/(2 * iterations) of the search, so the
-    // fraction a caller sees is monotone and reaches 1.0 only after the last
-    // one. A hook that throws (the task's cancel) propagates out of the sweep
-    // loop: the partial result is never returned, which is what makes a
-    // cancelled map distinguishable from a finished one.
-    const double sweeps_total = static_cast<double>(std::max(2 * options.iterations, 1));
-    double sweeps_done = 0.0;
-
-    for (int it = 0; it < options.iterations; ++it) {
+    const int iterations = plan.iterations;
+    for (int it = 0; it < iterations; ++it) {
         const double s = std::pow(0.5, static_cast<double>(it) + 1.0);
-        const double depth_delta = inv_span * s;
+        const double depth_delta = plan.span * s;
         const double normal_angle = kMaxNormalRefineAngle * s;
 
         for (int colour = 0; colour < 2; ++colour) {
@@ -802,7 +821,7 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                         best.cost = static_cast<double>(result.cost[p]);
                         if (!(best.depth > 0.0)) {
                             // No incumbent yet: seed from a fresh random plane.
-                            RngStream rng(options.seed, static_cast<std::int64_t>(p),
+                            RngStream rng(plan.seed, static_cast<std::int64_t>(p),
                                           static_cast<std::int64_t>(it), 0);
                             // Sequenced draws: two calls in one argument list are
                             // evaluated in an unspecified order (clang left to
@@ -838,20 +857,20 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                             }
                             // Refinement: a fresh random plane, then the current
                             // plane perturbed in inverse depth and normal.
-                            RngStream rng(options.seed, static_cast<std::int64_t>(p),
+                            RngStream rng(plan.seed, static_cast<std::int64_t>(p),
                                           static_cast<std::int64_t>(it), 0);
                             const double fresh_depth = random_depth(rng, depth_min, depth_max);
                             const Eigen::Vector3d fresh_normal = random_cone_normal(rng, b_p);
                             evaluate_hypothesis(ctx, local, fresh_depth, fresh_normal, depth_min,
                                                 depth_max, b_p, best);
 
-                            RngStream rng_d(options.seed, static_cast<std::int64_t>(p),
+                            RngStream rng_d(plan.seed, static_cast<std::int64_t>(p),
                                             static_cast<std::int64_t>(it), 1);
                             const double inv_d = 1.0 / best.depth;
                             const double perturbed_inv =
                                 inv_d + (2.0 * rng_d.next() - 1.0) * depth_delta;
                             if (perturbed_inv > 0.0) {
-                                RngStream rng_n(options.seed, static_cast<std::int64_t>(p),
+                                RngStream rng_n(plan.seed, static_cast<std::int64_t>(p),
                                                 static_cast<std::int64_t>(it), 2);
                                 const Eigen::Vector3d perturbed =
                                     perturb_normal(rng_n, best.normal, normal_angle);
@@ -869,9 +888,9 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
                     }
                 }
             }
-            if (options.on_sweep) {
-                sweeps_done += 1.0;
-                options.on_sweep(sweeps_done / sweeps_total);
+            if (plan.on_sweeps) {
+                ++sweeps_done;
+                plan.on_sweeps(sweeps_done, 2 * iterations);
             }
         }
     }
@@ -879,8 +898,8 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
     // ---- Finalisation ------------------------------------------------------
     // A zero-iteration search has no sweeps to report, so the caller still gets
     // one "finished" tick rather than a progress bar that never leaves 0.
-    if (options.on_sweep && options.iterations == 0) {
-        options.on_sweep(1.0);
+    if (plan.on_sweeps && iterations == 0) {
+        plan.on_sweeps(1, 1);
     }
     for (std::size_t p = 0; p < count; ++p) {
         if (result.depth[p] <= 0.0F || static_cast<double>(result.cost[p]) > options.max_cost) {
@@ -891,6 +910,198 @@ PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMVi
         }
     }
 
+    return result;
+}
+
+/// Validates a whole run (reference, neighbours, options) before any level is
+/// touched, so a bad call is rejected identically whether it resolves to one
+/// level or five.
+void validate_run(const PMView& reference, const std::vector<PMView>& neighbours,
+                  const PatchMatchOptions& options) {
+    if (reference.image == nullptr) {
+        throw ValueError("stereo::run_patch_match: reference image is null");
+    }
+    if (reference.image->width() != reference.calibration.width ||
+        reference.image->height() != reference.calibration.height) {
+        throw ValueError("stereo::run_patch_match: reference calibration does not match image size");
+    }
+    if (neighbours.empty()) {
+        throw ValueError("stereo::run_patch_match: no neighbour views");
+    }
+    for (std::size_t i = 0; i < neighbours.size(); ++i) {
+        if (neighbours[i].image == nullptr) {
+            throw ValueError("stereo::run_patch_match: neighbour image is null");
+        }
+        if (neighbours[i].image->width() != neighbours[i].calibration.width ||
+            neighbours[i].image->height() != neighbours[i].calibration.height) {
+            throw ValueError(
+                "stereo::run_patch_match: neighbour calibration does not match image size");
+        }
+    }
+    if (!(options.depth_min > 0.0) || !(options.depth_max > options.depth_min)) {
+        throw ValueError("stereo::run_patch_match: depth range must satisfy 0 < min < max");
+    }
+    if (options.window_radius < 0) {
+        throw ValueError("stereo::run_patch_match: window_radius must be non-negative");
+    }
+    if (options.window_step < 1) {
+        throw ValueError("stereo::run_patch_match: window_step must be at least 1");
+    }
+    if (options.iterations < 0) {
+        throw ValueError("stereo::run_patch_match: iterations must be non-negative");
+    }
+    if (options.best_k < 0) {
+        throw ValueError("stereo::run_patch_match: best_k must be non-negative");
+    }
+    if (options.pyramid_levels < 0) {
+        throw ValueError("stereo::run_patch_match: pyramid_levels must be non-negative");
+    }
+    if (options.pyramid_levels != 1 && options.pyramid_min_size <= 0) {
+        throw ValueError("stereo::run_patch_match: pyramid_min_size must be positive");
+    }
+}
+
+}  // namespace
+
+std::vector<int> patch_match_iteration_plan(int width, int height,
+                                            const PatchMatchOptions& options) {
+    const int levels = pyramid_level_count(width, height, options.pyramid_levels,
+                                           options.pyramid_min_size, options.window_radius);
+    return pyramid_iterations(levels, options.iterations);
+}
+
+PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMView>& neighbours,
+                                 const PatchMatchOptions& options) {
+    validate_run(reference, neighbours, options);
+
+    const int width = reference.image->width();
+    const int height = reference.image->height();
+    const std::vector<int> iterations_by_level = patch_match_iteration_plan(width, height, options);
+    const int level_count = static_cast<int>(iterations_by_level.size());
+
+    // Half-sweeps over the WHOLE pyramid, so the fraction a caller sees is
+    // monotone across level boundaries and reaches 1.0 only at the end.
+    int total_sweeps = 0;
+    for (const int iterations : iterations_by_level) {
+        total_sweeps += 2 * std::max(iterations, 0);
+    }
+    int done_before = 0;  // half-sweeps finished by the coarser levels
+
+    // The pyramid's images. A single-level run allocates nothing: `image(0)` of
+    // a one-level DepthPyramid is the caller's reference image.
+    DepthPyramid pyramid;
+    pyramid.reference = reference.image;
+    pyramid.calibrations.push_back(reference.calibration);
+    if (level_count > 1) {
+        pyramid = build_depth_pyramid(*reference.image, reference.calibration, level_count);
+    }
+    // Coarsest first: every level beyond the first inherits the level beneath.
+    DepthHypotheses inherited;
+    PatchMatchResult result;
+    for (int level = 0; level < level_count; ++level) {
+        const int from_finest = level_count - 1 - level;  // 0 = the reference resolution
+        const int iterations = iterations_by_level[si(level)];
+
+        // This level's neighbour images, derived for this level only and freed
+        // when the iteration ends. Holding a reduced copy of every neighbour for
+        // every level costs sum(f * N) images for the whole run -- on a 5-level
+        // block of 16 neighbours that is most of the process's memory, and only
+        // one level's worth is ever live. Level f is the original reduced f
+        // times, one halving at a time (the same chain the reference pyramid
+        // follows, so truncating sizes and the `- W/2 * 0.5` term of the
+        // principal-point formula stay consistent between a level's reference
+        // and its neighbours), which is bit-identical to reusing the level
+        // above: a halving is a pure function of its input.
+        std::vector<FloatImage> reduced_neighbours;
+        std::vector<Calibration> reduced_calibrations;
+        if (from_finest > 0) {
+            reduced_neighbours.reserve(neighbours.size());
+            reduced_calibrations.reserve(neighbours.size());
+            for (std::size_t i = 0; i < neighbours.size(); ++i) {
+                // from_finest >= 1 here, so the first halving always reads the
+                // original and each later one reads the level above it.
+                FloatImage reduced = pyramid_downsample(*neighbours[i].image);
+                Calibration reduced_calibration =
+                    scaled_calibration(neighbours[i].calibration, 2);
+                for (int halvings = 1; halvings < from_finest; ++halvings) {
+                    reduced = pyramid_downsample(reduced);
+                    reduced_calibration = scaled_calibration(reduced_calibration, 2);
+                }
+                reduced_neighbours.push_back(std::move(reduced));
+                reduced_calibrations.push_back(reduced_calibration);
+            }
+        }
+
+        PMView level_reference;
+        level_reference.calibration = pyramid.calibration_from_finest(from_finest);
+        level_reference.R = reference.R;
+        level_reference.t = reference.t;
+        level_reference.image = &pyramid.image(level);
+
+        std::vector<PMView> level_neighbours;
+        level_neighbours.reserve(neighbours.size());
+        for (std::size_t i = 0; i < neighbours.size(); ++i) {
+            PMView view;
+            view.calibration = from_finest == 0 ? neighbours[i].calibration
+                                                : reduced_calibrations[i];
+            view.R = neighbours[i].R;
+            view.t = neighbours[i].t;
+            view.image = from_finest == 0 ? neighbours[i].image : &reduced_neighbours[i];
+            level_neighbours.push_back(std::move(view));
+        }
+
+        // The radius the random search perturbs from. The coarsest level keeps
+        // the configured inverse-depth range (the pre-pyramid behaviour). A
+        // warm-started level starts from the local variation of its inherited
+        // map instead -- floored so a degenerate map still searches, and capped
+        // at the configured range so it can never explore further than a flat
+        // run's first sweep would.
+        const double configured_span = 1.0 / options.depth_min - 1.0 / options.depth_max;
+        double span = configured_span;
+        if (level > 0 && inherited.width > 0) {
+            const double local_span =
+                pyramid_search_span(inherited.depth, inherited.width, inherited.height,
+                                    options.window_radius, configured_span / 64.0);
+            span = std::min(configured_span, local_span);
+        }
+
+        LevelPlan level_plan;
+        level_plan.reference = &level_reference;
+        level_plan.neighbours = &level_neighbours;
+        level_plan.seed = pyramid_level_seed(options.seed, from_finest);
+        level_plan.iterations = iterations;
+        level_plan.warm = inherited.width > 0 ? &inherited : nullptr;
+        level_plan.span = span;
+        if (options.on_sweep) {
+            level_plan.on_sweeps = [&](int done, int level_total) {
+                const int level_done = done_before + std::min(done, level_total);
+                const double fraction =
+                    total_sweeps > 0 ? static_cast<double>(level_done) /
+                                           static_cast<double>(total_sweeps)
+                                     : 1.0;
+                options.on_sweep(std::min(fraction, 1.0));
+            };
+        }
+
+        result = run_level(level_plan, options);
+        done_before += 2 * std::max(iterations, 0);
+
+        if (level + 1 < level_count) {
+            // Carry the map up to the NEXT level's resolution. Depth along a
+            // bearing and a reference-frame normal both survive a level change
+            // unchanged (see depth_pyramid.hpp), so this is a bilinear
+            // interpolation with the hole-aware weights, nothing else.
+            const int next_from_finest = level_count - 2 - level;
+            const Calibration& next_calibration =
+                pyramid.calibration_from_finest(next_from_finest);
+            DepthHypotheses coarse;
+            coarse.width = result.width;
+            coarse.height = result.height;
+            coarse.depth = std::move(result.depth);
+            coarse.normals = std::move(result.normals);
+            inherited = pyramid_upsample(coarse, next_calibration.width, next_calibration.height);
+        }
+    }
     return result;
 }
 
