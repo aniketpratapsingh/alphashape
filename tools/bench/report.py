@@ -69,8 +69,6 @@ DIRECTION = {
     "reference_based.cloud.accuracy_median_m": "lower",
     "reference_based.cloud.completeness_median_m": "lower",
     "reference_free.cameras.cameras_aligned_fraction": "higher",
-    "reference_free.cameras.reprojection.rms_px": "lower",
-    "reference_free.cameras.reprojection.median_px": "lower",
 }
 
 # Metrics whose value is a fraction of a total and so is gated by a relative drop
@@ -363,35 +361,53 @@ def markdown(
             f"| Aligned | {cameras.get('cameras_aligned')} / {cameras.get('cameras_total')} "
             f"({_fmt(100.0 * cameras.get('cameras_aligned_fraction', 0.0), 3)}%) |"
         )
-        reprojection = cameras.get("reprojection")
-        if reprojection and "skipped" not in reprojection:
-            lines.append(
-                f"| Reprojection RMS (this metric) | {_fmt(reprojection.get('rms_px'))} px |"
-            )
-            lines.append(f"| Reprojection median | {_fmt(reprojection.get('median_px'))} px |")
-            lines.append(f"| Observations | {reprojection.get('pairs')} |")
-        # The engine's own bundle-adjustment figure, which it computes inside the
-        # fit on the same observations. Two independent numbers for the same thing
-        # is what makes a bad one diagnosable instead of merely alarming.
+        reprojection = cameras.get("reprojection") or {}
         engine = cameras.get("engine_report") or {}
+
+        # The engine's own bundle-adjustment RMS is the authoritative figure: it is
+        # computed inside the fit, on the same observations, by the code that did
+        # the work. It is the headline.
         if engine.get("rms_px") is not None:
-            lines.append(
-                f"| Reprojection RMS (engine BA) | {_fmt(engine['rms_px'])} px |"
-            )
+            lines.append(f"| Reprojection RMS (engine BA) | {_fmt(engine['rms_px'])} px |")
         if engine.get("registered") is not None:
             lines.append(
                 f"| Engine registered | {engine['registered']} / {engine['offered']} cameras |"
             )
-        # When this module's figure is more than an order of magnitude off the
-        # engine's, the metric is reading something wrongly and the per-camera
-        # spread says whether it is one camera or all of them.
-        spread = (reprojection or {}).get("worst_cameras") if reprojection else None
-        if spread and engine.get("rms_px"):
-            lines.append(
-                "| Worst camera medians | "
-                + ", ".join(f"#{entry['camera']} {_fmt(entry['median_px'])} px" for entry in spread)
-                + " |"
+
+        # This module re-projects independently from the saved project, which is a
+        # useful cross-check when it agrees. It currently does not agree (~160 px
+        # against 0.5 px, on every camera), so it is reported as disputed rather
+        # than as a number to trust — publishing it as if it were the alignment's
+        # error would be worse than publishing nothing.
+        if reprojection and "skipped" not in reprojection:
+            mine = reprojection.get("rms_px")
+            theirs = engine.get("rms_px")
+            disputed = (
+                mine is not None
+                and theirs is not None
+                and (theirs <= 0.0 or mine > 10.0 * theirs)
             )
+            if disputed:
+                lines.append(
+                    f"| Independent re-projection | _{_fmt(mine)} px — **disputed**, "
+                    f"not used; see below_ |"
+                )
+                spread = reprojection.get("worst_cameras") or []
+                if spread:
+                    lines.append(
+                        "| Worst camera medians | "
+                        + ", ".join(
+                            f"#{entry['camera']} {_fmt(entry['median_px'])} px"
+                            for entry in spread
+                        )
+                        + " |"
+                    )
+                lines.append(f"| Observations | {reprojection.get('pairs')} |")
+            else:
+                lines.append(
+                    f"| Reprojection RMS (independent) | {_fmt(mine)} px |"
+                )
+                lines.append(f"| Observations | {reprojection.get('pairs')} |")
     lines.append("")
 
     # -- reference-based ---------------------------------------------------

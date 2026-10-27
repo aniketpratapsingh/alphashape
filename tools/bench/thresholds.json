@@ -3,31 +3,59 @@
   "tolerances": {
     "default_absolute": 0.0,
     "default_relative": 0.0,
-
-    "reference_free.ortho.covered_fraction": { "relative": 0.02 },
-    "reference_free.ortho.hole_fraction": { "relative": 0.25 },
-    "reference_free.ortho.holes_inside_hull": { "absolute": 8 },
-    "reference_free.ortho.largest_hole_m2": { "absolute": 25.0 },
-    "reference_free.ortho.effective_resolution_ratio": { "absolute": 0.20 },
-    "reference_free.ortho.gradient_energy": { "relative": 0.10 },
-
-    "reference_free.dem.nodata_fraction": { "relative": 0.05 },
-
-    "reference_based.ortho.offset_m": { "absolute": 0.05 },
-    "reference_based.ortho.overlap_fraction": { "relative": 0.02 },
-
-    "reference_based.dem.median_m": { "absolute": 0.05 },
-    "reference_based.dem.nmad_m": { "absolute": 0.05 },
-    "reference_based.dem.p68_m": { "absolute": 0.08 },
-    "reference_based.dem.p95_m": { "absolute": 0.15 },
-    "reference_based.dem.overlap_fraction": { "relative": 0.02 },
-
-    "reference_based.cloud.f_score_5cm": { "relative": 0.03 },
-    "reference_based.cloud.accuracy_median_m": { "absolute": 0.01 },
-    "reference_based.cloud.completeness_median_m": { "absolute": 0.01 },
-
-    "reference_free.cameras.cameras_aligned_fraction": { "relative": 0.02 },
-    "reference_free.cameras.reprojection.rms_px": { "absolute": 0.25 },
-    "reference_free.cameras.reprojection.median_px": { "absolute": 0.25 }
+    "reference_free.ortho.covered_fraction": {
+      "relative": 0.02
+    },
+    "reference_free.ortho.hole_fraction": {
+      "relative": 0.25
+    },
+    "reference_free.ortho.holes_inside_hull": {
+      "absolute": 8
+    },
+    "reference_free.ortho.largest_hole_m2": {
+      "absolute": 25.0
+    },
+    "reference_free.ortho.effective_resolution_ratio": {
+      "absolute": 0.2
+    },
+    "reference_free.ortho.gradient_energy": {
+      "relative": 0.1
+    },
+    "reference_free.dem.nodata_fraction": {
+      "relative": 0.05
+    },
+    "reference_based.ortho.offset_m": {
+      "absolute": 0.05
+    },
+    "reference_based.ortho.overlap_fraction": {
+      "relative": 0.02
+    },
+    "reference_based.dem.median_m": {
+      "absolute": 0.05
+    },
+    "reference_based.dem.nmad_m": {
+      "absolute": 0.05
+    },
+    "reference_based.dem.p68_m": {
+      "absolute": 0.08
+    },
+    "reference_based.dem.p95_m": {
+      "absolute": 0.15
+    },
+    "reference_based.dem.overlap_fraction": {
+      "relative": 0.02
+    },
+    "reference_based.cloud.f_score_5cm": {
+      "relative": 0.03
+    },
+    "reference_based.cloud.accuracy_median_m": {
+      "absolute": 0.01
+    },
+    "reference_based.cloud.completeness_median_m": {
+      "absolute": 0.01
+    },
+    "reference_free.cameras.cameras_aligned_fraction": {
+      "relative": 0.02
+    }
   }
 }

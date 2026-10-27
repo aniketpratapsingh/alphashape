@@ -315,6 +315,32 @@ class MarkdownTest(unittest.TestCase):
         self.assertIn("no usable texture", text)
 
 
+class ReprojectionReportingTest(unittest.TestCase):
+    def test_a_disputed_independent_figure_is_flagged_not_headlined(self):
+        current = metrics()
+        current["reference_free"]["cameras"]["reprojection"] = {
+            "pairs": 500, "rms_px": 163.0, "median_px": 89.0,
+            "worst_cameras": [{"camera": 3, "pairs": 10, "median_px": 270.0}],
+        }
+        current["reference_free"]["cameras"]["engine_report"] = {"rms_px": 0.51,
+                                                                "registered": 30, "offered": 30}
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("engine BA", text)
+        self.assertIn("disputed", text)
+        self.assertNotIn("| Reprojection RMS (independent) |", text)
+
+    def test_agreeing_figures_are_both_reported(self):
+        current = metrics()
+        current["reference_free"]["cameras"]["reprojection"] = {
+            "pairs": 500, "rms_px": 0.55, "median_px": 0.5,
+        }
+        current["reference_free"]["cameras"]["engine_report"] = {"rms_px": 0.51,
+                                                                "registered": 30, "offered": 30}
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Reprojection RMS (independent)", text)
+        self.assertNotIn("disputed", text)
+
+
 class SubsetNoteTest(unittest.TestCase):
     def test_a_subset_run_says_how_many_of_how_many(self):
         current = metrics()

@@ -25,7 +25,7 @@ only when the publisher ships a matching reference product.
 | Gradient energy | raw sharpness, the quantity the effective GSD is derived from |
 | DEM nodata fraction | share of DEM cells with no measurement |
 | Cameras aligned | aligned / total cameras in the saved project |
-| Reprojection RMS | tie-point reprojection error, re-projected from the saved project's own poses and calibration |
+| Reprojection RMS | the engine's own bundle-adjustment RMS, parsed from its `AlignCameras` output |
 
 **Reference-based** — does it agree with someone else's answer?
 
@@ -38,6 +38,14 @@ only when the publisher ships a matching reference product.
 Reprojection RMS is an internal-consistency measure, not an accuracy one: a self-consistent
 but wrongly scaled model scores well. The report never presents it alone for that reason,
 and the reference-based rows are what actually say whether the model is right.
+
+There is also an **independent** re-projection: `run_bench` re-projects every triangulated
+tie point from the saved project's own poses and calibration, which is a cross-check on
+both the project writer and the metric. That figure currently disagrees with the engine's
+by two orders of magnitude on every camera — ~160 px against 0.5 px — so the report labels
+it **disputed**, shows the per-camera medians that localise it, and excludes it from the
+regression gate. Publishing it as if it were the alignment's error would be worse than
+publishing nothing. Until it is resolved, the engine's own RMS is the figure to read.
 
 ## Running it locally
 
