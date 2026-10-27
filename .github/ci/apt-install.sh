@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# Resilient `apt-get install` for CI.
+#
+# The GitHub-hosted runner's default mirror (azure.archive.ubuntu.com) is intermittently
+# throttled to a crawl. A plain 4x `apt-get -o Acquire::Retries=3` retry loop then spends
+# twelve minutes timing out against the same dead mirror before the job even starts compiling.
+#
+# This script replaces that loop in every workflow:
+#
+#   1. Cache: when actions/cache restored the .deb cache for this exact package set, install
+#      with `--no-download` (no network at all). Anything missing falls through to step 2.
+#   2. Rotation: retry with a per-attempt timeout, rewriting the Ubuntu sources to the next
+#      mirror after every failure, starting from the mirror the image is already configured
+#      with:
+#          azure.archive.ubuntu.com -> archive.ubuntu.com -> mirrors.edge.kernel.org
+#          -> mirror.math.princeton.edu
+#      Both the deb822 form (/etc/apt/sources.list.d/*.sources, Ubuntu 24.04's
+#      ubuntu.sources) and the classic /etc/apt/sources.list are rewritten.
+#   3. `apt-get update` refreshes only the Ubuntu source files (third-party sources on the
+#      image are never contacted), and every apt invocation is bounded by `timeout`.
+#   4. The mirror that worked is printed, so a run's log says which one was healthy.
+#
+# Usage:
+#   .github/ci/apt-install.sh --print-key cmake ninja-build   # cache key -> stdout/$GITHUB_OUTPUT
+#   .github/ci/apt-install.sh cmake ninja-build               # update + install
+#
+# Environment:
+#   APT_DEB_CACHE_DIR   user-writable cache, default ~/.cache/apt-debs. Holds the .debs, the
+#                       apt lists they were resolved against, and the mirror that served them.
+#   APT_CACHE_HIT       "true" when actions/cache restored APT_DEB_CACHE_DIR.
+#   APT_ATTEMPT_TIMEOUT seconds per `apt-get update` attempt (default 150).
+#   APT_INSTALL_TIMEOUT seconds per `apt-get install` (default 300).
+#   APT_PASSES          passes over the mirror list (default 1 => 4 attempts).
+#   APT_SOURCES_ROOT, APT_ARCHIVES_DIR, APT_LISTS_DIR
+#                       overrides for /etc/apt, /var/cache/apt/archives and /var/lib/apt/lists;
+#                       used by .github/ci/test-apt-install.sh to exercise this script unprivileged.
+#
+# Exit status: 0 when the packages are installed, 1 when every mirror failed.
+
+set -uo pipefail
+
+CACHE_DIR="${APT_DEB_CACHE_DIR:-$HOME/.cache/apt-debs}"
+ATTEMPT_TIMEOUT="${APT_ATTEMPT_TIMEOUT:-150}"
+INSTALL_TIMEOUT="${APT_INSTALL_TIMEOUT:-300}"
+PASSES="${APT_PASSES:-1}"
+SOURCES_ROOT="${APT_SOURCES_ROOT:-/etc/apt}"
+ARCHIVES_DIR="${APT_ARCHIVES_DIR:-/var/cache/apt/archives}"
+LISTS_DIR="${APT_LISTS_DIR:-/var/lib/apt/lists}"
+# Empty => run privileged commands directly. The test harness sets this to "" with stubs.
+ROOT_CMD="${APT_ROOT_CMD-sudo}"
+
+# Mirrors in rotation order: host + path prefix, no trailing slash.
+MIRRORS=(
+  "azure.archive.ubuntu.com/ubuntu"
+  "archive.ubuntu.com/ubuntu"
+  "mirrors.edge.kernel.org/ubuntu"
+  "mirror.math.princeton.edu/pub/ubuntu"
+)
+
+log() { printf 'apt: %s\n' "$*"; }
+die() { printf 'apt: error: %s\n' "$*" >&2; exit 1; }
+
+as_root() {
+  if [ "$(id -u)" -eq 0 ] || [ -z "$ROOT_CMD" ]; then "$@"; else $ROOT_CMD "$@"; fi
+}
+
+# Shared by every apt-get call. Acquire::Retries=1 keeps a dead mirror from multiplying the
+# wait by three before the rotation gets its turn; ForceIPv4 removes the IPv6-hang class of
+# stalls seen on hosted runners; Keep-Downloaded-Packages fills the .deb cache.
+APT_OPTS=(
+  -q
+  -o Acquire::ForceIPv4=true
+  -o Acquire::http::Timeout=20
+  -o Acquire::https::Timeout=20
+  -o Acquire::Retries=1
+  -o Dpkg::Use-Pty=0
+  -o APT::Keep-Downloaded-Packages=true
+)
+
+PRINT_KEY=0
+if [ "${1:-}" = "--print-key" ]; then
+  PRINT_KEY=1
+  shift
+fi
+
+PKGS=("$@")
+[ "${#PKGS[@]}" -gt 0 ] || die "no packages given"
+
+# --- cache key ------------------------------------------------------------------------------
+
+# Image version, architecture and the sorted package list identify the cache entry: a change
+# to either the packages or the runner image must miss the cache rather than install stale debs.
+os_version() {
+  # shellcheck disable=SC1091
+  (. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-unknown}") || printf 'unknown'
+}
+arch() { dpkg --print-architecture 2>/dev/null || uname -m; }
+
+cache_key() {
+  local hash
+  hash=$(printf '%s\n' "${PKGS[@]}" | LC_ALL=C sort -u | sha256sum | cut -c1-16)
+  printf 'apt-v2-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
+}
+
+if [ "$PRINT_KEY" -eq 1 ]; then
+  key=$(cache_key)
+  printf '%s\n' "$key"
+  [ -n "${GITHUB_OUTPUT:-}" ] && printf 'key=%s\n' "$key" >>"$GITHUB_OUTPUT"
+  exit 0
+fi
+
+# --- sources --------------------------------------------------------------------------------
+
+# Any source file that points at an Ubuntu archive or one of the rotation mirrors.
+# ports.ubuntu.com (arm) and third-party repositories (packages.microsoft.com, ...) never match.
+UBUNTU_HOST_RE='([a-z0-9.-]*\.)?(archive\.ubuntu\.com|security\.ubuntu\.com|mirrors\.edge\.kernel\.org|mirror\.math\.princeton\.edu)'
+
+SOURCE_FILES=()
+discover_sources() {
+  local f
+  for f in "$SOURCES_ROOT/sources.list" "$SOURCES_ROOT"/sources.list.d/*.list \
+    "$SOURCES_ROOT"/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    grep -Eq "https?://${UBUNTU_HOST_RE}" "$f" && SOURCE_FILES+=("$f")
+  done
+}
+
+# Rewrite the URI, keeping suites/components/signing untouched. Handles deb822
+# (`URIs: http://host/ubuntu/`, possibly comma-separated) and classic `deb http://host/ubuntu`.
+# The trailing slash matches the convention Ubuntu ships in both forms.
+# Written through a temp file rather than `sed -i`, whose spelling differs between GNU and BSD.
+rewrite_sources() {
+  local mirror="$1" url="http://$1/" f tmp rc
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    tmp=$(mktemp) || return 1
+    if sed -E "s#https?://${UBUNTU_HOST_RE}(/[^[:space:],]*)?#${url}#g" "$f" >"$tmp"; then
+      as_root cp "$tmp" "$f"
+      rc=$?
+      rm -f "$tmp"
+      [ "$rc" -eq 0 ] || return 1
+    else
+      rm -f "$tmp"
+      return 1
+    fi
+  done
+}
+
+current_mirror() {
+  local f
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    m=$(grep -oE "https?://[^[:space:],]+" "$f" | head -n1)
+    if [ -n "${m:-}" ]; then printf '%s' "$m"; return 0; fi
+  done
+  printf 'unknown'
+}
+
+# Index into MIRRORS for the mirror the image is already configured with, else 1 (the
+# canonical archive). Attempt 1 therefore never rewrites a working setup, and the dead azure
+# default costs only one bounded attempt before the rotation moves on.
+start_index() {
+  local host i
+  host=$(current_mirror)
+  host=${host#*://}
+  host=${host%%/*}
+  for i in "${!MIRRORS[@]}"; do
+    case "${MIRRORS[$i]}" in
+      "$host"/*) printf '%s' "$i"; return 0 ;;
+    esac
+  done
+  printf '1'
+}
+
+# Refresh only the Ubuntu lists: apt is pointed at a temp sourceparts directory holding copies
+# of the matched files, so unrelated repositories on the image cannot stall the job.
+refresh_ubuntu_lists() {
+  local dir f rc
+  if [ "${#SOURCE_FILES[@]}" -eq 0 ]; then
+    log "no Ubuntu source file under $SOURCES_ROOT; running a full apt-get update"
+    as_root timeout "$ATTEMPT_TIMEOUT" apt-get "${APT_OPTS[@]}" update
+    return $?
+  fi
+
+  dir=$(mktemp -d) || return 1
+  : >"$dir/placeholder.list"
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    if ! as_root cp "$f" "$dir/$(basename "$f")"; then
+      rm -rf "$dir"
+      return 1
+    fi
+  done
+
+  as_root timeout "$ATTEMPT_TIMEOUT" apt-get "${APT_OPTS[@]}" \
+    -o Dir::Etc::sourcelist="$dir/placeholder.list" \
+    -o Dir::Etc::sourceparts="$dir" \
+    update
+  rc=$?
+  rm -rf "$dir"
+  return $rc
+}
+
+# --- cache ----------------------------------------------------------------------------------
+
+seed_debs_from_cache() {
+  local debs=() f
+  for f in "$CACHE_DIR"/*.deb; do [ -f "$f" ] && debs+=("$f"); done
+  [ "${#debs[@]}" -gt 0 ] || return 1
+  as_root mkdir -p "$ARCHIVES_DIR"
+  as_root cp -n "${debs[@]}" "$ARCHIVES_DIR/" 2>/dev/null
+  log "cache: seeded ${#debs[@]} .deb(s) into $ARCHIVES_DIR"
+  return 0
+}
+
+restore_lists_from_cache() {
+  [ -d "$CACHE_DIR/lists" ] || return 1
+  local f n=0
+  as_root mkdir -p "$LISTS_DIR"
+  for f in "$CACHE_DIR"/lists/*; do
+    [ -f "$f" ] || continue
+    as_root cp -n "$f" "$LISTS_DIR/" 2>/dev/null && n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  log "cache: restored $n apt list file(s)"
+  return 0
+}
+
+# Keep the debs apt downloaded, the lists they were resolved against, and the mirror that
+# served them, so the next run with this key can install with no network at all.
+harvest_cache() {
+  local mirror="$1" f n=0
+  as_root mkdir -p "$CACHE_DIR/lists"
+  as_root chown "$(id -u):$(id -g)" "$CACHE_DIR" "$CACHE_DIR/lists" 2>/dev/null
+
+  for f in "$ARCHIVES_DIR"/*.deb; do
+    [ -f "$f" ] || continue
+    as_root cp -n "$f" "$CACHE_DIR/" 2>/dev/null && n=$((n + 1))
+  done
+  log "cache: stored $n .deb(s)"
+
+  n=0
+  for f in "$LISTS_DIR"/*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in lock) continue ;; esac
+    as_root cp -n "$f" "$CACHE_DIR/lists/" 2>/dev/null && n=$((n + 1))
+  done
+  log "cache: stored $n apt list file(s)"
+
+  as_root chown -R "$(id -u):$(id -g)" "$CACHE_DIR" 2>/dev/null
+  printf '%s\n' "$mirror" >"$CACHE_DIR/mirror" 2>/dev/null
+}
+
+# Install without touching the network. Non-zero means something the packages need is absent
+# from the cache, which sends the caller down the rotation path.
+try_offline_install() {
+  local cached_mirror=""
+  log "cache hit: trying apt-get install --no-download"
+  if [ -f "$CACHE_DIR/mirror" ]; then
+    cached_mirror=$(cat "$CACHE_DIR/mirror")
+    # The cached lists are keyed by URI, so the sources must point at the cached mirror.
+    [ -n "$cached_mirror" ] && rewrite_sources "$cached_mirror" || true
+  fi
+  restore_lists_from_cache || log "cache: no cached apt lists; using the lists on the image"
+
+  as_root timeout "$INSTALL_TIMEOUT" apt-get "${APT_OPTS[@]}" \
+    install -y --no-install-recommends --no-download "${PKGS[@]}"
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "success via cache${cached_mirror:+ (originally $cached_mirror)}: no network used"
+  else
+    log "cache could not satisfy the package set (rc=$rc); falling back to the mirrors"
+  fi
+  return $rc
+}
+
+# --- network path ---------------------------------------------------------------------------
+
+network_install() {
+  local total=$(( ${#MIRRORS[@]} * PASSES )) attempt=0 mirror rc start
+  start=$(start_index)
+
+  while [ "$attempt" -lt "$total" ]; do
+    mirror="${MIRRORS[$(( (start + attempt) % ${#MIRRORS[@]} ))]}"
+    attempt=$((attempt + 1))
+    log "attempt $attempt/$total: mirror http://$mirror"
+
+    if ! rewrite_sources "$mirror"; then
+      log "attempt $attempt: could not rewrite sources for $mirror"
+      continue
+    fi
+
+    if ! refresh_ubuntu_lists; then
+      log "attempt $attempt failed: apt-get update timed out or errored on $mirror"
+      [ "$attempt" -lt "$total" ] && sleep 3
+      continue
+    fi
+
+    as_root timeout "$INSTALL_TIMEOUT" apt-get "${APT_OPTS[@]}" \
+      install -y --no-install-recommends "${PKGS[@]}"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log "success via http://$mirror (attempt $attempt/$total)"
+      harvest_cache "$mirror"
+      return 0
+    fi
+    log "attempt $attempt failed: apt-get install rc=$rc on $mirror"
+    [ "$attempt" -lt "$total" ] && sleep 3
+  done
+
+  log "all $total attempts failed; mirrors tried: ${MIRRORS[*]}"
+  return 1
+}
+
+# --- main -----------------------------------------------------------------------------------
+
+discover_sources
+log "sources: ${SOURCE_FILES[*]:-none}"
+log "current mirror: $(current_mirror)"
+
+if [ "${APT_CACHE_HIT:-}" = "true" ] && seed_debs_from_cache && try_offline_install; then
+  exit 0
+fi
+
+network_install || die "could not install: ${PKGS[*]}"
