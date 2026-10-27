@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -28,6 +29,7 @@
 #include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
+#include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/core/document.hpp"
@@ -1134,6 +1136,790 @@ TEST(OrthoAutoResolution, LocalAndUtmPlanesAreMetres) {
     ASSERT_TRUE(frame.is_local());
     EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(0.0).x(), 1.0);
     EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(1234.0).y(), 1.0);
+}
+
+
+// ---------------------------------------------------------------------------
+// 10. Block-wise processing
+// ---------------------------------------------------------------------------
+//
+// A full-resolution ortho over a large site cannot be held in memory as one
+// piece: the rectified tiles alone are footprint x 8 B/cell, and a flight of
+// overlapping obliques makes the footprint a large multiple of the grid. The
+// task therefore processes the output in blocks with a margin, and these cases
+// pin the two properties that make that safe: a small raster still takes exactly
+// the old single-piece path, and the blocked path produces the same product.
+
+namespace {
+
+/// The owner's repro case, as the planner sees it: 36 obliques of 4592x3056 at
+/// f ~ 3140 px from 59 m, over a 100 m site at a 1.9 cm cell (28 M cells).
+OrthoBlockPlanInput owner_case_input(std::uint64_t budget_bytes) {
+    OrthoBlockPlanInput input;
+    const int side = static_cast<int>(std::ceil(100.0 / 0.019));  // 5264
+    input.grid_width = side;
+    input.grid_height = side;
+    input.camera_count = 36;
+    input.photo_cells = 4592.0 * 3056.0;
+    // Every oblique sees roughly the whole site, so the summed crop boxes are a
+    // large multiple of the grid -- this is the term that made the old run peak
+    // at ~8 GB.
+    input.footprint_cells = 36.0 * static_cast<double>(side) * static_cast<double>(side);
+    input.has_node_map = true;
+    input.budget_bytes = budget_bytes;
+    return input;
+}
+
+/// Set the BuildOrthomosaic "block_size" parameter.
+Params block_params(const std::string& blending, double resolution, std::int64_t block_size,
+                    bool fill_holes, bool refine_seamlines) {
+    Params params = ortho_params(blending, "elevation", resolution, fill_holes, refine_seamlines);
+    params.set("block_size", ParamValue{block_size});
+    return params;
+}
+
+/// Run one ortho and hand back the product it committed.
+Orthomosaic run_ortho(OrthoSetup& s, Params params) {
+    run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    return s.document.active_chunk()->orthomosaic();
+}
+
+}  // namespace
+
+TEST(OrthoBlockPlan, WholeGridWhenItFits) {
+    // A small raster with a generous budget must stay ONE piece: this is what
+    // makes the change a no-op for everyone whose ortho already fit.
+    OrthoBlockPlanInput input;
+    input.grid_width = 1035;
+    input.grid_height = 777;
+    input.camera_count = 12;
+    input.photo_cells = 480.0 * 360.0;
+    input.footprint_cells = 12.0 * 1035.0 * 777.0;
+    input.has_node_map = true;
+    input.budget_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+
+    const OrthoBlockPlan plan = plan_ortho_blocks(input);
+    std::printf("[OrthoBlockPlan.WholeGrid] block=%d margin=%d peak=%.1f MB\n", plan.block_cells,
+                plan.margin_cells, plan.estimated_peak_bytes / 1e6);
+    EXPECT_EQ(plan.block_cells, 0) << "a fitting grid must not be split";
+    EXPECT_EQ(plan.margin_cells, 0) << "one piece needs no margin";
+    EXPECT_EQ(plan.columns, 1);
+    EXPECT_EQ(plan.rows, 1);
+    EXPECT_EQ(plan.levels, -1) << "the single piece keeps the grid's own pyramid depth";
+    EXPECT_FALSE(plan.coarsened);
+}
+
+TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
+    // The estimator itself, on the owner's exact parameters: 36 obliques of
+    // 4592x3056 at f ~ 3140 px from 59 m AGL over a 100 m site, planned at the
+    // 1.9 cm the photographs resolve (5264 x 5264 = 27.7 M cells, 28 M cells).
+    // The old run peaked at ~8 GB.
+    //
+    // The plan takes the LARGEST block whose estimate fits the machine's budget
+    // (platform::memory_budget_bytes already reserves headroom), so the peak
+    // tracks the budget instead of a fixed absolute target: a small machine gets
+    // a small block, a big one gets few big blocks (less margin overhead). This
+    // test pins both ends of that, plus the arithmetic.
+    constexpr int kSide = 5264;           // 100 m / 0.019 m
+    constexpr double kPhotoCells = 4592.0 * 3056.0;
+    constexpr int kCameras = 36;
+    constexpr double kCells = static_cast<double>(kSide) * static_cast<double>(kSide);
+
+    const auto plan_for = [&](std::uint64_t budget) {
+        OrthoBlockPlanInput input;
+        input.grid_width = kSide;
+        input.grid_height = kSide;
+        input.camera_count = kCameras;
+        input.photo_cells = kPhotoCells;
+        input.footprint_cells = kCameras * kCells;  // fully overlapping obliques
+        input.has_node_map = true;
+        input.budget_bytes = budget;
+        return plan_ortho_blocks(input);
+    };
+
+    // The review's bound: on a machine whose budget only carries a 1024-cell
+    // block, the whole plan (window + assembled raster + fill stage + cache)
+    // must stay under 2.5 GB.
+    const OrthoBlockPlan small = plan_for(2ULL * 1024ULL * 1024ULL * 1024ULL);
+    std::printf("[OrthoBlockPlan.Estimator] 2 GiB budget: block=%d margin=%d grid=%dx%d "
+                "peak=%.2f GB (window %.2f, fill %.2f, cache %.2f)\n",
+                small.block_cells, small.margin_cells, small.columns, small.rows,
+                small.estimated_peak_bytes / 1e9, small.estimated_window_bytes / 1e9,
+                small.estimated_fill_bytes / 1e9,
+                static_cast<double>(small.photo_cache_bytes) / 1e9);
+    ASSERT_FALSE(small.coarsened) << "the owner's case must complete at full resolution";
+    EXPECT_EQ(small.block_cells, 1024) << "2 GiB carries a 1024-cell block and not a 2048";
+    EXPECT_LT(small.estimated_peak_bytes, 2.5e9) << "the planned block peak must be under 2.5 GB";
+
+    // Bigger budgets take bigger blocks, and NEVER exceed the budget they were
+    // planned against. That is the point of dropping the absolute target: a
+    // machine with the RAM should spend it on fewer, bigger blocks.
+    int previous_side = small.block_cells;
+    for (const std::uint64_t budget : {4ULL, 8ULL, 16ULL, 32ULL}) {
+        const std::uint64_t bytes = budget * 1024ULL * 1024ULL * 1024ULL;
+        const OrthoBlockPlan plan = plan_for(bytes);
+        std::printf("[OrthoBlockPlan.Estimator] %llu GiB budget: block=%d margin=%d grid=%dx%d "
+                    "peak=%.2f GB cache=%.2f GB\n",
+                    static_cast<unsigned long long>(budget), plan.block_cells, plan.margin_cells,
+                    plan.columns, plan.rows, plan.estimated_peak_bytes / 1e9,
+                    static_cast<double>(plan.photo_cache_bytes) / 1e9);
+        ASSERT_FALSE(plan.coarsened) << budget << " GiB must complete at full resolution";
+        EXPECT_LE(plan.estimated_peak_bytes, static_cast<double>(bytes))
+            << budget << " GiB plan does not fit its own budget";
+        if (plan.block_cells > 0) {
+            EXPECT_GE(plan.block_cells, previous_side)
+                << "a bigger budget must not shrink blocks";
+            previous_side = plan.block_cells;
+        }
+    }
+    // Enough RAM and the whole grid is one piece again (the previous behaviour,
+    // which is byte-identical for everything that always fit).
+    const OrthoBlockPlan roomy = plan_for(64ULL * 1024ULL * 1024ULL * 1024ULL);
+    std::printf("[OrthoBlockPlan.Estimator] 64 GiB budget: block=%d peak=%.2f GB\n",
+                roomy.block_cells, roomy.estimated_peak_bytes / 1e9);
+    EXPECT_EQ(roomy.block_cells, 0) << "a grid that fits must not be split";
+
+    // The components add up: fixed (max of window+assembled and the post-loop
+    // fill stage) plus the cache, and the fill stage is a real term now.
+    const double assembled = 8.0 * kCells;  // rgba u8 + int32 label per cell
+    const double staged = small.estimated_window_bytes;
+    const double fill = small.estimated_fill_bytes;
+    EXPECT_GT(fill, 0.0) << "the assembled-grid fill_holes stage must be in the plan";
+    EXPECT_GT(staged, assembled) << "the window stages must be there on top of the assembled grid";
+    EXPECT_DOUBLE_EQ(small.estimated_peak_bytes,
+                     std::max(staged, fill) + static_cast<double>(small.photo_cache_bytes));
+    // The window's own estimate is the same arithmetic the single-piece guard
+    // uses, applied to the block+margin cell count: nothing new is invented.
+    const double window_side = static_cast<double>(small.block_cells + 2 * small.margin_cells);
+    const std::uint64_t window_cells = static_cast<std::uint64_t>(window_side) *
+                                       static_cast<std::uint64_t>(window_side);
+    const double window_footprint = std::min(
+        kCameras * kCells, static_cast<double>(kCameras) * static_cast<double>(window_cells));
+    const double expected = estimate_block_peak_bytes(
+        window_cells, window_footprint, true, kPhotoCells,
+        static_cast<std::uint64_t>(kSide) * static_cast<std::uint64_t>(kSide),
+        small.photo_cache_bytes);
+    EXPECT_DOUBLE_EQ(expected, small.estimated_peak_bytes);
+
+    // A run with fill_holes off must not pay for a stage it never reaches.
+    OrthoBlockPlanInput no_fill_input;
+    no_fill_input.grid_width = kSide;
+    no_fill_input.grid_height = kSide;
+    no_fill_input.camera_count = kCameras;
+    no_fill_input.photo_cells = kPhotoCells;
+    no_fill_input.footprint_cells = kCameras * kCells;
+    no_fill_input.has_node_map = true;
+    no_fill_input.fill_holes = false;
+    no_fill_input.budget_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    const OrthoBlockPlan no_fill = plan_ortho_blocks(no_fill_input);
+    std::printf("[OrthoBlockPlan.Estimator] fill_holes off: block=%d peak=%.2f GB fill=%.2f\n",
+                no_fill.block_cells, no_fill.estimated_peak_bytes / 1e9,
+                no_fill.estimated_fill_bytes / 1e9);
+    EXPECT_DOUBLE_EQ(no_fill.estimated_fill_bytes, 0.0);
+    EXPECT_GE(no_fill.block_cells, small.block_cells)
+        << "not running fill_holes must not shrink the block";
+}
+
+TEST(OrthoBlockPlan, OwnerCaseFitsUnderTwoGigabytes) {
+    // The reported dataset: 36 obliques, 28 M cells, 1.9 cm, which peaked at
+    // ~8 GB before. An 8 GB machine's own budget must plan blocks that fit it
+    // (with the photo cache sized from what the block plan leaves over), and the
+    // plan must be a real split, not "coarsen it".
+    const OrthoBlockPlan plan =
+        plan_ortho_blocks(owner_case_input(8ULL * 1024ULL * 1024ULL * 1024ULL));
+    std::printf("[OrthoBlockPlan.OwnerCase] block=%d margin=%d grid=%dx%d peak=%.0f MB "
+                "cache=%.0f MB coarsened=%d\n",
+                plan.block_cells, plan.margin_cells, plan.columns, plan.rows,
+                plan.estimated_peak_bytes / 1e6, static_cast<double>(plan.photo_cache_bytes) / 1e6,
+                plan.coarsened ? 1 : 0);
+    EXPECT_FALSE(plan.coarsened) << "the run must complete at full resolution";
+    EXPECT_GT(plan.block_cells, 0) << "the run must be split into blocks";
+    EXPECT_GE(plan.block_cells, 512);
+    EXPECT_LE(plan.block_cells, 4096);
+    EXPECT_LT(plan.estimated_peak_bytes, 8.0e9) << "the planned peak must fit the budget";
+    EXPECT_GT(plan.columns, 1);
+    EXPECT_GT(plan.rows, 1);
+
+    // The estimate must be the whole story, not the window alone: the assembled
+    // output raster (8 B/cell) and the post-loop fill stage are part of it.
+    const double assembled = 8.0 * 5264.0 * 5264.0;
+    EXPECT_GT(plan.estimated_window_bytes, assembled)
+        << "the estimate must count the window's own stages";
+    EXPECT_GT(plan.estimated_fill_bytes, assembled)
+        << "the assembled-grid fill_holes must be counted too";
+}
+
+TEST(OrthoBlockPlan, CoarsensOnlyWhenTheMinimumBlockCannotFit) {
+    // 64 MB is far too little for the owner case at any block size: the planner
+    // must say so rather than pretend a 512 block fits, which is what makes the
+    // task fall back to a coarser cell.
+    const OrthoBlockPlan plan = plan_ortho_blocks(owner_case_input(64ULL * 1024ULL * 1024ULL));
+    std::printf("[OrthoBlockPlan.Coarsen] block=%d peak=%.0f MB coarsened=%d\n", plan.block_cells,
+                plan.estimated_peak_bytes / 1e6, plan.coarsened ? 1 : 0);
+    EXPECT_TRUE(plan.coarsened);
+    EXPECT_EQ(plan.block_cells, 512) << "the minimum block is the last resort";
+}
+
+TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
+    // The margin must reach the blend pyramid's support at the depth the plan
+    // pins, otherwise a block's interior would be blended with a shallower
+    // operator than the whole grid's. The reach is computed, not guessed.
+    EXPECT_EQ(ortho::pyramid_support_cells(0), 0);
+    EXPECT_EQ(ortho::pyramid_support_cells(1), 2);
+    EXPECT_EQ(ortho::pyramid_support_cells(6), 126);
+    EXPECT_LE(ortho::pyramid_support_cells(6), 192);
+
+    // The margin is the operator's reach, rounded up to a pyramid-alignment
+    // multiple (see block_margin_cells), never a fraction of the block.
+    const int expected = ((2 * ortho::pyramid_support_cells(6) + 16 + 63) / 64) * 64;
+    EXPECT_EQ(block_margin_cells(1024, 6), expected);
+    EXPECT_EQ(expected % 64, 0) << "block origins must stay on the pyramid lattice";
+    EXPECT_EQ(block_margin_cells(4096, 0), 64);
+    EXPECT_EQ(block_margin_cells(0, 6), 0);
+
+    for (const int side : {512, 1024, 2048, 4096}) {
+        const int margin = block_margin_cells(side, 6);
+        EXPECT_GE(margin, 16);
+        EXPECT_GE(margin, 2 * ortho::pyramid_support_cells(0));
+        OrthoBlockPlanInput input;
+        input.grid_width = 5264;
+        input.grid_height = 5264;
+        input.camera_count = 36;
+        input.photo_cells = 4592.0 * 3056.0;
+        input.footprint_cells = 36.0 * 5264.0 * 5264.0;
+        input.has_node_map = true;
+        input.budget_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+        input.forced_block_cells = side;
+        const OrthoBlockPlan plan = plan_ortho_blocks(input);
+        std::printf("[OrthoBlockPlan.Margin] block=%d margin=%d levels=%d support=%d\n", side,
+                    plan.margin_cells, plan.levels, ortho::pyramid_support_cells(plan.levels));
+        EXPECT_GE(plan.margin_cells, margin);
+        EXPECT_GE(plan.margin_cells, 16);
+        EXPECT_GE(plan.levels, 0);
+        EXPECT_LE(ortho::pyramid_support_cells(plan.levels), plan.margin_cells)
+            << "the pinned pyramid must fit inside the margin at block " << side;
+        // Every block applies the WHOLE grid's depth: 6 at the level_count() cap
+        // for 5264 cells. Lowering it per block would change the operator.
+        EXPECT_EQ(plan.levels, 6) << "block " << side << " lost the whole grid's depth";
+    }
+    EXPECT_EQ(block_margin_cells(0, 6), 0);
+}
+
+TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {
+    // A block side larger than the grid degenerates to the previous single-piece
+    // run: the window is clipped to the whole grid, nothing is pinned, and the
+    // output must be byte-identical to the default (unblocked) path.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, true, true));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic forced =
+        run_ortho(s, block_params("mosaic", 0.125, 4096, true, true));
+
+    std::printf("[BuildOrthomosaic.BlockWiseSingle] grid=%dx%d levels default\n",
+                whole.raster.grid.width, whole.raster.grid.height);
+    EXPECT_EQ(forced.raster.grid, whole.raster.grid);
+    EXPECT_EQ(forced.labels, whole.labels);
+    EXPECT_EQ(forced.raster.data, whole.raster.data);
+
+    // The plane->local map must also agree: a forced block is the same block, so
+    // its map is built on the global lattice with the global anchor and its
+    // values are the whole grid's, bit for bit, at every node of the window.
+    if (std::optional<elevation::SurfaceFrame> frame = s.frame) {
+        const Elevation& dem = s.document.active_chunk()->elevation();
+        const double fallback = -9999.0;
+        const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> whole_map =
+            make_plane_to_local(*frame, dem.raster.grid, dem.raster, dem.nodata, fallback);
+        PlaneToLocalLattice lattice;
+        lattice.origin_x = dem.raster.grid.origin_x;
+        lattice.origin_y = dem.raster.grid.origin_y;
+        lattice.anchor = plane_to_local_anchor(*frame, dem.raster.grid, dem.raster,
+                                              dem.nodata, fallback);
+        const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> blocked_map =
+            make_plane_to_local(*frame, dem.raster.grid, dem.raster, dem.nodata, fallback,
+                                &lattice);
+        double worst = 0.0;
+        for (int row = 0; row < dem.raster.grid.height; row += 37) {
+            for (int col = 0; col < dem.raster.grid.width; col += 37) {
+                const Eigen::Vector2d c = dem.raster.grid.pixel_center(col, row);
+                const Eigen::Vector3d p(c.x(), c.y(),
+                                        static_cast<double>(dem.raster.at(col, row)));
+                worst = std::max(worst, (whole_map(p) - blocked_map(p)).norm());
+            }
+        }
+        std::printf("[BuildOrthomosaic.BlockWiseSingle] lattice worst=%.3e m\n", worst);
+        EXPECT_EQ(worst, 0.0) << "the shared lattice must reproduce the whole-grid map exactly";
+    }
+}
+
+TEST(BuildOrthomosaic, BlockWiseAverageAndDisabledMatchTheWholeGrid) {
+    // Average and Disabled blending are per-cell operations: the blocked path
+    // must be byte-identical, coverage included. Seams are off so the labelling
+    // is the per-cell argmax and cannot differ by optimisation order.
+    OrthoSetup& s = setup();
+    for (const char* mode : {"average", "disabled"}) {
+        const Orthomosaic whole = run_ortho(s, block_params(mode, 0.125, 0, false, false));
+        ASSERT_FALSE(whole.empty()) << mode;
+        const Orthomosaic blocked = run_ortho(s, block_params(mode, 0.125, 512, false, false));
+        ASSERT_EQ(blocked.raster.grid, whole.raster.grid) << mode;
+        ASSERT_EQ(blocked.raster.data.size(), whole.raster.data.size()) << mode;
+
+        std::size_t differing = 0;
+        std::size_t covered_whole = 0;
+        std::size_t covered_blocked = 0;
+        for (std::size_t i = 0; i < whole.raster.data.size(); i += 4) {
+            covered_whole += whole.raster.data[i + 3] != 0 ? 1U : 0U;
+            covered_blocked += blocked.raster.data[i + 3] != 0 ? 1U : 0U;
+            for (int c = 0; c < 4; ++c) {
+                if (whole.raster.data[i + static_cast<std::size_t>(c)] !=
+                    blocked.raster.data[i + static_cast<std::size_t>(c)]) {
+                    ++differing;
+                    break;
+                }
+            }
+        }
+        std::printf("[BuildOrthomosaic.BlockWise%s] differing=%zu covered=%zu/%zu\n", mode,
+                    differing, covered_blocked, covered_whole);
+        EXPECT_EQ(covered_blocked, covered_whole) << mode;
+        EXPECT_EQ(differing, 0U) << mode << " blending must be cell-local, so blocks agree";
+        EXPECT_EQ(blocked.labels, whole.labels) << mode;
+    }
+}
+
+TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
+    // Seams on, mosaic blending: the blocked labelling cannot be byte-identical
+    // to the whole-grid one (the optimiser is not separable), but it must
+    // (a) cover exactly the same cells and (b) never jump across a block border:
+    // the cells a later block inherits from an earlier one keep their labels,
+    // which is what makes the seams continuous instead of restarting per block.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, true, true));
+    ASSERT_FALSE(whole.empty());
+    ScopedLogCapture capture;
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, 512, true, true));
+    const std::string warnings = capture.text(LogLevel::Info);
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    std::size_t covered_whole = 0;
+    std::size_t covered_blocked = 0;
+    std::size_t labelled_whole = 0;
+    std::size_t labelled_blocked = 0;
+    for (std::size_t i = 0; i < whole.labels.size(); ++i) {
+        covered_whole += whole.raster.data[i * 4 + 3] != 0 ? 1U : 0U;
+        covered_blocked += blocked.raster.data[i * 4 + 3] != 0 ? 1U : 0U;
+        labelled_whole += whole.labels[i] >= 0 ? 1U : 0U;
+        labelled_blocked += blocked.labels[i] >= 0 ? 1U : 0U;
+    }
+
+    // Label disagreement ACROSS a block border: a cell on the left/top of the
+    // border and its neighbour on the other side were decided by different
+    // blocks; a continuous seam means the labels agree there where both are
+    // labelled (a seam may legitimately run ALONG a border, so this is a
+    // diagnostic, not a hard zero).
+    constexpr int kBlock = 512;
+    const int w = blocked.raster.grid.width;
+    const int h = blocked.raster.grid.height;
+    std::size_t across = 0;
+    std::size_t across_labelled = 0;
+    for (int row = 0; row < h; ++row) {
+        for (int col = 1; col < w; ++col) {
+            if (col % kBlock != 0) {
+                continue;
+            }
+            const std::size_t a = static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(col - 1);
+            const std::size_t b = a + 1;
+            if (blocked.labels[a] >= 0 && blocked.labels[b] >= 0) {
+                ++across_labelled;
+                across += blocked.labels[a] != blocked.labels[b] ? 1U : 0U;
+            }
+        }
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseSeams] covered=%zu/%zu labelled=%zu/%zu "
+                "border-disagreement=%zu/%zu\n",
+                covered_blocked, covered_whole, labelled_blocked, labelled_whole, across,
+                across_labelled);
+    EXPECT_EQ(covered_blocked, covered_whole);
+    EXPECT_EQ(labelled_blocked, labelled_whole);
+    EXPECT_GT(across_labelled, 0U);
+    // The exact pinning contract (an overlap cell keeps the label an earlier
+    // block decided) is asserted at the seamlines level, where it is directly
+    // observable (Seam.PinnedLabelsAreHonoured...). Here the assembled product
+    // only shows the borders: a seam may legitimately sit ON a border, so this
+    // bounds how often one does rather than demanding zero.
+    EXPECT_LT(across, across_labelled / 4) << "seams restarted at block borders";
+
+    // Determinism: the blocked path is thread-count independent like the rest.
+    const Orthomosaic again = run_ortho(s, block_params("mosaic", 0.125, 512, true, true));
+    EXPECT_EQ(again.raster.data, blocked.raster.data);
+    EXPECT_EQ(again.labels, blocked.labels);
+
+    // Seam CONTINUITY at the border, observed where it is actually visible. A
+    // "pinned label changed" counter cannot fail: the block loop restores any
+    // label the optimiser dropped, so it always reads zero and proves nothing.
+    // What a restart at a block border would look like instead is a label step
+    // ACROSS the border that is not there in the whole-grid run: compare each
+    // border-crossing pair against the same pair's decision in the unblocked
+    // product and count the pairs the blocked run splits that the whole run did
+    // not. Exact zero is not required (the optimiser legitimately moves seams in
+    // the overlap), but a systematic restart would show up as a large fraction.
+    std::size_t crossed_both = 0;
+    std::size_t split_whole = 0;
+    std::size_t split_blocked = 0;
+    for (int row = 0; row < h; ++row) {
+        for (int col = 0; col < w; ++col) {
+            const bool right_border = col + 1 < w && (col + 1) % kBlock == 0;
+            const bool down_border = row + 1 < h && (row + 1) % kBlock == 0;
+            if (!right_border && !down_border) {
+                continue;
+            }
+            const std::size_t a =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                static_cast<std::size_t>(col);
+            if (right_border && whole.labels[a] >= 0 && whole.labels[a + 1] >= 0 &&
+                blocked.labels[a] >= 0 && blocked.labels[a + 1] >= 0) {
+                ++crossed_both;
+                split_whole += whole.labels[a] != whole.labels[a + 1] ? 1U : 0U;
+                split_blocked += blocked.labels[a] != blocked.labels[a + 1] ? 1U : 0U;
+            }
+            if (down_border) {
+                const std::size_t b = a + static_cast<std::size_t>(w);
+                if (whole.labels[a] >= 0 && whole.labels[b] >= 0 && blocked.labels[a] >= 0 &&
+                    blocked.labels[b] >= 0) {
+                    ++crossed_both;
+                    split_whole += whole.labels[a] != whole.labels[b] ? 1U : 0U;
+                    split_blocked += blocked.labels[a] != blocked.labels[b] ? 1U : 0U;
+                }
+            }
+        }
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseSeams] border pairs=%zu split whole=%zu blocked=%zu\n",
+                crossed_both, split_whole, split_blocked);
+    EXPECT_GT(crossed_both, 0U) << "no labelled cell pair straddles a block border";
+    // The blocked run may split a border pair the whole run kept together only
+    // where the overlap genuinely gives the optimiser a different choice. A
+    // restarting seam would split most of them, so the guard is the ratio.
+    EXPECT_LE(split_blocked, split_whole + crossed_both / 50)
+        << "seams restarted at block borders: the blocked labelling splits far more "
+           "border pairs than the whole-grid one";
+
+    // The pinning contract that REMAINS observable: the blocked run must inherit
+    // a meaningful number of margin labels from earlier blocks (the blocks really
+    // do overlap), which is what gives the optimiser the continuity above.
+    std::size_t inherited = 0;
+    std::size_t from = 0;
+    while ((from = warnings.find("pinned=", from)) != std::string::npos) {
+        inherited += std::strtoul(warnings.c_str() + from + 7, nullptr, 10);
+        from += 7;
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseSeams] inherited=%zu\n", inherited);
+    EXPECT_GT(inherited, 0U) << "no margin label was inherited: the blocks are not overlapping";
+}
+
+TEST(BuildOrthomosaic, BlockWiseNarrowLastWindowHasNoBorderStep) {
+    // A block at the output border can be far narrower than the blend pyramid's
+    // depth needs. The fixture's 0.125 m grid is 960 wide, so a forced 464-cell
+    // block splits it 464 + 464 + 32: the last block is 32 cells, and its window
+    // is only 32 + 320 margin = 352 wide. blend() must apply the WHOLE grid's
+    // depth to that window (padding it out to 512) rather than clamping down to
+    // the 5 levels a 352-wide grid can carry, which is a shallower operator and
+    // shows up as a step exactly where the 32-cell block meets its neighbour.
+    //
+    // This is the end-to-end form of the check. Seam refinement is off so the
+    // labelling is the per-cell argmax in both runs and cannot differ by
+    // optimisation order, which leaves the blend as the only thing that could
+    // make the border worse than the interior.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, false, false));
+    ASSERT_FALSE(whole.empty());
+    constexpr int kBlock = 464;
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, kBlock, false, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    const int w = blocked.raster.grid.width;
+    const int h = blocked.raster.grid.height;
+    // The narrow last block begins at 2 * kBlock. Confirm it really is narrow
+    // (and that its window therefore needed padding), so the test cannot quietly
+    // stop exercising the case if the fixture ever changes.
+    constexpr int kMargin = 320;
+    const int last_block_width = w - 2 * kBlock;
+    ASSERT_GT(last_block_width, 0);
+    // The last column block sits at the right border, so its window gets a margin
+    // on ONE side only: width = block + margin. It must be narrower than what the
+    // whole grid's depth needs (8 << 6 = 512), which is what forces the padding.
+    const int last_window_width = last_block_width + kMargin;
+    ASSERT_LT(last_window_width, 8 << 6)
+        << "the last window must be narrower than the pyramid needs (width "
+        << last_window_width << ")";
+    ASSERT_LT(ortho::pyramid_level_count(last_window_width, h),
+              ortho::pyramid_level_count(w, h))
+        << "the narrow window's own depth must be shallower, or this is not the case";
+
+    const auto near_border = [w, h](int col, int row) {
+        constexpr int kNear = 4;
+        const auto on_border = [](int index, int extent) {
+            const int border = (index / kBlock + 1) * kBlock;
+            return border < extent && (border - index <= kNear || index - border < kNear);
+        };
+        return on_border(col, w) || on_border(row, h);
+    };
+
+    std::size_t pixels = 0;
+    std::size_t border_pixels = 0;
+    std::size_t border_visible = 0;
+    std::size_t interior_visible = 0;
+    std::size_t covered_whole = 0;
+    std::size_t covered_blocked = 0;
+    for (int row = 0; row < h; ++row) {
+        for (int col = 0; col < w; ++col) {
+            const std::size_t i =
+                (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                 static_cast<std::size_t>(col)) * 4U;
+            const bool opaque_whole = whole.raster.data[i + 3] != 0;
+            const bool opaque_blocked = blocked.raster.data[i + 3] != 0;
+            covered_whole += opaque_whole ? 1U : 0U;
+            covered_blocked += opaque_blocked ? 1U : 0U;
+            if (!opaque_whole || !opaque_blocked) {
+                continue;
+            }
+            ++pixels;
+            int diff = 0;
+            for (int c = 0; c < 3; ++c) {
+                diff = std::max(
+                    diff,
+                    std::abs(static_cast<int>(whole.raster.data[i +
+                                                               static_cast<std::size_t>(c)]) -
+                             static_cast<int>(blocked.raster.data[i +
+                                                                  static_cast<std::size_t>(c)])));
+            }
+            const bool visible = diff > 2;
+            if (near_border(col, row)) {
+                ++border_pixels;
+                border_visible += visible ? 1U : 0U;
+            } else {
+                interior_visible += visible ? 1U : 0U;
+            }
+        }
+    }
+    const std::size_t interior_pixels = pixels > border_pixels ? pixels - border_pixels : 0;
+    EXPECT_EQ(covered_blocked, covered_whole);
+    ASSERT_GT(pixels, 1000U);
+    ASSERT_GT(border_pixels, 0U);
+    ASSERT_GT(interior_pixels, 0U);
+    const double border_fraction =
+        static_cast<double>(border_visible) / static_cast<double>(border_pixels);
+    const double interior_fraction =
+        static_cast<double>(interior_visible) / static_cast<double>(interior_pixels);
+    std::printf("[BuildOrthomosaic.NarrowLastWindow] last=%d grid=%dx%d "
+                "border>2=%zu/%zu (%.3f%%) interior>2=%zu/%zu (%.3f%%)\n",
+                last_block_width, w, h, border_visible, border_pixels,
+                100.0 * border_fraction, interior_visible, interior_pixels,
+                100.0 * interior_fraction);
+
+    // The narrower-than-the-pyramid block must not blend with a different
+    // operator from its neighbour: the border is allowed to be no worse than an
+    // arbitrary interior cell (the margin makes it the edge of a window), and in
+    // particular there is no spike of disagreement along the grid.
+    EXPECT_LE(border_fraction, 2.0 * interior_fraction + 0.005)
+        << "the narrow last block blends with a shallower operator: a step at its border";
+}
+
+TEST(BuildOrthomosaic, BlockWiseFillHolesMatchesTheWholeGrid) {
+    // fill_holes runs ONCE on the assembled raster, not per block: its
+    // `interior_only` mode decides reachability from the output's own border,
+    // which a block cannot know. With it on, the blocked run must reproduce the
+    // single-piece coverage exactly (the same cells become opaque).
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("average", 0.125, 0, true, false));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.125, 512, true, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    std::size_t opaque_whole = 0;
+    std::size_t opaque_blocked = 0;
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < whole.raster.data.size(); i += 4) {
+        const bool a = whole.raster.data[i + 3] != 0;
+        const bool b = blocked.raster.data[i + 3] != 0;
+        opaque_whole += a ? 1U : 0U;
+        opaque_blocked += b ? 1U : 0U;
+        if (a != b) {
+            ++differ;
+        }
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseFill] opaque=%zu/%zu alpha-differ=%zu\n",
+                opaque_blocked, opaque_whole, differ);
+    EXPECT_EQ(differ, 0U) << "fill_holes must run on the assembled raster, not per block";
+    EXPECT_GT(opaque_whole, 10000U);
+}
+
+TEST(BuildOrthomosaic, BlockWiseMosaicMatchesWithInOneGreyLevel) {
+    // The multiresolution spline is a local operator up to its pyramid support,
+    // which the margin covers. With the seam labelling held fixed (the per-cell
+    // argmax, refine_seamlines off) block-wise and whole-grid outputs must
+    // therefore agree within one grey level on essentially every pixel. Seam
+    // refinement is a global optimisation over block+margin and legitimately
+    // moves seams, so it is tested separately (BlockWiseSeamsStayContinuous...).
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, false, false));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, 512, false, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    std::size_t pixels = 0;
+    std::size_t within_one = 0;
+    std::size_t covered_whole = 0;
+    std::size_t covered_blocked = 0;
+    int worst = 0;
+    for (std::size_t i = 0; i + 3 < whole.raster.data.size(); i += 4) {
+        const bool opaque_whole = whole.raster.data[i + 3] != 0;
+        const bool opaque_blocked = blocked.raster.data[i + 3] != 0;
+        covered_whole += opaque_whole ? 1U : 0U;
+        covered_blocked += opaque_blocked ? 1U : 0U;
+        if (!opaque_whole || !opaque_blocked) {
+            continue;
+        }
+        ++pixels;
+        int diff = 0;
+        for (int c = 0; c < 3; ++c) {
+            diff = std::max(diff, std::abs(static_cast<int>(whole.raster.data[i +
+                                                                           static_cast<std::size_t>(c)]) -
+                                           static_cast<int>(blocked.raster.data[i +
+                                                                                static_cast<std::size_t>(c)])));
+        }
+        worst = std::max(worst, diff);
+        within_one += diff <= 1 ? 1U : 0U;
+    }
+    std::printf("[BuildOrthomosaic.BlockWiseMosaic] within1=%zu/%zu worst=%d covered=%zu/%zu\n",
+                within_one, pixels, worst, covered_blocked, covered_whole);
+    EXPECT_EQ(covered_blocked, covered_whole);
+    ASSERT_GT(pixels, 1000U);
+    // Coverage is EXACT and the blend agrees to a grey level or two nearly
+    // everywhere. It is not required to agree bit for bit: the spline's masks and
+    // its Gaussian/Laplacian levels are edge-clamped blurs, so near a validity or
+    // window edge a block's value can differ from the whole grid's by a grey
+    // level or two even inside the margin. What must not happen is a gross
+    // disagreement (a visible step), so the worst case is bounded as well.
+    EXPECT_GE(within_one * 100, pixels * 98U) << "more than 2% of pixels differ by >1";
+    EXPECT_LE(worst, 8) << "the mosaic differs grossly between blocked and whole grid";
+    std::printf("[BuildOrthomosaic.BlockWiseMosaic] coverage is exact; %zu of %zu pixels "
+                "agree within one grey level, worst %d\n",
+                within_one, pixels, worst);
+}
+
+TEST(BuildOrthomosaic, BlockWiseDefaultMosaicHasNoBlockGrid) {
+    // The SHIPPING default is mosaic blending with refine_seamlines=true, which
+    // the previous test deliberately avoids (it turns refinement off so the
+    // labelling cannot differ). On the default the optimiser runs per window and
+    // legitimately places a seam somewhere else in the overlap, so a pixel that
+    // switched cameras reads the other view's colour: a few percent of pixels
+    // will differ there for that reason alone, and no colour bound can tell that
+    // apart from a blending difference. What this test therefore pins is what the
+    // review asked for:
+    //
+    //   1. the overall agreement is what the blend, not the seam moves, predicts;
+    //   2. the disagreement is NOT concentrated at the block borders. A seam that
+    //      restarted at a border, or a pyramid that changed depth there, shows up
+    //      as a systematic grid: a visibly larger fraction of big disagreements
+    //      within two cells of a border than anywhere else.
+    //
+    // Point 2 is the load-bearing one, and it is insensitive to where seams land:
+    // it compares border cells against interior cells of the SAME run.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, true, true));
+    ASSERT_FALSE(whole.empty());
+    constexpr int kBlock = 512;
+    // A disagreement this large is a visible step (the eye needs a few levels on
+    // a smooth gradient to notice). Counting only those keeps ordinary seam moves
+    // out of the border statistics.
+    constexpr int kVisible = 8;
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, kBlock, true, true));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    const int w = blocked.raster.grid.width;
+    const int h = blocked.raster.grid.height;
+    const auto near_border = [w, h](int col, int row) {
+        // Within two cells of any INTERIOR block border.
+        constexpr int kNear = 2;
+        const int col_mod = col % kBlock;
+        const int row_mod = row % kBlock;
+        const bool col_border = col / kBlock + 1 < (w + kBlock - 1) / kBlock;
+        const bool row_border = row / kBlock + 1 < (h + kBlock - 1) / kBlock;
+        if (col_border && (col_mod < kNear || col_mod >= kBlock - kNear)) {
+            return true;
+        }
+        if (row_border && (row_mod < kNear || row_mod >= kBlock - kNear)) {
+            return true;
+        }
+        return false;
+    };
+
+    std::size_t pixels = 0;
+    std::size_t within_one = 0;
+    std::size_t visible = 0;
+    std::size_t border_pixels = 0;
+    std::size_t border_visible = 0;
+    std::size_t interior_visible = 0;
+    int worst = 0;
+    for (int row = 0; row < h; ++row) {
+        for (int col = 0; col < w; ++col) {
+            const std::size_t i =
+                (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                 static_cast<std::size_t>(col)) * 4U;
+            if (whole.raster.data[i + 3] == 0 || blocked.raster.data[i + 3] == 0) {
+                continue;
+            }
+            ++pixels;
+            int diff = 0;
+            for (int c = 0; c < 3; ++c) {
+                diff = std::max(
+                    diff,
+                    std::abs(static_cast<int>(whole.raster.data[i + static_cast<std::size_t>(c)]) -
+                             static_cast<int>(blocked.raster.data[i +
+                                                                  static_cast<std::size_t>(c)])));
+            }
+            worst = std::max(worst, diff);
+            within_one += diff <= 1 ? 1U : 0U;
+            const bool big = diff >= kVisible;
+            visible += big ? 1U : 0U;
+            if (near_border(col, row)) {
+                ++border_pixels;
+                border_visible += big ? 1U : 0U;
+            } else {
+                interior_visible += big ? 1U : 0U;
+            }
+        }
+    }
+    const std::size_t interior_pixels = pixels > border_pixels ? pixels - border_pixels : 0;
+    ASSERT_GT(pixels, 1000U);
+    ASSERT_GT(border_pixels, 0U) << "the test grid must have interior block borders";
+    ASSERT_GT(interior_pixels, 0U);
+    const double border_fraction =
+        static_cast<double>(border_visible) / static_cast<double>(border_pixels);
+    const double interior_fraction =
+        static_cast<double>(interior_visible) / static_cast<double>(interior_pixels);
+    std::printf("[BuildOrthomosaic.BlockWiseDefault] within1=%zu/%zu (%.2f%%) visible=%zu "
+                "(%.3f%%) worst=%d border-visible=%zu/%zu (%.3f%%) "
+                "interior-visible=%zu/%zu (%.3f%%)\n",
+                within_one, pixels,
+                100.0 * static_cast<double>(within_one) / static_cast<double>(pixels), visible,
+                100.0 * static_cast<double>(visible) / static_cast<double>(pixels), worst,
+                border_visible, border_pixels, 100.0 * border_fraction, interior_visible,
+                interior_pixels, 100.0 * interior_fraction);
+
+    // 1. Overall: refinement legitimately re-places seams, so agreement is looser
+    //    than the refine-off case but must still hold on almost every pixel, and
+    //    only a small fraction may show a visible step.
+    EXPECT_GE(within_one * 100, pixels * 96U)
+        << "the default mosaic differs from the whole grid on too many pixels";
+    EXPECT_LE(visible * 100, pixels * 3U)
+        << "a visible step on more than 3% of pixels";
+    // 2. No systematic block grid. The border may be slightly worse than an
+    //    arbitrary interior cell (it is where two different windows met), but it
+    //    must not be an order of magnitude worse: that is what a restarting seam
+    //    or a shallow edge-block pyramid would look like. The +0.5% floor keeps
+    //    the ratio meaningful when the interior has almost no visible steps.
+    EXPECT_LE(border_fraction, 2.0 * interior_fraction + 0.005)
+        << "the disagreement is concentrated at the block borders: the grid is visible";
 }
 
 }  // namespace

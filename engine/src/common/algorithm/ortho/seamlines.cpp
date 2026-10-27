@@ -30,6 +30,11 @@ struct Field {
     std::vector<const float*> score;
     std::vector<const std::uint8_t*> rgb;
     std::vector<const std::uint8_t*> valid;
+    /// Optional pin mask (nullptr when every cell is free): a non-zero entry
+    /// fixes the cell's label for the whole optimisation.
+    const std::uint8_t* pinned = nullptr;
+    /// The pinned label values, consulted only where `pinned` is non-zero.
+    const std::int32_t* pinned_label = nullptr;
     /// Tile crop boxes and buffer row strides, in FIELD cells (a coarse level
     /// scales them down with its own grid).
     std::vector<int> x0;
@@ -113,7 +118,6 @@ void finalize(Field& field) {
     }
 }
 
-/// True when `label` covers `cell`.
 bool covers(const Field& field, int label, std::size_t cell) {
     if (label < 0) {
         return false;
@@ -463,8 +467,12 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
         }
         const double to_alpha =
             covers(field, alpha, cell) ? data_cost(field, alpha, cell, options) : kForbid;
-        flow.add_edge(p, sink, to_alpha);                          // p switches
-        flow.add_edge(source, p, data_cost(field, labels[cell], cell, options));  // p keeps
+        // A pinned cell may not switch: forbid the sink side outright, so the
+        // pair decomposition below stays the standard one and the pin is a hard
+        // constraint rather than a very expensive preference.
+        const bool is_pinned = field.pinned != nullptr && field.pinned[cell] != 0;
+        flow.add_edge(p, sink, is_pinned ? kForbid : to_alpha);     // p switches
+        flow.add_edge(source, p, is_pinned ? 0.0 : data_cost(field, labels[cell], cell, options));
     }
 
     // Exact pairwise decomposition of E(x_p, x_q), where x = 1 means "switch to
@@ -560,7 +568,10 @@ void icm_sweep(const Field& field, std::vector<std::int32_t>& labels,
 #pragma omp parallel for schedule(static)
 #endif
         for (std::ptrdiff_t i = 0; i < count; ++i) {
-            const std::size_t cell = list[static_cast<std::size_t>(i)];
+            const size_t cell = list[static_cast<std::size_t>(i)];
+            if (field.pinned != nullptr && field.pinned[cell] != 0) {
+                continue;  // decided by an already-processed block
+            }
             const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
             const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
 
@@ -793,7 +804,9 @@ Field fine_field(const std::vector<OrthoTile>& tiles, int width, int height) {
 
 std::vector<std::int32_t> assign_seams(int width, int height,
                                        const std::vector<OrthoTile>& tiles,
-                                       const SeamOptions& options) {
+                                       const SeamOptions& options,
+                                       const std::vector<std::int32_t>* pinned_labels,
+                                       const std::vector<std::uint8_t>* pinned) {
     const std::size_t cells =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     std::vector<std::int32_t> labels(cells, -1);
@@ -801,9 +814,45 @@ std::vector<std::int32_t> assign_seams(int width, int height,
         return labels;
     }
 
-    const Field fine = fine_field(tiles, width, height);
+    Field fine = fine_field(tiles, width, height);
+
+    // A block-wise caller pins the margin cells already decided by an earlier
+    // block. A pin only survives when the pinned tile actually covers the cell;
+    // a pinned camera that this block's tile set does not hold (or that is
+    // invalid there) is ignored, and the cell is optimised normally.
+    std::vector<std::uint8_t> pin_mask;
+    std::vector<std::int32_t> pin_values;
+    const bool have_pins = pinned != nullptr && pinned_labels != nullptr &&
+                           pinned->size() == cells && pinned_labels->size() == cells;
+    if (have_pins) {
+        pin_mask.assign(cells, 0);
+        pin_values.assign(cells, -1);
+        for (std::size_t cell = 0; cell < cells; ++cell) {
+            const std::int32_t label = (*pinned_labels)[cell];
+            if ((*pinned)[cell] == 0 || !covers(fine, label, cell)) {
+                continue;
+            }
+            pin_mask[cell] = 1;
+            pin_values[cell] = label;
+        }
+    }
+    const bool any_pin = have_pins && std::any_of(pin_mask.begin(), pin_mask.end(),
+                                                  [](std::uint8_t v) { return v != 0; });
+    if (any_pin) {
+        fine.pinned = pin_mask.data();
+        fine.pinned_label = pin_values.data();
+    }
+
     if (options.iterations <= 0) {
-        return argmax_labels(fine);  // the plain per-cell argmax, no smoothing
+        labels = argmax_labels(fine);  // the plain per-cell argmax, no smoothing
+        if (any_pin) {
+            for (std::size_t cell = 0; cell < cells; ++cell) {
+                if (pin_mask[cell] != 0) {
+                    labels[cell] = pin_values[cell];
+                }
+            }
+        }
+        return labels;
     }
 
     // -- multi-scale: alpha-expand coarsest first, upsample, refine -----------
@@ -826,6 +875,15 @@ std::vector<std::int32_t> assign_seams(int width, int height,
 
     labels = previous.empty() ? argmax_labels(fine)
                               : seed_from(previous, previous_width, fine, 2);
+    // Pinned cells start from their decided label and never leave it: the ICM
+    // sweep skips them (Field::pinned) and no coarse level can override them.
+    if (any_pin) {
+        for (std::size_t cell = 0; cell < cells; ++cell) {
+            if (pin_mask[cell] != 0) {
+                labels[cell] = pin_values[cell];
+            }
+        }
+    }
     // The coarse levels carry the global structure; from the upsampled labels
     // only the cheap ICM polish runs at full resolution.
     for (int iteration = 0; iteration < options.iterations; ++iteration) {

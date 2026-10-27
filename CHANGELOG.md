@@ -28,6 +28,34 @@ All notable changes to alphashape are recorded here. The format follows
   fingerprint records the level count the run actually used, so a map built
   before this change is still reused by a single-level run and rebuilt by a
   pyramid run. The CPU and the GPU path both implement it from the same plan.
+- **Build Orthomosaic processes the output in blocks, so a full-resolution ortho
+  fits in memory.** A run whose whole-grid estimate fits the machine's budget
+  still builds as one piece, byte for byte as before; a larger one is split into
+  square blocks with a margin, each block rectifying only the cameras whose
+  footprint reaches it and writing only its interior into the assembled output.
+  Seams stay continuous across block borders: the margin an earlier block decided
+  is pinned as a hard constraint, in raster order, out to the blend pyramid's
+  reach (cells nearer the border stay free so the optimiser keeps its full
+  window context instead of inheriting a window-edge artefact). Mosaic blending
+  applies the whole grid's pyramid depth to every block, edge-padding a window
+  too narrow to carry that depth, so an edge block does not blend with a
+  shallower operator than its neighbours. Photographs are decoded through a
+  byte-bounded LRU cache sized from what the block plan leaves over, with the
+  next block's frames kept at the head of the LRU, and the decode count is
+  logged at Info. Progress is reported per block and Cancel is honoured between
+  blocks.
+- **The orthomosaic block plan takes the largest block the machine can carry.**
+  It walks 4096 → 512 cells and takes the first side whose peak (one window's
+  stages plus the assembled output raster, the assembled-grid `fill_holes` and
+  the photo cache) fits `platform::memory_budget_bytes`, which already reserves
+  headroom (60% of physical RAM). A machine with the RAM does fewer, bigger
+  blocks instead of being held to a fixed absolute target. The reported
+  36-photo, 4592x3056, 1.9 cm case over a 100 m site (28 M cells, ~8 GB before)
+  plans at 2048-cell blocks (3x3, ~4.5 GB peak) on an 8 GB machine, 1024-cell
+  blocks (~2.5 GB) on a 2 GB budget, 4096-cell (2x2, ~12 GB) on 32 GB, and as
+  one piece once the whole grid's ~14 GB estimate fits. The resolution is only
+  coarsened when even a 512-cell block cannot fit. `block_size` overrides the
+  block side (0 = automatic).
 - **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
   (including one during filtering) stores the finished maps before it stops,
   and `reuse_depth` (now on by default) skips their search on the next run and

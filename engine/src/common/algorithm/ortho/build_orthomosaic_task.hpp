@@ -13,6 +13,7 @@
 // Python API; the implementation (true orthorectification with a DEM occlusion
 // test) is ours.
 
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -84,9 +85,137 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
 ///
 /// `heights` must be the DEM whose grid `grid` follows; `nodata` marks missing
 /// samples at the nodes (their height falls back to the first valid sample).
+///
+/// `fallback_height` overrides the nodata fallback: block-wise callers compute
+/// the DEM's median valid height ONCE and pass it here, because recomputing the
+/// median per block would rescan the whole DEM for every block. NaN (the
+/// default) means "compute it from `heights`".
+///
+/// `lattice`, when given, makes a block's map reproduce the WHOLE grid's map bit
+/// for bit inside the block: the node coordinates are evaluated on the global
+/// lattice (not recomputed from the block's own origin, which differs in the
+/// last bit) and the float offsets share the global anchor, which is what the
+/// subtraction rounds against. Without it the map is self-consistent but its
+/// values can differ from a whole-grid map in the last float bit, which would
+/// make block-wise rectification differ from whole-grid rectification.
+struct PlaneToLocalLattice {
+    double origin_x = 0.0;   ///< global grid's outer top-left corner
+    double origin_y = 0.0;
+    int col_offset = 0;      ///< this block's first node, in global node columns
+    int row_offset = 0;
+    Eigen::Vector3d anchor = Eigen::Vector3d::Zero();  ///< global first-node local
+};
+
+/// The local position of a grid's first node at the height sampled there: the
+/// anchor every map over that grid shares. Block-wise callers compute it once on
+/// the WHOLE grid and put it in PlaneToLocalLattice.
+Eigen::Vector3d plane_to_local_anchor(const elevation::SurfaceFrame& frame,
+                                     const RasterGrid& grid,
+                                     const GeoRaster<float>& heights, float nodata,
+                                     double fallback_height);
+
 std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
     const elevation::SurfaceFrame& frame, const RasterGrid& grid,
-    const GeoRaster<float>& heights, float nodata);
+    const GeoRaster<float>& heights, float nodata,
+    double fallback_height = std::numeric_limits<double>::quiet_NaN(),
+    const PlaneToLocalLattice* lattice = nullptr);
+
+// -- block plan --------------------------------------------------------------
+//
+// A full-resolution ortho over a large site does not fit in memory as one
+// piece: the rectified tiles alone are "footprint x 8 B/cell", and a flight of
+// fully overlapping obliques makes the footprint a large multiple of the grid.
+// The task therefore processes the output grid in square blocks, each with a
+// margin of cells that overlaps its neighbours, and keeps only one block's
+// tiles, seam field and blend planes alive at a time. The assembled result
+// (RGBA + seam labels, 8 B/cell) is the only grid-sized object.
+//
+// Small rasters take exactly the old path: when the whole grid already fits the
+// budget the plan asks for ONE block, and the block loop degenerates to the
+// previous whole-grid code (no margin, no re-indexing of cells).
+
+/// What build_orthomosaic_task passes to plan_ortho_blocks().
+struct OrthoBlockPlanInput {
+    int grid_width = 0;
+    int grid_height = 0;
+    /// Summed area of every camera's tile crop box over the WHOLE grid (what
+    /// predicted_footprint_cells() returns).
+    double footprint_cells = 0.0;
+    /// Pixels of the largest photograph (3 bytes each when decoded).
+    double photo_cells = 0.0;
+    int camera_count = 0;
+    /// True when the chunk is georeferenced (the plane->local node map exists).
+    bool has_node_map = false;
+    /// True when the run will fill holes on the assembled raster. The fill stage
+    /// is a real candidate for the blocked run's peak only when it runs, so the
+    /// plan must know: estimating it for a fill_holes=false run would coarsen a
+    /// grid that actually fits.
+    bool fill_holes = true;
+    /// The task's byte budget; 0 means "no limit" (one block).
+    std::uint64_t budget_bytes = 0;
+    /// Expert/test override: process in blocks of this side (0 = automatic).
+    int forced_block_cells = 0;
+};
+
+/// The block layout a run will use, with the peak it is planned for.
+struct OrthoBlockPlan {
+    /// Side of a block in cells; 0 means "process the whole grid in one piece".
+    int block_cells = 0;
+    /// Overlap kept around every block, on each side, in cells.
+    int margin_cells = 0;
+    int columns = 1;
+    int rows = 1;
+    /// The mosaic blend's pyramid depth. Pinned to the WHOLE grid's depth (or
+    /// as deep as the margin supports) and shared by every block, so all blocks
+    /// apply the same operator; -1 would let each block pick its own.
+    int levels = 0;
+    /// LRU capacity for decoded photographs. A share of what the block plan
+    /// leaves over, so the cache can never be the reason a run does not fit.
+    std::uint64_t photo_cache_bytes = 0;
+    /// The predicted peak of one block's window stages plus the assembled
+    /// output raster, in bytes (the block loop's own high-water mark).
+    double estimated_window_bytes = 0.0;
+    /// The predicted peak of the assembled-grid fill_holes stage that runs after
+    /// the last block, in bytes. fill_holes=true makes this a real candidate for
+    /// the run's maximum; a run with it off never reaches it.
+    double estimated_fill_bytes = 0.0;
+    /// The predicted peak of the planned layout: whichever of the two above is
+    /// larger, plus the photo cache, in bytes.
+    double estimated_peak_bytes = 0.0;
+    /// True when even the smallest block does not fit the budget: the caller
+    /// then falls back to the last-resort resolution coarsening.
+    bool coarsened = false;
+};
+
+/// The margin a block of `block_cells` cells is processed with, at the mosaic
+/// pyramid depth `pyramid_levels` the plan pins. It is the blend's own support
+/// (126 cells at the 6-level cap) plus a small slack, NOT a fraction of the
+/// block: the margin is what makes a block's interior identical to the whole
+/// grid's there, so it is set by the operators that read across cells. Returns 0
+/// for a non-positive block side.
+int block_margin_cells(int block_cells, int pyramid_levels);
+
+/// The predicted peak of one block, in bytes:
+/// max(window stages + assembled output raster/labels (8 B per OUTPUT cell),
+///     assembled-grid fill_holes)
+/// plus the photo cache. The window and the assembled raster are disjoint from
+/// the fill stage in TIME (fill runs after the last block), so the two are a
+/// maximum, not a sum; only the cache is alive through both.
+double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
+                                 bool has_node_map, double photo_cells,
+                                 std::uint64_t output_cells,
+                                 std::uint64_t photo_cache_bytes, bool fill_holes = true);
+/// The peak of the assembled-grid fill_holes stage alone (labels + RGBA + one
+/// channel's float plane, validity mask, EDT and banded Sibson accumulators).
+double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);
+
+/// Choose the block layout for a run. One block when the whole grid fits the
+/// budget (identical behaviour for small rasters); otherwise the LARGEST block
+/// side from 4096 down to 512 whose estimate fits the budget. The budget
+/// (platform::memory_budget_bytes) already reserves headroom for the rest of the
+/// process, so there is no second fraction on top: a machine with the RAM does
+/// fewer, bigger blocks, which shrinks the margin overhead quadratically.
+OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input);
 
 /// Build the chunk's orthomosaic from its DEM (surface_data = "elevation") or
 /// from a DSM derived from Chunk::model() (surface_data = "model"). Throws
