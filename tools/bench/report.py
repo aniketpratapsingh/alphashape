@@ -246,6 +246,30 @@ def _wrap_list(values: list[str], per_chunk: int = 6) -> str:
     return "<br>".join(groups)
 
 
+def _crs_rows(provenance: Any) -> list[str]:
+    """Table rows saying whether a reference had to be reprojected, and from what.
+
+    A reader comparing this week's number with last week's needs to know the
+    comparison was made in the same frame; a silent CRS change would look like a
+    metric movement.
+    """
+    if not isinstance(provenance, dict):
+        return []
+    rows = []
+    if provenance.get("reprojected"):
+        rows.append(
+            f"| CRS | reference EPSG:{provenance.get('reference_epsg')} reprojected "
+            f"to EPSG:{provenance.get('our_epsg')} |"
+        )
+    elif provenance.get("our_epsg") is not None:
+        rows.append(f"| CRS | both EPSG:{provenance.get('our_epsg')} |")
+    elif provenance.get("note"):
+        rows.append(f"| CRS | _{provenance['note']}_ |")
+    else:
+        rows.append("| CRS | not declared by either product |")
+    return rows
+
+
 def markdown(
     current: dict,
     previous: dict | None,
@@ -477,6 +501,7 @@ def markdown(
             lines.append(f"| dx / dy | {_fmt(ref_ortho.get('dx_m'))} / {_fmt(ref_ortho.get('dy_m'))} m |")
             lines.append(f"| Overlap | {_fmt(ref_ortho.get('overlap_fraction'))} |")
             lines.append(f"| Comparison grid | {_fmt(ref_ortho.get('grid_pixel_m'))} m |")
+            lines.extend(_crs_rows(ref_ortho.get("crs")))
         else:
             lines.append(f"- Orthomosaic vs reference: _{ref_ortho.get('reason', 'not comparable')}_")
         lines.append("")
@@ -506,6 +531,7 @@ def markdown(
             )
             lines.append(f"| Cells compared | {ref_dem.get('cells')} |")
             lines.append(f"| Overlap | {_fmt(ref_dem.get('overlap_fraction'))} |")
+            lines.extend(_crs_rows(ref_dem.get("crs")))
             datums = ref_dem.get("vertical_datum") or {}
             lines.append(
                 f"| Vertical datum (ours) | {datums.get('ours') or 'unknown — not recorded'} |"
@@ -661,11 +687,12 @@ def comparison_png(current: dict, metrics_json_path: Path, destination: Path) ->
 
         # Both reads are cell-bounded: a survey orthomosaic is hundreds of
         # megapixels, and a thumbnail beside a crop does not need it at full size.
-        # The reference is additionally windowed to our extent, so only the part
-        # both products cover is read.
+        # The reference is additionally windowed to our extent and reprojected onto
+        # our CRS when the two differ — a side-by-side of two different projections
+        # stretches one of them against a grid it does not belong to.
         ours = metrics.read_geotiff(ortho_path, max_cells=1_000_000)
-        theirs = metrics.read_geotiff(
-            str(reference), bounds=ours.extent(), max_cells=1_000_000
+        theirs, _ = metrics.aligned_reference(
+            str(reference), ours, bounds=ours.extent(), max_cells=1_000_000
         )
         ox, oy, pixel, width, height = metrics.common_grid(ours, theirs, max_cells=1_000_000)
         a, a_valid = metrics.resample_to_grid(

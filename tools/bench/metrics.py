@@ -217,7 +217,17 @@ def common_grid(
     intersection would exceed ``max_cells``. An integer factor keeps every output
     cell aligned with the source grids, so the resampler adds no phase shift of
     its own.
+
+    The two rasters must share a CRS. Comparing across CRSs is otherwise a silent
+    nonsense — the metre-valued origins of a projected grid and the degree-valued
+    ones of a geographic grid overlap nowhere or, worse, appear to overlap — so a
+    mismatch raises here rather than producing a number.
     """
+    if a.epsg is not None and b.epsg is not None and a.epsg != b.epsg:
+        raise ValueError(
+            f"rasters are in different CRSs (EPSG:{a.epsg} vs EPSG:{b.epsg}); "
+            "reproject one onto the other before comparing"
+        )
     ax0, ay0, ax1, ay1 = a.extent()
     bx0, by0, bx1, by1 = b.extent()
     x0, x1 = max(ax0, bx0), min(ax1, bx1)
@@ -1418,6 +1428,188 @@ def read_geotiff(
     )
 
 
+def reproject_raster_to(
+    path: str,
+    target_epsg: int | None,
+    *,
+    max_cells: int = 8_000_000,
+    resampling: str = "average",
+) -> Raster:
+    """Warp the raster in ``path`` onto ``target_epsg`` and return it in memory.
+
+    Only needed when the two products being compared are in different CRSs. The
+    engine writes its own products in the CRS of the project; a publisher's
+    reference is in whatever its own pipeline chose, and the two differ more often
+    than they agree (a UTM zone boundary, a national grid, a geographic lat/lon
+    reference). Comparing their metre-valued origins without reprojecting is a
+    silent nonsense, so ``aligned_reference`` calls this and records that it did.
+
+    ``max_cells`` bounds the output grid so the warp never materialises more than a
+    comparison needs; float32 keeps the largest case around 128 MB for four bands.
+
+    ``target_epsg is None`` means the target carries no CRS: there is nothing to
+    reproject onto, and the caller treats the comparison as unusable rather than
+    guessing.
+    """
+    if target_epsg is None:
+        raise ValueError("cannot reproject onto an unknown CRS")
+    import rasterio  # noqa: PLC0415
+    from rasterio.warp import Resampling, calculate_default_transform, reproject  # noqa: PLC0415
+
+    with rasterio.open(path) as src:
+        if src.crs is None:
+            raise ValueError(f"{path}: source has no CRS")
+        target = rasterio.crs.CRS.from_epsg(target_epsg)
+        if src.crs == target:
+            # Nothing to do: re-read through the normal path so the caller's
+            # windowing and decimation rules still apply.
+            return read_geotiff(path, max_cells=max_cells, resampling=resampling)
+        transform, width, height = calculate_default_transform(
+            src.crs, target, src.width, src.height, *src.bounds
+        )
+        cells = width * height
+        if cells > max_cells:
+            # Ask rasterio for a smaller destination directly instead of scaling
+            # the transform by hand: it keeps the extent and the aspect exact.
+            factor = math.sqrt(cells / max_cells)
+            transform, width, height = calculate_default_transform(
+                src.crs, target, src.width, src.height, *src.bounds,
+                dst_width=max(1, int(src.width / factor)),
+                dst_height=max(1, int(src.height / factor)),
+            )
+        destination = np.full((src.count, height, width), np.nan, dtype=np.float32)
+        method = Resampling.nearest if resampling == "nearest" else Resampling.average
+        for band in range(src.count):
+            reproject(
+                source=rasterio.band(src, band + 1),
+                destination=destination[band],
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=target,
+                resampling=method,
+                dst_nodata=float("nan"),
+            )
+
+    payload = destination[0] if destination.shape[0] == 1 else np.moveaxis(destination, 0, 2)
+    return Raster(
+        data=payload,
+        origin_x=float(transform.c),
+        origin_y=float(transform.f),
+        pixel_size_x=float(transform.a),
+        pixel_size_y=float(-transform.e),
+        nodata=float("nan"),
+        epsg=target_epsg,
+    )
+
+
+def aligned_reference(
+    reference_path: str,
+    ours: Raster,
+    *,
+    bounds: tuple[float, float, float, float] | None,
+    max_cells: int = 4_000_000,
+    resampling: str = "average",
+) -> tuple[Raster, dict]:
+    """Read a reference so it is directly comparable with ``ours``.
+
+    Three cases, all decided from the files' own metadata:
+
+    * **same CRS** — read the window over our extent, as before.
+    * **ours has a CRS, the reference does not** — fail loudly. Nothing can be
+      inferred about where the reference is, and comparing it by coordinate value
+      would produce a plausible-looking wrong number.
+    * **different CRSs** — warp the reference onto ours with rasterio. If OUR
+      product carries no CRS there is nothing to warp onto, which is also an error.
+
+    Returns ``(raster, provenance)`` where provenance records what happened, so the
+    report and the metrics JSON say whether a reprojection was applied instead of
+    leaving a reader to guess why the numbers moved.
+    """
+    grid = read_geotiff_grid(reference_path)
+    reference_epsg = grid["epsg"]
+    our_epsg = ours.epsg
+    provenance: dict = {
+        "reference_epsg": reference_epsg,
+        "our_epsg": our_epsg,
+        "reprojected": False,
+    }
+
+    if reference_epsg is None:
+        if our_epsg is not None:
+            raise ValueError(
+                f"{reference_path}: the reference states no CRS but our product is "
+                f"EPSG:{our_epsg}; there is no coordinate reference in common"
+            )
+        # Neither side declares one: the only defensible comparison is the same-
+        # coordinate one, and the provenance says so.
+        provenance["note"] = "neither raster declares a CRS; compared by coordinate value"
+        return (
+            read_geotiff(reference_path, bounds=bounds, max_cells=max_cells,
+                         resampling=resampling),
+            provenance,
+        )
+
+    if our_epsg is None:
+        raise ValueError(
+            f"our product declares no CRS but the reference is EPSG:{reference_epsg}"
+        )
+
+    if reference_epsg == our_epsg:
+        return (
+            read_geotiff(reference_path, bounds=bounds, max_cells=max_cells,
+                         resampling=resampling),
+            provenance,
+        )
+
+    # Different CRSs: warp the reference onto ours. ``bounds`` is expressed in OUR
+    # CRS, so it is applied by windowing the warped result rather than being passed
+    # to rasterio in the wrong frame.
+    warped = reproject_raster_to(
+        reference_path, our_epsg, max_cells=max_cells, resampling=resampling
+    )
+    provenance["reprojected"] = True
+    provenance["note"] = (
+        f"reference reprojected from EPSG:{reference_epsg} to EPSG:{our_epsg}"
+    )
+    if bounds is not None:
+        x0, y0, x1, y1 = bounds
+        warped = crop_raster(
+            warped,
+            origin_x=x0,
+            origin_y=y1,
+            width=max(1, int(math.ceil((x1 - x0) / warped.pixel_size_x))),
+            height=max(1, int(math.ceil((y1 - y0) / warped.pixel_size_y))),
+        )
+    return warped, provenance
+
+
+def crop_raster(
+    raster: Raster, *, origin_x: float, origin_y: float, width: int, height: int
+) -> Raster:
+    """A sub-raster in the same grid, clipped to the source. Never extrapolates.
+
+    Used only to bound a WARPED reference (whose grid the caller did not choose) to
+    our extent; nodata cells outside the source stay nodata.
+    """
+    col0 = int(round((origin_x - raster.origin_x) / raster.pixel_size_x))
+    row0 = int(round((raster.origin_y - origin_y) / raster.pixel_size_y))
+    col0 = max(0, min(col0, raster.width - 1))
+    row0 = max(0, min(row0, raster.height - 1))
+    cols = max(1, min(width, raster.width - col0))
+    rows = max(1, min(height, raster.height - row0))
+    data = raster.data[row0:row0 + rows, col0:col0 + cols]
+    return Raster(
+        data=data,
+        origin_x=raster.origin_x + col0 * raster.pixel_size_x,
+        origin_y=raster.origin_y - row0 * raster.pixel_size_y,
+        pixel_size_x=raster.pixel_size_x,
+        pixel_size_y=raster.pixel_size_y,
+        nodata=raster.nodata,
+        epsg=raster.epsg,
+    )
+
+
 def _full_window(src):
     from rasterio.windows import Window  # noqa: PLC0415
 
@@ -1999,8 +2191,12 @@ def evaluate(
         result["reference_based"]["ortho"] = {"skipped": "no orthomosaic produced"}
     else:
         try:
-            reference = read_geotiff(spec.ortho_reference, bounds=ortho.extent())
-            result["reference_based"]["ortho"] = compare_ortho_to_reference(ortho, reference)
+            reference, provenance = aligned_reference(
+                spec.ortho_reference, ortho, bounds=ortho.extent()
+            )
+            comparison = compare_ortho_to_reference(ortho, reference)
+            comparison["crs"] = provenance
+            result["reference_based"]["ortho"] = comparison
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["ortho"] = {"skipped": f"reference unusable: {exc}"}
 
@@ -2013,15 +2209,19 @@ def evaluate(
         try:
             # "nearest" here: a DSM compared cell for cell must not have heights
             # averaged across a building edge before the difference is taken.
-            reference = read_geotiff(spec.dem_reference, bounds=dem.extent())
+            reference, provenance = aligned_reference(
+                spec.dem_reference, dem, bounds=dem.extent(), resampling="nearest"
+            )
             # Both datums, from the files themselves. Our writer records ellipsoidal
             # heights; the reference's is whatever the publisher shipped.
-            result["reference_based"]["dem"] = compare_dem_to_reference(
+            comparison = compare_dem_to_reference(
                 dem,
                 reference,
                 our_datum=read_vertical_datum(dem_path),
                 reference_datum=read_vertical_datum(spec.dem_reference),
             )
+            comparison["crs"] = provenance
+            result["reference_based"]["dem"] = comparison
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["dem"] = {"skipped": f"reference unusable: {exc}"}
 

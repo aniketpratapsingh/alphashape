@@ -39,6 +39,11 @@ Reprojection RMS is an internal-consistency measure, not an accuracy one: a self
 but wrongly scaled model scores well. The report never presents it alone for that reason,
 and the reference-based rows are what actually say whether the model is right.
 
+Every reference-based metric first reads both products' CRSs. A reference in a different CRS
+is reprojected onto ours with rasterio and the report says so; a reference that states no CRS
+against a product that does is a hard error, because there is no defensible way to compare
+them by coordinate value. Neither comparison is ever made silently.
+
 There is also an **independent** re-projection: `run_bench` re-projects every triangulated
 tie point from the saved project's own poses and calibration, which is a cross-check on
 both the project writer and the metric. It is reported beside the engine's RMS and gated,

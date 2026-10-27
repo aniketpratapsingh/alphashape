@@ -18,6 +18,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -173,6 +174,119 @@ class CommonGridTest(unittest.TestCase):
         b = metrics.Raster(np.zeros((4, 4)), 100.0, 100.0, 1.0, 1.0)
         with self.assertRaises(ValueError):
             metrics.common_grid(a, b)
+
+    def test_a_crs_mismatch_is_an_error_not_a_comparison(self):
+        # Two grids whose coordinate values happen to overlap but which describe
+        # different worlds. Silently comparing them is the failure this guards.
+        a = metrics.Raster(np.zeros((4, 4)), 0.0, 4.0, 1.0, 1.0, epsg=32632)
+        b = metrics.Raster(np.zeros((4, 4)), 0.0, 4.0, 1.0, 1.0, epsg=3857)
+        with self.assertRaises(ValueError) as raised:
+            metrics.common_grid(a, b)
+        self.assertIn("32632", str(raised.exception))
+        self.assertIn("3857", str(raised.exception))
+
+    def test_an_unknown_crs_is_allowed_through(self):
+        # A hand-built Raster in a test carries no EPSG; that is "not declared",
+        # which is different from "declared and different".
+        a = metrics.Raster(np.zeros((4, 4)), 0.0, 4.0, 1.0, 1.0)
+        b = metrics.Raster(np.zeros((4, 4)), 0.0, 4.0, 1.0, 1.0, epsg=32632)
+        self.assertEqual(metrics.common_grid(a, b)[3:], (4, 4))
+
+
+class AlignedReferenceTest(unittest.TestCase):
+    """The CRS gate in front of every raster comparison, on real GeoTIFFs."""
+
+    @staticmethod
+    def _write(path, *, epsg, value, transform, size=(32, 32), bands=1):
+        import rasterio  # noqa: PLC0415
+
+        data = np.full((bands, size[1], size[0]), value, dtype="float32")
+        with rasterio.open(
+            str(path), "w", driver="GTiff", height=size[1], width=size[0],
+            count=bands, dtype="float32", crs=f"EPSG:{epsg}",
+            transform=transform, nodata=float("nan"),
+        ) as dataset:
+            dataset.write(data)
+
+    def _skip_without_rasterio(self):
+        try:
+            import rasterio  # noqa: F401, PLC0415
+        except ImportError:  # pragma: no cover - rasterio is in the workflow
+            self.skipTest("rasterio is not installed")
+
+    def test_a_matching_crs_is_read_without_a_warp(self):
+        self._skip_without_rasterio()
+        from rasterio.transform import from_origin  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ref.tif"
+            self._write(path, epsg=32632, value=7.0, transform=from_origin(0, 32, 1, 1))
+            ours = metrics.Raster(np.zeros((32, 32)), 0.0, 32.0, 1.0, 1.0, epsg=32632)
+            reference, provenance = metrics.aligned_reference(str(path), ours, bounds=None)
+        self.assertFalse(provenance["reprojected"])
+        self.assertEqual(provenance["reference_epsg"], 32632)
+        self.assertAlmostEqual(float(np.nanmax(reference.band(0))), 7.0)
+
+    def test_a_reference_without_a_crs_against_ours_with_one_is_an_error(self):
+        self._skip_without_rasterio()
+        from rasterio.transform import from_origin  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ref.tif"
+            import rasterio  # noqa: PLC0415
+
+            with rasterio.open(
+                str(path), "w", driver="GTiff", height=32, width=32, count=1,
+                dtype="float32", transform=from_origin(0, 32, 1, 1),
+            ) as dataset:
+                dataset.write(np.full((1, 32, 32), 1.0, dtype="float32"))
+            ours = metrics.Raster(np.zeros((32, 32)), 0.0, 32.0, 1.0, 1.0, epsg=32632)
+            with self.assertRaises(ValueError):
+                metrics.aligned_reference(str(path), ours, bounds=None)
+
+    def test_a_different_crs_is_reprojected_onto_ours(self):
+        self._skip_without_rasterio()
+        import rasterio  # noqa: PLC0415
+        from rasterio.transform import from_origin  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmp:
+            utm = Path(tmp) / "ours.tif"
+            mercator = Path(tmp) / "ref.tif"
+            transform = from_origin(500000.0, 5500000.0, 1.0, 1.0)
+            self._write(utm, epsg=32632, value=3.0, transform=transform)
+            # Build the 3857 copy by warping the UTM one, so both describe the same
+            # ground and the only difference is the datum of the grid.
+            from rasterio.warp import Resampling, calculate_default_transform, reproject
+
+            with rasterio.open(str(utm)) as src:
+                dst_transform, width, height = calculate_default_transform(
+                    src.crs, "EPSG:3857", src.width, src.height, *src.bounds
+                )
+                payload = np.full((height, width), np.nan, dtype="float32")
+                reproject(
+                    rasterio.band(src, 1), payload,
+                    src_transform=src.transform, src_crs=src.crs,
+                    dst_transform=dst_transform, dst_crs="EPSG:3857",
+                    resampling=Resampling.bilinear, dst_nodata=np.nan,
+                )
+            with rasterio.open(
+                str(mercator), "w", driver="GTiff", height=height, width=width,
+                count=1, dtype="float32", crs="EPSG:3857",
+                transform=dst_transform, nodata=float("nan"),
+            ) as dataset:
+                dataset.write(payload, 1)
+
+            ours = metrics.read_geotiff(str(utm))
+            reference, provenance = metrics.aligned_reference(
+                str(mercator), ours, bounds=ours.extent()
+            )
+            comparison = metrics.compare_dem_to_reference(ours, reference)
+
+        self.assertTrue(provenance["reprojected"])
+        self.assertEqual(reference.epsg, ours.epsg)
+        # Same constant both sides: round-tripping the warp must not invent a bias.
+        self.assertAlmostEqual(comparison["cells"], 32 * 32, delta=64)
+        self.assertAlmostEqual(comparison["median_m"], 0.0, delta=0.02)
 
 
 class ErosionTest(unittest.TestCase):
