@@ -408,11 +408,23 @@ class SubsetNoteTest(unittest.TestCase):
         current = metrics()
         current["dataset_manifest"].update(
             images=30, images_available=102,
-            image_selection={"mode": "gps-centred block", "first": "A.JPG", "last": "B.JPG"},
+            image_selection={
+                "mode": "nearest-to-centroid cluster",
+                "images": ["A.JPG", "C.JPG", "D.JPG"],
+            },
         )
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("30 of 102", text)
-        self.assertIn("gps-centred block", text)
+        self.assertIn("nearest-to-centroid cluster", text)
+        self.assertIn("A.JPG, C.JPG, D.JPG", text)
+
+    def test_an_older_metrics_file_with_only_endpoints_still_renders(self):
+        current = metrics()
+        current["dataset_manifest"].update(
+            images=30, images_available=102,
+            image_selection={"mode": "gps-centred block", "first": "A.JPG", "last": "B.JPG"},
+        )
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("A.JPG .. B.JPG", text)
 
     def test_a_full_run_does_not_mention_a_subset(self):

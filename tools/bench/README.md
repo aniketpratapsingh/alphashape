@@ -118,9 +118,11 @@ Both datasets are bounded in two ways, because 20–24 MP frames at the default 
 settings do not fit a weekly job on a shared CPU runner — the first version of this
 benchmark spent over five hours in BuildDepthMaps and was cancelled:
 
-- **a 30-image block**, chosen as a contiguous spatial strip (nearest the flight's centre
-  by GPS where the images carry it) rather than a strided sample across the whole flight,
-  which would only just overlap and produce sparse depth maps for the wrong reason;
+- **a 30-image cluster**, chosen as the 30 images nearest the flight's centre (the median GPS
+  position, or file order where the frames carry no GPS) rather than a strided sample across
+  the whole flight, which would only just overlap and produce sparse depth maps for the wrong
+  reason. The cluster is deterministic and every selected file name is printed in the log and
+  listed in the report;
 - **`MatchPhotos keypoint_limit_per_mpx=250`**, a quarter of the default density: at
   20–24 MP per frame the default is 20 000+ keypoints per image, and the resulting matching
   ran the first working CI attempt out of memory at 97%;

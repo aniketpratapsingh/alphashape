@@ -145,13 +145,29 @@ class SubsetTest(unittest.TestCase):
             second, _ = run_bench.select_subset(images, 5)
             self.assertEqual(first, second)
 
-    def test_the_selection_records_its_endpoints(self):
+    def test_the_selection_names_every_image_it_chose(self):
         with tempfile.TemporaryDirectory() as tmp:
             images = self._images(Path(tmp), 12)
             selected, info = run_bench.select_subset(images, 5)
-            self.assertEqual(info["first"], selected[0].name)
-            self.assertEqual(info["last"], selected[-1].name)
+            self.assertEqual(info["images"], [path.name for path in selected])
             self.assertEqual(info["selected"], 5)
+            self.assertNotIn("first", info)  # a range would misstate a GPS cluster
+
+    def test_a_gps_cluster_is_nearest_the_flight_centre(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 9)
+            # One row of positions; the middle three are nearest the median.
+            positions = [(float(index), 0.0) for index in range(9)]
+            original = run_bench._image_positions
+            run_bench._image_positions = lambda _images: positions
+            try:
+                selected, info = run_bench.select_subset(images, 3)
+            finally:
+                run_bench._image_positions = original
+        self.assertEqual(info["mode"], "nearest-to-centroid cluster")
+        self.assertEqual(
+            [images.index(path) for path in selected], [3, 4, 5]
+        )
 
     def test_dms_conversion(self):
         self.assertAlmostEqual(run_bench._dms((11.0, 40.0, 7.5477)), 11.0 + 40.0 / 60 + 7.5477 / 3600)

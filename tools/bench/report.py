@@ -233,6 +233,19 @@ def _skipped(section: Any) -> str | None:
     return None
 
 
+def _wrap_list(values: list[str], per_chunk: int = 6) -> str:
+    """A long list of file names as comma-separated groups, inside one table cell.
+
+    A markdown table cell cannot contain a raw newline, so the groups are joined
+    with an explicit ``<br>``.
+    """
+    groups = [
+        ", ".join(values[start:start + per_chunk])
+        for start in range(0, len(values), per_chunk)
+    ]
+    return "<br>".join(groups)
+
+
 def markdown(
     current: dict,
     previous: dict | None,
@@ -281,9 +294,16 @@ def markdown(
         lines.append(f"| Nominal GSD | {_fmt(manifest['nominal_gsd_m'])} m |")
     selection = manifest.get("image_selection") or {}
     if selection and selection.get("mode") not in (None, "all"):
-        lines.append(
-            f"| Image block | {selection.get('first')} .. {selection.get('last')} |"
-        )
+        # The actual selected files. A first..last range used to be printed, but
+        # the subset is a nearest-to-centroid cluster and is not contiguous in file
+        # order, so a range claimed images the run never used.
+        chosen = selection.get("images") or []
+        if chosen:
+            lines.append(f"| Images used | {_wrap_list(chosen)} |")
+        else:  # an older metrics JSON with only first/last
+            lines.append(
+                f"| Image block | {selection.get('first')} .. {selection.get('last')} |"
+            )
     lines.append(
         f"| Licence | {licence.get('spdx', '-')}"
         + (f" — [terms]({licence['url']})" if licence.get("url") else "")

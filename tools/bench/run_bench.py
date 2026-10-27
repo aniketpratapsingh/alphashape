@@ -302,7 +302,7 @@ def collect_images(dataset: dict, work: Path) -> list[Path]:
 
 
 def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], dict]:
-    """A contiguous block of ``limit`` images around the block's centroid.
+    """The ``limit`` images nearest the flight's centre, as a spatial cluster.
 
     Needed because the dense stage's cost is images x pixels, and this dataset is
     102 frames at 20 MP: at any downscale that still resolves the 2.4 cm GSD, the
@@ -310,21 +310,31 @@ def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], di
     way to keep the run inside its budget without falling back to a resolution so
     coarse that none of the metrics mean anything.
 
-    Contiguous, not strided: a drone flies a lawnmower pattern, so a run of
-    consecutive file names is a contiguous strip of the site with the overlap the
-    stereo stage needs. Striding across the whole flight would hand the engine
-    images that only just overlap, and the depth maps would be sparse for a reason
-    that has nothing to do with the code.
+    The selection is the ``limit`` images with the smallest squared distance to the
+    MEDIAN position of the whole set (longitude/latitude, or file order when the
+    images carry no GPS). On a lawnmower flight that is a contiguous block around
+    the middle of the site — a real spatial neighbourhood, so consecutive frames
+    overlap the way the stereo stage needs. It is not a strided sample across the
+    whole flight (those only just overlap and produce sparse depth maps for a
+    reason that has nothing to do with the code), and it is not "the first N" in
+    file order (which is the edge of the site, where a drone's first passes can be
+    the least overlapping).
 
-    Chosen by GPS where the images carry it, so the strip is a real spatial block;
-    by file order otherwise. Deterministic either way, so two runs of the same
-    dataset select the same images.
+    Deterministic: the same images, in the same order, every run of the dataset.
 
     Returns ``(images, selection)`` where ``selection`` records what was done, for
-    the report's provenance.
+    the report's provenance. ``selection["images"]`` is the actual list of selected
+    file names, not a first..last range: the cluster is not contiguous in file
+    order when the flight crosses the centroid more than once, and a range would
+    claim images that were not used.
     """
     if limit is None or limit <= 0 or len(images) <= limit:
-        return images, {"requested": limit, "selected": len(images), "mode": "all"}
+        return images, {
+            "requested": limit,
+            "selected": len(images),
+            "mode": "all",
+            "images": [path.name for path in images],
+        }
 
     positions = _image_positions(images)
     if positions is not None:
@@ -344,9 +354,9 @@ def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], di
     return selected, {
         "requested": limit,
         "selected": len(selected),
-        "mode": "gps-centred block" if positions is not None else "middle file-order block",
-        "first": selected[0].name,
-        "last": selected[-1].name,
+        "mode": "nearest-to-centroid cluster" if positions is not None
+                else "middle file-order block",
+        "images": [path.name for path in selected],
     }
 
 
@@ -758,6 +768,11 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
     available = collect_images(dataset, work)
     images, selection = select_subset(available, dataset.get("max_images"))
     print(f"   {len(images)} of {len(available)} images ({selection['mode']})")
+    if selection["mode"] != "all":
+        # The actual list, not a first..last range: the cluster is chosen by
+        # position, so its members are not always contiguous in file order and a
+        # range would name images that were not used.
+        print("   selected: " + ", ".join(selection["images"]))
     overrides = dataset.get("param_overrides") or {}
     if overrides:
         print(f"   parameter overrides: {overrides}")
