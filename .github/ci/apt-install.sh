@@ -32,7 +32,9 @@
 #   APT_INSTALL_TIMEOUT seconds per `apt-get install` (default 300).
 #   APT_PASSES          passes over the mirror list (default 1 => 4 attempts).
 #   APT_CACHE_SCOPE     ref name folded into the cache key; the action sets it to
-#                       github.ref_name so one branch cannot seed another's cache entry.
+#                       github.ref_name so one branch cannot seed another's cache entry. The
+#                       action only ever saves after this script has run, and only when the
+#                       checked-out commit is the run's own; see that action for the gate.
 #   APT_SOURCES_ROOT, APT_ARCHIVES_DIR, APT_LISTS_DIR
 #                       overrides for /etc/apt, /var/cache/apt/archives and /var/lib/apt/lists;
 #                       used by .github/ci/test-apt-install.sh to exercise this script unprivileged.
@@ -96,7 +98,8 @@ PKGS=("$@")
 # The ref is part of the key because the debs are installed as root from a cache entry, and a
 # workflow that checks out an arbitrary `inputs.ref` must not be able to seed the entry that
 # `main` reads (CodeQL's "cache poisoning via untrusted code"). PRs read main's entry through
-# restore-keys, which is safe: main's cache is trusted, a branch's is not.
+# restore-keys, which is safe: main's cache is trusted, a branch's is not. The action that wraps
+# this script additionally refuses to save unless the checked-out commit is the run's own.
 #
 # The ISO year-week is in the exact key but not in the restore prefix, so a run restores last
 # week's entry, harvests fresh .debs into it, and saves under a new key: an archive snapshot is

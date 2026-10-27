@@ -2,8 +2,8 @@ name: apt-install
 description: >-
   Install .deb packages with mirror rotation and a .deb cache. Wraps
   .github/ci/apt-install.sh, which holds all the logic: it computes the cache key from
-  (image version, architecture, sorted package list), restores the cached debs, tries an
-  offline `apt-get install --no-download`, and otherwise rotates through the Ubuntu
+  (image version, architecture, ref, ISO week, sorted package list), restores the cached debs,
+  tries an offline `apt-get install --no-download`, and otherwise rotates through the Ubuntu
   mirrors with bounded attempts until one works.
 
 inputs:
@@ -24,7 +24,7 @@ outputs:
     description: The actions/cache key derived from the package list.
     value: ${{ steps.key.outputs.key }}
   cache-hit:
-    description: "'true' when the .deb cache was restored."
+    description: "'true' when the exact .deb cache entry was restored."
     value: ${{ steps.cache.outputs.cache-hit }}
 
 runs:
@@ -35,18 +35,27 @@ runs:
       shell: bash
       env:
         APT_PACKAGES: ${{ inputs.packages }}
-        # Scoping the key to the ref keeps one branch (or a run that checked out an arbitrary
-        # ref) from seeding the entry another reads. PRs fall back to main's entry through
-        # restore-keys, which only ever reads a cache main itself wrote.
+        # The ref name scopes the key so one branch's entry is never read as another's. It is
+        # not sufficient on its own, because preview.yml and release.yml are dispatched from the
+        # default branch with an arbitrary `ref` input: such a run has this branch's ref_name
+        # while building someone else's tree. The save step is therefore gated on HEAD below.
         APT_CACHE_SCOPE: ${{ github.ref_name }}
-      run: '"$GITHUB_ACTION_PATH/../../ci/apt-install.sh" --print-key $APT_PACKAGES'
+      run: |
+        "$GITHUB_ACTION_PATH/../../ci/apt-install.sh" --print-key $APT_PACKAGES
+        # The commit actually checked out, when there is a checkout of this repository. Jobs that
+        # run this action without actions/checkout, or outside a git repository, get an empty
+        # value and therefore never save.
+        head=$(git rev-parse HEAD 2>/dev/null || true)
+        printf 'head=%s\n' "$head" >>"$GITHUB_OUTPUT"
 
     - name: Restore the .deb cache
       id: cache
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ~/.cache/apt-debs
         key: ${{ steps.key.outputs.key }}
+        # main's entries only, and only ever read here: the prefix carries no ISO week, so a run
+        # picks up whatever was saved last and refreshes it (see the save step).
         restore-keys: ${{ steps.key.outputs.shared_prefix }}
 
     - name: Install packages
@@ -57,3 +66,30 @@ runs:
         APT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
         APT_INSTALL_TIMEOUT: ${{ inputs.install-timeout }}
       run: '"$GITHUB_ACTION_PATH/../../ci/apt-install.sh" $APT_PACKAGES'
+
+    # Separate from the restore on purpose. The cache entry is unpacked and the .debs in it are
+    # then installed with sudo, so an entry must only ever be written by a run that built the
+    # commit it was started for:
+    #
+    #   * head == github.sha means actions/checkout restored the tree of the run's own event.
+    #     A `workflow_dispatch ... -f ref=<anything else>` builds a different tree while
+    #     github.ref_name still says "main"; that run must not seed what later main runs
+    #     restore and install as root. (The ref is already in the key; this is the second lock.)
+    #   * cache-hit != 'true' means the restored entry was not the exact one, so the tree has
+    #     just been harvested with a fresh archive snapshot. An exact hit has nothing new to add.
+    #
+    # The key carries the ISO week, so an exact hit can only happen within one week: a new week
+    # forces the network path, which refreshes the lists and stores a new snapshot instead of
+    # pinning apt to a stale one forever.
+    - name: Save the .deb cache
+      if: >-
+        steps.key.outputs.head != '' &&
+        steps.key.outputs.head == github.sha &&
+        steps.cache.outputs.cache-hit != 'true'
+      # A cache write is an optimisation: a read-only token (pull requests from forks) or a
+      # full cache must not turn a green build red.
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/apt-debs
+        key: ${{ steps.key.outputs.key }}
