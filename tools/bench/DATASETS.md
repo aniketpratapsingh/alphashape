@@ -124,22 +124,31 @@ does not come from a photogrammetry pipeline at all.
   - `terrains_dslr_jpg.7z` — 42 JPEGs. The pre-undistorted variant is deliberately **not**
     used: the engine estimates distortion itself, and feeding it undistorted images would
     hide distortion-model errors.
-  - `terrains_scan_clean.7z` — the cleaned laser scan (PLY) in the scan's own frame.
-  - `terrains_dslr_scan_eval.7z` — the scan/pose alignment (`scan_alignment.mlp`) that
-    places the laser scan in the image frame, plus the per-image masks. Without this the
-    two clouds live in different coordinate systems and any distance is meaningless.
-  - `terrains_dslr_occlusion.7z` — the occlusion masks. ETH3D's evaluator uses these to
-    score accuracy only on points the laser could actually see.
+  - `terrains_dslr_scan_eval.7z` — the two laser scans already placed in the image frame
+    (`scan1.ply`, `scan2.ply`) and the transform that put them there
+    (`scan_alignment.mlp`). Without the alignment the two clouds live in different
+    coordinate systems and any distance is meaningless. There is one download for this
+    dataset: the archive holds all three files, so it is fetched and extracted once.
+  - `terrains_dslr_occlusion.7z` — the occlusion masks and the scanner's own surface and
+    splats. ETH3D's evaluator uses these to score accuracy only on points the laser could
+    actually see.
 
-    **This benchmark does not download or apply them.** They live in a separate archive
-    whose SHA-256 and byte count are not pinned in `datasets.json`, and the manifest's rule
-    is that a file whose bytes are not verified is not downloaded. Applying them would also
-    need a ray test from each scanner position against the reference surface. The
-    consequence is stated rather than hidden: accuracy is scored over the whole cloud, so a
-    correct reconstruction of a region the scanner was blind to counts as an error, and the
-    reported accuracy is therefore a lower bound. Completeness is unaffected — every
-    reference point genuinely should be reconstructed. `README.md` says the same beside the
-    dataset table, so the claim and the code agree.
+    **This benchmark does not download or apply them.** They live in a separate 43 MB
+    archive whose SHA-256 and byte count are not pinned in `datasets.json`, and the
+    manifest's rule is that a file whose bytes are not verified is not downloaded.
+    Applying them would also need a ray test from each scanner position against the
+    reference surface. The consequence is stated rather than hidden: accuracy is scored
+    over the whole cloud, so a correct reconstruction of a region the scanner was blind to
+    counts as an error, and the reported accuracy is therefore a lower bound. Completeness
+    is unaffected — every reference point genuinely should be reconstructed. `README.md`
+    says the same beside the dataset table, so the claim and the code agree.
+
+    The absence is checked rather than assumed: `terrains_dslr_scan_eval.7z` holds five
+    entries — two scans, the alignment and two directory records — and no masks. That was
+    verified against the real archive, which is why no code looks for masks in it.
+  - `terrains_scan_clean.7z` — the cleaned scan in the scan's own frame. **Not used:**
+    `scan_eval.7z` already carries the scans registered into the image frame, and the
+    benchmark never needs the scanner's own frame.
 - Accuracy/completeness follow ETH3D's own definition as implemented by
   `ETH3D/multi-view-evaluation`: accuracy is the fraction of reconstructed points within
   a tolerance of the reference surface, completeness the fraction of reference points
