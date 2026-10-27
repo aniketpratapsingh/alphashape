@@ -34,6 +34,13 @@ jobs:
         run: tools/check_repo_hygiene.sh
       - name: Seeded-RNG evaluation order
         run: python3 engine/tools/check_rng_order.py engine/src engine/tests
+      - name: Quality-bench metrics
+        # The weekly benchmark's maths and its regression verdict. Stdlib + numpy and
+        # under a second, so a broken metric is caught on the PR that breaks it rather
+        # than a week later in a scheduled run.
+        run: |
+          python3 -m pip install --disable-pip-version-check numpy
+          python3 -m unittest discover -s tools/bench/tests -v
       - name: Release metadata generators
         # NOTICE.txt and sbom.spdx.json are generated from packaging/licenses/deps.yaml at
         # release time; a change to the parser or the renderer must not wait for a release to

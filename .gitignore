@@ -5,6 +5,7 @@ tools/*
 !tools/theme/
 !tools/*.sh
 !tools/sample/
+!tools/bench/
 run/
 work/
 .claude/
