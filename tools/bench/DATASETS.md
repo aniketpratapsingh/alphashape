@@ -89,8 +89,12 @@ does not come from a photogrammetry pipeline at all.
   At 10 cm the mosaic is 4.8 million cells and the argmax labelling keeps the cost linear
   in cells; the trade is visible seams where a camera's score steps, which is exactly what
   the side-by-side comparison image is for. 10 cm is also an ordinary orthomosaic
-  deliverable for a site this size. The effective-resolution metric is reported against
-  this nominal, so "did the mosaic get softer" stays a valid run-over-run signal.
+  deliverable for a site this size. The effective-resolution metric is measured on a
+  full-resolution window of the mosaic and reported against the mosaic's own cell size,
+  never against this nominal: the cell and the imagery are different grids, and mixing
+  them made the number depend on a resolution that describes neither. The nominal is
+  provenance only, and "did the mosaic get softer" stays a valid run-over-run signal
+  because the ratio moves with the mosaic, not with the grid it was asked for.
 
   All of this is recorded in every metrics JSON and printed at the top of the report, so a
   bounded run is never mistaken for a default one. Each stage also carries a budget

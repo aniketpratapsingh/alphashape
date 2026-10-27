@@ -41,7 +41,7 @@ def metrics(**overrides):
                 "hole_area_m2": 1.0,
                 "hole_fraction": 0.01,
                 "largest_hole_m2": 0.5,
-                "effective_gsd_m": 0.024,
+                "effective_resolution_m": 0.024,
                 "effective_resolution_ratio": 1.2,
                 "textured": True,
                 "epsg": 32632,
@@ -359,7 +359,7 @@ class MarkdownTest(unittest.TestCase):
         current["reference_free"]["ortho"]["textured"] = False
         current["reference_free"]["ortho"]["effective_measured"] = False
         current["reference_free"]["ortho"]["effective_resolution_ratio"] = None
-        current["reference_free"]["ortho"]["effective_gsd_m"] = None
+        current["reference_free"]["ortho"]["effective_resolution_m"] = None
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("no usable texture", text)
         self.assertIn("unmeasured", text)

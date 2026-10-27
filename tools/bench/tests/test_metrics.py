@@ -422,7 +422,7 @@ class MtfTest(unittest.TestCase):
     def test_a_sharp_random_image_reports_a_ratio_near_one(self):
         rng = np.random.default_rng(7)
         image = rng.random((128, 128))
-        result = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
+        result = metrics.mtf50_effective_resolution(image, pixel_size_m=0.02)
         self.assertTrue(result["textured"])
         # White noise has almost no spatial correlation, so any blur halves its
         # gradient energy immediately: the ratio stays under two.
@@ -432,22 +432,24 @@ class MtfTest(unittest.TestCase):
     def test_a_pre_blurred_image_reports_a_larger_ratio(self):
         rng = np.random.default_rng(11)
         image = rng.random((128, 128))
-        sharp = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
-        soft = metrics.mtf50_effective_gsd(metrics._box_blur(image, 2), pixel_size_m=0.02)
+        sharp = metrics.mtf50_effective_resolution(image, pixel_size_m=0.02)
+        soft = metrics.mtf50_effective_resolution(metrics._box_blur(image, 2), pixel_size_m=0.02)
         self.assertGreater(soft["ratio"], sharp["ratio"])
 
-    def test_effective_gsd_is_the_cell_size_times_the_ratio(self):
+    def test_effective_resolution_is_the_cell_size_times_the_ratio(self):
         rng = np.random.default_rng(3)
         image = rng.random((64, 64))
-        one = metrics.mtf50_effective_gsd(image, pixel_size_m=0.01)
-        two = metrics.mtf50_effective_gsd(image, pixel_size_m=0.02)
+        one = metrics.mtf50_effective_resolution(image, pixel_size_m=0.01)
+        two = metrics.mtf50_effective_resolution(image, pixel_size_m=0.02)
         # The ratio is a property of the image alone; only the metre conversion
         # follows the cell size.
         self.assertAlmostEqual(two["ratio"], one["ratio"], places=12)
-        self.assertAlmostEqual(two["effective_gsd_m"], 2.0 * one["effective_gsd_m"], places=12)
+        self.assertAlmostEqual(
+            two["effective_resolution_m"], 2.0 * one["effective_resolution_m"], places=12
+        )
 
     def test_a_flat_image_is_not_textured(self):
-        result = metrics.mtf50_effective_gsd(np.full((32, 32), 0.25), pixel_size_m=0.02)
+        result = metrics.mtf50_effective_resolution(np.full((32, 32), 0.25), pixel_size_m=0.02)
         self.assertFalse(result["textured"])
         self.assertFalse(result["measured"])
         self.assertIsNone(result["ratio"])
@@ -457,15 +459,76 @@ class MtfTest(unittest.TestCase):
         # search: the answer is "no half-energy point inside the cap", never the
         # cap itself dressed up as a measurement.
         image = np.tile(np.arange(64, dtype=np.float64), (64, 1))
-        result = metrics.mtf50_effective_gsd(image, pixel_size_m=0.05, max_blur_radius=2)
+        result = metrics.mtf50_effective_resolution(image, pixel_size_m=0.05, max_blur_radius=2)
         self.assertFalse(result["measured"])
         self.assertIsNone(result["ratio"])
-        self.assertIsNone(result["effective_gsd_m"])
+        self.assertIsNone(result["effective_resolution_m"])
         self.assertIn("cap", result["reason"])
 
     def test_a_non_positive_pixel_size_is_rejected(self):
         with self.assertRaises(ValueError):
-            metrics.mtf50_effective_gsd(np.ones((8, 8)), pixel_size_m=0.0)
+            metrics.mtf50_effective_resolution(np.ones((8, 8)), pixel_size_m=0.0)
+
+    @staticmethod
+    def _blurred_step(sigma_px: float, size: int = 1024) -> np.ndarray:
+        """A straight step edge blurred by a KNOWN Gaussian, pixel-area sampled.
+
+        Each pixel holds the integral of the blurred edge over its own width,
+        which is what a sensor records, so a sharp edge (sigma_px = 0) already
+        carries the 1/sqrt(12) of a cell that area sampling implies.
+
+        The answer is known by construction: Sobel gradient energy of an edge
+        falls as 1/sigma_total, so it halves when the total sigma doubles, and
+        the effective resolution in cells is sqrt(1 + 12*sigma_px^2).
+        """
+        mid = np.arange(size, dtype=np.float64) - size / 2.0 + 0.5
+        if sigma_px <= 0.0:
+            row = (mid < 0).astype(np.float64)
+        else:
+            row = 0.5 * np.vectorize(math.erfc)(mid / (math.sqrt(2.0) * sigma_px))
+        return np.tile(row, (16, 1))
+
+    def test_a_known_gaussian_blur_is_recovered_analytically(self):
+        # The claim the metric rests on: for a step blurred by a known Gaussian,
+        # the ratio equals sqrt(1 + 12*sigma^2) to within 10%. Without this the
+        # blur-to-metres conversion is a constant nobody checked.
+        for sigma_px in (1.0, 2.0, 3.0, 4.0):
+            with self.subTest(sigma_px=sigma_px):
+                analytic = math.sqrt(1.0 + 12.0 * sigma_px * sigma_px)
+                result = metrics.mtf50_effective_resolution(
+                    self._blurred_step(sigma_px),
+                    pixel_size_m=0.1,
+                    max_blur_radius=60,
+                )
+                self.assertTrue(result["measured"])
+                self.assertLess(abs(result["ratio"] / analytic - 1.0), 0.10)
+
+    def test_the_analytic_ratio_converts_to_metres_through_the_cell(self):
+        # 3 cells of Gaussian on a 0.05 m grid is 3.6 cells of effective
+        # resolution, i.e. 0.18 m — derived from the mosaic's own cell, with no
+        # dataset GSD anywhere in the arithmetic.
+        result = metrics.mtf50_effective_resolution(
+            self._blurred_step(1.0), pixel_size_m=0.05, max_blur_radius=60
+        )
+        analytic_ratio = math.sqrt(1.0 + 12.0 * 1.0)
+        self.assertAlmostEqual(
+            result["effective_resolution_m"],
+            0.05 * result["ratio"],
+            places=12,
+        )
+        self.assertLess(abs(result["effective_resolution_m"] - 0.05 * analytic_ratio), 0.05 * analytic_ratio * 0.10)
+
+    def test_a_perfect_edge_reads_at_the_methods_floor(self):
+        # The method's floor: the search starts at radius 1, so a perfect edge is
+        # already past half energy there. It must report a measured ratio near 2,
+        # never zero or a negative - and reporting ~2 for a perfect edge is the
+        # documented, conservative floor.
+        result = metrics.mtf50_effective_resolution(
+            self._blurred_step(0.0), pixel_size_m=0.1, max_blur_radius=60
+        )
+        self.assertTrue(result["measured"])
+        self.assertGreater(result["ratio"], 1.0)
+        self.assertLess(result["ratio"], 2.5)
 
 
 class PhaseCorrelationTest(unittest.TestCase):
@@ -1157,12 +1220,12 @@ class OrthoMetricsTest(unittest.TestCase):
 
     def test_effective_resolution_is_reported_against_the_mosaic_cell(self):
         # The metric must not depend on a dataset's nominal GSD: 0.05 m cells mean
-        # effective_gsd_m = 0.05 * ratio, whatever the imagery's own GSD was.
+        # effective_resolution_m = 0.05 * ratio, whatever the imagery's own GSD was.
         result = metrics.ortho_metrics(self._ortho())
         self.assertTrue(result["effective_measured"])
-        self.assertGreater(result["effective_gsd_m"], 0.0)
+        self.assertGreater(result["effective_resolution_m"], 0.0)
         self.assertAlmostEqual(
-            result["effective_gsd_m"],
+            result["effective_resolution_m"],
             0.05 * result["effective_resolution_ratio"],
             places=12,
         )
@@ -1174,7 +1237,7 @@ class OrthoMetricsTest(unittest.TestCase):
         result = metrics.ortho_metrics(ortho)
         self.assertFalse(result["effective_measured"])
         self.assertIsNone(result["effective_resolution_ratio"])
-        self.assertIsNone(result["effective_gsd_m"])
+        self.assertIsNone(result["effective_resolution_m"])
 
     def test_the_texture_window_is_taken_at_full_resolution(self):
         # A 3000 x 3000 mosaic with a 1024 cap must give a 1024-square window whose

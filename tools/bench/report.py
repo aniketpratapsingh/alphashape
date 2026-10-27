@@ -398,9 +398,9 @@ def markdown(
             lines.append(
                 f"| Effective resolution | {_fmt(ortho.get('effective_resolution_ratio'))} x cell size |"
             )
-            if ortho.get("effective_gsd_m") is not None:
+            if ortho.get("effective_resolution_m") is not None:
                 lines.append(
-                    f"| Effective GSD | {_fmt(ortho.get('effective_gsd_m'))} m "
+                    f"| Effective resolution | {_fmt(ortho.get('effective_resolution_m'))} m "
                     f"(cell {_fmt(ortho.get('pixel_size_m'))} m) |"
                 )
         if ortho.get("epsg") is not None:
