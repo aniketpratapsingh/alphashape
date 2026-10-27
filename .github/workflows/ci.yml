@@ -32,6 +32,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: Repository hygiene
         run: tools/check_repo_hygiene.sh
+      - name: apt install helper
+        # Every Linux job installs packages through this script; its mirror rotation and cache
+        # fallbacks are tested here so a broken helper cannot take the build jobs down with it.
+        run: |
+          shellcheck -S warning .github/ci/apt-install.sh .github/ci/test-apt-install.sh
+          .github/ci/test-apt-install.sh
       - name: Seeded-RNG evaluation order
         run: python3 engine/tools/check_rng_order.py engine/src engine/tests
       - name: Quality-bench metrics

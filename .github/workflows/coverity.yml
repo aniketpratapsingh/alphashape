@@ -29,11 +29,15 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build \
-            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake ninja-build
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev
             libtiff-dev libvulkan-dev glslc spirv-tools
+
+      - name: Install the VMA header
+        run: |
           sudo mkdir -p /usr/include/vma
           sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
