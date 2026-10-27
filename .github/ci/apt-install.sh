@@ -332,6 +332,18 @@ restore_sources_from_cache() {
   return 0
 }
 
+# Copy into the cache without taking root whenever the job user can read the source. apt's own
+# files (.debs, lists, sources) are world-readable, so the privileged branch only runs for an
+# unusual umask; when it does, ownership is handed straight back, because a root-owned file
+# under ~/.cache breaks every later tool that writes there (ccache is the first).
+cache_copy() {
+  local src="$1" dest="$2"
+  cp -f "$src" "$dest" 2>/dev/null && return 0
+  as_root cp -f "$src" "$dest" 2>/dev/null || return 1
+  as_root chown "$(id -u):$(id -g)" "$dest" 2>/dev/null
+  return 0
+}
+
 # Keep the debs apt downloaded, the lists they were resolved against, and the mirror that
 # served them, so the next run with this key can install with no network at all.
 harvest_cache() {
@@ -343,7 +355,7 @@ harvest_cache() {
 
   for f in "$ARCHIVES_DIR"/*.deb; do
     [ -f "$f" ] || continue
-    as_root cp -f "$f" "$CACHE_DIR/" 2>/dev/null && n=$((n + 1))
+    cache_copy "$f" "$CACHE_DIR/" && n=$((n + 1))
   done
   log "cache: stored $n .deb(s)"
 
@@ -351,7 +363,7 @@ harvest_cache() {
   for f in "$LISTS_DIR"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in lock) continue ;; esac
-    as_root cp -f "$f" "$CACHE_DIR/lists/" 2>/dev/null && n=$((n + 1))
+    cache_copy "$f" "$CACHE_DIR/lists/" && n=$((n + 1))
   done
   log "cache: stored $n apt list file(s)"
 
@@ -363,11 +375,16 @@ harvest_cache() {
     else
       base="d__$base"
     fi
-    as_root cp "$f" "$CACHE_DIR/sources/$base" 2>/dev/null && n=$((n + 1))
+    cache_copy "$f" "$CACHE_DIR/sources/$base" && n=$((n + 1))
   done
   log "cache: stored $n source file(s)"
 
-  as_root chown -R "$(id -u):$(id -g)" "$CACHE_DIR" 2>/dev/null
+  # Last resort for the privileged copy above: if anything under the cache is still not the job
+  # user's, hand it back now. Probed first, so the common path never invokes sudo at all.
+  if [ -n "$(find "$CACHE_DIR" \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit \
+    2>/dev/null)" ]; then
+    as_root chown -R "$(id -u):$(id -g)" "$CACHE_DIR" 2>/dev/null
+  fi
 }
 
 # Install without touching the network. Non-zero means something the packages need is absent

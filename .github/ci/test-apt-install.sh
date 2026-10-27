@@ -12,6 +12,8 @@
 #      the restore prefix deliberately omits the ISO week.
 #   5. A cache hit installs with --no-download and no update; a cache that cannot satisfy the
 #      set falls back to the network path.
+#   6. Harvesting the cache never leaves a root-owned path under ~/.cache, and the cache
+#      directory itself ends up owned by the job user.
 #
 # Usage: .github/ci/test-apt-install.sh        (exit 0 = all pass)
 
@@ -32,12 +34,75 @@ check() { local d="$1"; shift; if "$@"; then ok "$d"; else no "$d"; fi; }
 
 mkdir -p "$work/bin"
 
-# sudo: record the call, then exec the rest. The recording is what proves the script never
-# takes root for a path under $HOME (a root-owned ~/.cache breaks ccache with EACCES).
+# sudo: simulates taking root. Every call is recorded so the test can prove the script never
+# names a path under $HOME or the .deb cache as root, and any such path is additionally recorded
+# in "root_owned": what a real root shell would leave owned by uid 0. A chown back to the job
+# user clears those again, exactly as the real thing would, so the honest fix (hand ownership
+# back) passes and a script that takes root without handing it back does not.
 cat >"$work/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_DIR/sudo_calls"
+
+args=("$@")
+me=$(id -u):$(id -g)
+targets=()
+chown_self=0
+if [ "${args[0]:-}" = chown ]; then
+  i=1
+  [ "${args[1]:-}" = -R ] && i=2
+  if [ "${args[$i]:-}" = "$me" ] || [ "${args[$i]:-}" = "${me%%:*}" ]; then
+    chown_self=1
+    i=$((i + 1))
+    while [ "$i" -lt "${#args[@]}" ]; do targets+=("${args[$i]}"); i=$((i + 1)); done
+  fi
+fi
+
+# A path is private when the job user owns it: anything under $HOME, or the .deb cache when the
+# harness put it elsewhere.
+private_path() {
+  local p="$1"
+  case "$p" in
+    "$HOME"|"$HOME"/*) return 0 ;;
+    "${APT_DEB_CACHE_DIR:-}"|"${APT_DEB_CACHE_DIR:-}"/*) return 0 ;;
+  esac
+  return 1
+}
+
+if [ "$chown_self" -eq 1 ] && [ -f "$STUB_DIR/root_owned" ]; then
+  : >"$STUB_DIR/root_owned.new"
+  while IFS= read -r p; do
+    drop=0
+    for t in ${targets[@]+"${targets[@]}"}; do
+      case "$p" in "$t"|"$t"/*) drop=1 ;; esac
+    done
+    [ "$drop" -eq 0 ] && printf '%s\n' "$p" >>"$STUB_DIR/root_owned.new"
+  done <"$STUB_DIR/root_owned"
+  mv "$STUB_DIR/root_owned.new" "$STUB_DIR/root_owned"
+elif [ "$chown_self" -eq 0 ]; then
+  for a in "${args[@]}"; do
+    private_path "$a" && printf '%s\n' "$a" >>"$STUB_DIR/root_owned"
+  done
+fi
+# Mark the invocation so a stub that wants to model root-only access (cp, below) can tell.
+export STUB_AS_ROOT=1
 exec "$@"
+EOF
+
+# cp: when "force_root_copy" exists, a plain (non-root) copy into the .deb cache fails with
+# EACCES, as it would for a file whose owning tool made it unreadable. That drives the script
+# down its privileged branch, which is the branch whose ownership handling is under test.
+cat >"$work/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+if [ -f "$STUB_DIR/force_root_copy" ] && [ "${STUB_AS_ROOT:-}" != 1 ]; then
+  for a in "$@"; do
+    case "$a" in
+      "${APT_DEB_CACHE_DIR:-}"|"${APT_DEB_CACHE_DIR:-}"/*)
+        echo "cp: cannot create '$a': Permission denied" >&2
+        exit 1 ;;
+    esac
+  done
+fi
+exec /bin/cp "$@"
 EOF
 
 # apt-get: records its arguments. Driven by the files in $STUB_DIR:
@@ -144,6 +209,7 @@ new_stub() {
   rm -rf "$STUB_DIR"
   mkdir -p "$STUB_DIR/sources/sources.list.d" "$STUB_DIR/archives" "$STUB_DIR/lists" \
     "$STUB_DIR/cache" "$STUB_DIR/home"
+  : >"$STUB_DIR/root_owned"
 
   cat >"$STUB_DIR/sources/sources.list.d/ubuntu.sources" <<'EOF'
 Types: deb
@@ -169,6 +235,10 @@ EOF
 
 # Args are the script's own (--print-key, packages); prefix a call with VAR=... to set extra
 # environment (bash applies it to the function's environment).
+#
+# APT_ROOT_CMD is left unset, so the script takes its real default of "sudo" and every privileged
+# step goes through the recording stub. Forcing it to "" here (as this harness once did) would
+# make the root-ownership assertions below unfalsifiable.
 run_script() {
   local stub="$STUB_DIR"
   env \
@@ -178,7 +248,6 @@ run_script() {
     APT_ARCHIVES_DIR="$stub/archives" \
     APT_LISTS_DIR="$stub/lists" \
     APT_DEB_CACHE_DIR="$stub/cache" \
-    APT_ROOT_CMD="" \
     STUB_DIR="$stub" \
     bash "$script" "$@"
 }
@@ -206,10 +275,30 @@ check "rotation: third-party source untouched" \
 check "rotation: archives harvested into the cache" \
   bash -c 'ls "$1"/cache/*.deb >/dev/null' _ "$STUB_DIR"
 # A root-owned ~/.cache (from `sudo mkdir ~/.cache/...`) makes ccache fail on every compile,
-# so nothing the script runs as root may name a path under the cache directory.
-check "rotation: never runs sudo on a path under the cache dir" \
-  bash -c '! grep -q "$1" "$2" 2>/dev/null' _ "$STUB_DIR/cache" "$STUB_DIR/sudo_calls"
+# so nothing the job user owns may end up owned by root through a privileged copy.
+check "rotation: no path under ~/.cache is left root-owned" \
+  bash -c '[ ! -s "$1" ]' _ "$STUB_DIR/root_owned"
 check "rotation: cache directory stays user-owned" [ -O "$STUB_DIR/cache" ]
+check "rotation: every harvested cache file is user-owned" \
+  bash -c '[ -z "$(find "$1" ! -user "$(id -u)")" ]' _ "$STUB_DIR/cache"
+
+# --- 1b. the privileged harvest branch hands ownership back --------------------------------
+
+# The unprivileged copy normally works, which would leave the ownership path above untested.
+# force_root_copy makes a plain copy into the cache fail, so the script must use sudo -- and then
+# hand the copied files back to the job user. A `sudo cp` that is never undone leaves a
+# root-owned ~/.cache, which breaks ccache on the next build ("Permission denied").
+new_stub root-harvest
+: >"$STUB_DIR/force_root_copy"
+out=$(run_script cmake 2>&1)
+rc=$?
+check "root harvest: still exits 0" [ "$rc" -eq 0 ]
+check "root harvest: the privileged branch really ran" [ -s "$STUB_DIR/sudo_calls" ]
+check "root harvest: no path under the cache is left root-owned" \
+  bash -c '[ ! -s "$1" ]' _ "$STUB_DIR/root_owned"
+check "root harvest: the cache directory is user-owned" [ -O "$STUB_DIR/cache" ]
+check "root harvest: the .deb in the cache is user-owned" \
+  bash -c '[ -z "$(find "$1" ! -user "$(id -u)")" ]' _ "$STUB_DIR/cache"
 
 # --- 2. rotation starts at the configured (healthy) mirror ----------------------------------
 
