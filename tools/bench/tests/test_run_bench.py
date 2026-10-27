@@ -365,6 +365,30 @@ class ProjectInspectionTest(unittest.TestCase):
         self.assertIn("error", stats)
 
 
+class EngineReportTest(unittest.TestCase):
+    def test_the_alignment_line_is_parsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli.log"
+            log.write_text(
+                "[info] AlignCameras: registered 30/30 cameras, RMS 0.412 px\n"
+                "[info] AlignCameras: georeferenced from 30 references\n"
+            )
+            report = run_bench.engine_alignment_report(log)
+        self.assertEqual(report["registered"], 30)
+        self.assertEqual(report["offered"], 30)
+        self.assertAlmostEqual(report["rms_px"], 0.412)
+        self.assertTrue(report["georeferenced"])
+
+    def test_a_log_without_the_line_gives_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli.log"
+            log.write_text("[match] 50%\n")
+            self.assertEqual(run_bench.engine_alignment_report(log), {})
+
+    def test_a_missing_log_gives_nothing(self):
+        self.assertEqual(run_bench.engine_alignment_report(Path("/nonexistent/cli.log")), {})
+
+
 class ReprojectionTest(unittest.TestCase):
     """The tie-point reprojection metric, end to end through the project archive.
 
@@ -398,7 +422,10 @@ class ReprojectionTest(unittest.TestCase):
         tracks = b"ATR2" + struct.pack("<I", 1)
         tracks += struct.pack("<I", 1) + struct.pack("<iI", 0, 0)
         tracks += b"\x01" + struct.pack("<ddd", *point)
-        keypoints = b"AKP1" + struct.pack("<I", 1) + struct.pack("<ffff", 50.0, 50.0, 1.0, 0.0)
+        # Stored keypoints are pixel-CORNER based: the centre of pixel (49, 49) is
+        # (49.5, 49.5) in that convention, which is (50.0, 50.0) once the +0.5
+        # bridge to the calibration's pixel-centre convention is applied.
+        keypoints = b"AKP1" + struct.pack("<I", 1) + struct.pack("<ffff", 49.5, 49.5, 1.0, 0.0)
         with zipfile.ZipFile(bundle, "w") as archive:
             archive.writestr("doc.xml", xml)
             archive.writestr("chunks/1/tie_points/tracks.bin", tracks)
@@ -417,7 +444,9 @@ class ReprojectionTest(unittest.TestCase):
         self.assertEqual(stats["tracks"], 1)
 
     def test_the_metric_reports_a_mismatch_as_an_error(self):
-        # The keypoint says (50, 50); this camera puts the point at (70, 50).
+        # The keypoint's centre is (50, 50); this camera puts the point at (70, 50),
+        # so the error is 20 px — the +0.5 convention bridge is applied to the
+        # observed side only, and a correct bridge leaves the difference intact.
         with tempfile.TemporaryDirectory() as tmp:
             project = self._project(Path(tmp), point=(4.0, 0.0, 10.0), camera_x=0.0)
             stats = run_bench._reprojection(Path(tmp), project)

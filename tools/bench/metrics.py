@@ -35,6 +35,13 @@ import numpy as np
 # resolution-independent.
 MASK_MAX_SIDE = 1200
 
+# Ceiling on reading one of OUR products whole. The mosaic size is a consequence of
+# the resolution this run asked for, so it is predictable; a reference from a
+# publisher is not, which is why only that one is windowed and coarsened. 64 M
+# cells is a 8000 x 8000 mosaic, comfortably beyond anything a benchmark run
+# produces at a useful resolution.
+OUR_PRODUCT_MAX_CELLS = 64_000_000
+
 # Ceiling on the zero-padded inverse transform used to refine a phase-correlation
 # peak. 64 M complex cells is about 1 GB, which is more than CI runners want to
 # spend on one refinement; the loop in phase_correlation_shift halves the factor
@@ -1592,6 +1599,7 @@ def ortho_metrics(ortho: Raster, *, nominal_gsd_m: float, texture_max_side: int 
     return {
         "width": ortho.width,
         "height": ortho.height,
+        # The product's own cell size (not the mask's or the texture crop's).
         "pixel_size_m": ortho.pixel_size_x,
         "mask_stride": stride,
         "covered_fraction": float(validity.sum()) / validity.size if validity.size else 0.0,
@@ -1779,7 +1787,11 @@ def evaluate(
     ortho = None
     if ortho_path:
         try:
-            ortho = read_geotiff(ortho_path)
+            # Our own product is read whole: it is bounded by the resolution this
+            # run chose, and decimating it would make the reported pixel size and
+            # the effective-resolution ratio describe the analysis grid instead of
+            # the mosaic. Only the REFERENCE is windowed and coarsened.
+            ortho = read_geotiff(ortho_path, max_cells=OUR_PRODUCT_MAX_CELLS)
         except Exception as exc:  # noqa: BLE001 - reported, never fatal
             result["reference_free"]["ortho"] = {"skipped": f"orthomosaic unreadable: {exc}"}
     if ortho is not None:
@@ -1791,7 +1803,7 @@ def evaluate(
     dem = None
     if dem_path:
         try:
-            dem = read_geotiff(dem_path)
+            dem = read_geotiff(dem_path, max_cells=OUR_PRODUCT_MAX_CELLS)
         except Exception as exc:  # noqa: BLE001
             result["reference_free"]["dem"] = {"skipped": f"DEM unreadable: {exc}"}
     if dem is not None:

@@ -442,12 +442,16 @@ def run_cli(args: list[str], *, log: Path | None = None, timeout: float | None =
     command = [cli, *args]
     print(f"  $ {' '.join(command)}")
     started = time.monotonic()
+    # Both streams go to the log. The engine writes its Info diagnostics — the
+    # bundle-adjustment RMS, the georeferencing outcome — to STDOUT, and its
+    # progress to stderr, so discarding stdout would throw away the one number that
+    # says whether the alignment is any good.
     try:
         if log is not None:
             log.parent.mkdir(parents=True, exist_ok=True)
             with open(log, "ab") as errlog:
                 result = subprocess.run(
-                    command, stdout=subprocess.DEVNULL, stderr=errlog, timeout=timeout
+                    command, stdout=errlog, stderr=errlog, timeout=timeout
                 )
         else:
             result = subprocess.run(command, stdout=subprocess.DEVNULL, timeout=timeout)
@@ -597,6 +601,34 @@ def _timed(function, *args, **kwargs):
     return function(*args, **kwargs)
 
 
+def engine_alignment_report(log: Path) -> dict:
+    """The engine's own alignment numbers, parsed from its Info output.
+
+    ``AlignCameras`` logs "registered N/M cameras, RMS X px" and whether it
+    georeferenced. Those are the engine's OWN figures, computed inside the bundle
+    adjustment on the same observations, so quoting them beside this module's
+    independently re-projected RMS is what turns a suspicious number into a
+    diagnosis: agreement means the metric is measuring what it claims, and a large
+    disagreement means one of the two is reading the project wrongly.
+    """
+    out: dict = {}
+    if not log.exists():
+        return out
+    import re  # noqa: PLC0415
+
+    text = log.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"AlignCameras: registered (\d+)/(\d+) cameras, RMS ([0-9.eE+-]+) px", text)
+    if match:
+        out["registered"] = int(match.group(1))
+        out["offered"] = int(match.group(2))
+        out["rms_px"] = float(match.group(3))
+    if "AlignCameras: georeferenced from" in text:
+        out["georeferenced"] = True
+    elif "AlignCameras: not georeferenced" in text:
+        out["georeferenced"] = False
+    return out
+
+
 def _tail(path: Path, lines: int) -> list[str]:
     if not path.exists():
         return []
@@ -736,6 +768,9 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
 
     print("-- inspect")
     camera_stats = inspect_project(Path(timing["project"]))
+    engine_report = engine_alignment_report(work / "cli.log")
+    if engine_report:
+        camera_stats["engine_report"] = engine_report
     if "error" not in camera_stats:
         camera_stats["reprojection"] = _reprojection(work, Path(timing["project"]))
     else:
@@ -833,7 +868,12 @@ def _reprojection(work: Path, project: Path) -> dict:
             kp = keypoints.get(camera_id)
             if kp is None or keypoint_index >= kp.shape[0]:
                 continue
-            observed.append(kp[keypoint_index][:2])
+            # Keypoint coordinates are pixel-CORNER based (the detector's integer
+            # index is the top-left corner of that pixel), while Calibration::project
+            # puts the CENTRE of the top-left pixel at (0.5, 0.5). The engine bridges
+            # the two with keypoint_to_pixel (+0.5, +0.5); measuring without it would
+            # charge every observation a constant half-pixel bias.
+            observed.append(kp[keypoint_index][:2] + 0.5)
             projected.append(pixels[0])
 
     if not observed:

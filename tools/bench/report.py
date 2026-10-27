@@ -365,9 +365,23 @@ def markdown(
         )
         reprojection = cameras.get("reprojection")
         if reprojection and "skipped" not in reprojection:
-            lines.append(f"| Reprojection RMS | {_fmt(reprojection.get('rms_px'))} px |")
+            lines.append(
+                f"| Reprojection RMS (this metric) | {_fmt(reprojection.get('rms_px'))} px |"
+            )
             lines.append(f"| Reprojection median | {_fmt(reprojection.get('median_px'))} px |")
             lines.append(f"| Observations | {reprojection.get('pairs')} |")
+        # The engine's own bundle-adjustment figure, which it computes inside the
+        # fit on the same observations. Two independent numbers for the same thing
+        # is what makes a bad one diagnosable instead of merely alarming.
+        engine = cameras.get("engine_report") or {}
+        if engine.get("rms_px") is not None:
+            lines.append(
+                f"| Reprojection RMS (engine BA) | {_fmt(engine['rms_px'])} px |"
+            )
+        if engine.get("registered") is not None:
+            lines.append(
+                f"| Engine registered | {engine['registered']} / {engine['offered']} cameras |"
+            )
     lines.append("")
 
     # -- reference-based ---------------------------------------------------
