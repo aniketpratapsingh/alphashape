@@ -374,18 +374,26 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         // the output border, e.g. 464 cells where the others are 1152 -- blend
         // with one level less than every other block, which shows up as a
         // systematic step where that block meets its neighbour.
+        //
+        // A pin at or below what the grid itself carries is applied unchanged,
+        // so a caller that pins the grid's own depth (every block-wise run on a
+        // grid that is not at the level-count cap) stays byte-identical to the
+        // automatic path.
         levels = std::min(pyramid_levels, kMaxPinnedLevels);
     }
 
     // A depth of `levels` decimates the finest plane down to
     // ceil(size / 2^levels) cells, and level_count()'s own rule is that every
     // level keeps at least kLevelMinCells across. A window smaller than that
-    // cannot carry the depth, so it is PADDED by edge-replicating its last
-    // row/column. That is not an approximation of the whole grid at an output
-    // border, it is exactly what blur5()'s own clamp does there: the whole grid
-    // has no cells past its border and its border taps read the border value,
-    // and so does a replica. The tint planes at levels 1..levels therefore come
-    // out identical to the whole grid's inside the real region.
+    // cannot carry the depth, so it is PADDED (edge-replicated from its last
+    // row/column) to the size the depth needs. This is what keeps an edge block
+    // on the same operator as its neighbours: the depth is the whole grid's, and
+    // the padding only supplies the cells the pyramid has to read.
+    //
+    // The replication is the clamp blur5() applies anyway: a window at the
+    // output border has no cells past it and its border taps read the border
+    // value, exactly as a replica does, so the levels inside the real region are
+    // unchanged by extending the plane.
     const int pad_w = std::max(width, kLevelMinCells << levels);
     const int pad_h = std::max(height, kLevelMinCells << levels);
 
