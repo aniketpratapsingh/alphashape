@@ -1615,6 +1615,109 @@ TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     EXPECT_GT(inherited, 0U) << "no margin label was inherited: the blocks are not overlapping";
 }
 
+TEST(BuildOrthomosaic, BlockWiseNarrowLastWindowHasNoBorderStep) {
+    // A block at the output border can be far narrower than the blend pyramid's
+    // depth needs. The fixture's 0.125 m grid is 960 wide, so a forced 464-cell
+    // block splits it 464 + 464 + 32: the last block is 32 cells, and its window
+    // is only 32 + 320 margin = 352 wide. blend() must apply the WHOLE grid's
+    // depth to that window (padding it out to 512) rather than clamping down to
+    // the 5 levels a 352-wide grid can carry, which is a shallower operator and
+    // shows up as a step exactly where the 32-cell block meets its neighbour.
+    //
+    // This is the end-to-end form of the check. Seam refinement is off so the
+    // labelling is the per-cell argmax in both runs and cannot differ by
+    // optimisation order, which leaves the blend as the only thing that could
+    // make the border worse than the interior.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("mosaic", 0.125, 0, false, false));
+    ASSERT_FALSE(whole.empty());
+    constexpr int kBlock = 464;
+    const Orthomosaic blocked = run_ortho(s, block_params("mosaic", 0.125, kBlock, false, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+
+    const int w = blocked.raster.grid.width;
+    const int h = blocked.raster.grid.height;
+    // The narrow last block begins at 2 * kBlock. Confirm it really is narrow
+    // (and that its window therefore needed padding), so the test cannot quietly
+    // stop exercising the case if the fixture ever changes.
+    const int last_block_width = w - 2 * kBlock;
+    ASSERT_GT(last_block_width, 0);
+    ASSERT_LT(last_block_width + 2 * 320, 512)
+        << "the last window must be narrower than the pyramid needs (width "
+        << last_block_width << ")";
+    ASSERT_LT(ortho::pyramid_level_count(last_block_width + 320, h),
+              ortho::pyramid_level_count(w, h))
+        << "the narrow window's own depth must be shallower, or this is not the case";
+
+    const auto near_border = [w, h](int col, int row) {
+        constexpr int kNear = 4;
+        const auto on_border = [kNear](int index, int extent) {
+            const int border = (index / kBlock + 1) * kBlock;
+            return border < extent && (border - index <= kNear || index - border < kNear);
+        };
+        return on_border(col, w) || on_border(row, h);
+    };
+
+    std::size_t pixels = 0;
+    std::size_t border_pixels = 0;
+    std::size_t border_visible = 0;
+    std::size_t interior_visible = 0;
+    std::size_t covered_whole = 0;
+    std::size_t covered_blocked = 0;
+    for (int row = 0; row < h; ++row) {
+        for (int col = 0; col < w; ++col) {
+            const std::size_t i =
+                (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                 static_cast<std::size_t>(col)) * 4U;
+            const bool opaque_whole = whole.raster.data[i + 3] != 0;
+            const bool opaque_blocked = blocked.raster.data[i + 3] != 0;
+            covered_whole += opaque_whole ? 1U : 0U;
+            covered_blocked += opaque_blocked ? 1U : 0U;
+            if (!opaque_whole || !opaque_blocked) {
+                continue;
+            }
+            ++pixels;
+            int diff = 0;
+            for (int c = 0; c < 3; ++c) {
+                diff = std::max(
+                    diff,
+                    std::abs(static_cast<int>(whole.raster.data[i +
+                                                               static_cast<std::size_t>(c)]) -
+                             static_cast<int>(blocked.raster.data[i +
+                                                                  static_cast<std::size_t>(c)])));
+            }
+            const bool visible = diff > 2;
+            if (near_border(col, row)) {
+                ++border_pixels;
+                border_visible += visible ? 1U : 0U;
+            } else {
+                interior_visible += visible ? 1U : 0U;
+            }
+        }
+    }
+    const std::size_t interior_pixels = pixels > border_pixels ? pixels - border_pixels : 0;
+    EXPECT_EQ(covered_blocked, covered_whole);
+    ASSERT_GT(pixels, 1000U);
+    ASSERT_GT(border_pixels, 0U);
+    ASSERT_GT(interior_pixels, 0U);
+    const double border_fraction =
+        static_cast<double>(border_visible) / static_cast<double>(border_pixels);
+    const double interior_fraction =
+        static_cast<double>(interior_visible) / static_cast<double>(interior_pixels);
+    std::printf("[BuildOrthomosaic.NarrowLastWindow] last=%d grid=%dx%d "
+                "border>2=%zu/%zu (%.3f%%) interior>2=%zu/%zu (%.3f%%)\n",
+                last_block_width, w, h, border_visible, border_pixels,
+                100.0 * border_fraction, interior_visible, interior_pixels,
+                100.0 * interior_fraction);
+
+    // The narrower-than-the-pyramid block must not blend with a different
+    // operator from its neighbour: the border is allowed to be no worse than an
+    // arbitrary interior cell (the margin makes it the edge of a window), and in
+    // particular there is no spike of disagreement along the grid.
+    EXPECT_LE(border_fraction, 2.0 * interior_fraction + 0.005)
+        << "the narrow last block blends with a shallower operator: a step at its border";
+}
+
 TEST(BuildOrthomosaic, BlockWiseFillHolesMatchesTheWholeGrid) {
     // fill_holes runs ONCE on the assembled raster, not per block: its
     // `interior_only` mode decides reachability from the output's own border,
