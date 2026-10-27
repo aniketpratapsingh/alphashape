@@ -31,9 +31,11 @@ check() { local d="$1"; shift; if "$@"; then ok "$d"; else no "$d"; fi; }
 
 mkdir -p "$work/bin"
 
-# sudo: drop the leading flags apt does not use here and exec the rest.
+# sudo: record the call, then exec the rest. The recording is what proves the script never
+# takes root for a path under $HOME (a root-owned ~/.cache breaks ccache with EACCES).
 cat >"$work/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_DIR/sudo_calls"
 exec "$@"
 EOF
 
@@ -178,6 +180,11 @@ check "rotation: third-party source untouched" \
   grep -q 'packages.microsoft.com/repos/edge' "$STUB_DIR/sources/sources.list.d/microsoft.list"
 check "rotation: archives harvested into the cache" \
   bash -c 'ls "$1"/cache/*.deb >/dev/null' _ "$STUB_DIR"
+# A root-owned ~/.cache (from `sudo mkdir ~/.cache/...`) makes ccache fail on every compile,
+# so nothing the script runs as root may name a path under the cache directory.
+check "rotation: never runs sudo on a path under the cache dir" \
+  bash -c '! grep -q "$1" "$2" 2>/dev/null' _ "$STUB_DIR/cache" "$STUB_DIR/sudo_calls"
+check "rotation: cache directory stays user-owned" [ -O "$STUB_DIR/cache" ]
 
 # --- 2. rotation starts at the configured (healthy) mirror ----------------------------------
 

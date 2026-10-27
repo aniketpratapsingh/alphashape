@@ -227,8 +227,10 @@ restore_lists_from_cache() {
 # served them, so the next run with this key can install with no network at all.
 harvest_cache() {
   local mirror="$1" f n=0
-  as_root mkdir -p "$CACHE_DIR/lists"
-  as_root chown "$(id -u):$(id -g)" "$CACHE_DIR" "$CACHE_DIR/lists" 2>/dev/null
+  # The cache lives under $HOME and must stay owned by the job user: creating it with sudo
+  # would leave a root-owned ~/.cache behind, and every later tool that writes there (ccache
+  # is the first) would fail with "Permission denied".
+  mkdir -p "$CACHE_DIR/lists" || return 1
 
   for f in "$ARCHIVES_DIR"/*.deb; do
     [ -f "$f" ] || continue
