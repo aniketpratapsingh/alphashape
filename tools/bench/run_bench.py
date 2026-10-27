@@ -991,7 +991,9 @@ def _decode_sensors(xml_bytes: bytes) -> dict:
         if calibration is None:
             continue
         entry = {
-            "type": calibration.get("type", "Frame"),
+            # The writer emits lower-case type names; keep them verbatim and let
+            # metrics.project_pixels interpret them case-insensitively.
+            "type": (calibration.get("type") or "frame").strip().lower(),
             "width": int(calibration.get("width", 0)),
             "height": int(calibration.get("height", 0)),
         }

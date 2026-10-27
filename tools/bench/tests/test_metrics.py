@@ -684,7 +684,7 @@ class ProjectionTest(unittest.TestCase):
         return np.eye(4)
 
     def test_a_point_on_the_axis_lands_at_the_principal_point(self):
-        calibration = {"type": "Frame", "width": 100, "height": 50, "f": 50.0}
+        calibration = {"type": "frame", "width": 100, "height": 50, "f": 50.0}
         pixels, ok = metrics.project_pixels(
             np.array([[0.0, 0.0, 10.0]]), self.identity_pose(), calibration
         )
@@ -692,22 +692,75 @@ class ProjectionTest(unittest.TestCase):
         np.testing.assert_allclose(pixels[0], [50.0, 25.0])
 
     def test_a_known_offset_projects_to_the_hand_computed_pixel(self):
-        calibration = {"type": "Frame", "width": 100, "height": 50, "f": 50.0}
+        calibration = {"type": "frame", "width": 100, "height": 50, "f": 50.0}
         # X/Z = 0.2 -> u = 50 + 0.2*50 = 60 ; Y/Z = -0.1 -> v = 25 - 5 = 20
         pixels, _ = metrics.project_pixels(
             np.array([[2.0, -1.0, 10.0]]), self.identity_pose(), calibration
         )
         np.testing.assert_allclose(pixels[0], [60.0, 20.0])
 
+    def test_a_lower_case_frame_project_reprojects_under_a_pixel(self):
+        # The regression this guards: the writer emits ``type="frame"`` but the
+        # projection used to compare against "Frame", so every frame camera fell
+        # through to the fisheye branch and a pinhole scene re-projected ~160 px
+        # off. A lowercase frame project must come back exact.
+        calibration = {"type": "frame", "width": 6000, "height": 4000, "f": 5000.0}
+        rng = np.random.default_rng(7)
+        points = np.column_stack([
+            rng.uniform(-40.0, 40.0, 200),
+            rng.uniform(-25.0, 25.0, 200),
+            np.full(200, 100.0),
+        ])
+        pose = np.eye(4)
+        # Yaw the camera a little; every point stays well in front of it, so the
+        # comparison is about the projection model and not about culling.
+        yaw = math.radians(12.0)
+        pose[:3, :3] = np.array(
+            [
+                [math.cos(yaw), 0.0, math.sin(yaw)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(yaw), 0.0, math.cos(yaw)],
+            ]
+        )
+        pose[:3, 3] = [0.0, 0.0, 0.0]
+        pixels, ok = metrics.project_pixels(points, pose, calibration)
+        self.assertTrue(ok.all())
+        # Compare against an explicit pinhole computation with the same pose.
+        cam = points @ pose[:3, :3].T + pose[:3, 3]
+        expected = np.column_stack([
+            calibration["width"] * 0.5 + calibration["f"] * cam[:, 0] / cam[:, 2],
+            calibration["height"] * 0.5 + calibration["f"] * cam[:, 1] / cam[:, 2],
+        ])
+        error = np.linalg.norm(pixels - expected, axis=1)
+        self.assertLess(float(error.max()), 1.0)
+
+    def test_the_type_is_read_case_insensitively(self):
+        point = np.array([[2.0, -1.0, 10.0]])
+        lower, _ = metrics.project_pixels(
+            point, self.identity_pose(), {"type": "frame", "width": 100, "height": 50, "f": 50.0}
+        )
+        upper, _ = metrics.project_pixels(
+            point, self.identity_pose(), {"type": " Frame ", "width": 100, "height": 50, "f": 50.0}
+        )
+        np.testing.assert_allclose(lower, upper)
+
+    def test_an_unknown_camera_type_is_rejected(self):
+        with self.assertRaises(ValueError):
+            metrics.project_pixels(
+                np.array([[0.0, 0.0, 1.0]]),
+                self.identity_pose(),
+                {"type": "spherical", "width": 10, "height": 10, "f": 5.0},
+            )
+
     def test_the_principal_point_offset_moves_the_image_of_the_axis(self):
-        calibration = {"type": "Frame", "width": 100, "height": 50, "f": 50.0, "cx": 4.0, "cy": -3.0}
+        calibration = {"type": "frame", "width": 100, "height": 50, "f": 50.0, "cx": 4.0, "cy": -3.0}
         pixels, _ = metrics.project_pixels(
             np.array([[0.0, 0.0, 10.0]]), self.identity_pose(), calibration
         )
         np.testing.assert_allclose(pixels[0], [54.0, 22.0])
 
     def test_radial_distortion_moves_a_point_outward_for_positive_k1(self):
-        straight = {"type": "Frame", "width": 100, "height": 100, "f": 50.0}
+        straight = {"type": "frame", "width": 100, "height": 100, "f": 50.0}
         bent = dict(straight, k1=0.5)
         point = np.array([[5.0, 0.0, 10.0]])
         plain, _ = metrics.project_pixels(point, self.identity_pose(), straight)
@@ -715,7 +768,7 @@ class ProjectionTest(unittest.TestCase):
         self.assertGreater(distorted[0, 0], plain[0, 0])
 
     def test_a_point_behind_the_camera_is_not_projected(self):
-        calibration = {"type": "Frame", "width": 100, "height": 100, "f": 50.0}
+        calibration = {"type": "frame", "width": 100, "height": 100, "f": 50.0}
         pixels, ok = metrics.project_pixels(
             np.array([[0.0, 0.0, -1.0]]), self.identity_pose(), calibration
         )
@@ -723,14 +776,23 @@ class ProjectionTest(unittest.TestCase):
         self.assertTrue(np.isnan(pixels[0, 0]))
 
     def test_the_pose_is_applied_world_to_camera(self):
-        calibration = {"type": "Frame", "width": 100, "height": 100, "f": 50.0}
+        calibration = {"type": "frame", "width": 100, "height": 100, "f": 50.0}
         pose = np.eye(4)
         pose[:3, 3] = [-10.0, 0.0, 0.0]  # the camera sits at x = +10
         pixels, _ = metrics.project_pixels(np.array([[10.0, 0.0, 5.0]]), pose, calibration)
         self.assertAlmostEqual(pixels[0, 0], 50.0)
 
+    def test_fisheye_uses_an_equidistant_model(self):
+        calibration = {"type": "fisheye", "width": 100, "height": 100, "f": 25.0}
+        # 45 degrees off axis: theta = pi/4, so x_s = theta and u = 50 + 25*pi/4.
+        pixels, ok = metrics.project_pixels(
+            np.array([[10.0, 0.0, 10.0]]), self.identity_pose(), calibration
+        )
+        self.assertTrue(ok[0])
+        self.assertAlmostEqual(pixels[0, 0], 50.0 + 25.0 * math.pi / 4.0)
+
     def test_an_empty_point_set_projects_to_nothing(self):
-        calibration = {"type": "Frame", "width": 10, "height": 10, "f": 5.0}
+        calibration = {"type": "frame", "width": 10, "height": 10, "f": 5.0}
         pixels, ok = metrics.project_pixels(np.zeros((0, 3)), self.identity_pose(), calibration)
         self.assertEqual(pixels.shape, (0, 2))
         self.assertEqual(ok.size, 0)

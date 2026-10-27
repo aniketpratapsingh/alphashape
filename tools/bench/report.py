@@ -69,6 +69,10 @@ DIRECTION = {
     "reference_based.cloud.accuracy_median_m": "lower",
     "reference_based.cloud.completeness_median_m": "lower",
     "reference_free.cameras.cameras_aligned_fraction": "higher",
+    # The independent re-projection agrees with the engine's own RMS once the
+    # camera type is read the way the writer spells it, so it is gated. If the two
+    # ever diverge again the cross-check row says so and this gate catches the move.
+    "reference_free.cameras.reprojection.rms_px": "lower",
 }
 
 # Metrics whose value is a fraction of a total and so is gated by a relative drop
@@ -374,40 +378,40 @@ def markdown(
                 f"| Engine registered | {engine['registered']} / {engine['offered']} cameras |"
             )
 
-        # This module re-projects independently from the saved project, which is a
-        # useful cross-check when it agrees. It currently does not agree (~160 px
-        # against 0.5 px, on every camera), so it is reported as disputed rather
-        # than as a number to trust — publishing it as if it were the alignment's
-        # error would be worse than publishing nothing.
+        # This module re-projects independently from the saved project's own
+        # poses and calibration. It is a cross-check on the project writer and on
+        # this metric: after the camera-type comparison was made case-insensitive
+        # (the writer emits "frame", not "Frame") it agrees with the engine's own
+        # bundle-adjustment RMS, so it is reported and gated like any other
+        # number. ``agrees`` is kept as a diagnostic: if the two ever diverge
+        # again the report says so instead of silently headlining a wrong figure.
         if reprojection and "skipped" not in reprojection:
             mine = reprojection.get("rms_px")
             theirs = engine.get("rms_px")
-            disputed = (
-                mine is not None
-                and theirs is not None
-                and (theirs <= 0.0 or mine > 10.0 * theirs)
-            )
-            if disputed:
+            lines.append(f"| Reprojection RMS (independent) | {_fmt(mine)} px |")
+            lines.append(f"| Observations | {reprojection.get('pairs')} |")
+            if mine is not None and theirs is not None:
+                # Agreement is "within 1 px, or within 50% of the engine's own
+                # figure". The two are not the same computation — the engine's RMS
+                # is taken inside the fit over the observations it kept, this one
+                # re-projects every stored track from the saved poses — so a small
+                # difference is expected, but an order of magnitude is a bug.
+                agrees = abs(mine - theirs) <= max(1.0, 0.5 * abs(theirs))
                 lines.append(
-                    f"| Independent re-projection | _{_fmt(mine)} px — **disputed**, "
-                    f"not used; see below_ |"
+                    f"| Cross-check vs engine BA | "
+                    f"{'agrees' if agrees else '**disagrees** — investigate the writer before trusting either'} |"
                 )
-                spread = reprojection.get("worst_cameras") or []
-                if spread:
-                    lines.append(
-                        "| Worst camera medians | "
-                        + ", ".join(
-                            f"#{entry['camera']} {_fmt(entry['median_px'])} px"
-                            for entry in spread
+                if not agrees:
+                    spread = reprojection.get("worst_cameras") or []
+                    if spread:
+                        lines.append(
+                            "| Worst camera medians | "
+                            + ", ".join(
+                                f"#{entry['camera']} {_fmt(entry['median_px'])} px"
+                                for entry in spread
+                            )
+                            + " |"
                         )
-                        + " |"
-                    )
-                lines.append(f"| Observations | {reprojection.get('pairs')} |")
-            else:
-                lines.append(
-                    f"| Reprojection RMS (independent) | {_fmt(mine)} px |"
-                )
-                lines.append(f"| Observations | {reprojection.get('pairs')} |")
     lines.append("")
 
     # -- reference-based ---------------------------------------------------

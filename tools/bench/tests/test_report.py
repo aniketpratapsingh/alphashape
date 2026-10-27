@@ -316,7 +316,11 @@ class MarkdownTest(unittest.TestCase):
 
 
 class ReprojectionReportingTest(unittest.TestCase):
-    def test_a_disputed_independent_figure_is_flagged_not_headlined(self):
+    def test_a_diverging_independent_figure_is_still_reported_but_flagged(self):
+        # The independent figure is gated like any other number once the camera
+        # type is read case-insensitively; a divergence is a diagnostic, not a
+        # reason to drop the number. A 163 px figure against 0.51 px must still
+        # appear in the table AND say it disagrees.
         current = metrics()
         current["reference_free"]["cameras"]["reprojection"] = {
             "pairs": 500, "rms_px": 163.0, "median_px": 89.0,
@@ -326,8 +330,9 @@ class ReprojectionReportingTest(unittest.TestCase):
                                                                 "registered": 30, "offered": 30}
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("engine BA", text)
-        self.assertIn("disputed", text)
-        self.assertNotIn("| Reprojection RMS (independent) |", text)
+        self.assertIn("| Reprojection RMS (independent) |", text)
+        self.assertIn("disagrees", text)
+        self.assertIn("#3 270", text)
 
     def test_agreeing_figures_are_both_reported(self):
         current = metrics()
@@ -338,7 +343,8 @@ class ReprojectionReportingTest(unittest.TestCase):
                                                                 "registered": 30, "offered": 30}
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("Reprojection RMS (independent)", text)
-        self.assertNotIn("disputed", text)
+        self.assertIn("agrees", text)
+        self.assertNotIn("disagrees", text)
 
 
 class SubsetNoteTest(unittest.TestCase):

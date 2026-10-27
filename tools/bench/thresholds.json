@@ -56,6 +56,9 @@
     },
     "reference_free.cameras.cameras_aligned_fraction": {
       "relative": 0.02
+    },
+    "reference_free.cameras.reprojection.rms_px": {
+      "relative": 0.15
     }
   }
 }

@@ -335,7 +335,7 @@ class ProjectInspectionTest(unittest.TestCase):
           <chunks>
             <chunk id="1" label="Chunk 1">
               <sensors><sensor id="0" label="s" width="100" height="100">
-                <calibration type="Frame" width="100" height="100" f="50" cx="0" cy="0"
+                <calibration type="frame" width="100" height="100" f="50" cx="0" cy="0"
                   b1="0" b2="0" k1="0" k2="0" k3="0" k4="0" p1="0" p2="0"/>
               </sensor></sensors>
               <cameras>
@@ -398,7 +398,9 @@ class ReprojectionTest(unittest.TestCase):
     optical axis must reproject to its principal point.
     """
 
-    def _project(self, tmp: Path, *, point=(0.0, 0.0, 10.0), camera_x=0.0) -> Path:
+    def _project(
+        self, tmp: Path, *, point=(0.0, 0.0, 10.0), camera_x=0.0, camera_type="frame"
+    ) -> Path:
         project = tmp / "site.psx"
         project.write_text("alphashape-project 2\nfiles=site.files/project.zip\n")
         bundle = tmp / "site.files" / "project.zip"
@@ -408,7 +410,7 @@ class ReprojectionTest(unittest.TestCase):
           <chunks>
             <chunk id="1" label="c">
               <sensors><sensor id="0" label="s" width="100" height="100">
-                <calibration type="Frame" width="100" height="100" f="50" cx="0" cy="0"
+                <calibration type="{camera_type}" width="100" height="100" f="50" cx="0" cy="0"
                   b1="0" b2="0" k1="0" k2="0" k3="0" k4="0" p1="0" p2="0"/>
               </sensor></sensors>
               <cameras>
@@ -451,6 +453,18 @@ class ReprojectionTest(unittest.TestCase):
             project = self._project(Path(tmp), point=(4.0, 0.0, 10.0), camera_x=0.0)
             stats = run_bench._reprojection(Path(tmp), project)
         self.assertAlmostEqual(stats["rms_px"], 20.0, places=6)
+
+    def test_a_lower_case_frame_project_is_not_treated_as_fisheye(self):
+        # The writer emits type="frame". When the projection compared against
+        # "Frame" every frame camera took the fisheye branch: at 76 degrees off
+        # axis the two models differ by 134 px on this fixture. A pinhole point at
+        # x/z = 4 projects to u = 50 + 50*4 = 250, so the error from the stored
+        # keypoint centre (50, 50) is exactly 200 px.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp), point=(40.0, 0.0, 10.0), camera_x=0.0)
+            stats = run_bench._reprojection(Path(tmp), project)
+        self.assertNotIn("skipped", stats)
+        self.assertAlmostEqual(stats["rms_px"], 200.0, places=6)
 
     def test_a_project_without_tracks_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,7 +510,7 @@ class SidecarDecodeTest(unittest.TestCase):
           <chunks>
             <chunk id="1" label="c">
               <sensors><sensor id="3" label="s" width="10" height="10">
-                <calibration type="Frame" width="10" height="10" f="7" cx="1" cy="2"
+                <calibration type="frame" width="10" height="10" f="7" cx="1" cy="2"
                   b1="0" b2="0" k1="0.1" k2="0" k3="0" k4="0" p1="0" p2="0"/>
               </sensor></sensors>
               <cameras>
@@ -514,6 +528,8 @@ class SidecarDecodeTest(unittest.TestCase):
         self.assertEqual(sensors[3]["f"], 7.0)
         self.assertEqual(sensors[3]["cx"], 1.0)
         self.assertEqual(sensors[3]["k1"], 0.1)
+        # The writer's own spelling, pass-through and case-normalised.
+        self.assertEqual(sensors[3]["type"], "frame")
 
 
 class CommandLineTest(unittest.TestCase):

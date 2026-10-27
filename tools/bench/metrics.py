@@ -1195,12 +1195,18 @@ def project_pixels(
     cam = p @ m[:3, :3].T + m[:3, 3]
     x, y, z = cam[:, 0], cam[:, 1], cam[:, 2]
 
-    if calibration.get("type", "Frame") == "Frame":
+    # The project writer emits lower-case ``frame``/``fisheye``
+    # (``camera_type_name`` in engine/src/common/io/doc_xml_common.cpp), so the
+    # model is chosen case-insensitively. An unknown type is a hard error: a
+    # silent fall-through to the fisheye branch is how every frame camera once
+    # got projecting with the wrong model and a ~160 px "disagreement".
+    camera_type = str(calibration.get("type", "frame")).strip().lower()
+    if camera_type == "frame":
         ok = z > 0.0
         safe_z = np.where(ok, z, 1.0)
         xs = x / safe_z
         ys = y / safe_z
-    else:
+    elif camera_type == "fisheye":
         r3d = np.hypot(x, y)
         theta = np.arctan2(r3d, z)
         safe_r = np.where(r3d > 0, r3d, 1.0)
@@ -1208,6 +1214,11 @@ def project_pixels(
         ok = ~((r3d == 0) & (z == 0))
         xs = x * scale
         ys = y * scale
+    else:
+        raise ValueError(
+            f"project_pixels: unknown camera type {calibration.get('type')!r} "
+            "(the project format defines 'frame' and 'fisheye')"
+        )
 
     k1 = float(calibration.get("k1", 0.0))
     k2 = float(calibration.get("k2", 0.0))

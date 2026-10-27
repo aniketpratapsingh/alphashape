@@ -25,7 +25,7 @@ only when the publisher ships a matching reference product.
 | Gradient energy | raw sharpness, the quantity the effective GSD is derived from |
 | DEM nodata fraction | share of DEM cells with no measurement |
 | Cameras aligned | aligned / total cameras in the saved project |
-| Reprojection RMS | the engine's own bundle-adjustment RMS, parsed from its `AlignCameras` output |
+| Reprojection RMS | the engine's own bundle-adjustment RMS, parsed from its `AlignCameras` output, plus an independent re-projection from the saved project (see below) |
 
 **Reference-based** — does it agree with someone else's answer?
 
@@ -41,11 +41,12 @@ and the reference-based rows are what actually say whether the model is right.
 
 There is also an **independent** re-projection: `run_bench` re-projects every triangulated
 tie point from the saved project's own poses and calibration, which is a cross-check on
-both the project writer and the metric. That figure currently disagrees with the engine's
-by two orders of magnitude on every camera — ~160 px against 0.5 px — so the report labels
-it **disputed**, shows the per-camera medians that localise it, and excludes it from the
-regression gate. Publishing it as if it were the alignment's error would be worse than
-publishing nothing. Until it is resolved, the engine's own RMS is the figure to read.
+both the project writer and the metric. It is reported beside the engine's RMS and gated,
+and the report prints whether the two agree. They do agree: the writer emits the sensor
+type as `frame`/`fisheye`, and the projection compares case-insensitively (an earlier
+version compared against `Frame`, so every frame camera was projected with the fisheye
+model and the figure read ~160 px). If the cross-check row ever says "disagrees", read
+that as a bug in the project writer before trusting either number.
 
 ## Running it locally
 
