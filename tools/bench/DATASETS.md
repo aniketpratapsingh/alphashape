@@ -131,14 +131,15 @@ does not come from a photogrammetry pipeline at all.
   - `terrains_dslr_occlusion.7z` — the occlusion masks. ETH3D's evaluator uses these to
     score accuracy only on points the laser could actually see.
 
-    **This benchmark does not use them yet.** Applying them needs a ray test from each
-    scanner position against the reference surface, which the evaluator does across the
-    full scan; the work is straightforward but is not in this version. The consequence is
-    known and stated rather than hidden: accuracy is scored over the whole cloud, so a
-    correct reconstruction of a region the scanner was blind to counts as an error, and
-    the reported accuracy is therefore a lower bound. Completeness is unaffected — every
-    reference point genuinely should be reconstructed. The manifest does not download
-    the occlusion archive, so a run does not pay for a file it does not read.
+    **This benchmark does not download or apply them.** They live in a separate archive
+    whose SHA-256 and byte count are not pinned in `datasets.json`, and the manifest's rule
+    is that a file whose bytes are not verified is not downloaded. Applying them would also
+    need a ray test from each scanner position against the reference surface. The
+    consequence is stated rather than hidden: accuracy is scored over the whole cloud, so a
+    correct reconstruction of a region the scanner was blind to counts as an error, and the
+    reported accuracy is therefore a lower bound. Completeness is unaffected — every
+    reference point genuinely should be reconstructed. `README.md` says the same beside the
+    dataset table, so the claim and the code agree.
 - Accuracy/completeness follow ETH3D's own definition as implemented by
   `ETH3D/multi-view-evaluation`: accuracy is the fraction of reconstructed points within
   a tolerance of the reference surface, completeness the fraction of reference points

@@ -160,7 +160,13 @@ one.
 | Name | Flight | Images | Reference products | Licence |
 |---|---|---|---|---|
 | `aerial-nadir` | nadir drone | 102 | orthomosaic + DSM + dense cloud, from the publisher's own OpenDroneMap run | CC BY 4.0 |
-| `terrestrial-laser` | oblique handheld DSLR | 42 | registered terrestrial laser scan, occlusion masks | CC BY-NC-SA 4.0 |
+| `terrestrial-laser` | oblique handheld DSLR | 42 | registered terrestrial laser scan (ETH3D `terrains`) | CC BY-NC-SA 4.0 |
+
+`terrestrial-laser` scores accuracy and completeness against the laser scan. ETH3D also
+publishes per-image occlusion masks, in a separate archive this benchmark does **not**
+download; accuracy is therefore scored over the whole scan and is a lower bound, because a
+correct reconstruction of a surface the scanner could not see counts as an error.
+Completeness is unaffected. `DATASETS.md` records why the masks are not applied.
 
 `terrestrial-laser` is ETH3D's `terrains` training scene. Its non-commercial licence
 permits downloading it to evaluate; it does not permit redistribution, so the job downloads
