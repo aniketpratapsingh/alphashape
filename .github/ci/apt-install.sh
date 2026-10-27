@@ -31,6 +31,8 @@
 #   APT_ATTEMPT_TIMEOUT seconds per `apt-get update` attempt (default 150).
 #   APT_INSTALL_TIMEOUT seconds per `apt-get install` (default 300).
 #   APT_PASSES          passes over the mirror list (default 1 => 4 attempts).
+#   APT_CACHE_SCOPE     ref name folded into the cache key; the action sets it to
+#                       github.ref_name so one branch cannot seed another's cache entry.
 #   APT_SOURCES_ROOT, APT_ARCHIVES_DIR, APT_LISTS_DIR
 #                       overrides for /etc/apt, /var/cache/apt/archives and /var/lib/apt/lists;
 #                       used by .github/ci/test-apt-install.sh to exercise this script unprivileged.
@@ -88,8 +90,13 @@ PKGS=("$@")
 
 # --- cache key ------------------------------------------------------------------------------
 
-# Image version, architecture and the sorted package list identify the cache entry: a change
-# to either the packages or the runner image must miss the cache rather than install stale debs.
+# Image version, architecture, ref and the sorted package list identify the cache entry: a
+# change to any of them must miss the cache rather than install stale debs.
+#
+# The ref is part of the key because the debs are installed as root from a cache entry, and a
+# workflow that checks out an arbitrary `inputs.ref` must not be able to seed the entry that
+# `main` reads (CodeQL's "cache poisoning via untrusted code"). PRs read main's entry through
+# restore-keys, which is safe: main's cache is trusted, a branch's is not.
 os_version() {
   # shellcheck disable=SC1091
   (. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-unknown}") || printf 'unknown'
@@ -97,15 +104,26 @@ os_version() {
 arch() { dpkg --print-architecture 2>/dev/null || uname -m; }
 
 cache_key() {
-  local hash
+  local hash scope
   hash=$(printf '%s\n' "${PKGS[@]}" | LC_ALL=C sort -u | sha256sum | cut -c1-16)
-  printf 'apt-v3-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
+  scope="${APT_CACHE_SCOPE:-}"
+  if [ -n "$scope" ]; then
+    printf 'apt-v4-%s-%s-%s-%s' "$(os_version)" "$(arch)" "$scope" "$hash"
+  else
+    printf 'apt-v4-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
+  fi
 }
 
 if [ "$PRINT_KEY" -eq 1 ]; then
   key=$(cache_key)
   printf '%s\n' "$key"
-  [ -n "${GITHUB_OUTPUT:-}" ] && printf 'key=%s\n' "$key" >>"$GITHUB_OUTPUT"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    {
+      printf 'key=%s\n' "$key"
+      # A prefix that only matches entries main wrote; used as restore-keys for PR runs.
+      printf 'shared_prefix=apt-v4-%s-%s-main-\n' "$(os_version)" "$(arch)"
+    } >>"$GITHUB_OUTPUT"
+  fi
   exit 0
 fi
 

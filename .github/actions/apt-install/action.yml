@@ -35,6 +35,10 @@ runs:
       shell: bash
       env:
         APT_PACKAGES: ${{ inputs.packages }}
+        # Scoping the key to the ref keeps one branch (or a run that checked out an arbitrary
+        # ref) from seeding the entry another reads. PRs fall back to main's entry through
+        # restore-keys, which only ever reads a cache main itself wrote.
+        APT_CACHE_SCOPE: ${{ github.ref_name }}
       run: '"$GITHUB_ACTION_PATH/../../ci/apt-install.sh" --print-key $APT_PACKAGES'
 
     - name: Restore the .deb cache
@@ -43,6 +47,7 @@ runs:
       with:
         path: ~/.cache/apt-debs
         key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.shared_prefix }}
 
     - name: Install packages
       shell: bash

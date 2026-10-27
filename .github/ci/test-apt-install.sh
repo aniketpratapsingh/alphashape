@@ -306,7 +306,23 @@ k2=$(run_script --print-key ninja-build cmake 2>/dev/null)
 k3=$(run_script --print-key cmake 2>/dev/null)
 check "cache key: is stable across package order" [ "$k1" = "$k2" ]
 check "cache key: changes with the package set" [ "$k1" != "$k3" ]
-check "cache key: carries the image version" bash -c '[[ "$1" == apt-v3-*-amd64-* ]]' _ "$k1"
+check "cache key: carries the image version" bash -c '[[ "$1" == apt-v4-*-amd64-* ]]' _ "$k1"
+
+# The key is scoped to the ref: a run that checks out an arbitrary ref must not be able to seed
+# the entry another branch reads (CodeQL "cache poisoning via untrusted code").
+kb=$(APT_CACHE_SCOPE=main run_script --print-key cmake 2>/dev/null)
+kf=$(APT_CACHE_SCOPE=feature run_script --print-key cmake 2>/dev/null)
+check "cache key: differs per ref" [ "$kb" != "$kf" ]
+check "cache key: main's own key is stable" \
+  [ "$kb" = "$(APT_CACHE_SCOPE=main run_script --print-key cmake 2>/dev/null)" ]
+out=$(APT_CACHE_SCOPE=feature run_script --print-key cmake 2>/dev/null)
+check "cache key: no scope still yields a usable key" [ -n "$k1" ]
+gout="$work/github_output"
+: >"$gout"
+GITHUB_OUTPUT="$gout" APT_CACHE_SCOPE=feature bash -c 'true'
+out=$(GITHUB_OUTPUT="$gout" APT_CACHE_SCOPE=feature run_script --print-key cmake 2>/dev/null)
+check "cache key: publishes a main-only restore prefix" \
+  bash -c 'grep -q "^shared_prefix=apt-v4-.*-amd64-main-$" "$1"' _ "$gout"
 
 # --- 6. cache hit installs offline ----------------------------------------------------------
 
