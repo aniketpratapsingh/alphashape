@@ -28,11 +28,12 @@ All notable changes to alphashape are recorded here. The format follows
   It walks 4096 → 512 cells and takes the first side whose peak (one window's
   stages plus the assembled output raster, the assembled-grid `fill_holes` and
   the photo cache) fits `platform::memory_budget_bytes`, which already reserves
-  headroom. A machine with the RAM does fewer, bigger blocks instead of being
-  held to a fixed absolute target. The reported 36-photo, 4592x3056, 1.9 cm case
-  over a 100 m site (28 M cells, ~8 GB before) plans at 2048-cell blocks (3x3)
-  for a ~5.3 GB peak on an 8 GB machine, at 1024-cell blocks for a ~2.5 GB peak
-  on a 4 GB budget, and as one piece on a 16 GB one. The resolution is only
+  headroom (60% of physical RAM). A machine with the RAM does fewer, bigger
+  blocks instead of being held to a fixed absolute target. The reported
+  36-photo, 4592x3056, 1.9 cm case over a 100 m site (28 M cells, ~8 GB before)
+  plans at 2048-cell blocks (3x3, ~4.5 GB peak) on an 8 GB machine, 1024-cell
+  blocks (~2.5 GB) on a 2 GB budget, 4096-cell (2x2, ~12 GB) on 32 GB, and as
+  one piece once the whole grid's ~14 GB estimate fits. The resolution is only
   coarsened when even a 512-cell block cannot fit. `block_size` overrides the
   block side (0 = automatic).
 - **Build Depth Maps keeps the cameras it finished when cancelled.** A cancel
