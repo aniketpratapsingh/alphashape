@@ -161,10 +161,22 @@ discover_sources() {
 # (`URIs: http://host/ubuntu/`, possibly comma-separated), classic `deb http://host/ubuntu`, and
 # the runner image's `mirror+file:` indirection, which is replaced by the plain mirror URI.
 # The trailing slash matches the convention Ubuntu ships in both forms.
+# The scheme is inherited from the file being rewritten: a source configured over https is never
+# downgraded to http. A file with no scheme of its own (the `mirror+file:` indirection, which is
+# a local path) gets the rotation mirrors' default of http.
 # Written through a temp file rather than `sed -i`, whose spelling differs between GNU and BSD.
 rewrite_sources() {
-  local mirror="$1" url="http://$1/" f tmp rc
+  local mirror="$1" scheme f tmp rc url
   for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    # Only the Ubuntu URIs decide the scheme, and only outside comments: a third-party https
+    # repository in the same classic sources.list must not force the archive to https, and
+    # Ubuntu's `# See http://help.ubuntu.com/...` comment must not force it back to http.
+    if grep -vE '^[[:space:]]*#' "$f" | grep -qE "https://${UBUNTU_HOST_RE}"; then
+      scheme=https
+    else
+      scheme=http
+    fi
+    url="$scheme://$mirror/"
     tmp=$(mktemp) || return 1
     # Comment lines are skipped: Ubuntu ships `# See http://help.ubuntu.com/...` in
     # ubuntu.sources, and rewriting that produces a useless "mirror" the next run would cache.

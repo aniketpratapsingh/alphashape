@@ -5,8 +5,8 @@
 # What is proven here:
 #   1. A dead mirror is rotated past: the failed mirror is logged, the next one is tried, and
 #      the log names the mirror that succeeded.
-#   2. Both source formats are rewritten (deb822 ubuntu.sources and classic sources.list),
-#      https URIs are normalised, and third-party sources are left alone.
+#   2. Both source formats are rewritten (deb822 ubuntu.sources and classic sources.list), the
+#      original scheme is preserved (https stays https), and third-party sources are left alone.
 #   3. Rotation starts at the configured mirror, so a healthy azure setup is not rewritten.
 #   4. The cache key covers image version, architecture and the sorted package list.
 #   5. A cache hit installs with --no-download and no update; a cache that cannot satisfy the
@@ -195,9 +195,11 @@ out=$(run_script cmake ninja-build 2>&1)
 rc=$?
 check "rotation: exits 0 after a dead azure mirror" [ "$rc" -eq 0 ]
 check "rotation: logs the failed attempt" grep -q "apt-get update timed out or errored on azure.archive.ubuntu.com" <<<"$out"
-check "rotation: logs the mirror that succeeded" grep -q "success on attempt 2/4 (sources: http://archive.ubuntu.com/ubuntu/)" <<<"$out"
+check "rotation: logs the mirror that succeeded" grep -q "success on attempt 2/4 (sources: https://archive.ubuntu.com/ubuntu/)" <<<"$out"
+# Both files rotate to the same mirror, each keeping the scheme it was configured with: the
+# classic list was https and must stay https rather than being downgraded.
 check "rotation: both source files now point at the working mirror" \
-  [ "$(mirrors_in_sources)" = "http://archive.ubuntu.com/ubuntu/" ]
+  [ "$(mirrors_in_sources | tr '\n' ' ')" = "http://archive.ubuntu.com/ubuntu/ https://archive.ubuntu.com/ubuntu/ " ]
 check "rotation: third-party source untouched" \
   grep -q 'packages.microsoft.com/repos/edge' "$STUB_DIR/sources/sources.list.d/microsoft.list"
 check "rotation: archives harvested into the cache" \
@@ -214,14 +216,14 @@ new_stub healthy
 out=$(run_script zlib1g-dev 2>&1)
 check "healthy: first attempt uses the configured azure mirror" \
   grep -q "attempt 1/4: mirror http://azure.archive.ubuntu.com/ubuntu" <<<"$out"
-check "healthy: azure succeeds without rotating" grep -q "success on attempt 1/4 (sources: http://azure.archive.ubuntu.com/ubuntu/)" <<<"$out"
+check "healthy: azure succeeds without rotating" grep -q "success on attempt 1/4 (sources: https://azure.archive.ubuntu.com/ubuntu/)" <<<"$out"
 
 # --- 3. install failure (not update) also rotates -------------------------------------------
 
 new_stub install-fail
 echo "azure.archive.ubuntu.com" >"$STUB_DIR/install_fail_until"
 out=$(run_script libtiff6 2>&1)
-check "install failure: rotates to the next mirror" grep -q "success on attempt 2/4 (sources: http://archive.ubuntu.com/ubuntu/)" <<<"$out"
+check "install failure: rotates to the next mirror" grep -q "success on attempt 2/4 (sources: https://archive.ubuntu.com/ubuntu/)" <<<"$out"
 
 # --- 4. every mirror dead => non-zero -------------------------------------------------------
 
@@ -298,6 +300,67 @@ check "comments: the real mirror is rotated" \
 # canonical archive; a commented URL must not have been taken for the configured mirror.
 check "comments: rotation did not start at the commented URL" \
   bash -c 'grep -q "URIs: http://archive.ubuntu.com/ubuntu/" "$1"' _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+
+# --- 4d. the original scheme is preserved ---------------------------------------------------
+
+# A source configured over https must not be downgraded to http by the rotation. Downloads over
+# plain http can be tampered with in transit, so the scheme the operator chose has to survive.
+new_stub https-only
+cat >"$STUB_DIR/sources/sources.list.d/ubuntu.sources" <<'EOF2'
+Types: deb
+URIs: https://azure.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF2
+rm -f "$STUB_DIR/sources/sources.list"
+echo "azure.archive.ubuntu.com" >"$STUB_DIR/update_fail_until"
+out=$(run_script cmake 2>&1)
+check "https: rotates to the next mirror" grep -q "success on attempt 2/4" <<<"$out"
+check "https: stays https after the rotation" \
+  grep -q "URIs: https://archive.ubuntu.com/ubuntu/" "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+check "https: nothing was downgraded to http" \
+  bash -c '! grep -q "URIs: http://" "$1"' _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+
+# http sources stay http: the point is to keep what was configured, not to force https.
+new_stub http-only
+rm -f "$STUB_DIR/sources/sources.list"
+echo "azure.archive.ubuntu.com" >"$STUB_DIR/update_fail_until"
+out=$(run_script cmake 2>&1)
+check "http: stays http after the rotation" \
+  grep -q "URIs: http://archive.ubuntu.com/ubuntu/" "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+
+# A third-party https line in the same file must not make the Ubuntu archive https: the scheme
+# follows the Ubuntu URIs only.
+new_stub third-party-https
+cat >"$STUB_DIR/sources/sources.list" <<'EOF2'
+deb http://azure.archive.ubuntu.com/ubuntu noble main
+deb [arch=amd64] https://packages.microsoft.com/repos/edge stable main
+EOF2
+echo "azure.archive.ubuntu.com" >"$STUB_DIR/update_fail_until"
+out=$(run_script cmake 2>&1)
+check "http: a third-party https line in the same file does not force https" \
+  grep -q "^deb http://archive.ubuntu.com/ubuntu/ noble main$" "$STUB_DIR/sources/sources.list"
+check "http: the third-party line is untouched" \
+  grep -q 'packages.microsoft.com/repos/edge' "$STUB_DIR/sources/sources.list"
+
+# The runner image's mirror+file: indirection names no scheme of its own, so the rotation has to
+# fall back to the mirrors' default of http.
+new_stub mirrorlist-scheme
+cat >"$STUB_DIR/sources/sources.list.d/ubuntu.sources" <<'EOF2'
+Types: deb
+URIs: mirror+file:/etc/apt/apt-mirrors.txt
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF2
+rm -f "$STUB_DIR/sources/sources.list"
+printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n' >"$STUB_DIR/sources/apt-mirrors.txt"
+echo yes >"$STUB_DIR/update_fail_mirrorlist"
+out=$(run_script cmake 2>&1)
+check "mirror+file: the rotated replacement defaults to http" \
+  bash -c 'grep -qE "URIs: http://(archive\.ubuntu\.com|mirrors\.edge\.kernel\.org|mirror\.math\.princeton\.edu)/ubuntu/" "$1"' \
+  _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
 
 # --- 5. cache key ---------------------------------------------------------------------------
 
