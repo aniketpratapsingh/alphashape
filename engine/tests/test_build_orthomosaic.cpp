@@ -1651,7 +1651,7 @@ TEST(BuildOrthomosaic, BlockWiseNarrowLastWindowHasNoBorderStep) {
 
     const auto near_border = [w, h](int col, int row) {
         constexpr int kNear = 4;
-        const auto on_border = [kNear](int index, int extent) {
+        const auto on_border = [](int index, int extent) {
             const int border = (index / kBlock + 1) * kBlock;
             return border < extent && (border - index <= kNear || index - border < kNear);
         };
