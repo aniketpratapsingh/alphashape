@@ -54,9 +54,10 @@ for f in "$STUB_DIR"/sources/sources.list.d/*.sources "$STUB_DIR"/sources/source
   [ -f "$f" ] || continue
   # `mirror+file:` means apt walks the mirrorlist itself; the stub models that as "every
   # entry is tried", so the first entry stands in for the whole list.
-  m=$(grep -oE 'https?://[^[:space:],/]+' "$f" | head -n1)
+  # apt ignores comment lines, so the stub must too.
+  m=$(grep -vE '^[[:space:]]*#' "$f" | grep -oE 'https?://[^[:space:],/]+' | head -n1)
   [ -n "$m" ] && { mirror=$m; break; }
-  m=$(grep -oE 'mirror\+file:[^[:space:],]+' "$f" | head -n1)
+  m=$(grep -vE '^[[:space:]]*#' "$f" | grep -oE 'mirror\+file:[^[:space:],]+' | head -n1)
   if [ -n "$m" ]; then
     m=$(grep -oE 'https?://[^[:space:]/]+' "${m#mirror+file:}" | head -n1)
     [ -n "$m" ] && { mirror=$m; break; }
@@ -264,6 +265,33 @@ check "mirrorlist image, list dead: names the mirror that worked" \
 check "mirrorlist image, list dead: indirection is replaced" \
   bash -c '! grep -q "mirror+file:" "$1"' _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
 
+# --- 4c. comment lines are not mirrors ------------------------------------------------------
+
+new_stub comments
+{
+  echo "# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to"
+  cat <<'EOF2'
+Types: deb
+URIs: http://azure.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF2
+} >"$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+rm -f "$STUB_DIR/sources/sources.list"
+echo "azure.archive.ubuntu.com" >"$STUB_DIR/update_fail_until"
+out=$(run_script cmake 2>&1)
+check "comments: a URL in a comment is not reported as the mirror" \
+  bash -c '! grep -q "current mirror: http://help.ubuntu.com" <<<"$1"' _ "$out"
+check "comments: the comment itself is preserved" \
+  grep -q "help.ubuntu.com/community/UpgradeNotes" "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+check "comments: the real mirror is rotated" \
+  grep -q "URIs: http://archive.ubuntu.com/ubuntu/" "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+# The fixture above has no mirror+file:, so rotation starts at azure and must move to the
+# canonical archive; a commented URL must not have been taken for the configured mirror.
+check "comments: rotation did not start at the commented URL" \
+  bash -c 'grep -q "URIs: http://archive.ubuntu.com/ubuntu/" "$1"' _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+
 # --- 5. cache key ---------------------------------------------------------------------------
 
 k1=$(run_script --print-key cmake ninja-build 2>/dev/null)
@@ -271,22 +299,32 @@ k2=$(run_script --print-key ninja-build cmake 2>/dev/null)
 k3=$(run_script --print-key cmake 2>/dev/null)
 check "cache key: is stable across package order" [ "$k1" = "$k2" ]
 check "cache key: changes with the package set" [ "$k1" != "$k3" ]
-check "cache key: carries the image version" bash -c '[[ "$1" == apt-v2-*-amd64-* ]]' _ "$k1"
+check "cache key: carries the image version" bash -c '[[ "$1" == apt-v3-*-amd64-* ]]' _ "$k1"
 
 # --- 6. cache hit installs offline ----------------------------------------------------------
 
 new_stub offline
 echo yes >"$STUB_DIR/offline_ok"
-mkdir -p "$STUB_DIR/cache/lists"
-echo "mirrors.edge.kernel.org/ubuntu" >"$STUB_DIR/cache/mirror"
+echo yes >"$STUB_DIR/accept_cached_sources"
+mkdir -p "$STUB_DIR/cache/lists" "$STUB_DIR/cache/sources"
 : >"$STUB_DIR/cache/libtiff6_1.0_amd64.deb"
 : >"$STUB_DIR/cache/lists/libtiff6_Packages"
+# The cached source snapshot is the one that produced the lists; it is restored verbatim.
+cat >"$STUB_DIR/cache/sources/d__ubuntu.sources" <<'EOF2'
+Types: deb
+URIs: http://mirrors.edge.kernel.org/ubuntu/
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF2
 out=$(APT_CACHE_HIT=true run_script libtiff6 2>&1)
 rc=$?
 check "offline: exits 0 on a cache hit" [ "$rc" -eq 0 ]
 check "offline: used --no-download" grep -q -- '--no-download' "$STUB_DIR/calls"
 check "offline: never ran apt-get update" bash -c '! grep -q " update" "$1"' _ "$STUB_DIR/calls"
-check "offline: reported the cached mirror" grep -q "success via cache (originally mirrors.edge.kernel.org/ubuntu)" <<<"$out"
+check "offline: reported the cache as the source of the packages" grep -q "success from the cache: no network used" <<<"$out"
+check "offline: restored the matching source snapshot" \
+  grep -q "mirrors.edge.kernel.org" "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
 check "offline: seeded the cached deb" [ -f "$STUB_DIR/archives/libtiff6_1.0_amd64.deb" ]
 
 # --- 7. cache hit that cannot satisfy the set falls back to the network ----------------------
@@ -300,6 +338,26 @@ rc=$?
 check "offline miss: still exits 0 via the network" [ "$rc" -eq 0 ]
 check "offline miss: reported the fallback" grep -q "falling back to the mirrors" <<<"$out"
 check "offline miss: ran apt-get update" bash -c 'grep -q " update" "$1"' _ "$STUB_DIR/calls"
+
+# --- 7b. round trip: a cold run's harvest serves the next run offline ----------------------
+
+new_stub roundtrip
+echo yes >"$STUB_DIR/offline_ok"
+echo yes >"$STUB_DIR/accept_cached_sources"
+: >"$STUB_DIR/sources/sources.list.d/ubuntu.sources.comment"
+out1=$(run_script libtiff6 2>&1)
+check "round trip: cold run installs over the network" grep -q "success on attempt" <<<"$out1"
+check "round trip: cold run harvested the source snapshot" \
+  [ -f "$STUB_DIR/cache/sources/d__ubuntu.sources" ]
+check "round trip: cold run harvested the deb" [ -f "$STUB_DIR/cache/libtiff6_1.0_amd64.deb" ]
+: >"$STUB_DIR/calls"
+out2=$(APT_CACHE_HIT=true run_script libtiff6 2>&1)
+rc=$?
+check "round trip: warm run exits 0" [ "$rc" -eq 0 ]
+check "round trip: warm run used --no-download" grep -q -- '--no-download' "$STUB_DIR/calls"
+check "round trip: warm run ran exactly one apt-get call, and it was the offline install" \
+  bash -c '[ "$(wc -l < "$1" | tr -d " ")" = 1 ] && grep -q -- "--no-download" "$1"' _ "$STUB_DIR/calls"
+check "round trip: warm run reported no network use" grep -q "success from the cache: no network used" <<<"$out2"
 
 # --- 8. no source file at all ---------------------------------------------------------------
 

@@ -99,7 +99,7 @@ arch() { dpkg --print-architecture 2>/dev/null || uname -m; }
 cache_key() {
   local hash
   hash=$(printf '%s\n' "${PKGS[@]}" | LC_ALL=C sort -u | sha256sum | cut -c1-16)
-  printf 'apt-v2-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
+  printf 'apt-v3-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
 }
 
 if [ "$PRINT_KEY" -eq 1 ]; then
@@ -148,8 +148,11 @@ rewrite_sources() {
   local mirror="$1" url="http://$1/" f tmp rc
   for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
     tmp=$(mktemp) || return 1
-    if sed -E -e "s#mirror\\+file:[^[:space:],]+#${url}#g" \
-      -e "s#https?://${UBUNTU_HOST_RE}(/[^[:space:],]*)?#${url}#g" "$f" >"$tmp"; then
+    # Comment lines are skipped: Ubuntu ships `# See http://help.ubuntu.com/...` in
+    # ubuntu.sources, and rewriting that produces a useless "mirror" the next run would cache.
+    if sed -E \
+      -e "/^[[:space:]]*#/!s#mirror\\+file:[^[:space:],]+#${url}#g" \
+      -e "/^[[:space:]]*#/!s#https?://${UBUNTU_HOST_RE}(/[^[:space:],]*)?#${url}#g" "$f" >"$tmp"; then
       as_root cp "$tmp" "$f"
       rc=$?
       rm -f "$tmp"
@@ -164,12 +167,12 @@ rewrite_sources() {
 current_mirror() {
   local f m
   for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
-    m=$(grep -oE "https?://[^[:space:],]+" "$f" | head -n1)
+    m=$(grep -vE '^[[:space:]]*#' "$f" | grep -oE "https?://[^[:space:],]+" | head -n1)
     if [ -n "${m:-}" ]; then printf '%s' "$m"; return 0; fi
   done
   # No host in the sources: report the highest-priority entry of the mirrorlist.
   for f in ${MIRROR_FILES[@]+"${MIRROR_FILES[@]}"}; do
-    m=$(grep -oE 'https?://[^[:space:]]+' "$f" 2>/dev/null | head -n1)
+    m=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE 'https?://[^[:space:]]+' | head -n1)
     if [ -n "${m:-}" ]; then printf '%s' "$m"; return 0; fi
   done
   printf 'unknown'
@@ -255,14 +258,43 @@ restore_lists_from_cache() {
   return 0
 }
 
+# The .deb files and the lists are keyed by the URI that served them, so an offline install only
+# works against the exact sources that produced them. Those are cached verbatim and put back
+# before the offline attempt; anything else (a rotated mirror, the image's own mirrorlist) would
+# make apt reject every cached file as a URI mismatch.
+#
+# Names carry the location they came from: "d__x" is sources.list.d/x, "r__x" is /etc/apt/x.
+restore_sources_from_cache() {
+  [ -d "$CACHE_DIR/sources" ] || return 1
+  local f base n=0
+  for f in "$CACHE_DIR"/sources/*; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    case "$base" in
+      d__*)
+        as_root mkdir -p "$SOURCES_ROOT/sources.list.d"
+        as_root cp "$f" "$SOURCES_ROOT/sources.list.d/${base#d__}" 2>/dev/null || continue
+        ;;
+      r__*)
+        as_root cp "$f" "$SOURCES_ROOT/${base#r__}" 2>/dev/null || continue
+        ;;
+      *) continue ;;
+    esac
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  log "cache: restored $n source file(s)"
+  return 0
+}
+
 # Keep the debs apt downloaded, the lists they were resolved against, and the mirror that
 # served them, so the next run with this key can install with no network at all.
 harvest_cache() {
-  local mirror="$1" f n=0
+  local f n=0 base
   # The cache lives under $HOME and must stay owned by the job user: creating it with sudo
   # would leave a root-owned ~/.cache behind, and every later tool that writes there (ccache
   # is the first) would fail with "Permission denied".
-  mkdir -p "$CACHE_DIR/lists" || return 1
+  mkdir -p "$CACHE_DIR/lists" "$CACHE_DIR/sources" || return 1
 
   for f in "$ARCHIVES_DIR"/*.deb; do
     [ -f "$f" ] || continue
@@ -278,27 +310,33 @@ harvest_cache() {
   done
   log "cache: stored $n apt list file(s)"
 
+  n=0
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    base=$(basename "$f")
+    if [ "$(dirname "$f")" = "$SOURCES_ROOT" ]; then
+      base="r__$base"
+    else
+      base="d__$base"
+    fi
+    as_root cp "$f" "$CACHE_DIR/sources/$base" 2>/dev/null && n=$((n + 1))
+  done
+  log "cache: stored $n source file(s)"
+
   as_root chown -R "$(id -u):$(id -g)" "$CACHE_DIR" 2>/dev/null
-  printf '%s\n' "$mirror" >"$CACHE_DIR/mirror" 2>/dev/null
 }
 
 # Install without touching the network. Non-zero means something the packages need is absent
 # from the cache, which sends the caller down the rotation path.
 try_offline_install() {
-  local cached_mirror=""
   log "cache hit: trying apt-get install --no-download"
-  if [ -f "$CACHE_DIR/mirror" ]; then
-    cached_mirror=$(cat "$CACHE_DIR/mirror")
-    # The cached lists are keyed by URI, so the sources must point at the cached mirror.
-    [ -n "$cached_mirror" ] && rewrite_sources "$cached_mirror" || true
-  fi
+  restore_sources_from_cache || log "cache: no cached sources; using the image's own"
   restore_lists_from_cache || log "cache: no cached apt lists; using the lists on the image"
 
   as_root timeout "$INSTALL_TIMEOUT" apt-get "${APT_OPTS[@]}" \
     install -y --no-install-recommends --no-download "${PKGS[@]}"
   local rc=$?
   if [ "$rc" -eq 0 ]; then
-    log "success via cache${cached_mirror:+ (originally $cached_mirror)}: no network used"
+    log "success from the cache: no network used"
   else
     log "cache could not satisfy the package set (rc=$rc); falling back to the mirrors"
   fi
@@ -347,7 +385,7 @@ network_install() {
     rc=$?
     if [ "$rc" -eq 0 ]; then
       log "success on attempt $attempt/$total (sources: $(current_mirror))"
-      harvest_cache "$(current_mirror)"
+      harvest_cache
       return 0
     fi
     log "attempt $attempt failed: apt-get install rc=$rc"
