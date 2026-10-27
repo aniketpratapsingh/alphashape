@@ -119,24 +119,17 @@ jobs:
       # touches. The configure flags below are the ones build.yml uses for Linux,
       # minus everything the bench does not need.
       # The Azure apt mirror is intermittently throttled to a crawl — it failed this
-      # job outright on one run — so the .debs are kept between runs, the way
-      # build.yml does it.
-      - name: Restore the apt package cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: ~/apt-debs
-          key: bench-apt-v1
-
+      # job outright on one run — so installs go through the shared action: mirror
+      # rotation plus a .deb cache keyed on the package list.
       - name: Install build dependencies
-        run: |
-          apt_retry() { for i in 1 2 3 4 5 6; do sudo timeout 240 apt-get -q -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed or timed out"; sleep 5; done; return 1; }
-          mkdir -p ~/apt-debs
-          sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
-          apt_retry update
-          apt_retry install -y --no-install-recommends build-essential cmake ninja-build ccache \
-            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake ninja-build ccache
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
             libpng-dev libtiff-dev
-          cp /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
+          attempt-timeout: "240"
+          install-timeout: "420"
 
       - name: Restore the compiler cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -194,23 +187,16 @@ jobs:
           name: bench-cli
           path: build/bench/bin
 
-      - name: Restore the apt package cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: ~/apt-debs
-          key: bench-apt-runtime-v1
-
+      # Runtime libraries for the CLI, p7zip for the ETH3D archives. The metrics Python
+      # packages are installed separately below, pinned in versions.txt.
       - name: Install runtime dependencies
-        run: |
-          apt_retry() { for i in 1 2 3 4 5 6; do sudo timeout 240 apt-get -q -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "$@" && return 0; echo "apt attempt $i failed or timed out"; sleep 5; done; return 1; }
-          mkdir -p ~/apt-debs
-          sudo cp -n ~/apt-debs/*.deb /var/cache/apt/archives/ 2>/dev/null || true
-          apt_retry update
-          # Runtime libraries for the CLI, 7-Zip for the ETH3D archives, and the
-          # Python stack below for the metrics.
-          apt_retry install -y --no-install-recommends libceres4t64 libproj25 proj-data \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libceres4t64 libproj25 proj-data
             libtiff6 libjpeg-turbo8 libpng16-16t64 p7zip-full
-          cp /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
+          attempt-timeout: "240"
+          install-timeout: "420"
 
       - name: Install the metrics dependencies
         # Pinned exactly, for the same reason the actions above are pinned to a
