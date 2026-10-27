@@ -1,0 +1,54 @@
+name: apt-install
+description: >-
+  Install .deb packages with mirror rotation and a .deb cache. Wraps
+  .github/ci/apt-install.sh, which holds all the logic: it computes the cache key from
+  (image version, architecture, sorted package list), restores the cached debs, tries an
+  offline `apt-get install --no-download`, and otherwise rotates through the Ubuntu
+  mirrors with bounded attempts until one works.
+
+inputs:
+  packages:
+    description: Space- or newline-separated package list (--no-install-recommends).
+    required: true
+  attempt-timeout:
+    description: Seconds allowed per `apt-get update` attempt.
+    required: false
+    default: "150"
+  install-timeout:
+    description: Seconds allowed per `apt-get install`.
+    required: false
+    default: "300"
+
+outputs:
+  cache-key:
+    description: The actions/cache key derived from the package list.
+    value: ${{ steps.key.outputs.key }}
+  cache-hit:
+    description: "'true' when the .deb cache was restored."
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute the .deb cache key
+      id: key
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+      run: '"$GITHUB_ACTION_PATH/../../ci/apt-install.sh" --print-key $APT_PACKAGES'
+
+    - name: Restore the .deb cache
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ~/.cache/apt-debs
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Install packages
+      shell: bash
+      env:
+        APT_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+        APT_INSTALL_TIMEOUT: ${{ inputs.install-timeout }}
+      run: '"$GITHUB_ACTION_PATH/../../ci/apt-install.sh" $APT_PACKAGES'
