@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -233,6 +234,71 @@ def download(remote: RemoteFile, destination: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def check_member_name(name: str, *, archive: Path) -> str:
+    """Reject an archive member that would land outside the extraction root.
+
+    The archives are downloaded, not authored here, and an archive is untrusted
+    input in exactly the sense that matters: a member named ``../../etc/cron.d/x``
+    or ``/etc/ld.so.preload`` writes wherever the runner's user can write. Python
+    resolves a bare name inside ``destination`` for us, but it does so for the
+    paths it is handed — ``zipfile.extract`` strips a leading ``/`` and drops ``..``
+    components silently, which means the file lands somewhere other than where the
+    manifest says and the run continues on the wrong data. ``7z`` is worse: it is a
+    separate process that honours absolute paths and will happily write outside
+    ``-o``. Checking once, before anything is unpacked, makes both cases a named
+    error instead of a surprise.
+
+    Windows separators are rejected too: a member is a POSIX path inside the
+    archive, and ``..\\..\\x`` is only dangerous on a platform this job does not
+    run on — but an archive carrying it is malformed, and a run that silently
+    accepted it would be trusting a file that lied about its own layout.
+    """
+    if not name or "\x00" in name:
+        raise SystemExit(f"{archive.name}: archive member has an empty or NUL-containing name")
+    if "\\" in name:
+        raise SystemExit(
+            f"{archive.name}: archive member {name!r} uses a Windows separator; "
+            "archive paths must be POSIX"
+        )
+    if name.startswith("/"):
+        raise SystemExit(f"{archive.name}: archive member {name!r} is an absolute path")
+    # A drive-letter or UNC-style prefix ("C:foo", "//host/share") is absolute in
+    # spirit even though it does not start with a bare "/".
+    if re.match(r"^[A-Za-z]:", name) or name.startswith("//"):
+        raise SystemExit(f"{archive.name}: archive member {name!r} is an absolute path")
+    parts = Path(name).parts
+    if any(part == ".." for part in parts):
+        raise SystemExit(f"{archive.name}: archive member {name!r} escapes the extraction root")
+    return name
+
+
+def _seven_zip() -> str:
+    seven = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+    if seven is None:
+        raise SystemExit(
+            "extracting a .7z needs 7-Zip on PATH "
+            "(the workflow installs it with `apt-get install p7zip-full`)"
+        )
+    return seven
+
+
+def seven_zip_members(archive: Path) -> list[str]:
+    """The entry names inside a ``.7z``, without extracting anything.
+
+    ``-slt -ba`` is the machine-readable listing: ``-slt`` prints one
+    ``Key = value`` block per entry, ``-ba`` drops the banner and the summary, so
+    every ``Path = `` line is a member and nothing else in the output is. Needed
+    because 7-Zip enforces no path containment of its own, so the names have to be
+    checked before the ``x`` that would act on them.
+    """
+    seven = _seven_zip()
+    listing = subprocess.run(
+        [seven, "l", "-slt", "-ba", str(archive)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [line[len("Path = "):] for line in listing.splitlines() if line.startswith("Path = ")]
+
+
 def extract_archive(archive: Path, destination: Path, *, members: list[str] | None = None) -> None:
     """Extract ``archive`` under ``destination``.
 
@@ -240,12 +306,37 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
     reference archive is unpacked once even when several reference files come out
     of it. Zip and tar (including .tar.zst handled by the external `tar`) are
     supported; a `.7z` needs `7z`, which the workflow installs.
+
+    Every entry is checked against :func:`check_member_name` BEFORE it is written,
+    including the entries of a full extraction: an archive is downloaded from a
+    third party, and a member that resolves outside ``destination`` is either a
+    malformed archive or an attempt to write outside it. Both fail the run here,
+    with the offending name, rather than landing a file somewhere else.
     """
     destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
     name = archive.name.lower()
+
+    def checked(entry: str) -> str:
+        return check_member_name(entry, archive=archive)
+
+    def check_resolved(target: Path, entry: str) -> None:
+        # Belt and braces on top of the name check: what matters is where the file
+        # ends up, and only the resolved path says that (symlinked parents, a
+        # destination that is itself relative).
+        resolved = target.resolve()
+        if not resolved.is_relative_to(root):
+            raise SystemExit(
+                f"{archive.name}: archive member {entry!r} resolves outside "
+                f"the extraction root ({resolved} is not under {root})"
+            )
 
     if name.endswith(".zip"):
         with zipfile.ZipFile(archive) as bundle:
+            wanted = members if members is not None else bundle.namelist()
+            for member in wanted:
+                checked(member)
+                check_resolved(destination / member, member)
             if members is None:
                 bundle.extractall(destination)
             else:
@@ -255,7 +346,14 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
 
     if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.zst", ".tar.xz", ".tar.bz2")):
         with tarfile.open(archive) as bundle:
+            wanted = members if members is not None else [entry.name for entry in bundle.getmembers()]
+            for member in wanted:
+                checked(member)
+                check_resolved(destination / member, member)
             if members is None:
+                # `data` refuses absolute paths on its own, but the names are
+                # already checked above and leaving it off keeps the behaviour
+                # identical to the named-member path.
                 bundle.extractall(destination)
             else:
                 for member in members:
@@ -263,12 +361,23 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
         return
 
     if name.endswith(".7z"):
-        seven = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
-        if seven is None:
-            raise SystemExit(
-                f"{archive.name}: extracting a .7z needs 7-Zip on PATH "
-                "(the workflow installs it with `apt-get install p7zip-full`)"
-            )
+        seven = _seven_zip()
+        present = seven_zip_members(archive)
+        wanted = members if members is not None else present
+        for member in wanted:
+            checked(member)
+            check_resolved(destination / member, member)
+        if members is not None:
+            listed = set(present)
+            missing = [member for member in members if member not in listed]
+            if missing:
+                # 7-Zip exits 0 on an unmatched name and unpacks nothing, which
+                # would leave a reference file silently absent and the scoring
+                # step reading the wrong thing (or failing much later).
+                raise SystemExit(
+                    f"{archive.name}: archive has no member(s) {missing!r}; it holds "
+                    f"{len(present)} entries, e.g. {present[:3]!r}"
+                )
         command = [seven, "x", "-y", f"-o{destination}", str(archive)]
         if members:
             command.extend(members)

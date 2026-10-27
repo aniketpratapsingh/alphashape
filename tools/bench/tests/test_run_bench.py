@@ -271,6 +271,117 @@ class ExtractTest(unittest.TestCase):
                 run_bench.extract_archive(archive, Path(tmp) / "out")
 
 
+class ArchiveMemberSafetyTest(unittest.TestCase):
+    """An archive is third-party input: a member that lands outside the root is
+    either malformed or an attempt to write there, and both must fail the run
+    with the offending name instead of silently unpacking elsewhere."""
+
+    ESCAPES = [
+        "../escape.txt",
+        "../../escape.txt",
+        "nested/../../escape.txt",
+        "/etc/escape.txt",
+        "//host/share/escape.txt",
+        "C:/escape.txt",
+        "c:escape.txt",
+        "back\\slash.txt",
+        "..",
+    ]
+
+    def test_an_escaping_name_is_rejected_by_the_checker(self):
+        archive = Path("thing.zip")
+        for name in self.ESCAPES:
+            with self.subTest(name=name), self.assertRaises(SystemExit) as caught:
+                run_bench.check_member_name(name, archive=archive)
+            # The message has to name the member: "extraction failed" alone gives
+            # an operator nothing to act on.
+            self.assertIn(repr(name), str(caught.exception))
+
+    def test_an_ordinary_nested_name_is_accepted(self):
+        archive = Path("thing.zip")
+        for name in ("a.JPG", "nested/b.JPG", "terrains/images/dslr_images/x.JPG", "."):
+            with self.subTest(name=name):
+                self.assertEqual(run_bench.check_member_name(name, archive=archive), name)
+
+    def test_a_zip_carrying_a_traversal_member_is_refused_before_unpacking(self):
+        # The archive itself is well formed; only the member name is hostile.
+        # Refusing means nothing at all is written, including the innocent member.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "hostile.zip"
+            write_zip(archive, {"ok.JPG": b"fine", "../escape.txt": b"pwned"})
+            out = Path(tmp) / "out"
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(archive, out)
+            self.assertFalse((Path(tmp) / "escape.txt").exists(), "wrote outside the root")
+            self.assertFalse((out / "ok.JPG").exists(), "extracted before checking every name")
+
+    def test_a_zip_named_member_outside_the_root_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "ref.zip"
+            write_zip(archive, {"keep/ortho.tif": b"T"})
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(
+                    archive, Path(tmp) / "out", members=["../keep/ortho.tif"]
+                )
+
+    def test_a_tar_carrying_a_traversal_member_is_refused(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "hostile.tar"
+            payload = b"pwned"
+            with tarfile.open(archive, "w") as bundle:
+                info = tarfile.TarInfo("../escape.txt")
+                info.size = len(payload)
+                bundle.addfile(info, io.BytesIO(payload))
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(archive, Path(tmp) / "out")
+            self.assertFalse((Path(tmp) / "escape.txt").exists())
+
+    def test_a_7z_carrying_a_traversal_member_is_refused_before_7z_runs(self):
+        # 7-Zip normalises the paths it is handed, so a hostile member cannot be
+        # authored on demand; what matters is our own behaviour when one is
+        # present, which is checked against the listing 7-Zip would print. The
+        # binary must not be invoked at all: it honours absolute paths, so a name
+        # check that ran after `x` would already have written the file.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "hostile.7z"
+            archive.write_bytes(b"stand-in: the listing is stubbed")
+            out = Path(tmp) / "out"
+            with mock.patch.object(
+                run_bench, "seven_zip_members",
+                return_value=["ok.txt", "../escape.txt"],
+            ), mock.patch.object(run_bench.subprocess, "run") as ran:
+                with self.assertRaises(SystemExit) as caught:
+                    run_bench.extract_archive(archive, out)
+            self.assertIn("escape.txt", str(caught.exception))
+            ran.assert_not_called()
+
+    def test_a_7z_named_member_that_is_absent_fails_loudly(self):
+        # 7-Zip exits 0 and unpacks nothing for a name it does not hold. A
+        # reference file would then be silently missing, so this has to be an
+        # error naming what the archive actually contains.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "ref.7z"
+            archive.write_bytes(b"stand-in")
+            with mock.patch.object(
+                run_bench, "seven_zip_members",
+                return_value=["terrains/dslr_scan_eval/scan1.ply"],
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    run_bench.extract_archive(
+                        archive, Path(tmp) / "out",
+                        members=["terrains/dslr_scan_eval/scan9.ply"],
+                    )
+            message = str(caught.exception)
+            self.assertIn("scan9.ply", message)
+            self.assertIn("scan1.ply", message)
+
+
 def shutil_which(name: str):
     import shutil
 

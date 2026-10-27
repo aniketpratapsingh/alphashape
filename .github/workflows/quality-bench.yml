@@ -122,7 +122,7 @@ jobs:
       # job outright on one run — so the .debs are kept between runs, the way
       # build.yml does it.
       - name: Restore the apt package cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/apt-debs
           key: bench-apt-v1
@@ -139,7 +139,7 @@ jobs:
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
 
       - name: Restore the compiler cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: .ccache
           key: bench-ccache-${{ github.sha }}
@@ -165,7 +165,7 @@ jobs:
           build/src/apps/cli/alphashape-cli --list-tasks
           build/src/apps/cli/alphashape-cli --proj-info
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: bench-cli
           path: build/src/apps/cli/alphashape-cli
@@ -189,13 +189,13 @@ jobs:
 
       # The CLI comes from the build job as a single file, so there is no build tree
       # to unpack and no absolute-path dependence between the two jobs.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: bench-cli
           path: build/bench/bin
 
       - name: Restore the apt package cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/apt-debs
           key: bench-apt-runtime-v1
@@ -213,9 +213,13 @@ jobs:
           cp /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null || true
 
       - name: Install the metrics dependencies
+        # Pinned exactly, for the same reason the actions above are pinned to a
+        # commit: this job records NUMBERS that are compared week over week, and a
+        # silent minor-version bump in a resampler or a TIFF reader would move them
+        # for a reason no commit caused. versions.txt is the one place they live.
         run: |
           python3 -m pip install --disable-pip-version-check --break-system-packages \
-            numpy rasterio Pillow 'laspy[lazrs]'
+            -r tools/bench/requirements.txt
 
       - name: Smoke the binary
         run: |
@@ -228,7 +232,7 @@ jobs:
       # runs of the same manifest, so they are cached by manifest hash. A cache miss
       # re-downloads; a corrupt entry fails the SHA-256 check and is re-fetched.
       - name: Restore the dataset cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.0.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build/bench/cache
           key: ${{ needs.plan.outputs.cache-key }}-${{ matrix.dataset }}
@@ -352,7 +356,7 @@ jobs:
 
       - name: Upload the report
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: bench-report-${{ matrix.dataset }}
           path: |
@@ -375,7 +379,7 @@ jobs:
       # restarts the baseline with a "first run" report rather than failing.
       - name: Publish the new baseline
         if: steps.report.outputs.status == '0'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: bench-baseline-${{ matrix.dataset }}
           path: build/bench/metrics-${{ matrix.dataset }}.json

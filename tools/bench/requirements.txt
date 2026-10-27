@@ -1,0 +1,22 @@
+# Exact versions of the Python stack the quality benchmark measures with.
+#
+# These are pinned, not ranged, on purpose. The job records numbers that are
+# compared against the previous run of the same dataset, and every one of these
+# libraries sits underneath a metric: numpy does the resampling and the blur
+# search, rasterio/GDAL decides how a GeoTIFF is read and reprojected, Pillow
+# decodes the comparison rasters, laspy+lazrs read the reference cloud. A minor
+# bump in any of them can move a value without a single commit changing, which
+# would show up as a regression the code did not cause.
+#
+# Bump deliberately, and expect the next run's report to show the movement: a
+# version change is a reason to re-establish the baseline, not to widen a
+# tolerance.
+#
+# Install with:
+#   python3 -m pip install --break-system-packages -r tools/bench/requirements.txt
+
+numpy==2.5.4
+rasterio==1.5.2
+Pillow==13.0.0
+laspy==2.7.0
+lazrs==0.8.2
