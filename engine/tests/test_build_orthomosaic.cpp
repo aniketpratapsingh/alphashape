@@ -1640,12 +1640,17 @@ TEST(BuildOrthomosaic, BlockWiseNarrowLastWindowHasNoBorderStep) {
     // The narrow last block begins at 2 * kBlock. Confirm it really is narrow
     // (and that its window therefore needed padding), so the test cannot quietly
     // stop exercising the case if the fixture ever changes.
+    constexpr int kMargin = 320;
     const int last_block_width = w - 2 * kBlock;
     ASSERT_GT(last_block_width, 0);
-    ASSERT_LT(last_block_width + 2 * 320, 512)
+    // The last column block sits at the right border, so its window gets a margin
+    // on ONE side only: width = block + margin. It must be narrower than what the
+    // whole grid's depth needs (8 << 6 = 512), which is what forces the padding.
+    const int last_window_width = last_block_width + kMargin;
+    ASSERT_LT(last_window_width, 8 << 6)
         << "the last window must be narrower than the pyramid needs (width "
-        << last_block_width << ")";
-    ASSERT_LT(ortho::pyramid_level_count(last_block_width + 320, h),
+        << last_window_width << ")";
+    ASSERT_LT(ortho::pyramid_level_count(last_window_width, h),
               ortho::pyramid_level_count(w, h))
         << "the narrow window's own depth must be shallower, or this is not the case";
 
