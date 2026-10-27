@@ -90,13 +90,19 @@ PKGS=("$@")
 
 # --- cache key ------------------------------------------------------------------------------
 
-# Image version, architecture, ref and the sorted package list identify the cache entry: a
-# change to any of them must miss the cache rather than install stale debs.
+# Image version, architecture, ref, ISO week and the sorted package list identify the cache
+# entry: a change to any of them must miss the cache rather than install stale debs.
 #
 # The ref is part of the key because the debs are installed as root from a cache entry, and a
 # workflow that checks out an arbitrary `inputs.ref` must not be able to seed the entry that
 # `main` reads (CodeQL's "cache poisoning via untrusted code"). PRs read main's entry through
 # restore-keys, which is safe: main's cache is trusted, a branch's is not.
+#
+# The ISO year-week is in the exact key but not in the restore prefix, so a run restores last
+# week's entry, harvests fresh .debs into it, and saves under a new key: an archive snapshot is
+# refreshed weekly instead of being pinned until the package list changes. The `v5` schema
+# version itself discards every entry written before the save gate existed.
+iso_week() { date -u +%G-%V 2>/dev/null || printf 'unknown'; }
 os_version() {
   # shellcheck disable=SC1091
   (. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-unknown}") || printf 'unknown'
@@ -108,9 +114,9 @@ cache_key() {
   hash=$(printf '%s\n' "${PKGS[@]}" | LC_ALL=C sort -u | sha256sum | cut -c1-16)
   scope="${APT_CACHE_SCOPE:-}"
   if [ -n "$scope" ]; then
-    printf 'apt-v4-%s-%s-%s-%s' "$(os_version)" "$(arch)" "$scope" "$hash"
+    printf 'apt-v5-%s-%s-%s-%s-%s' "$(os_version)" "$(arch)" "$scope" "$(iso_week)" "$hash"
   else
-    printf 'apt-v4-%s-%s-%s' "$(os_version)" "$(arch)" "$hash"
+    printf 'apt-v5-%s-%s-%s-%s' "$(os_version)" "$(arch)" "$(iso_week)" "$hash"
   fi
 }
 
@@ -120,8 +126,10 @@ if [ "$PRINT_KEY" -eq 1 ]; then
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
       printf 'key=%s\n' "$key"
-      # A prefix that only matches entries main wrote; used as restore-keys for PR runs.
-      printf 'shared_prefix=apt-v4-%s-%s-main-\n' "$(os_version)" "$(arch)"
+      # A prefix that only matches entries main wrote; used as restore-keys for PR runs. It
+      # deliberately carries no ISO week, so a run always restores whatever was saved last and
+      # then harvests a fresh snapshot under the current week's key.
+      printf 'shared_prefix=apt-v5-%s-%s-main-\n' "$(os_version)" "$(arch)"
     } >>"$GITHUB_OUTPUT"
   fi
   exit 0
