@@ -88,9 +88,16 @@ if [ "$sub" = update ]; then
   exit 0
 fi
 
-# --no-download is only satisfiable from a populated cache.
+# --no-download is only satisfiable from a populated cache whose lists are the ones apt sees:
+# a cached list that the image's own copy shadowed is the bug this models.
 for a in "${args[@]}"; do
   if [ "$a" = --no-download ]; then
+    if [ -f "$STUB_DIR/cache/lists/libtiff6_Packages" ] &&
+       [ -f "$STUB_DIR/lists/libtiff6_Packages" ] &&
+       ! cmp -s "$STUB_DIR/cache/lists/libtiff6_Packages" "$STUB_DIR/lists/libtiff6_Packages"; then
+      echo "E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?" >&2
+      exit 100
+    fi
     if [ "$(cat "$STUB_DIR/offline_ok" 2>/dev/null)" = yes ]; then exit 0; fi
     echo "E: --no-download was used but the package could not be found" >&2
     exit 100
@@ -338,6 +345,27 @@ rc=$?
 check "offline miss: still exits 0 via the network" [ "$rc" -eq 0 ]
 check "offline miss: reported the fallback" grep -q "falling back to the mirrors" <<<"$out"
 check "offline miss: ran apt-get update" bash -c 'grep -q " update" "$1"' _ "$STUB_DIR/calls"
+
+# --- 7a. the image's own lists must not win over the cached ones ---------------------------
+
+new_stub stale-image-lists
+echo yes >"$STUB_DIR/offline_ok"
+mkdir -p "$STUB_DIR/cache/lists" "$STUB_DIR/cache/sources"
+: >"$STUB_DIR/cache/libtiff6_1.0_amd64.deb"
+echo "cached-list" >"$STUB_DIR/cache/lists/libtiff6_Packages"
+# The runner image already has apt lists from a different mirror/snapshot.
+echo "image-list" >"$STUB_DIR/lists/libtiff6_Packages"
+out=$(APT_CACHE_HIT=true run_script libtiff6 2>&1)
+rc=$?
+check "stale image lists: the cached list replaces the image's" \
+  [ "$(cat "$STUB_DIR/lists/libtiff6_Packages")" = "cached-list" ]
+# The stub refuses --no-download while the lists disagree, so a clean exit proves the restore
+# actually took effect rather than the fallback network path having run.
+check "stale image lists: the offline install succeeds on the first try" [ "$rc" -eq 0 ]
+check "stale image lists: no mirror fallback was needed" \
+  bash -c '! grep -q "falling back to the mirrors" <<<"$1"' _ "$out"
+check "stale image lists: reported no network use" \
+  grep -q "success from the cache: no network used" <<<"$out"
 
 # --- 7b. round trip: a cold run's harvest serves the next run offline ----------------------
 

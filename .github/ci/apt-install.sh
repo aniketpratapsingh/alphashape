@@ -240,7 +240,9 @@ seed_debs_from_cache() {
   for f in "$CACHE_DIR"/*.deb; do [ -f "$f" ] && debs+=("$f"); done
   [ "${#debs[@]}" -gt 0 ] || return 1
   as_root mkdir -p "$ARCHIVES_DIR"
-  as_root cp -n "${debs[@]}" "$ARCHIVES_DIR/" 2>/dev/null
+  # Overwrite, never skip: a deb of a different version already on the image would otherwise be
+  # kept, and the cached lists would then reference versions that are not there.
+  as_root cp -f "${debs[@]}" "$ARCHIVES_DIR/" 2>/dev/null
   log "cache: seeded ${#debs[@]} .deb(s) into $ARCHIVES_DIR"
   return 0
 }
@@ -248,10 +250,15 @@ seed_debs_from_cache() {
 restore_lists_from_cache() {
   [ -d "$CACHE_DIR/lists" ] || return 1
   local f n=0
-  as_root mkdir -p "$LISTS_DIR"
+  # The image ships its own lists, from a different mirror and possibly a different snapshot of
+  # the archive. Overwriting them is the whole point: the cached .debs are only usable against
+  # the exact lists that were cached with them. (`cp -n` here silently kept the image's lists,
+  # and the offline install then failed with "Unable to fetch some archives".)
+  as_root rm -f "$LISTS_DIR"/* >/dev/null 2>&1
+  as_root mkdir -p "$LISTS_DIR" || return 1
   for f in "$CACHE_DIR"/lists/*; do
     [ -f "$f" ] || continue
-    as_root cp -n "$f" "$LISTS_DIR/" 2>/dev/null && n=$((n + 1))
+    as_root cp -f "$f" "$LISTS_DIR/" 2>/dev/null && n=$((n + 1))
   done
   [ "$n" -gt 0 ] || return 1
   log "cache: restored $n apt list file(s)"
@@ -298,7 +305,7 @@ harvest_cache() {
 
   for f in "$ARCHIVES_DIR"/*.deb; do
     [ -f "$f" ] || continue
-    as_root cp -n "$f" "$CACHE_DIR/" 2>/dev/null && n=$((n + 1))
+    as_root cp -f "$f" "$CACHE_DIR/" 2>/dev/null && n=$((n + 1))
   done
   log "cache: stored $n .deb(s)"
 
@@ -306,7 +313,7 @@ harvest_cache() {
   for f in "$LISTS_DIR"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in lock) continue ;; esac
-    as_root cp -n "$f" "$CACHE_DIR/lists/" 2>/dev/null && n=$((n + 1))
+    as_root cp -f "$f" "$CACHE_DIR/lists/" 2>/dev/null && n=$((n + 1))
   done
   log "cache: stored $n apt list file(s)"
 
