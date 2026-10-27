@@ -23,6 +23,7 @@ increase southward.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
@@ -1161,10 +1162,23 @@ def dem_difference(
 ) -> dict:
     """ΔZ statistics over cells where both DEMs carry a height.
 
-    Reports median (systematic offset), NMAD (1.4826 x MAD: robust spread, so a
-    handful of building edges cannot drag it around the way a standard deviation
-    can) and the 68/95 percentiles of |ΔZ|. Heights are in the rasters' own
-    vertical units, metres for both datasets here.
+    Two families of number, because they answer different questions:
+
+    * **Raw** — ``median_m`` (the systematic offset), ``mean_m``, ``rmse_m``, and
+      the 68/95 percentiles of |ΔZ| including it. The offset is dominated by the
+      vertical datum each side is expressed in, not by the reconstruction: a DEM in
+      WGS84 ellipsoidal heights compared with one in a national orthometric datum
+      differs by metres, and no pipeline change moves that. The report therefore
+      names each side's datum beside the number.
+    * **Offset-removed** — the same statistics after subtracting the median, which
+      is what the reconstruction's own vertical error looks like. ``offset_removed
+      .p68_m``/``p95_m``/``nmad_m`` are what the regression gate compares: a bias
+      that shifts by a constant is a datum change, while a spread that grows is the
+      model getting worse.
+
+    NMAD is 1.4826 x MAD: a robust spread, so a handful of building edges cannot
+    drag it around the way a standard deviation can. Heights are in the rasters'
+    own vertical units, metres for both datasets here.
     """
     a = np.asarray(ours, dtype=np.float64)
     b = np.asarray(reference, dtype=np.float64)
@@ -1175,18 +1189,34 @@ def dem_difference(
         both &= valid
     n = int(both.sum())
     if n == 0:
-        return {"cells": 0, "median_m": None, "nmad_m": None, "p68_m": None, "p95_m": None}
+        return {
+            "cells": 0,
+            "median_m": None,
+            "nmad_m": None,
+            "p68_m": None,
+            "p95_m": None,
+            "offset_removed": {"nmad_m": None, "p68_m": None, "p95_m": None},
+        }
     delta = a[both] - b[both]
     median = float(np.median(delta))
     mad = float(np.median(np.abs(delta - median)))
+    removed = delta - median
     return {
         "cells": n,
+        # Raw: includes the datum offset, which no pipeline change can move.
         "median_m": median,
         "nmad_m": 1.4826 * mad,
         "p68_m": float(np.percentile(np.abs(delta), 68)),
         "p95_m": float(np.percentile(np.abs(delta), 95)),
         "mean_m": float(np.mean(delta)),
         "rmse_m": float(np.sqrt(np.mean(delta * delta))),
+        # Offset removed: the spread the reconstruction itself contributes.
+        "offset_removed": {
+            "nmad_m": 1.4826 * float(np.median(np.abs(removed - np.median(removed)))),
+            "p68_m": float(np.percentile(np.abs(removed), 68)),
+            "p95_m": float(np.percentile(np.abs(removed), 95)),
+            "rmse_m": float(np.sqrt(np.mean(removed * removed))),
+        },
     }
 
 
@@ -1415,6 +1445,56 @@ def read_geotiff_grid(path: str) -> dict:
             "epsg": src.crs.to_epsg() if src.crs else None,
             "nodata": None if src.nodata is None else float(src.nodata),
         }
+
+
+def read_vertical_datum(path: str) -> str | None:
+    """The vertical CRS a raster's heights are expressed in, or None.
+
+    This exists because a ΔZ median between two DEMs is meaningless without it:
+    our own DEM is written in WGS84 ELLIPSOIDAL heights (the engine's
+    ``SurfaceFrame::to_plane`` returns the geodetic ellipsoidal height), while a
+    publisher's DSM may be orthometric, in a local datum, or carry no vertical
+    reference at all. The difference between the two can be tens of metres and no
+    code change moves it, which is why the report names each side's datum and the
+    regression gate compares the offset-REMOVED spread instead of the bias.
+
+    Read from the GeoTIFF's CRS WKT (a compound CRS names its ``VERTCRS``), then
+    from the GeoTIFF ``GEO`` keys, then from a plain tag. None means the file does
+    not say — which is itself worth reporting.
+    """
+    import rasterio  # noqa: PLC0415
+
+    with rasterio.open(path) as src:
+        crs = src.crs
+        if crs is not None:
+            try:
+                wkt = crs.to_wkt()
+            except Exception:  # noqa: BLE001 - a broken CRS is reported as unknown
+                wkt = ""
+            for pattern in (
+                r'VERTCRS\["([^"]+)"',
+                r'VERT_CS\["([^"]+)"',
+                r'VERT_DATUM\["([^"]+)"',
+            ):
+                found = re.search(pattern, wkt)
+                if found:
+                    return found.group(1)
+        tags = {}
+        try:
+            tags.update(src.tags(ns="GEO") or {})
+        except Exception:  # noqa: BLE001 - not every driver exposes a GEO namespace
+            pass
+        tags.update(src.tags() or {})
+        for key in (
+            "vertical_datum",
+            "VERTICAL_DATUM",
+            "VerticalCSTypeGeoKey",
+            "VerticalUnitsGeoKey",
+        ):
+            value = tags.get(key)
+            if value not in (None, "", "0"):
+                return str(value)
+    return None
 
 
 def read_ply_points(path: str, *, max_points: int | None = None) -> np.ndarray:
@@ -1738,7 +1818,12 @@ def dem_metrics(dem: Raster, *, reference: Raster | None = None) -> dict:
 
 
 def compare_dem_to_reference(
-    ours: Raster, reference: Raster, *, max_cells: int = 4_000_000
+    ours: Raster,
+    reference: Raster,
+    *,
+    max_cells: int = 4_000_000,
+    our_datum: str | None = None,
+    reference_datum: str | None = None,
 ) -> dict:
     """Resample both DEMs to a common grid and report ΔZ.
 
@@ -1747,6 +1832,12 @@ def compare_dem_to_reference(
     pipeline that produced our own product. Coarsening both sides by the same
     integer factor changes the ΔZ statistics by far less than the reconstruction's
     own error, and the reported ``grid_pixel_m`` says exactly what was compared.
+
+    ``our_datum``/``reference_datum`` are recorded in the result so the report can
+    print them next to the raw offset. A ΔZ median across two vertical datums is a
+    datum difference, not an error, and a reader cannot tell which they are looking
+    at without both names. ``None`` means the file did not say, which is reported
+    as unknown rather than guessed.
     """
     ox, oy, pixel, width, height = common_grid(ours, reference, max_cells=max_cells)
     a, a_valid = resample_to_grid(
@@ -1763,6 +1854,10 @@ def compare_dem_to_reference(
     stats["overlap_fraction"] = (
         float(both.sum()) / float(a_valid.sum()) if a_valid.any() else 0.0
     )
+    stats["vertical_datum"] = {
+        "ours": our_datum,
+        "reference": reference_datum,
+    }
     return stats
 
 
@@ -1919,7 +2014,14 @@ def evaluate(
             # "nearest" here: a DSM compared cell for cell must not have heights
             # averaged across a building edge before the difference is taken.
             reference = read_geotiff(spec.dem_reference, bounds=dem.extent())
-            result["reference_based"]["dem"] = compare_dem_to_reference(dem, reference)
+            # Both datums, from the files themselves. Our writer records ellipsoidal
+            # heights; the reference's is whatever the publisher shipped.
+            result["reference_based"]["dem"] = compare_dem_to_reference(
+                dem,
+                reference,
+                our_datum=read_vertical_datum(dem_path),
+                reference_datum=read_vertical_datum(spec.dem_reference),
+            )
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["dem"] = {"skipped": f"reference unusable: {exc}"}
 

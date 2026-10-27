@@ -58,12 +58,14 @@ DIRECTION = {
     "reference_free.dem.nodata_fraction": "lower",
     "reference_based.ortho.offset_m": "lower",
     "reference_based.ortho.overlap_fraction": "higher",
-    # A signed bias is judged by its MAGNITUDE: either sign moving away from
-    # zero is worse, so the comparison is on |value| rather than on the delta.
-    "reference_based.dem.median_m": "magnitude",
-    "reference_based.dem.nmad_m": "lower",
-    "reference_based.dem.p68_m": "lower",
-    "reference_based.dem.p95_m": "lower",
+    # The DEM is gated on the OFFSET-REMOVED spread, not on the raw median: that
+    # median is the difference between the two products' vertical datums (our DEM
+    # is in WGS84 ellipsoidal heights, the publisher's is whatever its own datum
+    # is), and no commit moves it. The raw figures are still reported, with each
+    # side's datum named beside them.
+    "reference_based.dem.offset_removed.nmad_m": "lower",
+    "reference_based.dem.offset_removed.p68_m": "lower",
+    "reference_based.dem.offset_removed.p95_m": "lower",
     "reference_based.dem.overlap_fraction": "higher",
     "reference_based.cloud.f_score_5cm": "higher",
     "reference_based.cloud.accuracy_median_m": "lower",
@@ -464,14 +466,37 @@ def markdown(
         if reason:
             lines.append(f"- DSM vs reference: _{reason}_")
         else:
+            # Two families of number. The raw offset is a datum difference, not an
+            # error the reconstruction can fix, so it is reported with both datums
+            # named and the gate compares the offset-removed spread instead.
             lines.append("| DSM vs reference | Value |")
             lines.append("|---|---:|")
-            lines.append(f"| ΔZ median | {_fmt(ref_dem.get('median_m'))} m |")
-            lines.append(f"| ΔZ NMAD | {_fmt(ref_dem.get('nmad_m'))} m |")
-            lines.append(f"| |ΔZ| p68 | {_fmt(ref_dem.get('p68_m'))} m |")
-            lines.append(f"| |ΔZ| p95 | {_fmt(ref_dem.get('p95_m'))} m |")
+            lines.append(f"| ΔZ median (raw offset) | {_fmt(ref_dem.get('median_m'))} m |")
+            lines.append(f"| |ΔZ| p68 (raw) | {_fmt(ref_dem.get('p68_m'))} m |")
+            lines.append(f"| |ΔZ| p95 (raw) | {_fmt(ref_dem.get('p95_m'))} m |")
+            removed = ref_dem.get("offset_removed") or {}
+            lines.append(
+                f"| ΔZ NMAD, offset removed | {_fmt(removed.get('nmad_m'))} m |"
+            )
+            lines.append(
+                f"| |ΔZ| p68, offset removed | {_fmt(removed.get('p68_m'))} m |"
+            )
+            lines.append(
+                f"| |ΔZ| p95, offset removed | {_fmt(removed.get('p95_m'))} m |"
+            )
             lines.append(f"| Cells compared | {ref_dem.get('cells')} |")
             lines.append(f"| Overlap | {_fmt(ref_dem.get('overlap_fraction'))} |")
+            datums = ref_dem.get("vertical_datum") or {}
+            lines.append(
+                f"| Vertical datum (ours) | {datums.get('ours') or 'unknown — not recorded'} |"
+            )
+            lines.append(
+                f"| Vertical datum (reference) | {datums.get('reference') or 'unknown — not recorded'} |"
+            )
+            lines.append(
+                "| Gated on | offset-removed spread; the raw median is the datum "
+                "difference |"
+            )
         lines.append("")
 
         cloud = based.get("cloud")

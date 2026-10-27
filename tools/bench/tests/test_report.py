@@ -65,7 +65,10 @@ def metrics(**overrides):
             "ortho": {"comparable": True, "offset_m": 0.04, "dx_m": 0.03, "dy_m": 0.02,
                       "overlap_fraction": 0.9, "grid_pixel_m": 0.02},
             "dem": {"median_m": 0.02, "nmad_m": 0.05, "p68_m": 0.06, "p95_m": 0.11,
-                    "cells": 1000, "overlap_fraction": 0.8},
+                    "cells": 1000, "overlap_fraction": 0.8,
+                    "offset_removed": {"nmad_m": 0.05, "p68_m": 0.04, "p95_m": 0.09},
+                    "vertical_datum": {"ours": "WGS 84 ellipsoidal",
+                                       "reference": None}},
             "cloud": {"accuracy": {"0.02": 0.7, "0.05": 0.95, "0.1": 0.99},
                       "completeness": {"0.02": 0.6, "0.05": 0.9, "0.1": 0.98},
                       "f_score_5cm": 0.92, "accuracy_median_m": 0.012,
@@ -190,22 +193,26 @@ class RegressionTest(unittest.TestCase):
         bad, _ = report.regressions(current, previous, thresholds())
         self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
 
-    def test_a_signed_dem_bias_growing_either_way_is_a_regression(self):
+    def test_the_raw_dem_bias_is_reported_but_not_gated(self):
+        # A change in the raw ΔZ median is a vertical datum difference between the
+        # two products, not a regression: the pipeline cannot move it.
         previous = metrics()
         previous["reference_based"]["dem"]["median_m"] = 0.01
-        for value in (0.08, -0.08):
-            current = metrics()
-            current["reference_based"]["dem"]["median_m"] = value
-            bad, _ = report.regressions(current, previous, thresholds())
-            self.assertIn("reference_based.dem.median_m", [r["metric"] for r in bad], value)
-
-    def test_a_signed_dem_bias_shrinking_is_not_a_regression(self):
-        previous = metrics()
-        previous["reference_based"]["dem"]["median_m"] = 0.06
         current = metrics()
-        current["reference_based"]["dem"]["median_m"] = -0.01
+        current["reference_based"]["dem"]["median_m"] = -8.0
         bad, _ = report.regressions(current, previous, thresholds())
         self.assertNotIn("reference_based.dem.median_m", [r["metric"] for r in bad])
+
+    def test_a_widening_offset_removed_spread_is_a_regression(self):
+        policy = thresholds()
+        policy["tolerances"]["reference_based.dem.offset_removed.p68_m"] = {"absolute": 0.08}
+        previous = metrics()
+        previous["reference_based"]["dem"]["offset_removed"] = {"p68_m": 0.05, "p95_m": 0.1}
+        current = metrics()
+        current["reference_based"]["dem"]["offset_removed"] = {"p68_m": 0.20, "p95_m": 0.1}
+        bad, _ = report.regressions(current, previous, policy)
+        self.assertIn("reference_based.dem.offset_removed.p68_m",
+                      [r["metric"] for r in bad])
 
     def test_a_relative_tolerance_gates_a_dimensionless_ratio(self):
         # effective_resolution_ratio is dimensionless: the policy gates "15% worse
@@ -284,6 +291,13 @@ class RegressionTest(unittest.TestCase):
 
 
 class MarkdownTest(unittest.TestCase):
+    def test_the_dem_table_names_both_vertical_datums(self):
+        text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("offset removed", text)
+        self.assertIn("Vertical datum (ours)", text)
+        self.assertIn("WGS 84 ellipsoidal", text)
+        self.assertIn("unknown", text)  # the reference's is not recorded
+
     def test_the_verdict_names_a_first_run(self):
         text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("Verdict: pass", text)

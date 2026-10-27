@@ -32,7 +32,7 @@ only when the publisher ships a matching reference product.
 | Metric | Reference | What it says |
 |---|---|---|
 | Ortho offset | a reference orthomosaic | residual plan-view offset in metres, by phase correlation on luminance |
-| DSM ΔZ | a reference DSM | median (bias) and NMAD (robust spread) of the height difference, plus the 68/95 percentiles of \|ΔZ\| |
+| DSM ΔZ | a reference DSM | the raw median offset (a vertical-datum difference, reported with both datums named) and, after removing it, the NMAD and the 68/95 percentiles of \|ΔZ\| — the spread the reconstruction itself contributes, which is what the gate compares |
 | Cloud accuracy / completeness | a laser scan | ETH3D's definition at 2/5/10 cm, after voxel normalisation |
 
 Reprojection RMS is an internal-consistency measure, not an accuracy one: a self-consistent

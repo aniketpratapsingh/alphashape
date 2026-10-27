@@ -667,6 +667,35 @@ class DemDifferenceTest(unittest.TestCase):
         self.assertAlmostEqual(result["nmad_m"], 0.0)
         self.assertEqual(result["cells"], 16)
 
+    def test_a_constant_datum_offset_disappears_from_the_offset_removed_spread(self):
+        # The case this exists for: our DEM in ellipsoidal heights against a
+        # reference in a national orthometric datum. The raw median is metres, the
+        # offset-removed spread is what the reconstruction actually did.
+        rng = np.random.default_rng(21)
+        reference = rng.normal(100.0, 3.0, (40, 40))
+        noise = rng.normal(0.0, 0.05, (40, 40))
+        ours = reference + 47.31 + noise
+        result = metrics.dem_difference(ours, reference)
+        self.assertAlmostEqual(result["median_m"], 47.31, delta=0.01)
+        removed = result["offset_removed"]
+        self.assertLess(abs(removed["nmad_m"]), 0.10)
+        self.assertLess(abs(removed["p68_m"]), 0.10)
+        # The raw percentile includes the constant, which is why it is not gated.
+        self.assertGreater(result["p68_m"], 47.0)
+
+    def test_the_offset_removed_percentiles_drop_the_constant(self):
+        # delta = [0, 2, 10, 10] -> median 6, removed = [-6, -4, 4, 4]. The raw p95
+        # carries the offset, the removed one does not.
+        ours = np.array([[0.0, 2.0], [10.0, 10.0]])
+        reference = np.zeros((2, 2))
+        result = metrics.dem_difference(ours, reference)
+        self.assertAlmostEqual(result["median_m"], 6.0)
+        self.assertAlmostEqual(result["p95_m"], 10.0, places=6)
+        self.assertLess(result["offset_removed"]["p95_m"], result["p95_m"])
+        # |removed| = [6, 4, 4, 4], so the interpolated p95 lands just under the max
+        # and well under the raw p95 of 10.
+        self.assertLess(result["offset_removed"]["p95_m"], 6.5)
+
     def test_a_single_outlier_does_not_move_the_nmad(self):
         a = np.zeros((3, 3))
         b = np.zeros((3, 3))
