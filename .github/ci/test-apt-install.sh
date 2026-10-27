@@ -52,7 +52,15 @@ echo "$*" >>"$STUB_DIR/calls"
 mirror=""
 for f in "$STUB_DIR"/sources/sources.list.d/*.sources "$STUB_DIR"/sources/sources.list; do
   [ -f "$f" ] || continue
-  m=$(grep -oE 'https?://[^[:space:],/]+' "$f" | head -n1) && [ -n "$m" ] && { mirror=$m; break; }
+  # `mirror+file:` means apt walks the mirrorlist itself; the stub models that as "every
+  # entry is tried", so the first entry stands in for the whole list.
+  m=$(grep -oE 'https?://[^[:space:],/]+' "$f" | head -n1)
+  [ -n "$m" ] && { mirror=$m; break; }
+  m=$(grep -oE 'mirror\+file:[^[:space:],]+' "$f" | head -n1)
+  if [ -n "$m" ]; then
+    m=$(grep -oE 'https?://[^[:space:]/]+' "${m#mirror+file:}" | head -n1)
+    [ -n "$m" ] && { mirror=$m; break; }
+  fi
 done
 mirror=${mirror#*://}
 
@@ -65,6 +73,12 @@ if [ "$(cat "$STUB_DIR/all_fail" 2>/dev/null)" = yes ]; then
 fi
 
 if [ "$sub" = update ]; then
+  # Every entry of the runner mirrorlist is dead.
+  if [ -f "$STUB_DIR/update_fail_mirrorlist" ] &&
+     grep -q 'mirror+file:' "$STUB_DIR"/sources/sources.list.d/*.sources 2>/dev/null; then
+    echo "E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu (timeout)" >&2
+    exit 100
+  fi
   if [ -f "$STUB_DIR/update_fail_until" ] &&
      [ "$mirror" = "$(cat "$STUB_DIR/update_fail_until")" ]; then
     echo "E: Failed to fetch http://$mirror (timeout)" >&2
@@ -173,7 +187,7 @@ out=$(run_script cmake ninja-build 2>&1)
 rc=$?
 check "rotation: exits 0 after a dead azure mirror" [ "$rc" -eq 0 ]
 check "rotation: logs the failed attempt" grep -q "apt-get update timed out or errored on azure.archive.ubuntu.com" <<<"$out"
-check "rotation: logs the mirror that succeeded" grep -q "success via http://archive.ubuntu.com/ubuntu" <<<"$out"
+check "rotation: logs the mirror that succeeded" grep -q "success on attempt 2/4 (sources: http://archive.ubuntu.com/ubuntu/)" <<<"$out"
 check "rotation: both source files now point at the working mirror" \
   [ "$(mirrors_in_sources)" = "http://archive.ubuntu.com/ubuntu/" ]
 check "rotation: third-party source untouched" \
@@ -192,14 +206,14 @@ new_stub healthy
 out=$(run_script zlib1g-dev 2>&1)
 check "healthy: first attempt uses the configured azure mirror" \
   grep -q "attempt 1/4: mirror http://azure.archive.ubuntu.com/ubuntu" <<<"$out"
-check "healthy: azure succeeds without rotating" grep -q "success via http://azure.archive.ubuntu.com/ubuntu" <<<"$out"
+check "healthy: azure succeeds without rotating" grep -q "success on attempt 1/4 (sources: http://azure.archive.ubuntu.com/ubuntu/)" <<<"$out"
 
 # --- 3. install failure (not update) also rotates -------------------------------------------
 
 new_stub install-fail
 echo "azure.archive.ubuntu.com" >"$STUB_DIR/install_fail_until"
 out=$(run_script libtiff6 2>&1)
-check "install failure: rotates to the next mirror" grep -q "success via http://archive.ubuntu.com/ubuntu" <<<"$out"
+check "install failure: rotates to the next mirror" grep -q "success on attempt 2/4 (sources: http://archive.ubuntu.com/ubuntu/)" <<<"$out"
 
 # --- 4. every mirror dead => non-zero -------------------------------------------------------
 
@@ -211,6 +225,44 @@ check "all dead: exit status is 1" [ "$rc" -eq 1 ]
 check "all dead: reports the mirrors it tried" grep -q "all 4 attempts failed" <<<"$out"
 check "all dead: names each mirror in the failure summary" \
   grep -q "mirror.math.princeton.edu/pub/ubuntu" <<<"$out"
+
+# --- 4b. the GitHub runner image layout (mirror+file:) --------------------------------------
+
+new_stub runner-mirrorlist
+cat >"$STUB_DIR/sources/sources.list.d/ubuntu.sources" <<'EOF2'
+Types: deb
+URIs: mirror+file:/etc/apt/apt-mirrors.txt
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF2
+rm -f "$STUB_DIR/sources/sources.list"
+printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n' >"$STUB_DIR/sources/apt-mirrors.txt"
+printf 'https://archive.ubuntu.com/ubuntu/\tpriority:2\n' >>"$STUB_DIR/sources/apt-mirrors.txt"
+
+out=$(run_script cmake 2>&1)
+rc=$?
+check "mirrorlist image: the source file is recognised" \
+  grep -q "sources: $STUB_DIR/sources/sources.list.d/ubuntu.sources" <<<"$out"
+check "mirrorlist image: attempt 1 keeps the runner's own list" \
+  grep -q "attempt 1/4: runner mirrorlist" <<<"$out"
+check "mirrorlist image: succeeds without rewriting a working image" [ "$rc" -eq 0 ]
+check "mirrorlist image: source left as mirror+file:" \
+  grep -q 'mirror+file:/etc/apt/apt-mirrors.txt' "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+
+# The whole runner list dead: the rotation must take over from attempt 2.
+new_stub runner-mirrorlist-dead
+cp "$work/case-runner-mirrorlist/sources/sources.list.d/ubuntu.sources" \
+  "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
+rm -f "$STUB_DIR/sources/sources.list"
+echo yes >"$STUB_DIR/update_fail_mirrorlist"
+out=$(run_script cmake 2>&1)
+rc=$?
+check "mirrorlist image, list dead: falls through to a rotated mirror" [ "$rc" -eq 0 ]
+check "mirrorlist image, list dead: names the mirror that worked" \
+  grep -qE "success on attempt [2-9]/4 \(sources: http://(archive.ubuntu.com|mirrors.edge.kernel.org|mirror.math.princeton.edu)" <<<"$out"
+check "mirrorlist image, list dead: indirection is replaced" \
+  bash -c '! grep -q "mirror+file:" "$1"' _ "$STUB_DIR/sources/sources.list.d/ubuntu.sources"
 
 # --- 5. cache key ---------------------------------------------------------------------------
 

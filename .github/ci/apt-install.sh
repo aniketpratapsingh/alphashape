@@ -111,29 +111,45 @@ fi
 
 # --- sources --------------------------------------------------------------------------------
 
-# Any source file that points at an Ubuntu archive or one of the rotation mirrors.
-# ports.ubuntu.com (arm) and third-party repositories (packages.microsoft.com, ...) never match.
+# A source file is ours when it names an Ubuntu archive, one of the rotation mirrors, or the
+# GitHub runner image's mirrorlist indirection. ports.ubuntu.com (arm) and third-party
+# repositories (packages.microsoft.com, ...) never match.
 UBUNTU_HOST_RE='([a-z0-9.-]*\.)?(archive\.ubuntu\.com|security\.ubuntu\.com|mirrors\.edge\.kernel\.org|mirror\.math\.princeton\.edu)'
+MIRRORFILE_RE='mirror\+file:([^[:space:],]+)'
 
 SOURCE_FILES=()
+MIRROR_FILES=()
 discover_sources() {
-  local f
+  local f m
   for f in "$SOURCES_ROOT/sources.list" "$SOURCES_ROOT"/sources.list.d/*.list \
     "$SOURCES_ROOT"/sources.list.d/*.sources; do
     [ -f "$f" ] || continue
-    grep -Eq "https?://${UBUNTU_HOST_RE}" "$f" && SOURCE_FILES+=("$f")
+    if grep -Eq "https?://${UBUNTU_HOST_RE}|${MIRRORFILE_RE}" "$f"; then
+      SOURCE_FILES+=("$f")
+      # GitHub's Ubuntu images ship `URIs: mirror+file:/etc/apt/apt-mirrors.txt` instead of a
+      # host, so the host to rotate lives in that list, not in the sources file.
+      while read -r m; do
+        [ -n "$m" ] || continue
+        case " ${MIRROR_FILES[*]-} " in
+          *" $m "*) continue ;;
+        esac
+        MIRROR_FILES+=("$m")
+      done < <(grep -oE "$MIRRORFILE_RE" "$f" | sed -E "s#^mirror\\+file:##")
+    fi
   done
 }
 
 # Rewrite the URI, keeping suites/components/signing untouched. Handles deb822
-# (`URIs: http://host/ubuntu/`, possibly comma-separated) and classic `deb http://host/ubuntu`.
+# (`URIs: http://host/ubuntu/`, possibly comma-separated), classic `deb http://host/ubuntu`, and
+# the runner image's `mirror+file:` indirection, which is replaced by the plain mirror URI.
 # The trailing slash matches the convention Ubuntu ships in both forms.
 # Written through a temp file rather than `sed -i`, whose spelling differs between GNU and BSD.
 rewrite_sources() {
   local mirror="$1" url="http://$1/" f tmp rc
   for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
     tmp=$(mktemp) || return 1
-    if sed -E "s#https?://${UBUNTU_HOST_RE}(/[^[:space:],]*)?#${url}#g" "$f" >"$tmp"; then
+    if sed -E -e "s#mirror\\+file:[^[:space:],]+#${url}#g" \
+      -e "s#https?://${UBUNTU_HOST_RE}(/[^[:space:],]*)?#${url}#g" "$f" >"$tmp"; then
       as_root cp "$tmp" "$f"
       rc=$?
       rm -f "$tmp"
@@ -146,9 +162,14 @@ rewrite_sources() {
 }
 
 current_mirror() {
-  local f
+  local f m
   for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
     m=$(grep -oE "https?://[^[:space:],]+" "$f" | head -n1)
+    if [ -n "${m:-}" ]; then printf '%s' "$m"; return 0; fi
+  done
+  # No host in the sources: report the highest-priority entry of the mirrorlist.
+  for f in ${MIRROR_FILES[@]+"${MIRROR_FILES[@]}"}; do
+    m=$(grep -oE 'https?://[^[:space:]]+' "$f" 2>/dev/null | head -n1)
     if [ -n "${m:-}" ]; then printf '%s' "$m"; return 0; fi
   done
   printf 'unknown'
@@ -168,6 +189,17 @@ start_index() {
     esac
   done
   printf '1'
+}
+
+# True when the sources use the runner image's `mirror+file:` indirection. apt then reads the
+# host list itself and tries each entry in priority order, so attempt 1 is left untouched and
+# the rotation takes over only when that whole list has failed.
+uses_mirrorlist() {
+  local f
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    grep -qE "$MIRRORFILE_RE" "$f" && return 0
+  done
+  return 1
 }
 
 # Refresh only the Ubuntu lists: apt is pointed at a temp sourceparts directory holding copies
@@ -276,34 +308,49 @@ try_offline_install() {
 # --- network path ---------------------------------------------------------------------------
 
 network_install() {
-  local total=$(( ${#MIRRORS[@]} * PASSES )) attempt=0 mirror rc start
+  local total=$(( ${#MIRRORS[@]} * PASSES )) attempt=0 mirror rc start keep_mirrorlist=0
   start=$(start_index)
+  uses_mirrorlist && keep_mirrorlist=1
 
   while [ "$attempt" -lt "$total" ]; do
     mirror="${MIRRORS[$(( (start + attempt) % ${#MIRRORS[@]} ))]}"
     attempt=$((attempt + 1))
-    log "attempt $attempt/$total: mirror http://$mirror"
 
-    if ! rewrite_sources "$mirror"; then
-      log "attempt $attempt: could not rewrite sources for $mirror"
-      continue
-    fi
-
-    if ! refresh_ubuntu_lists; then
-      log "attempt $attempt failed: apt-get update timed out or errored on $mirror"
-      [ "$attempt" -lt "$total" ] && sleep 3
-      continue
+    # Attempt 1 on the runner image keeps its own mirrorlist: apt walks every entry there
+    # itself, which is a better first try than any single mirror. The rotation takes over from
+    # attempt 2, once that whole list has failed.
+    if [ "$attempt" -eq 1 ] && [ "$keep_mirrorlist" -eq 1 ]; then
+      log "attempt $attempt/$total: runner mirrorlist (apt tries each entry in priority order)"
+      if refresh_ubuntu_lists; then
+        log "mirrors listed in the runner mirrorlist are responsive"
+        keep_mirrorlist=0
+      else
+        log "attempt $attempt failed: every mirror in the runner list timed out"
+        [ "$attempt" -lt "$total" ] && sleep 3
+        continue
+      fi
+    else
+      log "attempt $attempt/$total: mirror http://$mirror"
+      if ! rewrite_sources "$mirror"; then
+        log "attempt $attempt: could not rewrite sources for $mirror"
+        continue
+      fi
+      if ! refresh_ubuntu_lists; then
+        log "attempt $attempt failed: apt-get update timed out or errored on $mirror"
+        [ "$attempt" -lt "$total" ] && sleep 3
+        continue
+      fi
     fi
 
     as_root timeout "$INSTALL_TIMEOUT" apt-get "${APT_OPTS[@]}" \
       install -y --no-install-recommends "${PKGS[@]}"
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      log "success via http://$mirror (attempt $attempt/$total)"
-      harvest_cache "$mirror"
+      log "success on attempt $attempt/$total (sources: $(current_mirror))"
+      harvest_cache "$(current_mirror)"
       return 0
     fi
-    log "attempt $attempt failed: apt-get install rc=$rc on $mirror"
+    log "attempt $attempt failed: apt-get install rc=$rc"
     [ "$attempt" -lt "$total" ] && sleep 3
   done
 
