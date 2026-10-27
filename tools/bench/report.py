@@ -382,6 +382,16 @@ def markdown(
             lines.append(
                 f"| Engine registered | {engine['registered']} / {engine['offered']} cameras |"
             )
+        # When this module's figure is more than an order of magnitude off the
+        # engine's, the metric is reading something wrongly and the per-camera
+        # spread says whether it is one camera or all of them.
+        spread = (reprojection or {}).get("worst_cameras") if reprojection else None
+        if spread and engine.get("rms_px"):
+            lines.append(
+                "| Worst camera medians | "
+                + ", ".join(f"#{entry['camera']} {_fmt(entry['median_px'])} px" for entry in spread)
+                + " |"
+            )
     lines.append("")
 
     # -- reference-based ---------------------------------------------------

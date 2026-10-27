@@ -851,6 +851,7 @@ def _reprojection(work: Path, project: Path) -> dict:
 
     observed = []
     projected = []
+    camera_of: list[int] = []
     for track in tracks:
         if track["point"] is None:
             continue
@@ -875,13 +876,36 @@ def _reprojection(work: Path, project: Path) -> dict:
             # charge every observation a constant half-pixel bias.
             observed.append(kp[keypoint_index][:2] + 0.5)
             projected.append(pixels[0])
+            camera_of.append(camera_id)
 
     if not observed:
         return {"skipped": "no projectable observations"}
-    stats = metrics.reprojection_stats(
-        np.asarray(observed, dtype=np.float64), np.asarray(projected, dtype=np.float64)
-    )
+    observed_array = np.asarray(observed, dtype=np.float64)
+    projected_array = np.asarray(projected, dtype=np.float64)
+    stats = metrics.reprojection_stats(observed_array, projected_array)
     stats["tracks"] = len(tracks)
+
+    # A per-camera median, so a disagreement with the engine's own RMS can be
+    # located rather than guessed at. The engine computes its figure inside the
+    # bundle adjustment on the same observations, so if the two disagree by an
+    # order of magnitude, this says whether it is one camera or all of them — a
+    # single outlier camera and a systematic misreading look identical in the
+    # aggregate number.
+    finite = np.isfinite(projected_array).all(axis=1) & np.isfinite(observed_array).all(axis=1)
+    if finite.any():
+        errors = np.linalg.norm(projected_array[finite] - observed_array[finite], axis=1)
+        labels = np.asarray(camera_of, dtype=np.int64)[finite]
+        worst: list[dict] = []
+        for camera_id in np.unique(labels):
+            subset = errors[labels == camera_id]
+            worst.append({
+                "camera": int(camera_id),
+                "pairs": int(subset.size),
+                "median_px": float(np.median(subset)),
+            })
+        worst.sort(key=lambda entry: -entry["median_px"])
+        stats["worst_cameras"] = worst[:3]
+        stats["best_camera_median_px"] = float(min(entry["median_px"] for entry in worst))
     return stats
 
 
