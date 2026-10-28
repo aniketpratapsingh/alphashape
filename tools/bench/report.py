@@ -130,6 +130,21 @@ def is_fraction(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in FRACTION_PREFIXES)
 
 
+def experiment_params(metrics: dict) -> dict[str, str]:
+    """The non-default depth parameters a run was dispatched with, if any.
+
+    An empty dict means the run is at the dataset's own settings and is eligible
+    to be a regression baseline. A non-empty one means somebody asked for a
+    specific configuration to be measured — the census cost, say — and the run is
+    evidence, not a reference point: it must never become the baseline the next
+    week compares against, and it must never gate.
+    """
+    value = metrics.get("depth_params")
+    if isinstance(value, dict):
+        return {str(key): str(item) for key, item in value.items()}
+    return {}
+
+
 def regressions(
     current: dict, previous: dict, thresholds: dict
 ) -> tuple[list[dict], list[dict]]:
@@ -285,12 +300,20 @@ def markdown(
     timing = current.get("timing", {}) or {}
     manifest = current.get("dataset_manifest", {}) or {}
     licence = current.get("licence", {}) or {}
+    experiment = experiment_params(current)
 
     lines: list[str] = []
     lines.append(f"# Quality benchmark: {manifest.get('title') or current.get('dataset', '?')}")
     lines.append("")
 
-    if previous is None:
+    if experiment:
+        # An experimental dispatch is never a pass/fail verdict: it exists to
+        # measure a configuration against the control run, not to defend a
+        # baseline. Saying so up front is what keeps the numbers below from being
+        # read as "the code regressed".
+        given = ", ".join(f"`{key}={value}`" for key, value in sorted(experiment.items()))
+        lines.append(f"**Verdict: experiment** ({given}) — reported, not gated, not baselined")
+    elif previous is None:
         lines.append("**Verdict: pass** (first run for this dataset; no history to compare)")
     elif bad:
         lines.append(f"**Verdict: FAIL** — {len(bad)} metric(s) regressed")
@@ -336,6 +359,9 @@ def markdown(
     if licence.get("redistribution"):
         lines.append(f"| Redistribution | {licence['redistribution']} |")
     lines.append(f"| Manifest hash | `{current.get('manifest_hash', '-')}` |")
+    if experiment:
+        given = ", ".join(f"`{key}={value}`" for key, value in sorted(experiment.items()))
+        lines.append(f"| Dispatch parameters | {given} |")
     lines.append("")
 
     # -- products ----------------------------------------------------------
@@ -592,11 +618,28 @@ def markdown(
         lines.append("No previous run was supplied.")
     else:
         previous_manifest = (previous.get("dataset_manifest") or {}).get("title")
+        previous_experiment = experiment_params(previous)
+        different_settings = previous_experiment != experiment
         if previous_manifest and previous_manifest != manifest.get("title"):
             lines.append(
                 f"> The previous run was for **{previous_manifest}**, not this dataset. "
                 "Comparing across datasets is meaningless; the table is shown for the "
                 "record only and the verdict ignores it."
+            )
+            lines.append("")
+        elif different_settings:
+            # The comparison below is still useful — it is how an experiment is
+            # read against the control — but it is not a regression verdict, and
+            # the reader has to know that before they read a moving metric.
+            before = (
+                ", ".join(f"`{k}={v}`" for k, v in sorted(previous_experiment.items()))
+                or "defaults"
+            )
+            now = ", ".join(f"`{k}={v}`" for k, v in sorted(experiment.items())) or "defaults"
+            lines.append(
+                f"> The previous run used {before}; this one used {now}. The two are "
+                "different configurations, so no metric is gated here — the table is "
+                "shown for comparison only."
             )
             lines.append("")
         if bad:
@@ -617,7 +660,13 @@ def markdown(
             )
             lines.append("")
         if not bad and not good:
-            lines.append("No metric moved beyond its tolerance.")
+            if different_settings:
+                lines.append(
+                    "No metric was gated: the two runs used different dispatch "
+                    "parameters. Compare the tables above by hand."
+                )
+            else:
+                lines.append("No metric moved beyond its tolerance.")
             lines.append("")
 
     if png_name:
@@ -776,12 +825,22 @@ def main(argv: list[str] | None = None) -> int:
 
     bad: list[dict] = []
     good: list[dict] = []
+    experiment = experiment_params(current)
     if previous is not None:
         # A different dataset is not a regression baseline; comparing across
         # datasets would compare a Comoros beach against a Swiss rock face.
         same_dataset = (previous.get("dataset") or "") == (current.get("dataset") or "")
-        if same_dataset:
+        # Nor is a run that used different parameters: a baseline restored from a
+        # configuration somebody was evaluating says nothing about this one.
+        same_settings = experiment_params(previous) == experiment
+        if same_dataset and same_settings:
             bad, good = regressions(current, previous, thresholds)
+        elif same_dataset:
+            print(
+                "note: the previous run used different dispatch parameters; "
+                "the comparison is report-only",
+                file=sys.stderr,
+            )
 
     png_name = None
     if args.png:
@@ -807,7 +866,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"(limit {record['limit']:.6g})",
                 file=sys.stderr,
             )
-        if args.fail_on_regression:
+        # An experimental run measures a configuration; it does not defend one.
+        # Its report still names every metric that moved, but it never fails the
+        # job, because a red check on "census was worse this week" would block the
+        # branch that is being evaluated rather than inform it.
+        if args.fail_on_regression and not experiment:
             return 1
     return 0
 

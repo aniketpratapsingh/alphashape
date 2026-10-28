@@ -10,9 +10,12 @@ Run with plain unittest (no pytest):
     python3 -m unittest discover -s tools/bench/tests -v
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -443,6 +446,90 @@ class OverrideNoteTest(unittest.TestCase):
     def test_a_default_run_says_nothing_about_overrides(self):
         text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
         self.assertNotIn("Not at defaults", text)
+
+
+class ExperimentTest(unittest.TestCase):
+    """A run dispatched with extra depth parameters is evidence, not a baseline."""
+
+    def experiment(self, **params):
+        current = metrics()
+        current["depth_params"] = params or {"cost_type": "census"}
+        return current
+
+    def verdict(self, current, previous=None, *, gates=True):
+        """Run report.main over two metrics dicts and return its exit status."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "thresholds.json").write_text(json.dumps(thresholds()), encoding="utf-8")
+            current_path = root / "current.json"
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            argv = [
+                "--current", str(current_path),
+                "--thresholds", str(root / "thresholds.json"),
+            ]
+            if previous is not None:
+                previous_path = root / "previous.json"
+                previous_path.write_text(json.dumps(previous), encoding="utf-8")
+                argv += ["--previous", str(previous_path)]
+            if gates:
+                argv.append("--fail-on-regression")
+            return report.main(argv)
+
+    def test_a_default_run_has_no_dispatch_parameters(self):
+        self.assertEqual(report.experiment_params(metrics()), {})
+
+    def test_a_missing_key_is_not_an_experiment(self):
+        # Every metrics file written before this flag existed has no key at all.
+        current = metrics()
+        current.pop("depth_params", None)
+        self.assertEqual(report.experiment_params(current), {})
+
+    def test_dispatch_parameters_are_read_back_as_strings(self):
+        current = metrics()
+        current["depth_params"] = {"cost_type": "census", "max_cost": 0.4}
+        self.assertEqual(
+            report.experiment_params(current),
+            {"cost_type": "census", "max_cost": "0.4"},
+        )
+
+    def test_the_verdict_is_experiment_not_pass_or_fail(self):
+        text = report.markdown(self.experiment(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Verdict: experiment", text)
+        self.assertIn("cost_type=census", text)
+        self.assertNotIn("Verdict: pass", text)
+
+    def test_an_experiment_never_fails_even_with_a_regression(self):
+        current = self.experiment()
+        # A coverage drop well past its tolerance would fail a control run.
+        current["reference_free"]["ortho"]["covered_fraction"] = 0.50
+        self.assertEqual(self.verdict(current, metrics()), 0)
+
+    def test_a_control_run_with_the_same_regression_does_fail(self):
+        # The mirror of the test above: the gate itself still works. Without this,
+        # "experiments do not gate" could be satisfied by disabling the gate.
+        current = metrics()
+        current["reference_free"]["ortho"]["covered_fraction"] = 0.50
+        self.assertEqual(self.verdict(current, metrics()), 1)
+
+    def test_a_different_configuration_is_compared_but_not_gated(self):
+        current = self.experiment()
+        previous = metrics()  # the control, at defaults
+        text = report.markdown(current, previous, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("different configurations", text)
+
+    def test_an_experiment_never_gates_even_against_another_experiment(self):
+        # "Must not fail the regression gate" is unconditional: the run is evidence
+        # about a configuration, and a red check would block the branch being
+        # evaluated. The report still lists what moved, which is the useful part.
+        current = self.experiment()
+        current["reference_free"]["ortho"]["covered_fraction"] = 0.50
+        self.assertEqual(self.verdict(current, self.experiment()), 0)
+        text = report.markdown(current, self.experiment(), [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Verdict: experiment", text)
+
+    def test_provenance_names_the_dispatch_parameters(self):
+        text = report.markdown(self.experiment(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Dispatch parameters", text)
 
 
 class FormatTest(unittest.TestCase):

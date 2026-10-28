@@ -28,6 +28,7 @@ add_library(alphashape_algorithms STATIC
     sfm/georeference.cpp
     sfm/similarity.cpp
     stereo/view_selection.cpp
+    stereo/census.cpp
     stereo/depth_pyramid.cpp
     stereo/patch_match.cpp
     stereo/patch_match_gpu.cpp

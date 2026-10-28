@@ -30,6 +30,54 @@ All notable changes to alphashape are recorded here. The format follows
   naming the grid, where it is not installed. The macOS and Windows packages
   still ship only a subset of the PROJ grids, so some national shifts need
   `proj-data` installed (see `engine/LIMITATIONS.md`).
+
+### Changed
+
+- **A pair on aligned datums no longer needs `allow_ballpark`.** An unpinned
+  transform is PROJ's own pipeline, and PROJ used to be asked for a pipeline
+  that PROJ itself described as a ballpark for pairs such as WGS 84 ↔ ETRS89,
+  NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 and NTF, so `create()`
+  refused them even though the real EPSG operation exists (a null shift, a
+  Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
+  are accepted and their numbers come from the EPSG operation PROJ picks per
+  point rather than a `+proj=noop` fallback; `accuracy_m()` reports that
+  operation's stated accuracy (1 m for ETRS89 ↔ WGS 84, 2 m for the NAD83(2011)
+  Helmert, 3 m for GDA2020). A pair with no known shift at all (WGS 84 ↔ NAD27,
+  Amersfoort, …) has only a ballpark candidate and is still refused without
+  `allow_ballpark`. See `engine/LIMITATIONS.md`.
+- **An optional grid is not reported missing.** PROJ's `+grids=@name` means
+  "use it if installed, otherwise run without it". Such a grid is now listed
+  without the leading `@` and never reported under `missing_grids`, so a
+  transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
+  instead of failing with `transformation needs grid @name; install proj-data`.
+
+## [0.2.0] - 2026-10-28
+
+### Added
+
+- **Depth maps can search with a census cost.** `BuildDepthMaps` gains
+  `cost_type` (`"zncc"`, the original intensity cost, or `"census"`) and
+  `max_cost`. The census cost replaces each pixel's intensity with the 16-bit
+  wide census transform of Zabih & Woodfill (1994) using the four-arm
+  descriptor of Mei et al. (2011) -- the sign of the intensity difference to
+  four arms of four samples (left, right, top, bottom; 16 comparisons fill the
+  word) -- read as a sample in [0, 1] (mask / 65535) and then correlated by the
+  existing ZNCC. Reuse of the ZNCC core keeps its bilinear sub-pixel sampling
+  and its variance floor while the descriptor makes the cost invariant to any
+  monotone intensity change
+  -- exposure, white balance, gamma -- which is where depth-map holes on real
+  photo sets come from. The texture gate that skips flat windows is measured on
+  the intensity window for both costs, so a low-contrast window is skipped by the
+  same rule either way. Each view is transformed once per pyramid level and
+  cached, so the search pays the transform once, not per candidate. The census
+  cost is (1 - ZNCC) / 2 on its own [0, 1] interval; a `-1` `max_cost` resolves to
+  the cost type's own default (0.5 for `zncc` on [0, 2], 0.6 for `census` on
+  [0, 1], which runs slightly higher on a correct match because its descriptor is
+  coarser). The depth-map fingerprint records both the choice and the effective
+  threshold, so switching cost or `max_cost` rebuilds the maps instead of reusing
+  them. The GPU PatchMatch kernels implement the `zncc` cost only and decline a
+  census run to the CPU with a log line (the per-view descriptor buffer does not
+  fit the kernels' binding budget); the CPU census cost is used either way.
 - **Build Depth Maps searches coarse to fine.** The PatchMatch search now runs
   first on a reduced copy of each camera's block and starts every finer level
   from the level beneath, instead of spending the whole budget at the working
@@ -105,23 +153,6 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
-- **A pair on aligned datums no longer needs `allow_ballpark`.** An unpinned
-  transform is PROJ's own pipeline, and PROJ used to be asked for a pipeline
-  that PROJ itself described as a ballpark for pairs such as WGS 84 ↔ ETRS89,
-  NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 and NTF, so `create()`
-  refused them even though the real EPSG operation exists (a null shift, a
-  Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
-  are accepted and their numbers come from the EPSG operation PROJ picks per
-  point rather than a `+proj=noop` fallback; `accuracy_m()` reports that
-  operation's stated accuracy (1 m for ETRS89 ↔ WGS 84, 2 m for the NAD83(2011)
-  Helmert, 3 m for GDA2020). A pair with no known shift at all (WGS 84 ↔ NAD27,
-  Amersfoort, …) has only a ballpark candidate and is still refused without
-  `allow_ballpark`. See `engine/LIMITATIONS.md`.
-- **An optional grid is not reported missing.** PROJ's `+grids=@name` means
-  "use it if installed, otherwise run without it". Such a grid is now listed
-  without the leading `@` and never reported under `missing_grids`, so a
-  transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
-  instead of failing with `transformation needs grid @name; install proj-data`.
 - **Project format version 3.** The depth-map sidecar moved from ADM1 to ADM2,
   so the project version is bumped: an older 0.1.0 build refuses such a project
   with its clear "newer than this build supports" message instead of failing
@@ -181,9 +212,9 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Limitations
 
-- A full-resolution orthomosaic of a very large site on a low-memory machine is not possible yet: the output grid is still held in one piece, so the automatic cell is coarsened (with a Warning) or an explicit cell is refused. Block-wise processing — building the ortho in overlapping memory-bounded blocks at full resolution — is planned. See `engine/LIMITATIONS.md`.
+- The orthomosaic is now rectified and blended in memory-bounded blocks, but the assembled output raster is still held in one piece, so a very large site on a low-memory machine can still be limited by it: when even a 512-cell block cannot fit, the automatic cell is coarsened (with a Warning) or an explicit cell is refused. See `engine/LIMITATIONS.md`.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-26
 
 The first release. Photos in, 3-D models and maps out, from a desktop app, the command
 line or Python.
@@ -313,4 +344,5 @@ without one), and there is no georeferencing, marker editing or tiled-model outp
   0.5th-99.5th percentile core is now clipped to that core plus 3%; an ordinary,
   outlier-free sample set keeps exactly the grid it always had.
 
+[0.2.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.2.0
 [0.1.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.1.0
