@@ -1195,20 +1195,21 @@ yet.
   `Crs.ProjectedToGeographicIsAxisNormalised` pin both directions.
 - **Ballpark is refused by default, and the refusal is not a heuristic.** PROJ
   marks an operation as a ballpark (`proj_coordoperation_has_ballpark_transformation`);
-  `create()` throws when the *selected* operation is one and `allow_ballpark`
-  is false. The check runs twice: on the listed operation and on the pipeline
-  that was actually built. The second check is load-bearing — an operation
-  listed with a real accuracy can degrade to a ballpark at build time when the
-  grid it needs is not installed, and that degradation must hit the same
-  refusal. A pair with a real datum shift available is accepted regardless: the
-  flag governs the operation actually chosen, not whether a ballpark exists
-  anywhere in the list. With `allow_ballpark` the transform reports
-  `is_ballpark()` and an accuracy of -1 (PROJ states none).
-- **Accuracy is the operation's, not the pipeline's.** `accuracy_m()` is
-  `proj_coordoperation_get_accuracy()` on the selected operation, -1 when PROJ
+  `create()` throws when the operation PROJ offers for the CRS pair is one and
+  `allow_ballpark` is false. The opening decision reads the pair's own
+  candidate list (PROJ's default ranking) and is unchanged from before WP-12.4;
+  a pinned operation is judged by its own flag. For a pair whose only real
+  shifts are area-limited national operations PROJ's default ranking proposes
+  the ballpark, so such a pair is refused unless `allow_ballpark` is set — that
+  is deliberate, and it also means an unpinned national pair needs the flag to
+  be built at all. With `allow_ballpark` the transform reports `is_ballpark()`
+  and an accuracy of -1 (PROJ states none).
+- **Accuracy is the pair's first candidate, not the pipeline's.**
+  `accuracy_m()` is `proj_coordoperation_get_accuracy()` on the operation PROJ
+  ranks first for the CRS extents (or on the pinned operation), -1 when PROJ
   reports 0 for a non-ballpark (a UTM conversion states 0 m, which is not the
-  "unknown" sentinel upstream). WP-12.4 owns listing and ranking those
-  operations.
+  "unknown" sentinel upstream). A per-point pipeline has no single accuracy to
+  report; `description()` shows what the pipeline actually is.
 - **`preferred_operation` pins an identifier PROJ already lists; it does not
   search `proj.db`.** "EPSG:16033" is matched against each candidate's
   `AUTH:CODE` (case-insensitive, after stripping PROJ's computed wrappers, so
