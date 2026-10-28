@@ -54,6 +54,42 @@ std::string proj_context_error(PJ_CONTEXT* ctx) {
 
 std::string quoted(const CoordinateSystem& cs) { return "\"" + cs.name() + "\""; }
 
+/// Case-insensitive equality, used for operation identifiers.
+bool equals_ignoring_case(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::toupper(static_cast<unsigned char>(a[i])) !=
+            std::toupper(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An authority name without PROJ's computed wrappers: "INVERSE(DERIVED_FROM
+/// (EPSG))" -> "EPSG", "DERIVED_FROM(EPSG)" -> "EPSG", "EPSG" -> "EPSG".
+std::string unwrapped_authority(std::string name) {
+    for (;;) {
+        const std::size_t open = name.find('(');
+        const std::size_t close = name.rfind(')');
+        if (open == std::string::npos || close != name.size() - 1 || close <= open + 1) {
+            return name;
+        }
+        name = name.substr(open + 1, close - open - 1);
+    }
+}
+
+/// Split "AUTH:CODE" into its parts; either is empty when there is no colon.
+std::pair<std::string, std::string> split_id(const std::string& id) {
+    const std::size_t colon = id.find(':');
+    if (colon == std::string::npos) {
+        return {std::string(), std::string()};
+    }
+    return {id.substr(0, colon), id.substr(colon + 1)};
+}
+
 /// The operation's authority identifier as "AUTH:CODE", empty when anonymous.
 std::string operation_id(PJ* operation) {
     const char* auth = proj_get_id_auth_name(operation, 0);
@@ -64,41 +100,56 @@ std::string operation_id(PJ* operation) {
     return std::string(auth) + ":" + code;
 }
 
-/// True when an operation's identifier matches "AUTH:CODE" (case-insensitive).
+/// True when an operation's identifier matches `wanted` (case-insensitive).
+///
+/// PROJ reports some operations under a computed authority name, so the
+/// reported id of the reverse of NAD 27 to WGS 84 (33) is
+/// "INVERSE(DERIVED_FROM(EPSG)):1693". A caller who writes "EPSG:1693" means
+/// that same operation, so the wrappers are stripped from both sides before
+/// comparing; the code must still match exactly.
 bool operation_matches(PJ* operation, const std::string& wanted) {
-    const std::string id = operation_id(operation);
-    if (id.empty() || id.size() != wanted.size()) {
+    const std::string reported = operation_id(operation);
+    if (reported.empty() || wanted.empty()) {
+        return reported.empty() && wanted.empty();
+    }
+    if (equals_ignoring_case(reported, wanted)) {
+        return true;
+    }
+    const auto [reported_auth, reported_code] = split_id(reported);
+    const auto [wanted_auth, wanted_code] = split_id(wanted);
+    if (reported_code.empty() || wanted_code.empty()) {
         return false;
     }
-    for (std::size_t i = 0; i < id.size(); ++i) {
-        if (std::toupper(static_cast<unsigned char>(id[i])) !=
-            std::toupper(static_cast<unsigned char>(wanted[i]))) {
+    return equals_ignoring_case(reported_code, wanted_code) &&
+           equals_ignoring_case(unwrapped_authority(reported_auth),
+                               unwrapped_authority(wanted_auth));
+}
+
+/// True when PROJ can be asked for an object's operation data. A per-point
+/// pipeline and a CRS report "not a CoordinateOperation", which PROJ prints to
+/// stderr, so these questions are only asked of objects that can answer.
+bool is_coordinate_operation(PJ* pj) {
+    switch (proj_get_type(pj)) {
+        case PJ_TYPE_CONVERSION:
+        case PJ_TYPE_TRANSFORMATION:
+        case PJ_TYPE_CONCATENATED_OPERATION:
+        case PJ_TYPE_OTHER_COORDINATE_OPERATION:
+            return true;
+        default:
             return false;
-        }
     }
-    return true;
 }
 
-/// Build an axis-normalized pipeline for one CRS pair. With `authority` empty
-/// PROJ picks the operation itself; otherwise the pipeline is built from that
-/// operation, so the pinned choice is the one actually used.
-PjPtr build_pipeline(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const std::string& authority) {
-    std::string option;
-    const char* option_storage[2] = {nullptr, nullptr};
-    if (!authority.empty()) {
-        option = "AUTHORITY=" + authority;
-        option_storage[0] = option.c_str();
-    }
-    PjPtr pipeline{proj_create_crs_to_crs_from_pj(ctx, src_pj, dst_pj, nullptr,
-                                                  option_storage[0] != nullptr ? option_storage
-                                                                               : nullptr)};
-    if (!pipeline) {
-        return PjPtr{};
-    }
-    return PjPtr{proj_normalize_for_visualization(ctx, pipeline.get())};
+/// True when PROJ can be asked for an object's grids. Only transformations and
+/// concatenations carry a `grids=` step; a conversion cannot.
+bool reads_grids(PJ* pj) {
+    const PJ_TYPE type = proj_get_type(pj);
+    return type == PJ_TYPE_TRANSFORMATION || type == PJ_TYPE_CONCATENATED_OPERATION;
 }
 
-/// Choose the operation PROJ should use and capture its accuracy/ballpark
+/// True for a CRS pinned to a datum by an explicit operation (WP-12.4).
+bool is_bound(PJ* pj) { return proj_get_type(pj) == PJ_TYPE_BOUND_CRS; }
+
 /// The first grid the operation needs that is not installed, or "" when it can
 /// run. PROJ's short name is what `+grids=` and a proj-data package use.
 std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
@@ -123,76 +174,197 @@ std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
     return std::string();
 }
 
-/// status. Returns the operation's identifier so the pipeline can be built
-/// from exactly that operation (empty when the operation is anonymous).
-std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
-                             const CoordinateSystem& dst, const TransformOptions& options,
-                             double* accuracy, bool* ballpark) {
-    // Missing optional grids must not remove an operation from the list: a
-    // transform that only needs a grid PROJ cannot find is reported by the
-    // pipeline build (WP-12.4 owns the "install proj-data" diagnosis), while a
-    // silently shorter list would make `preferred_operation` fail confusingly.
+/// Candidate operations for a CRS pair, as `available_transformations()` lists
+/// them: grid availability ignored (so a missing grid is diagnosed rather than
+/// hiding the operation) and areas intersected (so an area-limited national
+/// operation stays selectable). Only pinning may use this list; the automatic
+/// path must never select from it, because its first entry is not the operation
+/// PROJ would apply at a given point.
+ObjListPtr list_candidates(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
+                           const CoordinateSystem& dst) {
     FactoryContextPtr factory{proj_create_operation_factory_context(ctx, nullptr)};
     if (!factory) {
         throw Error("cannot create a PROJ operation factory context: " + proj_context_error(ctx));
     }
-    proj_operation_factory_context_set_grid_availability_use(
-        ctx, factory.get(), PROJ_GRID_AVAILABILITY_IGNORED);
-    // The factory context defaults to STRICT_CONTAINMENT, which hides every
-    // operation whose area does not strictly contain the CRSs' whole extents —
-    // for a pinned datum that means every operation, so a plain transform from
-    // a bound CRS to a projected CRS would find none and throw. PROJ's own
-    // pipeline builder uses PARTIAL_INTERSECTION; matching it keeps "the first
-    // candidate" here the operation that builder would have used.
+    proj_operation_factory_context_set_grid_availability_use(ctx, factory.get(),
+                                                             PROJ_GRID_AVAILABILITY_IGNORED);
     proj_operation_factory_context_set_spatial_criterion(
         ctx, factory.get(), PROJ_SPATIAL_CRITERION_PARTIAL_INTERSECTION);
     ObjListPtr operations{proj_create_operations(ctx, src_pj, dst_pj, factory.get())};
     if (!operations) {
-        throw Error("cannot list datum transformations from " + quoted(src) + " to " +
-                    quoted(dst) + ": " + proj_context_error(ctx));
+        throw Error("cannot list datum transformations from " + quoted(src) + " to " + quoted(dst) +
+                    ": " + proj_context_error(ctx));
+    }
+    return operations;
+}
+
+/// The listed operation whose identifier matches `wanted`, or null.
+PjPtr find_operation(PJ_CONTEXT* ctx, PJ_OBJ_LIST* operations, const std::string& wanted) {
+    const int count = proj_list_get_count(operations);
+    for (int i = 0; i < count; ++i) {
+        PjPtr candidate{proj_list_get(ctx, operations, i)};
+        if (candidate && operation_matches(candidate.get(), wanted)) {
+            return candidate;
+        }
+    }
+    return PjPtr{};
+}
+
+/// Throw the "install proj-data" diagnosis when `pj` needs a grid that is not
+/// installed. Only objects that can answer the question are inspected (see
+/// `reads_grids`); everything else passes.
+void diagnose_missing_grid(PJ_CONTEXT* ctx, PJ* pj) {
+    if (pj == nullptr || !reads_grids(pj)) {
+        return;
+    }
+    // Without this the pipeline would build and either degrade or fail with
+    // "File not found", which says nothing about installing proj-data.
+    const std::string missing = first_missing_grid(ctx, pj);
+    if (!missing.empty()) {
+        throw Error("transformation needs grid " + missing + "; install proj-data");
+    }
+}
+
+/// The pipeline PROJ builds for a CRS pair with no operation pinned.
+///
+/// This is deliberately the bare call, with no options: PROJ then keeps every
+/// candidate operation and chooses per point, respecting each operation's area
+/// of use and the grids that are actually installed. That is the only way an
+/// area-limited national operation (`Amersfoort to WGS 84 (4)` over the
+/// Netherlands, `OSGB36 to ETRS89 (1)` over Great Britain) is applied where it
+/// belongs and skipped where it does not.
+PjPtr automatic_pipeline(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj) {
+    PjPtr pipeline{proj_create_crs_to_crs_from_pj(ctx, src_pj, dst_pj, nullptr, nullptr)};
+    if (!pipeline) {
+        return PjPtr{};
+    }
+    return PjPtr{proj_normalize_for_visualization(ctx, pipeline.get())};
+}
+
+/// The pipeline for one chosen operation object.
+///
+/// Pinning exists to override PROJ's per-point choice, so the pipeline is the
+/// operation itself — normalised to visualisation order — not a re-request of
+/// "the operation with this identifier" from the pair. Round-tripping the id
+/// through `proj_create_crs_to_crs_from_pj`'s `AUTHORITY=` option is wrong twice
+/// over: the option is an authority-name filter (it cannot express an operation
+/// id), and an id PROJ computes rather than stores ("DERIVED_FROM(EPSG):1313")
+/// is not one proj.db can answer for, so it silently yields a null shift.
+PjPtr pinned_pipeline(PJ_CONTEXT* ctx, PJ* operation) {
+    PjPtr normalized{proj_normalize_for_visualization(ctx, operation)};
+    return normalized;
+}
+
+/// Describe the pair the way the engine always has: list the operations PROJ
+/// considers for the two CRS extents (the factory's own defaults — operations
+/// whose area does not cover the pair, and operations whose grid is absent, are
+/// ranked last) and read the first. That is what `preferred_operation`,
+/// `accuracy_m()`, the ballpark refusal and the missing-grid diagnosis have
+/// always meant.
+///
+/// This is a *diagnosis*, not a selection: the pipeline itself is built by
+/// `automatic_pipeline`, so each point is transformed by whichever operation
+/// PROJ deems right for it. Selecting from this list instead would hand one
+/// area-limited national operation to every point in the world.
+void describe_pair(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
+                   const CoordinateSystem& dst, double* accuracy, bool* ballpark) {
+    FactoryContextPtr factory{proj_create_operation_factory_context(ctx, nullptr)};
+    if (!factory) {
+        throw Error("cannot create a PROJ operation factory context: " + proj_context_error(ctx));
+    }
+    // Grid availability is ignored so the list stays complete: an operation
+    // whose grid is missing keeps its place (and is diagnosed by name below)
+    // instead of disappearing into a ranking. The spatial criterion stays at
+    // the factory default, which is what the engine has always used here.
+    proj_operation_factory_context_set_grid_availability_use(ctx, factory.get(),
+                                                             PROJ_GRID_AVAILABILITY_IGNORED);
+    ObjListPtr operations{proj_create_operations(ctx, src_pj, dst_pj, factory.get())};
+    if (!operations) {
+        throw Error("cannot list datum transformations from " + quoted(src) + " to " + quoted(dst) +
+                    ": " + proj_context_error(ctx));
+    }
+    if (proj_list_get_count(operations.get()) <= 0 && (is_bound(src_pj) || is_bound(dst_pj))) {
+        // The strict criterion compares against both CRSs' whole extents, and a
+        // bound CRS subtends only the area of the operation it was pinned by —
+        // so a pinned source with a continental target lists nothing even
+        // though the pipeline above was built. Widen the *listing* only; which
+        // operation transforms a point is decided by PROJ, never by this list.
+        // Any other empty list keeps main's behaviour: an error.
+        proj_operation_factory_context_set_spatial_criterion(
+            ctx, factory.get(), PROJ_SPATIAL_CRITERION_PARTIAL_INTERSECTION);
+        operations.reset(proj_create_operations(ctx, src_pj, dst_pj, factory.get()));
+        if (!operations) {
+            throw Error("cannot list datum transformations from " + quoted(src) + " to " +
+                        quoted(dst) + ": " + proj_context_error(ctx));
+        }
     }
     const int count = proj_list_get_count(operations.get());
     if (count <= 0) {
         throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst));
     }
-
-    PjPtr chosen;
-    if (options.preferred_operation.empty()) {
-        chosen.reset(proj_list_get(ctx, operations.get(), 0));
-    } else {
-        for (int i = 0; i < count && !chosen; ++i) {
-            PjPtr candidate{proj_list_get(ctx, operations.get(), i)};
-            if (candidate && operation_matches(candidate.get(), options.preferred_operation)) {
-                chosen = std::move(candidate);
-            }
-        }
-        if (!chosen) {
-            throw Error("preferred operation " + options.preferred_operation +
-                        " is not available from " + quoted(src) + " to " + quoted(dst));
-        }
-    }
-    if (!chosen) {
+    PjPtr first{proj_list_get(ctx, operations.get(), 0)};
+    if (!first) {
         throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) + ": " +
                     proj_context_error(ctx));
     }
+    *ballpark = proj_coordoperation_has_ballpark_transformation(ctx, first.get()) == 1;
+    *accuracy = proj_coordoperation_get_accuracy(ctx, first.get());
+    if (*accuracy <= 0.0 && !*ballpark) {
+        *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
+    }
+    diagnose_missing_grid(ctx, first.get());
+}
 
+/// Choose the operation PROJ should use and capture its accuracy/ballpark
+/// status. Returns the operation's identifier when the pipeline is pinned to one
+/// (empty for the automatic, per-point pipeline), so another thread can rebuild
+/// exactly the same choice.
+std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
+                             const CoordinateSystem& dst, const TransformOptions& options,
+                             double* accuracy, bool* ballpark, PjPtr* pipeline) {
+    if (options.preferred_operation.empty()) {
+        // PROJ's own pipeline: no options and no pre-selected operation, so it
+        // keeps every candidate and chooses per point by area of use and grid
+        // availability. This is the same construction the engine has always
+        // used, which is what keeps every pair's numbers unchanged.
+        *pipeline = automatic_pipeline(ctx, src_pj, dst_pj);
+        if (!*pipeline) {
+            throw Error("PROJ could not build a transform from " + quoted(src) + " to " +
+                        quoted(dst) + ": " + proj_context_error(ctx));
+        }
+        describe_pair(ctx, src_pj, dst_pj, src, dst, accuracy, ballpark);
+        if (*ballpark && !options.allow_ballpark) {
+            throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
+                        "; enable allow_ballpark");
+        }
+        return std::string();
+    }
+
+    // A pinned operation is looked up in the pair's candidate list, which keeps
+    // every operation (grid availability ignored, areas intersected) so a
+    // national operation stays selectable and a missing grid stays diagnosable.
+    // Only this listing uses a wide criterion; the automatic path above never
+    // selects from it.
+    ObjListPtr operations = list_candidates(ctx, src_pj, dst_pj, src, dst);
+    PjPtr chosen = find_operation(ctx, operations.get(), options.preferred_operation);
+    if (!chosen) {
+        throw Error("preferred operation " + options.preferred_operation +
+                    " is not available from " + quoted(src) + " to " + quoted(dst));
+    }
     *ballpark = proj_coordoperation_has_ballpark_transformation(ctx, chosen.get()) == 1;
     *accuracy = proj_coordoperation_get_accuracy(ctx, chosen.get());
     if (*accuracy <= 0.0 && !*ballpark) {
         *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
     }
-
-    // A grid this operation needs but PROJ cannot find is diagnosed by name.
-    // Without this the pipeline would build and either degrade or fail with
-    // "File not found", which says nothing about installing proj-data.
-    const std::string missing = first_missing_grid(ctx, chosen.get());
-    if (!missing.empty()) {
-        throw Error("transformation needs grid " + missing + "; install proj-data");
-    }
-
+    diagnose_missing_grid(ctx, chosen.get());
     if (*ballpark && !options.allow_ballpark) {
         throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
                     "; enable allow_ballpark");
+    }
+    *pipeline = pinned_pipeline(ctx, chosen.get());
+    if (!*pipeline) {
+        throw Error("PROJ could not build the pinned operation " + options.preferred_operation +
+                    " for " + quoted(src) + " to " + quoted(dst) + ": " + proj_context_error(ctx));
     }
     return operation_id(chosen.get());
 }
@@ -315,7 +487,9 @@ struct CrsTransform::Impl {
     std::string src_wkt;
     std::string dst_wkt;
     bool identity = false;
-    std::string operation_authority;  ///< "EPSG:16033", empty = PROJ's choice
+    /// "AUTH:CODE" of the operation the pipeline is pinned to; empty means
+    /// PROJ's own per-point choice, rebuilt by re-asking for the pair.
+    std::string operation_authority;
     std::string description;
     double accuracy = -1.0;
     bool ballpark = false;
@@ -331,12 +505,30 @@ struct CrsTransform::Impl {
             throw Error("cannot recreate a stored CRS for " + quoted(src) + " -> " + quoted(dst) +
                         ": " + proj_context_error(ctx));
         }
-        PjPtr normalized = build_pipeline(ctx, src_pj.get(), dst_pj.get(), operation_authority);
-        if (!normalized) {
-            throw Error("PROJ could not build a transform from " + quoted(src) + " to " +
-                        quoted(dst) + ": " + proj_context_error(ctx));
+        if (operation_authority.empty()) {
+            PjPtr automatic = automatic_pipeline(ctx, src_pj.get(), dst_pj.get());
+            if (!automatic) {
+                throw Error("PROJ could not build a transform from " + quoted(src) + " to " +
+                            quoted(dst) + ": " + proj_context_error(ctx));
+            }
+            return automatic;
         }
-        return normalized;
+        // Pinned: find the very operation again and build from the object, so
+        // the pipeline is that operation rather than an id looked up in a
+        // different context (ids PROJ computes are not answerable by proj.db).
+        ObjListPtr operations = list_candidates(ctx, src_pj.get(), dst_pj.get(), src, dst);
+        PjPtr chosen = find_operation(ctx, operations.get(), operation_authority);
+        if (!chosen) {
+            throw Error("pinned operation " + operation_authority +
+                        " is no longer available from " + quoted(src) + " to " + quoted(dst));
+        }
+        PjPtr pinned = pinned_pipeline(ctx, chosen.get());
+        if (!pinned) {
+            throw Error("PROJ could not build the pinned operation " + operation_authority +
+                        " for " + quoted(src) + " to " + quoted(dst) + ": " +
+                        proj_context_error(ctx));
+        }
+        return pinned;
     }
 
     /// Register `pipeline` as this thread's, replacing one left by a transform
@@ -412,26 +604,27 @@ CrsTransform CrsTransform::create(const CoordinateSystem& src, const CoordinateS
                     ": " + proj_context_error(ctx));
     }
 
+    PjPtr pipeline;
     impl->operation_authority = select_operation(ctx, src_pj.get(), dst_pj.get(), src, dst, options,
-                                                 &impl->accuracy, &impl->ballpark);
+                                                 &impl->accuracy, &impl->ballpark, &pipeline);
 
     // Build once here so a broken pipeline fails at create() rather than on
     // first use deep inside a task. The built pipeline is also the authority on
     // what will actually be applied: an operation listed as non-ballpark can
     // still degrade to a ballpark at build time when the grid it needs is not
-    // installed, and that must hit the same refusal.
-    PjPtr pipeline = impl->build();
-    if (proj_coordoperation_has_ballpark_transformation(ctx, pipeline.get()) == 1) {
+    // installed, and that must hit the same refusal. A per-point pipeline has no
+    // single operation to ask — PROJ decides for each point — so it is skipped.
+    if (is_coordinate_operation(pipeline.get()) &&
+        proj_coordoperation_has_ballpark_transformation(ctx, pipeline.get()) == 1) {
         impl->ballpark = true;
         if (!options.allow_ballpark) {
             throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
                         "; enable allow_ballpark");
         }
     }
-    const double built_accuracy = proj_coordoperation_get_accuracy(ctx, pipeline.get());
-    if (built_accuracy > 0.0) {
-        impl->accuracy = built_accuracy;
-    }
+    // The factory-reported accuracy is the number to publish: a per-point
+    // pipeline reports none (it may pick differently at every point), so a 0
+    // here must not erase what the selected operation stated.
     const PJ_PROJ_INFO info = proj_pj_info(pipeline.get());
     impl->description = info.definition != nullptr ? std::string(info.definition) : std::string();
     impl->store_here(std::move(pipeline));
