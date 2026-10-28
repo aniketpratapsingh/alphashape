@@ -65,15 +65,18 @@ void require_transformable(const CoordinateSystem& cs, const char* role) {
 }
 
 /// PROJ reports some operations under a computed authority name
-/// ("DERIVED_FROM(EPSG)", "INVERSE(EPSG)") that proj.db cannot answer for.
-/// The inner authority is the one that resolves, and the code is the same.
-std::string lookup_authority(const std::string& auth_name) {
-    const std::size_t open = auth_name.find('(');
-    const std::size_t close = auth_name.rfind(')');
-    if (open != std::string::npos && close == auth_name.size() - 1 && close > open + 1) {
-        return auth_name.substr(open + 1, close - open - 1);
+/// ("DERIVED_FROM(EPSG)", "INVERSE(EPSG)", "INVERSE(DERIVED_FROM(EPSG))") that
+/// proj.db cannot answer for. Unwrapping all of them reaches the authority that
+/// resolves: the code is the same and the wrapper only says how PROJ derived it.
+std::string lookup_authority(std::string auth_name) {
+    for (;;) {
+        const std::size_t open = auth_name.find('(');
+        const std::size_t close = auth_name.rfind(')');
+        if (open == std::string::npos || close != auth_name.size() - 1 || close <= open + 1) {
+            return auth_name;
+        }
+        auth_name = auth_name.substr(open + 1, close - open - 1);
     }
-    return auth_name;
 }
 
 /// The grid ids an operation requires, split into all and missing. PROJ reports
@@ -176,6 +179,26 @@ PjPtr create_crs(PJ_CONTEXT* ctx, const CoordinateSystem& cs) {
     return pj;
 }
 
+/// True when PROJ considers two objects the same CRS for coordinate-operation
+/// purposes, ignoring identifier and axis order. The axis-order relaxation
+/// matters because a listed operation's source CRS is usually in authority
+/// (lat/lon) order while the engine's value normalises to visualisation order.
+bool equivalent_crs(PJ_CONTEXT* ctx, PJ* a, PJ* b) {
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    return proj_is_equivalent_to_with_ctx(ctx, a, b,
+                                          PJ_COMP_EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS) == 1;
+}
+
+/// True when `operation` runs *from* the CRS `base`. Used to orient a stored
+/// operation (the caller may have listed its inverse) and to refuse one that
+/// belongs to a different pair.
+bool runs_from(PJ_CONTEXT* ctx, PJ* base, PJ* operation) {
+    PjPtr source{proj_get_source_crs(ctx, operation)};
+    return equivalent_crs(ctx, source.get(), base);
+}
+
 /// A datum shift attaches to a geodetic CRS, so only a geographic source can be
 /// bound; PROJ rejects a projected or geocentric base.
 bool bindable_kind(CrsKind kind) {
@@ -256,14 +279,13 @@ std::vector<DatumTransformation> CoordinateSystem::available_transformations(
         transformations.push_back(std::move(entry));
     }
 
-    // PROJ's first candidate is the one it would use, so it is the preferred
-    // entry; the rest follow in increasing accuracy behind it.
-    DatumTransformation preferred = std::move(transformations.front());
-    preferred.preferred = true;
-    std::vector<DatumTransformation> rest(transformations.begin() + 1, transformations.end());
-    std::stable_sort(rest.begin(), rest.end(), ranks_before);
-    transformations.assign(1, preferred);
-    transformations.insert(transformations.end(), rest.begin(), rest.end());
+    // Order the list by accuracy, unknown accuracy last; PROJ's own order is
+    // kept among equals. No entry is flagged as "the one PROJ would use":
+    // PROJ's automatic transform chooses per point (an area-limited national
+    // operation applies only inside its area and a less accurate one takes over
+    // outside it), so there is no single such operation to name. See the
+    // DatumTransformation documentation.
+    std::stable_sort(transformations.begin(), transformations.end(), ranks_before);
     return transformations;
 }
 
@@ -298,24 +320,43 @@ CoordinateSystem CoordinateSystem::with_transformation(
     PJ_CONTEXT* ctx = thread_context();
     PjPtr base = create_crs(ctx, *this);
 
-    // Look the operation up again rather than trusting the entry: this both
-    // validates a persisted entry and gives the operation's hub CRS, which the
-    // bound CRS needs. Derived names ("DERIVED_FROM(EPSG)") map back to the
-    // authority proj.db answers for.
+    // Recover the operation object from proj.db. The identifier alone is not
+    // enough: PROJ decorates it for operations it derives or inverts
+    // ("DERIVED_FROM(EPSG)", "INVERSE(DERIVED_FROM(EPSG))"), and those
+    // decorated names are not rows proj.db answers for, so the wrapper is
+    // peeled off to reach the stored code. The stored operation is then
+    // *oriented*: the caller may have picked the inverse of a stored shift
+    // (WGS 84 -> NAD27 is EPSG:1693 NAD27 -> WGS 84 reversed).
     const std::string authority = lookup_authority(transformation.auth_name);
-    PjPtr chosen{proj_create_from_database(ctx, authority.c_str(), transformation.code.c_str(),
+    PjPtr stored{proj_create_from_database(ctx, authority.c_str(), transformation.code.c_str(),
                                            PJ_CATEGORY_COORDINATE_OPERATION,
                                            /*usePROJAlternativeGridNames=*/1, nullptr)};
-    if (!chosen) {
+    if (!stored) {
         throw ValueError("unknown datum transformation " + transformation.auth_name + ":" +
                          transformation.code + ": " + proj_context_error(ctx));
     }
-    if (proj_get_type(chosen.get()) == PJ_TYPE_CONVERSION) {
+    if (proj_get_type(stored.get()) == PJ_TYPE_CONVERSION) {
         // A projection conversion between two CRSs on the same datum: there is
         // no datum shift to pin, and binding would be a no-op wrapper. The
         // caller wants CrsTransform for this, not a pinned datum.
         throw ValueError("\"" + transformation.name + "\" is a projection conversion, not a "
                          "datum shift from " + quoted(*this) + "; use CrsTransform directly");
+    }
+
+    // One of the operation's two ends must be this CRS, or the entry belongs to
+    // another pair and pinning it would silently apply the wrong shift.
+    PjPtr chosen;
+    if (runs_from(ctx, base.get(), stored.get())) {
+        chosen = std::move(stored);
+    } else {
+        PjPtr reversed{proj_coordoperation_create_inverse(ctx, stored.get())};
+        if (!reversed || !runs_from(ctx, base.get(), reversed.get())) {
+            throw ValueError("datum transformation \"" + transformation.name + "\" (" +
+                             transformation.auth_name + ":" + transformation.code +
+                             ") does not apply to " + quoted(*this) +
+                             "; it is a shift between other CRSs");
+        }
+        chosen = std::move(reversed);
     }
     PjPtr hub{proj_get_target_crs(ctx, chosen.get())};
     if (!hub) {
