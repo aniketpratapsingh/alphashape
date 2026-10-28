@@ -120,10 +120,16 @@ Xyz position_vector(const Xyz& source, double tx, double ty, double tz, double r
                tz + m * (-ry * source.x + rx * source.y + source.z)};
 }
 
-/// The GN 7-2 Helmert parameters of EPSG:1314 "OSGB36 to WGS 84 (6)": the
-/// OSGB36 datum shift as a Position Vector transformation on Airy 1830.
+/// The Helmert shift PROJ applies for EPSG:1314 "OSGB36 to WGS 84 (6)", the
+/// OSGB36 datum shift as a Position Vector transformation on Airy 1830. The
+/// rotations and scale are proj.db's: 0.15"/0.247"/0.842", -20.489 ppm. The
+/// EPSG registry carries one more digit on each (0.1502"/0.2470"/0.8421",
+/// -20.4894 ppm), and that difference alone moves a British point by about
+/// 3 mm, so the reference must use the parameters PROJ actually applies; the
+/// parity with the registry's four-decimal figures is recorded in
+/// engine/LIMITATIONS.md rather than asserted here.
 Xyz osgb36_helmert_to_wgs84_geocentric(const Xyz& source) {
-    return position_vector(source, 446.448, -125.157, 542.060, 0.1502, 0.2470, 0.8421, -20.4894);
+    return position_vector(source, 446.448, -125.157, 542.060, 0.15, 0.247, 0.842, -20.489);
 }
 
 /// Horizontal gap in metres at `latitude_deg`, from two lon/lat points. The
@@ -253,8 +259,8 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
     }
 
     // OSGB36 -> WGS 84 by the 7-parameter Helmert shift (EPSG:1314): the
-    // §4.3.1 concatenation on Airy 1830 with tZ=542.060 m, rX=0.1502",
-    // rY=0.2470", rZ=0.8421", dS=-20.4894 ppm. There is no printed OSGB36
+    // §4.3.1 concatenation on Airy 1830 with tZ=542.060 m and proj.db's
+    // 0.15"/0.247"/0.842", -20.489 ppm. There is no printed OSGB36
     // example, so the reference is the document's formulas fed those
     // parameters, over points spread across Great Britain. The pair is 2D, so
     // PROJ leaves the ellipsoidal height alone; only lon/lat are compared.

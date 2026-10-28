@@ -1289,4 +1289,13 @@ yet.
   `z` comes back unchanged; the horizontal result still depends on the input
   height. `DatumShiftMatchesEpsgExamples` asserts the pass-through explicitly
   rather than assuming a height shift.
+- **The shift parameters are `proj.db`'s, which can be coarser than the
+  registry's.** EPSG:1314 (OSGB36 to WGS 84 (6)) is published with rotations
+  to four decimals (0.1502"/0.2470"/0.8421", -20.4894 ppm); PROJ's database
+  stores three (0.15"/0.247"/0.842", -20.489 ppm). The difference moves a point
+  in Great Britain by about 3 mm, so `DatumShiftMatchesEpsgExamples` compares
+  against the parameters PROJ actually applies. Regenerating from the EPSG
+  registry would need `PROJ_DATA` pointed at a database built from it; the
+  engine deliberately trusts whatever `proj.db` the platform ships, since that
+  is what the user's PROJ sees.
 
