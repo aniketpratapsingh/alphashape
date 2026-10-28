@@ -127,6 +127,14 @@ CensusImage census_transform(const FloatImage& image, const CensusOptions& optio
     return out;
 }
 
+std::vector<float> census_values(const CensusImage& census) {
+    std::vector<float> out(census.values.size(), 0.0F);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = static_cast<float>(census.values[i]) / 65535.0F;
+    }
+    return out;
+}
+
 const CensusImage& CensusCache::get(const FloatImage& image) {
     for (const Entry& entry : entries_) {
         if (entry.image == &image) {

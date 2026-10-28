@@ -29,21 +29,18 @@
 // flat region is all zeros rather than all ones and a saturated flat region
 // cannot masquerade as a strongly textured one.
 //
-// The comparison is the census *distance* of the published cost (Mei et al.
-// 2011; Hirschmuller & Scharstein 2009, "Evaluation of Stereo Matching Costs on
-// New Radiometric Calibration Data"): the Hamming distance of the two bit masks,
-// normalised by the number of bits, so every census cost lives in [0, 1] and 0.5
-// is exactly chance-level agreement (half the bits differ). The [0, 1] scale is
-// the same interval the intensity cost uses (1 - ZNCC) / 2, so one `max_cost`
-// threshold keeps its meaning ("the match must be better than chance") whichever
-// cost a run selects.
-//
-// Why Hamming rather than a correlation of the packed bytes: the numeric value
-// of a packed bit mask is not a metric on the pattern -- flipping the top bit of
-// 0x7FFF moves the value by 0.5 while flipping the bottom bit moves it by
-// 1/65535, though both are one disagreeing comparison. Hamming weights every
-// comparison equally, which is the property the census's noise tolerance rests
-// on (and is the distance both cited papers evaluate).
+// Two ways to compare a pair of descriptors live here. `census_distance` is the
+// mine, cheap Hamming distance of two masks (the distance the cited papers
+// evaluate). The search itself uses `census_values`: it reads the mask as a
+// sample in [0, 1] and lets the existing ZNCC aggregate over the window, which
+// is the census-and-ZNCC cost of the plan's algorithm section. The distinction
+// that mattered when choosing: Hamming treats each comparison equally (right for
+// "how many ranks disagree") but is 16 discrete levels with no sub-pixel
+// interpolation possible on a bit mask, while correlating the mask values keeps
+// the ZNCC's bilinear sampling and variance floor, and the descriptor has already
+// made the values invariant to any monotone intensity change, so the invariance
+// survives the correlation. `census_distance` stays as the descriptor-level
+// primitive (tests, future use); the search does not call it.
 
 #include <cstdint>
 #include <deque>
@@ -107,6 +104,19 @@ inline double census_distance(std::uint16_t a, std::uint16_t b) {
     }
     return static_cast<double>(bits) / 16.0;
 }
+
+/// The descriptor field as intensities in [0, 1] (the mask over 65535).
+///
+/// The search correlates these values rather than the raw masks: the census
+/// descriptor is a bit mask, but correlating its numeric value as a sample in
+/// [0, 1] is what lets the existing ZNCC machinery (and its bilinear sampling,
+/// i.e. sub-pixel accuracy) work on census data unchanged. The rank bits, not
+/// the mask's numeric magnitude, are what survive an intensity change, so the
+/// quotient preserves the invariance (a monotone map leaves every bit fixed,
+/// hence every value fixed). This is the census-and-ZNCC cost the plan's
+/// algorithm section describes. Normalising to [0, 1] keeps it on the same
+/// scale as the intensity cost.
+std::vector<float> census_values(const CensusImage& census);
 
 /// Per-view descriptor cache. A run transforms each view once and reuses it for
 /// every candidate plane, so the O(pixels * support) transform is paid once per

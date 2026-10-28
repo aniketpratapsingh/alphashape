@@ -23,11 +23,15 @@ namespace alphashape::stereo {
 /// Zncc    the intensity ZNCC normalised to [0, 1]: (1 - z) / 2. The original
 ///         cost; assumes the two views of a surface point differ by a gain and a
 ///         bias, which real photo sets only approximately do.
-/// Census  the Hamming distance of the 16-bit census descriptors (census.hpp),
-///         also in [0, 1] and with 0.5 exactly at chance level. Invariant to a
-///         monotone intensity change, so it survives exposure, white balance and
-///         gamma differences between overlapping images and keeps a usable
-///         signal on low-contrast ground where an intensity correlation is noise.
+/// Census  the ZNCC computed on the census descriptor values (census.hpp):
+///         each pixel's 16-bit census mask is read as a sample in [0, 1]
+///         (mask / 65535) and the existing ZNCC aggregation runs on those
+///         values. The descriptor is invariant to any monotone intensity
+///         change, so this survives exposure, white-balance and gamma
+///         differences between overlapping images and keeps a usable signal on
+///         low-contrast ground where an intensity correlation is noise. Reusing
+///         the ZNCC core also keeps the sub-pixel bilinear sampling and the
+///         variance floor, which a per-sample Hamming mean would lose.
 ///
 /// The two costs share the [0, 1] scale and the "0.5 = chance" convention, so
 /// `max_cost` means the same thing ("the winning match must be better than

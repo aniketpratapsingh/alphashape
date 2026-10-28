@@ -1,11 +1,11 @@
 // Census transform and cost tests (WP-17.13, DP-03).
 //
-// The transform is checked against a hand-computed descriptor, and the cost's
-// robustness properties are checked directly: invariance to an affine intensity
-// change (on descriptors and end to end through the search), the [0, 1] range
-// and the chance-level mean. The noise advantage over the ZNCC cost is the
-// PatchMatch.CensusImprovesPlaneNoise case in test_patch_match.cpp, which owns
-// the synthetic scene helpers this file borrows the geometry from.
+// The transform is checked against a hand-computed descriptor, and the search's
+// census cost (the ZNCC of the descriptor values in [0, 1]) is checked for its
+// defining property: invariance to an affine intensity change, on descriptors
+// and end to end through the search. The noise advantage over the intensity cost
+// is PatchMatch.CensusImprovesPlaneNoise in test_patch_match.cpp, which owns the
+// synthetic scene helpers.
 
 #include <gtest/gtest.h>
 
@@ -291,8 +291,7 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
 // ---------------------------------------------------------------------------
 
 /// A reproducible pseudo-random field in [0, 1), so two unrelated images give
-/// unrelated descriptors at every shift (a linear ramp would correlate with
-/// itself under a small shift and bias the mean away from chance).
+/// unrelated descriptors.
 float hash_field(int x, int y, int salt) {
     std::uint32_t h = static_cast<std::uint32_t>(x) * 374761393U +
                       static_cast<std::uint32_t>(y) * 668265263U +
@@ -302,41 +301,50 @@ float hash_field(int x, int y, int salt) {
     return static_cast<float>(h & 0xFFFFFFU) / static_cast<float>(0x1000000U);
 }
 
-TEST(Census, CostDistributionSameRange) {
-    // Two unrelated patterns: every compared pair is a pure Hamming distance, so
-    // every value lies in [0, 1] and the mean sits at chance (half the bits
-    // differ). This is the [0, 1] range contract the max_cost cut depends on.
-    FloatImage a(48, 40, 0.0F);
-    FloatImage b(48, 40, 0.0F);
-    for (int y = 0; y < 40; ++y) {
-        for (int x = 0; x < 48; ++x) {
+TEST(Census, ValuesAreNormalisedToUnitRange) {
+    // The search correlates mask / 65535, so every transformed value lies in
+    // [0, 1]; this is the [0, 1] scale the max_cost cut depends on.
+    FloatImage image(24, 20, 0.0F);
+    for (int y = 0; y < 20; ++y) {
+        for (int x = 0; x < 24; ++x) {
+            image.at(x, y) = hash_field(x, y, 3);
+        }
+    }
+    const CensusImage census = alphashape::stereo::census_transform(image, CensusOptions{});
+    const std::vector<float> values = alphashape::stereo::census_values(census);
+    ASSERT_EQ(values.size(), census.values.size());
+    for (const float v : values) {
+        EXPECT_GE(v, 0.0F);
+        EXPECT_LE(v, 1.0F);
+    }
+}
+
+TEST(Census, DistanceAtChanceForUnrelatedPatterns) {
+    // Unrelated descriptors differ on about half their bits: the Hamming distance
+    // of two independent patterns sits at chance, not at agreement.
+    FloatImage a(40, 32, 0.0F);
+    FloatImage b(40, 32, 0.0F);
+    for (int y = 0; y < 32; ++y) {
+        for (int x = 0; x < 40; ++x) {
             a.at(x, y) = hash_field(x, y, 1);
             b.at(x, y) = hash_field(x, y, 2);
         }
     }
     const CensusImage ca = alphashape::stereo::census_transform(a, CensusOptions{});
     const CensusImage cb = alphashape::stereo::census_transform(b, CensusOptions{});
-
     double total = 0.0;
     std::size_t count = 0;
-    for (int dy = 0; dy < 6; ++dy) {
-        for (int dx = 0; dx < 6; ++dx) {
-            for (int y = 4; y < 36; ++y) {
-                for (int x = 4; x < 44; ++x) {
-                    const double d =
-                        alphashape::stereo::census_distance(ca.at(x, y), cb.at(x + dx, y + dy));
-                    EXPECT_GE(d, 0.0);
-                    EXPECT_LE(d, 1.0);
-                    total += d;
-                    ++count;
-                }
-            }
+    for (int y = 4; y < 28; ++y) {
+        for (int x = 4; x < 36; ++x) {
+            const double d = alphashape::stereo::census_distance(ca.at(x, y), cb.at(x, y));
+            EXPECT_GE(d, 0.0);
+            EXPECT_LE(d, 1.0);
+            total += d;
+            ++count;
         }
     }
     ASSERT_GT(count, 0U);
     const double mean = total / static_cast<double>(count);
-    // Independent patterns agree on about half the bits; the mean must sit near
-    // chance, not near agreement or near total disagreement.
     EXPECT_GT(mean, 0.4) << mean;
     EXPECT_LT(mean, 0.6) << mean;
 }

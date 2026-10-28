@@ -255,9 +255,9 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     // map holes come from. "zncc" is the original intensity cost.
     ParamSpec cost_type{"cost_type", ParamType::String, std::string{"zncc"},
                         "Photometric cost the depth search minimises: \"zncc\" (intensity "
-                        "normalised cross-correlation) or \"census\" (Hamming distance of 16-bit "
-                        "census descriptors; more robust to lighting differences and low "
-                        "texture)."};
+                        "normalised cross-correlation) or \"census\" (census descriptors "
+                        "correlated by the same ZNCC; more robust to lighting differences and "
+                        "low texture)."};
     cost_type.choices = {"zncc", "census"};
     params.declare(cost_type);
 

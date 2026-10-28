@@ -10,21 +10,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 - **Depth maps can search with a census cost.** `BuildDepthMaps` gains
   `cost_type` (`"zncc"`, the original intensity cost, or `"census"`) and
-  `max_cost`. The census cost is the 16-bit wide census transform of Zabih &
-  Woodfill (1994) with the two-arm descriptor of Mei et al. (2011): each pixel
-  records the sign of the intensity difference to eight horizontal and eight
-  vertical neighbours, a reference window pixel and a neighbour pixel are
-  compared by Hamming distance, and the per-view cost is the mean over the
-  visible window (the same visibility quorum and best-of-k vote as the intensity
-  cost). Because it compares ranks rather than values, it is invariant to any
-  monotone intensity change -- exposure, white balance, gamma -- which is where
-  depth-map holes on real photo sets come from; on a plane with impulsive noise
-  it recovers the true plane at a fraction of the intensity cost. Both
-  descriptors are transformed once per view per pyramid level and cached, so the
-  search pays the transform once, not per candidate. Both costs live on [0, 1]
-  with 0.5 exactly at chance, so `max_cost` keeps its "better than chance"
-  meaning; a `-1` value resolves to the cost type's own default (0.5 for
-  `zncc`, 0.35 for `census`). The depth-map fingerprint records the choice, so
+  `max_cost`. The census cost replaces each pixel's intensity with the 16-bit
+  wide census transform of Zabih & Woodfill (1994) using the two-arm descriptor
+  of Mei et al. (2011) -- the sign of the intensity difference to eight
+  horizontal and eight vertical neighbours, packed into a mask -- read as a
+  sample in [0, 1] (mask / 65535) and then correlated by the existing ZNCC. Reuse
+  of the ZNCC core keeps its bilinear sub-pixel sampling and its variance floor
+  while the descriptor makes the cost invariant to any monotone intensity change
+  -- exposure, white balance, gamma -- which is where depth-map holes on real
+  photo sets come from. Each view is transformed once per pyramid level and
+  cached, so the search pays the transform once, not per candidate. Both costs
+  are (1 - ZNCC) / 2 on [0, 1], so `max_cost` keeps its "better than chance"
+  meaning; a `-1` value resolves to the cost type's own default (0.5 for `zncc`,
+  0.6 for `census`, which runs slightly higher on a correct match because its
+  descriptor is coarser). The depth-map fingerprint records the choice, so
   switching cost rebuilds the maps instead of reusing them. The GPU PatchMatch
   kernels implement the `zncc` cost only and decline a census run to the CPU
   with a log line (the per-view descriptor buffer does not fit the kernels'

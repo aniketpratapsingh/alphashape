@@ -89,18 +89,9 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kConeHalfAngle = kPi / 3.0;         // 60 degree init cone around -b_p
 constexpr double kMaxNormalRefineAngle = kPi / 3.0;  // 60 degree refinement ceiling
 constexpr double kNoMatchCost = 2.0;                 // ZNCC = -1 (no agreement)
-constexpr double kNoMatchCostCensus = 1.0;           // every census bit disagrees
 constexpr double kFacingEps = 1e-6;                  // n . b must be < -eps
 constexpr double kCameraZEps = 1e-9;                 // neighbour z > eps (a guard
                                                      // against division blow-up)
-
-/// The sentinel a rejected match scores, per cost type. It only has to be
-/// strictly worse than any real cost of that type: 2.0 is the top of the ZNCC
-/// range and 1.0 the top of the census range. A smaller sentinel would let a
-/// phantom cost survive the best-k average; a larger one changes nothing.
-double no_match_cost(CostType type) {
-    return type == CostType::Census ? kNoMatchCostCensus : kNoMatchCost;
-}
 
 /// Iteration key used for the initial random draw, kept distinct from the sweep
 /// iterations 0..iterations-1 so the streams never collide.
@@ -165,10 +156,6 @@ struct NeighbourView {
     double params[kCalibrationParamCount] = {};
     Eigen::Matrix3d M = Eigen::Matrix3d::Identity();
     Eigen::Vector3d c = Eigen::Vector3d::Zero();
-    /// This view's census descriptors, row-major, one per pixel; null unless the
-    /// run selected CostType::Census. Transformed once per view and shared by
-    /// every candidate evaluation, which is the "cached per view" half of DP-03.
-    const std::uint16_t* census = nullptr;
 };
 
 /// Bilinear sample at integer-centred coordinates. Identical, operation for
@@ -210,11 +197,6 @@ struct CostContext {
     const float* ref_values = nullptr;           // count * n_samples window values
     const Eigen::Vector3d* bearings = nullptr;   // count bearings, row-major
     const Eigen::Vector2i* offsets = nullptr;    // window offsets
-    /// The reference view's census descriptors, row-major, or null unless the
-    /// run selected CostType::Census. Transformed once and shared by every
-    /// pixel, the "reference image transformed once" half of the per-view cache.
-    const std::uint16_t* ref_census = nullptr;
-    CostType cost_type = CostType::Zncc;
     std::vector<NeighbourView> neighbours;
     int best_k = 1;
 };
@@ -230,10 +212,6 @@ struct WindowCache {
     int n_neighbours = 0;
     std::vector<Eigen::Vector3d> b_store;   // n
     std::vector<float> ref_store;           // n
-    /// The reference window's census descriptors at the same offsets, filled
-    /// only for a census run. Gathering them once per pixel per half-sweep keeps
-    /// the candidate loop reading a flat array, exactly like ref_store.
-    std::vector<std::uint16_t> ref_census_store;  // n
     std::vector<Eigen::Vector3d> mb_store;  // n_neighbours * n
     std::vector<double> dq;                 // n, candidate-level plane depths
 };
@@ -351,84 +329,6 @@ double neighbour_cost(const NeighbourView& view, const float* ref, const double*
     return 1.0 - z;
 }
 
-/// Census cost over the window for one neighbour view, in [0, 1] (1 = every bit
-/// disagrees, the sentinel for "no agreement").
-///
-/// The descriptor is a bit mask, so it cannot be interpolated: the neighbour's
-/// mask is read at the NEAREST pixel to the projected coordinate (a census
-/// comparison is a discrete relation of a pixel to its neighbours, and blending
-/// two masks would mix two unrelated descriptors), while the reference masks
-/// `ref_window` are the descriptors of the exact window pixels. The per-sample
-/// cost is the normalised Hamming distance, and the per-view cost is its mean
-/// over the valid samples -- the same quorum and the same visibility vote as the
-/// ZNCC path, so a neighbour that cannot see the window is still not a vote and
-/// a genuine mismatch still is.
-///
-/// One deliberate difference from the ZNCC path: there is no variance floor.
-/// Two flat windows have identical all-zero descriptors and therefore a distance
-/// of 0, so census matching alone cannot tell a flat surface that agrees from
-/// one that has nothing to compare. That is a property of the descriptor, not a
-/// bug to paper over by injecting a penalty: the texture mask applied at
-/// initialisation already excludes reference pixels whose own window is flat,
-/// and the best-of-k vote across neighbours is what rejects a degenerate match
-/// in practice.
-double census_neighbour_cost(const NeighbourView& view, const std::uint16_t* ref_window,
-                             const double* dq, const Eigen::Vector3d* mb, int n_samples,
-                             int min_valid, int& valid_out) {
-    if (ref_window == nullptr || view.census == nullptr) {
-        valid_out = 0;
-        return kNoMatchCostCensus;
-    }
-    double total = 0.0;
-    int valid_count = 0;
-
-    for (int k = 0; k < n_samples; ++k) {
-        const double depth_q = dq[si(k)];
-        if (!(depth_q > 0.0)) {
-            continue;  // edge-on or behind the reference camera for every view
-        }
-        if (valid_count + (n_samples - k) < min_valid) {
-            valid_out = valid_count;
-            return kNoMatchCostCensus;
-        }
-        // X_n = M * (depth_q * b_q) + c, exactly as the ZNCC path.
-        const Eigen::Vector3d x_n = depth_q * mb[si(k)] + view.c;
-        const double z_n = x_n.z();
-        if (!(z_n > kCameraZEps)) {
-            continue;
-        }
-        double pixel[2] = {0.0, 0.0};
-        const double p_cam[3] = {x_n.x(), x_n.y(), z_n};
-        if (!try_project_point<double>(view.type, view.width, view.height, view.params, p_cam,
-                                       pixel)) {
-            continue;
-        }
-        // Census sampling is nearest-neighbour, so the only convention that
-        // matters is which pixel (x, y) names: project() centres the top-left
-        // pixel at (0.5, 0.5), and the descriptor array is indexed at integers
-        // whose pixel covers [i, i + 1) in that convention. So a continuous
-        // coordinate inside [-0.5, width - 0.5] belongs to a pixel that exists
-        // (the edge pixels' descriptors are already edge-clamped), and the
-        // nearest integer, clamped, is that pixel.
-        const double px = pixel[0];
-        const double py = pixel[1];
-        if (px < -0.5 || py < -0.5 || px > static_cast<double>(view.width) - 0.5 ||
-            py > static_cast<double>(view.height) - 0.5) {
-            continue;  // out-of-bounds sample is invalid
-        }
-        const int mx = std::clamp(static_cast<int>(std::lround(px)), 0, view.width - 1);
-        const int my = std::clamp(static_cast<int>(std::lround(py)), 0, view.height - 1);
-        total += census_distance(ref_window[si(k)], view.census[si(my) * si(view.width) + si(mx)]);
-        ++valid_count;
-    }
-
-    valid_out = valid_count;
-    if (valid_count < min_valid) {
-        return kNoMatchCostCensus;
-    }
-    return total / static_cast<double>(valid_count);
-}
-
 /// Fill the per-pixel window cache: the window bearings, the reference window
 /// values (copied once so the candidate loop never touches the full arrays) and
 /// M * b_q for every neighbour. Called once per pixel per half-sweep, i.e. once
@@ -441,16 +341,10 @@ void fill_window_cache(const CostContext& ctx, WindowCache& wc, int px, int py) 
     // at the offset pixels p + off_k, are gathered.
     const std::size_t p = si(py) * si(ctx.width) + si(px);
     const float* const window = ctx.ref_values + p * si(wc.n);
-    std::uint16_t* const ref_census =
-        wc.ref_census_store.empty() ? nullptr : wc.ref_census_store.data();
     for (int k = 0; k < wc.n; ++k) {
         const Eigen::Vector2i off = ctx.offsets[si(k)];
         b[si(k)] = ctx.bearings[p + si(off.y()) * si(ctx.width) + si(off.x())];
         ref[si(k)] = window[si(k)];
-        if (ref_census != nullptr) {
-            ref_census[si(k)] =
-                ctx.ref_census[p + si(off.y()) * si(ctx.width) + si(off.x())];
-        }
     }
     Eigen::Vector3d* const mb = wc.mb_store.data();
     for (int j = 0; j < wc.n_neighbours; ++j) {
@@ -469,27 +363,24 @@ void fill_window_cache(const CostContext& ctx, WindowCache& wc, int px, int py) 
 /// surface here is real. A neighbour that cannot see enough of the window (a
 /// wide-baseline block: at 22-24 m spacing and 60 m altitude two nadir cameras
 /// share only part of their footprint, so most of a pixel's neighbourhood cannot
-/// map its window at all) is not a vote; folding its no-match cost (2.0 for
-/// ZNCC, 1.0 for census) into the
+/// map its window at all) is not a vote; folding its no-match cost (2.0) into the
 /// average forces every partially-observed pixel above `max_cost` and erases it
 /// from the map. Clamping `best_k` to the number of votes is the other half of
 /// the same point: "average the best k of n" is a robustness rule against
 /// outlier neighbours, but it presupposes n votes exist — here k must never
 /// exceed the votes there are, or the average is diluted by phantom costs.
 ///
-/// A neighbour that *does* see the window but correlates badly still returns the
-/// sentinel (2.0 for ZNCC, 1.0 for census) and still counts as a vote, because
-/// that is a genuine rejection of the hypothesis. Only geometric invisibility is
-/// discounted.
+/// A neighbour that *does* see the window but correlates badly still returns 2.0
+/// and still counts as a vote, because that is a genuine rejection of the
+/// hypothesis. Only geometric invisibility is discounted.
 double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
                       const Eigen::Vector3d& n) {
     const int nn = wc.n_neighbours;
     const int min_valid = (3 * wc.n + 3) / 4;  // ceil(0.75 * n_samples)
-    const double no_match = no_match_cost(ctx.cost_type);
     int candidate_valid = 0;
     prepare_candidate(wc, rho, n, wc.dq, candidate_valid);
     if (candidate_valid < min_valid) {
-        return no_match;  // not even the whole plane covers 75% of the window
+        return kNoMatchCost;  // not even the whole plane covers 75% of the window
     }
 
     // Keep the `best_k` smallest *voting* costs, with their running sum. votes
@@ -509,18 +400,12 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
         many.reserve(si(nn));
     }
 
-    const std::uint16_t* const ref_census =
-        wc.ref_census_store.empty() ? nullptr : wc.ref_census_store.data();
     for (int j = 0; j < nn; ++j) {
         int valid = 0;
         const NeighbourView& view = ctx.neighbours[si(j)];
         const Eigen::Vector3d* const mb = wc.mb_store.data() + si(j) * si(wc.n);
-        const double c =
-            ctx.cost_type == CostType::Census
-                ? census_neighbour_cost(view, ref_census, wc.dq.data(), mb, wc.n, min_valid,
-                                        valid)
-                : neighbour_cost(view, wc.ref_store.data(), wc.dq.data(), mb, wc.n, min_valid,
-                                 valid);
+        const double c = neighbour_cost(view, wc.ref_store.data(), wc.dq.data(), mb, wc.n,
+                                        min_valid, valid);
         if (valid < min_valid) {
             continue;  // this neighbour cannot see the window: not a vote
         }
@@ -550,7 +435,7 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
     }
 
     if (votes == 0) {
-        return no_match;  // no neighbour sees this pixel
+        return kNoMatchCost;  // no neighbour sees this pixel
     }
     const int k_eff = std::min(want, votes);
     if (many_mode) {
@@ -673,6 +558,43 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         throw ValueError("stereo::run_patch_match: reference image is empty");
     }
 
+    // Cost selection (DP-03). The census cost is the ZNCC of the census
+    // descriptor values in [0, 1] (census_values()), computed for the reference
+    // and every neighbour exactly once here. Transforming into plain FloatImage
+    // arrays rather than teaching the cost core a second aggregation is what
+    // keeps one ZNCC implementation, its bilinear sub-pixel sampling and its
+    // variance floor -- and therefore one code path to verify. The transform is
+    // O(pixels * support); the search is O(pixels * candidates * neighbours),
+    // so paying it once per view per level is the cheap half of that product.
+    // The reduced images a pyramid level owns are transformed here too, so a
+    // census run is coarse-to-fine at every level.
+    std::vector<FloatImage> census_storage;
+    std::vector<const FloatImage*> view_images;  // reference first, then neighbours
+    view_images.reserve(1 + neighbours.size());
+    if (options.cost_type == CostType::Census) {
+        // One entry per view, reserved exactly: `view_images` holds pointers into
+        // this vector, and an exact reserve means no push_back can reallocate and
+        // invalidate them.
+        census_storage.reserve(1 + neighbours.size());
+        const auto transformed = [&](const FloatImage& source) {
+            census_storage.push_back(FloatImage(source.width(), source.height(), 0.0F));
+            const std::vector<float> values = census_values(
+                census_transform(source, options.census));
+            census_storage.back().pixels().assign(values.begin(), values.end());
+            return &census_storage.back();
+        };
+        view_images.push_back(transformed(*reference.image));
+        for (const PMView& view : neighbours) {
+            view_images.push_back(transformed(*view.image));
+        }
+    } else {
+        view_images.push_back(reference.image);
+        for (const PMView& view : neighbours) {
+            view_images.push_back(view.image);
+        }
+    }
+    const FloatImage* const ref_pixels = view_images[0];
+
     // ---- Static setup ------------------------------------------------------
     const int r = options.window_radius;
 
@@ -720,7 +642,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     for (const PMView& view : neighbours) {
         NeighbourView nv;
         const Calibration& c = view.calibration;
-        nv.data = view.image->pixels().data();
+        nv.data = view_images[1 + neighbour_views.size()]->pixels().data();
         nv.width = c.width;
         nv.height = c.height;
         nv.max_x = static_cast<float>(c.width - 1);
@@ -757,7 +679,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     // (y * width + x) * n_samples + k, so a window sample is one multiply away.
     std::vector<float> ref_values(count * si(n_samples), 0.0F);
     {
-        const std::vector<float>& pixels = reference.image->pixels();
+        const std::vector<float>& pixels = ref_pixels->pixels();
         for (int y = interior_y0; y <= interior_y1; ++y) {
             for (int x = interior_x0; x <= interior_x1; ++x) {
                 const std::size_t q = si(y) * si(width) + si(x);
@@ -770,31 +692,12 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         }
     }
 
-    // Census descriptors, when the run selects that cost. Both the reference and
-    // every neighbour are transformed exactly once here and cached for the whole
-    // level: the transform is O(pixels * support) and a cost evaluation is
-    // O(pixels * candidates * neighbours), so computing the descriptor in the
-    // loop would multiply the transform by the search's candidate count. The
-    // cache owns the descriptor arrays; its entries are stable across later
-    // insertions, so the raw pointers taken below stay valid. A pyramid level has
-    // its own reduced images, so each level owns its own cache, which dies with
-    // the level.
-    CensusCache census_cache(options.census);
-
     CostContext ctx;
     ctx.width = width;
     ctx.height = height;
     ctx.ref_values = ref_values.data();
     ctx.bearings = bearings.data();
     ctx.offsets = offsets.data();
-    ctx.cost_type = options.cost_type;
-    if (options.cost_type == CostType::Census) {
-        ctx.ref_census = census_cache.get(*reference.image).values.data();
-        for (std::size_t j = 0; j < neighbour_views.size(); ++j) {
-            neighbour_views[j].census =
-                census_cache.get(*neighbours[j].image).values.data();
-        }
-    }
     ctx.neighbours = std::move(neighbour_views);
     {
         int k = options.best_k == 0 ? (n_neighbours + 1) / 2 : options.best_k;  // 0 = ceil(n/2)
@@ -810,7 +713,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     result.height = height;
     result.depth.assign(count, -1.0F);
     result.normals.assign(count * 3, 0.0F);
-    result.cost.assign(count, static_cast<float>(no_match_cost(options.cost_type)));
+    result.cost.assign(count, static_cast<float>(kNoMatchCost));
 
     std::vector<std::uint8_t> active(count, 0);
 
@@ -826,9 +729,6 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         local.n_neighbours = n_neighbours;
         local.b_store.resize(si(n_samples));
         local.ref_store.resize(si(n_samples));
-        if (options.cost_type == CostType::Census) {
-            local.ref_census_store.resize(si(n_samples));
-        }
         local.mb_store.resize(si(n_neighbours) * si(n_samples));
         local.dq.resize(si(n_samples));
 
@@ -931,9 +831,6 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
                 local.n_neighbours = n_neighbours;
                 local.b_store.resize(si(n_samples));
                 local.ref_store.resize(si(n_samples));
-                if (options.cost_type == CostType::Census) {
-                    local.ref_census_store.resize(si(n_samples));
-                }
                 local.mb_store.resize(si(n_neighbours) * si(n_samples));
                 local.dq.resize(si(n_samples));
 
@@ -1126,11 +1023,15 @@ std::vector<int> patch_match_iteration_plan(int width, int height,
 }
 
 double patch_match_default_max_cost(CostType type) {
-    // 0.35 of the 16 bits is ~5.6 disagreeing comparisons: on our fixtures the
-    // true plane stays under it in every scene we run, while a wrong depth lands
-    // near the chance level of 8. The ZNCC figure is the search's historical
-    // threshold, unchanged.
-    return type == CostType::Census ? 0.35 : 0.5;
+    // Both costs are (1 - ZNCC) / 2 on [0, 1], so one threshold is meaningful for
+    // both. The census descriptor is coarser than 8-bit intensity, so an
+    // otherwise-correct pixel correlates a little less sharply and its true-plane
+    // cost sits slightly higher (measured ~0.03 against the intensity cost's
+    // ~0.01 on the noisy plane fixture). The census default is therefore the more
+    // permissive 0.6 -- a threshold both costs' chance level (0.5) still has to
+    // beat, so it never admits a non-match, while leaving room above the
+    // descriptor's higher correct-match floor. The plan's re-tune to 0.6.
+    return type == CostType::Census ? 0.6 : 0.5;
 }
 
 PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMView>& neighbours,
