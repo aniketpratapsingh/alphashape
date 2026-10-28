@@ -109,23 +109,16 @@ TEST(Census, InvalidOptionsThrow) {
     EXPECT_THROW(alphashape::stereo::census_transform(image, wide_too_big),
                  alphashape::ValueError);
 
-    // The cap itself is accepted, and a textured image reaches every one of the
-    // 16 bits at it -- the descriptor is exactly full, not full-but-for-a-few.
-    // (A pattern with period 17 in both axes: no two samples of a 9x9 patch tie.)
-    FloatImage textured(9, 9, 0.0F);
-    for (int y = 0; y < 9; ++y) {
-        for (int x = 0; x < 9; ++x) {
-            textured.at(x, y) = static_cast<float>((x * 7 + y * 13) % 17) / 17.0F;
-        }
-    }
+    // The cap itself is accepted, and the descriptor is exactly full there: with
+    // the centre as the highest value in its 9x9 neighbourhood, all four arms of
+    // four comparisons are "darker than the centre", i.e. all 16 bits.
+    FloatImage valley(9, 9, 0.1F);
+    valley.at(4, 4) = 0.9F;
     CensusOptions widest;
     widest.window_radius = alphashape::stereo::kCensusMaxRadius;
-    const CensusImage at_cap = alphashape::stereo::census_transform(textured, widest);
-    std::uint16_t any = 0;
-    for (const std::uint16_t value : at_cap.values) {
-        any = static_cast<std::uint16_t>(any | value);
-    }
-    EXPECT_EQ(any, 0xFFFFU) << "radius 4 must reach every one of the 16 bits";
+    const CensusImage at_cap = alphashape::stereo::census_transform(valley, widest);
+    EXPECT_EQ(at_cap.at(4, 4), 0xFFFFU)
+        << "radius 4 must reach every one of the 16 bits";
 
     CensusOptions narrow_wrong_radius;
     narrow_wrong_radius.wide = false;
