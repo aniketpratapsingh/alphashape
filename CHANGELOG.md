@@ -10,6 +10,29 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Depth maps can search with a census cost.** `BuildDepthMaps` gains
+  `cost_type` (`"zncc"`, the original intensity cost, or `"census"`) and
+  `max_cost`. The census cost replaces each pixel's intensity with the 16-bit
+  wide census transform of Zabih & Woodfill (1994) using the four-arm
+  descriptor of Mei et al. (2011) -- the sign of the intensity difference to
+  four arms of four samples (left, right, top, bottom; 16 comparisons fill the
+  word) -- read as a sample in [0, 1] (mask / 65535) and then correlated by the
+  existing ZNCC. Reuse of the ZNCC core keeps its bilinear sub-pixel sampling
+  and its variance floor while the descriptor makes the cost invariant to any
+  monotone intensity change
+  -- exposure, white balance, gamma -- which is where depth-map holes on real
+  photo sets come from. The texture gate that skips flat windows is measured on
+  the intensity window for both costs, so a low-contrast window is skipped by the
+  same rule either way. Each view is transformed once per pyramid level and
+  cached, so the search pays the transform once, not per candidate. The census
+  cost is (1 - ZNCC) / 2 on its own [0, 1] interval; a `-1` `max_cost` resolves to
+  the cost type's own default (0.5 for `zncc` on [0, 2], 0.6 for `census` on
+  [0, 1], which runs slightly higher on a correct match because its descriptor is
+  coarser). The depth-map fingerprint records both the choice and the effective
+  threshold, so switching cost or `max_cost` rebuilds the maps instead of reusing
+  them. The GPU PatchMatch kernels implement the `zncc` cost only and decline a
+  census run to the CPU with a log line (the per-view descriptor buffer does not
+  fit the kernels' binding budget); the CPU census cost is used either way.
 - **Build Depth Maps searches coarse to fine.** The PatchMatch search now runs
   first on a reduced copy of each camera's block and starts every finer level
   from the level beneath, instead of spending the whole budget at the working

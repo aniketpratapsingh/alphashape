@@ -11,6 +11,7 @@
 #include <Eigen/Geometry>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/stereo/census.hpp"
 #include "common/algorithm/stereo/depth_pyramid.hpp"
 #include "image/image.hpp"
 #include "model/camera/calibration.hpp"
@@ -88,6 +89,14 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kConeHalfAngle = kPi / 3.0;         // 60 degree init cone around -b_p
 constexpr double kMaxNormalRefineAngle = kPi / 3.0;  // 60 degree refinement ceiling
 constexpr double kNoMatchCost = 2.0;                 // ZNCC = -1 (no agreement)
+// Scale applied to (1 - ZNCC) to land on each cost type's own [0, 1] interval.
+// The intensity cost keeps the historical (1 - ZNCC) in [0, 2]. The census cost
+// is half that -- (1 - ZNCC) / 2 -- exactly as the plan's algorithm section
+// specifies, so its own scale is [0, 1] and a max_cost of 0.6 means what the
+// plan says it means. Because ZNCC is invariant to a positive scale of either
+// input, this cannot be folded into the transformed values; it is applied to the
+// finished per-neighbour cost.
+constexpr double kCensusCostScale = 0.5;
 constexpr double kFacingEps = 1e-6;                  // n . b must be < -eps
 constexpr double kCameraZEps = 1e-9;                 // neighbour z > eps (a guard
                                                      // against division blow-up)
@@ -196,6 +205,10 @@ struct CostContext {
     const float* ref_values = nullptr;           // count * n_samples window values
     const Eigen::Vector3d* bearings = nullptr;   // count bearings, row-major
     const Eigen::Vector2i* offsets = nullptr;    // window offsets
+    /// Multiplier on (1 - ZNCC) that puts the cost on the selected type's own
+    /// [0, 1] interval: 1.0 for intensity ((1 - ZNCC), [0, 2]), 0.5 for census
+    /// ((1 - ZNCC) / 2, [0, 1]).
+    double cost_scale = 1.0;
     std::vector<NeighbourView> neighbours;
     int best_k = 1;
 };
@@ -376,10 +389,14 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
                       const Eigen::Vector3d& n) {
     const int nn = wc.n_neighbours;
     const int min_valid = (3 * wc.n + 3) / 4;  // ceil(0.75 * n_samples)
+    // The sentinel, on the selected cost's own interval: 2.0 for intensity, 1.0
+    // for census. It must sit at the top of that interval so no real cost of the
+    // same type can exceed a rejection.
+    const double no_match = kNoMatchCost * ctx.cost_scale;
     int candidate_valid = 0;
     prepare_candidate(wc, rho, n, wc.dq, candidate_valid);
     if (candidate_valid < min_valid) {
-        return kNoMatchCost;  // not even the whole plane covers 75% of the window
+        return no_match;  // not even the whole plane covers 75% of the window
     }
 
     // Keep the `best_k` smallest *voting* costs, with their running sum. votes
@@ -401,9 +418,14 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
 
     for (int j = 0; j < nn; ++j) {
         int valid = 0;
-        const double c = neighbour_cost(ctx.neighbours[si(j)], wc.ref_store.data(), wc.dq.data(),
-                                        wc.mb_store.data() + si(j) * si(wc.n), wc.n, min_valid,
-                                        valid);
+        const NeighbourView& view = ctx.neighbours[si(j)];
+        const Eigen::Vector3d* const mb = wc.mb_store.data() + si(j) * si(wc.n);
+        // (1 - ZNCC), scaled onto the selected cost's interval. A neighbour whose
+        // cells are cut by the sentinel still contributes 2.0 * scale, i.e. the
+        // worst possible value on that interval.
+        const double c = neighbour_cost(view, wc.ref_store.data(), wc.dq.data(), mb, wc.n,
+                                        min_valid, valid) *
+                         ctx.cost_scale;
         if (valid < min_valid) {
             continue;  // this neighbour cannot see the window: not a vote
         }
@@ -433,7 +455,7 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
     }
 
     if (votes == 0) {
-        return kNoMatchCost;  // no neighbour sees this pixel
+        return no_match;  // no neighbour sees this pixel
     }
     const int k_eff = std::min(want, votes);
     if (many_mode) {
@@ -556,6 +578,46 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         throw ValueError("stereo::run_patch_match: reference image is empty");
     }
 
+    // Cost selection (DP-03). The census cost is the ZNCC of the census
+    // descriptor values in [0, 1] (census_values()), computed for the reference
+    // and every neighbour exactly once here. Transforming into plain FloatImage
+    // arrays rather than teaching the cost core a second aggregation is what
+    // keeps one ZNCC implementation, its bilinear sub-pixel sampling and its
+    // variance floor -- and therefore one code path to verify. The transform is
+    // O(pixels * support); the search is O(pixels * candidates * neighbours),
+    // so paying it once per view per level is the cheap half of that product.
+    // The reduced images a pyramid level owns are transformed here too, so a
+    // census run is coarse-to-fine at every level.
+    std::vector<FloatImage> census_storage;
+    std::vector<const FloatImage*> view_images;  // reference first, then neighbours
+    view_images.reserve(1 + neighbours.size());
+    if (options.cost_type == CostType::Census) {
+        // One entry per view, reserved exactly: `view_images` holds pointers into
+        // this vector, and an exact reserve means no push_back can reallocate and
+        // invalidate them.
+        census_storage.reserve(1 + neighbours.size());
+        const auto transformed = [&](const FloatImage& source) {
+            census_storage.push_back(FloatImage(source.width(), source.height(), 0.0F));
+            const std::vector<float> values = census_values(
+                census_transform(source, options.census));
+            census_storage.back().pixels().assign(values.begin(), values.end());
+            return &census_storage.back();
+        };
+        // transform_neighbours is validated true for a search (a census cost
+        // needs both sides transformed; mixing a descriptor with raw intensities
+        // would be meaningless), so both views are transformed here.
+        view_images.push_back(transformed(*reference.image));
+        for (const PMView& view : neighbours) {
+            view_images.push_back(transformed(*view.image));
+        }
+    } else {
+        view_images.push_back(reference.image);
+        for (const PMView& view : neighbours) {
+            view_images.push_back(view.image);
+        }
+    }
+    const FloatImage* const ref_pixels = view_images[0];
+
     // ---- Static setup ------------------------------------------------------
     const int r = options.window_radius;
 
@@ -603,7 +665,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     for (const PMView& view : neighbours) {
         NeighbourView nv;
         const Calibration& c = view.calibration;
-        nv.data = view.image->pixels().data();
+        nv.data = view_images[1 + neighbour_views.size()]->pixels().data();
         nv.width = c.width;
         nv.height = c.height;
         nv.max_x = static_cast<float>(c.width - 1);
@@ -634,13 +696,25 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     const int interior_y0 = r;
     const int interior_y1 = height - 1 - r;
 
-    // The reference window values for every interior pixel, gathered once: the
-    // candidate loop then reads them straight from this flat array instead of
-    // re-indexing the image per candidate. Indexed like the bearings, at
-    // (y * width + x) * n_samples + k, so a window sample is one multiply away.
+    // The texture gate (below) is measured on the INTENSITY window for both cost
+    // types. `min_texture_stddev` is documented as an intensity stddev on [0, 1]
+    // (default one 8-bit level), so feeding it the census descriptor values --
+    // mask / 65535, whose spread has nothing to do with an intensity spread --
+    // would apply the caller's threshold to a quantity it was never measured on.
+    // The descriptor's values are a ranking, not a brightness: in a mildly
+    // textured window they are sparse and quantised, so their stddev is not
+    // comparable to an intensity stddev in either direction, and gating on them
+    // rejects windows the intensity gate (and the census cost's own raison
+    // d'etre: low-contrast ground) would keep. Gating on the intensity window
+    // keeps one meaning for both costs. The intensity image is still alive here
+    // (it is the caller's, or this level's reduced reference) and for zncc it is
+    // the same image the cost reads, so the gate uses it in place either way and
+    // allocates nothing.
+    const std::vector<float>& gate_pixels = reference.image->pixels();
+
     std::vector<float> ref_values(count * si(n_samples), 0.0F);
     {
-        const std::vector<float>& pixels = reference.image->pixels();
+        const std::vector<float>& pixels = ref_pixels->pixels();
         for (int y = interior_y0; y <= interior_y1; ++y) {
             for (int x = interior_x0; x <= interior_x1; ++x) {
                 const std::size_t q = si(y) * si(width) + si(x);
@@ -659,6 +733,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     ctx.ref_values = ref_values.data();
     ctx.bearings = bearings.data();
     ctx.offsets = offsets.data();
+    ctx.cost_scale = options.cost_type == CostType::Census ? kCensusCostScale : 1.0;
     ctx.neighbours = std::move(neighbour_views);
     {
         int k = options.best_k == 0 ? (n_neighbours + 1) / 2 : options.best_k;  // 0 = ceil(n/2)
@@ -674,7 +749,10 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     result.height = height;
     result.depth.assign(count, -1.0F);
     result.normals.assign(count * 3, 0.0F);
-    result.cost.assign(count, static_cast<float>(kNoMatchCost));
+    result.cost.assign(count, static_cast<float>(kNoMatchCost *
+                                                 (options.cost_type == CostType::Census
+                                                      ? kCensusCostScale
+                                                      : 1.0)));
 
     std::vector<std::uint8_t> active(count, 0);
 
@@ -701,11 +779,16 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
             for (int x = interior_x0; x <= interior_x1; ++x) {
                 const std::size_t p = si(y) * si(width) + si(x);
                 fill_window_cache(ctx, local, x, y);
-                // Reference window mean / stddev over the sampled offsets.
-                const float* const ref = local.ref_store.data();
+                // Reference window mean / stddev over the sampled offsets, of the
+                // INTENSITY window (see gate_pixels above), for both cost types.
+                // `local.ref_store` already holds this pixel's window values from
+                // its own image (descriptors for census), so the intensity window
+                // is read from gate_pixels instead.
                 double sum = 0.0, sq = 0.0;
                 for (int k = 0; k < n_samples; ++k) {
-                    const double v = static_cast<double>(ref[si(k)]);
+                    const Eigen::Vector2i off = offsets[si(k)];
+                    const double v = static_cast<double>(
+                        gate_pixels[si(y + off.y()) * si(width) + si(x + off.x())]);
                     sum += v;
                     sq += v * v;
                 }
@@ -959,6 +1042,28 @@ void validate_run(const PMView& reference, const std::vector<PMView>& neighbours
     if (options.pyramid_levels != 1 && options.pyramid_min_size <= 0) {
         throw ValueError("stereo::run_patch_match: pyramid_min_size must be positive");
     }
+    if (options.cost_type == CostType::Census) {
+        if (options.census.window_radius < 1) {
+            throw ValueError("stereo::run_patch_match: census window_radius must be positive");
+        }
+        if (options.census.wide && options.census.window_radius > kCensusMaxRadius) {
+            throw ValueError(
+                "stereo::run_patch_match: a wide census needs census window_radius <= 4 "
+                "(four arms of window_radius comparisons, 16 bits)");
+        }
+        if (!options.census.wide && options.census.window_radius != 1) {
+            throw ValueError(
+                "stereo::run_patch_match: the 3x3 census requires census window_radius == 1");
+        }
+        if (!options.census.transform_neighbours) {
+            // The search correlates the reference window against each neighbour,
+            // so both sides must be descriptors. transform_neighbours=false is a
+            // reference-only mode for callers computing a mask; it is not a
+            // valid search configuration.
+            throw ValueError(
+                "stereo::run_patch_match: the census cost requires census.transform_neighbours");
+        }
+    }
 }
 
 }  // namespace
@@ -968,6 +1073,21 @@ std::vector<int> patch_match_iteration_plan(int width, int height,
     const int levels = pyramid_level_count(width, height, options.pyramid_levels,
                                            options.pyramid_min_size, options.window_radius);
     return pyramid_iterations(levels, options.iterations);
+}
+
+double patch_match_default_max_cost(CostType type) {
+    // Each cost is (1 - ZNCC) on its own interval: intensity in [0, 2], census
+    // (1 - ZNCC) / 2 in [0, 1]. Both defaults sit above that interval's chance
+    // value (1.0 and 0.5 respectively, where the correlation is zero), so a
+    // non-match never passes the cut on its own. The census descriptor is
+    // coarser than 8-bit intensity, so an otherwise-correct pixel correlates a
+    // little less sharply and its true-plane cost sits slightly higher (measured
+    // ~0.03 against the intensity cost's ~0.01 on the noisy plane fixture, on
+    // the census cost's own halved scale). The census default is therefore the
+    // more permissive 0.6: still above the 0.5 chance level, and below the 1.0
+    // rejection sentinel, which leaves room above the descriptor's higher
+    // correct-match floor.
+    return type == CostType::Census ? 0.6 : 0.5;
 }
 
 PatchMatchResult run_patch_match(const PMView& reference, const std::vector<PMView>& neighbours,

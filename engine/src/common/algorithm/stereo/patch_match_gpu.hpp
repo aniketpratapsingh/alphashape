@@ -6,6 +6,12 @@
 // accepted gpu:: layer when a device is available and enabled, with an
 // automatic per-image CPU fallback. See patch_match_gpu.cpp for the scheme.
 //
+// Cost types: the kernels implement the ZNCC cost only. A census run is
+// declined before anything is dispatched (the per-view descriptor buffer would
+// exceed the kernels' binding budget, see fits_kernel_limits()) and answered by
+// the CPU implementation, so patch_match_gpu_supported() and
+// patch_match_gpu_would_run() are false for CostType::Census by design.
+//
 // The search itself is the published red-black checkerboard propagation of
 // Galliani, Lasinger and Schindler (2015), "Massively parallel multiview
 // stereopsis by surface normal diffusion": each half-sweep updates one colour

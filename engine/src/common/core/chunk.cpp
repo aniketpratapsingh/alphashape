@@ -344,6 +344,21 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
         if (context->pyramid_levels > 1) {
             h = fold_int(h, context->pyramid_levels);
         }
+        // The photometric cost. Folded only when it is not the historic one, so
+        // a map built before the cost was selectable (which recorded nothing
+        // here, i.e. 0 = zncc) keeps matching a zncc run.
+        if (context->cost_type != 0) {
+            h = fold_int(h, context->cost_type);
+        }
+        // The effective max_cost decides which pixels keep a depth, so it is part
+        // of the map's identity. Folded only when it is not the historic zncc
+        // default (0.5): a map built before the cut was configurable ran zncc at
+        // 0.5 and recorded nothing here, so it must keep matching a zncc run that
+        // leaves the default alone. Folded as the exact double bits, because the
+        // value round-trips through the project writer unchanged.
+        if (context->max_cost != 0.5) {
+            h = fold_double(h, context->max_cost);
+        }
         h = fold_int(h, static_cast<std::int64_t>(context->seed));
     }
 

@@ -155,6 +155,40 @@ fixed rather than being silently adopted as the new normal.
 The first run of a dataset has no baseline, so it always passes and simply establishes
 one.
 
+### Measuring a non-default configuration
+
+The on-demand run also takes an optional `depth_params` input: extra `BuildDepthMaps`
+keyword arguments, space separated, e.g. `cost_type=census`. It exists so a change to a
+depth-map parameter can be measured on the same dataset as a control run, which is the
+only way to answer "is this better" with evidence rather than an argument.
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=aerial-nadir -f depth_params=cost_type=census
+```
+
+The parameters are merged over the dataset's own `BuildDepthMaps` overrides, so the
+measured `downscale` of the control run is kept and the two runs stay comparable. They are
+validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and
+reach the script through an environment variable, never interpolated into a shell line.
+
+Such a run is an **experiment**, and differs from a normal run in three ways:
+
+- it is **never published as the baseline**, so the following week's run still compares
+  against the last control run;
+- it **never fails the regression gate** — its report names every metric that moved, but a
+  red check on "the experiment was worse this week" would block the branch being evaluated
+  rather than inform it;
+- its verdict reads `experiment` rather than `pass`, and the report says so above the
+  numbers.
+
+An experimental baseline is also refused on the way in: when the newest successful runs
+have no baseline artifact the lookup walks back to one that does, and a restored baseline
+that itself records `depth_params` is only ever compared against, never gated on.
+
+Every scheduled, push and ordinary manual run passes an empty string, which is the same
+argv and the same metrics JSON as before this input existed.
+
 ## The datasets
 
 | Name | Flight | Images | Reference products | Licence |

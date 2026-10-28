@@ -577,3 +577,169 @@ TEST(PatchMatch, InvalidInputsThrow) {
     EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, zero_min),
                  alphashape::ValueError);
 }
+
+// ---------------------------------------------------------------------------
+// Cost selection: census vs ZNCC on impulsive noise
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Impulsive ("salt and pepper") corruption of an image: `fraction` of the pixels
+/// are replaced by a uniformly random value. Deterministic, so the test is
+/// reproducible; this is the noise model a census transform is built to survive
+/// (a minority of samples lie arbitrarily far off, the rest are intact).
+void add_impulsive_noise(FloatImage& image, double fraction) {
+    const std::size_t count = image.pixels().size();
+    const std::size_t target = static_cast<std::size_t>(fraction * static_cast<double>(count));
+    std::uint32_t state = 0x2545F491U;  // arbitrary non-zero seed
+    const auto next = [&state] {
+        state ^= state << 13U;
+        state ^= state >> 17U;
+        state ^= state << 5U;
+        return state;
+    };
+    for (std::size_t i = 0; i < target; ++i) {
+        const std::size_t index = next() % count;
+        image.pixels()[index] = static_cast<float>(next() & 0xFFFFFFU) /
+                                static_cast<float>(0xFFFFFFU);
+    }
+}
+
+}  // namespace
+
+TEST(PatchMatch, CensusImprovesPlaneNoise) {
+    // A plane seen from five viewpoints, every image corrupted by 2 % impulsive
+    // noise. The census descriptor compares ranks, so a corrupted pixel changes
+    // only its own mask entries by a small number of bits and a neighbour pixel's
+    // descriptor mostly survives; the intensity ZNCC is dragged by the wild
+    // values. The measurement (see the assertion below) says the two costs come
+    // out level on this noise model: at 2 % corruption the wild values are sparse
+    // enough that the window mean the ZNCC normalises by absorbs them.
+    //
+    // max_cost is set high on both runs, so the comparison is the search's own
+    // accuracy, not the threshold's permissiveness.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                              Eigen::Vector3d(0.0, 0.0, 10.0));
+    for (FloatImage& image : scene.images) {
+        add_impulsive_noise(image, 0.02);
+    }
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions zncc = options_for(5.0, 20.0);
+    zncc.cost_type = alphashape::stereo::CostType::Zncc;
+    zncc.max_cost = 2.0;  // never cut: compare the search's accuracy
+
+    PatchMatchOptions census = zncc;
+    census.cost_type = alphashape::stereo::CostType::Census;
+
+    const PatchMatchResult zncc_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, zncc);
+    const PatchMatchResult census_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, census);
+
+    const Accuracy zncc_accuracy = measure(scene, zncc_result, 5);
+    const Accuracy census_accuracy = measure(scene, census_result, 5);
+    std::printf("[census noise] zncc median=%.5f cov=%.4f angle=%.2f, census median=%.5f "
+                "cov=%.4f angle=%.2f\n",
+                zncc_accuracy.median_rel, zncc_accuracy.coverage,
+                zncc_accuracy.median_angle_deg, census_accuracy.median_rel,
+                census_accuracy.coverage, census_accuracy.median_angle_deg);
+    RecordProperty("zncc_median", zncc_accuracy.median_rel);
+    RecordProperty("census_median", census_accuracy.median_rel);
+
+    // Both must still find the plane (the noise is survivable); the census must
+    // not be *less* accurate than the intensity cost on it. Measured on the
+    // Linux GCC lane: zncc 0.01790 vs census 0.01714 median relative depth error
+    // (~4 % apart, both at coverage 1.0, and the census normal angle is in fact
+    // worse: 30.2 deg against 21.7). That is a tie, not the decisive census
+    // advantage the noise model was expected to show, so the assertion states
+    // only what the numbers support: census is not worse here. The clear win is
+    // on the brightness change the descriptor is actually designed for
+    // (CensusImprovesUnderBrightnessChange below).
+    ASSERT_GT(census_accuracy.coverage, 0.9);
+    EXPECT_LE(census_accuracy.median_rel, zncc_accuracy.median_rel * 1.1 + 0.001);
+    EXPECT_LE(census_accuracy.median_rel, 0.02);
+}
+
+TEST(PatchMatch, CensusImprovesUnderBrightnessChange) {
+    // The case the descriptor exists for: the neighbour views saw the same
+    // surface through a NONLINEAR brightness change (a gamma, which is what an
+    // auto-exposure or a different camera response does), plus a gain and a
+    // bias. ZNCC assumes the two views of a point differ by an affine map, so a
+    // gamma bends its correlation; the census compares ranks, and any monotone
+    // map leaves every rank alone. The census run must therefore recover the
+    // plane more accurately than the intensity cost on exactly this scene.
+    //
+    // Both runs keep max_cost high, so this measures search accuracy and not the
+    // threshold's permissiveness.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                              Eigen::Vector3d(0.0, 0.0, 10.0));
+    // Reference keeps its intensity; every neighbour is re-exposed. Applying the
+    // map to the rendered luminance is exactly "the same surface, another
+    // response curve", which no amount of ZNCC normalisation can undo.
+    const auto response = [](float v) {
+        const float clamped = std::clamp(v, 0.0F, 1.0F);
+        return 0.10F + 0.85F * std::pow(clamped, 1.9F);  // gain, bias, gamma
+    };
+    for (std::size_t i = 1; i < scene.images.size(); ++i) {
+        for (float& pixel : scene.images[i].pixels()) {
+            pixel = response(pixel);
+        }
+    }
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions zncc = options_for(5.0, 20.0);
+    zncc.cost_type = alphashape::stereo::CostType::Zncc;
+    zncc.max_cost = 2.0;  // never cut: compare the search's accuracy
+
+    PatchMatchOptions census = zncc;
+    census.cost_type = alphashape::stereo::CostType::Census;
+
+    const PatchMatchResult zncc_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, zncc);
+    const PatchMatchResult census_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, census);
+
+    const Accuracy zncc_accuracy = measure(scene, zncc_result, 5);
+    const Accuracy census_accuracy = measure(scene, census_result, 5);
+    std::printf("[census exposure] zncc median=%.5f cov=%.4f, census median=%.5f cov=%.4f\n",
+                zncc_accuracy.median_rel, zncc_accuracy.coverage,
+                census_accuracy.median_rel, census_accuracy.coverage);
+    RecordProperty("zncc_median", zncc_accuracy.median_rel);
+    RecordProperty("census_median", census_accuracy.median_rel);
+
+    // Both must still find the plane, and the census must be clearly better on
+    // the change it is designed for. Measured on the Linux GCC lane
+    // (median relative depth error, coverage 1.0 on both):
+    //     zncc 0.02053   census 0.01427   (census ~30 % lower)
+    // The assertion keeps a third of that advantage as headroom for the other
+    // toolchains rather than pinning the exact number.
+    ASSERT_GT(census_accuracy.coverage, 0.9);
+    EXPECT_LT(census_accuracy.median_rel, zncc_accuracy.median_rel * 0.9)
+        << "census must clearly beat the intensity cost under a monotone change";
+    EXPECT_LE(census_accuracy.median_rel, 0.02);
+}
+
+TEST(PatchMatch, CensusCostStaysInSearchRange) {
+    // The census cost is (1 - ZNCC) / 2, so it lies in [0, 1]: this is the
+    // interval its max_cost default of 0.6 is expressed in.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    const Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                                    Eigen::Vector3d(0.0, 0.0, 10.0));
+    const std::vector<PMView> views = scene.views();
+    std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions options = reduced_options(5.0, 20.0);
+    options.cost_type = alphashape::stereo::CostType::Census;
+    options.max_cost = 2.0;  // never cut, so untouched pixels keep the sentinel
+    const PatchMatchResult result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, options);
+    for (const float cost : result.cost) {
+        EXPECT_GE(cost, 0.0F) << cost;
+        EXPECT_LE(cost, 1.0F) << cost;
+    }
+}

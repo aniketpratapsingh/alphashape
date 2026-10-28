@@ -16,10 +16,12 @@ import hashlib
 import io
 import json
 import os
+import ssl
 import struct
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -209,16 +211,16 @@ class VerifyTest(unittest.TestCase):
             remote = self._remote(payload)
             # Pretend the download fails, so the point is that the stale file is
             # gone rather than that the new one arrived.
-            with self.assertRaises(Exception), redirect_stdout(io.StringIO()):
-                run_bench.download(remote, destination)
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(remote, destination, attempts=1, backoff_s=0)
             self.assertFalse(destination.exists())
 
     def test_a_hash_mismatch_is_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "file.zip"
             remote = run_bench.RemoteFile("https://example.invalid/x", "0" * 64, 3)
-            with self.assertRaises(Exception), redirect_stdout(io.StringIO()):
-                run_bench.download(remote, destination)
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(remote, destination, attempts=1, backoff_s=0)
 
     def test_the_hash_of_a_known_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,6 +230,151 @@ class VerifyTest(unittest.TestCase):
                 run_bench.sha256_file(path),
                 hashlib.sha256(b"abc").hexdigest(),
             )
+
+
+class DownloadRetryTest(unittest.TestCase):
+    """The retry loop around ``_fetch_once``.
+
+    The failures these cover are the ones three CI runs actually hit: a dropped TLS
+    stream (``ssl.SSLEOFError`` wrapped in ``URLError``) on a big archive. The loop
+    is driven directly with a stub fetch, so no network is involved and the backoff
+    is zero.
+    """
+
+    def _remote(self, payload: bytes, url: str = "https://example.invalid/file") -> run_bench.RemoteFile:
+        return run_bench.RemoteFile(url, hashlib.sha256(payload).hexdigest(), len(payload))
+
+    def _with_fetch(self, fetch):
+        original = run_bench._fetch_once
+        run_bench._fetch_once = fetch
+        self.addCleanup(setattr, run_bench, "_fetch_once", original)
+
+    def test_a_transient_failure_is_retried_and_then_succeeds(self):
+        payload = b"a payload that arrives on the second try"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.URLError(
+                    ssl.SSLEOFError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+                )
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(len(calls), 2)
+
+    def test_a_non_transient_http_error_is_not_retried(self):
+        payload = b"x"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(remote.url, 403, "Forbidden", {}, None)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(len(calls), 1)
+
+    def test_a_server_error_is_retried_until_the_attempts_run_out(self):
+        payload = b"y"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(remote.url, 503, "Service Unavailable", {}, None)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with self.assertRaises(SystemExit) as caught, redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=3, backoff_s=0)
+            self.assertEqual(len(calls), 3)
+            self.assertIn("3 attempts", str(caught.exception))
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_suffix(".zip.part").exists())
+
+    def test_a_short_body_resumes_instead_of_restarting(self):
+        payload = b"0123456789"
+        seen = []
+
+        def fetch(remote, tmp, **kwargs):
+            # Emulate a transfer that ends early, then a resume that completes it.
+            have = tmp.stat().st_size if tmp.exists() else 0
+            seen.append(have)
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "ab") as out:
+                out.write(payload[have:])
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            # First attempt writes only half; the loop must keep the bytes.
+            calls = {"n": 0}
+            original = fetch
+
+            def half_then_full(remote, tmp, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    tmp.write_bytes(payload[:5])
+                    return
+                original(remote, tmp, **kwargs)
+
+            run_bench._fetch_once = half_then_full
+            try:
+                with redirect_stdout(io.StringIO()):
+                    run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            finally:
+                run_bench._fetch_once = original
+            self.assertEqual(destination.read_bytes(), payload)
+            # The second attempt saw the five bytes the first one left behind.
+            self.assertEqual(seen, [5])
+
+    def test_an_unexpected_partial_with_a_bad_hash_is_discarded_before_retrying(self):
+        payload = b"the good payload"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                tmp.write_bytes(b"the bad payload!")  # right length, wrong bytes
+                return
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(len(calls), 2)
+
+    def test_a_range_not_satisfiable_response_restarts_from_zero(self):
+        payload = b"restart me"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                # A stale .part whose length equals the whole file.
+                tmp.write_bytes(b"x" * len(payload))
+                raise urllib.error.HTTPError(remote.url, 416, "Range Not Satisfiable", {}, None)
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
 
 
 class ExtractTest(unittest.TestCase):
@@ -717,6 +864,161 @@ class CliValueTest(unittest.TestCase):
 
     def test_a_string_passes_through(self):
         self.assertEqual(run_bench.cli_value("source"), "source")
+
+
+class DepthParamsTest(unittest.TestCase):
+    """The dispatch string is untrusted text; it is validated before it is an argv."""
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_depth_params(""), {})
+        self.assertEqual(run_bench.parse_depth_params(None), {})
+        self.assertEqual(run_bench.parse_depth_params("   "), {})
+
+    def test_a_single_pair(self):
+        self.assertEqual(run_bench.parse_depth_params("cost_type=census"), {"cost_type": "census"})
+
+    def test_several_pairs_are_split_on_whitespace(self):
+        self.assertEqual(
+            run_bench.parse_depth_params("  cost_type=census   max_cost=0.4\nmax_neighbors=8 "),
+            {"cost_type": "census", "max_cost": "0.4", "max_neighbors": "8"},
+        )
+
+    def test_a_negative_and_a_decimal_value_are_admitted(self):
+        parsed = run_bench.parse_depth_params("max_cost=-1 downscale=8 filter_mode=disabled")
+        self.assertEqual(parsed["max_cost"], "-1")
+        self.assertEqual(parsed["downscale"], "8")
+        self.assertEqual(parsed["filter_mode"], "disabled")
+
+    def test_a_token_without_an_equals_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("cost_type")
+
+    def test_an_empty_key_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("=census")
+
+    def test_an_empty_value_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("cost_type=")
+
+    def test_an_uppercase_or_dashed_key_is_rejected(self):
+        for token in ("CostType=census", "cost-type=census", "cost$type=census"):
+            with self.assertRaises(run_bench.DepthParamError, msg=token):
+                run_bench.parse_depth_params(token)
+
+    def test_a_value_with_shell_or_json_metacharacters_is_rejected(self):
+        # These have no legitimate use and are exactly what would be dangerous if
+        # the string were ever handed to a shell.
+        for token in ("cost_type=cen;sus", 'cost_type="census"', "cost_type=$(id)",
+                      "cost_type=census|cat", "cost_type=census&x"):
+            with self.assertRaises(run_bench.DepthParamError, msg=token):
+                run_bench.parse_depth_params(token)
+
+    def test_a_repeated_key_is_rejected(self):
+        # Not "last wins": a repeated key is more likely a typo than a deliberate
+        # override, and silently choosing one would make the record a lie.
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("max_cost=0.4 max_cost=0.5")
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "aerial-nadir", "--list", "--depth-params", "oops"])
+
+    def test_the_command_line_accepts_a_good_string(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = run_bench.main(
+                ["--dataset", "aerial-nadir", "--list", "--depth-params", "cost_type=census"]
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("CC-BY-4.0", out.getvalue())
+
+
+class DepthParamMergeTest(unittest.TestCase):
+    """The dispatch parameters are merged over the dataset's manifest overrides."""
+
+    def dataset(self):
+        return run_bench.load_manifest()["datasets"]["aerial-nadir"]
+
+    def test_a_parameter_is_added_to_build_depth_maps(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["cost_type"], "census")
+
+    def test_the_dataset_s_own_overrides_survive_the_merge(self):
+        # The experiment has to stay comparable with the control, so the dataset's
+        # measured downscale must not be lost just because a new key was given.
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], 8)
+        self.assertEqual(merged["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], 250)
+
+    def test_a_parameter_overrides_the_manifest_value_of_the_same_name(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"downscale": "4"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], "4")
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        original = self.dataset()
+        self.assertEqual(run_bench.merge_depth_params(original, {}), original)
+
+    def test_the_input_dataset_is_not_mutated(self):
+        original = self.dataset()
+        before = json.dumps(original, sort_keys=True)
+        run_bench.merge_depth_params(original, {"cost_type": "census"})
+        self.assertEqual(json.dumps(original, sort_keys=True), before)
+
+    def test_the_manifest_is_not_mutated(self):
+        before = json.dumps(run_bench.load_manifest(), sort_keys=True)
+        run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(json.dumps(run_bench.load_manifest(), sort_keys=True), before)
+
+    def test_a_dataset_with_no_depth_overrides_still_gets_a_task_entry(self):
+        merged = run_bench.merge_depth_params({"param_overrides": {}}, {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"], {"BuildDepthMaps": {"cost_type": "census"}})
+
+
+class IsExperimentTest(unittest.TestCase):
+    """The workflow's one definition of "is this a control run"."""
+
+    def status(self, payload):
+        import tempfile
+
+        import is_experiment
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(payload, encoding="utf-8")
+            return is_experiment.main([str(path)])
+
+    def test_a_run_without_dispatch_parameters_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"dataset": "x"})), 0)
+
+    def test_an_empty_depth_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"depth_params": {}})), 0)
+
+    def test_a_run_with_dispatch_parameters_is_an_experiment(self):
+        self.assertEqual(self.status(json.dumps({"depth_params": {"cost_type": "census"}})), 1)
+
+    def test_a_missing_file_cannot_tell(self):
+        import is_experiment
+
+        self.assertEqual(is_experiment.main(["/nonexistent/metrics.json"]), 2)
+
+    def test_malformed_json_cannot_tell(self):
+        self.assertEqual(self.status("{not json"), 2)
+
+    def test_a_json_array_cannot_tell(self):
+        self.assertEqual(self.status("[]"), 2)
+
+    def test_no_argument_cannot_tell(self):
+        import is_experiment
+
+        self.assertEqual(is_experiment.main([]), 2)
 
 
 class PipelineShapeTest(unittest.TestCase):

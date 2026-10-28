@@ -44,6 +44,7 @@
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
+#include "common/algorithm/stereo/patch_match.hpp"
 #include "common/algorithm/stereo/view_selection.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
@@ -1492,6 +1493,101 @@ TEST(DepthMapsReuse, FingerprintCoversTheNeighbourhood) {
 
     // Never the "unknown" sentinel, whatever the input.
     EXPECT_NE(h, 0U);
+}
+
+TEST(DepthMapsReuse, ChangingMaxCostInvalidatesTheMaps) {
+    // max_cost decides which pixels survive the final cut, so it is part of a
+    // map's identity: a run with a different threshold must re-search rather than
+    // adopt maps whose holes are at the wrong level.
+    Document document = aligned_document(seq_files(4));
+    Chunk& chunk = *document.active_chunk();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    const std::size_t map_count = chunk.depth_maps().size();
+    ASSERT_GT(map_count, 0U);
+
+    // A no-op re-run at the default (zncc 0.5) still reuses everything: the
+    // default folds nothing, which is what keeps maps built before the cut was
+    // configurable reusable.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), 0U) << "the default threshold must not invalidate maps";
+
+    // A different threshold is a different map: every camera re-searches.
+    {
+        Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+        params.set("max_cost", ParamValue{0.9});
+        reset_depth_map_search_count();
+        run_task(builtin_registry(), document, "BuildDepthMaps", params);
+    }
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "changing max_cost must rebuild every map";
+
+    // And going back to the default rebuilds them again, because the stored maps
+    // now carry the 0.9 threshold.
+    reset_depth_map_search_count();
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "a map built at another max_cost must not be served to the default run";
+}
+
+TEST(DepthMapsReuse, FingerprintCoversTheEffectiveMaxCost) {
+    // The final cut decides which pixels keep a depth, so a run that differs only
+    // in max_cost holds a different map. The field is folded only when it is not
+    // the historic zncc default (0.5), which keeps every map built before the cut
+    // became configurable reusable by a zncc run that leaves the default alone.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    const Camera& camera = chunk.cameras().front();
+    const Sensor& sensor = chunk.sensors().front();
+
+    DepthMapFingerprintContext context;
+    context.max_neighbors = 16;
+    context.neighbour_ids = {1, 2};
+    context.neighbour_poses = {chunk.cameras()[1].pose, chunk.cameras()[2].pose};
+    context.neighbour_calibrations = {sensor.calibration, sensor.calibration};
+    context.depth_min = 5.0;
+    context.depth_max = 40.0;
+    context.image_path = "photos/a.jpg";
+    context.image_size = 1234;
+    context.image_mtime = 5678;
+    context.window_radius = 5;
+    context.window_step = 2;
+    context.iterations = 6;
+    context.seed = 42;
+
+    // A zncc run at the default threshold: 0.5 folds nothing, so the hash is the
+    // "no max_cost recorded" hash -- what a map saved before the field existed
+    // carries, and what keeps such a map reusable.
+    ASSERT_DOUBLE_EQ(context.max_cost, 0.5) << "the context's default must be the zncc one";
+    const std::uint64_t default_hash =
+        depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &context);
+    // A map saved before max_cost was recorded carries nothing for it, which is
+    // the same "zncc at 0.5" identity: it must still be reused.
+    DepthMapFingerprintContext legacy = context;
+    legacy.cost_type = 0;  // no cost type recorded either: the oldest maps
+    EXPECT_EQ(default_hash,
+              depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &legacy));
+
+    // Any other threshold is a different map.
+    DepthMapFingerprintContext permissive = context;
+    permissive.max_cost = 0.6;
+    EXPECT_NE(default_hash,
+              depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &permissive));
+    DepthMapFingerprintContext strict = context;
+    strict.max_cost = 0.4;
+    EXPECT_NE(default_hash,
+              depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &strict));
+    EXPECT_NE(depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &permissive),
+              depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &strict));
+
+    // A census run resolves to its own default (0.6), which is folded -- so a
+    // census map is never confused with a zncc one even at the same nominal
+    // "default" setting.
+    DepthMapFingerprintContext census = context;
+    census.cost_type = 1;
+    census.max_cost = stereo::patch_match_default_max_cost(stereo::CostType::Census);
+    EXPECT_NE(default_hash,
+              depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &census));
 }
 
 TEST(DepthMapsReuse, FingerprintCoversThePyramidLevelCount) {

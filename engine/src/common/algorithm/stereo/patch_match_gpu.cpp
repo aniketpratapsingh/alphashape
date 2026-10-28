@@ -214,11 +214,43 @@ void validate_inputs(const PMView& reference, const std::vector<PMView>& neighbo
     if (options.pyramid_levels != 1 && options.pyramid_min_size <= 0) {
         throw ValueError("stereo::run_patch_match: pyramid_min_size must be positive");
     }
+    if (options.cost_type == CostType::Census) {
+        if (options.census.window_radius < 1) {
+            throw ValueError("stereo::run_patch_match: census window_radius must be positive");
+        }
+        if (options.census.wide && options.census.window_radius > kCensusMaxRadius) {
+            throw ValueError(
+                "stereo::run_patch_match: a wide census needs census window_radius <= 4 "
+                "(four arms of window_radius comparisons, 16 bits)");
+        }
+        if (!options.census.wide && options.census.window_radius != 1) {
+            throw ValueError(
+                "stereo::run_patch_match: the 3x3 census requires census window_radius == 1");
+        }
+        if (!options.census.transform_neighbours) {
+            throw ValueError(
+                "stereo::run_patch_match: the census cost requires census.transform_neighbours");
+        }
+    }
 }
 
 /// True when one image and its neighbour list fit the kernel limits.
+///
+/// The census cost is declined here rather than implemented: the descriptors are
+/// another whole-image buffer per view, which would take the kernel from 14
+/// storage-buffer bindings to 16 and put pm_init/pm_refine over the binding
+/// budget the Vulkan layer guarantees (the spec's own risk note leaves the
+/// decision to WP-17.15). Recomputing the descriptor inline instead would mean
+/// 16 extra image loads per window sample per neighbour -- a multiple of the
+/// cost core's work, on shaders that must stay at -O0 to agree with the CPU.
+/// Both are worse than running census on the CPU, so the GPU declines and the
+/// caller falls back with the log below (a decline is not a device failure:
+/// nothing is dispatched and gpu::failure_count() is not advanced).
 bool fits_kernel_limits(const PMView& reference, const std::vector<PMView>& neighbours,
                         const PatchMatchOptions& options) {
+    if (options.cost_type == CostType::Census) {
+        return false;
+    }
     if (reference.image == nullptr || neighbours.empty()) {
         return false;
     }
@@ -740,6 +772,20 @@ PatchMatchResult run_patch_match_device(const PMView& reference,
                                         const std::vector<PMView>& neighbours,
                                         const PatchMatchOptions& options) {
     validate_inputs(reference, neighbours, options);
+    // The census decline is a decision, not a failure: it is explained once per
+    // process (a per-map line on a 300-camera block would drown the log) and
+    // never counted, because nothing was dispatched.
+    if (options.cost_type == CostType::Census) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            log(LogLevel::Info)
+                << "PatchMatch: the census cost runs on the CPU (the GPU kernels' "
+                   "binding budget cannot hold a per-view census buffer); "
+                << (g::available() && g::enabled() ? "the device is left unused for this stage"
+                                                  : "no GPU is in use anyway");
+        }
+        return run_patch_match(reference, neighbours, options);
+    }
     const bool gpu_ok = fits_kernel_limits(reference, neighbours, options);
     if (!gpu_ok) {
         return run_patch_match(reference, neighbours, options);
