@@ -612,8 +612,9 @@ TEST(PatchMatch, CensusImprovesPlaneNoise) {
     // noise. The census descriptor compares ranks, so a corrupted pixel changes
     // only its own mask entries by a small number of bits and a neighbour pixel's
     // descriptor mostly survives; the intensity ZNCC is dragged by the wild
-    // values. The census run must recover the plane at a smaller depth error and
-    // a comparable coverage -- what "fewer holes" means in practice.
+    // values. The measurement (see the assertion below) says the two costs come
+    // out level on this noise model: at 2 % corruption the wild values are sparse
+    // enough that the window mean the ZNCC normalises by absorbs them.
     //
     // max_cost is set high on both runs, so the comparison is the search's own
     // accuracy, not the threshold's permissiveness.
@@ -649,9 +650,16 @@ TEST(PatchMatch, CensusImprovesPlaneNoise) {
     RecordProperty("census_median", census_accuracy.median_rel);
 
     // Both must still find the plane (the noise is survivable); the census must
-    // not be *less* accurate than the intensity cost on it.
+    // not be *less* accurate than the intensity cost on it. Measured on the
+    // Linux GCC lane: zncc 0.01790 vs census 0.01714 median relative depth error
+    // (~4 % apart, both at coverage 1.0, and the census normal angle is in fact
+    // worse: 30.2 deg against 21.7). That is a tie, not the decisive census
+    // advantage the noise model was expected to show, so the assertion states
+    // only what the numbers support: census is not worse here. The clear win is
+    // on the brightness change the descriptor is actually designed for
+    // (CensusImprovesUnderBrightnessChange below).
     ASSERT_GT(census_accuracy.coverage, 0.9);
-    EXPECT_LE(census_accuracy.median_rel, zncc_accuracy.median_rel * 1.5 + 0.002);
+    EXPECT_LE(census_accuracy.median_rel, zncc_accuracy.median_rel * 1.1 + 0.001);
     EXPECT_LE(census_accuracy.median_rel, 0.02);
 }
 
@@ -704,12 +712,15 @@ TEST(PatchMatch, CensusImprovesUnderBrightnessChange) {
     RecordProperty("zncc_median", zncc_accuracy.median_rel);
     RecordProperty("census_median", census_accuracy.median_rel);
 
-    // Both must still find the plane; the census must be at least as good as the
-    // intensity cost on the change it is designed for. The margin is tightened
-    // once the measurement in this lane is known (see the printf above and the
-    // PR); the assertion here is the honest floor, not a guess.
+    // Both must still find the plane, and the census must be clearly better on
+    // the change it is designed for. Measured on the Linux GCC lane
+    // (median relative depth error, coverage 1.0 on both):
+    //     zncc 0.02053   census 0.01427   (census ~30 % lower)
+    // The assertion keeps a third of that advantage as headroom for the other
+    // toolchains rather than pinning the exact number.
     ASSERT_GT(census_accuracy.coverage, 0.9);
-    EXPECT_LE(census_accuracy.median_rel, zncc_accuracy.median_rel * 1.5 + 0.002);
+    EXPECT_LT(census_accuracy.median_rel, zncc_accuracy.median_rel * 0.9)
+        << "census must clearly beat the intensity cost under a monotone change";
     EXPECT_LE(census_accuracy.median_rel, 0.02);
 }
 
