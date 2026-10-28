@@ -671,7 +671,8 @@ TEST(PatchMatch, CensusCostStaysInUnitRange) {
     const PatchMatchResult result =
         alphashape::stereo::run_patch_match(views[0], neighbours, options);
     for (const float cost : result.cost) {
+        // A real census cost is in [0, 1]; the search's rejection sentinel is 2.0.
         EXPECT_GE(cost, 0.0F);
-        EXPECT_LE(cost, 1.0F);
+        EXPECT_TRUE(cost <= 1.0F || cost == 2.0F) << cost;
     }
 }
