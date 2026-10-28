@@ -16,10 +16,12 @@ import hashlib
 import io
 import json
 import os
+import ssl
 import struct
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -209,16 +211,16 @@ class VerifyTest(unittest.TestCase):
             remote = self._remote(payload)
             # Pretend the download fails, so the point is that the stale file is
             # gone rather than that the new one arrived.
-            with self.assertRaises(Exception), redirect_stdout(io.StringIO()):
-                run_bench.download(remote, destination)
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(remote, destination, attempts=1, backoff_s=0)
             self.assertFalse(destination.exists())
 
     def test_a_hash_mismatch_is_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "file.zip"
             remote = run_bench.RemoteFile("https://example.invalid/x", "0" * 64, 3)
-            with self.assertRaises(Exception), redirect_stdout(io.StringIO()):
-                run_bench.download(remote, destination)
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(remote, destination, attempts=1, backoff_s=0)
 
     def test_the_hash_of_a_known_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,6 +230,151 @@ class VerifyTest(unittest.TestCase):
                 run_bench.sha256_file(path),
                 hashlib.sha256(b"abc").hexdigest(),
             )
+
+
+class DownloadRetryTest(unittest.TestCase):
+    """The retry loop around ``_fetch_once``.
+
+    The failures these cover are the ones three CI runs actually hit: a dropped TLS
+    stream (``ssl.SSLEOFError`` wrapped in ``URLError``) on a big archive. The loop
+    is driven directly with a stub fetch, so no network is involved and the backoff
+    is zero.
+    """
+
+    def _remote(self, payload: bytes, url: str = "https://example.invalid/file") -> run_bench.RemoteFile:
+        return run_bench.RemoteFile(url, hashlib.sha256(payload).hexdigest(), len(payload))
+
+    def _with_fetch(self, fetch):
+        original = run_bench._fetch_once
+        run_bench._fetch_once = fetch
+        self.addCleanup(setattr, run_bench, "_fetch_once", original)
+
+    def test_a_transient_failure_is_retried_and_then_succeeds(self):
+        payload = b"a payload that arrives on the second try"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.URLError(
+                    ssl.SSLEOFError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+                )
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(len(calls), 2)
+
+    def test_a_non_transient_http_error_is_not_retried(self):
+        payload = b"x"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(remote.url, 403, "Forbidden", {}, None)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(len(calls), 1)
+
+    def test_a_server_error_is_retried_until_the_attempts_run_out(self):
+        payload = b"y"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(remote.url, 503, "Service Unavailable", {}, None)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with self.assertRaises(SystemExit) as caught, redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=3, backoff_s=0)
+            self.assertEqual(len(calls), 3)
+            self.assertIn("3 attempts", str(caught.exception))
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_suffix(".zip.part").exists())
+
+    def test_a_short_body_resumes_instead_of_restarting(self):
+        payload = b"0123456789"
+        seen = []
+
+        def fetch(remote, tmp, **kwargs):
+            # Emulate a transfer that ends early, then a resume that completes it.
+            have = tmp.stat().st_size if tmp.exists() else 0
+            seen.append(have)
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "ab") as out:
+                out.write(payload[have:])
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            # First attempt writes only half; the loop must keep the bytes.
+            calls = {"n": 0}
+            original = fetch
+
+            def half_then_full(remote, tmp, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    tmp.write_bytes(payload[:5])
+                    return
+                original(remote, tmp, **kwargs)
+
+            run_bench._fetch_once = half_then_full
+            try:
+                with redirect_stdout(io.StringIO()):
+                    run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            finally:
+                run_bench._fetch_once = original
+            self.assertEqual(destination.read_bytes(), payload)
+            # The second attempt saw the five bytes the first one left behind.
+            self.assertEqual(seen, [5])
+
+    def test_an_unexpected_partial_with_a_bad_hash_is_discarded_before_retrying(self):
+        payload = b"the good payload"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                tmp.write_bytes(b"the bad payload!")  # right length, wrong bytes
+                return
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(len(calls), 2)
+
+    def test_a_range_not_satisfiable_response_restarts_from_zero(self):
+        payload = b"restart me"
+        calls = []
+
+        def fetch(remote, tmp, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                # A stale .part whose length equals the whole file.
+                tmp.write_bytes(b"x" * len(payload))
+                raise urllib.error.HTTPError(remote.url, 416, "Range Not Satisfiable", {}, None)
+            tmp.write_bytes(payload)
+
+        self._with_fetch(fetch)
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "file.zip"
+            with redirect_stdout(io.StringIO()):
+                run_bench.download(self._remote(payload), destination, attempts=4, backoff_s=0)
+            self.assertEqual(destination.read_bytes(), payload)
 
 
 class ExtractTest(unittest.TestCase):

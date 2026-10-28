@@ -29,15 +29,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import struct
 import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -245,13 +249,88 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(remote: RemoteFile, destination: Path) -> None:
+# Dataset mirrors are university and institute hosts, not a CDN: three separate CI
+# runs died mid-download with ``ssl.SSLEOFError``/``URLError`` on a several-hundred
+# MB archive. One dropped connection must not cost the whole job, so a transfer is
+# retried a bounded number of times, with exponential backoff, and RESUMES from the
+# bytes already on disk when the server honours a Range request. The attempt count
+# is a module constant rather than a literal so a test can drive the loop directly.
+DOWNLOAD_ATTEMPTS = 4
+DOWNLOAD_BACKOFF_S = 5.0
+DOWNLOAD_TIMEOUT_S = 120
+
+
+def _is_transient_download_error(error: BaseException) -> bool:
+    """True for a network failure that is worth retrying.
+
+    The distinction is the point: a 403 or a 404 will say the same thing on every
+    attempt, so retrying it only hides the reason behind a delay, while a dropped
+    TLS stream, a reset connection or a read timeout is a mirror having a bad
+    moment and is very likely to succeed immediately after.
+
+    ``urllib`` wraps the low-level SSL error, so the ``URLError`` check covers the
+    ``SSLEOFError`` that broke the last three runs; the raw types are listed as well
+    because ``_fetch_once`` is called directly by the tests.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        # 408 and 429 are "come back later" by definition; 5xx is a broken mirror.
+        return error.code in (408, 429) or 500 <= error.code < 600
+    return isinstance(
+        error,
+        (
+            urllib.error.URLError,
+            ssl.SSLError,
+            http.client.HTTPException,
+            ConnectionError,
+            TimeoutError,
+            socket.timeout,
+        ),
+    )
+
+
+def _fetch_once(remote: RemoteFile, tmp: Path, *, timeout: float = DOWNLOAD_TIMEOUT_S) -> None:
+    """Stream one response into ``tmp``, appending when a partial file exists.
+
+    When ``tmp`` already holds bytes from an interrupted attempt the request asks
+    for the remainder with a Range header. A mirror that ignores the header answers
+    200 with the whole file, which must NOT be appended to the partial bytes — that
+    would produce a corrupt file whose size still looks plausible — so the write
+    mode falls back to truncation in that case. The caller's size and SHA-256 check
+    is what ultimately decides; this function only avoids re-fetching what is
+    already on disk.
+    """
+    have = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"User-Agent": "alphashape-quality-bench/1.0"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    request = urllib.request.Request(remote.url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(tmp, "ab" if have else "wb") as out:
+        # A 206 is the server honouring the Range request; anything else means the
+        # body starts at byte 0 and the partial file has to be discarded.
+        if have and getattr(response, "status", 0) != 206:
+            out.seek(0)
+            out.truncate()
+        shutil.copyfileobj(response, out, length=1 << 20)
+
+
+def download(
+    remote: RemoteFile,
+    destination: Path,
+    *,
+    attempts: int = DOWNLOAD_ATTEMPTS,
+    backoff_s: float = DOWNLOAD_BACKOFF_S,
+) -> None:
     """Fetch ``remote`` to ``destination``, verifying size and hash.
 
     A file already present with the right hash is left alone, which is what makes
     a cached work directory cheap. A file with the right size but the wrong hash
     is deleted rather than overwritten in place, so a subsequent run re-downloads
     instead of hashing a corrupt cache every time.
+
+    A failed transfer is retried up to ``attempts`` times with exponential backoff
+    and, where the server allows it, resumed rather than restarted. Every attempt
+    is verified the same way, so a resume that silently produced a wrong file is
+    caught exactly like a fresh download would be.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -265,29 +344,58 @@ def download(remote: RemoteFile, destination: Path) -> None:
     print(f"  download {remote.url}")
     print(f"           -> {destination} ({remote.bytes:,} bytes)")
     tmp = destination.with_suffix(destination.suffix + ".part")
-    request = urllib.request.Request(
-        remote.url, headers={"User-Agent": "alphashape-quality-bench/1.0"}
-    )
     started = time.monotonic()
-    with urllib.request.urlopen(request, timeout=120) as response, open(tmp, "wb") as out:
-        shutil.copyfileobj(response, out, length=1 << 20)
-    elapsed = time.monotonic() - started
+    reason = "no attempt was made"
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            delay = backoff_s * (2 ** (attempt - 2))
+            print(f"  retry    {destination.name}: {reason}; attempt {attempt}/{attempts} in {delay:.0f} s")
+            time.sleep(delay)
+        # A complete-but-unverified file cannot be resumed — a Range request would
+        # ask for zero bytes — so it is dropped before the attempt. Only a partial
+        # file is kept, and that is the one resumption is for.
+        if tmp.exists() and tmp.stat().st_size >= remote.bytes:
+            tmp.unlink()
+        try:
+            _fetch_once(remote, tmp)
+        except Exception as error:  # noqa: BLE001 - classified immediately below
+            if isinstance(error, urllib.error.HTTPError) and error.code == 416:
+                # The resume offset is not what the server expects. Restart the
+                # file from byte zero instead of treating it as a hard failure.
+                tmp.unlink(missing_ok=True)
+                reason = "range not satisfiable; restarting from the first byte"
+                continue
+            if not _is_transient_download_error(error):
+                tmp.unlink(missing_ok=True)
+                raise SystemExit(f"{remote.url}: {error}") from error
+            reason = f"{type(error).__name__}: {error}"
+            continue
 
-    size = tmp.stat().st_size
-    if size != remote.bytes:
-        tmp.unlink()
-        raise SystemExit(
-            f"{remote.url}: expected {remote.bytes:,} bytes, got {size:,}"
-        )
-    actual = sha256_file(tmp)
-    if actual != remote.sha256:
-        tmp.unlink()
-        raise SystemExit(
-            f"{remote.url}: sha256 mismatch\n  expected {remote.sha256}\n  actual   {actual}"
-        )
-    tmp.rename(destination)
-    rate = size / elapsed / 1e6 if elapsed > 0 else 0.0
-    print(f"  verified {destination.name} in {elapsed:.1f} s ({rate:.1f} MB/s)")
+        size = tmp.stat().st_size
+        if size < remote.bytes:
+            # The connection ended early without raising, which is how a truncated
+            # chunked body looks. Keep the bytes: the next attempt resumes.
+            reason = f"short body: {size:,} of {remote.bytes:,} bytes"
+            continue
+        if size > remote.bytes:
+            reason = f"overlong body: {size:,} of {remote.bytes:,} bytes"
+            tmp.unlink()
+            continue
+        actual = sha256_file(tmp)
+        if actual != remote.sha256:
+            reason = f"sha256 mismatch (got {actual})"
+            tmp.unlink()
+            continue
+
+        tmp.rename(destination)
+        elapsed = time.monotonic() - started
+        rate = size / elapsed / 1e6 if elapsed > 0 else 0.0
+        print(f"  verified {destination.name} in {elapsed:.1f} s ({rate:.1f} MB/s)")
+        return
+
+    tmp.unlink(missing_ok=True)
+    plural = "attempt" if attempts == 1 else "attempts"
+    raise SystemExit(f"{remote.url}: download failed after {attempts} {plural} ({reason})")
 
 
 # ---------------------------------------------------------------------------

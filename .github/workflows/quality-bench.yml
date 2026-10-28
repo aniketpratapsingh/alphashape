@@ -316,15 +316,26 @@ jobs:
           found=""
           for run_id in $runs; do
             echo "looking for a baseline in run $run_id"
-            # "artifact not found" on an older successful run is legitimate (a new
+            # An absent artifact on an older successful run is legitimate (a new
             # dataset, an experiment that published nothing, or an expiry older than
-            # the retention below), so it moves on to the next run. Any other
-            # failure is not: a 401/403/5xx here has to surface.
+            # the retention below), so it moves on to the next run. gh spells that
+            # absence more than one way, and the pattern has to match what it
+            # actually prints: a named artifact that is not in the run is
+            #   "no artifact matches any of the names or patterns provided"
+            # while a run whose artifacts have all expired is
+            #   "no valid artifacts found"
+            # Both, plus an explicit 404 (unknown artifact) or 410/expired, mean
+            # "this run has no baseline". Any other failure must NOT be swallowed:
+            # a 401/403 or a network error means the gate would be silently
+            # disabled, which is worse than a red job.
+            rm -rf build/bench/previous
+            mkdir -p build/bench/previous
             if ! err=$(gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
                          --name "bench-baseline-$DATASET" --dir build/bench/previous 2>&1); then
               case "$err" in
-                *"no valid artifacts found"*|*"artifact"*"not found"*|*"HTTP 404"*)
-                  echo "  no bench-baseline-$DATASET artifact; trying an older run"
+                *"no artifact matches"*|*"no valid artifacts found"*|\
+                *"artifact"*"not found"*|*"HTTP 404"*|*"HTTP 410"*|*"has expired"*)
+                  echo "  no bench-baseline-$DATASET artifact in run $run_id: $err"
                   continue
                   ;;
                 *)
@@ -334,11 +345,33 @@ jobs:
                   ;;
               esac
             fi
+            # A published baseline is a control run by construction — the publish
+            # step withholds experiments — so this is defence against an artifact
+            # that reached the run some other way (a hand upload, or a past bug).
+            # The gate must never compare against a configuration that is not the
+            # default, and the metrics file itself is the single source of that
+            # answer, so a run whose baseline reports depth_params is skipped like
+            # a run with no artifact at all.
+            metrics="build/bench/previous/metrics-$DATASET.json"
+            set +e
+            python3 tools/bench/is_experiment.py "$metrics"
+            probe=$?
+            set -e
+            if [ "$probe" -ne 0 ]; then
+              echo "  run $run_id has a baseline that is not a control run (is_experiment=$probe); skipping it"
+              continue
+            fi
             found="$run_id"
             echo "using baseline from run $run_id"
             break
           done
           if [ -z "$found" ]; then
+            # Whatever the last skipped run downloaded is still on disk. The
+            # "Find the baseline" step adopts any metrics file it finds there, so
+            # an experiment that was skipped must not be left behind to be
+            # mistaken for a baseline: the directory is cleared, not just ignored.
+            rm -rf build/bench/previous
+            mkdir -p build/bench/previous
             echo "no successful run in the last 10 has a baseline artifact; treating as a first run"
             echo "::notice::no baseline artifact in the last successful runs"
           fi
