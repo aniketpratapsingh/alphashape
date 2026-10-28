@@ -696,10 +696,23 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     const int interior_y0 = r;
     const int interior_y1 = height - 1 - r;
 
-    // The reference window values for every interior pixel, gathered once: the
-    // candidate loop then reads them straight from this flat array instead of
-    // re-indexing the image per candidate. Indexed like the bearings, at
-    // (y * width + x) * n_samples + k, so a window sample is one multiply away.
+    // The texture gate (below) is measured on the INTENSITY window for both cost
+    // types. `min_texture_stddev` is documented as an intensity stddev on [0, 1]
+    // (default one 8-bit level), so feeding it the census descriptor values --
+    // mask / 65535, whose spread has nothing to do with an intensity spread --
+    // would apply the caller's threshold to a quantity it was never measured on.
+    // The descriptor's values are a ranking, not a brightness: in a mildly
+    // textured window they are sparse and quantised, so their stddev is not
+    // comparable to an intensity stddev in either direction, and gating on them
+    // rejects windows the intensity gate (and the census cost's own raison
+    // d'etre: low-contrast ground) would keep. Gating on the intensity window
+    // keeps one meaning for both costs. The intensity image is still alive here
+    // (it is the caller's, or this level's reduced reference), so the gate reads
+    // it in place and allocates nothing.
+    const std::vector<float>* const gate_pixels =
+        options.cost_type == CostType::Census ? &reference.image->pixels()
+                                              : &ref_pixels->pixels();
+
     std::vector<float> ref_values(count * si(n_samples), 0.0F);
     {
         const std::vector<float>& pixels = ref_pixels->pixels();
@@ -767,11 +780,16 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
             for (int x = interior_x0; x <= interior_x1; ++x) {
                 const std::size_t p = si(y) * si(width) + si(x);
                 fill_window_cache(ctx, local, x, y);
-                // Reference window mean / stddev over the sampled offsets.
-                const float* const ref = local.ref_store.data();
+                // Reference window mean / stddev over the sampled offsets, of the
+                // INTENSITY window (see gate_pixels above), for both cost types.
+                // `local.ref_store` already holds this pixel's window values from
+                // its own image (descriptors for census), so the intensity window
+                // is read from gate_pixels instead.
                 double sum = 0.0, sq = 0.0;
                 for (int k = 0; k < n_samples; ++k) {
-                    const double v = static_cast<double>(ref[si(k)]);
+                    const Eigen::Vector2i off = offsets[si(k)];
+                    const double v = static_cast<double>(
+                        (*gate_pixels)[si(y + off.y()) * si(width) + si(x + off.x())]);
                     sum += v;
                     sq += v * v;
                 }

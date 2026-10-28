@@ -73,7 +73,11 @@ struct PatchMatchOptions {
     /// (patch_match_default_max_cost()); this struct's 0.5 is the intensity
     /// threshold the search has always used.
     double max_cost = 0.5;
-    double min_texture_stddev = 1.0 / 255.0;  // skip windows flatter than this (intensity 0..1)
+    /// Skip reference windows flatter than this. The gate is measured on the
+    /// INTENSITY window for both cost types (a census run reads the same pixels
+    /// through the descriptor's transform instead), so this stays an intensity
+    /// stddev on [0, 1], roughly one 8-bit level.
+    double min_texture_stddev = 1.0 / 255.0;
     /// Photometric cost the search minimises. Zncc by default: selecting census
     /// is an explicit accuracy/robustness trade a caller opts into (it costs one
     /// extra transform per view and a second correlation arithmetic).

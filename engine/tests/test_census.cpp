@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include <Eigen/Core>
@@ -309,6 +310,168 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
     // must land on the same plane at the same cost almost everywhere.
     EXPECT_GT(static_cast<double>(same_depth) / static_cast<double>(valid), 0.99);
     EXPECT_LT(cost_delta / static_cast<double>(valid), 1.0 / 65536.0);
+}
+
+// ---------------------------------------------------------------------------
+// The texture gate is the same quantity for both costs
+// ---------------------------------------------------------------------------
+
+TEST(Census, TextureGateIsMeasuredOnIntensityForBothCosts) {
+    // `min_texture_stddev` is documented as an INTENSITY stddev on [0, 1] (default
+    // one 8-bit level), and both costs must apply it to the intensity window.
+    // The scene below is the case the scale mismatch makes visible: a gentle but
+    // plainly visible brightness ramp, i.e. low-contrast ground with smooth
+    // shading. Its intensity window stddev is a few times the gate -- above it,
+    // but nowhere near a strongly textured image's -- while every interior
+    // pixel's census mask is IDENTICAL (in this slow monotone ramp every
+    // supported neighbour is on the same side of its centre), so the descriptor
+    // values are constant and their stddev is exactly 0. A census run that gated
+    // on the descriptor values therefore threw the whole image away as "too
+    // flat"; gating on the intensity window keeps it, like the intensity cost.
+    //
+    // The assertion is about the GATE, not the matching: on a monotone ramp the
+    // descriptor has no variance, so the census cost's own correlation cannot
+    // rank planes and every candidate scores the no-match sentinel. That is the
+    // descriptor's business; what must not happen is the gate erasing the pixels
+    // before the cost is ever consulted. max_cost is set high so the cut cannot
+    // be what removes them either.
+    const int width = 96;
+    const int height = 72;
+    const Calibration calib =
+        Calibration::initial(alphashape::CameraType::Frame, width, height, 100.0);
+    const Eigen::Vector3d plane_n(0.0, 0.0, -1.0);
+    const Eigen::Vector3d plane_p(0.0, 0.0, 8.0);
+    const Eigen::Matrix3d r = Eigen::Matrix3d::Identity();
+    const Eigen::Vector3d ref_c(0.0, 0.0, 0.0);
+    const Eigen::Vector3d nb_c(0.5, 0.0, 0.0);
+    const Eigen::Matrix3d nb_r = Eigen::Matrix3d::Identity();
+    const Eigen::Vector3d nb_t = -nb_r * nb_c;
+
+    // A gentle ramp: 0.10 per world unit across (about 0.008 per pixel at this
+    // depth: a 10-pixel window steps ~0.08, so its stddev is well above the
+    // 1/255 gate), and a tenth of that along y so the vertical arm is monotone
+    // too.
+    const auto render = [&](const Eigen::Vector3d& camera_centre, const Eigen::Matrix3d& rot) {
+        FloatImage image(width, height, 0.0F);
+        const Eigen::Matrix3d rt = rot.transpose();
+        const double dw = plane_n.dot(plane_p);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const Eigen::Vector2d pixel(static_cast<double>(x) + 0.5,
+                                            static_cast<double>(y) + 0.5);
+                const Eigen::Vector3d dir = (rt * calib.unproject(pixel)).normalized();
+                const double depth = (dw - plane_n.dot(camera_centre)) / plane_n.dot(dir);
+                const Eigen::Vector3d world = camera_centre + depth * dir;
+                image.at(x, y) =
+                    static_cast<float>(0.4 + 0.10 * world.x() + 0.01 * world.y());
+            }
+        }
+        return image;
+    };
+
+    FloatImage reference = render(ref_c, r);
+    const FloatImage neighbour = render(nb_c, nb_r);
+
+    // What the test relies on, stated rather than assumed: the descriptor field
+    // is constant, and the intensity window is far from flat. The intensity
+    // claim is measured directly on a representative interior window, with the
+    // search's own offsets (radius 5, step 2).
+    {
+        double sum = 0.0;
+        double sq = 0.0;
+        int n = 0;
+        for (int dy = -5; dy <= 5; dy += 2) {
+            for (int dx = -5; dx <= 5; dx += 2) {
+                const float v = reference.at(width / 2 + dx, height / 2 + dy);
+                sum += static_cast<double>(v);
+                sq += static_cast<double>(v) * static_cast<double>(v);
+                ++n;
+            }
+        }
+        const double mean = sum / static_cast<double>(n);
+        const double stddev = std::sqrt(std::max(0.0, sq / static_cast<double>(n) - mean * mean));
+        const double gate = PatchMatchOptions{}.min_texture_stddev;
+        EXPECT_GT(stddev, gate * 2.0)
+            << "the ramp must be clearly above the texture gate (stddev " << stddev
+            << " vs gate " << gate << ")";
+    }
+
+    const CensusImage census_field =
+        alphashape::stereo::census_transform(reference, CensusOptions{});
+    double descriptor_sum = 0.0;
+    double descriptor_sq = 0.0;
+    for (int y = 8; y < height - 8; ++y) {
+        for (int x = 8; x < width - 8; ++x) {
+            const double v = static_cast<double>(census_field.at(x, y));
+            descriptor_sum += v;
+            descriptor_sq += v * v;
+        }
+    }
+    const std::size_t n = static_cast<std::size_t>(height - 16) * static_cast<std::size_t>(width - 16);
+    const double descriptor_mean = descriptor_sum / static_cast<double>(n);
+    const double descriptor_stddev =
+        std::sqrt(std::max(0.0, descriptor_sq / static_cast<double>(n) -
+                                    descriptor_mean * descriptor_mean));
+    EXPECT_LT(descriptor_stddev, 1e-9)
+        << "the ramp must give every interior pixel the same descriptor";
+
+    PMView ref_view;
+    ref_view.image = &reference;
+    ref_view.calibration = calib;
+    ref_view.R = r;
+    ref_view.t = -r * ref_c;
+
+    PMView nb_view;
+    nb_view.image = &neighbour;
+    nb_view.calibration = calib;
+    nb_view.R = nb_r;
+    nb_view.t = nb_t;
+
+    const auto run = [&](alphashape::stereo::CostType type) {
+        PatchMatchOptions options;
+        options.depth_min = 5.0;
+        options.depth_max = 12.0;
+        options.window_radius = 5;
+        options.window_step = 2;
+        options.iterations = 3;
+        options.max_cost = 2.0;  // never cut: count what the SEARCH handled
+        options.pyramid_levels = 1;
+        options.cost_type = type;
+        options.seed = 11;
+        return alphashape::stereo::run_patch_match(ref_view, {nb_view}, options);
+    };
+
+    const PatchMatchResult zncc = run(alphashape::stereo::CostType::Zncc);
+    const PatchMatchResult census = run(alphashape::stereo::CostType::Census);
+
+    // A pixel the gate rejected keeps the initial -1; one it let through carries
+    // a depth from the search (the sentinel cost still records the best random
+    // candidate). So this counts exactly what the gate accepted.
+    const auto depth_fraction = [](const PatchMatchResult& result) {
+        std::size_t have = 0;
+        for (const float d : result.depth) {
+            if (d > 0.0F) {
+                ++have;
+            }
+        }
+        return result.depth.empty()
+                   ? 0.0
+                   : static_cast<double>(have) / static_cast<double>(result.depth.size());
+    };
+    const double zncc_fraction = depth_fraction(zncc);
+    const double census_fraction = depth_fraction(census);
+    std::printf("[census texture gate] zncc depth fraction=%.4f census=%.4f\n", zncc_fraction,
+                census_fraction);
+
+    // The fractions are of the whole image, and only the interior carries
+    // hypotheses (a window must fit), so ~0.77 is "everything the search could
+    // reach". What matters is that census matches it: gating on the descriptor
+    // values dropped the field to (near) zero here.
+    EXPECT_GT(zncc_fraction, 0.7) << "a low-contrast ramp is not a flat window";
+    EXPECT_GT(census_fraction, 0.7)
+        << "the census gate must accept the same windows the intensity gate does";
+    EXPECT_NEAR(census_fraction, zncc_fraction, 0.02)
+        << "the two costs must agree on which windows are textured enough";
 }
 
 // ---------------------------------------------------------------------------
