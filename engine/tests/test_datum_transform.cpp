@@ -1234,14 +1234,14 @@ TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
     // as the wrong pair, and that at least one pins.
     for (int target_code : {4267, 4269}) {
         const CoordinateSystem target = CoordinateSystem::from_epsg(target_code);
-        for (const CoordinateSystem& source : {wgs84(), wgs84_3d}) {
+        for (const CoordinateSystem& pinned_source : {wgs84(), wgs84_3d}) {
             const std::vector<DatumTransformation> entries =
-                source.available_transformations(target);
+                pinned_source.available_transformations(target);
             int wrong_pair = 0;
             int pinned = 0;
             for (const DatumTransformation& entry : entries) {
                 try {
-                    (void)source.with_transformation(entry);
+                    (void)pinned_source.with_transformation(entry);
                     ++pinned;
                 } catch (const ValueError& error) {
                     if (std::string(error.what()).find("other CRSs") != std::string::npos) {
@@ -1254,8 +1254,8 @@ TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
                     // concatenated operation), or its grid is absent here.
                 }
             }
-            const std::string where = "EPSG:" + std::to_string(source.epsg()) + " -> EPSG:" +
-                                      std::to_string(target_code);
+            const std::string where = "EPSG:" + std::to_string(pinned_source.epsg()) +
+                                      " -> EPSG:" + std::to_string(target_code);
             EXPECT_EQ(wrong_pair, 0)
                 << where << ": a listed operation must not be rejected as belonging to other "
                 << "CRSs";
