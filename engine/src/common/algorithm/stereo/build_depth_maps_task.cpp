@@ -443,6 +443,9 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // The cost changes the map as much as the geometry does: the same inputs
         // searched with a different cost find different planes.
         context.cost_type = static_cast<int>(cost_type);
+        // And the cut changes which of those planes survive into the map, so the
+        // EFFECTIVE threshold (the resolved default included) is folded too.
+        context.max_cost = max_cost;
         const auto hood_it = hood_of.find(camera_id);
         if (hood_it != hood_of.end()) {
             const stereo::ViewNeighbourhood& hood = *hood_it->second;
