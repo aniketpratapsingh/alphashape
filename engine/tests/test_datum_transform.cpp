@@ -315,12 +315,11 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
         EXPECT_NEAR(got->z, 73.0, 1e-9) << "a 2D shift must not change the height";
     }
 
-    // NAD27 -> NAD83 across the CONUS needs a grid. The document prints no
-    // worked example for the grid method, so the check is that the pinned
-    // operation runs on its grid and shifts by the grid's own magnitude.
-    // Pinning matters here: PROJ's *automatic* choice for this pair is the
-    // ballpark, because a strict area test rejects every NADCON region, so the
-    // grid must be asked for by code. Skipped when the grid is absent.
+    // NAD27 -> NAD83 across the CONUS is the grid case; its own test
+    // (Crs.GridOperationRunsWhenInstalled) covers it, because a GTEST_SKIP here
+    // would discard the Helmert assertions above. The list is still checked
+    // without needing the grid: the NADCON operation must be offered and name
+    // its grid.
     {
         const CoordinateSystem nad27 = CoordinateSystem::from_epsg(4267);
         const CoordinateSystem nad83 = CoordinateSystem::from_epsg(4269);
@@ -328,21 +327,7 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
             nad27.available_transformations(nad83);
         const DatumTransformation* conus = find_code(conus_list, "1241");
         ASSERT_NE(conus, nullptr) << "EPSG:1241 (NAD27 to NAD83 (1)) is not offered";
-        if (!grid_installed("us_noaa_conus.tif")) {
-            GTEST_SKIP() << "the NADCON grid us_noaa_conus.tif is not installed; install "
-                            "proj-data (or the proj-data package) to run this case";
-        }
-        EXPECT_FALSE(conus->needs_missing_grid()) << "the grid is installed but reported missing";
-
-        const CrsTransform shift =
-            CrsTransform::create(nad27.with_transformation(*conus), nad83);
-        const std::optional<CrsPoint> got = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
-        ASSERT_TRUE(got.has_value());
-        // NADCON 27->83 in the CONUS moves a point by well under 1", and never
-        // by exactly zero on this grid.
-        const double offset_arcsec = std::fabs(got->x + 100.0) * 3600.0;
-        EXPECT_GT(offset_arcsec, 1e-4) << "no shift at all";
-        EXPECT_LT(offset_arcsec, 2.0) << "shift larger than the grid's magnitude";
+        EXPECT_FALSE(conus->grids.empty()) << "the NADCON operation must name its grid";
     }
 }
 
@@ -564,18 +549,22 @@ TEST(Crs, MissingGridNamedByPlainTransformCreate) {
 }
 
 TEST(Crs, GridOperationRunsWhenInstalled) {
-    // The complement of the two refusal tests: with a real grid present, the
-    // grid operation loads and transforms. Uses the NADCON CONUS grid, which
-    // every proj-data packaging ships; skipped when absent.
+    // The complement of the two refusal tests, and the grid half of the spec's
+    // NAD27 -> NAD83 case: with the grid present, the pinned grid operation
+    // loads and transforms. PROJ's *automatic* choice for this pair is the
+    // ballpark (a strict area test rejects every NADCON region), so the grid
+    // operation has to be asked for by pinning it. Skipped when the grid is
+    // absent, naming it.
     if (!grid_installed("us_noaa_conus.tif")) {
-        GTEST_SKIP() << "us_noaa_conus.tif is not installed; install proj-data to run this case";
+        GTEST_SKIP() << "the NADCON grid us_noaa_conus.tif is not installed; install proj-data "
+                        "(or the proj-data package) to run this case";
     }
     const CoordinateSystem nad27 = CoordinateSystem::from_epsg(4267);
     const CoordinateSystem nad83 = CoordinateSystem::from_epsg(4269);
     const std::vector<DatumTransformation> list = nad27.available_transformations(nad83);
     const DatumTransformation* conus = find_code(list, "1241");
     ASSERT_NE(conus, nullptr);
-    EXPECT_FALSE(conus->needs_missing_grid());
+    EXPECT_FALSE(conus->needs_missing_grid()) << "the grid is installed but reported missing";
 
     const CoordinateSystem pinned = nad27.with_transformation(*conus);
     const CrsTransform pinned_transform = CrsTransform::create(pinned, nad83);
