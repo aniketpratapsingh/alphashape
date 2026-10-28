@@ -20,7 +20,9 @@ inline float clamped(const std::vector<float>& pixels, int width, int height, in
     return pixels[si(cy) * si(width) + si(cx)];
 }
 
-/// The wide census: four arms of `radius` samples each, 8 bits per axis.
+/// The wide census: four half-arms of `radius` samples each (left, right, top,
+/// bottom), so 4 * radius comparisons -- 16 bits at radius 4. See
+/// kCensusMaxRadius for why the radius cannot go higher.
 ///
 /// Bit order chosen so that a horizontal pair is adjacent in the word and the
 /// two axes occupy one byte each -- pure convenience for anyone reading the
@@ -138,15 +140,5 @@ std::vector<float> census_values(const CensusImage& census) {
         out[i] = static_cast<float>(census.values[i]) / 65535.0F;
     }
     return out;
-}
-
-const CensusImage& CensusCache::get(const FloatImage& image) {
-    for (const Entry& entry : entries_) {
-        if (entry.image == &image) {
-            return entry.census;
-        }
-    }
-    entries_.push_back(Entry{&image, census_transform(image, options_)});
-    return entries_.back().census;
 }
 }  // namespace alphashape::stereo

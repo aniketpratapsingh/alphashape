@@ -147,19 +147,18 @@ TEST(Census, DistanceIsNormalisedHamming) {
                      alphashape::stereo::census_distance(0x4321U, 0x1234U));
 }
 
-TEST(Census, CacheTransformsEachViewOnce) {
+TEST(Census, TransformOfTwoViewsIsIndependent) {
+    // The search transforms each view once per level and keeps the results side
+    // by side (see run_level's census_storage), so one transform must not depend
+    // on another having run: two different images give different descriptor
+    // fields, and transforming one again reproduces it exactly.
     FloatImage a(16, 16, 0.2F);
     FloatImage b(16, 16, 0.8F);
     a.at(3, 3) = 0.9F;
-    alphashape::stereo::CensusCache cache(CensusOptions{});
-    const CensusImage& ca = cache.get(a);
-    const CensusImage& cb = cache.get(b);
-    EXPECT_EQ(cache.size(), 2U);
-    // A second request returns the same entry, not a new transform.
-    EXPECT_EQ(&cache.get(a), &ca);
-    EXPECT_EQ(&cache.get(b), &cb);
-    EXPECT_EQ(cache.size(), 2U);
+    const CensusImage ca = alphashape::stereo::census_transform(a, CensusOptions{});
+    const CensusImage cb = alphashape::stereo::census_transform(b, CensusOptions{});
     EXPECT_NE(ca.values, cb.values);
+    EXPECT_EQ(ca.values, alphashape::stereo::census_transform(a, CensusOptions{}).values);
 }
 
 // ---------------------------------------------------------------------------

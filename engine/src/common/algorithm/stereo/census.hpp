@@ -11,11 +11,12 @@
 // stay meaningful on low-contrast ground where a ZNCC window is mostly noise.
 //
 // This is the "wide census" of Mei et al. (2011), "On Building an Accurate
-// Stereo Matching System on Graphics Hardware": the 16 bits are the horizontal
-// arm and the vertical arm of the window compared against the centre, 8 samples
-// each at unit spacing. Two arms rather than the full (2r+1)^2 grid is what fits
-// a 32-bit register while keeping a support wide enough to see structure at the
-// 9x9 scale the search uses.
+// Stereo Matching System on Graphics Hardware": the 16 bits are the four sides
+// of the window (left, right, top, bottom) compared against the centre, `radius`
+// samples per side at unit spacing -- 4 * radius comparisons, 16 at radius 4.
+// Four one-sided arms rather than the full (2r+1)^2 grid is what fits a 16-bit
+// word while keeping a support wide enough to see structure at the 9x9 scale the
+// search uses. The word is exactly full at radius 4, so that is the cap.
 //
 // Bit layout, for radius r = 4 and the centre at (x, y) (unit spacing inside the
 // census itself; PatchMatch's own window subsampling is unrelated):
@@ -33,9 +34,10 @@
 // Hamming distance of two masks (the distance the cited papers evaluate, and the
 // cheapest). The search itself uses `census_values`: it reads the mask as a
 // sample in [0, 1] and lets the existing ZNCC aggregate over the window, which
-// is the census-and-ZNCC cost of the plan's algorithm section (the resulting cost
-// is (1 - ZNCC), the same scale as the intensity cost). The distinction
-// that mattered when choosing: Hamming treats each comparison equally (right for
+// is the census-and-ZNCC cost of the plan's algorithm section (the resulting
+// cost is (1 - ZNCC) / 2, on the census cost's own [0, 1] interval). The
+// distinction that mattered when choosing: Hamming treats each comparison
+// equally (right for
 // "how many ranks disagree") but is 16 discrete levels with no sub-pixel
 // interpolation possible on a bit mask, while correlating the mask values keeps
 // the ZNCC's bilinear sampling and variance floor, and the descriptor has already
@@ -44,7 +46,6 @@
 // primitive (tests, future use); the search does not call it.
 
 #include <cstdint>
-#include <deque>
 #include <vector>
 
 #include "image/image.hpp"
@@ -125,35 +126,5 @@ inline double census_distance(std::uint16_t a, std::uint16_t b) {
 /// algorithm section describes. Normalising to [0, 1] keeps it on the same
 /// scale as the intensity cost.
 std::vector<float> census_values(const CensusImage& census);
-
-/// Per-view descriptor cache. A run transforms each view once and reuses it for
-/// every candidate plane, so the O(pixels * support) transform is paid once per
-/// view per pyramid level rather than once per cost evaluation. Keyed by the
-/// image's address: the caller owns the images and keeps them alive for the
-/// cache's lifetime (the search builds one cache per level and drops it with the
-/// level's reduced images). References returned by get() stay valid for the
-/// cache's lifetime, including across later get() calls for other images.
-class CensusCache {
-public:
-    explicit CensusCache(CensusOptions options = {}) : options_(options) {}
-
-    /// The descriptor field for `image`, computed on first request.
-    const CensusImage& get(const FloatImage& image);
-
-    /// Number of views transformed so far (diagnostics and tests).
-    std::size_t size() const { return entries_.size(); }
-
-    const CensusOptions& options() const { return options_; }
-
-private:
-    struct Entry {
-        const FloatImage* image = nullptr;
-        CensusImage census;
-    };
-
-    CensusOptions options_;
-    /// A deque so that push_back never moves an already-returned descriptor.
-    std::deque<Entry> entries_;
-};
 
 }  // namespace alphashape::stereo

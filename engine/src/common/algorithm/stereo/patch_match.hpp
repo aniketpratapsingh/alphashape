@@ -37,9 +37,9 @@ namespace alphashape::stereo {
 ///         variance floor, which a per-sample Hamming mean would lose.
 ///
 /// The two costs have different intervals (intensity [0, 2], census [0, 1]) and
-/// therefore different max_cost defaults; both keep 0.5-of-the-interval as the
-/// "zero correlation / chance" reference and patch_match_default_max_cost()
-/// supplies the right one for each.
+/// therefore different max_cost defaults. Their zero-correlation (chance) points
+/// are 1.0 and 0.5 respectively -- half of each interval -- and
+/// patch_match_default_max_cost() supplies a threshold above that for each.
 enum class CostType {
     Zncc = 0,
     Census = 1,
@@ -118,8 +118,10 @@ std::vector<int> patch_match_iteration_plan(int width, int height,
 /// sharply and its true-plane cost sits a little above the intensity cost's
 /// (measured ~0.015 against ~0.009 on the noisy plane fixture, both halved),
 /// so the default is made more permissive so the stricter descriptor does not
-/// cut pixels the intensity run keeps. The figure is our own calibration on our
-/// fixtures, matching the plan's re-tune, not a value taken from a paper.
+/// cut pixels the intensity run keeps. 0.6 is still above the census cost's
+/// chance value of 0.5 (zero correlation) and below its 1.0 rejection sentinel.
+/// The figure is our own calibration on our fixtures, not a value taken from a
+/// paper.
 double patch_match_default_max_cost(CostType type);
 
 struct PatchMatchResult {

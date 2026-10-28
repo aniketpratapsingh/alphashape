@@ -1077,14 +1077,17 @@ std::vector<int> patch_match_iteration_plan(int width, int height,
 }
 
 double patch_match_default_max_cost(CostType type) {
-    // Both costs are (1 - ZNCC) / 2 on [0, 1], so one threshold is meaningful for
-    // both. The census descriptor is coarser than 8-bit intensity, so an
-    // otherwise-correct pixel correlates a little less sharply and its true-plane
-    // cost sits slightly higher (measured ~0.03 against the intensity cost's
-    // ~0.01 on the noisy plane fixture). The census default is therefore the more
-    // permissive 0.6 -- a threshold both costs' chance level (0.5) still has to
-    // beat, so it never admits a non-match, while leaving room above the
-    // descriptor's higher correct-match floor. The plan's re-tune to 0.6.
+    // Each cost is (1 - ZNCC) on its own interval: intensity in [0, 2], census
+    // (1 - ZNCC) / 2 in [0, 1]. Both defaults sit above that interval's chance
+    // value (1.0 and 0.5 respectively, where the correlation is zero), so a
+    // non-match never passes the cut on its own. The census descriptor is
+    // coarser than 8-bit intensity, so an otherwise-correct pixel correlates a
+    // little less sharply and its true-plane cost sits slightly higher (measured
+    // ~0.03 against the intensity cost's ~0.01 on the noisy plane fixture, on
+    // the census cost's own halved scale). The census default is therefore the
+    // more permissive 0.6: still above the 0.5 chance level, and below the 1.0
+    // rejection sentinel, which leaves room above the descriptor's higher
+    // correct-match floor.
     return type == CostType::Census ? 0.6 : 0.5;
 }
 
