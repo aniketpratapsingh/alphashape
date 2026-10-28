@@ -1197,13 +1197,24 @@ yet.
   marks an operation as a ballpark (`proj_coordoperation_has_ballpark_transformation`);
   `create()` throws when the operation PROJ offers for the CRS pair is one and
   `allow_ballpark` is false. The opening decision reads the pair's own
-  candidate list (PROJ's default ranking) and is unchanged from before WP-12.4;
-  a pinned operation is judged by its own flag. For a pair whose only real
-  shifts are area-limited national operations PROJ's default ranking proposes
-  the ballpark, so such a pair is refused unless `allow_ballpark` is set — that
-  is deliberate, and it also means an unpinned national pair needs the flag to
-  be built at all. With `allow_ballpark` the transform reports `is_ballpark()`
-  and an accuracy of -1 (PROJ states none).
+  candidate list (PROJ's default ranking); a pinned operation is judged by its
+  own flag. For a pair whose only real shifts are area-limited national
+  operations PROJ's default ranking proposes the ballpark, so such a pair is
+  refused unless `allow_ballpark` is set — that is deliberate, and it also means
+  an unpinned national pair needs the flag to be built at all. With
+  `allow_ballpark` the transform reports `is_ballpark()` and an accuracy of -1
+  (PROJ states none).
+- **A pair between aligned datums is no longer refused as a ballpark.** This
+  *is* a change from before WP-12.4, and a deliberate one. Before, the pipeline
+  was built with `AUTHORITY=<the first candidate's authority>`, so for WGS 84 ↔
+  ETRS89, NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 or NTF PROJ built
+  a `+proj=noop` and called it a ballpark, which `create()` then refused: the
+  real EPSG operation for those pairs exists (a null shift, a Helmert or a grid
+  shift), it was simply never asked for. The unpinned pipeline is now the bare
+  one, so those 38 pairs are accepted without `allow_ballpark` and transform by
+  the EPSG operation PROJ picks per point. Refusal is unchanged for pairs where
+  the only candidate genuinely is a ballpark (WGS 84 ↔ NAD27, WGS 84 ↔
+  Amersfoort/RD New, NAD27 ↔ NAD83 on a gridless machine).
 - **Accuracy is the pair's first candidate, not the pipeline's.**
   `accuracy_m()` is `proj_coordoperation_get_accuracy()` on the operation PROJ
   ranks first for the CRS extents (or on the pinned operation), -1 when PROJ
@@ -1259,6 +1270,14 @@ yet.
   curated subset, so some operations work out of the box and some do not; the
   error names the grid rather than saying "File not found", which is the whole
   point of listing a grid operation that cannot run.
+- **An optional grid is never reported missing.** PROJ's `+grids=@name` means
+  "use this grid if it is installed, otherwise run without it", and PROJ
+  carries the `@` into the short name `proj_coordoperation_get_grid_used()`
+  reports. That marker is stripped from `DatumTransformation::grids` and the
+  grid is never added to `missing_grids`, so a CRS built with
+  `+nadgrids=@name` transforms as it did before WP-12.4 instead of failing with
+  `transformation needs grid @name; install proj-data`. A *required* grid
+  (`+grids=name`) is still diagnosed by name.
 - **An absent grid does not make the automatic transform fail.** An unpinned
   `CrsTransform::create()` is PROJ's own pipeline, which keeps every candidate and
   picks per point, so a grid needed by one candidate is not a grid this pair
@@ -1290,12 +1309,30 @@ yet.
   transform uses the pinned shift. PROJ attaches a datum shift to a geodetic
   CRS, so a projected source (EPSG:27700, say) is refused with a message
   pointing at the geographic CRS underneath (EPSG:4277 for that pair) or at
-  `TransformOptions::preferred_operation`, which pins by code without binding.
-- **An anonymous operation cannot be pinned by `with_transformation()`.**
-  A ballpark entry, or a custom CRS's `nadgrids=` shift, often carries no
-  authority code, and its hub CRS cannot be recovered from the entry alone.
-  `TransformOptions::preferred_operation` and `TransformOptions::allow_ballpark`
-  are the routes for those; the exception says so.
+  `TransformOptions::preferred_operation`, which builds the pipeline from the
+  listed operation without binding the CRS — that route needs the listed entry
+  to carry an identifier, which is why it works for a projection conversion
+  (EPSG:32633 → 4326 lists `INVERSE(EPSG):16033`) but not for a concatenated
+  operation with the shift baked in (all nine of 27700 → 4326 are anonymous).
+- **An anonymous operation cannot be pinned.** A ballpark entry, or a custom
+  CRS's `nadgrids=` shift, often carries no authority code: all nine candidates
+  of OSGB36 → UTM 30N (EPSG:4277 → 32630) are anonymous, and so is the ballpark
+  itself. `with_transformation()` needs an `AUTH:CODE` to recover the operation
+  from `proj.db`, so it refuses one with a `ValueError`; `preferred_operation`
+  is not a route either, because it matches the same listed identifier and an
+  anonymous candidate has none. `allow_ballpark` is the only route for a
+  ballpark, and a custom CRS's own shift applies through the CRS definition
+  (`from_proj`) rather than by pinning it. `with_transformation()`'s exception
+  says this rather than pointing at a route that does not exist.
+- **A 3D source pins against a 2D operation.** Datum shifts are stored against
+  the horizontal datum, so an operation's source is a 2D geographic CRS even
+  when the caller's source is 3D (EPSG:4979). Pinning compares the *horizontal*
+  identity — the source demoted to 2D via `proj_crs_demote_to_2D` when the base
+  is 3D — so the 2D operations of a 3D-source pair stay pinnable: 35 of the 79
+  listed for 4979 → 4267 and 52 of 53 for 4979 → 4269, the same counts as their
+  4326 pairs. The `BOUNDCRS` keeps the 3D base, so the ellipsoidal height is
+  still carried and a 2D Helmert still passes it through unchanged, exactly as
+  the 2D pair does.
 - **`with_transformation()` recovers the operation from `proj.db` and orients
   it.** The entry's `AUTH:CODE` is looked up with PROJ's computed wrappers
   (`INVERSE(...)`, `DERIVED_FROM(...)`) stripped, and the stored operation is
