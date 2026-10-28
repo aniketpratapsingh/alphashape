@@ -265,9 +265,12 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
     std::size_t same_depth = 0;
     double cost_delta = 0.0;
     for (std::size_t i = 0; i < plain.depth.size(); ++i) {
+        // max_cost was raised above 2 so nothing is cut; a pixel the search never
+        // settled keeps the 2.0 sentinel, an accepted one is in [0, 1].
         EXPECT_GE(plain.cost[i], 0.0F);
-        EXPECT_LE(plain.cost[i], 1.0F) << "census cost must live in [0, 1]";
+        EXPECT_LE(plain.cost[i], 2.0F);
         if (plain.depth[i] > 0.0F && affine.depth[i] > 0.0F) {
+            EXPECT_LE(plain.cost[i], 1.0F) << "an accepted census cost lives in [0, 1]";
             ++valid;
             const double rel = std::abs(static_cast<double>(plain.depth[i]) -
                                         static_cast<double>(affine.depth[i])) /
