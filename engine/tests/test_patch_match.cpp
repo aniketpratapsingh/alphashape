@@ -577,3 +577,125 @@ TEST(PatchMatch, InvalidInputsThrow) {
     EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, zero_min),
                  alphashape::ValueError);
 }
+
+// ---------------------------------------------------------------------------
+// Cost selection: census vs ZNCC on impulsive noise
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Impulsive ("salt and pepper") corruption of an image: `fraction` of the pixels
+/// are replaced by a uniformly random value. Deterministic, so the test is
+/// reproducible; this is the noise model a census transform is built to survive
+/// (a minority of samples lie arbitrarily far off, the rest are intact).
+void add_impulsive_noise(FloatImage& image, double fraction) {
+    const std::size_t count = image.pixels().size();
+    const std::size_t target = static_cast<std::size_t>(fraction * static_cast<double>(count));
+    std::uint32_t state = 0x2545F491U;  // arbitrary non-zero seed
+    const auto next = [&state] {
+        state ^= state << 13U;
+        state ^= state >> 17U;
+        state ^= state << 5U;
+        return state;
+    };
+    for (std::size_t i = 0; i < target; ++i) {
+        const std::size_t index = next() % count;
+        image.pixels()[index] = static_cast<float>(next() & 0xFFFFFFU) /
+                                static_cast<float>(0xFFFFFFU);
+    }
+}
+
+}  // namespace
+
+TEST(PatchMatch, CensusImprovesPlaneNoise) {
+    // A plane seen from five viewpoints, every image corrupted by 2 % impulsive
+    // noise. The census compares ranks (robust to a minority of wild samples),
+    // the intensity ZNCC is dragged by them: the recovered cost of the true
+    // plane must be at most half the ZNCC cost.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                              Eigen::Vector3d(0.0, 0.0, 10.0));
+    for (FloatImage& image : scene.images) {
+        add_impulsive_noise(image, 0.02);
+    }
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions zncc = options_for(5.0, 20.0);
+    zncc.cost_type = alphashape::stereo::CostType::Zncc;
+    zncc.max_cost = 1.0;  // compare every recovered plane, not just cheap ones
+
+    PatchMatchOptions census = zncc;
+    census.cost_type = alphashape::stereo::CostType::Census;
+
+    const PatchMatchResult zncc_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, zncc);
+    const PatchMatchResult census_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, census);
+
+    const Accuracy zncc_accuracy = measure(scene, zncc_result, 5);
+    const Accuracy census_accuracy = measure(scene, census_result, 5);
+
+    // Both costs must recover the plane; the census must do it more cheaply and
+    // no less accurately.
+    ASSERT_GT(census_accuracy.median_rel, 0.0);
+    EXPECT_LE(census_accuracy.median_rel, zncc_accuracy.median_rel * 1.05);
+    EXPECT_LE(census_accuracy.median_rel, 0.02);
+    EXPECT_LE(census_accuracy.median_angle_deg, 2.0);
+
+    // Cost of the true plane: pixels that recovered the plane and whose depth is
+    // close to the analytic answer. Comparing the mean over those pixels removes
+    // the effect of the two runs converging to different pixel sets.
+    const auto true_plane_cost = [&](const PatchMatchResult& result) {
+        double sum = 0.0;
+        std::size_t count = 0;
+        for (int y = 5; y < kHeight - 5; ++y) {
+            for (int x = 5; x < kWidth - 5; ++x) {
+                const double expected = ray_plane_depth(scene.plane, scene.calibs[0],
+                                                        scene.rotations[0], scene.translations[0],
+                                                        x, y);
+                if (expected <= 0.0) {
+                    continue;
+                }
+                const std::size_t index =
+                    static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+                    static_cast<std::size_t>(x);
+                const double depth = static_cast<double>(result.depth[index]);
+                if (depth <= 0.0) {
+                    continue;
+                }
+                if (std::abs(depth - expected) / expected > 0.01) {
+                    continue;  // not the true plane at this pixel
+                }
+                sum += static_cast<double>(result.cost[index]);
+                ++count;
+            }
+        }
+        return count > 0 ? sum / static_cast<double>(count) : 2.0;
+    };
+    const double zncc_cost = true_plane_cost(zncc_result);
+    const double census_cost = true_plane_cost(census_result);
+    EXPECT_LE(census_cost, 0.5 * zncc_cost)
+        << "census " << census_cost << " vs zncc " << zncc_cost;
+}
+
+TEST(PatchMatch, CensusCostStaysInUnitRange) {
+    // Every accepted pixel's cost is in [0, 1] on the census scale, and the
+    // sentinel for a rejected one is 1.0 -- the range contract the max_cost cut
+    // depends on.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    const Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                                    Eigen::Vector3d(0.0, 0.0, 10.0));
+    const std::vector<PMView> views = scene.views();
+    std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions options = reduced_options(5.0, 20.0);
+    options.cost_type = alphashape::stereo::CostType::Census;
+    options.max_cost = 2.0;  // never cut, so untouched pixels keep the sentinel
+    const PatchMatchResult result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, options);
+    for (const float cost : result.cost) {
+        EXPECT_GE(cost, 0.0F);
+        EXPECT_LE(cost, 1.0F);
+    }
+}

@@ -1225,5 +1225,81 @@ TEST(PatchMatchGpu, TimingAgainstCpu) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 8. Census cost: declined on the GPU, answered by the CPU
+// ---------------------------------------------------------------------------
+
+TEST(PatchMatchGpu, CensusDeclinesBeforeDispatchAndMatchesCpu) {
+    // The census cost is not implemented in the kernels (see patch_match_gpu.cpp
+    // fits_kernel_limits): a census run must be declined before anything is
+    // dispatched -- no failure is recorded -- and answered by the CPU
+    // implementation, bit for bit.
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(128, 96, 150.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    PatchMatchOptions options = plane_options();
+    options.cost_type = stereo::CostType::Census;
+
+    EXPECT_FALSE(stereo::patch_match_gpu_supported(reference, neighbours, options))
+        << "the GPU must decline the census cost";
+    EXPECT_FALSE(stereo::patch_match_gpu_would_run(reference, neighbours, options));
+
+    const std::uint64_t before = gpu::failure_count();
+    const PatchMatchResult result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    EXPECT_EQ(gpu::failure_count(), before) << "a decline is not a device failure";
+
+    const PatchMatchResult cpu = stereo::run_patch_match(reference, neighbours, options);
+    EXPECT_EQ(result.depth, cpu.depth);
+    EXPECT_EQ(result.normals, cpu.normals);
+    EXPECT_EQ(result.cost, cpu.cost);
+
+    // And the census result is still a depth map of the plane (the decline must
+    // not silently produce an empty map).
+    std::size_t valid = 0;
+    for (const float d : result.depth) {
+        if (d > 0.0F) {
+            ++valid;
+        }
+    }
+    EXPECT_GT(valid, result.depth.size() / 2);
+}
+
+TEST(PatchMatchGpu, CensusAgreesWithZnccOnThePlane) {
+    // A clean plane is the case both costs handle: the census result must land in
+    // the same accuracy region as the ZNCC one (it runs on the CPU either way, so
+    // this checks the cost's own correctness rather than the device's).
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(160, 120, 150.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    PatchMatchOptions census_options = plane_options();
+    census_options.cost_type = stereo::CostType::Census;
+    PatchMatchOptions zncc_options = plane_options();
+    zncc_options.cost_type = stereo::CostType::Zncc;
+
+    const PatchMatchResult census =
+        stereo::run_patch_match_device(reference, neighbours, census_options);
+    const PatchMatchResult zncc =
+        stereo::run_patch_match_device(reference, neighbours, zncc_options);
+
+    const PlaneAccuracy census_accuracy = measure_plane(scene, census, /*radius=*/5);
+    const PlaneAccuracy zncc_accuracy = measure_plane(scene, zncc, /*radius=*/5);
+    EXPECT_GT(census_accuracy.coverage, 0.7);
+    EXPECT_LT(census_accuracy.median, 0.02);
+    EXPECT_LT(census_accuracy.median, zncc_accuracy.median * 2.0);
+}
+
 }  // namespace
 }  // namespace alphashape

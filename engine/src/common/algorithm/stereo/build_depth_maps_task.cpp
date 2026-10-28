@@ -248,6 +248,30 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     pyramid_min_size.minimum = std::int64_t{32};
     pyramid_min_size.maximum = std::int64_t{8192};
     params.declare(pyramid_min_size);
+
+    // Photometric cost (DP-03). Census is opt-in because it costs one extra
+    // transform per view; it is the more robust of the two on real photo sets
+    // (exposure / white-balance differences, low texture), which is where depth
+    // map holes come from. "zncc" is the original intensity cost.
+    ParamSpec cost_type{"cost_type", ParamType::String, std::string{"zncc"},
+                        "Photometric cost the depth search minimises: \"zncc\" (intensity "
+                        "normalised cross-correlation) or \"census\" (Hamming distance of 16-bit "
+                        "census descriptors; more robust to lighting differences and low "
+                        "texture)."};
+    cost_type.choices = {"zncc", "census"};
+    params.declare(cost_type);
+
+    // max_cost is on the selected cost's own [0, 1] scale, and its useful value
+    // differs between the two costs. -1 means "whatever this cost's default is"
+    // (patch_match_default_max_cost()), which is how a run gets a sensible
+    // threshold without the caller having to know either scale.
+    ParamSpec max_cost{"max_cost", ParamType::Float, -1.0,
+                       "Final pixels whose cost at the selected cost_type's [0, 1] scale is "
+                       "above this are left empty (depth -1). -1 selects the cost type's own "
+                       "default (0.5 for zncc, 0.35 for census)."};
+    max_cost.minimum = -1.0;
+    max_cost.maximum = 2.0;
+    params.declare(max_cost);
 }
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
@@ -263,6 +287,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const bool reuse_depth = params.get_bool("reuse_depth");
     const std::int64_t pyramid_levels_value = params.get_int("pyramid_levels");
     const std::int64_t pyramid_min_size = params.get_int("pyramid_min_size");
+    const std::string cost_type_text = params.get_string("cost_type");
+    const double max_cost_value = params.get_float("max_cost");
 
     if (downscale_value <= 0) {
         throw ValueError("Downscale must be positive");
@@ -286,6 +312,23 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     if (pyramid_min_size < 32 || pyramid_min_size > 8192) {
         throw ValueError("pyramid_min_size must be in [32, 8192]");
     }
+    // The cost type is a closed set; the name is validated here rather than
+    // defaulted, so a typo fails before the chunk is touched (and before the
+    // CLI writes an unknown value into the project file).
+    stereo::CostType cost_type = stereo::CostType::Zncc;
+    if (cost_type_text == "census") {
+        cost_type = stereo::CostType::Census;
+    } else if (cost_type_text != "zncc") {
+        throw ValueError("cost_type must be \"zncc\" or \"census\"");
+    }
+    if (max_cost_value < -1.0 || max_cost_value > 2.0) {
+        throw ValueError("max_cost must be in [-1, 2]");
+    }
+    // -1 means "the cost type's own default", resolved once here so every map of
+    // the run (and the log line) uses the same number.
+    const double max_cost = max_cost_value < 0.0
+                                ? stereo::patch_match_default_max_cost(cost_type)
+                                : max_cost_value;
     const stereo::FilterMode filter_mode = stereo::parse_filter_mode(filter_mode_text);
 
     // -- validate the chunk --------------------------------------------------
@@ -397,6 +440,9 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             return static_cast<int>(
                 stereo::patch_match_iteration_plan(width, height, pyramid_options).size());
         }();
+        // The cost changes the map as much as the geometry does: the same inputs
+        // searched with a different cost find different planes.
+        context.cost_type = static_cast<int>(cost_type);
         const auto hood_it = hood_of.find(camera_id);
         if (hood_it != hood_of.end()) {
             const stereo::ViewNeighbourhood& hood = *hood_it->second;
@@ -699,6 +745,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             options.seed = seed_for_camera(hood.camera_id);
             options.pyramid_levels = kPyramidLevels;
             options.pyramid_min_size = kPyramidMinSize;
+            options.cost_type = cost_type;
+            options.max_cost = max_cost;
             options.on_sweep = sweep_progress;
 
             log_device_once();

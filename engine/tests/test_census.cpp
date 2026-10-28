@@ -1,0 +1,315 @@
+// Census transform and cost tests (WP-17.13, DP-03).
+//
+// The transform is checked against a hand-computed descriptor, and the cost's
+// robustness properties are checked directly: invariance to an affine intensity
+// change, a [0, 1] range, and a lower error than ZNCC on a plane corrupted by
+// impulsive noise. The scene helpers are the same synthetic plane machinery
+// test_patch_match.cpp uses, so the geometry is analytic and the expected depth
+// is exact.
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
+#include "common/algorithm/stereo/census.hpp"
+#include "common/algorithm/stereo/patch_match.hpp"
+#include "image/image.hpp"
+#include "model/camera/calibration.hpp"
+
+namespace {
+
+using alphashape::Calibration;
+using alphashape::FloatImage;
+using alphashape::stereo::CensusOptions;
+using alphashape::stereo::CensusImage;
+using alphashape::stereo::PMView;
+using alphashape::stereo::PatchMatchOptions;
+using alphashape::stereo::PatchMatchResult;
+
+// ---------------------------------------------------------------------------
+// Transform
+// ---------------------------------------------------------------------------
+
+TEST(Census, TransformKnownPattern) {
+    // A 9x9 patch around a centre of 0.5. Every supported sample is brighter
+    // (0.6) except four, one per arm at a known bit position:
+    //   (0, 4) -> left arm k = 0  -> bit 0
+    //   (6, 4) -> right arm k = 1 -> bit 5
+    //   (4, 0) -> top arm k = 0   -> bit 8
+    //   (4, 8) -> bottom arm k = 3 -> bit 15
+    FloatImage image(9, 9, 0.6F);
+    image.at(4, 4) = 0.5F;
+    image.at(0, 4) = 0.25F;
+    image.at(6, 4) = 0.3F;
+    image.at(4, 0) = 0.1F;
+    image.at(4, 8) = 0.45F;
+
+    CensusOptions options;  // wide, radius 4
+    const CensusImage census = alphashape::stereo::census_transform(image, options);
+    ASSERT_EQ(census.width, 9);
+    ASSERT_EQ(census.height, 9);
+
+    const std::uint16_t expected = static_cast<std::uint16_t>((1U << 0) | (1U << 5) |
+                                                             (1U << 8) | (1U << 15));
+    EXPECT_EQ(census.at(4, 4), expected);
+}
+
+TEST(Census, FlatPatchIsZero) {
+    // Every comparison against a constant is a tie, and a tie sets no bit. A
+    // flat region is therefore all zeros, not all ones: a saturated white patch
+    // cannot masquerade as strongly textured.
+    FloatImage image(9, 9, 0.7F);
+    const CensusImage census = alphashape::stereo::census_transform(image, CensusOptions{});
+    for (const std::uint16_t value : census.values) {
+        EXPECT_EQ(value, 0U);
+    }
+}
+
+TEST(Census, RadianceOrderIsWhatMatters) {
+    // A single bright centre against darker neighbours sets every bit; the
+    // magnitudes are irrelevant. This is the property the cost relies on.
+    FloatImage image(9, 9, 0.2F);
+    image.at(4, 4) = 0.8F;
+    const CensusImage census = alphashape::stereo::census_transform(image, CensusOptions{});
+    EXPECT_EQ(census.at(4, 4), 0xFFFFU);
+}
+
+TEST(Census, NarrowCensusFillsLowByteOnly) {
+    FloatImage image(3, 3, 0.5F);
+    image.at(0, 0) = 0.1F;   // neighbour (-1, -1) -> bit 0
+    image.at(2, 2) = 0.9F;   // brighter: sets nothing
+    image.at(1, 0) = 0.2F;   // neighbour (0, -1) -> bit 6
+
+    CensusOptions options;
+    options.wide = false;
+    options.window_radius = 1;
+    const CensusImage census = alphashape::stereo::census_transform(image, options);
+    EXPECT_EQ(census.at(1, 1),
+              static_cast<std::uint16_t>((1U << 0) | (1U << 6)));
+    for (const std::uint16_t value : census.values) {
+        EXPECT_EQ(value & 0xFF00U, 0U) << "narrow census must leave the high byte zero";
+    }
+}
+
+TEST(Census, InvalidOptionsThrow) {
+    FloatImage image(9, 9, 0.5F);
+    CensusOptions wide_too_big;
+    wide_too_big.window_radius = 9;  // 4 arms x 9 = 36 bits
+    EXPECT_THROW(alphashape::stereo::census_transform(image, wide_too_big),
+                 alphashape::ValueError);
+
+    CensusOptions narrow_wrong_radius;
+    narrow_wrong_radius.wide = false;
+    narrow_wrong_radius.window_radius = 2;
+    EXPECT_THROW(alphashape::stereo::census_transform(image, narrow_wrong_radius),
+                 alphashape::ValueError);
+
+    CensusOptions zero;
+    zero.window_radius = 0;
+    EXPECT_THROW(alphashape::stereo::census_transform(image, zero), alphashape::ValueError);
+}
+
+TEST(Census, DistanceIsNormalisedHamming) {
+    EXPECT_DOUBLE_EQ(alphashape::stereo::census_distance(0x0000U, 0x0000U), 0.0);
+    EXPECT_DOUBLE_EQ(alphashape::stereo::census_distance(0x0000U, 0xFFFFU), 1.0);
+    EXPECT_DOUBLE_EQ(alphashape::stereo::census_distance(0x00FFU, 0x0000U), 8.0 / 16.0);
+    // Symmetric.
+    EXPECT_DOUBLE_EQ(alphashape::stereo::census_distance(0x1234U, 0x4321U),
+                     alphashape::stereo::census_distance(0x4321U, 0x1234U));
+}
+
+TEST(Census, CacheTransformsEachViewOnce) {
+    FloatImage a(16, 16, 0.2F);
+    FloatImage b(16, 16, 0.8F);
+    a.at(3, 3) = 0.9F;
+    alphashape::stereo::CensusCache cache(CensusOptions{});
+    const CensusImage& ca = cache.get(a);
+    const CensusImage& cb = cache.get(b);
+    EXPECT_EQ(cache.size(), 2U);
+    // A second request returns the same entry, not a new transform.
+    EXPECT_EQ(&cache.get(a), &ca);
+    EXPECT_EQ(&cache.get(b), &cb);
+    EXPECT_EQ(cache.size(), 2U);
+    EXPECT_NE(ca.values, cb.values);
+}
+
+// ---------------------------------------------------------------------------
+// Invariance to an affine intensity change
+// ---------------------------------------------------------------------------
+
+/// A deterministic patch of values on a coarse grid, so every pair of pixels in
+/// any 9x9 window is separated by much more than a float rounding step. The
+/// affine map below then cannot turn a strict comparison into a tie by rounding.
+FloatImage grid_image(int width, int height, float gain, float offset) {
+    FloatImage image(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int level = (x * 7 + y * 13) % 17;  // 17 distinct levels
+            const float base = 0.15F + 0.04F * static_cast<float>(level);  // [0.15, 0.79]
+            image.at(x, y) = gain * base + offset;
+        }
+    }
+    return image;
+}
+
+TEST(Census, InvariantToAffineIntensity) {
+    // The census compares ranks, so a positive gain and a bias must leave every
+    // descriptor unchanged; the cost is therefore unchanged too.
+    const FloatImage original = grid_image(40, 32, 1.0F, 0.0F);
+    const FloatImage affine = grid_image(40, 32, 1.3F, 0.05F);
+
+    const CensusImage a = alphashape::stereo::census_transform(original, CensusOptions{});
+    const CensusImage b = alphashape::stereo::census_transform(affine, CensusOptions{});
+
+    double total = 0.0;
+    std::size_t count = 0;
+    for (int y = 0; y < a.height; ++y) {
+        for (int x = 0; x < a.width; ++x) {
+            total += alphashape::stereo::census_distance(a.at(x, y), b.at(x, y));
+            ++count;
+        }
+    }
+    ASSERT_GT(count, 0U);
+    EXPECT_LE(total / static_cast<double>(count), 1e-3);
+}
+
+TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
+    // The same invariance, measured through the search's own cost. Two views of
+    // one flat scene, the neighbour's gain and bias changed: a census run must
+    // recover the same plane at the same cost.
+    const int width = 96;
+    const int height = 72;
+    const double focal = 100.0;
+    const Calibration calib = Calibration::initial(alphashape::CameraType::Frame, width, height,
+                                                   focal);
+    const Eigen::Vector3d plane_n(0.0, 0.0, -1.0);
+    const Eigen::Vector3d plane_p(0.0, 0.0, 8.0);
+    const Eigen::Matrix3d r = Eigen::Matrix3d::Identity();
+
+    // Reference at the origin, one neighbour 0.6 to the right, both looking
+    // along +Z at the plane z = 8.
+    const Eigen::Vector3d ref_c(0.0, 0.0, 0.0);
+    const Eigen::Vector3d nb_c(0.6, 0.0, 0.0);
+    const Eigen::Matrix3d nb_r = Eigen::Matrix3d::Identity();
+    const Eigen::Vector3d nb_t = -nb_r * nb_c;
+
+    const auto render = [&](const Eigen::Vector3d& camera_centre, const Eigen::Matrix3d& rot,
+                            float gain, float offset) {
+        FloatImage image(width, height, 0.0F);
+        const Eigen::Matrix3d rt = rot.transpose();
+        // Camera centre in world space: t = -R C, so C = -R^T t = the centre the
+        // caller passed.
+        const Eigen::Vector3d c = camera_centre;
+        const double dw = plane_n.dot(plane_p);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const Eigen::Vector2d pixel(static_cast<double>(x) + 0.5,
+                                            static_cast<double>(y) + 0.5);
+                const Eigen::Vector3d dir = (rt * calib.unproject(pixel)).normalized();
+                const double denom = plane_n.dot(dir);
+                const double depth = (dw - plane_n.dot(c)) / denom;
+                const Eigen::Vector3d world = c + depth * dir;
+                // Ranks only: a smooth ramp plus a checker, all well separated.
+                const double u = 0.15 + 0.3 * (0.5 + 0.5 * std::sin(world.x() * 2.0)) +
+                                 0.2 * ((static_cast<int>(std::floor(world.x() * 3.0)) +
+                                         static_cast<int>(std::floor(world.y() * 3.0))) &
+                                        1);
+                image.at(x, y) = gain * static_cast<float>(u) + offset;
+            }
+        }
+        return image;
+    };
+
+    FloatImage reference = render(ref_c, r, 1.0F, 0.0F);
+    const FloatImage neighbour = render(nb_c, nb_r, 1.3F, 0.05F);
+
+    PMView ref_view;
+    ref_view.image = &reference;
+    ref_view.calibration = calib;
+    ref_view.R = r;
+    ref_view.t = -r * ref_c;
+    PMView nb_view;
+    nb_view.image = &neighbour;
+    nb_view.calibration = calib;
+    nb_view.R = nb_r;
+    nb_view.t = nb_t;
+
+    PatchMatchOptions options;
+    options.depth_min = 5.0;
+    options.depth_max = 12.0;
+    options.window_radius = 5;
+    options.window_step = 2;
+    options.iterations = 3;
+    options.max_cost = 1.0;  // keep everything, we compare costs
+    options.pyramid_levels = 1;
+    options.cost_type = alphashape::stereo::CostType::Census;
+    options.seed = 7;
+
+    const PatchMatchResult result =
+        alphashape::stereo::run_patch_match(ref_view, {nb_view}, options);
+
+    // The plane is smooth, so both runs find it; the point of the test is the
+    // cost level, which must stay low despite the neighbour's affine change.
+    std::size_t valid = 0;
+    double cost_sum = 0.0;
+    for (std::size_t i = 0; i < result.depth.size(); ++i) {
+        if (result.depth[i] > 0.0F) {
+            ++valid;
+            cost_sum += static_cast<double>(result.cost[i]);
+            EXPECT_LE(result.cost[i], 1.0F) << "census cost must live in [0, 1]";
+        }
+    }
+    ASSERT_GT(valid, result.depth.size() / 2);
+    EXPECT_LT(cost_sum / static_cast<double>(valid), 0.2)
+        << "an affine change of the neighbour must not raise the census cost";
+}
+
+// ---------------------------------------------------------------------------
+// Cost distribution
+// ---------------------------------------------------------------------------
+
+TEST(Census, CostDistributionSameRange) {
+    // Compared descriptors at unrelated shifts are pure Hamming distances: every
+    // value lies in [0, 1], agreement is 0 and total disagreement is 1.
+    FloatImage a(48, 40, 0.0F);
+    FloatImage b(48, 40, 0.0F);
+    for (int y = 0; y < 40; ++y) {
+        for (int x = 0; x < 48; ++x) {
+            a.at(x, y) = static_cast<float>((x * 37 + y * 11) % 101) / 100.0F;
+            b.at(x, y) = static_cast<float>((x * 53 + y * 29) % 103) / 102.0F;
+        }
+    }
+    const CensusImage ca = alphashape::stereo::census_transform(a, CensusOptions{});
+    const CensusImage cb = alphashape::stereo::census_transform(b, CensusOptions{});
+
+    double total = 0.0;
+    std::size_t count = 0;
+    for (int dy = 0; dy < 6; ++dy) {
+        for (int dx = 0; dx < 6; ++dx) {
+            for (int y = 4; y < 36; ++y) {
+                for (int x = 4; x < 44; ++x) {
+                    const double d =
+                        alphashape::stereo::census_distance(ca.at(x, y), cb.at(x + dx, y + dy));
+                    EXPECT_GE(d, 0.0);
+                    EXPECT_LE(d, 1.0);
+                    total += d;
+                    ++count;
+                }
+            }
+        }
+    }
+    ASSERT_GT(count, 0U);
+    const double mean = total / static_cast<double>(count);
+    // Independent patterns agree on about half the bits; the mean must sit near
+    // chance, not near agreement or near total disagreement.
+    EXPECT_GT(mean, 0.4);
+    EXPECT_LT(mean, 0.6);
+}
+
+}  // namespace

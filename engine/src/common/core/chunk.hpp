@@ -161,6 +161,11 @@ struct DepthMapFingerprintContext {
     /// -- which recorded nothing here (0), i.e. the flat search -- is still
     /// reused by a run that resolves to a single level.
     int pyramid_levels = 1;
+    /// Photometric cost the search minimised (stereo::CostType as an int: 0 =
+    /// zncc, 1 = census). Folded only when non-zero, so a map built before the
+    /// cost became selectable -- which ran the only cost there was, zncc -- is
+    /// still reused by a zncc run.
+    int cost_type = 0;
     std::uint64_t seed = 0;
 };
 
