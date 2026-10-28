@@ -6,6 +6,8 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-28
+
 ### Added
 
 - **Build Depth Maps searches coarse to fine.** The PatchMatch search now runs
@@ -142,9 +144,9 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Limitations
 
-- A full-resolution orthomosaic of a very large site on a low-memory machine is not possible yet: the output grid is still held in one piece, so the automatic cell is coarsened (with a Warning) or an explicit cell is refused. Block-wise processing — building the ortho in overlapping memory-bounded blocks at full resolution — is planned. See `engine/LIMITATIONS.md`.
+- The orthomosaic is now rectified and blended in memory-bounded blocks, but the assembled output raster is still held in one piece, so a very large site on a low-memory machine can still be limited by it: when even a 512-cell block cannot fit, the automatic cell is coarsened (with a Warning) or an explicit cell is refused. See `engine/LIMITATIONS.md`.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-26
 
 The first release. Photos in, 3-D models and maps out, from a desktop app, the command
 line or Python.
@@ -274,4 +276,5 @@ without one), and there is no georeferencing, marker editing or tiled-model outp
   0.5th-99.5th percentile core is now clipped to that core plus 3%; an ordinary,
   outlier-free sample set keeps exactly the grid it always had.
 
+[0.2.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.2.0
 [0.1.0]: https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.1.0
