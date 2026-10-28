@@ -2,10 +2,10 @@
 //
 // The transform is checked against a hand-computed descriptor, and the cost's
 // robustness properties are checked directly: invariance to an affine intensity
-// change, a [0, 1] range, and a lower error than ZNCC on a plane corrupted by
-// impulsive noise. The scene helpers are the same synthetic plane machinery
-// test_patch_match.cpp uses, so the geometry is analytic and the expected depth
-// is exact.
+// change (on descriptors and end to end through the search), the [0, 1] range
+// and the chance-level mean. The noise advantage over the ZNCC cost is the
+// PatchMatch.CensusImprovesPlaneNoise case in test_patch_match.cpp, which owns
+// the synthetic scene helpers this file borrows the geometry from.
 
 #include <gtest/gtest.h>
 
