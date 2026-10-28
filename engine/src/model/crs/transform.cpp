@@ -138,6 +138,14 @@ std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const Coor
     }
     proj_operation_factory_context_set_grid_availability_use(
         ctx, factory.get(), PROJ_GRID_AVAILABILITY_IGNORED);
+    // The factory context defaults to STRICT_CONTAINMENT, which hides every
+    // operation whose area does not strictly contain the CRSs' whole extents —
+    // for a pinned datum that means every operation, so a plain transform from
+    // a bound CRS to a projected CRS would find none and throw. PROJ's own
+    // pipeline builder uses PARTIAL_INTERSECTION; matching it keeps "the first
+    // candidate" here the operation that builder would have used.
+    proj_operation_factory_context_set_spatial_criterion(
+        ctx, factory.get(), PROJ_SPATIAL_CRITERION_PARTIAL_INTERSECTION);
     ObjListPtr operations{proj_create_operations(ctx, src_pj, dst_pj, factory.get())};
     if (!operations) {
         throw Error("cannot list datum transformations from " + quoted(src) + " to " +

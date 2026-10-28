@@ -167,17 +167,19 @@ const CoordinateSystem& wgs84() {
 TEST(Crs, ReferenceFormulasMatchPublishedExamples) {
     // Before the reference implementation is used as an oracle, it must
     // reproduce what the document prints. Each block quotes the worked example
-    // it checks, with the document's own rounding.
+    // it checks. The document prints geocentric XYZ to a centimetre, so a
+    // centimetre is the tightest honest tolerance there (the printed figures
+    // themselves are 2 dp); the millimetre agreement is asserted against the
+    // formulas in DatumShiftMatchesEpsgExamples.
 
     // §4.2.3: WGS 72 -> WGS 84 (EPSG 1238), tZ=+4.5 m, rZ=+0.554", dS=+0.219 ppm;
     //   3657660.66 255768.55 5201382.11 -> 3657660.78 255778.43 5201387.75
-    // The document prints two decimals, so the tolerance is half the last digit.
     {
         const Xyz got = position_vector(Xyz{3657660.66, 255768.55, 5201382.11}, 0.0, 0.0, 4.5, 0.0,
                                         0.0, 0.554, 0.219);
-        EXPECT_NEAR(got.x, 3657660.78, 0.005);
-        EXPECT_NEAR(got.y, 255778.43, 0.005);
-        EXPECT_NEAR(got.z, 5201387.75, 0.005);
+        EXPECT_NEAR(got.x, 3657660.78, 0.01);
+        EXPECT_NEAR(got.y, 255778.43, 0.01);
+        EXPECT_NEAR(got.z, 5201387.75, 0.01);
     }
 
     // §4.2.4: WGS 84 -> ED50 3-parameter, t=(+84.87, +96.49, +116.95) m;
@@ -185,9 +187,9 @@ TEST(Crs, ReferenceFormulasMatchPublishedExamples) {
     {
         const Xyz got = position_vector(Xyz{3771793.97, 140253.34, 5124304.35}, 84.87, 96.49,
                                         116.95, 0.0, 0.0, 0.0, 0.0);
-        EXPECT_NEAR(got.x, 3771878.84, 0.005);
-        EXPECT_NEAR(got.y, 140349.83, 0.005);
-        EXPECT_NEAR(got.z, 5124421.30, 0.005);
+        EXPECT_NEAR(got.x, 3771878.84, 0.01);
+        EXPECT_NEAR(got.y, 140349.83, 0.01);
+        EXPECT_NEAR(got.z, 5124421.30, 0.01);
     }
 
     // §4.3.2: the same WGS 84 -> ED50 shift applied to a geographic point,
@@ -207,7 +209,7 @@ TEST(Crs, ReferenceFormulasMatchPublishedExamples) {
         EXPECT_NEAR(got.x, dms(2, 7, 51.477), 0.0005 / 3600.0);
         EXPECT_NEAR(got.y, dms(53, 48, 36.565), 0.0005 / 3600.0);
         // The document prints the ellipsoidal height to a centimetre.
-        EXPECT_NEAR(got.z, 28.02, 0.005);
+        EXPECT_NEAR(got.z, 28.02, 0.01);
     }
 
     // §4.1.1 round trip: the two geographic/geocentric formulas are inverses.
@@ -237,11 +239,12 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
         const std::optional<CrsPoint> got =
             shift.forward(CrsPoint{3657660.66, 255768.55, 5201382.11});
         ASSERT_TRUE(got.has_value());
-        // The document prints two decimals, so half the last digit is the
-        // tightest honest bound; the formula is checked to a millimetre below.
-        EXPECT_NEAR(got->x, 3657660.78, 0.005) << "GN 7-2 §4.2.3 X";
-        EXPECT_NEAR(got->y, 255778.43, 0.005) << "GN 7-2 §4.2.3 Y";
-        EXPECT_NEAR(got->z, 5201387.75, 0.005) << "GN 7-2 §4.2.3 Z";
+        // The document prints XYZ to two decimals, so a centimetre is the
+        // tightest honest bound there; the formula agreement is asserted at a
+        // millimetre just below.
+        EXPECT_NEAR(got->x, 3657660.78, 0.01) << "GN 7-2 §4.2.3 X";
+        EXPECT_NEAR(got->y, 255778.43, 0.01) << "GN 7-2 §4.2.3 Y";
+        EXPECT_NEAR(got->z, 5201387.75, 0.01) << "GN 7-2 §4.2.3 Z";
 
         const Xyz want = position_vector(Xyz{3657660.66, 255768.55, 5201382.11}, 0.0, 0.0, 4.5,
                                          0.0, 0.0, 0.554, 0.219);
@@ -406,17 +409,21 @@ TEST(Crs, PreferredTransformationHonoured) {
     // the ballpark (it ranks by area, and a strict area test rejects the
     // national operations), so `CrsTransform::create(osgb36(), wgs84())` may
     // legitimately apply no shift at all. What "pinning is honoured" means here
-    // is narrower and checkable: the transform built from the pinned CRS reports
-    // the pinned operation, and its numbers are the pinned operation's.
+    // is narrower and checkable: the transform built from the pinned CRS runs
+    // the pinned operation's pipeline, and its numbers are that operation's.
+    // `description()` is the PROJ pipeline text (not the operation's name), so
+    // the Helmert parameters are what identifies it.
     const DatumTransformation* helmert = find_code(list, "1314");
     ASSERT_NE(helmert, nullptr);
     const CoordinateSystem pinned = osgb36().with_transformation(*helmert);
     const CrsPoint point{dms(1, 43, 4.5177), dms(52, 39, 27.2531), 0.0};
 
     const CrsTransform pinned_transform = CrsTransform::create(pinned, wgs84());
-    EXPECT_NE(pinned_transform.description().find("OSGB36 to WGS 84 (6)"), std::string::npos)
-        << "the pinned operation must be the one the pipeline used: "
+    EXPECT_NE(pinned_transform.description().find("x=446.448"), std::string::npos)
+        << "the pinned Helmert must be the operation the pipeline used: "
         << pinned_transform.description();
+    EXPECT_EQ(pinned_transform.description().find("hgridshift"), std::string::npos)
+        << "the OSTN15 grid must not be what the pinned Helmert transform ran";
 
     // ... and its answer is the §4.1.1/§4.2.3 formula result, not a null shift.
     const std::optional<CrsPoint> got = pinned_transform.forward(point);
@@ -454,8 +461,10 @@ TEST(Crs, DerivedAuthorityOperationIsPinnable) {
     const CrsPoint point{dms(1, 43, 4.5177), dms(52, 39, 27.2531), 0.0};
     const CrsTransform pinned =
         CrsTransform::create(osgb36().with_transformation(*ostn15), wgs84());
-    EXPECT_NE(pinned.description().find("OSGB36 to WGS 84 (9)"), std::string::npos)
-        << pinned.description();
+    EXPECT_NE(pinned.description().find("hgridshift"), std::string::npos)
+        << "the pinned OSTN15 transform must run the grid: " << pinned.description();
+    EXPECT_EQ(pinned.description().find("x=446.448"), std::string::npos)
+        << "the Helmert must not be what the pinned OSTN15 transform ran";
 
     const std::optional<CrsPoint> got = pinned.forward(point);
     ASSERT_TRUE(got.has_value());
@@ -568,7 +577,7 @@ TEST(Crs, GridOperationRunsWhenInstalled) {
 
     const CoordinateSystem pinned = nad27.with_transformation(*conus);
     const CrsTransform pinned_transform = CrsTransform::create(pinned, nad83);
-    EXPECT_NE(pinned_transform.description().find("NAD27 to NAD83 (1)"), std::string::npos)
+    EXPECT_NE(pinned_transform.description().find("hgridshift"), std::string::npos)
         << "the pinned grid operation must be the one the pipeline used: "
         << pinned_transform.description();
 
@@ -612,10 +621,15 @@ TEST(Crs, Towgs84Applied) {
     ASSERT_TRUE(got.has_value());
 
     // ... and the reference formulas agree with it, so the shift applied really
-    // is the TOWGS84 Helmert. The pair is 2D, so only lon/lat move.
+    // is the TOWGS84 Helmert. The pair is 2D, so only lon/lat move. The
+    // reference uses the *WKT's own* rounded parameters (0.15"/0.247"/0.842",
+    // -20.489 ppm), not EPSG:1314's four-decimal ones: the two differ by about
+    // 3 mm, so comparing against the EPSG figures would test the parameters
+    // rather than the engine.
     const Xyz geocentric = geodetic_to_geocentric(point, kAiry1830);
-    const CrsPoint want =
-        geocentric_to_geodetic(osgb36_helmert_to_wgs84_geocentric(geocentric), kWgs84);
+    const CrsPoint want = geocentric_to_geodetic(
+        position_vector(geocentric, 446.448, -125.157, 542.06, 0.15, 0.247, 0.842, -20.489),
+        kWgs84);
     EXPECT_LE(horizontal_gap_m(*got, want, point.y), 1e-3);
     EXPECT_NEAR(got->z, point.z, 1e-9);
 }
