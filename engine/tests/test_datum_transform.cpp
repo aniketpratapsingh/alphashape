@@ -587,18 +587,22 @@ TEST(Crs, GridOperationRunsWhenInstalled) {
         << "the pinned grid operation must be the one the pipeline used: "
         << pinned_transform.description();
 
-    // Every CONUS sample moves, by the grid's own sub-arcsecond magnitude.
+    // Every CONUS sample moves, by the grid's own arcsecond-scale magnitude.
+    // NADCON 27->83 CONUS offsets reach about 4" (largest near the west coast),
+    // so 10" is a ceiling that still proves a grid shift rather than a null
+    // one; a shift of tens of arcseconds would mean a different operation.
     const std::vector<CrsPoint> points = {CrsPoint{-100.0, 40.0, 0.0},
                                           CrsPoint{-90.0, 35.0, 0.0},
                                           CrsPoint{-80.0, 30.0, 0.0},
-                                          CrsPoint{-120.0, 45.0, 0.0}};
+                                          CrsPoint{-120.0, 45.0, 0.0},
+                                          CrsPoint{-75.0, 42.0, 0.0}};
     for (const CrsPoint& point : points) {
         const std::optional<CrsPoint> got = pinned_transform.forward(point);
         ASSERT_TRUE(got.has_value()) << "lon " << point.x;
         const double offset_arcsec =
             std::hypot(got->x - point.x, got->y - point.y) * 3600.0;
         EXPECT_GT(offset_arcsec, 1e-4) << "no shift at lon " << point.x;
-        EXPECT_LT(offset_arcsec, 2.0) << "shift above the grid's magnitude at lon " << point.x;
+        EXPECT_LT(offset_arcsec, 10.0) << "shift above the grid's magnitude at lon " << point.x;
     }
 }
 
