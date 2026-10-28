@@ -312,6 +312,9 @@ void describe_pair(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSyst
     if (*accuracy <= 0.0 && !*ballpark) {
         *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
     }
+    // The grid diagnosis comes from this listing, exactly as it always has: the
+    // operation PROJ ranks first for the pair is the one whose absent grid is
+    // reported. It is a diagnosis of the pair, never a change to the pipeline.
     diagnose_missing_grid(ctx, first.get());
 }
 

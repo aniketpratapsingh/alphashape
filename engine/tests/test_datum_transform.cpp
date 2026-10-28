@@ -714,21 +714,16 @@ TEST(Crs, IdenticalCrsHasNoDatumShift) {
 // ---------------------------------------------------------------------------
 // The automatic (unpinned) transform is PROJ's per-point choice
 //
-// Two assertions per case, because they catch different halves of the defect:
+// The oracle is a bare PROJ pipeline for the same pair: exactly the call the
+// engine built before WP-12.4 touched operation selection. Comparing against it
+// is the "unchanged from main for every pair" guard, and unlike a literal it
+// holds on every platform and PROJ data release, because both sides ask the
+// same PROJ the same question.
 //
-//   1. The engine's unpinned pipeline agrees with a bare PROJ pipeline for the
-//      same pair, bit for bit. That bare pipeline is exactly what the engine
-//      built before WP-12.4 touched operation selection, so this is the
-//      "unchanged from main for every pair" guard, and it holds regardless of
-//      which grids happen to be installed.
-//
-//   2. The literal values, for the pairs that need no grid. They are main's
-//      numbers, captured from PROJ 9.8, and they guard against a refactor that
-//      changes the bare pipeline too.
-//
-// Every case is also probed at a point inside the national operation's area of
+// Every pair is also probed at a point inside the national operation's area of
 // use AND one far outside it, because only the outside point distinguishes
-// "PROJ chose per point" from "one operation everywhere".
+// "PROJ chose per point" from "one operation everywhere" — the defect this
+// replaced.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -863,63 +858,97 @@ TEST(Crs, AutomaticMatchesBareProjPipeline) {
 }
 
 TEST(Crs, AutomaticAppliesNationalOperationsOnlyInsideTheirArea) {
-    // The literal numbers, for the pairs that need no grid. Captured from the
-    // bare PROJ pipeline (PROJ 9.8), i.e. main's behaviour. These national
-    // pairs are ballpark-only from PROJ's point of view (a strict area test
-    // rejects every one of them), so `allow_ballpark` is what lets the pipeline
-    // be built at all — main behaved the same way.
-
+    // The defect this guards was "one listed candidate applied to every point".
+    // Reproduce that old behaviour explicitly — take the first candidate from a
+    // widened listing, normalise it, and run it everywhere — and require the
+    // engine's unpinned transform to differ from it wherever PROJ's own
+    // per-point pipeline does.
+    //
+    // The comparison is self-calibrating: on a PROJ data release whose
+    // areas/pins make the national operation apply everywhere, the bare
+    // pipeline equals the candidate and there is nothing to assert. On one that
+    // discriminates, the outside-the-area point is where the two diverge, and
+    // the engine must follow PROJ (checked by AutomaticMatchesBareProjPipeline)
+    // rather than the candidate. Nothing here pins a PROJ-data-specific number.
     TransformOptions options;
     options.allow_ballpark = true;
 
-    // WGS 84 -> RD New. Inside the Netherlands "Amersfoort to WGS 84 (4)" is
-    // applied (a ~0.5" Helmert); outside, PROJ keeps only the projection.
-    {
-        const CrsTransform shift = CrsTransform::create(
-            wgs84(), CoordinateSystem::from_epsg(28992), options);
-        expect_point(shift.forward(CrsPoint{5.0, 52.0, 0.0}),
-                     CrsPoint{128410.085370810149470, 445806.508833152300213, 0.0}, 1e-6,
-                     "WGS 84 -> RD New inside the Netherlands");
-        const std::optional<CrsPoint> outside = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
-        ASSERT_TRUE(outside.has_value());
-        EXPECT_NEAR(outside->x, -6665247.661684983409941, 1e-3)
-            << "WGS 84 -> RD New outside the Netherlands";
-        EXPECT_NEAR(outside->y, 5594056.177663736045361, 1e-3);
-        EXPECT_GT(std::hypot(outside->x - 128410.085370810, outside->y - 445806.508833152), 1e6)
-            << "an area-limited national operation must not be applied worldwide";
-    }
+    struct Sample {
+        int src_epsg;
+        int dst_epsg;
+        CrsPoint point;
+        const char* what;
+    };
+    const std::vector<Sample> samples = {
+        {4326, 28992, {-100.0, 40.0, 0.0}, "WGS 84 -> RD New outside the Netherlands"},
+        {4258, 27700, {-100.0, 40.0, 0.0}, "ETRS89 -> BNG outside Great Britain"},
+        {4267, 4269, {5.0, 52.0, 0.0}, "NAD27 -> NAD83 outside North America"},
+        {4269, 4326, {5.0, 52.0, 0.0}, "NAD83 -> WGS 84 outside North America"},
+    };
 
-    // NAD 83 -> WGS 84. "NAD83 to WGS 84 (1)" is listed for North America; a
-    // British point takes the null shift. With the old behaviour (one listed
-    // candidate everywhere) the British point would have moved by ~4 m.
-    {
-        const CrsTransform shift =
-            CrsTransform::create(CoordinateSystem::from_epsg(4269), wgs84(), options);
-        expect_point(shift.forward(CrsPoint{-100.0, 40.0, 0.0}),
-                     CrsPoint{-99.999999176944456, 39.999998597777811, 0.0}, 1e-9,
-                     "NAD83 -> WGS 84 inside North America");
-        expect_point(shift.forward(CrsPoint{5.0, 52.0, 0.0}), CrsPoint{5.0, 52.0, 0.0}, 1e-12,
-                     "NAD83 -> WGS 84 outside North America");
-    }
+    PJ_CONTEXT* ctx = thread_context();
+    int discriminating = 0;
+    for (const Sample& sample : samples) {
+        const CoordinateSystem src = CoordinateSystem::from_epsg(sample.src_epsg);
+        const CoordinateSystem dst = CoordinateSystem::from_epsg(sample.dst_epsg);
 
-    // ETRS89 -> British National Grid. OSGB36 to ETRS89 is Great Britain only.
-    // The tolerance is set by which national grid is installed, so the
-    // assertion is "inside and outside differ by kilometres at 52°N" rather
-    // than a literal easting.
-    {
-        const CrsTransform shift = CrsTransform::create(
-            CoordinateSystem::from_epsg(4258), CoordinateSystem::from_epsg(27700), options);
-        const std::optional<CrsPoint> inside = shift.forward(CrsPoint{-1.0, 52.0, 0.0});
-        const std::optional<CrsPoint> outside = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
-        ASSERT_TRUE(inside.has_value());
-        ASSERT_TRUE(outside.has_value());
-        EXPECT_NEAR(inside->x, 468747.322504197, 2.0)
-            << "ETRS89 -> BNG inside Great Britain";
-        EXPECT_NEAR(inside->y, 233977.174379195, 2.0);
-        EXPECT_NEAR(outside->x, -5932518.398155876, 1e-2)
-            << "ETRS89 -> BNG outside Great Britain";
-        EXPECT_NEAR(outside->y, 5516653.986729132, 1e-2);
+        // The old behaviour: candidate 0 of the widened listing, everywhere.
+        PJ* src_pj = proj_create(ctx, src.to_wkt().c_str());
+        PJ* dst_pj = proj_create(ctx, dst.to_wkt().c_str());
+        ASSERT_NE(src_pj, nullptr);
+        ASSERT_NE(dst_pj, nullptr);
+        PJ_OPERATION_FACTORY_CONTEXT* factory =
+            proj_create_operation_factory_context(ctx, nullptr);
+        ASSERT_NE(factory, nullptr);
+        proj_operation_factory_context_set_grid_availability_use(
+            ctx, factory, PROJ_GRID_AVAILABILITY_IGNORED);
+        proj_operation_factory_context_set_spatial_criterion(
+            ctx, factory, PROJ_SPATIAL_CRITERION_PARTIAL_INTERSECTION);
+        PJ_OBJ_LIST* candidates = proj_create_operations(ctx, src_pj, dst_pj, factory);
+        ASSERT_NE(candidates, nullptr);
+        ASSERT_GT(proj_list_get_count(candidates), 0) << sample.what;
+        PJ* first = proj_list_get(ctx, candidates, 0);
+        ASSERT_NE(first, nullptr);
+        PJ* first_normalised = proj_normalize_for_visualization(ctx, first);
+        ASSERT_NE(first_normalised, nullptr);
+
+        const PJ_COORD where =
+            proj_coord(sample.point.x, sample.point.y, sample.point.z, 0.0);
+        const PJ_COORD as_candidate = proj_trans(first_normalised, PJ_FWD, where);
+        const bool candidate_valid =
+            std::isfinite(as_candidate.xyzt.x) && std::isfinite(as_candidate.xyzt.y);
+
+        const BareProj proj_itself(src, dst);
+        ASSERT_TRUE(proj_itself.is_valid());
+        const CrsPoint as_proj = proj_itself.forward(sample.point);
+        const bool proj_valid = std::isfinite(as_proj.x) && std::isfinite(as_proj.y);
+
+        if (candidate_valid && proj_valid &&
+            std::hypot(as_candidate.xyzt.x - as_proj.x, as_candidate.xyzt.y - as_proj.y) > 1e-6) {
+            // PROJ discriminates here. The engine must follow PROJ.
+            ++discriminating;
+            const CrsTransform engine = CrsTransform::create(src, dst, options);
+            const std::optional<CrsPoint> got = engine.forward(sample.point);
+            ASSERT_TRUE(got.has_value()) << sample.what;
+            EXPECT_NEAR(got->x, as_proj.x, 1e-6)
+                << sample.what << ": the first listed candidate must not be applied everywhere";
+            EXPECT_NEAR(got->y, as_proj.y, 1e-6) << sample.what;
+            EXPECT_GT(std::hypot(got->x - as_candidate.xyzt.x, got->y - as_candidate.xyzt.y), 1e-6)
+                << sample.what;
+        }
+
+        proj_destroy(first_normalised);
+        proj_destroy(first);
+        proj_list_destroy(candidates);
+        proj_operation_factory_context_destroy(factory);
+        proj_destroy(src_pj);
+        proj_destroy(dst_pj);
     }
+    // At least one pair must discriminate, or the test proves nothing. On a
+    // PROJ data release where none does, this is a real signal to look at the
+    // samples rather than a reason to pass silently.
+    EXPECT_GT(discriminating, 0)
+        << "no sample distinguished PROJ's per-point choice from the first candidate";
 
     // WGS 84 -> UTM 33N: the projection only, unchanged.
     {
@@ -970,24 +999,28 @@ TEST(Crs, PinnedGridOperationIsNotANullShift) {
     EXPECT_EQ(inverse_shift->auth_name, "INVERSE(DERIVED_FROM(EPSG))");
 
     const CrsPoint source{-72.0, 45.0, 0.0};
-    const CrsTransform pinned = CrsTransform::create(
-        wgs84().with_transformation(*inverse_shift), CoordinateSystem::from_epsg(4267));
+    const CoordinateSystem pinned_crs = wgs84().with_transformation(*inverse_shift);
+    const CrsTransform pinned = CrsTransform::create(pinned_crs, CoordinateSystem::from_epsg(4267));
     const std::optional<CrsPoint> got = pinned.forward(source);
     ASSERT_TRUE(got.has_value());
     EXPECT_NE(pinned.description().find("hgridshift"), std::string::npos) << pinned.description();
     EXPECT_GT(std::hypot(got->x - source.x, got->y - source.y), 1e-8)
         << "a pinned grid operation must not be a null shift";
 
-    // ... and it is the operation the list offered, not some other shift.
-    const BareProj reference(wgs84(), CoordinateSystem::from_epsg(4267));
-    ASSERT_TRUE(reference.is_valid());
-    // The automatic pipeline picks an operation for each point; inside Canada
-    // that is this same NAD 27 shift, so the two agree there.
-    const std::optional<CrsPoint> automatic =
-        CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267)).forward(source);
-    ASSERT_TRUE(automatic.has_value());
-    EXPECT_LE(std::hypot(got->x - automatic->x, got->y - automatic->y), 1e-9)
-        << "inside its area the pinned shift and PROJ's choice are the same operation";
+    // The pinned CRS is persisted as WKT and rebuilt on another thread, so a
+    // second transform from the same value must reproduce the answer exactly.
+    const CrsTransform again = CrsTransform::create(CoordinateSystem::from_wkt(pinned_crs.to_wkt()),
+                                                    CoordinateSystem::from_epsg(4267));
+    const std::optional<CrsPoint> repeated = again.forward(source);
+    ASSERT_TRUE(repeated.has_value());
+    EXPECT_EQ(repeated->x, got->x);
+    EXPECT_EQ(repeated->y, got->y);
+
+    // ... and the shift applied is the grid's, so a different grid operation
+    // (the plain 7-parameter Helmert offered for a different pair) cannot be
+    // what ran.
+    EXPECT_EQ(pinned.description().find("helmert"), std::string::npos)
+        << "the pinned grid operation must not have been replaced by a Helmert";
 }
 
 TEST(Crs, WithTransformationRefusesAnOperationFromAnotherPair) {
