@@ -51,13 +51,20 @@
 
 namespace alphashape::stereo {
 
+/// Largest support radius the 16-bit wide descriptor can hold: its four arms
+/// make 4 * radius comparisons, so radius 4 fills the word exactly and anything
+/// larger would silently drop comparisons.
+constexpr int kCensusMaxRadius = 4;
+
 /// Census transform parameters.
 struct CensusOptions {
-    /// Support radius, in pixels. The wide census uses `2 * window_radius`
-    /// comparisons (8 horizontal + 8 vertical at radius 4), so 16 bits are exact
-    /// for radius 4 and the radius is capped at 8 by the 16-bit descriptor.
+    /// Support radius, in pixels. The wide census makes `4 * window_radius`
+    /// comparisons (four arms of `window_radius` samples each: left, right, top,
+    /// bottom), so 16 bits are exact for radius 4 and the radius is capped at
+    /// kCensusMaxRadius (4) by the 16-bit descriptor. A larger radius would shift
+    /// comparisons out of the word and silently drop them.
     int window_radius = 4;
-    /// True: the 16-bit two-arm wide census described above. False: a 3x3
+    /// True: the 16-bit four-arm wide census described above. False: a 3x3
     /// census (the eight immediate neighbours, packed in the low byte), kept for
     /// a cheap descriptor and for experiments; the search's own cost type uses
     /// the wide form.

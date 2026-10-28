@@ -99,10 +99,32 @@ TEST(Census, NarrowCensusFillsLowByteOnly) {
 
 TEST(Census, InvalidOptionsThrow) {
     FloatImage image(9, 9, 0.5F);
+    // The wide descriptor has four arms of `window_radius` comparisons, so only
+    // radius <= 4 fits the 16-bit word. Radius 5 needs 20 bits: accepting it
+    // would shift four comparisons out of the word and silently drop them, so it
+    // is rejected rather than truncated.
     CensusOptions wide_too_big;
-    wide_too_big.window_radius = 9;  // 4 arms x 9 = 36 bits
+    wide_too_big.window_radius = alphashape::stereo::kCensusMaxRadius + 1;
     EXPECT_THROW(alphashape::stereo::census_transform(image, wide_too_big),
                  alphashape::ValueError);
+
+    // The cap itself is accepted, and a textured image reaches every one of the
+    // 16 bits at it -- the descriptor is exactly full, not full-but-for-a-few.
+    // (A pattern with period 17 in both axes: no two samples of a 9x9 patch tie.)
+    FloatImage textured(9, 9, 0.0F);
+    for (int y = 0; y < 9; ++y) {
+        for (int x = 0; x < 9; ++x) {
+            textured.at(x, y) = static_cast<float>((x * 7 + y * 13) % 17) / 17.0F;
+        }
+    }
+    CensusOptions widest;
+    widest.window_radius = alphashape::stereo::kCensusMaxRadius;
+    const CensusImage at_cap = alphashape::stereo::census_transform(textured, widest);
+    std::uint16_t any = 0;
+    for (const std::uint16_t value : at_cap.values) {
+        any = static_cast<std::uint16_t>(any | value);
+    }
+    EXPECT_EQ(any, 0xFFFFU) << "radius 4 must reach every one of the 16 bits";
 
     CensusOptions narrow_wrong_radius;
     narrow_wrong_radius.wide = false;

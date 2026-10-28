@@ -99,9 +99,14 @@ CensusImage census_transform(const FloatImage& image, const CensusOptions& optio
     if (options.window_radius < 1) {
         throw ValueError("stereo::census_transform: window_radius must be positive");
     }
-    if (options.wide && options.window_radius > 8) {
-        // 2 arms * 2 * radius comparisons must fit the 16-bit descriptor.
-        throw ValueError("stereo::census_transform: a wide census needs window_radius <= 8");
+    if (options.wide && options.window_radius > kCensusMaxRadius) {
+        // Four arms of `radius` samples each, so 4 * radius comparisons must fit
+        // the 16-bit descriptor: radius 4 is exactly the 16 bits it has, and a
+        // larger radius would shift bits out of the word and silently discard
+        // comparisons (a descriptor that looks full but is not).
+        throw ValueError(
+            "stereo::census_transform: a wide census needs window_radius <= 4 "
+            "(four arms of window_radius comparisons, 16 bits)");
     }
     if (!options.wide && options.window_radius != 1) {
         throw ValueError("stereo::census_transform: the 3x3 census requires window_radius == 1");

@@ -1029,9 +1029,10 @@ void validate_run(const PMView& reference, const std::vector<PMView>& neighbours
         if (options.census.window_radius < 1) {
             throw ValueError("stereo::run_patch_match: census window_radius must be positive");
         }
-        if (options.census.wide && options.census.window_radius > 8) {
+        if (options.census.wide && options.census.window_radius > kCensusMaxRadius) {
             throw ValueError(
-                "stereo::run_patch_match: a wide census needs census window_radius <= 8");
+                "stereo::run_patch_match: a wide census needs census window_radius <= 4 "
+                "(four arms of window_radius comparisons, 16 bits)");
         }
         if (!options.census.wide && options.census.window_radius != 1) {
             throw ValueError(
