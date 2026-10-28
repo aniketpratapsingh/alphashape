@@ -857,19 +857,73 @@ TEST(Crs, AutomaticMatchesBareProjPipeline) {
                              "WGS 84 -> UTM 33N");
 }
 
+TEST(Crs, AutomaticIsNotRefusedForAGridOnlyTheFirstCandidateNeeds) {
+    // OSGB36 -> WGS 84's first listed candidate needs the OSTN15 grid, which a
+    // `proj-data` package without the `.tif` files does not carry. PROJ's own
+    // automatic pipeline still transforms every point: it falls back to a
+    // grid-free shift. The missing-grid diagnosis used to read the first listed
+    // candidate and refuse the whole pair, rejecting a transform that works.
+    //
+    // The assertion does not care which operation PROJ picks or whether the grid
+    // is installed — only that `create()` succeeds and agrees with bare PROJ,
+    // which is exactly the contract the listing must not override. The pair is
+    // chosen because its first candidate is the grid operation on every data
+    // package seen, so it reproduces the bug wherever a grid is absent.
+    const CoordinateSystem source = osgb36();
+    const CoordinateSystem target = wgs84();
+
+    const BareProj reference(source, target);
+    ASSERT_TRUE(reference.is_valid());
+
+    std::optional<CrsTransform> engine;
+    std::string refusal;
+    try {
+        engine.emplace(CrsTransform::create(source, target));
+    } catch (const Error& error) {
+        refusal = error.what();
+    }
+    ASSERT_TRUE(refusal.empty())
+        << "the automatic transform must not be refused for a grid only the first listed "
+           "candidate needs, but create() threw: "
+        << refusal;
+    ASSERT_TRUE(engine.has_value());
+
+    // One point inside Great Britain and one far outside every candidate's area:
+    // PROJ answers both, and the engine must answer the same.
+    for (const CrsPoint& point : {CrsPoint{-0.0016, 51.5, 0.0}, CrsPoint{-100.0, 40.0, 0.0}}) {
+        const CrsPoint want = reference.forward(point);
+        ASSERT_TRUE(std::isfinite(want.x) && std::isfinite(want.y));
+        const std::optional<CrsPoint> got = engine->forward(point);
+        ASSERT_TRUE(got.has_value()) << "at " << point.x << "," << point.y;
+        EXPECT_EQ(got->x, want.x) << "at " << point.x << "," << point.y;
+        EXPECT_EQ(got->y, want.y) << "at " << point.x << "," << point.y;
+    }
+}
+
 TEST(Crs, AutomaticAppliesNationalOperationsOnlyInsideTheirArea) {
     // The defect this guards was "one listed candidate applied to every point".
     // Reproduce that old behaviour explicitly — take the first candidate from a
     // widened listing, normalise it, and run it everywhere — and require the
     // engine's unpinned transform to differ from it wherever PROJ's own
-    // per-point pipeline does.
+    // per-point pipeline does, following PROJ rather than the candidate.
     //
-    // The comparison is self-calibrating: on a PROJ data release whose
-    // areas/pins make the national operation apply everywhere, the bare
-    // pipeline equals the candidate and there is nothing to assert. On one that
-    // discriminates, the outside-the-area point is where the two diverge, and
-    // the engine must follow PROJ (checked by AutomaticMatchesBareProjPipeline)
-    // rather than the candidate. Nothing here pins a PROJ-data-specific number.
+    // **This assertion has a premise that is PROJ's, not the engine's.** For it
+    // to say anything, PROJ's bare pipeline must actually pick a *different*
+    // operation for a point outside the first candidate's area. That depends on
+    // the linked PROJ and the installed grids: with PROJ 9.8 plus the full
+    // grid set the Netherlands pair diverges by kilometres; with the gridless
+    // data package a CI runner gets from `proj-data` (PROJ 9.4, no `.tif`s) the
+    // bare pipeline instantiates the area-limited operation itself and agrees
+    // with candidate 0 everywhere, so there is nothing to discriminate. Nothing
+    // is wrong with the engine in that case — `AutomaticMatchesBareProjPipeline`
+    // still requires it to reproduce PROJ's answer exactly.
+    //
+    // So the samples loop runs on every machine, and only the "at least one
+    // pair discriminated" premise skips, naming the condition. The assertions
+    // that hold regardless (engine == bare PROJ at every sample; UTM stays a
+    // plain projection; an outside-every-area point stays put) live in
+    // `AutomaticKeepsTheProjectionAndTheOutsidePoint` so a skip here cannot
+    // hide them.
     TransformOptions options;
     options.allow_ballpark = true;
 
@@ -922,19 +976,24 @@ TEST(Crs, AutomaticAppliesNationalOperationsOnlyInsideTheirArea) {
         ASSERT_TRUE(proj_itself.is_valid());
         const CrsPoint as_proj = proj_itself.forward(sample.point);
         const bool proj_valid = std::isfinite(as_proj.x) && std::isfinite(as_proj.y);
+        ASSERT_TRUE(proj_valid) << sample.what << ": bare PROJ must answer this sample";
 
-        if (candidate_valid && proj_valid &&
+        // Half one, meaningful on every PROJ version and data package: the
+        // engine reproduces bare PROJ exactly.
+        const CrsTransform engine = CrsTransform::create(src, dst, options);
+        const std::optional<CrsPoint> got = engine.forward(sample.point);
+        ASSERT_TRUE(got.has_value()) << sample.what;
+        EXPECT_EQ(got->x, as_proj.x) << sample.what << " must reproduce bare PROJ (x)";
+        EXPECT_EQ(got->y, as_proj.y) << sample.what << " must reproduce bare PROJ (y)";
+
+        // Half two, measurable only where PROJ itself discriminates: candidate 0
+        // of the widened listing is not what PROJ applies for a point outside
+        // its area, and the engine must not apply it either.
+        if (candidate_valid &&
             std::hypot(as_candidate.xyzt.x - as_proj.x, as_candidate.xyzt.y - as_proj.y) > 1e-6) {
-            // PROJ discriminates here. The engine must follow PROJ.
             ++discriminating;
-            const CrsTransform engine = CrsTransform::create(src, dst, options);
-            const std::optional<CrsPoint> got = engine.forward(sample.point);
-            ASSERT_TRUE(got.has_value()) << sample.what;
-            EXPECT_NEAR(got->x, as_proj.x, 1e-6)
-                << sample.what << ": the first listed candidate must not be applied everywhere";
-            EXPECT_NEAR(got->y, as_proj.y, 1e-6) << sample.what;
             EXPECT_GT(std::hypot(got->x - as_candidate.xyzt.x, got->y - as_candidate.xyzt.y), 1e-6)
-                << sample.what;
+                << sample.what << ": the first listed candidate must not be applied everywhere";
         }
 
         proj_destroy(first_normalised);
@@ -944,11 +1003,33 @@ TEST(Crs, AutomaticAppliesNationalOperationsOnlyInsideTheirArea) {
         proj_destroy(src_pj);
         proj_destroy(dst_pj);
     }
-    // At least one pair must discriminate, or the test proves nothing. On a
-    // PROJ data release where none does, this is a real signal to look at the
-    // samples rather than a reason to pass silently.
-    EXPECT_GT(discriminating, 0)
-        << "no sample distinguished PROJ's per-point choice from the first candidate";
+    if (discriminating == 0) {
+        // See the comment at the top: this is the linked PROJ's routing, not
+        // the engine's. Name what was measured so a reader knows the guard did
+        // not run rather than that it passed.
+        //
+        // A skip would hide any expectation the loop already recorded, so it is
+        // only taken when the test is still passing; a real disagreement is
+        // reported as a failure. (The engine-matches-bare-PROJ half is asserted
+        // unconditionally by `AutomaticMatchesBareProjPipeline` either way.)
+        ASSERT_TRUE(!::testing::Test::HasFailure())
+            << "the engine disagreed with bare PROJ above; refusing to report a skip over it";
+        GTEST_SKIP() << "PROJ " << proj_version() << " with this data package ("
+                     << proj_data_info().search_directory.string()
+                     << ") applies the first listed candidate everywhere for every sample, so "
+                        "candidate-0 and the bare pipeline never differ and there is nothing to "
+                        "discriminate. A PROJ data set with the national grids makes this case "
+                        "run; the engine's equality with bare PROJ is asserted unconditionally by "
+                        "Crs.AutomaticMatchesBareProjPipeline.";
+    }
+}
+
+TEST(Crs, AutomaticKeepsTheProjectionAndTheOutsidePoint) {
+    // The half of the automatic-transform contract that holds on every PROJ and
+    // data package, so none of it is skipped where `discriminating` cannot be
+    // measured (see the test above).
+    TransformOptions options;
+    options.allow_ballpark = true;
 
     // WGS 84 -> UTM 33N: the projection only, unchanged.
     {

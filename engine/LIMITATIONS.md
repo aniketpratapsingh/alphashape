@@ -1248,10 +1248,10 @@ yet.
 - **The grids are not bundled and are not downloaded.** `crs::CoordinateSystem::available_transformations()`
   lists every operation PROJ knows, including the ones whose grids are absent,
   and reports the missing ones per entry (`DatumTransformation::missing_grids`).
-  Applying such an operation — through `with_transformation()` or through a plain
-  `CrsTransform::create()` — throws
-  `Error("transformation needs grid <name>; install proj-data")`, naming the grid
-  PROJ wants and the package that carries it. Nothing is fetched from
+  Applying such an operation *explicitly* — through `with_transformation()`, or
+  through a `CrsTransform` pinned by `TransformOptions::preferred_operation` —
+  throws `Error("transformation needs grid <name>; install proj-data")`, naming
+  the grid PROJ wants and the package that carries it. Nothing is fetched from
   `cdn.proj.org`: the thread context has network access and the grid cache
   disabled (WP-12.1). A user who needs a national grid must install `proj-data`
   (Ubuntu), the Homebrew `proj` data, or point `ALPHASHAPE_PROJ_DATA` at a
@@ -1259,6 +1259,15 @@ yet.
   curated subset, so some operations work out of the box and some do not; the
   error names the grid rather than saying "File not found", which is the whole
   point of listing a grid operation that cannot run.
+- **An absent grid does not make the automatic transform fail.** An unpinned
+  `CrsTransform::create()` is PROJ's own pipeline, which keeps every candidate and
+  picks per point, so a grid needed by one candidate is not a grid this pair
+  needs: OSGB36 → WGS 84 still transforms without OSTN15, falling back to a
+  grid-free shift. The diagnosis is therefore made on the pipeline PROJ actually
+  built, not on the first listed candidate — which is only the operation PROJ
+  would prefer, not the one every point will use. A plain `create()` is refused
+  only when the pipeline itself is a single fixed operation that cannot run,
+  which is what a custom CRS's `+nadgrids=` produces.
 - **Only Helmert (7-parameter / 3-parameter) and grid shifts are exercised by
   the test suite.** The millimetre assertions run against the §4.1.1 and §4.2.3
   formulas with published EPSG parameters (OSGB36 → WGS 84, ED50 → WGS 84),

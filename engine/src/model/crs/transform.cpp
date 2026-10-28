@@ -140,11 +140,16 @@ bool is_coordinate_operation(PJ* pj) {
     }
 }
 
-/// True when PROJ can be asked for an object's grids. Only transformations and
-/// concatenations carry a `grids=` step; a conversion cannot.
+/// True when PROJ can be asked for an object's grids. A transformation, a
+/// concatenation, or an "other coordinate operation" carries such a step; a
+/// plain conversion cannot, and a per-point pipeline (type 0) is not a
+/// coordinate operation at all — asking it makes PROJ print "Object is not a
+/// CoordinateOperation". `proj_normalize_for_visualization()` can turn a
+/// transformation into the "other" type, so both are accepted.
 bool reads_grids(PJ* pj) {
     const PJ_TYPE type = proj_get_type(pj);
-    return type == PJ_TYPE_TRANSFORMATION || type == PJ_TYPE_CONCATENATED_OPERATION;
+    return type == PJ_TYPE_TRANSFORMATION || type == PJ_TYPE_CONCATENATED_OPERATION ||
+           type == PJ_TYPE_OTHER_COORDINATE_OPERATION;
 }
 
 /// True for a CRS pinned to a datum by an explicit operation (WP-12.4).
@@ -259,13 +264,13 @@ PjPtr pinned_pipeline(PJ_CONTEXT* ctx, PJ* operation) {
 /// considers for the two CRS extents (the factory's own defaults — operations
 /// whose area does not cover the pair, and operations whose grid is absent, are
 /// ranked last) and read the first. That is what `preferred_operation`,
-/// `accuracy_m()`, the ballpark refusal and the missing-grid diagnosis have
-/// always meant.
+/// `accuracy_m()` and the ballpark refusal have always meant.
 ///
 /// This is a *diagnosis*, not a selection: the pipeline itself is built by
 /// `automatic_pipeline`, so each point is transformed by whichever operation
 /// PROJ deems right for it. Selecting from this list instead would hand one
-/// area-limited national operation to every point in the world.
+/// area-limited national operation to every point in the world — and its first
+/// entry is also why a missing grid is *not* diagnosed here (see below).
 void describe_pair(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
                    const CoordinateSystem& dst, double* accuracy, bool* ballpark) {
     FactoryContextPtr factory{proj_create_operation_factory_context(ctx, nullptr)};
@@ -312,10 +317,14 @@ void describe_pair(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSyst
     if (*accuracy <= 0.0 && !*ballpark) {
         *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
     }
-    // The grid diagnosis comes from this listing, exactly as it always has: the
-    // operation PROJ ranks first for the pair is the one whose absent grid is
-    // reported. It is a diagnosis of the pair, never a change to the pipeline.
-    diagnose_missing_grid(ctx, first.get());
+    // No grid diagnosis here. The first listed candidate is *not* what a point
+    // is transformed by — PROJ keeps every candidate in the automatic pipeline
+    // and picks per point — so an absent grid on that candidate does not mean
+    // this pair cannot run. On a machine without OSTN15, OSGB36 -> WGS 84 still
+    // transforms every point (PROJ falls back to a grid-free shift), while the
+    // first candidate needs `uk_os_OSTN15_NTv2_OSGBtoETRS.tif`; refusing here
+    // would reject a transform that works. The diagnosis belongs on the
+    // pipeline actually built — see `select_operation`.
 }
 
 /// Choose the operation PROJ should use and capture its accuracy/ballpark
@@ -335,6 +344,15 @@ std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const Coor
             throw Error("PROJ could not build a transform from " + quoted(src) + " to " +
                         quoted(dst) + ": " + proj_context_error(ctx));
         }
+        // The grid diagnosis is asked of the pipeline PROJ actually built, not
+        // of a listed candidate: this pipeline is the thing that will run, so
+        // its grids are the ones this pair needs. A per-point pipeline (type 0)
+        // is not a coordinate operation and cannot be asked — and it only
+        // exists when PROJ found something it can always run, so there is
+        // nothing to diagnose on it. A fixed pipeline that needs an absent grid
+        // (a custom CRS's `+nadgrids=`) is reported by name here rather than
+        // failing later with "File not found".
+        diagnose_missing_grid(ctx, pipeline->get());
         describe_pair(ctx, src_pj, dst_pj, src, dst, accuracy, ballpark);
         if (*ballpark && !options.allow_ballpark) {
             throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
