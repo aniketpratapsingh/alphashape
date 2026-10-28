@@ -26,14 +26,16 @@
 ///     or "use the NTv2 grid" and gets it everywhere, including outside the
 ///     operation's area of use.
 ///
-/// Grids are never downloaded. Grids are never downloaded: the context built by
+/// Grids are never downloaded: the context built by
 /// `crs::thread_context()` disables network access and the grid cache, and
 /// operation selection ignores grid availability so the *list* stays complete —
 /// an operation whose grid is missing is reported, and *pinning* it throws
 /// `Error("transformation needs grid <name>; install proj-data")` instead of
-/// silently degrading to a ballpark. An unpinned transform is PROJ's own
-/// pipeline and is not refused for a grid only one candidate needs: PROJ picks
-/// a candidate whose grids are installed.
+/// silently degrading to a ballpark. An optional grid (`+grids=@name`, where
+/// PROJ itself runs without it) is never reported as missing, and the `@` is
+/// not part of the name. An unpinned transform is PROJ's own pipeline and is
+/// not refused for a grid only one candidate needs: PROJ picks a candidate
+/// whose grids are installed.
 ///
 /// `+towgs84` is honoured without special handling here: PROJ models a CRS
 /// carrying TOWGS84 as a bound CRS, so its Helmert shift is one of the

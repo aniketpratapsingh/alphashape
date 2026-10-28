@@ -1135,6 +1135,238 @@ TEST(Crs, WithTransformationRefusesAnOperationFromAnotherPair) {
 }
 
 // ---------------------------------------------------------------------------
+// A 3D source pins the same 2D operations a 2D source does
+// ---------------------------------------------------------------------------
+
+TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
+    // Datum shifts are stored against the horizontal datum: EPSG:1693's source
+    // is NAD27, a 2D geographic CRS. Comparing an EPSG:4979 source with that
+    // source under PJ_COMP_EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS fails (the
+    // criterion does not equate 2D with 3D), which used to reject every
+    // operation of a 3D-source pair. The pin path now compares the horizontal
+    // (2D) identity instead.
+    const CoordinateSystem wgs84_3d = CoordinateSystem::from_epsg(4979);
+    ASSERT_EQ(wgs84_3d.kind(), CrsKind::Geographic3D);
+    const CoordinateSystem nad27 = CoordinateSystem::from_epsg(4267);
+
+    const std::vector<DatumTransformation> list = wgs84_3d.available_transformations(nad27);
+    ASSERT_FALSE(list.empty()) << "a 3D source lists nothing for NAD27";
+
+    // EPSG:1172 is NAD 27 to WGS 84 (3): a grid-free 3-parameter Helmert, so
+    // the case runs on a machine with no proj-data.
+    const DatumTransformation* helmert = find_code(list, "1172");
+    ASSERT_NE(helmert, nullptr) << "EPSG:1172 (NAD 27 to WGS 84 (3)) is not offered";
+    if (helmert->needs_missing_grid()) {
+        GTEST_SKIP() << "EPSG:1172 needs " << missing_grids_summary(*helmert)
+                     << ", which is not installed; install proj-data";
+    }
+
+    const CoordinateSystem pinned_3d = wgs84_3d.with_transformation(*helmert);
+    EXPECT_EQ(pinned_3d.kind(), CrsKind::Geographic3D)
+        << "the BOUNDCRS keeps the 3D base CRS";
+    EXPECT_EQ(pinned_3d.epsg(), 0) << "a BOUNDCRS carries no EPSG code";
+
+    // The same operation pinned from the 2D form of the same datum: the
+    // horizontal result must be identical, so a 3D source is not a different
+    // shift.
+    const CoordinateSystem pinned_2d = wgs84().with_transformation(*helmert);
+
+    const CrsPoint source{-100.0, 40.0, 1234.5};
+    const std::optional<CrsPoint> from_3d =
+        CrsTransform::create(pinned_3d, nad27).forward(source);
+    const std::optional<CrsPoint> from_2d =
+        CrsTransform::create(pinned_2d, nad27).forward(source);
+    ASSERT_TRUE(from_3d.has_value()) << "the 3D-source pin produced no coordinate";
+    ASSERT_TRUE(from_2d.has_value());
+    // The same operation, so the same answer to within PROJ's arithmetic; a
+    // degree is ~111 km, so 1e-12° is a micrometre.
+    EXPECT_NEAR(from_3d->x, from_2d->x, 1e-12);
+    EXPECT_NEAR(from_3d->y, from_2d->y, 1e-12);
+    EXPECT_GT(std::hypot(from_3d->x - source.x, from_3d->y - source.y), 1e-6)
+        << "the pinned Helmert must move the point, not pass it through";
+
+    // A 2D Helmert pushes and pops the height around the geocentric step, so
+    // the ellipsoidal height the 3D base carries comes back unchanged. This is
+    // the "3D source does not lose z" assertion.
+    EXPECT_NEAR(from_3d->z, source.z, 1e-9);
+
+    // The bound CRS round-trips as WKT and pins the same shift a second time —
+    // the 3D base survives serialisation.
+    const CoordinateSystem reparsed = CoordinateSystem::from_wkt(pinned_3d.to_wkt());
+    EXPECT_EQ(reparsed.kind(), CrsKind::Geographic3D);
+    const std::optional<CrsPoint> again = CrsTransform::create(reparsed, nad27).forward(source);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_NEAR(again->x, from_3d->x, 1e-12);
+    EXPECT_NEAR(again->y, from_3d->y, 1e-12);
+    EXPECT_NEAR(again->z, from_3d->z, 1e-12);
+
+    // Pinning still refuses an operation whose horizontal ends are neither this
+    // CRS: EPSG:1314 (OSGB36 -> WGS 84) is not a NAD 27 shift.
+    const std::vector<DatumTransformation> osgb =
+        osgb36().available_transformations(wgs84());
+    const DatumTransformation* osgb_helmert = find_code(osgb, "1314");
+    ASSERT_NE(osgb_helmert, nullptr);
+    try {
+        (void)CoordinateSystem::from_epsg(4267).with_transformation(*osgb_helmert);
+        FAIL() << "expected the wrong-pair refusal with a 3D source in play";
+    } catch (const ValueError& error) {
+        EXPECT_NE(std::string(error.what()).find("other CRSs"), std::string::npos)
+            << error.what();
+    }
+    // ... while its own WGS 84 end accepts it from the 3D CRS too, because the
+    // horizontal datums match.
+    EXPECT_NO_THROW((void)wgs84_3d.with_transformation(*osgb_helmert));
+
+    // The regression in full: every listed operation of a 3D-source pair must
+    // reach the same verdict as the 2D pair's, because a datum shift is a
+    // property of the horizontal datum. Before the fix all 79 entries of
+    // 4979 -> 4267 and 52 of 53 of 4979 -> 4269 threw "does not apply … other
+    // CRSs" — the shape the reviewer measured. Entries that cannot be *bound*
+    // at all (PROJ refuses a concatenated operation as a BOUNDCRS payload) are
+    // not counted either way; what is asserted is that no 3D entry is rejected
+    // as the wrong pair, and that at least one pins.
+    for (int target_code : {4267, 4269}) {
+        const CoordinateSystem target = CoordinateSystem::from_epsg(target_code);
+        for (const CoordinateSystem& source : {wgs84(), wgs84_3d}) {
+            const std::vector<DatumTransformation> entries =
+                source.available_transformations(target);
+            int wrong_pair = 0;
+            int pinned = 0;
+            int unboundable = 0;
+            for (const DatumTransformation& entry : entries) {
+                try {
+                    (void)source.with_transformation(entry);
+                    ++pinned;
+                } catch (const ValueError& error) {
+                    if (std::string(error.what()).find("other CRSs") != std::string::npos) {
+                        ++wrong_pair;
+                    } else {
+                        ++unboundable;  // anonymous, or no stated target CRS
+                    }
+                } catch (const Error&) {
+                    ++unboundable;  // PROJ will not bind this operation's payload
+                }
+            }
+            EXPECT_EQ(wrong_pair, 0)
+                << "source " << source.name() << " to " << target.name()
+                << ": a listed operation must not be rejected as belonging to other CRSs";
+            EXPECT_GT(pinned, 0)
+                << "source " << source.name() << " to " << target.name()
+                << ": no listed operation can be pinned";
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A pair on aligned datums is accepted, not refused as a ballpark
+// ---------------------------------------------------------------------------
+
+TEST(Crs, AlignedDatumPairIsAcceptedWithoutAllowBallpark) {
+    // WGS 84 and ETRS89 are aligned to within a metre, and PROJ knows the EPSG
+    // operation (1149, ETRS89 to WGS 84 (1)) that says so. The pipeline used to
+    // be built with `AUTHORITY=` and came back a ballpark, so create() refused
+    // the pair; it must now be built and report the operation's accuracy.
+    const CoordinateSystem etrs89 = CoordinateSystem::from_epsg(4258);
+    const CrsTransform transform = CrsTransform::create(wgs84(), etrs89);
+    EXPECT_FALSE(transform.is_ballpark());
+    EXPECT_NEAR(transform.accuracy_m(), 1.0, 1e-9)
+        << "EPSG:1149 is published at 1 m";
+
+    // The shift is a null one at the metre level, so a European point comes
+    // back where it started to well under the operation's stated accuracy.
+    const CrsPoint point{5.0, 52.0, 42.0};
+    const std::optional<CrsPoint> got = transform.forward(point);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_LE(horizontal_gap_m(*got, point, point.y), 1.0);
+    EXPECT_NEAR(got->z, point.z, 1e-9);
+
+    // The reverse direction is the same pair, listed and accepted likewise.
+    const CrsTransform back = CrsTransform::create(etrs89, wgs84());
+    EXPECT_FALSE(back.is_ballpark());
+    EXPECT_NEAR(back.accuracy_m(), 1.0, 1e-9);
+
+    // Two more aligned pairs with a *non-null* operation: the NAD83(2011)
+    // Helmert states 2 m, the GDA2020 shift 3 m. Both are accepted and report
+    // what PROJ publishes, which is the documented accuracy the API promises.
+    const CrsTransform nad83_2011 =
+        CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(6318));
+    EXPECT_FALSE(nad83_2011.is_ballpark());
+    EXPECT_NEAR(nad83_2011.accuracy_m(), 2.0, 1e-9);
+
+    const CrsTransform gda2020 = CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(7844));
+    EXPECT_FALSE(gda2020.is_ballpark());
+    EXPECT_NEAR(gda2020.accuracy_m(), 3.0, 1e-9);
+
+    // A pair with no known shift at all still has only a ballpark candidate, and
+    // is still refused without allow_ballpark.
+    try {
+        (void)CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267));
+        FAIL() << "WGS 84 to NAD27 has no real shift and must be refused";
+    } catch (const Error& error) {
+        EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
+            << error.what();
+    }
+    // ... and the same point with the flag set is the ballpark.
+    TransformOptions options;
+    options.allow_ballpark = true;
+    const CrsTransform ballpark = CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267),
+                                                       options);
+    EXPECT_TRUE(ballpark.is_ballpark());
+    EXPECT_EQ(ballpark.accuracy_m(), -1.0);
+}
+
+// ---------------------------------------------------------------------------
+// An optional grid is not a missing grid
+// ---------------------------------------------------------------------------
+
+TEST(Crs, OptionalGridIsNotReportedMissing) {
+    // PROJ's `+grids=@name` means "use this grid if it is installed, otherwise
+    // run without it". Reporting it under missing_grids would make create()
+    // throw for a transform PROJ runs happily, which is what main did. The
+    // leading '@' is PROJ's marker, not part of the file name.
+    const std::string absent = "alphashape_optional_absent.gsb";
+    const CoordinateSystem source =
+        CoordinateSystem::from_proj("+proj=longlat +ellps=clrk66 +nadgrids=@" + absent);
+
+    const std::vector<DatumTransformation> list = source.available_transformations(wgs84());
+    ASSERT_FALSE(list.empty()) << "the optional-grid CRS listed no operation";
+
+    bool saw_grid = false;
+    for (const DatumTransformation& entry : list) {
+        const bool names_it =
+            std::find(entry.grids.begin(), entry.grids.end(), absent) != entry.grids.end();
+        if (!names_it) {
+            continue;
+        }
+        saw_grid = true;
+        EXPECT_FALSE(entry.needs_missing_grid())
+            << "an optional grid must not be reported as required";
+        EXPECT_TRUE(entry.missing_grids.empty()) << describe_transformation(entry);
+        for (const std::string& grid : entry.grids) {
+            EXPECT_EQ(grid.find('@'), std::string::npos)
+                << "the optional marker must be stripped from the reported name: " << grid;
+        }
+    }
+    EXPECT_TRUE(saw_grid) << "the operation must still list the optional grid it names";
+
+    // The plain transform builds and runs: the point passes through unchanged,
+    // because the grid that would move it is not installed and was optional.
+    const CrsTransform transform = CrsTransform::create(source, wgs84());
+    const CrsPoint point{9.0, 50.0, 12.0};
+    const std::optional<CrsPoint> got = transform.forward(point);
+    ASSERT_TRUE(got.has_value()) << "an optional missing grid must not refuse the transform";
+    EXPECT_NEAR(got->x, point.x, 1e-12);
+    EXPECT_NEAR(got->y, point.y, 1e-12);
+    EXPECT_NEAR(got->z, point.z, 1e-12);
+
+    // A *required* missing grid is still refused, so the optional handling did
+    // not widen into "no grid ever matters".
+    const CoordinateSystem required =
+        CoordinateSystem::from_proj("+proj=longlat +ellps=clrk66 +nadgrids=" + absent);
+    EXPECT_THROW((void)CrsTransform::create(required, wgs84()), Error);
+}
+
+// ---------------------------------------------------------------------------
 // A pinned CRS survives persistence
 // ---------------------------------------------------------------------------
 

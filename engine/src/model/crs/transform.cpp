@@ -157,6 +157,11 @@ bool is_bound(PJ* pj) { return proj_get_type(pj) == PJ_TYPE_BOUND_CRS; }
 
 /// The first grid the operation needs that is not installed, or "" when it can
 /// run. PROJ's short name is what `+grids=` and a proj-data package use.
+///
+/// An optional grid (`+grids=@name`) is skipped: PROJ was told the operation
+/// may run without it, so reporting it would refuse a pipeline PROJ is happy
+/// to execute. PROJ marks such a grid with a leading '@' in its short name, so
+/// no name reported from here carries that marker either.
 std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
     const int count = proj_coordoperation_get_grid_used_count(ctx, operation);
     for (int i = 0; i < count; ++i) {
@@ -172,7 +177,10 @@ std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
                                               &available) == 0) {
             continue;
         }
-        if (available == 0 && short_name != nullptr && *short_name != '\0') {
+        if (short_name == nullptr || *short_name == '\0' || *short_name == '@') {
+            continue;
+        }
+        if (available == 0) {
             return short_name;
         }
     }

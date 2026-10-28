@@ -79,9 +79,32 @@ std::string lookup_authority(std::string auth_name) {
     }
 }
 
+/// The grid id an operation names, without PROJ's optional-grid marker. PROJ
+/// reports `+grids=@name` as the short name "@name" (leading '@' included);
+/// the '@' means "use this grid if it is installed, otherwise carry on", so it
+/// is a syntax marker rather than part of the file name, and an error message
+/// that says "@x" would name no installable grid.
+std::string grid_name(const char* short_name) {
+    if (short_name == nullptr) {
+        return std::string();
+    }
+    return *short_name == '@' ? std::string(short_name + 1) : std::string(short_name);
+}
+
+/// True when PROJ reports this grid as optional (`+grids=@name`). PROJ does not
+/// publish the distinction through `proj_coordoperation_get_grid_used`, but it
+/// keeps the '@' in the short name.
+bool optional_grid(const char* short_name) {
+    return short_name != nullptr && *short_name == '@';
+}
+
 /// The grid ids an operation requires, split into all and missing. PROJ reports
 /// availability per grid; the short name is what `+grids=` names and what a
 /// `proj-data` package installs, so it is what an error message must show.
+///
+/// An optional grid (`+grids=@name`) is never reported missing: PROJ itself
+/// runs such a pipeline without it, having been told the absence is acceptable,
+/// so treating it as a hard error would refuse a transform main ran fine.
 void read_grids(PJ_CONTEXT* ctx, PJ* operation, DatumTransformation* out) {
     const int count = proj_coordoperation_get_grid_used_count(ctx, operation);
     for (int i = 0; i < count; ++i) {
@@ -97,12 +120,13 @@ void read_grids(PJ_CONTEXT* ctx, PJ* operation, DatumTransformation* out) {
                                               &available) == 0) {
             continue;
         }
-        if (short_name == nullptr || *short_name == '\0') {
+        const std::string name = grid_name(short_name);
+        if (name.empty()) {
             continue;
         }
-        out->grids.emplace_back(short_name);
-        if (available == 0) {
-            out->missing_grids.emplace_back(short_name);
+        out->grids.emplace_back(name);
+        if (available == 0 && !optional_grid(short_name)) {
+            out->missing_grids.emplace_back(name);
         }
     }
 }
@@ -191,12 +215,40 @@ bool equivalent_crs(PJ_CONTEXT* ctx, PJ* a, PJ* b) {
                                           PJ_COMP_EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS) == 1;
 }
 
-/// True when `operation` runs *from* the CRS `base`. Used to orient a stored
+/// The 2D form of a 3D geographic CRS, or null when the CRS is not one.
+///
+/// A datum shift is stored against the horizontal datum: EPSG:1693's source is
+/// NAD27 (a 2D geographic CRS), even when the caller's source is the 3D
+/// EPSG:4979. `PJ_COMP_EQUIVALENT_EXCEPT_AXIS_ORDER_GEOGCRS` does not equate a
+/// 2D and a 3D CRS, so comparing a 3D base with an operation's source rejected
+/// essentially every operation of a 3D-source pair (78 of the 79 listed for
+/// 4979 -> 4267, 52 of the 53 for 4979 -> 4269).
+///
+/// `proj_crs_demote_to_2D` is the PROJ-blessed way to drop the height axis and
+/// keep the datum and ellipsoid; the name override is left null so PROJ keeps
+/// its own. It arrived in PROJ 6.3, which the build already requires
+/// (find_package(PROJ 9.3)), so no version guard is needed.
+PjPtr demote_to_2d(PJ_CONTEXT* ctx, PJ* crs) {
+    if (crs == nullptr || proj_get_type(crs) != PJ_TYPE_GEOGRAPHIC_3D_CRS) {
+        return PjPtr{};
+    }
+    return PjPtr{proj_crs_demote_to_2D(ctx, nullptr, crs)};
+}
+
+/// True when `operation` runs *from* the CRS `base`, comparing the horizontal
+/// (2D) identity so a 3D source matches a 2D operation. Used to orient a stored
 /// operation (the caller may have listed its inverse) and to refuse one that
 /// belongs to a different pair.
 bool runs_from(PJ_CONTEXT* ctx, PJ* base, PJ* operation) {
     PjPtr source{proj_get_source_crs(ctx, operation)};
-    return equivalent_crs(ctx, source.get(), base);
+    if (source == nullptr || base == nullptr) {
+        return false;
+    }
+    if (equivalent_crs(ctx, source.get(), base)) {
+        return true;
+    }
+    PjPtr horizontal = demote_to_2d(ctx, base);
+    return horizontal != nullptr && equivalent_crs(ctx, source.get(), horizontal.get());
 }
 
 /// A datum shift attaches to a geodetic CRS, so only a geographic source can be
@@ -293,6 +345,10 @@ CoordinateSystem CoordinateSystem::with_transformation(
     const DatumTransformation& transformation) const {
     require_transformable(*this, "source");
     if (!bindable_kind(kind())) {
+        // A projected source still has a route: `preferred_operation` matches a
+        // listed operation's AUTH:CODE and builds the pipeline from it without
+        // binding the CRS, which is the one way a projected CRS can pin a
+        // datum shift.
         throw ValueError("cannot bind a datum transformation to " + quoted(*this) + " (a " +
                          crs_kind_name(kind()) +
                          " CRS); bind its geographic CRS instead, or pin the operation with "
@@ -308,13 +364,14 @@ CoordinateSystem CoordinateSystem::with_transformation(
     }
 
     if (transformation.auth_name.empty() || transformation.code.empty()) {
-        // An anonymous entry (the ballpark offset, or a custom CRS's nadgrids
-        // shift) has no proj.db object, so its hub cannot be recovered from the
-        // entry alone; a ballpark is still reachable through
-        // TransformOptions::allow_ballpark.
+        // An anonymous entry has no proj.db object, so its operation cannot be
+        // recovered from the entry: `TransformOptions::preferred_operation`
+        // matches the same AUTH:CODE and an anonymous entry has none. A
+        // ballpark is still reachable through allow_ballpark; a custom CRS's
+        // nadgrids shift applies by defining the CRS that way.
         throw ValueError("transformation \"" + transformation.name +
-                         "\" has no authority code and cannot be pinned; use "
-                         "TransformOptions::allow_ballpark for a ballpark shift");
+                         "\" has no authority code and cannot be pinned; a ballpark shift is "
+                         "available through TransformOptions::allow_ballpark");
     }
 
     PJ_CONTEXT* ctx = thread_context();
