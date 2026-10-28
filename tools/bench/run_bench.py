@@ -111,6 +111,67 @@ def manifest_hash(manifest: dict) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+class DepthParamError(ValueError):
+    """A ``depth_params`` string that is not a list of well-formed ``key=value``."""
+
+
+# A BuildDepthMaps parameter name is what the engine declares: lowercase words and
+# underscores (``cost_type``, ``max_cost``, ``max_neighbors``). A value is a number,
+# a word, or a decimal (``census``, ``-1``, ``0.05``). Both are deliberately
+# narrower than "anything without a space": the string arrives from a workflow
+# input, so it is untrusted text reaching an argv list, and a value containing a
+# semicolon or a quote has no legitimate use here.
+DEPTH_PARAM_KEY = re.compile(r"^[a-z_]+$")
+DEPTH_PARAM_VALUE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def parse_depth_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``depth_params`` string into a dict.
+
+    ``"cost_type=census max_cost=0.4"`` becomes
+    ``{"cost_type": "census", "max_cost": "0.4"}``. Everything is validated here,
+    at the system boundary, because after this point the values are handed to the
+    CLI as ``--set key=value`` and a malformed pair would surface as a stage
+    failure hours into a run — or worse, as a silently ignored parameter.
+
+    A missing separator, an empty key or value, a character outside the two
+    patterns, and a repeated key are all errors rather than being skipped: a typo
+    that is quietly dropped would produce a run that looks like an experiment and
+    is actually the default, which is exactly the confusion this flag exists to
+    avoid.
+    """
+    params: dict[str, str] = {}
+    for token in (text or "").split():
+        key, separator, value = token.partition("=")
+        if not separator:
+            raise DepthParamError(f"{token!r} is not a key=value pair")
+        if not DEPTH_PARAM_KEY.match(key):
+            raise DepthParamError(f"{key!r} is not a valid parameter name")
+        if not DEPTH_PARAM_VALUE.match(value):
+            raise DepthParamError(f"{value!r} is not a valid value for {key}")
+        if key in params:
+            raise DepthParamError(f"{key} is given more than once")
+        params[key] = value
+    return params
+
+
+def merge_depth_params(dataset: dict, depth_params: dict[str, str]) -> dict:
+    """The dataset with ``depth_params`` merged into its BuildDepthMaps overrides.
+
+    The merge is over the dataset's own entries, not a replacement of them: an
+    experiment such as ``cost_type=census`` keeps the measured ``downscale`` of the
+    control run, which is what makes the two comparable at all. Nothing is mutated —
+    the manifest is loaded once and shared by every run in a job, so an in-place
+    update here would leak into whatever ran next.
+    """
+    if not depth_params:
+        return dataset
+    overrides = {task: dict(values or {}) for task, values in (dataset.get("param_overrides") or {}).items()}
+    merged = overrides.setdefault("BuildDepthMaps", {})
+    merged.update(depth_params)
+    return {**dataset, "param_overrides": overrides}
+
+
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
     """Every (cache file name, remote file) pair a dataset needs, deduplicated.
 
@@ -641,7 +702,6 @@ def run_pipeline(
     log = work / "cli.log"
     stages: dict[str, float] = {}
     overrides = overrides or {}
-
     started = time.monotonic()
     # The log is truncated per RUN, not per stage: it is one run's evidence, and a
     # stale log from a previous attempt would bury this one's error.
@@ -811,13 +871,30 @@ def inspect_project(project: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
+def run(
+    dataset_name: str,
+    work: Path,
+    *,
+    keep: bool = False,
+    depth_params: dict[str, str] | None = None,
+) -> dict:
+    """Run one dataset and score it.
+
+    ``depth_params`` are extra ``BuildDepthMaps`` keyword arguments from a manual
+    dispatch, already validated by :func:`parse_depth_params`. They are merged over
+    the dataset's own manifest overrides for ``BuildDepthMaps``, so an experiment
+    such as ``cost_type=census`` keeps the dataset's measured ``downscale`` and is
+    therefore comparable with the control run of the same dataset. The manifest's
+    own dicts are never mutated: they are copied, because the manifest is loaded
+    once and a mutation would leak into the next run.
+    """
     manifest = load_manifest()
     if dataset_name not in manifest["datasets"]:
         raise SystemExit(
             f"unknown dataset {dataset_name!r}; known: {', '.join(sorted(manifest['datasets']))}"
         )
     dataset = manifest["datasets"][dataset_name]
+    dataset = merge_depth_params(dataset, depth_params or {})
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -922,6 +999,12 @@ def run(dataset_name: str, work: Path, *, keep: bool = False) -> dict:
     )
     result["timing"] = timing
     result["manifest_hash"] = manifest_hash(manifest)
+    # A default run's JSON is unchanged byte for byte: the key is present only when
+    # the run was dispatched with extra parameters. The report keys "is this an
+    # experiment" off the key's presence, so its absence means "control run" for
+    # every metrics file that predates this flag as well.
+    if depth_params:
+        result["depth_params"] = dict(depth_params)
     result["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1135,7 +1218,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="describe the dataset and exit")
     parser.add_argument("--list-datasets", action="store_true", help="list dataset names and exit")
     parser.add_argument("--manifest-hash", action="store_true", help="print the cache key and exit")
+    parser.add_argument(
+        "--depth-params",
+        default="",
+        help='extra BuildDepthMaps keyword args, e.g. "cost_type=census max_cost=0.4"; '
+        "marks the run as an experiment (never a baseline, never gated)",
+    )
     args = parser.parse_args(argv)
+
+    try:
+        depth_params = parse_depth_params(args.depth_params)
+    except DepthParamError as exc:
+        parser.error(f"--depth-params: {exc}")
 
     manifest = load_manifest()
 
@@ -1159,7 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(dataset))
         return 0
 
-    result = run(args.dataset, Path(args.work))
+    result = run(args.dataset, Path(args.work), depth_params=depth_params)
 
     if args.json:
         destination = Path(args.json)

@@ -719,6 +719,161 @@ class CliValueTest(unittest.TestCase):
         self.assertEqual(run_bench.cli_value("source"), "source")
 
 
+class DepthParamsTest(unittest.TestCase):
+    """The dispatch string is untrusted text; it is validated before it is an argv."""
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_depth_params(""), {})
+        self.assertEqual(run_bench.parse_depth_params(None), {})
+        self.assertEqual(run_bench.parse_depth_params("   "), {})
+
+    def test_a_single_pair(self):
+        self.assertEqual(run_bench.parse_depth_params("cost_type=census"), {"cost_type": "census"})
+
+    def test_several_pairs_are_split_on_whitespace(self):
+        self.assertEqual(
+            run_bench.parse_depth_params("  cost_type=census   max_cost=0.4\nmax_neighbors=8 "),
+            {"cost_type": "census", "max_cost": "0.4", "max_neighbors": "8"},
+        )
+
+    def test_a_negative_and_a_decimal_value_are_admitted(self):
+        parsed = run_bench.parse_depth_params("max_cost=-1 downscale=8 filter_mode=disabled")
+        self.assertEqual(parsed["max_cost"], "-1")
+        self.assertEqual(parsed["downscale"], "8")
+        self.assertEqual(parsed["filter_mode"], "disabled")
+
+    def test_a_token_without_an_equals_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("cost_type")
+
+    def test_an_empty_key_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("=census")
+
+    def test_an_empty_value_is_rejected(self):
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("cost_type=")
+
+    def test_an_uppercase_or_dashed_key_is_rejected(self):
+        for token in ("CostType=census", "cost-type=census", "cost$type=census"):
+            with self.assertRaises(run_bench.DepthParamError, msg=token):
+                run_bench.parse_depth_params(token)
+
+    def test_a_value_with_shell_or_json_metacharacters_is_rejected(self):
+        # These have no legitimate use and are exactly what would be dangerous if
+        # the string were ever handed to a shell.
+        for token in ("cost_type=cen;sus", 'cost_type="census"', "cost_type=$(id)",
+                      "cost_type=census|cat", "cost_type=census&x"):
+            with self.assertRaises(run_bench.DepthParamError, msg=token):
+                run_bench.parse_depth_params(token)
+
+    def test_a_repeated_key_is_rejected(self):
+        # Not "last wins": a repeated key is more likely a typo than a deliberate
+        # override, and silently choosing one would make the record a lie.
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("max_cost=0.4 max_cost=0.5")
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "aerial-nadir", "--list", "--depth-params", "oops"])
+
+    def test_the_command_line_accepts_a_good_string(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = run_bench.main(
+                ["--dataset", "aerial-nadir", "--list", "--depth-params", "cost_type=census"]
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("CC-BY-4.0", out.getvalue())
+
+
+class DepthParamMergeTest(unittest.TestCase):
+    """The dispatch parameters are merged over the dataset's manifest overrides."""
+
+    def dataset(self):
+        return run_bench.load_manifest()["datasets"]["aerial-nadir"]
+
+    def test_a_parameter_is_added_to_build_depth_maps(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["cost_type"], "census")
+
+    def test_the_dataset_s_own_overrides_survive_the_merge(self):
+        # The experiment has to stay comparable with the control, so the dataset's
+        # measured downscale must not be lost just because a new key was given.
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], 8)
+        self.assertEqual(merged["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], 250)
+
+    def test_a_parameter_overrides_the_manifest_value_of_the_same_name(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"downscale": "4"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], "4")
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        original = self.dataset()
+        self.assertEqual(run_bench.merge_depth_params(original, {}), original)
+
+    def test_the_input_dataset_is_not_mutated(self):
+        original = self.dataset()
+        before = json.dumps(original, sort_keys=True)
+        run_bench.merge_depth_params(original, {"cost_type": "census"})
+        self.assertEqual(json.dumps(original, sort_keys=True), before)
+
+    def test_the_manifest_is_not_mutated(self):
+        before = json.dumps(run_bench.load_manifest(), sort_keys=True)
+        run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        self.assertEqual(json.dumps(run_bench.load_manifest(), sort_keys=True), before)
+
+    def test_a_dataset_with_no_depth_overrides_still_gets_a_task_entry(self):
+        merged = run_bench.merge_depth_params({"param_overrides": {}}, {"cost_type": "census"})
+        self.assertEqual(merged["param_overrides"], {"BuildDepthMaps": {"cost_type": "census"}})
+
+
+class IsExperimentTest(unittest.TestCase):
+    """The workflow's one definition of "is this a control run"."""
+
+    def status(self, payload):
+        import tempfile
+
+        import is_experiment
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(payload, encoding="utf-8")
+            return is_experiment.main([str(path)])
+
+    def test_a_run_without_dispatch_parameters_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"dataset": "x"})), 0)
+
+    def test_an_empty_depth_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"depth_params": {}})), 0)
+
+    def test_a_run_with_dispatch_parameters_is_an_experiment(self):
+        self.assertEqual(self.status(json.dumps({"depth_params": {"cost_type": "census"}})), 1)
+
+    def test_a_missing_file_cannot_tell(self):
+        import is_experiment
+
+        self.assertEqual(is_experiment.main(["/nonexistent/metrics.json"]), 2)
+
+    def test_malformed_json_cannot_tell(self):
+        self.assertEqual(self.status("{not json"), 2)
+
+    def test_a_json_array_cannot_tell(self):
+        self.assertEqual(self.status("[]"), 2)
+
+    def test_no_argument_cannot_tell(self):
+        import is_experiment
+
+        self.assertEqual(is_experiment.main([]), 2)
+
+
 class PipelineShapeTest(unittest.TestCase):
     def test_the_pipeline_order_matches_the_documented_one(self):
         # A missing or reordered stage is a silent score change, so the order the
