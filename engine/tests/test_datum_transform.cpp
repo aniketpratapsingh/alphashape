@@ -1200,6 +1200,13 @@ TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
     EXPECT_NEAR(again->y, from_3d->y, 1e-12);
     EXPECT_NEAR(again->z, from_3d->z, 1e-12);
 
+    // Inverse direction: still 3D, and the height is not lost on the way back.
+    const std::optional<CrsPoint> restored =
+        CrsTransform::create(reparsed, nad27).inverse(*from_3d);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_NEAR(restored->z, source.z, 1e-9);
+    EXPECT_LE(horizontal_gap_m(*restored, source, source.y), 1e-3);
+
     // Pinning still refuses an operation whose horizontal ends are neither this
     // CRS: EPSG:1314 (OSGB36 -> WGS 84) is not a NAD 27 shift.
     const std::vector<DatumTransformation> osgb =
@@ -1232,7 +1239,6 @@ TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
                 source.available_transformations(target);
             int wrong_pair = 0;
             int pinned = 0;
-            int unboundable = 0;
             for (const DatumTransformation& entry : entries) {
                 try {
                     (void)source.with_transformation(entry);
@@ -1240,19 +1246,23 @@ TEST(Crs, ThreeDSourcePinsTheHorizontalOperation) {
                 } catch (const ValueError& error) {
                     if (std::string(error.what()).find("other CRSs") != std::string::npos) {
                         ++wrong_pair;
-                    } else {
-                        ++unboundable;  // anonymous, or no stated target CRS
                     }
+                    // Anything else (an anonymous entry, no stated target CRS)
+                    // is a property of that entry, not of the pair.
                 } catch (const Error&) {
-                    ++unboundable;  // PROJ will not bind this operation's payload
+                    // PROJ will not bind this operation's payload (a
+                    // concatenated operation), or its grid is absent here.
                 }
             }
+            const std::string where = "EPSG:" + std::to_string(source.epsg()) + " -> EPSG:" +
+                                      std::to_string(target_code);
             EXPECT_EQ(wrong_pair, 0)
-                << "source " << source.name() << " to " << target.name()
-                << ": a listed operation must not be rejected as belonging to other CRSs";
-            EXPECT_GT(pinned, 0)
-                << "source " << source.name() << " to " << target.name()
-                << ": no listed operation can be pinned";
+                << where << ": a listed operation must not be rejected as belonging to other "
+                << "CRSs";
+            // 35 of 79 and 52 of 53 bind from either source, with or without
+            // the grids installed (measured on PROJ 9.8 with grids and with
+            // proj.db alone), so this is not a data-dependent premise.
+            EXPECT_GT(pinned, 0) << where << ": no listed operation can be pinned";
         }
     }
 }
