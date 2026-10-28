@@ -603,6 +603,9 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
             census_storage.back().pixels().assign(values.begin(), values.end());
             return &census_storage.back();
         };
+        // transform_neighbours is validated true for a search (a census cost
+        // needs both sides transformed; mixing a descriptor with raw intensities
+        // would be meaningless), so both views are transformed here.
         view_images.push_back(transformed(*reference.image));
         for (const PMView& view : neighbours) {
             view_images.push_back(transformed(*view.image));
@@ -1033,6 +1036,14 @@ void validate_run(const PMView& reference, const std::vector<PMView>& neighbours
         if (!options.census.wide && options.census.window_radius != 1) {
             throw ValueError(
                 "stereo::run_patch_match: the 3x3 census requires census window_radius == 1");
+        }
+        if (!options.census.transform_neighbours) {
+            // The search correlates the reference window against each neighbour,
+            // so both sides must be descriptors. transform_neighbours=false is a
+            // reference-only mode for callers computing a mask; it is not a
+            // valid search configuration.
+            throw ValueError(
+                "stereo::run_patch_match: the census cost requires census.transform_neighbours");
         }
     }
 }

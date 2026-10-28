@@ -226,6 +226,10 @@ void validate_inputs(const PMView& reference, const std::vector<PMView>& neighbo
             throw ValueError(
                 "stereo::run_patch_match: the 3x3 census requires census window_radius == 1");
         }
+        if (!options.census.transform_neighbours) {
+            throw ValueError(
+                "stereo::run_patch_match: the census cost requires census.transform_neighbours");
+        }
     }
 }
 

@@ -352,6 +352,24 @@ TEST(Census, DistanceAtChanceForUnrelatedPatterns) {
     EXPECT_LT(mean, 0.6) << mean;
 }
 
+TEST(Census, SearchRequiresBothSidesTransformed) {
+    // A census search needs the reference and the neighbours as descriptors;
+    // transform_neighbours=false is a reference-only mode for callers computing
+    // a mask, not a valid search configuration.
+    FloatImage image(32, 24, 0.5F);
+    image.at(5, 5) = 0.1F;
+    PMView view;
+    view.image = &image;
+    view.calibration = Calibration::initial(alphashape::CameraType::Frame, 32, 24, 30.0);
+    PatchMatchOptions options;
+    options.depth_min = 1.0;
+    options.depth_max = 10.0;
+    options.cost_type = alphashape::stereo::CostType::Census;
+    options.census.transform_neighbours = false;
+    EXPECT_THROW(alphashape::stereo::run_patch_match(view, {view}, options),
+                 alphashape::ValueError);
+}
+
 // ---------------------------------------------------------------------------
 // Cost scale and default threshold
 // ---------------------------------------------------------------------------
