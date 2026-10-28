@@ -19,11 +19,11 @@ All notable changes to alphashape are recorded here. The format follows
   while the descriptor makes the cost invariant to any monotone intensity change
   -- exposure, white balance, gamma -- which is where depth-map holes on real
   photo sets come from. Each view is transformed once per pyramid level and
-  cached, so the search pays the transform once, not per candidate. Both costs
-  are (1 - ZNCC) / 2 on [0, 1], so `max_cost` keeps its "better than chance"
-  meaning; a `-1` value resolves to the cost type's own default (0.5 for `zncc`,
-  0.6 for `census`, which runs slightly higher on a correct match because its
-  descriptor is coarser). The depth-map fingerprint records the choice, so
+  cached, so the search pays the transform once, not per candidate. The census
+  cost is (1 - ZNCC) / 2 on its own [0, 1] interval; a `-1` `max_cost` resolves to
+  the cost type's own default (0.5 for `zncc` on [0, 2], 0.6 for `census` on
+  [0, 1], which runs slightly higher on a correct match because its descriptor is
+  coarser). The depth-map fingerprint records the choice, so
   switching cost rebuilds the maps instead of reusing them. The GPU PatchMatch
   kernels implement the `zncc` cost only and decline a census run to the CPU
   with a log line (the per-view descriptor buffer does not fit the kernels'

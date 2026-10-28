@@ -265,11 +265,11 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
     std::size_t same_depth = 0;
     double cost_delta = 0.0;
     for (std::size_t i = 0; i < plain.depth.size(); ++i) {
-        // A real census cost is in [0, 1]; the search writes the 2.0 sentinel for
-        // a pixel whose only evaluated candidates were rejected, which keeps its
-        // seeded depth. Both are legitimate here, anything else is not.
+        // The census cost is (1 - ZNCC) / 2 on [0, 1]; the rejection sentinel is
+        // 1.0 (the top of that interval). Both are legitimate here.
         const float cost = plain.cost[i];
-        EXPECT_TRUE((cost >= 0.0F && cost <= 1.0F) || cost == 2.0F) << cost;
+        EXPECT_GE(cost, 0.0F) << cost;
+        EXPECT_LE(cost, 1.0F) << cost;
         if (plain.depth[i] > 0.0F && affine.depth[i] > 0.0F) {
             ++valid;
             const double rel = std::abs(static_cast<double>(plain.depth[i]) -
@@ -350,6 +350,23 @@ TEST(Census, DistanceAtChanceForUnrelatedPatterns) {
     const double mean = total / static_cast<double>(count);
     EXPECT_GT(mean, 0.4) << mean;
     EXPECT_LT(mean, 0.6) << mean;
+}
+
+// ---------------------------------------------------------------------------
+// Cost scale and default threshold
+// ---------------------------------------------------------------------------
+
+TEST(Census, CostIntervalAndDefaultThreshold) {
+    // Each cost type has its own interval and its own default threshold on it:
+    // the intensity cost is (1 - ZNCC) in [0, 2] (the historical 0.5), the census
+    // cost is (1 - ZNCC) / 2 in [0, 1] (0.6, a fraction of that interval). This
+    // pins the contract a caller relies on when it leaves max_cost at its default.
+    EXPECT_DOUBLE_EQ(alphashape::stereo::patch_match_default_max_cost(
+                         alphashape::stereo::CostType::Zncc),
+                     0.5);
+    EXPECT_DOUBLE_EQ(alphashape::stereo::patch_match_default_max_cost(
+                         alphashape::stereo::CostType::Census),
+                     0.6);
 }
 
 }  // namespace

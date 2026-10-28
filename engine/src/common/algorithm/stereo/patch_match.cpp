@@ -89,6 +89,14 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kConeHalfAngle = kPi / 3.0;         // 60 degree init cone around -b_p
 constexpr double kMaxNormalRefineAngle = kPi / 3.0;  // 60 degree refinement ceiling
 constexpr double kNoMatchCost = 2.0;                 // ZNCC = -1 (no agreement)
+// Scale applied to (1 - ZNCC) to land on each cost type's own [0, 1] interval.
+// The intensity cost keeps the historical (1 - ZNCC) in [0, 2]. The census cost
+// is half that -- (1 - ZNCC) / 2 -- exactly as the plan's algorithm section
+// specifies, so its own scale is [0, 1] and a max_cost of 0.6 means what the
+// plan says it means. Because ZNCC is invariant to a positive scale of either
+// input, this cannot be folded into the transformed values; it is applied to the
+// finished per-neighbour cost.
+constexpr double kCensusCostScale = 0.5;
 constexpr double kFacingEps = 1e-6;                  // n . b must be < -eps
 constexpr double kCameraZEps = 1e-9;                 // neighbour z > eps (a guard
                                                      // against division blow-up)
@@ -197,6 +205,10 @@ struct CostContext {
     const float* ref_values = nullptr;           // count * n_samples window values
     const Eigen::Vector3d* bearings = nullptr;   // count bearings, row-major
     const Eigen::Vector2i* offsets = nullptr;    // window offsets
+    /// Multiplier on (1 - ZNCC) that puts the cost on the selected type's own
+    /// [0, 1] interval: 1.0 for intensity ((1 - ZNCC), [0, 2]), 0.5 for census
+    /// ((1 - ZNCC) / 2, [0, 1]).
+    double cost_scale = 1.0;
     std::vector<NeighbourView> neighbours;
     int best_k = 1;
 };
@@ -377,10 +389,14 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
                       const Eigen::Vector3d& n) {
     const int nn = wc.n_neighbours;
     const int min_valid = (3 * wc.n + 3) / 4;  // ceil(0.75 * n_samples)
+    // The sentinel, on the selected cost's own interval: 2.0 for intensity, 1.0
+    // for census. It must sit at the top of that interval so no real cost of the
+    // same type can exceed a rejection.
+    const double no_match = kNoMatchCost * ctx.cost_scale;
     int candidate_valid = 0;
     prepare_candidate(wc, rho, n, wc.dq, candidate_valid);
     if (candidate_valid < min_valid) {
-        return kNoMatchCost;  // not even the whole plane covers 75% of the window
+        return no_match;  // not even the whole plane covers 75% of the window
     }
 
     // Keep the `best_k` smallest *voting* costs, with their running sum. votes
@@ -404,8 +420,12 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
         int valid = 0;
         const NeighbourView& view = ctx.neighbours[si(j)];
         const Eigen::Vector3d* const mb = wc.mb_store.data() + si(j) * si(wc.n);
+        // (1 - ZNCC), scaled onto the selected cost's interval. A neighbour whose
+        // cells are cut by the sentinel still contributes 2.0 * scale, i.e. the
+        // worst possible value on that interval.
         const double c = neighbour_cost(view, wc.ref_store.data(), wc.dq.data(), mb, wc.n,
-                                        min_valid, valid);
+                                        min_valid, valid) *
+                         ctx.cost_scale;
         if (valid < min_valid) {
             continue;  // this neighbour cannot see the window: not a vote
         }
@@ -435,7 +455,7 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
     }
 
     if (votes == 0) {
-        return kNoMatchCost;  // no neighbour sees this pixel
+        return no_match;  // no neighbour sees this pixel
     }
     const int k_eff = std::min(want, votes);
     if (many_mode) {
@@ -698,6 +718,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     ctx.ref_values = ref_values.data();
     ctx.bearings = bearings.data();
     ctx.offsets = offsets.data();
+    ctx.cost_scale = options.cost_type == CostType::Census ? kCensusCostScale : 1.0;
     ctx.neighbours = std::move(neighbour_views);
     {
         int k = options.best_k == 0 ? (n_neighbours + 1) / 2 : options.best_k;  // 0 = ceil(n/2)
@@ -713,7 +734,10 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     result.height = height;
     result.depth.assign(count, -1.0F);
     result.normals.assign(count * 3, 0.0F);
-    result.cost.assign(count, static_cast<float>(kNoMatchCost));
+    result.cost.assign(count, static_cast<float>(kNoMatchCost *
+                                                 (options.cost_type == CostType::Census
+                                                      ? kCensusCostScale
+                                                      : 1.0)));
 
     std::vector<std::uint8_t> active(count, 0);
 

@@ -655,10 +655,9 @@ TEST(PatchMatch, CensusImprovesPlaneNoise) {
     EXPECT_LE(census_accuracy.median_rel, 0.02);
 }
 
-TEST(PatchMatch, CensusCostStaysInUnitRange) {
-    // Every accepted pixel's cost is in [0, 1] on the census scale (the ZNCC of
-    // the descriptor values), and a rejected one keeps the search's own 2.0
-    // sentinel -- the range contract the max_cost cut depends on.
+TEST(PatchMatch, CensusCostStaysInSearchRange) {
+    // The census cost is (1 - ZNCC) / 2, so it lies in [0, 1]: this is the
+    // interval its max_cost default of 0.6 is expressed in.
     const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
     const Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
                                     Eigen::Vector3d(0.0, 0.0, 10.0));
@@ -671,8 +670,7 @@ TEST(PatchMatch, CensusCostStaysInUnitRange) {
     const PatchMatchResult result =
         alphashape::stereo::run_patch_match(views[0], neighbours, options);
     for (const float cost : result.cost) {
-        // A real census cost is in [0, 1]; the search's rejection sentinel is 2.0.
-        EXPECT_GE(cost, 0.0F);
-        EXPECT_TRUE(cost <= 1.0F || cost == 2.0F) << cost;
+        EXPECT_GE(cost, 0.0F) << cost;
+        EXPECT_LE(cost, 1.0F) << cost;
     }
 }

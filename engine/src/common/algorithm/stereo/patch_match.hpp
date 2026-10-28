@@ -20,23 +20,26 @@ namespace alphashape::stereo {
 
 /// Which photometric cost the search minimises.
 ///
-/// Zncc    the intensity ZNCC normalised to [0, 1]: (1 - z) / 2. The original
-///         cost; assumes the two views of a surface point differ by a gain and a
-///         bias, which real photo sets only approximately do.
-/// Census  the ZNCC computed on the census descriptor values (census.hpp):
+/// Zncc    the intensity cost (1 - ZNCC), in [0, 2] with 1.0 at zero
+///         correlation. The original cost; assumes the two views of a surface
+///         point differ by a gain and a bias, which real photo sets only
+///         approximately do.
+/// Census  (1 - ZNCC) / 2 computed on the census descriptor values (census.hpp):
 ///         each pixel's 16-bit census mask is read as a sample in [0, 1]
 ///         (mask / 65535) and the existing ZNCC aggregation runs on those
-///         values. The descriptor is invariant to any monotone intensity
+///         values. The half factor puts this cost on its own [0, 1] interval, as
+///         the plan specifies, so its max_cost default (0.6) is a fraction of
+///         that interval. The descriptor is invariant to any monotone intensity
 ///         change, so this survives exposure, white-balance and gamma
 ///         differences between overlapping images and keeps a usable signal on
 ///         low-contrast ground where an intensity correlation is noise. Reusing
 ///         the ZNCC core also keeps the sub-pixel bilinear sampling and the
 ///         variance floor, which a per-sample Hamming mean would lose.
 ///
-/// The two costs share the [0, 1] scale and the "0.5 = chance" convention, so
-/// `max_cost` means the same thing ("the winning match must be better than
-/// chance") whichever type a run selects; the best threshold for a given scene
-/// still differs between them and is set per cost type by the caller.
+/// The two costs have different intervals (intensity [0, 2], census [0, 1]) and
+/// therefore different max_cost defaults; both keep 0.5-of-the-interval as the
+/// "zero correlation / chance" reference and patch_match_default_max_cost()
+/// supplies the right one for each.
 enum class CostType {
     Zncc = 0,
     Census = 1,
@@ -64,9 +67,11 @@ struct PatchMatchOptions {
     int iterations = 6;          // red-black sweeps
     int best_k = 0;              // neighbours averaged per pixel; 0 = ceil(n/2)
     /// Final pixels whose cost is above this get depth -1. The value is on the
-    /// selected cost's own [0, 1] scale. A task that exposes the cost as a
-    /// choice should default it per cost type (patch_match_default_max_cost());
-    /// this struct's 0.5 is the ZNCC threshold the search has always used.
+    /// selected cost's interval: intensity (1 - ZNCC) in [0, 2] (1.0 = zero
+    /// correlation), census (1 - ZNCC) / 2 in [0, 1]. A task that exposes the
+    /// cost as a choice should default it per cost type
+    /// (patch_match_default_max_cost()); this struct's 0.5 is the intensity
+    /// threshold the search has always used.
     double max_cost = 0.5;
     double min_texture_stddev = 1.0 / 255.0;  // skip windows flatter than this (intensity 0..1)
     /// Photometric cost the search minimises. Zncc by default: selecting census
@@ -101,15 +106,16 @@ struct PatchMatchOptions {
 std::vector<int> patch_match_iteration_plan(int width, int height,
                                             const PatchMatchOptions& options);
 
-/// The `max_cost` a run should start from for `type`, on that cost's own [0, 1]
-/// scale.
+/// The `max_cost` a run should start from for `type`, on that type's own
+/// interval (intensity [0, 2], census [0, 1]).
 ///
-/// ZNCC keeps the historical 0.5. Census uses 0.35: a census distance above
-/// roughly a third of the bits is what a rejection looks like in practice, and
-/// on the dense test scenes the true plane sits far below it while a spurious
-/// match sits above. (The exact figure is a calibration of ours, measured on
-/// our own fixtures, not a value taken from a paper; it is deliberately stricter
-/// than 0.5 so the default does not admit the chance-level plateau at 0.5.)
+/// ZNCC keeps the historical 0.5. Census uses 0.6: the descriptor is coarser
+/// than 8-bit intensity, so an otherwise-correct pixel correlates a little less
+/// sharply and its true-plane cost sits a little above the intensity cost's
+/// (measured ~0.015 against ~0.009 on the noisy plane fixture, both halved),
+/// so the default is made more permissive so the stricter descriptor does not
+/// cut pixels the intensity run keeps. The figure is our own calibration on our
+/// fixtures, matching the plan's re-tune, not a value taken from a paper.
 double patch_match_default_max_cost(CostType type);
 
 struct PatchMatchResult {

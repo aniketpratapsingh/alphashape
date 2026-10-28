@@ -30,10 +30,11 @@
 // cannot masquerade as a strongly textured one.
 //
 // Two ways to compare a pair of descriptors live here. `census_distance` is the
-// mine, cheap Hamming distance of two masks (the distance the cited papers
-// evaluate). The search itself uses `census_values`: it reads the mask as a
+// Hamming distance of two masks (the distance the cited papers evaluate, and the
+// cheapest). The search itself uses `census_values`: it reads the mask as a
 // sample in [0, 1] and lets the existing ZNCC aggregate over the window, which
-// is the census-and-ZNCC cost of the plan's algorithm section. The distinction
+// is the census-and-ZNCC cost of the plan's algorithm section (the resulting cost
+// is (1 - ZNCC), the same scale as the intensity cost). The distinction
 // that mattered when choosing: Hamming treats each comparison equally (right for
 // "how many ranks disagree") but is 16 discrete levels with no sub-pixel
 // interpolation possible on a bit mask, while correlating the mask values keeps
