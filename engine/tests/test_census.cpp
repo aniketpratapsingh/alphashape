@@ -234,6 +234,12 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
     const FloatImage neighbour = render(nb_c, nb_r, 1.0F, 0.0F);
     const FloatImage bright = render(nb_c, nb_r, 1.3F, 0.05F);
 
+    PMView ref_view;
+    ref_view.image = &reference;
+    ref_view.calibration = calib;
+    ref_view.R = r;
+    ref_view.t = -r * ref_c;
+
     const auto run_with = [&](const FloatImage& neighbour_image) {
         PMView nb_view;
         nb_view.image = &neighbour_image;

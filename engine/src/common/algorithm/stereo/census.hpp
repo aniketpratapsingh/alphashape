@@ -91,6 +91,11 @@ CensusImage census_transform(const FloatImage& image, const CensusOptions& optio
 
 /// Normalised Hamming distance of two descriptors, in [0, 1]: the number of
 /// differing bits over the 16 the wide census fills.
+///
+/// The normaliser is 16 even for the 3x3 (`wide = false`) descriptor, whose
+/// eight bits only reach 0.5: that keeps one scale across both forms and is
+/// harmless because the search always uses the wide form (the narrow one is a
+/// cheap descriptor for previews and experiments, see CensusOptions::wide).
 inline double census_distance(std::uint16_t a, std::uint16_t b) {
     // Portable popcount: the width is fixed at 16, so the loop is unrolled by
     // any optimiser and no <bit> / builtin dependency is introduced.
