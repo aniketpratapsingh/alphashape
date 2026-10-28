@@ -308,8 +308,10 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
                             0.0, 0.0),
             kInternational1924);
         EXPECT_LE(horizontal_gap_m(*got, reference, 53.8), 1e-3) << "GN 7-2 §4.3.2 formulas";
-        EXPECT_NEAR(got->x, dms(2, 7, 51.477), 0.0005 / 3600.0) << "GN 7-2 §4.3.2 printed longitude";
-        EXPECT_NEAR(got->y, dms(53, 48, 36.565), 0.0005 / 3600.0) << "GN 7-2 §4.3.2 printed latitude";
+        EXPECT_NEAR(got->x, dms(2, 7, 51.477), 0.0005 / 3600.0)
+            << "GN 7-2 §4.3.2 printed longitude";
+        EXPECT_NEAR(got->y, dms(53, 48, 36.565), 0.0005 / 3600.0)
+            << "GN 7-2 §4.3.2 printed latitude";
         EXPECT_NEAR(got->z, 73.0, 1e-9) << "a 2D shift must not change the height";
     }
 
@@ -447,6 +449,37 @@ TEST(Crs, PreferredTransformationHonoured) {
     ASSERT_TRUE(c.has_value());
     EXPECT_GT(horizontal_gap_m(*got, *c, point.y), 1.0)
         << "EPSG:1314 and EPSG:1195 are different shifts, so pinning must matter";
+}
+
+TEST(Crs, DerivedAuthorityOperationIsPinnable) {
+    // The OSTN15 shift (EPSG:7710) is reported by PROJ under the computed
+    // authority "DERIVED_FROM(EPSG)". Pinning must resolve it — the code is an
+    // EPSG code, only the authority string is decorated — and the pinned grid
+    // shift must then run. Skipped when the OSTN15 grid is absent.
+    if (!grid_installed("uk_os_OSTN15_NTv2_OSGBtoETRS.tif")) {
+        GTEST_SKIP() << "the OSTN15 grid uk_os_OSTN15_NTv2_OSGBtoETRS.tif is not installed; "
+                        "install proj-data to run this case";
+    }
+    const std::vector<DatumTransformation> list = osgb36().available_transformations(wgs84());
+    const DatumTransformation* ostn15 = find_code(list, "7710");
+    ASSERT_NE(ostn15, nullptr) << "the OSTN15 operation (EPSG:7710) is not offered";
+    EXPECT_EQ(ostn15->auth_name, "DERIVED_FROM(EPSG)");
+    EXPECT_FALSE(ostn15->needs_missing_grid());
+
+    const CrsPoint point{dms(1, 43, 4.5177), dms(52, 39, 27.2531), 0.0};
+    const CrsTransform pinned =
+        CrsTransform::create(osgb36().with_transformation(*ostn15), wgs84());
+    EXPECT_NE(pinned.description().find("OSGB36 to WGS 84 (9)"), std::string::npos)
+        << pinned.description();
+
+    const std::optional<CrsPoint> got = pinned.forward(point);
+    ASSERT_TRUE(got.has_value());
+    // The OSTN15 shift differs from the EPSG:1314 Helmert by metres, so this
+    // proves the grid operation (not the Helmert) is what ran.
+    const CrsPoint helmert_want = geocentric_to_geodetic(
+        osgb36_helmert_to_wgs84_geocentric(geodetic_to_geocentric(point, kAiry1830)), kWgs84);
+    EXPECT_GT(horizontal_gap_m(*got, helmert_want, point.y), 0.5)
+        << "the OSTN15 shift must not coincide with the 7-parameter Helmert";
 }
 
 TEST(Crs, PinnedTransformationComposesWithProjectedTarget) {
