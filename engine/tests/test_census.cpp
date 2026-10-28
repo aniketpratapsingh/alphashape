@@ -406,7 +406,8 @@ TEST(Census, TextureGateIsMeasuredOnIntensityForBothCosts) {
             descriptor_sq += v * v;
         }
     }
-    const std::size_t n = static_cast<std::size_t>(height - 16) * static_cast<std::size_t>(width - 16);
+    const std::size_t n = static_cast<std::size_t>(height - 16) *
+                          static_cast<std::size_t>(width - 16);
     const double descriptor_mean = descriptor_sum / static_cast<double>(n);
     const double descriptor_stddev =
         std::sqrt(std::max(0.0, descriptor_sq / static_cast<double>(n) -

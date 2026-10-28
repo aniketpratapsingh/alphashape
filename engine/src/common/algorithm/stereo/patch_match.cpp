@@ -707,11 +707,10 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
     // rejects windows the intensity gate (and the census cost's own raison
     // d'etre: low-contrast ground) would keep. Gating on the intensity window
     // keeps one meaning for both costs. The intensity image is still alive here
-    // (it is the caller's, or this level's reduced reference), so the gate reads
-    // it in place and allocates nothing.
-    const std::vector<float>* const gate_pixels =
-        options.cost_type == CostType::Census ? &reference.image->pixels()
-                                              : &ref_pixels->pixels();
+    // (it is the caller's, or this level's reduced reference) and for zncc it is
+    // the same image the cost reads, so the gate uses it in place either way and
+    // allocates nothing.
+    const std::vector<float>& gate_pixels = reference.image->pixels();
 
     std::vector<float> ref_values(count * si(n_samples), 0.0F);
     {
@@ -789,7 +788,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
                 for (int k = 0; k < n_samples; ++k) {
                     const Eigen::Vector2i off = offsets[si(k)];
                     const double v = static_cast<double>(
-                        (*gate_pixels)[si(y + off.y()) * si(width) + si(x + off.x())]);
+                        gate_pixels[si(y + off.y()) * si(width) + si(x + off.x())]);
                     sum += v;
                     sq += v * v;
                 }
