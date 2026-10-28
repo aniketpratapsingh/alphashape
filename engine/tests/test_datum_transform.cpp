@@ -303,7 +303,7 @@ TEST(Crs, DatumShiftMatchesEpsgExamples) {
         const std::optional<CrsPoint> got = to_ed50.forward(source);
         ASSERT_TRUE(got.has_value());
 
-        const Xyz reference = geocentric_to_geodetic(
+        const CrsPoint reference = geocentric_to_geodetic(
             position_vector(geodetic_to_geocentric(source, kWgs84), 84.87, 96.49, 116.95, 0.0, 0.0,
                             0.0, 0.0),
             kInternational1924);
