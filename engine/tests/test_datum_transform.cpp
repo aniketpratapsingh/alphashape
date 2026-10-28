@@ -3,9 +3,14 @@
 // Two layers are tested.
 //
 // The *selection* layer (`available_transformations`, `with_transformation`) is
-// checked against its contract: preferred first, then increasing accuracy with
-// unknown accuracy last; pinning an operation must reproduce it; and a grid that
-// is not installed must be named rather than silently degrading to a ballpark.
+// checked against its contract: increasing accuracy with unknown accuracy last;
+// pinning an operation must reproduce it; and a grid that is not installed must
+// be named rather than silently degrading to a ballpark.
+//
+// The *automatic* layer is checked against main: an unpinned transform must
+// transform exactly as the bare PROJ pipeline did — per point, so an
+// area-limited national operation applies inside its area and not outside it.
+// Those numbers are pinned below in `AutomaticMatchesBareProjPipeline`.
 //
 // The *numeric* layer checks the Helmert shifts against IOGP Publication
 // 373-7-2 (Geomatics Guidance Note 7, part 2, September 2019). Rather than
@@ -24,12 +29,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <proj.h>
 
+#include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
+#include "common/core/document.hpp"
+#include "common/io/project_io.hpp"
 #include "model/crs/coordinate_system.hpp"
 #include "model/crs/datum.hpp"
 #include "model/crs/proj_context.hpp"
@@ -348,18 +359,13 @@ TEST(Crs, AvailableTransformationsSorted) {
     const std::vector<DatumTransformation> list = osgb36().available_transformations(wgs84());
     ASSERT_GE(list.size(), 2u) << "OSGB36 -> WGS 84 offers several Helmert shifts plus a ballpark";
 
-    // Exactly one preferred entry, and it is first: that is the one PROJ would
-    // pick, so the ordering contract is "preferred first".
-    EXPECT_TRUE(list.front().preferred);
-    EXPECT_EQ(std::count_if(list.begin(), list.end(),
-                            [](const DatumTransformation& e) { return e.preferred; }),
-              1);
-
-    // Behind it, known accuracy ascending and unknown accuracy last. The
-    // ballpark has unknown accuracy, so it must come after every Helmert shift.
+    // Known accuracy ascending and unknown accuracy last. The ballpark has
+    // unknown accuracy, so it must come after every Helmert shift. Nothing is
+    // marked preferred: PROJ's automatic transform chooses per point, so no
+    // single entry is "the operation PROJ would use".
     bool saw_unknown = false;
     double previous = -1.0;
-    for (std::size_t i = 1; i < list.size(); ++i) {
+    for (std::size_t i = 0; i < list.size(); ++i) {
         const double accuracy = list[i].accuracy_m;
         if (accuracy <= 0.0) {
             saw_unknown = true;
@@ -406,17 +412,16 @@ TEST(Crs, AvailableTransformationsSorted) {
     EXPECT_LT(at_1314, at_1195) << "the 2 m shift must precede the 21 m shift";
 }
 
-TEST(Crs, PreferredTransformationHonoured) {
+TEST(Crs, PinnedTransformationIsHonoured) {
     const std::vector<DatumTransformation> list = osgb36().available_transformations(wgs84());
     ASSERT_FALSE(list.empty());
 
     // Pinning an operation and comparing against the unpinned transform is not a
-    // meaningful equality test: PROJ's own automatic pick for this pair can be
-    // the ballpark (it ranks by area, and a strict area test rejects the
-    // national operations), so `CrsTransform::create(osgb36(), wgs84())` may
-    // legitimately apply no shift at all. What "pinning is honoured" means here
-    // is narrower and checkable: the transform built from the pinned CRS runs
-    // the pinned operation's pipeline, and its numbers are that operation's.
+    // meaningful equality test: an unpinned transform lets PROJ choose per
+    // point, and for OSGB36 -> WGS 84 that means the Helmert applies inside
+    // Great Britain only. What "pinning is honoured" means here is narrower and
+    // checkable: the transform built from the pinned CRS runs the pinned
+    // operation's pipeline, and its numbers are that operation's.
     // `description()` is the PROJ pipeline text (not the operation's name), so
     // the Helmert parameters are what identifies it.
     const DatumTransformation* helmert = find_code(list, "1314");
@@ -608,8 +613,9 @@ TEST(Crs, GridOperationRunsWhenInstalled) {
 
 TEST(Crs, Towgs84Applied) {
     // A custom WKT with TOWGS84[] is modelled by PROJ as a bound CRS, so its
-    // Helmert shift is the preferred operation, is not a ballpark, and produces
-    // the same coordinates as EPSG:1314, which carries the same parameters.
+    // Helmert shift is the pair's only real operation, is not a ballpark, and
+    // produces the same coordinates as EPSG:1314, which carries the same
+    // parameters.
     const char* wkt =
         "GEOGCS[\"Custom Airy\","
         "DATUM[\"Custom OSGB36\","
@@ -621,8 +627,7 @@ TEST(Crs, Towgs84Applied) {
     ASSERT_TRUE(custom.is_set());
 
     const std::vector<DatumTransformation> list = custom.available_transformations(wgs84());
-    ASSERT_FALSE(list.empty());
-    EXPECT_TRUE(list.front().preferred);
+    ASSERT_EQ(list.size(), 1u) << "a bound CRS offers exactly its own shift";
     EXPECT_FALSE(list.front().ballpark) << "TOWGS84 is a real shift, not a ballpark";
     EXPECT_FALSE(list.front().needs_missing_grid());
 
@@ -691,18 +696,423 @@ TEST(Crs, DatumRefusesLocalUnsetAndProjected) {
 }
 
 TEST(Crs, IdenticalCrsHasNoDatumShift) {
-    // WGS 84 to itself: PROJ offers one null geographic offset. The list is
-    // short, every entry is a no-op, and a transform built from the pair is the
+    // WGS 84 to itself: PROJ offers one null geographic offset. The list has
+    // one entry, it is a no-op, and a transform built from the pair is the
     // identity. The point is that the entry point does not throw for a pair with
     // nothing to do.
     const std::vector<DatumTransformation> list = wgs84().available_transformations(wgs84());
-    ASSERT_FALSE(list.empty());
-    EXPECT_TRUE(list.front().preferred);
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list.front().name, "Null geographic offset from WGS 84 to WGS 84");
+    EXPECT_FALSE(list.front().ballpark) << "a null offset is not a ballpark";
 
     const CrsPoint point{9.0, 50.0, 12.5};
     const std::optional<CrsPoint> got = CrsTransform::create(wgs84(), wgs84()).forward(point);
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(*got, point);
+}
+
+// ---------------------------------------------------------------------------
+// The automatic (unpinned) transform is PROJ's per-point choice
+//
+// Two assertions per case, because they catch different halves of the defect:
+//
+//   1. The engine's unpinned pipeline agrees with a bare PROJ pipeline for the
+//      same pair, bit for bit. That bare pipeline is exactly what the engine
+//      built before WP-12.4 touched operation selection, so this is the
+//      "unchanged from main for every pair" guard, and it holds regardless of
+//      which grids happen to be installed.
+//
+//   2. The literal values, for the pairs that need no grid. They are main's
+//      numbers, captured from PROJ 9.8, and they guard against a refactor that
+//      changes the bare pipeline too.
+//
+// Every case is also probed at a point inside the national operation's area of
+// use AND one far outside it, because only the outside point distinguishes
+// "PROJ chose per point" from "one operation everywhere".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Assert `got` reproduces `want` to `tolerance` in x/y (z passes through).
+void expect_point(const std::optional<CrsPoint>& got, const CrsPoint& want, double tolerance,
+                  const char* what) {
+    ASSERT_TRUE(got.has_value()) << what;
+    EXPECT_NEAR(got->x, want.x, tolerance) << what << " (x)";
+    EXPECT_NEAR(got->y, want.y, tolerance) << what << " (y)";
+    EXPECT_DOUBLE_EQ(got->z, want.z) << what << " (z must pass through a 2D shift)";
+}
+
+/// The reference: a bare `proj_create_crs_to_crs_from_pj` pipeline with no
+/// options and no pre-selected operation, normalised to visualisation order.
+/// This is deliberately the same call the engine makes, spelled out here so the
+/// test fails if the engine starts doing something else.
+class BareProj {
+public:
+    BareProj(const CoordinateSystem& src, const CoordinateSystem& dst) {
+        const std::string src_wkt = src.to_wkt();
+        const std::string dst_wkt = dst.to_wkt();
+        ctx_ = thread_context();
+        PJ* src_pj = proj_create(ctx_, src_wkt.c_str());
+        PJ* dst_pj = proj_create(ctx_, dst_wkt.c_str());
+        pipeline_ = (src_pj != nullptr && dst_pj != nullptr)
+                        ? proj_create_crs_to_crs_from_pj(ctx_, src_pj, dst_pj, nullptr, nullptr)
+                        : nullptr;
+        if (pipeline_ != nullptr) {
+            PJ* normalised = proj_normalize_for_visualization(ctx_, pipeline_);
+            proj_destroy(pipeline_);
+            pipeline_ = normalised;
+        }
+        proj_destroy(src_pj);
+        proj_destroy(dst_pj);
+    }
+    ~BareProj() {
+        if (pipeline_ != nullptr) {
+            proj_destroy(pipeline_);
+        }
+    }
+    BareProj(const BareProj&) = delete;
+    BareProj& operator=(const BareProj&) = delete;
+
+    bool is_valid() const { return pipeline_ != nullptr; }
+
+    CrsPoint forward(const CrsPoint& point) const {
+        proj_errno_reset(pipeline_);
+        const PJ_COORD in = proj_coord(point.x, point.y, point.z, 0.0);
+        const PJ_COORD out = proj_trans(pipeline_, PJ_FWD, in);
+        return CrsPoint{out.xyzt.x, out.xyzt.y, out.xyzt.z};
+    }
+
+private:
+    PJ_CONTEXT* ctx_ = nullptr;
+    PJ* pipeline_ = nullptr;
+};
+
+/// The engine's unpinned transform must reproduce `reference` at every point,
+/// and both must either succeed or fail together. The comparison is exact: the
+/// two are the same PROJ call, so any difference is the bug this guards.
+///
+/// `allow_ballpark` is on because PROJ's own pick for a pair with only
+/// area-limited national operations (NAD 27 -> NAD 83 and friends) is the
+/// ballpark, and `create()` refuses that by default — main did too. The flag
+/// only lifts the refusal; it does not change the pipeline.
+void expect_matches_bare_proj(const CoordinateSystem& src, const CoordinateSystem& dst,
+                              const std::vector<CrsPoint>& points, const char* what) {
+    const BareProj reference(src, dst);
+    ASSERT_TRUE(reference.is_valid()) << what;
+    TransformOptions options;
+    options.allow_ballpark = true;
+    const CrsTransform engine = CrsTransform::create(src, dst, options);
+    for (const CrsPoint& point : points) {
+        const CrsPoint want = reference.forward(point);
+        const std::optional<CrsPoint> got = engine.forward(point);
+        const bool want_valid = std::isfinite(want.x) && std::isfinite(want.y) &&
+                                std::isfinite(want.z);
+        EXPECT_EQ(got.has_value(), want_valid)
+            << what << " at " << point.x << "," << point.y << ": validity differs";
+        if (!want_valid || !got) {
+            continue;
+        }
+        EXPECT_EQ(got->x, want.x) << what << " (x) at " << point.x << "," << point.y;
+        EXPECT_EQ(got->y, want.y) << what << " (y) at " << point.x << "," << point.y;
+        EXPECT_EQ(got->z, want.z) << what << " (z) at " << point.x << "," << point.y;
+    }
+}
+
+}  // namespace
+
+TEST(Crs, AutomaticMatchesBareProjPipeline) {
+    const CoordinateSystem nad27 = CoordinateSystem::from_epsg(4267);
+    const CoordinateSystem nad83 = CoordinateSystem::from_epsg(4269);
+    const CoordinateSystem etrs89 = CoordinateSystem::from_epsg(4258);
+    const CoordinateSystem bng = CoordinateSystem::from_epsg(27700);
+    const CoordinateSystem rd_new = CoordinateSystem::from_epsg(28992);
+
+    // NAD 27 -> NAD 83. The reported id of the CONUS operation is
+    // "DERIVED_FROM(EPSG):1241", which is not a proj.db row — the case that
+    // used to build a null shift when an id was handed back to PROJ.
+    expect_matches_bare_proj(nad27, nad83,
+                             {CrsPoint{-100.0, 40.0, 0.0}, CrsPoint{5.0, 52.0, 0.0},
+                              CrsPoint{-72.0, 45.0, 0.0}},
+                             "NAD27 -> NAD83");
+
+    // ETRS89 -> British National Grid: OSGB36 to ETRS89 is Great Britain only.
+    expect_matches_bare_proj(etrs89, bng,
+                             {CrsPoint{-1.0, 52.0, 0.0}, CrsPoint{-100.0, 40.0, 0.0}},
+                             "ETRS89 -> BNG");
+
+    // WGS 84 -> RD New: Amersfoort to WGS 84 (4) is the Netherlands only.
+    expect_matches_bare_proj(wgs84(), rd_new,
+                             {CrsPoint{5.0, 52.0, 0.0}, CrsPoint{-100.0, 40.0, 0.0}},
+                             "WGS 84 -> RD New");
+
+    // NAD 83 -> WGS 84 and WGS 84 -> NAD 27 (the computed-id inverse).
+    expect_matches_bare_proj(nad83, wgs84(),
+                             {CrsPoint{-100.0, 40.0, 0.0}, CrsPoint{5.0, 52.0, 0.0}},
+                             "NAD83 -> WGS 84");
+    expect_matches_bare_proj(wgs84(), nad27,
+                             {CrsPoint{-72.0, 45.0, 0.0}, CrsPoint{-100.0, 40.0, 0.0}},
+                             "WGS 84 -> NAD 27");
+    expect_matches_bare_proj(osgb36(), wgs84(),
+                             {CrsPoint{1.7167, 52.65, 0.0}, CrsPoint{-100.0, 40.0, 0.0}},
+                             "OSGB36 -> WGS 84");
+
+    // WGS 84 -> UTM 33N must stay what it always was: no datum shift at all.
+    expect_matches_bare_proj(wgs84(), CoordinateSystem::from_epsg(32633),
+                             {CrsPoint{9.0, 50.0, 123.0}, CrsPoint{-1.0, 52.0, 0.0}},
+                             "WGS 84 -> UTM 33N");
+}
+
+TEST(Crs, AutomaticAppliesNationalOperationsOnlyInsideTheirArea) {
+    // The literal numbers, for the pairs that need no grid. Captured from the
+    // bare PROJ pipeline (PROJ 9.8), i.e. main's behaviour. These national
+    // pairs are ballpark-only from PROJ's point of view (a strict area test
+    // rejects every one of them), so `allow_ballpark` is what lets the pipeline
+    // be built at all — main behaved the same way.
+
+    TransformOptions options;
+    options.allow_ballpark = true;
+
+    // WGS 84 -> RD New. Inside the Netherlands "Amersfoort to WGS 84 (4)" is
+    // applied (a ~0.5" Helmert); outside, PROJ keeps only the projection.
+    {
+        const CrsTransform shift = CrsTransform::create(
+            wgs84(), CoordinateSystem::from_epsg(28992), options);
+        expect_point(shift.forward(CrsPoint{5.0, 52.0, 0.0}),
+                     CrsPoint{128410.085370810149470, 445806.508833152300213, 0.0}, 1e-6,
+                     "WGS 84 -> RD New inside the Netherlands");
+        const std::optional<CrsPoint> outside = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
+        ASSERT_TRUE(outside.has_value());
+        EXPECT_NEAR(outside->x, -6665247.661684983409941, 1e-3)
+            << "WGS 84 -> RD New outside the Netherlands";
+        EXPECT_NEAR(outside->y, 5594056.177663736045361, 1e-3);
+        EXPECT_GT(std::hypot(outside->x - 128410.085370810, outside->y - 445806.508833152), 1e6)
+            << "an area-limited national operation must not be applied worldwide";
+    }
+
+    // NAD 83 -> WGS 84. "NAD83 to WGS 84 (1)" is listed for North America; a
+    // British point takes the null shift. With the old behaviour (one listed
+    // candidate everywhere) the British point would have moved by ~4 m.
+    {
+        const CrsTransform shift =
+            CrsTransform::create(CoordinateSystem::from_epsg(4269), wgs84(), options);
+        expect_point(shift.forward(CrsPoint{-100.0, 40.0, 0.0}),
+                     CrsPoint{-99.999999176944456, 39.999998597777811, 0.0}, 1e-9,
+                     "NAD83 -> WGS 84 inside North America");
+        expect_point(shift.forward(CrsPoint{5.0, 52.0, 0.0}), CrsPoint{5.0, 52.0, 0.0}, 1e-12,
+                     "NAD83 -> WGS 84 outside North America");
+    }
+
+    // ETRS89 -> British National Grid. OSGB36 to ETRS89 is Great Britain only.
+    // The tolerance is set by which national grid is installed, so the
+    // assertion is "inside and outside differ by kilometres at 52°N" rather
+    // than a literal easting.
+    {
+        const CrsTransform shift = CrsTransform::create(
+            CoordinateSystem::from_epsg(4258), CoordinateSystem::from_epsg(27700), options);
+        const std::optional<CrsPoint> inside = shift.forward(CrsPoint{-1.0, 52.0, 0.0});
+        const std::optional<CrsPoint> outside = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
+        ASSERT_TRUE(inside.has_value());
+        ASSERT_TRUE(outside.has_value());
+        EXPECT_NEAR(inside->x, 468747.322504197, 2.0)
+            << "ETRS89 -> BNG inside Great Britain";
+        EXPECT_NEAR(inside->y, 233977.174379195, 2.0);
+        EXPECT_NEAR(outside->x, -5932518.398155876, 1e-2)
+            << "ETRS89 -> BNG outside Great Britain";
+        EXPECT_NEAR(outside->y, 5516653.986729132, 1e-2);
+    }
+
+    // WGS 84 -> UTM 33N: the projection only, unchanged.
+    {
+        const CrsTransform shift =
+            CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(32633));
+        expect_point(shift.forward(CrsPoint{9.0, 50.0, 123.0}),
+                     CrsPoint{70134.497635423846, 5555901.554208880290, 123.0}, 1e-9,
+                     "WGS 84 -> UTM 33N");
+        EXPECT_NE(shift.description().find("utm"), std::string::npos) << shift.description();
+        EXPECT_EQ(shift.description().find("hgridshift"), std::string::npos)
+            << "a UTM conversion must not grow a datum shift: " << shift.description();
+    }
+
+    // NAD 27 -> NAD 83 needs a NADCON grid. Where one is installed the CONUS
+    // point must move; where none is, the pair must be a clean null shift rather
+    // than a crash.
+    {
+        const CrsTransform shift = CrsTransform::create(
+            CoordinateSystem::from_epsg(4267), CoordinateSystem::from_epsg(4269), options);
+        const std::optional<CrsPoint> conus = shift.forward(CrsPoint{-100.0, 40.0, 0.0});
+        ASSERT_TRUE(conus.has_value());
+        if (grid_installed("us_noaa_conus.tif") ||
+            grid_installed("us_noaa_nadcon5_nad27_nad83_1986_conus.tif")) {
+            EXPECT_GT(std::hypot(conus->x + 100.0, conus->y - 40.0), 1e-7)
+                << "the NADCON grid must move a CONUS point";
+        }
+        // Outside every NAD 27 -> NAD 83 area there is nothing to apply.
+        expect_point(shift.forward(CrsPoint{5.0, 52.0, 0.0}), CrsPoint{5.0, 52.0, 0.0}, 1e-12,
+                     "NAD27 -> NAD83 outside every area");
+    }
+}
+
+TEST(Crs, PinnedGridOperationIsNotANullShift) {
+    // The pinned form of a grid operation: the shift must move the point by the
+    // grid amount, not pass it through. EPSG:1693 is the stored NAD 27 -> WGS 84
+    // shift, so pinning the listed *inverse* exercises the orientation logic in
+    // `with_transformation()` and the object-based pipeline in transform.cpp —
+    // the two places a decorated identifier ("INVERSE(DERIVED_FROM(EPSG)):1693")
+    // used to be handed back to PROJ and silently became a null shift.
+    if (!grid_installed("ca_nrc_ntv2_0.tif")) {
+        GTEST_SKIP() << "the NTv2 grid ca_nrc_ntv2_0.tif is not installed; install proj-data to "
+                        "run the pinned WGS 84 -> NAD 27 case";
+    }
+    const std::vector<DatumTransformation> list =
+        wgs84().available_transformations(CoordinateSystem::from_epsg(4267));
+    const DatumTransformation* inverse_shift = find_code(list, "1693");
+    ASSERT_NE(inverse_shift, nullptr) << "the inverse NAD 27 -> WGS 84 shift is not offered";
+    EXPECT_EQ(inverse_shift->auth_name, "INVERSE(DERIVED_FROM(EPSG))");
+
+    const CrsPoint source{-72.0, 45.0, 0.0};
+    const CrsTransform pinned = CrsTransform::create(
+        wgs84().with_transformation(*inverse_shift), CoordinateSystem::from_epsg(4267));
+    const std::optional<CrsPoint> got = pinned.forward(source);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_NE(pinned.description().find("hgridshift"), std::string::npos) << pinned.description();
+    EXPECT_GT(std::hypot(got->x - source.x, got->y - source.y), 1e-8)
+        << "a pinned grid operation must not be a null shift";
+
+    // ... and it is the operation the list offered, not some other shift.
+    const BareProj reference(wgs84(), CoordinateSystem::from_epsg(4267));
+    ASSERT_TRUE(reference.is_valid());
+    // The automatic pipeline picks an operation for each point; inside Canada
+    // that is this same NAD 27 shift, so the two agree there.
+    const std::optional<CrsPoint> automatic =
+        CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267)).forward(source);
+    ASSERT_TRUE(automatic.has_value());
+    EXPECT_LE(std::hypot(got->x - automatic->x, got->y - automatic->y), 1e-9)
+        << "inside its area the pinned shift and PROJ's choice are the same operation";
+}
+
+TEST(Crs, WithTransformationRefusesAnOperationFromAnotherPair) {
+    // The API takes a DatumTransformation, not a CRS pair, so a hand-built or
+    // stale entry can name a shift between other CRSs. Binding it would apply
+    // the wrong datum shift; it must be refused, naming the CRSs involved.
+    const std::vector<DatumTransformation> osgb =
+        osgb36().available_transformations(wgs84());
+    const DatumTransformation* helmert = find_code(osgb, "1314");
+    ASSERT_NE(helmert, nullptr);
+
+    // EPSG:1314 is OSGB36 -> WGS 84. NAD 27 is neither end of it.
+    try {
+        (void)CoordinateSystem::from_epsg(4267).with_transformation(*helmert);
+        FAIL() << "expected the wrong-pair refusal";
+    } catch (const ValueError& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find("other CRSs"), std::string::npos) << what;
+    }
+
+    // The same operation pinned from either of its own ends is accepted.
+    EXPECT_NO_THROW((void)osgb36().with_transformation(*helmert));
+    EXPECT_NO_THROW((void)wgs84().with_transformation(*helmert));
+
+    // ... and an identifier proj.db does not know is still a ValueError.
+    DatumTransformation bogus;
+    bogus.auth_name = "EPSG";
+    bogus.code = "999999";
+    bogus.name = "not a real operation";
+    EXPECT_THROW((void)wgs84().with_transformation(bogus), ValueError);
+}
+
+// ---------------------------------------------------------------------------
+// A pinned CRS survives persistence
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A scratch directory, unique across processes (ctest -jN), removed on exit.
+class ScratchDir {
+public:
+    ScratchDir()
+        : path_(platform::unique_temp_path("alphashape_pinned_crs_", "")) {
+        std::error_code ec;
+        std::filesystem::create_directories(path_, ec);
+    }
+    ~ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+    ScratchDir(const ScratchDir&) = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+
+    std::string file(const std::string& name) const {
+        return (std::filesystem::path(path_) / name).string();
+    }
+
+private:
+    std::string path_;
+};
+
+}  // namespace
+
+TEST(Crs, PinnedCrsSurvivesDocXmlRoundTrip) {
+    // A pinned CRS is stored as its BOUNDCRS WKT, with `epsg` 0 because a
+    // BOUNDCRS has no authority code. Saving and loading must preserve both the
+    // WKT and the behaviour, and `kind()` must still report the source CRS's
+    // kind rather than fall through to the bound-CRS default.
+    const std::vector<DatumTransformation> list = osgb36().available_transformations(wgs84());
+    const DatumTransformation* helmert = find_code(list, "1314");
+    ASSERT_NE(helmert, nullptr);
+    const CoordinateSystem pinned = osgb36().with_transformation(*helmert);
+    ASSERT_EQ(pinned.epsg(), 0) << "a BOUNDCRS carries no EPSG code";
+    EXPECT_EQ(pinned.kind(), CrsKind::Geographic2D)
+        << "a bound CRS is as its source CRS is, not a projected/unknown kind";
+
+    const CrsPoint point{dms(1, 43, 4.5177), dms(52, 39, 27.2531), 0.0};
+    const CrsTransform before = CrsTransform::create(pinned, wgs84());
+    const std::optional<CrsPoint> before_answer = before.forward(point);
+    ASSERT_TRUE(before_answer.has_value());
+
+    ScratchDir scratch;
+    {
+        ::alphashape::Document document;
+        ::alphashape::Chunk& chunk = document.workspace().add_chunk("crs");
+        document.set_active_chunk_id(chunk.id());
+        chunk.set_coordinate_system(pinned);
+        document.set_global_coordinate_system(pinned);
+        ::alphashape::ProjectIO::save(document, scratch.file("pinned.psx"));
+    }
+
+    const std::shared_ptr<::alphashape::Document> loaded =
+        ::alphashape::ProjectIO::load(scratch.file("pinned.psx"));
+    ASSERT_NE(loaded, nullptr);
+    const CoordinateSystem after = loaded->global_coordinate_system();
+    EXPECT_EQ(after.to_wkt(), pinned.to_wkt()) << "the BOUNDCRS WKT must round-trip verbatim";
+    EXPECT_EQ(after.epsg(), 0);
+    EXPECT_EQ(after.kind(), CrsKind::Geographic2D);
+    EXPECT_EQ(loaded->workspace().chunks().front()->coordinate_system().to_wkt(),
+              pinned.to_wkt())
+        << "the chunk slot must round-trip too";
+
+    const std::optional<CrsPoint> after_answer =
+        CrsTransform::create(after, wgs84()).forward(point);
+    ASSERT_TRUE(after_answer.has_value());
+    EXPECT_EQ(after_answer->x, before_answer->x);
+    EXPECT_EQ(after_answer->y, before_answer->y);
+}
+
+TEST(Crs, KindUnwrapsABoundCrs) {
+    // `kind()` on a BOUNDCRS recurses into its source CRS. A 3D source must
+    // report Geographic3D, not the 2D default the fallback would give.
+    const std::vector<DatumTransformation> list = osgb36().available_transformations(wgs84());
+    const DatumTransformation* helmert = find_code(list, "1314");
+    ASSERT_NE(helmert, nullptr);
+    const CoordinateSystem bound = osgb36().with_transformation(*helmert);
+
+    EXPECT_EQ(bound.kind(), osgb36().kind());
+    EXPECT_EQ(bound.kind(), CrsKind::Geographic2D);
+
+    // An equivalent copy parsed afresh reaches the same conclusion, so the kind
+    // is a property of the stored WKT rather than of how the value was built.
+    const CoordinateSystem reparsed = CoordinateSystem::from_wkt(bound.to_wkt());
+    EXPECT_EQ(reparsed.kind(), CrsKind::Geographic2D);
+    EXPECT_EQ(reparsed.to_wkt(), bound.to_wkt());
 }
 
 }  // namespace

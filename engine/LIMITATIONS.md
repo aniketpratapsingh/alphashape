@@ -1211,9 +1211,16 @@ yet.
   operations.
 - **`preferred_operation` pins an identifier PROJ already lists; it does not
   search `proj.db`.** "EPSG:16033" is matched against each candidate's
-  `AUTH:CODE` (case-insensitive). An anonymous candidate (PROJ's grid
-  operations often carry no id) cannot be pinned, and an unknown id is a
-  creation error rather than a silent fallback to the automatic choice.
+  `AUTH:CODE` (case-insensitive, after stripping PROJ's computed wrappers, so
+  "EPSG:1693" matches the listed "INVERSE(DERIVED_FROM(EPSG)):1693"). An
+  anonymous candidate (PROJ's grid operations often carry no id) cannot be
+  pinned, and an unknown id is a creation error rather than a silent fallback
+  to the automatic choice. An unpinned transform is deliberately *not* "the
+  first listed candidate": PROJ picks the operation per point, so an
+  area-limited national operation (Amersfoort→WGS 84 over the Netherlands,
+  OSGB36→ETRS89 over Great Britain, NAD83→WGS 84 over North America) applies
+  only inside its area and a less accurate one takes over outside it. Pinning
+  is how a caller overrides that for every point.
 - **Out-of-domain detection relies on PROJ's per-point failure marker.** A
   single point fails when the output is not finite or `proj_errno` is set; a
   batch fails per point on non-finite outputs (`proj_trans_generic` does not
@@ -1261,12 +1268,12 @@ yet.
   methods are reachable through the same API but are not separately asserted;
   they are PROJ's arithmetic, not the engine's.
 - **`available_transformations()` lists *candidate* operations, not a routing
-  decision.** The first entry is PROJ's own pick for the CRS pair with no area
-  given, and the rest are ordered by accuracy. PROJ orders by area first, so an
-  operation that is accurate only inside one country can sit behind one with a
-  worse stated accuracy but a worldwide area; the list reports what PROJ says,
-  and choosing requires knowing the area of interest. Area-aware selection is
-  not exposed yet (there is no area parameter on the API).
+  decision.** The entries are ordered by stated accuracy (unknown last) and
+  carry each operation's area-independent metadata; no entry is flagged as
+  "the one PROJ would use", because PROJ's automatic transform does not use one
+  operation for every point. Choosing requires knowing the area of interest;
+  area-aware selection is not exposed yet (there is no area parameter on the
+  API), so a caller who wants one operation everywhere pins it instead.
 - **Pinning is `BOUNDCRS`, so it needs a geographic source.** `with_transformation()`
   returns the source CRS bound to the operation's hub CRS, which is a WKT2
   `BOUNDCRS`; that CRS then has exactly one operation to any target, so a later
@@ -1275,13 +1282,20 @@ yet.
   pointing at the geographic CRS underneath (EPSG:4277 for that pair) or at
   `TransformOptions::preferred_operation`, which pins by code without binding.
 - **An anonymous operation cannot be pinned by `with_transformation()`.**
-  `preferred` and ballpark entries often carry no authority code, and their hub
-  CRS cannot be recovered from the entry alone. `TransformOptions::preferred_operation`
-  and `TransformOptions::allow_ballpark` are the routes for those; the exception
-  says so.
+  A ballpark entry, or a custom CRS's `nadgrids=` shift, often carries no
+  authority code, and its hub CRS cannot be recovered from the entry alone.
+  `TransformOptions::preferred_operation` and `TransformOptions::allow_ballpark`
+  are the routes for those; the exception says so.
+- **`with_transformation()` recovers the operation from `proj.db` and orients
+  it.** The entry's `AUTH:CODE` is looked up with PROJ's computed wrappers
+  (`INVERSE(...)`, `DERIVED_FROM(...)`) stripped, and the stored operation is
+  reversed when the entry was the inverse of it (WGS 84 → NAD 27 is EPSG:1693
+  NAD 27 → WGS 84 reversed). An operation whose ends are not this CRS (in
+  either direction) is refused rather than bound, so an entry copied from a
+  different pair cannot apply the wrong shift.
 - **`+towgs84` needs no special handling and gets none.** PROJ models a CRS that
   carries `TOWGS84[...]` as a bound CRS, so its Helmert shift is an ordinary
-  candidate and is usually the preferred one. `Crs.Towgs84Applied` pins that
+  candidate. `Crs.Towgs84Applied` pins that
   behaviour against the §4.2.3 parameters rather than asserting a bespoke code
   path.
 - **A 2D Helmert does not move the ellipsoidal height.** PROJ's geographic-2D
