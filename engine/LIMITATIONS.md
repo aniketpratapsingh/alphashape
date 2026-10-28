@@ -174,7 +174,16 @@ sections below give the engineering detail behind each item.
 - Re-aligning cameras does not invalidate existing depth maps.
 - *(Fixed in M9.)* The multi-view cost counted neighbours that could not see a pixel as failed matches, which erased most pixels on low-overlap (nadir grid) blocks. Per-camera coverage on the aerial block rose from 26–54% to 74–95%.
 - Ground seen by only one camera gets no depth: there is no single-view or shape-from-shading fallback.
-- Census matching cost is not built.
+- **Census matching cost is built** (WP-17.13, opt-in with
+  `cost_type="census"`): a 16-bit wide census descriptor compared by normalised
+  Hamming distance, cached per view. It is invariant to affine intensity changes
+  and measured more robust than the intensity cost under impulsive noise. Its
+  limits: the GPU PatchMatch kernels implement the intensity cost only, so a
+  census run always executes on the CPU (declined before dispatch and logged
+  once, not counted as a device failure); the descriptor has no notion of
+  contrast, so it cannot separate two flat windows (the texture mask and the
+  best-of-k vote are what keep that out of the map); and its `max_cost` default
+  of 0.35 is calibrated on our own fixtures, not transferred from a benchmark.
 - **Coarse-to-fine (multi-resolution) PatchMatch is built** (WP-17.14): the
   search runs at up to `pyramid_levels` reduced resolutions and each finer
   level starts from the plane the level beneath found. It is on by default

@@ -84,14 +84,14 @@ TEST(Census, NarrowCensusFillsLowByteOnly) {
     FloatImage image(3, 3, 0.5F);
     image.at(0, 0) = 0.1F;   // neighbour (-1, -1) -> bit 0
     image.at(2, 2) = 0.9F;   // brighter: sets nothing
-    image.at(1, 0) = 0.2F;   // neighbour (0, -1) -> bit 6
+    image.at(1, 0) = 0.2F;   // neighbour (0, -1)  -> bit 3
 
     CensusOptions options;
     options.wide = false;
     options.window_radius = 1;
     const CensusImage census = alphashape::stereo::census_transform(image, options);
     EXPECT_EQ(census.at(1, 1),
-              static_cast<std::uint16_t>((1U << 0) | (1U << 6)));
+              static_cast<std::uint16_t>((1U << 0) | (1U << 3)));
     for (const std::uint16_t value : census.values) {
         EXPECT_EQ(value & 0xFF00U, 0U) << "narrow census must leave the high byte zero";
     }
@@ -227,47 +227,57 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
     };
 
     FloatImage reference = render(ref_c, r, 1.0F, 0.0F);
-    const FloatImage neighbour = render(nb_c, nb_r, 1.3F, 0.05F);
+    // The same neighbour twice: once as rendered, once with a gain and a bias.
+    // The census compares ranks, so the two must search to the same plane at the
+    // same cost -- which is the invariance claim, measured end to end through
+    // the search rather than on descriptors alone.
+    const FloatImage neighbour = render(nb_c, nb_r, 1.0F, 0.0F);
+    const FloatImage bright = render(nb_c, nb_r, 1.3F, 0.05F);
 
-    PMView ref_view;
-    ref_view.image = &reference;
-    ref_view.calibration = calib;
-    ref_view.R = r;
-    ref_view.t = -r * ref_c;
-    PMView nb_view;
-    nb_view.image = &neighbour;
-    nb_view.calibration = calib;
-    nb_view.R = nb_r;
-    nb_view.t = nb_t;
+    const auto run_with = [&](const FloatImage& neighbour_image) {
+        PMView nb_view;
+        nb_view.image = &neighbour_image;
+        nb_view.calibration = calib;
+        nb_view.R = nb_r;
+        nb_view.t = nb_t;
+        PatchMatchOptions options;
+        options.depth_min = 5.0;
+        options.depth_max = 12.0;
+        options.window_radius = 5;
+        options.window_step = 2;
+        options.iterations = 3;
+        options.max_cost = 2.0;  // never cut: compare whole fields
+        options.pyramid_levels = 1;
+        options.cost_type = alphashape::stereo::CostType::Census;
+        options.seed = 7;
+        return alphashape::stereo::run_patch_match(ref_view, {nb_view}, options);
+    };
+    const PatchMatchResult plain = run_with(neighbour);
+    const PatchMatchResult affine = run_with(bright);
 
-    PatchMatchOptions options;
-    options.depth_min = 5.0;
-    options.depth_max = 12.0;
-    options.window_radius = 5;
-    options.window_step = 2;
-    options.iterations = 3;
-    options.max_cost = 1.0;  // keep everything, we compare costs
-    options.pyramid_levels = 1;
-    options.cost_type = alphashape::stereo::CostType::Census;
-    options.seed = 7;
-
-    const PatchMatchResult result =
-        alphashape::stereo::run_patch_match(ref_view, {nb_view}, options);
-
-    // The plane is smooth, so both runs find it; the point of the test is the
-    // cost level, which must stay low despite the neighbour's affine change.
     std::size_t valid = 0;
-    double cost_sum = 0.0;
-    for (std::size_t i = 0; i < result.depth.size(); ++i) {
-        if (result.depth[i] > 0.0F) {
+    std::size_t same_depth = 0;
+    double cost_delta = 0.0;
+    for (std::size_t i = 0; i < plain.depth.size(); ++i) {
+        EXPECT_GE(plain.cost[i], 0.0F);
+        EXPECT_LE(plain.cost[i], 1.0F) << "census cost must live in [0, 1]";
+        if (plain.depth[i] > 0.0F && affine.depth[i] > 0.0F) {
             ++valid;
-            cost_sum += static_cast<double>(result.cost[i]);
-            EXPECT_LE(result.cost[i], 1.0F) << "census cost must live in [0, 1]";
+            const double rel = std::abs(static_cast<double>(plain.depth[i]) -
+                                        static_cast<double>(affine.depth[i])) /
+                               static_cast<double>(plain.depth[i]);
+            if (rel < 1e-3) {
+                ++same_depth;
+            }
+            cost_delta += std::abs(static_cast<double>(plain.cost[i]) -
+                                   static_cast<double>(affine.cost[i]));
         }
     }
-    ASSERT_GT(valid, result.depth.size() / 2);
-    EXPECT_LT(cost_sum / static_cast<double>(valid), 0.2)
-        << "an affine change of the neighbour must not raise the census cost";
+    ASSERT_GT(valid, plain.depth.size() / 2);
+    // An affine intensity change is invisible to the descriptor, so the search
+    // must land on the same plane at the same cost almost everywhere.
+    EXPECT_GT(static_cast<double>(same_depth) / static_cast<double>(valid), 0.99);
+    EXPECT_LT(cost_delta / static_cast<double>(valid), 1.0 / 65536.0);
 }
 
 // ---------------------------------------------------------------------------
