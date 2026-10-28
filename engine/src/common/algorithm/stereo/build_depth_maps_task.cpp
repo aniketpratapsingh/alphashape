@@ -261,14 +261,16 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     cost_type.choices = {"zncc", "census"};
     params.declare(cost_type);
 
-    // max_cost is on the selected cost's own [0, 1] scale, and its useful value
-    // differs between the two costs. -1 means "whatever this cost's default is"
+    // max_cost is on the selected cost's own scale -- intensity (1 - ZNCC) in
+    // [0, 2], census (1 - ZNCC) / 2 in [0, 1] -- and its useful value differs
+    // between the two costs. -1 means "whatever this cost's default is"
     // (patch_match_default_max_cost()), which is how a run gets a sensible
     // threshold without the caller having to know either scale.
     ParamSpec max_cost{"max_cost", ParamType::Float, -1.0,
-                       "Final pixels whose cost at the selected cost_type's [0, 1] scale is "
-                       "above this are left empty (depth -1). -1 selects the cost type's own "
-                       "default (0.5 for zncc, 0.35 for census)."};
+                       "Final pixels whose cost at the selected cost_type's own scale is above "
+                       "this are left empty (depth -1). The scale is [0, 2] for zncc "
+                       "(1 - ZNCC) and [0, 1] for census ((1 - ZNCC) / 2). -1 selects the cost "
+                       "type's own default (0.5 for zncc, 0.6 for census)."};
     max_cost.minimum = -1.0;
     max_cost.maximum = 2.0;
     params.declare(max_cost);
