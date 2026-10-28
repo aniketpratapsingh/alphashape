@@ -8,6 +8,27 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Datum transformations can be listed, chosen and pinned.** A coordinate
+  system now reports every datum shift PROJ knows to a target CRS —
+  `CoordinateSystem::available_transformations()` — with each operation's
+  authority code, stated accuracy, ballpark flag, grids and pipeline text,
+  ordered so the operation PROJ itself would pick comes first and the rest
+  follow by increasing accuracy (unknown accuracy last).
+  `CoordinateSystem::with_transformation()` turns one of those entries into a
+  CRS bound to the operation's hub (a WKT2 `BOUNDCRS`), so a transform built
+  from it applies exactly that shift instead of re-deriving one: that is how a
+  caller says "use the 7-parameter Helmert" or "use the NTv2 grid" and gets it.
+  A missing grid is never downloaded and never silently downgraded to a
+  ballpark: the operation stays in the list with the grid named under
+  `missing_grids`, and applying it throws
+  `transformation needs grid <name>; install proj-data`, which also replaces
+  PROJ's opaque "File not found" on the plain `CrsTransform::create()` path.
+  `+towgs84` in a CRS definition is honoured by PROJ and needs no special
+  handling. The Helmert shifts are checked against the worked examples and
+  formulas of IOGP Publication 373-7-2 to a millimetre; the grid cases skip,
+  naming the grid, where it is not installed. The macOS and Windows packages
+  still ship only a subset of the PROJ grids, so some national shifts need
+  `proj-data` installed (see `engine/LIMITATIONS.md`).
 - **Build Depth Maps searches coarse to fine.** The PatchMatch search now runs
   first on a reduced copy of each camera's block and starts every finer level
   from the level beneath, instead of spending the whole budget at the working

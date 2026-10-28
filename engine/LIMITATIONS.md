@@ -1059,10 +1059,12 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 ## M12 — Coordinate systems (PROJ), in progress
 
 WP-12.1 lands the dependency, discovery and data layout. WP-12.2 adds
-`crs::CoordinateSystem` (the value type) and the 48-entry built-in list, and
-WP-12.3 adds `crs::CrsTransform` between two of them (axis-normalised, ballpark
-refused by default, per-thread pipelines). Datums, geoids and raster
-reprojection arrive with WP-12.4 … WP-12.12; until then the engine still uses
+`crs::CoordinateSystem` (the value type) and the 48-entry built-in list, WP-12.3
+adds `crs::CrsTransform` between two of them (axis-normalised, ballpark refused
+by default, per-thread pipelines), and WP-12.4 adds datum-transformation
+selection and pinning (`available_transformations()`, `with_transformation()`,
+and a named "install proj-data" error for a missing grid). Geoids and raster
+reprojection arrive with WP-12.5 … WP-12.12; until then the engine still uses
 the legacy three-CRS stub (`geo::Projection`: local / EPSG:4326 / EPSG:326xx)
 for DEM and ortho output, so a `CrsTransform` exists but no task consumes it
 yet.
@@ -1232,4 +1234,59 @@ yet.
   data version it was made with; a PROJ release that changes a projection
   constant moves those last digits, and regenerating the fixture is the
   deliberate act that acknowledges it. CI needs no PROJ command-line tools.
+
+### WP-12.4 — datum transformations and grid shifts
+
+- **The grids are not bundled and are not downloaded.** `crs::CoordinateSystem::available_transformations()`
+  lists every operation PROJ knows, including the ones whose grids are absent,
+  and reports the missing ones per entry (`DatumTransformation::missing_grids`).
+  Applying such an operation — through `with_transformation()` or through a plain
+  `CrsTransform::create()` — throws
+  `Error("transformation needs grid <name>; install proj-data")`, naming the grid
+  PROJ wants and the package that carries it. Nothing is fetched from
+  `cdn.proj.org`: the thread context has network access and the grid cache
+  disabled (WP-12.1). A user who needs a national grid must install `proj-data`
+  (Ubuntu), the Homebrew `proj` data, or point `ALPHASHAPE_PROJ_DATA` at a
+  directory containing it. The packaged macOS/Windows builds ship a large but
+  curated subset, so some operations work out of the box and some do not; the
+  error names the grid rather than saying "File not found", which is the whole
+  point of listing a grid operation that cannot run.
+- **Only Helmert (7-parameter / 3-parameter) and grid shifts are exercised by
+  the test suite.** The millimetre assertions run against the §4.1.1 and §4.2.3
+  formulas with published EPSG parameters (OSGB36 → WGS 84, ED50 → WGS 84),
+  which need no grid and so run on every machine. The NTv2/NADCON/OSTN15 cases
+  `GTEST_SKIP` with a message naming the grid when it is not installed; CI runs
+  the Helmert cases everywhere and the grid cases only where `proj-data` happens
+  to be present. Molodensky-Badekas, time-dependent Helmert and the vertical
+  methods are reachable through the same API but are not separately asserted;
+  they are PROJ's arithmetic, not the engine's.
+- **`available_transformations()` lists *candidate* operations, not a routing
+  decision.** The first entry is PROJ's own pick for the CRS pair with no area
+  given, and the rest are ordered by accuracy. PROJ orders by area first, so an
+  operation that is accurate only inside one country can sit behind one with a
+  worse stated accuracy but a worldwide area; the list reports what PROJ says,
+  and choosing requires knowing the area of interest. Area-aware selection is
+  not exposed yet (there is no area parameter on the API).
+- **Pinning is `BOUNDCRS`, so it needs a geographic source.** `with_transformation()`
+  returns the source CRS bound to the operation's hub CRS, which is a WKT2
+  `BOUNDCRS`; that CRS then has exactly one operation to any target, so a later
+  transform uses the pinned shift. PROJ attaches a datum shift to a geodetic
+  CRS, so a projected source (EPSG:27700, say) is refused with a message
+  pointing at the geographic CRS underneath (EPSG:4277 for that pair) or at
+  `TransformOptions::preferred_operation`, which pins by code without binding.
+- **An anonymous operation cannot be pinned by `with_transformation()`.**
+  `preferred` and ballpark entries often carry no authority code, and their hub
+  CRS cannot be recovered from the entry alone. `TransformOptions::preferred_operation`
+  and `TransformOptions::allow_ballpark` are the routes for those; the exception
+  says so.
+- **`+towgs84` needs no special handling and gets none.** PROJ models a CRS that
+  carries `TOWGS84[...]` as a bound CRS, so its Helmert shift is an ordinary
+  candidate and is usually the preferred one. `Crs.Towgs84Applied` pins that
+  behaviour against the §4.2.3 parameters rather than asserting a bespoke code
+  path.
+- **A 2D Helmert does not move the ellipsoidal height.** PROJ's geographic-2D
+  Helmert pipeline pushes and pops the height around the geocentric step, so
+  `z` comes back unchanged; the horizontal result still depends on the input
+  height. `DatumShiftMatchesEpsgExamples` asserts the pass-through explicitly
+  rather than assuming a height shift.
 

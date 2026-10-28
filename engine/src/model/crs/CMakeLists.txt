@@ -14,6 +14,7 @@ add_library(alphashape_crs STATIC
     coordinate_system.cpp
     builtin_crs.cpp
     transform.cpp
+    datum.cpp
 )
 
 target_include_directories(alphashape_crs PUBLIC ${ALPHASHAPE_INCLUDE_DIR})

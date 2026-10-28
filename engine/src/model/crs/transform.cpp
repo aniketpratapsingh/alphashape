@@ -99,6 +99,30 @@ PjPtr build_pipeline(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const std::string&
 }
 
 /// Choose the operation PROJ should use and capture its accuracy/ballpark
+/// The first grid the operation needs that is not installed, or "" when it can
+/// run. PROJ's short name is what `+grids=` and a proj-data package use.
+std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
+    const int count = proj_coordoperation_get_grid_used_count(ctx, operation);
+    for (int i = 0; i < count; ++i) {
+        const char* short_name = nullptr;
+        const char* full_name = nullptr;
+        const char* package_name = nullptr;
+        const char* url = nullptr;
+        int direct_download = 0;
+        int open_license = 0;
+        int available = 0;
+        if (proj_coordoperation_get_grid_used(ctx, operation, i, &short_name, &full_name,
+                                              &package_name, &url, &direct_download, &open_license,
+                                              &available) == 0) {
+            continue;
+        }
+        if (available == 0 && short_name != nullptr && *short_name != '\0') {
+            return short_name;
+        }
+    }
+    return std::string();
+}
+
 /// status. Returns the operation's identifier so the pipeline can be built
 /// from exactly that operation (empty when the operation is anonymous).
 std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
@@ -149,6 +173,15 @@ std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const Coor
     if (*accuracy <= 0.0 && !*ballpark) {
         *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
     }
+
+    // A grid this operation needs but PROJ cannot find is diagnosed by name.
+    // Without this the pipeline would build and either degrade or fail with
+    // "File not found", which says nothing about installing proj-data.
+    const std::string missing = first_missing_grid(ctx, chosen.get());
+    if (!missing.empty()) {
+        throw Error("transformation needs grid " + missing + "; install proj-data");
+    }
+
     if (*ballpark && !options.allow_ballpark) {
         throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
                     "; enable allow_ballpark");
