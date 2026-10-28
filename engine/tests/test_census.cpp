@@ -290,15 +290,28 @@ TEST(Census, AffineIntensityDoesNotChangePlaneCost) {
 // Cost distribution
 // ---------------------------------------------------------------------------
 
+/// A reproducible pseudo-random field in [0, 1), so two unrelated images give
+/// unrelated descriptors at every shift (a linear ramp would correlate with
+/// itself under a small shift and bias the mean away from chance).
+float hash_field(int x, int y, int salt) {
+    std::uint32_t h = static_cast<std::uint32_t>(x) * 374761393U +
+                      static_cast<std::uint32_t>(y) * 668265263U +
+                      static_cast<std::uint32_t>(salt) * 2246822519U;
+    h = (h ^ (h >> 13)) * 1274126177U;
+    h ^= h >> 16;
+    return static_cast<float>(h & 0xFFFFFFU) / static_cast<float>(0x1000000U);
+}
+
 TEST(Census, CostDistributionSameRange) {
-    // Compared descriptors at unrelated shifts are pure Hamming distances: every
-    // value lies in [0, 1], agreement is 0 and total disagreement is 1.
+    // Two unrelated patterns: every compared pair is a pure Hamming distance, so
+    // every value lies in [0, 1] and the mean sits at chance (half the bits
+    // differ). This is the [0, 1] range contract the max_cost cut depends on.
     FloatImage a(48, 40, 0.0F);
     FloatImage b(48, 40, 0.0F);
     for (int y = 0; y < 40; ++y) {
         for (int x = 0; x < 48; ++x) {
-            a.at(x, y) = static_cast<float>((x * 37 + y * 11) % 101) / 100.0F;
-            b.at(x, y) = static_cast<float>((x * 53 + y * 29) % 103) / 102.0F;
+            a.at(x, y) = hash_field(x, y, 1);
+            b.at(x, y) = hash_field(x, y, 2);
         }
     }
     const CensusImage ca = alphashape::stereo::census_transform(a, CensusOptions{});
@@ -324,8 +337,8 @@ TEST(Census, CostDistributionSameRange) {
     const double mean = total / static_cast<double>(count);
     // Independent patterns agree on about half the bits; the mean must sit near
     // chance, not near agreement or near total disagreement.
-    EXPECT_GT(mean, 0.4);
-    EXPECT_LT(mean, 0.6);
+    EXPECT_GT(mean, 0.4) << mean;
+    EXPECT_LT(mean, 0.6) << mean;
 }
 
 }  // namespace
