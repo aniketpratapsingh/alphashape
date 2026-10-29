@@ -84,10 +84,10 @@ def validate_reason(text: str | None) -> str:
 def measure_params(metrics: dict) -> dict[str, object]:
     """Any dispatch parameters that make a run an experiment rather than a control.
 
-    ``depth_params`` is the one the workflow has today; ``dem_params`` is read as
-    well so that adding it later cannot quietly let an experiment be accepted
-    before this check knows about it. Either being present and non-empty means
-    the run measured a configuration and must never move the baseline.
+    Both dispatch inputs the workflow offers — ``depth_params`` for BuildDepthMaps
+    and ``dem_params`` for BuildDem — mean the run measured a configuration rather
+    than the defaults. Either one being present and non-empty withholds the
+    baseline, so either one refuses an acceptance.
     """
     found: dict[str, object] = {}
     for key in ("depth_params", "dem_params"):

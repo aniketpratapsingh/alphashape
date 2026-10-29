@@ -721,6 +721,7 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         HoleFillOptions fill_options;
         fill_options.method = options.fill;
         fill_options.interior_only = interpolation == Interpolation::Enabled;
+        fill_options.sibson_exact_max_sites = options.sibson_exact_max_sites;
         fill_holes(grid.width, grid.height, filled, filled_valid, fill_options);
     }
     tick(0.7);
