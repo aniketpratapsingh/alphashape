@@ -145,6 +145,18 @@ def experiment_params(metrics: dict) -> dict[str, str]:
     return {}
 
 
+def accepted_regression(metrics: dict) -> dict | None:
+    """The deliberate acceptance recorded on this run, if there is one.
+
+    A run may carry an accepted regression when a trade-off was approved by hand:
+    the verdict is still computed and still reads FAIL, but the run publishes its
+    numbers as the next baseline anyway. The record is what makes that auditable,
+    so the report repeats it in full rather than only in the workflow log.
+    """
+    value = metrics.get("accepted_regression")
+    return value if isinstance(value, dict) else None
+
+
 def regressions(
     current: dict, previous: dict, thresholds: dict
 ) -> tuple[list[dict], list[dict]]:
@@ -301,6 +313,7 @@ def markdown(
     manifest = current.get("dataset_manifest", {}) or {}
     licence = current.get("licence", {}) or {}
     experiment = experiment_params(current)
+    accepted = accepted_regression(current)
 
     lines: list[str] = []
     lines.append(f"# Quality benchmark: {manifest.get('title') or current.get('dataset', '?')}")
@@ -315,11 +328,49 @@ def markdown(
         lines.append(f"**Verdict: experiment** ({given}) — reported, not gated, not baselined")
     elif previous is None:
         lines.append("**Verdict: pass** (first run for this dataset; no history to compare)")
+    elif bad and accepted:
+        # The gate still computed a FAIL; the difference is that a human accepted
+        # the trade-off by hand and the run publishes anyway. Both facts are
+        # stated, because "accepted" must never be read as "did not regress".
+        lines.append(
+            f"**Verdict: FAIL (accepted)** — {len(bad)} metric(s) regressed; "
+            "the trade-off was accepted by dispatch and this run publishes the new baseline"
+        )
     elif bad:
         lines.append(f"**Verdict: FAIL** — {len(bad)} metric(s) regressed")
     else:
         lines.append(f"**Verdict: pass** ({len(good)} improved, none regressed)")
     lines.append("")
+
+    if accepted:
+        lines.append("## Accepted regression")
+        lines.append("")
+        lines.append(
+            "This run failed the gate and was adopted as the new baseline anyway. "
+            "The reason, the actor and the exact moves it covers are recorded below "
+            "and in the metrics JSON the next run will compare against."
+        )
+        lines.append("")
+        lines.append("| | |")
+        lines.append("|---|---|")
+        lines.append(f"| Reason | {accepted.get('reason') or '-'} |")
+        lines.append(f"| Accepted by | {accepted.get('actor') or '-'} |")
+        if accepted.get("run_id"):
+            lines.append(f"| Accepting run | `{accepted['run_id']}` |")
+        covered = accepted.get("metrics") or []
+        if covered:
+            lines.append(
+                "| Accepted moves | "
+                + ", ".join(
+                    f"`{record.get('metric')}` {_fmt(record.get('previous'))} -> "
+                    f"{_fmt(record.get('current'))}"
+                    for record in covered
+                )
+                + " |"
+            )
+        else:
+            lines.append("| Accepted moves | none — the run had no previous baseline to regress against |")
+        lines.append("")
 
     lines.append("## Provenance")
     lines.append("")
@@ -859,7 +910,14 @@ def main(argv: list[str] | None = None) -> int:
         print(report)
 
     if bad:
-        print(f"::error::{len(bad)} metric(s) regressed against the previous run", file=sys.stderr)
+        # An accepted regression still names every metric in the log, but as a
+        # warning rather than an annotation that reads like a failed job: the run
+        # is green by decision, and the acceptance is spelled out above.
+        level = "warning" if accepted_regression(current) else "error"
+        print(
+            f"::{level}::{len(bad)} metric(s) regressed against the previous run",
+            file=sys.stderr,
+        )
         for record in bad:
             print(
                 f"  {record['metric']}: {record['previous']:.6g} -> {record['current']:.6g} "
@@ -870,6 +928,11 @@ def main(argv: list[str] | None = None) -> int:
         # Its report still names every metric that moved, but it never fails the
         # job, because a red check on "census was worse this week" would block the
         # branch that is being evaluated rather than inform it.
+        #
+        # An ACCEPTED regression is the control case whose trade-off a human
+        # approved: the verdict is still FAIL (status 1, so the report and the
+        # baseline step see it), but the workflow's publish/fail conditions act on
+        # the acceptance, not on this exit code.
         if args.fail_on_regression and not experiment:
             return 1
     return 0

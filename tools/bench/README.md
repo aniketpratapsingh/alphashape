@@ -117,7 +117,8 @@ every Monday at 04:17 UTC and on demand.
    - compares against the last **successful** run's metrics for the same dataset,
    - uploads the report, the metrics JSON, the side-by-side PNG and the CLI log,
    - writes the report to the job summary,
-   - publishes the new baseline — but only when the run passed.
+   - publishes the new baseline — when the run passed, or when a regression was
+     [accepted by hand](#accepting-a-regression-on-purpose).
 
 Both datasets are bounded in two ways, because 20–24 MP frames at the default dense
 settings do not fit a weekly job on a shared CPU runner — the first version of this
@@ -150,7 +151,9 @@ metrics are gated by a relative move, lengths and heights by an absolute move in
 A metric with no tolerance is reported and never fails a run.
 
 A failing run does **not** replace the baseline, so a regression keeps failing until it is
-fixed rather than being silently adopted as the new normal.
+fixed rather than being silently adopted as the new normal. The one exception is a
+regression a human has accepted on purpose — see
+[below](#accepting-a-regression-on-purpose).
 
 The first run of a dataset has no baseline, so it always passes and simply establishes
 one.
@@ -188,6 +191,41 @@ that itself records `depth_params` is only ever compared against, never gated on
 
 Every scheduled, push and ordinary manual run passes an empty string, which is the same
 argv and the same metrics JSON as before this input existed.
+
+### Accepting a regression on purpose
+
+Sometimes a change is clearly the right trade: one metric moves the wrong way while the
+rest improve enough to cover it. The gate must still show that move — but a failed run
+never publishes a baseline, so without a way to adopt the trade-off every later week would
+fail against a baseline nobody can reach any more.
+
+An on-demand run can accept the trade-off explicitly. Dispatch it on the **default
+branch**, with no `depth_params`, and a reason of at most 200 printable characters:
+
+```sh
+gh workflow run quality-bench.yml --ref main \
+  -f dataset=aerial-nadir \
+  -f accept_regression="depth defaults: ortho offset +0.10 m, every other metric improved"
+```
+
+An accepted run differs from a normal one in these ways, and in no others:
+
+- the verdict is **still computed and still reads FAIL** — the report names every
+  regressed metric with previous → current and its limit, headed `FAIL (accepted)`;
+- the **job does not fail** on it, and the run **publishes its metrics as the new
+  baseline**, so next week compares against the numbers this trade-off produced;
+- the reason, the **dispatching actor**, the run id and the exact accepted moves are
+  written into the metrics JSON under `accepted_regression`, and repeated in an
+  **Accepted regression** section of the report — the published baseline explains
+  itself months later.
+
+The input is refused with an error, and the run fails before reporting, when it is
+combined with `depth_params` (an experiment measures a configuration and is never a
+baseline), or when the run is not on the default branch. That second rule matters: a
+feature branch must never move the baseline the whole project is measured against, so the
+accepting run is dispatched on `main` *after* the change is merged.
+
+Every schedule-triggered run has no dispatch inputs at all, so its behaviour is unchanged.
 
 ## The datasets
 
@@ -245,6 +283,8 @@ tools/bench/
   run_bench.py         download, verify, extract, run the pipeline, call the metrics
   metrics.py           the metric maths (numpy only) plus lazily-imported readers
   report.py            Markdown, the side-by-side PNG, and the regression verdict
+  accept_regression.py the manual escape hatch: record and adopt an accepted regression
+  is_experiment.py     classify a metrics file as a control run or an experiment
   thresholds.json      the regression policy
   tests/               unit tests for the metrics and the verdict
 ```
