@@ -532,16 +532,72 @@ void read_meta(const XmlNode* node, Meta& meta) {
     }
 }
 
+namespace {
+
+/// doc.xml spelling of a `VerticalCrs::Kind`. Stable strings, not the enum's
+/// numeric value: the XML is a file format, and a renumbered enum must not
+/// change what an old project means.
+const char* vertical_kind_name(crs::VerticalCrs::Kind kind) {
+    switch (kind) {
+        case crs::VerticalCrs::Kind::Ellipsoidal:
+            return "ellipsoidal";
+        case crs::VerticalCrs::Kind::GeoidModel:
+            return "geoid";
+        case crs::VerticalCrs::Kind::GravityRelated:
+            return "gravity-related";
+    }
+    return "ellipsoidal";
+}
+
+/// The inverse of vertical_kind_name(); an unknown spelling is a load error,
+/// because guessing the datum is how heights end up tens of metres wrong.
+/// A missing `kind` means geoid: the pre-M12 element never existed, so an
+/// element that is there at all was written by a build that had this code.
+crs::VerticalCrs::Kind parse_vertical_kind(const std::string& text) {
+    if (text.empty() || text == "geoid") {
+        return crs::VerticalCrs::Kind::GeoidModel;
+    }
+    if (text == "ellipsoidal") {
+        return crs::VerticalCrs::Kind::Ellipsoidal;
+    }
+    if (text == "gravity-related") {
+        return crs::VerticalCrs::Kind::GravityRelated;
+    }
+    throw ProjectIOError("doc.xml: unknown <vertical> kind '" + text + "'");
+}
+
+}  // namespace
+
 void write_crs(const char* name, const CRS& crs, XmlNode& parent) {
     XmlNode& node = add_child(parent, name);
     set_attr(node, "epsg", std::to_string(crs.epsg));
     set_attr(node, "wkt", crs.wkt);
+    // M12 §4.8: the vertical datum is a child element, written only when one is
+    // set, so a project with ellipsoidal heights keeps producing the pre-M12
+    // bytes.
+    if (crs.vertical && crs.vertical->is_set()) {
+        XmlNode& vertical = add_child(node, "vertical");
+        set_attr(vertical, "kind", vertical_kind_name(crs.vertical->kind));
+        set_attr(vertical, "name", crs.vertical->name);
+        set_attr(vertical, "grid", crs.vertical->grid);
+        set_attr(vertical, "offset", fmt(crs.vertical->offset_m));
+    }
 }
 
 void read_crs(const XmlNode* node, CRS& crs) {
     if (node == nullptr) return;
     crs.epsg = parse_int(require_attr(*node, "epsg"));
     crs.wkt = require_attr(*node, "wkt");
+    if (const XmlNode* vertical = find_child(*node, "vertical")) {
+        crs::VerticalCrs parsed;
+        parsed.kind = parse_vertical_kind(attr_or(*vertical, "kind", std::string()));
+        parsed.name = attr_or(*vertical, "name", std::string());
+        parsed.grid = attr_or(*vertical, "grid", std::string());
+        if (const std::string* offset = find_attr(*vertical, "offset")) {
+            parsed.offset_m = parse_double(*offset);
+        }
+        crs.vertical = parsed;
+    }
 }
 
 // Calibration coefficients, in the packed order of kCalibrationParamCount and

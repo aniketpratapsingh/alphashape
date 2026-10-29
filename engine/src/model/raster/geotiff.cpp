@@ -1,8 +1,9 @@
 // GeoTIFF 1.1 writer/reader implemented directly against TIFF 6.0 via libtiff.
-// See geotiff.hpp for the interface. Tag numbers come from the GeoTIFF 1.1
-// spec (OGC 19-008r4): ModelPixelScale 33550, ModelTiepoint 33922,
-// GeoKeyDirectory 34735, and GDAL's private GDAL_NODATA 42113.
+// See geotiff.hpp for the interface. The tag numbers and their process-wide
+// libtiff registration live in base/io/geotiff_tags.hpp.
 #include "model/raster/geotiff.hpp"
+
+#include "base/io/geotiff_tags.hpp"
 
 #include <algorithm>
 #include <cstdarg>
@@ -13,7 +14,6 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -25,11 +25,10 @@
 namespace alphashape {
 namespace {
 
-// --- GeoTIFF tag numbers ------------------------------------------------
-constexpr std::uint32_t kTagModelPixelScale = 33550;
-constexpr std::uint32_t kTagModelTiepoint = 33922;
-constexpr std::uint32_t kTagGeoKeyDirectory = 34735;
-constexpr std::uint32_t kTagGdalNodata = 42113;
+/// The GeoTIFF tag numbers and the process-wide registration live in
+/// base/io/geotiff_tags.hpp, shared with the CRS layer's geoid decoder: libtiff
+/// keeps exactly one tag extender per process, and two of them would chain and
+/// merge overlapping field sets. This TU only consumes the reader/writer side.
 
 // --- GeoKey IDs ---------------------------------------------------------
 constexpr std::uint16_t kKeyGtModelType = 1024;
@@ -44,52 +43,6 @@ constexpr std::uint16_t kRasterTypePixelIsArea = 1;
 
 /// A 4xxx EPSG code is a geographic CRS; the special-cased 4326 always is.
 bool is_geographic_epsg(int epsg) { return epsg >= 4000 && epsg <= 4999; }
-
-/// The extender libtiff installed before us, so our hook can chain to it.
-TIFFExtendProc g_parent_extender = nullptr;
-
-/// Merges the four private GeoTIFF/GDAL tags into ONE handle. libtiff keeps no
-/// process-global slot for custom fields: the fields live on the handle, so
-/// this must run for every TIFF we open (not once per process).
-void merge_geotiff_fields(TIFF* tif) {
-    // field_readcount/field_writecount of TIFF_VARIABLE says "a count is passed
-    // alongside the data" (TIFFSetField(tif, tag, count, ptr)) — the same
-    // convention libgeotiff uses. GDAL_NODATA is a passcount-less ASCII string,
-    // matching how GDAL itself declares it. The names must outlive the handle,
-    // hence static storage.
-    static char kNamePixelScale[] = "ModelPixelScaleTag";
-    static char kNameTiepoint[] = "ModelTiepointTag";
-    static char kNameGeoKeys[] = "GeoKeyDirectoryTag";
-    static char kNameNodata[] = "GDAL_NODATA";
-    static const TIFFFieldInfo fields[] = {
-        {kTagModelPixelScale, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
-         kNamePixelScale},
-        {kTagModelTiepoint, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
-         kNameTiepoint},
-        {kTagGeoKeyDirectory, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_SHORT, FIELD_CUSTOM, 1, 1,
-         kNameGeoKeys},
-        {kTagGdalNodata, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII, FIELD_CUSTOM, 1, 0,
-         kNameNodata},
-    };
-    TIFFMergeFieldInfo(tif, fields, static_cast<std::uint32_t>(std::size(fields)));
-}
-
-/// Tag extender: libtiff calls this from TIFFClientOpen on EVERY handle, right
-/// after the standard tags are registered, which is the only supported place to
-/// add custom fields. Installed once per process via install_geotiff_tags().
-void geotiff_tag_extender(TIFF* tif) {
-    merge_geotiff_fields(tif);
-    if (g_parent_extender != nullptr) {
-        g_parent_extender(tif);
-    }
-}
-
-/// Installs the extender exactly once for the process (thread-safe via
-/// call_once; this only guards the one-time global install, not tag merging).
-void install_geotiff_tags() {
-    static std::once_flag once;
-    std::call_once(once, [] { g_parent_extender = TIFFSetTagExtender(geotiff_tag_extender); });
-}
 
 // --- Silence libtiff, collecting the message into the thrown exception ---
 

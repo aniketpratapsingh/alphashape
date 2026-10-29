@@ -33,6 +33,26 @@ All notable changes to alphashape are recorded here. The format follows
   to the WGS 84 coordinate system it fits to. Converting the data itself to a
   target CRS is a separate, explicit step (WP-12.7).
 
+- **Geoid grids and vertical datums.** A project can carry geoid models —
+  EGM96 and EGM2008 when `proj-data` has installed them, and any custom grid a
+  user adds — and convert between ellipsoidal and orthometric heights. A
+  geoid grid is evaluated through PROJ's `+proj=vgridshift` step, which is the
+  same code `cs2cs EPSG:4979 EPSG:5773` runs, with a direct GeoTIFF read plus
+  Catmull–Rom bicubic interpolation as the fallback; the two agree at the grid
+  nodes, and the off-node difference is the grid's own curvature because PROJ
+  interpolates bilinearly (see `engine/LIMITATIONS.md`). Outside a grid's
+  coverage every entry point returns "no value" rather than extrapolating, and
+  nothing is downloaded. `GeoidStore` writes a project's grids and their index
+  to `<project>.files/geoids/`, and a project that names a geoid it does not
+  carry fails to load, naming it, instead of silently treating its orthometric
+  heights as ellipsoidal. Heights convert as `H = h − N`; when a vertical datum
+  is EPSG-defined, PROJ builds the whole compound pipeline
+  (`EPSG:4979` → `EPSG:32633+5773`), and a custom grid is applied after the
+  horizontal transform. The vertical datum persists in doc.xml as a
+  `<vertical>` child of `<crs>`, written only when one is set. Accuracy is
+  checked against NGS's published USGG2012 geoid heights at 50 CONUS points
+  (EGM2008 RMSE 0.026 m, EGM96 0.284 m), skipping when the full grid is not
+  installed.
 - **Exact natural-neighbour hole filling in Build DEM.** Holes bordered by at
   most `sibson_exact_max_sites` data cells (new `BuildDem` parameter; off by
   default until the quality benchmark confirms it, 20 000 is a sensible value)
