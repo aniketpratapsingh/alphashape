@@ -54,6 +54,7 @@
 #include <vector>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/elevation/sibson.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -355,6 +356,9 @@ HoleFillReport fill_holes(int width, int height, std::vector<float>& values,
     if (options.max_distance < 0.0) {
         throw ValueError("fill_holes: max_distance must be >= 0");
     }
+    if (options.sibson_exact_max_sites < 0) {
+        throw ValueError("fill_holes: sibson_exact_max_sites must be >= 0");
+    }
 
     const int W = width;
     const int H = height;
@@ -618,6 +622,10 @@ HoleFillReport fill_holes(int width, int height, std::vector<float>& values,
                 }
             }
         }
+    }
+
+    if (options.method == HoleFill::NaturalNeighbour && options.sibson_exact_max_sites > 0) {
+        exact_sibson_fill(W, H, values, valid, fill, result, options.sibson_exact_max_sites);
     }
 
     std::size_t filled = 0;

@@ -43,7 +43,8 @@ enum class HoleFill {
     Nearest,
     /// Inverse distance weighting over the k nearest valid cells.
     Idw,
-    /// Discrete Sibson (natural neighbour) interpolation.
+    /// Sibson (natural neighbour) interpolation: discrete (Park et al. 2006),
+    /// or exact for holes within HoleFillOptions::sibson_exact_max_sites.
     NaturalNeighbour,
 };
 
@@ -62,6 +63,11 @@ struct HoleFillOptions {
     /// If true, fill only holes not connected (4-connectivity) to the raster
     /// border through invalid cells.
     bool interior_only = false;
+    /// NaturalNeighbour only: a hole whose bordering data cells number at most
+    /// this many is filled with exact Sibson interpolation on their Delaunay
+    /// triangulation (see sibson.hpp) instead of the discrete approximation.
+    /// 0 keeps the discrete method everywhere.
+    int sibson_exact_max_sites = 0;
 };
 
 struct HoleFillReport {
