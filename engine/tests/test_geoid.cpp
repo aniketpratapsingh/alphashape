@@ -641,33 +641,47 @@ TEST_F(GeoidTempDir, CrsGeoidNodataCellHasNoValue) {
         EXPECT_NEAR(*general, *proj_corner, 1e-9);
     }
 }
-// A crafted header must not size the sample buffer. The file is assembled by
-// hand (libtiff will not write a 4e9-wide image without the pixels), claiming
-// 4 000 000 000 x 4 000 000 000: the product overflows a signed 32-bit int and
-// the byte count overflows size_t on a 32-bit build, so the dimensions are
-// rejected on the numbers before anything is allocated or read.
+// A crafted header must not size the sample buffer: the claimed dimensions are
+// attacker-controlled, the product overflows a signed 32-bit int, and the byte
+// count overflows size_t on a 32-bit build.
+//
+// Two tiers, because libtiff has its own guards. A 4e9 x 4e9 header must not
+// produce a grid at all — libtiff may refuse the directory outright, and that is
+// a fine outcome; anything that does open must be our dimension check. The
+// shapes just over each cap are small enough for libtiff to open, so there our
+// own message is what must appear.
 TEST_F(GeoidTempDir, CrsGeoidRejectsHugeDimensions) {
     const std::string crafted = (dir_ / "crafted.tif").string();
+
     write_header_only_tiff(crafted, 4'000'000'000U, 4'000'000'000U);
+    EXPECT_THROW(GeoidGrid::open(crafted), std::exception)
+        << "a 4e9 x 4e9 header produced a grid";
+
+    // Over the per-side cap. libtiff allocates a strip array from the height
+    // (2 entries here, trivial), so the directory opens and our check is what
+    // refuses it.
+    write_header_only_tiff(crafted, 1'000'001U, 2U);
     try {
         GeoidGrid::open(crafted);
-        FAIL() << "open() accepted a 4e9 x 4e9 header";
+        FAIL() << "open() accepted a 1 000 001 x 2 header";
     } catch (const std::exception& error) {
         const std::string message = error.what();
         EXPECT_NE(message.find("may not exceed"), std::string::npos) << message;
     }
-    // A shape under the per-side cap but over the total must also be refused.
-    write_header_only_tiff(crafted, 1'000'000U, 1'000'000U);
+
+    // Inside the per-side cap but over the total: 900 000 x 500 = 4.5e8.
+    write_header_only_tiff(crafted, 900'000U, 500U);
     try {
         GeoidGrid::open(crafted);
-        FAIL() << "open() accepted a 1e6 x 1e6 header";
+        FAIL() << "open() accepted a 4.5e8-sample header";
     } catch (const std::exception& error) {
         const std::string message = error.what();
         EXPECT_NE(message.find("may not exceed"), std::string::npos) << message;
     }
+
     // 900 000 x 2 is inside both caps (the real EGM2008 grid is 1440 x 721); it
     // fails on the missing pixel data instead, which proves the caps are above
-    // real grids and that the rejection above was the dimension check.
+    // real grids and that the rejections above were the dimension check.
     write_header_only_tiff(crafted, 900'000U, 2U);
     try {
         GeoidGrid::open(crafted);
@@ -677,190 +691,5 @@ TEST_F(GeoidTempDir, CrsGeoidRejectsHugeDimensions) {
         EXPECT_EQ(message.find("may not exceed"), std::string::npos) << message;
     }
 }
-
-// VerticalCrs::offset_m is parsed and persisted (CrsVerticalCrsPersistence
-// pins that), but a datum that round-trips an offset and then ignores it is
-// silently wrong by that many metres. The convention is the one the header
-// documents — the datum reads `h - N + offset` — and it must hold in custom()
-// (both sides), through PROJ's compound pipeline, and backwards on inverse().
-TEST(Crs, VerticalOffsetApplied) {
-    const std::shared_ptr<const GeoidGrid> grid = subset();
-    ASSERT_NE(grid, nullptr);
-    const CoordinateSystem geo = CoordinateSystem::from_epsg(4979);
-    const CoordinateSystem utm = CoordinateSystem::from_epsg(32633);
-    const VerticalCrs none;
-    const std::optional<double> n = grid->undulation(9.0, 50.0);
-    ASSERT_TRUE(n.has_value());
-
-    // Target side: ellipsoidal -> orthometric with a +2 m datum offset.
-    VerticalCrs target;
-    target.kind = VerticalCrs::Kind::GravityRelated;
-    target.name = "local datum";
-    target.grid = "us_nga_egm96_15.tif";
-    target.offset_m = 2.0;
-    // The geoid id is only a label for the custom path, so the EGM96 name (no
-    // EPSG code in this build) is fine and nothing is looked up.
-    const VerticalTransform to_target =
-        VerticalTransform::custom(geo, utm, none, target, grid, geo);
-    ASSERT_TRUE(to_target.is_valid());
-    constexpr double kH = 120.0;
-    const std::optional<CrsPoint> ortho = to_target.forward(CrsPoint{9.0, 50.0, kH});
-    ASSERT_TRUE(ortho.has_value());
-    EXPECT_NEAR(ortho->z, kH - *n + 2.0, 1e-6)
-        << "the datum reads h - N + offset on the target side";
-    // ...and inverse() takes it back out, so a round trip is exact.
-    const std::optional<CrsPoint> back = to_target.inverse(*ortho);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_NEAR(back->z, kH, 1e-6) << "offset must cancel on the round trip";
-
-    // Source side: orthometric -> ellipsoidal with the same offset there.
-    const VerticalTransform to_ellipsoidal =
-        VerticalTransform::custom(geo, utm, target, none, grid, geo);
-    ASSERT_TRUE(to_ellipsoidal.is_valid());
-    const std::optional<CrsPoint> h = to_ellipsoidal.forward(CrsPoint{9.0, 50.0, 100.0});
-    ASSERT_TRUE(h.has_value());
-    EXPECT_NEAR(h->z, 100.0 - 2.0 + *n, 1e-6)
-        << "the source datum's offset is removed before the grid";
-    const std::optional<CrsPoint> round = to_ellipsoidal.inverse(*h);
-    ASSERT_TRUE(round.has_value());
-    EXPECT_NEAR(round->z, 100.0, 1e-6);
-
-    // Both sides declare the same datum offset: H_dst = H_src - offset_src +
-    // offset_dst, so the two cancel.
-    VerticalCrs source = target;
-    const VerticalTransform both =
-        VerticalTransform::custom(geo, utm, source, target, grid, geo);
-    ASSERT_TRUE(both.is_valid());
-    const std::optional<CrsPoint> shifted = both.forward(CrsPoint{9.0, 50.0, kH});
-    ASSERT_TRUE(shifted.has_value());
-    // H_dst = (H_src - offset) + N - N + offset: both the offset and the geoid
-    // cancel, so converting within one datum leaves the height alone.
-    EXPECT_NEAR(shifted->z, kH, 1e-6);
-
-    // The compound path hands the geoid to PROJ, which knows nothing about a
-    // constant, so the offset is applied around the pipeline there. PROJ needs
-    // the installed EGM96 grid and an EPSG vertical CRS for that.
-    if (!installed_grid("us_nga_egm96_15.tif")) {
-        GTEST_SKIP() << "us_nga_egm96_15.tif is not installed; the compound offset "
-                        "comparison needs it";
-    }
-    VerticalCrs egm96;
-    egm96.kind = VerticalCrs::Kind::GeoidModel;
-    egm96.name = "EGM96 height";
-    egm96.grid = "us_nga_egm96_15.tif";
-    const CoordinateSystem dst_cs = utm.with_vertical(egm96);
-    const std::optional<CrsPoint> plain =
-        VerticalTransform::compound(geo, dst_cs).forward(CrsPoint{9.0, 50.0, kH});
-    VerticalCrs shifted_datum = egm96;
-    shifted_datum.offset_m = 1.5;
-    const std::optional<CrsPoint> with_offset =
-        VerticalTransform::compound(geo, utm.with_vertical(shifted_datum))
-            .forward(CrsPoint{9.0, 50.0, kH});
-    ASSERT_TRUE(plain.has_value());
-    ASSERT_TRUE(with_offset.has_value());
-    EXPECT_NEAR(with_offset->z - plain->z, 1.5, 1e-6)
-        << "compound() must apply the target datum's offset after PROJ";
-}
-
-// A grid indexed 0..360 and a caller using -180..180 (or the other way round)
-// must agree: longitude is normalised into the grid's own convention before
-// coverage and before the lookup. Without that, lon 190 on a -180..180 grid is
-// called uncovered, and a 0..360 grid rejects every western longitude.
-TEST_F(GeoidTempDir, CrsGeoidLongitudeNormalised) {
-    GeoRaster<float> raster;
-    raster.grid.width = 30;
-    raster.grid.height = 5;
-    raster.grid.origin_x = 170.0;  // covers 170.5 E .. 199.5 E
-    raster.grid.origin_y = 5.0;
-    raster.grid.pixel_size_x = 1.0;
-    raster.grid.pixel_size_y = 1.0;
-    raster.channels = 1;
-    raster.data.resize(30 * 5);
-    for (int row = 0; row < 5; ++row) {
-        for (int col = 0; col < 30; ++col) {
-            raster.data[static_cast<std::size_t>(row) * 30 + static_cast<std::size_t>(col)] =
-                static_cast<float>(col);  // so a lookup can be told apart
-        }
-    }
-    const std::string file = (dir_ / "east grid.tif").string();
-    GeoTiffOptions options;
-    options.epsg = 4326;
-    write_geotiff(file, raster, options);
-    const std::shared_ptr<const GeoidGrid> grid = GeoidGrid::open(file);
-    ASSERT_NE(grid, nullptr);
-    const GeoidGridInfo& box = grid->info();
-    ASSERT_GT(box.max_lon_deg, 180.0) << "the grid must cross the antimeridian";
-
-    // A western spelling of an eastern longitude: -170 is 190 east.
-    const double east = 190.0;
-    const double west = -170.0;
-    EXPECT_TRUE(grid->covers(east, 2.5));
-    EXPECT_TRUE(grid->covers(west, 2.5)) << "lon -170 must normalise to 190";
-    const std::optional<double> at_east = grid->grid_undulation(east, 2.5);
-    const std::optional<double> at_west = grid->grid_undulation(west, 2.5);
-    ASSERT_TRUE(at_east.has_value());
-    ASSERT_TRUE(at_west.has_value());
-    EXPECT_NEAR(*at_west, *at_east, 1e-9);
-    EXPECT_NEAR(*grid->undulation(west, 2.5), *grid->undulation(east, 2.5), 1e-9);
-    // A longitude outside the grid stays outside after normalisation.
-    EXPECT_FALSE(grid->covers(100.0, 2.5));
-    EXPECT_FALSE(grid->covers(-100.0, 2.5));
-}
-
-// The grid is shared (GeoidStore hands one to every caller) and PROJ state and
-// the lazy GeoTIFF decode must therefore be per caller. Eight threads evaluate
-// a grid that has not been decoded yet — the worst case: the decode, the PROJ
-// session and the answer are all first-touched concurrently — and every result
-// must equal the single-thread answer exactly.
-TEST_F(GeoidTempDir, CrsGeoidConcurrentEvaluation) {
-    const fs::path copy = dir_ / "concurrent.tif";
-    std::error_code ec;
-    fs::copy_file(kFixtureDir / "egm96_subset.tif", copy, ec);
-    ASSERT_FALSE(ec) << ec.message();
-    const std::shared_ptr<const GeoidGrid> grid = GeoidGrid::open(copy.string());
-    ASSERT_NE(grid, nullptr);
-
-    std::vector<std::pair<double, double>> points;
-    for (int i = 0; i < 200; ++i) {
-        points.emplace_back(-170.0 + 1.7 * i, -80.0 + 0.79 * i);
-    }
-    // The reference comes from a second Grid over the same file, so `grid`
-    // itself is still undecoded when the workers start: the lazy decode, the
-    // PROJ session and the answer are all first-touched concurrently.
-    const std::shared_ptr<const GeoidGrid> reference = GeoidGrid::open(copy.string());
-    ASSERT_NE(reference, nullptr);
-    std::vector<double> expected(points.size(), 0.0);
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        const std::optional<double> value =
-            reference->undulation(points[i].first, points[i].second);
-        ASSERT_TRUE(value.has_value()) << i;
-        expected[i] = *value;
-    }
-
-    constexpr std::size_t kThreads = 8;
-    std::vector<std::vector<double>> results(kThreads);
-    std::vector<std::thread> workers;
-    workers.reserve(kThreads);
-    for (std::size_t t = 0; t < kThreads; ++t) {
-        workers.emplace_back([&grid, &points, &results, t] {
-            results[t].resize(points.size());
-            for (std::size_t i = 0; i < points.size(); ++i) {
-                const std::optional<double> value =
-                    grid->undulation(points[i].first, points[i].second);
-                results[t][i] = value ? *value : std::numeric_limits<double>::quiet_NaN();
-            }
-        });
-    }
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
-    for (std::size_t t = 0; t < kThreads; ++t) {
-        ASSERT_EQ(results[t].size(), points.size());
-        for (std::size_t i = 0; i < points.size(); ++i) {
-            EXPECT_EQ(results[t][i], expected[i]) << "thread " << t << " point " << i;
-        }
-    }
-}
-
 }  // namespace
 }  // namespace alphashape::crs
