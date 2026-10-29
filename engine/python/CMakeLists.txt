@@ -40,35 +40,45 @@ message(STATUS "  python module ..... alphashape for Python ${Python3_VERSION}")
 
 # ---------------------------------------------------------------------------
 # Tests. TESTS=OFF (the default for this build) suppresses the C++ suite in
-# tests/, but these two belong to the Python front end and run here regardless.
+# tests/, but these belong to the Python front end and run here regardless.
 # ---------------------------------------------------------------------------
 enable_testing()
 
 set(ALPHASHAPE_PYTHON_DIR ${CMAKE_BINARY_DIR}/python)
 set(ALPHASHAPE_DATA_DIR ${PROJECT_SOURCE_DIR}/data)
 
-add_test(
-    NAME python_parity
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py)
-set_tests_properties(python_parity PROPERTIES
-    # The module lives in build/python; put it first on the path.
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
+# The interpreter is resolved when the test runs, not baked in here: CI
+# configures the build on one runner image and unpacks it on another, and the
+# Homebrew Python the configure found may not exist there. The module is per
+# minor version, so the resolver insists on ${Python3_VERSION_MAJOR}.${...MINOR}.
+set(ALPHASHAPE_RUN_PYTHON "${CMAKE_SOURCE_DIR}/cmake/run_python_test.cmake")
+set(ALPHASHAPE_PYTHON_MINOR "${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}")
+
+function(alphashape_add_python_test name script)
+    cmake_parse_arguments(ARG "" "TIMEOUT" "" ${ARGN})
+    add_test(
+        NAME ${name}
+        COMMAND ${CMAKE_COMMAND}
+            "-DTEST_SCRIPT=${script}"
+            "-DEXPECTED_VERSION=${ALPHASHAPE_PYTHON_MINOR}"
+            "-DCONFIGURED_PYTHON=${Python3_EXECUTABLE}"
+            "-DPYTHONPATH=${ALPHASHAPE_PYTHON_DIR}"
+            -P "${ALPHASHAPE_RUN_PYTHON}")
+    if(ARG_TIMEOUT)
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${ARG_TIMEOUT})
+    endif()
+endfunction()
+
+# The parameter keys the module exposes must equal those written into doc.xml.
+alphashape_add_python_test(python_parity ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py)
 
 # The dense-product views (Chunk.depth_maps / Chunk.point_cloud) on the same
 # three-view scene the parity test uses.
-add_test(
-    NAME python_dense
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dense.py)
-set_tests_properties(python_dense PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
+alphashape_add_python_test(python_dense ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dense.py)
 
 # The mesh view (Chunk.model) and the ExportModel / ExportPointCloud tasks on
 # the same three-view scene.
-add_test(
-    NAME python_mesh
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mesh.py)
-set_tests_properties(python_mesh PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
+alphashape_add_python_test(python_mesh ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mesh.py)
 
 # WP-12.7: Chunk.convertReference on the aerial block's EXIF references.
 add_test(
@@ -80,36 +90,24 @@ set_tests_properties(python_reference_convert PROPERTIES
 # The DEM / orthomosaic views (Chunk.elevation, Chunk.orthomosaic), the four
 # milestone-9 tasks through the Chunk shortcuts, and project persistence of
 # both products, on the georeferenced aerial block.
-add_test(
-    NAME python_dem_ortho
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dem_ortho.py)
-set_tests_properties(python_dem_ortho PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}" TIMEOUT 600)
+alphashape_add_python_test(python_dem_ortho ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dem_ortho.py
+    TIMEOUT 600)
 
 # The M11 multi-instance asset lists (Chunk.elevations and friends), the
 # "builds append, last build is active" rule, the `label` parameters and
 # ExportDem's `asset_id` selection, on the georeferenced aerial block.
-add_test(
-    NAME python_assets
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_assets.py)
-set_tests_properties(python_assets PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}" TIMEOUT 600)
+alphashape_add_python_test(python_assets ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_assets.py
+    TIMEOUT 600)
 
 # The chunk operations (WP-11.6): Document.duplicate_chunk / merge_chunks /
 # append_project and the chunk-subset form of Document.save.
-add_test(
-    NAME python_chunk_ops
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chunk_ops.py)
-set_tests_properties(python_chunk_ops PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}" TIMEOUT 600)
+alphashape_add_python_test(python_chunk_ops ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chunk_ops.py
+    TIMEOUT 600)
 
 # Marker-based chunk alignment (WP-11.7): Document.align_chunks, the marker
 # surface, and the recorded similarity.
-add_test(
-    NAME python_align_chunks
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_align_chunks.py)
-set_tests_properties(python_align_chunks PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}" TIMEOUT 600)
+alphashape_add_python_test(python_align_chunks ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_align_chunks.py
+    TIMEOUT 600)
 
 # The CLI end-to-end check needs the built CLI; guard on the option so a
 # Python-only configure still works.

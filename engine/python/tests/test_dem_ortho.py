@@ -46,7 +46,7 @@ DOWNSCALE = 8
 UTM_ZONE_32N = 32632
 
 
-def built_document():
+def built_document(fill="enabled"):
     """A georeferenced chunk with a DEM and an orthomosaic, built via the
     Chunk convenience methods (so the shortcut path is exercised too).
 
@@ -54,6 +54,11 @@ def built_document():
     not the filter: at downscale 8 on these 60x45 maps the moderate default
     (2-support) keeps 14-34% of the pixels, which leaves the DEM centre a hole
     and makes the view assertions below about emptiness rather than shape.
+
+    `fill` is the DEM's interpolation mode. "enabled" leaves no nodata inside
+    this fixture's footprints, so the orthomosaic built on it is fully covered;
+    the orthomosaic view tests that need an uncovered pixel build with
+    "disabled" instead, which keeps the depth maps' own holes.
     """
     doc = alphashape.Document()
     chunk = doc.add_chunk("Chunk 1")
@@ -62,9 +67,7 @@ def built_document():
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
     doc.run_task("AlignCameras")
     doc.run_task("BuildDepthMaps", downscale=DOWNSCALE, filter_mode="mild")
-    # interpolation="enabled" fills interior holes only: reaching 100% needs
-    # the extrapolating mode, which is not what this test is about.
-    chunk.buildDem(interpolation="enabled", smoothing="none")
+    chunk.buildDem(interpolation=fill, smoothing="none")
     chunk.buildOrthomosaic(refine_seamlines=False, fill_holes=False)
     return doc, chunk
 
@@ -165,23 +168,49 @@ class TestElevationView(unittest.TestCase):
         self.assertIsNone(dem.height_at(ox, oy + 10.0 * ry))
 
     def test_nodata_cells_report_the_sentinel(self):
-        dem = self.dem
+        # interpolation="enabled" fills the whole of this fixture (the DEM grid is
+        # inside the 4x3 block's footprints), so the sentinel is exercised on a
+        # second chunk built with interpolation="disabled", where every hole must
+        # keep it.
+        doc = alphashape.Document()
+        chunk = doc.add_chunk("Chunk 1")
+        doc.active_chunk = chunk
+        doc.run_task("AddPhotos", filenames=list(AERIAL))
+        doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
+        doc.run_task("AlignCameras")
+        doc.run_task("BuildDepthMaps", downscale=DOWNSCALE, filter_mode="mild")
+        chunk.buildDem(interpolation="disabled", smoothing="none")
+        dem = chunk.elevation
         nodata = dem.nodata
-        # "enabled" fill leaves the one-camera rim empty, so at least one cell
-        # must carry the sentinel. height_at over a fully-empty corner is None.
         heights = dem.heights()
         seen_nodata = any(value == nodata for row in heights for value in row)
         self.assertTrue(seen_nodata)
         has_value = any(value != nodata for row in heights for value in row)
         self.assertTrue(has_value)
 
+    def test_enabled_leaves_no_nodata_inside_the_block(self):
+        # The intended new semantics: the flight's footprint covers the DEM grid,
+        # so interpolation="enabled" has no hole left to leave empty. (Before the
+        # footprint region, the mode filled only enclosed holes and the grid kept
+        # a nodata rim.)
+        dem = self.dem
+        nodata = dem.nodata
+        heights = dem.heights()
+        self.assertFalse(any(value == nodata for row in heights for value in row))
+
 
 class TestOrthomosaicView(unittest.TestCase):
-    """Chunk.orthomosaic exposes the RGBA mosaic and its seam labels."""
+    """Chunk.orthomosaic exposes the RGBA mosaic and its seam labels.
+
+    Built with interpolation="disabled" so the DEM keeps the depth maps' own
+    holes: that is what makes an uncovered ortho pixel exist, which the tests
+    below assert on. (With "enabled" the whole grid is filled and the mosaic
+    would be fully opaque.)
+    """
 
     @classmethod
     def setUpClass(cls):
-        cls.doc, cls.chunk = built_document()
+        cls.doc, cls.chunk = built_document("disabled")
         cls.ortho = cls.chunk.orthomosaic
 
     def test_metadata(self):

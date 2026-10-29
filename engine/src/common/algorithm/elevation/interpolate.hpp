@@ -61,8 +61,17 @@ struct HoleFillOptions {
     /// IDW: maximum radius (cells) for the nearest-neighbour search.
     double idw_search_radius = 64.0;
     /// If true, fill only holes not connected (4-connectivity) to the raster
-    /// border through invalid cells.
+    /// border through invalid cells. Ignored when `region` is non-empty: the
+    /// region is then the authority on which cells may be filled.
     bool interior_only = false;
+    /// Optional fill region, width*height cells (empty = unused). When given, a
+    /// hole cell is fillable only where `region[i] != 0`; `interior_only` no
+    /// longer blocks anything, so a hole that reaches the raster border is
+    /// filled as long as it lies inside the region. This is what lets a caller
+    /// fill the area the survey actually covers (e.g. the cameras' ground
+    /// footprints) rather than only holes enclosed by data. The region must not
+    /// change the VALUE of any cell, only whether a hole may be filled at all.
+    std::vector<std::uint8_t> region;
     /// NaturalNeighbour only: a hole whose bordering data cells number at most
     /// this many is filled with exact Sibson interpolation on their Delaunay
     /// triangulation (see sibson.hpp) instead of the discrete approximation.
