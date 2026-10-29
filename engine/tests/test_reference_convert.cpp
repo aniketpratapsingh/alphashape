@@ -340,6 +340,19 @@ TEST(Crs, EpsgVerticalDatumIgnoresStoreGridInFavourOfCompound) {
     fs::remove_all(dir, ec);
 }
 
+// The unset/local guard runs before the identity shortcut: LOCAL -> LOCAL must
+// throw, not answer "same CRS, so identity".
+TEST(Crs, FrameRotationRejectsLocalBeforeIdentityShortcut) {
+    const crs::CoordinateSystem local = crs::CoordinateSystem::local();
+    const crs::CrsPoint point{0.0, 0.0, 0.0};
+    EXPECT_THROW(frame_rotation(local, local, point), ValueError);
+    EXPECT_THROW(frame_rotation(geographic(), local, point), ValueError);
+    EXPECT_THROW(frame_rotation(local, geographic(), point), ValueError);
+    // The identity shortcut still applies to a real, equal CRS.
+    const Eigen::Matrix3d identity = frame_rotation(geographic(), geographic(), point);
+    EXPECT_TRUE(identity.isApprox(Eigen::Matrix3d::Identity(), 1e-15));
+}
+
 // --- chunk 3
 /// Textbook meridian convergence in degrees, γ = atan(tan Δλ · sin φ), with Δλ
 /// the longitude minus the zone's central meridian and φ the latitude. Positive

@@ -242,12 +242,15 @@ Eigen::Matrix3d local_basis(const CoordinateSystem& cs, const crs::CrsPoint& poi
 
 Eigen::Matrix3d frame_rotation(const CoordinateSystem& source, const CoordinateSystem& target,
                                const crs::CrsPoint& point) {
-    if (source == target) {
-        return Eigen::Matrix3d::Identity();
-    }
+    // The guard comes first: an unset or local CRS has no local axes to express
+    // a rotation in, and "LOCAL -> LOCAL" comparing equal must not silently
+    // answer with the identity and hide the caller's mistake.
     if (source.is_local() || target.is_local() || !source.is_set() || !target.is_set()) {
         throw ValueError("frame_rotation: both coordinate systems must be set and not the local "
                          "engineering frame");
+    }
+    if (source == target) {
+        return Eigen::Matrix3d::Identity();
     }
     const crs::CrsTransform to_target = crs::CrsTransform::create(source, target);
     const std::optional<CrsPoint> there = to_target.forward(point);
