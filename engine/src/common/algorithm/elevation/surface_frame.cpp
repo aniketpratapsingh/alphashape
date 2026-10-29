@@ -36,9 +36,9 @@ int auto_utm_epsg(double longitude_deg, double latitude_deg) {
 
 }  // namespace
 
-crs::CoordinateSystem parse_crs_param(const std::string& text) {
+CRS parse_crs_param(const std::string& text) {
     if (text.empty()) {
-        return crs::CoordinateSystem::local();
+        return CRS{};
     }
 #if defined(ALPHASHAPE_USE_PROJ)
     // "EPSG:n" (the spelling the engine itself emits) and a bare number are the
@@ -52,16 +52,31 @@ crs::CoordinateSystem parse_crs_param(const std::string& text) {
     }
     const bool all_digits =
         !body.empty() && body.find_first_not_of("0123456789") == std::string::npos;
-    if (all_digits) {
-        return crs::CoordinateSystem::from_epsg(std::stoi(body));
-    }
-    if (text.find("+proj") != std::string::npos) {
-        return crs::CoordinateSystem::from_proj(text);
-    }
-    return crs::CoordinateSystem::from_wkt(text);
+    crs::CoordinateSystem cs = all_digits
+                                   ? crs::CoordinateSystem::from_epsg(std::stoi(body))
+                                   : (text.find("+proj") != std::string::npos
+                                          ? crs::CoordinateSystem::from_proj(text)
+                                          : crs::CoordinateSystem::from_wkt(text));
+    return CRS(cs);
 #else
     throw ValueError("BuildDem/BuildOrthomosaic: the crs parameter needs a build with PROJ "
                      "(ALPHASHAPE_USE_PROJ=ON)");
+#endif
+}
+
+bool requests_other_crs(const Chunk& chunk, const CRS& requested) {
+    return requested.is_set() && requested.epsg != 0 && requested.epsg != chunk.crs().epsg;
+}
+
+SurfaceFrame for_options(const Chunk& chunk, const CRS& requested) {
+    if (!requested.is_set()) {
+        return SurfaceFrame::for_chunk(chunk, 0);
+    }
+#if defined(ALPHASHAPE_USE_PROJ)
+    return SurfaceFrame::for_chunk(chunk, static_cast<crs::CoordinateSystem>(requested));
+#else
+    throw ValueError(
+        "SurfaceFrame: a CRS plane needs a build with PROJ (ALPHASHAPE_USE_PROJ=ON)");
 #endif
 }
 
@@ -81,9 +96,11 @@ struct SurfaceFrame::Impl {
 #else  // !ALPHASHAPE_USE_PROJ
 
 /// Without the CRS engine there is no geographic frame: the type exists only so
-/// DEM/ortho code compiles, and every request for a real CRS throws.
+/// DEM/ortho code compiles, and every request for a real CRS throws. `for_chunk`
+/// never constructs an Impl here, so it carries no engine-backed member (a
+/// `CoordinateSystem` value would need symbols this build does not link).
 struct SurfaceFrame::Impl {
-    crs::CoordinateSystem crs;
+    int unused = 0;
 };
 
 #endif  // ALPHASHAPE_USE_PROJ
@@ -152,6 +169,8 @@ const crs::CoordinateSystem& SurfaceFrame::crs() const {
 }
 
 int SurfaceFrame::epsg() const { return impl_ ? impl_->crs.epsg() : 0; }
+
+bool SurfaceFrame::is_local() const { return impl_ == nullptr; }
 
 Eigen::Vector3d SurfaceFrame::to_plane(const Eigen::Vector3d& local) const {
     if (!impl_) {

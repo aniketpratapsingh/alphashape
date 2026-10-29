@@ -818,9 +818,7 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     }
 
     tick(0.05);
-    const SurfaceFrame frame = options.crs.is_set()
-                                  ? SurfaceFrame::for_chunk(chunk, options.crs)
-                                  : SurfaceFrame::for_chunk(chunk, 0);
+    const SurfaceFrame frame = for_options(chunk, options.crs);
 
     // -- collect the plane-frame samples / geometry --------------------------
     std::vector<PlaneSample> samples;

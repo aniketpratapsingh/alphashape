@@ -7,6 +7,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/dem_builder.hpp"
+#include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/document.hpp"
 
@@ -61,7 +62,7 @@ DemOptions resolve_options(const Params& params) {
     const std::string crs_text = params.get_string("crs");
     if (!crs_text.empty()) {
         options.crs = elevation::parse_crs_param(crs_text);
-        if (projection != 0 && options.crs.is_set() && options.crs.epsg() != projection) {
+        if (projection != 0 && options.crs.is_set() && options.crs.epsg != projection) {
             throw ValueError(
                 "BuildDem: projection (" + std::to_string(projection) +
                 ") and crs (\"" + crs_text + "\") name different coordinate systems; "

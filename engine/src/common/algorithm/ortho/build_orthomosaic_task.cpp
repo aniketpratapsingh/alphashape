@@ -372,8 +372,9 @@ struct ResolvedOptions {
     bool refine_seamlines = true;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
-    /// The requested output CRS (M12 §4.9). Unset = the DEM's own CRS.
-    crs::CoordinateSystem crs;
+    /// The requested output CRS (M12 §4.9), as the DTO the parameter produced.
+    /// Unset = the DEM's own CRS.
+    CRS crs;
 };
 
 ResolvedOptions resolve_options(const Params& params) {
@@ -405,7 +406,7 @@ ResolvedOptions resolve_options(const Params& params) {
     if (!crs_text.empty()) {
         options.crs = elevation::parse_crs_param(crs_text);
         if (options.projection != 0 && options.crs.is_set() &&
-            options.crs.epsg() != options.projection) {
+            options.crs.epsg != options.projection) {
             throw ValueError(
                 "BuildOrthomosaic: projection (" + std::to_string(options.projection) +
                 ") and crs (\"" + crs_text +
@@ -1302,17 +1303,15 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // the auto-UTM / local rule.
     elevation::SurfaceFrame frame;
     if (!dem.empty() && dem.crs.is_set()) {
-        frame = elevation::SurfaceFrame::for_chunk(*chunk, dem.crs);
-    } else if (options.crs.is_set()) {
-        frame = elevation::SurfaceFrame::for_chunk(*chunk, options.crs);
+        frame = elevation::for_options(*chunk, dem.crs);
     } else {
-        frame = elevation::SurfaceFrame::for_chunk(*chunk, 0);
+        frame = elevation::for_options(*chunk, options.crs);
     }
     const int epsg = frame.epsg();
-    if (Log::enabled(LogLevel::Info) && options.crs.is_set() && options.crs.epsg() != 0 &&
-        options.crs.epsg() != epsg) {
+    if (Log::enabled(LogLevel::Info) && elevation::requests_other_crs(*chunk, options.crs) &&
+        options.crs.epsg != epsg) {
         log(LogLevel::Info) << "BuildOrthomosaic: building in the DEM's EPSG " << epsg
-                            << "; the requested EPSG " << options.crs.epsg()
+                            << "; the requested EPSG " << options.crs.epsg
                             << " is applied by the export";
     }
 
@@ -1460,7 +1459,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         // measured cell. The DSM's own automatic cell (the median mesh edge) is
         // the natural provisional value.
         dsm_options.resolution = resolution;
-        dsm_options.crs = frame.crs();
+        // The DSM must land on the same plane the frame chose: the DEM's CRS
+        // when there is one, else the request (unset = the same auto rule).
+        dsm_options.crs = dem.empty() ? options.crs : dem.crs;
         dsm_options.tgv = false;  // a rasterised mesh needs no smoothing
         Elevation dsm =
             elevation::build_dem(*chunk, dsm_options, [&](double fraction) {
@@ -1491,6 +1492,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         }
         surface = dsm.raster;
         surface_nodata = dsm.nodata;
+        // dsm_options.crs above is exactly what the frame was built from (the
+        // DEM's CRS, or the request / auto rule when there is no DEM), so the
+        // DSM and the ortho share a plane by construction.
     }
 
     if (!(resolution > 0.0)) {
