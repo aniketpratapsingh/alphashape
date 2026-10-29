@@ -510,5 +510,42 @@ TEST_F(GeoidTempDir, CrsVerticalCrsPersistence) {
     EXPECT_EQ(without->coordinate_system().epsg(), 4326);
 }
 
+// custom() is the only path that evaluates a grid the engine opened itself, and
+// it must give H = h - N with N from that grid. Constructing the transform is
+// also the regression test for a use-after-move: the description is built from
+// the stored geoid after ownership moved into the impl, so a null dereference
+// there aborts before any point is transformed.
+TEST(Crs, VerticalCustomAppliesGeoidSign) {
+    const std::shared_ptr<const GeoidGrid> grid = subset();
+    ASSERT_NE(grid, nullptr);
+    const CoordinateSystem geo = CoordinateSystem::from_epsg(4979);  // WGS 84 3D
+    const CoordinateSystem utm = CoordinateSystem::from_epsg(32633);
+    VerticalCrs egm96;
+    egm96.kind = VerticalCrs::Kind::GeoidModel;
+    egm96.name = "EGM96 height";
+    egm96.grid = "us_nga_egm96_15.tif";
+    VerticalCrs none;
+    const VerticalTransform custom =
+        VerticalTransform::custom(geo, utm, none, egm96, grid, geo);
+    ASSERT_TRUE(custom.is_valid());
+    EXPECT_NE(custom.description().find("egm96_subset.tif"), std::string::npos)
+        << custom.description();
+
+    constexpr double kH = 120.0;
+    const std::optional<CrsPoint> moved = custom.forward(CrsPoint{9.0, 50.0, kH});
+    ASSERT_TRUE(moved.has_value());
+    const std::optional<double> n = grid->undulation(9.0, 50.0);
+    ASSERT_TRUE(n.has_value());
+    EXPECT_NEAR(moved->z, kH - *n, 1e-6) << "custom() must apply H = h - N";
+    // The horizontal part is still the UTM transform, not a pass-through.
+    const std::optional<CrsPoint> horizontal = custom.horizontal().forward(CrsPoint{9.0, 50.0, 0});
+    ASSERT_TRUE(horizontal.has_value());
+    EXPECT_NEAR(moved->x, horizontal->x, 1e-6);
+    EXPECT_NEAR(moved->y, horizontal->y, 1e-6);
+
+    // Outside the geoid the conversion refuses rather than extrapolating.
+    EXPECT_FALSE(custom.forward(CrsPoint{9.0, 90.5, kH}).has_value());
+}
+
 }  // namespace
 }  // namespace alphashape::crs

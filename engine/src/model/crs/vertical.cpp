@@ -304,7 +304,9 @@ VerticalTransform VerticalTransform::custom(const CoordinateSystem& src,
     if (dst_ortho) {
         impl->dst_to_geographic = CrsTransform::create(dst, geographic_crs, options);
     }
-    impl->description = "custom geoid " + geoid->path();
+    // Read the path from the moved-to owner: `geoid` is empty after the move
+    // above, so `geoid->path()` would dereference a null shared_ptr.
+    impl->description = "custom geoid " + impl->geoid->path();
     return VerticalTransform(std::move(impl));
 }
 
