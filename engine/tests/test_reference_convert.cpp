@@ -370,7 +370,7 @@ TEST(Crs, FrameRotationBetweenUtmZonesIsAboutUp) {
 TEST(Crs, FrameRotationIdentityForSameCrs) {
     const Eigen::Matrix3d rotation =
         frame_rotation(utm(32), utm(32), crs::CrsPoint{500000.0, 5500000.0, 0.0});
-    EXPECT_DOUBLE_EQ(rotation.cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_LE((rotation - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 0.0);
 }
 
 // The chunk meta key selects the order; an unknown name is an error rather than
