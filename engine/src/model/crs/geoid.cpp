@@ -174,6 +174,9 @@ private:
 // base/io/geotiff_tags.hpp.
 // ---------------------------------------------------------------------------
 
+/// GeoKey 1025, GTRasterTypeGeoKey: 1 = PixelIsArea, 2 = PixelIsPoint.
+constexpr std::uint16_t kKeyRasterType = 1025;
+
 struct DecodedGrid {
     GeoidGridInfo info;
     std::vector<float> samples;
@@ -1066,7 +1069,8 @@ GeoidStore GeoidStore::load(const std::filesystem::path& dir) {
                                  *why);
         }
         entry.model.name = attr_of(attrs, "name", index, false);
-        const std::string file = attr_of(attrs, "file", index, true);        entry.model.source = attr_of(attrs, "source", index, false);
+        const std::string file = attr_of(attrs, "file", index, true);
+        entry.model.source = attr_of(attrs, "source", index, false);
         entry.model.licence = attr_of(attrs, "licence", index, false);
         entry.model.min_lon_deg = number_of(attrs, "min_lon", index);
         entry.model.min_lat_deg = number_of(attrs, "min_lat", index);

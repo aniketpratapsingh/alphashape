@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -124,10 +125,10 @@ double rms(const std::vector<double>& values) {
 /// not create an image that big without the samples, and the point here is a
 /// crafted header. Layout (classic TIFF, little endian):
 ///
-///   0: header "II", 42, IFD offset 80
+///   0: header "II", 42, IFD offset 84
 ///   8: ModelPixelScale, 3 doubles
-///   32: ModelTiepoint, 6 doubles
-///   80: IFD with 10 entries, next IFD = 0
+///   34: ModelTiepoint, 6 doubles
+///   84: IFD with 10 entries, next IFD = 0
 ///
 /// Only what the geoid decoder reads is supplied; width and height are LONG
 /// so a 4e9 value survives.
@@ -153,7 +154,7 @@ void write_header_only_tiff(const std::string& path, std::uint32_t width, std::u
         std::memcpy(&bits, &v, sizeof(bits));
         put64(bits);
     };
-    constexpr std::uint32_t kIfdOffset = 80;
+    constexpr std::uint32_t kIfdOffset = 8 + 2 + 24 + 2 + 48;  // 84
     out.push_back('I');
     out.push_back('I');
     put16(42);
@@ -664,9 +665,10 @@ TEST_F(GeoidTempDir, CrsGeoidRejectsHugeDimensions) {
         const std::string message = error.what();
         EXPECT_NE(message.find("may not exceed"), std::string::npos) << message;
     }
-    // 30 M per side is a legal geoid grid shape; it fails on the missing pixel
-    // data instead, which proves the cap is above real grids.
-    write_header_only_tiff(crafted, 30'000'000U, 2U);
+    // 900 000 x 2 is inside both caps (the real EGM2008 grid is 1440 x 721); it
+    // fails on the missing pixel data instead, which proves the caps are above
+    // real grids and that the rejection above was the dimension check.
+    write_header_only_tiff(crafted, 900'000U, 2U);
     try {
         GeoidGrid::open(crafted);
         FAIL() << "open() accepted a header with no pixel data";
@@ -756,6 +758,106 @@ TEST(Crs, VerticalOffsetApplied) {
     ASSERT_TRUE(with_offset.has_value());
     EXPECT_NEAR(with_offset->z - plain->z, 1.5, 1e-6)
         << "compound() must apply the target datum's offset after PROJ";
+}
+
+// A grid indexed 0..360 and a caller using -180..180 (or the other way round)
+// must agree: longitude is normalised into the grid's own convention before
+// coverage and before the lookup. Without that, lon 190 on a -180..180 grid is
+// called uncovered, and a 0..360 grid rejects every western longitude.
+TEST_F(GeoidTempDir, CrsGeoidLongitudeNormalised) {
+    GeoRaster<float> raster;
+    raster.grid.width = 30;
+    raster.grid.height = 5;
+    raster.grid.origin_x = 170.0;  // covers 170.5 E .. 199.5 E
+    raster.grid.origin_y = 5.0;
+    raster.grid.pixel_size_x = 1.0;
+    raster.grid.pixel_size_y = 1.0;
+    raster.channels = 1;
+    raster.data.resize(30 * 5);
+    for (int row = 0; row < 5; ++row) {
+        for (int col = 0; col < 30; ++col) {
+            raster.data[static_cast<std::size_t>(row) * 30 + static_cast<std::size_t>(col)] =
+                static_cast<float>(col);  // so a lookup can be told apart
+        }
+    }
+    const std::string file = (dir_ / "east grid.tif").string();
+    GeoTiffOptions options;
+    options.epsg = 4326;
+    write_geotiff(file, raster, options);
+    const std::shared_ptr<const GeoidGrid> grid = GeoidGrid::open(file);
+    ASSERT_NE(grid, nullptr);
+    const GeoidGridInfo& box = grid->info();
+    ASSERT_GT(box.max_lon_deg, 180.0) << "the grid must cross the antimeridian";
+
+    // A western spelling of an eastern longitude: -170 is 190 east.
+    const double east = 190.0;
+    const double west = -170.0;
+    EXPECT_TRUE(grid->covers(east, 2.5));
+    EXPECT_TRUE(grid->covers(west, 2.5)) << "lon -170 must normalise to 190";
+    const std::optional<double> at_east = grid->grid_undulation(east, 2.5);
+    const std::optional<double> at_west = grid->grid_undulation(west, 2.5);
+    ASSERT_TRUE(at_east.has_value());
+    ASSERT_TRUE(at_west.has_value());
+    EXPECT_NEAR(*at_west, *at_east, 1e-9);
+    EXPECT_NEAR(*grid->undulation(west, 2.5), *grid->undulation(east, 2.5), 1e-9);
+    // A longitude outside the grid stays outside after normalisation.
+    EXPECT_FALSE(grid->covers(100.0, 2.5));
+    EXPECT_FALSE(grid->covers(-100.0, 2.5));
+}
+
+// The grid is shared (GeoidStore hands one to every caller) and PROJ state and
+// the lazy GeoTIFF decode must therefore be per caller. Eight threads evaluate
+// a grid that has not been decoded yet — the worst case: the decode, the PROJ
+// session and the answer are all first-touched concurrently — and every result
+// must equal the single-thread answer exactly.
+TEST_F(GeoidTempDir, CrsGeoidConcurrentEvaluation) {
+    const fs::path copy = dir_ / "concurrent.tif";
+    std::error_code ec;
+    fs::copy_file(kFixtureDir / "egm96_subset.tif", copy, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    const std::shared_ptr<const GeoidGrid> grid = GeoidGrid::open(copy.string());
+    ASSERT_NE(grid, nullptr);
+
+    std::vector<std::pair<double, double>> points;
+    for (int i = 0; i < 200; ++i) {
+        points.emplace_back(-170.0 + 1.7 * i, -80.0 + 0.79 * i);
+    }
+    // The reference comes from a second Grid over the same file, so `grid`
+    // itself is still undecoded when the workers start: the lazy decode, the
+    // PROJ session and the answer are all first-touched concurrently.
+    const std::shared_ptr<const GeoidGrid> reference = GeoidGrid::open(copy.string());
+    ASSERT_NE(reference, nullptr);
+    std::vector<double> expected(points.size(), 0.0);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const std::optional<double> value =
+            reference->undulation(points[i].first, points[i].second);
+        ASSERT_TRUE(value.has_value()) << i;
+        expected[i] = *value;
+    }
+
+    constexpr int kThreads = 8;
+    std::vector<std::vector<double>> results(kThreads);
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&grid, &points, &results, t] {
+            results[t].resize(points.size());
+            for (std::size_t i = 0; i < points.size(); ++i) {
+                const std::optional<double> value =
+                    grid->undulation(points[i].first, points[i].second);
+                results[t][i] = value ? *value : std::numeric_limits<double>::quiet_NaN();
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    for (int t = 0; t < kThreads; ++t) {
+        ASSERT_EQ(results[t].size(), points.size());
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            EXPECT_EQ(results[t][i], expected[i]) << "thread " << t << " point " << i;
+        }
+    }
 }
 
 }  // namespace
