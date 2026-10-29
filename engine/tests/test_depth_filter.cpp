@@ -526,8 +526,8 @@ TEST(DepthRepair, StepEdgeHoleIsNotFilled) {
             const double d = index_depth(view.map, i, j);
             if (d > 0.0) {
                 const double scale = i < edge_i ? 1.0 : 2.0;  // the far half
-                view.map.depths[static_cast<std::size_t>(j) * kW + i] =
-                    static_cast<float>(d * scale);
+                view.map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(kW) +
+                                static_cast<std::size_t>(i)] = static_cast<float>(d * scale);
             }
         }
     }
@@ -593,15 +593,18 @@ TEST(DepthRepair, IsDeterministicAndMarksConfidence) {
 
     // A repaired pixel is marked with the reduced confidence and a plane
     // normal; a measured pixel keeps its own values.
-    const std::size_t filled = static_cast<std::size_t>(25) * kW + 35;
+    const std::size_t filled =
+        static_cast<std::size_t>(25) * static_cast<std::size_t>(kW) + std::size_t{35};
     EXPECT_FLOAT_EQ(a.confidence[filled], kRepairedConfidence);
     EXPECT_GT(a.depths[filled], 0.0f);
-    const std::size_t measured = static_cast<std::size_t>(5) * kW + 5;
+    const std::size_t measured =
+        static_cast<std::size_t>(5) * static_cast<std::size_t>(kW) + std::size_t{5};
     EXPECT_FLOAT_EQ(a.confidence[measured], 3.0f);
-    const double norm = std::sqrt(static_cast<double>(a.normals[3 * filled + 0]) * a.normals[3 * filled + 0] +
-                                  static_cast<double>(a.normals[3 * filled + 1]) * a.normals[3 * filled + 1] +
-                                  static_cast<double>(a.normals[3 * filled + 2]) * a.normals[3 * filled + 2]);
-    EXPECT_NEAR(norm, 1.0, 1e-6);
+    const std::size_t base = filled * 3;
+    const double nx = static_cast<double>(a.normals[base + 0]);
+    const double ny = static_cast<double>(a.normals[base + 1]);
+    const double nz = static_cast<double>(a.normals[base + 2]);
+    EXPECT_NEAR(std::sqrt(nx * nx + ny * ny + nz * nz), 1.0, 1e-6);
 }
 
 TEST(DepthRepair, ZeroMaxAreaFillsNothing) {
