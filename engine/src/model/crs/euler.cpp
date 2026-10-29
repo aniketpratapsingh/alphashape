@@ -1,6 +1,5 @@
 #include "model/crs/euler.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -55,8 +54,6 @@ Eigen::Matrix3d permutation_of(const std::array<int, 3>& axes, double* det) {
     *det = p.determinant();
     return p;
 }
-
-double clamp_unit(double value) { return std::max(-1.0, std::min(1.0, value)); }
 
 }  // namespace
 
@@ -135,18 +132,27 @@ EulerAngles from_matrix(const Eigen::Matrix3d& matrix, RotationOrder order) {
     // Q R_n(t) Q^T = R_{Qn}(det(Q) t), so conjugating by the axis permutation
     // turns any Tait-Bryan sequence into the canonical Rx(A) Ry(B) Rz(C).
     const Eigen::Matrix3d r = p * matrix * p.transpose();
-    const double b = std::asin(clamp_unit(r(0, 2)));
+    // The middle angle from atan2 rather than asin: asin(sin B) loses digits
+    // exactly where the sequence is degenerate (B near +/-90), which is where
+    // the branch below must be decided. cos(B) = hypot(r00, r01) is exact and
+    // non-negative, so the sign of B comes from r02 and the branch is taken
+    // only when cos(B) is genuinely zero.
+    const double cos_middle = std::hypot(r(0, 0), r(0, 1));
+    const double b = std::atan2(r(0, 2), cos_middle);
     double a = 0.0;
     double c = 0.0;
-    if (std::abs(std::cos(b)) > 1e-9) {
+    if (cos_middle > 1e-12) {
         a = std::atan2(-r(1, 2), r(2, 2));
         c = std::atan2(-r(0, 1), r(0, 0));
     } else {
         // Gimbal lock: the outer axes coincide. Keep the middle angle at its
-        // singular value, set the third angle to zero, and absorb everything
-        // observable into the first (documented alternative solution).
+        // singular value (+/-90), set the third angle to zero, and absorb
+        // everything observable into the first (documented alternative
+        // solution). atan2 returns exactly +/-pi/2 here, so the recovered
+        // middle angle compares equal to the input.
         c = 0.0;
         a = std::atan2(r(2, 1), r(1, 1));
+        b = r(0, 2) >= 0.0 ? kPi / 2.0 : -kPi / 2.0;
     }
     EulerAngles angles;
     angles.yaw = det * a / kDeg;

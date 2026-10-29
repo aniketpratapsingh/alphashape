@@ -89,7 +89,7 @@ TEST(Crs, EulerGimbalLockPutsEverythingInYaw) {
                 const EulerAngles recovered = from_matrix(expected, order);
                 // The documented alternative solution.
                 EXPECT_EQ(recovered.roll, 0.0) << rotation_order_name(order);
-                EXPECT_NEAR(recovered.pitch, middle, 1e-12) << rotation_order_name(order);
+                EXPECT_DOUBLE_EQ(recovered.pitch, middle) << rotation_order_name(order);
                 // Still the same rotation.
                 EXPECT_LE(rotation_angle(expected, to_matrix(recovered)), 1e-12)
                     << rotation_order_name(order) << " yaw " << input.yaw << " roll "
