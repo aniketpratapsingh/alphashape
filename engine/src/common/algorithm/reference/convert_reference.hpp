@@ -163,10 +163,13 @@ crs::EulerAngles convert_orientation(const crs::EulerAngles& angles,
 /// Convert camera and/or marker references of `chunk` into `target`.
 ///
 /// `geoids` supplies the grid for a `VerticalCrs` that is not an EPSG vertical
-/// CRS (a project geoid). An EPSG vertical datum is resolved by PROJ through
-/// `VerticalTransform::compound` and needs no store; a geoid datum with no
-/// store, or an id the store does not carry, throws naming the datum. The store
-/// id is the datum's `grid` when set, otherwise its `name`.
+/// CRS (a project geoid). The route follows the datum's description, never what
+/// the store happens to hold: an EPSG vertical CRS always goes through PROJ's
+/// `VerticalTransform::compound` pipeline (its exact `cs2cs` answer, and a
+/// store grid never shadows it); a datum with no EPSG code uses the store's
+/// grid through `VerticalTransform::custom`. A geoid datum with no store, or an
+/// id the store does not carry, throws naming the datum. The store id is the
+/// datum's `grid` when set, otherwise its `name`.
 ///
 /// On success the camera/marker slot is set to `target`, so the stored numbers
 /// and their label agree. On failure the chunk is unchanged.

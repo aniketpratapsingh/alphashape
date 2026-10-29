@@ -27,6 +27,7 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
+#include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/commands/command.hpp"
@@ -38,6 +39,8 @@
 #include "model/crs/geoid.hpp"
 #include "model/crs/transform.hpp"
 #include "model/crs/vertical.hpp"
+#include "model/raster/geo_raster.hpp"
+#include "model/raster/geotiff.hpp"
 
 namespace alphashape::reference {
 namespace {
@@ -287,6 +290,54 @@ TEST(Crs, ConvertReferenceNeedsGeoidForCustomDatum) {
     // The chunk is untouched.
     EXPECT_DOUBLE_EQ((*chunk.cameras()[0].reference.location).x(), 9.0);
     EXPECT_EQ(chunk.camera_crs().epsg, 4979);
+}
+
+// An EPSG vertical datum always takes PROJ's compound pipeline, even when the
+// store carries a grid keyed under the same id/name. The store grid here is a
+// deliberately wrong constant (a flat 1000 m over the fixture's area), so the
+// two routes give answers ~1000 m apart and cannot be confused.
+TEST(Crs, EpsgVerticalDatumIgnoresStoreGridInFavourOfCompound) {
+    const double lon = 9.0;
+    const double lat = 50.0;
+    const std::optional<double> n = egm96()->undulation(lon, lat);
+    ASSERT_TRUE(n.has_value());
+
+    crs::VerticalCrs egm;
+    egm.kind = crs::VerticalCrs::Kind::GeoidModel;
+    egm.name = "EGM96 height";  // resolves to EPSG:5773
+    ASSERT_EQ(crs::lookup_vertical_crs(egm).epsg, 5773);
+    const crs::CoordinateSystem source = geographic().with_vertical(egm);
+
+    // A store whose "EGM96" entry is a wrong constant, not the real grid.
+    const std::string dir = platform::unique_temp_path("alphashape_convref_badgrid_", "");
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    const std::string bad = (fs::path(dir) / "bad_egm96.tif").string();
+    {
+        GeoRaster<float> raster;
+        raster.grid.width = 5;
+        raster.grid.height = 5;
+        raster.grid.origin_x = 8.0;
+        raster.grid.origin_y = 51.0;
+        raster.grid.pixel_size_x = 1.0;
+        raster.grid.pixel_size_y = 1.0;
+        raster.channels = 1;
+        raster.data.assign(25, 1000.0f);  // would shift heights by 1000 m
+        GeoTiffOptions options;
+        options.epsg = 4326;
+        write_geotiff(bad, raster, options);
+    }
+    crs::GeoidStore store;
+    store.add("EGM96", "EGM96 height", bad, "custom", "test");
+    ASSERT_TRUE(store.grid("EGM96") != nullptr) << "the shadowing grid must be present";
+
+    Chunk chunk = make_chunk(source, 1, 0, lon, lat);
+    chunk.cameras()[0].reference.location = Eigen::Vector3d(lon, lat, 300.0);
+    convert_reference(chunk, geographic(), ReferenceKind::Cameras, &store);
+    // Compound route: h = H + N. The bad grid's 1000 m would fail this by ~1000.
+    EXPECT_NEAR((*chunk.cameras()[0].reference.location).z(), 300.0 + *n, 0.05);
+    fs::remove_all(dir, ec);
 }
 
 // --- chunk 3

@@ -74,9 +74,9 @@ std::string where(const Marker& marker) {
 ///
 /// With no vertical datum set on either side this is a plain `CrsTransform`
 /// and heights stay ellipsoidal. With a datum, PROJ's compound pipeline is used
-/// when every vertical CRS involved is EPSG-defined; otherwise the geoid is
-/// taken from `geoids` and `VerticalTransform::custom` applies `H = h - N`
-/// around the horizontal transform.
+/// when every vertical CRS involved is EPSG-defined; only a datum with no EPSG
+/// code (a project geoid) is taken from `geoids` and applied by
+/// `VerticalTransform::custom` around the horizontal transform.
 struct Converter {
     /// The plain horizontal transform; unset when a vertical one handles both.
     std::optional<crs::CrsTransform> horizontal;
@@ -103,13 +103,19 @@ Converter build_converter(const CoordinateSystem& source, const CoordinateSystem
     }
     const crs::VerticalCrs src_datum = src_set ? *src_v : crs::VerticalCrs{};
     const crs::VerticalCrs dst_datum = dst_set ? *dst_v : crs::VerticalCrs{};
-    // The grid this conversion should use, in priority order:
-    //   1. a grid the supplied store carries for one of the datums -- the
-    //      project's own grid is the datum's authoritative sample, and this is
-    //      what makes a conversion reproducible from the files the project
-    //      ships;
-    //   2. PROJ's compound pipeline for an EPSG vertical CRS (the installed
-    //      proj-data grid), which is exact `cs2cs` agreement.
+    // Which route applies is decided by the description, not by what the store
+    // happens to hold. An EPSG vertical CRS has an authority-defined geoid and
+    // a PROJ compound pipeline is its exact `cs2cs` answer, so it always takes
+    // that route; a store grid never shadows it, because a project grid keyed
+    // under the same name may be a different model or a bad copy. Only a datum
+    // with no EPSG code (a project geoid, identifiable by name only) needs the
+    // store's grid and `VerticalTransform::custom`.
+    const bool src_epsg = !src_set || crs::lookup_vertical_crs(src_datum).epsg != 0;
+    const bool dst_epsg = !dst_set || crs::lookup_vertical_crs(dst_datum).epsg != 0;
+    if (src_epsg && dst_epsg) {
+        out.vertical = crs::VerticalTransform::compound(source, target);
+        return out;
+    }
     std::shared_ptr<const crs::GeoidGrid> stored;
     if (geoids != nullptr) {
         for (const crs::VerticalCrs* datum : {&src_datum, &dst_datum}) {
@@ -128,17 +134,10 @@ Converter build_converter(const CoordinateSystem& source, const CoordinateSystem
                                                      CoordinateSystem::from_epsg(4979));
         return out;
     }
-    const bool both_epsg =
-        (!src_set || crs::lookup_vertical_crs(src_datum).epsg != 0) &&
-        (!dst_set || crs::lookup_vertical_crs(dst_datum).epsg != 0);
-    if (both_epsg) {
-        out.vertical = crs::VerticalTransform::compound(source, target);
-        return out;
-    }
-    // No usable grid: fail by name. A silently skipped geoid would move every
-    // height by tens of metres. The datum to name is the one without an EPSG
-    // code; at least one side is set here, so when the source is EPSG-defined
-    // the target must be the custom one.
+    // No EPSG code and no usable grid: fail by name. A silently skipped geoid
+    // would move every height by tens of metres. The datum to name is the one
+    // without an EPSG code; at least one side is set here, so when the source is
+    // EPSG-defined the target must be the custom one.
     const crs::VerticalCrs& needed =
         (src_set && crs::lookup_vertical_crs(src_datum).epsg == 0) ? src_datum : dst_datum;
     if (geoids == nullptr) {

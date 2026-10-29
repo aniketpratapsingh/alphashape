@@ -14,10 +14,12 @@ All notable changes to alphashape are recorded here. The format follows
   `camera_crs`/`marker_crs` slot, so an imported lon/lat/alt campaign can be
   expressed in a UTM zone (or the reverse) without touching poses, tie points or
   assets. Horizontal positions go through `CrsTransform`; heights go through
-  `VerticalTransform` whenever either slot carries a vertical datum -- a project
-  geoid applies `H = h - N` through the store's grid, an EPSG vertical CRS uses
-  PROJ's compound pipeline -- and an absent height stays absent. Accuracies are
-  measurement weights in metres and are carried unchanged. The conversion is
+  `VerticalTransform` whenever either slot carries a vertical datum. The route
+  follows the datum, not the store: an EPSG vertical CRS always uses PROJ's
+  compound pipeline (exact `cs2cs` agreement, and a store grid never shadows
+  it), while a datum with no EPSG code uses the store's grid and applies
+  `H = h - N`. An absent height stays absent. Accuracies are measurement
+  weights in metres and are carried unchanged. The conversion is
   all-or-nothing (a point outside the target's area of use fails the call and
   leaves the chunk untouched) and undoable as one `Convert Camera/Marker
   References` step.
