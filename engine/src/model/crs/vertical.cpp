@@ -168,8 +168,6 @@ struct VerticalTransform::Impl {
     enum class Mode { Compound, Custom };
 
     Mode mode = Mode::Compound;
-    CoordinateSystem src;
-    CoordinateSystem dst;
     /// Compound mode: the two compound CRSs, resolved at create() so a missing
     /// grid fails there. The transform between them is CrsTransform's.
     CrsTransform compound;
@@ -266,8 +264,6 @@ VerticalTransform VerticalTransform::compound(const CoordinateSystem& src,
     }
     auto impl = std::make_shared<Impl>();
     impl->mode = Impl::Mode::Compound;
-    impl->src = src;
-    impl->dst = dst;
     const auto [src_compound, dst_compound] = compound_pair(src, dst);
     impl->compound = CrsTransform::create(src_compound, dst_compound, options);
     impl->description = src.name() + " -> " + dst.name();
@@ -291,8 +287,10 @@ VerticalTransform VerticalTransform::custom(const CoordinateSystem& src,
     }
     auto impl = std::make_shared<Impl>();
     impl->mode = Impl::Mode::Custom;
-    impl->src = src;
-    impl->dst = dst;
+    // The horizontal transform is built from the two CRSs' *horizontal* parts:
+    // CrsTransform::to_wkt() emits the horizontal WKT, and the vertical datum
+    // is applied here around it. That is the whole difference from the
+    // compound route, where PROJ owns the shift.
     impl->horizontal = CrsTransform::create(src, dst, options);
     impl->geoid = std::move(geoid);
     impl->src_orthometric = src_ortho;
