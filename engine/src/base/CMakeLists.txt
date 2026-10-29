@@ -9,6 +9,8 @@ add_library(alphashape_base STATIC
     utils/log.cpp
     utils/error.cpp
     io/zip.cpp
+    algorithm/predicates.cpp
+    algorithm/delaunay2d.cpp
     algorithm/voxel_grid.cpp
 )
 

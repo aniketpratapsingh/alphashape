@@ -47,6 +47,7 @@ add_library(alphashape_algorithms STATIC
     texture/build_uv_task.cpp
     texture/build_texture_task.cpp
     elevation/interpolate.cpp
+    elevation/sibson.cpp
     elevation/tgv_denoise.cpp
     elevation/surface_frame.cpp
     elevation/dem_builder.cpp
