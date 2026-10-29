@@ -835,11 +835,11 @@ TEST_F(GeoidTempDir, CrsGeoidConcurrentEvaluation) {
         expected[i] = *value;
     }
 
-    constexpr int kThreads = 8;
+    constexpr std::size_t kThreads = 8;
     std::vector<std::vector<double>> results(kThreads);
     std::vector<std::thread> workers;
     workers.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         workers.emplace_back([&grid, &points, &results, t] {
             results[t].resize(points.size());
             for (std::size_t i = 0; i < points.size(); ++i) {
@@ -852,7 +852,7 @@ TEST_F(GeoidTempDir, CrsGeoidConcurrentEvaluation) {
     for (std::thread& worker : workers) {
         worker.join();
     }
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         ASSERT_EQ(results[t].size(), points.size());
         for (std::size_t i = 0; i < points.size(); ++i) {
             EXPECT_EQ(results[t][i], expected[i]) << "thread " << t << " point " << i;
