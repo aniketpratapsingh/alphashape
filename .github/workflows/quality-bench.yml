@@ -8,6 +8,29 @@ name: Quality benchmark
 # The datasets are NOT committed. Each is fetched from its publisher at run time and
 # verified against tools/bench/datasets.json (URL, SHA-256, byte count). Licences differ
 # per dataset and are recorded in tools/bench/DATASETS.md; none are redistributed here.
+#
+# Accepting a regression (workflow_dispatch only)
+# -----------------------------------------------
+# A failed run never publishes a baseline, so a deliberate trade-off — one metric worse,
+# the rest clearly better — would fail every later run against a baseline that can no
+# longer be reached. The `accept_regression` dispatch input is the way out, and it is
+# deliberately narrow:
+#
+#   * it holds the REASON, which must be non-empty printable text of <= 200 characters;
+#   * it is honoured only on the DEFAULT branch, never on a feature branch, and never
+#     for an experiment (empty `depth_params` and `dem_params`);
+#   * when honoured, the verdict is still computed and shown in the report — every
+#     regressed metric with previous -> current — but the job does not fail on it, and
+#     the run publishes its metrics as the new baseline;
+#   * the reason, the dispatching actor, the run id and the accepted moves are written
+#     into the published metrics JSON (and the report), so the baseline explains itself.
+#
+#   gh workflow run quality-bench.yml --ref main \
+#     -f dataset=aerial-nadir -f accept_regression="why the trade-off is acceptable"
+#
+# The reason reaches tools/bench/accept_regression.py through an environment variable,
+# never interpolated into a shell line, because a dispatch input is untrusted text.
+# Scheduled runs have no input, so their behaviour is unchanged.
 
 on:
   schedule:
@@ -52,6 +75,26 @@ on:
       # never gates.
       dem_params:
         description: 'Extra BuildDem key=value pairs, space separated (e.g. "sibson_exact_max_sites=20000")'
+        type: string
+        default: ""
+      # Accept a regression BY HAND, so a deliberate trade-off (worse on one metric,
+      # clearly better on the rest) can become the new baseline instead of failing
+      # every later run against a baseline nobody can reach.
+      #
+      # Requires ALL of: a non-empty reason here, a run on the DEFAULT branch, and a
+      # control run (no depth_params and no dem_params). A non-default branch, or an
+      # experiment, is refused with an error rather than silently honoured — a
+      # feature branch must never move the shared baseline. The reason is untrusted
+      # dispatch text: it reaches the script through an environment variable, never
+      # interpolated into a shell line, and tools/bench/accept_regression.py
+      # validates it (printable, <= 200 chars).
+      #
+      # When honoured: the verdict is STILL computed and shown, naming every
+      # regressed metric old -> new; the job does not fail on it; the run publishes
+      # its metrics as the new baseline; and the reason, the actor and the accepted
+      # moves are recorded in the metrics JSON and the report.
+      accept_regression:
+        description: 'Reason for accepting a regression (default branch only; e.g. "depth defaults: offset +0.1 m for +12% coverage")'
         type: string
         default: ""
 
@@ -415,6 +458,37 @@ jobs:
             echo "no baseline; this is a first run"
           fi
 
+      # A deliberate trade-off is adoptable, but only by hand. The
+      # `accept_regression` dispatch input records why a run that failed the gate
+      # should still become the baseline: the regressed metrics are named in the
+      # report, the job does not fail, and the metrics JSON the next week compares
+      # against carries the reason, the actor and the accepted moves. It is
+      # refused on a non-default branch and on an experiment (see the input's
+      # comment above). Empty — every scheduled, push and ordinary manual run —
+      # skips the step and leaves the publish/fail conditions exactly as before.
+      #
+      # This runs BEFORE the report so the report can show the acceptance it
+      # describes, and it rewrites the metrics JSON in place.
+      - name: Accept regression
+        id: accept
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.accept_regression != ''
+        env:
+          ACCEPT_REGRESSION: ${{ github.event.inputs.accept_regression }}
+          BRANCH: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          BASELINE: ${{ steps.baseline-path.outputs.path }}
+        run: |
+          python3 tools/bench/accept_regression.py \
+            --current "build/bench/metrics-${{ matrix.dataset }}.json" \
+            --previous "$BASELINE" \
+            --branch "$BRANCH" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --actor "$ACTOR" \
+            --run-id "$RUN_ID" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Report
         id: report
         env:
@@ -486,8 +560,12 @@ jobs:
       # baseline can reach. A gap longer than 90 days — the workflow disabled, or
       # three months of failures — leaves no artifact to find, and the next run
       # restarts the baseline with a "first run" report rather than failing.
+      #
+      # An ACCEPTED regression publishes despite its failing verdict: that is the
+      # whole point of the accept_regression input, and the metrics file carries
+      # the reason and the accepted moves into the artifact.
       - name: Publish the new baseline
-        if: steps.report.outputs.status == '0' && steps.report.outputs.experiment != 'true'
+        if: (steps.report.outputs.status == '0' || steps.accept.outputs.accepted == 'true') && steps.report.outputs.experiment != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: bench-baseline-${{ matrix.dataset }}
@@ -496,7 +574,10 @@ jobs:
           if-no-files-found: error
 
       - name: Fail on regression
-        if: steps.report.outputs.status != '0'
+        # An accepted regression does not fail the job. Its report still names
+        # every regressed metric, and the baseline it published says who accepted
+        # the trade-off and why.
+        if: steps.report.outputs.status != '0' && steps.accept.outputs.accepted != 'true'
         run: |
           echo "::error::the benchmark regressed against the previous run; see the report artifact"
           exit 1

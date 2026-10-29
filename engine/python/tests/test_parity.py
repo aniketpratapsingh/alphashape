@@ -153,7 +153,12 @@ class TestDriftInvariant(unittest.TestCase):
             elif task in ("BuildDepthMaps", "BuildPointCloud", "BuildModel", "BuildUV",
                           "BuildTexture", "ExportModel", "ExportPointCloud",
                           "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
-                doc.run_task("BuildDepthMaps")
+                # filter_mode="mild" is pinned: this file checks the parameter
+                # contract (declared keys reach the meta and survive a save), not
+                # the filter's strength. At the 120x90 working resolution of this
+                # fixture the moderate default keeps well under half the pixels,
+                # which starves the small BuildModel volume used below.
+                doc.run_task("BuildDepthMaps", filter_mode="mild")
                 if task in ("BuildPointCloud", "BuildModel", "BuildUV", "BuildTexture",
                             "ExportModel", "ExportPointCloud"):
                     doc.run_task("BuildPointCloud")

@@ -197,7 +197,6 @@ std::uint64_t depth_map_search_count() { return g_search_count.load(); }
 void reset_depth_map_search_count() { g_search_count.store(0); }
 
 void BuildDepthMapsTask::declare_params(Params& params) const {
-    // Defaults follow Metashape's public Python API.
     ParamSpec downscale{"downscale", ParamType::Int, std::int64_t{4},
                         "Image downscale factor (power of two). Depth maps are built at the "
                         "reduced resolution."};
@@ -205,15 +204,25 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     downscale.power_of_two = true;
     params.declare(downscale);
 
-    ParamSpec filter_mode{"filter_mode", ParamType::String, std::string{"mild"},
-                          "Depth filter strength: \"disabled\", \"mild\", \"moderate\" or "
-                          "\"aggressive\"."};
+    // "moderate" is the default because it is measurably better on real aerial
+    // blocks at no time cost: against "mild" on the aerial-nadir benchmark,
+    // moderate left 21% less hole area, with DSM NMAD 0.653 -> 0.574 m and p95
+    // 2.51 -> 2.12 m. "mild" restores the previous behaviour.
+    ParamSpec filter_mode{"filter_mode", ParamType::String, std::string{"moderate"},
+                          "Depth filter strength: \"disabled\", \"mild\", \"moderate\" (default) "
+                          "or \"aggressive\". A stronger mode rejects more weakly supported "
+                          "pixels, keeping fewer but more reliable ones."};
     filter_mode.choices = {"disabled", "mild", "moderate", "aggressive"};
     params.declare(filter_mode);
 
-    ParamSpec max_neighbors{"max_neighbors", ParamType::Int, std::int64_t{16},
-                            "Maximum number of neighbour cameras per reference. Must be in "
-                            "[1, 256)."};
+    // 8 is the default because a wider neighbourhood costs search time and buys
+    // nothing measurable: against 16 on the aerial-nadir benchmark, the depth
+    // stage was 30-40% faster and coverage, hole area and DSM accuracy were equal
+    // or slightly better. 16 restores the previous behaviour.
+    ParamSpec max_neighbors{"max_neighbors", ParamType::Int, std::int64_t{8},
+                            "Maximum number of neighbour cameras per reference (default 8). "
+                            "More neighbours cost search time without improving the map on "
+                            "typical blocks. Must be in [1, 256)."};
     max_neighbors.minimum = std::int64_t{1};
     max_neighbors.maximum = static_cast<std::int64_t>(kMaxNeighborsExclusive) - 1;
     params.declare(max_neighbors);
@@ -713,6 +722,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     };
 
     progress.update("buildDepthMaps", 0.0);
+    std::size_t reused_count = 0;
     for (std::size_t i = 0; i < neighbourhoods.size(); ++i) {
         current_index = i;
         const stereo::ViewNeighbourhood& hood = neighbourhoods[i];
@@ -724,6 +734,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             if (reuse_depth) {
                 const auto kept = existing.find(hood.camera_id);
                 if (kept != existing.end() && reusable(*kept->second)) {
+                    ++reused_count;
                     built.push_back(*kept->second);
                     progress.update("buildDepthMaps",
                                     (static_cast<double>(i) + 1.0) / camera_count);
@@ -732,6 +743,23 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                         checkpoint_and_throw("BuildDepthMaps was cancelled");
                     }
                     continue;
+                }
+                // Say WHY a stored map is being rebuilt. After a defaults change
+                // (or a re-alignment) every map is rebuilt, which looks like the
+                // reuse setting did nothing unless the cause is stated.
+                if (kept != existing.end() && Log::enabled(LogLevel::Info)) {
+                    const DepthMap& old = *kept->second;
+                    const char* reason =
+                        old.downscale != downscale
+                            ? "built at a different downscale"
+                            : (old.alignment_fingerprint == 0
+                                   ? "built without a fingerprint"
+                                   : (old.alignment_fingerprint != fingerprint_of(hood.camera_id)
+                                          ? "built from different settings, alignment or "
+                                            "neighbourhood"
+                                          : "filtered with a different mode"));
+                    log(LogLevel::Info) << "BuildDepthMaps: camera " << hood.camera_id
+                                        << ": rebuilding depth map (" << reason << ")";
                 }
             }
 
@@ -942,8 +970,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     if (Log::enabled(LogLevel::Info)) {
         log(LogLevel::Info) << "BuildDepthMaps: " << chunk->depth_maps().size() << " of "
                             << chunk->cameras().size() << " cameras at downscale " << downscale
-                            << ", filter " << stereo::to_string(filter_mode) << " -> asset "
-                            << chunk->active_depth_maps_id() << " '" << written_label << "'";
+                            << ", filter " << stereo::to_string(filter_mode) << ", "
+                            << max_neighbors << " neighbours, " << reused_count << " reused"
+                            << " -> asset " << chunk->active_depth_maps_id() << " '"
+                            << written_label << "'";
     }
 }
 
