@@ -555,14 +555,27 @@ TEST(DepthRepair, OversizedHoleIsNotFilled) {
 }
 
 TEST(DepthRepair, BorderTouchingHoleIsNotFilled) {
-    // A hole open to the map border has no enclosed ring; a plane fitted to it
-    // would be extrapolated over unmeasured ground.
+    // A hole cut off by the map edge has too little of its perimeter on measured
+    // pixels; a plane fitted to the rest would be extrapolated over ground
+    // nothing measured. This one is 7 wide x 11 tall against the left border:
+    // 11 of its 36 perimeter edges are image border, so only 25/36 = 69% is
+    // measured, under the 75% threshold.
     View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
     punch(view.map, 0, 10, 6, 20);
     RepairStats stats;
     const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
     EXPECT_EQ(stats.filled_pixels, 0u);
     EXPECT_EQ(index_depth(out, 3, 15), -1.0);
+
+    // A WIDE, SHALLOW notch leaves most of the ring measured (21 wide x 5 tall:
+    // 5 of 52 edges on the border, 90% measured), so it is a legitimate repair:
+    // the surface is enclosed on three sides and the plane explains the rest.
+    View wide = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(wide.map, 0, 13, 20, 17);
+    RepairStats wide_stats;
+    const DepthMap wide_out = repair_depth_map(wide.map, wide.calib, RepairOptions{}, &wide_stats);
+    EXPECT_EQ(wide_stats.filled_pixels, 105u) << "a 21x5 notch should be filled";
+    EXPECT_GT(index_depth(wide_out, 10, 15), 0.0);
 }
 
 TEST(DepthRepair, IsDeterministicAndMarksConfidence) {

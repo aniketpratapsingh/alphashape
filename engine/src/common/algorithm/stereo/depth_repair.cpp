@@ -9,6 +9,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
+#include <Eigen/Geometry>
 
 #include "base/utils/error.hpp"
 #include "model/camera/calibration.hpp"
@@ -32,11 +33,14 @@ constexpr double kPlaneRelativeTolerance = 0.01;
 // the remaining 30% is the ragged edge the filter left behind.
 constexpr double kPlaneInlierFraction = 0.7;
 
-// Share of the component's perimeter that must be enclosed by MEASURED pixels.
-// 0.75 rejects a component open to the map border or to another hole: an open
-// ring means the hole is not enclosed by measurements, so a plane fitted to it
-// describes an unmeasured region (usually the depth range running out) rather
-// than a surface.
+// Share of a component's perimeter that must lie on MEASURED pixels. A
+// 4-connected invalid component never has an invalid 4-neighbour (it would be
+// part of the same component), so every uncovered perimeter edge is an image
+// border edge: the fraction is exactly "at most 25% of the hole's edge may be
+// the image boundary". A hole enclosed by measurements scores 1.0; one cut off
+// by the image edge (typically where the depth range runs out) does not, and a
+// plane fitted to the remainder would be extrapolated over ground nothing
+// measured.
 constexpr double kBoundaryCoverageFraction = 0.75;
 
 // Below this many distinct boundary points a plane is not determined well enough
@@ -94,10 +98,13 @@ bool fit_plane_least_squares(const std::vector<Eigen::Vector3d>& points,
         return false;
     }
     const Eigen::Vector3d normal = solver.eigenvectors().col(0).normalized();
-    // A degenerate ring (all boundary points on a line) has no plane; its two
-    // smallest eigenvectors are comparable.
+    // A ring whose points are all on one line has no plane: its middle
+    // eigenvalue vanishes too, and the "normal" would be an arbitrary
+    // perpendicular. A genuine (even noisy) surface always spreads in two
+    // directions. The RANSAC inlier fraction is the real acceptance test; this
+    // guard only keeps the refit numerically meaningful.
     const Eigen::Vector3d eigenvalues = solver.eigenvalues();
-    if (!(eigenvalues(1) > 0.0) || eigenvalues(0) > 1e-6 * eigenvalues(1)) {
+    if (!(eigenvalues(2) > 0.0) || !(eigenvalues(1) > 1e-12 * eigenvalues(2))) {
         return false;
     }
     out.normal = normal;
@@ -211,12 +218,11 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
     const bool have_normals = !out.normals.empty();
     const bool have_confidence = !out.confidence.empty();
 
-    // 4-connected invalid components. The component's PERIMETER is split into
-    // edges onto a measured pixel and edges that are not (map border, or an
-    // edge outside the image). kBoundaryCoverageFraction asks that the measured
-    // share dominate: an open region -- one running out of the map, where the
-    // depth range usually ends -- has too much uncovered perimeter, so a plane
-    // fitted to what is left would be extrapolated over unmeasured ground.
+    // 4-connected invalid components. Uncovered perimeter edges are image-border
+    // edges (an invalid 4-neighbour would share the component), so
+    // kBoundaryCoverageFraction bounds how much of a hole may be cut off by the
+    // map edge: a plane fitted to a partially unobserved ring would be
+    // extrapolated over ground nothing measured.
     std::vector<std::uint8_t> visited(pixels, 0);
     std::vector<std::size_t> stack;
     std::vector<std::size_t> component;
@@ -279,19 +285,19 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
             ++local.rejected_area;
             continue;
         }
-        if (border_edges > 0) {
-            // Open to the map border: the plane's extent would be a guess.
-            ++local.rejected_boundary;
-            continue;
-        }
 
-        // Ring coverage: the share of the perimeter that lies on a measured
-        // pixel. Counting EDGES (not ring points) is what makes an open
-        // component fail: one that runs into the map border, or through a
-        // column of invalid pixels, has edges no ring point covers.
-        if (measured_edges == 0 ||
-            static_cast<double>(measured_edges) <
-                kBoundaryCoverageFraction * static_cast<double>(measured_edges + border_edges)) {
+        // Ring coverage: the share of the component's perimeter that lies on a
+        // measured pixel. Every perimeter edge is either measured (an invalid
+        // 4-neighbour would have merged into this component) or an image-border
+        // edge, so the two counts' sum is the whole perimeter. Below the
+        // threshold the hole is cut off by the map edge, not enclosed by a
+        // surface, and the plane would be extrapolated over unmeasured ground.
+        const double coverage =
+            (measured_edges + border_edges) == 0
+                ? 0.0
+                : static_cast<double>(measured_edges) /
+                      static_cast<double>(measured_edges + border_edges);
+        if (coverage < kBoundaryCoverageFraction) {
             ++local.rejected_boundary;
             continue;
         }

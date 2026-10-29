@@ -12,18 +12,17 @@ All notable changes to alphashape are recorded here. The format follows
   (bool, default `false`) and `repair_max_area` (int pixels, default `2000`).
   When enabled, after the cross-view consistency filter each depth map's
   invalid 4-connected components are examined: a component no larger than
-  `repair_max_area` and fully enclosed by measured pixels is refilled from a
-  robust plane fitted to its boundary in camera space (RANSAC, then a
-  least-squares refit on the inliers) when at least 70% of that boundary lies
-  within 1% of the boundary's mean depth of the same plane. Each hole pixel is
-  filled
-  by intersecting its viewing ray with the plane and receives the plane normal
-  and a reduced confidence (`0.25`), so later stages can tell a repaired pixel
-  from a measured one. A hole straddling a depth discontinuity, an oversized
-  hole, or one open to the map border is left empty. The two parameters are
-  folded into the depth-map fingerprint only when repair is on, so existing
-  maps stay reusable. The pass runs on the filtered map in both the CPU and GPU
-  depth paths.
+  `repair_max_area`, with at least 75% of its perimeter on measured pixels, is
+  refilled from a robust plane fitted to that boundary in camera space (RANSAC,
+  then a least-squares refit on the inliers) when at least 70% of the boundary
+  points lie within 1% of the boundary's mean depth of the same plane. Each
+  hole pixel is filled by intersecting its viewing ray with the plane and
+  receives the plane normal and a reduced confidence (`0.25`), so later stages
+  can tell a repaired pixel from a measured one. A hole straddling a depth
+  discontinuity, an oversized hole, or one cut off by the map border is left
+  empty. The two parameters are folded into the depth-map fingerprint only when
+  repair is on, so existing maps stay reusable. The pass runs on the filtered
+  map in both the CPU and GPU depth paths.
 
 - **Local tangent frames and per-object CRS slots.** A `LocalFrame`
   (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
