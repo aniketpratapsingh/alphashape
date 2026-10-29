@@ -302,6 +302,54 @@ double meridian_convergence(double lon_deg, double lat_deg, int zone) {
            kDeg;
 }
 
+// The orientation contract: FLU body frame, yaw CCW from north in the CRS's
+// ENU basis, so a compass heading maps to yaw = -heading.
+//
+// Derivation for a nadir camera with compass heading 90 degrees (flying east):
+//   body frame (level, yaw -90): x forward = east, y left = north, z up.
+//   nadir mount (pitch -90): body_to_camera_nadir() rows give bore (cam +Z) =
+//   body -z = down, image down (cam +Y) = body -x = -east = west, image right
+//   (cam +X) = body -y = -north = south.
+// The header's contract is R_wb = Rz(yaw + 90deg) * Ry(-pitch) * Rx(roll),
+// i.e. Rz(90deg) * crs::to_matrix({yaw, -pitch, roll}); camera-to-world is
+// R_wb * body_to_camera_nadir()^T.
+TEST(Crs, NadirCameraHeadingEastMapsCompassToNegativeYaw) {
+    const double heading_deg = 90.0;  // compass: clockwise from north, east
+    const crs::EulerAngles angles{/*yaw=*/-heading_deg, /*pitch=*/0.0, /*roll=*/0.0,
+                                 crs::RotationOrder::ZYX};
+    Eigen::Matrix3d yaw_offset;
+    yaw_offset << 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0;  // Rz(90 deg)
+    // The level body at yaw -90 collapses to the ENU basis: Rz(90)*Rz(-90)=I.
+    const Eigen::Matrix3d world_to_body = yaw_offset * crs::to_matrix(angles);
+    EXPECT_TRUE(world_to_body.isApprox(Eigen::Matrix3d::Identity(), 1e-12))
+        << "level body at compass heading east is the ENU basis";
+
+    const Eigen::Matrix3d camera_to_world = world_to_body.transpose() *
+                                            body_to_camera_nadir().transpose();
+    // Image down (camera +Y) in world coordinates: body -x = -east.
+    const Eigen::Vector3d image_down = camera_to_world.col(1);
+    EXPECT_NEAR(image_down.x(), -1.0, 1e-12) << "image down points west (-east)";
+    EXPECT_NEAR(image_down.y(), 0.0, 1e-12);
+    EXPECT_NEAR(image_down.z(), 0.0, 1e-12);
+    // Boresight (camera +Z) points straight down; image right is south.
+    EXPECT_NEAR(camera_to_world.col(2).z(), -1.0, 1e-12);
+    EXPECT_NEAR(camera_to_world.col(0).y(), -1.0, 1e-12) << "image right points south";
+}
+
+TEST(Crs, BodyToCameraIsAProperRotationForLevelAndNadir) {
+    Eigen::Matrix3d ry_minus_90;
+    ry_minus_90 << 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0;
+    EXPECT_TRUE(body_to_camera_nadir().isApprox(body_to_camera() * ry_minus_90, 1e-15));
+    for (const Eigen::Matrix3d& rotation : {body_to_camera(), body_to_camera_nadir()}) {
+        EXPECT_NEAR(rotation.determinant(), 1.0, 1e-15);
+        EXPECT_TRUE((rotation * rotation.transpose()).isApprox(Eigen::Matrix3d::Identity(), 1e-15));
+    }
+    // A level, forward-looking camera's boresight is body forward (+x); a
+    // nadir camera's is body down (-z).
+    EXPECT_NEAR(body_to_camera().transpose().col(2).x(), 1.0, 1e-15);
+    EXPECT_NEAR(body_to_camera_nadir().transpose().col(2).z(), -1.0, 1e-15);
+}
+
 TEST(Crs, ConvertReferenceYawGainsMeridianConvergence) {
     const int zone = 32;
     const double lat = 50.0;

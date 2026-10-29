@@ -26,10 +26,37 @@
 ///   *coordinates* are degrees. It is a weight, not a coordinate, and a datum
 ///   shift does not change how well a point was measured, so it is carried
 ///   unchanged. No unit conversion is ever applied to it.
-/// * **Orientation angles** are a camera-to-world rotation in the slot CRS's
-///   local east/north/up axes (`TrajectoryPoint::orientation` documents the
-///   same convention). `convert_orientation` re-expresses one in the target's
-///   axes; see its own comment for the exact rule. The current data model has
+/// * **Orientation angles** use an explicit contract, not an "ENU-aligned"
+///   hand-wave. The camera's body frame is x forward, y left, z up (FLU). Yaw,
+///   pitch and roll describe that frame relative to the slot CRS's local
+///   east-north-up basis: yaw is the rotation about up, counter-clockwise from
+///   north (towards east); pitch is about the left axis, positive nose up; roll
+///   is about the forward axis, positive left wing up. They compose in the
+///   chunk's rotation order (`rotation_order_of`). Because yaw is
+///   counter-clockwise from north, a compass heading -- clockwise from true
+///   north, as in a flight log's yaw-degree field -- maps to `yaw = -heading`
+///   (heading 90 degrees east is yaw -90 degrees).
+///
+///   Because ENU's x axis is east while a zero yaw points north, the zero-yaw
+///   body frame is x = north, y = west, z = up, not the ENU basis itself. The
+///   body-to-world rotation is therefore
+///
+///       R_wb = Rz(90 deg) * Rz(yaw) * Ry(-pitch) * Rx(roll)
+///            = Rz(yaw + 90 deg) * Ry(-pitch) * Rx(roll)
+///
+///   for the default `ZYX` order; heading east (yaw = -90 deg) is the
+///   identity: body x = east, y = north, z = up. In the `crs::EulerAngles`
+///   representation the same matrix is `Rz(90 deg) *
+///   crs::to_matrix({yaw, -pitch, roll})`, since `to_matrix` composes
+///   `Rz(yaw) * Ry(pitch) * Rx(roll)` and takes the angles in the ENU basis.
+///
+///   `body_to_camera()` and `body_to_camera_nadir()` convert that FLU body
+///   frame into the engine camera frame (x right, y down, z forward; see
+///   `model/camera/calibration.hpp`) for a level and a straight-down camera.
+///   A camera-to-world rotation is `R_wb * body_to_camera().transpose()`.
+///
+///   `convert_orientation` re-expresses an orientation in the target's axes;
+///   see its own comment for the exact rule. The current data model has
 ///   no per-camera orientation field (M13 adds `orientation_deg` to
 ///   `CameraReference`), so `convert_reference` converts positions only until
 ///   that field exists; the orientation entry point is already public and is
@@ -79,6 +106,27 @@ inline constexpr const char* kRotationOrderKey = "reference/rotation_order";
 /// The chunk's configured rotation order, `ZYX` when the meta key is absent.
 /// @throws ValueError when the key holds a name that is not a rotation order.
 crs::RotationOrder rotation_order_of(const Chunk& chunk);
+
+/// The fixed rotation from the FLU body frame to the engine camera frame
+/// (+X right, +Y down, +Z forward; `model/camera/calibration.hpp:8`) for a
+/// camera whose optical axis is body +x, i.e. a level, forward-looking camera.
+///
+/// Derived from the two frames (`v_camera = M * v_body`, rows = camera axes in
+/// body coordinates): the boresight camera +Z is body x, so row 2 is (1, 0, 0);
+/// image down camera +Y is body -z, so row 1 is (0, 0, -1); image right camera
+/// +X is then `row1 x row2` = (0, -1, 0), i.e. body -y. Hence
+///
+///     body_to_camera() = | 0 -1  0 |
+///                        | 0  0 -1 |
+///                        | 1  0  0 |
+///
+/// @see body_to_camera_nadir for the straight-down camera.
+Eigen::Matrix3d body_to_camera();
+
+/// `body_to_camera()` for a nadir (pitch -90 degrees) camera:
+/// `body_to_camera() * Ry(-90 deg)`. The boresight is body -z (down), image
+/// down camera +Y is body -x (aft), image right camera +X is body -y.
+Eigen::Matrix3d body_to_camera_nadir();
 
 /// The rotation that re-expresses a world-frame direction from `source`'s local
 /// axes in `target`'s local axes, at `point` (given in `source`).

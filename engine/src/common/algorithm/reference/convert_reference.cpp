@@ -271,6 +271,29 @@ crs::EulerAngles convert_orientation(const crs::EulerAngles& angles,
     return crs::from_matrix(in_target, angles.order);
 }
 
+Eigen::Matrix3d body_to_camera() {
+    // Rows are the camera axes written in body coordinates: camera +X (image
+    // right) = body -y, camera +Y (image down) = body -z, camera +Z (boresight)
+    // = body +x. v_camera = body_to_camera() * v_body.
+    Eigen::Matrix3d to_camera;
+    to_camera << 0.0, -1.0, 0.0,   //
+        0.0, 0.0, -1.0,            //
+        1.0, 0.0, 0.0;
+    return to_camera;
+}
+
+Eigen::Matrix3d body_to_camera_nadir() {
+    // A nadir camera is the level camera pitched -90 degrees about body y in
+    // the mount: body_to_camera() * Ry(-90 deg). That body-frame rotation is
+    // the inverse of the +90 degrees a -90 degree pitch contributes to R_wb
+    // (R_wb composes Ry(-pitch)).
+    Eigen::Matrix3d mount;
+    mount << 0.0, 0.0, -1.0,   //
+        0.0, 1.0, 0.0,         //
+        1.0, 0.0, 0.0;         // Ry(-90 deg)
+    return body_to_camera() * mount;
+}
+
 // --- chunk 3
 const char* reference_kind_name(ReferenceKind kind) {
     switch (kind) {
