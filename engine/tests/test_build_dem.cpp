@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <random>
 #include <string>
@@ -37,6 +38,7 @@
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/core/document.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
 
@@ -300,7 +302,10 @@ TEST(Dem, InterpolationModesFillAsDocumented) {
     // disabled: both holes remain nodata.
     EXPECT_GT(disabled.disc_nodata, 0U);
     EXPECT_GT(disabled.strip_nodata, 0U);
-    // enabled: the interior disc is filled, the border strip is not.
+    // enabled: this chunk has NO cameras, so there is no footprint region and the
+    // builder falls back to the interior-only rule: the disc is filled, the
+    // border strip is not. (With cameras, "enabled" would fill the strip too --
+    // see Dem.EnabledFillsHolesInsideTheCameraFootprint.)
     EXPECT_EQ(enabled.disc_nodata, 0U);
     EXPECT_GT(enabled.strip_nodata, 0U);
     // extrapolated: both are filled.
@@ -424,6 +429,225 @@ TEST(Dem, CleanCloudKeepsTheExactExtent) {
 }
 
 // ---------------------------------------------------------------------------
+// 4c. "enabled" fills what the cameras see, not only enclosed holes
+// ---------------------------------------------------------------------------
+//
+// The aerial block's DEM is ~1/3 nodata, and most of the holes inside the flown
+// area touch the nodata RIM outside the cameras' cover. Filling only holes
+// enclosed by data ("interior_only") therefore fills almost nothing. The rule is
+// now the union of the cameras' ground footprints: inside it, a hole is filled
+// even when it reaches the raster border; outside it, nothing is invented.
+
+namespace {
+
+/// A nadir pinhole camera at `height` metres over local (x, y) using sensor 0.
+void add_nadir_camera(Chunk& chunk, double x, double y, double height) {
+    Camera camera;
+    camera.id = static_cast<std::int32_t>(chunk.cameras().size());
+    camera.sensor_id = 0;
+    camera.enabled = true;
+    // World -> camera: look straight down (camera +z = world -z), optical
+    // centre (x, y, height). R is its own inverse, so t = -R * centre.
+    Eigen::Matrix3d R = Eigen::Matrix3d::Zero();
+    R(0, 0) = 1.0;
+    R(1, 1) = -1.0;
+    R(2, 2) = -1.0;
+    Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+    pose.block<3, 3>(0, 0) = R;
+    pose.block<3, 1>(0, 3) = -R * Eigen::Vector3d(x, y, height);
+    camera.pose = pose;
+    chunk.cameras().push_back(camera);
+}
+
+/// A point cloud over [-60, 60]^2 on the 0.5 m cell lattice (so every 0.5 m DEM
+/// cell holds exactly one sample), with every sample removed for `hole(x)` true.
+/// The removed columns form a full-height invalid band that touches the raster's
+/// north and south borders -- the "border-connected but inside the survey" case
+/// the footprint region exists for.
+void fill_cloud_with_band(Chunk& chunk, const std::function<bool(double)>& hole) {
+    PointCloud& cloud = chunk.point_cloud();
+    cloud.points.clear();
+    for (int ix = -120; ix <= 120; ++ix) {
+        for (int iy = -120; iy <= 120; ++iy) {
+            const double x = 0.5 * static_cast<double>(ix) + 0.25;
+            const double y = 0.5 * static_cast<double>(iy) + 0.25;
+            if (hole(x)) {
+                continue;
+            }
+            cloud.points.push_back(Eigen::Vector3d(x, y, 10.0 + 0.01 * x));
+        }
+    }
+}
+
+/// Nodata cells of `dem` whose centre satisfies `predicate`, out of the
+/// matching cells in total.
+std::pair<std::size_t, std::size_t> count_nodata(
+    const Elevation& dem, const std::function<bool(double, double)>& predicate) {
+    std::size_t nodata = 0;
+    std::size_t total = 0;
+    for (int row = 0; row < dem.raster.grid.height; ++row) {
+        for (int col = 0; col < dem.raster.grid.width; ++col) {
+            const Eigen::Vector2d c = dem.raster.grid.pixel_center(col, row);
+            if (!predicate(c.x(), c.y())) {
+                continue;
+            }
+            ++total;
+            if (is_nodata(dem, col, row)) {
+                ++nodata;
+            }
+        }
+    }
+    return {nodata, total};
+}
+
+}  // namespace
+
+TEST(Dem, EnabledFillsHolesInsideTheCameraFootprint) {
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    chunk.sensors().push_back(sensor);
+
+    // Band of holes at 0 < x < 12, reaching the raster border top and bottom.
+    fill_cloud_with_band(chunk, [](double x) { return x > 0.0 && x < 12.0; });
+    // At 100 m with f = 2000 px the half-footprint is 50 m: the band is inside.
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const auto band = count_nodata(chunk.elevation(), [](double x, double y) {
+        return x > 1.0 && x < 11.0 && y > -40.0 && y < 40.0;
+    });
+    std::printf("[Dem.EnabledFillsHolesInsideTheCameraFootprint] band nodata=%zu/%zu\n",
+                band.first, band.second);
+    EXPECT_GT(band.second, 0U);
+    // Inside the footprint the band is a hole the survey covers: filled, even
+    // though it is border-connected.
+    EXPECT_EQ(band.first, 0U);
+}
+
+TEST(Dem, EnabledKeepsTheConcaveGapAndTheOutsideNodata) {
+    // Two cameras 60 m apart, each with a ~18 m half-footprint on the ground (90 m
+    // of relief below a 100 m camera at f = 5000 px over 2000 px): the union is
+    // [-48, -12] + [12, 48] with a 24 m gap no camera sees, though it lies inside
+    // the convex hull of the two footprints.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 5000.0);
+    chunk.sensors().push_back(sensor);
+
+    // One band of holes across the middle, spanning both footprints, the gap and
+    // 5 m beyond the cameras' cover on each side, so "outside every footprint"
+    // is exercised on hole cells too.
+    fill_cloud_with_band(chunk, [](double x) { return x > -55.0 && x < 55.0; });
+    add_nadir_camera(chunk, -30.0, 0.0, 100.0);
+    add_nadir_camera(chunk, 30.0, 0.0, 100.0);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    // Inside a footprint's interior in BOTH axes: the footprints are 36 m squares
+    // centred at x = -30 and x = 30, so y has to stay within (-15, 15).
+    const auto west = count_nodata(dem, [](double x, double y) {
+        return x > -40.0 && x < -15.0 && y > -15.0 && y < 15.0;
+    });
+    const auto gap = count_nodata(dem, [](double x, double y) {
+        return x > -5.0 && x < 5.0 && y > -15.0 && y < 15.0;
+    });
+    const auto east = count_nodata(dem, [](double x, double y) {
+        return x > 15.0 && x < 40.0 && y > -15.0 && y < 15.0;
+    });
+    const auto outside = count_nodata(dem, [](double x, double y) {
+        return x > 50.5 && x < 54.5 && y > -15.0 && y < 15.0;
+    });
+    std::printf("[Dem.EnabledKeepsTheConcaveGapAndTheOutsideNodata] "
+                "west=%zu/%zu gap=%zu/%zu east=%zu/%zu outside=%zu/%zu\n",
+                west.first, west.second, gap.first, gap.second, east.first, east.second,
+                outside.first, outside.second);
+
+    EXPECT_GT(west.second, 0U);
+    EXPECT_GT(gap.second, 0U);
+    EXPECT_GT(east.second, 0U);
+    EXPECT_GT(outside.second, 0U);
+    // Under a camera: filled.
+    EXPECT_EQ(west.first, 0U);
+    EXPECT_EQ(east.first, 0U);
+    // The gap is seen by neither camera: it stays nodata. A convex hull of the
+    // two footprints would have filled it.
+    EXPECT_EQ(gap.first, gap.second);
+    // Beyond the last camera's cover: nodata, both because it is a hole and
+    // because no footprint claims it.
+    EXPECT_EQ(outside.first, outside.second);
+}
+
+TEST(Dem, MaxFillDistanceLeavesTheDeepHoleCentreNodata) {
+    // A hole 30 cells wide (cell centres x = -7.25 .. 7.25 at 0.5 m), running the
+    // full height, on a point cloud with a camera covering the block.
+    // max_fill_distance = 2.5 m is 5 cells: the rim (1-5 cells from the data)
+    // fills, the centre (6+ cells from it) stays nodata. Unlimited (0) fills
+    // all of it.
+    Document unlimited_doc = make_local_chunk_document();
+    Document capped_doc = make_local_chunk_document();
+    for (Document* doc : {&unlimited_doc, &capped_doc}) {
+        Chunk& chunk = *doc->active_chunk();
+        Sensor sensor;
+        sensor.type = CameraType::Frame;
+        sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+        chunk.sensors().push_back(sensor);
+        fill_cloud_with_band(chunk, [](double x) { return x > -7.5 && x < 7.5; });
+        // ~50 m half-footprint at 100 m, f = 2000 px: the band is well inside.
+        add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+    }
+
+    Params unlimited = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    unlimited.set("max_fill_distance", ParamValue{0.0});
+    run_build_dem(unlimited_doc, unlimited);
+
+    Params capped = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    capped.set("max_fill_distance", ParamValue{2.5});  // 5 cells at 0.5 m
+    run_build_dem(capped_doc, capped);
+
+    // Band centre: the nearest cell centres here are 6 m (12 cells) from the
+    // data columns at x = -7.75 and x = 7.75, so they are well beyond the cap.
+    // The middle two cells are 7.5 m (15 cells) out either way.
+    const auto centre_capped = count_nodata(capped_doc.active_chunk()->elevation(),
+                                            [](double x, double y) {
+        return std::abs(x) < 2.0 && std::abs(y) < 40.0;
+    });
+    const auto centre_unlimited = count_nodata(unlimited_doc.active_chunk()->elevation(),
+                                               [](double x, double y) {
+        return std::abs(x) < 2.0 && std::abs(y) < 40.0;
+    });
+    // Band rim: x in (-7, -5.5) holds the cell centres at -6.75, -6.25 and
+    // -5.75, i.e. 2, 3 and 4 cells from the data column at x = -7.75 -- inside
+    // the 5-cell cap, so they must fill.
+    const auto rim_capped = count_nodata(capped_doc.active_chunk()->elevation(),
+                                         [](double x, double y) {
+        return x > -7.0 && x < -5.5 && std::abs(y) < 40.0;
+    });
+    std::printf("[Dem.MaxFillDistanceLeavesTheDeepHoleCentreNodata] "
+                "capped centre=%zu/%zu rim=%zu/%zu unlimited centre=%zu/%zu\n",
+                centre_capped.first, centre_capped.second, rim_capped.first, rim_capped.second,
+                centre_unlimited.first, centre_unlimited.second);
+
+    EXPECT_GT(centre_capped.second, 0U);
+    EXPECT_GT(rim_capped.second, 0U);
+    // The cap leaves the centre unfilled ...
+    EXPECT_EQ(centre_capped.first, centre_capped.second);
+    // ... and fills the rim.
+    EXPECT_EQ(rim_capped.first, 0U);
+    // Without the cap the whole hole fills.
+    EXPECT_GT(centre_unlimited.second, 0U);
+    EXPECT_EQ(centre_unlimited.first, 0U);
+}
+
+// ---------------------------------------------------------------------------
 // 5. Errors
 // ---------------------------------------------------------------------------
 
@@ -452,6 +676,14 @@ TEST(BuildDemErrors, UnknownInterpolationThrows) {
 TEST(BuildDemErrors, EmptyModelSourceThrows) {
     Document document = make_local_chunk_document();
     Params params = dem_params("model");
+    EXPECT_THROW(run_build_dem(document, params), ValueError);
+}
+
+TEST(BuildDemErrors, NegativeMaxFillDistanceThrows) {
+    Document document = make_local_chunk_document();
+    fill_truth_point_cloud(*document.active_chunk(), -5.0, 5.0, -5.0, 5.0, 0.5);
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    params.set("max_fill_distance", ParamValue{-1.0});
     EXPECT_THROW(run_build_dem(document, params), ValueError);
 }
 
@@ -686,12 +918,12 @@ TEST(BuildDemPipeline, AerialDepthMapsToDem) {
     // test measures (local x in [-50, 50], y in [-38, 38]) includes a ~12% outer
     // band that only ONE camera sees (the 22-24 m nadir grid at 60 m has a ~27 m
     // x / ~20 m y half-footprint, so the outermost columns/rows fall outside the
-    // second camera). No stereo matcher can observe those cells, and the default
-    // "enabled" mode deliberately fills interior holes only, so it saturates at
-    // ~0.87. "extrapolated" extends the observed surface outward, which is what
-    // a complete DEM product is for; on this smooth scene the extrapolated-only
-    // cells are accurate to ~2.5 cm median / ~11 cm p90 against truth (measured
-    // by the DISABLED_DepthMapDiagnostic test), so the added coverage is honest.
+    // second camera). No stereo matcher can observe those cells, so "enabled"
+    // has to interpolate them rather than measure them. "extrapolated" extends
+    // the observed surface outward from the grid's edge, which is what a
+    // complete DEM product is for; on this smooth scene those cells are accurate
+    // to ~2.5 cm median / ~11 cm p90 against truth (measured by the
+    // DISABLED_DepthMapDiagnostic test), so the added coverage is honest.
     const auto t0 = clock::now();
     Params depth = make_params(builtin_registry().require("BuildDepthMaps"));
     depth.set("downscale", ParamValue{std::int64_t{1}});

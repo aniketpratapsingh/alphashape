@@ -359,21 +359,31 @@ HoleFillReport fill_holes(int width, int height, std::vector<float>& values,
     if (options.sibson_exact_max_sites < 0) {
         throw ValueError("fill_holes: sibson_exact_max_sites must be >= 0");
     }
+    const bool has_region = !options.region.empty();
+    if (has_region && options.region.size() != n) {
+        throw ValueError("fill_holes: region size does not match width*height");
+    }
 
     const int W = width;
     const int H = height;
     const std::size_t total = n;
 
     const NearestSites edt = nearest_sites(W, H, valid);
+    // A fill region replaces the border-reachability rule: the caller states
+    // which holes are inside the area it surveyed, and a hole that reaches the
+    // raster border through invalid cells is still filled when the region says
+    // so. That is the normal case when the nodata rim lies outside the survey:
+    // the rim surrounds the data, so almost every in-site hole touches it.
     std::vector<std::uint8_t> blocked(total, 0);
-    if (options.interior_only) blocked = border_reachable(W, H, valid);
+    if (options.interior_only && !has_region) blocked = border_reachable(W, H, valid);
 
-    // Gate per hole, before filling: not too far, and (optionally) not on a
-    // border-connected region.
+    // Gate per hole, before filling: not too far, inside the region (when one is
+    // given), and (without a region) not on a border-connected one.
     std::vector<std::uint8_t> fill(total, 0);
     for (std::size_t i = 0; i < total; ++i) {
         if (valid[i] != 0) continue;
         if (blocked[i] != 0) continue;
+        if (has_region && options.region[i] == 0) continue;
         const double d = static_cast<double>(edt.distance[i]);
         if (!std::isfinite(d)) continue;  // no data cell anywhere
         if (!(d <= options.max_distance)) continue;

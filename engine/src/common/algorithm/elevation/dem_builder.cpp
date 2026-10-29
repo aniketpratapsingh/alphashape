@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -542,6 +543,114 @@ std::vector<float> rasterise_model(const RasterGrid& grid, const ModelSamples& m
     return heights;
 }
 
+// -- camera ground footprints -------------------------------------------------
+//
+// `interpolation = "enabled"` fills the holes inside the area the survey
+// actually sees. "Inside" is the union of the cameras' ground footprints, not
+// the convex hull of them: a block flown as two strips with a gap between them
+// must leave that gap nodata, and a hull would invent surface there. Nor is the
+// raster border a useful test: the outside-hull nodata rim surrounds the data,
+// so almost every real hole is border-connected (see fill_holes/region).
+
+/// Number of border samples per image edge when tracing a footprint. A frame
+/// lens is rectilinear, so the footprint of a horizontal plane is a quadrilateral
+/// and the samples land on its edges; the extra points only matter for a
+/// distorted border, which the samples then bracket.
+constexpr int kFootprintSamplesPerEdge = 8;
+
+/// The height (plane frame) of the observed surface at plane (x, y), or NaN when
+/// the cell is unobserved. Used to trace a footprint onto the terrain; a flat
+/// plane at the median height would shift the border rays by ~height/camera
+/// height on a slope, which is tens of percent on a real block.
+using SurfaceHeightFn = std::function<double(double, double)>;
+
+/// The ring of plane-frame points a camera sees on the surface, starting from the
+/// horizontal plane at `ground_local_z` (a CHUNK-LOCAL height, because the pose
+/// lives in that frame) and refining each border ray onto `surface_height` (a few
+/// fixed-point iterations; the ray/height map is a contraction at the incidence
+/// angles a footprint has). Empty when the camera has no usable sensor, sits at a
+/// degenerate pose, or sees nothing in front of it. The ring is ordered around the
+/// image border.
+std::vector<Eigen::Vector2d> camera_ground_ring(const Camera& camera, const Sensor& sensor,
+                                                const SurfaceFrame& frame,
+                                                double ground_local_z,
+                                                const SurfaceHeightFn& surface_height) {
+    std::vector<Eigen::Vector2d> ring;
+    const Calibration& calibration = sensor.calibration;
+    if (calibration.width <= 0 || calibration.height <= 0 || calibration.f <= 0.0) {
+        return ring;
+    }
+    const Eigen::Matrix3d rt = pose_rotation(camera.pose).transpose();
+    const Eigen::Vector3d centre = -rt * pose_translation(camera.pose);
+    if (!centre.allFinite() || !std::isfinite(ground_local_z)) {
+        return ring;
+    }
+    const double iw = static_cast<double>(calibration.width);
+    const double ih = static_cast<double>(calibration.height);
+    constexpr int kRefineIterations = 3;
+    ring.reserve(4 * kFootprintSamplesPerEdge);
+    for (int edge = 0; edge < 4; ++edge) {
+        for (int k = 0; k < kFootprintSamplesPerEdge; ++k) {
+            const double f =
+                static_cast<double>(k) / static_cast<double>(kFootprintSamplesPerEdge - 1);
+            double u = 0.0;
+            double v = 0.0;
+            switch (edge) {
+                case 0:  // top
+                    u = f * iw;
+                    break;
+                case 1:  // right
+                    u = iw;
+                    v = f * ih;
+                    break;
+                case 2:  // bottom
+                    u = f * iw;
+                    v = ih;
+                    break;
+                default:  // left
+                    v = f * ih;
+                    break;
+            }
+            const Eigen::Vector3d d_cam = calibration.unproject(Eigen::Vector2d(u, v));
+            if (!d_cam.allFinite()) {
+                return std::vector<Eigen::Vector2d>();
+            }
+            const Eigen::Vector3d direction = rt * d_cam;
+            if (!(std::abs(direction.z()) > 1e-9)) {
+                continue;  // parallel to the ground: no bounded intersection
+            }
+            double local_z = ground_local_z;
+            Eigen::Vector3d plane = Eigen::Vector3d::Zero();
+            bool hit = false;
+            for (int iteration = 0; iteration < kRefineIterations; ++iteration) {
+                const double t_hit = (local_z - centre.z()) / direction.z();
+                if (!(t_hit > 0.0) || !std::isfinite(t_hit)) {
+                    break;  // the surface is behind the camera
+                }
+                plane = frame.to_plane(centre + t_hit * direction);
+                if (!std::isfinite(plane.x()) || !std::isfinite(plane.y())) {
+                    break;
+                }
+                hit = true;
+                const double sampled =
+                    surface_height ? surface_height(plane.x(), plane.y()) : plane.z();
+                if (!std::isfinite(sampled)) {
+                    break;  // unobserved: keep the estimate that got us here
+                }
+                local_z = frame.to_local(Eigen::Vector3d(plane.x(), plane.y(), sampled)).z();
+                if (!std::isfinite(local_z)) {
+                    break;
+                }
+            }
+            if (!hit) {
+                continue;
+            }
+            ring.emplace_back(plane.x(), plane.y());
+        }
+    }
+    return ring;
+}
+
 }  // namespace
 
 // -- orchestration -----------------------------------------------------------
@@ -557,6 +666,137 @@ struct AssembledSurface {
     std::vector<std::uint8_t> valid;
     std::vector<float> confidence;  ///< per cell, 0 where unobserved
 };
+
+/// Monotone-chain convex hull of `points` (Andrew 1979), counter-clockwise,
+/// without a repeated first point. A camera's footprint on a horizontal plane is
+/// the projective image of a rectangle, which is convex; taken per camera, the
+/// hull is the footprint, while the hull of ALL cameras would also cover the
+/// concave gaps between flight strips.
+std::vector<Eigen::Vector2d> convex_hull(std::vector<Eigen::Vector2d> points) {
+    if (points.size() < 3) {
+        return points;
+    }
+    std::sort(points.begin(), points.end(),
+              [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+                  return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
+              });
+    const auto cross = [](const Eigen::Vector2d& o, const Eigen::Vector2d& a,
+                          const Eigen::Vector2d& b) {
+        return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x());
+    };
+    std::vector<Eigen::Vector2d> hull(2 * points.size());
+    std::size_t k = 0;
+    for (const Eigen::Vector2d& p : points) {  // lower hull
+        while (k >= 2 && cross(hull[k - 2], hull[k - 1], p) <= 0.0) {
+            --k;
+        }
+        hull[k++] = p;
+    }
+    const std::size_t lower = k + 1;
+    for (std::size_t i = points.size() - 1; i-- > 0;) {  // upper hull
+        const Eigen::Vector2d& p = points[i];
+        while (k >= lower && cross(hull[k - 2], hull[k - 1], p) <= 0.0) {
+            --k;
+        }
+        hull[k++] = p;
+    }
+    hull.resize(k > 0 ? k - 1 : 0);  // the last point repeats the first
+    return hull;
+}
+
+/// The fill region of `interpolation = "enabled"`: every grid cell whose centre
+/// lies inside at least one enabled camera's ground footprint. Each footprint is
+/// traced by intersecting the camera's border rays with the observed surface
+/// (`ground_local_z` is the starting horizontal plane, refined per ray), so the
+/// footprint follows the terrain instead of a single flat height.
+///
+/// An empty region (`any == false`) means no camera yielded a usable footprint;
+/// the caller then keeps the old interior-only rule.
+struct FootprintRegion {
+    std::vector<std::uint8_t> cells;  ///< 1 where a camera sees the cell
+    bool any = false;
+};
+
+FootprintRegion build_footprint_region(const Chunk& chunk, const SurfaceFrame& frame,
+                                       const RasterGrid& grid, double ground_local_z,
+                                       const SurfaceHeightFn& surface_height) {
+    FootprintRegion region;
+    const std::size_t count =
+        static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height);
+    region.cells.assign(count, 0U);
+    if (grid.width <= 0 || grid.height <= 0 || !std::isfinite(ground_local_z)) {
+        return region;
+    }
+    const double px = grid.pixel_size_x;
+    const double py = grid.pixel_size_y;
+    const double west = grid.origin_x;
+    const double north = grid.origin_y;
+    const auto sensor_of = [&chunk](const Camera& camera) -> const Sensor* {
+        if (camera.sensor_id < 0 ||
+            camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
+            return nullptr;
+        }
+        return &chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)];
+    };
+    for (const Camera& camera : chunk.cameras()) {
+        if (!camera.enabled) {
+            continue;
+        }
+        const Sensor* sensor = sensor_of(camera);
+        if (sensor == nullptr) {
+            continue;
+        }
+        const std::vector<Eigen::Vector2d> ring = camera_ground_ring(
+            camera, *sensor, frame, ground_local_z, surface_height);
+        const std::vector<Eigen::Vector2d> hull = convex_hull(ring);
+        if (hull.size() < 3) {
+            continue;
+        }
+        double min_x = hull[0].x(), max_x = hull[0].x();
+        double min_y = hull[0].y(), max_y = hull[0].y();
+        for (const Eigen::Vector2d& p : hull) {
+            min_x = std::min(min_x, p.x());
+            max_x = std::max(max_x, p.x());
+            min_y = std::min(min_y, p.y());
+            max_y = std::max(max_y, p.y());
+        }
+        const int row0 = std::max(
+            0, static_cast<int>(std::floor((north - max_y) / py - 0.5)) - 1);
+        const int row1 = std::min(
+            grid.height - 1, static_cast<int>(std::ceil((north - min_y) / py - 0.5)) + 1);
+        std::vector<double> xs;
+        for (int row = row0; row <= row1; ++row) {
+            const double y = north - (static_cast<double>(row) + 0.5) * py;
+            xs.clear();
+            for (std::size_t i = 0; i < hull.size(); ++i) {
+                const Eigen::Vector2d& a = hull[i];
+                const Eigen::Vector2d& b = hull[(i + 1) % hull.size()];
+                if ((a.y() <= y) == (b.y() <= y)) {
+                    continue;  // the horizontal line does not cross this edge
+                }
+                xs.push_back(a.x() + (y - a.y()) * (b.x() - a.x()) / (b.y() - a.y()));
+            }
+            if (xs.size() < 2) {
+                continue;
+            }
+            std::sort(xs.begin(), xs.end());
+            for (std::size_t i = 0; i + 1 < xs.size(); i += 2) {
+                const int col0 = std::max(
+                    0, static_cast<int>(std::ceil((xs[i] - west) / px - 0.5)));
+                const int col1 = std::min(
+                    grid.width - 1,
+                    static_cast<int>(std::floor((xs[i + 1] - west) / px - 0.5)));
+                const std::size_t base =
+                    static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width);
+                for (int col = col0; col <= col1; ++col) {
+                    region.cells[base + static_cast<std::size_t>(col)] = 1U;
+                }
+                region.any = col0 <= col1 || region.any;
+            }
+        }
+    }
+    return region;
+}
 
 }  // namespace
 
@@ -722,6 +962,90 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         fill_options.method = options.fill;
         fill_options.interior_only = interpolation == Interpolation::Enabled;
         fill_options.sibson_exact_max_sites = options.sibson_exact_max_sites;
+        if (options.max_fill_distance > 0.0) {
+            // The option is metres; fill_holes gates on cells. A local plane is
+            // already in metres; a geographic plane is in degrees, so the cell
+            // size has to be converted at the grid's latitude (the y of the
+            // middle row, where the scale is representative of the block).
+            const double plane_y = 0.5 * (grid.pixel_center(0, grid.height / 2).y() +
+                                          grid.pixel_center(0, 0).y());
+            const Eigen::Vector2d metres_per_unit =
+                frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                                 : frame.metres_per_plane_unit(plane_y);
+            double cell_metres = grid.pixel_size_x * metres_per_unit.x();
+            if (!(cell_metres > 0.0) || !std::isfinite(cell_metres)) {
+                cell_metres = grid.pixel_size_x;  // degenerate frame: plane units are metres
+            }
+            if (cell_metres > 0.0 && std::isfinite(cell_metres)) {
+                fill_options.max_distance = options.max_fill_distance / cell_metres;
+            }
+        }
+        if (interpolation == Interpolation::Enabled) {
+            // Fill the holes the survey covers: the union of the cameras' ground
+            // footprints. The observed surface's median height is only the
+            // STARTING plane each border ray is intersected with; the ray then
+            // refines onto the terrain, so a sloped block's footprint is not
+            // displaced by the slope. The old rule (fill only holes enclosed by
+            // data) skipped every hole that reached the nodata rim outside the
+            // cameras' cover, which on a flight is nearly all of them.
+            std::vector<double> observed_heights;
+            observed_heights.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                if (observed[i] != 0U) {
+                    observed_heights.push_back(static_cast<double>(surface.values[i]));
+                }
+            }
+            // An empty observation set has no relief level to trace on; NaN makes
+            // build_footprint_region() return an empty region, which keeps the
+            // interior-only fallback.
+            const double ground_plane_z =
+                observed_heights.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                         : median_of(observed_heights);
+            // Nearest-neighbour lookup of the observed surface, so each footprint
+            // border ray lands on the terrain it actually sees.
+            const SurfaceHeightFn surface_height =
+                [&grid, &surface, &observed](double x, double y) -> double {
+                const Eigen::Vector2d p = grid.to_pixel(x, y);
+                const int col = static_cast<int>(std::floor(p.x()));
+                const int row = static_cast<int>(std::floor(p.y()));
+                if (!grid.contains_pixel(col, row)) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                const std::size_t index =
+                    static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width) +
+                    static_cast<std::size_t>(col);
+                if (observed[index] == 0U) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                return static_cast<double>(surface.values[index]);
+            };
+            // The pose is chunk-local, so the starting plane is given as a local
+            // height: for a UTM DEM the plane z is ellipsoidal, off the local z by
+            // the chunk's vertical datum offset.
+            const Eigen::Vector2d mid = grid.pixel_center(grid.width / 2, grid.height / 2);
+            const double ground_local_z =
+                std::isfinite(ground_plane_z)
+                    ? frame.to_local(Eigen::Vector3d(mid.x(), mid.y(), ground_plane_z)).z()
+                    : ground_plane_z;
+            FootprintRegion footprint =
+                build_footprint_region(chunk, frame, grid, ground_local_z, surface_height);
+            if (footprint.any) {
+                fill_options.region = std::move(footprint.cells);
+            } else {
+                // No cameras at all is a normal input (a merged cloud or a mesh
+                // exported from elsewhere): the interior-only rule is the best
+                // available statement of "inside the survey". Cameras that exist
+                // but yielded no footprint are a real surprise and worth a line.
+                const bool has_cameras = std::any_of(
+                    chunk.cameras().begin(), chunk.cameras().end(),
+                    [](const Camera& camera) { return camera.enabled; });
+                if (has_cameras) {
+                    log(LogLevel::Warn)
+                        << "BuildDem: no camera ground footprint could be computed; falling "
+                           "back to interior-only hole filling";
+                }
+            }
+        }
         fill_holes(grid.width, grid.height, filled, filled_valid, fill_options);
     }
     tick(0.7);

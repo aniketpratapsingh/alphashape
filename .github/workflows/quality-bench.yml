@@ -542,6 +542,10 @@ jobs:
             build/bench/metrics-${{ matrix.dataset }}.json
             build/bench/compare-${{ matrix.dataset }}.png
             build/bench/cli.log
+            # The exported DEM raster itself, so a coverage question (nodata,
+            # hole placement, filled-cell accuracy) can be answered from the
+            # artifact instead of a re-run.
+            build/bench/products/dem.tif
           if-no-files-found: warn
           retention-days: 90
 
