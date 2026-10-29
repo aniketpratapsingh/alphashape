@@ -1072,10 +1072,12 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 ## M12 — Coordinate systems (PROJ), in progress
 
 WP-12.1 lands the dependency, discovery and data layout. WP-12.2 adds
-`crs::CoordinateSystem` (the value type) and the 48-entry built-in list, and
-WP-12.3 adds `crs::CrsTransform` between two of them (axis-normalised, ballpark
-refused by default, per-thread pipelines). Datums, geoids and raster
-reprojection arrive with WP-12.4 … WP-12.12; until then the engine still uses
+`crs::CoordinateSystem` (the value type) and the 48-entry built-in list, WP-12.3
+adds `crs::CrsTransform` between two of them (axis-normalised, ballpark refused
+by default, per-thread pipelines), and WP-12.4 adds datum-transformation
+selection and pinning (`available_transformations()`, `with_transformation()`,
+and a named "install proj-data" error for a missing grid). Geoids and raster
+reprojection arrive with WP-12.5 … WP-12.12; until then the engine still uses
 the legacy three-CRS stub (`geo::Projection`: local / EPSG:4326 / EPSG:326xx)
 for DEM and ortho output, so a `CrsTransform` exists but no task consumes it
 yet.
@@ -1206,25 +1208,44 @@ yet.
   `Crs.ProjectedToGeographicIsAxisNormalised` pin both directions.
 - **Ballpark is refused by default, and the refusal is not a heuristic.** PROJ
   marks an operation as a ballpark (`proj_coordoperation_has_ballpark_transformation`);
-  `create()` throws when the *selected* operation is one and `allow_ballpark`
-  is false. The check runs twice: on the listed operation and on the pipeline
-  that was actually built. The second check is load-bearing — an operation
-  listed with a real accuracy can degrade to a ballpark at build time when the
-  grid it needs is not installed, and that degradation must hit the same
-  refusal. A pair with a real datum shift available is accepted regardless: the
-  flag governs the operation actually chosen, not whether a ballpark exists
-  anywhere in the list. With `allow_ballpark` the transform reports
-  `is_ballpark()` and an accuracy of -1 (PROJ states none).
-- **Accuracy is the operation's, not the pipeline's.** `accuracy_m()` is
-  `proj_coordoperation_get_accuracy()` on the selected operation, -1 when PROJ
+  `create()` throws when the operation PROJ offers for the CRS pair is one and
+  `allow_ballpark` is false. The opening decision reads the pair's own
+  candidate list (PROJ's default ranking); a pinned operation is judged by its
+  own flag. For a pair whose only real shifts are area-limited national
+  operations PROJ's default ranking proposes the ballpark, so such a pair is
+  refused unless `allow_ballpark` is set — that is deliberate, and it also means
+  an unpinned national pair needs the flag to be built at all. With
+  `allow_ballpark` the transform reports `is_ballpark()` and an accuracy of -1
+  (PROJ states none).
+- **A pair between aligned datums is no longer refused as a ballpark.** This
+  *is* a change from before WP-12.4, and a deliberate one. Before, the pipeline
+  was built with `AUTHORITY=<the first candidate's authority>`, so for WGS 84 ↔
+  ETRS89, NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 or NTF PROJ built
+  a `+proj=noop` and called it a ballpark, which `create()` then refused: the
+  real EPSG operation for those pairs exists (a null shift, a Helmert or a grid
+  shift), it was simply never asked for. The unpinned pipeline is now the bare
+  one, so those 38 pairs are accepted without `allow_ballpark` and transform by
+  the EPSG operation PROJ picks per point. Refusal is unchanged for pairs where
+  the only candidate genuinely is a ballpark (WGS 84 ↔ NAD27, WGS 84 ↔
+  Amersfoort/RD New, NAD27 ↔ NAD83 on a gridless machine).
+- **Accuracy is the pair's first candidate, not the pipeline's.**
+  `accuracy_m()` is `proj_coordoperation_get_accuracy()` on the operation PROJ
+  ranks first for the CRS extents (or on the pinned operation), -1 when PROJ
   reports 0 for a non-ballpark (a UTM conversion states 0 m, which is not the
-  "unknown" sentinel upstream). WP-12.4 owns listing and ranking those
-  operations.
+  "unknown" sentinel upstream). A per-point pipeline has no single accuracy to
+  report; `description()` shows what the pipeline actually is.
 - **`preferred_operation` pins an identifier PROJ already lists; it does not
   search `proj.db`.** "EPSG:16033" is matched against each candidate's
-  `AUTH:CODE` (case-insensitive). An anonymous candidate (PROJ's grid
-  operations often carry no id) cannot be pinned, and an unknown id is a
-  creation error rather than a silent fallback to the automatic choice.
+  `AUTH:CODE` (case-insensitive, after stripping PROJ's computed wrappers, so
+  "EPSG:1693" matches the listed "INVERSE(DERIVED_FROM(EPSG)):1693"). An
+  anonymous candidate (PROJ's grid operations often carry no id) cannot be
+  pinned, and an unknown id is a creation error rather than a silent fallback
+  to the automatic choice. An unpinned transform is deliberately *not* "the
+  first listed candidate": PROJ picks the operation per point, so an
+  area-limited national operation (Amersfoort→WGS 84 over the Netherlands,
+  OSGB36→ETRS89 over Great Britain, NAD83→WGS 84 over North America) applies
+  only inside its area and a less accurate one takes over outside it. Pinning
+  is how a caller overrides that for every point.
 - **Out-of-domain detection relies on PROJ's per-point failure marker.** A
   single point fails when the output is not finite or `proj_errno` is set; a
   batch fails per point on non-finite outputs (`proj_trans_generic` does not
@@ -1245,4 +1266,110 @@ yet.
   data version it was made with; a PROJ release that changes a projection
   constant moves those last digits, and regenerating the fixture is the
   deliberate act that acknowledges it. CI needs no PROJ command-line tools.
+
+### WP-12.4 — datum transformations and grid shifts
+
+- **The grids are not bundled and are not downloaded.** `crs::CoordinateSystem::available_transformations()`
+  lists every operation PROJ knows, including the ones whose grids are absent,
+  and reports the missing ones per entry (`DatumTransformation::missing_grids`).
+  Applying such an operation *explicitly* — through `with_transformation()`, or
+  through a `CrsTransform` pinned by `TransformOptions::preferred_operation` —
+  throws `Error("transformation needs grid <name>; install proj-data")`, naming
+  the grid PROJ wants and the package that carries it. Nothing is fetched from
+  `cdn.proj.org`: the thread context has network access and the grid cache
+  disabled (WP-12.1). A user who needs a national grid must install `proj-data`
+  (Ubuntu), the Homebrew `proj` data, or point `ALPHASHAPE_PROJ_DATA` at a
+  directory containing it. The packaged macOS/Windows builds ship a large but
+  curated subset, so some operations work out of the box and some do not; the
+  error names the grid rather than saying "File not found", which is the whole
+  point of listing a grid operation that cannot run.
+- **An optional grid is never reported missing.** PROJ's `+grids=@name` means
+  "use this grid if it is installed, otherwise run without it", and PROJ
+  carries the `@` into the short name `proj_coordoperation_get_grid_used()`
+  reports. That marker is stripped from `DatumTransformation::grids` and the
+  grid is never added to `missing_grids`, so a CRS built with
+  `+nadgrids=@name` transforms as it did before WP-12.4 instead of failing with
+  `transformation needs grid @name; install proj-data`. A *required* grid
+  (`+grids=name`) is still diagnosed by name.
+- **An absent grid does not make the automatic transform fail.** An unpinned
+  `CrsTransform::create()` is PROJ's own pipeline, which keeps every candidate and
+  picks per point, so a grid needed by one candidate is not a grid this pair
+  needs: OSGB36 → WGS 84 still transforms without OSTN15, falling back to a
+  grid-free shift. The diagnosis is therefore made on the pipeline PROJ actually
+  built, not on the first listed candidate — which is only the operation PROJ
+  would prefer, not the one every point will use. A plain `create()` is refused
+  only when the pipeline itself is a single fixed operation that cannot run,
+  which is what a custom CRS's `+nadgrids=` produces.
+- **Only Helmert (7-parameter / 3-parameter) and grid shifts are exercised by
+  the test suite.** The millimetre assertions run against the §4.1.1 and §4.2.3
+  formulas with published EPSG parameters (OSGB36 → WGS 84, ED50 → WGS 84),
+  which need no grid and so run on every machine. The NTv2/NADCON/OSTN15 cases
+  `GTEST_SKIP` with a message naming the grid when it is not installed; CI runs
+  the Helmert cases everywhere and the grid cases only where `proj-data` happens
+  to be present. Molodensky-Badekas, time-dependent Helmert and the vertical
+  methods are reachable through the same API but are not separately asserted;
+  they are PROJ's arithmetic, not the engine's.
+- **`available_transformations()` lists *candidate* operations, not a routing
+  decision.** The entries are ordered by stated accuracy (unknown last) and
+  carry each operation's area-independent metadata; no entry is flagged as
+  "the one PROJ would use", because PROJ's automatic transform does not use one
+  operation for every point. Choosing requires knowing the area of interest;
+  area-aware selection is not exposed yet (there is no area parameter on the
+  API), so a caller who wants one operation everywhere pins it instead.
+- **Pinning is `BOUNDCRS`, so it needs a geographic source.** `with_transformation()`
+  returns the source CRS bound to the operation's hub CRS, which is a WKT2
+  `BOUNDCRS`; that CRS then has exactly one operation to any target, so a later
+  transform uses the pinned shift. PROJ attaches a datum shift to a geodetic
+  CRS, so a projected source (EPSG:27700, say) is refused with a message
+  pointing at the geographic CRS underneath (EPSG:4277 for that pair) or at
+  `TransformOptions::preferred_operation`, which builds the pipeline from the
+  listed operation without binding the CRS — that route needs the listed entry
+  to carry an identifier, which is why it works for a projection conversion
+  (EPSG:32633 → 4326 lists `INVERSE(EPSG):16033`) but not for a concatenated
+  operation with the shift baked in (all nine of 27700 → 4326 are anonymous).
+- **An anonymous operation cannot be pinned.** A ballpark entry, or a custom
+  CRS's `nadgrids=` shift, often carries no authority code: all nine candidates
+  of OSGB36 → UTM 30N (EPSG:4277 → 32630) are anonymous, and so is the ballpark
+  itself. `with_transformation()` needs an `AUTH:CODE` to recover the operation
+  from `proj.db`, so it refuses one with a `ValueError`; `preferred_operation`
+  is not a route either, because it matches the same listed identifier and an
+  anonymous candidate has none. `allow_ballpark` is the only route for a
+  ballpark, and a custom CRS's own shift applies through the CRS definition
+  (`from_proj`) rather than by pinning it. `with_transformation()`'s exception
+  says this rather than pointing at a route that does not exist.
+- **A 3D source pins against a 2D operation.** Datum shifts are stored against
+  the horizontal datum, so an operation's source is a 2D geographic CRS even
+  when the caller's source is 3D (EPSG:4979). Pinning compares the *horizontal*
+  identity — the source demoted to 2D via `proj_crs_demote_to_2D` when the base
+  is 3D — so the 2D operations of a 3D-source pair stay pinnable: 35 of the 79
+  listed for 4979 → 4267 and 52 of 53 for 4979 → 4269, the same counts as their
+  4326 pairs. The `BOUNDCRS` keeps the 3D base, so the ellipsoidal height is
+  still carried and a 2D Helmert still passes it through unchanged, exactly as
+  the 2D pair does.
+- **`with_transformation()` recovers the operation from `proj.db` and orients
+  it.** The entry's `AUTH:CODE` is looked up with PROJ's computed wrappers
+  (`INVERSE(...)`, `DERIVED_FROM(...)`) stripped, and the stored operation is
+  reversed when the entry was the inverse of it (WGS 84 → NAD 27 is EPSG:1693
+  NAD 27 → WGS 84 reversed). An operation whose ends are not this CRS (in
+  either direction) is refused rather than bound, so an entry copied from a
+  different pair cannot apply the wrong shift.
+- **`+towgs84` needs no special handling and gets none.** PROJ models a CRS that
+  carries `TOWGS84[...]` as a bound CRS, so its Helmert shift is an ordinary
+  candidate. `Crs.Towgs84Applied` pins that
+  behaviour against the §4.2.3 parameters rather than asserting a bespoke code
+  path.
+- **A 2D Helmert does not move the ellipsoidal height.** PROJ's geographic-2D
+  Helmert pipeline pushes and pops the height around the geocentric step, so
+  `z` comes back unchanged; the horizontal result still depends on the input
+  height. `DatumShiftMatchesEpsgExamples` asserts the pass-through explicitly
+  rather than assuming a height shift.
+- **The shift parameters are `proj.db`'s, which can be coarser than the
+  registry's.** EPSG:1314 (OSGB36 to WGS 84 (6)) is published with rotations
+  to four decimals (0.1502"/0.2470"/0.8421", -20.4894 ppm); PROJ's database
+  stores three (0.15"/0.247"/0.842", -20.489 ppm). The difference moves a point
+  in Great Britain by about 3 mm, so `DatumShiftMatchesEpsgExamples` compares
+  against the parameters PROJ actually applies. Regenerating from the EPSG
+  registry would need `PROJ_DATA` pointed at a database built from it; the
+  engine deliberately trusts whatever `proj.db` the platform ships, since that
+  is what the user's PROJ sees.
 

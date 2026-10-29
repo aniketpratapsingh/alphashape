@@ -22,6 +22,11 @@
 /// rejected at `create()` time. Refusing by default means a coordinate is never
 /// silently off by hundreds of metres.
 ///
+/// With no `preferred_operation` the pipeline is PROJ's own: PROJ keeps every
+/// candidate operation and picks per point, so an area-limited national
+/// operation is applied inside its area of use and skipped outside it. Pinning
+/// an operation forces that one everywhere (see WP-12.4 / `datum.hpp`).
+///
 /// Out of scope here: datum-transformation selection and grid installation
 /// (WP-12.4) and geoid evaluation (WP-12.5). `preferred_operation` pins an
 /// operation PROJ already knows; vertical components are rejected until the
@@ -50,9 +55,15 @@ inline bool operator==(const CrsPoint& a, const CrsPoint& b) {
 
 struct TransformOptions {
     /// PROJ operation authority, e.g. "EPSG:1613" (M12 §4.3). Empty lets PROJ
-    /// pick the first operation for the CRS pair. An unknown code is an error;
-    /// the selected operation's name and accuracy are visible through
-    /// `description()`/`accuracy_m()`.
+    /// choose per point: an area-limited national operation applies inside its
+    /// area of use and another (less accurate, or the ballpark) takes over
+    /// outside it — a bare PROJ transform. Setting it pins that one operation
+    /// for every point instead.
+    ///
+    /// The id is matched against each candidate's `AUTH:CODE` after stripping
+    /// PROJ's computed wrappers, so "EPSG:1693" finds the listed
+    /// "INVERSE(DERIVED_FROM(EPSG)):1693". An unknown code is an error; the
+    /// operation actually used is visible through `description()`.
     std::string preferred_operation;
 
     /// Allow a ballpark (null) datum shift. Default false: refuse rather than
