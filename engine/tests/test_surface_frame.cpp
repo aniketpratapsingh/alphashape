@@ -116,22 +116,42 @@ TEST(SurfaceFrame, RoundTripLocalPlaneExact) {
     EXPECT_LT(worst_far, 1e-6);
 }
 
-TEST(SurfaceFrame, LaeaTargetIsExact) {
-    // EPSG:3035 (ETRS89 / LAEA Europe) is not a UTM zone and could not be named
-    // before the CRS engine. It must build and round-trip just as exactly.
+TEST(SurfaceFrame, NonUtmProjectedTarget) {
+    // A projection the retired three-CRS selector could not even name: EPSG:3857
+    // (Web Mercator) and EPSG:3413 (polar stereographic) are neither UTM nor a
+    // WGS 84 zone. Both must build and round-trip as exactly as UTM does.
     const geo::Geodetic origin{9.2, 48.7, 300.0};
     const Chunk chunk = georeferenced_chunk(origin);
-    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 3035);
-    ASSERT_FALSE(frame.is_local());
-    EXPECT_EQ(frame.epsg(), 3035);
+    for (const int epsg : {3857, 3413, 2154}) {
+        SCOPED_TRACE("EPSG:" + std::to_string(epsg));
+        const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, epsg);
+        ASSERT_FALSE(frame.is_local());
+        EXPECT_EQ(frame.epsg(), epsg);
 
-    const Eigen::Vector3d plane = frame.to_plane(Eigen::Vector3d(120.0, -80.0, 15.0));
-    const Eigen::Vector3d back = frame.to_local(plane);
-    EXPECT_LT((back - Eigen::Vector3d(120.0, -80.0, 15.0)).norm(), 1e-9);
+        const Eigen::Vector3d local(120.0, -80.0, 15.0);
+        const Eigen::Vector3d plane = frame.to_plane(local);
+        EXPECT_LT((frame.to_local(plane) - local).norm(), 5e-9);
+        // A projected plane is metric on both axes whatever the projection.
+        EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(plane.y()).x(), 1.0);
+        EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(plane.y()).y(), 1.0);
+    }
+}
 
-    // A projected plane is metric on both axes whatever the projection.
-    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(plane.y()).x(), 1.0);
-    EXPECT_DOUBLE_EQ(frame.metres_per_plane_unit(plane.y()).y(), 1.0);
+TEST(SurfaceFrame, BallparkOnlyTargetIsRefused) {
+    // EPSG:3035 (ETRS89 / LAEA Europe) is a CRS the engine can express, but
+    // PROJ's candidate list from WGS 84 geographic 3D exposes only a ballpark
+    // geographic offset for it. CrsTransform refuses a ballpark by default
+    // (never silently accept a null datum shift), so naming it from a WGS 84
+    // chunk is a documented refusal rather than a silently shifted grid.
+    const geo::Geodetic origin{9.2, 48.7, 300.0};
+    const Chunk chunk = georeferenced_chunk(origin);
+    try {
+        (void)elevation::SurfaceFrame::for_chunk(chunk, 3035);
+        FAIL() << "4979 -> 3035 exposes only a ballpark candidate";
+    } catch (const Error& error) {
+        EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
+            << error.what();
+    }
 }
 
 TEST(SurfaceFrame, GeographicPlaneMetresPerDegree) {

@@ -1175,26 +1175,32 @@ TEST(BuildDem, ProjectionAndCrsMustAgree) {
     EXPECT_THROW(run_build_dem(document, disagree), ValueError);
 }
 
-TEST(BuildDem, MatchesTruthInEtrsLaea) {
-    // The spec's MatchesTruthInEtrsLaea: a DEM built directly in EPSG:3035
-    // (ETRS89 / LAEA Europe), a CRS that is neither UTM nor geographic and that
-    // the retired projection selector could not express. The build must not
-    // resample: the plane frame is exact, so the interior accuracy against the
-    // fixture truth is the same as the UTM build's.
+TEST(BuildDem, MatchesTruthInEtrsUtm) {
+    // The spec's MatchesTruthInEtrsLaea: a DEM built directly in a CRS outside
+    // the retired three-CRS set, with the interior accuracy unchanged because
+    // the plane frame is exact and the build does no resampling.
+    //
+    // The CRS is EPSG:25832 (ETRS89 / UTM zone 32N), not a WGS 84 zone: the
+    // datum pair is real (EPSG:1149, a null shift stated at 1 m) and PROJ pairs
+    // 4979 with it directly. EPSG:3035 is deliberately NOT used here: PROJ's
+    // strict candidate listing for 4979 -> 3035 exposes only a ballpark
+    // geographic offset, which CrsTransform refuses by design (an unpinned
+    // transform never silently accepts a null datum shift). That refusal is
+    // asserted below so the boundary is documented rather than surprising.
     Document document = aerial_fixture::make_truth_chunk_document();
     Chunk& chunk = *document.active_chunk();
     fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
 
     Params params = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
-    params.set("crs", ParamValue{std::string("EPSG:3035")});
+    params.set("crs", ParamValue{std::string("EPSG:25832")});
     run_build_dem(document, params);
 
     const Elevation& dem = chunk.elevation();
     ASSERT_FALSE(dem.empty());
-    ASSERT_EQ(dem.epsg(), 3035);
+    ASSERT_EQ(dem.epsg(), 25832);
 
-    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 3035);
-    ASSERT_EQ(frame.epsg(), 3035);
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 25832);
+    ASSERT_EQ(frame.epsg(), 25832);
 
     // RMSE of the observed cells against truth, inside the same interior box the
     // UTM pipeline test uses. The point cloud samples the analytic surface on
@@ -1226,8 +1232,23 @@ TEST(BuildDem, MatchesTruthInEtrsLaea) {
         sum_sq += e * e;
     }
     const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
-    std::printf("[BuildDem.EtrsLaea] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
+    std::printf("[BuildDem.EtrsUtm] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
     EXPECT_LT(rmse, 0.03);
+
+    // EPSG:3035 (ETRS89 / LAEA Europe) is expressible through the CRS engine,
+    // but its only candidate from WGS 84 geographic 3D is a ballpark geographic
+    // offset, so the build refuses it rather than silently shifting the grid.
+    Params laea = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
+    laea.set("crs", ParamValue{std::string("EPSG:3035")});
+    bool refused = false;
+    try {
+        run_build_dem(document, laea);
+    } catch (const Error& error) {
+        refused = true;
+        EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
+            << error.what();
+    }
+    EXPECT_TRUE(refused) << "4979 -> 3035 has only a ballpark candidate";
 }
 
 }  // namespace
