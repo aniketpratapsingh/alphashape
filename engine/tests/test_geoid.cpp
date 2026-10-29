@@ -98,6 +98,13 @@ std::shared_ptr<const GeoidGrid> installed_grid(const char* file) {
     return GeoidGrid::open(path.string());
 }
 
+/// Whole file as text; empty when it cannot be read.
+std::string read_text(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+}
+
 double rms(const std::vector<double>& values) {
     if (values.empty()) {
         return 0.0;
@@ -175,7 +182,6 @@ TEST(Crs, GeoidBicubicVsProj) {
 TEST(Crs, GeoidBicubicVsProjOffNode) {
     const std::shared_ptr<const GeoidGrid> grid = subset();
     ASSERT_NE(grid, nullptr);
-    const GeoidGridInfo& info = grid->info();
     // Deterministic positions: a fixed lattice of fractional offsets, so a
     // failure is reproducible without a seed printed in the log.
     double worst = 0.0;
@@ -198,7 +204,6 @@ TEST(Crs, GeoidBicubicVsProjOffNode) {
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
     EXPECT_GT(std::abs(*a - *b), 1e-4) << "bicubic and bilinear are indistinguishable";
-    static_cast<void>(info);
 }
 
 }  // namespace
@@ -369,16 +374,9 @@ TEST_F(TempDir, GeoidStoreRoundTrip) {
 
     // A second save of an unchanged store reproduces the same index bytes, so a
     // project save is idempotent for the files it did not touch.
-    const std::string first = [&] {
-        std::ifstream in(store_dir / "index.xml", std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(in),
-                           std::istreambuf_iterator<char>());
-    }();
+    const std::string first = read_text(store_dir / "index.xml");
     loaded.save(store_dir);
-    std::ifstream again(store_dir / "index.xml", std::ios::binary);
-    const std::string second(std::istreambuf_iterator<char>(again),
-                             std::istreambuf_iterator<char>());
-    EXPECT_EQ(first, second);
+    EXPECT_EQ(first, read_text(store_dir / "index.xml"));
 }
 
 // A project that names a geoid its store does not carry must fail loudly:
@@ -461,8 +459,6 @@ TEST(Crs, OrthometricHeightConversion) {
     // so a 1 mm bound holds where both use the same grid.
     EXPECT_NEAR(moved->z, *expected, 1e-3);
 }
-
-}  // namespace
 
 // The vertical datum survives a project save/load: doc.xml carries it as a
 // `<vertical>` child of `<crs>` (M12 §4.8), and an ellipsoidal CRS writes no
