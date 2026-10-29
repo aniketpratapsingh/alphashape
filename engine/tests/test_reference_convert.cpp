@@ -37,6 +37,7 @@
 #include "model/crs/coordinate_system.hpp"
 #include "model/crs/euler.hpp"
 #include "model/crs/geoid.hpp"
+#include "model/crs/proj_context.hpp"
 #include "model/crs/transform.hpp"
 #include "model/crs/vertical.hpp"
 #include "model/raster/geo_raster.hpp"
@@ -297,6 +298,11 @@ TEST(Crs, ConvertReferenceNeedsGeoidForCustomDatum) {
 // deliberately wrong constant (a flat 1000 m over the fixture's area), so the
 // two routes give answers ~1000 m apart and cannot be confused.
 TEST(Crs, EpsgVerticalDatumIgnoresStoreGridInFavourOfCompound) {
+    // The compound route needs PROJ's own EGM96 grid; an installation without it
+    // has no authority pipeline to compare against.
+    if (crs::find_data_file("us_nga_egm96_15.tif").empty()) {
+        GTEST_SKIP() << "us_nga_egm96_15.tif is not installed in PROJ's data directory";
+    }
     const double lon = 9.0;
     const double lat = 50.0;
     const std::optional<double> n = egm96()->undulation(lon, lat);
