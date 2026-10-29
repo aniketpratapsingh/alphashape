@@ -66,6 +66,7 @@ add_executable(alphashape_tests
     test_aerial_fixture.cpp
     test_build_dem.cpp
     test_ortho.cpp
+    test_ortho_gain.cpp
     test_build_orthomosaic.cpp
     test_chunk_ops.cpp
     test_align_chunks.cpp

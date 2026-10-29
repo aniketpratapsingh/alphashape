@@ -8,6 +8,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
+  a `color_correction` parameter (off by default). When set, one brightness gain
+  per camera per channel is solved over the whole flight (Brown & Lowe 2007,
+  "Automatic Panoramic Image Stitching using Invariant Features", section 6):
+  each gain minimises a sum over overlapping camera pairs of a data term that
+  drives overlapping photographs to agree and a prior that keeps a gain near 1,
+  giving a small symmetric positive-definite system solved by Cholesky per
+  channel. The gains are estimated ONCE on a coarse whole-grid lattice before any
+  block is processed, so a block-wise mosaic applies exactly the same multiplier
+  as a whole-grid one and no block border disagrees. Gains are solved and applied
+  on stored (sRGB-encoded) values — the pipeline never decodes, and the defect
+  being removed is a step in the stored mosaic — so no colour-space conversion is
+  introduced. New `engine/src/common/algorithm/ortho/gain.*`.
+
 - **Orthomosaic colour-consistency metrics (bench).** `tools/bench/metrics.py`
   gains two metrics that measure the brightness steps between photographs in an
   orthomosaic, computed without any engine change. `seam_step` is a
