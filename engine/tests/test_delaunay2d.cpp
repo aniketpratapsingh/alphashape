@@ -30,8 +30,9 @@ std::vector<V> random_sites(int n, std::uint32_t seed) {
     out.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
         // Raw generator output keeps the sequence identical on every standard library.
-        out.emplace_back(static_cast<double>(rng()) / 4294967296.0,
-                         static_cast<double>(rng()) / 4294967296.0);
+        const double x = static_cast<double>(rng()) / 4294967296.0;
+        const double y = static_cast<double>(rng()) / 4294967296.0;
+        out.emplace_back(x, y);
     }
     return out;
 }
@@ -140,7 +141,7 @@ TEST(Delaunay2D, Duplicates) {
 TEST(Delaunay2D, Collinear) {
     std::vector<V> line;
     for (int i = 0; i < 10; ++i) {
-        line.emplace_back(0.1 * i, 0.3 * i);
+        line.emplace_back(i, 3 * i);  // integers: exactly collinear
     }
     const Delaunay2D dt(line);
     EXPECT_TRUE(dt.degenerate());

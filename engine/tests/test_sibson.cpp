@@ -25,8 +25,9 @@ std::vector<V> unit_sites(int n, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::vector<V> out = {V(0, 0), V(1, 0), V(1, 1), V(0, 1)};
     for (int i = 0; i < n; ++i) {
-        out.emplace_back(static_cast<double>(rng()) / 4294967296.0,
-                         static_cast<double>(rng()) / 4294967296.0);
+        const double x = static_cast<double>(rng()) / 4294967296.0;
+        const double y = static_cast<double>(rng()) / 4294967296.0;
+        out.emplace_back(x, y);
     }
     return out;
 }
