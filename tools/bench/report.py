@@ -501,7 +501,10 @@ def markdown(
         if colour.get("seam_step_measured"):
             lines.append(f"| Seam step (median) | {_fmt(colour.get('seam_step'))} |")
             lines.append(f"| Seam step (max) | {_fmt(colour.get('seam_step_max'))} |")
-            lines.append(f"| Seam lines / samples | {colour.get('seam_lines')} / {colour.get('seam_samples')} |")
+            lines.append(
+                f"| Seam lines / samples | {colour.get('seam_lines')} / "
+                f"{colour.get('seam_samples')} |"
+            )
         elif colour:
             lines.append(
                 f"| Seam step | _unmeasured — {colour.get('seam_step_reason') or 'no seam found'}_ |"

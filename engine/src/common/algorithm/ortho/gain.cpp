@@ -162,6 +162,26 @@ std::vector<std::array<double, 3>> solve_gains(int camera_count,
             gains[static_cast<std::size_t>(i)][static_cast<std::size_t>(channel)] =
                 std::clamp(x[static_cast<std::size_t>(i)], options.min_gain, options.max_gain);
         }
+
+        // The absolute gain scale is unidentifiable from the data term alone —
+        // multiplying every gain by a constant is the same solution — and the
+        // prior is deliberately weak next to the (count-weighted) data term, so
+        // on a flight whose photographs genuinely differ it lets the whole vector
+        // drift dark or bright. Brown & Lowe fix the free scale by normalising the
+        // gain vector: here, to a mean of 1, so the mosaic keeps the overall
+        // brightness the photographs had instead of being uniformly darkened or
+        // lightened. The RATIOS — which are what remove a seam — are unchanged.
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) {
+            sum += gains[static_cast<std::size_t>(i)][static_cast<std::size_t>(channel)];
+        }
+        const double mean = sum / static_cast<double>(n);
+        if (mean > 1e-9) {
+            for (int i = 0; i < n; ++i) {
+                double& gain = gains[static_cast<std::size_t>(i)][static_cast<std::size_t>(channel)];
+                gain = std::clamp(gain / mean, options.min_gain, options.max_gain);
+            }
+        }
     }
     return gains;
 }

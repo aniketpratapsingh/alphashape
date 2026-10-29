@@ -347,7 +347,7 @@ class MarkdownTest(unittest.TestCase):
     def test_the_seam_step_is_reported_when_measured(self):
         current = metrics()
         current["reference_free"]["ortho"]["colour_consistency"] = {
-            "seam_step": 0.04, "seam_step_max": 0.07, "seam_lines": 3,
+            "seam_step": 0.04, "seam_step_p90": 0.06, "seam_step_max": 0.07,
             "seam_samples": 900, "seam_step_measured": True,
         }
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
@@ -376,7 +376,7 @@ class MarkdownTest(unittest.TestCase):
         # Report-only for now: a large seam step must NOT turn the verdict red.
         current = metrics()
         current["reference_free"]["ortho"]["colour_consistency"] = {
-            "seam_step": 0.4, "seam_step_max": 0.9, "seam_lines": 20,
+            "seam_step": 0.4, "seam_step_p90": 0.8, "seam_step_max": 0.9,
             "seam_samples": 4000, "seam_step_measured": True,
         }
         current["reference_based"]["ortho"]["colour_error"] = {

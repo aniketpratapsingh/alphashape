@@ -69,21 +69,20 @@ SEAM_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
 # yields hundreds of qualifying samples per boundary line.
 SEAM_FLAT_TOLERANCE = 0.02
 
-# Fewer qualifying samples than this on a boundary line and its median describes
-# noise rather than a mosaic; such a line is excluded from the per-line statistics
-# rather than contributing a spurious zero.
+# A boundary LINE is a run of cells along one boundary between cell columns (or
+# rows). Its step is the median difference over its flat samples; a line is a SEAM
+# when |step| clears this absolute floor (about four grey levels of 255). On flat
+# ground a gain-induced step is a coherent offset of at least that much, while
+# sensor noise averages out over the line's samples. An absolute floor is used
+# rather than a per-line noise estimate because a fully flat line has near-zero
+# internal scatter and would otherwise promote its own rounding noise.
+SEAM_MIN_STEP = 0.015
+# Fewer flat samples than this on a line and its median is noise, not a step.
 SEAM_MIN_LINE_SAMPLES = 16
-# The whole scan needs at least this many qualifying samples to report a step at
-# all; below it the answer is "unmeasured", not "zero". A mosaic with almost no
-# flat ground genuinely has no seam step to measure, and saying 0.0 would claim a
-# perfect seam.
+# The whole scan needs at least this many flat samples to report anything; below
+# it the answer is "unmeasured", not "zero". A mosaic with almost no flat ground
+# genuinely has no seam to measure, and saying 0.0 would claim a perfect seam.
 SEAM_MIN_SAMPLES = 64
-# A boundary line is promoted to a seam when its median step clears BOTH an
-# absolute floor and this many robust deviations of its own scatter. The floor
-# keeps a numerically flat synthetic mosaic from selecting rounding noise; the
-# sigma arm keeps a noisy real mosaic from promoting every faint line.
-SEAM_MIN_STEP = 0.01
-SEAM_SIGMAS = 4.0
 # Ceiling on the decimated grid the seam scan works on. The scan is a per-cell
 # numpy pass over every interior boundary, so it is bounded for the same reason
 # MASK_MAX_SIDE is: a bigger grid reports the same seam at more cost.
@@ -2114,36 +2113,44 @@ def _seam_luma(rgb: np.ndarray) -> np.ndarray:
 
 
 def ortho_colour_consistency(ortho: Raster) -> dict:
-    """Reference-free brightness-step statistics along the mosaic's seams.
+    """Reference-free brightness-step statistics across the mosaic's seams.
 
-    A per-camera gain error shows up in an orthomosaic as a coherent brightness
-    step where the seamline hands a cell from one photograph to the next. The
-    GeoTIFF export carries no seam labels, so the seams are found from the
-    colour: every interior boundary between cell columns (and, separately,
-    rows) is scanned, and a boundary is called a seam when the median signed
-    luminance difference across it is non-trivial and consistent along the line.
-    A boundary that merely crosses texture has its samples rejected by the
-    flatness test; a line that is flat but not offset has a median near zero.
+    A per-camera gain error shows up in an orthomosaic as a brightness step where
+    the seamline hands a cell from one photograph to the next. The GeoTIFF export
+    carries no seam labels, so the seams are found from the colour: at every
+    interior boundary between cell columns (and, separately, rows), a boundary
+    SAMPLE exists wherever the 3-cell window on each side is valid and flat. Its
+    value is the difference of the two window means. Texture is rejected by the
+    flatness test, so what remains is a boundary that separates two areas of
+    similar, low-gradient ground — exactly where a gain step would be visible.
 
-    Two numbers come out:
+    The samples are grouped into boundary LINES (one per boundary between cell
+    columns, or rows). A line is a SEAM when its median step clears an absolute
+    floor, ``SEAM_MIN_STEP``. This is what separates a real seam from the mass of
+    flat boundaries that step by nothing: pooling all boundary cells and taking a
+    median drowns a real seam in the thousands of no-step cells around it, whereas
+    a per-line median followed by a floor finds it.
 
-      * ``seam_step`` — the median |signed step| over the seam boundaries found,
-        as a fraction of full scale. Zero means no boundary offsets the colour.
-      * ``seam_energy`` — the summed |step| over those lines, a size-aware
-        companion (a mosaic with one faint seam and one with ten read alike in
-        ``seam_step`` alone).
+    Reported, in fraction of full scale:
 
-    ``seam_step_measured`` is false when no boundary qualifies, because
-    reporting 0.0 there would claim a perfect seam. The counters say why:
-    ``seam_samples`` is the number of flat interior boundary samples and
-    ``seam_lines`` the count of boundaries promoted to seams.
+      * ``seam_step`` — the median |step| over the detected seam lines. This is
+        the typical brightness discontinuity along the seams; a well-corrected
+        mosaic drives it to zero.
+      * ``seam_step_max`` — the worst seam line, so one uncorrected photograph is
+        not hidden by a median over the rest.
+      * ``seam_lines`` — how many boundary lines were called seams.
+      * ``seam_samples`` — the number of flat boundary cells examined.
+
+    ``seam_step_measured`` is false when too few flat samples qualify at all,
+    because reporting 0.0 would claim a perfect seam on a mosaic with no flat
+    ground to judge one on; the absence of any seam LINE on a mosaic that does
+    have flat ground is a genuine 0.0.
     """
     rgb, validity = _ortho_rgb_valid(ortho)
     luma = _seam_luma(rgb)
 
     # Decimate by an integer stride to bound the cost. A seam is a coherent
-    # offset along a whole line, so it survives coarsening; only the sample count
-    # falls. The stride is reported so a reader can see what was scanned.
+    # offset along a line, so it survives coarsening; only the sample count falls.
     height, width = luma.shape
     stride = 1
     while (
@@ -2155,9 +2162,8 @@ def ortho_colour_consistency(ortho: Raster) -> dict:
         luma = luma[::stride, ::stride]
         validity = validity[::stride, ::stride]
 
-    # axis=1 scans the boundaries between COLUMNS (each line runs down the rows).
-    vertical = _seam_scan(luma, validity, axis=1)
-    horizontal = _seam_scan(luma, validity, axis=0)
+    vertical = _seam_lines(luma, validity, axis=1)  # boundaries between columns
+    horizontal = _seam_lines(luma, validity, axis=0)  # boundaries between rows
     lines = vertical["lines"] + horizontal["lines"]
     samples = vertical["samples"] + horizontal["samples"]
 
@@ -2165,40 +2171,40 @@ def ortho_colour_consistency(ortho: Raster) -> dict:
         "mask_stride": stride,
         "seam_samples": samples,
         "seam_lines": len(lines),
-        "seam_step_measured": bool(samples >= SEAM_MIN_SAMPLES and lines),
+        "seam_step_measured": samples >= SEAM_MIN_SAMPLES,
     }
     if not out["seam_step_measured"]:
         out["seam_step"] = None
-        out["seam_energy"] = None
-        out["seam_step_reason"] = (
-            "too few flat boundary samples"
-            if samples < SEAM_MIN_SAMPLES
-            else "no boundary steps"
-        )
+        out["seam_step_max"] = None
+        out["seam_step_reason"] = "too few flat boundary samples"
+        return out
+    if not lines:
+        # Flat ground everywhere and no line steps: a genuine clean seam.
+        out["seam_step"] = 0.0
+        out["seam_step_max"] = 0.0
         return out
 
     steps = np.abs(np.array([line["step"] for line in lines], dtype=np.float64))
     out["seam_step"] = float(np.median(steps))
-    out["seam_energy"] = float(steps.sum())
-    # The largest single step: one uncorrected camera can dominate the product
-    # while the median stays small.
+    out["seam_step_p90"] = float(np.percentile(steps, 90))
     out["seam_step_max"] = float(steps.max())
     return out
 
 
-def _seam_scan(luma: np.ndarray, valid: np.ndarray, *, axis: int) -> dict:
-    """Score every interior boundary parallel to an axis; return the seam lines.
+def _seam_lines(luma: np.ndarray, valid: np.ndarray, *, axis: int) -> dict:
+    """Detect the seam lines parallel to an axis.
 
     ``axis=1`` treats each boundary between cell COLUMNS: a line is one column
-    index and its samples run down the rows. ``axis=0`` is the transpose of that,
-    so one implementation serves both directions.
+    index and its samples run down the rows. ``axis=0`` is the transpose, so one
+    implementation serves both.
 
     The boundary between cells ``c`` and ``c+1`` gets a sample wherever BOTH
     3-cell windows that touch it are entirely valid and flat (peak-to-trough
-    within ``SEAM_FLAT_TOLERANCE``). Its value is the difference of the two
-    window means. Both sides being flat is what separates a gain step — a flat
-    scene rendered slightly darker by the next camera — from ordinary texture,
-    and averaging over three cells keeps one noisy pixel from faking an edge.
+    within ``SEAM_FLAT_TOLERANCE``); the sample is the difference of the two
+    window means. Requiring both sides flat is what separates a gain step from
+    ordinary texture, and averaging over three cells keeps one noisy pixel from
+    faking an edge. A line whose median |sample| reaches ``SEAM_MIN_STEP`` is a
+    seam.
     """
     a = luma if axis == 1 else luma.T
     m = valid if axis == 1 else valid.T
@@ -2223,20 +2229,8 @@ def _seam_scan(luma: np.ndarray, valid: np.ndarray, *, axis: int) -> dict:
             continue
         diff = right[keep].mean(axis=1) - left[keep].mean(axis=1)
         step = float(np.median(diff))
-        # Robust spread of this line's own differences: a flat-but-noisy line has
-        # a wide MAD, so a small step there must not be promoted to a seam.
-        mad = float(np.median(np.abs(diff - step))) * 1.4826
-        lines.append({"boundary": c, "step": step, "samples": count, "spread": mad})
-
-    # Promote the lines whose step stands clear of both a fixed floor and their
-    # own noise. Both arms are needed: the floor keeps a numerically flat
-    # synthetic mosaic from selecting rounding noise, and the sigma arm keeps a
-    # noisy real one from promoting every faint line.
-    if lines:
-        spreads = np.array([line["spread"] for line in lines], dtype=np.float64)
-        steps = np.array([line["step"] for line in lines], dtype=np.float64)
-        promoted = np.abs(steps) >= SEAM_MIN_STEP + SEAM_SIGMAS * spreads
-        lines = [line for line, yes in zip(lines, promoted) if yes]
+        if abs(step) >= SEAM_MIN_STEP:
+            lines.append({"boundary": c, "step": step, "samples": count})
     return {"lines": lines, "samples": total}
 
 

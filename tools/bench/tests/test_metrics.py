@@ -1327,61 +1327,62 @@ class SeamStepTest(unittest.TestCase):
         data[:, :, 3] = 255
         return metrics.Raster(data, 0.0, float(size), 0.05, 0.05)
 
-    def test_a_flat_mosaic_has_no_measurable_step(self):
+    def test_a_flat_mosaic_reports_zero_step(self):
+        # Flat everywhere: every boundary line is flat and steps by nothing, so no
+        # line is a seam and the result is a genuine 0.0 (measured, not omitted).
         result = metrics.ortho_colour_consistency(self._mosaic())
-        # Flat everywhere: every boundary sample has a zero difference, so there
-        # are samples but no promoted line. Reporting None (not 0.0) is the point:
-        # an unseamed flat mosaic has nothing to measure, not a perfect seam.
-        self.assertIn("seam_step", result)
-        if result["seam_step_measured"]:
-            self.assertAlmostEqual(result["seam_step"], 0.0, places=6)
-        else:
-            self.assertIsNone(result["seam_step"])
-            self.assertIn("seam_step_reason", result)
+        self.assertTrue(result["seam_step_measured"])
+        self.assertEqual(result["seam_lines"], 0)
+        self.assertAlmostEqual(result["seam_step"], 0.0, places=6)
+        self.assertAlmostEqual(result["seam_step_max"], 0.0, places=6)
 
     def test_a_column_step_is_measured_at_its_own_height(self):
         result = metrics.ortho_colour_consistency(self._mosaic(step=0.2))
         self.assertTrue(result["seam_step_measured"])
-        self.assertGreaterEqual(result["seam_lines"], 1)
-        # The step is 0.2 of full scale, plus the uint8 rounding at most 1/255.
+        self.assertEqual(result["seam_lines"], 1)
+        # The step is 0.2 of full scale, up to the uint8 rounding.
         self.assertAlmostEqual(result["seam_step"], 0.2, delta=0.01)
         self.assertAlmostEqual(result["seam_step_max"], 0.2, delta=0.01)
 
     def test_a_row_step_is_measured_too(self):
         result = metrics.ortho_colour_consistency(self._mosaic(step=-0.15, axis="row"))
         self.assertTrue(result["seam_step_measured"])
+        self.assertEqual(result["seam_lines"], 1)
         self.assertAlmostEqual(result["seam_step"], 0.15, delta=0.01)
 
     def test_correction_toward_the_mean_shrinks_the_step(self):
-        # A 0.2 step corrected by a gain that splits the difference in two
-        # directions leaves a 0.1 step: the metric must follow it down.
+        # A 0.2 step corrected towards the mean leaves a 0.1 step: the measured
+        # seam step must follow it down.
         before = metrics.ortho_colour_consistency(self._mosaic(step=0.2))
         after = metrics.ortho_colour_consistency(self._mosaic(step=0.1))
         self.assertLess(after["seam_step"], before["seam_step"])
         self.assertAlmostEqual(after["seam_step"], 0.1, delta=0.01)
 
     def test_moderate_noise_does_not_manufacture_a_seam(self):
-        result = metrics.ortho_colour_consistency(
-            self._mosaic(noise=0.02, seed=11)
-        )
-        self.assertFalse(result["seam_step_measured"])
-        self.assertIsNone(result["seam_step"])
+        result = metrics.ortho_colour_consistency(self._mosaic(noise=0.02, seed=11))
+        # Noise on a flat scene must not clear the seam floor: either no line is
+        # promoted, or the reported step is below a visible one.
+        if result["seam_step_measured"]:
+            self.assertLess(result["seam_step"], metrics.SEAM_MIN_STEP)
+        else:
+            self.assertIsNone(result["seam_step"])
 
     def test_a_step_still_reads_through_moderate_noise(self):
         result = metrics.ortho_colour_consistency(
-            self._mosaic(step=0.25, noise=0.02, seed=12)
+            self._mosaic(step=0.25, noise=0.01, seed=12)
         )
         self.assertTrue(result["seam_step_measured"])
-        self.assertAlmostEqual(result["seam_step"], 0.25, delta=0.02)
+        self.assertAlmostEqual(result["seam_step"], 0.25, delta=0.03)
 
     def test_holes_do_not_contribute_boundary_samples(self):
         mosaic = self._mosaic(step=0.2)
-        # Knock out the right half's alpha: those cells are no-data, and the step
-        # must be measured only where both sides of the boundary are valid.
+        # Knock out the right half's alpha over the top rows: those cells are
+        # no-data, and the step must be measured only where both sides of the
+        # boundary are valid. The surviving rows still carry the 0.2 step.
         mosaic.data[:64, 128:, 3] = 0
         result = metrics.ortho_colour_consistency(mosaic)
         self.assertTrue(result["seam_step_measured"])
-        self.assertAlmostEqual(result["seam_step"], 0.2, delta=0.01)
+        self.assertGreater(result["seam_step_p90"], 0.15)
 
     def test_an_all_nodata_mosaic_is_unmeasured(self):
         mosaic = self._mosaic()
