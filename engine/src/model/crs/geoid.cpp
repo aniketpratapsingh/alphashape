@@ -382,8 +382,8 @@ struct GeoidGrid::Impl {
     mutable bool decode_ok = false;
     /// GDAL_NODATA when the grid declares one; bicubic support that touches a
     /// nodata cell has no value rather than a 32 768 m one.
-    double nodata = 0.0;
-    bool has_nodata = false;
+    mutable double nodata = 0.0;
+    mutable bool has_nodata = false;
     std::string path;
     ProjGridShift proj;
 

@@ -1,6 +1,7 @@
 #include "base/io/geotiff_tags.hpp"
 
 #include <cstddef>
+#include <iterator>
 #include <mutex>
 
 #include <tiffio.h>
