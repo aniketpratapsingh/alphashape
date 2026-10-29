@@ -15,6 +15,7 @@ add_library(alphashape_crs STATIC
     builtin_crs.cpp
     transform.cpp
     datum.cpp
+    local_frame.cpp
 )
 
 target_include_directories(alphashape_crs PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
