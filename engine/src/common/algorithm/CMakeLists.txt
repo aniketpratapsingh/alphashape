@@ -10,6 +10,7 @@ add_library(alphashape_algorithms STATIC
     chunk/duplicate_chunk_task.cpp
     chunk/merge_chunks_task.cpp
     photos/add_photos_task.cpp
+    reference/convert_reference.cpp
     feature/dog_detector.cpp
     feature/mldb_descriptor.cpp
     feature/detect_features_task.cpp
@@ -72,4 +73,9 @@ target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
 # crs:: directly). PRIVATE: no algorithm header exposes PROJ or crs headers.
 if(TARGET alphashape_crs)
     target_link_libraries(alphashape_algorithms PRIVATE alphashape_crs)
+    # convert_reference.hpp names crs:: types in its signatures, so a consumer
+    # that links only alphashape_algorithms still needs PROJ behind them at the
+    # final link. The CRS engine is a static library, so this stays out of the
+    # public include surface (the headers carry no <proj.h>).
+    target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()
