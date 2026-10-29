@@ -57,9 +57,11 @@ sections below give the engineering detail behind each item.
   the CPU if a specific machine proves unstable.
 - **The Python module is per interpreter.** A `.so`/`.pyd` is loadable only
   by the CPython minor version it was built against: 3.12 for the `.deb`
-  (Ubuntu 24.04's system `python3`) and for the Windows installer (a pinned
-  python.org 3.12), while the macOS module is built against whichever
-  `python3` the build machine had and its file name names that version. On
+  (Ubuntu 24.04's system `python3`), for the Windows installer (a pinned
+  python.org 3.12) and for the macOS build (CI pins `actions/setup-python`
+  3.12 in the build and the test jobs alike). The Python ctest entries resolve
+  their interpreter when they run rather than using the absolute path CMake
+  configured with, because CI builds and tests on different runner images. On
   Windows the module needs the DLLs in its own directory; the installer ships
   them together, and copying just the `.pyd` elsewhere fails at import with a
   DLL error.
