@@ -66,10 +66,15 @@ struct CRS {
     CRS() = default;
     std::string wkt;                        ///< WKT2 definition, empty if unset
     int epsg = 0;                           ///< EPSG code, 0 if unknown
+    /// Vertical datum (`<vertical kind= name= grid= offset=/>` in doc.xml).
+    /// nullopt means ellipsoidal heights; the M12 §4.8 element is written
+    /// only when a datum is set, so an older project's XML is unchanged.
+    std::optional<crs::VerticalCrs> vertical;
+
     bool is_set() const { return !wkt.empty() || epsg != 0; }
 
     bool operator==(const CRS& other) const {
-        return wkt == other.wkt && epsg == other.epsg;
+        return wkt == other.wkt && epsg == other.epsg && vertical == other.vertical;
     }
 
     // Declared unconditionally, even though the definitions need PROJ: a class

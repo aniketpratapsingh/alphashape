@@ -76,7 +76,8 @@ if(ALPHASHAPE_USE_PROJ)
         test_crs_context.cpp
         test_crs.cpp
         test_crs_transform.cpp
-        test_datum_transform.cpp)
+        test_datum_transform.cpp
+        test_geoid.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>
     # directly for the raw-API assertions; linking the interface target keeps
     # the include directories available without a second package lookup.
