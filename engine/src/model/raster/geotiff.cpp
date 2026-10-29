@@ -36,6 +36,14 @@ constexpr std::uint16_t kKeyGtRasterType = 1025;
 constexpr std::uint16_t kKeyGeographicType = 2048;
 constexpr std::uint16_t kKeyProjectedCstType = 3072;
 
+constexpr std::uint16_t kModelProjected = 1;
+constexpr std::uint16_t kModelGeographic = 2;
+constexpr std::uint16_t kModelUserDefined = 32767;
+constexpr std::uint16_t kRasterTypePixelIsArea = 1;
+
+/// A 4xxx EPSG code is a geographic CRS; the special-cased 4326 always is.
+bool is_geographic_epsg(int epsg) { return epsg >= 4000 && epsg <= 4999; }
+
 // --- Silence libtiff, collecting the message into the thrown exception ---
 
 /// Per-handle handlers so a corrupt file produces an exception and not a wall
