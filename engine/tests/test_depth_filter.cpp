@@ -21,6 +21,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/stereo/depth_filter.hpp"
+#include "common/algorithm/stereo/depth_repair.hpp"
 #include "common/core/chunk.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -471,6 +472,139 @@ TEST(DepthFilter, ThreadCountDeterminism) {
     EXPECT_EQ(single.depths, multi.depths);
     EXPECT_EQ(single.confidence, multi.confidence);
     EXPECT_EQ(single.normals, multi.normals);
+}
+
+// ---------------------------------------------------------------------------
+// Post-filter hole repair (depth_repair.hpp)
+// ---------------------------------------------------------------------------
+
+void punch(DepthMap& map, int i0, int j0, int i1, int j1) {
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+                       static_cast<std::size_t>(i)] = -1.0f;
+        }
+    }
+}
+
+double index_depth(const DepthMap& map, int i, int j) {
+    return static_cast<double>(map.depths[static_cast<std::size_t>(j) *
+                                          static_cast<std::size_t>(map.width) +
+                                          static_cast<std::size_t>(i)]);
+}
+
+TEST(DepthRepair, PlaneHoleIsFilled) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const DepthMap before = view.map;
+    punch(view.map, 30, 20, 40, 30);  // 11x11 square (area 121 <= default 2000)
+    ASSERT_LE(index_depth(view.map, 35, 25), 0.0);
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_components, 1u);
+    EXPECT_EQ(stats.filled_pixels, 121u);
+    for (int j = 20; j <= 30; ++j) {
+        for (int i = 30; i <= 40; ++i) {
+            const double got = index_depth(out, i, j);
+            const double want = index_depth(before, i, j);
+            ASSERT_GT(got, 0.0) << "pixel " << i << "," << j;
+            EXPECT_LE(std::abs(got - want) / want, 1e-6)
+                << "pixel " << i << "," << j << " got " << got << " want " << want;
+        }
+    }
+}
+
+TEST(DepthRepair, StepEdgeHoleIsNotFilled) {
+    // Two PARALLEL planes at different depths (a step): scaling the ray depth
+    // moves the surface to another plane parallel to the first. A hole
+    // straddling the step has its ring split between them, so no single plane
+    // explains it and the fill must be refused rather than bridge the gap.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const int edge_i = 35;
+    for (int j = 0; j < kH; ++j) {
+        for (int i = 0; i < kW; ++i) {
+            const double d = index_depth(view.map, i, j);
+            if (d > 0.0) {
+                const double scale = i < edge_i ? 1.0 : 2.0;  // the far half
+                view.map.depths[static_cast<std::size_t>(j) * kW + i] =
+                    static_cast<float>(d * scale);
+            }
+        }
+    }
+    // A hole centred on the step, 21x15.
+    punch(view.map, 25, 22, 45, 36);
+    const std::size_t before_valid = count_valid(view.map);
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_components, 0u) << "a step edge must not be bridged";
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(count_valid(out), before_valid);
+}
+
+TEST(DepthRepair, OversizedHoleIsNotFilled) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 20, 15, 60, 45);  // 41*31 = 1271 px
+    RepairOptions options;
+    options.max_area = 500;
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, options, &stats);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(stats.rejected_area, 1u);
+    EXPECT_EQ(index_depth(out, 40, 30), -1.0);
+}
+
+TEST(DepthRepair, BorderTouchingHoleIsNotFilled) {
+    // A hole open to the map border has no enclosed ring; a plane fitted to it
+    // would be extrapolated over unmeasured ground.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 0, 10, 6, 20);
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(index_depth(out, 3, 15), -1.0);
+}
+
+TEST(DepthRepair, IsDeterministicAndMarksConfidence) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const std::size_t pixels = static_cast<std::size_t>(kW) * static_cast<std::size_t>(kH);
+    view.map.normals.assign(3 * pixels, 0.0f);
+    view.map.confidence.assign(pixels, 3.0f);
+    punch(view.map, 30, 20, 40, 30);
+
+    const DepthMap a = repair_depth_map(view.map, view.calib, RepairOptions{});
+    const DepthMap b = repair_depth_map(view.map, view.calib, RepairOptions{});
+    EXPECT_EQ(a.depths, b.depths);
+    EXPECT_EQ(a.normals, b.normals);
+    EXPECT_EQ(a.confidence, b.confidence);
+
+    // A repaired pixel is marked with the reduced confidence and a plane
+    // normal; a measured pixel keeps its own values.
+    const std::size_t filled = static_cast<std::size_t>(25) * kW + 35;
+    EXPECT_FLOAT_EQ(a.confidence[filled], kRepairedConfidence);
+    EXPECT_GT(a.depths[filled], 0.0f);
+    const std::size_t measured = static_cast<std::size_t>(5) * kW + 5;
+    EXPECT_FLOAT_EQ(a.confidence[measured], 3.0f);
+    const double norm = std::sqrt(static_cast<double>(a.normals[3 * filled + 0]) * a.normals[3 * filled + 0] +
+                                  static_cast<double>(a.normals[3 * filled + 1]) * a.normals[3 * filled + 1] +
+                                  static_cast<double>(a.normals[3 * filled + 2]) * a.normals[3 * filled + 2]);
+    EXPECT_NEAR(norm, 1.0, 1e-6);
+}
+
+TEST(DepthRepair, ZeroMaxAreaFillsNothing) {
+    // The degenerate configuration of an enabled pass: never modifies the input
+    // and never fills. (The TASK simply does not call the pass when repair_holes
+    // is false; that path is covered by the fingerprint test in the dense suite.)
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 30, 20, 40, 30);
+    const std::vector<float> original = view.map.depths;
+    RepairOptions options;
+    options.max_area = 0;
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, options, &stats);
+    EXPECT_EQ(out.depths, original);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(view.map.depths, original) << "the input map must not be modified in place";
 }
 
 }  // namespace

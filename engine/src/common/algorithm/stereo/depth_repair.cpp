@@ -1,0 +1,366 @@
+#include "common/algorithm/stereo/depth_repair.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+#include <Eigen/Core>
+#include <Eigen/Eigenvalues>
+
+#include "base/utils/error.hpp"
+#include "model/camera/calibration.hpp"
+
+namespace alphashape::stereo {
+
+namespace {
+
+// --- tuned constants -------------------------------------------------------
+
+// A boundary point explains the hole's plane when it is within this FRACTION of
+// the boundary's mean depth. 1% matches the cross-view filter's own relative
+// depth tolerance, so a filled pixel is about as trustworthy as one the filter
+// kept: the filter already accepted cross-view agreement to 1% as consistency.
+constexpr double kPlaneRelativeTolerance = 0.01;
+
+// Share of the boundary that must lie on the plane for the fill to be accepted.
+// 0.7 is chosen to make a depth discontinuity fail: a hole straddling a step
+// edge has its ring split between the two surfaces, so no single plane reaches
+// 0.7. A surface that owns 70% of its ring is a hole inside that surface, and
+// the remaining 30% is the ragged edge the filter left behind.
+constexpr double kPlaneInlierFraction = 0.7;
+
+// Share of the component's perimeter that must be enclosed by MEASURED pixels.
+// 0.75 rejects a component open to the map border or to another hole: an open
+// ring means the hole is not enclosed by measurements, so a plane fitted to it
+// describes an unmeasured region (usually the depth range running out) rather
+// than a surface.
+constexpr double kBoundaryCoverageFraction = 0.75;
+
+// Below this many distinct boundary points a plane is not determined well enough
+// to extrapolate across the hole: 3 points define a plane exactly, so fewer
+// than this many (6) leaves no redundancy to notice a bad fit.
+constexpr std::size_t kMinBoundaryPoints = 6;
+
+// RANSAC (Fischler & Bolles 1981) draws; fixed so a map repairs identically on
+// every run and platform. The ring is small (tens of points), so a few dozen
+// draws find the dominant plane with near-certainty.
+constexpr int kRansacIterations = 64;
+constexpr std::uint64_t kRansacSeed = 0x243F6A8885A308D3ULL;
+
+/// A plane n . x = offset in camera space; `normal` is unit length.
+struct Plane {
+    Eigen::Vector3d normal = Eigen::Vector3d::UnitZ();
+    double offset = 0.0;
+};
+
+/// Plane through three points; false when they are (nearly) collinear, where
+/// the normal is dominated by rounding noise rather than by the geometry.
+bool plane_from_points(const Eigen::Vector3d& a, const Eigen::Vector3d& b, const Eigen::Vector3d& c,
+                       Plane& out) {
+    const Eigen::Vector3d ab = b - a;
+    const Eigen::Vector3d ac = c - a;
+    const Eigen::Vector3d n = ab.cross(ac);
+    const double scale = ab.norm() * ac.norm();
+    if (!(scale > 0.0) || n.norm() <= 1e-9 * scale) {
+        return false;
+    }
+    out.normal = n.normalized();
+    out.offset = out.normal.dot(a);
+    return true;
+}
+
+/// Least-squares plane through the selected points: the eigenvector of their
+/// covariance with the smallest eigenvalue, plus the centroid's offset.
+bool fit_plane_least_squares(const std::vector<Eigen::Vector3d>& points,
+                             const std::vector<std::size_t>& selected, Plane& out) {
+    if (selected.size() < 3) {
+        return false;
+    }
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const std::size_t i : selected) {
+        mean += points[i];
+    }
+    mean /= static_cast<double>(selected.size());
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    for (const std::size_t i : selected) {
+        const Eigen::Vector3d d = points[i] - mean;
+        cov += d * d.transpose();
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
+    if (solver.info() != Eigen::Success) {
+        return false;
+    }
+    const Eigen::Vector3d normal = solver.eigenvectors().col(0).normalized();
+    // A degenerate ring (all boundary points on a line) has no plane; its two
+    // smallest eigenvectors are comparable.
+    const Eigen::Vector3d eigenvalues = solver.eigenvalues();
+    if (!(eigenvalues(1) > 0.0) || eigenvalues(0) > 1e-6 * eigenvalues(1)) {
+        return false;
+    }
+    out.normal = normal;
+    out.offset = normal.dot(mean);
+    return true;
+}
+
+/// Plane through the ring: RANSAC for the dominant plane, then a least-squares
+/// refit on its inliers. `relative_tolerance` is a fraction of the ring's mean
+/// depth, so the same number means the same physical slack at any scale.
+/// Returns false when no plane reaches the required inlier fraction.
+bool fit_ring_plane(const std::vector<Eigen::Vector3d>& ring, double mean_depth,
+                    double relative_tolerance, double required_fraction, Plane& out) {
+    if (ring.size() < kMinBoundaryPoints) {
+        return false;
+    }
+    const double tolerance = relative_tolerance * mean_depth;
+    if (!(tolerance > 0.0)) {
+        return false;
+    }
+    // splitmix64 (the same mixing depth_map_fingerprint uses) drives RANSAC
+    // directly: no std:: distribution, so a fixed seed picks the same triples on
+    // every implementation (see base/utils/portable_rng.hpp for why).
+    std::uint64_t state = kRansacSeed;
+    const auto next = [&state]() {
+        std::uint64_t x = (state += 0x9E3779B97F4A7C15ULL);
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    };
+    std::vector<std::size_t> scratch(ring.size());
+    std::size_t triple[3] = {0, 0, 0};
+    std::vector<std::size_t> best_inliers;
+    Plane best;
+    for (int iteration = 0; iteration < kRansacIterations; ++iteration) {
+        // Partial Fisher-Yates: three DISTINCT ring indices, uniform and
+        // reproducible from the splitmix stream alone.
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            scratch[i] = i;
+        }
+        for (std::size_t i = 0; i < 3; ++i) {
+            const std::size_t j = i + static_cast<std::size_t>(next() % (ring.size() - i));
+            std::swap(scratch[i], scratch[j]);
+            triple[i] = scratch[i];
+        }
+        Plane candidate;
+        if (!plane_from_points(ring[triple[0]], ring[triple[1]], ring[triple[2]], candidate)) {
+            continue;
+        }
+        std::vector<std::size_t> inliers;
+        inliers.reserve(ring.size());
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            if (std::abs(candidate.normal.dot(ring[i]) - candidate.offset) <= tolerance) {
+                inliers.push_back(i);
+            }
+        }
+        if (inliers.size() > best_inliers.size()) {
+            best_inliers = std::move(inliers);
+            best = candidate;
+        }
+    }
+    if (best_inliers.size() < kMinBoundaryPoints ||
+        static_cast<double>(best_inliers.size()) <
+            required_fraction * static_cast<double>(ring.size())) {
+        return false;
+    }
+    Plane refined;
+    if (fit_plane_least_squares(ring, best_inliers, refined)) {
+        best = refined;
+    }
+    out = best;
+    return true;
+}
+
+}  // namespace
+
+DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
+                          const RepairOptions& options, RepairStats* stats) {
+    if (map.width < 0 || map.height < 0) {
+        throw ValueError("repair_depth_map: map has negative size");
+    }
+    const std::size_t pixels =
+        static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.height);
+    if (map.depths.size() != pixels) {
+        throw ValueError("repair_depth_map: depths array size does not match map size");
+    }
+    if (!map.normals.empty() && map.normals.size() != 3 * pixels) {
+        throw ValueError("repair_depth_map: normals array size does not match map size");
+    }
+    if (!map.confidence.empty() && map.confidence.size() != pixels) {
+        throw ValueError("repair_depth_map: confidence array size does not match map size");
+    }
+    if (calibration.width != map.width || calibration.height != map.height) {
+        throw ValueError("repair_depth_map: calibration size does not match the map");
+    }
+    if (options.max_area < 0) {
+        throw ValueError("repair_depth_map: max_area must not be negative");
+    }
+
+    DepthMap out = map;  // a copy: the caller's map is never modified
+    RepairStats local;
+    if (options.max_area == 0 || pixels == 0 || map.width == 0 || map.height == 0) {
+        if (stats != nullptr) {
+            *stats = local;
+        }
+        return out;
+    }
+    const int width = map.width;
+    const int height = map.height;
+    const std::size_t stride = static_cast<std::size_t>(width);
+    const bool have_normals = !out.normals.empty();
+    const bool have_confidence = !out.confidence.empty();
+
+    // 4-connected invalid components. The component's PERIMETER is split into
+    // edges onto a measured pixel and edges that are not (map border, or an
+    // edge outside the image). kBoundaryCoverageFraction asks that the measured
+    // share dominate: an open region -- one running out of the map, where the
+    // depth range usually ends -- has too much uncovered perimeter, so a plane
+    // fitted to what is left would be extrapolated over unmeasured ground.
+    std::vector<std::uint8_t> visited(pixels, 0);
+    std::vector<std::size_t> stack;
+    std::vector<std::size_t> component;
+    std::vector<std::size_t> ring_indices;    // valid 4-neighbours of the component
+    std::vector<Eigen::Vector3d> ring_points;  // their camera-space positions
+    std::vector<std::uint8_t> ring_mark(pixels, 0);
+    std::vector<std::size_t> fill_pixels;
+
+    const auto invalid = [&](std::size_t idx) { return !(out.depths[idx] > 0.0F); };
+
+    for (std::size_t start = 0; start < pixels; ++start) {
+        if (visited[start] != 0 || !invalid(start)) {
+            continue;
+        }
+        component.clear();
+        stack.clear();
+        ring_indices.clear();
+        std::size_t border_edges = 0;     // perimeter edges that leave the image
+        std::size_t measured_edges = 0;   // perimeter edges onto a measured pixel
+        stack.push_back(start);
+        visited[start] = 1;
+        while (!stack.empty()) {
+            const std::size_t cur = stack.back();
+            stack.pop_back();
+            component.push_back(cur);
+
+            const int ci = static_cast<int>(cur % stride);
+            const int cj = static_cast<int>(cur / stride);
+            const int di[4] = {1, -1, 0, 0};
+            const int dj[4] = {0, 0, 1, -1};
+            for (int k = 0; k < 4; ++k) {
+                const int ni = ci + di[k];
+                const int nj = cj + dj[k];
+                if (ni < 0 || nj < 0 || ni >= width || nj >= height) {
+                    ++border_edges;
+                    continue;  // an uncovered edge: the ring is open here
+                }
+                const std::size_t nidx = static_cast<std::size_t>(nj) * stride +
+                                         static_cast<std::size_t>(ni);
+                if (invalid(nidx)) {
+                    if (visited[nidx] == 0) {
+                        visited[nidx] = 1;
+                        stack.push_back(nidx);
+                    }
+                } else {
+                    ++measured_edges;
+                    if (ring_mark[nidx] == 0) {
+                        ring_mark[nidx] = 1;
+                        ring_indices.push_back(nidx);
+                    }
+                }
+            }
+        }
+        for (const std::size_t idx : ring_indices) {
+            ring_mark[idx] = 0;  // restore for the next component
+        }
+
+        ++local.components;
+        if (static_cast<int>(component.size()) > options.max_area) {
+            ++local.rejected_area;
+            continue;
+        }
+        if (border_edges > 0) {
+            // Open to the map border: the plane's extent would be a guess.
+            ++local.rejected_boundary;
+            continue;
+        }
+
+        // Ring coverage: the share of the perimeter that lies on a measured
+        // pixel. Counting EDGES (not ring points) is what makes an open
+        // component fail: one that runs into the map border, or through a
+        // column of invalid pixels, has edges no ring point covers.
+        if (measured_edges == 0 ||
+            static_cast<double>(measured_edges) <
+                kBoundaryCoverageFraction * static_cast<double>(measured_edges + border_edges)) {
+            ++local.rejected_boundary;
+            continue;
+        }
+
+        // Back-project the ring to camera space and fit one plane to it.
+        ring_points.clear();
+        ring_points.reserve(ring_indices.size());
+        double depth_sum = 0.0;
+        for (const std::size_t idx : ring_indices) {
+            const int i = static_cast<int>(idx % stride);
+            const int j = static_cast<int>(idx / stride);
+            const Eigen::Vector2d centre(static_cast<double>(i) + 0.5,
+                                         static_cast<double>(j) + 0.5);
+            const double depth = static_cast<double>(out.depths[idx]);
+            ring_points.push_back(calibration.unproject(centre) * depth);
+            depth_sum += depth;
+        }
+        const double mean_depth = depth_sum / static_cast<double>(ring_points.size());
+        Plane plane;
+        if (!fit_ring_plane(ring_points, mean_depth, kPlaneRelativeTolerance,
+                            kPlaneInlierFraction, plane)) {
+            ++local.rejected_plane;
+            continue;
+        }
+
+        // Fill: intersect each component pixel's viewing ray with the plane.
+        fill_pixels.clear();
+        for (const std::size_t idx : component) {
+            const int i = static_cast<int>(idx % stride);
+            const int j = static_cast<int>(idx / stride);
+            const Eigen::Vector2d centre(static_cast<double>(i) + 0.5,
+                                         static_cast<double>(j) + 0.5);
+            const Eigen::Vector3d bearing = calibration.unproject(centre);
+            const double denom = plane.normal.dot(bearing);
+            if (std::abs(denom) <= 1e-12) {
+                ++local.unfilled_pixels;  // grazing ray: the plane is edge-on
+                continue;
+            }
+            const double depth = plane.offset / denom;
+            if (!(depth > 0.0) || !std::isfinite(depth)) {
+                ++local.unfilled_pixels;
+                continue;
+            }
+            fill_pixels.push_back(idx);
+            out.depths[idx] = static_cast<float>(depth);
+            if (have_confidence) {
+                out.confidence[idx] = kRepairedConfidence;
+            }
+            if (have_normals) {
+                // The map's convention is a normal pointing TOWARD the camera,
+                // i.e. n . bearing < 0 (see patch_match's cone normal). The
+                // least-squares sign is arbitrary, so orient it here.
+                const Eigen::Vector3d n =
+                    (plane.normal.dot(bearing) > 0.0 ? -plane.normal : plane.normal);
+                out.normals[3 * idx + 0] = static_cast<float>(n.x());
+                out.normals[3 * idx + 1] = static_cast<float>(n.y());
+                out.normals[3 * idx + 2] = static_cast<float>(n.z());
+            }
+        }
+        if (!fill_pixels.empty()) {
+            ++local.filled_components;
+            local.filled_pixels += fill_pixels.size();
+        }
+    }
+
+    if (stats != nullptr) {
+        *stats = local;
+    }
+    return out;
+}
+
+}  // namespace alphashape::stereo

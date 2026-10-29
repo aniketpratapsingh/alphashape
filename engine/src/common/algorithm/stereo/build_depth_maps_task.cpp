@@ -6,7 +6,9 @@
 // reduced calibration derived, stereo::run_patch_match estimates a per-pixel
 // depth (distance along the unit bearing) and normals, and
 // stereo::filter_depth_map cross-checks the map against its neighbours, leaving
-// the retained count as the pixel's confidence.
+// the retained count as the pixel's confidence and, when repair_holes is on,
+// stereo::repair_depth_map refills small holes the filter opened inside an
+// otherwise consistent surface.
 //
 // INCREMENTAL. A camera's search is hours of work at downscale 2, so the run is
 // checkpointed in this task's own terms: every finished map stays staged, and a
@@ -60,6 +62,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/stereo/depth_filter.hpp"
+#include "common/algorithm/stereo/depth_repair.hpp"
 #include "common/algorithm/stereo/patch_match.hpp"
 #include "common/algorithm/stereo/patch_match_gpu.hpp"
 #include "common/algorithm/stereo/view_selection.hpp"
@@ -75,6 +78,11 @@ namespace alphashape {
 namespace {
 
 constexpr int kMaxNeighborsExclusive = 256;
+
+/// Upper bound on repair_max_area. A hole this large at the working resolution
+/// is no longer a filter artefact, and the repair pass must not spend its time
+/// on one; 1e6 pixels is a quarter of a 2000x2000 map.
+constexpr std::int64_t kMaxRepairArea = 1000000;
 
 /// Set metadata marking a depth-map set a CANCELLED run left behind: every map
 /// in it is per-camera complete but has not been through the cross-view filter.
@@ -283,6 +291,23 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     max_cost.minimum = -1.0;
     max_cost.maximum = 2.0;
     params.declare(max_cost);
+
+    // Post-filter hole repair. Off by default: it synthesises depth the search
+    // never measured, so a run opts in explicitly. Only maps REPAIRED this way
+    // take the new fingerprint component (see fingerprint_of), so turning it on
+    // and off does not invalidate maps built without it.
+    params.declare({"repair_holes", ParamType::Bool, false,
+                    "After cross-view filtering, refill small holes left inside an otherwise "
+                    "consistent surface. A hole is filled only when one plane explains its "
+                    "measured boundary and it does not straddle a depth discontinuity; the "
+                    "filled pixels are marked with a reduced confidence."});
+    ParamSpec repair_max_area{"repair_max_area", ParamType::Int, std::int64_t{2000},
+                              "Largest hole, in pixels at the working resolution, that "
+                              "repair_holes may fill (default 2000). Larger holes are left "
+                              "empty. Ignored when repair_holes is false."};
+    repair_max_area.minimum = std::int64_t{0};
+    repair_max_area.maximum = kMaxRepairArea;
+    params.declare(repair_max_area);
 }
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
@@ -300,6 +325,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const std::int64_t pyramid_min_size = params.get_int("pyramid_min_size");
     const std::string cost_type_text = params.get_string("cost_type");
     const double max_cost_value = params.get_float("max_cost");
+    const bool repair_holes = params.get_bool("repair_holes");
+    const std::int64_t repair_max_area = params.get_int("repair_max_area");
 
     if (downscale_value <= 0) {
         throw ValueError("Downscale must be positive");
@@ -334,6 +361,12 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     }
     if (max_cost_value < -1.0 || max_cost_value > 2.0) {
         throw ValueError("max_cost must be in [-1, 2]");
+    }
+    if (repair_max_area < 0) {
+        throw ValueError("repair_max_area must not be negative");
+    }
+    if (repair_max_area > kMaxRepairArea) {
+        throw ValueError("repair_max_area must be at most " + std::to_string(kMaxRepairArea));
     }
     // -1 means "the cost type's own default", resolved once here so every map of
     // the run (and the log line) uses the same number.
@@ -502,9 +535,21 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                 context.image_mtime = static_cast<std::int64_t>(mtime.time_since_epoch().count());
             }
         }
-        return depth_map_fingerprint(camera,
-                                     chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)],
-                                     downscale, &context);
+        // Hole repair changes the final depths, so a repaired map is a different
+        // map from an unrepaired one. Folded ONLY when repair_holes is on: a map
+        // built before the feature existed hashed neither value, so it keeps
+        // matching a repair-off run exactly and existing maps stay reusable.
+        std::uint64_t fingerprint = depth_map_fingerprint(
+            camera, chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)], downscale,
+            &context);
+        if (repair_holes) {
+            // A string marker, not a bare 1: no unrepaired fingerprint folds a
+            // string here, so enabling repair can never collide with a map built
+            // while it was off.
+            fingerprint = depth_map_fingerprint_fold_string(fingerprint, "repair_holes");
+            fingerprint = depth_map_fingerprint_fold_int(fingerprint, repair_max_area);
+        }
+        return fingerprint;
     };
 
     // Existing maps by camera id, for reuse_depth. Read through a CONST view: the
@@ -906,6 +951,24 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
 
         const std::size_t before = valid_count(map);
         DepthMap result = stereo::filter_depth_map(reference, neighbours, filter_options);
+        // Post-process on the FILTERED map, in both the CPU and GPU depth paths:
+        // both converge on `built` before this loop, so there is one repair site.
+        if (repair_holes) {
+            stereo::RepairOptions repair_options;
+            repair_options.max_area = static_cast<int>(repair_max_area);
+            stereo::RepairStats repair_stats;
+            result = stereo::repair_depth_map(result, reference.calibration, repair_options,
+                                              &repair_stats);
+            if (Log::enabled(LogLevel::Info) && repair_stats.components > 0) {
+                log(LogLevel::Info) << "BuildDepthMaps: camera " << map.camera_id << ": repaired "
+                                    << repair_stats.filled_pixels << " px in "
+                                    << repair_stats.filled_components << " of "
+                                    << repair_stats.components << " holes ("
+                                    << repair_stats.rejected_area << " too large, "
+                                    << repair_stats.rejected_boundary << " open, "
+                                    << repair_stats.rejected_plane << " no plane)";
+            }
+        }
         const std::size_t after = valid_count(result);
         filtered.push_back(std::move(result));
 

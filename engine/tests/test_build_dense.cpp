@@ -1724,6 +1724,57 @@ TEST(BuildDenseParams, DeclaredQualityDefaultsFollowTheBenchmark) {
     EXPECT_EQ(wide.get_int("max_neighbors"), 16);
 }
 
+TEST(BuildDenseParams, RepairDefaultsAreOffAndBounded) {
+    const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
+    const Params defaults = make_params(entry);
+    EXPECT_FALSE(defaults.get_bool("repair_holes"));
+    EXPECT_EQ(defaults.get_int("repair_max_area"), 2000);
+
+    Params params = defaults;
+    params.set("repair_max_area", ParamValue{std::int64_t{-1}});
+    Document document = aligned_document(seq_files(4));
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError);
+    EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
+}
+
+TEST(DepthMapsReuse, RepairOffKeepsTheFingerprintUnchanged) {
+    // The new parameters must not invalidate a stored map. A run with repair off
+    // -- the default -- stamps exactly the fingerprint an older build did, so an
+    // existing map is reused rather than silently rebuilt.
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    std::vector<std::uint64_t> before;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        before.push_back(map.alignment_fingerprint);
+    }
+    ASSERT_FALSE(before.empty());
+
+    // Repair ON is a different map, so every camera is searched again.
+    Params on = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    on.set("repair_holes", ParamValue{true});
+    reset_depth_map_search_count();
+    run_task(builtin_registry(), document, "BuildDepthMaps", on);
+    EXPECT_EQ(depth_map_search_count(), before.size())
+        << "repair_holes=true must not reuse an unrepaired map";
+    std::vector<std::uint64_t> after;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        after.push_back(map.alignment_fingerprint);
+    }
+    std::sort(before.begin(), before.end());
+    std::sort(after.begin(), after.end());
+    EXPECT_NE(before, after);
+
+    // Repair OFF again is the ORIGINAL map: the fingerprint did not move.
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true);
+    std::vector<std::uint64_t> restored;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        restored.push_back(map.alignment_fingerprint);
+    }
+    ASSERT_EQ(restored.size(), before.size());
+    std::sort(restored.begin(), restored.end());
+    EXPECT_EQ(before, restored) << "repair_holes=false must stamp the historic fingerprint";
+}
+
 // ---------------------------------------------------------------------------
 // 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
 // ---------------------------------------------------------------------------
