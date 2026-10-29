@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -23,6 +24,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -114,6 +116,90 @@ double rms(const std::vector<double>& values) {
         sum += v * v;
     }
     return std::sqrt(sum / static_cast<double>(values.size()));
+}
+
+/// Writes a header-only TIFF (no pixel data) claiming `width` x `height`.
+///
+/// The bytes are assembled by hand rather than through libtiff: libtiff will
+/// not create an image that big without the samples, and the point here is a
+/// crafted header. Layout (classic TIFF, little endian):
+///
+///   0: header "II", 42, IFD offset 80
+///   8: ModelPixelScale, 3 doubles
+///   32: ModelTiepoint, 6 doubles
+///   80: IFD with 10 entries, next IFD = 0
+///
+/// Only what the geoid decoder reads is supplied; width and height are LONG
+/// so a 4e9 value survives.
+void write_header_only_tiff(const std::string& path, std::uint32_t width, std::uint32_t height) {
+    std::vector<std::uint8_t> out;
+    const auto put16 = [&out](std::uint16_t v) {
+        out.push_back(static_cast<std::uint8_t>(v & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFU));
+    };
+    const auto put32 = [&out](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFU));
+        }
+    };
+    const auto put64 = [&out](std::uint64_t bits) {
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<std::uint8_t>((bits >> (8 * i)) & 0xFFU));
+        }
+    };
+    const auto put_double = [&put64](double v) {
+        std::uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(v));
+        std::memcpy(&bits, &v, sizeof(bits));
+        put64(bits);
+    };
+    constexpr std::uint32_t kIfdOffset = 80;
+    out.push_back('I');
+    out.push_back('I');
+    put16(42);
+    put32(kIfdOffset);
+    put16(3);  // ModelPixelScale: 1 degree cells
+    put_double(1.0);
+    put_double(1.0);
+    put_double(0.0);
+    put16(6);  // ModelTiepoint: node (0,0) at 0,0
+    for (int i = 0; i < 6; ++i) {
+        put_double(0.0);
+    }
+    struct Entry {
+        std::uint16_t tag;
+        std::uint16_t type;  // 3 = SHORT, 4 = LONG
+        std::uint32_t count;
+        std::uint32_t value;
+    };
+    const Entry entries[] = {
+        {256, 4, 1, width},                       // ImageWidth
+        {257, 4, 1, height},                      // ImageLength
+        {258, 3, 1, 32},                          // BitsPerSample
+        {259, 3, 1, 1},                           // Compression = none
+        {262, 3, 1, 1},                           // Photometric = BlackIsZero
+        {273, 4, 1, 0},                           // StripOffsets (no pixels)
+        {277, 3, 1, 1},                           // SamplesPerPixel
+        {278, 4, 1, height},                      // RowsPerStrip
+        {279, 4, 1, 0},                           // StripByteCounts
+        {339, 3, 1, 3},                           // SampleFormat = IEEE float
+    };
+    put16(static_cast<std::uint16_t>(std::size(entries)));
+    for (const Entry& entry : entries) {
+        put16(entry.tag);
+        put16(entry.type);
+        put32(entry.count);
+        if (entry.type == 3) {
+            put16(static_cast<std::uint16_t>(entry.value));
+            put16(0);  // the 4-byte value field is left-justified
+        } else {
+            put32(entry.value);
+        }
+    }
+    put32(0);  // no next IFD
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(file.good()) << path;
+    file.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
 }
 
 /// A scratch directory removed on teardown, unique per process and per test.
@@ -481,6 +567,113 @@ TEST_F(GeoidTempDir, CrsGeoidIndexRejectsPathTraversal) {
         }
     }
     EXPECT_EQ(parent_entries, 1) << "a rejected geoid name created a file outside the store";
+}
+
+// GDAL_NODATA marks cells with no data, and PROJ honours it. The GeoTIFF
+// fallback must too: before it did, a nodata cell was interpolated as the
+// sentinel itself, so H = h - N came out tens of thousands of metres wrong.
+//
+// The grid is built inside the test (the engine's own writer emits the tag), so
+// the test knows exactly which node is missing. Its file name contains a space,
+// which makes PROJ unavailable (`+grids=` cannot carry one) and forces exactly
+// the fallback this test is about.
+TEST_F(GeoidTempDir, CrsGeoidNodataCellHasNoValue) {
+    constexpr float kNodata = -32767.0f;
+    GeoRaster<float> raster;
+    raster.grid.width = 8;
+    raster.grid.height = 8;
+    raster.grid.origin_x = 10.0;
+    raster.grid.origin_y = 20.0;
+    raster.grid.pixel_size_x = 1.0;
+    raster.grid.pixel_size_y = 1.0;
+    raster.channels = 1;
+    raster.data.assign(64, 20.0f);
+    raster.data[4 * 8 + 4] = kNodata;
+    const std::string file = (dir_ / "nodata grid.tif").string();
+    GeoTiffOptions options;
+    options.epsg = 4326;
+    options.nodata = static_cast<double>(kNodata);
+    write_geotiff(file, raster, options);
+
+    const std::shared_ptr<const GeoidGrid> grid = GeoidGrid::open(file);
+    ASSERT_NE(grid, nullptr);
+    const GeoidGridInfo& box = grid->info();
+    ASSERT_EQ(box.width, 8);
+    ASSERT_EQ(box.height, 8);
+    const double cell_x = (box.max_lon_deg - box.min_lon_deg) / 7.0;
+    const double cell_y = (box.max_lat_deg - box.min_lat_deg) / 7.0;
+    const auto node_lon = [&](int col) { return box.min_lon_deg + col * cell_x; };
+    const auto node_lat = [&](int row) { return box.max_lat_deg - row * cell_y; };
+
+    // Exactly on the missing node.
+    EXPECT_FALSE(grid->grid_undulation(node_lon(4), node_lat(4)).has_value());
+    EXPECT_FALSE(grid->undulation(node_lon(4), node_lat(4)).has_value());
+    // A fraction of a cell away the nodata node is still in the 4x4 support, so
+    // the point is refused rather than interpolated across the hole.
+    EXPECT_FALSE(
+        grid->grid_undulation(node_lon(4) + 0.25 * cell_x, node_lat(4) + 0.25 * cell_y)
+            .has_value());
+    // Beyond the hole's support the grid answers normally: the refusal is local.
+    for (const int col : {0, 7}) {
+        const std::optional<double> value = grid->grid_undulation(node_lon(col), node_lat(col));
+        ASSERT_TRUE(value.has_value()) << col;
+        EXPECT_NEAR(*value, 20.0, 1e-6);
+        const std::optional<double> general = grid->undulation(node_lon(col), node_lat(col));
+        ASSERT_TRUE(general.has_value()) << col;
+        EXPECT_NEAR(*general, 20.0, 1e-6);
+    }
+
+    // The same grid under a name PROJ can take: PROJ is then the evaluator, and
+    // `undulation()` must not answer through the reader behind PROJ's back. At
+    // the hole both refuse; on a good node they agree whenever PROJ ran.
+    const std::string plain = (dir_ / "nodata_plain.tif").string();
+    write_geotiff(plain, raster, options);
+    const std::shared_ptr<const GeoidGrid> via_proj = GeoidGrid::open(plain);
+    ASSERT_NE(via_proj, nullptr);
+    const std::optional<double> refused = via_proj->undulation(node_lon(4), node_lat(4));
+    EXPECT_TRUE(!refused || std::abs(*refused) < 1e3)
+        << "nodata reached the caller: " << (refused ? *refused : 0.0);
+    const std::optional<double> proj_corner = via_proj->proj_undulation(node_lon(0), node_lat(0));
+    if (proj_corner) {
+        const std::optional<double> general = via_proj->undulation(node_lon(0), node_lat(0));
+        ASSERT_TRUE(general.has_value());
+        EXPECT_NEAR(*general, *proj_corner, 1e-9);
+    }
+}
+// A crafted header must not size the sample buffer. The file is assembled by
+// hand (libtiff will not write a 4e9-wide image without the pixels), claiming
+// 4 000 000 000 x 4 000 000 000: the product overflows a signed 32-bit int and
+// the byte count overflows size_t on a 32-bit build, so the dimensions are
+// rejected on the numbers before anything is allocated or read.
+TEST_F(GeoidTempDir, CrsGeoidRejectsHugeDimensions) {
+    const std::string crafted = (dir_ / "crafted.tif").string();
+    write_header_only_tiff(crafted, 4'000'000'000U, 4'000'000'000U);
+    try {
+        GeoidGrid::open(crafted);
+        FAIL() << "open() accepted a 4e9 x 4e9 header";
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("may not exceed"), std::string::npos) << message;
+    }
+    // A shape under the per-side cap but over the total must also be refused.
+    write_header_only_tiff(crafted, 1'000'000U, 1'000'000U);
+    try {
+        GeoidGrid::open(crafted);
+        FAIL() << "open() accepted a 1e6 x 1e6 header";
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("may not exceed"), std::string::npos) << message;
+    }
+    // 30 M per side is a legal geoid grid shape; it fails on the missing pixel
+    // data instead, which proves the cap is above real grids.
+    write_header_only_tiff(crafted, 30'000'000U, 2U);
+    try {
+        GeoidGrid::open(crafted);
+        FAIL() << "open() accepted a header with no pixel data";
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        EXPECT_EQ(message.find("may not exceed"), std::string::npos) << message;
+    }
 }
 
 }  // namespace

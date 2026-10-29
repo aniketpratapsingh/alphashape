@@ -8,8 +8,10 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -17,6 +19,7 @@
 
 #include <tiffio.h>
 
+#include "base/io/geotiff_tags.hpp"
 #include "base/utils/error.hpp"
 #include "model/crs/proj_context.hpp"
 
@@ -52,131 +55,132 @@ double catmull_rom(double p0, double p1, double p2, double p3, double t) {
 
 double clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-/// A grid opened on a private PROJ context whose grid search path is the
-/// grid's directory. PROJ resolves `+grids=` by name only, and the thread
-/// context must not be mutated (it is shared with every other CRS operation on
-/// that thread), so the path is provided here and the bare file name is passed.
+/// One thread's PROJ state for one grid: a private context whose search path
+/// is the grid's directory, and the vgridshift pipeline built on it.
 ///
-/// Both the horizontal extent check and the evaluation go through this object;
-/// `proj_undulation` returns nullopt as soon as PROJ reports the grid outside
-/// its coverage, so a caller never sees an extrapolated value.
+/// PROJ forbids sharing a PJ_CONTEXT between threads, and these grids are
+/// shared (GeoidStore hands the same GeoidGrid to every caller), so the state
+/// is per thread. Construction order matters: `ctx` is declared first so it is
+/// destroyed last, after `pj` which belongs to it.
+struct ProjGridSession {
+    ContextPtr ctx;
+    PjPtr pj;
+};
+
+/// Per-thread sessions, keyed by grid path. A path identifies a grid
+/// completely, so an entry never needs invalidating: it lives until the thread
+/// exits, holding at most one context per distinct grid the thread evaluated.
+struct ThreadGeoidProj {
+    std::unordered_map<std::string, ProjGridSession> grids;
+};
+
+thread_local ThreadGeoidProj tl_geoid_proj;
+
+/// The outcome of asking PROJ. The three cases must stay distinguishable: a
+/// grid PROJ cannot open must fall back to the GeoTIFF reader, while a point
+/// PROJ *refused* (outside the grid's own coverage, or nodata) must not be
+/// answered by a reader that might invent a value.
+struct ProjAnswer {
+    enum class Kind { Unavailable, Refused, Value };
+    Kind kind = Kind::Unavailable;
+    double value = 0.0;
+};
+
+/// A grid evaluated through PROJ. PROJ resolves `+grids=` by name only, and the
+/// thread context must not be mutated (it is shared with every other CRS
+/// operation on that thread), so a private context per thread carries the
+/// grid's directory as its search path and the bare file name is passed.
 class ProjGridShift {
 public:
-    explicit ProjGridShift(const std::string& grid_path) {
+    explicit ProjGridShift(std::string grid_path) {
         const std::filesystem::path path(grid_path);
+        dir_ = path.parent_path().empty() ? std::string(".") : path.parent_path().string();
+        name_ = path.filename().string();
         // PROJ splits +grids= on whitespace and has no quoting rule, so a file
         // name containing a space cannot be handed over at all. That is not an
         // error: proj_undulation() stays unavailable and the GeoTIFF reader
         // answers instead.
-        if (path.filename().string().find_first_of(" \t") != std::string::npos) {
-            return;
-        }
-        ctx_.reset(proj_context_create());
-        if (!ctx_) {
-            return;
-        }
-        // No downloads, no shared grid cache: the file is already on disk and is
-        // the only grid this context will ever look for.
-        proj_context_set_enable_network(ctx_.get(), 0);
-        proj_grid_cache_set_enable(ctx_.get(), 0);
-        const std::string dir = path.parent_path().empty() ? std::string(".")
-                                                           : path.parent_path().string();
-        const char* paths[2] = {dir.c_str(), nullptr};
-        proj_context_set_search_paths(ctx_.get(), 1, paths);
-
-        // vgridshift works in radians like every PROJ step, so the degrees the
-        // engine speaks are converted in and back out. The vertical value it
-        // produces is already metres.
-        const std::string pipeline = "+proj=pipeline"
-                                     " +step +proj=unitconvert +xy_in=deg +xy_out=rad"
-                                     " +step +proj=vgridshift +grids=" +
-                                     path.filename().string() +
-                                     " +multiplier=1"
-                                     " +step +proj=unitconvert +xy_in=rad +xy_out=deg";
-        pj_.reset(proj_create(ctx_.get(), pipeline.c_str()));
-        usable_ = pj_ != nullptr;
+        available_ = !name_.empty() && name_.find_first_of(" \t") == std::string::npos;
+        key_ = dir_ + "/" + name_;
     }
 
-    bool usable() const { return usable_; }
+    /// True when PROJ could be asked for this grid at all (path shape only; a
+    /// grid PROJ cannot open is discovered on first evaluation).
+    bool available() const { return available_; }
 
-    /// N in metres at (lon, lat), with the horizontal axes switched into PROJ's
-    /// pipeline order (lon, lat) and the vertical input at 0.
-    std::optional<double> at(double lon_deg, double lat_deg) const {
-        if (!usable_) {
-            return std::nullopt;
+    ProjAnswer at(double lon_deg, double lat_deg) const {
+        if (!available_) {
+            return {};
         }
-        proj_errno_reset(pj_.get());
+        ProjGridSession& session = session_for_thread();
+        if (!session.pj) {
+            return {};
+        }
+        proj_errno_reset(session.pj.get());
         // Visualisation order (x = lon, y = lat) in, the same order out.
         const PJ_COORD in = proj_coord(lon_deg, lat_deg, 0.0, 0.0);
-        const PJ_COORD out = proj_trans(pj_.get(), PJ_FWD, in);
-        if (proj_errno(pj_.get()) != 0 || !std::isfinite(out.xyz.z)) {
-            return std::nullopt;
+        const PJ_COORD out = proj_trans(session.pj.get(), PJ_FWD, in);
+        if (proj_errno(session.pj.get()) != 0 || !std::isfinite(out.xyz.z)) {
+            return ProjAnswer{ProjAnswer::Kind::Refused, 0.0};
         }
-        return out.xyz.z;
+        return ProjAnswer{ProjAnswer::Kind::Value, out.xyz.z};
     }
 
 private:
-    ContextPtr ctx_;
-    PjPtr pj_;  ///< the vgridshift step, not a pipeline: input is lon/lat degrees
-    bool usable_ = false;
+    /// This thread's session for this grid, created on first use. A grid the
+    /// session could not build stays cached as "no pipeline" so a 77 MB grid
+    /// PROJ refuses is not re-tried on every point.
+    ProjGridSession& session_for_thread() const {
+        auto found = tl_geoid_proj.grids.find(key_);
+        if (found != tl_geoid_proj.grids.end()) {
+            return found->second;
+        }
+        ProjGridSession session;
+        session.ctx.reset(proj_context_create());
+        if (session.ctx) {
+            // No downloads, no shared grid cache: the file is already on disk
+            // and is the only grid this context will ever look for.
+            proj_context_set_enable_network(session.ctx.get(), 0);
+            proj_grid_cache_set_enable(session.ctx.get(), 0);
+            const char* paths[2] = {dir_.c_str(), nullptr};
+            proj_context_set_search_paths(session.ctx.get(), 1, paths);
+            // vgridshift works in radians like every PROJ step, so the degrees
+            // the engine speaks are converted in and back out. The vertical
+            // value it produces is already metres.
+            const std::string pipeline = "+proj=pipeline"
+                                         " +step +proj=unitconvert +xy_in=deg +xy_out=rad"
+                                         " +step +proj=vgridshift +grids=" +
+                                         name_ +
+                                         " +multiplier=1"
+                                         " +step +proj=unitconvert +xy_in=rad +xy_out=deg";
+            session.pj.reset(proj_create(session.ctx.get(), pipeline.c_str()));
+        }
+        return tl_geoid_proj.grids.emplace(key_, std::move(session)).first->second;
+    }
+
+    std::string dir_;
+    std::string name_;
+    std::string key_;
+    bool available_ = false;
 };
 
 // ---------------------------------------------------------------------------
 // The GeoTIFF carrier. A geoid grid is the NGA layout: one band, 32-bit IEEE
 // float, ModelPixelScale (33550) and ModelTiepoint (33922) describing a north-up
-// grid. This is decoded here rather than through model/raster/geotiff.cpp
-// because that library depends on this one, so calling it back would be a
-// cycle; the subset needed is a header read and one copy loop.
+// grid, plus GDAL_NODATA (42113) when cells are missing. This is decoded here
+// rather than through model/raster/geotiff.cpp because that library depends on
+// this one, so calling it back would be a cycle; the subset needed is a header
+// read and one copy loop. The tag registration itself is shared, though: see
+// base/io/geotiff_tags.hpp.
 // ---------------------------------------------------------------------------
-
-constexpr std::uint32_t kTagPixelScale = 33550;
-constexpr std::uint32_t kTagTiepoint = 33922;
-constexpr std::uint32_t kTagGeoKeyDirectory = 34735;
-/// GeoKey 1025, GTRasterTypeGeoKey: 1 = PixelIsArea, 2 = PixelIsPoint.
-constexpr std::uint16_t kKeyRasterType = 1025;
-
-/// The extender libtiff had installed before ours, so the hook can chain.
-TIFFExtendProc g_parent_tag_extender = nullptr;
-
-void merge_geotiff_fields(TIFF* tif) {
-    // Field names must have static storage: they outlive every handle.
-    static char kPixelScale[] = "ModelPixelScaleTag";
-    static char kTiepoint[] = "ModelTiepointTag";
-    static char kGeoKeys[] = "GeoKeyDirectoryTag";
-    static const TIFFFieldInfo fields[] = {
-        {kTagPixelScale, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
-         kPixelScale},
-        {kTagTiepoint, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1, kTiepoint},
-        {kTagGeoKeyDirectory, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_SHORT, FIELD_CUSTOM, 1, 1,
-         kGeoKeys},
-    };
-    TIFFMergeFieldInfo(tif, fields, static_cast<std::uint32_t>(std::size(fields)));
-}
-
-/// libtiff has no process-global slot for custom fields: they are per handle,
-/// and this extender is the only supported way to add them to every file this
-/// process opens. A one-shot TIFFMergeFieldInfo would work for the first grid
-/// and silently lose the tags for the second.
-void geotiff_tag_extender(TIFF* tif) {
-    merge_geotiff_fields(tif);
-    if (g_parent_tag_extender != nullptr) {
-        g_parent_tag_extender(tif);
-    }
-}
-
-void install_geotiff_tags() {
-    // A plain function-local static: the initialiser runs once, guarded by the
-    // compiler's own thread-safe initialisation, so no <mutex> is needed here.
-    static const bool installed = [] {
-        g_parent_tag_extender = TIFFSetTagExtender(geotiff_tag_extender);
-        return true;
-    }();
-    static_cast<void>(installed);
-}
 
 struct DecodedGrid {
     GeoidGridInfo info;
     std::vector<float> samples;
+    /// GDAL_NODATA (42113) as a number; `has_nodata` is false when the tag is
+    /// absent or is not a finite number.
+    double nodata = 0.0;
+    bool has_nodata = false;
 };
 
 /// Reads one geoid GeoTIFF. Every failure is a ProjectIOError naming the file,
@@ -208,6 +212,20 @@ DecodedGrid decode_grid(const std::string& path, bool decode_samples = true) {
     if (width < 2 || height < 2) {
         fail("a geoid grid needs at least 2x2 nodes");
     }
+    // The dimensions are attacker-controlled (a crafted header can claim
+    // 0xFFFFFFFF per side), and the sample buffer is allocated from them, so
+    // they are bounded BEFORE any size arithmetic. The limits are far above the
+    // 1440x721 EGM2008 grid: 1e6 nodes per side, 4e8 samples (1.6 GB of float32)
+    // in total. Width and height are uint32, so the cap also keeps every
+    // conversion to int (GeoidGridInfo::width) in range.
+    constexpr std::uint32_t kMaxSide = 1'000'000U;
+    constexpr std::uint64_t kMaxSamples = 400'000'000ULL;
+    if (width > kMaxSide || height > kMaxSide) {
+        fail("a geoid grid may not exceed " + std::to_string(kMaxSide) + " nodes per side");
+    }
+    if (static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) > kMaxSamples) {
+        fail("a geoid grid may not exceed " + std::to_string(kMaxSamples) + " samples");
+    }
     if (bits != 32 || sample_format != SAMPLEFORMAT_IEEEFP) {
         fail("a geoid grid must be 32-bit IEEE float");
     }
@@ -219,11 +237,11 @@ DecodedGrid decode_grid(const std::string& path, bool decode_samples = true) {
     std::uint16_t scale_count = 0;
     double* tie = nullptr;
     std::uint16_t tie_count = 0;
-    if (TIFFGetField(tif, kTagPixelScale, &scale_count, &scale) == 0 || scale == nullptr ||
+    if (TIFFGetField(tif, kTagModelPixelScale, &scale_count, &scale) == 0 || scale == nullptr ||
         scale_count < 2) {
         fail("missing ModelPixelScale (33550)");
     }
-    if (TIFFGetField(tif, kTagTiepoint, &tie_count, &tie) == 0 || tie == nullptr ||
+    if (TIFFGetField(tif, kTagModelTiepoint, &tie_count, &tie) == 0 || tie == nullptr ||
         tie_count < 6) {
         fail("missing ModelTiepoint (33922)");
     }
@@ -239,6 +257,15 @@ DecodedGrid decode_grid(const std::string& path, bool decode_samples = true) {
     // would read half a cell off while a PROJ grid read correctly.
     double node_x = tie[3];
     double node_y = tie[4];
+    // GDAL_NODATA marks missing cells (the NGA grids declare -32767). Read here
+    // because both evaluators honour it: PROJ refuses the value, and the
+    // bicubic reader must refuse a stencil that touches one.
+    char* nodata_text = nullptr;
+    if (TIFFGetField(tif, kTagGdalNodata, &nodata_text) != 0 && nodata_text != nullptr) {
+        char* end = nullptr;
+        out.nodata = std::strtod(nodata_text, &end);
+        out.has_nodata = end != nodata_text && std::isfinite(out.nodata);
+    }
     std::uint16_t* keys = nullptr;
     std::uint16_t key_count = 0;
     if (TIFFGetField(tif, kTagGeoKeyDirectory, &key_count, &keys) != 0 && keys != nullptr &&
@@ -343,9 +370,17 @@ struct GeoidGrid::Impl {
     /// for a resident copy. A decode that fails leaves `samples` empty and
     /// records it, so `grid_undulation()` reports "no value" instead of
     /// re-attempting a 77 MB read on every point.
+    ///
+    /// A GeoidGrid is shared (GeoidStore hands one out per entry) and callers
+    /// evaluate from several threads, so the lazy decode is guarded by
+    /// call_once: the samples are written exactly once and afterwards only read.
     mutable std::vector<float> samples;
-    mutable bool decode_attempted = false;
+    mutable std::once_flag decode_once;
     mutable bool decode_ok = false;
+    /// GDAL_NODATA when the grid declares one; bicubic support that touches a
+    /// nodata cell has no value rather than a 32 768 m one.
+    double nodata = 0.0;
+    bool has_nodata = false;
     std::string path;
     ProjGridShift proj;
 
@@ -353,17 +388,29 @@ struct GeoidGrid::Impl {
 
     /// The samples, decoded on first use. Null when they cannot be read.
     const std::vector<float>* decoded() const {
-        if (!decode_attempted) {
-            decode_attempted = true;
+        std::call_once(decode_once, [this] {
             try {
                 DecodedGrid grid = decode_grid(path);
                 samples = std::move(grid.samples);
+                nodata = grid.nodata;
+                has_nodata = grid.has_nodata;
                 decode_ok = true;
             } catch (const std::exception&) {
                 decode_ok = false;
             }
-        }
+        });
         return decode_ok ? &samples : nullptr;
+    }
+
+    /// True when the sample at (col,row) carries a value: finite, and not the
+    /// declared nodata sentinel.
+    bool valid(int col, int row) const {
+        const float value = samples[static_cast<std::size_t>(row) *
+                                        static_cast<std::size_t>(info.width) +
+                                    static_cast<std::size_t>(col)];
+        // Compare in the stored precision: a sentinel such as -32767 is only
+        // meaningful as the float32 that GDAL wrote and the file holds.
+        return std::isfinite(value) && !(has_nodata && value == static_cast<float>(nodata));
     }
 
     double sample(int col, int row) const {
@@ -397,20 +444,52 @@ const std::string& GeoidGrid::path() const {
     return impl_ ? impl_->path : kEmpty;
 }
 
+namespace {
+
+/// `lon` moved into [min_lon, min_lon + 360): the grid's own convention.
+///
+/// A geoid grid may be indexed by either convention (a global grid west-first,
+/// -180..180, or one at 0..360), and a caller may hand over either spelling.
+/// Comparing raw degrees would then declare a covered point uncovered (lon 190
+/// on a -180..180 grid, or lon -170 on a 0..360 grid), so every lookup and
+/// coverage test normalises first.
+double normalize_lon(double lon, double min_lon) {
+    if (!std::isfinite(lon)) {
+        return lon;
+    }
+    double wrapped = std::fmod(lon - min_lon, 360.0);
+    if (wrapped < 0.0) {
+        wrapped += 360.0;
+    }
+    return min_lon + wrapped;
+}
+
+}  // namespace
+
 bool GeoidGrid::covers(double lon_deg, double lat_deg) const {
-    if (!impl_) {
+    if (!impl_ || !std::isfinite(lat_deg)) {
         return false;
     }
     const GeoidGridInfo& g = impl_->info;
-    return lon_deg >= g.min_lon_deg && lon_deg <= g.max_lon_deg && lat_deg >= g.min_lat_deg &&
+    // A grid spanning 360 degrees is closed in longitude; every other grid is
+    // a closed box, so the normalised longitude is compared against its east
+    // edge too. Shifting by min_lon makes both conventions work: lon 190 on a
+    // -180..180 grid normalises to -170.
+    const double lon = normalize_lon(lon_deg, g.min_lon_deg);
+    return lon >= g.min_lon_deg && lon <= g.max_lon_deg && lat_deg >= g.min_lat_deg &&
            lat_deg <= g.max_lat_deg;
 }
 
 std::optional<double> GeoidGrid::proj_undulation(double lon_deg, double lat_deg) const {
-    if (!impl_ || !covers(lon_deg, lat_deg)) {
+    if (!impl_ || !covers(lon_deg, lat_deg) || !impl_->proj.available()) {
         return std::nullopt;
     }
-    return impl_->proj.at(lon_deg, lat_deg);
+    const ProjAnswer answer =
+        impl_->proj.at(normalize_lon(lon_deg, impl_->info.min_lon_deg), lat_deg);
+    if (answer.kind != ProjAnswer::Kind::Value) {
+        return std::nullopt;
+    }
+    return answer.value;
 }
 
 std::optional<double> GeoidGrid::grid_undulation(double lon_deg, double lat_deg) const {
@@ -418,10 +497,11 @@ std::optional<double> GeoidGrid::grid_undulation(double lon_deg, double lat_deg)
         return std::nullopt;
     }
     const GeoidGridInfo& g = impl_->info;
+    const double lon = normalize_lon(lon_deg, g.min_lon_deg);
     // Continuous node coordinates: node (col,row) sits at (col,row), so a
     // point at the bounding box's edges lands exactly on the outer nodes and
     // the 4x4 stencil's clamped indices keep it in range there.
-    const double x = (lon_deg - g.min_lon_deg) / (g.max_lon_deg - g.min_lon_deg) *
+    const double x = (lon - g.min_lon_deg) / (g.max_lon_deg - g.min_lon_deg) *
                      static_cast<double>(g.width - 1);
     const double y = (g.max_lat_deg - lat_deg) / (g.max_lat_deg - g.min_lat_deg) *
                      static_cast<double>(g.height - 1);
@@ -439,15 +519,52 @@ std::optional<double> GeoidGrid::grid_undulation(double lon_deg, double lat_deg)
     double rows[4];
     for (int d = 0; d < 4; ++d) {
         const int rr = sy(row + d - 1);
-        rows[d] = catmull_rom(impl_->sample(sx(col - 1), rr), impl_->sample(sx(col), rr),
-                              impl_->sample(sx(col + 1), rr), impl_->sample(sx(col + 2), rr), fx);
+        // The interpolation is a weighted average with negative lobes, so one
+        // nodata or NaN support sample would smear a sentinel into its whole
+        // neighbourhood. A nodata cell therefore makes the point valueless.
+        const int c0 = sx(col - 1);
+        const int c1 = sx(col);
+        const int c2 = sx(col + 1);
+        const int c3 = sx(col + 2);
+        if (!impl_->valid(c0, rr) || !impl_->valid(c1, rr) || !impl_->valid(c2, rr) ||
+            !impl_->valid(c3, rr)) {
+            return std::nullopt;
+        }
+        rows[d] = catmull_rom(impl_->sample(c0, rr), impl_->sample(c1, rr), impl_->sample(c2, rr),
+                              impl_->sample(c3, rr), fx);
     }
-    return catmull_rom(rows[0], rows[1], rows[2], rows[3], fy);
+    if (!std::isfinite(rows[0]) || !std::isfinite(rows[1]) || !std::isfinite(rows[2]) ||
+        !std::isfinite(rows[3])) {
+        return std::nullopt;
+    }
+    const double value = catmull_rom(rows[0], rows[1], rows[2], rows[3], fy);
+    return std::isfinite(value) ? std::optional<double>(value) : std::nullopt;
 }
 
 std::optional<double> GeoidGrid::undulation(double lon_deg, double lat_deg) const {
-    if (const auto via_proj = proj_undulation(lon_deg, lat_deg)) {
-        return via_proj;
+    if (!impl_) {
+        return std::nullopt;
+    }
+    if (impl_->proj.available()) {
+        // PROJ is the evaluator whenever it can be asked at all, so its answer
+        // stands — including "no value". A point PROJ refused (outside the
+        // grid's own coverage, or on a nodata cell) must not be answered by the
+        // GeoTIFF reader: that would replace a refusal with an interpolated
+        // value. Only a grid PROJ cannot even open falls through.
+        if (!covers(lon_deg, lat_deg)) {
+            return std::nullopt;
+        }
+        const ProjAnswer answer =
+            impl_->proj.at(normalize_lon(lon_deg, impl_->info.min_lon_deg), lat_deg);
+        if (answer.kind == ProjAnswer::Kind::Value) {
+            return answer.value;
+        }
+        if (answer.kind == ProjAnswer::Kind::Refused) {
+            return std::nullopt;
+        }
+        // Unavailable: the context or the pipeline could not be built on this
+        // thread. That is "PROJ is unavailable for this grid", so the reader
+        // answers below.
     }
     return grid_undulation(lon_deg, lat_deg);
 }
