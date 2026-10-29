@@ -11,6 +11,9 @@
 
 #include <cmath>
 #include <limits>
+#include <utility>
+
+#include "base/utils/error.hpp"
 
 namespace alphashape::crs {
 namespace {
@@ -18,7 +21,7 @@ namespace {
 /// WGS 84 defining constants (the ellipsoid EPSG:4978 is defined on).
 constexpr double kWgs84A = 6378137.0;
 constexpr double kWgs84F = 1.0 / 298.257223563;
-constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+constexpr double kPi = 3.14159265358979323846;
 
 /// Geocentric ECEF (metres) -> geodetic latitude/longitude (radians).
 /// Bowring's iteration on the reduced latitude, the same construction the
@@ -28,8 +31,7 @@ void ecef_to_lat_lon(const Eigen::Vector3d& ecef, double* lat_rad, double* lon_r
     const double p = std::hypot(ecef.x(), ecef.y());
     *lon_rad = std::atan2(ecef.y(), ecef.x());
     if (p == 0.0) {
-        *lat_rad = ecef.z() >= 0.0 ? 0.5 * 3.14159265358979323846
-                                   : -0.5 * 3.14159265358979323846;
+        *lat_rad = ecef.z() >= 0.0 ? 0.5 * kPi : -0.5 * kPi;
         return;
     }
     double lat = std::atan2(ecef.z(), p * (1.0 - e2));
@@ -63,9 +65,13 @@ Eigen::Matrix3d enu_rotation(double lat_rad, double lon_rad) {
 
 /// Step (metres) used to linearise to_crs() at the anchor for `transform()`.
 /// A central difference makes the result exact for an affine (geocentric)
-/// mapping and accurate to well under a millimetre over a kilometre for a
-/// curved one.
-constexpr double kJacobianStepM = 1.0;
+/// mapping. The step is not 1 m: the CRS values it differences are around the
+/// ECEF magnitude (6.4e6 m) or a longitude in degrees (11), where one ULP is
+/// about 1e-9 m and 2e-15 deg, so a 1 m step would lose most of the derivative
+/// to cancellation. 100 m keeps the difference well above that noise while the
+/// curvature it ignores stays far below the documented "near the anchor"
+/// accuracy.
+constexpr double kJacobianStepM = 100.0;
 
 }  // namespace
 
