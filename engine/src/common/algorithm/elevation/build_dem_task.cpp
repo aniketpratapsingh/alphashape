@@ -77,8 +77,8 @@ void BuildDemTask::declare_params(Params& params) const {
     params.declare(source_data);
 
     ParamSpec interpolation{"interpolation", ParamType::String, std::string("enabled"),
-                            "How holes are filled: \"disabled\" (nodata), \"enabled\" (interior "
-                            "holes only) or \"extrapolated\" (every hole)."};
+                            "How holes are filled: \"disabled\" (nodata), \"enabled\" (holes inside "
+                            "the cameras' ground footprints) or \"extrapolated\" (every hole)."};
     interpolation.choices = {"disabled", "enabled", "extrapolated"};
     params.declare(interpolation);
 

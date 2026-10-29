@@ -62,8 +62,9 @@ def built_document():
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
     doc.run_task("AlignCameras")
     doc.run_task("BuildDepthMaps", downscale=DOWNSCALE, filter_mode="mild")
-    # interpolation="enabled" fills interior holes only: reaching 100% needs
-    # the extrapolating mode, which is not what this test is about.
+    # interpolation="enabled" fills the holes inside the cameras' ground
+    # footprints; this fixture builds it because the views below read a real
+    # DEM, not because of the fill policy.
     chunk.buildDem(interpolation="enabled", smoothing="none")
     chunk.buildOrthomosaic(refine_seamlines=False, fill_holes=False)
     return doc, chunk
@@ -167,8 +168,8 @@ class TestElevationView(unittest.TestCase):
     def test_nodata_cells_report_the_sentinel(self):
         dem = self.dem
         nodata = dem.nodata
-        # "enabled" fill leaves the one-camera rim empty, so at least one cell
-        # must carry the sentinel. height_at over a fully-empty corner is None.
+        # The DEM grid extends past the cameras' footprints (the outside-hull
+        # nodata rim), so at least one cell must carry the sentinel.
         heights = dem.heights()
         seen_nodata = any(value == nodata for row in heights for value in row)
         self.assertTrue(seen_nodata)

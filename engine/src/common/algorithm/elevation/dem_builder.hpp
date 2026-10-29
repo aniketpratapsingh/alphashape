@@ -45,8 +45,8 @@ TgvOptions dem_smoothing_options();
 struct DemOptions {
     /// "point_cloud", "model" or "depth_maps".
     std::string source = "depth_maps";
-    /// "disabled", "enabled" (fill interior holes only) or "extrapolated"
-    /// (fill every hole).
+    /// "disabled", "enabled" (fill holes inside the cameras' ground footprints)
+    /// or "extrapolated" (fill every hole).
     std::string interpolation = "enabled";
     /// Cell size in plane units. <= 0 selects an automatic resolution from the
     /// source's sample spacing.

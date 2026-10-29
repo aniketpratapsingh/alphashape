@@ -621,6 +621,111 @@ TEST(HoleFill, InteriorOnlySkipsBorderConnectedHole) {
     EXPECT_FLOAT_EQ(values[static_cast<std::size_t>(40) * W + 40], 1.0f);
 }
 
+TEST(HoleFill, RegionFillsBorderConnectedHoleInsideIt) {
+    // The failure this guards: the nodata rim OUTSIDE the survey surrounds the
+    // data, so a real hole inside the cover reaches the raster border through
+    // invalid cells. A fill region states the cover explicitly, so the hole is
+    // filled even though `interior_only` would have skipped it.
+    const int W = 48;
+    const int H = 48;
+    std::vector<float> values(area(W, H), 2.0f);
+    std::vector<std::uint8_t> valid(area(W, H), 1);
+    // A 6-wide column of holes from the top border down to the middle: connected
+    // to the raster border, so `interior_only` alone would leave it nodata.
+    for (int y = 0; y <= 23; ++y) {
+        for (int x = 20; x <= 25; ++x) {
+            valid[lin(x, y, W)] = 0;
+        }
+    }
+    // The region: two overlapping "footprints" covering x in [8, 39] -- the
+    // hole is inside their union, the rest of the raster is outside it.
+    HoleFillOptions opt;
+    opt.method = HoleFill::Nearest;
+    opt.interior_only = true;  // ignored because a region is given
+    opt.region.assign(area(W, H), 0);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 8; x <= 39; ++x) {
+            opt.region[lin(x, y, W)] = 1;
+        }
+    }
+    const HoleFillReport rep = fill_holes(W, H, values, valid, opt);
+
+    // Every hole cell is inside the region: all 24 * 6 of them are filled.
+    EXPECT_EQ(rep.filled, 24u * 6u);
+    EXPECT_EQ(rep.remaining, 0u);
+    EXPECT_EQ(valid[lin(20, 0, W)], 1);
+    EXPECT_EQ(valid[lin(22, 23, W)], 1);
+    EXPECT_FLOAT_EQ(values[lin(22, 10, W)], 2.0f);  // nearest cell's value
+}
+
+TEST(HoleFill, RegionLeavesCellsOutsideItInvalid) {
+    // A hole spanning both the region and the ground beyond it: only the cells
+    // where region[i] != 0 may be filled, the rest stay nodata.
+    const int W = 40;
+    const int H = 40;
+    std::vector<float> values(area(W, H), 3.0f);
+    std::vector<std::uint8_t> valid(area(W, H), 1);
+    for (int y = 10; y <= 29; ++y) {
+        for (int x = 10; x <= 29; ++x) {
+            valid[lin(x, y, W)] = 0;
+        }
+    }
+    HoleFillOptions opt;
+    opt.method = HoleFill::Nearest;
+    opt.region.assign(area(W, H), 0);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < 20; ++x) {  // the region: the western half only
+            opt.region[lin(x, y, W)] = 1;
+        }
+    }
+    const HoleFillReport rep = fill_holes(W, H, values, valid, opt);
+
+    EXPECT_EQ(rep.filled, 20u * 10u);  // hole cells with x in [10, 19]
+    EXPECT_EQ(valid[lin(15, 20, W)], 1);
+    EXPECT_EQ(valid[lin(25, 20, W)], 0);  // inside the hole, outside the region
+    EXPECT_GT(rep.remaining, 0u);
+}
+
+TEST(HoleFill, RegionKeepsAConcaveGapInvalid) {
+    // Two separated footprints with a gap between them. The union of two
+    // rectangles is concave; a convex hull of the region would fill the gap.
+    const int W = 64;
+    const int H = 32;
+    std::vector<float> values(area(W, H), 4.0f);
+    std::vector<std::uint8_t> valid(area(W, H), 1);
+    for (int y = 8; y <= 23; ++y) {
+        for (int x = 8; x <= 55; ++x) {
+            valid[lin(x, y, W)] = 0;
+        }
+    }
+    HoleFillOptions opt;
+    opt.method = HoleFill::Nearest;
+    opt.region.assign(area(W, H), 0);
+    for (int y = 8; y <= 23; ++y) {
+        for (int x = 8; x <= 23; ++x) {  // west strip
+            opt.region[lin(x, y, W)] = 1;
+        }
+        for (int x = 40; x <= 55; ++x) {  // east strip
+            opt.region[lin(x, y, W)] = 1;
+        }
+    }
+    const HoleFillReport rep = fill_holes(W, H, values, valid, opt);
+
+    EXPECT_EQ(rep.filled, 2u * 16u * 16u);
+    EXPECT_EQ(valid[lin(15, 15, W)], 1);  // inside the west strip
+    EXPECT_EQ(valid[lin(47, 15, W)], 1);  // inside the east strip
+    EXPECT_EQ(valid[lin(31, 15, W)], 0);  // the gap: neither footprint
+    EXPECT_EQ(valid[lin(32, 8, W)], 0);
+}
+
+TEST(HoleFill, RegionSizeMismatchThrows) {
+    std::vector<float> values(16, 0.0f);
+    std::vector<std::uint8_t> valid(16, 1);
+    HoleFillOptions opt;
+    opt.region.assign(15, 1);
+    EXPECT_THROW(fill_holes(4, 4, values, valid, opt), ValueError);
+}
+
 TEST(HoleFill, ThreadCountDoesNotChangeResult) {
     const int W = 128;
     const int H = 128;
