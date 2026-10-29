@@ -28,7 +28,6 @@ add_executable(alphashape_tests
     test_align_cameras.cpp
     test_optimize_cameras.cpp
     test_geodesy.cpp
-    test_projection.cpp
     test_similarity.cpp
     test_georeference.cpp
     test_view_selection.cpp
@@ -83,7 +82,8 @@ if(ALPHASHAPE_USE_PROJ)
         test_local_frame.cpp
         test_geoid.cpp
         test_euler_angles.cpp
-        test_reference_convert.cpp)
+        test_reference_convert.cpp
+        test_surface_frame.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>
     # directly for the raw-API assertions; linking the interface target keeps
     # the include directories available without a second package lookup.
@@ -159,3 +159,19 @@ gtest_discover_tests(alphashape_tests
     ${_alphashape_discovery_args}
     ${_alphashape_test_args}
     TEST_FILTER ${_alphashape_gpu_ports_filter})
+
+# M12 WP-12.8: geo::Projection (the hand-written Transverse Mercator selector)
+# was deleted in favour of the PROJ-backed CRS engine. A stale copy of the
+# header would silently let a caller keep using the parallel implementation, so
+# this guard fails the configure/build step instead. It is slow-free (a
+# configure-time test) and names the offending files.
+file(GLOB_RECURSE _alphashape_removed_geo_headers
+    "${PROJECT_SOURCE_DIR}/src/model/geo/projection.hpp"
+    "${PROJECT_SOURCE_DIR}/src/model/geo/transverse_mercator.hpp")
+if(_alphashape_removed_geo_headers)
+    message(FATAL_ERROR
+        "WP-12.8 removed geo::Projection and TransverseMercator "
+        "(src/model/geo/projection.hpp, transverse_mercator.hpp); these files "
+        "still exist: ${_alphashape_removed_geo_headers}. Use crs::CoordinateSystem "
+        "and crs::CrsTransform instead.")
+endif()

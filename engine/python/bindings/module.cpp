@@ -419,8 +419,9 @@ PYBIND11_MODULE(alphashape, m) {
             return py::make_tuple(v.elevation->raster.grid.origin_x,
                                   v.elevation->raster.grid.origin_y);
         })
+        // Compatibility accessor over `crs` (M12 §4.9, WP-12.8).
         .def_property_readonly("epsg",
-                               [](const ElevationView& v) { return v.elevation->epsg; })
+                               [](const ElevationView& v) { return v.elevation->epsg(); })
         .def_property_readonly("nodata", [](const ElevationView& v) {
             return static_cast<double>(v.elevation->nodata);
         })
@@ -468,8 +469,9 @@ PYBIND11_MODULE(alphashape, m) {
             return py::make_tuple(v.orthomosaic->raster.grid.origin_x,
                                   v.orthomosaic->raster.grid.origin_y);
         })
+        // Compatibility accessor over `crs` (M12 §4.9, WP-12.8).
         .def_property_readonly("epsg",
-                               [](const OrthomosaicView& v) { return v.orthomosaic->epsg; })
+                               [](const OrthomosaicView& v) { return v.orthomosaic->epsg(); })
         .def_property_readonly("surface",
                                [](const OrthomosaicView& v) { return v.orthomosaic->surface; })
         // The raw RGBA bytes, row-major: width*height*4.

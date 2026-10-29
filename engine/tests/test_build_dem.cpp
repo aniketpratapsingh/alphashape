@@ -940,9 +940,9 @@ TEST(BuildDemPipeline, AerialDepthMapsToDem) {
     const auto t3 = clock::now();
     std::printf("[BuildDemPipeline] BuildDem (tgv) %.1f s, grid %dx%d epsg %d\n",
                 seconds(t2, t3), chunk.elevation().raster.grid.width,
-                chunk.elevation().raster.grid.height, chunk.elevation().epsg);
+                chunk.elevation().raster.grid.height, chunk.elevation().epsg());
     ASSERT_FALSE(chunk.elevation().empty());
-    EXPECT_EQ(chunk.elevation().epsg, 32632);  // UTM zone 32N
+    EXPECT_EQ(chunk.elevation().epsg(), 32632);  // UTM zone 32N
 
     const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 0);
     ASSERT_FALSE(frame.is_local());
@@ -1005,7 +1005,7 @@ TEST(ExportDem, WritesGeoTiffWithChunkEpsg) {
     chunk.transform() = geo::enu_to_ecef(geo::Geodetic{9.2, 48.7, 300.0});
     run_build_dem(document, build);
     ASSERT_FALSE(chunk.elevation().empty());
-    EXPECT_EQ(chunk.elevation().epsg, 32632);
+    EXPECT_EQ(chunk.elevation().epsg(), 32632);
 
     const std::string dir = ::testing::TempDir() + "/alphashape_export_dem";
     std::filesystem::create_directories(dir);
@@ -1107,7 +1107,7 @@ TEST(DemAutoResolution, GeographicDepthMapCellIsInDegrees) {
     run_build_dem(document, dem);
     const Elevation& elevation = chunk.elevation();
     ASSERT_FALSE(elevation.empty());
-    ASSERT_EQ(elevation.epsg, 4326);
+    ASSERT_EQ(elevation.epsg(), 4326);
 
     const double cell_deg = elevation.raster.grid.pixel_size_x;
     const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 4326);
@@ -1126,6 +1126,108 @@ TEST(DemAutoResolution, GeographicDepthMapCellIsInDegrees) {
     EXPECT_LT(cell_deg, 1e-4) << "a degree cell for this block is ~1e-6 deg";
     EXPECT_GT(cell_metres, 0.01);
     EXPECT_LT(cell_metres, 5.0);
+}
+
+// 8. CRS migration (M12 §4.9, WP-12.8)
+// ---------------------------------------------------------------------------
+
+TEST(BuildDem, InvalidEpsgRejected) {
+    // An EPSG code PROJ does not know is refused at the task boundary, before
+    // any work: the DEM build names the same CRS the grid would be written in.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -10.0, 10.0, -10.0, 10.0, 1.0);
+    Params params = dem_params("point_cloud", "enabled", 1.0, 999999, "nearest", "none");
+    EXPECT_THROW(run_build_dem(document, params), ValueError);
+    EXPECT_TRUE(chunk.elevation().empty());
+
+    // The same code through the `crs` string form.
+    Params text = dem_params("point_cloud", "enabled", 1.0, 0, "nearest", "none");
+    text.set("crs", ParamValue{std::string("EPSG:999999")});
+    EXPECT_THROW(run_build_dem(document, text), ValueError);
+    EXPECT_TRUE(chunk.elevation().empty());
+
+    // A negative projection is rejected too (the parameter carries a minimum,
+    // but a direct struct/ParamValue write is still guarded).
+    Params negative = dem_params("point_cloud", "enabled", 1.0, -1, "nearest", "none");
+    EXPECT_THROW(run_build_dem(document, negative), ValueError);
+}
+
+TEST(BuildDem, ProjectionAndCrsMustAgree) {
+    // `projection` (Int EPSG) and `crs` (String) are two spellings of one
+    // request. Both set to the same CRS is fine; disagreeing values are a
+    // ValueError naming the conflict, before any grid is allocated.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -10.0, 10.0, -10.0, 10.0, 1.0);
+
+    Params agree = dem_params("point_cloud", "enabled", 1.0, 32632, "nearest", "none");
+    agree.set("crs", ParamValue{std::string("EPSG:32632")});
+    run_build_dem(document, agree);
+    ASSERT_FALSE(chunk.elevation().empty());
+    EXPECT_EQ(chunk.elevation().epsg(), 32632);
+    // A plain EPSG request records the code and no WKT beyond the canonical one
+    // the builder writes; doc.xml then prefers the code on the way back in.
+    EXPECT_EQ(chunk.elevation().crs.epsg, 32632);
+
+    Params disagree = dem_params("point_cloud", "enabled", 1.0, 32632, "nearest", "none");
+    disagree.set("crs", ParamValue{std::string("EPSG:32633")});
+    EXPECT_THROW(run_build_dem(document, disagree), ValueError);
+}
+
+TEST(BuildDem, MatchesTruthInEtrsLaea) {
+    // The spec's MatchesTruthInEtrsLaea: a DEM built directly in EPSG:3035
+    // (ETRS89 / LAEA Europe), a CRS that is neither UTM nor geographic and that
+    // the retired projection selector could not express. The build must not
+    // resample: the plane frame is exact, so the interior accuracy against the
+    // fixture truth is the same as the UTM build's.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
+    params.set("crs", ParamValue{std::string("EPSG:3035")});
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    ASSERT_EQ(dem.epsg(), 3035);
+
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 3035);
+    ASSERT_EQ(frame.epsg(), 3035);
+
+    // RMSE of the observed cells against truth, inside the same interior box the
+    // UTM pipeline test uses. The point cloud samples the analytic surface on
+    // 0.5 m, so the median rule is well inside the 0.03 m bound.
+    std::vector<double> errors;
+    const RasterGrid& grid = dem.raster.grid;
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            const double value = static_cast<double>(dem.raster.at(col, row));
+            if (value == static_cast<double>(dem.nodata)) {
+                continue;
+            }
+            const Eigen::Vector2d c = grid.pixel_center(col, row);
+            const Eigen::Vector3d local =
+                frame.to_local(Eigen::Vector3d(c.x(), c.y(), value));
+            const double lx = local.x(), ly = local.y();
+            if (lx < -50.0 || lx > 50.0 || ly < -38.0 || ly > 38.0) {
+                continue;
+            }
+            if (near_scene_edge(lx, ly, 1.5)) {
+                continue;
+            }
+            errors.push_back(local.z() - aerial_fixture::truth_height(lx, ly));
+        }
+    }
+    ASSERT_GT(errors.size(), 20000U);
+    double sum_sq = 0.0;
+    for (const double e : errors) {
+        sum_sq += e * e;
+    }
+    const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
+    std::printf("[BuildDem.EtrsLaea] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
+    EXPECT_LT(rmse, 0.03);
 }
 
 }  // namespace

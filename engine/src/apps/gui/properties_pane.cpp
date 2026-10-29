@@ -281,7 +281,7 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_elevation_id());
                 if (slot->data) {
-                    describe_raster(r, slot->data->raster.grid, slot->data->epsg);
+                    describe_raster(r, slot->data->raster.grid, slot->data->epsg());
                     add(r, QObject::tr("Source"), qs(slot->data->source));
                     add(r, QObject::tr("No-data value"), num(static_cast<double>(slot->data->nodata)));
                 } else {
@@ -295,7 +295,7 @@ bool describe_one(const Document& document, const NodeRef& ref, PropertySheet& s
                 sheet.title = qs(slot->label);
                 add_slot_common(r, *slot, chunk->active_orthomosaic_id());
                 if (slot->data) {
-                    describe_raster(r, slot->data->raster.grid, slot->data->epsg);
+                    describe_raster(r, slot->data->raster.grid, slot->data->epsg());
                     add(r, QObject::tr("Surface"), qs(slot->data->surface));
                 } else {
                     add(r, QObject::tr("Resolution"), QObject::tr("(not loaded)"));

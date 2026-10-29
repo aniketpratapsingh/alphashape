@@ -83,7 +83,7 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
     }
 
     GeoTiffOptions options;
-    options.epsg = orthomosaic.epsg;
+    options.epsg = orthomosaic.epsg();
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;
@@ -118,7 +118,7 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
         log(LogLevel::Info) << "ExportOrthomosaic: " << orthomosaic.raster.grid.width << "x"
                             << orthomosaic.raster.grid.height << " cells, "
                             << (alpha ? "RGBA" : "RGB") << ", epsg "
-                            << orthomosaic.epsg << " (asset " << asset->id << ") -> " << path
+                            << orthomosaic.epsg() << " (asset " << asset->id << ") -> " << path
                             << (world_file ? " (+ .tfw)" : "");
     }
 }

@@ -173,6 +173,28 @@ All notable changes to alphashape are recorded here. The format follows
   without the leading `@` and never reported under `missing_grids`, so a
   transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
   instead of failing with `transformation needs grid @name; install proj-data`.
+- **DEMs and orthomosaics are built through the CRS engine, in any CRS.**
+  `SurfaceFrame` no longer carries a hand-written Transverse Mercator series
+  and a three-CRS selector; it is now the exact chain chunk-local → ECEF (the
+  chunk transform) → `crs::LocalFrame` → target CRS. DEM and orthomosaic grids
+  can therefore be built in any CRS PROJ knows — a national grid such as
+  ETRS89 / LAEA Europe (EPSG:3035), a compound CRS, or one described by WKT —
+  not just UTM or geographic lon/lat. Auto-selection for an unspecified CRS is
+  still the regular 6-degree UTM rule at the chunk origin, so an existing
+  project's DEM lands in exactly the same zone as before, and the change is
+  numerically neutral for UTM/lon-lat output (the retired series and PROJ agree
+  well inside a millimetre). `BuildDem` and `BuildOrthomosaic` keep the
+  `projection` (Int, EPSG) parameter and gain `crs` (String: `"EPSG:<code>"`, a
+  PROJ string or WKT); setting both to disagreeing values is a `ValueError`. A
+  DEM names its CRS as `Elevation::crs` (`Orthomosaic::crs` likewise) with an
+  `epsg()` compatibility accessor; doc.xml writes the EPSG code as before and
+  adds a `crs_wkt` attribute only when the CRS carries one, so an old project
+  (an EPSG code and nothing else) loads to the same CRS and a plain-code
+  project re-saves byte-identically. `BuildOrthomosaic` now always builds on the
+  DEM's own plane: a request for a different CRS no longer fails with "reproject
+  the DEM first" — it is accepted, and the ortho is written in the DEM's CRS (a
+  cross-CRS conversion is an export-time reprojection). The `geo::Projection`
+  and `TransverseMercator` implementation is removed.
 
 ## [0.2.0] - 2026-10-28
 

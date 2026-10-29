@@ -75,7 +75,7 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
     }
 
     GeoTiffOptions options;
-    options.epsg = elevation.epsg;
+    options.epsg = elevation.epsg();
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;

@@ -164,7 +164,7 @@ inline Document make_v1_fixture_document() {
     dem.raster.data = {2.0F, 2.5F, 3.0F, 3.5F,
                        2.25F, 2.75F, 3.25F, 3.75F,
                        2.5F, 3.0F, 3.5F, 4.0F};
-    dem.epsg = 32633;
+    dem.set_epsg(32633);
     dem.nodata = -32767.0F;
     dem.source = "depth_maps";
     chunk.elevation() = std::move(dem);
@@ -179,7 +179,7 @@ inline Document make_v1_fixture_document() {
     ortho.raster.channels = 4;
     ortho.raster.data = {10, 20, 30, 255, 40, 50, 60, 255,
                          70, 80, 90, 255, 100, 110, 120, 0};
-    ortho.epsg = 32633;
+    ortho.set_epsg(32633);
     ortho.labels = {0, 1, 2, -1};
     ortho.surface = "elevation";
     chunk.orthomosaic() = std::move(ortho);

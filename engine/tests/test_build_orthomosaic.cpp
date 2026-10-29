@@ -333,7 +333,7 @@ TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     const Orthomosaic& ortho = chunk.orthomosaic();
     ASSERT_FALSE(ortho.empty());
     ASSERT_EQ(ortho.raster.channels, 4);
-    ASSERT_EQ(ortho.epsg, 32632);
+    ASSERT_EQ(ortho.epsg(), 32632);
     ASSERT_EQ(ortho.surface, "elevation");
     ASSERT_EQ(ortho.labels.size(),
               static_cast<std::size_t>(ortho.raster.grid.width) *
@@ -507,6 +507,69 @@ TEST(BuildOrthomosaic, PlaneToLocalIsExact) {
 // 4. Errors
 // ---------------------------------------------------------------------------
 
+TEST(BuildOrthomosaic, BuildsInDemCrsWithoutPreprojection) {
+    // The spec's BuildsInDemCrsWithoutPreprojection (M12 §4.9, WP-12.8): asking
+    // for an ortho whose `projection` differs from the DEM's used to be refused
+    // ("reproject the DEM first"). The ortho is now always built on the DEM's
+    // plane, so the request succeeds and lands on the DEM's CRS, with no
+    // reprojection-induced geometric error.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const RasterGrid dem_grid = chunk.elevation().raster.grid;
+    const int dem_epsg = chunk.elevation().crs.epsg;
+    ASSERT_EQ(dem_epsg, 32632);
+
+    // 1 m cells keep the run cheap; the request names a DIFFERENT CRS.
+    Params params = ortho_params("mosaic", "elevation", 1.0, true, true,
+                                 std::int64_t{32633});
+    run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    // Built in the DEM's CRS, not the request's.
+    EXPECT_EQ(ortho.epsg(), dem_epsg);
+    // The grid follows the DEM's, so the same output origin and cell.
+    EXPECT_NEAR(ortho.raster.grid.origin_x, dem_grid.origin_x,
+                ortho.raster.grid.pixel_size_x);
+    EXPECT_NEAR(ortho.raster.grid.origin_y, dem_grid.origin_y,
+                ortho.raster.grid.pixel_size_y);
+
+    // Geometry is unaffected: every observed cell's local position, recovered
+    // through the DEM-CRS frame, lies within one cell of the DEM's own mapping
+    // of that cell (the "no preprojection" error budget of <= 1 px).
+    ASSERT_TRUE(s.frame.has_value());
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, dem_epsg);
+    std::size_t checked = 0;
+    double worst_px = 0.0;
+    const double cell = ortho.raster.grid.pixel_size_x;
+    for (int row = 0; row < ortho.raster.grid.height; row += 4) {
+        for (int col = 0; col < ortho.raster.grid.width; col += 4) {
+            const std::size_t i = static_cast<std::size_t>(row) *
+                                      static_cast<std::size_t>(ortho.raster.grid.width) +
+                                  static_cast<std::size_t>(col);
+            if (ortho.raster.data[i * 4 + 3] == 0) {
+                continue;  // unobserved
+            }
+            const Eigen::Vector2d c = ortho.raster.grid.pixel_center(col, row);
+            const double h = dem_height(chunk.elevation(), c.x(), c.y());
+            if (h == static_cast<double>(chunk.elevation().nodata) || !std::isfinite(h)) {
+                continue;
+            }
+            // The ortho cell centre expressed in the DEM plane must come back to
+            // the same local point through the DEM frame: that is exactly what
+            // "built without a second projection" means.
+            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), h));
+            const Eigen::Vector3d back = frame.to_plane(local);
+            worst_px = std::max(worst_px, std::hypot(back.x() - c.x(), back.y() - c.y()) / cell);
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 1000U);
+    EXPECT_LT(worst_px, 1.0);
+    std::printf("[BuildOrthomosaic.BuildsInDemCrs] cells=%zu worst=%.3e px\n", checked,
+                worst_px);
+}
+
 TEST(BuildOrthomosaic, Errors) {
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
@@ -523,20 +586,13 @@ TEST(BuildOrthomosaic, Errors) {
     EXPECT_THROW(run_task(builtin_registry(), empty, "BuildOrthomosaic", model_no_mesh),
                  ValueError);
 
-    // A projection that differs from the DEM's is refused with the documented
-    // message: the task does not reproject.
-    Params reproject = ortho_params("mosaic", "elevation", 0.0, true, true,
-                                    std::int64_t{32633});
-    bool threw = false;
-    try {
-        run_task(builtin_registry(), s.document, "BuildOrthomosaic", reproject);
-    } catch (const ValueError& error) {
-        threw = true;
-        EXPECT_NE(std::string(error.what()).find("reproject the DEM first"),
-                  std::string::npos)
-            << error.what();
-    }
-    EXPECT_TRUE(threw);
+    // `projection` and `crs` are two spellings of one request: disagreeing
+    // values are refused at the boundary (WP-12.8), before any work.
+    Params conflict = ortho_params("mosaic", "elevation", 1.0, true, true,
+                                   std::int64_t{32632});
+    conflict.set("crs", ParamValue{std::string("EPSG:32633")});
+    EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", conflict),
+                 ValueError);
 
     Params bad_blend = ortho_params("bogus");
     EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_blend),
@@ -894,9 +950,9 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     std::shared_ptr<Document> loaded = ProjectIO::load(project);
     const Chunk& got = *loaded->workspace().chunks().front();
     EXPECT_TRUE(got == project_chunk);
-    EXPECT_EQ(got.elevation().epsg, chunk.elevation().epsg);
+    EXPECT_EQ(got.elevation().epsg, chunk.elevation().epsg());
     EXPECT_EQ(got.elevation().source, "depth_maps");
-    EXPECT_EQ(got.orthomosaic().epsg, chunk.orthomosaic().epsg);
+    EXPECT_EQ(got.orthomosaic().epsg, chunk.orthomosaic().epsg());
     EXPECT_EQ(got.orthomosaic().surface, "elevation");
     EXPECT_EQ(got.orthomosaic().labels, chunk.orthomosaic().labels);
 }
@@ -989,7 +1045,7 @@ TEST(OrthoAutoResolution, DefaultFollowsTheMeasuredGsdNotAQuarterDemCell) {
     // surface the measurement sees.
     constexpr double kCell = 1.0;
     Elevation& elevation = chunk.elevation();
-    elevation.epsg = 0;
+    elevation.set_epsg(0);
     elevation.source = "depth_maps";
     elevation.nodata = -32767.0F;
     RasterGrid& grid = elevation.raster.grid;

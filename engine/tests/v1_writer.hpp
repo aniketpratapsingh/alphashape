@@ -190,7 +190,7 @@ void write_assets(const Chunk& chunk, docxml::XmlNode& node, ZipArchive& archive
         docxml::set_attr(e, "height", std::to_string(g.height));
         docxml::set_attr(e, "origin", docxml::vec2(g.origin_x, g.origin_y));
         docxml::set_attr(e, "pixel_size", docxml::vec2(g.pixel_size_x, g.pixel_size_y));
-        docxml::set_attr(e, "epsg", std::to_string(elevation.epsg));
+        docxml::set_attr(e, "epsg", std::to_string(elevation.epsg()));
         docxml::set_attr(e, "nodata",
                          docxml::fmt(static_cast<double>(elevation.nodata)));
         docxml::set_attr(e, "source", elevation.source);
@@ -207,7 +207,7 @@ void write_assets(const Chunk& chunk, docxml::XmlNode& node, ZipArchive& archive
         docxml::set_attr(e, "height", std::to_string(g.height));
         docxml::set_attr(e, "origin", docxml::vec2(g.origin_x, g.origin_y));
         docxml::set_attr(e, "pixel_size", docxml::vec2(g.pixel_size_x, g.pixel_size_y));
-        docxml::set_attr(e, "epsg", std::to_string(ortho.epsg));
+        docxml::set_attr(e, "epsg", std::to_string(ortho.epsg()));
         docxml::set_attr(e, "surface", ortho.surface);
     }
 }

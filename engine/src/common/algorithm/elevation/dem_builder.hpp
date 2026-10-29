@@ -51,9 +51,9 @@ struct DemOptions {
     /// Cell size in plane units. <= 0 selects an automatic resolution from the
     /// source's sample spacing.
     double resolution = 0.0;
-    /// Requested EPSG for the output grid; 0 = auto UTM (georeferenced chunk)
-    /// or chunk-local (unreferenced chunk).
-    int epsg = 0;
+    /// Requested CRS for the output grid (M12 §4.9). Unset = auto UTM for a
+    /// georeferenced chunk, or the chunk-local frame when unreferenced.
+    crs::CoordinateSystem crs;
     /// Hole-filling method used for the cells interpolation fills.
     HoleFill fill = HoleFill::NaturalNeighbour;
     /// Holes bordered by at most this many data cells are filled with exact
