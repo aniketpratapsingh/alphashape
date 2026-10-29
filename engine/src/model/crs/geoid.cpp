@@ -945,6 +945,15 @@ std::shared_ptr<const GeoidGrid> GeoidStore::grid_for(const Entry& entry) const 
     return entry.grid;
 }
 
+std::shared_ptr<const GeoidGrid> GeoidStore::grid(const std::string& id) const {
+    for (const Entry& entry : entries_) {
+        if (entry.model.id == id) {
+            return grid_for(entry);
+        }
+    }
+    return nullptr;
+}
+
 bool GeoidStore::covers(const std::string& id, double lon_deg, double lat_deg) const {
     for (const Entry& entry : entries_) {
         if (entry.model.id != id) {

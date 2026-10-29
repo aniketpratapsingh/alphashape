@@ -139,6 +139,11 @@ public:
                                      double lat_deg) const;
     bool covers(const std::string& id, double lon_deg, double lat_deg) const;
 
+    /// The opened grid for `id`, or null when the id is unknown or the grid
+    /// cannot be opened. The grid is shared and read-only, so a caller that
+    /// needs one (a `VerticalTransform::custom`) can hold it past this store.
+    std::shared_ptr<const GeoidGrid> grid(const std::string& id) const;
+
     /// Directory `save()` writes to and `load()` reads; empty until either is
     /// called or `set_directory()` is used.
     const std::filesystem::path& directory() const;

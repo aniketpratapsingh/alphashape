@@ -67,11 +67,23 @@ struct VerticalCrs {
     std::string name;      ///< "EGM2008 height", "NAVD88 height"
     std::string grid;      ///< geoid grid id, e.g. "us_nga_egm08_25.tif"
     double offset_m = 0.0; ///< constant offset applied after the grid
+    /// EPSG code of the horizontal CRS the geoid is referred to (its own
+    /// horizontal datum), e.g. 4979 for WGS 84. N is evaluated in this frame
+    /// before the horizontal transform; 0 means unspecified and defaults to
+    /// EPSG:4979.
+    int horizontal_epsg = 0;
+
+    /// The horizontal CRS a geoid's undulation N is referred to:
+    /// `horizontal_epsg` when set, EPSG:4979 (WGS 84 geographic 3D, NGS/EGM96
+    /// and EGM2008 grids' own frame) otherwise.
+    int geoid_horizontal_epsg() const {
+        return horizontal_epsg != 0 ? horizontal_epsg : 4979;
+    }
 
     bool is_set() const { return kind != Kind::Ellipsoidal; }
     bool operator==(const VerticalCrs& other) const {
         return kind == other.kind && name == other.name && grid == other.grid &&
-               offset_m == other.offset_m;
+               offset_m == other.offset_m && horizontal_epsg == other.horizontal_epsg;
     }
     bool operator!=(const VerticalCrs& other) const { return !(*this == other); }
 };
