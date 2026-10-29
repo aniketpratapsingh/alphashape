@@ -945,9 +945,35 @@ std::vector<std::array<double, 3>> estimate_camera_gains(
     }
 
     if (overlaps.empty()) {
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildOrthomosaic: gain compensation found no overlapping "
+                                   "camera pairs on the coarse grid; leaving gains at 1";
+        }
         return identity;
     }
-    return ortho::solve_gains(static_cast<int>(cameras.size()), overlaps.finish());
+    const std::vector<ortho::OverlapPair> pairs = overlaps.finish();
+    if (Log::enabled(LogLevel::Info)) {
+        // The RAW gain range before mean-normalisation is the useful diagnostic:
+        // a range hugging 1 means the photographs already agree, while a wide
+        // range that normalises flat would mean the solve found no real signal.
+        double raw_lo = 1.0;
+        double raw_hi = 1.0;
+        for (const ortho::OverlapPair& pair : pairs) {
+            for (int c = 0; c < 3; ++c) {
+                const double a = pair.mean_a[static_cast<std::size_t>(c)];
+                const double b = pair.mean_b[static_cast<std::size_t>(c)];
+                if (a > 1e-6 && b > 1e-6) {
+                    const double ratio = a / b;
+                    raw_lo = std::min(raw_lo, ratio);
+                    raw_hi = std::max(raw_hi, ratio);
+                }
+            }
+        }
+        log(LogLevel::Info) << "BuildOrthomosaic: gain estimate over " << pairs.size()
+                            << " overlapping camera pairs, overlap brightness ratio "
+                            << raw_lo << " .. " << raw_hi;
+    }
+    return ortho::solve_gains(static_cast<int>(cameras.size()), pairs);
 }
 
 }  // namespace
