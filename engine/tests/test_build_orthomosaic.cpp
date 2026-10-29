@@ -950,9 +950,9 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     std::shared_ptr<Document> loaded = ProjectIO::load(project);
     const Chunk& got = *loaded->workspace().chunks().front();
     EXPECT_TRUE(got == project_chunk);
-    EXPECT_EQ(got.elevation().epsg, chunk.elevation().epsg());
+    EXPECT_EQ(got.elevation().epsg(), chunk.elevation().epsg());
     EXPECT_EQ(got.elevation().source, "depth_maps");
-    EXPECT_EQ(got.orthomosaic().epsg, chunk.orthomosaic().epsg());
+    EXPECT_EQ(got.orthomosaic().epsg(), chunk.orthomosaic().epsg());
     EXPECT_EQ(got.orthomosaic().surface, "elevation");
     EXPECT_EQ(got.orthomosaic().labels, chunk.orthomosaic().labels);
 }
