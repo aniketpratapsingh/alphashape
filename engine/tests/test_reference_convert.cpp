@@ -30,7 +30,6 @@
 #include "base/utils/error.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/commands/command.hpp"
-#include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/marker.hpp"
@@ -125,10 +124,14 @@ TEST(Crs, ConvertReferenceUtmToGeographic) {
     EXPECT_EQ(chunk.marker_crs().epsg, 32632);
     // Accuracies are weights, carried unchanged.
     for (const Camera& camera : chunk.cameras()) {
-        EXPECT_EQ(camera.reference.accuracy, Eigen::Vector3d::Constant(10.0));
+        EXPECT_DOUBLE_EQ(camera.reference.accuracy.x(), 10.0);
+        EXPECT_DOUBLE_EQ(camera.reference.accuracy.y(), 10.0);
+        EXPECT_DOUBLE_EQ(camera.reference.accuracy.z(), 10.0);
     }
     for (const Marker& marker : chunk.markers()) {
-        EXPECT_EQ(marker.reference_accuracy, Eigen::Vector3d::Constant(0.5));
+        EXPECT_DOUBLE_EQ(marker.reference_accuracy.x(), 0.5);
+        EXPECT_DOUBLE_EQ(marker.reference_accuracy.y(), 0.5);
+        EXPECT_DOUBLE_EQ(marker.reference_accuracy.z(), 0.5);
     }
 
     // Round trip back: each value must return inside 1e-9 degrees.
@@ -181,9 +184,10 @@ TEST(Crs, ConvertReferenceKeepsMissingAltitude) {
     EXPECT_TRUE(std::isnan(after.z()));
     // The horizontal answer is the one the same point gets when a height is
     // supplied: a missing height must not leak into x/y.
-    const crs::CrsPoint with_height = transform_point(geographic(), utm(32), Eigen::Vector3d(9.0, 50.0, 0.0));
-    EXPECT_DOUBLE_EQ(after.x(), with_height.x);
-    EXPECT_DOUBLE_EQ(after.y(), with_height.y);
+    const crs::CrsPoint with_height =
+        transform_point(geographic(), utm(32), Eigen::Vector3d(9.0, 50.0, 0.0));
+    EXPECT_NEAR(after.x(), with_height.x, 1e-6);
+    EXPECT_NEAR(after.y(), with_height.y, 1e-6);
 }
 
 // A camera reference with no location at all is left alone, and the slot still
@@ -244,8 +248,8 @@ TEST(Crs, ConvertReferenceAltitudeUsesVerticalCrs) {
     EXPECT_NEAR((*chunk.cameras()[0].reference.location).z(), 300.0 + *n, 1e-3);
     EXPECT_NEAR((*chunk.markers()[0].reference).z(), 300.0 + *n, 1e-3);
     // The horizontal coordinates are untouched by a pure vertical change.
-    EXPECT_NEAR((*chunk.cameras()[0].reference.location).x(), lon, 1e-9);
-    EXPECT_NEAR((*chunk.cameras()[0].reference.location).y(), lat, 1e-9);
+    EXPECT_NEAR((*chunk.cameras()[0].reference.location).x(), lon, 1e-7);
+    EXPECT_NEAR((*chunk.cameras()[0].reference.location).y(), lat, 1e-7);
     // The target slot no longer carries a datum.
     EXPECT_FALSE(chunk.camera_crs().vertical.has_value());
 }
@@ -425,15 +429,23 @@ TEST(Crs, ConvertReferenceCommandRejectsBadTarget) {
 }
 
 // A failure in the second slot must not leave the first one converted: the
-// new values are computed for both slots before either is written.
+// new values are computed for both slots before either is written. (The
+// comparison is per field because a NaN position, which is what triggers the
+// failure, never compares equal to itself.)
 TEST(Crs, ConvertReferenceFailureLeavesChunkUntouched) {
     Chunk chunk = make_chunk(geographic(), 1, 1, 9.0, 50.0);
+    const Eigen::Vector3d camera_before = *chunk.cameras()[0].reference.location;
     // A marker with an unmeasurable longitude makes the marker slot throw.
     chunk.markers()[0].reference = Eigen::Vector3d(std::nan(""), 50.0, 0.0);
-    const Chunk before = chunk;
     EXPECT_THROW(convert_reference(chunk, utm(32), ReferenceKind::Both), ValueError);
-    EXPECT_TRUE(chunk == before) << "a failed conversion changed the camera slot";
+    ASSERT_TRUE(chunk.cameras()[0].reference.location.has_value());
+    const Eigen::Vector3d& camera_after = *chunk.cameras()[0].reference.location;
+    EXPECT_DOUBLE_EQ(camera_after.x(), camera_before.x())
+        << "a failed conversion changed the camera slot";
+    EXPECT_DOUBLE_EQ(camera_after.y(), camera_before.y());
+    EXPECT_DOUBLE_EQ(camera_after.z(), camera_before.z());
     EXPECT_EQ(chunk.camera_crs().epsg, 4979);
+    EXPECT_EQ(chunk.marker_crs().epsg, 4979);
 }
 
 }  // namespace

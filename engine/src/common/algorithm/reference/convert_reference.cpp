@@ -143,8 +143,8 @@ Converter build_converter(const CoordinateSystem& source, const CoordinateSystem
         (src_set && crs::lookup_vertical_crs(src_datum).epsg == 0) ? src_datum : dst_datum;
     if (geoids == nullptr) {
         throw Error(std::string("convert the ") + role + " references: vertical datum \"" +
-                    needed.name +
-                    "\" needs a geoid grid, but no geoid store was supplied");
+                    needed.name + "\" needs the geoid grid \"" + geoid_id(needed) +
+                    "\", but no geoid store was supplied");
     }
     throw Error(std::string("convert the ") + role + " references: vertical datum \"" +
                 needed.name + "\" needs the geoid grid \"" + geoid_id(needed) +
@@ -193,11 +193,14 @@ crs::RotationOrder rotation_order_of(const Chunk& chunk) {
 // --- chunk 2
 namespace {
 
-/// Central-difference step for one CRS's axes, in that CRS's own units. A
-/// geographic CRS is in degrees; every other CRS the engine accepts is metres.
-/// 1e-5 deg is about 1.1 m, far above the 1e-15 deg resolution of a longitude
-/// and small enough that curvature stays negligible at the anchor.
-double step_for(const CoordinateSystem& cs) { return is_geographic(cs) ? 1e-5 : 1.0; }
+/// Central-difference step for one axis, in the CRS's own units for that axis.
+/// A geographic CRS has degrees for x/y and metres for z (height), so the two
+/// kinds of axis need different steps: 1e-5 deg is about 1.1 m -- well above
+/// the 1e-15 deg resolution of a longitude, small enough that curvature stays
+/// negligible -- and 1 m is above the 1e-9 m resolution of an ECEF coordinate.
+double step_for(const CoordinateSystem& cs, int axis) {
+    return is_geographic(cs) && axis < 2 ? 1e-5 : 1.0;
+}
 
 /// A right-handed orthonormal basis of one CRS's local axes, in ECEF, at
 /// `point` (given in that CRS). Column i is the direction of the CRS's axis i.
@@ -212,8 +215,8 @@ Eigen::Matrix3d local_basis(const CoordinateSystem& cs, const crs::CrsPoint& poi
         return Eigen::Vector3d(out->x, out->y, out->z);
     };
     std::array<Eigen::Vector3d, 3> columns{};
-    const double step = step_for(cs);
     for (int axis = 0; axis < 3; ++axis) {
+        const double step = step_for(cs, axis);
         CrsPoint plus = point;
         CrsPoint minus = point;
         double* target_plus = axis == 0 ? &plus.x : axis == 1 ? &plus.y : &plus.z;
@@ -315,6 +318,10 @@ void convert_reference(Chunk& chunk, const CoordinateSystem& target, ReferenceKi
         throw ValueError("convert_reference: the target must be a set coordinate system, not the "
                          "local engineering frame");
     }
+    // The configured order governs any orientation angle in this chunk, so a
+    // corrupt `reference/rotation_order` is reported here rather than much
+    // later at an import that would otherwise silently mean another rotation.
+    (void)rotation_order_of(chunk);
     const bool cameras = kind == ReferenceKind::Cameras || kind == ReferenceKind::Both;
     const bool markers = kind == ReferenceKind::Markers || kind == ReferenceKind::Both;
     // Compute both slots' new values BEFORE writing either, so a failure in the
