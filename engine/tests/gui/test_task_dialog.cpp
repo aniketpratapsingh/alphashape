@@ -110,7 +110,7 @@ TEST_F(TaskDialogTest, WidgetTypeFollowsTheParamType) {
     QStringList modes;
     for (int i = 0; i < filter->count(); ++i) modes << filter->itemText(i);
     EXPECT_EQ(modes, (QStringList{"disabled", "mild", "moderate", "aggressive"}));
-    EXPECT_EQ(filter->currentText(), "mild");
+    EXPECT_EQ(filter->currentText(), "moderate") << "the schema default";
 
     TaskDialog dem("BuildDem", registry(), store());
     EXPECT_EQ(dem.kind("resolution"), EditorKind::DoubleSpinBox);
@@ -189,7 +189,9 @@ TEST_F(TaskDialogTest, LastUsedValuesAreRememberedAndResetRestoresDefaults) {
         // and its alignment fingerprint both match, so the default is safe.
         EXPECT_TRUE(qobject_cast<QCheckBox*>(again.editor("reuse_depth"))->isChecked());
         EXPECT_EQ(again.params().get_int("downscale"), 4);
-        EXPECT_EQ(again.params().get_string("filter_mode"), "mild");
+        EXPECT_EQ(again.params().get_string("filter_mode"), "moderate")
+            << "reset restores the schema default, not the previous behaviour";
+        EXPECT_EQ(again.params().get_int("max_neighbors"), 8);
         again.accept();
     }
     TaskDialog third("BuildDepthMaps", registry(), store());
@@ -212,6 +214,7 @@ TEST_F(TaskDialogTest, DeclaredRangesBindTheEditors) {
     ASSERT_NE(neighbours, nullptr);
     EXPECT_EQ(neighbours->minimum(), 1);
     EXPECT_EQ(neighbours->maximum(), 255) << "the engine accepts [1, 256)";
+    EXPECT_EQ(neighbours->value(), 8) << "the schema default";
     neighbours->setValue(9999);
     EXPECT_EQ(neighbours->value(), 255);
 

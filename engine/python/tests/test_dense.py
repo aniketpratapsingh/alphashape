@@ -196,6 +196,17 @@ class TestDashboardArgumentValidation(unittest.TestCase):
         with self.assertRaises(alphashape.ValueError):
             doc.run_task("BuildDepthMaps", filter_mode="bogus")
 
+    def test_quality_defaults_are_the_benchmarked_ones(self):
+        # The binder reads the same schema the engine declares, so this is the
+        # Python-visible half of the drift guard: the aerial-nadir benchmark
+        # settled on moderate filtering (21% less hole area than mild at no time
+        # cost) and 8 neighbours (depth stage 30-40% faster than 16, equal or
+        # better coverage). max_neighbors=16 / filter_mode="mild" restore the
+        # previous behaviour.
+        params = alphashape.task_params("BuildDepthMaps")
+        self.assertEqual(params["filter_mode"][1], "moderate")
+        self.assertEqual(params["max_neighbors"][1], "8")
+
     def test_unknown_keyword_is_an_invalid_argument(self):
         doc, chunk = dense_document()
         with self.assertRaises(alphashape.InvalidArgumentError) as ctx:

@@ -32,7 +32,10 @@ struct DepthView {
 };
 
 struct FilterOptions {
-    FilterMode mode = FilterMode::Mild;
+    /// Mirrors the BuildDepthMaps default: "moderate" is what the benchmark
+    /// settled on (21% less hole area than "mild" at no time cost), and a
+    /// default-constructed policy must not quietly ask for the weaker filter.
+    FilterMode mode = FilterMode::Moderate;
     double relative_depth_tolerance = 0.01;
     double reprojection_tolerance_px = 1.0;
 };

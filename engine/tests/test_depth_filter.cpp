@@ -151,6 +151,15 @@ TEST(DepthFilter, ParseModeRoundTrip) {
     }
 }
 
+TEST(DepthFilter, DefaultOptionsMatchTheTaskDefault) {
+    // BuildDepthMaps declares filter_mode="moderate" (the benchmark's winner:
+    // 21% less hole area than "mild" at no time cost), so a default-constructed
+    // FilterOptions must mean the same thing. Set them in one place or this
+    // trips.
+    EXPECT_EQ(FilterOptions{}.mode, FilterMode::Moderate);
+    EXPECT_EQ(to_string(FilterOptions{}.mode), "moderate");
+}
+
 TEST(DepthFilter, ParseModeCaseInsensitive) {
     EXPECT_EQ(parse_filter_mode("MILD"), FilterMode::Mild);
     EXPECT_EQ(parse_filter_mode("Aggressive"), FilterMode::Aggressive);

@@ -1702,6 +1702,28 @@ TEST(DepthMapsReuse, ReuseDepthDefaultsToTrue) {
     EXPECT_TRUE(defaults.get_bool("reuse_depth"));
 }
 
+TEST(BuildDenseParams, DeclaredQualityDefaultsFollowTheBenchmark) {
+    // Pinned so the two defaults the aerial-nadir benchmark settled on cannot
+    // drift silently. "moderate" filtering left 21% less hole area than "mild"
+    // at no measurable time cost, and 8 neighbours made the depth stage 30-40%
+    // faster than 16 with coverage and DSM accuracy equal or slightly better.
+    // A user who wants the old behaviour sets filter_mode="mild" and
+    // max_neighbors=16; both remain legal.
+    const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
+    const Params defaults = make_params(entry);
+    EXPECT_EQ(defaults.get_string("filter_mode"), "moderate");
+    EXPECT_EQ(defaults.get_int("max_neighbors"), 8);
+    // The old values still validate, so the escape hatch is real.
+    for (const char* mode : {"disabled", "mild", "moderate", "aggressive"}) {
+        Params params = defaults;
+        params.set("filter_mode", ParamValue{std::string(mode)});
+        EXPECT_EQ(params.get_string("filter_mode"), mode);
+    }
+    Params wide = defaults;
+    wide.set("max_neighbors", ParamValue{std::int64_t{16}});
+    EXPECT_EQ(wide.get_int("max_neighbors"), 16);
+}
+
 // ---------------------------------------------------------------------------
 // 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
 // ---------------------------------------------------------------------------
