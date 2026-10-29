@@ -29,31 +29,6 @@
 
 namespace alphashape::elevation {
 
-/// Parse a build task's `crs` parameter (M12 §4.9, WP-12.8): "EPSG:<n>", a bare
-/// integer code, a PROJ string ("+proj=utm +zone=33 +datum=WGS84") or WKT. An
-/// empty string yields the unset DTO (the local frame). Throws ValueError for
-/// text PROJ cannot read, and ValueError in a build without the CRS engine
-/// (which cannot express any CRS).
-///
-/// Returns the project DTO rather than an engine `CoordinateSystem` so that a
-/// `-DALPHASHAPE_USE_PROJ=OFF` build, where the engine library does not exist,
-/// still compiles the callers in this layer. The DTO converts to the engine type
-/// on the way in (`for_options`).
-CRS parse_crs_param(const std::string& text);
-
-/// Build the frame for a task's requested CRS, given as the DTO that a task
-/// parameter produced. An unset `requested` applies the chunk rules
-/// (`for_chunk(chunk, 0)`: auto UTM when georeferenced, identity otherwise);
-/// a set one is honoured exactly. In a build without the CRS engine only an
-/// unset request is possible and anything else throws ValueError.
-SurfaceFrame for_options(const Chunk& chunk, const CRS& requested);
-
-/// True when `requested` names something other than the chunk's own CRS, i.e.
-/// the caller asked for a specific output CRS. False for an unset DTO and for a
-/// code equal to `chunk.crs().epsg`. Kept here (rather than as a direct `.epsg`
-/// read) so the DTO's identity test is one place.
-bool requests_other_crs(const Chunk& chunk, const CRS& requested);
-
 /// Maps between a chunk's local metric frame and a target CRS.
 class SurfaceFrame {
 public:
@@ -111,5 +86,30 @@ private:
     /// Null is the local identity frame.
     std::shared_ptr<const Impl> impl_;
 };
+
+/// Parse a build task's `crs` parameter (M12 §4.9, WP-12.8): "EPSG:<n>", a bare
+/// integer code, a PROJ string ("+proj=utm +zone=33 +datum=WGS84") or WKT. An
+/// empty string yields the unset DTO (the local frame). Throws ValueError for
+/// text PROJ cannot read, and ValueError in a build without the CRS engine
+/// (which cannot express any CRS).
+///
+/// Returns the project DTO rather than an engine `CoordinateSystem` so that a
+/// `-DALPHASHAPE_USE_PROJ=OFF` build, where the engine library does not exist,
+/// still compiles the callers in this layer. The DTO converts to the engine type
+/// on the way in (`for_options`).
+CRS parse_crs_param(const std::string& text);
+
+/// Build the frame for a task's requested CRS, given as the DTO that a task
+/// parameter produced. An unset `requested` applies the chunk rules
+/// (`for_chunk(chunk, 0)`: auto UTM when georeferenced, identity otherwise);
+/// a set one is honoured exactly. In a build without the CRS engine only an
+/// unset request is possible and anything else throws ValueError.
+SurfaceFrame for_options(const Chunk& chunk, const CRS& requested);
+
+/// True when `requested` names something other than the chunk's own CRS, i.e.
+/// the caller asked for a specific output CRS. False for an unset DTO and for a
+/// code equal to `chunk.crs().epsg`. Kept here (rather than as a direct `.epsg`
+/// read) so the DTO's identity test is one place.
+bool requests_other_crs(const Chunk& chunk, const CRS& requested);
 
 }  // namespace alphashape::elevation
