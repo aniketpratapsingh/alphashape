@@ -214,26 +214,28 @@ std::shared_ptr<const crs::GeoidGrid> egm96() {
     return grid;
 }
 
-/// EGM96 orthometric heights on top of WGS 84 horizontal. The grid is referred
-/// to WGS 84 (EPSG:4979), and the projection is a plain horizontal one; the
-/// vertical datum lives beside the WKT (WP-12.5).
-crs::CoordinateSystem egm96_geographic() {
-    crs::VerticalCrs egm;
-    egm.kind = crs::VerticalCrs::Kind::GeoidModel;
-    egm.name = "EGM96 height";
-    return geographic().with_vertical(egm);
+/// A project geoid (no EPSG vertical code) over WGS 84 horizontal, backed by the
+/// fixture grid. This is the `VerticalTransform::custom` path: the applied
+/// undulation is exactly the fixture grid's own value, with no authority
+/// pipeline in between, so a test can compare against it to the last digit.
+crs::CoordinateSystem project_geoid_geographic() {
+    crs::VerticalCrs project;
+    project.kind = crs::VerticalCrs::Kind::GeoidModel;
+    project.name = "Project geoid 2019";
+    project.grid = "project_geoid_2019.tif";
+    return geographic().with_vertical(project);
 }
 
-crs::GeoidStore store_with_egm96() {
+crs::GeoidStore store_with_project_geoid() {
     crs::GeoidStore store;
-    store.add("EGM96", "EGM96 height", (kFixtureDir / "egm96_subset.tif").string(), "custom",
-              "public domain (NGA)");
+    store.add("project_geoid_2019", "Project geoid 2019",
+              (kFixtureDir / "egm96_subset.tif").string(), "custom", "public domain (NGA)");
     return store;
 }
 
-// EGM96 orthometric -> ellipsoidal moves a height by exactly the grid's
-// undulation: H = h - N, so the ellipsoidal target is higher by N. The undulation
-// is read from the fixture grid directly, not from the code path under test.
+// Custom-grid path, orthometric -> ellipsoidal: H = h - N, so the ellipsoidal
+// target is higher by exactly the grid's undulation, read from the fixture
+// grid directly rather than from the code path under test.
 TEST(Crs, ConvertReferenceAltitudeUsesVerticalCrs) {
     const double lon = 9.0;
     const double lat = 50.0;
@@ -241,13 +243,13 @@ TEST(Crs, ConvertReferenceAltitudeUsesVerticalCrs) {
     ASSERT_TRUE(n.has_value());
     ASSERT_GT(std::abs(*n), 1.0) << "fixture undulation is implausibly small";
 
-    Chunk chunk = make_chunk(egm96_geographic(), 1, 1, lon, lat);
+    Chunk chunk = make_chunk(project_geoid_geographic(), 1, 1, lon, lat);
     chunk.cameras()[0].reference.location = Eigen::Vector3d(lon, lat, 300.0);
     chunk.markers()[0].reference = Eigen::Vector3d(lon, lat, 300.0);
 
     // Target: the same horizontal CRS, ellipsoidal vertical. With the datum
     // applied the ellipsoidal height is H + N.
-    const crs::GeoidStore store = store_with_egm96();
+    const crs::GeoidStore store = store_with_project_geoid();
     convert_reference(chunk, geographic(), ReferenceKind::Both, &store);
     EXPECT_NEAR((*chunk.cameras()[0].reference.location).z(), 300.0 + *n, 1e-3);
     EXPECT_NEAR((*chunk.markers()[0].reference).z(), 300.0 + *n, 1e-3);
@@ -258,7 +260,7 @@ TEST(Crs, ConvertReferenceAltitudeUsesVerticalCrs) {
     EXPECT_FALSE(chunk.camera_crs().vertical.has_value());
 }
 
-// The reverse direction: ellipsoidal -> EGM96 orthometric subtracts N.
+// The reverse direction: ellipsoidal -> project orthometric subtracts N.
 TEST(Crs, ConvertReferenceAltitudeToOrthometricSubtractsGeoid) {
     const double lon = 9.0;
     const double lat = 50.0;
@@ -266,8 +268,8 @@ TEST(Crs, ConvertReferenceAltitudeToOrthometricSubtractsGeoid) {
     ASSERT_TRUE(n.has_value());
     Chunk chunk = make_chunk(geographic(), 1, 0, lon, lat);
     chunk.cameras()[0].reference.location = Eigen::Vector3d(lon, lat, 300.0);
-    const crs::GeoidStore store = store_with_egm96();
-    convert_reference(chunk, egm96_geographic(), ReferenceKind::Cameras, &store);
+    const crs::GeoidStore store = store_with_project_geoid();
+    convert_reference(chunk, project_geoid_geographic(), ReferenceKind::Cameras, &store);
     EXPECT_NEAR((*chunk.cameras()[0].reference.location).z(), 300.0 - *n, 1e-3);
 }
 
