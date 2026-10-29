@@ -18,7 +18,7 @@ name: Quality benchmark
 #
 #   * it holds the REASON, which must be non-empty printable text of <= 200 characters;
 #   * it is honoured only on the DEFAULT branch, never on a feature branch, and never
-#     for an experiment (empty `depth_params` and `dem_params`);
+#     for an experiment (empty `depth_params`, `dem_params` and `ortho_params`);
 #   * when honoured, the verdict is still computed and shown in the report — every
 #     regressed metric with previous -> current — but the job does not fail on it, and
 #     the run publishes its metrics as the new baseline;
@@ -91,7 +91,8 @@ on:
       # every later run against a baseline nobody can reach.
       #
       # Requires ALL of: a non-empty reason here, a run on the DEFAULT branch, and a
-      # control run (no depth_params and no dem_params). A non-default branch, or an
+      # control run (no depth_params, no dem_params and no ortho_params). A non-default
+      # branch, or an
       # experiment, is refused with an error rather than silently honoured — a
       # feature branch must never move the shared baseline. The reason is untrusted
       # dispatch text: it reaches the script through an environment variable, never
@@ -420,8 +421,8 @@ jobs:
             # that reached the run some other way (a hand upload, or a past bug).
             # The gate must never compare against a configuration that is not the
             # default, and the metrics file itself is the single source of that
-            # answer, so a run whose baseline reports depth_params OR dem_params is
-            # skipped like a run with no artifact at all.
+            # answer, so a run whose baseline reports depth_params, dem_params or
+            # ortho_params is skipped like a run with no artifact at all.
             metrics="build/bench/previous/metrics-$DATASET.json"
             set +e
             python3 tools/bench/is_experiment.py "$metrics"
