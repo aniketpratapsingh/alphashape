@@ -2,7 +2,8 @@
 """Report whether a metrics JSON records a dispatched experiment.
 
 The workflow has to answer one question about a run's metrics file: was this run
-made with extra depth parameters, or at the dataset's own settings? The answer
+made with extra dispatch parameters (``depth_params`` for BuildDepthMaps,
+``dem_params`` for BuildDem), or at the dataset's own settings? The answer
 decides two things that must agree — whether the run may become the regression
 baseline, and whether a baseline restored from it may be used. Both call this so
 there is one definition, in one place.
@@ -39,7 +40,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not isinstance(metrics, dict):
         return 2
-    return 1 if metrics.get("depth_params") else 0
+    if metrics.get("depth_params") or metrics.get("dem_params"):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -167,7 +167,15 @@ gh workflow run quality-bench.yml --ref <branch> \
   -f dataset=aerial-nadir -f depth_params=cost_type=census
 ```
 
-The parameters are merged over the dataset's own `BuildDepthMaps` overrides, so the
+`dem_params` is the same input for `BuildDem`, with identical validation and the same
+experiment rules; use it to measure a DEM-only change such as the exact Sibson fill:
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=aerial-nadir -f dem_params=sibson_exact_max_sites=20000
+```
+
+Both parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are
 validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and
 reach the script through an environment variable, never interpolated into a shell line.
@@ -184,7 +192,8 @@ Such a run is an **experiment**, and differs from a normal run in three ways:
 
 An experimental baseline is also refused on the way in: when the newest successful runs
 have no baseline artifact the lookup walks back to one that does, and a restored baseline
-that itself records `depth_params` is only ever compared against, never gated on.
+that itself records `depth_params` or `dem_params` is only ever compared against, never
+gated on.
 
 Every scheduled, push and ordinary manual run passes an empty string, which is the same
 argv and the same metrics JSON as before this input existed.

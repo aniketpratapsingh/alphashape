@@ -45,6 +45,15 @@ on:
         description: 'Extra BuildDepthMaps key=value pairs, space separated (e.g. "cost_type=census")'
         type: string
         default: ""
+      # Extra BuildDem keyword arguments, e.g. "sibson_exact_max_sites=20000".
+      # Exactly the same contract as depth_params above: validated by
+      # tools/bench/run_bench.py --dem-params, passed through an environment
+      # variable, and strictly a reporting mode — never the regression baseline,
+      # never gates.
+      dem_params:
+        description: 'Extra BuildDem key=value pairs, space separated (e.g. "sibson_exact_max_sites=20000")'
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -57,8 +66,10 @@ concurrency:
   # The group is unchanged for scheduled and ordinary manual runs: an experiment is
   # suffixed so it does not cancel (or wait behind) the control run on the same
   # dataset, which is the one it is being compared with. The `||` chain evaluates
-  # left to right, so with no depth_params the group is exactly what it was before.
-  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ github.event.inputs.depth_params && '-experiment' || '' }}
+  # left to right, so with neither input set the group is exactly what it was
+  # before. Either input earns the suffix: both are experiments under the same
+  # rules, and a dem_params run must not queue behind the control either.
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params) && '-experiment' || '' }}
   cancel-in-progress: false
 
 env:
@@ -254,12 +265,16 @@ jobs:
           # validates it before anything reaches the CLI. Empty for every scheduled,
           # push and ordinary manual run, which is what keeps those runs identical.
           DEPTH_PARAMS: ${{ github.event.inputs.depth_params }}
+          # Same contract for BuildDem: validated by `--dem-params`, empty on every
+          # run that did not ask for a DEM experiment.
+          DEM_PARAMS: ${{ github.event.inputs.dem_params }}
         run: |
           mkdir -p build/bench
           set +e
           python3 tools/bench/run_bench.py \
             --dataset "${{ matrix.dataset }}" \
             --depth-params "$DEPTH_PARAMS" \
+            --dem-params "$DEM_PARAMS" \
             --work build/bench \
             --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
           status=${PIPESTATUS[0]}
@@ -350,8 +365,8 @@ jobs:
             # that reached the run some other way (a hand upload, or a past bug).
             # The gate must never compare against a configuration that is not the
             # default, and the metrics file itself is the single source of that
-            # answer, so a run whose baseline reports depth_params is skipped like
-            # a run with no artifact at all.
+            # answer, so a run whose baseline reports depth_params OR dem_params is
+            # skipped like a run with no artifact at all.
             metrics="build/bench/previous/metrics-$DATASET.json"
             set +e
             python3 tools/bench/is_experiment.py "$metrics"

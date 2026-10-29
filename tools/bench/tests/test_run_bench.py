@@ -982,6 +982,124 @@ class DepthParamMergeTest(unittest.TestCase):
         self.assertEqual(merged["param_overrides"], {"BuildDepthMaps": {"cost_type": "census"}})
 
 
+class DemParamsTest(unittest.TestCase):
+    """``dem_params`` is the same contract as ``depth_params`` for BuildDem.
+
+    The two inputs are deliberately parallel: one grammar, one set of experiment
+    rules, and a DEM experiment must be neither weaker nor stricter than a depth
+    experiment. These tests mirror DepthParamsTest on purpose so that a change to
+    one without the other is visible as a gap rather than as silence.
+    """
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_dem_params(""), {})
+        self.assertEqual(run_bench.parse_dem_params(None), {})
+        self.assertEqual(run_bench.parse_dem_params("   "), {})
+
+    def test_a_single_pair(self):
+        self.assertEqual(
+            run_bench.parse_dem_params("sibson_exact_max_sites=20000"),
+            {"sibson_exact_max_sites": "20000"},
+        )
+
+    def test_several_pairs_are_split_on_whitespace(self):
+        self.assertEqual(
+            run_bench.parse_dem_params("  interpolation=extrapolated  fill_method=idw\nresolution=0.1 "),
+            {"interpolation": "extrapolated", "fill_method": "idw", "resolution": "0.1"},
+        )
+
+    def test_a_value_with_shell_or_json_metacharacters_is_rejected(self):
+        for token in ("fill_method=idw;rm", 'fill_method="idw"', "fill_method=$(id)",
+                      "fill_method=idw|cat", "fill_method=idw&x"):
+            with self.assertRaises(run_bench.DemParamError, msg=token):
+                run_bench.parse_dem_params(token)
+
+    def test_the_same_grammar_rejects_the_same_tokens_as_depth_params(self):
+        # Both inputs share one parser, so a token accepted by one and rejected by
+        # the other would mean the two drifted. Enumerate the grammar's edges.
+        tokens = ["no_equals", "=value", "key=", "Upper=1", "dashed-key=1",
+                  "key=a=b", "key=1 key=2", "key=v;x"]
+        for token in tokens:
+            for parser, error in ((run_bench.parse_depth_params, run_bench.DepthParamError),
+                                  (run_bench.parse_dem_params, run_bench.DemParamError)):
+                with self.assertRaises(error, msg=f"{parser.__name__}: {token}"):
+                    parser(token)
+
+    def test_the_error_names_the_input(self):
+        with self.assertRaises(run_bench.DemParamError):
+            run_bench.parse_dem_params("oops")
+        with self.assertRaises(run_bench.DepthParamError):
+            run_bench.parse_depth_params("oops")
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "aerial-nadir", "--list", "--dem-params", "oops"])
+
+    def test_the_command_line_accepts_a_good_string(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = run_bench.main(
+                ["--dataset", "aerial-nadir", "--list",
+                 "--dem-params", "sibson_exact_max_sites=20000"]
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("CC-BY-4.0", out.getvalue())
+
+
+class DemParamMergeTest(unittest.TestCase):
+    """``dem_params`` land in BuildDem and nowhere else."""
+
+    def dataset(self):
+        return run_bench.load_manifest()["datasets"]["aerial-nadir"]
+
+    def test_a_parameter_is_added_to_build_dem(self):
+        merged = run_bench.merge_dem_params(self.dataset(), {"sibson_exact_max_sites": "20000"})
+        self.assertEqual(merged["param_overrides"]["BuildDem"]["sibson_exact_max_sites"], "20000")
+
+    def test_it_does_not_touch_build_depth_maps(self):
+        merged = run_bench.merge_dem_params(self.dataset(), {"sibson_exact_max_sites": "20000"})
+        self.assertNotIn("sibson_exact_max_sites", merged["param_overrides"]["BuildDepthMaps"])
+
+    def test_the_dataset_s_own_overrides_survive_the_merge(self):
+        merged = run_bench.merge_dem_params(self.dataset(), {"sibson_exact_max_sites": "20000"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], 8)
+        self.assertEqual(merged["param_overrides"]["BuildOrthomosaic"]["resolution"], 0.1)
+
+    def test_a_parameter_overrides_the_manifest_value_of_the_same_name(self):
+        original = {**self.dataset(), "param_overrides": {"BuildDem": {"interpolation": "disabled"}}}
+        merged = run_bench.merge_dem_params(original, {"interpolation": "enabled"})
+        self.assertEqual(merged["param_overrides"]["BuildDem"]["interpolation"], "enabled")
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        original = self.dataset()
+        self.assertEqual(run_bench.merge_dem_params(original, {}), original)
+
+    def test_the_input_dataset_is_not_mutated(self):
+        original = self.dataset()
+        before = json.dumps(original, sort_keys=True)
+        run_bench.merge_dem_params(original, {"sibson_exact_max_sites": "20000"})
+        self.assertEqual(json.dumps(original, sort_keys=True), before)
+
+    def test_the_manifest_is_not_mutated(self):
+        before = json.dumps(run_bench.load_manifest(), sort_keys=True)
+        run_bench.merge_dem_params(self.dataset(), {"sibson_exact_max_sites": "20000"})
+        self.assertEqual(json.dumps(run_bench.load_manifest(), sort_keys=True), before)
+
+    def test_both_inputs_merge_independently(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        merged = run_bench.merge_dem_params(merged, {"sibson_exact_max_sites": "20000"})
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["cost_type"], "census")
+        self.assertEqual(merged["param_overrides"]["BuildDem"]["sibson_exact_max_sites"], "20000")
+        self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], 8)
+
+
 class IsExperimentTest(unittest.TestCase):
     """The workflow's one definition of "is this a control run"."""
 
@@ -1003,6 +1121,26 @@ class IsExperimentTest(unittest.TestCase):
 
     def test_a_run_with_dispatch_parameters_is_an_experiment(self):
         self.assertEqual(self.status(json.dumps({"depth_params": {"cost_type": "census"}})), 1)
+
+    def test_an_empty_dem_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"dem_params": {}})), 0)
+
+    def test_a_dem_only_run_is_an_experiment(self):
+        # The baseline lookup and the publish step both read this. A run that only
+        # tuned BuildDem must not be adopted as the yardstick just because it has
+        # no depth_params.
+        self.assertEqual(
+            self.status(json.dumps({"dem_params": {"sibson_exact_max_sites": "20000"}})), 1
+        )
+
+    def test_a_run_with_both_inputs_is_an_experiment(self):
+        self.assertEqual(
+            self.status(json.dumps({
+                "depth_params": {"cost_type": "census"},
+                "dem_params": {"sibson_exact_max_sites": "20000"},
+            })),
+            1,
+        )
 
     def test_a_missing_file_cannot_tell(self):
         import is_experiment
