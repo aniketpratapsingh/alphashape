@@ -555,6 +555,33 @@ TEST(DataModel, EqualityCoversEveryContainer) {
         c.set_active_tiled_model_id(-1);
         EXPECT_TRUE(differs(c)) << "active tiled model id";
     }
+    {
+        // Per-object CRS slots (WP-12.6): every slot is part of chunk identity,
+        // so a chunk that carries an explicit slot must never compare equal to
+        // one that follows its chunk CRS.
+        Chunk c = baseline;
+        CRS slot;
+        slot.epsg = 4326;
+        slot.wkt = "EPSG:4326";
+        c.set_camera_crs(slot);
+        EXPECT_TRUE(differs(c)) << "camera_crs slot";
+    }
+    {
+        Chunk c = baseline;
+        CRS slot;
+        slot.epsg = 4326;
+        slot.wkt = "EPSG:4326";
+        c.set_marker_crs(slot);
+        EXPECT_TRUE(differs(c)) << "marker_crs slot";
+    }
+    {
+        Chunk c = baseline;
+        CRS slot;
+        slot.epsg = 4326;
+        slot.wkt = "EPSG:4326";
+        c.set_world_crs(slot);
+        EXPECT_TRUE(differs(c)) << "world_crs slot";
+    }
 }
 
 TEST(DataModel, DefaultChunkHasNoAssets) {
