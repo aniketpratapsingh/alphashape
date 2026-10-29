@@ -77,6 +77,15 @@ on:
         description: 'Extra BuildDem key=value pairs, space separated (e.g. "sibson_exact_max_sites=20000")'
         type: string
         default: ""
+      # Extra BuildOrthomosaic keyword arguments, e.g. "color_correction=true".
+      # Exactly the same contract as depth_params and dem_params above: validated by
+      # tools/bench/run_bench.py --ortho-params, passed through an environment
+      # variable (never interpolated into `run:`), and strictly a reporting mode —
+      # never the regression baseline, never gates.
+      ortho_params:
+        description: 'Extra BuildOrthomosaic key=value pairs, space separated (e.g. "color_correction=true")'
+        type: string
+        default: ""
       # Accept a regression BY HAND, so a deliberate trade-off (worse on one metric,
       # clearly better on the rest) can become the new baseline instead of failing
       # every later run against a baseline nobody can reach.
@@ -112,7 +121,7 @@ concurrency:
   # left to right, so with neither input set the group is exactly what it was
   # before. Either input earns the suffix: both are experiments under the same
   # rules, and a dem_params run must not queue behind the control either.
-  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params) && '-experiment' || '' }}
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params) && '-experiment' || '' }}
   cancel-in-progress: false
 
 env:
@@ -311,6 +320,8 @@ jobs:
           # Same contract for BuildDem: validated by `--dem-params`, empty on every
           # run that did not ask for a DEM experiment.
           DEM_PARAMS: ${{ github.event.inputs.dem_params }}
+          # And for BuildOrthomosaic: validated by `--ortho-params`.
+          ORTHO_PARAMS: ${{ github.event.inputs.ortho_params }}
         run: |
           mkdir -p build/bench
           set +e
@@ -318,6 +329,7 @@ jobs:
             --dataset "${{ matrix.dataset }}" \
             --depth-params "$DEPTH_PARAMS" \
             --dem-params "$DEM_PARAMS" \
+            --ortho-params "$ORTHO_PARAMS" \
             --work build/bench \
             --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
           status=${PIPESTATUS[0]}

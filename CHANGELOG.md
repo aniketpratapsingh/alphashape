@@ -8,6 +8,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Orthomosaic colour-consistency metrics (bench).** `tools/bench/metrics.py`
+  gains two metrics that measure the brightness steps between photographs in an
+  orthomosaic, computed without any engine change. `seam_step` is a
+  reference-free measure: the GeoTIFF export carries no seam labels, so it scans
+  every interior row/column boundary for a coherent brightness step between two
+  flat 3-cell windows and reports the median step (and its maximum) as a fraction
+  of full scale. `colour_error` is reference-based: after a single global
+  per-channel affine fit against the published reference orthomosaic — which
+  absorbs a white-balance difference — it reports the median and p90 local
+  residual, so a spatially varying gain error is what shows up. Both are reported
+  in the metrics JSON and the report and are deliberately not yet gated. A third
+  dispatch input, `ortho_params` beside `depth_params` and `dem_params`, lets a
+  `BuildOrthomosaic` configuration be measured against a control run.
+
 - **Local tangent frames and per-object CRS slots.** A `LocalFrame`
   (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
   ECEF point and an explicit local-to-ECEF rotation, then converts to and from

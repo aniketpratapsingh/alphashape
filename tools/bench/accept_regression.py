@@ -13,8 +13,9 @@ An acceptance is a manual, auditable act, so it requires ALL of:
   * the ``accept_regression`` dispatch input, a non-empty reason;
   * a run on the default branch (a feature branch must never move the shared
     baseline — dispatch the accepting run on main after merging);
-  * a control run: ``depth_params`` and ``dem_params`` empty. An experiment
-    measures a configuration; it is not the yardstick and is refused here too.
+  * a control run: ``depth_params``, ``dem_params`` and ``ortho_params`` all
+    empty. An experiment measures a configuration; it is not the yardstick and is
+    refused here too.
 
 What it does, and does not, do:
 
@@ -84,13 +85,14 @@ def validate_reason(text: str | None) -> str:
 def measure_params(metrics: dict) -> dict[str, object]:
     """Any dispatch parameters that make a run an experiment rather than a control.
 
-    Both dispatch inputs the workflow offers — ``depth_params`` for BuildDepthMaps
-    and ``dem_params`` for BuildDem — mean the run measured a configuration rather
-    than the defaults. Either one being present and non-empty withholds the
-    baseline, so either one refuses an acceptance.
+    All three dispatch inputs the workflow offers — ``depth_params`` for
+    BuildDepthMaps, ``dem_params`` for BuildDem and ``ortho_params`` for
+    BuildOrthomosaic — mean the run measured a configuration rather than the
+    defaults. Any one being present and non-empty withholds the baseline, so any
+    one refuses an acceptance.
     """
     found: dict[str, object] = {}
-    for key in ("depth_params", "dem_params"):
+    for key in ("depth_params", "dem_params", "ortho_params"):
         value = metrics.get(key)
         if value:
             found[key] = value

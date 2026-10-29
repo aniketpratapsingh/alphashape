@@ -145,7 +145,11 @@ def experiment_params(metrics: dict) -> dict[str, str]:
     only ``dem_params`` must not compare as if it were a control.
     """
     combined: dict[str, str] = {}
-    for key, prefix in (("depth_params", "BuildDepthMaps"), ("dem_params", "BuildDem")):
+    for key, prefix in (
+        ("depth_params", "BuildDepthMaps"),
+        ("dem_params", "BuildDem"),
+        ("ortho_params", "BuildOrthomosaic"),
+    ):
         value = metrics.get(key)
         if isinstance(value, dict):
             for name, item in value.items():
@@ -490,6 +494,18 @@ def markdown(
                 )
         if ortho.get("epsg") is not None:
             lines.append(f"| EPSG | {ortho['epsg']} |")
+        colour = ortho.get("colour_consistency") or {}
+        # Reported, never gated: the metric is new and its threshold is not yet
+        # established. A seam step in fraction of full scale; "unmeasured" is a
+        # real answer (a mosaic with no flat ground to judge a seam on).
+        if colour.get("seam_step_measured"):
+            lines.append(f"| Seam step (median) | {_fmt(colour.get('seam_step'))} |")
+            lines.append(f"| Seam step (max) | {_fmt(colour.get('seam_step_max'))} |")
+            lines.append(f"| Seam lines / samples | {colour.get('seam_lines')} / {colour.get('seam_samples')} |")
+        elif colour:
+            lines.append(
+                f"| Seam step | _unmeasured — {colour.get('seam_step_reason') or 'no seam found'}_ |"
+            )
     lines.append("")
 
     dem = free.get("dem")
@@ -587,6 +603,18 @@ def markdown(
             lines.append(f"| Overlap | {_fmt(ref_ortho.get('overlap_fraction'))} |")
             lines.append(f"| Comparison grid | {_fmt(ref_ortho.get('grid_pixel_m'))} m |")
             lines.extend(_crs_rows(ref_ortho.get("crs")))
+            colour = ref_ortho.get("colour_error") or {}
+            if colour.get("comparable"):
+                luma = colour.get("luma") or {}
+                # Local colour residual after a global per-channel affine fit:
+                # the reference's own white balance is absorbed, so what remains
+                # is spatial inconsistency (seams, gain drift), not a global cast.
+                lines.append(f"| Colour error (median) | {_fmt(luma.get('median'))} |")
+                lines.append(f"| Colour error (p90) | {_fmt(luma.get('p90'))} |")
+            elif colour:
+                lines.append(
+                    f"- Colour vs reference: _{colour.get('reason') or colour.get('skipped')}_"
+                )
         else:
             lines.append(f"- Orthomosaic vs reference: _{ref_ortho.get('reason', 'not comparable')}_")
         lines.append("")
