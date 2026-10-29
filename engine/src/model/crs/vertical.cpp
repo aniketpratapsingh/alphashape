@@ -44,7 +44,7 @@ const std::vector<VerticalName>& vertical_names() {
     static const std::vector<VerticalName> names = [] {
         std::vector<VerticalName> out;
         PJ_CONTEXT* ctx = thread_context();
-        PJ_STRING_LIST* codes =
+        PROJ_STRING_LIST codes =
             proj_get_codes_from_database(ctx, "EPSG", PJ_TYPE_VERTICAL_CRS, 0);
         if (codes == nullptr) {
             return out;
@@ -101,41 +101,6 @@ VerticalCrsLookup lookup_vertical_crs(const VerticalCrs& vertical) {
     return lookup;
 }
 
-namespace {
-
-/// The grid a `VerticalCrs` needs, as PROJ names it: `grid` when set, otherwise
-/// the grid an EPSG vertical CRS's own definition carries (EGM96 height ->
-/// us_nga_egm96_15.tif). Empty when neither is available.
-std::string required_grid(const VerticalCrs& vertical) {
-    if (!vertical.grid.empty()) {
-        return vertical.grid;
-    }
-    const VerticalCrsLookup lookup = lookup_vertical_crs(vertical);
-    if (lookup.epsg == 0) {
-        return std::string();
-    }
-    PJ_CONTEXT* ctx = thread_context();
-    const std::string code = std::to_string(lookup.epsg);
-    PjPtr crs{proj_create_from_database(ctx, "EPSG", code.c_str(), PJ_CATEGORY_CRS, 0, nullptr)};
-    if (!crs) {
-        return std::string();
-    }
-    const char* proj4 = proj_as_proj_string(ctx, crs.get(), PJ_PROJ_4, nullptr);
-    if (proj4 == nullptr) {
-        return std::string();
-    }
-    const std::string text(proj4);
-    const std::string key = "+geoidgrids=";
-    const std::size_t at = text.find(key);
-    if (at == std::string::npos) {
-        return std::string();
-    }
-    const std::size_t start = at + key.size();
-    const std::size_t end = text.find(' ', start);
-    return text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-}
-
-}  // namespace
 
 std::optional<double> orthometric_height(double ellipsoidal_height_m, double lon_deg,
                                          double lat_deg, const GeoidGrid& geoid) {
@@ -439,3 +404,5 @@ const std::string& VerticalTransform::description() const {
     static const std::string kInvalid = "invalid";
     return impl_ ? impl_->description : kInvalid;
 }
+
+}  // namespace alphashape::crs

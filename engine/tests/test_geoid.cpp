@@ -472,7 +472,6 @@ TEST_F(TempDir, VerticalCrsPersistence) {
     egm96.offset_m = -0.5;
 
     Document document;
-    document.workspace().chunks().clear();
     Chunk& written = document.workspace().add_chunk("geoid");
     document.set_active_chunk_id(written.id());
     written.set_coordinate_system(CoordinateSystem::from_epsg(32633).with_vertical(egm96));

@@ -156,8 +156,13 @@ void geotiff_tag_extender(TIFF* tif) {
 }
 
 void install_geotiff_tags() {
-    static std::once_flag once;
-    std::call_once(once, [] { g_parent_tag_extender = TIFFSetTagExtender(geotiff_tag_extender); });
+    // A plain function-local static: the initialiser runs once, guarded by the
+    // compiler's own thread-safe initialisation, so no <mutex> is needed here.
+    static const bool installed = [] {
+        g_parent_tag_extender = TIFFSetTagExtender(geotiff_tag_extender);
+        return true;
+    }();
+    static_cast<void>(installed);
 }
 
 struct DecodedGrid {
@@ -819,3 +824,5 @@ GeoidStore GeoidStore::load(const std::filesystem::path& dir) {
     }
     return store;
 }
+
+}  // namespace alphashape::crs
