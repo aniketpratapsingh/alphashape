@@ -83,8 +83,15 @@ public:
         const char* paths[2] = {dir.c_str(), nullptr};
         proj_context_set_search_paths(ctx_.get(), 1, paths);
 
-        const std::string pipeline = "+proj=vgridshift +grids=" + path.filename().string() +
-                                     " +multiplier=1";
+        // vgridshift works in radians like every PROJ step, so the degrees the
+        // engine speaks are converted in and back out. The vertical value it
+        // produces is already metres.
+        const std::string pipeline = "+proj=pipeline"
+                                     " +step +proj=unitconvert +xy_in=deg +xy_out=rad"
+                                     " +step +proj=vgridshift +grids=" +
+                                     path.filename().string() +
+                                     " +multiplier=1"
+                                     " +step +proj=unitconvert +xy_in=rad +xy_out=deg";
         pj_.reset(proj_create(ctx_.get(), pipeline.c_str()));
         usable_ = pj_ != nullptr;
     }
@@ -98,6 +105,7 @@ public:
             return std::nullopt;
         }
         proj_errno_reset(pj_.get());
+        // Visualisation order (x = lon, y = lat) in, the same order out.
         const PJ_COORD in = proj_coord(lon_deg, lat_deg, 0.0, 0.0);
         const PJ_COORD out = proj_trans(pj_.get(), PJ_FWD, in);
         if (proj_errno(pj_.get()) != 0 || !std::isfinite(out.xyz.z)) {
@@ -478,7 +486,12 @@ std::vector<std::pair<std::string, std::string>> parse_element(const std::string
         }
         const std::string name = element.substr(name_start, i - name_start);
         skip_space();
-        if (i >= element.size() || element[i] != '=') {
+        // "/>" and ">" end the attribute list; a stray "/" here is that marker,
+        // not the start of another attribute.
+        if (i >= element.size() || element[i] == '/' || element[i] == '>') {
+            break;
+        }
+        if (element[i] != '=') {
             throw ProjectIOError("'" + file.string() + "': <geoid> attribute '" + name +
                                  "' has no value");
         }
