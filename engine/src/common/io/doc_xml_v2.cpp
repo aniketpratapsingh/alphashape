@@ -697,6 +697,48 @@ void write_tiled_models(const Chunk& chunk, XmlNode& node, ZipArchive& archive) 
     }
 }
 
+/// The per-object CRS slots (M12 §4.4, CRS-04), written only when a slot was
+/// set explicitly. A chunk that follows its own CRS throughout -- every project
+/// written before WP-12.6 -- carries no element at all, so its bytes are
+/// unchanged. Each slot is its own element rather than an attribute or a child
+/// of <crs>, both to keep the persistence of the chunk CRS untouched and so a
+/// slot can grow a vertical component later without disturbing its siblings.
+void write_crs_slots(const Chunk& chunk, XmlNode& parent) {
+    if (chunk.explicit_camera_crs()) {
+        write_crs("camera_crs", *chunk.explicit_camera_crs(), parent);
+    }
+    if (chunk.explicit_marker_crs()) {
+        write_crs("marker_crs", *chunk.explicit_marker_crs(), parent);
+    }
+    if (chunk.explicit_world_crs()) {
+        write_crs("world_crs", *chunk.explicit_world_crs(), parent);
+    }
+}
+
+/// Read the slots back. Absent elements leave the slot unset, which is exactly
+/// the "follow the chunk CRS" default; nothing here invents a value, so an old
+/// project loads with the same effective CRSs it always had.
+void read_crs_slots(const XmlNode& parent, Chunk& chunk, ReadReport* report) {
+    if (const XmlNode* camera = find_child(parent, "camera_crs")) {
+        warn_unknown_attrs(*camera, {"epsg", "wkt"}, report);
+        CRS slot;
+        read_crs(camera, slot);
+        chunk.set_camera_crs(slot);
+    }
+    if (const XmlNode* marker = find_child(parent, "marker_crs")) {
+        warn_unknown_attrs(*marker, {"epsg", "wkt"}, report);
+        CRS slot;
+        read_crs(marker, slot);
+        chunk.set_marker_crs(slot);
+    }
+    if (const XmlNode* world = find_child(parent, "world_crs")) {
+        warn_unknown_attrs(*world, {"epsg", "wkt"}, report);
+        CRS slot;
+        read_crs(world, slot);
+        chunk.set_world_crs(slot);
+    }
+}
+
 /// The containers every chunk carries, in the fixed order the writer emits
 /// them. The reader dispatches over the same set; anything else inside <chunk>
 /// is a hard error (v2 is strict about elements, §4.4).
@@ -740,6 +782,7 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
     set_attr(region, "size", vec3(chunk.region().size));
     set_attr(add_child(node, "transform"), "matrix", matrix4(chunk.transform()));
     write_crs("crs", chunk.crs(), node);
+    write_crs_slots(chunk, node);
     write_meta(chunk.meta(), node);
 }
 
@@ -1429,7 +1472,7 @@ void check_chunk_vocabulary(const XmlNode& node) {
         "scalebars", "tie_points", "mask_sets",     "depth_map_sets",
         "dense_clouds", "models",  "tiled_models",  "elevations", "orthomosaics",
         "trajectories", "shapes",  "panorama",      "region",     "transform",
-        "crs",       "meta",
+        "crs",       "meta",       "camera_crs",    "marker_crs", "world_crs",
     };
     for (const XmlNode& child : node.children) {
         bool known = false;
@@ -1481,6 +1524,7 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
         chunk.transform() = parse_matrix4(require_attr(*transform, "matrix"));
     }
     read_crs(find_child(node, "crs"), chunk.crs());
+    read_crs_slots(node, chunk, report);
     read_meta(find_child(node, "meta"), chunk.meta());
 
     // The id allocator, when the writer recorded it, and then reserve every

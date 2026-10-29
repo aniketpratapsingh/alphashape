@@ -426,6 +426,47 @@ public:
     CRS& crs() { return crs_; }
     const CRS& crs() const { return crs_; }
 
+    // -- per-object CRS slots (M12 §4.4, CRS-04) ---------------------------
+    //
+    // Three independent slots say which CRS an object's numbers are expressed
+    // in. `camera_crs` applies to camera references (position and rotation),
+    // `marker_crs` to marker references, `world_crs` to chunk-local geometry
+    // when it is displayed or exported. Each DEFAULTS to the chunk CRS and is
+    // stored only when set explicitly, so an old project (which never had
+    // them) reads back as "everything in the chunk CRS" and re-saves
+    // byte-identically.
+    //
+    // Setting a slot never transforms anything: it relabels which CRS the
+    // numbers are read in. Converting the data to a new CRS is a separate,
+    // explicit step (WP-12.7).
+
+    /// The explicitly set camera-reference CRS, if any.
+    const std::optional<CRS>& explicit_camera_crs() const { return camera_crs_; }
+    /// The effective camera CRS: the explicit slot when set, else `crs()`.
+    CRS camera_crs() const { return camera_crs_.has_value() ? *camera_crs_ : crs_; }
+    /// Set the slot explicitly. Does NOT convert any reference.
+    void set_camera_crs(const CRS& value) { camera_crs_ = value; }
+    /// Drop the explicit slot so it follows `crs()` again.
+    void clear_camera_crs() { camera_crs_.reset(); }
+
+    /// The explicitly set marker-reference CRS, if any.
+    const std::optional<CRS>& explicit_marker_crs() const { return marker_crs_; }
+    CRS marker_crs() const { return marker_crs_.has_value() ? *marker_crs_ : crs_; }
+    void set_marker_crs(const CRS& value) { marker_crs_ = value; }
+    void clear_marker_crs() { marker_crs_.reset(); }
+
+    /// The explicitly set world CRS (display/export default), if any.
+    const std::optional<CRS>& explicit_world_crs() const { return world_crs_; }
+    CRS world_crs() const { return world_crs_.has_value() ? *world_crs_ : crs_; }
+    void set_world_crs(const CRS& value) { world_crs_ = value; }
+    void clear_world_crs() { world_crs_.reset(); }
+
+    /// True when at least one per-object CRS slot is set explicitly, i.e. when
+    /// the writer must emit them at all. A chunk with none writes nothing extra.
+    bool has_explicit_crs_slots() const {
+        return camera_crs_.has_value() || marker_crs_.has_value() || world_crs_.has_value();
+    }
+
     /// Structural comparison, used by the project round-trip test.
     bool operator==(const Chunk& other) const;
 
@@ -478,6 +519,11 @@ private:
     Transform transform_ = Transform::Identity();
     Meta meta_;
     CRS crs_;
+    /// Per-object CRS slots (CRS-04). Nullopt = follow `crs_`; only an
+    /// explicitly set slot is persisted.
+    std::optional<CRS> camera_crs_;
+    std::optional<CRS> marker_crs_;
+    std::optional<CRS> world_crs_;
 };
 
 }  // namespace alphashape

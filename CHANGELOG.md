@@ -8,6 +8,51 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Local tangent frames and per-object CRS slots.** A `LocalFrame`
+  (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
+  ECEF point and an explicit local-to-ECEF rotation, then converts to and from
+  any CRS in `crs::CoordinateSystem`: local -> ECEF, ECEF -> geodetic by an
+  iterated Bowring inversion, geodetic -> target by PROJ (a geocentric target
+  needs no conversion). The conversion is exact, not a small-angle
+  approximation: it is done in doubles with the geodetic leg iterated, and a
+  point within 500 km of the anchor round-trips inside a micrometre. PROJ's own
+  `+proj=cart` inverse is deliberately not used there -- it loses millimetres at
+  ECEF magnitudes. `transform()` gives the 4x4 affine form -- exact for a
+  geocentric CRS, the anchor linearisation for a curved one -- and
+  `transformationMatrix()` its inverse.
+
+  A `Chunk` now carries three independent per-object CRS slots:
+  `camera_crs` (camera references), `marker_crs` (marker references) and
+  `world_crs` (chunk geometry as displayed or exported). Each follows
+  `chunk.crs` until set explicitly, and setting one only relabels which CRS the
+  numbers are read in -- no coordinate is ever transformed behind your back.
+  The slots are written to doc.xml as separate `<camera_crs>`, `<marker_crs>`
+  and `<world_crs>` elements, and only when set, so a project without them
+  loads and re-saves byte-identically; the reader treats absent elements as
+  "follow the chunk CRS". Georeferencing now sets `camera_crs` and `world_crs`
+  to the WGS 84 coordinate system it fits to. Converting the data itself to a
+  target CRS is a separate, explicit step (WP-12.7).
+
+- **Geoid grids and vertical datums.** A project can carry geoid models —
+  EGM96 and EGM2008 when `proj-data` has installed them, and any custom grid a
+  user adds — and convert between ellipsoidal and orthometric heights. A
+  geoid grid is evaluated through PROJ's `+proj=vgridshift` step, which is the
+  same code `cs2cs EPSG:4979 EPSG:5773` runs, with a direct GeoTIFF read plus
+  Catmull–Rom bicubic interpolation as the fallback; the two agree at the grid
+  nodes, and the off-node difference is the grid's own curvature because PROJ
+  interpolates bilinearly (see `engine/LIMITATIONS.md`). Outside a grid's
+  coverage every entry point returns "no value" rather than extrapolating, and
+  nothing is downloaded. `GeoidStore` writes a project's grids and their index
+  to `<project>.files/geoids/`, and a project that names a geoid it does not
+  carry fails to load, naming it, instead of silently treating its orthometric
+  heights as ellipsoidal. Heights convert as `H = h − N`; when a vertical datum
+  is EPSG-defined, PROJ builds the whole compound pipeline
+  (`EPSG:4979` → `EPSG:32633+5773`), and a custom grid is applied after the
+  horizontal transform. The vertical datum persists in doc.xml as a
+  `<vertical>` child of `<crs>`, written only when one is set. Accuracy is
+  checked against NGS's published USGG2012 geoid heights at 50 CONUS points
+  (EGM2008 RMSE 0.026 m, EGM96 0.284 m), skipping when the full grid is not
+  installed.
 - **Exact natural-neighbour hole filling in Build DEM.** Holes bordered by at
   most `sibson_exact_max_sites` data cells (new `BuildDem` parameter; off by
   default until the quality benchmark confirms it, 20 000 is a sensible value)

@@ -118,11 +118,39 @@ TEST(Theme, PaletteMatchesTokens) {
 
 TEST(Theme, QssMatchesTokens) {
     // 1. The checked-in sheets are exactly what the emitter produces from tokens.json.
+    // The compiled-in interpreter is the one CMake configured with. CI builds and runs the
+    // tests on different runner images, where that absolute path may be gone, so fall back
+    // to whatever python3 the test host has: compile_qss.py is stdlib-only.
+    QString python_exe = QStringLiteral(ALPHASHAPE_PYTHON);
     QProcess python;
-    python.start(QStringLiteral(ALPHASHAPE_PYTHON),
-                 {repo_path("tools/theme/compile_qss.py"), QStringLiteral("--check")});
-    ASSERT_TRUE(python.waitForFinished(60000)) << "compile_qss.py did not finish";
-    EXPECT_EQ(python.exitCode(), 0) << python.readAllStandardError().toStdString();
+    bool ran = false;
+    auto attempt = [&](const QString& exe) {
+        python.start(exe, {repo_path("tools/theme/compile_qss.py"), QStringLiteral("--check")});
+        if (!python.waitForStarted(15000)) {
+            return false;
+        }
+        if (python.waitForFinished(60000)) {
+            ran = true;
+            return true;
+        }
+        python.kill();
+        python.waitForFinished(5000);
+        return false;
+    };
+    if (!attempt(python_exe)) {
+        for (const char* fallback : {"python3", "python"}) {
+            python_exe = QString::fromLatin1(fallback);
+            if (attempt(python_exe)) {
+                break;
+            }
+        }
+    }
+    // Not just the exit code: a process that never started also reports 0.
+    ASSERT_TRUE(ran) << "no Python could run compile_qss.py (tried " << python_exe.toStdString()
+                     << " and python3/python on PATH)";
+    EXPECT_EQ(python.exitCode(), 0)
+        << "using " << python_exe.toStdString() << ": "
+        << python.readAllStandardError().toStdString();
 
     // 2. Each sheet records the hash of the tokens it was built from.
     const QByteArray hash =

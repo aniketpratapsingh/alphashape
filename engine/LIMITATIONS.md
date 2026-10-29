@@ -57,9 +57,11 @@ sections below give the engineering detail behind each item.
   the CPU if a specific machine proves unstable.
 - **The Python module is per interpreter.** A `.so`/`.pyd` is loadable only
   by the CPython minor version it was built against: 3.12 for the `.deb`
-  (Ubuntu 24.04's system `python3`) and for the Windows installer (a pinned
-  python.org 3.12), while the macOS module is built against whichever
-  `python3` the build machine had and its file name names that version. On
+  (Ubuntu 24.04's system `python3`), for the Windows installer (a pinned
+  python.org 3.12) and for the macOS build (CI pins `actions/setup-python`
+  3.12 in the build and the test jobs alike). The Python ctest entries resolve
+  their interpreter when they run rather than using the absolute path CMake
+  configured with, because CI builds and tests on different runner images. On
   Windows the module needs the DLLs in its own directory; the installer ships
   them together, and copying just the `.pyd` elsewhere fails at import with a
   DLL error.
@@ -1381,3 +1383,61 @@ yet.
   engine deliberately trusts whatever `proj.db` the platform ships, since that
   is what the user's PROJ sees.
 
+
+### WP-12.5 — geoid store and vertical datums
+
+- **Bicubic and PROJ agree at grid nodes, not everywhere.** `GeoidGrid::undulation()`
+  prefers PROJ's `+proj=vgridshift`, which is the same code `cs2cs EPSG:4979
+  EPSG:5773` runs, and falls back to a direct GeoTIFF read with Catmull–Rom
+  bicubic interpolation. Catmull–Rom is an interpolating spline, so at a grid
+  node both return that node's stored sample; between nodes PROJ interpolates
+  **bilinearly** (PROJ 9.8 has no bicubic grid-shift option — `+interpolation=bicubic`
+  is rejected at pipeline creation), so the bicubic path differs by the grid's
+  own curvature over half a cell. Measured on the checked-in 1-degree EGM96
+  subset that is up to ~1.2 m; on the 0.25-degree EGM96 grid up to ~0.3 m. The
+  gap is a property of the reference data and shrinks quadratically with cell
+  size, so a finer geoid always narrows it. `Crs.GeoidBicubicVsProj` therefore
+  asserts node agreement (1 mm) and `Crs.GeoidBicubicVsProjOffNode` bounds the
+  off-node gap rather than pretending the two are identical everywhere.
+- **A grid path containing a space is evaluated by the GeoTIFF reader only.**
+  PROJ splits `+grids=` on whitespace and offers no quoting rule, so a project
+  whose path has a space in it (this repository's own checkout does) cannot hand
+  the file to PROJ at all. `proj_undulation()` reports "unavailable" there and
+  `undulation()` answers through Catmull–Rom instead, which is why the fallback
+  is a correctness path, not just a build-time one. Both evaluators read the
+  same pixel-is-point node convention, so the numbers differ only by the
+  interpolation rule above.
+- **The grids are not bundled and never downloaded.** `GeoidStore::from_proj_data()`
+  lists EGM96 and EGM2008 only when `proj-data` (or the packaged subset) has
+  installed their grids, and no network fetch happens on any path. A project can
+  carry its own geoid in `<project>.files/geoids/` instead, and that store is
+  what `GeoidStore::load()` requires: a project naming a geoid the store does
+  not carry fails with `geoid '<id>' is not available` rather than loading with
+  ellipsoidal heights in an orthometric slot (which would be tens of metres
+  wrong at every point).
+- **`VerticalTransform::compound()` needs EPSG codes for both vertical CRSs.**
+  PROJ selects the geoid operation from the authority code, so a custom grid has
+  none and the compound route refuses it with a message pointing at
+  `custom()`. `custom()` applies `H = h - N` around the horizontal transform and
+  is exact in the same sense, but it is the engine's arithmetic rather than a
+  PROJ pipeline, so a PROJ version that changes how a compound pair is routed
+  would not be reflected in it.
+- **The NGS benchmark values come from the NGS GEOID web service, not from
+  datasheets.** The NGS datasheet retrieval endpoint was unavailable ("Unable to
+  connect to the database") when the fixture was generated on 2026-10-29, so
+  `tests/fixtures/crs/ngs_geoid_benchmarks.csv` holds NGS's own published geoid
+  heights for its **USGG2012** gravimetric model at 50 seeded CONUS positions,
+  with the service URL and retrieval date recorded in the file header. USGG2012
+  rather than GEOID18: the latter is fitted to NAVD88 GPS-on-benchmark data and
+  carries a national datum bias (~0.44 m over CONUS) that would dominate a
+  comparison with a global model. Measured RMSE on those points is 0.026 m for
+  EGM2008 and 0.284 m for EGM96; the test asserts the spec's 0.10 m / 0.60 m
+  ceilings and skips, naming the grid, when the full grid is not installed.
+- **Vertical datums ride beside the horizontal WKT, not inside it.** A
+  `CoordinateSystem` keeps `VerticalCrs` next to its canonical WKT, so
+  `to_wkt()` of a CRS with a vertical datum is the *horizontal* CRS's WKT and the
+  datum is written as doc.xml's `<vertical>` child. A tool that reads only the
+  WKT therefore sees an ellipsoidal CRS; the compound WKT is assembled on demand
+  by `VerticalTransform::compound()`. A geoid whose grid is missing at load time
+  fails the store load, so the datum's name is still readable from the XML for
+  diagnosis.

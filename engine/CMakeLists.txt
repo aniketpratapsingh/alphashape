@@ -262,10 +262,18 @@ endif()
 # runs with the suite instead of only when someone remembers to look.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+    # Resolved when the test runs, not baked in: CI configures on one runner
+    # image and runs the tests on another, and this script is stdlib-only, so
+    # any Python 3 will do (no version constraint).
     add_test(
         NAME rng_order_check
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_rng_order.py
-                ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests)
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_SCRIPT=${PROJECT_SOURCE_DIR}/tools/check_rng_order.py
+            -DEXPECTED_VERSION=
+            -DCONFIGURED_PYTHON=${Python3_EXECUTABLE}
+            -DPYTHONPATH=
+            "-DTEST_ARGS=${PROJECT_SOURCE_DIR}/src;${PROJECT_SOURCE_DIR}/tests"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_python_test.cmake")
     set_tests_properties(rng_order_check PROPERTIES LABELS "source-guard")
 endif()
 

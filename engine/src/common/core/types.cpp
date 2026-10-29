@@ -17,6 +17,7 @@ CRS::CRS(const crs::CoordinateSystem& cs) {
     if (cs.is_set()) {
         epsg = cs.epsg();
         wkt = cs.to_wkt();
+        vertical = cs.vertical();
     }
 }
 
@@ -24,10 +25,14 @@ CRS::operator crs::CoordinateSystem() const {
     if (!is_set()) {
         return crs::CoordinateSystem::local();
     }
-    if (epsg != 0) {
-        return crs::CoordinateSystem::from_epsg(epsg);
+    crs::CoordinateSystem cs = epsg != 0 ? crs::CoordinateSystem::from_epsg(epsg)
+                                        : crs::CoordinateSystem::from_wkt(wkt);
+    // The vertical datum lives beside the horizontal WKT, so it is reattached
+    // here: the canonical WKT of a horizontal CRS does not carry it.
+    if (vertical && vertical->is_set()) {
+        cs = cs.with_vertical(*vertical);
     }
-    return crs::CoordinateSystem::from_wkt(wkt);
+    return cs;
 }
 
 #else  // !ALPHASHAPE_USE_PROJ

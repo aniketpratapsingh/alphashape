@@ -156,6 +156,14 @@ TEST(Georeference, RecoversKnownSimilarity) {
     const Eigen::Vector3d mapped = (chunk.transform() * Eigen::Vector4d(0, 0, 0, 1)).head<3>();
     EXPECT_LT((mapped - geo::geodetic_to_ecef(origin_new)).norm(), 1e-6);
     EXPECT_EQ(chunk.crs().epsg, 4326);
+    // WP-12.6: the camera references and the (now metric ENU) world are in the
+    // chunk CRS, so both slots are set explicitly to it; the marker slot keeps
+    // following the chunk CRS because nothing here touched markers.
+    ASSERT_TRUE(chunk.explicit_camera_crs().has_value());
+    ASSERT_TRUE(chunk.explicit_world_crs().has_value());
+    EXPECT_EQ(chunk.camera_crs().epsg, 4326);
+    EXPECT_EQ(chunk.world_crs().epsg, 4326);
+    EXPECT_FALSE(chunk.explicit_marker_crs().has_value());
 
     ASSERT_TRUE(chunk.tie_points().tracks[0].point.has_value());
     EXPECT_LT((*chunk.tie_points().tracks[0].point - truth_in_new_frame(0)).norm(), 1e-6);

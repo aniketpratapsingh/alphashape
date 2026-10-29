@@ -264,6 +264,16 @@ jobs:
           curl -fsSL --retry 3 --max-time 60 -o "$prefix/include/vma/vk_mem_alloc.h" \
             "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/${VMA_TAG}/include/vk_mem_alloc.h"
 
+      # Pin the interpreter: CMake bakes its path into the Python ctest entries
+      # and the extension is built against it, so the test jobs must install the
+      # same one. Homebrew Python on the image rolls independently of the build
+      # (3.15 here, 3.14 two runners over), which made those entries "Not Run".
+      # macos-15 has no 3.12 newer than 3.12.10 in the tool cache, and setup-python
+      # needs a darwin-arm64 build, so that patch is the newest available.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12.10"
+
       - name: Install Qt 6.8 (GUI)
         uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
         env:
@@ -288,11 +298,21 @@ jobs:
 
       - name: Configure
         run: |
+          # FindPython3 is pointed at the pinned interpreter explicitly rather than
+          # left to the search order: the Homebrew formulae (pybind11 is one) pull a
+          # python@3.x of their own, and which of the two wins depends on the image.
+          # The module must be built against the interpreter the test lanes install.
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DALPHASHAPE_WARNINGS_AS_ERRORS=ON -DALPHASHAPE_GPU=ON \
             -DALPHASHAPE_BUILD_GUI=ON -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            "-DPython3_ROOT_DIR=$pythonLocation" -DPython3_FIND_STRATEGY=LOCATION \
+            "-DPython3_EXECUTABLE=$pythonLocation/python" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           grep -q 'ALPHASHAPE_GPU_HAS_VULKAN 1' build/src/gpu/generated/gpu/gpu_config.hpp
+          abi="$(cat build/dist/PYTHON-ABI.txt)"
+          expected="$("$pythonLocation/python" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
+          echo "module built for Python $abi (pinned $expected)"
+          [ "$abi" = "$expected" ] || { echo "::error::the module was configured for Python $abi, not the pinned $expected"; exit 1; }
 
       - name: Build
         run: cmake --build build --parallel 3
@@ -397,7 +417,7 @@ jobs:
           so="$(ls "$mnt"/alphashape.app/Contents/Resources/python/*.so)"
           hdiutil detach "$mnt"
           echo "version=$(basename "$so" | sed -E 's/.*cpython-3([0-9]+)-darwin.*/3.\1/')" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ steps.py.outputs.version }}
       - name: Hide Homebrew
@@ -458,7 +478,7 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
@@ -819,7 +839,7 @@ jobs:
           "module built for $version, installing $minor"
           "minor=$minor" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ steps.abi.outputs.minor }}
 
@@ -962,6 +982,13 @@ jobs:
         run: |
           brew install eigen ceres-solver proj libtiff libpng jpeg-turbo pybind11 libomp molten-vk \
             vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
+
+      # Same pin as the build job: the ctest entries run a Python that must match
+      # the interpreter the module was built for, and a Homebrew Python on the
+      # image is a different minor version from run to run.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12.10"
 
       - name: Install Qt 6.8 (GUI)
         uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125  # v4.4.1
@@ -1180,7 +1207,7 @@ jobs:
 
       # Pin the interpreter: CMake bakes its absolute path into the rng_order_check test, and the
       # test shards must find the same one (image Python patch versions differ between runners).
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 

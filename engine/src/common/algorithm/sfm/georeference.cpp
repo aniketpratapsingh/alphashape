@@ -177,6 +177,13 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
 
     chunk.transform() = geo::enu_to_ecef(origin);
     chunk.crs().epsg = 4326;
+    // The GNSS references this fit consumed are lon/lat/alt in that CRS, and the
+    // chunk's local frame is now metric ENU expressible in it, so the camera and
+    // world slots name it explicitly (M12 §4.4, WP-12.6). The slots only label
+    // the numbers; nothing below converts them, and the marker slot keeps
+    // following the chunk CRS because nothing here touched markers.
+    chunk.set_camera_crs(chunk.crs());
+    chunk.set_world_crs(chunk.crs());
 
     report.applied = true;
     report.references_used = inliers;
