@@ -9,8 +9,9 @@ All notable changes to alphashape are recorded here. The format follows
 ### Added
 
 - **Exact natural-neighbour hole filling in Build DEM.** Holes bordered by at
-  most `sibson_exact_max_sites` data cells (new `BuildDem` parameter, default
-  20 000; 0 keeps the previous behaviour) are now filled with exact Sibson
+  most `sibson_exact_max_sites` data cells (new `BuildDem` parameter; off by
+  default until the quality benchmark confirms it, 20 000 is a sensible value)
+  can now be filled with exact Sibson
   interpolation: the bordering cells are triangulated (incremental Delaunay
   with exact orientation and in-circle predicates), and each hole cell takes
   the area-weighted average of its natural neighbours. Planes are reproduced

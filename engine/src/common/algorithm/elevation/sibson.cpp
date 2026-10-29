@@ -136,7 +136,12 @@ bool sibson_coordinates(const Delaunay2D& dt, const V& q, std::vector<SibsonWeig
     const std::size_t m = boundary.size();
     std::vector<BoundaryEdge> ring;
     ring.reserve(m);
-    ring.push_back(boundary.front());
+    // Start the cycle at the edge leaving the smallest site index, so the order of
+    // the weights (and of their sum) does not depend on where location started.
+    ring.push_back(*std::min_element(boundary.begin(), boundary.end(),
+                                     [](const BoundaryEdge& x, const BoundaryEdge& y) {
+                                         return x.a < y.a;
+                                     }));
     while (ring.size() < m) {
         const int tail = ring.back().b;
         const auto next = std::find_if(boundary.begin(), boundary.end(),

@@ -101,10 +101,11 @@ void BuildDemTask::declare_params(Params& params) const {
     fill_method.choices = {"natural_neighbour", "idw", "nearest"};
     params.declare(fill_method);
 
-    ParamSpec exact_sites{"sibson_exact_max_sites", ParamType::Int, std::int64_t{20000},
+    ParamSpec exact_sites{"sibson_exact_max_sites", ParamType::Int, std::int64_t{0},
                           "natural_neighbour: holes bordered by at most this many data cells "
                           "use exact Sibson interpolation; larger ones the discrete "
-                          "approximation. 0 = discrete everywhere."};
+                          "approximation. 0 (default) = discrete everywhere; 20000 is a "
+                          "sensible value to enable it."};
     exact_sites.minimum = std::int64_t{0};
     exact_sites.maximum = std::int64_t{1000000};
     params.declare(exact_sites);
