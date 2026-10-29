@@ -340,8 +340,18 @@ TEST(Crs, ConvertReferenceYawGainsMeridianConvergence) {
     // yaw of a true-north heading is +gamma.)
     const double grid_azimuth = std::atan2(d_east, d_north) / kDeg;
     EXPECT_NEAR(converted.yaw, -grid_azimuth, 1e-3) << "grid yaw of a true-north heading";
-    EXPECT_NEAR(converted.pitch, 0.0, 1e-9) << "the frame rotation is about up only";
-    EXPECT_NEAR(converted.roll, 0.0, 1e-9);
+    // "About up only" is the physical claim, and it is checked on the rotation
+    // itself: the frame's up axis must stay up. The pitch/roll magnitudes are
+    // the finite-difference residue of that (about 1e-8 deg, from the 1e-5 deg
+    // step in `local_basis`), so they are bounded rather than zero.
+    const Eigen::Matrix3d frame =
+        frame_rotation(geographic(), utm(zone), crs::CrsPoint{lon, lat, 0.0});
+    const Eigen::Vector3d up = frame * Eigen::Vector3d::UnitZ();
+    EXPECT_NEAR(up.x(), 0.0, 1e-6);
+    EXPECT_NEAR(up.y(), 0.0, 1e-6);
+    EXPECT_NEAR(up.z(), 1.0, 1e-9);
+    EXPECT_NEAR(converted.pitch, 0.0, 1e-6) << "the frame rotation is about up only";
+    EXPECT_NEAR(converted.roll, 0.0, 1e-6);
 
     // Round trip: back to geographic, the heading is north again.
     const crs::CrsPoint there = *to_grid.forward(crs::CrsPoint{lon, lat, 0.0});
@@ -361,9 +371,11 @@ TEST(Crs, FrameRotationBetweenUtmZonesIsAboutUp) {
     EXPECT_LE((rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(),
               1e-12);
     EXPECT_NEAR(rotation.determinant(), 1.0, 1e-12);
+    // Up maps to up, at the finite-difference step's own accuracy (1e-5 deg in
+    // `local_basis`, so the direction is good to about 1e-8).
     const Eigen::Vector3d up = rotation * Eigen::Vector3d::UnitZ();
-    EXPECT_NEAR(up.x(), 0.0, 1e-9);
-    EXPECT_NEAR(up.y(), 0.0, 1e-9);
+    EXPECT_NEAR(up.x(), 0.0, 1e-6);
+    EXPECT_NEAR(up.y(), 0.0, 1e-6);
     EXPECT_NEAR(up.z(), 1.0, 1e-9);
 }
 
