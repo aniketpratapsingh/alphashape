@@ -138,7 +138,7 @@ EulerAngles from_matrix(const Eigen::Matrix3d& matrix, RotationOrder order) {
     // non-negative, so the sign of B comes from r02 and the branch is taken
     // only when cos(B) is genuinely zero.
     const double cos_middle = std::hypot(r(0, 0), r(0, 1));
-    const double b = std::atan2(r(0, 2), cos_middle);
+    double b = std::atan2(r(0, 2), cos_middle);
     double a = 0.0;
     double c = 0.0;
     if (cos_middle > 1e-12) {
