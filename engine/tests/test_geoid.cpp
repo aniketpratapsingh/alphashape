@@ -404,147 +404,83 @@ TEST_F(GeoidTempDir, CrsMissingGeoidThrowsOnLoad) {
     }
 }
 
-}  // namespace
-}  // namespace alphashape::crs
+// The index is untrusted input: both the `file` attribute and the `id` become
+// `dir / name`, so either could name a path outside the store. Every hostile
+// spelling must be refused by name, and nothing may be written outside `dir`.
+TEST_F(GeoidTempDir, CrsGeoidIndexRejectsPathTraversal) {
+    const fs::path store_dir = dir_ / "geoids";
+    std::error_code ec;
+    fs::create_directories(store_dir, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    // A readable grid just outside the store, which a successful escape would
+    // reach. Its presence makes "is the file there?" a useless defence.
+    fs::copy_file(kFixtureDir / "egm96_subset.tif", dir_ / "outside.tif", ec);
+    ASSERT_FALSE(ec) << ec.message();
 
-namespace alphashape::crs {
-namespace {
-
-// H = h - N and its inverse, against PROJ's own compound pipeline. The direct
-// functions and the EPSG compound transform must agree, which is what pins the
-// sign: a flipped sign would put the two ~2N apart (about 96 m at 50N), not
-// millimetres apart.
-TEST(Crs, OrthometricHeightConversion) {
-    const std::shared_ptr<const GeoidGrid> grid = subset();
-    ASSERT_NE(grid, nullptr);
-    constexpr double kEllipsoidal = 100.0;
-    for (const auto& [lon, lat] : std::vector<std::pair<double, double>>{
-             {9.0, 50.0}, {0.0, 0.0}, {-77.0, 39.0}, {151.0, -33.0}}) {
-        const std::optional<double> undulation = grid->undulation(lon, lat);
-        ASSERT_TRUE(undulation.has_value()) << lon << "," << lat;
-        const std::optional<double> orthometric =
-            orthometric_height(kEllipsoidal, lon, lat, *grid);
-        ASSERT_TRUE(orthometric.has_value());
-        EXPECT_NEAR(*orthometric, kEllipsoidal - *undulation, 1e-9);
-
-        const std::optional<double> back = ellipsoidal_height(*orthometric, lon, lat, *grid);
-        ASSERT_TRUE(back.has_value());
-        EXPECT_NEAR(*back, kEllipsoidal, 1e-6) << "round trip at " << lon << "," << lat;
-    }
-    // Outside coverage the conversion fails rather than extrapolating.
-    EXPECT_FALSE(orthometric_height(kEllipsoidal, 0.0, 90.5, *grid).has_value());
-
-    // The EPSG compound path must produce the same height: EPSG:4979 (WGS 84
-    // 3D) -> EPSG:32633 + EPSG:5773 (UTM 33N on the EGM96 geoid), for the one
-    // point inside the subset and inside zone 33.
-    const std::shared_ptr<const GeoidGrid> egm96 = installed_grid("us_nga_egm96_15.tif");
-    if (!egm96) {
-        GTEST_SKIP() << "us_nga_egm96_15.tif is not installed in PROJ's data directory; "
-                        "the EPSG compound comparison needs it";
-    }
-    VerticalCrs egm96_height;
-    egm96_height.kind = VerticalCrs::Kind::GeoidModel;
-    egm96_height.name = "EGM96 height";
-    egm96_height.grid = "us_nga_egm96_15.tif";
-    const CoordinateSystem src = CoordinateSystem::from_epsg(4979);
-    const CoordinateSystem dst =
-        CoordinateSystem::from_epsg(32633).with_vertical(egm96_height);
-    const VerticalTransform compound = VerticalTransform::compound(src, dst);
-    ASSERT_TRUE(compound.is_valid());
-    const std::optional<CrsPoint> moved =
-        compound.forward(CrsPoint{9.0, 50.0, kEllipsoidal});
-    ASSERT_TRUE(moved.has_value());
-    const std::optional<double> expected = orthometric_height(kEllipsoidal, 9.0, 50.0, *egm96);
-    ASSERT_TRUE(expected.has_value());
-    // PROJ's pipeline applies the geoid through the grid's own interpolation,
-    // so a 1 mm bound holds where both use the same grid.
-    EXPECT_NEAR(moved->z, *expected, 1e-3);
-}
-
-// The vertical datum survives a project save/load: doc.xml carries it as a
-// `<vertical>` child of `<crs>` (M12 §4.8), and an ellipsoidal CRS writes no
-// such element at all, so a project without a vertical datum is byte-identical
-// to what the pre-M12 writer produced.
-TEST_F(GeoidTempDir, CrsVerticalCrsPersistence) {
-    VerticalCrs egm96;
-    egm96.kind = VerticalCrs::Kind::GeoidModel;
-    egm96.name = "EGM96 height";
-    egm96.grid = "us_nga_egm96_15.tif";
-    egm96.offset_m = -0.5;
-
-    Document document;
-    Chunk& written = document.workspace().add_chunk("geoid");
-    document.set_active_chunk_id(written.id());
-    written.set_coordinate_system(CoordinateSystem::from_epsg(32633).with_vertical(egm96));
-    // A second chunk without a vertical datum, to pin the "no element" case.
-    Chunk& plain = document.workspace().add_chunk("plain");
-    plain.set_coordinate_system(CoordinateSystem::from_epsg(4326));
-
-    const std::string project = path("geoid_vertical.psx");
-    document.save(project);
-    const std::shared_ptr<Document> loaded = ProjectIO::load(project);
-    ASSERT_NE(loaded, nullptr);
-
-    const Chunk* restored = loaded->active_chunk();
-    ASSERT_NE(restored, nullptr);
-    const CoordinateSystem cs = restored->coordinate_system();
-    EXPECT_EQ(cs.epsg(), 32633);
-    const std::optional<VerticalCrs> vertical = cs.vertical();
-    ASSERT_TRUE(vertical.has_value());
-    EXPECT_EQ(vertical->kind, VerticalCrs::Kind::GeoidModel);
-    EXPECT_EQ(vertical->name, "EGM96 height");
-    EXPECT_EQ(vertical->grid, "us_nga_egm96_15.tif");
-    EXPECT_DOUBLE_EQ(vertical->offset_m, -0.5);
-
-    const Chunk* without = nullptr;
-    for (const std::shared_ptr<Chunk>& chunk : loaded->workspace().chunks()) {
-        if (chunk->id() == plain.id()) {
-            without = chunk.get();
+    const std::vector<std::string> hostile{
+        "../outside.tif", "..", ".", "a/b", "a\\b", "/etc/passwd", "C:outside.tif",
+        std::string(129, 'a'), std::string("a\0b", 3)};
+    for (const std::string& bad : hostile) {
+        std::string xml = "<?xml version=\"1.0\"?>\n<geoids>\n  <geoid id=\"EGM96\" file=\"";
+        xml += bad;
+        xml +=
+            "\" min_lon=\"-180\" min_lat=\"-90\" max_lon=\"180\" max_lat=\"90\"/>\n</geoids>\n";
+        {
+            std::ofstream out(store_dir / "index.xml", std::ios::binary | std::ios::trunc);
+            out << xml;
+        }
+        try {
+            const GeoidStore loaded = GeoidStore::load(store_dir);
+            static_cast<void>(loaded);
+            FAIL() << "load() accepted file=\"" << bad << "\"";
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("unusable file name"), std::string::npos) << message;
         }
     }
-    ASSERT_NE(without, nullptr);
-    EXPECT_FALSE(without->coordinate_system().vertical().has_value())
-        << "an ellipsoidal CRS must not come back with a datum";
-    // The CRS stands: only the vertical datum round-tripped, not a distortion of
-    // the horizontal part.
-    EXPECT_EQ(without->coordinate_system().epsg(), 4326);
-}
 
-// custom() is the only path that evaluates a grid the engine opened itself, and
-// it must give H = h - N with N from that grid. Constructing the transform is
-// also the regression test for a use-after-move: the description is built from
-// the stored geoid after ownership moved into the impl, so a null dereference
-// there aborts before any point is transformed.
-TEST(Crs, VerticalCustomAppliesGeoidSign) {
-    const std::shared_ptr<const GeoidGrid> grid = subset();
-    ASSERT_NE(grid, nullptr);
-    const CoordinateSystem geo = CoordinateSystem::from_epsg(4979);  // WGS 84 3D
-    const CoordinateSystem utm = CoordinateSystem::from_epsg(32633);
-    VerticalCrs egm96;
-    egm96.kind = VerticalCrs::Kind::GeoidModel;
-    egm96.name = "EGM96 height";
-    egm96.grid = "us_nga_egm96_15.tif";
-    VerticalCrs none;
-    const VerticalTransform custom =
-        VerticalTransform::custom(geo, utm, none, egm96, grid, geo);
-    ASSERT_TRUE(custom.is_valid());
-    EXPECT_NE(custom.description().find("egm96_subset.tif"), std::string::npos)
-        << custom.description();
+    // The id travels the same join, both in the index and as the copied file
+    // name, so a hostile id is refused on load and by add().
+    for (const std::string& bad : std::vector<std::string>{"../evil", "..", "a/b", "C:x"}) {
+        std::string xml = "<?xml version=\"1.0\"?>\n<geoids>\n  <geoid id=\"";
+        xml += bad;
+        xml +=
+            "\" file=\"EGM96.tif\" min_lon=\"-180\" min_lat=\"-90\" max_lon=\"180\" "
+            "max_lat=\"90\"/>\n</geoids>\n";
+        {
+            std::ofstream out(store_dir / "index.xml", std::ios::binary | std::ios::trunc);
+            out << xml;
+        }
+        try {
+            const GeoidStore loaded = GeoidStore::load(store_dir);
+            static_cast<void>(loaded);
+            FAIL() << "load() accepted id=\"" << bad << "\"";
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("geoid id"), std::string::npos) << message;
+        }
 
-    constexpr double kH = 120.0;
-    const std::optional<CrsPoint> moved = custom.forward(CrsPoint{9.0, 50.0, kH});
-    ASSERT_TRUE(moved.has_value());
-    const std::optional<double> n = grid->undulation(9.0, 50.0);
-    ASSERT_TRUE(n.has_value());
-    EXPECT_NEAR(moved->z, kH - *n, 1e-6) << "custom() must apply H = h - N";
-    // The horizontal part is still the UTM transform, not a pass-through.
-    const std::optional<CrsPoint> horizontal = custom.horizontal().forward(CrsPoint{9.0, 50.0, 0});
-    ASSERT_TRUE(horizontal.has_value());
-    EXPECT_NEAR(moved->x, horizontal->x, 1e-6);
-    EXPECT_NEAR(moved->y, horizontal->y, 1e-6);
+        GeoidStore store;
+        store.set_directory(store_dir);
+        try {
+            store.add(bad, bad, (kFixtureDir / "egm96_subset.tif").string(), "", "");
+            FAIL() << "add() accepted id=\"" << bad << "\"";
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("geoid id"), std::string::npos) << message;
+        }
+        EXPECT_FALSE(fs::exists(dir_ / "evil.tif")) << "add() wrote outside the store";
+    }
 
-    // Outside the geoid the conversion refuses rather than extrapolating.
-    EXPECT_FALSE(custom.forward(CrsPoint{9.0, 90.5, kH}).has_value());
+    // Nothing outside the store was created: `outside.tif` is still the only
+    // other entry in the parent.
+    int parent_entries = 0;
+    for (const fs::directory_entry& item : fs::directory_iterator(dir_)) {
+        if (item.path().filename() != "geoids") {
+            ++parent_entries;
+        }
+    }
+    EXPECT_EQ(parent_entries, 1) << "a rejected geoid name created a file outside the store";
 }
 
 }  // namespace

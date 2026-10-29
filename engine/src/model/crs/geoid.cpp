@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -593,6 +594,69 @@ double number_of(const std::vector<std::pair<std::string, std::string>>& attrs,
     return value;
 }
 
+/// Why `value` is not a single plain path component, or nullopt when it is.
+///
+/// Both the `file` attribute of an `index.xml` and the `id` a grid is stored
+/// under end up as `dir / name`, and the index is untrusted input: a project
+/// may be opened from anywhere. Anything that could escape `dir` or address a
+/// different volume is rejected, so the join can never leave the store.
+std::optional<std::string> path_component_error(const std::string& value) {
+    if (value.empty()) {
+        return "is empty";
+    }
+    if (value.size() > 128) {
+        return "is longer than 128 characters";
+    }
+    if (value == "." || value == "..") {
+        return "is a relative directory reference";
+    }
+    for (const char ch : value) {
+        const bool plain = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                           (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+        if (!plain) {
+            // Covers '/', '\', ':' (drive letters, ADS), NUL and everything
+            // else; the message names the rule rather than echoing bytes.
+            return "must match [A-Za-z0-9._-]+";
+        }
+    }
+    return std::nullopt;
+}
+
+/// True when `candidate` is `base` or sits below it, component by component.
+bool is_within(const std::filesystem::path& candidate, const std::filesystem::path& base) {
+    auto b = base.begin();
+    auto c = candidate.begin();
+    for (; b != base.end(); ++b, ++c) {
+        if (c == candidate.end() || *c != *b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `dir / name` after proving that the result resolves inside `dir`.
+///
+/// The component check above already excludes every escape we know of; this is
+/// the belt-and-braces check the join itself needs, so a platform quirk (a
+/// symlinked directory, a translated device path) cannot turn a plain name into
+/// a path outside the store.
+std::filesystem::path join_inside(const std::filesystem::path& dir, const std::string& name,
+                                  const std::string& what, const std::string& where) {
+    const std::filesystem::path joined = dir / name;
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::weakly_canonical(dir, ec);
+    if (ec) {
+        throw Error("'" + where + "': cannot resolve the geoid store directory '" + dir.string() +
+                    "': " + ec.message());
+    }
+    const std::filesystem::path full = std::filesystem::weakly_canonical(joined, ec);
+    if (ec || !is_within(full, base)) {
+        throw Error("'" + where + "': geoid " + what + " '" + name +
+                    "' resolves outside the geoid store directory");
+    }
+    return joined;
+}
+
 }  // namespace
 
 GeoidStore::GeoidStore() = default;
@@ -673,6 +737,11 @@ bool GeoidStore::add(const std::string& id, const std::string& name,
     if (id.empty()) {
         throw Error("a geoid needs an id");
     }
+    // The id names the stored file (`id + ".tif"`), so it must be one plain
+    // component: `add("../x", ...)` must not write outside the store.
+    if (const std::optional<std::string> why = path_component_error(id)) {
+        throw Error("geoid id '" + id + "' " + *why);
+    }
     if (find(id)) {
         throw Error("geoid '" + id + "' is already in the store");
     }
@@ -691,7 +760,8 @@ bool GeoidStore::add(const std::string& id, const std::string& name,
             throw Error("cannot create the geoid store directory '" + directory_.string() +
                         "': " + ec.message());
         }
-        const std::filesystem::path target = directory_ / (id + ".tif");
+        const std::filesystem::path target =
+            join_inside(directory_, id + ".tif", "id", "GeoidStore::add");
         if (std::filesystem::weakly_canonical(source_path, ec) !=
             std::filesystem::weakly_canonical(target, ec)) {
             std::filesystem::copy_file(source_path, target,
@@ -797,7 +867,14 @@ void GeoidStore::save(const std::filesystem::path& dir) const {
         // The store is copied next to the index under the model's id, so the
         // project keeps working when the machine that made it is gone.
         const std::string file_name = entry.model.id + ".tif";
-        const std::filesystem::path target = dir / file_name;
+        // The id was validated when it entered the store (add()/load()), and is
+        // validated again here because a store can be populated by other paths.
+        if (const std::optional<std::string> why = path_component_error(entry.model.id)) {
+            throw Error("geoid id '" + entry.model.id + "' " + *why +
+                        "; refusing to write grid '" + file_name + "'");
+        }
+        const std::filesystem::path target =
+            join_inside(dir, file_name, "id", "GeoidStore::save");
         if (!std::filesystem::exists(source)) {
             throw Error("geoid '" + entry.model.id + "' is missing its grid '" +
                         entry.model.path + "'");
@@ -865,15 +942,26 @@ GeoidStore GeoidStore::load(const std::filesystem::path& dir) {
         const auto attrs = parse_element(text.substr(pos + 7, end - pos - 7), index);
         Entry entry;
         entry.model.id = attr_of(attrs, "id", index, true);
+        // The id becomes the stored file name on the next save(), so it is held
+        // to the same rule as `file` here rather than only when it is written.
+        if (const std::optional<std::string> why = path_component_error(entry.model.id)) {
+            throw ProjectIOError("'" + index.string() + "': geoid id '" + entry.model.id + "' " +
+                                 *why);
+        }
         entry.model.name = attr_of(attrs, "name", index, false);
-        const std::string file = attr_of(attrs, "file", index, true);
-        entry.model.source = attr_of(attrs, "source", index, false);
+        const std::string file = attr_of(attrs, "file", index, true);        entry.model.source = attr_of(attrs, "source", index, false);
         entry.model.licence = attr_of(attrs, "licence", index, false);
         entry.model.min_lon_deg = number_of(attrs, "min_lon", index);
         entry.model.min_lat_deg = number_of(attrs, "min_lat", index);
         entry.model.max_lon_deg = number_of(attrs, "max_lon", index);
         entry.model.max_lat_deg = number_of(attrs, "max_lat", index);
-        const std::filesystem::path grid = dir / file;
+        // The index is untrusted: `file` is joined onto `dir`, so it must be one
+        // plain component and the result must stay inside the store.
+        if (const std::optional<std::string> why = path_component_error(file)) {
+            throw ProjectIOError("'" + index.string() + "': geoid '" + entry.model.id +
+                                 "' has an unusable file name: '" + file + "' " + *why);
+        }
+        const std::filesystem::path grid = join_inside(dir, file, "file", index.string());
         if (!std::filesystem::exists(grid)) {
             // A project that names a geoid it does not carry must not load as if
             // the heights were ellipsoidal: that would shift every orthometric
