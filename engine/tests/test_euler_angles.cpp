@@ -68,6 +68,25 @@ TEST(Crs, EulerRoundTripAllOrders) {
                                     << " pitch " << input.pitch << " roll " << input.roll;
             ++checked;
         }
+        // The two gimbal rows, explicitly, for every order: the middle angle is
+        // kept at ±90 degrees, roll is forced to 0 and yaw carries the rest,
+        // and the recovered angles still reproduce the matrix. Sampling never
+        // hits these exactly, so they are asserted here rather than left to
+        // luck.
+        for (const double middle : {90.0, -90.0}) {
+            EulerAngles input;
+            input.order = order;
+            input.yaw = 37.5;
+            input.pitch = middle;
+            input.roll = -112.25;
+            const Eigen::Matrix3d expected = to_matrix(input);
+            const EulerAngles recovered = from_matrix(expected, order);
+            EXPECT_DOUBLE_EQ(recovered.pitch, middle) << rotation_order_name(order);
+            EXPECT_EQ(recovered.roll, 0.0) << rotation_order_name(order);
+            EXPECT_LE(rotation_angle(expected, to_matrix(recovered)), 1e-12)
+                << rotation_order_name(order) << " pitch " << middle;
+            EXPECT_EQ(recovered.order, order);
+        }
         RecordProperty((std::string("worst_") + rotation_order_name(order)).c_str(), worst);
     }
     EXPECT_EQ(checked, 6u * 1000u);
