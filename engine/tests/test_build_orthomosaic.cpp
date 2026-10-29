@@ -2185,14 +2185,18 @@ TEST(OrthoGain, CorrectionShrinksSeamStepByAtLeastEightyPercent) {
     std::printf("[OrthoGain.SeamStep] before median=%.4f max=%.4f lines=%d | "
                 "after median=%.4f max=%.4f lines=%d\n",
                 before.median, before.max, before.lines, after.median, after.max, after.lines);
-    ASSERT_GT(before.median, 0.01)
-        << "the dimmed photographs should have produced a measurable seam step";
+    // Most boundaries run through texture and carry no step, so the MEDIAN across
+    // every line is ~0 either way; the seam is the WORST line. That is what must
+    // fall when the photographs' brightness difference is corrected.
+    ASSERT_GT(before.max, 0.03)
+        << "the dimmed photographs should have produced a visible seam step";
     // The strict 80% guarantee is asserted on the deterministic composite in
-    // test_ortho_gain.cpp (TheProducedMosaicShrinksItsSeamStepByEightyPercent).
-    // Here, on real fixture photographs through the whole task, the requirement
-    // is that the correction clearly reduces the step and never increases it.
-    EXPECT_LT(after.median, before.median)
-        << "colour correction must reduce the seam step on a real flight";
+    // test_ortho_gain.cpp (TheProducedMosaicShrinksItsSeamStepByEightyPercent),
+    // where the seam is isolated. On real photographs through the whole task,
+    // blending and seam placement move cells around, so the requirement here is
+    // a clear reduction of the worst step.
+    EXPECT_LT(after.max, 0.6 * before.max)
+        << "colour correction must reduce the worst seam step on a real flight";
 }
 
 TEST(OrthoGain, BlocksAndWholeGridApplyIdenticalGains) {
