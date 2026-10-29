@@ -6,6 +6,51 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Datum transformations can be listed, chosen and pinned.** A coordinate
+  system now reports every datum shift PROJ knows to a target CRS —
+  `CoordinateSystem::available_transformations()` — with each operation's
+  authority code, stated accuracy, ballpark flag, grids and pipeline text,
+  ordered by increasing accuracy with unknown accuracy last. That order is
+  accuracy-sorted, not PROJ's own per-point pick: no single entry is "the one
+  PROJ would use", because PROJ chooses per point by area of use.
+  `CoordinateSystem::with_transformation()` turns one of those entries into a
+  CRS bound to the operation's hub (a WKT2 `BOUNDCRS`), so a transform built
+  from it applies exactly that shift instead of re-deriving one: that is how a
+  caller says "use the 7-parameter Helmert" or "use the NTv2 grid" and gets it.
+  A missing grid is never downloaded and never silently downgraded to a
+  ballpark: the operation stays in the list with the grid named under
+  `missing_grids`, and applying it throws
+  `transformation needs grid <name>; install proj-data`, which also replaces
+  PROJ's opaque "File not found" on the plain `CrsTransform::create()` path.
+  `+towgs84` in a CRS definition is honoured by PROJ and needs no special
+  handling. The Helmert shifts are checked against the worked examples and
+  formulas of IOGP Publication 373-7-2 to a millimetre; the grid cases skip,
+  naming the grid, where it is not installed. The macOS and Windows packages
+  still ship only a subset of the PROJ grids, so some national shifts need
+  `proj-data` installed (see `engine/LIMITATIONS.md`).
+
+### Changed
+
+- **A pair on aligned datums no longer needs `allow_ballpark`.** An unpinned
+  transform is PROJ's own pipeline, and PROJ used to be asked for a pipeline
+  that PROJ itself described as a ballpark for pairs such as WGS 84 ↔ ETRS89,
+  NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 and NTF, so `create()`
+  refused them even though the real EPSG operation exists (a null shift, a
+  Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
+  are accepted and their numbers come from the EPSG operation PROJ picks per
+  point rather than a `+proj=noop` fallback; `accuracy_m()` reports that
+  operation's stated accuracy (1 m for ETRS89 ↔ WGS 84, 2 m for the NAD83(2011)
+  Helmert, 3 m for GDA2020). A pair with no known shift at all (WGS 84 ↔ NAD27,
+  Amersfoort, …) has only a ballpark candidate and is still refused without
+  `allow_ballpark`. See `engine/LIMITATIONS.md`.
+- **An optional grid is not reported missing.** PROJ's `+grids=@name` means
+  "use it if installed, otherwise run without it". Such a grid is now listed
+  without the leading `@` and never reported under `missing_grids`, so a
+  transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
+  instead of failing with `transformation needs grid @name; install proj-data`.
+
 ## [0.2.0] - 2026-10-28
 
 ### Added

@@ -76,16 +76,53 @@ struct VerticalCrs {
     bool operator!=(const VerticalCrs& other) const { return !(*this == other); }
 };
 
-/// A selectable datum transformation between two CRSs (M12 §4.2). The
-/// enumeration/selection logic is WP-12.4; the struct exists now because
-/// project persistence and the coordinate-system dialog carry it.
+/// A selectable datum transformation between two CRSs (M12 §4.2, WP-12.4).
+///
+/// Produced by `CoordinateSystem::available_transformations()` and consumed by
+/// `CoordinateSystem::with_transformation()` (datum.hpp). The grid fields are
+/// what makes a missing grid diagnosable rather than a silent downgrade to a
+/// ballpark: an operation that names a grid PROJ cannot find keeps its place in
+/// the list (so the choice stays visible and pinnable), reports the grid under
+/// `missing_grids`, and refuses to run with
+/// `Error("transformation needs grid <name>; install proj-data")`.
+///
+/// There is deliberately no "preferred" flag. PROJ's automatic transform does
+/// not run one operation for every point: an area-limited national operation
+/// applies inside its area of use and a less accurate one (down to the ballpark)
+/// takes over outside it. Calling any single entry "the one PROJ would use"
+/// would therefore be false for half the world. Use `accuracy_m` and `name`
+/// to choose, and pin the choice with `with_transformation()` or
+/// `TransformOptions::preferred_operation`.
 struct DatumTransformation {
-    std::string auth_name;   ///< "EPSG" | "PROJ" | "USER"
-    std::string code;
-    std::string name;        ///< "NTv2", "Helmert 7-param", ...
-    double accuracy_m = -1;  ///< -1 = unknown
-    bool preferred = false;
-    std::string definition;  ///< PROJ pipeline or "+towgs84=..." text
+    std::string auth_name;   ///< "EPSG" | "DERIVED_FROM(EPSG)" | "PROJ" | ""
+    std::string code;        ///< "1314", "7710"; "" for an anonymous operation
+    std::string name;        ///< "OSGB36 to WGS 84 (6)", "NTv2", ...
+    /// Accuracy in metres of the operation itself, -1 = unknown.
+    double accuracy_m = -1;
+    /// A null (ballpark) datum shift: the CRSs are on different datums and no
+    /// transformation is known, so coordinates would carry the datum offset.
+    /// `CrsTransform` refuses one unless `allow_ballpark` is set.
+    bool ballpark = false;
+    /// PROJ pipeline text, in visualisation order (x = east/lon). Empty for an
+    /// operation PROJ cannot express as a single PROJ string.
+    std::string definition;
+    /// Grid ids the operation needs, in the order PROJ reports them.
+    std::vector<std::string> grids;
+    /// The subset of `grids` that is not installed. Empty when it can run.
+    std::vector<std::string> missing_grids;
+
+    /// True when a required grid is absent: applying this operation needs
+    /// `proj-data` installed first.
+    bool needs_missing_grid() const { return !missing_grids.empty(); }
+
+    /// Identity comparison of every field.
+    bool operator==(const DatumTransformation& other) const {
+        return auth_name == other.auth_name && code == other.code && name == other.name &&
+               accuracy_m == other.accuracy_m && ballpark == other.ballpark &&
+               definition == other.definition && grids == other.grids &&
+               missing_grids == other.missing_grids;
+    }
+    bool operator!=(const DatumTransformation& other) const { return !(*this == other); }
 };
 
 class CoordinateSystem {
@@ -161,6 +198,45 @@ public:
     /// A copy with the vertical component attached. Attaching a geoid does not
     /// change the horizontal definition; applying the shift is WP-12.5.
     CoordinateSystem with_vertical(const VerticalCrs& vertical) const;
+
+    /// Every datum transformation PROJ knows from this CRS to `target`
+    /// (WP-12.4, datum.hpp). Ordered by increasing accuracy, unknown accuracy
+    /// last; ties keep PROJ's order.
+    ///
+    /// The entries are candidates, not a ranking PROJ would honour: an
+    /// unpinned `CrsTransform` does not pick the first one, it lets PROJ choose
+    /// per point so an area-limited national operation applies only inside its
+    /// area of use. Pinning one of these entries with
+    /// `with_transformation()` (or `TransformOptions::preferred_operation`) is
+    /// how a specific shift is forced everywhere.
+    ///
+    /// A missing grid does not remove an entry — it is reported through
+    /// `DatumTransformation::missing_grids` instead, because a silently shorter
+    /// list would hide the better operation the user could enable by installing
+    /// `proj-data`. Nothing is ever downloaded.
+    ///
+    /// @throws ValueError when either CRS is the local engineering frame or
+    ///         unset, matching `CrsTransform::create`.
+    /// @throws Error when PROJ cannot list operations for the pair.
+    std::vector<DatumTransformation> available_transformations(
+        const CoordinateSystem& target) const;
+
+    /// A copy of this CRS bound to `transformation`'s hub CRS (a WKT2
+    /// `BOUNDCRS`), so a later `CrsTransform::create()` with it uses exactly
+    /// that operation instead of PROJ's per-point choice.
+    ///
+    /// Only a geographic 2D/3D CRS can be bound: PROJ attaches a datum shift to
+    /// a geodetic CRS, so a projected source throws and the caller binds the
+    /// underlying geographic CRS instead. A transformation that names a grid
+    /// which is not installed throws
+    /// `Error("transformation needs grid <name>; install proj-data")` — pinning
+    /// is where a missing grid must surface, not at the first coordinate.
+    ///
+    /// @throws ValueError for the local frame, an unset CRS, a projected CRS,
+    ///         an operation that does not state a target CRS, an entry that
+    ///         belongs to a different CRS pair, or a transformation whose
+    ///         identifier PROJ does not know.
+    CoordinateSystem with_transformation(const DatumTransformation& transformation) const;
 
 private:
     explicit CoordinateSystem(std::shared_ptr<const detail::CoordinateSystemImpl> impl);

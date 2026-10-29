@@ -75,7 +75,8 @@ PjPtr create_crs_object(const std::string& text) {
     return pj;
 }
 
-CrsKind kind_from_proj(PJ_TYPE type) {
+CrsKind kind_from_proj(PJ* pj) {
+    const PJ_TYPE type = proj_get_type(pj);
     switch (type) {
         case PJ_TYPE_GEOGRAPHIC_2D_CRS:
             return CrsKind::Geographic2D;
@@ -91,6 +92,13 @@ CrsKind kind_from_proj(PJ_TYPE type) {
             return CrsKind::Compound;
         case PJ_TYPE_ENGINEERING_CRS:
             return CrsKind::Local;
+        case PJ_TYPE_BOUND_CRS: {
+            // A CRS pinned to a datum by an explicit transformation (WP-12.4):
+            // it is the source CRS plus the shift, so its kind is the source's.
+            PJ_CONTEXT* ctx = thread_context();
+            PjPtr source{proj_get_source_crs(ctx, pj)};
+            return source ? kind_from_proj(source.get()) : CrsKind::Geographic2D;
+        }
         default:
             // Dynamic geodetic CRSs (ITRF, plate-fixed) report as geocentric or
             // geographic depending on their CS; their CS kind is what callers
@@ -137,7 +145,7 @@ std::shared_ptr<const detail::CoordinateSystemImpl> describe(PJ* pj) {
     PJ_CONTEXT* ctx = thread_context();
     auto impl = std::make_shared<detail::CoordinateSystemImpl>();
     impl->local = false;
-    impl->kind = kind_from_proj(proj_get_type(pj));
+    impl->kind = kind_from_proj(pj);
 
     const char* name = proj_get_name(pj);
     impl->name = name != nullptr ? std::string(name) : std::string();
