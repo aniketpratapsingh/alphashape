@@ -206,8 +206,6 @@ const CrsTransform& VerticalTransform::horizontal() const {
     return impl_->mode == Impl::Mode::Compound ? impl_->compound : impl_->horizontal;
 }
 
-bool VerticalTransform::is_valid() const { return static_cast<bool>(impl_); }
-
 namespace {
 
 /// The vertical component of a CRS, or a default-constructed one (ellipsoidal)
