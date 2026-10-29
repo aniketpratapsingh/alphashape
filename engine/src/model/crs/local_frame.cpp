@@ -28,10 +28,12 @@ constexpr double kPi = 3.14159265358979323846;
 /// Geocentric ECEF (metres) -> geodetic. Bowring's iteration on the reduced
 /// latitude, the same construction model/geo/geodesy.hpp documents.
 ///
-/// The iteration matters: PROJ's `+inv +proj=cart` uses the non-iterated closed
-/// form, and at the ECEF magnitudes this frame handles that loses millimetres
-/// (measured: 2.7 mm worst-case round trip at a 500 km offset). Heights are the
-/// same robust formula as the geodesy header, finite at the poles.
+/// Done here rather than through PROJ's `+inv +proj=cart` because the frame
+/// promises a 1e-6 m round trip within 500 km and PROJ's inverse does not meet it
+/// at those ECEF magnitudes: 2.7 mm worst case measured in CI (PROJ 9.4), and
+/// about 4e-6 m in height on PROJ 9.8 (cct, against a 50-digit reference). This
+/// fixed-point iteration converges to the double-precision limit instead.
+/// Heights are the same robust formula as the geodesy header, finite at the poles.
 void ecef_to_geodetic(const Eigen::Vector3d& ecef, double* lon_deg, double* lat_deg,
                       double* height_m) {
     const double e2 = kWgs84F * (2.0 - kWgs84F);
