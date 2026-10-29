@@ -4,7 +4,9 @@
 // anchor sits at the ECEF magnitude the spec calls out (about 6.4e6 m), the
 // points extend 500 km from it, and the round trip must stay inside a
 // micrometre, which is what forces doubles throughout. The matrix form is
-// checked against the function form at the anchor and at a kilometre offset.
+// checked against the function form exactly for a geocentric target (where the
+// mapping is affine) and at the documented near-anchor scale for a geographic
+// one (where it is a linearisation).
 //
 // The slot tests cover the two rules that make the feature safe: a slot that
 // was never set follows the chunk CRS, and an unchanged project keeps its exact
@@ -120,6 +122,34 @@ TEST(Crs, LocalFrameRoundTripExact) {
     EXPECT_LE(worst, 1e-6) << "worst round-trip error (m): " << worst;
 }
 
+TEST(Crs, LocalFrameRoundTripProjected) {
+    // The path DEM and ortho actually take: a projected target. Same sphere,
+    // same micrometre. This also exercises the height carried through a
+    // projection, which a 2D geographic target would not.
+    const Eigen::Vector3d anchor = geodetic_to_ecef(11.4, 47.3, 600.0);
+    const LocalFrame frame = LocalFrame::enu_at(CoordinateSystem::from_epsg(32632), anchor);
+    ASSERT_FALSE(frame.is_identity());
+
+    std::mt19937_64 rng(20261028);
+    double worst = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        const double z = rng::uniform_real(rng, -1.0, 1.0);
+        const double y = rng::uniform_real(rng, -1.0, 1.0);
+        const double x = rng::uniform_real(rng, -1.0, 1.0);
+        Eigen::Vector3d local{x, y, z};
+        const double radius = local.norm();
+        if (radius > 1.0) {
+            local /= radius;
+        }
+        local *= 500000.0;
+        const CrsPoint crs = frame.to_crs(local);
+        ASSERT_TRUE(std::isfinite(crs.x) && std::isfinite(crs.y) && std::isfinite(crs.z))
+            << "point " << i << " outside the projection domain";
+        worst = std::max(worst, (frame.to_local(crs) - local).cwiseAbs().maxCoeff());
+    }
+    EXPECT_LE(worst, 1e-6) << "worst round-trip error (m): " << worst;
+}
+
 TEST(Crs, LocalFrameTransformMatrixMatchesFunction) {
     // Geocentric target: the mapping is affine, so the 4x4 must reproduce it
     // exactly and this pins the axis convention of the matrix columns.
@@ -131,17 +161,16 @@ TEST(Crs, LocalFrameTransformMatrixMatchesFunction) {
     const Eigen::Vector4d mapped =
         exact * Eigen::Vector4d{far.x(), far.y(), far.z(), 1.0};
     const CrsPoint exact_expected = geocentric.to_crs(far);
-    // A micrometre: the central difference divides values near the 6.4e6 m ECEF
-    // magnitude by a 200 m span, so it cannot be bit-exact, but it must not
-    // drift beyond the round-trip criterion either.
-    EXPECT_NEAR(mapped.x(), exact_expected.x, 1e-6);
-    EXPECT_NEAR(mapped.y(), exact_expected.y, 1e-6);
-    EXPECT_NEAR(mapped.z(), exact_expected.z, 1e-6);
+    // The geocentric mapping is affine and now needs no PROJ at all (the local
+    // point IS the ECEF point), so the 4x4 must reproduce it to the precision
+    // of the central difference alone: 1e-9 m over the 200 m span.
+    EXPECT_NEAR(mapped.x(), exact_expected.x, 1e-9);
+    EXPECT_NEAR(mapped.y(), exact_expected.y, 1e-9);
+    EXPECT_NEAR(mapped.z(), exact_expected.z, 1e-9);
 
     // Geographic target: the mapping is curved, so the matrix is the anchor
-    // linearisation. At a 10 km offset the ellipsoid curvature is ~8 m, far
-    // beyond a linearisation; at 10 m it is a tenth of a millimetre, which is
-    // the scale the matrix is documented for.
+    // linearisation. The offsets are kept small because that is the scale the
+    // matrix is documented for: at 10 km the ellipsoid curvature alone is ~8 m.
     const LocalFrame frame =
         LocalFrame::enu_at(wgs84_3d(), geodetic_to_ecef(9.2, 48.8, 250.0));
     const Eigen::Matrix4d m = frame.transform();
@@ -155,13 +184,13 @@ TEST(Crs, LocalFrameTransformMatrixMatchesFunction) {
     const Eigen::Vector3d near{7.0, -4.3, 1.2};
     const Eigen::Vector4d near_mapped = m * Eigen::Vector4d{near.x(), near.y(), near.z(), 1.0};
     const CrsPoint near_expected = frame.to_crs(near);
-    // Linearisation error for a 10 m offset: the second-order term is
-    // (offset^2 / R) with R ~ 6.4e6 m, so 1e-5 deg in longitude and ~1e-5 m in
-    // height. The tolerances below leave a margin for where in the spread the
-    // point falls.
-    EXPECT_NEAR(near_mapped.x(), near_expected.x, 1e-5);
-    EXPECT_NEAR(near_mapped.y(), near_expected.y, 1e-5);
-    EXPECT_NEAR(near_mapped.z(), near_expected.z, 1e-3);
+    // Over an 8 m offset the curvature term relative to the ellipsoid is
+    // offset^2 / (2 R) ~ 5e-6 m in height and ~1e-9 deg in lon/lat. These
+    // tolerances are the linearisation's real error, not a fudge: a wrong axis
+    // convention would be off by metres, not by 1e-5.
+    EXPECT_NEAR(near_mapped.x(), near_expected.x, 1e-8);
+    EXPECT_NEAR(near_mapped.y(), near_expected.y, 1e-8);
+    EXPECT_NEAR(near_mapped.z(), near_expected.z, 1e-4);
 
     // transformationMatrix() is the inverse.
     const Eigen::Matrix4d back = frame.transformationMatrix();

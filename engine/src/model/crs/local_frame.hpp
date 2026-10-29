@@ -15,17 +15,20 @@
 ///   * the target `CoordinateSystem`.
 ///
 /// The mapping is exact, not a small-angle approximation: a local point is
-/// carried to ECEF as `origin_ecef + rotation * local` and then through a
-/// `CrsTransform` from EPSG:4978 to the frame's CRS; `to_local` runs that
-/// backwards. Because every quantity is a double and the anchor is within a
-/// few thousand kilometres of the data, a local point within 500 km of the
-/// anchor round-trips to better than a micrometre for a WGS 84 geographic CRS.
+/// carried to ECEF as `origin_ecef + rotation * local`, ECEF to geodetic by the
+/// iterated Bowring inversion (see `ecef_to_geodetic` in the .cpp -- PROJ's
+/// closed-form inverse is off by millimetres at these magnitudes), and geodetic
+/// to the target projection by PROJ; `to_local` runs that backwards. A
+/// geocentric target skips the geodetic step entirely, because its coordinates
+/// are the ECEF coordinates. Because every step is done in doubles and iterated
+/// where it matters, a local point within 500 km of the anchor round-trips to
+/// better than a micrometre for any target CRS PROJ can express.
 ///
 /// `transform()` is the 4x4 affine local -> CRS form. It is exact for a
 /// geocentric CRS; for a curved CRS (geographic degrees, a projection) it is
-/// the linearisation at the anchor, built from `to_crs` at unit offsets, so it
-/// is only meaningful for coordinates near the anchor -- which is exactly what
-/// a floating-origin render/export path needs.
+/// the linearisation at the anchor, built from `to_crs` at a 100 m offset, so
+/// it is only meaningful for coordinates near the anchor -- which is exactly
+/// what a floating-origin render/export path needs.
 ///
 /// A default-constructed frame is the identity: the local coordinates ARE the
 /// CRS coordinates. That is the state of a chunk that has not been
@@ -33,10 +36,10 @@
 /// `to_crs`/`to_local` copy the value and `transform()` is the identity, and no
 /// PROJ transform is built.
 ///
-/// Errors: the factories throw `ValueError` when the CRS is unset (an identity
-/// frame needs no CRS; give it `CoordinateSystem::local()` instead), and
-/// whatever `CrsTransform::create` throws when PROJ cannot relate EPSG:4978 to
-/// the CRS.
+/// Errors: the factories throw `ValueError` when the CRS is unset or the local
+/// engineering frame (an identity frame needs neither; default-construct it
+/// instead), and whatever `CrsTransform::create` throws when PROJ cannot relate
+/// geographic 3D coordinates to the CRS.
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -105,7 +108,19 @@ private:
     Eigen::Vector3d origin_ecef_ = Eigen::Vector3d::Zero();
     Eigen::Matrix3d rotation_ = Eigen::Matrix3d::Identity();
     bool identity_ = true;
-    CrsTransform ecef_to_crs_;
+    /// True when the target is geocentric (EPSG:4978 and friends), where the
+    /// local point IS the ECEF point and no geodetic step is needed.
+    bool geocentric_ = false;
+    /// EPSG:4979 (geographic 3D, lon/lat/height in visualisation order) -> the
+    /// target CRS. Unset for a geocentric target and for the identity frame.
+    ///
+    /// The ECEF<->geodetic leg is deliberately NOT PROJ's `+inv +proj=cart`:
+    /// PROJ's closed-form geodetic inverse loses millimetres at the ECEF
+    /// magnitudes this frame handles (2.7 mm round trip at 500 km, measured),
+    /// which is the exact trap model/geo/geodesy.hpp documents and avoids by
+    /// iterating. The frame does the same iteration itself and asks PROJ only
+    /// for geodetic -> projection, which is where it is both exact and needed.
+    CrsTransform geo_to_crs_;
 };
 
 }  // namespace alphashape::crs

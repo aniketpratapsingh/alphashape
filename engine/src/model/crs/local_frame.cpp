@@ -25,15 +25,21 @@ constexpr double kWgs84A = 6378137.0;
 constexpr double kWgs84F = 1.0 / 298.257223563;
 constexpr double kPi = 3.14159265358979323846;
 
-/// Geocentric ECEF (metres) -> geodetic latitude/longitude (radians).
-/// Bowring's iteration on the reduced latitude, the same construction the
-/// geodesy header documents; converges to machine precision in a few passes.
-void ecef_to_lat_lon(const Eigen::Vector3d& ecef, double* lat_rad, double* lon_rad) {
+/// Geocentric ECEF (metres) -> geodetic. Bowring's iteration on the reduced
+/// latitude, the same construction model/geo/geodesy.hpp documents.
+///
+/// The iteration matters: PROJ's `+inv +proj=cart` uses the non-iterated closed
+/// form, and at the ECEF magnitudes this frame handles that loses millimetres
+/// (measured: 2.7 mm worst-case round trip at a 500 km offset). Heights are the
+/// same robust formula as the geodesy header, finite at the poles.
+void ecef_to_geodetic(const Eigen::Vector3d& ecef, double* lon_deg, double* lat_deg,
+                      double* height_m) {
     const double e2 = kWgs84F * (2.0 - kWgs84F);
     const double p = std::hypot(ecef.x(), ecef.y());
-    *lon_rad = std::atan2(ecef.y(), ecef.x());
+    *lon_deg = std::atan2(ecef.y(), ecef.x()) * (180.0 / kPi);
     if (p == 0.0) {
-        *lat_rad = ecef.z() >= 0.0 ? 0.5 * kPi : -0.5 * kPi;
+        *lat_deg = ecef.z() >= 0.0 ? 90.0 : -90.0;
+        *height_m = std::abs(ecef.z()) - kWgs84A;
         return;
     }
     double lat = std::atan2(ecef.z(), p * (1.0 - e2));
@@ -47,7 +53,22 @@ void ecef_to_lat_lon(const Eigen::Vector3d& ecef, double* lat_rad, double* lon_r
             break;
         }
     }
-    *lat_rad = lat;
+    *lat_deg = lat * (180.0 / kPi);
+    const double slat = std::sin(lat);
+    const double clat = std::cos(lat);
+    *height_m = p * clat + ecef.z() * slat - kWgs84A * std::sqrt(1.0 - e2 * slat * slat);
+}
+
+/// Geodetic (lon/lat degrees, ellipsoidal height m) -> geocentric ECEF.
+Eigen::Vector3d geodetic_to_ecef(double lon_deg, double lat_deg, double height_m) {
+    const double e2 = kWgs84F * (2.0 - kWgs84F);
+    const double lon = lon_deg * (kPi / 180.0);
+    const double lat = lat_deg * (kPi / 180.0);
+    const double slat = std::sin(lat);
+    const double clat = std::cos(lat);
+    const double n = kWgs84A / std::sqrt(1.0 - e2 * slat * slat);
+    return {(n + height_m) * clat * std::cos(lon), (n + height_m) * clat * std::sin(lon),
+            (n * (1.0 - e2) + height_m) * slat};
 }
 
 /// Rotation whose COLUMNS are the east, north and up axes at (lat, lon)
@@ -80,9 +101,16 @@ constexpr double kJacobianStepM = 100.0;
 LocalFrame::LocalFrame(CoordinateSystem cs, const Eigen::Vector3d& origin_ecef,
                        const Eigen::Matrix3d& rotation, bool identity)
     : cs_(std::move(cs)), origin_ecef_(origin_ecef), rotation_(rotation), identity_(identity) {
-    if (!identity_) {
-        ecef_to_crs_ =
-            CrsTransform::create(CoordinateSystem::from_epsg(4978), cs_, TransformOptions{});
+    if (identity_) {
+        return;
+    }
+    geocentric_ = cs_.kind() == CrsKind::Geocentric;
+    if (!geocentric_) {
+        // Everything else goes through geographic 3D. A 2D target (4326) drops
+        // no height here: PROJ's 4979 -> 4326 conversion keeps z untouched (it
+        // has no vertical component to drop), which the round trip relies on.
+        geo_to_crs_ =
+            CrsTransform::create(CoordinateSystem::from_epsg(4979), cs_, TransformOptions{});
     }
 }
 
@@ -90,26 +118,23 @@ LocalFrame LocalFrame::enu_at(const CoordinateSystem& cs, const Eigen::Vector3d&
     // The local CRS with a real anchor is a contradiction: a local frame has no
     // geographic origin. Only the identity (zero anchor, identity rotation)
     // local frame is meaningful.
-    if (cs.is_local()) {
+    if (!cs.is_set() || cs.is_local()) {
         throw ValueError(
             "a local frame needs a geographic or projected CRS; use the identity frame");
     }
-    if (!cs.is_set()) {
-        throw ValueError("cannot anchor a local frame on an unset CRS");
-    }
-    double lat = 0.0;
     double lon = 0.0;
-    ecef_to_lat_lon(origin_ecef, &lat, &lon);
-    return with_rotation(cs, origin_ecef, enu_rotation(lat, lon));
+    double lat = 0.0;
+    double height = 0.0;  // unused: only the direction of the up axis matters
+    ecef_to_geodetic(origin_ecef, &lon, &lat, &height);
+    const double lon_rad = lon * (kPi / 180.0);
+    const double lat_rad = lat * (kPi / 180.0);
+    return with_rotation(cs, origin_ecef, enu_rotation(lat_rad, lon_rad));
 }
 
 LocalFrame LocalFrame::with_rotation(const CoordinateSystem& cs,
                                      const Eigen::Vector3d& origin_ecef,
                                      const Eigen::Matrix3d& rotation) {
-    if (!cs.is_set()) {
-        throw ValueError("cannot anchor a local frame on an unset CRS");
-    }
-    if (cs.is_local()) {
+    if (!cs.is_set() || cs.is_local()) {
         throw ValueError(
             "a local frame needs a geographic or projected CRS; use the identity frame");
     }
@@ -130,7 +155,17 @@ CrsPoint LocalFrame::to_crs(const Eigen::Vector3d& local) const {
         return CrsPoint{local.x(), local.y(), local.z()};
     }
     const Eigen::Vector3d ecef = origin_ecef_ + rotation_ * local;
-    const std::optional<CrsPoint> out = ecef_to_crs_.forward(CrsPoint{ecef.x(), ecef.y(), ecef.z()});
+    if (geocentric_) {
+        // A geocentric target's coordinates ARE the ECEF coordinates, so this
+        // leg needs neither PROJ nor a geodetic detour.
+        return CrsPoint{ecef.x(), ecef.y(), ecef.z()};
+    }
+    double lon = 0.0;
+    double lat = 0.0;
+    double height = 0.0;
+    ecef_to_geodetic(ecef, &lon, &lat, &height);
+    const std::optional<CrsPoint> out =
+        geo_to_crs_.forward(CrsPoint{lon, lat, height});
     if (!out.has_value()) {
         return CrsPoint{nan, nan, nan};
     }
@@ -142,11 +177,17 @@ Eigen::Vector3d LocalFrame::to_local(const CrsPoint& point) const {
     if (identity_) {
         return Eigen::Vector3d{point.x, point.y, point.z};
     }
-    const CrsPoint ecef = ecef_to_crs_.inverse(point);
-    if (!std::isfinite(ecef.x) || !std::isfinite(ecef.y) || !std::isfinite(ecef.z)) {
-        return Eigen::Vector3d{nan, nan, nan};
+    Eigen::Vector3d ecef;
+    if (geocentric_) {
+        ecef = Eigen::Vector3d{point.x, point.y, point.z};
+    } else {
+        const CrsPoint geo = geo_to_crs_.inverse(point);
+        if (!std::isfinite(geo.x) || !std::isfinite(geo.y) || !std::isfinite(geo.z)) {
+            return Eigen::Vector3d{nan, nan, nan};
+        }
+        ecef = geodetic_to_ecef(geo.x, geo.y, geo.z);
     }
-    return rotation_.transpose() * (Eigen::Vector3d{ecef.x, ecef.y, ecef.z} - origin_ecef_);
+    return rotation_.transpose() * (ecef - origin_ecef_);
 }
 
 Eigen::Matrix4d LocalFrame::transform() const {
