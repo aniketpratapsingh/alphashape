@@ -48,14 +48,20 @@ UTM_ZONE_32N = 32632
 
 def built_document():
     """A georeferenced chunk with a DEM and an orthomosaic, built via the
-    Chunk convenience methods (so the shortcut path is exercised too)."""
+    Chunk convenience methods (so the shortcut path is exercised too).
+
+    filter_mode="mild" is pinned because this file tests the DEM/ortho VIEWS,
+    not the filter: at downscale 8 on these 60x45 maps the moderate default
+    (2-support) keeps 14-34% of the pixels, which leaves the DEM centre a hole
+    and makes the view assertions below about emptiness rather than shape.
+    """
     doc = alphashape.Document()
     chunk = doc.add_chunk("Chunk 1")
     doc.active_chunk = chunk
     doc.run_task("AddPhotos", filenames=list(AERIAL))
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
     doc.run_task("AlignCameras")
-    doc.run_task("BuildDepthMaps", downscale=DOWNSCALE)
+    doc.run_task("BuildDepthMaps", downscale=DOWNSCALE, filter_mode="mild")
     # interpolation="enabled" fills interior holes only: reaching 100% needs
     # the extrapolating mode, which is not what this test is about.
     chunk.buildDem(interpolation="enabled", smoothing="none")
