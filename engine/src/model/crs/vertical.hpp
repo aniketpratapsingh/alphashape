@@ -28,6 +28,16 @@
 /// A geoid that cannot evaluate the point (outside its coverage) makes the
 /// conversion fail with nullopt rather than return a height that is silently
 /// tens of metres off.
+///
+/// `VerticalCrs::offset_m` is a datum's constant bias, applied around the geoid
+/// so it works in both modes and both directions:
+///
+///   source side, orthometric -> ellipsoidal:  h = H + N + offset_src
+///   target side, ellipsoidal -> orthometric:  H = h - N - offset_dst
+///
+/// A compound pipeline carries the geoid but not a constant, so there the
+/// offset is applied before (source) and after (target) PROJ. `offset_m == 0`
+/// (the default) is exactly the plain H = h - N relation.
 
 #include <memory>
 #include <optional>
@@ -59,6 +69,9 @@ VerticalCrsLookup lookup_vertical_crs(const VerticalCrs& vertical);
 
 /// Ellipsoidal height -> orthometric height at (lon, lat):
 /// `H = h - N`. nullopt when the grid cannot evaluate the point.
+///
+/// This is the bare grid relation: a datum's constant offset is a property of
+/// the datum, so `VerticalTransform` applies it, not this function.
 std::optional<double> orthometric_height(double ellipsoidal_height_m, double lon_deg,
                                          double lat_deg, const GeoidGrid& geoid);
 

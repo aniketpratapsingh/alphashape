@@ -676,5 +676,87 @@ TEST_F(GeoidTempDir, CrsGeoidRejectsHugeDimensions) {
     }
 }
 
+// VerticalCrs::offset_m is parsed and persisted (CrsVerticalCrsPersistence
+// pins that), but a datum that round-trips an offset and then ignores it is
+// silently wrong by that many metres. The convention is the one the header
+// documents — the datum reads `h - N + offset` — and it must hold in custom()
+// (both sides), through PROJ's compound pipeline, and backwards on inverse().
+TEST(Crs, VerticalOffsetApplied) {
+    const std::shared_ptr<const GeoidGrid> grid = subset();
+    ASSERT_NE(grid, nullptr);
+    const CoordinateSystem geo = CoordinateSystem::from_epsg(4979);
+    const CoordinateSystem utm = CoordinateSystem::from_epsg(32633);
+    const VerticalCrs none;
+    const std::optional<double> n = grid->undulation(9.0, 50.0);
+    ASSERT_TRUE(n.has_value());
+
+    // Target side: ellipsoidal -> orthometric with a +2 m datum offset.
+    VerticalCrs target;
+    target.kind = VerticalCrs::Kind::GravityRelated;
+    target.name = "local datum";
+    target.grid = "us_nga_egm96_15.tif";
+    target.offset_m = 2.0;
+    // The geoid id is only a label for the custom path, so the EGM96 name (no
+    // EPSG code in this build) is fine and nothing is looked up.
+    const VerticalTransform to_target =
+        VerticalTransform::custom(geo, utm, none, target, grid, geo);
+    ASSERT_TRUE(to_target.is_valid());
+    constexpr double kH = 120.0;
+    const std::optional<CrsPoint> ortho = to_target.forward(CrsPoint{9.0, 50.0, kH});
+    ASSERT_TRUE(ortho.has_value());
+    EXPECT_NEAR(ortho->z, kH - *n + 2.0, 1e-6)
+        << "the datum reads h - N + offset on the target side";
+    // ...and inverse() takes it back out, so a round trip is exact.
+    const std::optional<CrsPoint> back = to_target.inverse(*ortho);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_NEAR(back->z, kH, 1e-6) << "offset must cancel on the round trip";
+
+    // Source side: orthometric -> ellipsoidal with the same offset there.
+    const VerticalTransform to_ellipsoidal =
+        VerticalTransform::custom(geo, utm, target, none, grid, geo);
+    ASSERT_TRUE(to_ellipsoidal.is_valid());
+    const std::optional<CrsPoint> h = to_ellipsoidal.forward(CrsPoint{9.0, 50.0, 100.0});
+    ASSERT_TRUE(h.has_value());
+    EXPECT_NEAR(h->z, 100.0 - 2.0 + *n, 1e-6)
+        << "the source datum's offset is removed before the grid";
+    const std::optional<CrsPoint> round = to_ellipsoidal.inverse(*h);
+    ASSERT_TRUE(round.has_value());
+    EXPECT_NEAR(round->z, 100.0, 1e-6);
+
+    // Both sides declare the same datum offset: H_dst = H_src - offset_src +
+    // offset_dst, so the two cancel.
+    VerticalCrs source = target;
+    const VerticalTransform both =
+        VerticalTransform::custom(geo, utm, source, target, grid, geo);
+    ASSERT_TRUE(both.is_valid());
+    const std::optional<CrsPoint> shifted = both.forward(CrsPoint{9.0, 50.0, kH});
+    ASSERT_TRUE(shifted.has_value());
+    EXPECT_NEAR(shifted->z, kH - *n, 1e-6);
+
+    // The compound path hands the geoid to PROJ, which knows nothing about a
+    // constant, so the offset is applied around the pipeline there. PROJ needs
+    // the installed EGM96 grid and an EPSG vertical CRS for that.
+    if (!installed_grid("us_nga_egm96_15.tif")) {
+        GTEST_SKIP() << "us_nga_egm96_15.tif is not installed; the compound offset "
+                        "comparison needs it";
+    }
+    VerticalCrs egm96;
+    egm96.kind = VerticalCrs::Kind::GeoidModel;
+    egm96.name = "EGM96 height";
+    egm96.grid = "us_nga_egm96_15.tif";
+    const CoordinateSystem dst_cs = utm.with_vertical(egm96);
+    const std::optional<CrsPoint> plain =
+        VerticalTransform::compound(geo, dst_cs).forward(CrsPoint{9.0, 50.0, kH});
+    VerticalCrs shifted_datum = egm96;
+    shifted_datum.offset_m = 1.5;
+    const std::optional<CrsPoint> with_offset =
+        VerticalTransform::compound(geo, utm.with_vertical(shifted_datum))
+            .forward(CrsPoint{9.0, 50.0, kH});
+    ASSERT_TRUE(plain.has_value());
+    ASSERT_TRUE(with_offset.has_value());
+    EXPECT_NEAR(with_offset->z - plain->z, 1.5, 1e-6)
+        << "compound() must apply the target datum's offset after PROJ";
+}
+
 }  // namespace
 }  // namespace alphashape::crs

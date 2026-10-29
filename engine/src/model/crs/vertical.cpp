@@ -179,6 +179,17 @@ struct VerticalTransform::Impl {
     CrsTransform dst_to_geographic;
     bool src_orthometric = false;
     bool dst_orthometric = false;
+    /// The source's and target's constant offsets (VerticalCrs::offset_m).
+    ///
+    /// The offset is what `VerticalCrs` documents: a constant applied after the
+    /// grid, i.e. the datum reads `h - N + offset`. Converting through the grid:
+    ///   source side, orthometric -> ellipsoidal:  h = H - offset_src + N
+    ///   target side, ellipsoidal -> orthometric:  H = h - N + offset_dst
+    /// which is exactly `ellipsoidal_height(H - offset)` / `orthometric_height(h)
+    /// + offset`. An offset of 0 (the default) is the plain H = h - N relation,
+    /// and the two sides cancel exactly on a round trip.
+    double src_offset_m = 0.0;
+    double dst_offset_m = 0.0;
     std::string description;
 
     /// lon/lat for the geoid at a source-side point, nullopt when the point
@@ -266,6 +277,12 @@ VerticalTransform VerticalTransform::compound(const CoordinateSystem& src,
     impl->mode = Impl::Mode::Compound;
     const auto [src_compound, dst_compound] = compound_pair(src, dst);
     impl->compound = CrsTransform::create(src_compound, dst_compound, options);
+    // The offsets are applied around PROJ's pipeline, so which side has a
+    // vertical datum at all is recorded here as well.
+    impl->src_orthometric = src_vertical.is_set();
+    impl->dst_orthometric = dst_vertical.is_set();
+    impl->src_offset_m = src_vertical.offset_m;
+    impl->dst_offset_m = dst_vertical.offset_m;
     impl->description = src.name() + " -> " + dst.name();
     return VerticalTransform(std::move(impl));
 }
@@ -295,6 +312,10 @@ VerticalTransform VerticalTransform::custom(const CoordinateSystem& src,
     impl->geoid = std::move(geoid);
     impl->src_orthometric = src_ortho;
     impl->dst_orthometric = dst_ortho;
+    // A datum's constant offset is part of the datum, not of the grid, so it is
+    // applied around the geoid on the side that declares it.
+    impl->src_offset_m = src_vertical.offset_m;
+    impl->dst_offset_m = dst_vertical.offset_m;
     // The geoid is a function of lon/lat, so each side that needs it gets a
     // transform to the geographic CRS it is referred to. An already-geographic
     // side is its own bridge (CrsTransform short-circuits equal CRSs).
@@ -316,21 +337,40 @@ std::optional<CrsPoint> VerticalTransform::forward(const CrsPoint& point) const 
     }
     if (impl_->mode == Impl::Mode::Compound) {
         // PROJ's own pipeline already carries the geoid step, so the height it
-        // returns is in the target's vertical datum.
-        return impl_->compound.forward(point);
+        // returns is in the target's vertical datum. A constant offset is not
+        // part of that pipeline, so it is applied around it with the same
+        // convention as custom(): the datum reads h - N + offset.
+        if (impl_->src_offset_m == 0.0 && impl_->dst_offset_m == 0.0) {
+            return impl_->compound.forward(point);
+        }
+        CrsPoint in = point;
+        if (impl_->src_orthometric) {
+            in.z -= impl_->src_offset_m;
+        }
+        const std::optional<CrsPoint> out = impl_->compound.forward(in);
+        if (!out) {
+            return std::nullopt;
+        }
+        CrsPoint shifted = *out;
+        if (impl_->dst_orthometric) {
+            shifted.z += impl_->dst_offset_m;
+        }
+        return shifted;
     }
     // Custom mode, source -> target:
-    //   1. orthometric -> ellipsoidal at the source (h = H + N);
+    //   1. orthometric -> ellipsoidal at the source (h = H - offset_src + N);
     //   2. horizontal transform (ellipsoidal heights travel through it);
-    //   3. ellipsoidal -> orthometric at the target (H = h - N).
+    //   3. ellipsoidal -> orthometric at the target (H = h - N + offset_dst).
     CrsPoint start = point;
     if (impl_->src_orthometric) {
         const auto lonlat = impl_->geographic_at(impl_->src_to_geographic, point);
         if (!lonlat) {
             return std::nullopt;
         }
-        const std::optional<double> height =
-            ellipsoidal_height(point.z, lonlat->first, lonlat->second, *impl_->geoid);
+        // The source datum reads `h - N + offset`, so its offset is removed
+        // before the grid's undulation is added.
+        const std::optional<double> height = ellipsoidal_height(
+            point.z - impl_->src_offset_m, lonlat->first, lonlat->second, *impl_->geoid);
         if (!height) {
             return std::nullopt;  // outside the geoid's coverage
         }
@@ -353,7 +393,8 @@ std::optional<CrsPoint> VerticalTransform::forward(const CrsPoint& point) const 
         return std::nullopt;
     }
     CrsPoint out = *moved;
-    out.z = *height;
+    // The target datum reads `h - N + offset`.
+    out.z = *height + impl_->dst_offset_m;
     return out;
 }
 
@@ -362,7 +403,22 @@ std::optional<CrsPoint> VerticalTransform::inverse(const CrsPoint& point) const 
         return std::nullopt;
     }
     if (impl_->mode == Impl::Mode::Compound) {
-        return impl_->compound.try_inverse(point);
+        if (impl_->src_offset_m == 0.0 && impl_->dst_offset_m == 0.0) {
+            return impl_->compound.try_inverse(point);
+        }
+        CrsPoint in = point;
+        if (impl_->dst_orthometric) {
+            in.z -= impl_->dst_offset_m;
+        }
+        const std::optional<CrsPoint> out = impl_->compound.try_inverse(in);
+        if (!out) {
+            return std::nullopt;
+        }
+        CrsPoint shifted = *out;
+        if (impl_->src_orthometric) {
+            shifted.z += impl_->src_offset_m;
+        }
+        return shifted;
     }
     CrsPoint start = point;
     if (impl_->dst_orthometric) {
@@ -370,8 +426,8 @@ std::optional<CrsPoint> VerticalTransform::inverse(const CrsPoint& point) const 
         if (!lonlat) {
             return std::nullopt;
         }
-        const std::optional<double> height =
-            ellipsoidal_height(point.z, lonlat->first, lonlat->second, *impl_->geoid);
+        const std::optional<double> height = ellipsoidal_height(
+            point.z - impl_->dst_offset_m, lonlat->first, lonlat->second, *impl_->geoid);
         if (!height) {
             return std::nullopt;
         }
@@ -394,7 +450,7 @@ std::optional<CrsPoint> VerticalTransform::inverse(const CrsPoint& point) const 
         return std::nullopt;
     }
     CrsPoint out = *moved;
-    out.z = *height;
+    out.z = *height + impl_->src_offset_m;
     return out;
 }
 
