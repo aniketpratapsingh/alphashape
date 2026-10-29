@@ -15,6 +15,7 @@ add_library(alphashape_crs STATIC
     builtin_crs.cpp
     transform.cpp
     datum.cpp
+    local_frame.cpp
     geoid.cpp
     vertical.cpp
 )
