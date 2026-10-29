@@ -117,7 +117,9 @@ double rms(const std::vector<double>& values) {
 }
 
 /// A scratch directory removed on teardown, unique per process and per test.
-class TempDir : public ::testing::Test {
+/// This name is deliberately not `TempDir`: gtest suites are one global
+/// namespace, and another suite already has a fixture by that name.
+class GeoidTempDir : public ::testing::Test {
 protected:
     void SetUp() override {
         dir_ = fs::path(platform::unique_temp_path("alphashape_geoid_", ""));
@@ -336,7 +338,7 @@ namespace {
 // load it back, and check that the model metadata and the evaluated undulation
 // survive. The grid is copied into the store, so the loaded entry works even
 // after the original is gone.
-TEST_F(TempDir, GeoidStoreRoundTrip) {
+TEST_F(GeoidTempDir, CrsGeoidStoreRoundTrip) {
     const fs::path store_dir = dir_ / "project.files" / "geoids";
     GeoidStore store;
     store.set_directory(store_dir);
@@ -382,7 +384,7 @@ TEST_F(TempDir, GeoidStoreRoundTrip) {
 // A project that names a geoid its store does not carry must fail loudly:
 // loading it as if heights were ellipsoidal would put every orthometric height
 // off by tens of metres without a word.
-TEST_F(TempDir, MissingGeoidThrowsOnLoad) {
+TEST_F(GeoidTempDir, CrsMissingGeoidThrowsOnLoad) {
     const fs::path store_dir = dir_ / "geoids";
     GeoidStore store;
     store.set_directory(store_dir);
@@ -464,7 +466,7 @@ TEST(Crs, OrthometricHeightConversion) {
 // `<vertical>` child of `<crs>` (M12 §4.8), and an ellipsoidal CRS writes no
 // such element at all, so a project without a vertical datum is byte-identical
 // to what the pre-M12 writer produced.
-TEST_F(TempDir, VerticalCrsPersistence) {
+TEST_F(GeoidTempDir, CrsVerticalCrsPersistence) {
     VerticalCrs egm96;
     egm96.kind = VerticalCrs::Kind::GeoidModel;
     egm96.name = "EGM96 height";
