@@ -8,6 +8,28 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Local tangent frames and per-object CRS slots.** A `LocalFrame`
+  (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
+  ECEF point and an explicit local-to-ECEF rotation, then converts to and from
+  any CRS in `crs::CoordinateSystem` through PROJ (`local -> ECEF` at
+  EPSG:4978, then a `CrsTransform` to the target). The conversion is exact, not
+  a small-angle approximation: it is done in doubles, and a point within 500 km
+  of the anchor round-trips inside a micrometre. `transform()` gives the 4x4
+  affine form -- exact for a geocentric CRS, the anchor linearisation for a
+  curved one -- and `transformationMatrix()` its inverse.
+
+  A `Chunk` now carries three independent per-object CRS slots:
+  `camera_crs` (camera references), `marker_crs` (marker references) and
+  `world_crs` (chunk geometry as displayed or exported). Each follows
+  `chunk.crs` until set explicitly, and setting one only relabels which CRS the
+  numbers are read in -- no coordinate is ever transformed behind your back.
+  The slots are written to doc.xml as separate `<camera_crs>`, `<marker_crs>`
+  and `<world_crs>` elements, and only when set, so a project without them
+  loads and re-saves byte-identically; the reader treats absent elements as
+  "follow the chunk CRS". Georeferencing now sets `camera_crs` and `world_crs`
+  to the WGS 84 coordinate system it fits to. Converting the data itself to a
+  target CRS is a separate, explicit step (WP-12.7).
+
 - **Exact natural-neighbour hole filling in Build DEM.** Holes bordered by at
   most `sibson_exact_max_sites` data cells (new `BuildDem` parameter; off by
   default until the quality benchmark confirms it, 20 000 is a sensible value)
