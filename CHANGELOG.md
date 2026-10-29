@@ -11,12 +11,15 @@ All notable changes to alphashape are recorded here. The format follows
 - **Local tangent frames and per-object CRS slots.** A `LocalFrame`
   (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
   ECEF point and an explicit local-to-ECEF rotation, then converts to and from
-  any CRS in `crs::CoordinateSystem` through PROJ (`local -> ECEF` at
-  EPSG:4978, then a `CrsTransform` to the target). The conversion is exact, not
-  a small-angle approximation: it is done in doubles, and a point within 500 km
-  of the anchor round-trips inside a micrometre. `transform()` gives the 4x4
-  affine form -- exact for a geocentric CRS, the anchor linearisation for a
-  curved one -- and `transformationMatrix()` its inverse.
+  any CRS in `crs::CoordinateSystem`: local -> ECEF, ECEF -> geodetic by an
+  iterated Bowring inversion, geodetic -> target by PROJ (a geocentric target
+  needs no conversion). The conversion is exact, not a small-angle
+  approximation: it is done in doubles with the geodetic leg iterated, and a
+  point within 500 km of the anchor round-trips inside a micrometre. PROJ's own
+  `+proj=cart` inverse is deliberately not used there -- it loses millimetres at
+  ECEF magnitudes. `transform()` gives the 4x4 affine form -- exact for a
+  geocentric CRS, the anchor linearisation for a curved one -- and
+  `transformationMatrix()` its inverse.
 
   A `Chunk` now carries three independent per-object CRS slots:
   `camera_crs` (camera references), `marker_crs` (marker references) and
