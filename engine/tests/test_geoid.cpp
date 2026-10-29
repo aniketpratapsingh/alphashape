@@ -733,7 +733,9 @@ TEST(Crs, VerticalOffsetApplied) {
     ASSERT_TRUE(both.is_valid());
     const std::optional<CrsPoint> shifted = both.forward(CrsPoint{9.0, 50.0, kH});
     ASSERT_TRUE(shifted.has_value());
-    EXPECT_NEAR(shifted->z, kH - *n, 1e-6);
+    // H_dst = (H_src - offset) + N - N + offset: both the offset and the geoid
+    // cancel, so converting within one datum leaves the height alone.
+    EXPECT_NEAR(shifted->z, kH, 1e-6);
 
     // The compound path hands the geoid to PROJ, which knows nothing about a
     // constant, so the offset is applied around the pipeline there. PROJ needs
