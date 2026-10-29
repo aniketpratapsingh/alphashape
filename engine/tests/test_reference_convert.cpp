@@ -328,11 +328,12 @@ TEST(Crs, ConvertReferenceYawGainsMeridianConvergence) {
     const crs::EulerAngles converted =
         convert_orientation(heading, geographic(), utm(zone), crs::CrsPoint{lon, lat, 0.0});
     EXPECT_EQ(converted.order, crs::RotationOrder::ZYX);
-    // Independent expectation for the sign: grid north lies gamma east of true
-    // north, so true north expressed in grid axes points at +x (east) by
-    // gamma. A ZYX yaw that takes +y (north) to the direction (sin g, cos g) is
-    // -g, because +yaw turns north towards -x (west). The measured grid azimuth
-    // above already carries the sign, and the yaw must be its negative.
+    // Independent expectation for the sign from the measured grid direction of
+    // true north: it is (sin(az), cos(az)) with az the grid azimuth. A positive
+    // ZYX yaw turns +y (north) towards -x (west), i.e. Rz(yaw) e_y is
+    // (-sin(yaw), cos(yaw)), so reproducing that direction needs yaw = -az.
+    // (Grid north lies gamma east of true north, so az = -gamma and the grid
+    // yaw of a true-north heading is +gamma.)
     const double grid_azimuth = std::atan2(d_east, d_north) / kDeg;
     EXPECT_NEAR(converted.yaw, -grid_azimuth, 1e-3) << "grid yaw of a true-north heading";
     EXPECT_NEAR(converted.pitch, 0.0, 1e-9) << "the frame rotation is about up only";
@@ -349,8 +350,10 @@ TEST(Crs, ConvertReferenceYawGainsMeridianConvergence) {
 // is not pure east in the next. The frame rotation must be orthonormal and
 // map up to up for a transverse Mercator pair.
 TEST(Crs, FrameRotationBetweenUtmZonesIsAboutUp) {
+    // The point is given in the SOURCE CRS (zone 32), so it is an easting and
+    // a northing, not a longitude and a latitude.
     const Eigen::Matrix3d rotation =
-        frame_rotation(utm(32), utm(33), crs::CrsPoint{9.5, 50.0, 0.0});
+        frame_rotation(utm(32), utm(33), crs::CrsPoint{500000.0, 5540000.0, 0.0});
     EXPECT_LE((rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(),
               1e-12);
     EXPECT_NEAR(rotation.determinant(), 1.0, 1e-12);

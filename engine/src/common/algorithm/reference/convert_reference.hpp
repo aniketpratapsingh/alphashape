@@ -57,11 +57,11 @@
 #include "model/crs/coordinate_system.hpp"
 #include "model/crs/euler.hpp"
 #include "model/crs/geoid.hpp"
+#include "model/crs/transform.hpp"
 
 namespace alphashape {
 
 class AbstractCommand;
-struct Document;
 
 namespace reference {
 

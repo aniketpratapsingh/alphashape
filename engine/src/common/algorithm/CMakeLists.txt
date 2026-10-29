@@ -10,7 +10,6 @@ add_library(alphashape_algorithms STATIC
     chunk/duplicate_chunk_task.cpp
     chunk/merge_chunks_task.cpp
     photos/add_photos_task.cpp
-    reference/convert_reference.cpp
     feature/dog_detector.cpp
     feature/mldb_descriptor.cpp
     feature/detect_features_task.cpp
@@ -71,11 +70,14 @@ target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
 # M12 §4.1: the algorithms layer links the CRS engine explicitly (it already
 # reaches it through alphashape_model, but WP-12.8 makes DEM/ortho tasks call
 # crs:: directly). PRIVATE: no algorithm header exposes PROJ or crs headers.
+#
+# WP-12.7's reference conversion is built only with the engine: with
+# -DALPHASHAPE_USE_PROJ=OFF there is no CRS to convert into, and the header
+# names crs:: types its caller cannot have. The PUBLIC link is what makes a
+# consumer of `convert_reference` (the test binary, the Python module) link the
+# engine that its signatures need; the engine is a static library whose headers
+# carry no <proj.h>, so nothing PROJ-shaped enters the public include surface.
 if(TARGET alphashape_crs)
-    target_link_libraries(alphashape_algorithms PRIVATE alphashape_crs)
-    # convert_reference.hpp names crs:: types in its signatures, so a consumer
-    # that links only alphashape_algorithms still needs PROJ behind them at the
-    # final link. The CRS engine is a static library, so this stays out of the
-    # public include surface (the headers carry no <proj.h>).
+    target_sources(alphashape_algorithms PRIVATE reference/convert_reference.cpp)
     target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()

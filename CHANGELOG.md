@@ -8,6 +8,31 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Reference data conversion and rotation orders.** `convert_reference`
+  (`common/algorithm/reference/convert_reference.hpp`) rewrites a chunk's camera
+  and/or marker reference positions into a target CRS and relabels the
+  `camera_crs`/`marker_crs` slot, so an imported lon/lat/alt campaign can be
+  expressed in a UTM zone (or the reverse) without touching poses, tie points or
+  assets. Horizontal positions go through `CrsTransform`; heights go through
+  `VerticalTransform` whenever either slot carries a vertical datum -- a project
+  geoid applies `H = h - N` through the store's grid, an EPSG vertical CRS uses
+  PROJ's compound pipeline -- and an absent height stays absent. Accuracies are
+  measurement weights in metres and are carried unchanged. The conversion is
+  all-or-nothing (a point outside the target's area of use fails the call and
+  leaves the chunk untouched) and undoable as one `Convert Camera/Marker
+  References` step.
+
+  `model/crs/euler.hpp` adds the six Tait-Bryan rotation orders (`XYZ` ...
+  `ZYX`, default `ZYX`), intrinsic and active with degrees at the API and the
+  `yaw`/`pitch`/`roll` fields taken as the first/second/third axis of the order.
+  The chunk meta key `reference/rotation_order` selects the order; an unknown
+  value is reported rather than defaulted. Gimbal lock is defined and tested:
+  the middle angle stays at ±90°, `roll` becomes 0 and the whole remaining
+  rotation is carried by `yaw`. `convert_orientation` re-expresses a
+  camera-to-world orientation in the target CRS's local axes, so a camera
+  heading true north in geographic reads the meridian convergence
+  (`γ = atan(tan Δλ · sin φ)`) as its grid yaw.
+
 - **Local tangent frames and per-object CRS slots.** A `LocalFrame`
   (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
   ECEF point and an explicit local-to-ECEF rotation, then converts to and from

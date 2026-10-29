@@ -34,6 +34,7 @@
 #include <pybind11/stl.h>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/reference/convert_reference.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
@@ -41,6 +42,7 @@
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
 #include "model/camera/calibration.hpp"
+#include "model/crs/coordinate_system.hpp"
 
 namespace py = pybind11;
 
@@ -750,6 +752,12 @@ PYBIND11_MODULE(alphashape, m) {
                 c.crs().wkt =
                     epsg == 0 ? std::string{} : "EPSG:" + std::to_string(epsg);
             })
+        // The effective camera-reference CRS (WP-12.6/WP-12.7): the explicit
+        // slot when set, else the chunk CRS. 0 = unset.
+        .def_property_readonly("camera_crs_epsg",
+                               [](const Chunk& c) { return c.camera_crs().epsg; })
+        .def_property_readonly("marker_crs_epsg",
+                               [](const Chunk& c) { return c.marker_crs().epsg; })
         // Markers (M11 §4.1 / WP-11.7). Each entry is a dict with `id`, `label`,
         // `position` (a chunk-local (x, y, z) tuple, or None while unestimated)
         // and `reference` (a (lon, lat, alt) tuple, or None). AlignChunks pairs
@@ -1022,7 +1030,37 @@ PYBIND11_MODULE(alphashape, m) {
         })
         .def("exportOrthomosaic", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "ExportOrthomosaic", std::move(kwargs));
-        });
+        })
+#if defined(ALPHASHAPE_USE_PROJ)
+        // Convert the camera/marker reference positions into another CRS
+        // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"
+        // or "both". The slots are relabelled, poses and assets are untouched.
+        // No geoid store is reachable from a bare Chunk, so a vertical datum
+        // that is not an EPSG vertical CRS is refused by name (the disks this
+        // front end exposes never carry one).
+        .def(
+            "convertReference",
+            [](Chunk& c, int target_epsg, const std::string& kind) {
+                if (target_epsg <= 0) {
+                    throw alphashape::ValueError(
+                        "convertReference: target_epsg must be a positive EPSG code");
+                }
+                alphashape::reference::ReferenceKind which;
+                if (kind == "cameras") {
+                    which = alphashape::reference::ReferenceKind::Cameras;
+                } else if (kind == "markers") {
+                    which = alphashape::reference::ReferenceKind::Markers;
+                } else if (kind == "both") {
+                    which = alphashape::reference::ReferenceKind::Both;
+                } else {
+                    throw alphashape::ValueError(
+                        "convertReference: kind must be 'cameras', 'markers' or 'both'");
+                }
+                alphashape::reference::convert_reference(
+                    c, alphashape::crs::CoordinateSystem::from_epsg(target_epsg), which);
+            },
+            py::arg("target_epsg"), py::arg("kind") = "both");
+#endif  // ALPHASHAPE_USE_PROJ
 
 
     // -- Document ------------------------------------------------------------
