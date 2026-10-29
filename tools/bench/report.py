@@ -131,18 +131,26 @@ def is_fraction(path: str) -> bool:
 
 
 def experiment_params(metrics: dict) -> dict[str, str]:
-    """The non-default depth parameters a run was dispatched with, if any.
+    """The non-default params a run was dispatched with, if any.
 
     An empty dict means the run is at the dataset's own settings and is eligible
     to be a regression baseline. A non-empty one means somebody asked for a
     specific configuration to be measured — the census cost, say — and the run is
     evidence, not a reference point: it must never become the baseline the next
     week compares against, and it must never gate.
+
+    Both dispatch inputs are folded into one mapping, prefixed by the task they
+    belong to, because the question the comparison asks is "were these two runs
+    the same configuration" and either input alone changes the answer. A run with
+    only ``dem_params`` must not compare as if it were a control.
     """
-    value = metrics.get("depth_params")
-    if isinstance(value, dict):
-        return {str(key): str(item) for key, item in value.items()}
-    return {}
+    combined: dict[str, str] = {}
+    for key, prefix in (("depth_params", "BuildDepthMaps"), ("dem_params", "BuildDem")):
+        value = metrics.get(key)
+        if isinstance(value, dict):
+            for name, item in value.items():
+                combined[f"{prefix}.{name}"] = str(item)
+    return combined
 
 
 def regressions(

@@ -53,6 +53,7 @@ DemOptions resolve_options(const Params& params) {
     }
     options.epsg = static_cast<int>(params.get_int("projection"));
     options.fill = parse_fill_method(params.get_string("fill_method"));
+    options.sibson_exact_max_sites = static_cast<int>(params.get_int("sibson_exact_max_sites"));
     const std::string smoothing = params.get_string("smoothing");
     if (smoothing == "tgv") {
         options.tgv = true;
@@ -99,6 +100,15 @@ void BuildDemTask::declare_params(Params& params) const {
                           "\"nearest\"."};
     fill_method.choices = {"natural_neighbour", "idw", "nearest"};
     params.declare(fill_method);
+
+    ParamSpec exact_sites{"sibson_exact_max_sites", ParamType::Int, std::int64_t{0},
+                          "natural_neighbour: holes bordered by at most this many data cells "
+                          "use exact Sibson interpolation; larger ones the discrete "
+                          "approximation. 0 (default) = discrete everywhere; 20000 is a "
+                          "sensible value to enable it."};
+    exact_sites.minimum = std::int64_t{0};
+    exact_sites.maximum = std::int64_t{1000000};
+    params.declare(exact_sites);
 
     ParamSpec smoothing{"smoothing", ParamType::String, std::string("tgv"),
                         "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "

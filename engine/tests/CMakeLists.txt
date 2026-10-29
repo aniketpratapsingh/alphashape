@@ -40,6 +40,9 @@ add_executable(alphashape_tests
     test_patch_match_gpu.cpp
     test_build_dense.cpp
     test_voxel_grid.cpp
+    test_predicates.cpp
+    test_delaunay2d.cpp
+    test_sibson.cpp
     test_mesh_io.cpp
     test_marching_tetrahedra.cpp
     test_mesh_ops.cpp

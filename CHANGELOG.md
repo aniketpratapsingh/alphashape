@@ -28,6 +28,16 @@ All notable changes to alphashape are recorded here. The format follows
   checked against NGS's published USGG2012 geoid heights at 50 CONUS points
   (EGM2008 RMSE 0.026 m, EGM96 0.284 m), skipping when the full grid is not
   installed.
+- **Exact natural-neighbour hole filling in Build DEM.** Holes bordered by at
+  most `sibson_exact_max_sites` data cells (new `BuildDem` parameter; off by
+  default until the quality benchmark confirms it, 20 000 is a sensible value)
+  can now be filled with exact Sibson
+  interpolation: the bordering cells are triangulated (incremental Delaunay
+  with exact orientation and in-circle predicates), and each hole cell takes
+  the area-weighted average of its natural neighbours. Planes are reproduced
+  exactly, so the small step the grid approximation could leave at the edge of
+  a hole is gone. Larger holes and the orthomosaic keep the grid approximation.
+
 - **Datum transformations can be listed, chosen and pinned.** A coordinate
   system now reports every datum shift PROJ knows to a target CRS —
   `CoordinateSystem::available_transformations()` — with each operation's

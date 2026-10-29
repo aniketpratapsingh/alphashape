@@ -489,8 +489,45 @@ class ExperimentTest(unittest.TestCase):
         current["depth_params"] = {"cost_type": "census", "max_cost": 0.4}
         self.assertEqual(
             report.experiment_params(current),
-            {"cost_type": "census", "max_cost": "0.4"},
+            {"BuildDepthMaps.cost_type": "census", "BuildDepthMaps.max_cost": "0.4"},
         )
+
+    def test_a_dem_only_run_is_an_experiment(self):
+        # The key alone must be enough: BuildDem parameters are not defaults either.
+        current = metrics()
+        current["dem_params"] = {"sibson_exact_max_sites": 20000}
+        self.assertEqual(
+            report.experiment_params(current),
+            {"BuildDem.sibson_exact_max_sites": "20000"},
+        )
+
+    def test_both_inputs_are_folded_into_one_mapping(self):
+        current = metrics()
+        current["depth_params"] = {"cost_type": "census"}
+        current["dem_params"] = {"sibson_exact_max_sites": "20000"}
+        self.assertEqual(
+            report.experiment_params(current),
+            {
+                "BuildDepthMaps.cost_type": "census",
+                "BuildDem.sibson_exact_max_sites": "20000",
+            },
+        )
+
+    def test_a_dem_experiment_never_gates(self):
+        current = self.experiment()
+        current.pop("depth_params", None)
+        current["dem_params"] = {"sibson_exact_max_sites": "20000"}
+        current["reference_free"]["ortho"]["covered_fraction"] = 0.50
+        self.assertEqual(self.verdict(current, metrics()), 0)
+
+    def test_a_dem_experiment_is_not_mistaken_for_the_control(self):
+        # Same regression, control parameters in the previous run: the two are
+        # different configurations, so the comparison must not gate.
+        current = self.experiment()
+        current.pop("depth_params", None)
+        current["dem_params"] = {"sibson_exact_max_sites": "20000"}
+        text = report.markdown(current, metrics(), [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("different configurations", text)
 
     def test_the_verdict_is_experiment_not_pass_or_fail(self):
         text = report.markdown(self.experiment(), None, [], [], thresholds=thresholds(), png_name=None)

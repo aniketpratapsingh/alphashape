@@ -115,22 +115,35 @@ def manifest_hash(manifest: dict) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-class DepthParamError(ValueError):
+class ParamError(ValueError):
+    """A dispatch parameter string that is not a list of well-formed ``key=value``."""
+
+
+class DepthParamError(ParamError):
     """A ``depth_params`` string that is not a list of well-formed ``key=value``."""
 
 
-# A BuildDepthMaps parameter name is what the engine declares: lowercase words and
+class DemParamError(ParamError):
+    """A ``dem_params`` string that is not a list of well-formed ``key=value``."""
+
+
+# A task parameter name is what the engine declares: lowercase words and
 # underscores (``cost_type``, ``max_cost``, ``max_neighbors``). A value is a number,
 # a word, or a decimal (``census``, ``-1``, ``0.05``). Both are deliberately
 # narrower than "anything without a space": the string arrives from a workflow
 # input, so it is untrusted text reaching an argv list, and a value containing a
 # semicolon or a quote has no legitimate use here.
-DEPTH_PARAM_KEY = re.compile(r"^[a-z_]+$")
-DEPTH_PARAM_VALUE = re.compile(r"^[A-Za-z0-9_.-]+$")
+PARAM_KEY = re.compile(r"^[a-z_]+$")
+PARAM_VALUE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# Backwards-compatible names: these two patterns were documented as the depth
+# parameter grammar and are the same grammar every dispatch input uses.
+DEPTH_PARAM_KEY = PARAM_KEY
+DEPTH_PARAM_VALUE = PARAM_VALUE
 
 
-def parse_depth_params(text: str | None) -> dict[str, str]:
-    """Parse the workflow's optional ``depth_params`` string into a dict.
+def parse_params(text: str | None, error: type[ParamError] = ParamError) -> dict[str, str]:
+    """Parse a workflow's optional ``key=value ...`` string into a dict.
 
     ``"cost_type=census max_cost=0.4"`` becomes
     ``{"cost_type": "census", "max_cost": "0.4"}``. Everything is validated here,
@@ -141,26 +154,39 @@ def parse_depth_params(text: str | None) -> dict[str, str]:
     A missing separator, an empty key or value, a character outside the two
     patterns, and a repeated key are all errors rather than being skipped: a typo
     that is quietly dropped would produce a run that looks like an experiment and
-    is actually the default, which is exactly the confusion this flag exists to
+    is actually the default, which is exactly the confusion these flags exist to
     avoid.
+
+    ``error`` is the exception class the caller wants, so each dispatch input can
+    name itself in the error it raises while sharing one grammar.
     """
     params: dict[str, str] = {}
     for token in (text or "").split():
         key, separator, value = token.partition("=")
         if not separator:
-            raise DepthParamError(f"{token!r} is not a key=value pair")
-        if not DEPTH_PARAM_KEY.match(key):
-            raise DepthParamError(f"{key!r} is not a valid parameter name")
-        if not DEPTH_PARAM_VALUE.match(value):
-            raise DepthParamError(f"{value!r} is not a valid value for {key}")
+            raise error(f"{token!r} is not a key=value pair")
+        if not PARAM_KEY.match(key):
+            raise error(f"{key!r} is not a valid parameter name")
+        if not PARAM_VALUE.match(value):
+            raise error(f"{value!r} is not a valid value for {key}")
         if key in params:
-            raise DepthParamError(f"{key} is given more than once")
+            raise error(f"{key} is given more than once")
         params[key] = value
     return params
 
 
-def merge_depth_params(dataset: dict, depth_params: dict[str, str]) -> dict:
-    """The dataset with ``depth_params`` merged into its BuildDepthMaps overrides.
+def parse_depth_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``depth_params`` string (BuildDepthMaps)."""
+    return parse_params(text, DepthParamError)
+
+
+def parse_dem_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``dem_params`` string (BuildDem)."""
+    return parse_params(text, DemParamError)
+
+
+def merge_task_params(dataset: dict, task: str, params: dict[str, str]) -> dict:
+    """The dataset with ``params`` merged into its ``task`` overrides.
 
     The merge is over the dataset's own entries, not a replacement of them: an
     experiment such as ``cost_type=census`` keeps the measured ``downscale`` of the
@@ -168,12 +194,22 @@ def merge_depth_params(dataset: dict, depth_params: dict[str, str]) -> dict:
     the manifest is loaded once and shared by every run in a job, so an in-place
     update here would leak into whatever ran next.
     """
-    if not depth_params:
+    if not params:
         return dataset
-    overrides = {task: dict(values or {}) for task, values in (dataset.get("param_overrides") or {}).items()}
-    merged = overrides.setdefault("BuildDepthMaps", {})
-    merged.update(depth_params)
+    overrides = {name: dict(values or {}) for name, values in (dataset.get("param_overrides") or {}).items()}
+    merged = overrides.setdefault(task, {})
+    merged.update(params)
     return {**dataset, "param_overrides": overrides}
+
+
+def merge_depth_params(dataset: dict, depth_params: dict[str, str]) -> dict:
+    """The dataset with ``depth_params`` merged into its BuildDepthMaps overrides."""
+    return merge_task_params(dataset, "BuildDepthMaps", depth_params)
+
+
+def merge_dem_params(dataset: dict, dem_params: dict[str, str]) -> dict:
+    """The dataset with ``dem_params`` merged into its BuildDem overrides."""
+    return merge_task_params(dataset, "BuildDem", dem_params)
 
 
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
@@ -985,16 +1021,18 @@ def run(
     *,
     keep: bool = False,
     depth_params: dict[str, str] | None = None,
+    dem_params: dict[str, str] | None = None,
 ) -> dict:
     """Run one dataset and score it.
 
     ``depth_params`` are extra ``BuildDepthMaps`` keyword arguments from a manual
-    dispatch, already validated by :func:`parse_depth_params`. They are merged over
-    the dataset's own manifest overrides for ``BuildDepthMaps``, so an experiment
-    such as ``cost_type=census`` keeps the dataset's measured ``downscale`` and is
-    therefore comparable with the control run of the same dataset. The manifest's
-    own dicts are never mutated: they are copied, because the manifest is loaded
-    once and a mutation would leak into the next run.
+    dispatch, already validated by :func:`parse_depth_params`; ``dem_params`` are
+    the same for ``BuildDem``. Each is merged over the dataset's own manifest
+    overrides for its task, so an experiment such as ``cost_type=census`` keeps the
+    dataset's measured ``downscale`` and is therefore comparable with the control
+    run of the same dataset. The manifest's own dicts are never mutated: they are
+    copied, because the manifest is loaded once and a mutation would leak into the
+    next run.
     """
     manifest = load_manifest()
     if dataset_name not in manifest["datasets"]:
@@ -1003,6 +1041,7 @@ def run(
         )
     dataset = manifest["datasets"][dataset_name]
     dataset = merge_depth_params(dataset, depth_params or {})
+    dataset = merge_dem_params(dataset, dem_params or {})
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1107,12 +1146,14 @@ def run(
     )
     result["timing"] = timing
     result["manifest_hash"] = manifest_hash(manifest)
-    # A default run's JSON is unchanged byte for byte: the key is present only when
+    # A default run's JSON is unchanged byte for byte: each key is present only when
     # the run was dispatched with extra parameters. The report keys "is this an
-    # experiment" off the key's presence, so its absence means "control run" for
-    # every metrics file that predates this flag as well.
+    # experiment" off the keys' presence, so their absence means "control run" for
+    # every metrics file that predates these flags as well.
     if depth_params:
         result["depth_params"] = dict(depth_params)
+    if dem_params:
+        result["dem_params"] = dict(dem_params)
     result["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1332,12 +1373,23 @@ def main(argv: list[str] | None = None) -> int:
         help='extra BuildDepthMaps keyword args, e.g. "cost_type=census max_cost=0.4"; '
         "marks the run as an experiment (never a baseline, never gated)",
     )
+    parser.add_argument(
+        "--dem-params",
+        default="",
+        help='extra BuildDem keyword args, e.g. "sibson_exact_max_sites=20000"; '
+        "marks the run as an experiment (never a baseline, never gated)",
+    )
     args = parser.parse_args(argv)
 
     try:
         depth_params = parse_depth_params(args.depth_params)
     except DepthParamError as exc:
         parser.error(f"--depth-params: {exc}")
+
+    try:
+        dem_params = parse_dem_params(args.dem_params)
+    except DemParamError as exc:
+        parser.error(f"--dem-params: {exc}")
 
     manifest = load_manifest()
 
@@ -1361,7 +1413,7 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(dataset))
         return 0
 
-    result = run(args.dataset, Path(args.work), depth_params=depth_params)
+    result = run(args.dataset, Path(args.work), depth_params=depth_params, dem_params=dem_params)
 
     if args.json:
         destination = Path(args.json)

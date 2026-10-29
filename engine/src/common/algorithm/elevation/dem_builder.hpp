@@ -56,6 +56,9 @@ struct DemOptions {
     int epsg = 0;
     /// Hole-filling method used for the cells interpolation fills.
     HoleFill fill = HoleFill::NaturalNeighbour;
+    /// Holes bordered by at most this many data cells are filled with exact
+    /// Sibson interpolation (natural_neighbour only); 0 = discrete everywhere.
+    int sibson_exact_max_sites = 0;
     /// Run the TGV^2 smoothing / inpainting pass (never for the model source).
     bool tgv = true;
     TgvOptions tgv_options = dem_smoothing_options();
