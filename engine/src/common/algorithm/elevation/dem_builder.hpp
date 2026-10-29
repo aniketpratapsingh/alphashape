@@ -59,6 +59,10 @@ struct DemOptions {
     /// Holes bordered by at most this many data cells are filled with exact
     /// Sibson interpolation (natural_neighbour only); 0 = discrete everywhere.
     int sibson_exact_max_sites = 0;
+    /// Maximum distance in METRES from an interpolated cell to the nearest
+    /// measured cell; farther holes stay nodata. 0 = unlimited. The builder
+    /// converts this to cells with the DEM's metres-per-cell before filling.
+    double max_fill_distance = 0.0;
     /// Run the TGV^2 smoothing / inpainting pass (never for the model source).
     bool tgv = true;
     TgvOptions tgv_options = dem_smoothing_options();

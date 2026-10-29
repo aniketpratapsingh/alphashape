@@ -52,12 +52,16 @@ All notable changes to alphashape are recorded here. The format follows
   image border projected onto the DEM's surface plane, convex hulled per camera
   and rasterised -- NOT the convex hull of all cameras, so a gap between
   adjacent flight strips stays nodata). Cells outside every footprint stay
-  nodata, and `max_distance` still applies. `"extrapolated"` (fill everything)
-  and `"disabled"` (fill nothing) are unchanged. If no footprint can be
-  computed the builder logs a warning and falls back to the old interior-only
-  rule. A georeferenced aerial DEM built with `enabled` therefore has fewer
-  nodata cells, including across gaps in the observation raster that used to
-  survive only because they touched the outer rim.
+  nodata. `"extrapolated"` (fill everything) and `"disabled"` (fill nothing)
+  are unchanged. If no footprint can be computed the builder logs a warning and
+  falls back to the old interior-only rule. A georeferenced aerial DEM built
+  with `enabled` therefore has fewer nodata cells, including across gaps in the
+  observation raster that used to survive only because they touched the outer
+  rim. The new `max_fill_distance` parameter (Float, metres, default 0 =
+  unlimited) caps how far a filled cell may sit from the nearest measured cell,
+  for every fill method; filled cells sag with distance (see
+  `engine/LIMITATIONS.md`), so `max_fill_distance=10` suits a measurement-grade
+  DEM while the orthomosaic keeps the uncapped default.
 
 - **`BuildDepthMaps` now defaults to `filter_mode="moderate"` and
   `max_neighbors=8`.** Both changes come from the aerial-nadir quality

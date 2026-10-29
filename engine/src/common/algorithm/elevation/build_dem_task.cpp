@@ -1,5 +1,6 @@
 #include "common/algorithm/elevation/build_dem_task.hpp"
 
+#include <cmath>
 #include <string>
 #include <utility>
 
@@ -54,6 +55,10 @@ DemOptions resolve_options(const Params& params) {
     options.epsg = static_cast<int>(params.get_int("projection"));
     options.fill = parse_fill_method(params.get_string("fill_method"));
     options.sibson_exact_max_sites = static_cast<int>(params.get_int("sibson_exact_max_sites"));
+    options.max_fill_distance = params.get_float("max_fill_distance");
+    if (!(options.max_fill_distance >= 0.0) || !std::isfinite(options.max_fill_distance)) {
+        throw ValueError("BuildDem: max_fill_distance must be a finite value >= 0 (metres)");
+    }
     const std::string smoothing = params.get_string("smoothing");
     if (smoothing == "tgv") {
         options.tgv = true;
@@ -109,6 +114,17 @@ void BuildDemTask::declare_params(Params& params) const {
     exact_sites.minimum = std::int64_t{0};
     exact_sites.maximum = std::int64_t{1000000};
     params.declare(exact_sites);
+
+    ParamSpec max_fill_distance{"max_fill_distance", ParamType::Float, 0.0,
+                                "Maximum distance in metres from an interpolated cell to the "
+                                "nearest measured cell. Holes farther than this stay nodata. "
+                                "0 (default) = unlimited. Applies to every fill_method and to "
+                                "both the \"enabled\" and \"extrapolated\" interpolation modes. "
+                                "Filled cells sag with distance, so 10 m is a sensible cap for "
+                                "a measurement-grade DEM; the orthomosaic benefits from the "
+                                "uncapped default."};
+    max_fill_distance.minimum = 0.0;
+    params.declare(max_fill_distance);
 
     ParamSpec smoothing{"smoothing", ParamType::String, std::string("tgv"),
                         "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "

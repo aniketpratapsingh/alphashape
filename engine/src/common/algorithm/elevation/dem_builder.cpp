@@ -962,6 +962,24 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         fill_options.method = options.fill;
         fill_options.interior_only = interpolation == Interpolation::Enabled;
         fill_options.sibson_exact_max_sites = options.sibson_exact_max_sites;
+        if (options.max_fill_distance > 0.0) {
+            // The option is metres; fill_holes gates on cells. A local plane is
+            // already in metres; a geographic plane is in degrees, so the cell
+            // size has to be converted at the grid's latitude (the y of the
+            // middle row, where the scale is representative of the block).
+            const double plane_y = 0.5 * (grid.pixel_center(0, grid.height / 2).y() +
+                                          grid.pixel_center(0, 0).y());
+            const Eigen::Vector2d metres_per_unit =
+                frame.is_local() ? Eigen::Vector2d(1.0, 1.0)
+                                 : frame.metres_per_plane_unit(plane_y);
+            double cell_metres = grid.pixel_size_x * metres_per_unit.x();
+            if (!(cell_metres > 0.0) || !std::isfinite(cell_metres)) {
+                cell_metres = grid.pixel_size_x;  // degenerate frame: plane units are metres
+            }
+            if (cell_metres > 0.0 && std::isfinite(cell_metres)) {
+                fill_options.max_distance = options.max_fill_distance / cell_metres;
+            }
+        }
         if (interpolation == Interpolation::Enabled) {
             // Fill the holes the survey covers: the union of the cameras' ground
             // footprints. The observed surface's median height is only the

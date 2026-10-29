@@ -586,6 +586,67 @@ TEST(Dem, EnabledKeepsTheConcaveGapAndTheOutsideNodata) {
     EXPECT_EQ(outside.first, outside.second);
 }
 
+TEST(Dem, MaxFillDistanceLeavesTheDeepHoleCentreNodata) {
+    // A hole 30 cells wide (cell centres x = -7.25 .. 7.25 at 0.5 m), running the
+    // full height, on a point cloud with a camera covering the block.
+    // max_fill_distance = 2.5 m is 5 cells: the rim (1-5 cells from the data)
+    // fills, the centre (6+ cells from it) stays nodata. Unlimited (0) fills
+    // all of it.
+    Document unlimited_doc = make_local_chunk_document();
+    Document capped_doc = make_local_chunk_document();
+    for (Document* doc : {&unlimited_doc, &capped_doc}) {
+        Chunk& chunk = *doc->active_chunk();
+        Sensor sensor;
+        sensor.type = CameraType::Frame;
+        sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+        chunk.sensors().push_back(sensor);
+        fill_cloud_with_band(chunk, [](double x) { return x > -7.5 && x < 7.5; });
+        // ~50 m half-footprint at 100 m, f = 2000 px: the band is well inside.
+        add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+    }
+
+    Params unlimited = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    unlimited.set("max_fill_distance", ParamValue{0.0});
+    run_build_dem(unlimited_doc, unlimited);
+
+    Params capped = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    capped.set("max_fill_distance", ParamValue{2.5});  // 5 cells at 0.5 m
+    run_build_dem(capped_doc, capped);
+
+    // Band centre: the nearest cell centres here are 6 m (12 cells) from the
+    // data columns at x = -7.75 and x = 7.75, so they are well beyond the cap.
+    // The middle two cells are 7.5 m (15 cells) out either way.
+    const auto centre_capped = count_nodata(capped_doc.active_chunk()->elevation(),
+                                            [](double x, double y) {
+        return std::abs(x) < 2.0 && std::abs(y) < 40.0;
+    });
+    const auto centre_unlimited = count_nodata(unlimited_doc.active_chunk()->elevation(),
+                                               [](double x, double y) {
+        return std::abs(x) < 2.0 && std::abs(y) < 40.0;
+    });
+    // Band rim: x in (-7, -5.5) holds the cell centres at -6.75, -6.25 and
+    // -5.75, i.e. 2, 3 and 4 cells from the data column at x = -7.75 -- inside
+    // the 5-cell cap, so they must fill.
+    const auto rim_capped = count_nodata(capped_doc.active_chunk()->elevation(),
+                                         [](double x, double y) {
+        return x > -7.0 && x < -5.5 && std::abs(y) < 40.0;
+    });
+    std::printf("[Dem.MaxFillDistanceLeavesTheDeepHoleCentreNodata] "
+                "capped centre=%zu/%zu rim=%zu/%zu unlimited centre=%zu/%zu\n",
+                centre_capped.first, centre_capped.second, rim_capped.first, rim_capped.second,
+                centre_unlimited.first, centre_unlimited.second);
+
+    EXPECT_GT(centre_capped.second, 0U);
+    EXPECT_GT(rim_capped.second, 0U);
+    // The cap leaves the centre unfilled ...
+    EXPECT_EQ(centre_capped.first, centre_capped.second);
+    // ... and fills the rim.
+    EXPECT_EQ(rim_capped.first, 0U);
+    // Without the cap the whole hole fills.
+    EXPECT_GT(centre_unlimited.second, 0U);
+    EXPECT_EQ(centre_unlimited.first, 0U);
+}
+
 // ---------------------------------------------------------------------------
 // 5. Errors
 // ---------------------------------------------------------------------------
@@ -615,6 +676,14 @@ TEST(BuildDemErrors, UnknownInterpolationThrows) {
 TEST(BuildDemErrors, EmptyModelSourceThrows) {
     Document document = make_local_chunk_document();
     Params params = dem_params("model");
+    EXPECT_THROW(run_build_dem(document, params), ValueError);
+}
+
+TEST(BuildDemErrors, NegativeMaxFillDistanceThrows) {
+    Document document = make_local_chunk_document();
+    fill_truth_point_cloud(*document.active_chunk(), -5.0, 5.0, -5.0, 5.0, 0.5);
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    params.set("max_fill_distance", ParamValue{-1.0});
     EXPECT_THROW(run_build_dem(document, params), ValueError);
 }
 
