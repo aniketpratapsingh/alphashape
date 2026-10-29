@@ -270,14 +270,44 @@ DecodedGrid decode_grid(const std::string& path, bool decode_samples = true) {
     }
 
     out.samples.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-    // Scanline at a time: a full EGM2008 grid is 77 MB and read-only here, so
-    // there is no reason to ask libtiff for one giant strip.
-    for (std::uint32_t row = 0; row < height; ++row) {
-        auto* dst = reinterpret_cast<float*>(out.samples.data() +
-                                             static_cast<std::size_t>(row) *
-                                                 static_cast<std::size_t>(width));
-        if (TIFFReadScanline(tif, dst, row, 0) < 0) {
-            fail("cannot read scanline " + std::to_string(row));
+    const std::size_t row_values = static_cast<std::size_t>(width);
+    auto* base = reinterpret_cast<float*>(out.samples.data());
+    if (TIFFIsTiled(tif) != 0) {
+        // The NGA grids are tiled and Deflate-compressed; libtiff refuses
+        // TIFFReadScanline on a tiled image, so read tile by tile.
+        std::uint32_t tile_width = 0;
+        std::uint32_t tile_height = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tile_width);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tile_height);
+        const tmsize_t tile_bytes = TIFFTileSize(tif);
+        if (tile_width == 0 || tile_height == 0 || tile_bytes <= 0) {
+            fail("tiled geoid grid with an unusable tile size");
+        }
+        std::vector<float> tile(static_cast<std::size_t>(tile_bytes) / sizeof(float));
+        for (std::uint32_t row = 0; row < height; row += tile_height) {
+            for (std::uint32_t col = 0; col < width; col += tile_width) {
+                if (TIFFReadTile(tif, tile.data(), col, row, 0, 0) < 0) {
+                    fail("cannot read a tile at " + std::to_string(col) + "," +
+                         std::to_string(row));
+                }
+                const std::uint32_t copy_w = std::min(tile_width, width - col);
+                const std::uint32_t copy_h = std::min(tile_height, height - row);
+                for (std::uint32_t ty = 0; ty < copy_h; ++ty) {
+                    std::copy_n(tile.data() + static_cast<std::size_t>(ty) *
+                                                  static_cast<std::size_t>(tile_width),
+                                copy_w,
+                                base + static_cast<std::size_t>(row + ty) * row_values + col);
+                }
+            }
+        }
+    } else {
+        // Scanline at a time; the full EGM2008 grid is 77 MB and read-only
+        // here, so there is no reason to ask libtiff for one giant strip.
+        for (std::uint32_t row = 0; row < height; ++row) {
+            if (TIFFReadScanline(tif, base + static_cast<std::size_t>(row) * row_values, row, 0) <
+                0) {
+                fail("cannot read scanline " + std::to_string(row));
+            }
         }
     }
     TIFFClose(tif);
@@ -291,8 +321,7 @@ DecodedGrid decode_grid(const std::string& path, bool decode_samples = true) {
     return out;
 }
 
-/// A GeoTIFF decode that keeps only the grid geometry. Used by add()/save(),
-/// which must not pull a 77 MB grid through memory to learn a bounding box.
+/// A GeoTIFF decode that keeps only the grid geometry.
 DecodedGrid decode_grid_header(const std::string& path) {
     return decode_grid(path, /*decode_samples=*/false);
 }
@@ -306,11 +335,35 @@ DecodedGrid decode_grid_header(const std::string& path) {
 struct GeoidGrid::Impl {
     GeoidGridInfo info;
     /// Row-major from the north-west node, row 0 = max_lat.
-    std::vector<float> samples;
+    ///
+    /// Decoded on the first bicubic evaluation, not at open(). The full EGM2008
+    /// grid is 77 MB and PROJ reads it through its own memory map, so a grid
+    /// opened only to be evaluated through PROJ (the normal path) never pays
+    /// for a resident copy. A decode that fails leaves `samples` empty and
+    /// records it, so `grid_undulation()` reports "no value" instead of
+    /// re-attempting a 77 MB read on every point.
+    mutable std::vector<float> samples;
+    mutable bool decode_attempted = false;
+    mutable bool decode_ok = false;
     std::string path;
     ProjGridShift proj;
 
     explicit Impl(std::string file);
+
+    /// The samples, decoded on first use. Null when they cannot be read.
+    const std::vector<float>* decoded() const {
+        if (!decode_attempted) {
+            decode_attempted = true;
+            try {
+                DecodedGrid grid = decode_grid(path);
+                samples = std::move(grid.samples);
+                decode_ok = true;
+            } catch (const std::exception&) {
+                decode_ok = false;
+            }
+        }
+        return decode_ok ? &samples : nullptr;
+    }
 
     double sample(int col, int row) const {
         return static_cast<double>(
@@ -324,10 +377,8 @@ GeoidGrid::GeoidGrid(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) 
 GeoidGrid::Impl::Impl(std::string file) : path(std::move(file)), proj(path) {}
 
 std::shared_ptr<const GeoidGrid> GeoidGrid::open(const std::string& path) {
-    DecodedGrid decoded = decode_grid(path);
     auto impl = std::make_shared<Impl>(path);
-    impl->info = decoded.info;
-    impl->samples = std::move(decoded.samples);
+    impl->info = decode_grid_header(path).info;
     // Node (0,0) is the tiepoint. The NGA grids declare pixel-is-point, so a
     // sample is the undulation AT that node, not a cell average — which is why
     // the bounding box is of nodes and a point exactly on a node interpolates to
@@ -362,7 +413,7 @@ std::optional<double> GeoidGrid::proj_undulation(double lon_deg, double lat_deg)
 }
 
 std::optional<double> GeoidGrid::grid_undulation(double lon_deg, double lat_deg) const {
-    if (!impl_ || !covers(lon_deg, lat_deg)) {
+    if (!impl_ || !covers(lon_deg, lat_deg) || impl_->decoded() == nullptr) {
         return std::nullopt;
     }
     const GeoidGridInfo& g = impl_->info;

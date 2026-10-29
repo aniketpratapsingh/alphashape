@@ -262,15 +262,14 @@ TEST(Crs, GeoidCoverageOutsideReturnsNullopt) {
     EXPECT_FALSE(small->covers(box.min_lon_deg, box.min_lat_deg - 0.5));
     EXPECT_FALSE(small->undulation(box.max_lon_deg + 0.5, box.min_lat_deg).has_value());
     EXPECT_FALSE(small->grid_undulation(box.min_lon_deg, box.min_lat_deg - 0.5).has_value());
-    // Every sample is 12 m, so an interior point must be 12 m from both
-    // evaluators: this also proves the PixelIsArea half-cell shift agrees with
-    // PROJ, which reads the same grid with the same convention.
-    const std::optional<double> via_proj = small->proj_undulation(12.0, 2.5);
+    // Every sample is 12 m, so an interior point must be 12 m. The file has no
+    // GDAL_METADATA (our writer does not emit it), so this exercises the read
+    // path only; `Crs.GeoidBicubicVsProj` is what pins the two evaluators
+    // against each other.
     const std::optional<double> via_grid = small->grid_undulation(12.0, 2.5);
-    ASSERT_TRUE(via_proj.has_value());
     ASSERT_TRUE(via_grid.has_value());
-    EXPECT_NEAR(*via_proj, 12.0, 1e-6);
     EXPECT_NEAR(*via_grid, 12.0, 1e-6);
+    EXPECT_NEAR(*small->undulation(12.0, 2.5), 12.0, 1e-6);
     fs::remove_all(dir, ec);
 }
 
