@@ -149,6 +149,18 @@ std::string compound_wkt(PJ_CONTEXT* ctx, const CoordinateSystem& horizontal,
         throw ValueError("cannot read the horizontal CRS \"" + horizontal.name() + "\": " +
                          proj_error(ctx));
     }
+    // A compound CRS pairs a HORIZONTAL 2D CRS with a vertical one. A 3D
+    // geographic horizontal (EPSG:4979) already carries an ellipsoidal height,
+    // and PROJ refuses the combination (18-005r5 3.4), so demote it first: the
+    // vertical CRS supplies the height axis.
+    if (proj_get_type(hcrs.get()) == PJ_TYPE_GEOGRAPHIC_3D_CRS) {
+        PjPtr flat{proj_crs_demote_to_2D(ctx, nullptr, hcrs.get())};
+        if (!flat) {
+            throw ValueError("cannot reduce the horizontal CRS \"" + horizontal.name() +
+                             "\" to two dimensions: " + proj_error(ctx));
+        }
+        hcrs = std::move(flat);
+    }
     const std::string name = horizontal.name() + " + " + vertical.name;
     PjPtr compound{proj_create_compound_crs(ctx, name.c_str(), hcrs.get(), vcrs.get())};
     if (!compound) {

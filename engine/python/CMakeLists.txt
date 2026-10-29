@@ -80,6 +80,13 @@ alphashape_add_python_test(python_dense ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_d
 # the same three-view scene.
 alphashape_add_python_test(python_mesh ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mesh.py)
 
+# WP-12.7: Chunk.convertReference on the aerial block's EXIF references.
+add_test(
+    NAME python_reference_convert
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_convert.py)
+set_tests_properties(python_reference_convert PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
+
 # The DEM / orthomosaic views (Chunk.elevation, Chunk.orthomosaic), the four
 # milestone-9 tasks through the Chunk shortcuts, and project persistence of
 # both products, on the georeferenced aerial block.
