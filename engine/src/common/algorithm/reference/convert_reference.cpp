@@ -129,9 +129,18 @@ Converter build_converter(const CoordinateSystem& source, const CoordinateSystem
         }
     }
     if (stored) {
+        // N is evaluated in the geoid's own horizontal reference, not blindly
+        // in WGS 84: a national grid (NAD83-based, say) is sampled at the
+        // lon/lat of its own datum, and its metadata names that datum. An
+        // unspecified reference defaults to EPSG:4979 (WGS 84), which is what
+        // the global EGM96/EGM2008 grids are referred to; see
+        // VerticalCrs::geoid_horizontal_epsg.
+        const crs::VerticalCrs& orthometric =
+            (src_set && crs::lookup_vertical_crs(src_datum).epsg == 0) ? src_datum : dst_datum;
+        const CoordinateSystem geoid_frame =
+            CoordinateSystem::from_epsg(orthometric.geoid_horizontal_epsg());
         out.vertical = crs::VerticalTransform::custom(source, target, src_datum, dst_datum,
-                                                     std::move(stored),
-                                                     CoordinateSystem::from_epsg(4979));
+                                                     std::move(stored), geoid_frame);
         return out;
     }
     // No EPSG code and no usable grid: fail by name. A silently skipped geoid

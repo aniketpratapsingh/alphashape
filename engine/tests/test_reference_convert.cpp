@@ -340,6 +340,35 @@ TEST(Crs, EpsgVerticalDatumIgnoresStoreGridInFavourOfCompound) {
     fs::remove_all(dir, ec);
 }
 
+// A custom grid's N is sampled in the geoid's own horizontal reference, not
+// always in WGS 84. The grid here is referred to EPSG:4979 (the default), so
+// N must be exactly the grid's value at the caller's own lon/lat.
+TEST(Crs, CustomGeoidUndulationUsesItsOwnHorizontalReference) {
+    const double lon = 9.0;
+    const double lat = 50.0;
+    crs::VerticalCrs project;
+    project.kind = crs::VerticalCrs::Kind::GeoidModel;
+    project.name = "Project geoid 2019";
+    project.grid = "project_geoid_2019.tif";
+    project.horizontal_epsg = 4979;  // explicit, equals the default
+    EXPECT_EQ(project.geoid_horizontal_epsg(), 4979);
+    const crs::CoordinateSystem source = geographic().with_vertical(project);
+    const std::optional<double> n = egm96()->undulation(lon, lat);
+    ASSERT_TRUE(n.has_value());
+
+    crs::GeoidStore store;
+    store.add("project_geoid_2019", project.name, (kFixtureDir / "egm96_subset.tif").string(),
+              "custom", "test");
+    Chunk chunk = make_chunk(source, 1, 0, lon, lat);
+    chunk.cameras()[0].reference.location = Eigen::Vector3d(lon, lat, 300.0);
+    convert_reference(chunk, geographic(), ReferenceKind::Cameras, &store);
+    EXPECT_NEAR((*chunk.cameras()[0].reference.location).z(), 300.0 + *n, 1e-3);
+    // Unspecified is exactly the same: 0 means EPSG:4979.
+    crs::VerticalCrs unspecified = project;
+    unspecified.horizontal_epsg = 0;
+    EXPECT_EQ(unspecified.geoid_horizontal_epsg(), 4979);
+}
+
 // The unset/local guard runs before the identity shortcut: LOCAL -> LOCAL must
 // throw, not answer "same CRS, so identity".
 TEST(Crs, FrameRotationRejectsLocalBeforeIdentityShortcut) {

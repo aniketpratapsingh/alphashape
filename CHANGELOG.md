@@ -18,8 +18,10 @@ All notable changes to alphashape are recorded here. The format follows
   follows the datum, not the store: an EPSG vertical CRS always uses PROJ's
   compound pipeline (exact `cs2cs` agreement, and a store grid never shadows
   it), while a datum with no EPSG code uses the store's grid and applies
-  `H = h - N`. An absent height stays absent. Accuracies are measurement
-  weights in metres and are carried unchanged. The conversion is
+  `H = h - N`, evaluating N in that grid's own horizontal reference (its
+  `horizontal_epsg`, persisted in doc.xml; EPSG:4979 when unset). An absent
+  height stays absent. Accuracies are measurement weights in metres and are
+  carried unchanged. The conversion is
   all-or-nothing (a point outside the target's area of use fails the call and
   leaves the chunk untouched) and undoable as one `Convert Camera/Marker
   References` step.

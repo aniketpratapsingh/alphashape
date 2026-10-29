@@ -171,6 +171,11 @@ crs::EulerAngles convert_orientation(const crs::EulerAngles& angles,
 /// id the store does not carry, throws naming the datum. The store id is the
 /// datum's `grid` when set, otherwise its `name`.
 ///
+/// A custom grid's undulation N is evaluated in the geoid's own horizontal
+/// reference, taken from the datum's `horizontal_epsg` (persisted in doc.xml);
+/// when that is unset it defaults to EPSG:4979, the frame the global
+/// EGM96/EGM2008 grids are referred to.
+///
 /// On success the camera/marker slot is set to `target`, so the stored numbers
 /// and their label agree. On failure the chunk is unchanged.
 ///
