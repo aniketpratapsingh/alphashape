@@ -620,7 +620,7 @@ std::vector<Eigen::Vector2d> camera_ground_ring(const Camera& camera, const Sens
                 continue;  // parallel to the ground: no bounded intersection
             }
             double local_z = ground_local_z;
-            Eigen::Vector3d plane;
+            Eigen::Vector3d plane = Eigen::Vector3d::Zero();
             bool hit = false;
             for (int iteration = 0; iteration < kRefineIterations; ++iteration) {
                 const double t_hit = (local_z - centre.z()) / direction.z();
