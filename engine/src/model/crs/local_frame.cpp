@@ -13,6 +13,8 @@
 #include <limits>
 #include <utility>
 
+#include <Eigen/LU>
+
 #include "base/utils/error.hpp"
 
 namespace alphashape::crs {
