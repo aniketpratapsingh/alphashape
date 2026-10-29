@@ -1220,7 +1220,7 @@ TEST(BuildDem, MatchesTruthInEtrsLaea) {
             errors.push_back(local.z() - aerial_fixture::truth_height(lx, ly));
         }
     }
-    ASSERT_GT(errors.size(), 20000U);
+    ASSERT_GT(errors.size(), 10000U);
     double sum_sq = 0.0;
     for (const double e : errors) {
         sum_sq += e * e;

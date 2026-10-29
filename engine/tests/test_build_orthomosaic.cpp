@@ -534,40 +534,62 @@ TEST(BuildOrthomosaic, BuildsInDemCrsWithoutPreprojection) {
     EXPECT_NEAR(ortho.raster.grid.origin_y, dem_grid.origin_y,
                 ortho.raster.grid.pixel_size_y);
 
-    // Geometry is unaffected: every observed cell's local position, recovered
-    // through the DEM-CRS frame, lies within one cell of the DEM's own mapping
-    // of that cell (the "no preprojection" error budget of <= 1 px).
-    ASSERT_TRUE(s.frame.has_value());
+    // Geometry is unaffected: map every opaque cell's centre into chunk-local
+    // space through the DEM-CRS frame. The covered footprint then has to reach
+    // the DEM's own local extent, which is what "built on the DEM plane, no
+    // second projection" means (a stale or mismatched frame would shift or
+    // shrink it).
     const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, dem_epsg);
     std::size_t checked = 0;
-    double worst_px = 0.0;
-    const double cell = ortho.raster.grid.pixel_size_x;
-    for (int row = 0; row < ortho.raster.grid.height; row += 4) {
-        for (int col = 0; col < ortho.raster.grid.width; col += 4) {
+    double local_min_x = std::numeric_limits<double>::infinity();
+    double local_max_x = -std::numeric_limits<double>::infinity();
+    double local_min_y = std::numeric_limits<double>::infinity();
+    double local_max_y = -std::numeric_limits<double>::infinity();
+    for (int row = 0; row < ortho.raster.grid.height; ++row) {
+        for (int col = 0; col < ortho.raster.grid.width; ++col) {
             const std::size_t i = static_cast<std::size_t>(row) *
                                       static_cast<std::size_t>(ortho.raster.grid.width) +
                                   static_cast<std::size_t>(col);
             if (ortho.raster.data[i * 4 + 3] == 0) {
                 continue;  // unobserved
             }
+            ++checked;
             const Eigen::Vector2d c = ortho.raster.grid.pixel_center(col, row);
             const double h = dem_height(chunk.elevation(), c.x(), c.y());
             if (h == static_cast<double>(chunk.elevation().nodata) || !std::isfinite(h)) {
                 continue;
             }
-            // The ortho cell centre expressed in the DEM plane must come back to
-            // the same local point through the DEM frame: that is exactly what
-            // "built without a second projection" means.
             const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), h));
-            const Eigen::Vector3d back = frame.to_plane(local);
-            worst_px = std::max(worst_px, std::hypot(back.x() - c.x(), back.y() - c.y()) / cell);
-            ++checked;
+            local_min_x = std::min(local_min_x, local.x());
+            local_max_x = std::max(local_max_x, local.x());
+            local_min_y = std::min(local_min_y, local.y());
+            local_max_y = std::max(local_max_y, local.y());
         }
     }
-    EXPECT_GT(checked, 1000U);
-    EXPECT_LT(worst_px, 1.0);
-    std::printf("[BuildOrthomosaic.BuildsInDemCrs] cells=%zu worst=%.3e px\n", checked,
-                worst_px);
+    EXPECT_GT(checked, 5000U);
+    // The observed ortho must span the DEM's own local extent to within one
+    // output cell on every side (this fixture's cameras cover the whole DEM).
+    Eigen::Vector2d dem_min = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector2d dem_max = Eigen::Vector2d::Constant(
+        -std::numeric_limits<double>::infinity());
+    for (int row = 0; row < dem_grid.height; ++row) {
+        for (int col = 0; col < dem_grid.width; ++col) {
+            const Eigen::Vector2d c = dem_grid.pixel_center(col, row);
+            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
+            dem_min = dem_min.cwiseMin(local.head<2>());
+            dem_max = dem_max.cwiseMax(local.head<2>());
+        }
+    }
+    const double cell = ortho.raster.grid.pixel_size_x;
+    EXPECT_LT(local_min_x, dem_min.x() + cell);
+    EXPECT_GT(local_max_x, dem_max.x() - cell);
+    EXPECT_LT(local_min_y, dem_min.y() + cell);
+    EXPECT_GT(local_max_y, dem_max.y() - cell);
+    std::printf("[BuildOrthomosaic.BuildsInDemCrs] cells=%zu local x[%.1f,%.1f] "
+                "y[%.1f,%.1f] (DEM x[%.1f,%.1f] y[%.1f,%.1f])\n",
+                checked, local_min_x, local_max_x, local_min_y, local_max_y,
+                dem_min.x(), dem_max.x(), dem_min.y(), dem_max.y());
 }
 
 TEST(BuildOrthomosaic, Errors) {
