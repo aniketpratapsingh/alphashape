@@ -155,6 +155,9 @@ void Chunk::copy_from(const Chunk& other) {
     transform_ = other.transform_;
     meta_ = other.meta_;
     crs_ = other.crs_;
+    camera_crs_ = other.camera_crs_;
+    marker_crs_ = other.marker_crs_;
+    world_crs_ = other.world_crs_;
 }
 
 // -- asset addition --------------------------------------------------------
@@ -550,6 +553,10 @@ bool Chunk::operator==(const Chunk& other) const {
     }
     if (!(region_ == other.region_) || !(meta_ == other.meta_) ||
         !(crs_ == other.crs_)) {
+        return false;
+    }
+    if (camera_crs_ != other.camera_crs_ || marker_crs_ != other.marker_crs_ ||
+        world_crs_ != other.world_crs_) {
         return false;
     }
     return transform_ == other.transform_;
