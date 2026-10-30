@@ -16,6 +16,7 @@
 #endif
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/stereo/depth_repair.hpp"  // kRepairedConfidence
 #include "common/algorithm/stereo/fusion.hpp"
 #include "common/core/chunk.hpp"
 #include "image/image.hpp"
