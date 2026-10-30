@@ -105,7 +105,8 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
 
     progress.update("write", 0.0);
     const GeoRaster<float> raster = elevation::reproject_for_export(
-        elevation.raster, elevation.crs, elevation.nodata, target, "ExportDem");
+        elevation.raster, elevation.crs, elevation.nodata,
+        static_cast<float>(params.get_float("nodata")), target, "ExportDem");
     options.epsg = elevation::export_epsg(elevation.crs, target);
     write_geotiff(path, raster, options);
     if (world_file) {

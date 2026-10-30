@@ -41,15 +41,17 @@ ExportCrs parse_export_crs(std::int64_t projection, const std::string& crs_text,
 
 /// The raster in its export form: reprojected into the requested CRS, or the
 /// input unchanged (a copy) when the request is unset. `raster_crs` is the
-/// container's recorded CRS.
+/// container's recorded CRS; `nodata_in` is the stored sentinel and `nodata_out`
+/// the one written for uncovered cells (they differ when the caller picked a
+/// custom `nodata`).
 ///
 /// @throws ValueError when a reprojection is requested but the raster has no
 ///         CRS to reproject FROM, or when the target CRS has no EPSG code (a
 ///         custom WKT target is written once WP-12.10 adds WKT GeoKeys), and
 ///         when the request cannot be satisfied at the requested cell size.
 GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS& raster_crs,
-                                      float nodata, const ExportCrs& target,
-                                      const char* task);
+                                      float nodata_in, float nodata_out,
+                                      const ExportCrs& target, const char* task);
 
 GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& raster,
                                              const CRS& raster_crs,

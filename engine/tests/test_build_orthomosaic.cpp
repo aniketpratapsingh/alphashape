@@ -521,59 +521,61 @@ TEST(BuildOrthomosaic, PlaneToLocalIsExact) {
 // 4. Errors
 // ---------------------------------------------------------------------------
 
-TEST(BuildOrthomosaic, BuildsInDemCrsWithoutPreprojection) {
-    // The spec's BuildsInDemCrsWithoutPreprojection (M12 §4.9, WP-12.8): asking
-    // for an ortho whose `projection` differs from the DEM's used to be refused
-    // ("reproject the DEM first"). The ortho is now always built on the DEM's
-    // plane, so the request succeeds and lands on the DEM's CRS, with no
-    // reprojection-induced geometric error.
+TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
+    // Superseded WP-12.8 placement: a differing `projection` used to build on
+    // the DEM's plane and only re-declare the CRS at export. WP-12.9 builds
+    // DIRECTLY in the requested CRS (the DEM surface is reprojected once, the
+    // photographs are sampled in the target projection), so the stored
+    // orthomosaic already carries the request. What the old test pinned — that
+    // a differing request is never an error and the geometry is not distorted —
+    // still holds and is what this checks.
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
-    const RasterGrid dem_grid = chunk.elevation().raster.grid;
     const int dem_epsg = chunk.elevation().crs.epsg;
     ASSERT_EQ(dem_epsg, 32632);
 
     // 1 m cells keep the run cheap; the request names a DIFFERENT CRS.
-    Params params = ortho_params("mosaic", "elevation", 1.0, true, true,
-                                 std::int64_t{32633});
+    constexpr int kRequested = 32633;
+    Params params =
+        ortho_params("mosaic", "elevation", 1.0, true, true, std::int64_t{kRequested});
     run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
 
     const Orthomosaic& ortho = chunk.orthomosaic();
     ASSERT_FALSE(ortho.empty());
-    // Built in the DEM's CRS, not the request's.
-    EXPECT_EQ(ortho.epsg(), dem_epsg);
-    // The grid follows the DEM's, so the same output origin and cell.
-    EXPECT_NEAR(ortho.raster.grid.origin_x, dem_grid.origin_x,
-                ortho.raster.grid.pixel_size_x);
-    EXPECT_NEAR(ortho.raster.grid.origin_y, dem_grid.origin_y,
-                ortho.raster.grid.pixel_size_y);
+    EXPECT_EQ(ortho.epsg(), kRequested);
+    // The stored cell is exactly the requested 1 m in the target CRS.
+    EXPECT_NEAR(ortho.raster.grid.pixel_size_x, 1.0, 1e-9);
+    // UTM 33N eastings are ~500 km, like 32N: the origin is a projected
+    // coordinate, not a Web-Mercator one, which is what "built in the request"
+    // means.
+    EXPECT_GT(ortho.raster.grid.origin_x, 100000.0);
+    EXPECT_LT(ortho.raster.grid.origin_x, 1000000.0);
 
-    // Geometry is unaffected: map every opaque cell's centre into chunk-local
-    // space through the DEM-CRS frame. The covered footprint then has to reach
-    // the DEM's own local extent, which is what "built on the DEM plane, no
-    // second projection" means (a stale or mismatched frame would shift or
-    // shrink it).
-    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, dem_epsg);
+    // Geometry is unaffected within a cell: map every opaque cell's centre into
+    // chunk-local space through the 33N frame and check the covered footprint
+    // reaches the DEM's own local extent (a stale frame would shift or shrink
+    // it). The reprojected surface costs at most a bilinear half-cell, so the
+    // tolerance is one output cell.
+    const elevation::SurfaceFrame frame =
+        elevation::SurfaceFrame::for_chunk(chunk, kRequested);
+    ASSERT_EQ(frame.epsg(), kRequested);
+    const RasterGrid& dem_grid = chunk.elevation().raster.grid;
     std::size_t checked = 0;
     double local_min_x = std::numeric_limits<double>::infinity();
-    double local_max_x = -std::numeric_limits<double>::infinity();
-    double local_min_y = std::numeric_limits<double>::infinity();
-    double local_max_y = -std::numeric_limits<double>::infinity();
+    double local_max_x = -local_min_x;
+    double local_min_y = local_min_x;
+    double local_max_y = -local_min_x;
     for (int row = 0; row < ortho.raster.grid.height; ++row) {
         for (int col = 0; col < ortho.raster.grid.width; ++col) {
             const std::size_t i = static_cast<std::size_t>(row) *
                                       static_cast<std::size_t>(ortho.raster.grid.width) +
                                   static_cast<std::size_t>(col);
             if (ortho.raster.data[i * 4 + 3] == 0) {
-                continue;  // unobserved
+                continue;
             }
             ++checked;
             const Eigen::Vector2d c = ortho.raster.grid.pixel_center(col, row);
-            const double h = dem_height(chunk.elevation(), c.x(), c.y());
-            if (h == static_cast<double>(chunk.elevation().nodata) || !std::isfinite(h)) {
-                continue;
-            }
-            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), h));
+            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
             local_min_x = std::min(local_min_x, local.x());
             local_max_x = std::max(local_max_x, local.x());
             local_min_y = std::min(local_min_y, local.y());
@@ -581,16 +583,15 @@ TEST(BuildOrthomosaic, BuildsInDemCrsWithoutPreprojection) {
         }
     }
     EXPECT_GT(checked, 5000U);
-    // The observed ortho must span the DEM's own local extent to within one
-    // output cell on every side (this fixture's cameras cover the whole DEM).
+    const elevation::SurfaceFrame dem_frame =
+        elevation::SurfaceFrame::for_chunk(chunk, dem_epsg);
     Eigen::Vector2d dem_min = Eigen::Vector2d::Constant(
         std::numeric_limits<double>::infinity());
-    Eigen::Vector2d dem_max = Eigen::Vector2d::Constant(
-        -std::numeric_limits<double>::infinity());
+    Eigen::Vector2d dem_max = Eigen::Vector2d::Constant(-local_min_x);
     for (int row = 0; row < dem_grid.height; ++row) {
         for (int col = 0; col < dem_grid.width; ++col) {
             const Eigen::Vector2d c = dem_grid.pixel_center(col, row);
-            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
+            const Eigen::Vector3d local = dem_frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
             dem_min = dem_min.cwiseMin(local.head<2>());
             dem_max = dem_max.cwiseMax(local.head<2>());
         }
@@ -600,9 +601,9 @@ TEST(BuildOrthomosaic, BuildsInDemCrsWithoutPreprojection) {
     EXPECT_GT(local_max_x, dem_max.x() - cell);
     EXPECT_LT(local_min_y, dem_min.y() + cell);
     EXPECT_GT(local_max_y, dem_max.y() - cell);
-    std::printf("[BuildOrthomosaic.BuildsInDemCrs] cells=%zu local x[%.1f,%.1f] "
+    std::printf("[BuildOrthomosaic.RequestedCrs] epsg=%d cells=%zu local x[%.1f,%.1f] "
                 "y[%.1f,%.1f] (DEM x[%.1f,%.1f] y[%.1f,%.1f])\n",
-                checked, local_min_x, local_max_x, local_min_y, local_max_y,
+                ortho.epsg(), checked, local_min_x, local_max_x, local_min_y, local_max_y,
                 dem_min.x(), dem_max.x(), dem_min.y(), dem_max.y());
 }
 

@@ -74,20 +74,20 @@ int exported_epsg(const CRS& raster_crs, const ExportCrs& target) {
     return static_cast<crs::CoordinateSystem>(target.crs).epsg();
 }
 
-/// The reprojection options for one raster: its own nodata is both the input
-/// sentinel and the output one, so a hole stays a hole.
-ReprojectOptions reproject_options(float nodata) {
+/// The reprojection options for one raster: a hole stays a hole, and carries
+/// the caller's nodata when it is written.
+ReprojectOptions reproject_options(float nodata_in, float nodata_out) {
     ReprojectOptions options;
-    options.nodata_in = nodata;
-    options.nodata_out = nodata;
+    options.nodata_in = nodata_in;
+    options.nodata_out = nodata_out;
     return options;
 }
 
 }  // namespace
 
 GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS& raster_crs,
-                                      float nodata, const ExportCrs& target,
-                                      const char* task) {
+                                      float nodata_in, float nodata_out,
+                                      const ExportCrs& target, const char* task) {
     if (!target.requested() && !(target.resolution > 0.0)) {
         return raster;  // unchanged: the common path, no work at all
     }
@@ -96,13 +96,13 @@ GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS&
         // so the source and target CRSs are the container's own.
         const crs::CoordinateSystem self = container_crs(raster_crs);
         const RasterGrid grid = suggest_grid(raster.grid, self, self, target.resolution);
-        return reproject(raster, self, self, grid, reproject_options(nodata));
+        return reproject(raster, self, self, grid, reproject_options(nodata_in, nodata_out));
     }
     const crs::CoordinateSystem from = container_crs(raster_crs);
     const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(target.crs);
     require_reprojectable(raster_crs, to, task);
     const RasterGrid grid = suggest_grid(raster.grid, from, to, target.resolution);
-    return reproject(raster, from, to, grid, reproject_options(nodata));
+    return reproject(raster, from, to, grid, reproject_options(nodata_in, nodata_out));
 }
 
 GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& raster,
