@@ -835,7 +835,54 @@ TEST(Reproject, InteriorHasNoNodata) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Error paths
+// 10. Multi-channel floats keep every channel
+// ---------------------------------------------------------------------------
+
+TEST(Reproject, MultiChannelFloatSamplesEveryChannel) {
+    // Bilinear resampling used to write channel 0's value to every channel.
+    // A 2-channel raster whose bands differ must come out with both bands
+    // sampled separately.
+    const Eigen::Vector2d anchor = utm_of(9.2, 48.7);
+    GeoRaster<float> src;
+    src.grid.width = 40;
+    src.grid.height = 40;
+    src.grid.origin_x = anchor.x();
+    src.grid.origin_y = anchor.y();
+    src.grid.pixel_size_x = 1.0;
+    src.grid.pixel_size_y = 1.0;
+    src.channels = 2;
+    src.data.resize(40U * 40U * 2U);
+    for (int row = 0; row < src.grid.height; ++row) {
+        for (int col = 0; col < src.grid.width; ++col) {
+            const Eigen::Vector2d c = src.grid.pixel_center(col, row);
+            src.at(col, row, 0) = static_cast<float>(c.x() - anchor.x());
+            src.at(col, row, 1) = 500.0F + static_cast<float>(c.y() - anchor.y());
+        }
+    }
+    const RasterGrid target = suggest_grid(src.grid, utm(), mercator());
+    const GeoRaster<float> out = reproject(src, utm(), mercator(), target, ReprojectOptions{});
+    ASSERT_EQ(out.channels, 2);
+    std::size_t compared = 0;
+    std::size_t wrong = 0;
+    for (int row = 0; row < out.grid.height; row += 3) {
+        for (int col = 0; col < out.grid.width; col += 3) {
+            const float band0 = out.at(col, row, 0);
+            const float band1 = out.at(col, row, 1);
+            if (band0 == -32767.0F || band1 == -32767.0F) {
+                continue;
+            }
+            ++compared;
+            // Band 1 carries the +500 offset; if channel 0 were copied into
+            // both, this difference would be about zero.
+            wrong += (band1 - band0) < 400.0F ? 1U : 0U;
+        }
+    }
+    EXPECT_GT(compared, 50U);
+    EXPECT_EQ(wrong, 0U) << "band 1 must be sampled from band 1, not copied from band 0";
+}
+
+// ---------------------------------------------------------------------------
+// 11. Error paths
 // ---------------------------------------------------------------------------
 
 TEST(Reproject, InconsistentBufferThrows) {

@@ -291,12 +291,14 @@ int choose_step(const Projection& projection, const RasterGrid& src,
 /// are at half-integers, so flooring picks the containing pixel).
 int nearest_index(double continuous) { return static_cast<int>(std::floor(continuous)); }
 
-/// Bilinear, nodata-aware float sample at continuous source pixel coordinate
-/// (px, py). Out-of-bounds, `nodata_in` and non-finite taps carry no weight; the
-/// rest renormalise. Returns false when the valid weight is below
-/// `kMinValidWeight`, and the caller writes `nodata_out`.
+/// Bilinear, nodata-aware float sample of ONE channel at continuous source pixel
+/// coordinate (px, py). Out-of-bounds, `nodata_in` and non-finite taps carry no
+/// weight; the rest renormalise. Returns false when the valid weight is below
+/// `kMinValidWeight`, and the caller writes `nodata_out`. The weights depend
+/// only on the geometry, so every channel is sampled with the same taps and a
+/// multi-channel float raster keeps its own values.
 bool sample_bilinear(const GeoRaster<float>& src, double px, double py, float nodata_in,
-                     double* out_sum, double* out_weight) {
+                     int channel, double* out_sum, double* out_weight) {
     const double cx = px - 0.5;  // bilinear lattice corner in index space
     const double cy = py - 0.5;
     const int c0 = static_cast<int>(std::floor(cx));
@@ -316,7 +318,7 @@ bool sample_bilinear(const GeoRaster<float>& src, double px, double py, float no
             if (!src.grid.contains_pixel(col, row)) {
                 continue;  // an edge tap is missing mass, not a zero measurement
             }
-            const double v = static_cast<double>(src.at(col, row));
+            const double v = static_cast<double>(src.at(col, row, channel));
             if (!std::isfinite(v) || v == static_cast<double>(nodata_in)) {
                 continue;
             }
@@ -443,10 +445,18 @@ void fill_band(const GeoRaster<T>& src, const Projection& projection, const Latt
                     double sum = 0.0;
                     double weight = 0.0;
                     const bool ok =
-                        sample_bilinear(src, p.x(), p.y(), nodata_in, &sum, &weight);
-                    const T value = ok ? static_cast<T>(sum / weight) : missing;
-                    for (int ch = 0; ch < channels; ++ch) {
-                        out.data[base + static_cast<std::size_t>(ch)] = value;
+                        sample_bilinear(src, p.x(), p.y(), nodata_in, 0, &sum, &weight);
+                    out.data[base] = ok ? static_cast<T>(sum / weight) : missing;
+                    // Channel 0 fixes the validity; every other channel is
+                    // resampled at the same coordinate so a multi-channel float
+                    // raster is not reduced to a copy of band 0.
+                    for (int ch = 1; ch < channels; ++ch) {
+                        double csum = 0.0;
+                        double cweight = 0.0;
+                        const bool cok = sample_bilinear(src, p.x(), p.y(), nodata_in, ch,
+                                                         &csum, &cweight);
+                        out.data[base + static_cast<std::size_t>(ch)] =
+                            cok ? static_cast<T>(csum / cweight) : missing;
                     }
                     continue;
                 }

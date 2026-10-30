@@ -21,7 +21,8 @@
 ///
 /// Resampling. Floats (DEMs) are bilinear and nodata-aware: out-of-bounds,
 /// `nodata_in` and non-finite taps carry no weight, the rest renormalise, and a
-/// cell below `kMinValidWeight` is `nodata_out`. 8-bit rasters
+/// cell below `kMinValidWeight` is `nodata_out`. Every source CHANNEL is sampled
+/// separately, so a multi-channel float raster keeps its channels. 8-bit rasters
 /// are ALWAYS nearest: a blended colour was never photographed. An identical CRS
 /// yields a bit-identical copy with no PROJ call and no arithmetic; a same-CRS
 /// re-cell keeps the source corner (see `resample_grid`).
