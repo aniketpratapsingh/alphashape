@@ -131,7 +131,7 @@ void write_tie_points(const Chunk& chunk, docxml::XmlNode& node, ZipArchive& arc
 /// The depth-map encoding that shipped with v1 ("ADM1"): four i32s, two u8
 /// flags, then the pixel blocks, with no alignment fingerprint. v1 projects in
 /// the field carry this exact layout, so the fixture must too; the current
-/// encoder writes "ADM2" and would break the byte comparison. The decoder in
+/// encoder writes "ADM3" and would break the byte comparison. The decoder in
 /// common/io/sidecars.hpp still reads "ADM1".
 std::vector<std::uint8_t> encode_legacy_depth_maps(const std::vector<DepthMap>& maps) {
     std::vector<std::uint8_t> out(docxml::sidecar::kDepthMapsMagic,

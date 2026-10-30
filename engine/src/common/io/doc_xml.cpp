@@ -65,9 +65,10 @@ std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* r
         if (version == 1) {
             return docxml::read_v1(root, archive, report);
         }
-        // v2 and v3 share the reader: v3 is a sidecar-encoding bump only (ADM1
-        // -> ADM2 for depth maps), and the codec keys off its own magic.
-        if (version == 2 || version == 3) {
+        // v2, v3 and v4 share the reader: v3 and v4 are sidecar-encoding bumps
+        // only (ADM1 -> ADM2 -> ADM3 for depth maps), and the codec keys off
+        // its own magic.
+        if (version >= 2 && version <= Document::kFormatVersion) {
             return docxml::read_v2(root, archive, report);
         }
     } catch (const ProjectIOError&) {

@@ -540,11 +540,12 @@ TEST_F(ProjectV2, WritesVersionTwo) {
     ProjectIO::save(document, psx);
 
     // The layout tests below are the M11 (v2) vocabulary; the CURRENT version
-    // number is one higher because the depth-map sidecar moved to ADM2. Pin
-    // both facts: the number, and that the XML it writes is the v2 vocabulary.
-    ASSERT_EQ(Document::kFormatVersion, 3);
+    // number is higher because the depth-map sidecar moved to ADM2 (v3) and
+    // then ADM3 (v4, repair provenance). Pin both facts: the number, and that
+    // the XML it writes is the v2 vocabulary.
+    ASSERT_EQ(Document::kFormatVersion, 4);
     const std::string xml = doc_text(psx);
-    EXPECT_NE(xml.find("<document version=\"3\""), std::string::npos);
+    EXPECT_NE(xml.find("<document version=\"4\""), std::string::npos);
     EXPECT_NE(xml.find("<chunks>"), std::string::npos);
     // The archive is partitioned per chunk: every bulk entry sits under
     // chunks/<chunk_id>/ and the flat v1 names are gone.
@@ -679,7 +680,7 @@ TEST_F(ProjectV2, SidecarMagicsAreDistinct) {
     // Every entry that is not doc.xml is either a GeoTIFF, a PNG, or a
     // magic-tagged sidecar whose four-byte magic is one of the documented ones.
     // A mislabelled entry (a decoder reading a different layout) cannot pass.
-    const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "ADM2",
+    const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "ADM2", "ADM3",
                                          "APC1", "AMS2", "AOL1", "AMK1", "ASH1",
                                          "ATJ1", "AFR1", "ATM1"};
     std::set<std::string> seen;
@@ -1041,7 +1042,7 @@ TEST_F(ProjectV2, MigratesV1ToV2) {
 
     ZipArchive out;
     write_document(*loaded, out);
-    EXPECT_NE(out.get_text("doc.xml").find("<document version=\"3\""),
+    EXPECT_NE(out.get_text("doc.xml").find("<document version=\"4\""),
               std::string::npos);
     EXPECT_TRUE(out.contains("chunks/" +
                              std::to_string(loaded->workspace().chunks().front()->id()) +
@@ -1050,7 +1051,7 @@ TEST_F(ProjectV2, MigratesV1ToV2) {
     ReadReport report;
     const std::shared_ptr<Document> again =
         read_document(ZipArchive::parse(out.serialise()), &report);
-    EXPECT_EQ(report.version, 3);
+    EXPECT_EQ(report.version, Document::kFormatVersion);
     ASSERT_EQ(again->workspace().chunks().size(), 1U);
     EXPECT_TRUE(*again->workspace().chunks().front() ==
                 *loaded->workspace().chunks().front());
@@ -1105,7 +1106,8 @@ TEST_F(ProjectV2, ReadsVersionTwoWithAdm1DepthMaps) {
     ASSERT_GT(downgraded, 0U) << "the fixture has no depth-map sidecar to downgrade";
 
     std::string xml = archive.get_text("doc.xml");
-    const std::string current = "<document version=\"3\"";
+    const std::string current = "<document version=\"" +
+                                std::to_string(Document::kFormatVersion) + "\"";
     const std::size_t at = xml.find(current);
     ASSERT_NE(at, std::string::npos);
     xml.replace(at, current.size(), "<document version=\"2\"");
@@ -1128,10 +1130,12 @@ TEST_F(ProjectV2, ReadsVersionTwoWithAdm1DepthMaps) {
     }
     EXPECT_GT(maps_seen, 0U);
 
-    // Reading it back does not silently upgrade the file: saving writes v3.
+    // Reading it back does not silently upgrade the file: saving writes the
+    // CURRENT version.
     ZipArchive again;
     write_document(*loaded, again);
-    EXPECT_NE(again.get_text("doc.xml").find("<document version=\"3\""),
+    EXPECT_NE(again.get_text("doc.xml").find(
+                  "<document version=\"" + std::to_string(Document::kFormatVersion) + "\""),
               std::string::npos);
 }
 
@@ -1139,10 +1143,12 @@ TEST_F(ProjectV2, RejectsNewerVersion) {
     ZipArchive archive;
     write_document(build_full_document(), archive);
     std::string xml = archive.get_text("doc.xml");
-    const std::string from = "<document version=\"3\"";
+    const std::string from = "<document version=\"" +
+                             std::to_string(Document::kFormatVersion) + "\"";
     const std::size_t at = xml.find(from);
     ASSERT_NE(at, std::string::npos);
-    xml.replace(at, from.size(), "<document version=\"4\"");
+    xml.replace(at, from.size(),
+                "<document version=\"" + std::to_string(Document::kFormatVersion + 1) + "\"");
     archive.add("doc.xml", xml);
     EXPECT_THROW(read_document(archive), ProjectIOError);
 
@@ -1158,7 +1164,7 @@ TEST_F(ProjectV2, RejectsNewerVersion) {
     // upgraded. v2 and v1 are read-only formats now.
     EXPECT_THROW(write_document(build_full_document(), archive, 1), ProjectIOError);
     EXPECT_THROW(write_document(build_full_document(), archive, 2), ProjectIOError);
-    EXPECT_THROW(write_document(build_full_document(), archive, 4), ProjectIOError);
+    EXPECT_THROW(write_document(build_full_document(), archive, 3), ProjectIOError);
 }
 
 TEST_F(ProjectV2, RejectsUnknownV2Element) {

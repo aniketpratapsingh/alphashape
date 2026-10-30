@@ -86,6 +86,14 @@ struct DepthMap {
     std::vector<float> normals;
     /// Empty, or width * height: per-pixel confidence / support weight.
     std::vector<float> confidence;
+    /// Empty, or width * height: per-pixel provenance bits (kDepthMeasured /
+    /// kDepthRepaired below). Empty means "every valid pixel was measured",
+    /// which is what a map built before the repair pass existed means, so an
+    /// empty vector costs nothing to carry and needs no migration. A flag, not a
+    /// confidence value, because a MEASURED pixel may legitimately carry any
+    /// confidence including 0 (a filter that keeps a pixel with no supporting
+    /// neighbour), so confidence cannot distinguish "measured" from "synthetic".
+    std::vector<std::uint8_t> flags;
 
     /// The cross-view filter this map has been through: -1 when it has not been
     /// filtered at all (a map checkpointed by a cancelled run, or one that
@@ -113,10 +121,17 @@ struct DepthMap {
         return camera_id == other.camera_id && width == other.width &&
                height == other.height && downscale == other.downscale &&
                depths == other.depths && normals == other.normals &&
-               confidence == other.confidence && filter_mode == other.filter_mode &&
+               confidence == other.confidence && flags == other.flags &&
+               filter_mode == other.filter_mode &&
                alignment_fingerprint == other.alignment_fingerprint;
     }
 };
+
+/// DepthMap::flags bits. `flags` is empty when no pixel is special; where it is
+/// present, bit 0 set means "this valid pixel came from the post-filter repair
+/// pass, not from the search", and clear means measured. Later stages use it to
+/// keep a repaired pixel from outvoting a measured one.
+constexpr std::uint8_t kDepthRepairedFlag = 1U;
 
 /// Deterministic hash of everything a depth map depends on besides the image
 /// pixels: the camera's world->camera pose, the sensor calibration and the

@@ -1662,7 +1662,7 @@ struct PayloadCodec<std::vector<DepthMap>> {
         for (const DepthMap& map : maps) {
             total += map.depths.size() * sizeof(float) +
                      map.normals.size() * sizeof(float) +
-                     map.confidence.size() * sizeof(float);
+                     map.confidence.size() * sizeof(float) + map.flags.size();
         }
         return total;
     }

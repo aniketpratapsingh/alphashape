@@ -108,6 +108,10 @@ void validate_view(const DepthView& view, const char* role) {
         throw ValueError(std::string("filter_depth_map: ") + role +
                          " confidence array size does not match map size");
     }
+    if (!map->flags.empty() && map->flags.size() != pixels) {
+        throw ValueError(std::string("filter_depth_map: ") + role +
+                         " flags array size does not match map size");
+    }
     if (view.calibration.width != map->width || view.calibration.height != map->height) {
         throw ValueError(std::string("filter_depth_map: ") + role +
                          " calibration size does not match its depth map");
@@ -188,9 +192,16 @@ DepthMap filter_depth_map(const DepthView& reference, const std::vector<DepthVie
     out.filter_mode = static_cast<int>(options.mode);
 
     // Output arrays are always full-size: the caller asked for a filtered copy.
+    // (`flags` is the exception: empty stays empty, so an unrepaired map is not
+    // silently given a provenance array it never had.)
     out.depths.assign(pixels, -1.0f);
     out.normals.assign(src.normals.empty() ? 0 : 3 * pixels, 0.0f);
     out.confidence.assign(pixels, 0.0f);  // Confidence exists even for Disabled.
+    // Provenance follows the pixel it describes: a repaired source pixel that
+    // survives stays flagged (and a rejected one is cleared below with the rest
+    // of its record), so re-filtering can never launder a synthetic depth into
+    // a measured one. An empty source vector stays empty.
+    out.flags = src.flags;
 
     const bool have_normals = !src.normals.empty();
     const bool disabled = options.mode == FilterMode::Disabled;
@@ -385,6 +396,9 @@ DepthMap filter_depth_map(const DepthView& reference, const std::vector<DepthVie
                 for (const std::size_t idx : component) {
                     out.depths[idx] = -1.0f;
                     out.confidence[idx] = 0.0f;
+                    if (!out.flags.empty()) {
+                        out.flags[idx] = 0U;  // the pixel is gone: so is its provenance
+                    }
                     if (have_normals) {
                         out.normals[3 * idx + 0] = 0.0f;
                         out.normals[3 * idx + 1] = 0.0f;

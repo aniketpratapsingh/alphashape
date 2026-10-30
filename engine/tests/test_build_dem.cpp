@@ -648,6 +648,143 @@ TEST(Dem, MaxFillDistanceLeavesTheDeepHoleCentreNodata) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Repaired depth samples must not outvote measured ones
+// ---------------------------------------------------------------------------
+
+/// The cell containing the plane-frame origin (the samples of the single-cell
+/// scenes all sit within a few decimetres of it).
+Eigen::Vector2i cell_at_axis(const RasterGrid& grid) {
+    return Eigen::Vector2i(static_cast<int>(std::floor((0.0 - grid.origin_x) /
+                                                       grid.pixel_size_x)),
+                           static_cast<int>(std::floor((grid.origin_y - 0.0) /
+                                                       grid.pixel_size_y)));
+}
+
+TEST(Dem, RepairedSamplesNeverOutvoteAMeasuredOneInTheSameCell) {
+    // One measured + three repaired samples in the SAME cell: the review's case.
+    // Without the rule the median of {50, 55, 55, 55} is 55, so the repaired
+    // pixels would have moved the cell 5 m off the plane. With it the median is
+    // taken over the measured samples alone and the cell holds the plane.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 400, 300, 400.0);
+    chunk.sensors().push_back(sensor);
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+    const Calibration cal = chunk.sensors().front().calibration;
+
+    DepthMap map;
+    map.camera_id = 0;
+    map.width = cal.width;
+    map.height = cal.height;
+    map.downscale = 1;
+    const std::size_t pixels =
+        static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.height);
+    map.depths.assign(pixels, -1.0F);
+    map.confidence.assign(pixels, 1.0F);
+    map.flags.assign(pixels, 0U);
+    // Four pixels at 0.125 m spacing, just left of and above the optical centre,
+    // all land in the single 1 m cell the 1.0 m DEM resolves. One is a
+    // measurement on the plane z = 50, three are repaired 5 m off it.
+    const auto put = [&](int i, int j, double h, bool repaired) {
+        const std::size_t idx =
+            static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+            static_cast<std::size_t>(i);
+        // Depth along the bearing to the plane z = h, camera at (0, 0, 100).
+        const Eigen::Vector3d ray =
+            cal.unproject(Eigen::Vector2d(static_cast<double>(i) + 0.5,
+                                          static_cast<double>(j) + 0.5));
+        const double clearance = 100.0 - h;
+        map.depths[idx] = static_cast<float>(clearance / std::abs(ray.z()));
+        if (repaired) {
+            map.flags[idx] = kDepthRepairedFlag;
+        }
+    };
+    put(200, 150, 50.0, false);
+    put(201, 150, 55.0, true);
+    put(200, 151, 55.0, true);
+    put(201, 151, 55.0, true);
+    chunk.depth_maps().push_back(std::move(map));
+
+    Params params = dem_params("depth_maps", "disabled", 1.0, 0, "nearest", "none");
+    params.set("smoothing", ParamValue{std::string("none")});
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    // Every sample lies within a third of a metre of the axis, so exactly one
+    // 1 m cell holds them all; every other cell is nodata.
+    const Eigen::Vector2i cell = cell_at_axis(dem.raster.grid);
+    ASSERT_FALSE(is_nodata(dem, cell.x(), cell.y()));
+    std::size_t valid = 0;
+    for (int row = 0; row < dem.raster.grid.height; ++row) {
+        for (int col = 0; col < dem.raster.grid.width; ++col) {
+            valid += is_nodata(dem, col, row) ? 0U : 1U;
+        }
+    }
+    EXPECT_EQ(valid, 1U) << "the four samples must share one cell";
+    const double value = static_cast<double>(dem.raster.at(cell.x(), cell.y()));
+    std::printf("[Dem.RepairedSamplesNeverOutvote] cell=%.3f m\n", value);
+    EXPECT_NEAR(value, 50.0, 0.5) << "the repaired samples outvoted the measured one";
+}
+
+TEST(Dem, RepairedSamplesStillFillACellNothingMeasured) {
+    // The other half of the rule: a repaired sample is only DISPLACED by a
+    // measurement, not discarded. A cell that holds nothing measured still takes
+    // the repaired height, so the pass adds coverage where it can without moving
+    // measured ground.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 400, 300, 400.0);
+    chunk.sensors().push_back(sensor);
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+    const Calibration cal = chunk.sensors().front().calibration;
+
+    DepthMap map;
+    map.camera_id = 0;
+    map.width = cal.width;
+    map.height = cal.height;
+    map.downscale = 1;
+    const std::size_t pixels =
+        static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.height);
+    map.depths.assign(pixels, -1.0F);
+    map.confidence.assign(pixels, 0.0F);
+    map.flags.assign(pixels, 0U);
+    // Only the four repaired pixels carry depth: nothing else in the map is
+    // measured, so that cell has no measured sample to defer to.
+    for (int j = 150; j < 152; ++j) {
+        for (int i = 200; i < 202; ++i) {
+            const std::size_t idx =
+                static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+                static_cast<std::size_t>(i);
+            // Depth along the bearing to the plane z = 50, camera at (0, 0, 100).
+            const Eigen::Vector3d ray =
+                cal.unproject(Eigen::Vector2d(static_cast<double>(i) + 0.5,
+                                              static_cast<double>(j) + 0.5));
+            map.depths[idx] = static_cast<float>(50.0 / std::abs(ray.z()));
+            map.flags[idx] = kDepthRepairedFlag;
+        }
+    }
+    chunk.depth_maps().push_back(std::move(map));
+
+    Params params = dem_params("depth_maps", "disabled", 1.0, 0, "nearest", "none");
+    params.set("smoothing", ParamValue{std::string("none")});
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    const Eigen::Vector2i cell = cell_at_axis(dem.raster.grid);
+    ASSERT_FALSE(is_nodata(dem, cell.x(), cell.y()))
+        << "a repaired-only cell must still be written";
+    const double value = static_cast<double>(dem.raster.at(cell.x(), cell.y()));
+    std::printf("[Dem.RepairedSamplesStillFill] cell=%.3f m\n", value);
+    EXPECT_NEAR(value, 50.0, 0.5);
+}
+
+// ---------------------------------------------------------------------------
 // 5. Errors
 // ---------------------------------------------------------------------------
 
