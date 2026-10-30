@@ -143,6 +143,17 @@ All notable changes to alphashape are recorded here. The format follows
   still ship only a subset of the PROJ grids, so some national shifts need
   `proj-data` installed (see `engine/LIMITATIONS.md`).
 
+- **`BuildDepthMaps` exposes `best_k` and `min_texture_stddev`.** Two
+  `PatchMatchOptions` fields that were previously fixed are now declared task
+  parameters. `best_k` (Int, default 0) sets how many per-neighbour costs the
+  multi-view cost averages: 0 keeps the historical `ceil(n/2)`, 1 trusts the
+  single best neighbour. `min_texture_stddev` (Float, default 1/255) is the
+  intensity standard deviation below which a window is not matched and so keeps
+  no depth; lowering it matches windows that were previously skipped. Both are
+  honoured by the CPU and GPU search paths. Each is folded into a depth map's
+  fingerprint only when it differs from its default, so existing maps stay
+  reusable; out-of-range values are rejected before the chunk is touched.
+
 ### Changed
 
 - **`BuildDem` `interpolation="enabled"` now fills the area the cameras

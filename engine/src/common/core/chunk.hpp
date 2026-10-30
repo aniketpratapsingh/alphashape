@@ -173,6 +173,14 @@ struct DepthMapFingerprintContext {
     /// before the cut became configurable -- all of them zncc at 0.5 -- is still
     /// reused by a zncc run that leaves the default alone.
     double max_cost = 0.5;
+    /// Multi-view aggregation: the mean of the best_k smallest per-neighbour
+    /// costs, 0 meaning the historical ceil(n/2). Folded only when non-zero, so
+    /// a map built before the field became selectable still matches a default
+    /// run.
+    int best_k = 0;
+    /// Flat-window gate, an intensity stddev on [0, 1]. Folded only when it is
+    /// not the historical 1/255, for the same reason as max_cost.
+    double min_texture_stddev = 1.0 / 255.0;
     std::uint64_t seed = 0;
 };
 
