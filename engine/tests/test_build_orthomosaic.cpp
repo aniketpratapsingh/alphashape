@@ -35,6 +35,7 @@
 
 #include <gtest/gtest.h>
 
+#include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
@@ -49,6 +50,7 @@
 #include "image/io/image_io.hpp"
 #include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
+#include "model/raster/reproject.hpp"
 
 namespace alphashape {
 namespace {
@@ -2464,6 +2466,126 @@ TEST(OrthoGain, TaskPathAppliesNonTrivialGainsOnAMismatchedFlight) {
     EXPECT_GT(differing, 0U)
         << "a non-trivial gain must actually change the mosaic, not be applied "
            "to a copy or dropped";
+}
+
+
+// ---------------------------------------------------------------------------
+// 7. WP-12.9: build in the requested CRS and reproject at export
+// ---------------------------------------------------------------------------
+
+TEST(BuildOrthomosaic, ReprojectsOntoDemCrs) {
+    // The spec's BuildOrthomosaic.ReprojectsOntoDemCrs. Before WP-12.9 a request
+    // naming a different CRS was silently built on the DEM's plane and only
+    // re-declared at export; it now builds IN the requested CRS, so the raster
+    // the chunk stores is already in EPSG:3857 and no colours are resampled a
+    // second time. (The fixture's DEM is EPSG:32632.)
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    ASSERT_EQ(chunk.elevation().epsg(), 32632);
+
+    Params params = ortho_params("mosaic", "elevation", 1.0);
+    params.set("crs", ParamValue{std::string("EPSG:3857")});
+    run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    EXPECT_EQ(ortho.epsg(), 3857);
+    // The stored grid is a Web Mercator grid: its eastings are in the millions
+    // (Web Mercator metres), not UTM's 500000 band.
+    EXPECT_GT(ortho.raster.grid.origin_x, 1000000.0);
+    // Web Mercator's scale at 48.7 N is ~1/cos(lat) = ~1.51, so 1 m in the DEM
+    // is stored at ~1.51 target units. The automatic cell was not used here
+    // (1.0 was requested), so the TARGET cell is 1.0 target metre, i.e. about
+    // 0.66 m on the ground — a coarser mosaic than a DEM-plane build at 1 m
+    // would give. Assert the cell is exactly what was asked for.
+    EXPECT_NEAR(ortho.raster.grid.pixel_size_x, 1.0, 1e-9);
+
+    // Coverage survives: the mosaic still has opaque cells over a real area.
+    std::size_t opaque = 0;
+    for (std::size_t i = 0; i < ortho.raster.data.size() / 4U; ++i) {
+        opaque += ortho.raster.data[i * 4 + 3] != 0 ? 1U : 0U;
+    }
+    EXPECT_GT(opaque, 5000U);
+
+    // And the geometry is right: opaque cells' centres, mapped back through the
+    // 3857 frame, land inside the chunk-local extent the DEM covers.
+    const elevation::SurfaceFrame frame =
+        elevation::SurfaceFrame::for_chunk(chunk, 3857);
+    ASSERT_EQ(frame.epsg(), 3857);
+    double local_min_x = std::numeric_limits<double>::infinity();
+    double local_max_x = -local_min_x;
+    for (int row = 0; row < ortho.raster.grid.height; row += 5) {
+        for (int col = 0; col < ortho.raster.grid.width; col += 5) {
+            const std::size_t i = static_cast<std::size_t>(row) *
+                                      static_cast<std::size_t>(ortho.raster.grid.width) +
+                                  static_cast<std::size_t>(col);
+            if (ortho.raster.data[i * 4 + 3] == 0) {
+                continue;
+            }
+            const Eigen::Vector2d c = ortho.raster.grid.pixel_center(col, row);
+            const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
+            local_min_x = std::min(local_min_x, local.x());
+            local_max_x = std::max(local_max_x, local.x());
+        }
+    }
+    EXPECT_GT(local_max_x - local_min_x, 40.0);
+    std::printf("[BuildOrthomosaic.ReprojectsOntoDemCrs] epsg=%d cell=%.3f cells=%dx%d\n",
+                ortho.epsg(), ortho.raster.grid.pixel_size_x, ortho.raster.grid.width,
+                ortho.raster.grid.height);
+}
+
+TEST(ExportOrthomosaic, ReprojectionKeepsEveryColour) {
+    // WP-12.9: an ortho exported to another CRS is nearest-sampled, so every
+    // colour in the file is a colour that exists in the stored mosaic. Checked
+    // on the real ortho of the fixture (a repaired tile would show an invented
+    // colour).
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    Params build = ortho_params("mosaic", "elevation", 1.0);
+    run_task(builtin_registry(), s.document, "BuildOrthomosaic", build);
+    ASSERT_EQ(chunk.orthomosaic().epsg(), 32632);
+
+    const std::string path = platform::unique_temp_path("alphashape_ortho_3857_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportOrthomosaic"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{3857}});
+    run_task(builtin_registry(), s.document, "ExportOrthomosaic", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 3857);
+    EXPECT_EQ(info.channels, 4);
+    EXPECT_NE(info.grid, chunk.orthomosaic().raster.grid);
+
+    const GeoRaster<std::uint8_t> out = read_geotiff_u8(path);
+    const GeoRaster<std::uint8_t>& src = chunk.orthomosaic().raster;
+    std::vector<std::uint32_t> keys;
+    keys.reserve(static_cast<std::size_t>(src.grid.width) *
+                 static_cast<std::size_t>(src.grid.height));
+    for (std::size_t i = 0; i < src.data.size() / 4U; ++i) {
+        keys.push_back((static_cast<std::uint32_t>(src.data[i * 4 + 0]) << 24) |
+                       (static_cast<std::uint32_t>(src.data[i * 4 + 1]) << 16) |
+                       (static_cast<std::uint32_t>(src.data[i * 4 + 2]) << 8) |
+                       static_cast<std::uint32_t>(src.data[i * 4 + 3]));
+    }
+    std::sort(keys.begin(), keys.end());
+    std::size_t checked = 0;
+    std::size_t invented = 0;
+    for (std::size_t i = 0; i < out.data.size() / 4U; ++i) {
+        if (out.data[i * 4 + 3] == 0) {
+            continue;
+        }
+        const std::uint32_t key = (static_cast<std::uint32_t>(out.data[i * 4 + 0]) << 24) |
+                                  (static_cast<std::uint32_t>(out.data[i * 4 + 1]) << 16) |
+                                  (static_cast<std::uint32_t>(out.data[i * 4 + 2]) << 8) |
+                                  static_cast<std::uint32_t>(out.data[i * 4 + 3]);
+        ++checked;
+        invented += std::binary_search(keys.begin(), keys.end(), key) ? 0U : 1U;
+    }
+    EXPECT_GT(checked, 5000U);
+    EXPECT_EQ(invented, 0U);
+    std::printf("[ExportOrthomosaic.Reprojection] checked=%zu invented=%zu cells=%dx%d\n",
+                checked, invented, out.grid.width, out.grid.height);
+    std::filesystem::remove(path);
 }
 
 }  // namespace

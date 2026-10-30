@@ -22,6 +22,8 @@
 #include "base/platform/memory.hpp"
 #include "common/algorithm/elevation/dem_builder.hpp"
 #include "common/algorithm/elevation/interpolate.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/raster/reproject.hpp"
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/gain.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
@@ -1496,29 +1498,52 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     }
     progress.update("initialize", 0.5);
 
-    // The plane frame is the DEM's (M12 §4.9): the DEM's extent and grid define
-    // the output raster, so a run always lands on the DEM's CRS and needs no
-    // preprojection, even when the request names another one. A differing
-    // request is applied at export (WP-12.9). A DEM without a recorded CRS (an
-    // older project, or a DSM-only run) falls back to the requested CRS, then to
-    // the auto-UTM / local rule.
+    // The plane frame (M12 §4.9, §4.10): the DEM's when it records a CRS,
+    // unless the run requests a DIFFERENT one — then the DEM surface is
+    // reprojected into that CRS once up front and the mosaic is built there
+    // directly, so the photographs are sampled in the requested projection
+    // exactly once (no build-then-reproject double resampling of the colours).
+    // A DEM without a recorded CRS (an older project, or a DSM-only run) falls
+    // back to the requested CRS, then to the auto-UTM / local rule.
     elevation::SurfaceFrame frame;
     if (!dem.empty() && dem.crs.is_set()) {
         frame = elevation::for_options(*chunk, dem.crs);
     } else {
         frame = elevation::for_options(*chunk, options.crs);
     }
-    const int epsg = frame.epsg();
     if (Log::enabled(LogLevel::Info) && options.crs.is_set() && options.crs.epsg != 0 &&
-        options.crs.epsg != epsg) {
-        log(LogLevel::Info) << "BuildOrthomosaic: building in the DEM's EPSG " << epsg
+        options.crs.epsg != frame.epsg()) {
+        log(LogLevel::Info) << "BuildOrthomosaic: the DEM is in EPSG " << frame.epsg()
                             << "; the requested EPSG " << options.crs.epsg
-                            << " is applied by the export";
+                            << " reprojects the surface and the mosaic is built there";
     }
 
     // -- the surface raster and the output grid ------------------------------
     GeoRaster<float> surface = dem.raster;
     float surface_nodata = dem.nodata;
+    // The DTO naming the surface's CRS, so a model-surface DSM is rasterised
+    // into the same plane the frame uses.
+    CRS surface_crs = dem.empty() ? options.crs : dem.crs;
+
+    if (!dem.empty() && dem.crs.is_set() && options.crs.is_set() &&
+        frame.epsg() != options.crs.epsg) {
+        // Build straight in the requested CRS: reproject the DEM surface once
+        // (bilinear, nodata-aware) and continue on the result. The photographs
+        // are then sampled in the requested projection, so the colours are
+        // never resampled — only the surface is, exactly once.
+        const crs::CoordinateSystem from = static_cast<crs::CoordinateSystem>(dem.crs);
+        const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(options.crs);
+        const RasterGrid surface_grid =
+            suggest_grid(dem.raster.grid, from, to, options.resolution);
+        ReprojectOptions reproject_options;
+        reproject_options.nodata_in = dem.nodata;
+        reproject_options.nodata_out = dem.nodata;
+        surface = reproject(dem.raster, from, to, surface_grid, reproject_options);
+        surface_nodata = dem.nodata;
+        surface_crs = options.crs;
+        frame = elevation::for_options(*chunk, options.crs);
+        progress.update("initialize", 0.6);
+    }
 
     // Camera centres in the plane frame (cheap, and the rigorous source of the
     // occlusion march target). For a Local frame to_plane is the identity.
@@ -1660,9 +1685,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         // measured cell. The DSM's own automatic cell (the median mesh edge) is
         // the natural provisional value.
         dsm_options.resolution = resolution;
-        // The DSM must land on the same plane the frame chose: the DEM's CRS
-        // when there is one, else the request (unset = the same auto rule).
-        dsm_options.crs = dem.empty() ? options.crs : dem.crs;
+        // The DSM must land on the same plane the frame chose: `surface_crs`,
+        // which is the DEM's own CRS, or the requested one when a reprojection
+        // above switched the plane (unset = the same auto rule).
+        dsm_options.crs = surface_crs;
         dsm_options.tgv = false;  // a rasterised mesh needs no smoothing
         Elevation dsm =
             elevation::build_dem(*chunk, dsm_options, [&](double fraction) {
