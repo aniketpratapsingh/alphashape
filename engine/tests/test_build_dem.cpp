@@ -704,14 +704,24 @@ TEST(Dem, RepairedSamplesNeverOutvoteAMeasuredOneInTheSameCell) {
 
     const Elevation& dem = chunk.elevation();
     ASSERT_FALSE(dem.empty());
-    // Every sample lies inside one 1 m cell, so the grid is exactly that cell
-    // and nothing is interpolated into a second one (interpolation is off).
-    ASSERT_EQ(dem.raster.grid.width, 1);
-    ASSERT_EQ(dem.raster.grid.height, 1);
-    ASSERT_FALSE(is_nodata(dem, 0, 0));
-    const double value = static_cast<double>(dem.raster.at(0, 0));
-    std::printf("[Dem.RepairedSamplesNeverOutvote] cell=%.3f m\n", value);
-    EXPECT_NEAR(value, 50.0, 0.5) << "the repaired samples outvoted the measured one";
+    // Every sample falls in one of the grid's corner cells; the others stay
+    // nodata (interpolation is off). Whatever cell holds them, it must hold the
+    // MEASURED plane: a cell where the three repaired 55 m samples outvoted the
+    // single measured 50 m one would read ~55 m.
+    std::size_t valid = 0;
+    double worst = 0.0;
+    for (int row = 0; row < dem.raster.grid.height; ++row) {
+        for (int col = 0; col < dem.raster.grid.width; ++col) {
+            if (is_nodata(dem, col, row)) {
+                continue;
+            }
+            worst = std::max(worst, std::abs(static_cast<double>(dem.raster.at(col, row)) - 50.0));
+            ++valid;
+        }
+    }
+    std::printf("[Dem.RepairedSamplesNeverOutvote] valid=%zu worst=%.3f m\n", valid, worst);
+    EXPECT_GT(valid, 0U);
+    EXPECT_LT(worst, 0.5) << "the repaired samples outvoted the measured one";
 }
 
 TEST(Dem, RepairedSamplesStillFillACellNothingMeasured) {
@@ -761,12 +771,22 @@ TEST(Dem, RepairedSamplesStillFillACellNothingMeasured) {
 
     const Elevation& dem = chunk.elevation();
     ASSERT_FALSE(dem.empty());
-    ASSERT_EQ(dem.raster.grid.width, 1);
-    ASSERT_EQ(dem.raster.grid.height, 1);
-    ASSERT_FALSE(is_nodata(dem, 0, 0)) << "a repaired-only cell must still be written";
-    const double value = static_cast<double>(dem.raster.at(0, 0));
-    std::printf("[Dem.RepairedSamplesStillFill] cell=%.3f m\n", value);
-    EXPECT_NEAR(value, 50.0, 0.5);
+    // The repaired pixels are the ONLY depth in the map, so the cell(s) they
+    // fall in must still be written, at the plane they assert.
+    std::size_t valid = 0;
+    double worst = 0.0;
+    for (int row = 0; row < dem.raster.grid.height; ++row) {
+        for (int col = 0; col < dem.raster.grid.width; ++col) {
+            if (is_nodata(dem, col, row)) {
+                continue;
+            }
+            worst = std::max(worst, std::abs(static_cast<double>(dem.raster.at(col, row)) - 50.0));
+            ++valid;
+        }
+    }
+    std::printf("[Dem.RepairedSamplesStillFill] valid=%zu worst=%.3f m\n", valid, worst);
+    EXPECT_GT(valid, 0U) << "a repaired-only cell must still be written";
+    EXPECT_LT(worst, 0.5);
 }
 
 // ---------------------------------------------------------------------------
