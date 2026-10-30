@@ -160,7 +160,7 @@ bool fit_plane_least_squares(const std::vector<Eigen::Vector3d>& points,
 /// two unrelated ones, so it may reject a fill it should have kept but will not
 /// accept one it should have refused.
 std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
-                                const std::vector<std::uint8_t>& inlier, const Plane& plane) {
+                                const std::vector<std::uint8_t>& outlier, const Plane& plane) {
     const std::size_t n = ring.size();
     if (n == 0) {
         return 0;
@@ -196,11 +196,11 @@ std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
         return a < b;  // total order, so the result is reproducible
     });
 
-    // Walk the circle starting just after an inlier, so a run that crosses the
-    // angular seam is counted whole rather than split in two.
+    // Walk the circle starting just after an INLIER (an outlier run must not
+    // span the angular seam), so a run that crosses it is counted whole.
     std::size_t start = n;
     for (std::size_t i = 0; i < n; ++i) {
-        if (inlier[order[i]] != 0) {
+        if (outlier[order[i]] == 0) {
             start = i;
             break;
         }
@@ -212,7 +212,7 @@ std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
     std::size_t run = 0;
     for (std::size_t k = 0; k < n; ++k) {
         const std::size_t idx = order[(start + k) % n];
-        if (inlier[idx] == 0) {
+        if (outlier[idx] != 0) {
             ++run;
             best = std::max(best, run);
         } else {
@@ -226,8 +226,8 @@ std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
 /// surface: no contiguous outlier arc longer than kMaxOutlierArcFraction of the
 /// ring, and no coherent one-sided offset. See the constants for the reasoning.
 bool outlier_distribution_is_noise(const std::vector<Eigen::Vector3d>& ring,
-                                   const std::vector<std::uint8_t>& inlier, const Plane& plane) {
-    const std::size_t arc = longest_outlier_arc(ring, inlier, plane);
+                                   const std::vector<std::uint8_t>& outlier, const Plane& plane) {
+    const std::size_t arc = longest_outlier_arc(ring, outlier, plane);
     const double allowed_arc =
         std::max(static_cast<double>(kMaxOutlierArcFloor),
                  kMaxOutlierArcFraction * static_cast<double>(ring.size()));
@@ -239,7 +239,7 @@ bool outlier_distribution_is_noise(const std::vector<Eigen::Vector3d>& ring,
     std::size_t above = 0;
     std::size_t below = 0;
     for (std::size_t i = 0; i < ring.size(); ++i) {
-        if (inlier[i] != 0) {
+        if (outlier[i] == 0) {
             continue;
         }
         const double residual = plane.normal.dot(ring[i]) - plane.offset;
