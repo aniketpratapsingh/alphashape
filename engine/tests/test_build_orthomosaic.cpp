@@ -2485,8 +2485,8 @@ TEST(OrthoAffine, task_path_applies_a_non_trivial_affine_model_on_a_mismatched_f
     std::string diagnostics;
     {
         ScopedLogCapture capture;
-        run_task(builtin_registry(), s.document, "BuildOrthomosaic",
-                 colour_mode_params(0.125, "affine", 0, false, "disabled"));
+        Params affine = colour_mode_params(0.125, "affine", 0, false, "disabled");
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", affine);
         diagnostics = capture.text(LogLevel::Info);
     }
     const std::size_t at = diagnostics.find("affine colour model over");
