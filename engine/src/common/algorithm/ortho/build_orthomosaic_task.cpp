@@ -1113,7 +1113,7 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
     // The lattice lives on the DEM, and only its VALID samples are used: a
     // nodata cell has no surface point to sample the photographs at.
     const RasterGrid& dem_grid = surface.grid;
-    const int dem_stride =
+    int dem_stride =
         std::max(stride, 1) * std::max(1, static_cast<int>(std::lround(
                                               grid.pixel_size_x / dem_grid.pixel_size_x)));
 
