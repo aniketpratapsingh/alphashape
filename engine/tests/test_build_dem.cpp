@@ -1606,5 +1606,56 @@ TEST(ExportDem, SameCrsResolutionChangeKeepsTheCorner) {
     std::filesystem::remove(path);
 }
 
+// ---------------------------------------------------------------------------
+// 12. WP-12.9 review: the `resolution` unit and a usable result grid
+// ---------------------------------------------------------------------------
+
+TEST(ExportDem, GeographicMetreResolutionIsRefused) {
+    // `resolution` is in DEGREES for a geographic target. 1.0 degree is ~111 km,
+    // absurd next to a 0.1 m source cell, so the export must refuse it with a
+    // message naming the unit and suggesting the degree value.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{platform::unique_temp_path("alphashape_dem_deg_unit_", ".tif")});
+    params.set("projection", ParamValue{std::int64_t{4326}});
+    params.set("resolution", ParamValue{1.0});
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), document, "ExportDem", params);
+    } catch (const ValueError& e) {
+        threw = true;
+        const std::string text = e.what();
+        EXPECT_NE(text.find("DEGREES"), std::string::npos) << text;
+        EXPECT_NE(text.find("metres"), std::string::npos) << text;
+    }
+    EXPECT_TRUE(threw) << "a metre value for a geographic target must be refused";
+}
+
+TEST(ExportDem, TooCoarseAGridIsRefused) {
+    // A cell far coarser than the raster's extent would leave 1x1. Refuse it:
+    // a 1-cell raster is not an output a caller can use.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);  // 6 m x 4 m
+    chunk.elevation() = dem;
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{platform::unique_temp_path("alphashape_dem_tiny_", ".tif")});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    params.set("resolution", ParamValue{10.0});  // 6 / 10 -> 1 cell wide
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), document, "ExportDem", params);
+    } catch (const ValueError& e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("1 x 1"), std::string::npos) << e.what();
+    }
+    EXPECT_TRUE(threw);
+}
+
 }  // namespace
 }  // namespace alphashape

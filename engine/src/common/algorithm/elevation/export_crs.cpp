@@ -1,7 +1,9 @@
 #include "common/algorithm/elevation/export_crs.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "base/utils/error.hpp"
@@ -74,6 +76,73 @@ int exported_epsg(const CRS& raster_crs, const ExportCrs& target) {
     return static_cast<crs::CoordinateSystem>(target.crs).epsg();
 }
 
+bool is_geographic(const crs::CoordinateSystem& cs) {
+    const crs::CrsKind kind = cs.kind();
+    return kind == crs::CrsKind::Geographic2D || kind == crs::CrsKind::Geographic3D;
+}
+
+/// Metres per degree of latitude. Only used to phrase the unit error: a value
+/// wrong by 111000x is what this catches, so a second-order ellipsoid
+/// correction would not change the diagnosis.
+constexpr double kMetresPerDegree = 111320.0;
+
+/// The source's ground sample distance in METRES. A projected or local grid is
+/// already metric; a geographic one converts its cell with cos(latitude), taken
+/// at the raster's centre row.
+double source_gsd_metres(const RasterGrid& grid, const crs::CoordinateSystem& recorded) {
+    if (recorded.is_set() && is_geographic(recorded)) {
+        const double lat = grid.origin_y - 0.5 * grid.height * grid.pixel_size_y;
+        const double radians = lat * 3.14159265358979323846 / 180.0;
+        const double cos_lat = std::max(1e-6, std::abs(std::cos(radians)));
+        return std::min(grid.pixel_size_x * kMetresPerDegree * cos_lat,
+                        grid.pixel_size_y * kMetresPerDegree);
+    }
+    return std::min(grid.pixel_size_x, grid.pixel_size_y);
+}
+
+/// One compact spelling for a suggested cell ("%.3g").
+std::string format_cell(double value) {
+    char buffer[32] = {};
+    std::snprintf(buffer, sizeof(buffer), "%.3g", value);
+    return buffer;
+}
+
+/// Refuse a value that is almost certainly metres handed to a geographic
+/// target. A geographic cell is in DEGREES, so a "resolution" of 0.01 or more
+/// is about 1.1 km of ground - absurd next to a source that resolves a few
+/// metres. Accepting it would silently produce a grid of one or two cells.
+void require_resolution_unit(double resolution, const RasterGrid& grid,
+                             const crs::CoordinateSystem& from,
+                             const crs::CoordinateSystem& to, const char* task) {
+    if (!(resolution >= 0.01) || !is_geographic(to)) {
+        return;
+    }
+    const double gsd = source_gsd_metres(grid, from);
+    if (!(gsd > 0.0) || gsd >= 10.0) {
+        return;  // a genuinely coarse source: the request may be honest
+    }
+    throw ValueError(std::string(task) + ": resolution " + format_cell(resolution) +
+                     " is in DEGREES for a geographic target CRS, so it is about " +
+                     format_cell(resolution * kMetresPerDegree) +
+                     " m of ground - the source resolves about " + format_cell(gsd) +
+                     " m, so this looks like a value in metres. Pass the degree value, "
+                     "about " + format_cell(gsd / kMetresPerDegree) +
+                     " for the source's own cell.");
+}
+
+/// Refuse a result grid with no area to speak of: a 1-cell-wide strip is not a
+/// raster a caller can use, and is the symptom of a unit error the checks above
+/// could not see (a coarse cell against a tiny extent).
+void require_usable_grid(const RasterGrid& grid, const char* task) {
+    if (grid.width >= 2 && grid.height >= 2) {
+        return;
+    }
+    throw ValueError(std::string(task) + ": the requested export would produce a " +
+                     std::to_string(grid.width) + " x " + std::to_string(grid.height) +
+                     " cell grid; the resolution is too coarse for the raster's extent. "
+                     "Ask for a smaller cell.");
+}
+
 /// The reprojection options for one raster: a hole stays a hole, and carries
 /// the caller's nodata when it is written.
 ReprojectOptions reproject_options(float nodata_in, float nodata_out) {
@@ -122,13 +191,18 @@ GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS&
     }
     if (same_coordinate_system(raster_crs, recorded, target)) {
         // Same plane, new cell: anchor the new grid at the source's own corner.
+        // A geographic source takes DEGREES here too, so the unit rule applies.
+        require_resolution_unit(target.resolution, raster.grid, recorded, recorded, task);
         const RasterGrid grid = resample_grid(raster.grid, target.resolution);
+        require_usable_grid(grid, task);
         return reproject(raster, recorded, recorded, grid,
                          reproject_options(nodata_in, nodata_out));
     }
     const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(target.crs);
     require_reprojectable(raster_crs, to, task);
+    require_resolution_unit(target.resolution, raster.grid, recorded, to, task);
     const RasterGrid grid = suggest_grid(raster.grid, recorded, to, target.resolution);
+    require_usable_grid(grid, task);
     return reproject(raster, recorded, to, grid, reproject_options(nodata_in, nodata_out));
 }
 
@@ -141,12 +215,16 @@ GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& rast
         return raster;
     }
     if (same_coordinate_system(raster_crs, recorded, target)) {
+        require_resolution_unit(target.resolution, raster.grid, recorded, recorded, task);
         const RasterGrid grid = resample_grid(raster.grid, target.resolution);
+        require_usable_grid(grid, task);
         return reproject(raster, recorded, recorded, grid, ReprojectOptions{});
     }
     const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(target.crs);
     require_reprojectable(raster_crs, to, task);
+    require_resolution_unit(target.resolution, raster.grid, recorded, to, task);
     const RasterGrid grid = suggest_grid(raster.grid, recorded, to, target.resolution);
+    require_usable_grid(grid, task);
     return reproject(raster, recorded, to, grid, ReprojectOptions{});
 }
 

@@ -16,6 +16,12 @@
 // resolution differs, and `resample_grid` sizes the new grid, not
 // `suggest_grid`'s outward snapping.
 //
+// Units. A geographic target takes `resolution` in DEGREES. A value that is
+// absurd for a geographic cell (>= 0.01 degrees, about a kilometre, against a
+// source that resolves a few metres) is refused as a likely value in metres,
+// with the degree value to pass instead. A request that would leave a grid
+// smaller than 2x2 cells is refused too.
+//
 // The parameter rules are shared with BuildDem/BuildOrthomosaic so a script that
 // works for one works for the others: `projection` is an Int EPSG code (0 =
 // unset), `crs` is "EPSG:<n>", a bare code, a PROJ string or WKT, and setting
@@ -54,8 +60,9 @@ ExportCrs parse_export_crs(std::int64_t projection, const std::string& crs_text,
 ///
 /// @throws ValueError when a reprojection is requested but the raster has no
 ///         CRS to reproject FROM, or when the target CRS has no EPSG code (a
-///         custom WKT target is written once WP-12.10 adds WKT GeoKeys), and
-///         when the request cannot be satisfied at the requested cell size.
+///         custom WKT target is written once WP-12.10 adds WKT GeoKeys), when
+///         `resolution` looks like metres handed to a geographic target, and
+///         when the request would leave a grid smaller than 2x2 cells.
 GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS& raster_crs,
                                       float nodata_in, float nodata_out,
                                       const ExportCrs& target, const char* task);
