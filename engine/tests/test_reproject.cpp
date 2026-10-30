@@ -254,11 +254,9 @@ TEST(Reproject, NodataPreserved) {
     const int hole_x = 40;
     const int hole_y = 22;
     constexpr int kHole = 20;
-    std::size_t source_holes = 0;
     for (int row = hole_y; row < hole_y + kHole; ++row) {
         for (int col = hole_x; col < hole_x + kHole; ++col) {
             src.at(col, row) = -32767.0F;
-            ++source_holes;
         }
     }
     const RasterGrid target = suggest_grid(src.grid, utm(), mercator());
@@ -397,7 +395,8 @@ TEST(Reproject, OrthoNearestForU8) {
     // Every RGB triplet in the output must exist in the source: with nearest
     // sampling the colour is a photographed one, never a mix of four.
     std::vector<std::uint32_t> source_keys;
-    source_keys.reserve(src.grid.width * src.grid.height);
+    source_keys.reserve(static_cast<std::size_t>(src.grid.width) *
+                        static_cast<std::size_t>(src.grid.height));
     for (int row = 0; row < src.grid.height; ++row) {
         for (int col = 0; col < src.grid.width; ++col) {
             source_keys.push_back((static_cast<std::uint32_t>(src.at(col, row, 0)) << 16) |
