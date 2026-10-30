@@ -1479,7 +1479,7 @@ Document build_products_document() {
         dem.raster.data[i] = (i % 17 == 3) ? -9999.5F
                                           : static_cast<float>(100.0 + std::sin(static_cast<double>(i) * 0.1));
     }
-    dem.epsg = 32632;
+    dem.set_epsg(32632);
     dem.nodata = -9999.5F;
     dem.source = "depth_maps";
 
@@ -1495,7 +1495,7 @@ Document build_products_document() {
     for (std::size_t i = 0; i < ortho.raster.data.size(); ++i) {
         ortho.raster.data[i] = static_cast<std::uint8_t>((i * 37U + 11U) % 256U);
     }
-    ortho.epsg = 32632;
+    ortho.set_epsg(32632);
     ortho.surface = "elevation";
     const std::size_t cells = 19U * 13U;
     ortho.labels.resize(cells);
@@ -1522,7 +1522,7 @@ TEST_F(TempDir, RoundTripPreservesElevationAndOrthomosaic) {
     EXPECT_DOUBLE_EQ(dem.raster.grid.origin_y, 5410000.0 - 7.0 / 9.0);
     EXPECT_DOUBLE_EQ(dem.raster.grid.pixel_size_x, 0.25);
     EXPECT_DOUBLE_EQ(dem.raster.grid.pixel_size_y, 0.5);
-    EXPECT_EQ(dem.epsg, 32632);
+    EXPECT_EQ(dem.epsg(), 32632);
     EXPECT_FLOAT_EQ(dem.nodata, -9999.5F);
     EXPECT_EQ(dem.source, "depth_maps");
 
@@ -1530,7 +1530,7 @@ TEST_F(TempDir, RoundTripPreservesElevationAndOrthomosaic) {
     EXPECT_EQ(ortho.raster.grid.width, 19);
     EXPECT_EQ(ortho.raster.grid.height, 13);
     EXPECT_EQ(ortho.raster.channels, 4);
-    EXPECT_EQ(ortho.epsg, 32632);
+    EXPECT_EQ(ortho.epsg(), 32632);
     EXPECT_EQ(ortho.surface, "elevation");
     ASSERT_EQ(ortho.labels.size(), 19U * 13U);
     EXPECT_EQ(ortho.labels[0], -1);  // i % 5 == 0

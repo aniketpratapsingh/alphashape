@@ -550,7 +550,14 @@ void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
         set_attr(e, "height", std::to_string(g.height));
         set_attr(e, "origin", vec2(g.origin_x, g.origin_y));
         set_attr(e, "pixel_size", vec2(g.pixel_size_x, g.pixel_size_y));
-        set_attr(e, "epsg", std::to_string(elevation.epsg));
+        set_attr(e, "epsg", std::to_string(elevation.epsg()));
+        // The canonical WKT is written only when the CRS carries one, so a grid
+        // in a plain EPSG code keeps producing the pre-M12 bytes. Reading
+        // prefers the code (types.cpp), so an EPSG-only element left by a
+        // pre-M12 build loads to exactly the same CRS.
+        if (!elevation.crs.wkt.empty()) {
+            set_attr(e, "crs_wkt", elevation.crs.wkt);
+        }
         set_attr(e, "nodataValue", fmt(static_cast<double>(elevation.nodata)));
         set_attr(e, "source_data", elevation.source);
     }
@@ -582,7 +589,10 @@ void write_orthomosaics(const Chunk& chunk, XmlNode& node, ZipArchive& archive) 
         set_attr(e, "height", std::to_string(g.height));
         set_attr(e, "origin", vec2(g.origin_x, g.origin_y));
         set_attr(e, "pixel_size", vec2(g.pixel_size_x, g.pixel_size_y));
-        set_attr(e, "epsg", std::to_string(ortho.epsg));
+        set_attr(e, "epsg", std::to_string(ortho.epsg()));
+        if (!ortho.crs.wkt.empty()) {
+            set_attr(e, "crs_wkt", ortho.crs.wkt);
+        }
         set_attr(e, "blendingMode", ortho.surface);
     }
 }
@@ -1254,7 +1264,7 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
         warn_unknown_attrs(e,
                            {"id", "label", "group", "enabled", "active", "path",
                             "width", "height", "origin", "pixel_size", "epsg",
-                            "nodataValue", "source_data"},
+                            "crs_wkt", "nodataValue", "source_data"},
                            report);
         ElevationAsset slot;
         read_slot_identity(e, slot);
@@ -1277,10 +1287,13 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
                 throw ProjectIOError(
                     "doc.xml: <elevation> georeferencing does not match the GeoTIFF");
             }
-            if (parse_int(require_attr(e, "epsg")) != dem.epsg) {
+            if (parse_int(require_attr(e, "epsg")) != dem.epsg()) {
                 throw ProjectIOError(
                     "doc.xml: <elevation> epsg does not match the GeoTIFF");
             }
+            // The WKT is optional: an EPSG-only element (any pre-M12 project)
+            // leaves `dem.crs` as the decoded code, which is the same CRS.
+            dem.crs.wkt = attr_or(e, "crs_wkt", std::string());
             dem.nodata =
                 static_cast<float>(parse_double(require_attr(e, "nodataValue")));
             *slot.data = std::move(dem);
@@ -1303,7 +1316,7 @@ void read_orthomosaics(const XmlNode& node, Chunk& chunk, const ZipArchive& arch
         warn_unknown_attrs(e,
                            {"id", "label", "group", "enabled", "active", "path",
                             "labels_path", "width", "height", "origin",
-                            "pixel_size", "epsg", "blendingMode"},
+                            "pixel_size", "epsg", "crs_wkt", "blendingMode"},
                            report);
         OrthomosaicAsset slot;
         read_slot_identity(e, slot);
@@ -1326,10 +1339,11 @@ void read_orthomosaics(const XmlNode& node, Chunk& chunk, const ZipArchive& arch
                 throw ProjectIOError(
                     "doc.xml: <orthomosaic> georeferencing does not match the GeoTIFF");
             }
-            if (parse_int(require_attr(e, "epsg")) != mosaic.epsg) {
+            if (parse_int(require_attr(e, "epsg")) != mosaic.epsg()) {
                 throw ProjectIOError(
                     "doc.xml: <orthomosaic> epsg does not match the GeoTIFF");
             }
+            mosaic.crs.wkt = attr_or(e, "crs_wkt", std::string());
             mosaic.labels = sidecar::decode_ortho_labels(
                 require_entry(archive, require_attr(e, "labels_path")), g.width, g.height);
             *slot.data = std::move(mosaic);

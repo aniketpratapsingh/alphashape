@@ -196,18 +196,29 @@ std::uint64_t depth_map_fingerprint_seed();
 
 /// Georeferenced elevation model (DEM), milestone 9. The raster's heights are in
 /// the plane frame's height unit (ellipsoidal metres for a georeferenced chunk,
-/// chunk-local units when unreferenced); `epsg` records which SurfaceFrame
-/// projection that grid is expressed in (0 = chunk-local / no geographic
-/// meaning).
+/// chunk-local units when unreferenced); `crs` records which coordinate system
+/// that grid is expressed in (the local engineering CRS when the chunk is
+/// unreferenced).
 ///
 /// Persisted in the project file as a float GeoTIFF side file ("elevation/
 /// dem.tif") plus an <elevation> element in doc.xml; exposed to Python as
 /// Chunk.elevation (see python/bindings/module.cpp).
+///
+/// `epsg` is the pre-M12 field. It is kept as a compatibility accessor pair
+/// (`epsg`/`set_epsg`) over `crs`, so a reader of an EPSG-only project and the
+/// Python `elevation.epsg` property both keep working; the grid's identity is
+/// `crs` (WP-12.8, M12 §4.9).
 struct Elevation {
     GeoRaster<float> raster;   ///< heights; single channel
-    int epsg = 0;              ///< SurfaceFrame epsg the grid is in (0 = local)
+    /// The CRS the grid is in; the local engineering frame when unreferenced.
+    CRS crs;
     float nodata = -32767.0F;  ///< sentinel written for unmeasured cells
     std::string source;        ///< "point_cloud" | "model" | "depth_maps"
+
+    /// EPSG code of `crs` (0 for the local frame or a custom CRS).
+    int epsg() const { return crs.epsg; }
+    /// Set `crs` from an EPSG code (0 = local). A bare code carries no WKT.
+    void set_epsg(int code) { crs = CRS{}; crs.epsg = code; }
 
     bool empty() const { return raster.empty(); }
 
@@ -218,17 +229,23 @@ struct Elevation {
 /// (RGBA); alpha 255 marks a cell that at least one camera observed, alpha 0 is
 /// nodata. `labels` records, per cell, the id of the source camera in
 /// `Chunk::cameras()` (the seamline labelling), or -1 where no camera covers the
-/// cell. `epsg` is the SurfaceFrame projection of the grid the same way
-/// `Elevation::epsg` is.
+/// cell. `crs` is the coordinate system of the grid the same way
+/// `Elevation::crs` is.
 ///
 /// Persisted in the project file as an RGBA u8 GeoTIFF side file
 /// ("orthomosaic/ortho.tif") plus an "AOL1" labels sidecar and an
 /// <orthomosaic> element in doc.xml; exposed to Python as Chunk.orthomosaic.
 struct Orthomosaic {
     GeoRaster<std::uint8_t> raster;   ///< RGBA, 4 channels; alpha 0 = nodata
-    int epsg = 0;                     ///< SurfaceFrame epsg the grid is in (0 = local)
+    /// The CRS the grid is in; the local engineering frame when unreferenced.
+    CRS crs;
     std::vector<std::int32_t> labels; ///< per-cell source camera id, -1 = none
     std::string surface;              ///< "elevation" | "model"
+
+    /// EPSG code of `crs` (0 for the local frame or a custom CRS).
+    int epsg() const { return crs.epsg; }
+    /// Set `crs` from an EPSG code (0 = local). A bare code carries no WKT.
+    void set_epsg(int code) { crs = CRS{}; crs.epsg = code; }
 
     bool empty() const { return raster.empty(); }
 

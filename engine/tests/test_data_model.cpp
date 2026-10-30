@@ -801,8 +801,8 @@ TEST(Assets, LegacyAccessorsReturnActive) {
     EXPECT_EQ(&view.elevation(), view.elevations().front().data.get());
 
     // Writing through the legacy accessors writes the active asset.
-    chunk.elevation().epsg = 32632;
-    EXPECT_EQ(chunk.elevations().back().data->epsg, 32632);
+    chunk.elevation().set_epsg(32632);
+    EXPECT_EQ(chunk.elevations().back().data->epsg(), 32632);
 
     // depth_maps() behaves the same way.
     EXPECT_TRUE(chunk.depth_maps().empty());
@@ -857,8 +857,8 @@ TEST(Assets, NullPayloadsReadAsEmptyAndAreRecreatedOnMutableAccess) {
     // caller that writes to the active asset gets a live object rather than undefined behaviour.
     chunk.point_cloud().points.push_back(Eigen::Vector3d(1.0, 2.0, 3.0));
     chunk.model().vertices.push_back(Eigen::Vector3d::Zero());
-    chunk.elevation().epsg = 32632;
-    chunk.orthomosaic().epsg = 3857;
+    chunk.elevation().set_epsg(32632);
+    chunk.orthomosaic().set_epsg(3857);
     chunk.depth_maps().push_back(DepthMap{});
 
     ASSERT_NE(chunk.point_clouds().front().data, nullptr);
@@ -868,7 +868,7 @@ TEST(Assets, NullPayloadsReadAsEmptyAndAreRecreatedOnMutableAccess) {
     ASSERT_NE(chunk.depth_map_sets().front().data, nullptr);
     EXPECT_EQ(chunk.point_cloud().points.size(), 1U);
     EXPECT_EQ(chunk.model().vertices.size(), 1U);
-    EXPECT_EQ(chunk.elevation().epsg, 32632);
+    EXPECT_EQ(chunk.elevation().epsg(), 32632);
     EXPECT_EQ(chunk.depth_maps().size(), 1U);
     // The write landed in the slot the accessors hand out, so validation passes again.
     EXPECT_TRUE(chunk.validate().empty()) << chunk.validate().front();}
@@ -963,7 +963,7 @@ TEST(Assets, CopyDeepClonesPayloads) {
     original.add_model();
     original.models().front().textures.push_back(Image(2, 2, 3));
     original.add_elevation();
-    original.elevation().epsg = 32632;
+    original.elevation().set_epsg(32632);
 
     Chunk copy = original;
     EXPECT_TRUE(copy == original);
@@ -975,10 +975,10 @@ TEST(Assets, CopyDeepClonesPayloads) {
               &original.models().front().textures.front());
 
     copy.point_cloud().points.push_back(Eigen::Vector3d(9.0, 9.0, 9.0));
-    copy.elevation().epsg = 4326;
+    copy.elevation().set_epsg(4326);
     copy.models().front().textures.front().at(0, 0, 0) = 7;
     EXPECT_EQ(original.point_cloud().points.size(), 1U);
-    EXPECT_EQ(original.elevation().epsg, 32632);
+    EXPECT_EQ(original.elevation().epsg(), 32632);
     EXPECT_EQ(original.models().front().textures.front().at(0, 0, 0), 0);
 
     // Assignment is deep too.

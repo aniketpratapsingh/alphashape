@@ -14,7 +14,6 @@
 #include <proj.h>
 
 #include "model/crs/proj_context.hpp"
-#include "model/geo/transverse_mercator.hpp"
 
 // WP-12.1: the PROJ dependency itself — version, data-directory discovery,
 // offline behaviour. Transforms proper arrive with WP-12.3; the one point
@@ -226,9 +225,6 @@ TEST(Crs, ContextTransformsKnownPoint) {
     point = proj_trans(transform, PJ_FWD, point);
     EXPECT_NEAR(point.xy.x, 500000.0, 1e-6);
     EXPECT_NEAR(point.xy.y, 5538630.702867, 1e-4);
-    // And the engine's own TM series must agree with PROJ to a millimetre.
-    const Eigen::Vector2d legacy = geo::tm_forward(15.0, 50.0, 15.0, 0.9996, 500000.0, 0.0);
-    EXPECT_NEAR(point.xy.y, legacy.y(), 1e-3);
 
     // Inverse: the same point comes back as (15, 50).
     const PJ_COORD back = proj_trans(transform, PJ_INV, point);

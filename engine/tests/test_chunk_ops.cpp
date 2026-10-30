@@ -187,7 +187,7 @@ void build_rich_chunk(Chunk& chunk, int camera_count, double seed) {
     elevation.data->raster.grid.pixel_size_y = 1.0;
     elevation.data->raster.channels = 1;
     elevation.data->raster.data.assign(4, 10.0F);
-    elevation.data->epsg = 32644;
+    elevation.data->set_epsg(32644);
     elevation.data->source = "point_cloud";
 
     DepthMapsAsset& depth = chunk.add_depth_maps("depth");
