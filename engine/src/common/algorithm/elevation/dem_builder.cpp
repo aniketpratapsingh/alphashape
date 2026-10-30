@@ -1134,7 +1134,10 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         std::vector<float> observed_confidences;
         observed_confidences.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
-            if (observed[i] != 0U) {
+            if (observed[i] != 0U && repaired_only_cells[i] == 0U) {
+                // The median is taken over MEASURED cells only: a repaired-only
+                // cell's near-zero confidence must not drag the reference down
+                // and inflate every measured weight to the clamp.
                 observed_confidences.push_back(surface.confidence[i]);
                 weights[i] = surface.confidence[i];
             } else if (filled_valid[i] != 0U) {
@@ -1150,15 +1153,14 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
                     w = static_cast<float>(static_cast<double>(w) / median_confidence);
                     w = std::min(std::max(w, 0.0F), 4.0F);
                 }
-                // A repaired-only cell must stay BELOW the normalised weight of
-                // the least-supported MEDIAN measured cell, not merely below the
-                // (possibly zero) median itself: after dividing, its tiny
-                // absolute confidence would otherwise round to a full unit.
-                for (std::size_t i = 0; i < count; ++i) {
-                    if (repaired_only_cells[i] != 0U) {
-                        weights[i] = std::min(weights[i], kRepairedCellWeightCap);
-                    }
-                }
+            }
+        }
+        // A repaired-only cell is data, but at a weight below any measured
+        // cell's: cap it after normalisation so the solver anchors it while a
+        // measured cell always outweighs it.
+        for (std::size_t i = 0; i < count; ++i) {
+            if (repaired_only_cells[i] != 0U) {
+                weights[i] = kRepairedCellWeightCap;
             }
         }
         for (std::size_t i = 0; i < count; ++i) {

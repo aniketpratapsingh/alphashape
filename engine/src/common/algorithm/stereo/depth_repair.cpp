@@ -167,13 +167,13 @@ std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
     }
     // An orthonormal basis (u, v) of the plane, built from the axis least
     // aligned with the normal so the cross product is well conditioned.
-    const Eigen::Vector3d axis =
-        std::abs(plane.normal.x()) <= std::abs(plane.normal.y()) &&
-                std::abs(plane.normal.x()) <= std::abs(plane.normal.z())
-            ? Eigen::Vector3d::UnitX()
-            : (std::abs(plane.normal.y()) <= std::abs(plane.normal.z())
-                   ? Eigen::Vector3d::UnitY()
-                   : Eigen::Vector3d::UnitZ());
+    Eigen::Vector3d axis = Eigen::Vector3d::UnitZ();
+    if (std::abs(plane.normal.x()) <= std::abs(plane.normal.y()) &&
+        std::abs(plane.normal.x()) <= std::abs(plane.normal.z())) {
+        axis = Eigen::Vector3d::UnitX();
+    } else if (std::abs(plane.normal.y()) <= std::abs(plane.normal.z())) {
+        axis = Eigen::Vector3d::UnitY();
+    }
     const Eigen::Vector3d u = plane.normal.cross(axis).normalized();
     const Eigen::Vector3d v = plane.normal.cross(u).normalized();
     Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
@@ -543,7 +543,7 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
             // pixel with no supporting neighbour), so a magic confidence could
             // not be told apart from a measured one. The confidence value below
             // is only a fallback for readers that predate the flag.
-            out.flags[idx] |= kDepthRepairedFlag;
+            out.flags[idx] = static_cast<std::uint8_t>(out.flags[idx] | kDepthRepairedFlag);
             if (have_confidence) {
                 out.confidence[idx] = kRepairedConfidence;
             }
