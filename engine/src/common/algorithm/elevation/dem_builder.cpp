@@ -991,7 +991,7 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
             surface.valid[index] = 1U;
             surface.confidence[index] =
                 repaired_only ? kRepairedSampleConfidence : static_cast<float>(acc.confidence);
-            repaired_only_cells[index] = repaired_only ? 1U : 0U;
+            repaired_only_cells[index] = repaired_only ? std::uint8_t{1} : std::uint8_t{0};
         }
     }
     tick(0.55);
