@@ -1218,15 +1218,20 @@ yet.
   `Crs.ProjectedToGeographicIsAxisNormalised` pin both directions.
 - **Ballpark is refused by default, and the refusal is not a heuristic.** PROJ
   marks an operation as a ballpark (`proj_coordoperation_has_ballpark_transformation`);
-  `create()` throws when the operation PROJ offers for the CRS pair is one and
-  `allow_ballpark` is false. The opening decision reads the pair's own
-  candidate list (PROJ's default ranking); a pinned operation is judged by its
-  own flag. For a pair whose only real shifts are area-limited national
-  operations PROJ's default ranking proposes the ballpark, so such a pair is
-  refused unless `allow_ballpark` is set — that is deliberate, and it also means
-  an unpinned national pair needs the flag to be built at all. With
-  `allow_ballpark` the transform reports `is_ballpark()` and an accuracy of -1
-  (PROJ states none).
+  `create()` throws when *no* non-ballpark operation exists for the CRS pair
+  and `allow_ballpark` is false. The opening decision reads a partial-
+  intersection candidate list (grid availability ignored); a pinned operation
+  is judged by its own flag. "No non-ballpark operation exists" means a genuine
+  ballpark alone — a datum with no published transformation to WGS 84 (WGS 84 ↔
+  OSGB70), a custom `+ellps=` with no datum name. A pair whose real shifts are
+  *area-limited* is accepted: PROJ's per-point pipeline applies them where they
+  belong, so NAD 27 ↔ WGS 84, WGS 84 ↔ Amersfoort/RD New and NAD27 ↔ NAD83 are
+  ordinary pairs even though no single operation covers both whole extents.
+  (An earlier build refused those and, wrongly, WGS 84 ↔ EPSG:3035 as well: the
+  strict listing asks an operation's area to contain both CRSs' extents, and
+  EPSG:3035's extent is wider than the ETRS89 operation's. See the accuracy
+  note below.) With `allow_ballpark` a true-ballpark transform reports
+  `is_ballpark()` and an accuracy of -1 (PROJ states none).
 - **A pair between aligned datums is no longer refused as a ballpark.** This
   *is* a change from before WP-12.4, and a deliberate one. Before, the pipeline
   was built with `AUTHORITY=<the first candidate's authority>`, so for WGS 84 ↔
@@ -1235,15 +1240,17 @@ yet.
   real EPSG operation for those pairs exists (a null shift, a Helmert or a grid
   shift), it was simply never asked for. The unpinned pipeline is now the bare
   one, so those 38 pairs are accepted without `allow_ballpark` and transform by
-  the EPSG operation PROJ picks per point. Refusal is unchanged for pairs where
-  the only candidate genuinely is a ballpark (WGS 84 ↔ NAD27, WGS 84 ↔
-  Amersfoort/RD New, NAD27 ↔ NAD83 on a gridless machine).
-- **Accuracy is the pair's first candidate, not the pipeline's.**
-  `accuracy_m()` is `proj_coordoperation_get_accuracy()` on the operation PROJ
-  ranks first for the CRS extents (or on the pinned operation), -1 when PROJ
-  reports 0 for a non-ballpark (a UTM conversion states 0 m, which is not the
-  "unknown" sentinel upstream). A per-point pipeline has no single accuracy to
-  report; `description()` shows what the pipeline actually is.
+  the EPSG operation PROJ picks per point.
+- **Accuracy is the pair's best non-ballpark candidate, not the pipeline's.**
+  `accuracy_m()` is the smallest positive `proj_coordoperation_get_accuracy()`
+  over the partial-intersection candidate list (or the pinned operation's own),
+  -1 when PROJ states none for any of them (a UTM conversion states 0 m, which
+  is not the "unknown" sentinel upstream, so 0 never wins). The listing is
+  wider than PROJ's default strict one on purpose: a projection's extent can be
+  larger than the shift that reaches it (EPSG:3035 against `ETRS89 to WGS 84
+  (1)`), and the strict list would call that pair a ballpark. A per-point
+  pipeline has no single operation to ask; `description()` shows what the
+  pipeline actually is.
 - **`preferred_operation` pins an identifier PROJ already lists; it does not
   search `proj.db`.** "EPSG:16033" is matched against each candidate's
   `AUTH:CODE` (case-insensitive, after stripping PROJ's computed wrappers, so

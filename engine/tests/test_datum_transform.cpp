@@ -571,10 +571,10 @@ TEST(Crs, MissingGridNamedByPlainTransformCreate) {
 TEST(Crs, GridOperationRunsWhenInstalled) {
     // The complement of the two refusal tests, and the grid half of the spec's
     // NAD27 -> NAD83 case: with the grid present, the pinned grid operation
-    // loads and transforms. PROJ's *automatic* choice for this pair is the
-    // ballpark (a strict area test rejects every NADCON region), so the grid
-    // operation has to be asked for by pinning it. Skipped when the grid is
-    // absent, naming it.
+    // loads and transforms. This pins the operation rather than relying on
+    // PROJ's per-point choice, so the assertion is about *this* grid's shift
+    // being applied, not about which candidate PROJ would rank first. Skipped
+    // when the grid is absent, naming it.
     if (!grid_installed("us_noaa_conus.tif")) {
         GTEST_SKIP() << "the NADCON grid us_noaa_conus.tif is not installed; install proj-data "
                         "(or the proj-data package) to run this case";
@@ -786,10 +786,12 @@ private:
 /// and both must either succeed or fail together. The comparison is exact: the
 /// two are the same PROJ call, so any difference is the bug this guards.
 ///
-/// `allow_ballpark` is on because PROJ's own pick for a pair with only
-/// area-limited national operations (NAD 27 -> NAD 83 and friends) is the
-/// ballpark, and `create()` refuses that by default — main did too. The flag
-/// only lifts the refusal; it does not change the pipeline.
+/// `allow_ballpark` is on so the comparison is about the pipeline, not about
+/// whether this machine's proj.db happens to publish a real operation for the
+/// pair: some of these pairs list only a ballpark on an older data package
+/// (NAD 27 -> NAD 83 is the usual one), and refusing there would hide the
+/// engine-versus-PROJ comparison this test exists for. The flag only lifts the
+/// refusal; it does not change the pipeline.
 void expect_matches_bare_proj(const CoordinateSystem& src, const CoordinateSystem& dst,
                               const std::vector<CrsPoint>& points, const char* what) {
     const BareProj reference(src, dst);
@@ -1307,22 +1309,75 @@ TEST(Crs, AlignedDatumPairIsAcceptedWithoutAllowBallpark) {
     EXPECT_FALSE(gda2020.is_ballpark());
     EXPECT_NEAR(gda2020.accuracy_m(), 3.0, 1e-9);
 
-    // A pair with no known shift at all still has only a ballpark candidate, and
-    // is still refused without allow_ballpark.
+    // A pair whose datum has *no published transformation to WGS 84 at all*
+    // still lists only a ballpark and is still refused. EPSG:4278 (OSGB70) is
+    // the discriminator: unlike NAD 27, whose national operations exist and are
+    // merely area-limited, OSGB70 has none, so no listing criterion finds a
+    // real one. The best real accuracy would have been the wrong thing to
+    // accept here.
     try {
-        (void)CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267));
-        FAIL() << "WGS 84 to NAD27 has no real shift and must be refused";
+        (void)CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4278));
+        FAIL() << "WGS 84 to OSGB70 has no real shift and must be refused";
     } catch (const Error& error) {
         EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
             << error.what();
     }
-    // ... and the same point with the flag set is the ballpark.
+    // ... and the same pair with the flag set is the ballpark.
     TransformOptions options;
     options.allow_ballpark = true;
-    const CrsTransform ballpark = CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4267),
+    const CrsTransform ballpark = CrsTransform::create(wgs84(), CoordinateSystem::from_epsg(4278),
                                                        options);
     EXPECT_TRUE(ballpark.is_ballpark());
     EXPECT_EQ(ballpark.accuracy_m(), -1.0);
+}
+
+// ---------------------------------------------------------------------------
+// A projection whose extent is wider than the real shift is not a ballpark
+// ---------------------------------------------------------------------------
+
+TEST(Crs, WiderTargetExtentIsNotABallpark) {
+    // EPSG:3035 (ETRS89 / LAEA Europe) has an area of use that reaches south of
+    // the ETRS89-to-WGS-84 operation's own area (24.6 N against 33.26 N). Under
+    // PROJ's *strict* listing, which asks an operation's area to contain both
+    // CRSs' whole extents, WGS 84 -> EPSG:3035 therefore offers only the world
+    // ballpark, and `create()` used to refuse it. PROJ's per-point pipeline
+    // nonetheless applies `ETRS89 to WGS 84 (1)` (EPSG:1149, 1 m) everywhere
+    // that operation covers, including inland Germany, so the refusal rejected
+    // a transform the engine runs correctly. EPSG:25832 escaped it only because
+    // its area happens to match the operation's.
+    const CoordinateSystem wgs84_3d = CoordinateSystem::from_epsg(4979);
+    const CoordinateSystem laea = CoordinateSystem::from_epsg(3035);
+
+    // No allow_ballpark: the pair must be accepted as an ordinary one.
+    const CrsTransform geographic = CrsTransform::create(wgs84(), laea);
+    EXPECT_FALSE(geographic.is_ballpark());
+    EXPECT_NEAR(geographic.accuracy_m(), 1.0, 1e-9) << "EPSG:1149 is published at 1 m";
+    const CrsTransform three_d = CrsTransform::create(wgs84_3d, laea);
+    EXPECT_FALSE(three_d.is_ballpark());
+    EXPECT_NEAR(three_d.accuracy_m(), 1.0, 1e-9);
+
+    // The pipeline is still the bare per-point one, so every answer is PROJ's
+    // own, bit for bit: 50 N 9 E (Germany, inside both areas) and 52 N 5 E
+    // (Netherlands, inside both) exercise the 1 m shift, and 40 N -100 E is far
+    // outside the operation's area, where PROJ applies its own fallback — so
+    // agreeing at all three requires a pipeline untouched by the diagnosis.
+    const BareProj reference(wgs84_3d, laea);
+    ASSERT_TRUE(reference.is_valid());
+    for (const CrsPoint& point : {CrsPoint{9.0, 50.0, 123.0}, CrsPoint{5.0, 52.0, 0.0},
+                                  CrsPoint{-100.0, 40.0, 0.0}}) {
+        const CrsPoint want = reference.forward(point);
+        const std::optional<CrsPoint> got = three_d.forward(point);
+        const bool want_valid =
+            std::isfinite(want.x) && std::isfinite(want.y) && std::isfinite(want.z);
+        EXPECT_EQ(got.has_value(), want_valid)
+            << "at " << point.x << "," << point.y << ": validity differs";
+        if (!want_valid || !got) {
+            continue;
+        }
+        EXPECT_EQ(got->x, want.x) << "lon " << point.x << " (x)";
+        EXPECT_EQ(got->y, want.y) << "lon " << point.x << " (y)";
+        EXPECT_EQ(got->z, want.z) << "lon " << point.x << " (z)";
+    }
 }
 
 // ---------------------------------------------------------------------------

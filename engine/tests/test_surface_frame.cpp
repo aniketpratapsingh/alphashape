@@ -118,8 +118,11 @@ TEST(SurfaceFrame, RoundTripLocalPlaneExact) {
 
 TEST(SurfaceFrame, NonUtmProjectedTarget) {
     // Projections the retired three-CRS selector could not even name: EPSG:3857
-    // (Web Mercator), EPSG:3413 (polar stereographic) and EPSG:2154 (Lambert-93)
-    // are neither UTM nor a WGS 84 zone. All three must build and round-trip.
+    // (Web Mercator), EPSG:3413 (polar stereographic), EPSG:2154 (Lambert-93)
+    // and EPSG:3035 (LAEA Europe) are neither UTM nor a WGS 84 zone. All four
+    // must build and round-trip. EPSG:3035 in particular used to be refused as
+    // a ballpark because its area of use is wider than the ETRS89 shift's; PROJ
+    // applies that 1 m shift per point, so it is an ordinary target.
     const geo::Geodetic origin{9.2, 48.7, 300.0};
     const Chunk chunk = georeferenced_chunk(origin);
     struct Case {
@@ -130,7 +133,8 @@ TEST(SurfaceFrame, NonUtmProjectedTarget) {
         /// 48.7 N on EPSG:3413, against ~1e-10 m on the other two).
         double tolerance_m;
     };
-    for (const Case& c : {Case{3857, 5e-9}, Case{2154, 5e-9}, Case{3413, 1e-4}}) {
+    for (const Case& c : {Case{3857, 5e-9}, Case{2154, 5e-9}, Case{3035, 5e-9},
+                          Case{3413, 1e-4}}) {
         const int epsg = c.epsg;
         SCOPED_TRACE("EPSG:" + std::to_string(epsg));
         const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, epsg);
@@ -147,16 +151,19 @@ TEST(SurfaceFrame, NonUtmProjectedTarget) {
 }
 
 TEST(SurfaceFrame, BallparkOnlyTargetIsRefused) {
-    // EPSG:3035 (ETRS89 / LAEA Europe) is a CRS the engine can express, but
-    // PROJ's candidate list from WGS 84 geographic 3D exposes only a ballpark
-    // geographic offset for it. CrsTransform refuses a ballpark by default
-    // (never silently accept a null datum shift), so naming it from a WGS 84
-    // chunk is a documented refusal rather than a silently shifted grid.
+    // A datum with no published transformation to WGS 84 has only a ballpark
+    // candidate, and CrsTransform refuses that by default (never silently
+    // accept a null datum shift). EPSG:4278 (OSGB70) is such a datum, so naming
+    // it from a WGS 84 chunk is a documented refusal rather than a shifted grid.
+    //
+    // EPSG:3035 is deliberately *not* used here: PROJ applies the 1 m ETRS89
+    // shift to it per point (see `Crs.WiderTargetExtentIsNotABallpark`), so a
+    // LAEA Europe frame builds and round-trips like any other projected target.
     const geo::Geodetic origin{9.2, 48.7, 300.0};
     const Chunk chunk = georeferenced_chunk(origin);
     try {
-        (void)elevation::SurfaceFrame::for_chunk(chunk, 3035);
-        FAIL() << "4979 -> 3035 exposes only a ballpark candidate";
+        (void)elevation::SurfaceFrame::for_chunk(chunk, 4278);
+        FAIL() << "4979 -> 4278 exposes only a ballpark candidate";
     } catch (const Error& error) {
         EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
             << error.what();

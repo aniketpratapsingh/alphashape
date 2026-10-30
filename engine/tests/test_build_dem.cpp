@@ -1176,17 +1176,17 @@ TEST(BuildDem, ProjectionAndCrsMustAgree) {
 }
 
 TEST(BuildDem, MatchesTruthInEtrsUtm) {
-    // The spec's MatchesTruthInEtrsLaea: a DEM built directly in a CRS outside
-    // the retired three-CRS set, with the interior accuracy unchanged because
-    // the plane frame is exact and the build does no resampling.
+    // The spec's ETRS89-in-a-non-legacy-CRS case in its UTM form: a DEM built
+    // directly in a CRS outside the retired three-CRS set, with the interior
+    // accuracy unchanged because the plane frame is exact and the build does no
+    // resampling. The spec's own `MatchesTruthInEtrsLaea` is the LAEA variant
+    // below.
     //
     // The CRS is EPSG:25832 (ETRS89 / UTM zone 32N), not a WGS 84 zone: the
     // datum pair is real (EPSG:1149, a null shift stated at 1 m) and PROJ pairs
-    // 4979 with it directly. EPSG:3035 is deliberately NOT used here: PROJ's
-    // strict candidate listing for 4979 -> 3035 exposes only a ballpark
-    // geographic offset, which CrsTransform refuses by design (an unpinned
-    // transform never silently accepts a null datum shift). That refusal is
-    // asserted below so the boundary is documented rather than surprising.
+    // 4979 with it directly. `MatchesTruthInEtrsLaea` below builds the same DEM
+    // in EPSG:3035 (LAEA Europe) and holds it to the same bound; the two CRSs
+    // differ only in the projection on top of the same ETRS89 datum.
     Document document = aerial_fixture::make_truth_chunk_document();
     Chunk& chunk = *document.active_chunk();
     fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
@@ -1234,21 +1234,66 @@ TEST(BuildDem, MatchesTruthInEtrsUtm) {
     const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
     std::printf("[BuildDem.EtrsUtm] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
     EXPECT_LT(rmse, 0.03);
+}
 
-    // EPSG:3035 (ETRS89 / LAEA Europe) is expressible through the CRS engine,
-    // but its only candidate from WGS 84 geographic 3D is a ballpark geographic
-    // offset, so the build refuses it rather than silently shifting the grid.
-    Params laea = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
-    laea.set("crs", ParamValue{std::string("EPSG:3035")});
-    bool refused = false;
-    try {
-        run_build_dem(document, laea);
-    } catch (const Error& error) {
-        refused = true;
-        EXPECT_NE(std::string(error.what()).find("allow_ballpark"), std::string::npos)
-            << error.what();
+TEST(BuildDem, MatchesTruthInEtrsLaea) {
+    // The spec's MatchesTruthInEtrsLaea: the same interior accuracy as the UTM
+    // variant, in EPSG:3035 (ETRS89 / LAEA Europe). Same ETRS89 datum, so the
+    // 1 m ETRS89-to-WGS-84 operation is the only horizontal shift either way;
+    // only the projection differs, and the plane frame is exact, so the DEM
+    // built straight in LAEA must reproduce the same truth.
+    //
+    // This CRS used to be refused: PROJ's *strict* candidate listing asks the
+    // operation's area to contain both CRSs' whole extents, and EPSG:3035's
+    // extent (to 24.6 N) is wider than EPSG:1149's (to 33.26 N), so only the
+    // world ballpark survived. PROJ's per-point pipeline applies the 1 m shift
+    // regardless (see `Crs.WiderTargetExtentIsNotABallpark`), so the refusal
+    // rejected a pair the engine transforms correctly.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
+    params.set("crs", ParamValue{std::string("EPSG:3035")});
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    ASSERT_EQ(dem.epsg(), 3035);
+
+    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(chunk, 3035);
+    ASSERT_EQ(frame.epsg(), 3035);
+
+    // The same interior box and the same 0.03 m bound as the UTM variant.
+    std::vector<double> errors;
+    const RasterGrid& grid = dem.raster.grid;
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            const double value = static_cast<double>(dem.raster.at(col, row));
+            if (value == static_cast<double>(dem.nodata)) {
+                continue;
+            }
+            const Eigen::Vector2d c = grid.pixel_center(col, row);
+            const Eigen::Vector3d local =
+                frame.to_local(Eigen::Vector3d(c.x(), c.y(), value));
+            const double lx = local.x(), ly = local.y();
+            if (lx < -50.0 || lx > 50.0 || ly < -38.0 || ly > 38.0) {
+                continue;
+            }
+            if (near_scene_edge(lx, ly, 1.5)) {
+                continue;
+            }
+            errors.push_back(local.z() - aerial_fixture::truth_height(lx, ly));
+        }
     }
-    EXPECT_TRUE(refused) << "4979 -> 3035 has only a ballpark candidate";
+    ASSERT_GT(errors.size(), 10000U);
+    double sum_sq = 0.0;
+    for (const double e : errors) {
+        sum_sq += e * e;
+    }
+    const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
+    std::printf("[BuildDem.EtrsLaea] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
+    EXPECT_LT(rmse, 0.03);
 }
 
 }  // namespace
