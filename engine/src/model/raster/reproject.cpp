@@ -144,7 +144,7 @@ Eigen::Vector2d exact_source_pixel(const Projection& projection, const RasterGri
     double x = target.pixel_center(col, row).x();
     double y = target.pixel_center(col, row).y();
     if (!projection.identity) {
-        const std::optional<crsc::CrsPoint> mapped = projection.source_to_target.inverse(
+        const std::optional<crsc::CrsPoint> mapped = projection.source_to_target.try_inverse(
             crsc::CrsPoint{x, y, 0.0});
         if (!mapped.has_value()) {
             return Eigen::Vector2d(kNaN, kNaN);
