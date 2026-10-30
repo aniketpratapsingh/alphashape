@@ -21,57 +21,27 @@
 ///
 /// Resampling. Floats (DEMs) are bilinear and nodata-aware: out-of-bounds,
 /// `nodata_in` and non-finite taps carry no weight, the rest renormalise, and a
-/// cell below `kMinValidWeight` is `nodata_out`. 8-bit rasters are ALWAYS
-/// nearest: a blended colour was never photographed. An identical CRS yields a
-/// bit-identical copy with no PROJ call and no arithmetic.
-
-#include <cstdint>
-
-#include "model/crs/coordinate_system.hpp"
-#include "model/raster/geo_raster.hpp"
-
-namespace alphashape {
-
-/// How source samples are combined into a target cell.
-enum class Resampling {
-    Nearest,   ///< the nearest source pixel centre, no mixing (u8 imagery)
-    Bilinear,  ///< nodata-aware bilinear (float DEMs)
-};
-
-/// The lattice spacing the refinement starts from, in target pixels.
-inline constexpr int kLatticeStep = 16;
-/// The largest acceptable source-coordinate error of the lattice, in source
-/// pixels, before the spacing is halved.
-inline constexpr double kMaxLatticeError = 0.1;
-/// Bilinear taps whose total weight falls below this leave the cell nodata.
-inline constexpr double kMinValidWeight = 0.5;
-
-struct ReprojectOptions {
-    /// Target cell size in TARGET CRS units. 0 (default) derives it from the
-    /// source GSD measured at the raster centre.
-    double resolution = 0.0;
-    /// Resampling for float rasters. 8-bit rasters always use nearest.
-    Resampling resampling = Resampling::Bilinear;
-    /// Source sentinel meaning "no measurement" (float rasters).
-    float nodata_in = -32767.0F;
-    /// Written where a target cell has no usable source sample.
-    float nodata_out = -32767.0F;
-    /// 0 (default) refines from `kLatticeStep`; 1 is the exact per-pixel
-    /// mapping; any other positive value pins that spacing.
-    int lattice_step = 0;
-};
-
-/// The target grid for reprojecting `src` from `src_crs` into `dst_crs`: the
-/// extent of the transformed, densified source boundary, its origin snapped
-/// outward to a whole multiple of the cell, and a cell of `resolution`
-/// (0 = the source GSD measured at the raster centre, so a geographic target
-/// gets degrees and a projected one metres).
+/// cell below `kMinValidWeight` is `nodata_out`. 8-bit rasters
+/// are ALWAYS nearest: a blended colour was never photographed. An identical CRS
+/// yields a bit-identical copy with no PROJ call and no arithmetic; a same-CRS
+/// re-cell keeps the source corner (see `resample_grid`).
 ///
 /// @throws ValueError when a CRS is unset/local (nothing to transform between),
 ///         when the transform does not cover the raster, or when no usable cell
 ///         size can be measured. @throws Error when PROJ is unavailable.
 RasterGrid suggest_grid(const RasterGrid& src, const crs::CoordinateSystem& src_crs,
                         const crs::CoordinateSystem& dst_crs, double resolution = 0.0);
+
+/// The target grid for a RE-CELL inside one coordinate system: the source's own
+/// north-west corner is kept, and the grid is sized to cover the source extent
+/// at `cell`. A same-CRS resample is a pure affine mapping, so snapping the
+/// origin to a multiple of `cell` (as `suggest_grid` must for a reprojection)
+/// would only shift a real georeference by up to one cell and leave a blank
+/// border row or column. `cell <= 0` or a cell equal to the source's returns
+/// the source grid itself.
+///
+/// @throws ValueError when the source grid is empty or has a non-positive cell.
+RasterGrid resample_grid(const RasterGrid& src, double cell);
 
 /// Reproject a float raster into `target` (a grid in `dst_crs`, normally from
 /// `suggest_grid`) and resample it there. `src` must be non-empty and its data

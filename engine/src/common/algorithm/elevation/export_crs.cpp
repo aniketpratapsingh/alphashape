@@ -83,43 +83,71 @@ ReprojectOptions reproject_options(float nodata_in, float nodata_out) {
     return options;
 }
 
+/// True when a requested CRS names the SAME coordinate system the raster already
+/// records: the identity case, which is a copy (or, at a new cell, an anchored
+/// re-cell), never a reprojection. `suggest_grid`'s outward snapping is for
+/// mapping between planes; on one plane it would shift a real origin by up to a
+/// cell and leave a blank border.
+bool same_coordinate_system(const CRS& raster_crs, const crs::CoordinateSystem& recorded,
+                            const ExportCrs& target) {
+    if (!target.requested()) {
+        return true;
+    }
+    return recorded.is_set() &&
+           recorded.is_equivalent_to(static_cast<crs::CoordinateSystem>(target.crs));
+}
+
+/// True when a re-cell request leaves the source grid untouched: an unchanged
+/// (or unset) cell size, so the export is a copy.
+bool keeps_source_grid(const RasterGrid& grid, double resolution) {
+    if (!(resolution > 0.0)) {
+        return true;
+    }
+    return std::abs(resolution / grid.pixel_size_x - 1.0) <= 1e-9 &&
+           std::abs(resolution / grid.pixel_size_y - 1.0) <= 1e-9;
+}
+
 }  // namespace
 
 GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS& raster_crs,
                                       float nodata_in, float nodata_out,
                                       const ExportCrs& target, const char* task) {
-    if (!target.requested() && !(target.resolution > 0.0)) {
-        return raster;  // unchanged: the common path, no work at all
+    const crs::CoordinateSystem recorded = container_crs(raster_crs);
+    if (same_coordinate_system(raster_crs, recorded, target) &&
+        keeps_source_grid(raster.grid, target.resolution)) {
+        // Same plane, same cell: a bit-identical copy, with no PROJ call at all.
+        // This is the common "export as built" path and the same-CRS export the
+        // caller asked for, which must not move the origin.
+        return raster;
     }
-    if (!target.requested()) {
-        // A resolution-only request: a same-CRS resample. Nothing to transform,
-        // so the source and target CRSs are the container's own.
-        const crs::CoordinateSystem self = container_crs(raster_crs);
-        const RasterGrid grid = suggest_grid(raster.grid, self, self, target.resolution);
-        return reproject(raster, self, self, grid, reproject_options(nodata_in, nodata_out));
+    if (same_coordinate_system(raster_crs, recorded, target)) {
+        // Same plane, new cell: anchor the new grid at the source's own corner.
+        const RasterGrid grid = resample_grid(raster.grid, target.resolution);
+        return reproject(raster, recorded, recorded, grid,
+                         reproject_options(nodata_in, nodata_out));
     }
-    const crs::CoordinateSystem from = container_crs(raster_crs);
     const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(target.crs);
     require_reprojectable(raster_crs, to, task);
-    const RasterGrid grid = suggest_grid(raster.grid, from, to, target.resolution);
-    return reproject(raster, from, to, grid, reproject_options(nodata_in, nodata_out));
+    const RasterGrid grid = suggest_grid(raster.grid, recorded, to, target.resolution);
+    return reproject(raster, recorded, to, grid, reproject_options(nodata_in, nodata_out));
 }
 
 GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& raster,
                                              const CRS& raster_crs,
                                              const ExportCrs& target, const char* task) {
-    if (!target.requested() && !(target.resolution > 0.0)) {
+    const crs::CoordinateSystem recorded = container_crs(raster_crs);
+    if (same_coordinate_system(raster_crs, recorded, target) &&
+        keeps_source_grid(raster.grid, target.resolution)) {
         return raster;
     }
-    const crs::CoordinateSystem from = container_crs(raster_crs);
-    if (!target.requested()) {
-        const RasterGrid grid = suggest_grid(raster.grid, from, from, target.resolution);
-        return reproject(raster, from, from, grid, ReprojectOptions{});
+    if (same_coordinate_system(raster_crs, recorded, target)) {
+        const RasterGrid grid = resample_grid(raster.grid, target.resolution);
+        return reproject(raster, recorded, recorded, grid, ReprojectOptions{});
     }
     const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(target.crs);
     require_reprojectable(raster_crs, to, task);
-    const RasterGrid grid = suggest_grid(raster.grid, from, to, target.resolution);
-    return reproject(raster, from, to, grid, ReprojectOptions{});
+    const RasterGrid grid = suggest_grid(raster.grid, recorded, to, target.resolution);
+    return reproject(raster, recorded, to, grid, ReprojectOptions{});
 }
 
 int export_epsg(const CRS& raster_crs, const ExportCrs& target) {

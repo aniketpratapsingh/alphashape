@@ -549,6 +549,38 @@ RasterGrid suggest_grid(const RasterGrid& src, const crsc::CoordinateSystem& src
     return grid;
 }
 
+RasterGrid resample_grid(const RasterGrid& src, double cell) {
+    require_grid(src);
+    if (!(cell > 0.0) || !std::isfinite(cell)) {
+        return src;  // "keep the source cell" is the source grid itself
+    }
+    const bool same_x = std::abs(cell / src.pixel_size_x - 1.0) <= 1e-9;
+    const bool same_y = std::abs(cell / src.pixel_size_y - 1.0) <= 1e-9;
+    if (same_x && same_y) {
+        return src;
+    }
+    // The source's own outer corner is the anchor: no snapping, so a real
+    // georeference is preserved and the resample cannot introduce a blank
+    // border. One extra row/column covers an extent that does not divide.
+    const double cols = std::ceil(static_cast<double>(src.width) * src.pixel_size_x / cell - 1e-9);
+    const double rows =
+        std::ceil(static_cast<double>(src.height) * src.pixel_size_y / cell - 1e-9);
+    if (!(cols >= 1.0) || !(rows >= 1.0) || !std::isfinite(cols) || !std::isfinite(rows) ||
+        cols * rows > 1.0e9) {
+        throw ValueError("resample_grid: the target grid came out degenerate (" +
+                         std::to_string(cols) + " x " + std::to_string(rows) +
+                         " cells); choose a coarser resolution");
+    }
+    RasterGrid grid;
+    grid.origin_x = src.origin_x;
+    grid.origin_y = src.origin_y;
+    grid.pixel_size_x = cell;
+    grid.pixel_size_y = cell;
+    grid.width = static_cast<int>(cols);
+    grid.height = static_cast<int>(rows);
+    return grid;
+}
+
 // ---------------------------------------------------------------------------
 // reproject (float)
 // ---------------------------------------------------------------------------
@@ -666,6 +698,28 @@ namespace {
 RasterGrid suggest_grid(const RasterGrid&, const crs::CoordinateSystem&,
                         const crs::CoordinateSystem&, double) {
     require_proj();
+}
+
+RasterGrid resample_grid(const RasterGrid& src, double cell) {
+    // A re-cell needs no CRS engine: it is the source plane's own geometry.
+    if (src.width <= 0 || src.height <= 0) {
+        throw ValueError("resample_grid: the source raster has no cells");
+    }
+    if (!(cell > 0.0) || !std::isfinite(cell) ||
+        (std::abs(cell / src.pixel_size_x - 1.0) <= 1e-9 &&
+         std::abs(cell / src.pixel_size_y - 1.0) <= 1e-9)) {
+        return src;
+    }
+    RasterGrid grid;
+    grid.origin_x = src.origin_x;
+    grid.origin_y = src.origin_y;
+    grid.pixel_size_x = cell;
+    grid.pixel_size_y = cell;
+    grid.width = static_cast<int>(
+        std::ceil(static_cast<double>(src.width) * src.pixel_size_x / cell - 1e-9));
+    grid.height = static_cast<int>(
+        std::ceil(static_cast<double>(src.height) * src.pixel_size_y / cell - 1e-9));
+    return grid;
 }
 
 GeoRaster<float> reproject(const GeoRaster<float>&, const crs::CoordinateSystem&,

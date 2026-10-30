@@ -9,6 +9,13 @@
 // CRS. `resolution` is the cell size in the TARGET CRS; 0 keeps the source
 // ground sample distance.
 //
+// A target naming the SAME coordinate system is NOT a reprojection: at the
+// source cell it is a bit-identical copy, and at a new cell the grid is
+// re-anchored on the source's own north-west corner (so a real georeference is
+// never shifted by up to a cell and no blank border row appears). Only the
+// resolution differs, and `resample_grid` sizes the new grid, not
+// `suggest_grid`'s outward snapping.
+//
 // The parameter rules are shared with BuildDem/BuildOrthomosaic so a script that
 // works for one works for the others: `projection` is an Int EPSG code (0 =
 // unset), `crs` is "EPSG:<n>", a bare code, a PROJ string or WKT, and setting

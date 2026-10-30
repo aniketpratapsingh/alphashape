@@ -715,7 +715,98 @@ TEST(Reproject, BandsHaveNoSeams) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Error paths
+// 8. Same-CRS re-cell keeps the source corner
+// ---------------------------------------------------------------------------
+
+TEST(ResampleGrid, AnchorsOnTheSourceCorner) {
+    // A real georeference does not divide by the cell (an origin of
+    // 500000.037 with 0.1 m cells). A same-CRS re-cell must KEEP that corner:
+    // snapping to a multiple of the cell would shift the raster by up to one
+    // cell and open a blank border row.
+    RasterGrid src;
+    src.width = 200;
+    src.height = 150;
+    src.origin_x = 500000.037;
+    src.origin_y = 5400000.083;
+    src.pixel_size_x = 0.1;
+    src.pixel_size_y = 0.1;
+    const RasterGrid grid = resample_grid(src, 0.25);
+    EXPECT_NEAR(grid.origin_x, src.origin_x, 1e-12);
+    EXPECT_NEAR(grid.origin_y, src.origin_y, 1e-12);
+    EXPECT_NEAR(grid.pixel_size_x, 0.25, 1e-12);
+    // The grid covers the source extent: 20 m / 0.25 = 80, 15 m / 0.25 = 60.
+    EXPECT_EQ(grid.width, 80);
+    EXPECT_EQ(grid.height, 60);
+}
+
+TEST(ResampleGrid, SameCellIsTheSourceGrid) {
+    RasterGrid src;
+    src.width = 33;
+    src.height = 17;
+    src.origin_x = 500000.037;
+    src.origin_y = 5400000.083;
+    src.pixel_size_x = 0.1;
+    src.pixel_size_y = 0.1;
+    EXPECT_EQ(resample_grid(src, 0.1), src);
+    EXPECT_EQ(resample_grid(src, 0.0), src);
+    EXPECT_EQ(resample_grid(src, -1.0), src);
+}
+
+TEST(ResampleGrid, FingerCellAddsTheTailCell) {
+    RasterGrid src;
+    src.width = 10;
+    src.height = 10;
+    src.origin_x = 1000.0;
+    src.origin_y = 2000.0;
+    src.pixel_size_x = 1.0;
+    src.pixel_size_y = 1.0;
+    const RasterGrid grid = resample_grid(src, 0.7);
+    // 10 m / 0.7 = 14.28 -> 15 cells cover the extent; the origin is unchanged.
+    EXPECT_EQ(grid.width, 15);
+    EXPECT_EQ(grid.height, 15);
+    EXPECT_DOUBLE_EQ(grid.origin_x, 1000.0);
+}
+
+TEST(Reproject, SameCrsNewCellKeepsTheCorner) {
+    // End to end through `reproject`: a same-CRS re-cell is an affine resample,
+    // so the source's north-west corner is unmoved and no blank halo appears.
+    GeoRaster<float> src = utm_plane(500000.037, 5400000.083,
+                                     [](double x, double y) { return 100.0 + 0.001 * (x - 500000.0); });
+    src.grid.pixel_size_x = 0.1;
+    src.grid.pixel_size_y = 0.1;
+    src.grid.width = 200;
+    src.grid.height = 150;
+    src.data.resize(200U * 150U);
+    for (int row = 0; row < src.grid.height; ++row) {
+        for (int col = 0; col < src.grid.width; ++col) {
+            const Eigen::Vector2d c = src.grid.pixel_center(col, row);
+            src.at(col, row) = static_cast<float>(100.0 + 0.001 * (c.x() - 500000.0));
+        }
+    }
+    const RasterGrid grid = resample_grid(src.grid, 0.1);
+    ASSERT_EQ(grid, src.grid);
+    const GeoRaster<float> out = reproject(src, utm(), utm(), grid, ReprojectOptions{});
+    ASSERT_EQ(out.data.size(), src.data.size());
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < src.data.size(); ++i) {
+        differing += src.data[i] != out.data[i] ? 1U : 0U;
+    }
+    EXPECT_EQ(differing, 0U) << "a same-CRS export at the source cell is a copy";
+
+    // At a coarser cell the top-left cell still covers the source corner, so no
+    // output row or column is entirely nodata.
+    const RasterGrid coarse = resample_grid(src.grid, 0.25);
+    const GeoRaster<float> out2 = reproject(src, utm(), utm(), coarse, ReprojectOptions{});
+    for (int col = 0; col < coarse.width; ++col) {
+        EXPECT_NE(out2.at(col, 0), -32767.0F) << "blank first row at col " << col;
+    }
+    for (int row = 0; row < coarse.height; ++row) {
+        EXPECT_NE(out2.at(0, row), -32767.0F) << "blank first column at row " << row;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Error paths
 // ---------------------------------------------------------------------------
 
 TEST(Reproject, InconsistentBufferThrows) {

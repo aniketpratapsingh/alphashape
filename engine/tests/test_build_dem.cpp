@@ -1513,5 +1513,98 @@ TEST(BuildDem, ReprojectsToRequestedCrs) {
     std::filesystem::remove(path);
 }
 
+// ---------------------------------------------------------------------------
+// 11. WP-12.9 review: a same-CRS export is a copy, never a re-snapped grid
+// ---------------------------------------------------------------------------
+
+/// A DEM with a real, non-round georeference: an origin whose easting and
+/// northing do not divide by the cell. `reproject_for_export` used to route this
+/// through `suggest_grid`, whose outward snapping moved the origin by up to a
+/// cell and opened a blank border.
+Elevation off_grid_dem(int width, int height, double cell) {
+    Elevation dem;
+    dem.raster.grid.width = width;
+    dem.raster.grid.height = height;
+    dem.raster.grid.origin_x = 500000.037;
+    dem.raster.grid.origin_y = 5400000.083;
+    dem.raster.grid.pixel_size_x = cell;
+    dem.raster.grid.pixel_size_y = cell;
+    dem.raster.channels = 1;
+    dem.raster.data.resize(static_cast<std::size_t>(width) *
+                           static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const Eigen::Vector2d c = dem.raster.grid.pixel_center(col, row);
+            dem.raster.at(col, row) = static_cast<float>(100.0 + 0.01 * (c.x() - 500000.0) +
+                                                         0.02 * (c.y() - 5400000.0));
+        }
+    }
+    dem.set_epsg(32632);
+    dem.nodata = -32767.0F;
+    dem.source = "depth_maps";
+    return dem;
+}
+
+TEST(ExportDem, SameCrsExportIsABitIdenticalCopy) {
+    // A same-CRS export must be a copy: the origin is preserved EXACTLY and
+    // every height is unchanged. The old path snapped the origin and produced
+    // a blank border row, which this catches.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_same_crs_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 32632);
+    EXPECT_EQ(info.grid, dem.raster.grid) << "a same-CRS export must not move the grid";
+
+    const GeoRaster<float> back = read_geotiff_float(path);
+    EXPECT_EQ(back.grid, dem.raster.grid);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < dem.raster.data.size() && i < back.data.size(); ++i) {
+        differing += dem.raster.data[i] != back.data[i] ? 1U : 0U;
+    }
+    EXPECT_EQ(differing, 0U) << "a same-CRS export is a bit-identical copy";
+    std::filesystem::remove(path);
+}
+
+TEST(ExportDem, SameCrsResolutionChangeKeepsTheCorner) {
+    // A same-CRS re-cell at a new resolution must keep the source corner. The
+    // old `suggest_grid` path snapped the origin to a multiple of the new cell,
+    // which on this georeference moves it by most of a cell.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_recell_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    params.set("resolution", ParamValue{0.25});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 32632);
+    EXPECT_NEAR(info.grid.pixel_size_x, 0.25, 1e-9);
+    EXPECT_NEAR(info.grid.origin_x, dem.raster.grid.origin_x, 1e-9)
+        << "a same-CRS re-cell anchors on the source corner";
+    EXPECT_NEAR(info.grid.origin_y, dem.raster.grid.origin_y, 1e-9);
+    // 6 m of extent at 0.25 m: 24 cells, and 4 m -> 16.
+    EXPECT_EQ(info.grid.width, 24);
+    EXPECT_EQ(info.grid.height, 16);
+
+    // The corner cell is covered: a snapped grid would leave it nodata.
+    const GeoRaster<float> back = read_geotiff_float(path);
+    EXPECT_NE(back.at(0, 0), -32767.0F) << "a blank corner cell means the origin moved";
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 }  // namespace alphashape
