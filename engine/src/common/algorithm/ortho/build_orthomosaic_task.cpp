@@ -1398,18 +1398,21 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
                     "until the benchmark shows it is a clear improvement."});
 
     ParamSpec resolution{"resolution", ParamType::Float, 0.0,
-                         "Output cell size in projection units. 0 selects the true ground "
-                         "sample distance seen at each camera's image centre (median over "
-                         "the enabled cameras, oblique flights included), in the DEM's own "
-                         "units and never finer than DEM cell / 4."};
+                         "Output cell size in the output CRS's own units: metres for a "
+                         "projected CRS, DEGREES for a geographic one. 0 selects the true "
+                         "ground sample distance seen at each camera's image centre (median "
+                         "over the enabled cameras, oblique flights included), converted to "
+                         "those units and never finer than 1/8 of the surface cell."};
     resolution.minimum = 0.0;
     params.declare(resolution);
 
     ParamSpec projection{"projection", ParamType::Int, std::int64_t{0},
-                         "Requested output EPSG code. 0 means the DEM's own; the ortho is "
-                         "always BUILT in the DEM's CRS (a differing request is applied "
-                         "when exporting). Setting `projection` and `crs` to disagreeing "
-                         "values is an error."};
+                         "Requested output EPSG code. 0 means the DEM's own; a differing "
+                         "request REPROJECTS the surface once and BUILDS the mosaic in that "
+                         "CRS (with surface_data=\"model\" the DSM is rasterised there "
+                         "directly), so the stored orthomosaic is in the requested CRS. "
+                         "Setting `projection` and `crs` to disagreeing values is an "
+                         "error."};
     projection.minimum = std::int64_t{0};
     params.declare(projection);
 
@@ -1525,8 +1528,22 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // into the same plane the frame uses.
     CRS surface_crs = dem.empty() ? options.crs : dem.crs;
 
-    if (!dem.empty() && dem.crs.is_set() && options.crs.is_set() &&
-        frame.epsg() != options.crs.epsg) {
+    // A "model" surface is a DSM rasterised from the mesh BELOW, into the frame
+    // the request chose (`surface_crs`); the DEM copy made here is discarded
+    // there. Reprojecting it first would cost a whole-grid resample for a
+    // raster nothing reads, so in that mode the frame moves and the DSM carries
+    // the requested plane, with no DEM reprojection at all. The DEM copy is
+    // blanked too: it is in the OLD plane, so measuring the automatic cell on
+    // it would read the wrong coordinates. The DSM supplies that measurement
+    // below, exactly as it does for a run with no DEM.
+    if (options.surface == "model" && !dem.empty() && dem.crs.is_set() &&
+        options.crs.is_set() && frame.epsg() != options.crs.epsg) {
+        surface = GeoRaster<float>{};
+        surface_crs = options.crs;
+        frame = elevation::for_options(*chunk, options.crs);
+        progress.update("initialize", 0.6);
+    } else if (!dem.empty() && dem.crs.is_set() && options.crs.is_set() &&
+               frame.epsg() != options.crs.epsg) {
         // Build straight in the requested CRS: reproject the DEM surface once
         // (bilinear, nodata-aware) and continue on the result. The photographs
         // are then sampled in the requested projection, so the colours are
@@ -1535,6 +1552,20 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         const crs::CoordinateSystem to = static_cast<crs::CoordinateSystem>(options.crs);
         const RasterGrid surface_grid =
             suggest_grid(dem.raster.grid, from, to, options.resolution);
+        // The surface reprojection holds the DEM AND its result at once. Check
+        // that pair against the budget before either exists, so an impossible
+        // request fails with an explanation instead of a bare bad_alloc.
+        const std::uint64_t budget = platform::memory_budget_bytes();
+        const double needed = 2.0 * static_cast<double>(dem.raster.data.size()) *
+                              static_cast<double>(sizeof(float));
+        if (budget != 0 && needed > static_cast<double>(budget)) {
+            throw ValueError(
+                "BuildOrthomosaic: not enough memory to reproject the surface (needs ~" +
+                platform::format_gb(needed) + " for the source DEM and its reprojected copy, "
+                "budget " + platform::format_gb(static_cast<double>(budget)) +
+                "); build the DEM directly in the requested CRS (BuildDem projection) or "
+                "free memory.");
+        }
         ReprojectOptions reproject_options;
         reproject_options.nodata_in = dem.nodata;
         reproject_options.nodata_out = dem.nodata;

@@ -2553,6 +2553,65 @@ TEST(BuildOrthomosaic, ReprojectsOntoDemCrs) {
                 ortho.raster.grid.height);
 }
 
+TEST(BuildOrthomosaic, ModelSurfaceTakesTheRequestedCrsWithoutReprojectingTheDem) {
+    // With surface_data="model" the DEM copy is discarded: the DSM is
+    // rasterised from the mesh into the requested plane directly. The run must
+    // land in the requested CRS at the requested cell, and (the point of the
+    // fix) must not pay for a whole-grid DEM reprojection first.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const RasterGrid dem_before = chunk.elevation().raster.grid;
+    ASSERT_EQ(chunk.elevation().epsg(), 32632);
+
+    Params model = make_params(builtin_registry().require("BuildModel"));
+    run_task(builtin_registry(), s.document, "BuildModel", model);
+    ASSERT_FALSE(chunk.model().empty());
+
+    Params params = ortho_params("mosaic", "model", 0.5);
+    params.set("crs", ParamValue{std::string("EPSG:3857")});
+    run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    EXPECT_EQ(ortho.surface, "model");
+    EXPECT_EQ(ortho.epsg(), 3857);
+    EXPECT_NEAR(ortho.raster.grid.pixel_size_x, 0.5, 1e-9);
+    EXPECT_GT(ortho.raster.grid.origin_x, 1000000.0)
+        << "a Web Mercator grid, not the DEM's UTM band";
+    std::size_t opaque = 0;
+    for (std::size_t i = 0; i < ortho.raster.data.size() / 4U; ++i) {
+        opaque += ortho.raster.data[i * 4 + 3] != 0 ? 1U : 0U;
+    }
+    EXPECT_GT(opaque, 5000U);
+    // The chunk's stored DEM is untouched: the run reprojected no surface.
+    EXPECT_EQ(chunk.elevation().raster.grid, dem_before);
+    std::printf("[BuildOrthomosaic.ModelSurfaceRequestedCrs] epsg=%d cell=%.3f cells=%dx%d\n",
+                ortho.epsg(), ortho.raster.grid.pixel_size_x, ortho.raster.grid.width,
+                ortho.raster.grid.height);
+}
+
+TEST(BuildOrthomosaic, SurfaceReprojectionIsRefusedWhenItCannotFit) {
+    // The DEM surface reprojection holds the source DEM and its result at once.
+    // Under a budget that cannot hold both, the run must fail with the
+    // "not enough memory for <step>" style message BEFORE allocating, not with
+    // a bare bad_alloc half-way through the resample.
+    OrthoSetup& s = setup();
+    const ScopedMemoryBudget tight("0.01");
+    bool threw = false;
+    std::string message;
+    try {
+        Params params = ortho_params("mosaic", "elevation", 0.5);
+        params.set("crs", ParamValue{std::string("EPSG:3857")});
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+    } catch (const ValueError& e) {
+        threw = true;
+        message = e.what();
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_NE(message.find("not enough memory"), std::string::npos) << message;
+    EXPECT_NE(message.find("surface"), std::string::npos) << message;
+}
+
 TEST(ExportOrthomosaic, ReprojectionKeepsEveryColour) {
     // WP-12.9: an ortho exported to another CRS is nearest-sampled, so every
     // colour in the file is a colour that exists in the stored mosaic. Checked
