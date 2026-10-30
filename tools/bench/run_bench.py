@@ -127,6 +127,10 @@ class DemParamError(ParamError):
     """A ``dem_params`` string that is not a list of well-formed ``key=value``."""
 
 
+class OrthoParamError(ParamError):
+    """An ``ortho_params`` string that is not a list of well-formed ``key=value``."""
+
+
 # A task parameter name is what the engine declares: lowercase words and
 # underscores (``cost_type``, ``max_cost``, ``max_neighbors``). A value is a number,
 # a word, or a decimal (``census``, ``-1``, ``0.05``). Both are deliberately
@@ -185,6 +189,11 @@ def parse_dem_params(text: str | None) -> dict[str, str]:
     return parse_params(text, DemParamError)
 
 
+def parse_ortho_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``ortho_params`` string (BuildOrthomosaic)."""
+    return parse_params(text, OrthoParamError)
+
+
 def merge_task_params(dataset: dict, task: str, params: dict[str, str]) -> dict:
     """The dataset with ``params`` merged into its ``task`` overrides.
 
@@ -210,6 +219,11 @@ def merge_depth_params(dataset: dict, depth_params: dict[str, str]) -> dict:
 def merge_dem_params(dataset: dict, dem_params: dict[str, str]) -> dict:
     """The dataset with ``dem_params`` merged into its BuildDem overrides."""
     return merge_task_params(dataset, "BuildDem", dem_params)
+
+
+def merge_ortho_params(dataset: dict, ortho_params: dict[str, str]) -> dict:
+    """The dataset with ``ortho_params`` merged into its BuildOrthomosaic overrides."""
+    return merge_task_params(dataset, "BuildOrthomosaic", ortho_params)
 
 
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
@@ -1022,17 +1036,18 @@ def run(
     keep: bool = False,
     depth_params: dict[str, str] | None = None,
     dem_params: dict[str, str] | None = None,
+    ortho_params: dict[str, str] | None = None,
 ) -> dict:
     """Run one dataset and score it.
 
     ``depth_params`` are extra ``BuildDepthMaps`` keyword arguments from a manual
     dispatch, already validated by :func:`parse_depth_params`; ``dem_params`` are
-    the same for ``BuildDem``. Each is merged over the dataset's own manifest
-    overrides for its task, so an experiment such as ``cost_type=census`` keeps the
-    dataset's measured ``downscale`` and is therefore comparable with the control
-    run of the same dataset. The manifest's own dicts are never mutated: they are
-    copied, because the manifest is loaded once and a mutation would leak into the
-    next run.
+    the same for ``BuildDem`` and ``ortho_params`` for ``BuildOrthomosaic``. Each
+    is merged over the dataset's own manifest overrides for its task, so an
+    experiment such as ``cost_type=census`` keeps the dataset's measured
+    ``downscale`` and is therefore comparable with the control run of the same
+    dataset. The manifest's own dicts are never mutated: they are copied, because
+    the manifest is loaded once and a mutation would leak into the next run.
     """
     manifest = load_manifest()
     if dataset_name not in manifest["datasets"]:
@@ -1042,6 +1057,7 @@ def run(
     dataset = manifest["datasets"][dataset_name]
     dataset = merge_depth_params(dataset, depth_params or {})
     dataset = merge_dem_params(dataset, dem_params or {})
+    dataset = merge_ortho_params(dataset, ortho_params or {})
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1154,6 +1170,8 @@ def run(
         result["depth_params"] = dict(depth_params)
     if dem_params:
         result["dem_params"] = dict(dem_params)
+    if ortho_params:
+        result["ortho_params"] = dict(ortho_params)
     result["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1379,6 +1397,12 @@ def main(argv: list[str] | None = None) -> int:
         help='extra BuildDem keyword args, e.g. "sibson_exact_max_sites=20000"; '
         "marks the run as an experiment (never a baseline, never gated)",
     )
+    parser.add_argument(
+        "--ortho-params",
+        default="",
+        help='extra BuildOrthomosaic keyword args, e.g. "color_correction=true"; '
+        "marks the run as an experiment (never a baseline, never gated)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1390,6 +1414,11 @@ def main(argv: list[str] | None = None) -> int:
         dem_params = parse_dem_params(args.dem_params)
     except DemParamError as exc:
         parser.error(f"--dem-params: {exc}")
+
+    try:
+        ortho_params = parse_ortho_params(args.ortho_params)
+    except OrthoParamError as exc:
+        parser.error(f"--ortho-params: {exc}")
 
     manifest = load_manifest()
 
@@ -1413,7 +1442,13 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(dataset))
         return 0
 
-    result = run(args.dataset, Path(args.work), depth_params=depth_params, dem_params=dem_params)
+    result = run(
+        args.dataset,
+        Path(args.work),
+        depth_params=depth_params,
+        dem_params=dem_params,
+        ortho_params=ortho_params,
+    )
 
     if args.json:
         destination = Path(args.json)

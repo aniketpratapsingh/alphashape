@@ -581,6 +581,11 @@ void write_crs(const char* name, const CRS& crs, XmlNode& parent) {
         set_attr(vertical, "name", crs.vertical->name);
         set_attr(vertical, "grid", crs.vertical->grid);
         set_attr(vertical, "offset", fmt(crs.vertical->offset_m));
+        // Written only when the geoid names a non-default horizontal datum, so
+        // the pre-existing bytes are unchanged for the common case.
+        if (crs.vertical->horizontal_epsg != 0) {
+            set_attr(vertical, "horizontal_epsg", std::to_string(crs.vertical->horizontal_epsg));
+        }
     }
 }
 
@@ -595,6 +600,9 @@ void read_crs(const XmlNode* node, CRS& crs) {
         parsed.grid = attr_or(*vertical, "grid", std::string());
         if (const std::string* offset = find_attr(*vertical, "offset")) {
             parsed.offset_m = parse_double(*offset);
+        }
+        if (const std::string* horizontal = find_attr(*vertical, "horizontal_epsg")) {
+            parsed.horizontal_epsg = parse_int(*horizontal);
         }
         crs.vertical = parsed;
     }

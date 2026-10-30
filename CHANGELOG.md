@@ -27,6 +27,63 @@ All notable changes to alphashape are recorded here. The format follows
   repair is on, so existing maps stay reusable. The pass runs on the filtered
   map in both the CPU and GPU depth paths.
 
+- **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
+  a `color_correction` parameter (off by default). When set, one brightness gain
+  per camera per channel is solved over the whole flight (Brown & Lowe 2007,
+  "Automatic Panoramic Image Stitching using Invariant Features", section 6):
+  each gain minimises a sum over overlapping camera pairs of a data term that
+  drives overlapping photographs to agree and a prior that keeps a gain near 1,
+  giving a small symmetric positive-definite system solved by Cholesky per
+  channel. The gains are estimated ONCE on a coarse whole-grid lattice before any
+  block is processed, so a block-wise mosaic applies exactly the same multiplier
+  as a whole-grid one and no block border disagrees. Gains are solved and applied
+  on stored (sRGB-encoded) values — the pipeline never decodes, and the defect
+  being removed is a step in the stored mosaic — so no colour-space conversion is
+  introduced. New `engine/src/common/algorithm/ortho/gain.*`.
+
+- **Orthomosaic colour-consistency metrics (bench).** `tools/bench/metrics.py`
+  gains two metrics that measure the brightness steps between photographs in an
+  orthomosaic, computed without any engine change. `seam_step` is a
+  reference-free measure: the GeoTIFF export carries no seam labels, so it scans
+  every interior row/column boundary for a coherent brightness step between two
+  flat 3-cell windows and reports the median step (and its maximum) as a fraction
+  of full scale. `colour_error` is reference-based: after a single global
+  per-channel affine fit against the published reference orthomosaic — which
+  absorbs a white-balance difference — it reports the median and p90 local
+  residual, so a spatially varying gain error is what shows up. Both are reported
+  in the metrics JSON and the report and are deliberately not yet gated. A third
+  dispatch input, `ortho_params` beside `depth_params` and `dem_params`, lets a
+  `BuildOrthomosaic` configuration be measured against a control run.
+
+- **Reference data conversion and rotation orders.** `convert_reference`
+  (`common/algorithm/reference/convert_reference.hpp`) rewrites a chunk's camera
+  and/or marker reference positions into a target CRS and relabels the
+  `camera_crs`/`marker_crs` slot, so an imported lon/lat/alt campaign can be
+  expressed in a UTM zone (or the reverse) without touching poses, tie points or
+  assets. Horizontal positions go through `CrsTransform`; heights go through
+  `VerticalTransform` whenever either slot carries a vertical datum. The route
+  follows the datum, not the store: an EPSG vertical CRS always uses PROJ's
+  compound pipeline (exact `cs2cs` agreement, and a store grid never shadows
+  it), while a datum with no EPSG code uses the store's grid and applies
+  `H = h - N`, evaluating N in that grid's own horizontal reference (its
+  `horizontal_epsg`, persisted in doc.xml; EPSG:4979 when unset). An absent
+  height stays absent. Accuracies are measurement weights in metres and are
+  carried unchanged. The conversion is
+  all-or-nothing (a point outside the target's area of use fails the call and
+  leaves the chunk untouched) and undoable as one `Convert Camera/Marker
+  References` step.
+
+  `model/crs/euler.hpp` adds the six Tait-Bryan rotation orders (`XYZ` ...
+  `ZYX`, default `ZYX`), intrinsic and active with degrees at the API and the
+  `yaw`/`pitch`/`roll` fields taken as the first/second/third axis of the order.
+  The chunk meta key `reference/rotation_order` selects the order; an unknown
+  value is reported rather than defaulted. Gimbal lock is defined and tested:
+  the middle angle stays at ±90°, `roll` becomes 0 and the whole remaining
+  rotation is carried by `yaw`. `convert_orientation` re-expresses a
+  camera-to-world orientation in the target CRS's local axes, so a camera
+  heading true north in geographic reads the meridian convergence
+  (`γ = atan(tan Δλ · sin φ)`) as its grid yaw.
+
 - **Local tangent frames and per-object CRS slots.** A `LocalFrame`
   (`model/crs/local_frame.hpp`) anchors chunk-local Cartesian coordinates in an
   ECEF point and an explicit local-to-ECEF rotation, then converts to and from

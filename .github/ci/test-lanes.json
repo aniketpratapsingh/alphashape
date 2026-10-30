@@ -10,6 +10,7 @@
     { "name": "texture-python", "tests": ["BuildTextureEndToEnd.BakesTheSceneOnTruthPoses", "BuildTextureDiagnostics.GroundsTheSeenTexelCoverageGap", "BuildDenseTruthPoses.DenseOnTruthPosesMatchesScene", "python_dem_ortho", "python_mesh", "python_parity"] },
     { "name": "depth-pyramid", "tests": ["PatchMatchPyramid.PyramidFasterOnLarge"] },
     { "name": "gui-e2e", "tests": ["GuiPipelineEndToEnd.BuildsSavesAndReopensTheSampleProject"] },
+    { "name": "ortho-gain", "tests": ["OrthoGain.CorrectionShrinksSeamStepByAtLeastEightyPercent", "OrthoGain.BlocksAndWholeGridApplyIdenticalGains", "OrthoGain.CorrectionLeavesAnUngainedFlightNearlyUntouched", "OrthoGain.TaskPathAppliesNonTrivialGainsOnAMismatchedFlight"] },
     { "name": "ortho-blocks", "tests": ["OrthoBlockPlan.EstimatorOwnerCaseUnderTwoGigabytes", "OrthoBlockPlan.OwnerCaseFitsUnderTwoGigabytes", "OrthoBlockPlan.CoarsensOnlyWhenTheMinimumBlockCannotFit", "OrthoBlockPlan.MarginCoversTheMosaicPyramidSupport", "OrthoBlockPlan.WholeGridWhenItFits", "Ortho.PinnedPyramidDepthEqualsTheWholeGridBlend", "Ortho.WindowGridReproducesTheWholeGridTiles", "BuildOrthomosaic.BlockWiseSingleBlockIsByteIdentical", "BuildOrthomosaic.BlockWiseAverageAndDisabledMatchTheWholeGrid", "BuildOrthomosaic.BlockWiseSeamsStayContinuousAcrossBorders", "BuildOrthomosaic.BlockWiseMosaicMatchesWithInOneGreyLevel", "BuildOrthomosaic.BlockWiseNarrowLastWindowHasNoBorderStep", "BuildOrthomosaic.BlockWiseDefaultMosaicHasNoBlockGrid", "BuildOrthomosaic.BlockWiseFillHolesMatchesTheWholeGrid"] }
   ]
 }

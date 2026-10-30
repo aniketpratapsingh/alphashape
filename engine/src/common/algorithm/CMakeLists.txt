@@ -57,6 +57,7 @@ add_library(alphashape_algorithms STATIC
     ortho/orthorectify.cpp
     ortho/seamlines.cpp
     ortho/blend.cpp
+    ortho/gain.cpp
     ortho/build_orthomosaic_task.cpp
     ortho/export_orthomosaic_task.cpp
 )
@@ -71,6 +72,14 @@ target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
 # M12 §4.1: the algorithms layer links the CRS engine explicitly (it already
 # reaches it through alphashape_model, but WP-12.8 makes DEM/ortho tasks call
 # crs:: directly). PRIVATE: no algorithm header exposes PROJ or crs headers.
+#
+# WP-12.7's reference conversion is built only with the engine: with
+# -DALPHASHAPE_USE_PROJ=OFF there is no CRS to convert into, and the header
+# names crs:: types its caller cannot have. The PUBLIC link is what makes a
+# consumer of `convert_reference` (the test binary, the Python module) link the
+# engine that its signatures need; the engine is a static library whose headers
+# carry no <proj.h>, so nothing PROJ-shaped enters the public include surface.
 if(TARGET alphashape_crs)
-    target_link_libraries(alphashape_algorithms PRIVATE alphashape_crs)
+    target_sources(alphashape_algorithms PRIVATE reference/convert_reference.cpp)
+    target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()

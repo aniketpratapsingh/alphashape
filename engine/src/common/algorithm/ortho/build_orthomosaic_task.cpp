@@ -23,6 +23,7 @@
 #include "common/algorithm/elevation/dem_builder.hpp"
 #include "common/algorithm/elevation/interpolate.hpp"
 #include "common/algorithm/ortho/blend.hpp"
+#include "common/algorithm/ortho/gain.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
 #include "common/algorithm/ortho/seamlines.hpp"
 #include "common/core/assets.hpp"
@@ -370,6 +371,7 @@ struct ResolvedOptions {
     ortho::Blending blending = ortho::Blending::Mosaic;
     bool fill_holes = true;
     bool refine_seamlines = true;
+    bool color_correction = false;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
 };
@@ -387,6 +389,7 @@ ResolvedOptions resolve_options(const Params& params) {
     options.blending = ortho::parse_blending(params.get_string("blending_mode"));
     options.fill_holes = params.get_bool("fill_holes");
     options.refine_seamlines = params.get_bool("refine_seamlines");
+    options.color_correction = params.get_bool("color_correction");
     options.resolution = params.get_float("resolution");
     if (options.resolution < 0.0) {
         throw ValueError(
@@ -835,9 +838,200 @@ private:
     std::unordered_map<std::size_t, std::size_t> index_;
 };
 
+/// Estimate one gain per camera per channel over the WHOLE output grid, read on
+/// a coarse lattice.
+///
+/// The coarse grid is the output grid coarsened by `stride`; the photographs are
+/// rectified onto it exactly as the block loop rectifies them onto the full grid
+/// (same plane frame, same occlusion test), and every coarse cell that two or
+/// more cameras cover contributes one sample to each of their overlap pairs. The
+/// solve then gives gains that are a property of the FLIGHT, not of a block, so
+/// every block applies the same multiplier to the same camera and no block border
+/// can disagree with its neighbour.
+///
+/// MEMORY. The coarse tiles are cropped to their footprints (the same crop the
+/// full pass uses) and a coarse tile is 1/stride^2 of the corresponding
+/// full-resolution one, so the pass costs a small fraction of a single extra
+/// ortho. They are kept only for the duration of this call and released before
+/// the block loop allocates anything.
+///
+/// Returns one {r, g, b} gain per camera, in the entry order of `cameras`.
+std::vector<std::array<double, 3>> estimate_camera_gains(
+    const std::vector<CameraEntry>& cameras, const elevation::SurfaceFrame& frame,
+    const GeoRaster<float>& surface, float surface_nodata,
+    const ortho::OrthoSurfaceRange& surface_range, double occlusion_tolerance,
+    const RasterGrid& grid, int stride, double fallback_height, PhotoCache& photos,
+    const Progress& progress, const std::string& stage) {
+    std::vector<std::array<double, 3>> identity(
+        cameras.size(), std::array<double, 3>{1.0, 1.0, 1.0});
+    if (cameras.size() < 2 || grid.width <= 0 || grid.height <= 0 || stride <= 0) {
+        return identity;
+    }
+
+    RasterGrid coarse;
+    coarse.pixel_size_x = grid.pixel_size_x * static_cast<double>(stride);
+    coarse.pixel_size_y = grid.pixel_size_y * static_cast<double>(stride);
+    coarse.origin_x = grid.origin_x;
+    coarse.origin_y = grid.origin_y;
+    coarse.width = (grid.width + stride - 1) / stride;
+    coarse.height = (grid.height + stride - 1) / stride;
+
+    const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
+        make_plane_to_local(frame, coarse, surface, surface_nodata, fallback_height);
+    const Eigen::Vector2d metres_per_unit =
+        frame.metres_per_plane_unit(coarse.pixel_center(0, coarse.height / 2).y());
+
+    std::vector<ortho::OrthoTile> tiles;
+    tiles.reserve(cameras.size());
+    for (std::size_t k = 0; k < cameras.size(); ++k) {
+        if (progress.is_cancelled()) {
+            throw Error("BuildOrthomosaic cancelled");
+        }
+        const CameraEntry& entry = cameras[k];
+        const Image& image = photos.get(k, entry.image_path);
+        if (image.empty()) {
+            throw ValueError("BuildOrthomosaic: camera " + std::to_string(entry.camera_id) +
+                             " has an unreadable image");
+        }
+        ortho::OrthoCamera camera;
+        camera.calibration = entry.calibration;
+        camera.R = entry.R;
+        camera.t = entry.t;
+        camera.image = &image;
+        camera.plane_metres_per_unit = metres_per_unit;
+        if (to_local) {
+            camera.plane_to_local = to_local;
+            camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                return frame.to_plane(p);
+            };
+            camera.plane_centre = frame.to_plane(entry.centre_local);
+        }
+        tiles.push_back(ortho::orthorectify(surface, surface_nodata, coarse, camera,
+                                           static_cast<int>(k), occlusion_tolerance, true,
+                                           &surface_range));
+        progress.update(stage, static_cast<double>(k + 1) / static_cast<double>(cameras.size()));
+    }
+
+    // Pair every coarse cell's covering cameras. Iterating the later camera
+    // against the earlier ones (j < i) records each pair exactly once; the
+    // accumulator itself also normalises the order, so this is only for locality.
+    ortho::OverlapAccumulator overlaps;
+    for (std::size_t i = 0; i < tiles.size(); ++i) {
+        const ortho::OrthoTile& later = tiles[i];
+        if (later.empty()) {
+            continue;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const ortho::OrthoTile& earlier = tiles[j];
+            if (earlier.empty()) {
+                continue;
+            }
+            const int x0 = std::max(earlier.x0, later.x0);
+            const int x1 = std::min(earlier.x0 + earlier.width, later.x0 + later.width);
+            const int y0 = std::max(earlier.y0, later.y0);
+            const int y1 = std::min(earlier.y0 + earlier.height, later.y0 + later.height);
+            for (int row = y0; row < y1; ++row) {
+                for (int col = x0; col < x1; ++col) {
+                    const std::size_t ec = earlier.index(col, row);
+                    const std::size_t lc = later.index(col, row);
+                    if (earlier.valid[ec] == 0 || later.valid[lc] == 0) {
+                        continue;
+                    }
+                    overlaps.add(static_cast<int>(j), static_cast<int>(i),
+                                 &earlier.rgb[ec * 3], &later.rgb[lc * 3]);
+                }
+            }
+        }
+    }
+
+    if (overlaps.empty()) {
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildOrthomosaic: gain compensation found no overlapping "
+                                   "camera pairs on the coarse grid; leaving gains at 1";
+        }
+        return identity;
+    }
+    const std::vector<ortho::OverlapPair> pairs = overlaps.finish();
+    if (Log::enabled(LogLevel::Info)) {
+        // The RAW gain range before mean-normalisation is the useful diagnostic:
+        // a range hugging 1 means the photographs already agree, while a wide
+        // range that normalises flat would mean the solve found no real signal.
+        double raw_lo = 1.0;
+        double raw_hi = 1.0;
+        for (const ortho::OverlapPair& pair : pairs) {
+            for (int c = 0; c < 3; ++c) {
+                const double a = pair.mean_a[static_cast<std::size_t>(c)];
+                const double b = pair.mean_b[static_cast<std::size_t>(c)];
+                if (a > 1e-6 && b > 1e-6) {
+                    const double ratio = a / b;
+                    raw_lo = std::min(raw_lo, ratio);
+                    raw_hi = std::max(raw_hi, ratio);
+                }
+            }
+        }
+        log(LogLevel::Info) << "BuildOrthomosaic: gain estimate over " << pairs.size()
+                            << " overlapping camera pairs, overlap brightness ratio "
+                            << raw_lo << " .. " << raw_hi;
+    }
+    const std::vector<std::array<double, 3>> gains =
+        ortho::solve_gains(static_cast<int>(cameras.size()), pairs);
+
+    // The solved gains themselves, per channel, at INFO: the pair/ratio log above
+    // says what went IN, this says what came OUT. A range of 1 .. 1 here while the
+    // ratios above are wide is the signature of a solve that failed to carry its
+    // signal through (the bug this diagnostic was added to catch), so the two
+    // lines are meant to be read together.
+    if (Log::enabled(LogLevel::Info)) {
+        double samples = 0.0;
+        for (const ortho::OverlapPair& pair : pairs) {
+            samples += pair.count;
+        }
+        std::ostringstream text;
+        text << "BuildOrthomosaic: gain solve used " << pairs.size() << " pairs, "
+             << static_cast<std::uint64_t>(samples) << " samples; gains per channel";
+        static const char* const kNames[3] = {"r", "g", "b"};
+        for (int c = 0; c < 3; ++c) {
+            double lo = gains.empty() ? 1.0 : gains.front()[static_cast<std::size_t>(c)];
+            double hi = lo;
+            double sum = 0.0;
+            for (const auto& gain : gains) {
+                const double g = gain[static_cast<std::size_t>(c)];
+                lo = std::min(lo, g);
+                hi = std::max(hi, g);
+                sum += g;
+            }
+            text << ' ' << kNames[c] << "[" << format_number(lo) << " .. "
+                 << format_number(hi) << " mean "
+                 << format_number(gains.empty() ? 1.0
+                                                : sum / static_cast<double>(gains.size()))
+                 << ']';
+        }
+        log(LogLevel::Info) << text.str();
+    }
+    return gains;
+}
+
 }  // namespace
 
-// -- block plan --------------------------------------------------------------
+// -- per-camera gain compensation -------------------------------------------
+//
+// The gains must be the SAME for every block (a block that solved its own would
+// disagree with its neighbour at the border), so they are estimated ONCE over
+// the whole grid before the block loop runs, and applied per camera inside each
+// block. The estimate never needs every cell: a coarse lattice of sample cells
+// gives each overlapping pair hundreds of colour samples, which pins a per-channel
+// mean far more precisely than a gain needs, at a memory cost of a few megabytes
+// rather than a whole extra ortho.
+
+namespace {
+
+/// The stride of the coarse sampling lattice the gain estimate reads, in cells.
+/// 8 thins a 4 cm mosaic to 32 cm spacing: a pair overlapping a 50 x 50 m area
+/// still contributes ~24 000 samples, and the coarse pass rectifies only those
+/// cells.
+constexpr int kGainSampleStride = 8;
+
+}  // namespace
 
 int block_margin_cells(int block_cells, int pyramid_levels) {
     // The margin exists to make a block's interior identical to the whole grid's
@@ -1176,6 +1370,11 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
+    params.declare({"color_correction", ParamType::Bool, false,
+                    "Compensate per-camera brightness so photographs do not step at the "
+                    "seams (one gain per camera per channel, solved over the whole flight). "
+                    "Off by default: it changes every colour in the mosaic, so it is opt-in "
+                    "until the benchmark shows it is a clear improvement."});
 
     ParamSpec resolution{"resolution", ParamType::Float, 0.0,
                          "Output cell size in projection units. 0 selects the true ground "
@@ -1206,8 +1405,10 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
 }
 
 std::vector<Stage> BuildOrthomosaicTask::stages() const {
-    return {Stage{"initialize", 0}, Stage{"rectify", 0}, Stage{"seamlines", 0},
-            Stage{"blend", 0}, Stage{"finalize", 0}};
+    // "color_correction" only runs when the parameter is set; it is its own
+    // stage so the coarse whole-flight pass does not rewind the initialize bar.
+    return {Stage{"initialize", 0}, Stage{"color_correction", 0}, Stage{"rectify", 0},
+            Stage{"seamlines", 0}, Stage{"blend", 0}, Stage{"finalize", 0}};
 }
 
 void BuildOrthomosaicTask::apply(Document& document, Params& params,
@@ -1685,6 +1886,36 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
     PhotoCache photos(plan.photo_cache_bytes);
 
+    // -- per-camera gains ----------------------------------------------------
+    // Solved ONCE over a coarse whole-grid lattice, before any block runs, so
+    // every block applies the same multiplier to the same camera. The gains live
+    // outside the block loop for exactly that reason: a per-block solve would
+    // make neighbouring blocks disagree at their shared border.
+    //
+    // The estimator shares the block loop's PhotoCache, so the flight is decoded
+    // at most twice even when the cache is too small to keep it.
+    std::vector<std::array<double, 3>> gains(
+        cameras.size(), std::array<double, 3>{1.0, 1.0, 1.0});
+    if (options.color_correction) {
+        gains = estimate_camera_gains(cameras, frame, surface, surface_nodata,
+                                      surface_range, occlusion_tolerance, grid,
+                                      kGainSampleStride, fallback_height, photos, progress,
+                                      "color_correction");
+        if (Log::enabled(LogLevel::Info)) {
+            double lo = 1.0;
+            double hi = 1.0;
+            for (const auto& gain : gains) {
+                for (const double g : gain) {
+                    lo = std::min(lo, g);
+                    hi = std::max(hi, g);
+                }
+            }
+            log(LogLevel::Info) << "BuildOrthomosaic: gain compensation " << lo << " .. " << hi
+                                << " over " << cameras.size() << " cameras (sample stride "
+                                << kGainSampleStride << ")";
+        }
+    }
+
     // The global cell lattice: a window's cell (col, row) is global cell
     // (col + wx0, row + wy0), and its centre is evaluated on the GLOBAL origin so
     // a block reproduces the whole grid's samples bit for bit.
@@ -1876,6 +2107,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     surface, surface_nodata, window, camera, static_cast<int>(k),
                     occlusion_tolerance, true, &surface_range,
                     plan.block_cells > 0 ? &cell_lattice : nullptr));
+                // Apply the camera's precomputed gain to the tile just rectified.
+                // The gains are whole-flight constants (see estimate_camera_gains),
+                // so a block and the whole grid apply the same multiplier.
+                if (options.color_correction) {
+                    ortho::apply_gain(tiles.back(), gains[block_cameras[k]]);
+                }
                 progress.update("rectify",
                                 (static_cast<double>(block_index) +
                                  static_cast<double>(k + 1) /

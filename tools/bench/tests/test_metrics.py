@@ -1296,6 +1296,161 @@ class CompareOrthoTest(unittest.TestCase):
         self.assertIn("reason", result)
 
 
+class SeamStepTest(unittest.TestCase):
+    """The reference-free colour-consistency metric, on mosaics built by hand.
+
+    A seam is a flat scene rendered at two brightnesses, so the synthetic mosaics
+    here are exactly that: a constant image with one column (or row) boundary
+    where the value steps. Everything else is a control the metric must not fire
+    on.
+    """
+
+    @staticmethod
+    def _mosaic(value=0.5, size=256, step=None, *, axis="column", noise=0.0, seed=7):
+        """A flat RGBA mosaic with an optional brightness step at one boundary.
+
+        ``step`` is the signed change applied to every cell past ``boundary``.
+        The value is in [0, 1] and written back as uint8, so the metric sees
+        exactly what a GeoTIFF round trip would give it.
+        """
+        rng = np.random.default_rng(seed)
+        rgb = np.full((size, size, 3), value, dtype=np.float64)
+        if noise:
+            rgb += rng.normal(0.0, noise, rgb.shape)
+        if step is not None:
+            if axis == "column":
+                rgb[:, size // 2 :, :] += step
+            else:
+                rgb[size // 2 :, :, :] += step
+        data = np.empty((size, size, 4), dtype=np.uint8)
+        data[:, :, :3] = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
+        data[:, :, 3] = 255
+        return metrics.Raster(data, 0.0, float(size), 0.05, 0.05)
+
+    def test_a_flat_mosaic_reports_zero_step(self):
+        # Flat everywhere: every boundary line is flat and steps by nothing, so no
+        # line is a seam and the result is a genuine 0.0 (measured, not omitted).
+        result = metrics.ortho_colour_consistency(self._mosaic())
+        self.assertTrue(result["seam_step_measured"])
+        self.assertEqual(result["seam_lines"], 0)
+        self.assertAlmostEqual(result["seam_step"], 0.0, places=6)
+        self.assertAlmostEqual(result["seam_step_max"], 0.0, places=6)
+
+    def test_a_column_step_is_measured_at_its_own_height(self):
+        result = metrics.ortho_colour_consistency(self._mosaic(step=0.2))
+        self.assertTrue(result["seam_step_measured"])
+        self.assertEqual(result["seam_lines"], 1)
+        # The step is 0.2 of full scale, up to the uint8 rounding.
+        self.assertAlmostEqual(result["seam_step"], 0.2, delta=0.01)
+        self.assertAlmostEqual(result["seam_step_max"], 0.2, delta=0.01)
+
+    def test_a_row_step_is_measured_too(self):
+        result = metrics.ortho_colour_consistency(self._mosaic(step=-0.15, axis="row"))
+        self.assertTrue(result["seam_step_measured"])
+        self.assertEqual(result["seam_lines"], 1)
+        self.assertAlmostEqual(result["seam_step"], 0.15, delta=0.01)
+
+    def test_correction_toward_the_mean_shrinks_the_step(self):
+        # A 0.2 step corrected towards the mean leaves a 0.1 step: the measured
+        # seam step must follow it down.
+        before = metrics.ortho_colour_consistency(self._mosaic(step=0.2))
+        after = metrics.ortho_colour_consistency(self._mosaic(step=0.1))
+        self.assertLess(after["seam_step"], before["seam_step"])
+        self.assertAlmostEqual(after["seam_step"], 0.1, delta=0.01)
+
+    def test_moderate_noise_does_not_manufacture_a_seam(self):
+        result = metrics.ortho_colour_consistency(self._mosaic(noise=0.02, seed=11))
+        # Noise on a flat scene must not clear the seam floor: either no line is
+        # promoted, or the reported step is below a visible one.
+        if result["seam_step_measured"]:
+            self.assertLess(result["seam_step"], metrics.SEAM_MIN_STEP)
+        else:
+            self.assertIsNone(result["seam_step"])
+
+    def test_a_step_still_reads_through_moderate_noise(self):
+        result = metrics.ortho_colour_consistency(
+            self._mosaic(step=0.25, noise=0.01, seed=12)
+        )
+        self.assertTrue(result["seam_step_measured"])
+        self.assertAlmostEqual(result["seam_step"], 0.25, delta=0.03)
+
+    def test_holes_do_not_contribute_boundary_samples(self):
+        mosaic = self._mosaic(step=0.2)
+        # Knock out the right half's alpha over the top rows: those cells are
+        # no-data, and the step must be measured only where both sides of the
+        # boundary are valid. The surviving rows still carry the 0.2 step.
+        mosaic.data[:64, 128:, 3] = 0
+        result = metrics.ortho_colour_consistency(mosaic)
+        self.assertTrue(result["seam_step_measured"])
+        self.assertGreater(result["seam_step_p90"], 0.15)
+
+    def test_an_all_nodata_mosaic_is_unmeasured(self):
+        mosaic = self._mosaic()
+        mosaic.data[:, :, 3] = 0
+        result = metrics.ortho_colour_consistency(mosaic)
+        self.assertFalse(result["seam_step_measured"])
+        self.assertIsNone(result["seam_step"])
+
+    def test_the_metric_is_reported_inside_ortho_metrics(self):
+        result = metrics.ortho_metrics(self._mosaic(step=0.2))
+        self.assertIn("colour_consistency", result)
+        self.assertAlmostEqual(result["colour_consistency"]["seam_step"], 0.2, delta=0.01)
+
+
+class ColourErrorVsReferenceTest(unittest.TestCase):
+    """The reference-based residual after a global per-channel affine fit."""
+
+    @staticmethod
+    def _raster(rgb, *, size=None):
+        rgb = np.asarray(rgb, dtype=np.float64)
+        h, w = rgb.shape[:2]
+        return metrics.Raster(rgb, 0.0, float(h), 1.0, 1.0)
+
+    def test_identical_rasters_have_zero_residual(self):
+        rng = np.random.default_rng(3)
+        img = rng.integers(0, 255, (64, 64, 3)).astype(np.float64)
+        result = metrics.ortho_colour_error_vs_reference(self._raster(img), self._raster(img))
+        self.assertTrue(result["comparable"])
+        self.assertAlmostEqual(result["luma"]["median"], 0.0, places=9)
+
+    def test_a_global_white_balance_difference_is_fitted_away(self):
+        # Our mosaic is the reference scaled by 0.7: a pure global difference the
+        # affine fit absorbs, so the residual is ~0 despite a large absolute gap.
+        rng = np.random.default_rng(4)
+        reference = rng.integers(40, 220, (64, 64, 3)).astype(np.float64)
+        ours = reference * 0.7
+        result = metrics.ortho_colour_error_vs_reference(self._raster(ours), self._raster(reference))
+        self.assertTrue(result["comparable"])
+        self.assertAlmostEqual(result["channels"]["red"]["slope"], 1.0 / 0.7, places=3)
+        self.assertLess(result["luma"]["median"], 1e-3)
+
+    def test_a_local_gain_error_survives_the_global_fit(self):
+        # Left half correct, right half 25% too bright: no single affine can fix
+        # both, so the residual is large on one side and the median moves.
+        rng = np.random.default_rng(5)
+        reference = rng.integers(40, 220, (64, 64, 3)).astype(np.float64)
+        ours = reference.copy()
+        ours[:, 32:, :] *= 1.25
+        result = metrics.ortho_colour_error_vs_reference(self._raster(ours), self._raster(reference))
+        self.assertTrue(result["comparable"])
+        self.assertGreater(result["luma"]["median"], 0.01)
+        self.assertGreater(result["luma"]["p90"], result["luma"]["median"])
+
+    def test_a_tiny_overlap_is_reported_not_scored(self):
+        a = self._raster(np.zeros((4, 4, 3)))
+        b = metrics.Raster(np.zeros((4, 4, 3)), 3.0, 4.0, 1.0, 1.0)
+        result = metrics.ortho_colour_error_vs_reference(a, b)
+        self.assertFalse(result["comparable"])
+
+    def test_a_flat_channel_is_not_a_division_by_zero(self):
+        flat = np.full((16, 16, 3), 100.0)
+        other = np.full((16, 16, 3), 140.0)
+        result = metrics.ortho_colour_error_vs_reference(self._raster(flat), self._raster(other))
+        self.assertTrue(result["comparable"])
+        self.assertAlmostEqual(result["channels"]["red"]["slope"], 1.0)
+        self.assertLess(result["luma"]["median"], 1e-6)
+
+
 class EvaluateTest(unittest.TestCase):
     def test_missing_products_are_explicitly_skipped(self):
         spec = metrics.DatasetSpec(name="synthetic", images=[])

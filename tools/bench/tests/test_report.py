@@ -344,6 +344,51 @@ class MarkdownTest(unittest.TestCase):
         text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
         self.assertIn("publishes no reference product", text)
 
+    def test_the_seam_step_is_reported_when_measured(self):
+        current = metrics()
+        current["reference_free"]["ortho"]["colour_consistency"] = {
+            "seam_step": 0.04, "seam_step_p90": 0.06, "seam_step_max": 0.07,
+            "seam_samples": 900, "seam_step_measured": True,
+        }
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Seam step (median)", text)
+        self.assertIn("0.04", text)
+
+    def test_an_unmeasured_seam_step_says_why(self):
+        current = metrics()
+        current["reference_free"]["ortho"]["colour_consistency"] = {
+            "seam_step": None, "seam_step_measured": False,
+            "seam_step_reason": "no boundary steps",
+        }
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("no boundary steps", text)
+
+    def test_the_colour_error_is_reported_when_comparable(self):
+        current = metrics()
+        current["reference_based"]["ortho"]["colour_error"] = {
+            "comparable": True, "luma": {"median": 0.012, "p90": 0.031},
+        }
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("Colour error (median)", text)
+        self.assertIn("0.031", text)
+
+    def test_the_colour_metrics_do_not_gate(self):
+        # Report-only for now: a large seam step must NOT turn the verdict red.
+        current = metrics()
+        current["reference_free"]["ortho"]["colour_consistency"] = {
+            "seam_step": 0.4, "seam_step_p90": 0.8, "seam_step_max": 0.9,
+            "seam_samples": 4000, "seam_step_measured": True,
+        }
+        current["reference_based"]["ortho"]["colour_error"] = {
+            "comparable": True, "luma": {"median": 0.4, "p90": 0.9},
+        }
+        previous = json.loads(json.dumps(current))
+        previous["reference_free"]["ortho"]["colour_consistency"]["seam_step"] = 0.001
+        previous["reference_based"]["ortho"]["colour_error"]["luma"]["median"] = 0.001
+        bad, _ = report.regressions(current, previous, thresholds())
+        metrics_named = {record["metric"] for record in bad}
+        self.assertFalse(any("colour" in name or "seam" in name for name in metrics_named))
+
     def test_a_cross_dataset_comparison_is_flagged(self):
         previous = metrics()
         previous["dataset_manifest"]["title"] = "A different scene"
