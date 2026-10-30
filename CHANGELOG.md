@@ -15,17 +15,36 @@ All notable changes to alphashape are recorded here. The format follows
   `repair_max_area`, with at least 75% of its perimeter on measured pixels, is
   refilled from a robust plane fitted to that boundary in camera space (RANSAC,
   then a least-squares refit on the inliers) when at least 70% of the boundary
-  points lie within 1% of the boundary's mean depth of the same plane. Each
-  hole pixel is filled by intersecting its viewing ray with the plane and
-  receives the plane normal and a reduced confidence (`0.25`), so later stages
-  can tell a repaired pixel from a measured one. The fill is bounded: a depth
+  points lie within 1% of the boundary's mean depth of the same plane, that
+  fraction being re-checked against the refitted plane. The ring is also checked
+  for coherence: a step whose far side owns only a contiguous arc of the ring
+  (more than 10%, or whose outliers sit one-sided on the plane) is rejected,
+  because the fraction alone would let the near plane bridge it. Each hole pixel
+  is filled by intersecting its viewing ray with the plane and receives the
+  plane normal and a `kDepthRepairedFlag` provenance bit (`flags`, depth-map
+  sidecar ADM3), so later stages can tell a repaired pixel from a measured one;
+  the repaired confidence is `0`, because the filter can keep a measured pixel
+  at `0` too, so a value could never carry that distinction. A repaired sample
+  never outvotes a measured one: BuildDem's per-cell median ignores repaired
+  samples where a cell has any measured sample (they still fill a cell nothing
+  measured), and point-cloud fusion weights each repaired sample at a fraction
+  of a measured sample's. The pass does nothing when `filter_mode` is
+  "disabled": those holes are genuine no-data, not filter artefacts. The fill is
+  bounded: a depth
   outside the range the hole's own ring measured (plus 1%), or an intersection
   at less than ~3 degrees to the plane, is left empty, so a near-edge-on plane
   cannot write a depth far outside the surface. A hole straddling a depth
   discontinuity, an oversized hole, or one cut off by the map border is left
   empty. The two parameters are folded into the depth-map fingerprint only when
-  repair is on, so existing maps stay reusable. The pass runs on the filtered
-  map in both the CPU and GPU depth paths.
+  repair actually runs, so existing maps stay reusable. The pass runs on the
+  filtered map in both the CPU and GPU depth paths.
+
+- **Project format v4 and depth-map sidecar ADM3.** The depth-map sidecar gains
+  an optional per-pixel provenance byte (`flags`: bit 0 = repaired by the pass
+  above) and moves ADM2 -> ADM3. ADM1 and ADM2 are still read, and an ADM2 map
+  decodes with every pixel measured, so no migration is needed. The doc.xml
+  version is bumped to 4 only so an older build reports "newer than this build
+  supports" instead of a header error.
 
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain

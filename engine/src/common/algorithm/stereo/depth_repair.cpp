@@ -34,6 +34,27 @@ constexpr double kPlaneRelativeTolerance = 0.01;
 // the remaining 30% is the ragged edge the filter left behind.
 constexpr double kPlaneInlierFraction = 0.7;
 
+// A run of outliers this long, walked along the boundary ring, is a second
+// surface rather than filter noise. The inlier fraction alone cannot see it: a
+// step whose far side owns 20% of the ring leaves 80% on the near plane, which
+// passes 0.7 -- and the fill would then bridge the step with the near plane.
+// Scattered ragged-edge outliers are isolated or come in pairs; a surface
+// boundary is one contiguous arc. 10% is the tolerance: it is a small fraction
+// of the ring (a few pixels on a ring of tens) yet far below the 30% the
+// inlier rule already permits, so a step that owns between 10% and 30% of the
+// ring is caught here. Two adjacent outliers are always tolerated, because on
+// the smallest rings (6 points) 10% would be less than one pixel of slack.
+constexpr double kMaxOutlierArcFraction = 0.1;
+constexpr std::size_t kMaxOutlierArcFloor = 2;
+
+// Share of the outliers that must sit on the plane's FAR side for the split to
+// read as noise rather than as a one-sided offset. Random speckle scatters
+// roughly evenly; a step is an offset, so its ring points land almost entirely
+// on one side. 0.25 tolerates the handful of speckles a real ragged boundary
+// leaves on the opposite side while still rejecting a coherent one-sided step.
+constexpr double kOutlierSideBalance = 0.25;
+constexpr std::size_t kMinOutliersForSideTest = 3;
+
 // Share of a component's perimeter that must lie on MEASURED pixels. A
 // 4-connected invalid component never has an invalid 4-neighbour (it would be
 // part of the same component), so every uncovered perimeter edge is an image
@@ -131,12 +152,122 @@ bool fit_plane_least_squares(const std::vector<Eigen::Vector3d>& points,
     return true;
 }
 
+/// Longest run of outliers along the ring, walking it as a closed loop. The
+/// ring is ordered by the angle its points make around their centroid in the
+/// plane (an orthonormal basis of that plane), which follows the boundary for
+/// the small, simply-connected holes this pass accepts. The order is only used
+/// as a conservative test: a mis-ordered ring can split a true arc, never join
+/// two unrelated ones, so it may reject a fill it should have kept but will not
+/// accept one it should have refused.
+std::size_t longest_outlier_arc(const std::vector<Eigen::Vector3d>& ring,
+                                const std::vector<std::uint8_t>& inlier, const Plane& plane) {
+    const std::size_t n = ring.size();
+    if (n == 0) {
+        return 0;
+    }
+    // An orthonormal basis (u, v) of the plane, built from the axis least
+    // aligned with the normal so the cross product is well conditioned.
+    const Eigen::Vector3d axis =
+        std::abs(plane.normal.x()) <= std::abs(plane.normal.y()) &&
+                std::abs(plane.normal.x()) <= std::abs(plane.normal.z())
+            ? Eigen::Vector3d::UnitX()
+            : (std::abs(plane.normal.y()) <= std::abs(plane.normal.z())
+                   ? Eigen::Vector3d::UnitY()
+                   : Eigen::Vector3d::UnitZ());
+    const Eigen::Vector3d u = plane.normal.cross(axis).normalized();
+    const Eigen::Vector3d v = plane.normal.cross(u).normalized();
+    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+    for (const Eigen::Vector3d& p : ring) {
+        centroid += p;
+    }
+    centroid /= static_cast<double>(n);
+
+    std::vector<std::size_t> order(n);
+    std::vector<double> angle(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const Eigen::Vector3d d = ring[i] - centroid;
+        angle[i] = std::atan2(d.dot(v), d.dot(u));
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&angle](std::size_t a, std::size_t b) {
+        if (angle[a] != angle[b]) {
+            return angle[a] < angle[b];
+        }
+        return a < b;  // total order, so the result is reproducible
+    });
+
+    // Walk the circle starting just after an inlier, so a run that crosses the
+    // angular seam is counted whole rather than split in two.
+    std::size_t start = n;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (inlier[order[i]] != 0) {
+            start = i;
+            break;
+        }
+    }
+    if (start == n) {
+        return n;  // every point is an outlier
+    }
+    std::size_t best = 0;
+    std::size_t run = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t idx = order[(start + k) % n];
+        if (inlier[idx] == 0) {
+            ++run;
+            best = std::max(best, run);
+        } else {
+            run = 0;
+        }
+    }
+    return best;
+}
+
+/// True when the ring's outlier set reads as noise rather than as a second
+/// surface: no contiguous outlier arc longer than kMaxOutlierArcFraction of the
+/// ring, and no coherent one-sided offset. See the constants for the reasoning.
+bool outlier_distribution_is_noise(const std::vector<Eigen::Vector3d>& ring,
+                                   const std::vector<std::uint8_t>& inlier, const Plane& plane) {
+    const std::size_t arc = longest_outlier_arc(ring, inlier, plane);
+    const double allowed_arc =
+        std::max(static_cast<double>(kMaxOutlierArcFloor),
+                 kMaxOutlierArcFraction * static_cast<double>(ring.size()));
+    if (static_cast<double>(arc) > allowed_arc) {
+        return false;
+    }
+    // Signed residuals: points of a parallel far surface all fall on the same
+    // side of the fitted plane, while speckle straddles it.
+    std::size_t above = 0;
+    std::size_t below = 0;
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        if (inlier[i] != 0) {
+            continue;
+        }
+        const double residual = plane.normal.dot(ring[i]) - plane.offset;
+        if (residual > 0.0) {
+            ++above;
+        } else {
+            ++below;
+        }
+    }
+    const std::size_t outliers = above + below;
+    if (outliers < kMinOutliersForSideTest) {
+        return true;  // too few to judge a side; the arc test already passed
+    }
+    const std::size_t minority = std::min(above, below);
+    return static_cast<double>(minority) >= kOutlierSideBalance * static_cast<double>(outliers);
+}
+
 /// Plane through the ring: RANSAC for the dominant plane, then a least-squares
 /// refit on its inliers. `relative_tolerance` is a fraction of the ring's mean
 /// depth, so the same number means the same physical slack at any scale.
-/// Returns false when no plane reaches the required inlier fraction.
+/// `outlier_mask` is filled in for the RETURNED plane, so callers see the
+/// residual classification the acceptance decision was made on.
+/// Returns false when no plane reaches the required inlier fraction, when the
+/// refit stops explaining the ring, or when the outliers are a coherent second
+/// surface rather than noise.
 bool fit_ring_plane(const std::vector<Eigen::Vector3d>& ring, double mean_depth,
-                    double relative_tolerance, double required_fraction, Plane& out) {
+                    double relative_tolerance, double required_fraction, Plane& out,
+                    std::vector<std::uint8_t>& outlier_mask) {
     if (ring.size() < kMinBoundaryPoints) {
         return false;
     }
@@ -194,6 +325,26 @@ bool fit_ring_plane(const std::vector<Eigen::Vector3d>& ring, double mean_depth,
     if (fit_plane_least_squares(ring, best_inliers, refined)) {
         best = refined;
     }
+    // Re-classify against the FINAL plane instead of trusting the RANSAC
+    // inlier set: the TLS refit can tilt the plane enough that some of the
+    // points that chose it no longer lie on it. The acceptance decision uses
+    // the same residual predicate the caller's later stages do, so the fraction
+    // below, the arc test and the span all describe one plane.
+    outlier_mask.assign(ring.size(), 1U);
+    std::size_t inliers = 0;
+    for (std::size_t i = 0; i < ring.size(); ++i) {
+        if (std::abs(best.normal.dot(ring[i]) - best.offset) <= tolerance) {
+            outlier_mask[i] = 0U;
+            ++inliers;
+        }
+    }
+    if (inliers < kMinBoundaryPoints ||
+        static_cast<double>(inliers) < required_fraction * static_cast<double>(ring.size())) {
+        return false;
+    }
+    if (!outlier_distribution_is_noise(ring, outlier_mask, best)) {
+        return false;
+    }
     out = best;
     return true;
 }
@@ -216,6 +367,9 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
     if (!map.confidence.empty() && map.confidence.size() != pixels) {
         throw ValueError("repair_depth_map: confidence array size does not match map size");
     }
+    if (!map.flags.empty() && map.flags.size() != pixels) {
+        throw ValueError("repair_depth_map: flags array size does not match map size");
+    }
     if (calibration.width != map.width || calibration.height != map.height) {
         throw ValueError("repair_depth_map: calibration size does not match the map");
     }
@@ -230,6 +384,12 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
             *stats = local;
         }
         return out;
+    }
+    if (out.flags.empty()) {
+        // Materialise the provenance array only when the pass will run: an
+        // empty flag vector means "all measured", so a map that is never
+        // touched costs nothing.
+        out.flags.assign(pixels, 0U);
     }
     const int width = map.width;
     const int height = map.height;
@@ -347,8 +507,9 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
         const double allowed_max = depth_max * (1.0 + kDepthSpanMargin);
         const double mean_depth = depth_sum / static_cast<double>(ring_points.size());
         Plane plane;
+        std::vector<std::uint8_t> outlier_mask;
         if (!fit_ring_plane(ring_points, mean_depth, kPlaneRelativeTolerance,
-                            kPlaneInlierFraction, plane)) {
+                            kPlaneInlierFraction, plane, outlier_mask)) {
             ++local.rejected_plane;
             continue;
         }
@@ -377,6 +538,12 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
             }
             fill_pixels.push_back(idx);
             out.depths[idx] = static_cast<float>(depth);
+            // Provenance is the flag, not the confidence: a MEASURED pixel can
+            // legitimately hold any confidence including 0 (the filter keeps a
+            // pixel with no supporting neighbour), so a magic confidence could
+            // not be told apart from a measured one. The confidence value below
+            // is only a fallback for readers that predate the flag.
+            out.flags[idx] |= kDepthRepairedFlag;
             if (have_confidence) {
                 out.confidence[idx] = kRepairedConfidence;
             }
