@@ -77,13 +77,13 @@ on:
         description: 'Extra BuildDem key=value pairs, space separated (e.g. "sibson_exact_max_sites=20000")'
         type: string
         default: ""
-      # Extra BuildOrthomosaic keyword arguments, e.g. "color_correction=true".
+      # Extra BuildOrthomosaic keyword arguments, e.g. "color_correction=affine".
       # Exactly the same contract as depth_params and dem_params above: validated by
       # tools/bench/run_bench.py --ortho-params, passed through an environment
       # variable (never interpolated into `run:`), and strictly a reporting mode —
       # never the regression baseline, never gates.
       ortho_params:
-        description: 'Extra BuildOrthomosaic key=value pairs, space separated (e.g. "color_correction=true")'
+        description: 'Extra BuildOrthomosaic key=value pairs, space separated (e.g. "color_correction=affine")'
         type: string
         default: ""
       # Accept a regression BY HAND, so a deliberate trade-off (worse on one metric,

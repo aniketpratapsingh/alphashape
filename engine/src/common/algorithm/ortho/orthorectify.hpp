@@ -195,6 +195,35 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const OrthoSurfaceRange* surface_range = nullptr,
                        const OrthoCellLattice* lattice = nullptr);
 
+// -- surface-point projection ------------------------------------------------
+//
+// The rectifier's visibility test, exposed so a caller that samples the SAME
+// surface point in several cameras (the affine colour model) can reuse exactly
+// the test the mosaic applies per cell instead of an approximation of it.
+
+/// Where one 3-D surface point lands in one camera, with the rectifier's
+/// visibility verdict.
+struct SurfaceSample {
+    double u = 0.0;      ///< continuous pixel coords; 0.5 = first pixel centre
+    double v = 0.0;
+    double score = 0.0;  ///< cos(view vs vertical) * border taper, in (0, 1]
+
+    /// Colour of the photograph at (u, v), bilinear, edges clamped.
+    void sample_colour(const Image& image, std::uint8_t out[3]) const;
+};
+
+/// Project the plane-frame surface point `p` into `camera` and report where it
+/// lands, WITHOUT reading colour. Returns false when the camera cannot see it:
+/// behind the camera, outside the image, or occluded by the DEM by more than
+/// `occlusion_tolerance` metres (the same march orthorectify() runs).
+///
+/// `surface_range` bounds the occlusion march; pass the DEM's own valid range
+/// (the value orthorectify() would take from `surface_range`).
+bool project_surface_point(const GeoRaster<float>& dem, float dem_nodata,
+                           const OrthoCamera& camera, double occlusion_tolerance,
+                           const Eigen::Vector3d& p, const OrthoSurfaceRange& surface_range,
+                           SurfaceSample& out);
+
 // -- test-only cost accounting ----------------------------------------------
 // The occlusion march's cost is invisible in a tile's contents: a 4x-finer
 // output grid must not multiply the DEM samples per output cell, but the tile

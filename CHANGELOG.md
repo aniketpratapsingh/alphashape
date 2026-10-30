@@ -6,7 +6,34 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool.** The
+  accepted values are `"none"` (default), `"gain"` and `"affine"`. An old project
+  file or script that recorded `true` still works: the value is read as `"gain"`,
+  which is exactly what the Bool selected, and `false` reads as `"none"`. The
+  Python binder likewise accepts a Bool and converts it to its text form, so a
+  caller that passed the Bool gets the same product as before.
+
 ### Added
+
+- **Per-camera, per-channel affine colour correction for the orthomosaic.**
+  `BuildOrthomosaic`'s `color_correction="affine"` fits `I' = a_c I + b_c` per
+  camera per channel, jointly over all cameras, from observations of the SAME
+  3-D surface point seen by several cameras: a coarse lattice of DEM cells is
+  projected into every camera with the rectifier's own occlusion test and each
+  point's colour is read bilinearly from that photograph. The residual is the
+  disagreement of the two corrected colours and the fit uses an IRLS Huber loss
+  (Huber 1964), so a moving object, a specular highlight or an occlusion — each a
+  large residual on a minority of points — cannot drag the result; a weak prior
+  pulls `a` toward 1 and `b` toward 0. The model is gauged to mean gain 1 and mean
+  offset 0 and clamped only AFTER that, and it is applied to each camera's
+  rectified pixels BEFORE the seam labeller runs, so seams are chosen on corrected
+  colours and a block-wise mosaic applies the same whole-flight model in every
+  block. The form follows joint radiometric alignment in the published literature
+  (Goldman & Chen 2005; Xiong & Pulli 2010) on top of the gain model Brown & Lowe
+  (2007) give. New `engine/src/common/algorithm/ortho/colour_model.*`; the
+  visibility test it reuses is exposed as `ortho::project_surface_point()`.
 
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain

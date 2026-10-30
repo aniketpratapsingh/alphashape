@@ -139,6 +139,107 @@ void reset_occlusion_sample_count() {
     g_occlusion_samples.store(0, std::memory_order_relaxed);
 }
 
+void SurfaceSample::sample_colour(const Image& image, std::uint8_t out[3]) const {
+    sample_rgb(image, u, v, out);
+}
+
+bool project_surface_point(const GeoRaster<float>& dem, float dem_nodata,
+                           const OrthoCamera& camera, double occlusion_tolerance,
+                           const Eigen::Vector3d& p, const OrthoSurfaceRange& surface_range,
+                           SurfaceSample& out) {
+    if (dem.empty()) {
+        return false;
+    }
+    // The pixel is bounded by the IMAGE when one is attached and by the
+    // calibration's sensor dimensions otherwise. A caller that only needs the
+    // geometry (the colour-model sampler does, before it decides whether to
+    // decode anything) therefore does not have to decode a photograph to ask
+    // "would this camera see this point?".
+    const double iw = camera.image != nullptr && !camera.image->empty()
+                          ? static_cast<double>(camera.image->width())
+                          : static_cast<double>(camera.calibration.width);
+    const double ih = camera.image != nullptr && !camera.image->empty()
+                          ? static_cast<double>(camera.image->height())
+                          : static_cast<double>(camera.calibration.height);
+    if (!(iw > 0.0) || !(ih > 0.0)) {
+        return false;
+    }
+
+    // The occlusion march runs in the plane frame, exactly as orthorectify()
+    // does: the direction is metric when the plane is geographic, and the centre
+    // is the plane-frame optical centre.
+    const Eigen::Vector3d centre =
+        camera.plane_to_local && camera.plane_centre.has_value() ? *camera.plane_centre
+                                                                 : camera.centre();
+    const double mx = camera.plane_metres_per_unit.x();
+    const double my = camera.plane_metres_per_unit.y();
+    const bool metric_march = mx != 1.0 || my != 1.0;
+    const double step =
+        0.5 * std::max(dem.grid.pixel_size_x, dem.grid.pixel_size_y) *
+        (metric_march ? std::max(mx, my) : 1.0);
+    const double max_height = surface_range.highest;
+
+    const Eigen::Vector3d to_cam =
+        metric_march ? Eigen::Vector3d((centre.x() - p.x()) * mx, (centre.y() - p.y()) * my,
+                                       centre.z() - p.z())
+                     : centre - p;
+    const double distance = to_cam.norm();
+    if (!(distance > 0.0)) {
+        return false;
+    }
+    const Eigen::Vector3d dir = to_cam / distance;
+
+    double march_end = distance;
+    if (dir.z() > 0.0 && std::isfinite(max_height)) {
+        const double rise = (max_height + occlusion_tolerance) - p.z();
+        if (rise <= 0.0) {
+            march_end = 0.0;  // already above every sample: no occluder
+        } else {
+            march_end = std::min(march_end, rise / dir.z());
+        }
+    }
+    std::size_t samples = 0;
+    for (double s = step; s <= march_end && samples < kMaxOcclusionSamplesPerRay; s += step) {
+        ++samples;
+        const double px = p.x() + dir.x() * s / mx;
+        const double py = p.y() + dir.y() * s / my;
+        const double pz = p.z() + dir.z() * s;
+        if (pz > max_height + occlusion_tolerance) {
+            break;  // above every surface sample: cannot be occluded
+        }
+        if (blocked(dem, dem_nodata, occlusion_tolerance, px, py, pz)) {
+            return false;
+        }
+    }
+
+    // -- project ---------------------------------------------------------------
+    const Eigen::Vector3d posed = camera.plane_to_local ? camera.plane_to_local(p) : p;
+    const Eigen::Vector3d p_cam = camera.R * posed + camera.t;
+    double params[kCalibrationParamCount];
+    calibration_params(camera.calibration, params);
+    double pixel[2] = {0.0, 0.0};
+    const double p_cam_arr[3] = {p_cam.x(), p_cam.y(), p_cam.z()};
+    if (!try_project_point(camera.calibration.type, camera.calibration.width,
+                           camera.calibration.height, params, p_cam_arr, pixel)) {
+        return false;
+    }
+    const double u = pixel[0];
+    const double v = pixel[1];
+    if (!(u >= 0.0 && u <= iw && v >= 0.0 && v <= ih)) {
+        return false;
+    }
+    // The same score orthorectify() assigns this pixel: cos(view vs vertical)
+    // times the border taper (whose span is 10% of the short image side).
+    const double taper_span = 0.1 * std::min(iw, ih);
+    const double edge = std::min(std::min(u, iw - u), std::min(v, ih - v));
+    const double taper = std::clamp(edge / taper_span, 0.0, 1.0);
+    const double cos_view = std::clamp(dir.z(), 0.0, 1.0);
+    out.u = u;
+    out.v = v;
+    out.score = std::max(1e-6, cos_view * taper);
+    return true;
+}
+
 TileBounds camera_footprint_bounds(
     const RasterGrid& out_grid, const OrthoCamera& camera, double lowest_height,
     double highest_height, int margin_cells) {

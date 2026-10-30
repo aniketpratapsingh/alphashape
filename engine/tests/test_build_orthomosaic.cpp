@@ -1197,11 +1197,24 @@ Orthomosaic run_ortho(OrthoSetup& s, Params params) {
 }
 
 /// Params for BuildOrthomosaic with colour correction and (optionally) a block
-/// side, on top of the given blending/resolution.
+/// side, on top of the given blending/resolution. `color_correction` is a String
+/// choice ("none"/"gain"/"affine"); the Bool spelling here keeps every existing
+/// case about the gain model, which is what it used to select.
 Params colour_params(double resolution, bool color_correction, std::int64_t block_size = 0,
                      bool refine_seamlines = true, const std::string& blending = "mosaic") {
     Params params = ortho_params(blending, "elevation", resolution, true, refine_seamlines);
-    params.set("color_correction", ParamValue{color_correction});
+    params.set("color_correction",
+               ParamValue{std::string(color_correction ? "gain" : "none")});
+    params.set("block_size", ParamValue{block_size});
+    return params;
+}
+
+/// The same helper, naming the correction mode explicitly.
+Params colour_mode_params(double resolution, const std::string& mode,
+                          std::int64_t block_size = 0, bool refine_seamlines = true,
+                          const std::string& blending = "mosaic") {
+    Params params = ortho_params(blending, "elevation", resolution, true, refine_seamlines);
+    params.set("color_correction", ParamValue{mode});
     params.set("block_size", ParamValue{block_size});
     return params;
 }
@@ -2386,6 +2399,144 @@ TEST(OrthoGain, TaskPathAppliesNonTrivialGainsOnAMismatchedFlight) {
     EXPECT_GT(differing, 0U)
         << "a non-trivial gain must actually change the mosaic, not be applied "
            "to a copy or dropped";
+}
+
+// -- the affine colour model, end to end ------------------------------------
+//
+// The unit cases in test_ortho_gain.cpp verify the solve against known
+// coefficients. These pin the two properties only the TASK can get wrong: that
+// "none" is exactly the old product, and that the affine model actually reaches
+// the mosaic (sampling, projection and application are all in the path between
+// the two).
+
+TEST(OrthoAffine, none_is_byte_identical_to_the_unparameterised_run) {
+    // The default must not change the product by one grey level. The parameter is
+    // spelled out here rather than left to its default, so a future change of the
+    // default would fail this case instead of silently moving every mosaic.
+    OrthoSetup& s = setup();
+    const Orthomosaic implicit = run_ortho(s, ortho_params("mosaic", "elevation", 0.125, true, true));
+    Params explicit_none =
+        ortho_params("mosaic", "elevation", 0.125, true, true);
+    explicit_none.set("color_correction", ParamValue{std::string("none")});
+    const Orthomosaic spelled = run_ortho(s, explicit_none);
+    ASSERT_EQ(spelled.raster.grid, implicit.raster.grid);
+    EXPECT_EQ(spelled.raster.data, implicit.raster.data);
+}
+
+TEST(OrthoAffine, a_bool_true_from_an_old_project_selects_the_gain_model) {
+    // The parameter used to be a Bool. A file that recorded "true" must keep
+    // working, and must mean the same thing it did: the gain solve. Setting it
+    // to the Bool form here would be rejected by Params (the type changed), so
+    // the compatibility is the STRING "true", which is what a saved project
+    // contains.
+    OrthoSetup& s = setup();
+    Params gain = colour_mode_params(0.125, "gain");
+    Params legacy = colour_mode_params(0.125, "true");
+    const Orthomosaic gain_product = run_ortho(s, gain);
+    const Orthomosaic legacy_product = run_ortho(s, legacy);
+    ASSERT_EQ(gain_product.raster.grid, legacy_product.raster.grid);
+    EXPECT_EQ(gain_product.raster.data, legacy_product.raster.data);
+}
+
+TEST(OrthoAffine, an_unknown_mode_is_refused) {
+    OrthoSetup& s = setup();
+    Params params = colour_mode_params(0.125, "quadratic");
+    EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", params),
+                 ValueError);
+}
+
+TEST(OrthoAffine, task_path_applies_a_non_trivial_affine_model_on_a_mismatched_flight) {
+    // Give alternate photographs a real AFFINE difference (0.8x plus a black
+    // lift), not merely a multiplier: a gain correction cannot remove the lift,
+    // so this is the case the affine model exists for. The task must sample,
+    // solve and apply without falling over, and the INFO line must report a
+    // non-identity model -- the black-box evidence that the model reached the
+    // product rather than being solved and dropped.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight flight(chunk, 0.8);
+
+    // Repaint the private copies with 0.8 I + 20 on odd cameras.
+    std::vector<Frame*> frames;
+    for (const auto& frame : chunk.frames()) {
+        if (frame->camera_id() >= 0) {
+            frames.push_back(frame.get());
+        }
+    }
+    ASSERT_EQ(frames.size(), 12U);
+    for (std::size_t c = 0; c < frames.size(); ++c) {
+        if (c % 2 == 0) {
+            continue;
+        }
+        Image image = read_image(frames[c]->path());
+        ASSERT_FALSE(image.empty());
+        for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
+            for (int channel = 0; channel < 3; ++channel) {
+                const double value =
+                    0.8 * static_cast<double>(image.data()[i + static_cast<std::size_t>(channel)]) +
+                    20.0;
+                image.data()[i + static_cast<std::size_t>(channel)] =
+                    static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
+            }
+        }
+        write_png(frames[c]->path(), image);
+    }
+
+    std::string diagnostics;
+    {
+        ScopedLogCapture capture;
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic",
+                 colour_mode_params(0.125, "affine", 0, false, "disabled"));
+        diagnostics = capture.text(LogLevel::Info);
+    }
+    const std::size_t at = diagnostics.find("affine colour model over");
+    ASSERT_NE(at, std::string::npos)
+        << "the affine solve must log what it saw at INFO; got:\n" << diagnostics;
+    EXPECT_NE(diagnostics.find("camera-pair observations"), std::string::npos);
+
+    // The product must differ from the uncorrected one: a model that solved but
+    // was never applied would leave the mosaic identical.
+    const Orthomosaic corrected = s.document.active_chunk()->orthomosaic();
+    const Orthomosaic plain = run_ortho(s, colour_mode_params(0.125, "none", 0, false, "disabled"));
+    ASSERT_EQ(plain.raster.grid, corrected.raster.grid);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < plain.raster.data.size(); i += 4) {
+        if (plain.raster.data[i + 3] == 0 || corrected.raster.data[i + 3] == 0) {
+            continue;
+        }
+        if (plain.raster.data[i] != corrected.raster.data[i]) {
+            ++differing;
+        }
+    }
+    std::printf("[OrthoAffine.TaskPath] differing red cells = %zu\n", differing);
+    EXPECT_GT(differing, 0U) << "the affine model must reach the mosaic";
+}
+
+TEST(OrthoAffine, blocked_and_whole_grid_apply_the_same_affine_model) {
+    // The model is solved once over the flight and applied per camera, so a
+    // block-wise run must produce the same product as the whole-grid one. The
+    // second witness after the unit case: this one goes through sampling,
+    // projection and application as well as the solve.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight flight(chunk, 0.8);
+    const Orthomosaic whole = run_ortho(s, colour_mode_params(0.125, "affine", 0, false, "disabled"));
+    const Orthomosaic blocked =
+        run_ortho(s, colour_mode_params(0.125, "affine", 512, false, "disabled"));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+    ASSERT_EQ(blocked.raster.data.size(), whole.raster.data.size());
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < whole.raster.data.size(); i += 4) {
+        if (whole.raster.data[i] != blocked.raster.data[i] ||
+            whole.raster.data[i + 1] != blocked.raster.data[i + 1] ||
+            whole.raster.data[i + 2] != blocked.raster.data[i + 2]) {
+            ++differing;
+        }
+    }
+    std::printf("[OrthoAffine.Blocks] differing=%zu\n", differing);
+    EXPECT_EQ(differing, 0U)
+        << "a per-camera model solved once must make the blocked run identical "
+           "to the whole-grid one";
 }
 
 }  // namespace

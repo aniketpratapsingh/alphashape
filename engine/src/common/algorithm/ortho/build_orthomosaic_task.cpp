@@ -23,6 +23,7 @@
 #include "common/algorithm/elevation/dem_builder.hpp"
 #include "common/algorithm/elevation/interpolate.hpp"
 #include "common/algorithm/ortho/blend.hpp"
+#include "common/algorithm/ortho/colour_model.hpp"
 #include "common/algorithm/ortho/gain.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
 #include "common/algorithm/ortho/seamlines.hpp"
@@ -365,16 +366,41 @@ std::function<Eigen::Vector3d(const Eigen::Vector3d&)> make_plane_to_local(
 
 namespace {
 
+/// How the per-camera colour model is built, and applied before the seams are
+/// chosen. "none" leaves every stored pixel alone; "gain" is one multiplier per
+/// camera per channel (gain.hpp); "affine" is a multiplier and an offset per
+/// camera per channel (colour_model.hpp), which also removes a contrast
+/// difference rather than only a brightness one.
+enum class ColourMode { None, Gain, Affine };
+
 /// The validated parameter bundle.
 struct ResolvedOptions {
     std::string surface = "elevation";
     ortho::Blending blending = ortho::Blending::Mosaic;
     bool fill_holes = true;
     bool refine_seamlines = true;
-    bool color_correction = false;
+    ColourMode colour = ColourMode::None;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
 };
+
+/// Parse the `color_correction` choice. The parameter used to be a Bool; a
+/// project saved by that version records "true"/"false", so those two spellings
+/// are still accepted here and mean what they meant then (an old `true` ran the
+/// gain solve, and now names it explicitly). Returns None and does not throw on
+/// an unknown word.
+ColourMode parse_colour_mode(const std::string& text) {
+    if (text == "none" || text == "false" || text.empty()) {
+        return ColourMode::None;
+    }
+    if (text == "gain" || text == "true") {
+        return ColourMode::Gain;
+    }
+    if (text == "affine") {
+        return ColourMode::Affine;
+    }
+    return ColourMode::None;
+}
 
 ResolvedOptions resolve_options(const Params& params) {
     ResolvedOptions options;
@@ -389,7 +415,14 @@ ResolvedOptions resolve_options(const Params& params) {
     options.blending = ortho::parse_blending(params.get_string("blending_mode"));
     options.fill_holes = params.get_bool("fill_holes");
     options.refine_seamlines = params.get_bool("refine_seamlines");
-    options.color_correction = params.get_bool("color_correction");
+    const std::string colour = params.get_string("color_correction");
+    options.colour = parse_colour_mode(colour);
+    if (options.colour == ColourMode::None && colour != "none" && colour != "false" &&
+        !colour.empty()) {
+        throw ValueError("BuildOrthomosaic: color_correction must be \"none\", \"gain\" or "
+                         "\"affine\" (got \"" +
+                         colour + "\")");
+    }
     options.resolution = params.get_float("resolution");
     if (options.resolution < 0.0) {
         throw ValueError(
@@ -1011,27 +1044,320 @@ std::vector<std::array<double, 3>> estimate_camera_gains(
     return gains;
 }
 
-}  // namespace
-
-// -- per-camera gain compensation -------------------------------------------
-//
-// The gains must be the SAME for every block (a block that solved its own would
-// disagree with its neighbour at the border), so they are estimated ONCE over
-// the whole grid before the block loop runs, and applied per camera inside each
-// block. The estimate never needs every cell: a coarse lattice of sample cells
-// gives each overlapping pair hundreds of colour samples, which pins a per-channel
-// mean far more precisely than a gain needs, at a memory cost of a few megabytes
-// rather than a whole extra ortho.
-
-namespace {
-
-/// The stride of the coarse sampling lattice the gain estimate reads, in cells.
-/// 8 thins a 4 cm mosaic to 32 cm spacing: a pair overlapping a 50 x 50 m area
-/// still contributes ~24 000 samples, and the coarse pass rectifies only those
-/// cells.
 constexpr int kGainSampleStride = 8;
 
+// -- the affine colour model's sampling budget -------------------------------
+//
+// The affine model is fitted on 3-D surface points, not on an output-grid
+// raster, so its budget is stated in POINTS rather than in cells. One point
+// sampled in C cameras yields up to C(C-1)/2 observations, which for the
+// 12-camera aerial fixture is 66 -- and for a 40-camera flight would be 780, so
+// the observation list is capped separately rather than letting the point cap
+// imply it.
+//
+// 200 000 points is the brief's figure, and it is also where the returns stop:
+// every camera's a and b are already pinned by tens of thousands of
+// observations, and a denser lattice changes the fit by far less than the
+// 8-bit quantisation the result is applied at. The solve's own memory is 2
+// unknowns per camera per channel and nothing per observation (the pair
+// statistics are accumulated as they are met).
+constexpr std::uint64_t kAffineMaxPoints = 200000;
+/// The observation cap: 32 B each, so 256 MB at the very worst, and only
+/// reachable by a very large flight seen by very many cameras at once. Reaching
+/// it truncates the sample rather than failing -- 8 M disagreement measurements
+/// still pin a two-parameter model.
+constexpr std::size_t kAffineMaxObservations = 8000000;
+/// The smallest rectifier score a sample may carry. The rectifier's score is
+/// cos(view) * border taper, in (0, 1]; 0.15 rejects the taper's outer 15% of
+/// the image border and views more oblique than about 81 degrees. A border pixel
+/// is a bilinear read across a compressed gradient, so its stored value is a
+/// poor measurement of the surface's colour -- exactly what the model must not
+/// be fitted to.
+constexpr double kAffineMinSampleScore = 0.15;
+
+/// Sample the paired observations the AFFINE colour model is fitted to, and
+/// solve it.
+///
+/// Sampling is on 3-D SURFACE points, not on output-grid overlap means. The two
+/// are not equivalent: a mean over an overlap region throws away the spread
+/// (dark vs bright parts of the shared area), and that spread is the only thing
+/// that separates the gain from the offset. One surface point sampled in several
+/// cameras gives the pair (I_i, I_j) the affine model needs.
+///
+/// The lattice is the DEM's own cell grid thinned by `stride`, capped at
+/// `kAffineMaxPoints` points overall. Each point is projected into every camera
+/// with orthorectify()'s visibility test (project_surface_point), and its colour
+/// is read bilinearly from the photograph at its working resolution. Points seen
+/// by three or more cameras contribute one observation per camera PAIR; points
+/// seen by fewer than two contribute nothing.
+///
+/// MEMORY. Nothing here is grid-sized. Each camera holds one `SurfaceSample`
+/// (24 B: two doubles and a score) per lattice point it actually sees, plus one
+/// three-float colour per such point, and both are released as soon as the
+/// observations are formed; the observations themselves are 32 B each and capped
+/// at kAffineMaxObservations. Photographs go through the caller's LRU cache,
+/// exactly like the rectify loop, so the sampler is not a second full decode of
+/// the flight.
+std::vector<ortho::CameraColour> estimate_camera_colours(
+    const std::vector<CameraEntry>& cameras, const elevation::SurfaceFrame& frame,
+    const GeoRaster<float>& surface, float surface_nodata,
+    const ortho::OrthoSurfaceRange& surface_range, double occlusion_tolerance,
+    const RasterGrid& grid, int stride, PhotoCache& photos, const Progress& progress,
+    const std::string& stage) {
+    std::vector<ortho::CameraColour> identity(cameras.size());
+    if (cameras.size() < 2 || grid.width <= 0 || grid.height <= 0 || stride <= 0 ||
+        surface.empty()) {
+        return identity;
+    }
+
+    // The lattice lives on the DEM, and only its VALID samples are used: a
+    // nodata cell has no surface point to sample the photographs at.
+    const RasterGrid& dem_grid = surface.grid;
+    const int dem_stride =
+        std::max(stride, 1) * std::max(1, static_cast<int>(std::lround(
+                                              grid.pixel_size_x / dem_grid.pixel_size_x)));
+
+    // Size the sampling stride from the DEM: the requested stride, then doubled
+    // until the total stays under the cap. Doubling keeps the lattice aligned to
+    // the DEM's own cells (which is what makes the sample set independent of the
+    // output grid's resolution) and converges in a handful of steps.
+    std::uint64_t columns = static_cast<std::uint64_t>((dem_grid.width + dem_stride - 1) / dem_stride);
+    std::uint64_t rows = static_cast<std::uint64_t>((dem_grid.height + dem_stride - 1) / dem_stride);
+    while (columns * rows > static_cast<std::uint64_t>(kAffineMaxPoints) && dem_stride < 4096) {
+        dem_stride *= 2;
+        columns = static_cast<std::uint64_t>((dem_grid.width + dem_stride - 1) / dem_stride);
+        rows = static_cast<std::uint64_t>((dem_grid.height + dem_stride - 1) / dem_stride);
+    }
+
+    const std::size_t camera_count = cameras.size();
+    std::vector<ortho::OrthoCamera> ortho_cameras(camera_count);
+    const auto to_local = [&frame](const Eigen::Vector3d& p) { return frame.to_local(p); };
+    const Eigen::Vector2d metres_per_unit =
+        frame.metres_per_plane_unit(grid.pixel_center(0, grid.height / 2).y());
+    for (std::size_t k = 0; k < camera_count; ++k) {
+        const CameraEntry& entry = cameras[k];
+        ortho::OrthoCamera& camera = ortho_cameras[k];
+        camera.calibration = entry.calibration;
+        camera.R = entry.R;
+        camera.t = entry.t;
+        camera.plane_metres_per_unit = metres_per_unit;
+        if (!frame.is_local()) {
+            camera.plane_to_local = to_local;
+            camera.local_to_plane = [&frame](const Eigen::Vector3d& p) { return frame.to_plane(p); };
+            camera.plane_centre = frame.to_plane(entry.centre_local);
+        }
+    }
+
+    // -- pass 1: where does each lattice point land in each camera? -----------
+    // The photographs are not needed yet, so this pass costs a projection and an
+    // occlusion march per (point, camera) and nothing else. A point no camera
+    // sees is dropped before any image is decoded.
+    //
+    // Storage is per camera and COMPACT: each camera's `pixels[k]` grows in
+    // lockstep with its `points_by_camera[k]` entry, so camera k's n-th colour
+    // vector belongs to the n-th point in its list. A dense C x points lattice
+    // would be mostly empty -- most cameras see only part of the site -- and
+    // would make the sampler's memory follow the camera count rather than the
+    // number of actual observations.
+    std::vector<std::vector<ortho::SurfaceSample>> pixels(camera_count);
+    std::vector<std::pair<int, ortho::SurfaceSample>> at_point;
+    std::vector<std::vector<int>> points_by_camera(camera_count);
+    std::size_t point_count = 0;
+    for (std::uint64_t y = 0; y < rows; ++y) {
+        if (progress.is_cancelled()) {
+            throw Error("BuildOrthomosaic cancelled");
+        }
+        for (std::uint64_t x = 0; x < columns; ++x) {
+            const int col = static_cast<int>(x) * dem_stride;
+            const int row = static_cast<int>(y) * dem_stride;
+            if (!dem_grid.contains_pixel(col, row)) {
+                continue;
+            }
+            const float h = surface.at(col, row);
+            if (h == surface_nodata || std::isnan(h)) {
+                continue;
+            }
+            const Eigen::Vector2d xy = dem_grid.pixel_center(col, row);
+            const Eigen::Vector3d p(xy.x(), xy.y(), static_cast<double>(h));
+            at_point.clear();
+            for (std::size_t k = 0; k < camera_count; ++k) {
+                ortho::SurfaceSample sample;
+                if (!ortho::project_surface_point(surface, surface_nodata, ortho_cameras[k],
+                                                  occlusion_tolerance, p, surface_range,
+                                                  sample)) {
+                    continue;
+                }
+                // A pixel the rectifier would score near zero is at the image
+                // border (stretched) or seen at a grazing angle: poor evidence
+                // for a colour model, so it is not offered as one.
+                if (sample.score < kAffineMinSampleScore) {
+                    continue;
+                }
+                at_point.emplace_back(static_cast<int>(k), sample);
+            }
+            if (at_point.size() < 2) {
+                continue;  // seen by one camera: no pair, no observation
+            }
+            // Commit the point. Ordering inside `at_point` is by camera index,
+            // so every camera's list stays ascending in point id and the pair
+            // merge below is a straight walk.
+            const int local = static_cast<int>(point_count);
+            for (const auto& [k, sample] : at_point) {
+                points_by_camera[static_cast<std::size_t>(k)].push_back(local);
+                pixels[static_cast<std::size_t>(k)].push_back(sample);
+            }
+            ++point_count;
+        }
+        progress.update(stage, 0.5 * (static_cast<double>(y + 1) / static_cast<double>(rows)));
+    }
+    ortho_cameras.clear();
+    ortho_cameras.shrink_to_fit();
+
+    if (point_count == 0) {
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildOrthomosaic: affine colour model found no surface point "
+                                   "seen by two or more cameras; leaving every camera at the "
+                                   "identity";
+        }
+        return identity;
+    }
+
+    // -- pass 2: read each camera's colour at its own lattice points ----------
+    // One decode per camera (through the LRU cache), then every point that
+    // camera saw. `pixels[k][i]` and `colour[k][i]` both belong to
+    // `points_by_camera[k][i]`, so every vector shares one index.
+    std::vector<std::vector<std::array<float, 3>>> colour(camera_count);
+    for (std::size_t k = 0; k < camera_count; ++k) {
+        if (progress.is_cancelled()) {
+            throw Error("BuildOrthomosaic cancelled");
+        }
+        if (points_by_camera[k].empty()) {
+            continue;
+        }
+        const CameraEntry& entry = cameras[k];
+        const Image& image = photos.get(k, entry.image_path);
+        if (image.empty()) {
+            throw ValueError("BuildOrthomosaic: camera " + std::to_string(entry.camera_id) +
+                             " has an unreadable image");
+        }
+        colour[k].resize(pixels[k].size());
+        for (std::size_t i = 0; i < pixels[k].size(); ++i) {
+            std::uint8_t rgb[3] = {0, 0, 0};
+            pixels[k][i].sample_colour(image, rgb);
+            colour[k][i] = {static_cast<float>(rgb[0]) * (1.0F / 255.0F),
+                            static_cast<float>(rgb[1]) * (1.0F / 255.0F),
+                            static_cast<float>(rgb[2]) * (1.0F / 255.0F)};
+        }
+        // The samples are spent once the colour is read, and the photograph is
+        // about to be handed back to the cache: release both now, so the peak
+        // while the observations are being formed is the observations alone.
+        pixels[k].clear();
+        pixels[k].shrink_to_fit();
+        progress.update(stage, 0.5 + 0.4 * (static_cast<double>(k + 1) /
+                                           static_cast<double>(colour.size())));
+    }
+    pixels.clear();
+    pixels.shrink_to_fit();
+
+    // -- pair extraction and solve --------------------------------------------
+    // Reserve for what this flight can produce, capped: the estimate is
+    // points x pairs-per-point, and reserving the hard ceiling would cost 256 MB
+    // on a run that will never reach it.
+    const std::size_t pairs_per_point =
+        camera_count < 8 ? camera_count * (camera_count - 1) / 2 : 28;
+    const std::size_t estimate = point_count * std::max<std::size_t>(pairs_per_point, 1);
+    std::vector<ortho::ColourObservation> observations;
+    observations.reserve(std::min<std::size_t>(estimate, kAffineMaxObservations));
+    for (std::size_t k = 0; k < colour.size() && observations.size() < kAffineMaxObservations; ++k) {
+        if (points_by_camera[k].empty()) {
+            continue;
+        }
+        for (std::size_t other = k + 1; other < colour.size(); ++other) {
+            if (points_by_camera[other].empty()) {
+                continue;
+            }
+            // Walk both lists in lockstep: both are ascending in point id, so a
+            // merge is linear and needs no bitmap. i and j also index the
+            // per-camera colour vectors, which share the lists' order.
+            std::size_t i = 0;
+            std::size_t j = 0;
+            while (i < points_by_camera[k].size() && j < points_by_camera[other].size() &&
+                   observations.size() < kAffineMaxObservations) {
+                const int a = points_by_camera[k][i];
+                const int b = points_by_camera[other][j];
+                if (a < b) {
+                    ++i;
+                    continue;
+                }
+                if (b < a) {
+                    ++j;
+                    continue;
+                }
+                ortho::ColourObservation observation;
+                observation.a = static_cast<std::int32_t>(k);
+                observation.b = static_cast<std::int32_t>(other);
+                observation.value_a = colour[k][i];
+                observation.value_b = colour[other][j];
+                observations.push_back(observation);
+                ++i;
+                ++j;
+            }
+        }
+        // Release the camera's colour as its pairs are consumed: the model is
+        // solved from the pair list, not from the per-camera arrays.
+        colour[k].clear();
+        colour[k].shrink_to_fit();
+    }
+    colour.clear();
+    colour.shrink_to_fit();
+
+    if (observations.empty()) {
+        return identity;
+    }
+
+    const std::vector<ortho::CameraColour> solved =
+        ortho::solve_affine_colours(static_cast<int>(cameras.size()), observations);
+
+    if (Log::enabled(LogLevel::Info)) {
+        std::ostringstream text;
+        text << "BuildOrthomosaic: affine colour model over " << point_count
+             << " surface points, " << observations.size() << " camera-pair observations;";
+        static const char* const kNames[3] = {"r", "g", "b"};
+        for (std::size_t c = 0; c < 3; ++c) {
+            double g_lo = 1.0;
+            double g_hi = 1.0;
+            double o_lo = 0.0;
+            double o_hi = 0.0;
+            for (const ortho::CameraColour& colour_of : solved) {
+                const double a = colour_of.gain[c];
+                const double b = colour_of.offset[c];
+                g_lo = std::min(g_lo, a);
+                g_hi = std::max(g_hi, a);
+                o_lo = std::min(o_lo, b);
+                o_hi = std::max(o_hi, b);
+            }
+            text << ' ' << kNames[c] << "[gain " << format_number(g_lo) << " .. "
+                 << format_number(g_hi) << ", offset " << format_number(o_lo) << " .. "
+                 << format_number(o_hi) << " grey]";
+        }
+        log(LogLevel::Info) << text.str();
+    }
+    return solved;
+}
+
 }  // namespace
+
+// -- per-camera colour correction -------------------------------------------
+//
+// The model must be the SAME for every block (a block that solved its own would
+// disagree with its neighbour at the border), so it is estimated ONCE over the
+// whole flight before the block loop runs, and applied per camera inside each
+// block. The gain estimate never needs every cell: a coarse lattice of sample
+// cells gives each overlapping pair hundreds of colour samples, which pins a
+// per-channel mean far more precisely than a gain needs, at a memory cost of a
+// few megabytes rather than a whole extra ortho. The affine estimate samples
+// surface points instead (see estimate_camera_colours), because a gain and an
+// offset need the SPREAD across a shared area, not just its mean.
 
 int block_margin_cells(int block_cells, int pyramid_levels) {
     // The margin exists to make a block's interior identical to the whole grid's
@@ -1370,11 +1696,18 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
-    params.declare({"color_correction", ParamType::Bool, false,
-                    "Compensate per-camera brightness so photographs do not step at the "
-                    "seams (one gain per camera per channel, solved over the whole flight). "
-                    "Off by default: it changes every colour in the mosaic, so it is opt-in "
-                    "until the benchmark shows it is a clear improvement."});
+    ParamSpec color_correction{"color_correction", ParamType::String, std::string("none"),
+                               "Per-camera colour compensation applied before seams are chosen: "
+                               "\"none\" (default), \"gain\" (one brightness multiplier per camera "
+                               "per channel, Brown & Lowe 2007 section 6) or \"affine\" (a "
+                               "multiplier and an offset per camera per channel, solved jointly "
+                               "over surface points several cameras see, robustly, so a contrast "
+                               "difference is removed too). Off by default: it changes every "
+                               "colour in the mosaic, so it is opt-in until the benchmark shows a "
+                               "clear improvement. A Bool from an older project file is still "
+                               "read (true selects \"gain\")."};
+    color_correction.choices = {"none", "gain", "affine"};
+    params.declare(color_correction);
 
     ParamSpec resolution{"resolution", ParamType::Float, 0.0,
                          "Output cell size in projection units. 0 selects the true ground "
@@ -1886,17 +2219,24 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
     PhotoCache photos(plan.photo_cache_bytes);
 
-    // -- per-camera gains ----------------------------------------------------
-    // Solved ONCE over a coarse whole-grid lattice, before any block runs, so
-    // every block applies the same multiplier to the same camera. The gains live
-    // outside the block loop for exactly that reason: a per-block solve would
-    // make neighbouring blocks disagree at their shared border.
+    // -- per-camera colour correction -----------------------------------------
+    // Solved ONCE over the whole flight, before any block runs, so every block
+    // applies the same model to the same camera. The model lives outside the
+    // block loop for exactly that reason: a per-block solve would make
+    // neighbouring blocks disagree at their shared border.
     //
-    // The estimator shares the block loop's PhotoCache, so the flight is decoded
+    // The two modes share this one place because they are two members of one
+    // family (a gain is the affine model with b = 0), must not be combined, and
+    // must both be active BEFORE the seam labeller sees the tiles -- a seam cost
+    // computed on uncorrected colour would pick the seam that looks cheapest
+    // before the correction and then step after it.
+    //
+    // The estimators share the block loop's PhotoCache, so the flight is decoded
     // at most twice even when the cache is too small to keep it.
     std::vector<std::array<double, 3>> gains(
         cameras.size(), std::array<double, 3>{1.0, 1.0, 1.0});
-    if (options.color_correction) {
+    std::vector<ortho::CameraColour> colours(cameras.size());
+    if (options.colour == ColourMode::Gain) {
         gains = estimate_camera_gains(cameras, frame, surface, surface_nodata,
                                       surface_range, occlusion_tolerance, grid,
                                       kGainSampleStride, fallback_height, photos, progress,
@@ -1914,6 +2254,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                                 << " over " << cameras.size() << " cameras (sample stride "
                                 << kGainSampleStride << ")";
         }
+    } else if (options.colour == ColourMode::Affine) {
+        colours = estimate_camera_colours(cameras, frame, surface, surface_nodata, surface_range,
+                                          occlusion_tolerance, grid, kGainSampleStride, photos,
+                                          progress, "color_correction");
     }
 
     // The global cell lattice: a window's cell (col, row) is global cell
@@ -2107,11 +2451,19 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     surface, surface_nodata, window, camera, static_cast<int>(k),
                     occlusion_tolerance, true, &surface_range,
                     plan.block_cells > 0 ? &cell_lattice : nullptr));
-                // Apply the camera's precomputed gain to the tile just rectified.
-                // The gains are whole-flight constants (see estimate_camera_gains),
-                // so a block and the whole grid apply the same multiplier.
-                if (options.color_correction) {
+                // Apply the camera's precomputed correction to the tile just
+                // rectified, BEFORE the seam labeller reads it. The model is a
+                // whole-flight constant (see estimate_camera_gains /
+                // estimate_camera_colours), so a block and the whole grid apply
+                // exactly the same coefficients and no block border disagrees.
+                // Applying here rather than after the blend is what makes the
+                // seam cost see corrected colours, which is the point of the
+                // stage: a seam chosen on uncorrected colour is chosen for the
+                // wrong reason.
+                if (options.colour == ColourMode::Gain) {
                     ortho::apply_gain(tiles.back(), gains[block_cameras[k]]);
+                } else if (options.colour == ColourMode::Affine) {
+                    ortho::apply_colour(tiles.back(), colours[block_cameras[k]]);
                 }
                 progress.update("rectify",
                                 (static_cast<double>(block_index) +
