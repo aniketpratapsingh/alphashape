@@ -66,9 +66,11 @@ constexpr std::uint64_t kRansacSeed = 0x243F6A8885A308D3ULL;
 constexpr double kDepthSpanMargin = 0.01;
 
 // |cos| between the viewing ray and the plane normal below which the
-// intersection is too grazing to trust: at <3 degrees the depth divides by a
-// number near zero, so pixel noise in the normal becomes metres of depth. 0.05
-// (87.1 degrees) is where a plane is still sampled in the depth image at all.
+// intersection is too grazing to trust. A small cosine means the ray meets the
+// plane almost edge-on, so the depth divides by a number near zero and pixel
+// noise in the fitted normal becomes metres of depth. 0.05 is ~87 degrees from
+// the normal (3 degrees from the plane): at that incidence the plane is barely
+// sampled in a depth image at all, so a fill there is not trustworthy either.
 constexpr double kMinRayCosine = 0.05;
 
 /// A plane n . x = offset in camera space; `normal` is unit length.
