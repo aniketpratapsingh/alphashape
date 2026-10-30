@@ -49,6 +49,51 @@ OUR_PRODUCT_MAX_CELLS = 64_000_000
 # until the padded grid fits under this.
 _MAX_PADDED = 1 << 26
 
+# -- ortho colour-consistency metric -----------------------------------------
+#
+# The mosaic's own seam labels live in the Orthomosaic asset but the GeoTIFF
+# export drops them, so a metrics file can only see colour. The seam metric
+# therefore looks for the *evidence* of a seam in the mosaic itself: a coherent
+# brightness step along a full row/column of boundary between adjacent cells.
+#
+# Rec.709 weights on the STORED (sRGB-encoded) values. The metric is a difference
+# of stored values, which is exactly what a per-camera gain acts on, and a monotone
+# per-channel weighting keeps a red-vs-green cast visible instead of cancelling it
+# the way a plain channel mean would. No decode is applied.
+SEAM_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
+
+# A boundary sample counts only when BOTH three-cell windows beside it are flat to
+# within this fraction of full scale. Above it the scene itself changes there (a
+# roof edge, a shadow line) and a difference across the boundary is not evidence
+# of a seam. Sensor noise is ~1/255 = 0.004, well under it, so a real mosaic still
+# yields hundreds of qualifying samples per boundary line.
+SEAM_FLAT_TOLERANCE = 0.02
+
+# A boundary LINE is a run of cells along one boundary between cell columns (or
+# rows). Its step is the median difference over its flat samples; a line is a SEAM
+# when |step| clears this absolute floor (about four grey levels of 255). On flat
+# ground a gain-induced step is a coherent offset of at least that much, while
+# sensor noise averages out over the line's samples. An absolute floor is used
+# rather than a per-line noise estimate because a fully flat line has near-zero
+# internal scatter and would otherwise promote its own rounding noise.
+SEAM_MIN_STEP = 0.015
+# Fewer flat samples than this on a line and its median is noise, not a step.
+SEAM_MIN_LINE_SAMPLES = 16
+# The whole scan needs at least this many flat samples to report anything; below
+# it the answer is "unmeasured", not "zero". A mosaic with almost no flat ground
+# genuinely has no seam to measure, and saying 0.0 would claim a perfect seam.
+SEAM_MIN_SAMPLES = 64
+# Ceiling on the decimated grid the seam scan works on. The scan is a per-cell
+# numpy pass over every interior boundary, so it is bounded for the same reason
+# MASK_MAX_SIDE is: a bigger grid reports the same seam at more cost.
+SEAM_MAX_CELLS = 4_000_000
+
+# Ceiling on the grid the reference colour residual is fitted on. The fit is a
+# per-channel least squares over every valid cell, and a survey reference is
+# hundreds of megapixels; a few million cells estimate two parameters to far more
+# precision than the residual being measured.
+COLOUR_MAX_CELLS = 4_000_000
+
 
 # ---------------------------------------------------------------------------
 # Core value types
@@ -1981,6 +2026,9 @@ def ortho_metrics(ortho: Raster, *, texture_max_side: int = 1024) -> dict:
         "texture_samples": texture["samples"],
         "texture_window_px": texture.get("window"),
         "epsg": ortho.epsg,
+        # Brightness steps along the mosaic's own seams, found without seam labels:
+        # this is what per-camera gain compensation is measured on.
+        "colour_consistency": ortho_colour_consistency(ortho),
     }
 
 
@@ -2030,6 +2078,256 @@ def _texture_crop(ortho: Raster, validity: np.ndarray, max_side: int) -> dict:
         "samples": int(rgb.shape[0] * rgb.shape[1]),
         "window": [int(c0), int(r0), int(c1 - c0), int(r1 - r0)],
     }
+
+
+def _ortho_rgb_valid(ortho: Raster) -> tuple[np.ndarray, np.ndarray]:
+    """(rgb in [0, 1] float64, validity) at the mosaic's own resolution.
+
+    The same rules as ``ortho_metrics``: the alpha band, when present, is the
+    engine's "this cell came from an image" flag, so validity comes from it rather
+    than from the colour. The scale is the actual peak, so a uint8 mosaic reads as
+    [0, 1] and a 16-bit one does not swamp a difference meant to be compared with
+    a fraction of full scale.
+    """
+    if ortho.bands >= 4:
+        validity = ortho.band(3) > 0
+    elif ortho.nodata is not None:
+        validity = ortho.validity()
+    else:
+        validity = np.ones((ortho.height, ortho.width), dtype=bool)
+
+    rgb = np.stack(
+        [ortho.band(ch) for ch in range(min(3, ortho.bands))], axis=2
+    ).astype(np.float64)
+    peak = float(rgb.max()) if rgb.size else 0.0
+    if peak > 1.5:
+        rgb /= 255.0 if peak <= 255.0 else peak
+    return rgb, validity
+
+
+def _seam_luma(rgb: np.ndarray) -> np.ndarray:
+    """Rec.709 luminance of an (h, w, c) array; a single band is itself."""
+    if rgb.shape[2] >= 3:
+        return rgb[:, :, :3] @ np.asarray(SEAM_LUMA_WEIGHTS, dtype=np.float64)
+    return rgb[:, :, 0]
+
+
+def ortho_colour_consistency(ortho: Raster) -> dict:
+    """Reference-free brightness-step statistics across the mosaic's seams.
+
+    A per-camera gain error shows up in an orthomosaic as a brightness step where
+    the seamline hands a cell from one photograph to the next. The GeoTIFF export
+    carries no seam labels, so the seams are found from the colour: at every
+    interior boundary between cell columns (and, separately, rows), a boundary
+    SAMPLE exists wherever the 3-cell window on each side is valid and flat. Its
+    value is the difference of the two window means. Texture is rejected by the
+    flatness test, so what remains is a boundary that separates two areas of
+    similar, low-gradient ground — exactly where a gain step would be visible.
+
+    The samples are grouped into boundary LINES (one per boundary between cell
+    columns, or rows). A line is a SEAM when its median step clears an absolute
+    floor, ``SEAM_MIN_STEP``. This is what separates a real seam from the mass of
+    flat boundaries that step by nothing: pooling all boundary cells and taking a
+    median drowns a real seam in the thousands of no-step cells around it, whereas
+    a per-line median followed by a floor finds it.
+
+    Reported, in fraction of full scale:
+
+      * ``seam_step`` — the median |step| over the detected seam lines. This is
+        the typical brightness discontinuity along the seams; a well-corrected
+        mosaic drives it to zero.
+      * ``seam_step_max`` — the worst seam line, so one uncorrected photograph is
+        not hidden by a median over the rest.
+      * ``seam_lines`` — how many boundary lines were called seams.
+      * ``seam_samples`` — the number of flat boundary cells examined.
+
+    ``seam_step_measured`` is false when too few flat samples qualify at all,
+    because reporting 0.0 would claim a perfect seam on a mosaic with no flat
+    ground to judge one on; the absence of any seam LINE on a mosaic that does
+    have flat ground is a genuine 0.0.
+    """
+    rgb, validity = _ortho_rgb_valid(ortho)
+    luma = _seam_luma(rgb)
+
+    # Decimate by an integer stride to bound the cost. A seam is a coherent
+    # offset along a line, so it survives coarsening; only the sample count falls.
+    height, width = luma.shape
+    stride = 1
+    while (
+        math.ceil(height / stride) * math.ceil(width / stride) > SEAM_MAX_CELLS
+        and stride < 32
+    ):
+        stride += 1
+    if stride > 1:
+        luma = luma[::stride, ::stride]
+        validity = validity[::stride, ::stride]
+
+    vertical = _seam_lines(luma, validity, axis=1)  # boundaries between columns
+    horizontal = _seam_lines(luma, validity, axis=0)  # boundaries between rows
+    lines = vertical["lines"] + horizontal["lines"]
+    samples = vertical["samples"] + horizontal["samples"]
+
+    out: dict = {
+        "mask_stride": stride,
+        "seam_samples": samples,
+        "seam_lines": len(lines),
+        "seam_step_measured": samples >= SEAM_MIN_SAMPLES,
+    }
+    if not out["seam_step_measured"]:
+        out["seam_step"] = None
+        out["seam_step_max"] = None
+        out["seam_step_reason"] = "too few flat boundary samples"
+        return out
+    if not lines:
+        # Flat ground everywhere and no line steps: a genuine clean seam.
+        out["seam_step"] = 0.0
+        out["seam_step_max"] = 0.0
+        return out
+
+    steps = np.abs(np.array([line["step"] for line in lines], dtype=np.float64))
+    out["seam_step"] = float(np.median(steps))
+    out["seam_step_p90"] = float(np.percentile(steps, 90))
+    out["seam_step_max"] = float(steps.max())
+    return out
+
+
+def _seam_lines(luma: np.ndarray, valid: np.ndarray, *, axis: int) -> dict:
+    """Detect the seam lines parallel to an axis.
+
+    ``axis=1`` treats each boundary between cell COLUMNS: a line is one column
+    index and its samples run down the rows. ``axis=0`` is the transpose, so one
+    implementation serves both.
+
+    The boundary between cells ``c`` and ``c+1`` gets a sample wherever BOTH
+    3-cell windows that touch it are entirely valid and flat (peak-to-trough
+    within ``SEAM_FLAT_TOLERANCE``); the sample is the difference of the two
+    window means. Requiring both sides flat is what separates a gain step from
+    ordinary texture, and averaging over three cells keeps one noisy pixel from
+    faking an edge. A line whose median |sample| reaches ``SEAM_MIN_STEP`` is a
+    seam.
+    """
+    a = luma if axis == 1 else luma.T
+    m = valid if axis == 1 else valid.T
+    _, cols = a.shape
+    lines: list[dict] = []
+    total = 0
+
+    # c is the last column of the LEFT window; the right window starts at c+1, so
+    # c ranges over the boundaries with a full 3-cell window on each side.
+    for c in range(2, cols - 3):
+        left = a[:, c - 2 : c + 1]
+        right = a[:, c + 1 : c + 4]
+        keep = (
+            m[:, c - 2 : c + 1].all(axis=1)
+            & m[:, c + 1 : c + 4].all(axis=1)
+            & (np.ptp(left, axis=1) <= SEAM_FLAT_TOLERANCE)
+            & (np.ptp(right, axis=1) <= SEAM_FLAT_TOLERANCE)
+        )
+        count = int(keep.sum())
+        total += count
+        if count < SEAM_MIN_LINE_SAMPLES:
+            continue
+        diff = right[keep].mean(axis=1) - left[keep].mean(axis=1)
+        step = float(np.median(diff))
+        if abs(step) >= SEAM_MIN_STEP:
+            lines.append({"boundary": c, "step": step, "samples": count})
+    return {"lines": lines, "samples": total}
+
+
+def ortho_colour_error_vs_reference(ours: Raster, reference: Raster) -> dict:
+    """Local colour residual against a reference mosaic, after a global fit.
+
+    The reference is another pipeline's mosaic of the same photographs, so its
+    absolute white balance differs from ours for reasons that are not an error.
+    A single per-channel affine fit — ``a * ours + b``, one ``a`` and one ``b``
+    for the whole mosaic — absorbs that difference, and what is left is the
+    LOCAL inconsistency: a per-camera gain error is a spatially varying offset
+    that no single affine can remove, so it survives the fit and shows up in the
+    residual.
+
+    The fit is least squares over every cell valid on both sides, which is the
+    maximum-likelihood estimate under a symmetric error and is not sensitive to
+    the scale difference between the two products (the residual is reported in
+    the reference's own [0, 1] scale, since that is what the fit is expressed in).
+
+    Returns per-channel and luminance ``median``/``p90``/``rms`` absolute
+    residuals plus the fitted slope and offset, so a reader can tell "our mosaic
+    is uniformly brighter" (slope far from 1) from "our mosaic has local seams"
+    (slope near 1, residual large).
+    """
+    ox, oy, pixel, width, height = common_grid(ours, reference, max_cells=COLOUR_MAX_CELLS)
+    a, a_valid = resample_to_grid(
+        ours, origin_x=ox, origin_y=oy, pixel_size=pixel, width=width, height=height
+    )
+    b, b_valid = resample_to_grid(
+        reference, origin_x=ox, origin_y=oy, pixel_size=pixel, width=width, height=height
+    )
+    both = a_valid & b_valid
+    if int(both.sum()) < SEAM_MIN_SAMPLES:
+        return {"comparable": False, "reason": "too few overlapping pixels"}
+
+    # Peak-normalise each side independently. A 16-bit product against an 8-bit
+    # reference would otherwise differ by a constant factor that the fit absorbs
+    # as a slope of 255 and a residual of meaningless size.
+    a = _normalise_peak(a)
+    b = _normalise_peak(b)
+
+    bands = min(3, a.shape[2], b.shape[2])
+    out: dict = {"comparable": True, "grid_pixel_m": pixel, "grid_size": [int(width), int(height)]}
+    per_channel: dict[str, dict] = {}
+    residuals_luma = []
+    for ch in range(bands):
+        x = a[:, :, ch][both]
+        y = b[:, :, ch][both]
+        slope, offset = _fit_affine(x, y)
+        residual = slope * x + offset - y
+        per_channel[_CHANNEL_NAMES[ch]] = {
+            "slope": float(slope),
+            "offset": float(offset),
+            "median": float(np.median(np.abs(residual))),
+            "p90": float(np.percentile(np.abs(residual), 90)),
+            "rms": float(np.sqrt(np.mean(residual * residual))),
+        }
+        residuals_luma.append(residual)
+
+    out["channels"] = per_channel
+    luma = np.abs(np.mean(residuals_luma, axis=0))
+    out["luma"] = {
+        "median": float(np.median(luma)),
+        "p90": float(np.percentile(luma, 90)),
+        "rms": float(np.sqrt(np.mean(luma * luma))),
+    }
+    out["compared_cells"] = int(both.sum())
+    out["overlap_fraction"] = float(both.sum()) / float(a_valid.sum()) if a_valid.any() else 0.0
+    return out
+
+
+_CHANNEL_NAMES = ("red", "green", "blue")
+
+
+def _normalise_peak(values: np.ndarray) -> np.ndarray:
+    """Scale an array to [0, 1] by its peak when it is clearly not already there."""
+    peak = float(np.nanmax(values)) if values.size else 0.0
+    if peak > 1.5:
+        return values / (255.0 if peak <= 255.0 else peak)
+    return values
+
+
+def _fit_affine(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Least-squares ``y ~ slope * x + offset``, with a degenerate-safe fallback.
+
+    A flat channel (every sample equal) makes the normal equations singular; the
+    right answer there is "match the mean", i.e. slope 1 and the offset that does
+    it, not a divide-by-zero.
+    """
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    dx = x - x_mean
+    denom = float(np.dot(dx, dx))
+    if denom <= 1e-12:
+        return 1.0, y_mean - x_mean
+    slope = float(np.dot(dx, y - y_mean) / denom)
+    return slope, y_mean - slope * x_mean
 
 
 def dem_metrics(dem: Raster, *, reference: Raster | None = None) -> dict:
@@ -2238,6 +2536,12 @@ def evaluate(
             )
             comparison = compare_ortho_to_reference(ortho, reference)
             comparison["crs"] = provenance
+            # Local colour residual after a global affine fit: the reference's
+            # white balance is absorbed, a per-camera gain error is not.
+            try:
+                comparison["colour_error"] = ortho_colour_error_vs_reference(ortho, reference)
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                comparison["colour_error"] = {"skipped": f"colour comparison failed: {exc}"}
             result["reference_based"]["ortho"] = comparison
         except Exception as exc:  # noqa: BLE001
             result["reference_based"]["ortho"] = {"skipped": f"reference unusable: {exc}"}

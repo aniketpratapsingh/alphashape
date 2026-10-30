@@ -56,6 +56,7 @@ add_library(alphashape_algorithms STATIC
     ortho/orthorectify.cpp
     ortho/seamlines.cpp
     ortho/blend.cpp
+    ortho/gain.cpp
     ortho/build_orthomosaic_task.cpp
     ortho/export_orthomosaic_task.cpp
 )

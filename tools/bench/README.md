@@ -23,6 +23,7 @@ only when the publisher ships a matching reference product.
 | Holes inside the convex hull | gaps inside the surveyed area, with their count and area in m² |
 | Effective resolution | how much resolution the mosaic actually carries, as a multiple of the mosaic's own cell size (a matched-blur MTF50-equivalent measured on a full-resolution window) |
 | Gradient energy | raw sharpness, the quantity the effective resolution is derived from |
+| Seam step | median brightness step (fraction of full scale) along the mosaic's seams, found from the colour because the GeoTIFF export carries no seam labels; a per-camera gain error reads as a step here |
 | DEM nodata fraction | share of DEM cells with no measurement |
 | Cameras aligned | aligned / total cameras in the saved project |
 | Reprojection RMS | the engine's own bundle-adjustment RMS, parsed from its `AlignCameras` output, plus an independent re-projection from the saved project (see below) |
@@ -32,6 +33,7 @@ only when the publisher ships a matching reference product.
 | Metric | Reference | What it says |
 |---|---|---|
 | Ortho offset | a reference orthomosaic | residual plan-view offset in metres, by phase correlation on luminance |
+| Ortho colour error | a reference orthomosaic | median and p90 local colour residual after one global per-channel affine fit; the fit absorbs a white-balance difference, so a spatially varying gain error survives as the residual |
 | DSM ΔZ | a reference DSM | the raw median offset (a vertical-datum difference, reported with both datums named) and, after removing it, the NMAD and the 68/95 percentiles of \|ΔZ\| — the spread the reconstruction itself contributes, which is what the gate compares |
 | Cloud accuracy / completeness | a laser scan | ETH3D's definition at 2/5/10 cm, after voxel normalisation |
 
@@ -178,7 +180,16 @@ gh workflow run quality-bench.yml --ref <branch> \
   -f dataset=aerial-nadir -f dem_params=sibson_exact_max_sites=20000
 ```
 
-Both parameters are merged over the dataset's own overrides for their task, so the
+`ortho_params` is the same input for `BuildOrthomosaic`. It is how the per-camera gain
+compensation (`color_correction=true`) is measured against a control run of the same
+dataset:
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=aerial-nadir -f ortho_params=color_correction=true
+```
+
+All three parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are
 validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and
 reach the script through an environment variable, never interpolated into a shell line.
@@ -195,8 +206,8 @@ Such a run is an **experiment**, and differs from a normal run in three ways:
 
 An experimental baseline is also refused on the way in: when the newest successful runs
 have no baseline artifact the lookup walks back to one that does, and a restored baseline
-that itself records `depth_params` or `dem_params` is only ever compared against, never
-gated on.
+that itself records `depth_params`, `dem_params` or `ortho_params` is only ever compared
+against, never gated on.
 
 Every scheduled, push and ordinary manual run passes an empty string, which is the same
 argv and the same metrics JSON as before this input existed.
@@ -209,8 +220,8 @@ never publishes a baseline, so without a way to adopt the trade-off every later 
 fail against a baseline nobody can reach any more.
 
 An on-demand run can accept the trade-off explicitly. Dispatch it on the **default
-branch**, with no `depth_params` and no `dem_params`, and a reason of at most 200
-printable characters:
+branch**, with no `depth_params`, no `dem_params` and no `ortho_params`, and a reason of at
+most 200 printable characters:
 
 ```sh
 gh workflow run quality-bench.yml --ref main \
@@ -230,10 +241,11 @@ An accepted run differs from a normal one in these ways, and in no others:
   itself months later.
 
 The input is refused with an error, and the run fails before reporting, when it is
-combined with `depth_params` or `dem_params` (an experiment measures a configuration and
-is never a baseline), or when the run is not on the default branch. That second rule
-matters: a feature branch must never move the baseline the whole project is measured
-against, so the accepting run is dispatched on `main` *after* the change is merged.
+combined with `depth_params`, `dem_params` or `ortho_params` (an experiment measures a
+configuration and is never a baseline), or when the run is not on the default branch. That
+second rule matters: a feature branch must never move the baseline the whole project is
+measured against, so the accepting run is dispatched on `main` *after* the change is
+merged.
 
 Every schedule-triggered run has no dispatch inputs at all, so its behaviour is unchanged.
 

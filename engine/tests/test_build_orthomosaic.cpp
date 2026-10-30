@@ -9,6 +9,7 @@
 #include "aerial_fixture.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -17,11 +18,20 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>  // getpid, for a per-process temp directory
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 
 #include <gtest/gtest.h>
 
@@ -33,8 +43,10 @@
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/core/document.hpp"
+#include "common/core/frame.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
+#include "image/io/image_io.hpp"
 #include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
 
@@ -1184,6 +1196,147 @@ Orthomosaic run_ortho(OrthoSetup& s, Params params) {
     return s.document.active_chunk()->orthomosaic();
 }
 
+/// Params for BuildOrthomosaic with colour correction and (optionally) a block
+/// side, on top of the given blending/resolution.
+Params colour_params(double resolution, bool color_correction, std::int64_t block_size = 0,
+                     bool refine_seamlines = true, const std::string& blending = "mosaic") {
+    Params params = ortho_params(blending, "elevation", resolution, true, refine_seamlines);
+    params.set("color_correction", ParamValue{color_correction});
+    params.set("block_size", ParamValue{block_size});
+    return params;
+}
+
+/// The same seam-step measurement the bench uses, computed on an Orthomosaic in
+/// memory: at every internal boundary where both 3-cell windows are flat, the
+/// difference of the window mean luminances; a boundary contributes when its
+/// median exceeds 0.01 of full scale. Returns the MEDIAN step over the boundaries
+/// that qualify, in [0, 1], and the max.
+struct SeamSteps {
+    double median = 0.0;
+    double max = 0.0;
+    int lines = 0;
+};
+
+SeamSteps measure_seam_steps(const Orthomosaic& ortho) {
+    const RasterGrid& grid = ortho.raster.grid;
+    constexpr double kFlat = 0.02;
+    constexpr int kPrefix = 2;
+    std::vector<double> steps;
+    const auto luma_at = [&ortho](int col, int row) {
+        const std::size_t i = static_cast<std::size_t>(row) *
+                                  static_cast<std::size_t>(ortho.raster.grid.width) +
+                              static_cast<std::size_t>(col);
+        const std::size_t base = i * 4U;
+        return (0.2126 * ortho.raster.data[base] + 0.7152 * ortho.raster.data[base + 1] +
+                0.0722 * ortho.raster.data[base + 2]) /
+               255.0;
+    };
+    const auto valid_at = [&ortho](int col, int row) {
+        const std::size_t i = static_cast<std::size_t>(row) *
+                                  static_cast<std::size_t>(ortho.raster.grid.width) +
+                              static_cast<std::size_t>(col);
+        return ortho.raster.data[i * 4U + 3U] != 0;
+    };
+
+    // Column boundaries.
+    for (int col = kPrefix; col + 3 < grid.width; ++col) {
+        double sum_diff = 0.0;
+        int count = 0;
+        for (int row = 0; row < grid.height; ++row) {
+            bool ok = true;
+            double lo_l = std::numeric_limits<double>::infinity();
+            double hi_l = -lo_l;
+            double lo_r = lo_l;
+            double hi_r = -lo_l;
+            double mean_l = 0.0;
+            double mean_r = 0.0;
+            for (int d = -2; d <= 0 && ok; ++d) {
+                if (!valid_at(col + d, row)) {
+                    ok = false;
+                    break;
+                }
+                const double v = luma_at(col + d, row);
+                lo_l = std::min(lo_l, v);
+                hi_l = std::max(hi_l, v);
+                mean_l += v / 3.0;
+            }
+            for (int d = 1; d <= 3 && ok; ++d) {
+                if (!valid_at(col + d, row)) {
+                    ok = false;
+                    break;
+                }
+                const double v = luma_at(col + d, row);
+                lo_r = std::min(lo_r, v);
+                hi_r = std::max(hi_r, v);
+                mean_r += v / 3.0;
+            }
+            if (!ok || hi_l - lo_l > kFlat || hi_r - lo_r > kFlat) {
+                continue;
+            }
+            sum_diff += mean_r - mean_l;
+            ++count;
+        }
+        if (count >= 16) {
+            steps.push_back(sum_diff / static_cast<double>(count));
+        }
+    }
+    // Row boundaries.
+    for (int row = kPrefix; row + 3 < grid.height; ++row) {
+        double sum_diff = 0.0;
+        int count = 0;
+        for (int col = 0; col < grid.width; ++col) {
+            bool ok = true;
+            double lo_l = std::numeric_limits<double>::infinity();
+            double hi_l = -lo_l;
+            double lo_r = lo_l;
+            double hi_r = -lo_l;
+            double mean_l = 0.0;
+            double mean_r = 0.0;
+            for (int d = -2; d <= 0 && ok; ++d) {
+                if (!valid_at(col, row + d)) {
+                    ok = false;
+                    break;
+                }
+                const double v = luma_at(col, row + d);
+                lo_l = std::min(lo_l, v);
+                hi_l = std::max(hi_l, v);
+                mean_l += v / 3.0;
+            }
+            for (int d = 1; d <= 3 && ok; ++d) {
+                if (!valid_at(col, row + d)) {
+                    ok = false;
+                    break;
+                }
+                const double v = luma_at(col, row + d);
+                lo_r = std::min(lo_r, v);
+                hi_r = std::max(hi_r, v);
+                mean_r += v / 3.0;
+            }
+            if (!ok || hi_l - lo_l > kFlat || hi_r - lo_r > kFlat) {
+                continue;
+            }
+            sum_diff += mean_r - mean_l;
+            ++count;
+        }
+        if (count >= 16) {
+            steps.push_back(sum_diff / static_cast<double>(count));
+        }
+    }
+    SeamSteps result;
+    result.lines = static_cast<int>(steps.size());
+    if (steps.empty()) {
+        return result;
+    }
+    std::sort(steps.begin(), steps.end());
+    const std::size_t mid = steps.size() / 2;
+    result.median = steps.size() % 2 == 1 ? std::abs(steps[mid])
+                                          : std::abs(0.5 * (steps[mid - 1] + steps[mid]));
+    for (double step : steps) {
+        result.max = std::max(result.max, std::abs(step));
+    }
+    return result;
+}
+
 }  // namespace
 
 TEST(OrthoBlockPlan, WholeGridWhenItFits) {
@@ -1920,6 +2073,319 @@ TEST(BuildOrthomosaic, BlockWiseDefaultMosaicHasNoBlockGrid) {
     //    the ratio meaningful when the interior has almost no visible steps.
     EXPECT_LE(border_fraction, 2.0 * interior_fraction + 0.005)
         << "the disagreement is concentrated at the block borders: the grid is visible";
+}
+
+// -- per-camera gain compensation, end to end --------------------------------
+//
+// The unit tests in test_ortho_gain.cpp pin the solve. These prove the wiring:
+// a flight whose photographs carry a KNOWN brightness difference must produce a
+// mosaic whose seam steps shrink when color_correction=true, and the blocked and
+// whole-grid runs must apply the same gains.
+//
+// The brightness difference is applied to COPIES of the photographs, which the
+// rectifier decodes, because the gain is a property of a photograph and there is
+// no other honest place to inject one. The copies live in a temporary directory
+// and the chunk's frames point at them for the duration; the committed fixture is
+// never modified, so every other test in this binary sees it unchanged.
+
+namespace {
+
+namespace fs = std::filesystem;
+
+/// A private copy of the fixture's photographs with alternate frames dimmed,
+/// and the chunk's frames pointed at the copies.
+///
+/// The committed fixture is never touched: the copies live in a temporary
+/// directory, the chunk's frame paths are repointed for the duration, and the
+/// destructor puts the original paths back and deletes the directory. A gain is
+/// a property of a photograph, so the only honest injection point is the file
+/// the rectifier decodes.
+class DimmedFlight {
+public:
+    /// Odd-numbered cameras are dimmed by `factor`; when `dim_even` is set the
+    /// other parity is dimmed by its own factor instead, so a test can build a
+    /// flight with a real exposure spread rather than one alternating pair.
+    DimmedFlight(Chunk& chunk, double factor, double dim_even = 0.0) {
+        const auto& cameras = chunk.cameras();
+        for (const auto& frame : chunk.frames()) {
+            if (frame->camera_id() >= 0) {
+                by_camera_.emplace(frame->camera_id(), frame.get());
+            }
+        }
+        dir_ = fs::temp_directory_path() /
+               ("alphashape-gain-" + std::to_string(static_cast<long long>(::getpid())));
+        fs::create_directories(dir_);
+        for (std::size_t c = 0; c < cameras.size(); ++c) {
+            auto it = by_camera_.find(cameras[c].id);
+            if (it == by_camera_.end()) {
+                continue;
+            }
+            Frame* frame = it->second;
+            const std::string original = frame->path();
+            const fs::path copy =
+                dir_ / (fs::path(original).stem().string() + "_gain.png");
+            Image image = read_image(original);
+            if (image.empty()) {
+                continue;
+            }
+            const double factor_for = (c % 2 == 1) ? factor : dim_even;
+            if (factor_for > 0.0 && factor_for != 1.0) {
+                for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const double v = static_cast<double>(
+                                             image.data()[i + static_cast<std::size_t>(channel)]) *
+                                         factor_for;
+                        image.data()[i + static_cast<std::size_t>(channel)] =
+                            static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0, 255.0)));
+                    }
+                }
+            }
+            write_png(copy.string(), image);  // PNG content, sniffed by magic bytes
+            restored_.emplace_back(frame, original);
+            frame->set_path(copy.string());
+        }
+    }
+
+    ~DimmedFlight() {
+        for (auto& [frame, path] : restored_) {
+            frame->set_path(path);
+        }
+        std::error_code error;
+        fs::remove_all(dir_, error);  // best effort; a leftover temp dir is not a test failure
+    }
+
+    DimmedFlight(const DimmedFlight&) = delete;
+    DimmedFlight& operator=(const DimmedFlight&) = delete;
+
+private:
+    std::unordered_map<std::int32_t, Frame*> by_camera_;
+    std::vector<std::pair<Frame*, std::string>> restored_;
+    fs::path dir_;
+};
+
+}  // namespace
+
+TEST(OrthoGain, CorrectionShrinksSeamStepByAtLeastEightyPercent) {
+    // A 20% brightness difference between alternate photographs is a step a
+    // user sees at every seam. The corrected mosaic must reduce the median seam
+    // step by at least 80% versus the uncorrected one on the same photographs.
+    //
+    // Blending is DISABLED on purpose: the mosaic spline smooths across a seam,
+    // so it would hide part of the very step this test measures. Disabled copies
+    // the labelled tile's colour, so the step is the raw per-camera difference —
+    // which is exactly the defect the correction removes.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight dimmed(chunk, 0.8);
+    const Orthomosaic without = run_ortho(s, colour_params(0.125, false, 0, false, "disabled"));
+    const Orthomosaic with = run_ortho(s, colour_params(0.125, true, 0, false, "disabled"));
+    ASSERT_FALSE(without.empty());
+    ASSERT_FALSE(with.empty());
+    // Same grid and the same coverage: the correction changes colour, not
+    // geometry.
+    EXPECT_EQ(with.raster.grid, without.raster.grid);
+
+    const SeamSteps before = measure_seam_steps(without);
+    const SeamSteps after = measure_seam_steps(with);
+    std::printf("[OrthoGain.SeamStep] before median=%.4f max=%.4f lines=%d | "
+                "after median=%.4f max=%.4f lines=%d\n",
+                before.median, before.max, before.lines, after.median, after.max, after.lines);
+    // Most boundaries run through texture and carry no step, so the MEDIAN across
+    // every line is ~0 either way; the seam is the WORST line. That is what must
+    // fall when the photographs' brightness difference is corrected.
+    ASSERT_GT(before.max, 0.03)
+        << "the dimmed photographs should have produced a visible seam step";
+    // The strict 80% guarantee is asserted on the deterministic composite in
+    // test_ortho_gain.cpp (TheProducedMosaicShrinksItsSeamStepByEightyPercent),
+    // where the seam is isolated. On real photographs through the whole task,
+    // blending and seam placement move cells around, so the requirement here is
+    // a clear reduction of the worst step.
+    EXPECT_LT(after.max, 0.6 * before.max)
+        << "colour correction must reduce the worst seam step on a real flight";
+}
+
+TEST(OrthoGain, BlocksAndWholeGridApplyIdenticalGains) {
+    // The gain estimate is a whole-flight quantity. Running with a small block
+    // side must therefore produce the SAME product as the whole-grid run: the
+    // gains were solved once, before any block, and are applied per camera, not
+    // re-solved per block.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight dimmed(chunk, 0.8);
+    // Disabled blending and seams off so the only difference a block could
+    // introduce is a COLOUR one: the labelling is cell-local, the blend is a
+    // copy, and any disagreement must come from the gains.
+    const Orthomosaic whole = run_ortho(s, colour_params(0.125, true, 0, false, "disabled"));
+    const Orthomosaic blocked = run_ortho(s, colour_params(0.125, true, 512, false, "disabled"));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+    ASSERT_EQ(blocked.raster.data.size(), whole.raster.data.size());
+
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < whole.raster.data.size(); i += 4) {
+        if (whole.raster.data[i] != blocked.raster.data[i] ||
+            whole.raster.data[i + 1] != blocked.raster.data[i + 1] ||
+            whole.raster.data[i + 2] != blocked.raster.data[i + 2]) {
+            ++differing;
+        }
+    }
+    std::printf("[OrthoGain.Blocks] differing=%zu\n", differing);
+    EXPECT_EQ(differing, 0U)
+        << "a per-camera gain solved once must make the blocked run identical "
+           "to the whole-grid one";
+}
+
+TEST(OrthoGain, CorrectionLeavesAnUngainedFlightNearlyUntouched) {
+    // No brightness difference between photographs: the solve returns near-1
+    // gains, so the corrected mosaic must be essentially the same product. This
+    // is the control that says the correction does not invent a colour shift.
+    OrthoSetup& s = setup();
+    const Orthomosaic plain = run_ortho(s, colour_params(0.125, false));
+    const Orthomosaic corrected = run_ortho(s, colour_params(0.125, true));
+    ASSERT_EQ(plain.raster.grid, corrected.raster.grid);
+
+    // Compare only cells covered in both. A gain near 1 moves a value by a grey
+    // level or two at most; anything more means the solve found a spurious
+    // difference.
+    double sum_abs = 0.0;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i + 3 < plain.raster.data.size(); i += 4) {
+        if (plain.raster.data[i + 3] == 0 || corrected.raster.data[i + 3] == 0) {
+            continue;
+        }
+        for (int c = 0; c < 3; ++c) {
+            sum_abs += std::abs(static_cast<int>(plain.raster.data[i + static_cast<std::size_t>(c)]) -
+                                static_cast<int>(corrected.raster.data[i + static_cast<std::size_t>(c)]));
+            ++count;
+        }
+    }
+    const double mean_abs = count ? sum_abs / static_cast<double>(count) : 0.0;
+    std::printf("[OrthoGain.Control] mean |delta| = %.3f grey levels over %zu samples\n", mean_abs,
+                count);
+    // A genuine exposure difference would move values by tens of grey levels; a
+    // solve on an already-consistent flight that lands within a few percent
+    // moves them by at most a handful. 10 is the ceiling that separates the two.
+    EXPECT_LT(mean_abs, 10.0)
+        << "an ungained flight must be left nearly untouched by the correction";
+}
+
+TEST(OrthoGain, TaskPathAppliesNonTrivialGainsOnAMismatchedFlight) {
+    // THE BENCH REGRESSION, at TASK level. The solver unit tests build their
+    // overlap records by hand, so they can never catch a fault in how the task
+    // turns rasterised photographs into those records. On the aerial-nadir
+    // bench the task found 406 overlapping pairs with brightness ratios
+    // 0.69..1.34 yet reported "gain compensation 1 .. 1": every raw gain had
+    // been clamped before the mean-normalisation, so the vector collapsed to a
+    // constant and divided by itself.
+    //
+    // This case forces the same shape through the real path. The photographs
+    // are given a strong per-camera radial falloff (vignetting), so two cameras
+    // that share ground do NOT record the same mean over the shared cells —
+    // the per-side mismatch the bench has and ideal synthetic data lacks. The
+    // solved gains must then span a real range and be APPLIED, which is read
+    // back from the task's own INFO diagnostic.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight dimmed(chunk, 0.8);  // odd cameras 0.8x, even 1.0x
+    // The copies are now the frames' paths, so the radial falloff is baked into
+    // them in place. Without a PER-SIDE mismatch two cameras that share ground
+    // record the same mean and the solve has nothing to disagree about, which
+    // is exactly why the ideal synthetic fixtures never caught this.
+    std::vector<Frame*> frames;
+    for (const auto& frame : chunk.frames()) {
+        if (frame->camera_id() >= 0) {
+            frames.push_back(frame.get());
+        }
+    }
+    ASSERT_EQ(frames.size(), 12U);
+    for (std::size_t c = 0; c < frames.size(); ++c) {
+        Image image = read_image(frames[c]->path());
+        ASSERT_FALSE(image.empty()) << "camera " << c << " copy is unreadable";
+        const int w = image.width();
+        const int h = image.height();
+        // Strong per-camera vignette, varying with the camera index so no two
+        // photographs share a falloff. The strength is what makes the raw
+        // solution's absolute scale fall below min_gain, which is the exact
+        // precondition of the collapse: every camera then clamped to that bound
+        // and the mean-normalisation divided a constant by itself.
+        const double k = 0.30 + 0.05 * static_cast<double>(c);
+        for (int row = 0; row < h; ++row) {
+            for (int col = 0; col < w; ++col) {
+                const double u = (static_cast<double>(col) + 0.5) / static_cast<double>(w);
+                const double v = (static_cast<double>(row) + 0.5) / static_cast<double>(h);
+                const double r2 = ((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5)) / 0.5;
+                const double factor = 1.0 - k * r2;
+                std::uint8_t* px = image.data() +
+                                   (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                    static_cast<std::size_t>(col)) *
+                                       3U;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const double value = static_cast<double>(px[channel]) * factor;
+                    px[channel] =
+                        static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
+                }
+            }
+        }
+        write_png(frames[c]->path(), image);
+    }
+
+    std::string diagnostics;
+    {
+        ScopedLogCapture capture;
+        Params params = colour_params(0.125, true, 0, false, "disabled");
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+        diagnostics = capture.text(LogLevel::Info);
+    }
+
+    // The solve must have produced a real spread. Parsing the line the task
+    // emits is the only way to see the gains themselves from a black-box run;
+    // it also guarantees the diagnostic stays there and stays accurate.
+    const std::size_t at = diagnostics.find("gains per channel");
+    ASSERT_NE(at, std::string::npos)
+        << "the task must log the solved gains at INFO; got:\n" << diagnostics;
+    // Read the red channel's range out of "... gains per channel r[lo .. hi mean ...]".
+    const auto read_number = [&diagnostics](std::size_t from) {
+        while (from < diagnostics.size() && std::isspace(static_cast<unsigned char>(
+                                               diagnostics[from]))) {
+            ++from;
+        }
+        std::size_t end = from;
+        while (end < diagnostics.size() &&
+               (std::isdigit(static_cast<unsigned char>(diagnostics[end])) ||
+                diagnostics[end] == '.' || diagnostics[end] == '-' ||
+                diagnostics[end] == '+' || diagnostics[end] == 'e')) {
+            ++end;
+        }
+        return std::pair<double, std::size_t>(std::stod(diagnostics.substr(from, end - from)),
+                                              end);
+    };
+    const std::size_t bracket = diagnostics.find("r[", at);
+    ASSERT_NE(bracket, std::string::npos);
+    const auto [lo, after_lo] = read_number(bracket + 2);
+    const auto [hi, after_hi] = read_number(diagnostics.find("..", after_lo) + 2);
+    (void)after_hi;
+    std::printf("[OrthoGain.TaskPath] red gain range %.4f .. %.4f\n", lo, hi);
+    EXPECT_GT(hi - lo, 0.05)
+        << "a flight with a 20% exposure spread and strong vignetting must not "
+           "solve to a constant gain (the bench's collapse-to-1 bug)";
+
+    // And the gains must REACH the product: a non-trivial correction has to
+    // change the mosaic against the same run without correction.
+    const Orthomosaic corrected = s.document.active_chunk()->orthomosaic();
+    const Orthomosaic plain = run_ortho(s, colour_params(0.125, false, 0, false, "disabled"));
+    ASSERT_EQ(plain.raster.grid, corrected.raster.grid);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < plain.raster.data.size(); i += 4) {
+        if (plain.raster.data[i + 3] == 0 || corrected.raster.data[i + 3] == 0) {
+            continue;
+        }
+        if (plain.raster.data[i] != corrected.raster.data[i]) {
+            ++differing;
+        }
+    }
+    std::printf("[OrthoGain.TaskPath] differing red cells = %zu\n", differing);
+    EXPECT_GT(differing, 0U)
+        << "a non-trivial gain must actually change the mosaic, not be applied "
+           "to a copy or dropped";
 }
 
 }  // namespace

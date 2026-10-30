@@ -3,10 +3,10 @@
 
 The workflow has to answer one question about a run's metrics file: was this run
 made with extra dispatch parameters (``depth_params`` for BuildDepthMaps,
-``dem_params`` for BuildDem), or at the dataset's own settings? The answer
-decides two things that must agree — whether the run may become the regression
-baseline, and whether a baseline restored from it may be used. Both call this so
-there is one definition, in one place.
+``dem_params`` for BuildDem, ``ortho_params`` for BuildOrthomosaic), or at the
+dataset's own settings? The answer decides two things that must agree — whether
+the run may become the regression baseline, and whether a baseline restored from
+it may be used. Both call this so there is one definition, in one place.
 
 Exit codes, because a shell `if` reads them directly:
 
@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not isinstance(metrics, dict):
         return 2
-    if metrics.get("depth_params") or metrics.get("dem_params"):
+    if metrics.get("depth_params") or metrics.get("dem_params") or metrics.get("ortho_params"):
         return 1
     return 0
 

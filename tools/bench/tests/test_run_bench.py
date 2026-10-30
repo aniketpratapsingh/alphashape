@@ -1100,8 +1100,126 @@ class DemParamMergeTest(unittest.TestCase):
         self.assertEqual(merged["param_overrides"]["BuildDepthMaps"]["downscale"], 8)
 
 
+class OrthoParamsTest(unittest.TestCase):
+    """``ortho_params`` is the same contract as ``dem_params`` for BuildOrthomosaic.
+
+    Mirrored on purpose from DemParamsTest: one grammar, one set of experiment
+    rules, and an orthomosaic experiment must be neither weaker nor stricter than a
+    DEM one. A change to one without the other then shows up as a gap.
+    """
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_ortho_params(""), {})
+        self.assertEqual(run_bench.parse_ortho_params(None), {})
+        self.assertEqual(run_bench.parse_ortho_params("   "), {})
+
+    def test_a_single_pair(self):
+        self.assertEqual(
+            run_bench.parse_ortho_params("color_correction=true"),
+            {"color_correction": "true"},
+        )
+
+    def test_several_pairs_are_split_on_whitespace(self):
+        self.assertEqual(
+            run_bench.parse_ortho_params(" blending_mode=average  fill_holes=false\nresolution=0.1 "),
+            {"blending_mode": "average", "fill_holes": "false", "resolution": "0.1"},
+        )
+
+    def test_a_value_with_shell_or_json_metacharacters_is_rejected(self):
+        for token in ("color_correction=true;rm", 'color_correction="true"',
+                      "color_correction=$(id)", "color_correction=true|cat",
+                      "color_correction=true&x"):
+            with self.assertRaises(run_bench.OrthoParamError, msg=token):
+                run_bench.parse_ortho_params(token)
+
+    def test_the_same_grammar_rejects_the_same_tokens(self):
+        tokens = ["no_equals", "=value", "key=", "Upper=1", "dashed-key=1",
+                  "key=a=b", "key=1 key=2", "key=v;x"]
+        for token in tokens:
+            for parser, error in ((run_bench.parse_depth_params, run_bench.DepthParamError),
+                                  (run_bench.parse_dem_params, run_bench.DemParamError),
+                                  (run_bench.parse_ortho_params, run_bench.OrthoParamError)):
+                with self.assertRaises(error, msg=f"{parser.__name__}: {token}"):
+                    parser(token)
+
+    def test_the_error_names_the_input(self):
+        with self.assertRaises(run_bench.OrthoParamError):
+            run_bench.parse_ortho_params("oops")
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "aerial-nadir", "--list", "--ortho-params", "oops"])
+
+    def test_the_command_line_accepts_a_good_string(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = run_bench.main(
+                ["--dataset", "aerial-nadir", "--list",
+                 "--ortho-params", "color_correction=true"]
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("CC-BY-4.0", out.getvalue())
+
+
+class OrthoParamMergeTest(unittest.TestCase):
+    """``ortho_params`` land in BuildOrthomosaic and nowhere else."""
+
+    def dataset(self):
+        return run_bench.load_manifest()["datasets"]["aerial-nadir"]
+
+    def test_a_parameter_is_added_to_build_orthomosaic(self):
+        merged = run_bench.merge_ortho_params(self.dataset(), {"color_correction": "true"})
+        self.assertEqual(
+            merged["param_overrides"]["BuildOrthomosaic"]["color_correction"], "true"
+        )
+
+    def test_it_does_not_touch_the_upstream_tasks(self):
+        merged = run_bench.merge_ortho_params(self.dataset(), {"color_correction": "true"})
+        overrides = merged["param_overrides"]
+        self.assertNotIn("color_correction", overrides.get("BuildDepthMaps", {}))
+        self.assertNotIn("color_correction", overrides.get("BuildDem", {}))
+
+    def test_the_dataset_s_own_ortho_overrides_survive_the_merge(self):
+        merged = run_bench.merge_ortho_params(self.dataset(), {"color_correction": "true"})
+        self.assertEqual(merged["param_overrides"]["BuildOrthomosaic"]["resolution"], 0.1)
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        original = self.dataset()
+        self.assertEqual(run_bench.merge_ortho_params(original, {}), original)
+
+    def test_the_input_dataset_is_not_mutated(self):
+        original = self.dataset()
+        before = json.dumps(original, sort_keys=True)
+        run_bench.merge_ortho_params(original, {"color_correction": "true"})
+        self.assertEqual(json.dumps(original, sort_keys=True), before)
+
+    def test_all_three_inputs_merge_independently(self):
+        merged = run_bench.merge_depth_params(self.dataset(), {"cost_type": "census"})
+        merged = run_bench.merge_dem_params(merged, {"sibson_exact_max_sites": "20000"})
+        merged = run_bench.merge_ortho_params(merged, {"color_correction": "true"})
+        overrides = merged["param_overrides"]
+        self.assertEqual(overrides["BuildDepthMaps"]["cost_type"], "census")
+        self.assertEqual(overrides["BuildDem"]["sibson_exact_max_sites"], "20000")
+        self.assertEqual(overrides["BuildOrthomosaic"]["color_correction"], "true")
+
+
 class IsExperimentTest(unittest.TestCase):
     """The workflow's one definition of "is this a control run"."""
+
+    def test_an_empty_ortho_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"ortho_params": {}})), 0)
+
+    def test_non_empty_ortho_params_is_an_experiment(self):
+        self.assertEqual(
+            self.status(json.dumps({"ortho_params": {"color_correction": "true"}})), 1
+        )
 
     def status(self, payload):
         import tempfile
