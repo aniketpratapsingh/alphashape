@@ -196,6 +196,50 @@ class RegressionTest(unittest.TestCase):
         bad, _ = report.regressions(current, previous, thresholds())
         self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
 
+    def test_a_redefined_metric_is_skipped_not_failed(self):
+        # The offset metric was redefined (global luminance -> per-tile gradient),
+        # so its value moved by design. Comparing across the redefinition would fail
+        # a run no commit regressed, so a version mismatch must skip the gate.
+        previous = metrics()
+        previous["reference_based"]["ortho"]["metric_version"] = 1
+        previous["reference_based"]["ortho"]["offset_m"] = 1.0
+        current = metrics()
+        current["reference_based"]["ortho"]["metric_version"] = 2
+        current["reference_based"]["ortho"]["offset_m"] = 5.0
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertNotIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+
+    def test_the_same_version_still_gates_the_offset(self):
+        previous = metrics()
+        previous["reference_based"]["ortho"]["metric_version"] = 2
+        current = metrics()
+        current["reference_based"]["ortho"]["metric_version"] = 2
+        current["reference_based"]["ortho"]["offset_m"] = 0.12
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+
+    def test_the_offset_gate_widens_with_its_tile_dispersion(self):
+        # 2 x MAD is the limit when that exceeds the floor: a move inside the
+        # metric's own scatter on this reference must not fail the run.
+        previous = metrics()
+        current = metrics()
+        current["reference_based"]["ortho"]["offset_m"] = 0.16
+        current["reference_based"]["ortho"]["offset_dispersion_m"] = 0.10
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertEqual(bad, [])
+        # ...but a move past twice the MAD still fails.
+        current["reference_based"]["ortho"]["offset_m"] = 0.30
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+
+    def test_the_offset_gate_keeps_its_floor_when_the_tiles_agree(self):
+        previous = metrics()
+        current = metrics()
+        current["reference_based"]["ortho"]["offset_m"] = 0.12
+        current["reference_based"]["ortho"]["offset_dispersion_m"] = 0.0
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+
     def test_the_raw_dem_bias_is_reported_but_not_gated(self):
         # A change in the raw ΔZ median is a vertical datum difference between the
         # two products, not a regression: the pipeline cannot move it.
@@ -291,6 +335,63 @@ class RegressionTest(unittest.TestCase):
         self.assertAlmostEqual(record["delta"], -0.45)
         self.assertAlmostEqual(record["limit"], 0.019)
         self.assertEqual(record["direction"], "higher")
+
+
+class MetricRedefinitionTest(unittest.TestCase):
+    """A metric whose definition changed is reported, not gated.
+
+    The ortho offset was redefined from a global luminance correlation to a
+    per-tile gradient one, and its value changed by design. Failing the first run
+    after that would be a regression no commit caused.
+    """
+
+    def test_the_notice_names_the_section_once(self):
+        previous = metrics()
+        previous["reference_based"]["ortho"]["metric_version"] = 1
+        previous["reference_based"]["ortho"]["offset_m"] = 1.0
+        current = metrics()
+        current["reference_based"]["ortho"]["metric_version"] = 2
+        current["reference_based"]["ortho"]["offset_m"] = 5.0
+        policy = thresholds()
+        bad, _ = report.regressions(current, previous, policy)
+        text = report.markdown(current, previous, bad, [], thresholds=policy, png_name=None)
+        self.assertIn("redefined since the previous run", text)
+        self.assertEqual(text.count("redefined since the previous run"), 1)
+        self.assertIn("`reference_based.ortho`", text)
+
+    def test_a_redefinition_is_not_listed_when_nothing_is_gated(self):
+        # A section whose value did not move still has a version change, but there
+        # is no skipped comparison to explain.
+        previous = metrics()
+        previous["reference_based"]["ortho"]["metric_version"] = 1
+        current = metrics()
+        current["reference_based"]["ortho"]["metric_version"] = 2
+        policy = thresholds()
+        text = report.markdown(current, previous, [], [], thresholds=policy, png_name=None)
+        self.assertNotIn("redefined since the previous run", text)
+
+    def test_an_unversioned_metric_still_gates(self):
+        # No metric_version on either side: nothing says the definition changed, so
+        # the gate behaves exactly as before.
+        previous = metrics()
+        current = metrics()
+        current["reference_based"]["ortho"]["offset_m"] = 0.12
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+
+    def test_the_first_run_after_a_version_is_introduced_is_skipped(self):
+        # The baseline artifact predates the field, so it is unversioned on one
+        # side only. That is the same incomparability as 1 -> 2, and must skip:
+        # this is exactly the situation of the first bench run after the change.
+        previous = metrics()
+        previous["reference_based"]["ortho"]["offset_m"] = 1.0
+        current = metrics()
+        current["reference_based"]["ortho"]["metric_version"] = 2
+        current["reference_based"]["ortho"]["offset_m"] = 0.31
+        bad, _ = report.regressions(current, previous, thresholds())
+        self.assertNotIn("reference_based.ortho.offset_m", [r["metric"] for r in bad])
+        text = report.markdown(current, previous, bad, [], thresholds=thresholds(), png_name=None)
+        self.assertIn("unversioned -> v2", text)
 
 
 class MarkdownTest(unittest.TestCase):
