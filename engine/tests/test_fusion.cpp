@@ -16,7 +16,6 @@
 #endif
 
 #include "base/utils/error.hpp"
-#include "common/algorithm/stereo/depth_repair.hpp"  // kRepairedConfidence
 #include "common/algorithm/stereo/fusion.hpp"
 #include "common/core/chunk.hpp"
 #include "image/image.hpp"
@@ -386,8 +385,10 @@ TEST(Fusion, RepairedSamplesCarryLessWeightThanMeasuredOnes) {
     std::vector<DepthMap> maps;
     maps.push_back(make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 0));
     maps.push_back(make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 1));
-    maps[0].confidence.assign(n, 1.0F);  // a measured pixel with minimal support
-    maps[1].confidence.assign(n, kRepairedConfidence);
+    // Both maps carry the SAME face-value confidence, so only the provenance
+    // flag can justify a different weight.
+    maps[0].confidence.assign(n, 1.0F);
+    maps[1].confidence.assign(n, 1.0F);
     maps[1].flags.assign(n, 0U);
     for (std::size_t i = 0; i < n; ++i) {
         if (maps[1].depths[i] > 0.0F) {
