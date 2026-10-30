@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,22 @@ constexpr std::size_t kMinBoundaryPoints = 6;
 // draws find the dominant plane with near-certainty.
 constexpr int kRansacIterations = 64;
 constexpr std::uint64_t kRansacSeed = 0x243F6A8885A308D3ULL;
+
+// A filled depth must lie within the span its own ring MEASURED. The fill is an
+// interpolation across a small gap between measured samples, not an
+// extrapolation; a plane that implies a depth outside [min, max] of the ring
+// (widened by the same 1% relative tolerance the fit uses) has been evaluated
+// where no measurement constrains it -- on real aerial blocks that is how a
+// near-edge-on plane produces a depth of hundreds of metres inside a surface
+// that spans 10. Rejecting those pixels keeps a repaired map from moving the
+// DEM's height range at all.
+constexpr double kDepthSpanMargin = 0.01;
+
+// |cos| between the viewing ray and the plane normal below which the
+// intersection is too grazing to trust: at <3 degrees the depth divides by a
+// number near zero, so pixel noise in the normal becomes metres of depth. 0.05
+// (87.1 degrees) is where a plane is still sampled in the depth image at all.
+constexpr double kMinRayCosine = 0.05;
 
 /// A plane n . x = offset in camera space; `normal` is unit length.
 struct Plane {
@@ -306,6 +323,8 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
         ring_points.clear();
         ring_points.reserve(ring_indices.size());
         double depth_sum = 0.0;
+        double depth_min = std::numeric_limits<double>::max();
+        double depth_max = 0.0;
         for (const std::size_t idx : ring_indices) {
             const int i = static_cast<int>(idx % stride);
             const int j = static_cast<int>(idx / stride);
@@ -314,7 +333,16 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
             const double depth = static_cast<double>(out.depths[idx]);
             ring_points.push_back(calibration.unproject(centre) * depth);
             depth_sum += depth;
+            depth_min = std::min(depth_min, depth);
+            depth_max = std::max(depth_max, depth);
         }
+        // The span a fill is allowed to produce: the ring's own measured range,
+        // widened by the same relative tolerance the plane fit uses. A fill
+        // outside it is an extrapolation nothing measured, so it is refused
+        // (this is what keeps a near-edge-on plane from writing a 100 m depth
+        // into a 10 m surface).
+        const double allowed_min = depth_min * (1.0 - kDepthSpanMargin);
+        const double allowed_max = depth_max * (1.0 + kDepthSpanMargin);
         const double mean_depth = depth_sum / static_cast<double>(ring_points.size());
         Plane plane;
         if (!fit_ring_plane(ring_points, mean_depth, kPlaneRelativeTolerance,
@@ -332,13 +360,17 @@ DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
                                          static_cast<double>(j) + 0.5);
             const Eigen::Vector3d bearing = calibration.unproject(centre);
             const double denom = plane.normal.dot(bearing);
-            if (std::abs(denom) <= 1e-12) {
+            if (std::abs(denom) < kMinRayCosine) {
                 ++local.unfilled_pixels;  // grazing ray: the plane is edge-on
                 continue;
             }
             const double depth = plane.offset / denom;
             if (!(depth > 0.0) || !std::isfinite(depth)) {
                 ++local.unfilled_pixels;
+                continue;
+            }
+            if (depth < allowed_min || depth > allowed_max) {
+                ++local.unfilled_pixels;  // extrapolated beyond what the ring measured
                 continue;
             }
             fill_pixels.push_back(idx);

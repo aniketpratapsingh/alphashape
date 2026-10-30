@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -605,6 +606,47 @@ TEST(DepthRepair, IsDeterministicAndMarksConfidence) {
     const double ny = static_cast<double>(a.normals[base + 1]);
     const double nz = static_cast<double>(a.normals[base + 2]);
     EXPECT_NEAR(std::sqrt(nx * nx + ny * ny + nz * nz), 1.0, 1e-6);
+}
+
+TEST(DepthRepair, FilledDepthStaysInsideTheRingSpan) {
+    // A fill is an interpolation, never an extrapolation. Every repaired depth
+    // must lie inside the range its own ring measured (plus 1%), so a
+    // near-edge-on plane cannot write a depth far outside a surface: on the
+    // aerial block that showed up as a DEM height range of -112..56 m where the
+    // control's was 8..28 m.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 30, 20, 40, 30);
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{});
+
+    double ring_min = std::numeric_limits<double>::max();
+    double ring_max = 0.0;
+    for (int j = 20; j <= 30; ++j) {
+        for (int i = 30; i <= 40; ++i) {
+            const bool ring = i == 30 || i == 40 || j == 20 || j == 30;
+            if (!ring) {
+                continue;
+            }
+            const double d = index_depth(view.map, (i == 30 ? 29 : i), j);
+            if (d > 0.0) {
+                ring_min = std::min(ring_min, d);
+                ring_max = std::max(ring_max, d);
+            }
+            const double e = index_depth(view.map, i, (j == 20 ? 19 : j));
+            if (e > 0.0) {
+                ring_min = std::min(ring_min, e);
+                ring_max = std::max(ring_max, e);
+            }
+        }
+    }
+    ASSERT_GT(ring_max, 0.0);
+    for (int j = 20; j <= 30; ++j) {
+        for (int i = 30; i <= 40; ++i) {
+            const double d = index_depth(out, i, j);
+            ASSERT_GT(d, 0.0) << "pixel " << i << "," << j;
+            EXPECT_GE(d, ring_min * (1.0 - 0.011)) << "pixel " << i << "," << j;
+            EXPECT_LE(d, ring_max * (1.0 + 0.011)) << "pixel " << i << "," << j;
+        }
+    }
 }
 
 TEST(DepthRepair, ZeroMaxAreaFillsNothing) {

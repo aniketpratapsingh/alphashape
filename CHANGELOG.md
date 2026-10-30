@@ -18,7 +18,10 @@ All notable changes to alphashape are recorded here. The format follows
   points lie within 1% of the boundary's mean depth of the same plane. Each
   hole pixel is filled by intersecting its viewing ray with the plane and
   receives the plane normal and a reduced confidence (`0.25`), so later stages
-  can tell a repaired pixel from a measured one. A hole straddling a depth
+  can tell a repaired pixel from a measured one. The fill is bounded: a depth
+  outside the range the hole's own ring measured (plus 1%), or an intersection
+  at less than ~3 degrees to the plane, is left empty, so a near-edge-on plane
+  cannot write a depth far outside the surface. A hole straddling a depth
   discontinuity, an oversized hole, or one cut off by the map border is left
   empty. The two parameters are folded into the depth-map fingerprint only when
   repair is on, so existing maps stay reusable. The pass runs on the filtered
