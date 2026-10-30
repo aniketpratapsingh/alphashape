@@ -1751,6 +1751,29 @@ TEST(BuildDenseParams, RejectsOutOfRangeSearchTuning) {
     EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
 }
 
+TEST(BuildDenseParams, TextureGateAndBestKReachTheSearch) {
+    // The two fields must reach PatchMatchOptions, not merely be declared. At a
+    // texture gate above any possible intensity stddev (max 0.5) every window is
+    // too flat, so every pixel keeps depth -1 -- a default run leaves most of
+    // them valid. best_k is exercised through the fingerprint test above; here
+    // the gate proves the option is threaded through the task.
+    Document document = aligned_document(seq_files(4));
+    Params params = make_params(builtin_registry().require("BuildDepthMaps"));
+    params.set("downscale", ParamValue{std::int64_t{4}});
+    params.set("min_texture_stddev", ParamValue{1.0});
+    run_task(builtin_registry(), document, "BuildDepthMaps", params);
+
+    const Chunk& chunk = *document.active_chunk();
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    for (const DepthMap& map : chunk.depth_maps()) {
+        EXPECT_FALSE(map.depths.empty());
+        for (const float d : map.depths) {
+            EXPECT_LT(d, 0.0F) << "camera " << map.camera_id
+                               << ": a gate above the maximum stddev must leave no depth";
+        }
+    }
+}
+
 TEST(DepthMapsReuse, FingerprintCoversBestKAndTheTextureGate) {
     // Both fields change the search's objective or its inputs, so a map built
     // with another value must not be served. Each is folded ONLY when it is not
