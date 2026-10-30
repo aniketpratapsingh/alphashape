@@ -1730,11 +1730,62 @@ TEST(BuildDenseParams, RepairDefaultsAreOffAndBounded) {
     EXPECT_FALSE(defaults.get_bool("repair_holes"));
     EXPECT_EQ(defaults.get_int("repair_max_area"), 2000);
 
+    // The bound is only enforced when the pass will run: with repair on it is a
+    // real rejection ...
     Params params = defaults;
+    params.set("repair_holes", ParamValue{true});
     params.set("repair_max_area", ParamValue{std::int64_t{-1}});
     Document document = aligned_document(seq_files(4));
     EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError);
     EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
+
+    // ... but with repair off the value is dead configuration and must not fail
+    // the whole run (a stored project could carry anything there).
+    Params off = defaults;
+    off.set("repair_max_area", ParamValue{std::int64_t{-1}});
+    Document dead = aligned_document(seq_files(4));
+    EXPECT_NO_THROW(run_task(builtin_registry(), dead, "BuildDepthMaps", off));
+    EXPECT_FALSE(dead.active_chunk()->depth_maps().empty());
+}
+
+TEST(BuildDenseParams, RepairIsSkippedWhenTheFilterIsDisabled) {
+    // The repair pass exists to undo holes the cross-view filter opened. With the
+    // filter disabled nothing was deleted as an artefact, so the holes are
+    // genuine no-data: repair_holes=true must change neither the maps nor the
+    // fingerprint, i.e. an existing unfiltered map is still reused.
+    Document document = aligned_document(seq_files(4));
+    run_depth_maps(document, kIncrementalDownscale, /*reuse=*/true, "disabled");
+    std::vector<std::uint64_t> before;
+    std::size_t repaired_pixels = 0;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        before.push_back(map.alignment_fingerprint);
+        for (const std::uint8_t flag : map.flags) {
+            repaired_pixels += (flag & kDepthRepairedFlag) != 0 ? 1U : 0U;
+        }
+    }
+    ASSERT_FALSE(before.empty());
+    EXPECT_EQ(repaired_pixels, 0U) << "a disabled filter run must not carry repaired pixels";
+
+    // Repair ON with the filter disabled: the historic fingerprint is kept, so
+    // every camera is REUSED rather than searched again, and no pixel is flagged.
+    Params on = reuse_params(kIncrementalDownscale, /*reuse=*/true, "disabled");
+    on.set("repair_holes", ParamValue{true});
+    reset_depth_map_search_count();
+    run_task(builtin_registry(), document, "BuildDepthMaps", on);
+    EXPECT_EQ(depth_map_search_count(), 0U)
+        << "repair_holes is inert with filter_mode=disabled, so the maps stay reusable";
+    std::vector<std::uint64_t> after;
+    std::size_t flagged = 0;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        after.push_back(map.alignment_fingerprint);
+        for (const std::uint8_t flag : map.flags) {
+            flagged += (flag & kDepthRepairedFlag) != 0 ? 1U : 0U;
+        }
+    }
+    std::sort(before.begin(), before.end());
+    std::sort(after.begin(), after.end());
+    EXPECT_EQ(before, after);
+    EXPECT_EQ(flagged, 0U);
 }
 
 TEST(DepthMapsReuse, RepairOffKeepsTheFingerprintUnchanged) {
@@ -1776,10 +1827,10 @@ TEST(DepthMapsReuse, RepairOffKeepsTheFingerprintUnchanged) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
+// 6. The sidecar format: ADM3 round-trips, ADM2/ADM1 are read but never reusable
 // ---------------------------------------------------------------------------
 
-TEST(DepthMapsSidecar, Adm2RoundTripsFingerprintAndFilterMode) {
+TEST(DepthMapsSidecar, Adm3RoundTripsFingerprintFilterModeAndFlags) {
     DepthMap map;
     map.camera_id = 3;
     map.width = 2;
@@ -1788,12 +1839,13 @@ TEST(DepthMapsSidecar, Adm2RoundTripsFingerprintAndFilterMode) {
     map.depths = {1.0F, 2.0F, -1.0F, 4.0F};
     map.normals = {0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
     map.confidence = {0.0F, 1.0F, 0.0F, 2.0F};
+    map.flags = {0U, kDepthRepairedFlag, 0U, 0U};
     map.alignment_fingerprint = 0xFEEDFACE12345678ULL;
     map.filter_mode = 3;  // aggressive
 
     const std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
     ASSERT_GE(bytes.size(), 4U);
-    EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 4), "ADM2");
+    EXPECT_EQ(std::string(bytes.begin(), bytes.begin() + 4), "ADM3");
     const std::vector<DepthMap> back = docxml::sidecar::decode_depth_maps(bytes);
     ASSERT_EQ(back.size(), 1U);
     EXPECT_EQ(back.front(), map);
@@ -1805,6 +1857,43 @@ TEST(DepthMapsSidecar, Adm2RoundTripsFingerprintAndFilterMode) {
     ASSERT_EQ(unfiltered.size(), 1U);
     EXPECT_EQ(unfiltered.front().filter_mode, -1);
     EXPECT_EQ(unfiltered.front().alignment_fingerprint, 0xFEEDFACE12345678ULL);
+
+    // An EMPTY flags vector stays empty (not "all zero"), so a measured map is
+    // byte-identical to what an ADM2-era build wrote for it.
+    map.flags.clear();
+    const std::vector<DepthMap> plain =
+        docxml::sidecar::decode_depth_maps(docxml::sidecar::encode_depth_maps({map}));
+    ASSERT_EQ(plain.size(), 1U);
+    EXPECT_TRUE(plain.front().flags.empty());
+}
+
+TEST(DepthMapsSidecar, Adm2IsReadWithEveryPixelMeasured) {
+    // Hand-built ADM2, so the layout is stated here rather than taken from a
+    // writer that might change with it: no has_flags byte, therefore no
+    // provenance array and every pixel reads as measured.
+    std::vector<std::uint8_t> bytes = {'A', 'D', 'M', '2'};
+    docxml::sidecar::put_u32(bytes, 1);
+    docxml::sidecar::put_u64(bytes, 0x1122334455667788ULL);
+    docxml::sidecar::put_i32(bytes, /*camera_id=*/5);
+    docxml::sidecar::put_i32(bytes, /*width=*/2);
+    docxml::sidecar::put_i32(bytes, /*height=*/2);
+    docxml::sidecar::put_i32(bytes, /*downscale=*/1);
+    bytes.push_back(0);    // has_normals
+    bytes.push_back(1);    // has_confidence
+    bytes.push_back(2);    // filter_mode = moderate
+    for (const float d : {5.0F, 6.0F, -1.0F, 7.0F}) {
+        docxml::sidecar::put_f32(bytes, d);
+    }
+    for (const float c : {1.0F, 0.0F, 0.0F, 2.0F}) {
+        docxml::sidecar::put_f32(bytes, c);
+    }
+
+    const std::vector<DepthMap> maps = docxml::sidecar::decode_depth_maps(bytes);
+    ASSERT_EQ(maps.size(), 1U);
+    EXPECT_TRUE(maps.front().flags.empty()) << "an ADM2 map has no repaired pixels";
+    EXPECT_EQ(maps.front().alignment_fingerprint, 0x1122334455667788ULL);
+    EXPECT_EQ(maps.front().filter_mode, 2);
+    EXPECT_EQ(maps.front().confidence, (std::vector<float>{1.0F, 0.0F, 0.0F, 2.0F}));
 }
 
 TEST(DepthMapsSidecar, Adm1IsReadWithUnknownFingerprintAndMildFilter) {
@@ -1835,19 +1924,27 @@ TEST(DepthMapsSidecar, Adm1IsReadWithUnknownFingerprintAndMildFilter) {
     EXPECT_EQ(map.filter_mode, 1);
 }
 
-TEST(DepthMapsSidecar, Adm2RejectsAnUnknownFilterMode) {
+TEST(DepthMapsSidecar, Adm3RejectsAnUnknownFilterMode) {
     DepthMap map;
     map.width = 1;
     map.height = 1;
     map.depths = {1.0F};
     map.filter_mode = 1;
     std::vector<std::uint8_t> bytes = docxml::sidecar::encode_depth_maps({map});
-    // The filter-mode byte is the last of the three flags of the first (and only)
-    // record: 4 magic + 4 count + 8 fingerprint + 16 four i32s + 2 flags.
+    // The filter-mode byte is the third of the record's flags: 4 magic + 4 count
+    // + 8 fingerprint + 16 four i32s + 2 flags.
     const std::size_t mode_at = 4 + 4 + 8 + 16 + 2;
     ASSERT_LT(mode_at, bytes.size());
     bytes[mode_at] = 9;
     EXPECT_THROW(docxml::sidecar::decode_depth_maps(bytes), ProjectIOError);
+
+    // The provenance array must be exactly one byte per pixel: truncating it is
+    // a malformed record, not a short-but-acceptable one. (Carry flags, or the
+    // encoder writes no array for the pop to shorten.)
+    map.flags = {0U};
+    std::vector<std::uint8_t> full = docxml::sidecar::encode_depth_maps({map});
+    full.pop_back();
+    EXPECT_THROW(docxml::sidecar::decode_depth_maps(full), ProjectIOError);
 }
 
 }  // namespace alphashape

@@ -299,12 +299,16 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     params.declare({"repair_holes", ParamType::Bool, false,
                     "After cross-view filtering, refill small holes left inside an otherwise "
                     "consistent surface. A hole is filled only when one plane explains its "
-                    "measured boundary and it does not straddle a depth discontinuity; the "
-                    "filled pixels are marked with a reduced confidence."});
+                    "measured boundary, no coherent second surface owns an arc of that "
+                    "boundary, and it does not straddle a depth discontinuity; the filled "
+                    "pixels are marked with a reduced confidence. Has no effect when "
+                    "filter_mode is \"disabled\": without the filter there are no holes to "
+                    "repair, only genuine no-data, and inventing depth there would be wrong."});
     ParamSpec repair_max_area{"repair_max_area", ParamType::Int, std::int64_t{2000},
                               "Largest hole, in pixels at the working resolution, that "
                               "repair_holes may fill (default 2000). Larger holes are left "
-                              "empty. Ignored when repair_holes is false."};
+                              "empty. Ignored (and not validated) when repair_holes is "
+                              "false or filter_mode is \"disabled\"."};
     repair_max_area.minimum = std::int64_t{0};
     repair_max_area.maximum = kMaxRepairArea;
     params.declare(repair_max_area);
@@ -362,18 +366,24 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     if (max_cost_value < -1.0 || max_cost_value > 2.0) {
         throw ValueError("max_cost must be in [-1, 2]");
     }
-    if (repair_max_area < 0) {
-        throw ValueError("repair_max_area must not be negative");
-    }
-    if (repair_max_area > kMaxRepairArea) {
-        throw ValueError("repair_max_area must be at most " + std::to_string(kMaxRepairArea));
+    // Only validate repair_max_area when the pass will actually run. With
+    // repair off (or the filter disabled) the value is dead configuration, and
+    // rejecting a stored project over a parameter nothing reads would be
+    // gratuitous. The parse below resolves the filter mode, so validate after.
+    const stereo::FilterMode filter_mode = stereo::parse_filter_mode(filter_mode_text);
+    if (repair_holes && filter_mode != stereo::FilterMode::Disabled) {
+        if (repair_max_area < 0) {
+            throw ValueError("repair_max_area must not be negative");
+        }
+        if (repair_max_area > kMaxRepairArea) {
+            throw ValueError("repair_max_area must be at most " + std::to_string(kMaxRepairArea));
+        }
     }
     // -1 means "the cost type's own default", resolved once here so every map of
     // the run (and the log line) uses the same number.
     const double max_cost = max_cost_value < 0.0
                                 ? stereo::patch_match_default_max_cost(cost_type)
                                 : max_cost_value;
-    const stereo::FilterMode filter_mode = stereo::parse_filter_mode(filter_mode_text);
 
     // -- validate the chunk --------------------------------------------------
     progress.update("initialize", 0.0);
@@ -542,7 +552,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         std::uint64_t fingerprint = depth_map_fingerprint(
             camera, chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)], downscale,
             &context);
-        if (repair_holes) {
+        // The fold follows what the pass actually DOES: with the filter disabled
+        // it never runs, so the map is the unrepaired one and must keep the
+        // historic fingerprint (and stay reusable).
+        if (repair_holes && filter_mode != stereo::FilterMode::Disabled) {
             // A string marker, not a bare 1: no unrepaired fingerprint folds a
             // string here, so enabling repair can never collide with a map built
             // while it was off.
@@ -953,7 +966,13 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         DepthMap result = stereo::filter_depth_map(reference, neighbours, filter_options);
         // Post-process on the FILTERED map, in both the CPU and GPU depth paths:
         // both converge on `built` before this loop, so there is one repair site.
-        if (repair_holes) {
+        //
+        // Never repair with the filter disabled: the pass exists to undo holes
+        // the cross-view filter opened inside a surface it had already judged
+        // consistent. With no filter those holes are genuine no-data (the search
+        // found nothing there), and synthesising depth for them would invent
+        // surface rather than restore it.
+        if (repair_holes && filter_mode != stereo::FilterMode::Disabled) {
             stereo::RepairOptions repair_options;
             repair_options.max_area = static_cast<int>(repair_max_area);
             stereo::RepairStats repair_stats;
