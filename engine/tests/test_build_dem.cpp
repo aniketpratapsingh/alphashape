@@ -651,15 +651,6 @@ TEST(Dem, MaxFillDistanceLeavesTheDeepHoleCentreNodata) {
 // 4b. Repaired depth samples must not outvote measured ones
 // ---------------------------------------------------------------------------
 
-/// The cell containing the plane-frame origin (the samples of the single-cell
-/// scenes all sit within a few decimetres of it).
-Eigen::Vector2i cell_at_axis(const RasterGrid& grid) {
-    return Eigen::Vector2i(static_cast<int>(std::floor((0.0 - grid.origin_x) /
-                                                       grid.pixel_size_x)),
-                           static_cast<int>(std::floor((grid.origin_y - 0.0) /
-                                                       grid.pixel_size_y)));
-}
-
 TEST(Dem, RepairedSamplesNeverOutvoteAMeasuredOneInTheSameCell) {
     // One measured + three repaired samples in the SAME cell: the review's case.
     // Without the rule the median of {50, 55, 55, 55} is 55, so the repaired
@@ -713,18 +704,12 @@ TEST(Dem, RepairedSamplesNeverOutvoteAMeasuredOneInTheSameCell) {
 
     const Elevation& dem = chunk.elevation();
     ASSERT_FALSE(dem.empty());
-    // Every sample lies within a third of a metre of the axis, so exactly one
-    // 1 m cell holds them all; every other cell is nodata.
-    const Eigen::Vector2i cell = cell_at_axis(dem.raster.grid);
-    ASSERT_FALSE(is_nodata(dem, cell.x(), cell.y()));
-    std::size_t valid = 0;
-    for (int row = 0; row < dem.raster.grid.height; ++row) {
-        for (int col = 0; col < dem.raster.grid.width; ++col) {
-            valid += is_nodata(dem, col, row) ? 0U : 1U;
-        }
-    }
-    EXPECT_EQ(valid, 1U) << "the four samples must share one cell";
-    const double value = static_cast<double>(dem.raster.at(cell.x(), cell.y()));
+    // Every sample lies inside one 1 m cell, so the grid is exactly that cell
+    // and nothing is interpolated into a second one (interpolation is off).
+    ASSERT_EQ(dem.raster.grid.width, 1);
+    ASSERT_EQ(dem.raster.grid.height, 1);
+    ASSERT_FALSE(is_nodata(dem, 0, 0));
+    const double value = static_cast<double>(dem.raster.at(0, 0));
     std::printf("[Dem.RepairedSamplesNeverOutvote] cell=%.3f m\n", value);
     EXPECT_NEAR(value, 50.0, 0.5) << "the repaired samples outvoted the measured one";
 }
@@ -776,10 +761,10 @@ TEST(Dem, RepairedSamplesStillFillACellNothingMeasured) {
 
     const Elevation& dem = chunk.elevation();
     ASSERT_FALSE(dem.empty());
-    const Eigen::Vector2i cell = cell_at_axis(dem.raster.grid);
-    ASSERT_FALSE(is_nodata(dem, cell.x(), cell.y()))
-        << "a repaired-only cell must still be written";
-    const double value = static_cast<double>(dem.raster.at(cell.x(), cell.y()));
+    ASSERT_EQ(dem.raster.grid.width, 1);
+    ASSERT_EQ(dem.raster.grid.height, 1);
+    ASSERT_FALSE(is_nodata(dem, 0, 0)) << "a repaired-only cell must still be written";
+    const double value = static_cast<double>(dem.raster.at(0, 0));
     std::printf("[Dem.RepairedSamplesStillFill] cell=%.3f m\n", value);
     EXPECT_NEAR(value, 50.0, 0.5);
 }
