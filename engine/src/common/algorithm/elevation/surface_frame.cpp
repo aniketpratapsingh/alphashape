@@ -64,10 +64,6 @@ CRS parse_crs_param(const std::string& text) {
 #endif
 }
 
-bool requests_other_crs(const Chunk& chunk, const CRS& requested) {
-    return requested.is_set() && requested.epsg != 0 && requested.epsg != chunk.crs().epsg;
-}
-
 SurfaceFrame for_options(const Chunk& chunk, const CRS& requested) {
     if (!requested.is_set()) {
         return SurfaceFrame::for_chunk(chunk, 0);

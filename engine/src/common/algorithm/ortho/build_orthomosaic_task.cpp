@@ -1308,7 +1308,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         frame = elevation::for_options(*chunk, options.crs);
     }
     const int epsg = frame.epsg();
-    if (Log::enabled(LogLevel::Info) && elevation::requests_other_crs(*chunk, options.crs) &&
+    if (Log::enabled(LogLevel::Info) && options.crs.is_set() && options.crs.epsg != 0 &&
         options.crs.epsg != epsg) {
         log(LogLevel::Info) << "BuildOrthomosaic: building in the DEM's EPSG " << epsg
                             << "; the requested EPSG " << options.crs.epsg

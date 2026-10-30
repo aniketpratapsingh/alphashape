@@ -106,10 +106,4 @@ CRS parse_crs_param(const std::string& text);
 /// unset request is possible and anything else throws ValueError.
 SurfaceFrame for_options(const Chunk& chunk, const CRS& requested);
 
-/// True when `requested` names something other than the chunk's own CRS, i.e.
-/// the caller asked for a specific output CRS. False for an unset DTO and for a
-/// code equal to `chunk.crs().epsg`. Kept here (rather than as a direct `.epsg`
-/// read) so the DTO's identity test is one place.
-bool requests_other_crs(const Chunk& chunk, const CRS& requested);
-
 }  // namespace alphashape::elevation
