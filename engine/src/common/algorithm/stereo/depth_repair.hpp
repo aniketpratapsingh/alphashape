@@ -41,13 +41,17 @@ struct RepairStats {
 };
 
 /// Returns a repaired copy of `map`. Pixels the fill produces get the plane
-/// normal and a reduced confidence (kRepairedConfidence), which is how a later
-/// stage tells a synthetic pixel from a measured one.
+/// normal and kDepthRepairedFlag set in `flags`; that bit is how a later stage
+/// tells a synthetic pixel from a measured one.
 DepthMap repair_depth_map(const DepthMap& map, const Calibration& calibration,
                           const RepairOptions& options, RepairStats* stats = nullptr);
 
-/// Confidence written on a repaired pixel. Below every measurable support count
-/// (the filter counts whole neighbour votes) and above 0, so it is unambiguous.
-constexpr float kRepairedConfidence = 0.25F;
+/// Confidence written on a repaired pixel. It is ZERO, because a repaired pixel
+/// has no measured support, and zero is the only value guaranteed not to exceed
+/// a measured pixel's: the filter keeps a pixel with no supporting neighbour at
+/// confidence 0, so any positive constant would invert the ordering. Provenance
+/// therefore lives in DepthMap::flags (kDepthRepairedFlag), not in this value;
+/// the confidence is a fallback for a reader that predates the flag.
+constexpr float kRepairedConfidence = 0.0F;
 
 }  // namespace alphashape::stereo
