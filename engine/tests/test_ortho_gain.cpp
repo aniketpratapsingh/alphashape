@@ -190,6 +190,101 @@ TEST(OrthoGain, a_gain_is_clamped_to_the_configured_range) {
     }
 }
 
+TEST(OrthoGain, a_noisy_flight_does_not_collapse_to_one) {
+    // THE BENCH REGRESSION. On the aerial-nadir flight the coarse pass finds
+    // thousands of cells per overlapping pair, so the count-weighted data term
+    // dwarfs the prior and the raw solution's absolute scale lands far below
+    // min_gain (it sits near prior / data, i.e. ~1e-2). A solve that clamped
+    // BEFORE normalising collapsed every camera onto the same bound and then
+    // divided a constant by itself, returning exactly 1.0 for every camera — a
+    // silent no-op that left the mosaic byte-identical to the control.
+    //
+    // The fixture here is that shape: 30 cameras on a 5x6 grid, adjacent and
+    // diagonal overlaps, realistic per-pair sample counts, one camera truly 1.2x
+    // too dark, and a small per-side content mismatch (real overlap means do not
+    // agree exactly). The assertion is on the RATIOS, which are what removes a
+    // seam and what the collapse destroyed.
+    constexpr int kRows = 5;
+    constexpr int kCols = 6;
+    constexpr int kCameras = kRows * kCols;
+    constexpr double kTrueDark = 1.2;  // camera 7 needs a 1.2x brightening
+    constexpr double kStored = 0.35;   // typical stored colour of the shared cells
+    constexpr double kCount = 1500.0;  // samples per overlapping pair
+    const auto slot = [](int row, int col) { return row * kCols + col; };
+
+    std::vector<std::array<double, 3>> true_gain(
+        static_cast<std::size_t>(kCameras), std::array<double, 3>{1.0, 1.0, 1.0});
+    true_gain[7] = {kTrueDark, kTrueDark, kTrueDark};
+
+    // Deterministic per-side content mismatch, +-3%: overlap means computed from
+    // different photographs of the same ground never agree exactly, and that
+    // residual is what makes the raw solution's scale depart from 1 at all.
+    const auto mismatch = [](int a, int b, int side) {
+        const std::int64_t h = (static_cast<std::int64_t>(a) * 7919 + b * 104729 +
+                                side * 15485863) %
+                               101;
+        return 1.0 + 0.03 * (static_cast<double>(h) / 100.0 * 2.0 - 1.0);
+    };
+
+    std::vector<OverlapPair> pairs;
+    const auto add_pair = [&](int a, int b) {
+        OverlapPair pair;
+        pair.a = std::min(a, b);
+        pair.b = std::max(a, b);
+        pair.count = kCount;
+        for (int c = 0; c < 3; ++c) {
+            const std::size_t channel = static_cast<std::size_t>(c);
+            pair.mean_a[channel] =
+                kStored / true_gain[static_cast<std::size_t>(pair.a)][channel] *
+                mismatch(pair.a, pair.b, 0);
+            pair.mean_b[channel] =
+                kStored / true_gain[static_cast<std::size_t>(pair.b)][channel] *
+                mismatch(pair.a, pair.b, 1);
+        }
+        pairs.push_back(pair);
+    };
+    for (int row = 0; row < kRows; ++row) {
+        for (int col = 0; col < kCols; ++col) {
+            for (const auto& step : {std::pair<int, int>{0, 1}, {1, 0}, {1, 1}, {1, -1}}) {
+                const int rr = row + step.first;
+                const int cc = col + step.second;
+                if (rr < 0 || rr >= kRows || cc < 0 || cc >= kCols) {
+                    continue;
+                }
+                add_pair(slot(row, col), slot(rr, cc));
+            }
+        }
+    }
+    ASSERT_GT(pairs.size(), 40U) << "the fixture should be a well-connected flight";
+
+    const auto gains = solve_gains(kCameras, pairs);
+    const auto rel = normalised(gains);
+    const auto truth = normalised(true_gain);
+
+    // The dark camera must come out brighter than the others by the true ratio.
+    // Comparing against the normalised truth is what makes this independent of
+    // the (unidentifiable) absolute scale.
+    for (int i = 0; i < kCameras; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            const double want = truth[static_cast<std::size_t>(i)][static_cast<std::size_t>(c)];
+            const double got = rel[static_cast<std::size_t>(i)][static_cast<std::size_t>(c)];
+            EXPECT_NEAR(got, want, 0.06) << "camera " << i << " channel " << c;
+        }
+    }
+    // The specific failure signature: every camera at exactly 1, which is what
+    // clamp-then-normalise produced on the bench.
+    double lo = gains.front()[0];
+    double hi = gains.front()[0];
+    for (const auto& gain : gains) {
+        lo = std::min(lo, gain[0]);
+        hi = std::max(hi, gain[0]);
+    }
+    std::printf("[OrthoGain.NoisyFlight] red gain range %.6f .. %.6f\n", lo, hi);
+    EXPECT_GT(hi - lo, 0.10)
+        << "a 1.2x exposure difference must survive the solve, not collapse to 1";
+    EXPECT_GT(gains[7][0], 1.05) << "the 1.2x-dark camera must be brightened";
+}
+
 TEST(OrthoGain, the_prior_pulls_a_single_camera_pair_toward_one) {
     // Sanity on the prior's role: with a tiny sample count (so the data term is
     // weak) a 1.3 ratio must still be pulled towards 1 versus a large count.

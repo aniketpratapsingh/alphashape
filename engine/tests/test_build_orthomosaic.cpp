@@ -9,6 +9,7 @@
 #include "aerial_fixture.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -2101,7 +2102,10 @@ namespace fs = std::filesystem;
 /// the rectifier decodes.
 class DimmedFlight {
 public:
-    DimmedFlight(Chunk& chunk, double factor) {
+    /// Odd-numbered cameras are dimmed by `factor`; when `dim_even` is set the
+    /// other parity is dimmed by its own factor instead, so a test can build a
+    /// flight with a real exposure spread rather than one alternating pair.
+    DimmedFlight(Chunk& chunk, double factor, double dim_even = 0.0) {
         const auto& cameras = chunk.cameras();
         for (const auto& frame : chunk.frames()) {
             if (frame->camera_id() >= 0) {
@@ -2124,12 +2128,13 @@ public:
             if (image.empty()) {
                 continue;
             }
-            if (c % 2 == 1) {  // every other camera
+            const double factor_for = (c % 2 == 1) ? factor : dim_even;
+            if (factor_for > 0.0 && factor_for != 1.0) {
                 for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
                     for (int channel = 0; channel < 3; ++channel) {
                         const double v = static_cast<double>(
                                              image.data()[i + static_cast<std::size_t>(channel)]) *
-                                         factor;
+                                         factor_for;
                         image.data()[i + static_cast<std::size_t>(channel)] =
                             static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0, 255.0)));
                     }
@@ -2261,6 +2266,126 @@ TEST(OrthoGain, CorrectionLeavesAnUngainedFlightNearlyUntouched) {
     // moves them by at most a handful. 10 is the ceiling that separates the two.
     EXPECT_LT(mean_abs, 10.0)
         << "an ungained flight must be left nearly untouched by the correction";
+}
+
+TEST(OrthoGain, TaskPathAppliesNonTrivialGainsOnAMismatchedFlight) {
+    // THE BENCH REGRESSION, at TASK level. The solver unit tests build their
+    // overlap records by hand, so they can never catch a fault in how the task
+    // turns rasterised photographs into those records. On the aerial-nadir
+    // bench the task found 406 overlapping pairs with brightness ratios
+    // 0.69..1.34 yet reported "gain compensation 1 .. 1": every raw gain had
+    // been clamped before the mean-normalisation, so the vector collapsed to a
+    // constant and divided by itself.
+    //
+    // This case forces the same shape through the real path. The photographs
+    // are given a strong per-camera radial falloff (vignetting), so two cameras
+    // that share ground do NOT record the same mean over the shared cells —
+    // the per-side mismatch the bench has and ideal synthetic data lacks. The
+    // solved gains must then span a real range and be APPLIED, which is read
+    // back from the task's own INFO diagnostic.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    DimmedFlight dimmed(chunk, 0.8);  // odd cameras 0.8x, even 1.0x
+    // The copies are now the frames' paths, so the radial falloff is baked into
+    // them in place. Without a PER-SIDE mismatch two cameras that share ground
+    // record the same mean and the solve has nothing to disagree about, which
+    // is exactly why the ideal synthetic fixtures never caught this.
+    std::vector<Frame*> frames;
+    for (const auto& frame : chunk.frames()) {
+        if (frame->camera_id() >= 0) {
+            frames.push_back(frame.get());
+        }
+    }
+    ASSERT_EQ(frames.size(), 12U);
+    for (std::size_t c = 0; c < frames.size(); ++c) {
+        Image image = read_image(frames[c]->path());
+        ASSERT_FALSE(image.empty()) << "camera " << c << " copy is unreadable";
+        const int w = image.width();
+        const int h = image.height();
+        // Strong per-camera vignette, varying with the camera index so no two
+        // photographs share a falloff. The strength is what makes the raw
+        // solution's absolute scale fall below min_gain, which is the exact
+        // precondition of the collapse: every camera then clamped to that bound
+        // and the mean-normalisation divided a constant by itself.
+        const double k = 0.30 + 0.05 * static_cast<double>(c);
+        for (int row = 0; row < h; ++row) {
+            for (int col = 0; col < w; ++col) {
+                const double u = (static_cast<double>(col) + 0.5) / static_cast<double>(w);
+                const double v = (static_cast<double>(row) + 0.5) / static_cast<double>(h);
+                const double r2 = ((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5)) / 0.5;
+                const double factor = 1.0 - k * r2;
+                std::uint8_t* px = image.data() +
+                                   (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                    static_cast<std::size_t>(col)) *
+                                       3U;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const double value = static_cast<double>(px[channel]) * factor;
+                    px[channel] =
+                        static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
+                }
+            }
+        }
+        write_png(frames[c]->path(), image);
+    }
+
+    std::string diagnostics;
+    {
+        ScopedLogCapture capture;
+        Params params = colour_params(0.125, true, 0, false, "disabled");
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", params);
+        diagnostics = capture.text(LogLevel::Info);
+    }
+
+    // The solve must have produced a real spread. Parsing the line the task
+    // emits is the only way to see the gains themselves from a black-box run;
+    // it also guarantees the diagnostic stays there and stays accurate.
+    const std::size_t at = diagnostics.find("gains per channel");
+    ASSERT_NE(at, std::string::npos)
+        << "the task must log the solved gains at INFO; got:\n" << diagnostics;
+    // Read the red channel's range out of "... gains per channel r[lo .. hi mean ...]".
+    const auto read_number = [&diagnostics](std::size_t from) {
+        while (from < diagnostics.size() && std::isspace(static_cast<unsigned char>(
+                                               diagnostics[from]))) {
+            ++from;
+        }
+        std::size_t end = from;
+        while (end < diagnostics.size() &&
+               (std::isdigit(static_cast<unsigned char>(diagnostics[end])) ||
+                diagnostics[end] == '.' || diagnostics[end] == '-' ||
+                diagnostics[end] == '+' || diagnostics[end] == 'e')) {
+            ++end;
+        }
+        return std::pair<double, std::size_t>(std::stod(diagnostics.substr(from, end - from)),
+                                              end);
+    };
+    const std::size_t bracket = diagnostics.find("r[", at);
+    ASSERT_NE(bracket, std::string::npos);
+    const auto [lo, after_lo] = read_number(bracket + 2);
+    const auto [hi, after_hi] = read_number(diagnostics.find("..", after_lo) + 2);
+    (void)after_hi;
+    std::printf("[OrthoGain.TaskPath] red gain range %.4f .. %.4f\n", lo, hi);
+    EXPECT_GT(hi - lo, 0.05)
+        << "a flight with a 20% exposure spread and strong vignetting must not "
+           "solve to a constant gain (the bench's collapse-to-1 bug)";
+
+    // And the gains must REACH the product: a non-trivial correction has to
+    // change the mosaic against the same run without correction.
+    const Orthomosaic corrected = s.document.active_chunk()->orthomosaic();
+    const Orthomosaic plain = run_ortho(s, colour_params(0.125, false, 0, false, "disabled"));
+    ASSERT_EQ(plain.raster.grid, corrected.raster.grid);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < plain.raster.data.size(); i += 4) {
+        if (plain.raster.data[i + 3] == 0 || corrected.raster.data[i + 3] == 0) {
+            continue;
+        }
+        if (plain.raster.data[i] != corrected.raster.data[i]) {
+            ++differing;
+        }
+    }
+    std::printf("[OrthoGain.TaskPath] differing red cells = %zu\n", differing);
+    EXPECT_GT(differing, 0U)
+        << "a non-trivial gain must actually change the mosaic, not be applied "
+           "to a copy or dropped";
 }
 
 }  // namespace

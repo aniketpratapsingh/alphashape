@@ -973,7 +973,42 @@ std::vector<std::array<double, 3>> estimate_camera_gains(
                             << " overlapping camera pairs, overlap brightness ratio "
                             << raw_lo << " .. " << raw_hi;
     }
-    return ortho::solve_gains(static_cast<int>(cameras.size()), pairs);
+    const std::vector<std::array<double, 3>> gains =
+        ortho::solve_gains(static_cast<int>(cameras.size()), pairs);
+
+    // The solved gains themselves, per channel, at INFO: the pair/ratio log above
+    // says what went IN, this says what came OUT. A range of 1 .. 1 here while the
+    // ratios above are wide is the signature of a solve that failed to carry its
+    // signal through (the bug this diagnostic was added to catch), so the two
+    // lines are meant to be read together.
+    if (Log::enabled(LogLevel::Info)) {
+        double samples = 0.0;
+        for (const ortho::OverlapPair& pair : pairs) {
+            samples += pair.count;
+        }
+        std::ostringstream text;
+        text << "BuildOrthomosaic: gain solve used " << pairs.size() << " pairs, "
+             << static_cast<std::uint64_t>(samples) << " samples; gains per channel";
+        static const char* const kNames[3] = {"r", "g", "b"};
+        for (int c = 0; c < 3; ++c) {
+            double lo = gains.empty() ? 1.0 : gains.front()[static_cast<std::size_t>(c)];
+            double hi = lo;
+            double sum = 0.0;
+            for (const auto& gain : gains) {
+                const double g = gain[static_cast<std::size_t>(c)];
+                lo = std::min(lo, g);
+                hi = std::max(hi, g);
+                sum += g;
+            }
+            text << ' ' << kNames[c] << "[" << format_number(lo) << " .. "
+                 << format_number(hi) << " mean "
+                 << format_number(gains.empty() ? 1.0
+                                                : sum / static_cast<double>(gains.size()))
+                 << ']';
+        }
+        log(LogLevel::Info) << text.str();
+    }
+    return gains;
 }
 
 }  // namespace
