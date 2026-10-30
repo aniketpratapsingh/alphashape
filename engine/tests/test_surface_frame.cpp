@@ -127,13 +127,16 @@ TEST(SurfaceFrame, NonUtmProjectedTarget) {
     const Chunk chunk = georeferenced_chunk(origin);
     struct Case {
         int epsg;
-        /// Round-trip tolerance. A polar stereographic grid's scale factor grows
-        /// sharply away from its standard parallel, so the same double-precision
-        /// ECEF quantisation is magnified on the way back (measured ~1.6e-6 m at
-        /// 48.7 N on EPSG:3413, against ~1e-10 m on the other two).
+        /// Round-trip tolerance. Both ends go through PROJ, so this is that
+        /// PROJ's own inversion error, not the engine's: a polar stereographic
+        /// grid magnifies double-precision quantisation away from its standard
+        /// parallel (~1.6e-6 m at 48.7 N on EPSG:3413), and LAEA's inverse
+        /// loses more on PROJ 9.4 (Ubuntu 24.04) than on 9.8 — measured 0.38 mm
+        /// there against ~1.5e-9 m here. 1 mm covers 9.4 without hiding a
+        /// broken round trip.
         double tolerance_m;
     };
-    for (const Case& c : {Case{3857, 5e-9}, Case{2154, 5e-9}, Case{3035, 5e-9},
+    for (const Case& c : {Case{3857, 5e-9}, Case{2154, 5e-9}, Case{3035, 1e-3},
                           Case{3413, 1e-4}}) {
         const int epsg = c.epsg;
         SCOPED_TRACE("EPSG:" + std::to_string(epsg));
