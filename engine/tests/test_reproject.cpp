@@ -806,7 +806,36 @@ TEST(Reproject, SameCrsNewCellKeepsTheCorner) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Error paths
+// 9. A clean scene has no nodata interior (the exact-transform fallback path)
+// ---------------------------------------------------------------------------
+
+TEST(Reproject, InteriorHasNoNodata) {
+    // A lattice cell spans up to 16 x 16 target pixels; one refused node would
+    // blank the whole cell under plain interpolation. On a scene entirely
+    // inside the projection's domain nothing is refused, so the interior must
+    // be complete, and any regression that blanks a cell shows up here.
+    const Eigen::Vector2d anchor = utm_of(9.2, 48.7);
+    const GeoRaster<float> src = utm_plane(anchor.x() - 60.0, anchor.y() + 60.0,
+                                           [](double x, double y) {
+                                               return 120.0 + 0.002 * (x - 500000.0) -
+                                                      0.003 * (y - 5400000.0);
+                                           });
+    const RasterGrid target = suggest_grid(src.grid, utm(), mercator());
+    const GeoRaster<float> out = reproject(src, utm(), mercator(), target, ReprojectOptions{});
+    std::size_t interior = 0;
+    std::size_t nodata_interior = 0;
+    for (int row = 2; row < target.height - 2; ++row) {
+        for (int col = 2; col < target.width - 2; ++col) {
+            ++interior;
+            nodata_interior += out.at(col, row) == -32767.0F ? 1U : 0U;
+        }
+    }
+    EXPECT_GT(interior, 1000U);
+    EXPECT_EQ(nodata_interior, 0U) << "a clean scene must have no nodata in its interior";
+}
+
+// ---------------------------------------------------------------------------
+// 10. Error paths
 // ---------------------------------------------------------------------------
 
 TEST(Reproject, InconsistentBufferThrows) {

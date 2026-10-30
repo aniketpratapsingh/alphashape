@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -133,6 +134,26 @@ void to_source_pixels(const RasterGrid& src, std::vector<double>& xs,
         xs[i] = (xs[i] - src.origin_x) / src.pixel_size_x;
         ys[i] = (src.origin_y - ys[i]) / src.pixel_size_y;
     }
+}
+
+/// One target pixel centre's exact source pixel coordinate. Used for the
+/// per-pixel fallback in cells a NaN lattice node poisons; the single-point
+/// path keeps that fallback free of a per-pixel allocation.
+Eigen::Vector2d exact_source_pixel(const Projection& projection, const RasterGrid& src,
+                                   const RasterGrid& target, int col, int row) {
+    double x = target.pixel_center(col, row).x();
+    double y = target.pixel_center(col, row).y();
+    if (!projection.identity) {
+        const std::optional<crsc::CrsPoint> mapped = projection.source_to_target.inverse(
+            crsc::CrsPoint{x, y, 0.0});
+        if (!mapped.has_value()) {
+            return Eigen::Vector2d(kNaN, kNaN);
+        }
+        x = mapped->x;
+        y = mapped->y;
+    }
+    return Eigen::Vector2d((x - src.origin_x) / src.pixel_size_x,
+                           (src.origin_y - y) / src.pixel_size_y);
 }
 
 /// A lattice of target pixels, each node carrying the EXACT source pixel
@@ -347,6 +368,22 @@ struct AxisCells {
     }
 };
 
+/// True when any of the four lattice nodes around cell (i, j) carries a NaN
+/// coordinate: one refused transform poisons the whole cell, so the caller must
+/// take the exact per-pixel path there rather than interpolate across it.
+bool cell_has_nan(const Lattice& l, int i, int j) {
+    const int i1 = std::min(i + 1, l.cols - 1);
+    const int j1 = std::min(j + 1, l.rows - 1);
+    const std::size_t n = lattice_index(l, i, j);
+    const std::size_t a = lattice_index(l, i1, j);
+    const std::size_t b = lattice_index(l, i, j1);
+    const std::size_t c = lattice_index(l, i1, j1);
+    return !std::isfinite(l.x[n]) || !std::isfinite(l.y[n]) ||
+           !std::isfinite(l.x[a]) || !std::isfinite(l.y[a]) ||
+           !std::isfinite(l.x[b]) || !std::isfinite(l.y[b]) ||
+           !std::isfinite(l.x[c]) || !std::isfinite(l.y[c]);
+}
+
 /// Bilinear source pixel coordinate at target pixel (col, row) from the band's
 /// lattice: the exact nodes around it, interpolated.
 Eigen::Vector2d lattice_lookup(const Lattice& l, int i, double fx, int j, double fy) {
@@ -369,8 +406,9 @@ Eigen::Vector2d lattice_lookup(const Lattice& l, int i, double fx, int j, double
 /// failed the transform) or a sample the source does not cover leaves the cell
 /// at `missing`.
 template <typename T>
-void fill_band(const GeoRaster<T>& src, const Lattice& lattice, bool bilinear,
-               float nodata_in, T missing, int row0, int band_rows, GeoRaster<T>& out) {
+void fill_band(const GeoRaster<T>& src, const Projection& projection, const Lattice& lattice,
+               bool bilinear, float nodata_in, T missing, int row0, int band_rows,
+               GeoRaster<T>& out) {
     const int channels = out.channels;
     const AxisCells cols = AxisCells::for_range(lattice.tx, 0, out.grid.width);
     const AxisCells rows = AxisCells::for_range(lattice.ty, row0, band_rows);
@@ -381,7 +419,15 @@ void fill_band(const GeoRaster<T>& src, const Lattice& lattice, bool bilinear,
         for (int col = 0; col < out.grid.width; ++col) {
             const int i = cols.node[static_cast<std::size_t>(col)];
             const double fx = cols.fraction[static_cast<std::size_t>(col)];
-            const Eigen::Vector2d p = lattice_lookup(lattice, i, fx, j, fy);
+            Eigen::Vector2d p = lattice_lookup(lattice, i, fx, j, fy);
+            if (cell_has_nan(lattice, i, j)) {
+                // A refused lattice node on this cell's corner poisons the whole
+                // cell for interpolation (no finite weight to renormalise over),
+                // so take the EXACT transform at this pixel instead. That keeps
+                // the domain's genuine interior while only the true edge stays
+                // nodata.
+                p = exact_source_pixel(projection, src.grid, out.grid, col, row);
+            }
             std::size_t base = (static_cast<std::size_t>(row) *
                                 static_cast<std::size_t>(out.grid.width) +
                                 static_cast<std::size_t>(col)) *
@@ -649,7 +695,8 @@ GeoRaster<T> reproject_raster(const GeoRaster<T>& src, const crsc::CoordinateSys
         const int band_rows = std::min(kBandRows, target.height - row0);
         const Lattice lattice =
             build_lattice(projection, src.grid, target, row0, band_rows, step);
-        fill_band(src, lattice, bilinear, options.nodata_in, missing, row0, band_rows, out);
+        fill_band(src, projection, lattice, bilinear, options.nodata_in, missing, row0,
+                  band_rows, out);
     }
     return out;
 }

@@ -26,6 +26,15 @@
 /// yields a bit-identical copy with no PROJ call and no arithmetic; a same-CRS
 /// re-cell keeps the source corner (see `resample_grid`).
 ///
+/// Domain limits. The lattice is a lattice of one plane: a source that STRADDLES
+/// the antimeridian needs its `+over`-style handling in the transform, because
+/// the extent is a single box and a wrap would fold far-east samples onto the
+/// west edge (refused points become nodata rather than a wrong wrap). Near a
+/// pole the inverse transform is singular at the pole itself; target cells whose
+/// centres the transform refuses are written as nodata. Both are out of scope
+/// for the aerial/regional rasters this engine produces, and are why the lattice
+/// error probe measures the mapping rather than assuming a global affinity.
+///
 /// @throws ValueError when a CRS is unset/local (nothing to transform between),
 ///         when the transform does not cover the raster, or when no usable cell
 ///         size can be measured. @throws Error when PROJ is unavailable.
