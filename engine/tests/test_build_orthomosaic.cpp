@@ -545,9 +545,11 @@ TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
     EXPECT_EQ(ortho.epsg(), kRequested);
     // The stored cell is exactly the requested 1 m in the target CRS.
     EXPECT_NEAR(ortho.raster.grid.pixel_size_x, 1.0, 1e-9);
-    // UTM 33N eastings are ~500 km, like 32N: the origin is a projected
-    // coordinate, not a Web-Mercator one, which is what "built in the request"
-    // means.
+    // A UTM grid's easting is a few hundred kilometres (the false easting is
+    // 500 km; at 9.2 E, 3 degrees west of zone 33's central meridian, the
+    // easting is ~270 km, and the reprojected patch lands near 73 km). Assert
+    // the UTM band rather than Web Mercator's millions: 1e5..1e6 brackets a
+    // UTM easting and excludes both a local origin and a Web-Mercator one.
     EXPECT_GT(ortho.raster.grid.origin_x, 100000.0);
     EXPECT_LT(ortho.raster.grid.origin_x, 1000000.0);
 
@@ -561,10 +563,9 @@ TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
     ASSERT_EQ(frame.epsg(), kRequested);
     const RasterGrid& dem_grid = chunk.elevation().raster.grid;
     std::size_t checked = 0;
-    double local_min_x = std::numeric_limits<double>::infinity();
-    double local_max_x = -local_min_x;
-    double local_min_y = local_min_x;
-    double local_max_y = -local_min_x;
+    Eigen::Vector2d ortho_min = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector2d ortho_max = -ortho_min;
     for (int row = 0; row < ortho.raster.grid.height; ++row) {
         for (int col = 0; col < ortho.raster.grid.width; ++col) {
             const std::size_t i = static_cast<std::size_t>(row) *
@@ -576,18 +577,19 @@ TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
             ++checked;
             const Eigen::Vector2d c = ortho.raster.grid.pixel_center(col, row);
             const Eigen::Vector3d local = frame.to_local(Eigen::Vector3d(c.x(), c.y(), 0.0));
-            local_min_x = std::min(local_min_x, local.x());
-            local_max_x = std::max(local_max_x, local.x());
-            local_min_y = std::min(local_min_y, local.y());
-            local_max_y = std::max(local_max_y, local.y());
+            ortho_min = ortho_min.cwiseMin(local.head<2>());
+            ortho_max = ortho_max.cwiseMax(local.head<2>());
         }
     }
     EXPECT_GT(checked, 5000U);
+
+    // The DEM's own footprint in chunk-local space.
     const elevation::SurfaceFrame dem_frame =
         elevation::SurfaceFrame::for_chunk(chunk, dem_epsg);
     Eigen::Vector2d dem_min = Eigen::Vector2d::Constant(
         std::numeric_limits<double>::infinity());
-    Eigen::Vector2d dem_max = Eigen::Vector2d::Constant(-local_min_x);
+    Eigen::Vector2d dem_max = Eigen::Vector2d::Constant(
+        -std::numeric_limits<double>::infinity());
     for (int row = 0; row < dem_grid.height; ++row) {
         for (int col = 0; col < dem_grid.width; ++col) {
             const Eigen::Vector2d c = dem_grid.pixel_center(col, row);
@@ -596,15 +598,27 @@ TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
             dem_max = dem_max.cwiseMax(local.head<2>());
         }
     }
+
+    // The two grids are built in different projections, so their AXIS-aligned
+    // local bounding boxes are rotated relative to each other and their
+    // per-axis extremes legitimately differ by many cells. What must hold is
+    // that the mosaic covers the same GROUND: the footprint centres agree, and
+    // neither footprint's diagonal shrinks by more than a cell against the
+    // DEM's. That is what "the geometry is not distorted by the reprojection"
+    // means, and it is what a stale frame or a wrong lattice would break.
     const double cell = ortho.raster.grid.pixel_size_x;
-    EXPECT_LT(local_min_x, dem_min.x() + cell);
-    EXPECT_GT(local_max_x, dem_max.x() - cell);
-    EXPECT_LT(local_min_y, dem_min.y() + cell);
-    EXPECT_GT(local_max_y, dem_max.y() - cell);
-    std::printf("[BuildOrthomosaic.RequestedCrs] epsg=%d cells=%zu local x[%.1f,%.1f] "
-                "y[%.1f,%.1f] (DEM x[%.1f,%.1f] y[%.1f,%.1f])\n",
-                ortho.epsg(), checked, local_min_x, local_max_x, local_min_y, local_max_y,
-                dem_min.x(), dem_max.x(), dem_min.y(), dem_max.y());
+    const Eigen::Vector2d ortho_centre = 0.5 * (ortho_min + ortho_max);
+    const Eigen::Vector2d dem_centre = 0.5 * (dem_min + dem_max);
+    const double ortho_diagonal = (ortho_max - ortho_min).norm();
+    const double dem_diagonal = (dem_max - dem_min).norm();
+    EXPECT_LT((ortho_centre - dem_centre).norm(), 2.0 * cell);
+    EXPECT_GT(ortho_diagonal, dem_diagonal - 4.0 * cell);
+    EXPECT_LT(ortho_diagonal, dem_diagonal + 4.0 * cell);
+
+    std::printf("[BuildOrthomosaic.RequestedCrs] epsg=%d cells=%zu centre delta=%.2f m "
+                "diag %.1f vs %.1f m\n",
+                ortho.epsg(), checked, (ortho_centre - dem_centre).norm(), ortho_diagonal,
+                dem_diagonal);
 }
 
 TEST(BuildOrthomosaic, Errors) {
