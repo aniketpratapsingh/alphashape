@@ -874,7 +874,7 @@ Elevation sample_elevation() {
     elevation.raster.grid.pixel_size_x = 0.5;
     elevation.raster.grid.pixel_size_y = 0.5;
     elevation.raster.data = {100.0F, 101.0F, 102.0F, 103.0F, 104.0F, 105.0F};
-    elevation.epsg = 32633;
+    elevation.set_epsg(32633);
     elevation.source = "depth_maps";
     return elevation;
 }
@@ -887,7 +887,7 @@ Orthomosaic sample_orthomosaic() {
     ortho.raster.grid.pixel_size_y = 0.25;
     ortho.raster.channels = 4;
     ortho.raster.data = {1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 0, 10, 11, 12, 0};
-    ortho.epsg = 32633;
+    ortho.set_epsg(32633);
     ortho.labels = {0, 0, -1, -1};
     ortho.surface = "elevation";
     return ortho;
@@ -1095,7 +1095,7 @@ TEST(Undo, AssetPayloadSpillsWhenLarge) {
     const Orthomosaic& restored = *chunk.orthomosaics()[0].data;
     EXPECT_EQ(restored.raster.data, expected);
     EXPECT_EQ(restored.labels.size(), ortho.labels.size());
-    EXPECT_EQ(restored.epsg, 32633);
+    EXPECT_EQ(restored.epsg(), 32633);
     EXPECT_EQ(restored.surface, "elevation");
     EXPECT_TRUE(chunk.validate().empty());
 

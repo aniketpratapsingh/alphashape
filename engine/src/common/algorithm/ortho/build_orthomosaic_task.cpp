@@ -374,6 +374,9 @@ struct ResolvedOptions {
     bool color_correction = false;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
+    /// The requested output CRS (M12 §4.9), as the DTO the parameter produced.
+    /// Unset = the DEM's own CRS.
+    CRS crs;
 };
 
 ResolvedOptions resolve_options(const Params& params) {
@@ -398,6 +401,22 @@ ResolvedOptions resolve_options(const Params& params) {
     options.projection = static_cast<int>(params.get_int("projection"));
     if (options.projection < 0) {
         throw ValueError("BuildOrthomosaic: projection must be an EPSG code >= 0");
+    }
+    // `projection` (Int EPSG, retained) and `crs` (String, new) must agree when
+    // both are set. The ortho is built in the DEM's CRS; a DIFFERENT CRS here is
+    // a reprojection, which WP-12.9 adds.
+    const std::string crs_text = params.get_string("crs");
+    if (!crs_text.empty()) {
+        options.crs = elevation::parse_crs_param(crs_text);
+        if (options.projection != 0 && options.crs.is_set() &&
+            options.crs.epsg != options.projection) {
+            throw ValueError(
+                "BuildOrthomosaic: projection (" + std::to_string(options.projection) +
+                ") and crs (\"" + crs_text +
+                "\") name different coordinate systems; pass only one");
+        }
+    } else if (options.projection != 0) {
+        options.crs = elevation::parse_crs_param("EPSG:" + std::to_string(options.projection));
     }
     return options;
 }
@@ -1385,10 +1404,16 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare(resolution);
 
     ParamSpec projection{"projection", ParamType::Int, std::int64_t{0},
-                         "Output EPSG code. 0 uses the DEM's own projection; any other value "
-                         "must equal it (reproject the DEM first)."};
+                         "Requested output EPSG code. 0 means the DEM's own; the ortho is "
+                         "always BUILT in the DEM's CRS (a differing request is applied "
+                         "when exporting). Setting `projection` and `crs` to disagreeing "
+                         "values is an error."};
     projection.minimum = std::int64_t{0};
     params.declare(projection);
+
+    params.declare({"crs", ParamType::String, std::string{},
+                    "Requested output coordinate system as \"EPSG:<code>\", a PROJ string "
+                    "or WKT. Empty uses `projection`; when both are set they must agree."});
 
     params.declare({"label", ParamType::String, std::string{},
                     "Label for the new orthomosaic asset. Empty selects "
@@ -1461,14 +1486,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         throw ValueError("BuildOrthomosaic: the chunk has no elevation model; run BuildDem "
                          "first or use surface_data=\"model\"");
     }
-    if (options.projection != 0 && !dem.empty() && options.projection != dem.epsg) {
-        // The DEM is in another CRS: a projection change here would silently
-        // misplace every ray.
-        throw ValueError(
-            "BuildOrthomosaic: projection (" + std::to_string(options.projection) +
-            ") differs from the DEM's EPSG (" + std::to_string(dem.epsg) +
-            "); reproject the DEM first (a projection change is not applied here)");
-    }
     progress.update("initialize", 0.2);
 
     // Every enabled camera with a pose and an image path; the photographs are
@@ -1479,13 +1496,24 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     }
     progress.update("initialize", 0.5);
 
-    // The plane frame: the DEM's (0 = auto for a georeferenced chunk, identity
-    // for an unreferenced one). An unreferenced chunk's DEM epsg is 0 too.
-    const int epsg = options.projection != 0 ? options.projection : dem.epsg;
-    const elevation::SurfaceFrame frame = elevation::SurfaceFrame::for_chunk(*chunk, epsg);
-    if (epsg != 0 && frame.epsg() != epsg) {
-        throw ValueError("BuildOrthomosaic: the chunk cannot be expressed in EPSG " +
-                         std::to_string(epsg));
+    // The plane frame is the DEM's (M12 §4.9): the DEM's extent and grid define
+    // the output raster, so a run always lands on the DEM's CRS and needs no
+    // preprojection, even when the request names another one. A differing
+    // request is applied at export (WP-12.9). A DEM without a recorded CRS (an
+    // older project, or a DSM-only run) falls back to the requested CRS, then to
+    // the auto-UTM / local rule.
+    elevation::SurfaceFrame frame;
+    if (!dem.empty() && dem.crs.is_set()) {
+        frame = elevation::for_options(*chunk, dem.crs);
+    } else {
+        frame = elevation::for_options(*chunk, options.crs);
+    }
+    const int epsg = frame.epsg();
+    if (Log::enabled(LogLevel::Info) && options.crs.is_set() && options.crs.epsg != 0 &&
+        options.crs.epsg != epsg) {
+        log(LogLevel::Info) << "BuildOrthomosaic: building in the DEM's EPSG " << epsg
+                            << "; the requested EPSG " << options.crs.epsg
+                            << " is applied by the export";
     }
 
     // -- the surface raster and the output grid ------------------------------
@@ -1632,7 +1660,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         // measured cell. The DSM's own automatic cell (the median mesh edge) is
         // the natural provisional value.
         dsm_options.resolution = resolution;
-        dsm_options.epsg = epsg;
+        // The DSM must land on the same plane the frame chose: the DEM's CRS
+        // when there is one, else the request (unset = the same auto rule).
+        dsm_options.crs = dem.empty() ? options.crs : dem.crs;
         dsm_options.tgv = false;  // a rasterised mesh needs no smoothing
         Elevation dsm =
             elevation::build_dem(*chunk, dsm_options, [&](double fraction) {
@@ -1663,6 +1693,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         }
         surface = dsm.raster;
         surface_nodata = dsm.nodata;
+        // dsm_options.crs above is exactly what the frame was built from (the
+        // DEM's CRS, or the request / auto rule when there is no DEM), so the
+        // DSM and the ortho share a plane by construction.
     }
 
     if (!(resolution > 0.0)) {
@@ -2316,7 +2349,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             }
         }
     }
-    result.epsg = frame.epsg();
+    result.set_epsg(frame.epsg());
+#if defined(ALPHASHAPE_USE_PROJ)
+    if (!frame.is_local()) {
+        result.crs.wkt = frame.crs().to_wkt();
+    }
+#endif
     result.surface = options.surface;
     progress.update("finalize", 1.0);
 
@@ -2330,7 +2368,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             << " covered, blending " << params.get_string("blending_mode")
                             << ", blocks " << columns << "x" << rows << " of "
                             << plan.block_cells << " (+" << plan.margin_cells
-                            << " margin), epsg " << result.epsg;
+                            << " margin), epsg " << result.epsg();
         // Decode accounting: a cache too small for the flight shows up here as
         // decodes well above the camera count, which is the number to watch if a
         // future change to the plan or the block order starts thrashing.

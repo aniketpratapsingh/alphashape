@@ -5,8 +5,6 @@
 add_library(alphashape_model STATIC
     camera/calibration.cpp
     geo/geodesy.cpp
-    geo/transverse_mercator.cpp
-    geo/projection.cpp
     mesh/marching_tetrahedra.cpp
     mesh/mesh_ops.cpp
     mesh/decimate.cpp

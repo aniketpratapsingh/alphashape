@@ -312,6 +312,26 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     repair_max_area.minimum = std::int64_t{0};
     repair_max_area.maximum = kMaxRepairArea;
     params.declare(repair_max_area);
+
+    // Multi-view cost aggregation (patch_match.hpp): the mean of the best_k
+    // smallest per-neighbour costs. 0 keeps the historical ceil(n/2).
+    ParamSpec best_k{"best_k", ParamType::Int, std::int64_t{0},
+                     "The multi-view cost is the mean of the best_k smallest per-neighbour "
+                     "costs. 0 (default) uses ceil(n/2), the historical behaviour; 1 trusts "
+                     "the single best neighbour."};
+    best_k.minimum = std::int64_t{0};
+    best_k.maximum = std::int64_t{255};
+    params.declare(best_k);
+
+    // Flat-window gate. 1/255 is the historical value (one 8-bit level of
+    // intensity); lowering it matches windows that were previously skipped.
+    ParamSpec min_texture_stddev{
+        "min_texture_stddev", ParamType::Float, 1.0 / 255.0,
+        "Windows whose intensity standard deviation is below this are not matched, so they "
+        "keep no depth. On intensity in [0, 1]; the default 1/255 is roughly one 8-bit level."};
+    min_texture_stddev.minimum = 0.0;
+    min_texture_stddev.maximum = 1.0;
+    params.declare(min_texture_stddev);
 }
 
 std::vector<Stage> BuildDepthMapsTask::stages() const {
@@ -331,6 +351,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const double max_cost_value = params.get_float("max_cost");
     const bool repair_holes = params.get_bool("repair_holes");
     const std::int64_t repair_max_area = params.get_int("repair_max_area");
+    const std::int64_t best_k_value = params.get_int("best_k");
+    const double min_texture_stddev_value = params.get_float("min_texture_stddev");
 
     if (downscale_value <= 0) {
         throw ValueError("Downscale must be positive");
@@ -384,6 +406,20 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const double max_cost = max_cost_value < 0.0
                                 ? stereo::patch_match_default_max_cost(cost_type)
                                 : max_cost_value;
+    // best_k is clamped to the neighbour count by the search itself; the upper
+    // bound here only catches a caller passing a nonsense count. 0 is the
+    // historical ceil(n/2).
+    if (best_k_value < 0 || best_k_value > 255) {
+        throw ValueError("best_k must be in [0, 255]");
+    }
+    const int best_k = static_cast<int>(best_k_value);
+    // The texture gate is an intensity stddev on [0, 1]; the maximum such
+    // stddev is 0.5, but 1.0 is the honest bound for a value that silently
+    // stops every window from matching.
+    if (!(min_texture_stddev_value >= 0.0) || min_texture_stddev_value > 1.0) {
+        throw ValueError("min_texture_stddev must be in [0, 1]");
+    }
+    const double min_texture_stddev = min_texture_stddev_value;
 
     // -- validate the chunk --------------------------------------------------
     progress.update("initialize", 0.0);
@@ -500,6 +536,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // And the cut changes which of those planes survive into the map, so the
         // EFFECTIVE threshold (the resolved default included) is folded too.
         context.max_cost = max_cost;
+        context.best_k = best_k;
+        context.min_texture_stddev = min_texture_stddev;
         const auto hood_it = hood_of.find(camera_id);
         if (hood_it != hood_of.end()) {
             const stereo::ViewNeighbourhood& hood = *hood_it->second;
@@ -838,6 +876,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             options.pyramid_min_size = kPyramidMinSize;
             options.cost_type = cost_type;
             options.max_cost = max_cost;
+            options.best_k = best_k;
+            options.min_texture_stddev = min_texture_stddev;
             options.on_sweep = sweep_progress;
 
             log_device_once();

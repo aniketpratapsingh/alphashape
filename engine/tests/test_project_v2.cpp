@@ -135,7 +135,7 @@ Elevation make_elevation(float base) {
     dem.raster.grid.pixel_size_y = 0.5;
     dem.raster.channels = 1;
     dem.raster.data = {base, base + 1.0F, base + 2.0F, base + 3.0F};
-    dem.epsg = 32633;
+    dem.set_epsg(32633);
     dem.nodata = -9999.0F;
     dem.source = "depth_maps";
     return dem;
@@ -154,7 +154,7 @@ Orthomosaic make_ortho(std::uint8_t salt) {
     for (std::size_t i = 0; i < ortho.raster.data.size(); ++i) {
         ortho.raster.data[i] = static_cast<std::uint8_t>((i * 7U + salt) % 256U);
     }
-    ortho.epsg = 32633;
+    ortho.set_epsg(32633);
     ortho.surface = "elevation";
     ortho.labels = {0, 1, 1, -1};
     return ortho;
@@ -828,7 +828,7 @@ TEST_F(ProjectV2, LoadsV1Fixture) {
     EXPECT_EQ(dem.raster.grid.width, 4);
     EXPECT_EQ(dem.raster.grid.height, 3);
     EXPECT_EQ(dem.raster.grid.origin_x, 500000.0);
-    EXPECT_EQ(dem.epsg, 32633);
+    EXPECT_EQ(dem.epsg(), 32633);
     EXPECT_EQ(dem.nodata, -32767.0F);
     EXPECT_EQ(dem.source, "depth_maps");
     EXPECT_EQ(dem.raster.data, want.elevations().front().data->raster.data);
@@ -914,7 +914,7 @@ TEST_F(ProjectV2, LoadsV1RichProject) {
     EXPECT_EQ(dem.raster.grid.width, want_dem.raster.grid.width);
     EXPECT_EQ(dem.raster.grid.height, want_dem.raster.grid.height);
     EXPECT_EQ(dem.raster.grid.origin_x, want_dem.raster.grid.origin_x);
-    EXPECT_EQ(dem.epsg, want_dem.epsg);
+    EXPECT_EQ(dem.epsg(), want_dem.epsg());
     EXPECT_EQ(dem.nodata, want_dem.nodata);
     EXPECT_EQ(dem.source, want_dem.source);
     EXPECT_EQ(dem.raster.data, want_dem.raster.data);
@@ -965,7 +965,7 @@ TEST_F(ProjectV2, LoadsV1M9Project) {
         }
     }
     // The DEM is expressed in UTM 33N through the chunk's ENU placement.
-    dem.epsg = 32633;
+    dem.set_epsg(32633);
     dem.nodata = -32767.0F;
     dem.source = "depth_maps";
     chunk.elevation() = dem;
@@ -1001,7 +1001,7 @@ TEST_F(ProjectV2, LoadsV1M9Project) {
         ortho.raster.data[i * 4 + 3] = 255;
         ortho.labels[i] = static_cast<std::int32_t>(i % 12);
     }
-    ortho.epsg = 32633;
+    ortho.set_epsg(32633);
     ortho.surface = "elevation";
     chunk.orthomosaic() = ortho;
 
@@ -1021,7 +1021,7 @@ TEST_F(ProjectV2, LoadsV1M9Project) {
     const Elevation& got_dem = *got.elevations().front().data;
     EXPECT_EQ(got_dem.raster.grid.width, dem.raster.grid.width);
     EXPECT_EQ(got_dem.raster.grid.height, dem.raster.grid.height);
-    EXPECT_EQ(got_dem.epsg, 32633);
+    EXPECT_EQ(got_dem.epsg(), 32633);
     EXPECT_EQ(got_dem.raster.data, dem.raster.data);
     // The truth heights survive the GeoTIFF round-trip to float precision.
     EXPECT_EQ(got_dem.raster.at(0, 0), truth.at(0, 0));

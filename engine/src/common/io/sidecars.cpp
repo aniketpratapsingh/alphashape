@@ -783,7 +783,7 @@ void validate_raster_grid(const RasterGrid& grid, const char* what) {
 std::vector<std::uint8_t> encode_elevation(const Elevation& elevation) {
     ScopedTempFile scratch("dem");
     GeoTiffOptions options;
-    options.epsg = elevation.epsg;
+    options.epsg = elevation.epsg();
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;
@@ -801,7 +801,7 @@ Elevation decode_elevation(const std::vector<std::uint8_t>& bytes) {
     }
     Elevation elevation;
     elevation.raster = read_geotiff_float(scratch.path());
-    elevation.epsg = info.epsg;
+    elevation.set_epsg(info.epsg);
     elevation.nodata = info.nodata.has_value() ? static_cast<float>(*info.nodata) : -32767.0F;
     return elevation;
 }
@@ -809,7 +809,7 @@ Elevation decode_elevation(const std::vector<std::uint8_t>& bytes) {
 std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho) {
     ScopedTempFile scratch("ortho");
     GeoTiffOptions options;
-    options.epsg = ortho.epsg;
+    options.epsg = ortho.epsg();
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;
@@ -826,7 +826,7 @@ Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes) {
     }
     Orthomosaic ortho;
     ortho.raster = read_geotiff_u8(scratch.path());
-    ortho.epsg = info.epsg;
+    ortho.set_epsg(info.epsg);
     return ortho;
 }
 
@@ -1336,7 +1336,7 @@ void validate_products(const Chunk& chunk) {
         if (!std::isfinite(elevation.nodata)) {
             throw ProjectIOError("elevation: nodata must be finite");
         }
-        if (elevation.epsg < 0) {
+        if (elevation.crs.epsg < 0) {
             throw ProjectIOError("elevation: epsg must be >= 0");
         }
     }
@@ -1363,7 +1363,7 @@ void validate_products(const Chunk& chunk) {
         if (ortho.labels.size() != pixels) {
             throw ProjectIOError("orthomosaic: label count does not match width*height");
         }
-        if (ortho.epsg < 0) {
+        if (ortho.crs.epsg < 0) {
             throw ProjectIOError("orthomosaic: epsg must be >= 0");
         }
     }

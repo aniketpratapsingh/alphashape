@@ -99,9 +99,10 @@ public:
     /// @throws ValueError when a CRS is the local engineering frame (it needs a
     ///         LocalFrame, CRS-05, not a plain transform), when `src`/`dst`
     ///         is unset, or when a vertical component was supplied.
-    /// @throws Error when PROJ has no operation for the pair, when the only
-    ///         operation is a ballpark and `allow_ballpark` is false, or when
-    ///         `preferred_operation` cannot be used.
+    /// @throws Error when PROJ has no operation for the pair, when no real
+    ///         (non-ballpark) operation exists for it and `allow_ballpark` is
+    ///         false, or when `preferred_operation` cannot be used. An
+    ///         area-limited operation counts as real: PROJ applies it per point.
     static CrsTransform create(const CoordinateSystem& src, const CoordinateSystem& dst,
                                const TransformOptions& options = {});
 
@@ -128,7 +129,9 @@ public:
     /// The PROJ pipeline text of the operation (logging/diagnostics). Captured
     /// when the transform was created, so it is identical on every thread.
     const std::string& description() const;
-    /// Operation accuracy in metres from PROJ, -1 when unknown.
+    /// The best accuracy in metres PROJ states for the pair's real (non-
+    /// ballpark) operations, -1 when it states none for any of them. For a
+    /// pinned transform it is that operation's own stated accuracy.
     double accuracy_m() const;
     /// True when the selected operation is a ballpark (null) datum shift. Only
     /// reachable with `allow_ballpark`.

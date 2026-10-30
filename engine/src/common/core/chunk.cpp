@@ -362,6 +362,21 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
         if (context->max_cost != 0.5) {
             h = fold_double(h, context->max_cost);
         }
+        // best_k chooses how many neighbour costs the multi-view cost averages,
+        // so two runs that differ here searched with different objective values
+        // and hold different maps. Folded only when non-zero: 0 (ceil(n/2)) IS
+        // the historical search, and a map saved before the field existed
+        // recorded nothing here.
+        if (context->best_k != 0) {
+            h = fold_int(h, context->best_k);
+        }
+        // The texture gate decides which windows were searched at all, so it is
+        // part of the map's identity. Folded only when it is not the historical
+        // 1/255, so every map built before the gate became configurable keeps
+        // matching a default run.
+        if (context->min_texture_stddev != 1.0 / 255.0) {
+            h = fold_double(h, context->min_texture_stddev);
+        }
         h = fold_int(h, static_cast<std::int64_t>(context->seed));
     }
 
