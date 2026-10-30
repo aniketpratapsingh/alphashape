@@ -545,13 +545,17 @@ TEST(BuildOrthomosaic, BuildsInTheRequestedCrsWithoutPreprojection) {
     EXPECT_EQ(ortho.epsg(), kRequested);
     // The stored cell is exactly the requested 1 m in the target CRS.
     EXPECT_NEAR(ortho.raster.grid.pixel_size_x, 1.0, 1e-9);
-    // A UTM grid's easting is a few hundred kilometres (the false easting is
-    // 500 km; at 9.2 E, 3 degrees west of zone 33's central meridian, the
-    // easting is ~270 km, and the reprojected patch lands near 73 km). Assert
-    // the UTM band rather than Web Mercator's millions: 1e5..1e6 brackets a
-    // UTM easting and excludes both a local origin and a Web-Mercator one.
-    EXPECT_GT(ortho.raster.grid.origin_x, 100000.0);
+    // A projected easting, not a local or a geographic one: UTM 33N's false
+    // easting is 500 km and this patch sits 3 degrees west of zone 33's central
+    // meridian, so its easting is ~73 km (Computed, not assumed: the print
+    // below shows it). Web Mercator would be in the millions, a local frame
+    // near zero. The bound is wide enough to be a band test, not a constant.
+    EXPECT_GT(ortho.raster.grid.origin_x, 10000.0);
     EXPECT_LT(ortho.raster.grid.origin_x, 1000000.0);
+    // And genuinely a DIFFERENT plane from the DEM's own 32N grid (whose origin
+    // is ~500 km easting): if the request had been ignored these would match.
+    EXPECT_GT(std::abs(ortho.raster.grid.origin_x - chunk.elevation().raster.grid.origin_x),
+              10000.0);
 
     // Geometry is unaffected within a cell: map every opaque cell's centre into
     // chunk-local space through the 33N frame and check the covered footprint
