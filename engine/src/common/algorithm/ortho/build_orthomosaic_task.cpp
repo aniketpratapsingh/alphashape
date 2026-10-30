@@ -405,8 +405,9 @@ ResolvedOptions resolve_options(const Params& params) {
         throw ValueError("BuildOrthomosaic: projection must be an EPSG code >= 0");
     }
     // `projection` (Int EPSG, retained) and `crs` (String, new) must agree when
-    // both are set. The ortho is built in the DEM's CRS; a DIFFERENT CRS here is
-    // a reprojection, which WP-12.9 adds.
+    // both are set. An unset request builds in the DEM's CRS; a DIFFERENT one
+    // reprojects the surface once and builds the mosaic in the requested CRS
+    // (WP-12.9).
     const std::string crs_text = params.get_string("crs");
     if (!crs_text.empty()) {
         options.crs = elevation::parse_crs_param(crs_text);
