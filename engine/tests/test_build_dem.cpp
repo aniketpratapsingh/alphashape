@@ -1840,9 +1840,9 @@ TEST(Dem, RobustFusionIsDeterministicAndDefaultStaysMedian) {
     EXPECT_EQ(robust_one.raster.grid.width, explicit_median.raster.grid.width);
     EXPECT_EQ(robust_one.raster.grid.height, explicit_median.raster.grid.height);
     // Two robust runs are bit-identical ...
-    EXPECT_EQ(dem_values(robust_one), dem_values(robust_two));
+    EXPECT_TRUE(dem_values(robust_one) == dem_values(robust_two));
     // ... and the absent parameter is exactly the historical median path.
-    EXPECT_EQ(dem_values(default_fusion), dem_values(explicit_median));
+    EXPECT_TRUE(dem_values(default_fusion) == dem_values(explicit_median));
 
     Document bogus_document = make_local_chunk_document();
     fill_truth_point_cloud(*bogus_document.active_chunk(), -10.0, 10.0, -10.0, 10.0, 0.25);
