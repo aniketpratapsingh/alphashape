@@ -1,7 +1,7 @@
 /// GeoTIFF 1.1 (OGC 19-008r4) writer/reader for GeoRaster. Implements the
 /// GeoTIFF subset directly against TIFF 6.0 via libtiff: ModelPixelScale (33550),
-/// ModelTiepoint (33922), GeoKeyDirectory (34735) and GDAL_NODATA (42113).
-/// No GDAL.
+/// ModelTiepoint (33922), GeoKeyDirectory (34735), GeoAsciiParams (34737) and
+/// GDAL_NODATA (42113). No GDAL.
 #pragma once
 
 #include <cstdint>

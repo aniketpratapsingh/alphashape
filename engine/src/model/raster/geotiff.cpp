@@ -254,11 +254,11 @@ void write_geo_tags(TIFF* tif, const RasterGrid& g, const GeoTiffOptions& option
     const double tiepoint[6] = {0.0, 0.0, 0.0, g.origin_x, g.origin_y, 0.0};
     TIFFSetField(tif, kTagModelTiepoint, 6, tiepoint);
 
-    const GeoKeyEncoding keys = build_geo_keys(options);
+    GeoKeyEncoding keys = build_geo_keys(options);
     TIFFSetField(tif, kTagGeoKeyDirectory, static_cast<std::uint32_t>(keys.keys.size()),
                  keys.keys.data());
     if (!keys.ascii.empty()) {
-        TIFFSetField(tif, kTagGeoAsciiParams, keys.ascii.c_str());
+        TIFFSetField(tif, kTagGeoAsciiParams, keys.ascii.data());
     }
 
     if (options.nodata.has_value()) {

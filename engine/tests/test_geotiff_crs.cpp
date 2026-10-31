@@ -101,10 +101,11 @@ void write_raw_geotiff(const std::string& path, const std::vector<std::uint16_t>
     TIFFSetField(tif, kTagGeoKeyDirectory, static_cast<std::uint32_t>(keys.size()),
                  keys.data());
     if (!ascii.empty()) {
-        TIFFSetField(tif, kTagGeoAsciiParams, ascii.c_str());
+        std::string pool = ascii;
+        TIFFSetField(tif, kTagGeoAsciiParams, pool.data());
     }
     std::vector<std::uint8_t> row(16, 0);
-    for (std::uint32_t y = 0; y < 16; ++y) {
+    for (std::uint32_t y = 0; y < 16U; ++y) {
         TIFFWriteScanline(tif, row.data(), y, 0);
     }
     TIFFClose(tif);
@@ -167,7 +168,7 @@ TEST(Crs, GeoTiffWktGeoKeys) {
         previous = raw.keys[base];
         if (raw.keys[base] == 3072) {
             saw_type = true;
-            EXPECT_EQ(raw.keys[base + 3], 32767);
+            EXPECT_EQ(raw.keys[base + 3], static_cast<std::uint16_t>(32767));
         }
         if (raw.keys[base] == 3073) {
             saw_citation = true;
@@ -251,7 +252,7 @@ TEST(Crs, GeoTiffNoCrsWritesUserDefined) {
         switch (raw.keys[base]) {
             case 1024:
                 saw_model = true;
-                EXPECT_EQ(raw.keys[base + 3], 32767);
+                EXPECT_EQ(raw.keys[base + 3], static_cast<std::uint16_t>(32767));
                 break;
             case 2048:
             case 3072:
