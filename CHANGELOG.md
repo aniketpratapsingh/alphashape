@@ -19,10 +19,12 @@ All notable changes to alphashape are recorded here. The format follows
   curated 48-name list; `addGeoid(path)` / `listGeoids()` expose the process
   geoid registry (a custom grid is referenced where it is, never copied or
   downloaded). `Chunk.crs` reads and writes the engine CRS; assignment runs
-  the undoable "Set Chunk CRS" command (the first bound command, with
-  `Document.undo` / `redo` / `can_undo` / `undo_name` arriving alongside it)
-  and only relabels the chunk — no reference, pose, tie point or asset is
-  transformed. There is no `datumTransform()`: the engine lists candidate
+  the same "Set Chunk CRS" command the GUI uses and then discards it (the GUI
+  owns the document's undo history, and Metashape's Python API has no undo).
+  It only relabels the chunk — no reference, pose, tie point or asset is
+  transformed — and assigning an unset `CoordinateSystem()` clears the chunk
+  to LOCAL. The legacy `crs_epsg` setter routes through that same command, and
+  `__hash__` is disabled because `__eq__` is PROJ equivalence. There is no `datumTransform()`: the engine lists candidate
   operations per CRS pair (`available_transformations`) and pins one with
   `with_transformation`, but no single "preferred" operation exists to report.
   `BuildDem`'s `projection` (EPSG int) and `crs` (text) parameters are covered

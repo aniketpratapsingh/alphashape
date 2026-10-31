@@ -5,10 +5,12 @@ What this file pins:
 
   * construction from an EPSG code, WKT and a PROJ string, and by built-in
     name; the name / authority / epsg / wkt properties and the repr;
-  * `__eq__` is PROJ equivalence, so a WKT round trip compares equal;
-  * `Chunk.crs` is an undoable label change (Document.undo / redo), and
-    assigning it does NOT transform camera references;
-  * the geoid registry lists ids and refuses a missing grid;
+  * `__eq__` is PROJ equivalence, so a WKT round trip compares equal, and the
+    type is unhashable (hash / eq contract);
+  * `Chunk.crs` merely relabels the chunk (no Python-side undo stack: the GUI
+    owns undo and Metashape's API has none), and assigning it does NOT
+    transform camera references; `CoordinateSystem()` resets to LOCAL;
+  * the geoid registry lists ids and refuses a missing or non-grid file;
   * BuildDem accepts its `projection` EPSG parameter (and refuses a `crs`
     that disagrees).
 
@@ -37,6 +39,7 @@ AERIAL = [
 ]
 UTM_ZONE_32N = 32632
 UTM_ZONE_33N = 32633
+WEB_MERCATOR = 3857
 # 480x360 fixtures; downscale 8 keeps the DEM pipeline quick.
 DOWNSCALE = 8
 
@@ -114,43 +117,68 @@ class CoordinateSystemTest(unittest.TestCase):
         self.assertNotEqual(authority, alphashape.CoordinateSystem(UTM_ZONE_32N))
         self.assertFalse(authority == "EPSG:4326")
 
+    def test_unhashable(self):
+        # __eq__ is PROJ equivalence, not identity, so the class disables
+        # identity hashing: hash(cs) must raise, as it does for tuple.
+        with self.assertRaises(TypeError):
+            hash(alphashape.CoordinateSystem(UTM_ZONE_33N))
+
     def test_invalid_inputs(self):
         with self.assertRaises(alphashape.ValueError):
             alphashape.CoordinateSystem(999999)
         with self.assertRaises(alphashape.ValueError):
             alphashape.CoordinateSystem(wkt="not a crs")
         with self.assertRaises(alphashape.ValueError):
+            alphashape.CoordinateSystem(proj="not a proj string")
+        # Exactly one of wkt= / proj= / name= is accepted: any pair is
+        # ambiguous, including name= alongside a definition.
+        with self.assertRaises(alphashape.ValueError):
             alphashape.CoordinateSystem(wkt="EPSG:32633", proj="+proj=utm +zone=33")
+        with self.assertRaises(alphashape.ValueError):
+            alphashape.CoordinateSystem(wkt="EPSG:32633", name="LOCAL")
+        with self.assertRaises(alphashape.ValueError):
+            alphashape.CoordinateSystem(proj="+proj=utm +zone=33", name="LOCAL")
         with self.assertRaises(alphashape.ValueError):
             alphashape.CoordinateSystem(name="No Such CRS")
         with self.assertRaises(TypeError):
             alphashape.CoordinateSystem(bogus=1)
 
-    def test_chunk_crs_set_undo(self):
+    def test_chunk_crs_set_relabels_only(self):
         doc = alphashape.Document()
         chunk = doc.add_chunk("Chunk 1")
         doc.active_chunk = chunk
         doc.run_task("AddPhotos", filenames=[AERIAL[0], AERIAL[1]])
-        # A fresh chunk is the local frame; tasks are not undo-stack entries.
+        # A fresh chunk is the local frame.
         self.assertIsNone(chunk.crs.epsg)
         self.assertEqual(chunk.crs.name, "LOCAL")
-        self.assertFalse(doc.can_undo)
         before = _reference_repr(chunk)
         chunk.crs = alphashape.CoordinateSystem(UTM_ZONE_33N)
         self.assertEqual(chunk.crs.epsg, UTM_ZONE_33N)
         self.assertIn("UTM zone 33N", chunk.crs.name)
-        self.assertTrue(doc.can_undo)
-        self.assertEqual(doc.undo_name, "Set Chunk CRS")
         # Setting the CRS relabels the chunk; no reference is transformed.
         self.assertEqual(_reference_repr(chunk), before)
-        doc.undo()
+        # The GUI owns the document's undo history; there is no Python-side
+        # stack (Metashape's public API has no undo either).
+        self.assertFalse(hasattr(doc, "undo"))
+        self.assertFalse(hasattr(doc, "undo_stack"))
+
+    def test_chunk_crs_reset_to_local(self):
+        doc = alphashape.Document()
+        chunk = doc.add_chunk("Chunk 1")
+        doc.active_chunk = chunk
+        doc.run_task("AddPhotos", filenames=[AERIAL[0]])
+        chunk.crs = alphashape.CoordinateSystem(UTM_ZONE_33N)
+        self.assertEqual(chunk.crs.epsg, UTM_ZONE_33N)
+        before = _reference_repr(chunk)
+        # An unset CoordinateSystem clears the chunk to LOCAL rather than
+        # raising; the references are still untouched.
+        chunk.crs = alphashape.CoordinateSystem()
         self.assertIsNone(chunk.crs.epsg)
         self.assertEqual(chunk.crs.name, "LOCAL")
+        self.assertEqual(chunk.crs_epsg, 0)
         self.assertEqual(_reference_repr(chunk), before)
-        doc.redo()
-        self.assertEqual(chunk.crs.epsg, UTM_ZONE_33N)
 
-    def test_geoid_list(self):
+    def test_geoid_list_and_bad_file(self):
         ids = alphashape.CoordinateSystem.listGeoids()
         self.assertIsInstance(ids, list)
         self.assertTrue(all(isinstance(geoid_id, str) for geoid_id in ids))
@@ -159,8 +187,16 @@ class CoordinateSystemTest(unittest.TestCase):
                                "alphashape_definitely_missing_geoid.tif")
         if os.path.exists(missing):
             os.remove(missing)
-        with self.assertRaises(alphashape.Error):
+        with self.assertRaises(alphashape.ValueError):
             alphashape.CoordinateSystem.addGeoid(missing)
+        # A file that does not open as a geoid grid is refused at registration
+        # (addGeoid validates the grid, and resolves the path to absolute).
+        with tempfile.TemporaryDirectory() as directory:
+            bogus = os.path.join(directory, "bogus_geoid.tif")
+            with open(bogus, "w", encoding="utf-8") as handle:
+                handle.write("this is not a GeoTIFF\n")
+            with self.assertRaises(alphashape.ValueError):
+                alphashape.CoordinateSystem.addGeoid(bogus)
 
     def test_dem_projection_param(self):
         doc = alphashape.Document()
@@ -173,27 +209,16 @@ class CoordinateSystemTest(unittest.TestCase):
         # `projection` is the Int EPSG spelling the task schema declares; the
         # binder converts a Python int by the declared type. A CoordinateSystem
         # object is NOT accepted here on main (the `crs` parameter takes text).
-        chunk.buildDem(projection=UTM_ZONE_32N, smoothing="none")
+        # Web Mercator is not the fixture's auto-UTM (32632/32633), so the
+        # assertion proves `projection` is honoured rather than defaulted.
+        chunk.buildDem(projection=WEB_MERCATOR, smoothing="none")
         self.assertIsNotNone(chunk.elevation)
-        self.assertEqual(chunk.elevation.epsg, UTM_ZONE_32N)
+        self.assertEqual(chunk.elevation.epsg, WEB_MERCATOR)
         # projection and crs are two spellings of one request: disagreeing is
         # refused before any work starts.
         with self.assertRaises(alphashape.ValueError):
-            chunk.buildDem(projection=UTM_ZONE_32N,
+            chunk.buildDem(projection=WEB_MERCATOR,
                            crs="EPSG:{}".format(UTM_ZONE_33N))
-
-    @unittest.skip(
-        "covered by BuildOrthomosaic.BuildsInDemCrsWithoutPreprojection in "
-        "engine/tests/test_build_orthomosaic.cpp; the Python fixture would have "
-        "to build a DEM AND an orthomosaic, which is not cheap")
-    def test_ortho_projection_differs_from_dem_succeeds(self):
-        pass
-
-    @unittest.skip(
-        "no Python transform binding exists on main; CrsTransform is covered by "
-        "engine/tests/test_crs_transform.cpp")
-    def test_transform_roundtrip_performance(self):
-        pass
 
 
 if __name__ == "__main__":
