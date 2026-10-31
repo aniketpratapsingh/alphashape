@@ -1162,8 +1162,41 @@ TEST(Undo, SetChunkCrs) {
     command->revert(document);
     EXPECT_FALSE(chunk.crs().is_set());
 
-    EXPECT_THROW(make_set_chunk_crs_command(chunk_id, CRS{})->apply(document),
+    // An unset CRS now means "clear to LOCAL": applying it is legal, and a
+    // revert restores the previous definition.
+    command->apply(document);
+    EXPECT_EQ(chunk.crs(), crs);
+    auto clear = make_set_chunk_crs_command(chunk_id, CRS{});
+    clear->apply(document);
+    EXPECT_FALSE(chunk.crs().is_set());
+    EXPECT_TRUE(chunk.crs().wkt.empty());
+    clear->revert(document);
+    EXPECT_EQ(chunk.crs(), crs);
+
+    // A negative EPSG code is still rejected.
+    CRS negative;
+    negative.epsg = -1;
+    negative.wkt = R"(PROJCS["WGS 84 / UTM zone 33N"])";
+    EXPECT_THROW(make_set_chunk_crs_command(chunk_id, negative)->apply(document),
                  ValueError);
+}
+
+TEST(Undo, SetChunkCrsLocalThenRevertRestoresPrevious) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+
+    CRS crs;
+    crs.epsg = 32633;
+    crs.wkt = R"(PROJCS["WGS 84 / UTM zone 33N"])";
+    auto set = make_set_chunk_crs_command(chunk_id, crs);
+    set->apply(document);
+    auto local = make_set_chunk_crs_command(chunk_id, CRS{});
+    local->apply(document);
+    EXPECT_FALSE(chunk.crs().is_set());
+    EXPECT_TRUE(chunk.crs().wkt.empty());
+    local->revert(document);
+    EXPECT_EQ(chunk.crs(), crs);
 }
 
 // --- validation of missing ids everywhere ----------------------------------

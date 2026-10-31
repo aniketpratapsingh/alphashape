@@ -2381,10 +2381,8 @@ private:
     std::int32_t asset_id_ = -1;
 };
 
-/// Set a chunk's CRS. The M11 plan's `make_set_chunk_crs_command` is written
-/// against `crs::CoordinateSystem`, which arrives with M12 WP-12.11; until then
-/// this version takes the existing `CRS` (WKT + EPSG) so the wiring exists and
-/// M12 only has to widen the argument type. See LIMITATIONS.md.
+/// Set a chunk's CRS. An unset `CRS` clears the chunk to the local frame (the
+/// reverse of georeferencing), and revert() restores the previous definition.
 class SetChunkCrsCommand : public StagedMutation {
 public:
     SetChunkCrsCommand(std::int32_t chunk_id, CRS crs)
@@ -2398,9 +2396,9 @@ protected:
         if (crs_.epsg < 0) {
             throw ValueError("set chunk CRS: EPSG code must be non-negative");
         }
-        if (!crs_.is_set()) {
-            throw ValueError("set chunk CRS: the CRS has neither WKT nor an EPSG code");
-        }
+        // An unset CRS is legal: it clears the chunk to the local frame, which
+        // is what `chunk.crs = CoordinateSystem()` means. Any previous CRS is
+        // restored by revert().
     }
 
     void stage(Document& document) override {
