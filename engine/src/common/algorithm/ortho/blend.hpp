@@ -41,9 +41,16 @@ struct OrthoMosaic {
 /// the depth from the grid, as before. Block-wise callers pass one value derived
 /// from the WHOLE output grid so every block applies the same multiresolution
 /// operator instead of a shallower one of its own.
+/// `avoid` (optional, ghosting.hpp) is one tile-local deviant mask per tile.
+/// Average blending leaves a deviant camera out of the mean unless it is the
+/// only valid one (so a ghost cannot bleed into an averaged cell); Mosaic
+/// blending needs no change, because a tile's blend weight is its label mask
+/// and a non-winning tile already contributes nothing. Nullptr (the default)
+/// preserves the previous behaviour exactly.
 OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                   const std::vector<std::int32_t>& labels, Blending mode,
-                  int pyramid_levels = -1);
+                  int pyramid_levels = -1,
+                  const std::vector<std::vector<std::uint8_t>>* avoid = nullptr);
 
 /// The pyramid depth blend() would pick for a `width` x `height` grid. A block
 /// plan uses this to pin the depth at the whole grid's value.

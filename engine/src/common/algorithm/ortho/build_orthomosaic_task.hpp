@@ -156,6 +156,10 @@ struct OrthoBlockPlanInput {
     /// loop. Its sampled points, per-camera colours and observations are a
     /// separate, earlier peak that the plan has to account for.
     bool colour_correction = false;
+    /// True when the multi-view ghosting filter runs. Its per-tile deviant masks
+    /// are 1 byte per tile footprint cell, resident through the seam and blend
+    /// stages, so the estimate must include them.
+    bool ghosting_filter = false;
     /// The task's byte budget; 0 means "no limit" (one block).
     std::uint64_t budget_bytes = 0;
     /// Expert/test override: process in blocks of this side (0 = automatic).
@@ -209,7 +213,8 @@ int block_margin_cells(int block_cells, int pyramid_levels);
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
-                                 std::uint64_t photo_cache_bytes, bool fill_holes = true);
+                                 std::uint64_t photo_cache_bytes, bool fill_holes = true,
+                                 bool ghosting = false);
 /// The peak of the assembled-grid fill_holes stage alone (labels + RGBA + one
 /// channel's float plane, validity mask, EDT and banded Sibson accumulators).
 double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);

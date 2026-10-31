@@ -42,6 +42,30 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Multi-view consensus ghosting filter for BuildOrthomosaic (Q4).** New
+  `ghosting_filter` parameter (Bool, default `false` while the quality
+  benchmark decides the shipping default). Moving objects — cars, people,
+  transient shadows — seen by only a minority of overlapping views are found
+  before the seams are chosen: at three scales (1x, 4x, 16x) each cell is
+  compared with the per-channel median of the cameras valid there, and a camera
+  further than a robust (MAD) distance plus an absolute grey floor has its cells
+  marked deviant. Per tile the mask is closed then opened and small components
+  are dropped (a camera takes part in a coarse cell only when it covers at least
+  half of it, so a sliver of coverage is not compared as a full view). The seam
+  labeller pays an extra `avoid_cost` on a deviant cell (larger than one
+  smoothness edge, and never charged when the camera is the only valid view, so
+  no hole appears); its one full-resolution alpha-expansion pass is bounded to
+  the marked cells' bounding box grown by 32 cells and skipped when nothing is
+  marked, its pair terms are truncated to stay submodular, and each move is
+  accepted only when the true energy falls. Average blending drops deviant
+  cameras from the mean, and only label islands touching a deviant region are
+  relabelled afterwards, preferring a non-deviant neighbour. The formulation
+  follows robust multi-view deghosting and moving-object removal in mosaics
+  (Jacobs, Loscos & Ward 2008; Gallagher 2005; Davis 1998; Uyttendaele, Eden &
+  Szeliski 2001). New `engine/src/common/algorithm/ortho/ghosting.*`; the masks
+  and their scratch planes are counted in the block memory estimate and an INFO
+  line reports marked cells and removed speckles.
+
 - **Robust per-cell height fusion for BuildDem (Q3).** `BuildDem` gains `fusion`
   (string, default `"median"`; the other value is `"robust"`). The default keeps
   the historical per-cell median and its output byte-for-byte. With `"robust"`,
