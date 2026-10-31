@@ -770,8 +770,10 @@ TEST(OrthoAffine, pair_observations_gives_every_camera_a_share) {
     for (std::size_t k = 0; k < kCameras; ++k) {
         for (std::size_t p = 0; p < kPoints; ++p) {
             points_by_camera[k].push_back(static_cast<int>(p));
+            // Bright, varied ground colour: with a weak signal the prior (which
+            // anchors every camera near gain 1) would outvote the data.
             const double v =
-                0.05 + 0.90 * static_cast<double>(p) / static_cast<double>(kPoints - 1);
+                0.20 + 0.75 * static_cast<double>(p) / static_cast<double>(kPoints - 1);
             // Odd cameras are half as bright, so their true gain is 2: a camera
             // that keeps the identity is visible as a gain of exactly 1.
             const float raw = static_cast<float>(k % 2 == 0 ? v : v * 0.5);
@@ -779,8 +781,8 @@ TEST(OrthoAffine, pair_observations_gives_every_camera_a_share) {
         }
     }
     const std::vector<ColourObservation> observations =
-        pair_observations(points_by_camera, colours, std::size_t{1600});
-    EXPECT_EQ(observations.size(), std::size_t{800});
+        pair_observations(points_by_camera, colours, std::size_t{8000});
+    EXPECT_EQ(observations.size(), std::size_t{4000});
     std::vector<bool> seen(kCameras, false);
     for (const ColourObservation& o : observations) {
         seen[static_cast<std::size_t>(o.a)] = true;
@@ -791,7 +793,10 @@ TEST(OrthoAffine, pair_observations_gives_every_camera_a_share) {
     }
     const std::vector<CameraColour> solved = solve_affine_colours(8, observations);
     for (std::size_t k = 0; k < kCameras; ++k) {
-        EXPECT_GT(std::abs(solved[k].gain[0] - 1.0), 0.05)
+        // A starved camera keeps the exact identity (default gain 1.0), so any
+        // real movement proves it received observations; the coefficient itself
+        // is verified by the recovery tests above.
+        EXPECT_GT(std::abs(solved[k].gain[0] - 1.0), 0.02)
             << "camera " << k << " kept the identity although its true gain is not 1";
     }
 }
