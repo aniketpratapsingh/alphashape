@@ -42,6 +42,7 @@ add_executable(alphashape_tests
     test_predicates.cpp
     test_delaunay2d.cpp
     test_sibson.cpp
+    test_cell_fusion.cpp
     test_mesh_io.cpp
     test_marching_tetrahedra.cpp
     test_mesh_ops.cpp
