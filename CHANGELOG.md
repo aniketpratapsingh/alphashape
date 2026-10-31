@@ -8,6 +8,17 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **GeoTIFF GeoKeys carry a full CRS.** The GeoTIFF writer now records the
+  chunk's `crs::CoordinateSystem`, not just an EPSG number: an authority-coded
+  CRS is written as its type key plus a name citation, while a custom CRS with
+  no EPSG code is written as user-defined (32767) with its complete WKT2
+  definition in `GeoAsciiParamsTag`/`PCSCitationGeoKey` (GDAL's convention).
+  The reader reverses the priority — EPSG key, then WKT parsed from the
+  citation, then the local frame — and the DEM and orthomosaic exports pass the
+  asset's CRS through, so a custom-WKT grid round-trips through a GeoTIFF.
+  `GeoTiffOptions` keeps `epsg` as the fallback when no `CoordinateSystem` is
+  supplied, and `GeoTiffInfo` gains the decoded CRS beside the existing `epsg`.
+
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,
