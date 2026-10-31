@@ -16,6 +16,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
+#include "common/algorithm/elevation/cell_fusion.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -493,9 +494,9 @@ Eigen::Vector2i cell_of(const RasterGrid& grid, const Eigen::Vector2d& p) {
 /// repaired height is a plane's guess: it may break a tie but must never
 /// outvote a measurement.
 struct CellAccumulator {
-    std::vector<double> heights;          ///< measured
-    std::vector<double> repaired;         ///< synthesised by the repair pass
-    double confidence = 0.0;
+    std::vector<HeightObservation> measured;  ///< height plus per-sample confidence
+    std::vector<double> repaired;             ///< synthesised by the repair pass
+    double confidence = 0.0;                  ///< summed measured confidence
 };
 
 /// Rasterise point / depth-map samples into per-cell accumulators (an unordered
@@ -516,7 +517,8 @@ std::unordered_map<std::size_t, CellAccumulator> rasterise_samples(
         if (s.repaired) {
             acc.repaired.push_back(s.h);
         } else {
-            acc.heights.push_back(s.h);
+            acc.measured.push_back(
+                HeightObservation{s.h, static_cast<double>(s.confidence)});
             acc.confidence += static_cast<double>(s.confidence);
         }
     }
@@ -837,6 +839,10 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
                     const std::function<void(double)>& progress) {
     const Source source = parse_source(options.source);
     const Interpolation interpolation = parse_interpolation(options.interpolation);
+    if (options.fusion != "median" && options.fusion != "robust") {
+        throw ValueError("build_dem: fusion must be \"median\" or \"robust\" (got \"" +
+                         options.fusion + "\")");
+    }
     const auto tick = [&](double fraction) {
         if (progress) {
             progress(fraction);
@@ -949,6 +955,19 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     const std::size_t count =
         static_cast<std::size_t>(grid.width) * static_cast<std::size_t>(grid.height);
 
+    // Cell size in metres (the height unit), for the robust-fusion scale floor.
+    // A geographic plane is in degrees, so convert at the grid's latitude, as
+    // the TGV block below does.
+    const double fusion_plane_y =
+        0.5 * (grid.pixel_center(0, grid.height / 2).y() + grid.pixel_center(0, 0).y());
+    const Eigen::Vector2d fusion_metres_per_unit = frame.is_local()
+                                                       ? Eigen::Vector2d(1.0, 1.0)
+                                                       : frame.metres_per_plane_unit(fusion_plane_y);
+    double fusion_cell_size = grid.pixel_size_x * fusion_metres_per_unit.x();
+    if (!(fusion_cell_size > 0.0) || !std::isfinite(fusion_cell_size)) {
+        fusion_cell_size = grid.pixel_size_x;
+    }
+
     // -- rasterise into per-cell observations ---------------------------------
     AssembledSurface surface;
     surface.values.assign(count, std::numeric_limits<float>::quiet_NaN());
@@ -972,25 +991,36 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
             rasterise_samples(grid, samples);
         for (auto& [index, acc] : cells) {
             // A repaired sample is a plane's guess, so it must not outvote a
-            // measurement: whenever the cell holds a measured sample, the median
-            // is taken over MEASURED heights alone. Only a cell with no measured
+            // measurement: whenever the cell holds a measured sample, the rule
+            // is applied to MEASURED heights alone. Only a cell with no measured
             // sample falls back to the repaired ones, where they are better than
-            // nothing (the alternative is nodata).
-            const bool repaired_only = acc.heights.empty();
-            std::vector<double>& heights = repaired_only ? acc.repaired : acc.heights;
-            const std::size_t mid = heights.size() / 2;
-            std::nth_element(heights.begin(),
-                             heights.begin() + static_cast<std::ptrdiff_t>(mid), heights.end());
-            double median = heights[mid];
-            if (heights.size() % 2 == 0) {
-                const double lo = *std::max_element(
-                    heights.begin(), heights.begin() + static_cast<std::ptrdiff_t>(mid));
-                median = 0.5 * (lo + heights[mid]);
+            // nothing (the alternative is nodata). Repaired heights never enter
+            // the robust estimate.
+            const bool repaired_only = acc.measured.empty();
+            double cell_value = 0.0;
+            double cell_weight = 0.0;
+            if (repaired_only) {
+                cell_value = median_of(acc.repaired);
+                cell_weight = static_cast<double>(kRepairedSampleConfidence);
+            } else if (options.fusion == "robust") {
+                const FusedCell fused =
+                    fuse_cell(acc.measured, kFusionScaleFloorFactor * fusion_cell_size);
+                cell_value = fused.value;
+                cell_weight = fused.weight;
+            } else {
+                // The default: the plain median of the measured heights, with
+                // the summed confidence as the data weight.
+                std::vector<double> heights;
+                heights.reserve(acc.measured.size());
+                for (const HeightObservation& observation : acc.measured) {
+                    heights.push_back(observation.height);
+                }
+                cell_value = median_of(heights);
+                cell_weight = acc.confidence;
             }
-            surface.values[index] = static_cast<float>(median);
+            surface.values[index] = static_cast<float>(cell_value);
             surface.valid[index] = 1U;
-            surface.confidence[index] =
-                repaired_only ? kRepairedSampleConfidence : static_cast<float>(acc.confidence);
+            surface.confidence[index] = static_cast<float>(cell_weight);
             repaired_only_cells[index] = repaired_only ? std::uint8_t{1} : std::uint8_t{0};
         }
     }
