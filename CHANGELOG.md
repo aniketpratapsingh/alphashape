@@ -8,12 +8,17 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
-- **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool.** The
-  accepted values are `"none"` (default), `"gain"` and `"affine"`. An old project
-  file or script that recorded `true` still works: the value is read as `"gain"`,
-  which is exactly what the Bool selected, and `false` reads as `"none"`. The
-  Python binder likewise accepts a Bool and converts it to its text form, so a
-  caller that passed the Bool gets the same product as before.
+- **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool, and
+  defaults to `"affine"`.** The accepted values are `"none"`, `"gain"` and
+  `"affine"`, applied per camera per channel before seams are chosen. Affine is
+  the default because the seam benchmark shows a clear improvement (seam colour
+  step p90 0.0241 → 0.0214, −11%); pass `color_correction="none"` to get the
+  old uncorrected product. A model that cannot be solved (one camera, no
+  overlap, too few samples) logs and falls back to identity, so a single-camera
+  orthomosaic still works. An old project file or script that recorded `true`
+  still works: the value is read as `"gain"`, which is exactly what the Bool
+  selected, and `false` reads as `"none"`. The Python binder likewise accepts a
+  Bool and converts it to its text form.
 
 ### Added
 
@@ -34,6 +39,46 @@ All notable changes to alphashape are recorded here. The format follows
   (Goldman & Chen 2005; Xiong & Pulli 2010) on top of the gain model Brown & Lowe
   (2007) give. New `engine/src/common/algorithm/ortho/colour_model.*`; the
   visibility test it reuses is exposed as `ortho::project_surface_point()`.
+
+- **GeoTIFF GeoKeys carry a full CRS.** The GeoTIFF writer now records the
+  chunk's `crs::CoordinateSystem`, not just an EPSG number: an authority-coded
+  CRS is written as its type key plus a name citation, while a custom CRS with
+  no EPSG code is written as user-defined (32767) with its complete WKT2
+  definition in `GeoAsciiParamsTag`/`PCSCitationGeoKey` (GDAL's convention).
+  A vertical, geocentric or compound CRS (and any code above 65535, which the
+  16-bit type key cannot hold) is never written as a horizontal code: it is
+  user-defined 32767 with its full WKT2 citation. The reader prefers a real
+  projected code, then a real geographic one, then citation WKT (PCS, then
+  geographic, then `GTCitationGeoKey`, accepting GDAL's and ArcGIS's
+  `ESRI PE String = ` prefix), then the local frame. The DEM and orthomosaic
+  sidecars and the export tasks pass the asset's CRS through and restore it on
+  load, so a custom-WKT grid round-trips through a GeoTIFF; a malformed stored
+  WKT now fails the export/save with a message naming it instead of writing a
+  silently local file. `GeoTiffOptions` keeps `epsg` as the fallback when no
+  `CoordinateSystem` is supplied, and `GeoTiffInfo` gains the decoded CRS
+  beside the existing `epsg`.
+
+- **Python `CoordinateSystem` and `Chunk.crs` (WP-12.11).** The bindings expose
+  the CRS engine as a value type: `CoordinateSystem(epsg)` / `CoordinateSystem()`
+  for the local frame, `CoordinateSystem(wkt=..., proj=..., name=...)`,
+  `CoordinateSystem.init(name)` over the built-in list, and the
+  `name` / `authority` / `epsg` (None when absent) / `wkt` properties plus
+  `toWKT()` and `toProj4()`. `__eq__` is PROJ equivalence rather than string
+  identity, so two definitions of one CRS compare equal, and `repr` is
+  `<CoordinateSystem 'WGS 84 / UTM zone 33N'>`. `listBuiltinCRS()` returns the
+  curated 48-name list; `addGeoid(path)` / `listGeoids()` expose the process
+  geoid registry (a custom grid is referenced where it is, never copied or
+  downloaded). `Chunk.crs` reads and writes the engine CRS; assignment runs
+  the same "Set Chunk CRS" command the GUI uses and then discards it (the GUI
+  owns the document's undo history, and Metashape's Python API has no undo).
+  It only relabels the chunk — no reference, pose, tie point or asset is
+  transformed — and assigning an unset `CoordinateSystem()` clears the chunk
+  to LOCAL. The legacy `crs_epsg` setter routes through that same command, and
+  `__hash__` is disabled because `__eq__` is PROJ equivalence. There is no `datumTransform()`: the engine lists candidate
+  operations per CRS pair (`available_transformations`) and pins one with
+  `with_transformation`, but no single "preferred" operation exists to report.
+  `BuildDem`'s `projection` (EPSG int) and `crs` (text) parameters are covered
+  by the new `python_crs` test.
 
 - **Raster reprojection and CRS-aware DEM/ortho export.** `ExportDem` and
   `ExportOrthomosaic` gain `projection` (Int EPSG code), `crs` (String: an
@@ -76,7 +121,8 @@ All notable changes to alphashape are recorded here. The format follows
   requested CRS.
 
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
-  a `color_correction` parameter (off by default). When set, one brightness gain
+  a `color_correction` parameter, now selected as `"gain"` (affine is the
+  default; see Changed). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,
   "Automatic Panoramic Image Stitching using Invariant Features", section 6):
   each gain minimises a sum over overlapping camera pairs of a data term that

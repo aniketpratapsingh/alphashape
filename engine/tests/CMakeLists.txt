@@ -79,6 +79,7 @@ if(ALPHASHAPE_USE_PROJ)
         test_crs_context.cpp
         test_crs.cpp
         test_crs_transform.cpp
+        test_geotiff_crs.cpp
         test_datum_transform.cpp
         test_local_frame.cpp
         test_geoid.cpp
@@ -90,6 +91,10 @@ if(ALPHASHAPE_USE_PROJ)
     # directly for the raw-API assertions; linking the interface target keeps
     # the include directories available without a second package lookup.
     target_link_libraries(alphashape_tests PRIVATE alphashape_proj)
+    # test_geotiff_crs.cpp writes GDAL-convention files with libtiff directly,
+    # so the headers TIFF is a PRIVATE dependency of alphashape_model must be
+    # reachable from this suite as well.
+    target_link_libraries(alphashape_tests PRIVATE TIFF::TIFF)
 endif()
 
 target_link_libraries(alphashape_tests PRIVATE
