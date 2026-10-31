@@ -469,7 +469,7 @@ TEST(PatchMatch, CostMarginRecoversFromOccludedNeighbours) {
                 ++total;
                 const std::size_t index = static_cast<std::size_t>(y) * kWidth +
                                           static_cast<std::size_t>(x);
-                const double d = result.depth[index];
+                const double d = static_cast<double>(result.depth[index]);
                 if (d > 0.0 && std::abs(d - expected) / expected < 0.01) {
                     ++good;
                 }
