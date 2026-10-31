@@ -18,6 +18,11 @@ Qt 6.
 > **Status: early development (0.1.x).** The whole pipeline runs end to end, but formats,
 > APIs and results still change between versions. Not yet suitable for production
 > surveys. Known gaps are listed in [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md).
+>
+> **Coordinate systems (M12): done.** CRS definitions from EPSG, WKT or a PROJ
+> string, datum transformations with offline grids, geoids and vertical datums,
+> local frames, GeoTIFF GeoKeys, and raster reprojection are implemented. See
+> [`engine/docs/crs-guide.md`](engine/docs/crs-guide.md).
 
 ## What it does
 
@@ -317,6 +322,9 @@ design/         design system and GUI mockups
 
 - [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md) — what is missing or approximate in this
   release, and what would fix it.
+- [`engine/docs/crs-guide.md`](engine/docs/crs-guide.md) — the coordinate-system layer:
+  CRS and geoid registration, axis and heading conventions, PROJ data discovery, GeoTIFF
+  GeoKeys and raster reprojection.
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
 - [`engine/TESTING.md`](engine/TESTING.md) — how to build and test, and what CI runs.
 - [`SECURITY.md`](SECURITY.md) — supported versions and how to report a vulnerability.

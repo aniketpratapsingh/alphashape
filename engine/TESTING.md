@@ -150,6 +150,80 @@ ctest --test-dir build-mac -N | tail -2      # discovery ran during the link
   with a 5 s timeout; running the same command by hand reproduces exactly what
   the build step saw.
 
+## Coordinate-system tests (M12)
+
+The C++ suites live in `engine/tests/` and are listed in the
+`if(ALPHASHAPE_USE_PROJ)` block of `engine/tests/CMakeLists.txt`:
+
+- `test_crs_context.cpp` — discovery order, data publishing, offline grids.
+- `test_crs.cpp` — the value type, built-ins, WKT/PROJ-string round trips.
+- `test_crs_transform.cpp` — axis normalisation, batch validity, the 20 000-point
+  `cs2cs` comparison.
+- `test_datum_transform.cpp` — candidate listing, pinning, ballpark refusal,
+  Helmert and grid shifts.
+- `test_geoid.cpp` — grid evaluation, the store, NGS benchmarks.
+- `test_local_frame.cpp`, `test_euler_angles.cpp`,
+  `test_reference_convert.cpp`, `test_surface_frame.cpp` — frames, angles and
+  reference/CRS migration.
+- `test_reproject.cpp` and `test_geotiff_crs.cpp` — raster reprojection and
+  GeoKey encoding.
+
+Python coverage is `engine/python/tests/test_crs.py`.
+
+These sources are **compiled only when PROJ is enabled**. With
+`-DALPHASHAPE_USE_PROJ=OFF` they are absent from the test binary rather than
+skipped, so the test count is smaller by design. They need the PROJ library and
+`proj.db`, not the PROJ command-line tools; the `cs2cs` reference values are
+checked in. Cases that need a grid the host does not have call
+`GTEST_SKIP()`, naming the file: the NTv2/NADCON/OSTN15 datum cases, the
+EGM96/EGM2008 benchmark when the full grid is absent, and a vertical/compound or
+greater-than-65535 GeoKey case when the local `proj.db` has no such CRS. CI runs
+the grid-free Helmert cases everywhere.
+
+### Fixtures and regeneration
+
+All fixtures are under `engine/tests/fixtures/crs/` and are checked in; the
+tests read them without network access.
+
+- `egm96_subset.tif` — a 1-degree EGM96 subset (181 × 361 float32 samples),
+  made by keeping every fourth node of NGA's `us_nga_egm96_15.tif`. Regenerate
+  with `python3 make_egm96_subset.py [--full /path/to/us_nga_egm96_15.tif]`;
+  without `--full` the script downloads the source from `cdn.proj.org`, and it
+  needs `numpy`, `tifffile` and `imagecodecs`. Only the generator touches the
+  network; the engine never does.
+- `ngs_geoid_benchmarks.csv` — 50 seeded CONUS positions with NGS's USGG2012
+  geoid heights. Regenerate with `python3 make_ngs_benchmarks.py` (network to
+  the NGS service); `--check` verifies the recorded values without rewriting.
+- `builtin_wkt_skeletons.txt` — the normalised WKT2:2019 skeletons for the
+  48-code built-in list. `make_skeletons.cpp` compiles against the local PROJ
+  and writes one `<epsg> <skeleton>` line per code; regenerate it whenever the
+  built-in list or the PROJ data release changes.
+- `cs2cs_reference.csv` — 20 000 reference points for EPSG:4326 → EPSG:32633,
+  generated from an explicit 32-bit LCG by `tests/make_cs2cs_reference.sh
+  [count] [output]`. That script invokes `cs2cs -f %.9f`; the checked-in file
+  pins the PROJ data version it was made with, so regenerating it is a
+  deliberate acknowledgement of a numerical change.
+
+### Regenerating everything: `alphashape_crs_fixtures`
+
+The CMake target is opt-in: it is defined only when `ALPHASHAPE_USE_PROJ` is on,
+is not part of `all` (the helper executable is `EXCLUDE_FROM_ALL` and the custom
+target is not declared `ALL`), and is never a ctest. Run it explicitly:
+
+```sh
+cmake --build build --target alphashape_crs_fixtures
+```
+
+It builds and runs `make_crs_skeletons`, writing
+`builtin_wkt_skeletons.txt` as above. When CMake found a Python 3 interpreter
+(`find_package(Python3 COMPONENTS Interpreter)`), it also runs
+`make_egm96_subset.py` and `make_ngs_benchmarks.py`; when no interpreter is
+found those two steps are skipped and configure still succeeds. On a Unix host
+it runs `make_cs2cs_reference.sh`, which needs `cs2cs` on `PATH`. The target
+performs network access for the EGM96 source and the NGS service; the test
+suite itself does not. Review the generated diffs before committing them,
+because the fixtures intentionally record a PROJ data version.
+
 ## Bug-hunting (Debug + ASan + UBSan + Eigen NaN init)
 
 ```

@@ -1079,18 +1079,20 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 - **No Python-side undo hook yet.** `Document.align_chunks` runs the task
   directly (like every other task); the undo entry exists on the C++ side only.
   Wiring the Python undo stack is WP-11.11.
-## M12 — Coordinate systems (PROJ), in progress
+## M12 — Coordinate systems (PROJ)
 
-WP-12.1 lands the dependency, discovery and data layout. WP-12.2 adds
-`crs::CoordinateSystem` (the value type) and the 48-entry built-in list, WP-12.3
-adds `crs::CrsTransform` between two of them (axis-normalised, ballpark refused
-by default, per-thread pipelines), and WP-12.4 adds datum-transformation
-selection and pinning (`available_transformations()`, `with_transformation()`,
-and a named "install proj-data" error for a missing grid). Geoids and raster
-reprojection arrive with WP-12.5 … WP-12.12; until then the engine still uses
-the legacy three-CRS stub (`geo::Projection`: local / EPSG:4326 / EPSG:326xx)
-for DEM and ortho output, so a `CrsTransform` exists but no task consumes it
-yet.
+M12 is complete. WP-12.1 added PROJ discovery and the data layout, WP-12.2
+`crs::CoordinateSystem` and the 48-entry built-in list, WP-12.3
+`crs::CrsTransform` (axis-normalised, ballpark refused by default, per-thread
+pipelines), WP-12.4 datum-transformation selection and pinning
+(`available_transformations()`, `with_transformation()`, and a named "install
+proj-data" error for a missing grid), WP-12.5 geoids and vertical datums,
+WP-12.6 ECEF-anchored local frames, then reference conversion, the CRS
+migration of surface frames, DEM and ortho output (the legacy `geo::Projection`
+was deleted), raster reprojection (WP-12.9), GeoTIFF GeoKeys (WP-12.10), the
+Python `CoordinateSystem`/`chunk.crs` surface (WP-12.11), and this documentation
+close-out (WP-12.12). The engine guide is
+[`docs/crs-guide.md`](docs/crs-guide.md).
 
 ### WP-12.2 — `CoordinateSystem` and the built-in list
 
@@ -1448,3 +1450,58 @@ yet.
   by `VerticalTransform::compound()`. A geoid whose grid is missing at load time
   fails the store load, so the datum's name is still readable from the XML for
   diagnosis.
+
+### Reference conversion, raster CRS and the close-out
+
+- **Reprojection is per-cell inverse mapping over one plane.** For every target
+  pixel centre the source coordinate is found by a transform, evaluated exactly
+  on a 16-pixel lattice and bilinearly interpolated between lattice points, with
+  the spacing halved until the measured error is at most 0.1 source pixel. The
+  target extent is the transformed, densified source boundary (21 points per
+  edge). A source that straddles the antimeridian is not wrapped (`+over`-style
+  handling is not applied), so far-east samples cannot fold onto the west edge.
+- **Extreme projections, the antimeridian and the poles leave nodata.** Target
+  cells whose centres PROJ refuses are written as nodata instead of being
+  clamped; the inverse transform is singular at a pole. Float rasters are
+  nodata-aware bilinear (`kMinValidWeight` 0.5), 8-bit rasters are always
+  nearest, and uncovered 8-bit cells are zero (alpha 0 in RGBA).
+- **GeoTIFF writes a 16-bit EPSG code, or full WKT2 for everything else.** A
+  horizontal EPSG code is written inline only when `0 < code <= 0xFFFF`; a
+  custom CRS and any code above 65535 use user-defined 32767 with the WKT2 in
+  the citation. A compound or vertical CRS has no GeoTIFF model type, and the
+  vertical datum is stored beside the horizontal WKT, so the file records only
+  the horizontal part and the orthometric datum is not recoverable from the
+  GeoTIFF alone.
+- **GDAL's decomposed projection GeoKeys are not interpreted.** The reader
+  understands `GTModelType`, `GTCitation`, `GeographicType`, `GeogCitation`,
+  `ProjectedCSType` and `PCSCitation` (1024, 1026, 2048, 2049, 3072, 3073
+  respectively). Keys 3075 and above — `ProjCoordTransGeoKey`,
+  `ProjStdParallel1GeoKey`, and the rest — are ignored, so a file that spells a
+  projection only that way falls back to local unless its citation parses as
+  WKT.
+- **No plate-motion or time-dependent selection beyond what PROJ picks.**
+  `CrsTransform` passes no coordinate epoch (`proj_create_crs_to_crs_from_pj`
+  gets null options) and the project has no epoch field, so a dynamic operation
+  is selected and evaluated as PROJ chooses, not at a caller-supplied date. The
+  engine models no deformation over time; it applies whatever static or dynamic
+  operation `proj.db` offers for the pair.
+- **Nothing is downloaded; where a missing grid surfaces varies.** A pinned
+  operation or a fixed pipeline that needs an absent grid throws
+  `Error("transformation needs grid <name>; install proj-data")`.
+  `GeoidStore::load()` throws `geoid '<id>' is not available` for a grid its
+  index names but cannot find, and `GeoidGrid::open()` throws `ProjectIOError`
+  for an unreadable file. An unpinned per-point transform may instead use a
+  grid-free fallback, because one candidate's grid is not a grid every point
+  needs; an optional `+grids=@name` is never reported missing.
+- **Geoids are user-supplied or PROJ-installed, plus the test subset.**
+  `GeoidStore::from_proj_data()` recognises only `us_nga_egm96_15.tif` and
+  `us_nga_egm08_25.tif` (as EGM96 and EGM2008) in the resolved data directory.
+  A project can carry its own single-band float32 GeoTIFF, and Python can
+  register one with `addGeoid`. The checked-in
+  `tests/fixtures/crs/egm96_subset.tif` is a 1-degree test fixture, not a
+  shipped model. Packaging copies a curated subset of the platform's PROJ data
+  (see the packaged-data note above); it is not an ~80 MB geoid bundle and
+  EGM2008's 77 MB grid is excluded.
+- **There is no vertical-CRS or geoid editing UI yet.** Geoids and vertical
+  datums are set through the engine/Python API and recorded in the project; the
+  desktop dialogs cannot add, choose or edit one.
