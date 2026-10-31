@@ -961,6 +961,17 @@ std::vector<std::int32_t> assign_seams(int width, int height,
             }
         }
     }
+    // Ghosting needs a full-resolution alpha-expansion pass. The avoid cost is
+    // a per-cell unary term, but ICM can only flip a cell when its immediate
+    // seam penalty falls below that saving; inside a large object every cell is
+    // surrounded by object cells whose colour differs from the replacement, so
+    // a single-cell move always looks expensive and the object would survive.
+    // Alpha expansion flips the whole region at once, where the same seam term
+    // is paid only on the object's perimeter. This is opt-in, so the runtime of
+    // an ordinary run is unchanged.
+    if (options.avoid != nullptr) {
+        alpha_expansion(fine, labels, options, std::max(1, options.expansion_cycles));
+    }
     // The coarse levels carry the global structure; from the upsampled labels
     // only the cheap ICM polish runs at full resolution.
     for (int iteration = 0; iteration < options.iterations; ++iteration) {

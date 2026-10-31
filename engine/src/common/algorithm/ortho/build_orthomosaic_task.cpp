@@ -676,7 +676,11 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
     // level's alpha moves. Both coarse levels add their own Field and labels at
     // 1/4 and 1/16 of the fine cell count.
     const double coarse = grid * kCoarseFieldBytesPerCell * (1.0 / 4.0 + 1.0 / 16.0);
-    const double seam_graph = grid * kSeamGraphBytesPerNode * kSeamGraphCellFraction;
+    // A ghosting run also solves the FULL-resolution grid with alpha expansion
+    // (see SeamOptions::avoid), so its graph is the whole grid rather than the
+    // 2x level's quarter.
+    const double seam_graph =
+        grid * kSeamGraphBytesPerNode * (ghosting ? 1.0 : kSeamGraphCellFraction);
     stages.seams = grid * kBytesPerCellGridLabels + node_map +
                    grid * kBytesPerCellSeamField + seam_graph + tiles + coarse +
                    ghost_masks;

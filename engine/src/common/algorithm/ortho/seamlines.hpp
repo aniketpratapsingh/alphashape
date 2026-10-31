@@ -80,7 +80,11 @@ struct SeamOptions {
     /// valid one keeps its cell (the cost is not charged), so the filter never
     /// creates a hole. Nullptr (the default) leaves the labelling unchanged.
     const std::vector<std::vector<std::uint8_t>>* avoid = nullptr;
-    /// Data-term surcharge for choosing a deviant camera at a cell.
+    /// Data-term surcharge for choosing a deviant camera at a cell. When masks
+    /// are present the full-resolution grid also gets an alpha-expansion pass,
+    /// because a single-cell ICM move inside a large object always looks
+    /// expensive (its interior neighbours are object cells too); the expansion
+    /// cuts the whole region at once and pays the seam only on its perimeter.
     double avoid_cost = 1.0;
 };
 
