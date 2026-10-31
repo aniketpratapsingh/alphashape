@@ -25,9 +25,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -382,46 +384,19 @@ py::object attach_document(py::object document, const std::shared_ptr<alphashape
     return object;
 }
 
-/// The undo stack a Python Document owns (WP-12.11).
-///
-/// The GUI owns its stack in the application object, but a Python script has no
-/// such owner. This view holds the Document by shared_ptr (so the C++ document
-/// cannot die while the stack points at it) and is cached in the Document
-/// object's __dict__ under `_undo`, which is what makes the history survive
-/// across calls. Undo/redo is the only way a scripted edit can be reversed, and
-/// `Chunk.crs` is the first bound setter that uses it.
-struct UndoView {
-    std::shared_ptr<alphashape::Document> document;
-    alphashape::UndoStack stack;
-
-    explicit UndoView(std::shared_ptr<alphashape::Document> doc)
-        : document(std::move(doc)), stack(document.get()) {}
-};
-
-/// The cached UndoView of a Python Document object, created on first use.
-py::object undo_view(py::object document) {
-    if (!py::hasattr(document, "_undo")) {
-        auto doc = document.cast<std::shared_ptr<alphashape::Document>>();
-        // UndoStack owns unique_ptr commands and has a user-declared
-        // destructor, so UndoView is neither copyable nor movable: build it
-        // in a shared_ptr and hand that to the holder.
-        auto view = std::make_shared<UndoView>(std::move(doc));
-        document.attr("_undo") = py::cast(view);
-    }
-    return document.attr("_undo");
-}
-
-/// Run the undoable Set Chunk CRS command against the Document that owns
-/// `chunk_self` (every chunk the Document bindings hand out carries
-/// `_document`). Setting the CRS only relabels the chunk; no data is
-/// transformed.
-void run_crs_command(py::object chunk_self, const alphashape::crs::CoordinateSystem& cs) {
+/// Apply the Set Chunk CRS command to the Document that owns `chunk_self`
+/// (every chunk the Document bindings hand out carries `_document`) and discard
+/// it. The GUI owns the document's undo history; a scripted assignment is a
+/// one-shot relabel, not a stack entry (Metashape's Python API has no undo).
+/// Setting the CRS only relabels the chunk; no data is transformed.
+void apply_crs_command(py::object chunk_self, alphashape::CRS crs) {
     if (!py::hasattr(chunk_self, "_document")) {
         throw py::type_error("this Chunk is not attached to a Document");
     }
-    UndoView& view = undo_view(chunk_self.attr("_document")).cast<UndoView&>();
+    auto document =
+        chunk_self.attr("_document").cast<std::shared_ptr<alphashape::Document>>();
     const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
-    view.stack.execute(alphashape::make_set_chunk_crs_command(id, alphashape::CRS(cs)));
+    alphashape::make_set_chunk_crs_command(id, std::move(crs))->apply(*document);
 }
 
 #if defined(ALPHASHAPE_USE_PROJ)
@@ -486,21 +461,6 @@ PYBIND11_MODULE(alphashape, m) {
 
     py::register_exception_translator(&translate_alphashape);
 
-    // -- undo history --------------------------------------------------------
-    // One stack per Python Document, created lazily (see undo_view()). The
-    // scripted surface is deliberately small: undo/redo plus the labels a UI
-    // would show. Commands are the same objects the GUI executes.
-    py::class_<UndoView, std::shared_ptr<UndoView>>(m, "UndoStack")
-        .def_property_readonly("can_undo", [](const UndoView& v) { return v.stack.can_undo(); })
-        .def_property_readonly("can_redo", [](const UndoView& v) { return v.stack.can_redo(); })
-        .def_property_readonly("undo_name", [](const UndoView& v) { return v.stack.undo_name(); })
-        .def_property_readonly("redo_name", [](const UndoView& v) { return v.stack.redo_name(); })
-        .def_property_readonly("size",
-                               [](const UndoView& v) { return v.stack.command_names().size(); })
-        .def("undo", [](UndoView& v) { v.stack.undo(); })
-        .def("redo", [](UndoView& v) { v.stack.redo(); })
-        .def("clear", [](UndoView& v) { v.stack.clear(); });
-
 #if defined(ALPHASHAPE_USE_PROJ)
     // -- CoordinateSystem (WP-12.11) -----------------------------------------
     // A thin value wrapper over crs::CoordinateSystem. Copies are cheap (the
@@ -509,7 +469,8 @@ PYBIND11_MODULE(alphashape, m) {
     // two definitions of "the same CRS" means.
     using CoordinateSystem = alphashape::crs::CoordinateSystem;
 
-    py::class_<CoordinateSystem>(m, "CoordinateSystem")
+    py::class_<CoordinateSystem> coordinate_system_class(m, "CoordinateSystem");
+    coordinate_system_class
         .def(py::init<>(), "The local (unset) engineering CRS.")
         .def(py::init<const CoordinateSystem&>(), py::arg("other"),
              "Copy another coordinate system.")
@@ -528,9 +489,14 @@ PYBIND11_MODULE(alphashape, m) {
                          throw py::type_error("CoordinateSystem: '" + key + "' expects a str");
                      }
                  }
-                 if (has_wkt && has_proj) {
+                 // Exactly one spelling: the constructor-by-name is name=, so
+                 // any two of wkt= / proj= / name= is ambiguous.
+                 const int provided = static_cast<int>(has_wkt) +
+                                      static_cast<int>(has_proj) +
+                                      static_cast<int>(has_name);
+                 if (provided != 1) {
                      throw alphashape::ValueError(
-                         "CoordinateSystem: pass either wkt or proj, not both");
+                         "CoordinateSystem: pass exactly one of wkt, proj or name");
                  }
                  if (has_wkt) {
                      return CoordinateSystem::from_wkt(py::cast<std::string>(kwargs["wkt"]));
@@ -572,13 +538,34 @@ PYBIND11_MODULE(alphashape, m) {
         .def_static(
             "addGeoid",
             [](const std::string& path) {
-                const std::filesystem::path file(path);
+                // Register the grid at its canonical absolute path, so the store
+                // and the project file never depend on the caller's cwd.
+                std::error_code ec;
+                std::filesystem::path file =
+                    std::filesystem::absolute(std::filesystem::path(path), ec);
+                if (!ec) {
+                    file = std::filesystem::weakly_canonical(file, ec);
+                }
+                if (ec) {
+                    throw alphashape::ValueError("addGeoid: cannot resolve '" + path +
+                                                 "': " + ec.message());
+                }
                 const std::string id = file.stem().string();
                 if (id.empty() || !file.has_filename()) {
                     throw alphashape::ValueError("addGeoid: '" + path +
                                                  "' has no file name");
                 }
-                geoid_store().add(id, file.filename().string(), path, "custom", "");
+                // Register only a file that really opens as a geoid grid: this
+                // turns a late, confusing failure at evaluation time into a
+                // ValueError at registration.
+                try {
+                    (void)alphashape::crs::GeoidGrid::open(file.string());
+                } catch (const std::exception&) {
+                    throw alphashape::ValueError("addGeoid: '" + path +
+                                                 "' is not a readable geoid grid");
+                }
+                geoid_store().add(id, file.filename().string(), file.string(),
+                                  "custom", "");
             },
             py::arg("path"),
             "Register a geoid grid file. Raises when the file is missing or "
@@ -610,6 +597,10 @@ PYBIND11_MODULE(alphashape, m) {
                 return py::bool_(a.is_equivalent_to(b));
             },
             py::is_operator());
+    // Defining __eq__ would otherwise leave pybind's identity __hash__ in
+    // place, breaking the hash/eq contract. A value type that compares by PROJ
+    // equivalence is unhashable, so hash(cs) raises TypeError like tuple does.
+    coordinate_system_class.attr("__hash__") = py::none();
 #endif  // ALPHASHAPE_USE_PROJ
 
     // -- DEM and orthomosaic views (milestone 9) -----------------------------
@@ -957,23 +948,35 @@ PYBIND11_MODULE(alphashape, m) {
         // The chunk's CRS EPSG code (0 = unset, 4326 = WGS84 geographic once
         // georeferenced). Writable: AlignChunks(method="reference") requires
         // both chunks to be georeferenced, and a script or test needs a way to
-        // declare that. A non-zero code also writes a minimal WKT descriptor so
-        // `is_set()` and CRS equality behave like a project-loaded CRS.
+        // declare that. Assignment goes through the same "Set Chunk CRS"
+        // command as `crs` (EPSG 0 clears to LOCAL), so validation and
+        // semantics are identical to the GUI path.
+        // The setter is wrapped explicitly with py::is_method: its first
+        // parameter is py::object (the Python wrapper that carries
+        // `_document`), which def_property's automatic detection does not cover.
         .def_property(
-            "crs_epsg", [](const Chunk& c) { return c.crs().epsg; },
-            [](Chunk& c, int epsg) {
-                if (epsg < 0) {
-                    throw alphashape::ValueError("crs_epsg must not be negative");
-                }
-                c.crs().epsg = epsg;
-                c.crs().wkt =
-                    epsg == 0 ? std::string{} : "EPSG:" + std::to_string(epsg);
-            })
+            "crs_epsg",
+            py::cpp_function([](const Chunk& c) { return c.crs().epsg; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, int epsg) {
+                    if (epsg < 0) {
+                        throw alphashape::ValueError("crs_epsg must not be negative");
+                    }
+                    alphashape::CRS crs;
+                    if (epsg != 0) {
+                        crs.epsg = epsg;
+                        crs.wkt = "EPSG:" + std::to_string(epsg);
+                    }
+                    apply_crs_command(self, std::move(crs));
+                },
+                py::is_method(m)))
 #if defined(ALPHASHAPE_USE_PROJ)
         // The chunk CRS as a value (WP-12.11). Assignment goes through the
-        // undoable "Set Chunk CRS" command and only RELABELS the chunk: no
-        // reference, pose, tie point or asset is transformed. Reverse it with
-        // Document.undo().
+        // "Set Chunk CRS" command, which is then discarded: the GUI owns the
+        // document's undo history (Metashape's Python API has no undo). It only
+        // RELABELS the chunk: no reference, pose, tie point or asset is
+        // transformed. Assigning CoordinateSystem() clears to LOCAL.
         // The getter and setter are wrapped explicitly with py::is_method:
         // the setter's first parameter is py::object (the Python wrapper that
         // carries `_document`), which def_property's automatic method
@@ -984,11 +987,11 @@ PYBIND11_MODULE(alphashape, m) {
                              py::is_method(m)),
             py::cpp_function(
                 [](py::object self, const CoordinateSystem& cs) {
-                    run_crs_command(self, cs);
+                    apply_crs_command(self, alphashape::CRS(cs));
                 },
                 py::is_method(m)),
-            "The chunk coordinate system. Assigning a CoordinateSystem records "
-            "one undoable 'Set Chunk CRS' step; data are not transformed.")
+            "The chunk coordinate system. Assigning one relabels the chunk "
+            "only; data are not transformed.")
 #endif  // ALPHASHAPE_USE_PROJ
         // The effective camera-reference CRS (WP-12.6/WP-12.7): the explicit
         // slot when set, else the chunk CRS. 0 = unset.
@@ -1302,10 +1305,7 @@ PYBIND11_MODULE(alphashape, m) {
 
 
     // -- Document ------------------------------------------------------------
-    // dynamic_attr() gives the document a __dict__ used to cache its UndoStack
-    // (`_undo`, see undo_view()). pybind's GC traverses the dict, so the cache
-    // cannot leak.
-    py::class_<Document, std::shared_ptr<Document>>(m, "Document", py::dynamic_attr())
+    py::class_<Document, std::shared_ptr<Document>>(m, "Document")
         .def(py::init<>())
         .def_property("path", [](const Document& d) { return d.path(); },
                       [](Document& d, const std::string& path) { d.set_path(path); })
@@ -1521,27 +1521,7 @@ PYBIND11_MODULE(alphashape, m) {
             "fits a similarity from markers with matching labels and estimated "
             "positions; method=\"reference\" places both chunks by their shared "
             "CRS. The applied 4x4 is recorded in both chunks' meta under "
-            "AlignChunks/<other id>/matrix.")
-        // -- undo (WP-12.11) ---------------------------------------------------
-        // The scripted undo history. It starts empty (loading a project does
-        // not populate it) and records every edit executed through it, e.g.
-        // assigning Chunk.crs. The GUI's history is its own stack; a script
-        // does not see it and the GUI does not see this one.
-        .def_property_readonly("undo_stack", [](py::object self) {
-            return undo_view(std::move(self));
-        })
-        .def("undo",
-             [](py::object self) { undo_view(std::move(self)).cast<UndoView&>().stack.undo(); },
-             "Undo the last scripted edit recorded on this document's stack.")
-        .def("redo",
-             [](py::object self) { undo_view(std::move(self)).cast<UndoView&>().stack.redo(); },
-             "Redo the edit last undone on this document's stack.")
-        .def_property_readonly("can_undo", [](py::object self) {
-            return undo_view(std::move(self)).cast<UndoView&>().stack.can_undo();
-        })
-        .def_property_readonly("undo_name", [](py::object self) {
-            return undo_view(std::move(self)).cast<UndoView&>().stack.undo_name();
-        });
+            "AlignChunks/<other id>/matrix.");
 
     // -- module functions ----------------------------------------------------
     m.def("load_project",
