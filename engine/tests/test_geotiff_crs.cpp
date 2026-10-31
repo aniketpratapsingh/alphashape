@@ -19,6 +19,7 @@
 
 #include "base/io/geotiff_tags.hpp"
 #include "base/platform/temp.hpp"
+#include "base/utils/error.hpp"
 #include "model/crs/coordinate_system.hpp"
 
 namespace alphashape {
