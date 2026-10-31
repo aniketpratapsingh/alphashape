@@ -34,6 +34,9 @@ namespace {
 // --- GeoKey IDs ---------------------------------------------------------
 constexpr std::uint16_t kKeyGtModelType = 1024;
 constexpr std::uint16_t kKeyGtRasterType = 1025;
+/// GTCitationGeoKey: a general citation some writers (GDAL, ArcGIS) put a WKT
+/// or an "ESRI PE String = <WKT>" prefix into when no CRS-specific key does.
+constexpr std::uint16_t kKeyGtCitation = 1026;
 constexpr std::uint16_t kKeyGeographicType = 2048;
 constexpr std::uint16_t kKeyGeogCitation = 2049;
 constexpr std::uint16_t kKeyProjectedCstType = 3072;
@@ -180,30 +183,25 @@ struct GeoKeyPlan {
 
 GeoKeyPlan plan_geo_keys(const GeoTiffOptions& options) {
     GeoKeyPlan plan;
-    bool have_crs = false;
+    const crs::CoordinateSystem* cs = nullptr;
     bool projected = false;
     bool geographic = false;
-    int epsg = 0;
+    int epsg = options.epsg;
 #if defined(ALPHASHAPE_USE_PROJ)
     if (options.crs.has_value() && options.crs->is_set()) {
-        const crs::CoordinateSystem& cs = *options.crs;
-        have_crs = true;
-        epsg = cs.epsg();
-        // An authority-coded CRS cites its name; a custom one carries its WKT2
-        // definition in the citation (GDAL's convention).
-        plan.citation = epsg != 0 ? cs.name() : cs.to_wkt();
-        const crs::CrsKind kind = cs.kind();
+        cs = &*options.crs;
+        epsg = cs->epsg();
+        const crs::CrsKind kind = cs->kind();
         projected = kind == crs::CrsKind::Projected;
         geographic =
             kind == crs::CrsKind::Geographic2D || kind == crs::CrsKind::Geographic3D;
     }
 #endif
-    if (!have_crs) {
+    if (cs == nullptr) {
         if (options.epsg == 0) {
             return plan;  // local: model type 32767 and no CRS key
         }
-        epsg = options.epsg;
-        geographic = is_geographic_epsg(epsg);
+        geographic = is_geographic_epsg(options.epsg);
         projected = !geographic;
     }
     if (projected) {
@@ -215,13 +213,33 @@ GeoKeyPlan plan_geo_keys(const GeoTiffOptions& options) {
         plan.type_key = kKeyGeographicType;
         plan.citation_key = kKeyGeogCitation;
     } else {
-        // Vertical/compound/geocentric CRS: no GeoTIFF model type exists, so
-        // stay user-defined and carry the WKT in the geographic citation.
+        // Vertical, compound or geocentric: no GeoTIFF model type describes it,
+        // and the CRS engine does not expose a compound CRS's horizontal part,
+        // so the file stays user-defined and carries the full WKT2 below.
         plan.type_key = kKeyGeographicType;
         plan.citation_key = kKeyGeogCitation;
     }
-    plan.type_value =
-        epsg != 0 ? static_cast<std::uint16_t>(epsg) : kModelUserDefined;
+    // Only a horizontal code that fits the 16-bit key becomes the type value.
+    // A custom CRS, a vertical/compound code (which must never masquerade as a
+    // horizontal 2048/3072 code) and a code above 65535 are user-defined and
+    // carry their WKT2 definition in the citation (GDAL's convention).
+    const bool horizontal = projected || geographic;
+    const bool code_fits = epsg > 0 && epsg <= 0xFFFF;
+    if (horizontal && code_fits) {
+        plan.type_value = static_cast<std::uint16_t>(epsg);
+#if defined(ALPHASHAPE_USE_PROJ)
+        if (cs != nullptr) {
+            plan.citation = cs->name();
+        }
+#endif
+    } else {
+        plan.type_value = kModelUserDefined;
+#if defined(ALPHASHAPE_USE_PROJ)
+        if (cs != nullptr) {
+            plan.citation = cs->to_wkt();
+        }
+#endif
+    }
     return plan;
 }
 
@@ -644,6 +662,7 @@ GeoKeys read_geo_keys(TIFF* tif) {
     std::uint16_t projected_type = 0;
     std::optional<std::string> geog_citation;
     std::optional<std::string> pcs_citation;
+    std::optional<std::string> gt_citation;
     for (std::uint16_t i = 0; i < entries; ++i) {
         const std::size_t base = 4 + static_cast<std::size_t>(i) * 4;
         const std::uint16_t key_id = keys[base];
@@ -680,19 +699,34 @@ GeoKeys read_geo_keys(TIFF* tif) {
                 }
                 break;
             }
+            case kKeyGtCitation: {
+                std::string s = ascii_value(ascii, ascii_len, location, n, value);
+                if (!s.empty()) {
+                    gt_citation = std::move(s);
+                }
+                break;
+            }
             default:
                 break;
         }
     }
-    // 32767 is "user-defined", not an EPSG code.
-    const std::uint16_t type = projected_type != 0 ? projected_type : geographic_type;
-    out.epsg = (type != 0 && type != kModelUserDefined) ? static_cast<int>(type) : 0;
-    if (projected_type == kModelUserDefined && pcs_citation.has_value()) {
+    // 32767 is "user-defined", not an EPSG code. Prefer a real (non-user-
+    // defined) projected code, then a real geographic one: a file may carry
+    // both, and a vertical code must never be mistaken for either.
+    const auto real = [](std::uint16_t code) {
+        return code != 0 && code != kModelUserDefined ? code : std::uint16_t{0};
+    };
+    const std::uint16_t projected_code = real(projected_type);
+    const std::uint16_t geographic_code = real(geographic_type);
+    const std::uint16_t type = projected_code != 0 ? projected_code : geographic_code;
+    out.epsg = static_cast<int>(type);
+    // Citation priority: PCS, then geographic, then the general GTCitation.
+    if (pcs_citation.has_value()) {
         out.citation = std::move(pcs_citation);
     } else if (geog_citation.has_value()) {
         out.citation = std::move(geog_citation);
-    } else {
-        out.citation = std::move(pcs_citation);
+    } else if (gt_citation.has_value()) {
+        out.citation = std::move(gt_citation);
     }
     return out;
 }
@@ -719,8 +753,15 @@ ReadCrsInfo read_crs(TIFF* tif) {
         }
     }
     if (keys.citation.has_value() && !keys.citation->empty()) {
+        // ArcGIS writes its WKT as "ESRI PE String = <WKT>" in GTCitation;
+        // strip the marker before handing the text to PROJ.
+        constexpr const char* kEsriPrefix = "ESRI PE String = ";
+        std::string wkt = *keys.citation;
+        if (wkt.rfind(kEsriPrefix, 0) == 0) {
+            wkt.erase(0, std::strlen(kEsriPrefix));
+        }
         try {
-            out.crs = crs::CoordinateSystem::from_wkt(*keys.citation);
+            out.crs = crs::CoordinateSystem::from_wkt(wkt);
             return out;
         } catch (const ValueError&) {
             // The citation is a plain name (or malformed WKT): fall back local.
