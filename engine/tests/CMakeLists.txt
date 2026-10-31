@@ -166,6 +166,7 @@ if(ALPHASHAPE_USE_PROJ)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Regenerating engine/tests/fixtures/crs (EGM96/NGS need network)"
         VERBATIM)
+    add_dependencies(alphashape_crs_fixtures make_crs_skeletons)
 endif()
 
 # Under ALPHASHAPE_SANITIZE two third-party environment fixes are needed, and
