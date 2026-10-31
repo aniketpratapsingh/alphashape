@@ -193,12 +193,12 @@ gh workflow run quality-bench.yml --ref <branch> \
 ```
 
 `ortho_params` is the same input for `BuildOrthomosaic`. It is how the per-camera gain
-compensation (`color_correction=true`) is measured against a control run of the same
+compensation (`color_correction=affine`) is measured against a control run of the same
 dataset:
 
 ```sh
 gh workflow run quality-bench.yml --ref <branch> \
-  -f dataset=aerial-nadir -f ortho_params=color_correction=true
+  -f dataset=aerial-nadir -f ortho_params=color_correction=affine
 ```
 
 All three parameters are merged over the dataset's own overrides for their task, so the

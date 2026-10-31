@@ -178,7 +178,8 @@ class TestDriftInvariant(unittest.TestCase):
                             "ExportOrthomosaic"):
                     doc.run_task("BuildDem")
                 if task in ("BuildOrthomosaic", "ExportOrthomosaic"):
-                    doc.run_task("BuildOrthomosaic", refine_seamlines=False)
+                    doc.run_task("BuildOrthomosaic", refine_seamlines=False,
+                                 color_correction="none")
                 if task in ("ExportModel", "ExportPointCloud"):
                     # The export tasks need a real destination path.
                     with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +255,14 @@ class TestKeyboardBinder(unittest.TestCase):
         doc, _ = make_document_with_images(FIXTURE_A)
         with self.assertRaises(TypeError):
             doc.run_task("DetectFeatures", keypoint_limit="x")
+
+    def test_bool_is_rejected_for_a_free_form_string_param(self):
+        # The Bool-to-text compatibility hatch is scoped to `color_correction`
+        # (a Bool in an older release). Every other String parameter must reject
+        # a Bool, or `label=True` would silently become the label "true".
+        doc, _ = make_document_with_images(FIXTURE_A)
+        with self.assertRaises(TypeError):
+            doc.run_task("BuildOrthomosaic", label=True)
 
 
 class TestStringListBinder(unittest.TestCase):
