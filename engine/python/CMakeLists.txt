@@ -87,6 +87,13 @@ add_test(
 set_tests_properties(python_reference_convert PROPERTIES
     ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
 
+# WP-13.1: the six reference accuracy properties on Chunk.
+add_test(
+    NAME python_reference_settings
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_settings.py)
+set_tests_properties(python_reference_settings PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${ALPHASHAPE_PYTHON_DIR}")
+
 # The DEM / orthomosaic views (Chunk.elevation, Chunk.orthomosaic), the four
 # milestone-9 tasks through the Chunk shortcuts, and project persistence of
 # both products, on the georeferenced aerial block.

@@ -62,6 +62,13 @@ std::unique_ptr<AbstractCommand> make_set_chunk_transform_command(
 std::unique_ptr<AbstractCommand> make_set_chunk_crs_command(std::int32_t chunk_id,
                                                             CRS crs);
 
+/// Replace a chunk's reference settings (WP-13.1). Undoable: revert restores the
+/// previous settings. Every accuracy must be finite and strictly positive;
+/// `use_gcp` is unconstrained. Throws ValueError on a bad accuracy or an
+/// unknown chunk.
+std::unique_ptr<AbstractCommand> make_set_reference_settings_command(
+    std::int32_t chunk_id, ReferenceSettings settings);
+
 /// Install an already-computed geometry state on a chunk (camera poses, tie
 /// points, marker positions, region, transform, meta and asset payloads).
 /// AlignChunks (§4.8) is the caller: it estimates the similarity, builds the

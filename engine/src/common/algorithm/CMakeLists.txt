@@ -84,6 +84,8 @@ target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
 # engine that its signatures need; the engine is a static library whose headers
 # carry no <proj.h>, so nothing PROJ-shaped enters the public include surface.
 if(TARGET alphashape_crs)
-    target_sources(alphashape_algorithms PRIVATE reference/convert_reference.cpp)
+    target_sources(alphashape_algorithms PRIVATE
+        reference/convert_reference.cpp
+        reference/reference_table.cpp)
     target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()
