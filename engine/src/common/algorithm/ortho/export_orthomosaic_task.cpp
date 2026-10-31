@@ -100,6 +100,17 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
 
     GeoTiffOptions options;
     options.epsg = orthomosaic.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Carry the whole CRS, not just its code: a custom (uncoded) definition
+    // then travels in the citation key as WKT2 instead of being lost. A
+    // malformed stored definition is an error, not a silent local file.
+    try {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(orthomosaic.crs));
+    } catch (const ValueError& error) {
+        throw ValueError("ExportOrthomosaic: the stored CRS could not be read (" +
+                         std::string(error.what()) + ")");
+    }
+#endif
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;
@@ -117,6 +128,12 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
     const GeoRaster<std::uint8_t> raster = elevation::reproject_for_export(
         orthomosaic.raster, orthomosaic.crs, target, "ExportOrthomosaic");
     options.epsg = elevation::export_epsg(orthomosaic.crs, target);
+#if defined(ALPHASHAPE_USE_PROJ)
+    // A reprojected export declares the TARGET CRS, not the stored one.
+    if (target.requested()) {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(target.crs));
+    }
+#endif
     if (alpha) {
         write_geotiff(path, raster, options);
     } else {
