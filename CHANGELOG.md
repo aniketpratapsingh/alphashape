@@ -35,6 +35,46 @@ All notable changes to alphashape are recorded here. The format follows
   (2007) give. New `engine/src/common/algorithm/ortho/colour_model.*`; the
   visibility test it reuses is exposed as `ortho::project_surface_point()`.
 
+- **Raster reprojection and CRS-aware DEM/ortho export.** `ExportDem` and
+  `ExportOrthomosaic` gain `projection` (Int EPSG code), `crs` (String: an
+  `EPSG:<code>`, a PROJ string or WKT; setting both to disagreeing values is a
+  `ValueError`) and `resolution` (Float in TARGET-CRS units, 0 keeps the ground
+  sample distance). A target CRS reprojects the raster on the fly and the
+  GeoTIFF's georeferencing and world file are written in that CRS. The new
+  `model/raster/reproject.{hpp,cpp}` drives the mapping from the TARGET grid:
+  the extent comes from a densified source boundary (21 points per edge, so a
+  bowed projected edge is not clipped), the default cell is the source ground
+  sample distance measured at the raster centre, and every target cell centre is
+  inverse-transformed back to the source. The transform is evaluated exactly only
+  on a coarse control lattice (16 px), bilinearly interpolated in between, and
+  the spacing is halved until a midpoint check against exact transforms agrees to
+  0.1 source pixels — else the exact per-pixel mapping is used. Float rasters
+  (DEMs) resample bilinearly and nodata-aware: tags that are out of bounds, the
+  `nodata` sentinel or non-finite carry no weight, the remaining weights
+  renormalise, and a cell whose valid weight is under one half is written as
+  nodata, so a hole stays a hole and never becomes a blended value. 8-bit rasters
+  (orthomosaics) always resample nearest, because a blended colour was never
+  photographed. An identical CRS is a bit-identical copy with no PROJ call; a
+  same-CRS request at a different `resolution` keeps the source's north-west
+  corner rather than snapping the origin to a multiple of the cell, so a real
+  georeference is never shifted and no blank border row appears. A geographic
+  target takes `resolution` in DEGREES, and a value that is plainly metres (a
+  hundredth of a degree or more against a metre-scale source) is refused with
+  the degree value to pass instead; a request that would leave a grid smaller
+  than 2x2 cells is refused too. Float rasters keep every channel, and a lattice
+  cell whose corner a refused transform poisons falls back to the exact
+  per-pixel mapping instead of blanking all 16x16 pixels. Rows are produced in
+  bands and the output is checked against the machine's memory budget before it
+  is allocated. `BuildOrthomosaic` with a `crs` different from
+  the DEM's now reprojects the DEM surface once and builds directly in that CRS,
+  so the photographs are sampled in the requested projection exactly once
+  (previously the mosaic always landed on the DEM's plane and the request was
+  only honoured at export). With `surface_data="model"` the DSM is rasterised
+  straight into the requested CRS, so no DEM reprojection is paid for; the
+  elevation case checks the source DEM plus its reprojected copy against the
+  memory budget before allocating. `BuildDem` already built directly in the
+  requested CRS.
+
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,
@@ -170,6 +210,17 @@ All notable changes to alphashape are recorded here. The format follows
   still ship only a subset of the PROJ grids, so some national shifts need
   `proj-data` installed (see `engine/LIMITATIONS.md`).
 
+- **`BuildDepthMaps` exposes `best_k` and `min_texture_stddev`.** Two
+  `PatchMatchOptions` fields that were previously fixed are now declared task
+  parameters. `best_k` (Int, default 0) sets how many per-neighbour costs the
+  multi-view cost averages: 0 keeps the historical `ceil(n/2)`, 1 trusts the
+  single best neighbour. `min_texture_stddev` (Float, default 1/255) is the
+  intensity standard deviation below which a window is not matched and so keeps
+  no depth; lowering it matches windows that were previously skipped. Both are
+  honoured by the CPU and GPU search paths. Each is folded into a depth map's
+  fingerprint only when it differs from its default, so existing maps stay
+  reusable; out-of-range values are rejected before the chunk is touched.
+
 ### Changed
 
 - **`BuildDem` `interpolation="enabled"` now fills the area the cameras
@@ -218,16 +269,54 @@ All notable changes to alphashape are recorded here. The format follows
   refused them even though the real EPSG operation exists (a null shift, a
   Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
   are accepted and their numbers come from the EPSG operation PROJ picks per
-  point rather than a `+proj=noop` fallback; `accuracy_m()` reports that
-  operation's stated accuracy (1 m for ETRS89 ↔ WGS 84, 2 m for the NAD83(2011)
-  Helmert, 3 m for GDA2020). A pair with no known shift at all (WGS 84 ↔ NAD27,
-  Amersfoort, …) has only a ballpark candidate and is still refused without
+  point rather than a `+proj=noop` fallback; `accuracy_m()` reports the best
+  stated accuracy among the pair's real operations (1 m for ETRS89 ↔ WGS 84,
+  2 m for the NAD83(2011) Helmert, 3 m for GDA2020).
+- **A target whose extent is wider than the real shift is not a ballpark.**
+  The refusal decision now reads a partial-intersection candidate list, not
+  PROJ's default strict one. Strict containment asks an operation's area to
+  contain *both* CRSs' entire extents, so WGS 84 → EPSG:3035 (ETRS89 / LAEA
+  Europe) listed nothing but the world ballpark: EPSG:3035 reaches 24.6°N while
+  `ETRS89 to WGS 84 (1)` (EPSG:1149) stops at 33.26°N. PROJ's per-point
+  pipeline applies the 1 m operation throughout its area regardless, so
+  `create()` was refusing a transform the engine runs correctly (`BuildDem` in
+  EPSG:3035 works again). Pairs newly accepted without `allow_ballpark`, each
+  reporting the best stated accuracy among its real operations and transforming
+  per point exactly as bare PROJ does: WGS 84 / ETRS89, geographic 2D and 3D, →
+  EPSG:3035; WGS 84 → EPSG:28992 (Amersfoort / RD New); WGS 84 ↔ NAD 27
+  (EPSG:4267); WGS 84 ↔ NAD83 (EPSG:4269); and ETRS89 → EPSG:27700 (British
+  National Grid, the OSNet ETRS89-GBR realisation) and OSGB36 → EPSG:25832.
+  Nothing previously accepted is now refused. A pair with no published
+  transformation at all (WGS 84 ↔ OSGB70/EPSG:4278, a custom `+ellps=` with no
+  datum name) still has only a ballpark candidate and is still refused without
   `allow_ballpark`. See `engine/LIMITATIONS.md`.
 - **An optional grid is not reported missing.** PROJ's `+grids=@name` means
   "use it if installed, otherwise run without it". Such a grid is now listed
   without the leading `@` and never reported under `missing_grids`, so a
   transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
   instead of failing with `transformation needs grid @name; install proj-data`.
+- **DEMs and orthomosaics are built through the CRS engine, in any CRS.**
+  `SurfaceFrame` no longer carries a hand-written Transverse Mercator series
+  and a three-CRS selector; it is now the exact chain chunk-local → ECEF (the
+  chunk transform) → `crs::LocalFrame` → target CRS. DEM and orthomosaic grids
+  can therefore be built in any CRS PROJ knows — a national grid such as
+  ETRS89 / LAEA Europe (EPSG:3035), a compound CRS, or one described by WKT —
+  not just UTM or geographic lon/lat. Auto-selection for an unspecified CRS is
+  still the regular 6-degree UTM rule at the chunk origin, so an existing
+  project's DEM lands in exactly the same zone as before, and the change is
+  numerically neutral for UTM/lon-lat output (the retired series and PROJ agree
+  well inside a millimetre). `BuildDem` and `BuildOrthomosaic` keep the
+  `projection` (Int, EPSG) parameter and gain `crs` (String: `"EPSG:<code>"`, a
+  PROJ string or WKT); setting both to disagreeing values is a `ValueError`. A
+  DEM names its CRS as `Elevation::crs` (`Orthomosaic::crs` likewise) with an
+  `epsg()` compatibility accessor; doc.xml writes the EPSG code as before and
+  adds a `crs_wkt` attribute only when the CRS carries one, so an old project
+  (an EPSG code and nothing else) loads to the same CRS and a plain-code
+  project re-saves byte-identically. `BuildOrthomosaic` now always builds on the
+  DEM's own plane: a request for a different CRS no longer fails with "reproject
+  the DEM first" — it is accepted, and the ortho is written in the DEM's CRS (a
+  cross-CRS conversion is an export-time reprojection). The `geo::Projection`
+  and `TransverseMercator` implementation is removed.
 
 ## [0.2.0] - 2026-10-28
 

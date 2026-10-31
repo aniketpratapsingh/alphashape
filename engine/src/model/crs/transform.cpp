@@ -152,9 +152,6 @@ bool reads_grids(PJ* pj) {
            type == PJ_TYPE_OTHER_COORDINATE_OPERATION;
 }
 
-/// True for a CRS pinned to a datum by an explicit operation (WP-12.4).
-bool is_bound(PJ* pj) { return proj_get_type(pj) == PJ_TYPE_BOUND_CRS; }
-
 /// The first grid the operation needs that is not installed, or "" when it can
 /// run. PROJ's short name is what `+grids=` and a proj-data package use.
 ///
@@ -190,9 +187,9 @@ std::string first_missing_grid(PJ_CONTEXT* ctx, PJ* operation) {
 /// Candidate operations for a CRS pair, as `available_transformations()` lists
 /// them: grid availability ignored (so a missing grid is diagnosed rather than
 /// hiding the operation) and areas intersected (so an area-limited national
-/// operation stays selectable). Only pinning may use this list; the automatic
-/// path must never select from it, because its first entry is not the operation
-/// PROJ would apply at a given point.
+/// operation stays selectable). Only pinning and diagnosis may use this list;
+/// the automatic path must never select from it, because its first entry is not
+/// the operation PROJ would apply at a given point.
 ObjListPtr list_candidates(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
                            const CoordinateSystem& dst) {
     FactoryContextPtr factory{proj_create_operation_factory_context(ctx, nullptr)};
@@ -268,71 +265,74 @@ PjPtr pinned_pipeline(PJ_CONTEXT* ctx, PJ* operation) {
     return normalized;
 }
 
-/// Describe the pair the way the engine always has: list the operations PROJ
-/// considers for the two CRS extents (the factory's own defaults — operations
-/// whose area does not cover the pair, and operations whose grid is absent, are
-/// ranked last) and read the first. That is what `preferred_operation`,
-/// `accuracy_m()` and the ballpark refusal have always meant.
+/// Describe the pair for `accuracy_m()` and the ballpark refusal: does any real
+/// operation exist for these two CRS extents, and what is the best accuracy
+/// stated among them?
 ///
 /// This is a *diagnosis*, not a selection: the pipeline itself is built by
 /// `automatic_pipeline`, so each point is transformed by whichever operation
 /// PROJ deems right for it. Selecting from this list instead would hand one
-/// area-limited national operation to every point in the world — and its first
-/// entry is also why a missing grid is *not* diagnosed here (see below).
+/// area-limited national operation to every point in the world.
+///
+/// The listing is deliberately a *partial-intersection* one (see
+/// `list_candidates`), not PROJ's default strict containment. That difference
+/// is the whole point. Strict containment asks each operation's own area to
+/// contain both CRSs' entire extents; a projection's area of use is routinely
+/// larger than the transformation that reaches it — EPSG:3035 covers Europe to
+/// 24.6°N, while `ETRS89 to WGS 84 (1)` (EPSG:1149) stops at 33.26°N — so the
+/// strict listing offers WGS 84 -> EPSG:3035 nothing but the world ballpark.
+/// PROJ's own per-point pipeline still applies the 1 m operation everywhere
+/// that operation covers, because per point it only has to contain *that
+/// point*. Refusing on the strict list therefore rejected a pair the engine
+/// transforms correctly, which is exactly the bug fixed here.
+///
+/// So the refusal fires only when *no* non-ballpark candidate intersects the
+/// pair at all. A datum with a published transformation to WGS 84 is accepted
+/// even where that transformation's area is smaller than the target's, and a
+/// pair that has nothing but a ballpark (a datum with no published
+/// transformation, or a custom `+ellps=` with no datum name) is still refused.
 void describe_pair(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const CoordinateSystem& src,
                    const CoordinateSystem& dst, double* accuracy, bool* ballpark) {
-    FactoryContextPtr factory{proj_create_operation_factory_context(ctx, nullptr)};
-    if (!factory) {
-        throw Error("cannot create a PROJ operation factory context: " + proj_context_error(ctx));
-    }
-    // Grid availability is ignored so the list stays complete: an operation
-    // whose grid is missing keeps its place (and is diagnosed by name below)
-    // instead of disappearing into a ranking. The spatial criterion stays at
-    // the factory default, which is what the engine has always used here.
-    proj_operation_factory_context_set_grid_availability_use(ctx, factory.get(),
-                                                             PROJ_GRID_AVAILABILITY_IGNORED);
-    ObjListPtr operations{proj_create_operations(ctx, src_pj, dst_pj, factory.get())};
-    if (!operations) {
-        throw Error("cannot list datum transformations from " + quoted(src) + " to " + quoted(dst) +
-                    ": " + proj_context_error(ctx));
-    }
-    if (proj_list_get_count(operations.get()) <= 0 && (is_bound(src_pj) || is_bound(dst_pj))) {
-        // The strict criterion compares against both CRSs' whole extents, and a
-        // bound CRS subtends only the area of the operation it was pinned by —
-        // so a pinned source with a continental target lists nothing even
-        // though the pipeline above was built. Widen the *listing* only; which
-        // operation transforms a point is decided by PROJ, never by this list.
-        // Any other empty list keeps main's behaviour: an error.
-        proj_operation_factory_context_set_spatial_criterion(
-            ctx, factory.get(), PROJ_SPATIAL_CRITERION_PARTIAL_INTERSECTION);
-        operations.reset(proj_create_operations(ctx, src_pj, dst_pj, factory.get()));
-        if (!operations) {
-            throw Error("cannot list datum transformations from " + quoted(src) + " to " +
-                        quoted(dst) + ": " + proj_context_error(ctx));
-        }
-    }
+    ObjListPtr operations = list_candidates(ctx, src_pj, dst_pj, src, dst);
     const int count = proj_list_get_count(operations.get());
     if (count <= 0) {
         throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst));
     }
-    PjPtr first{proj_list_get(ctx, operations.get(), 0)};
-    if (!first) {
-        throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) + ": " +
-                    proj_context_error(ctx));
+    // Best (smallest positive) accuracy among the non-ballpark candidates, -1
+    // when PROJ states none for any of them. A conversion reports 0 m for "not
+    // stated", which is not the unknown sentinel the API uses, so 0 never wins.
+    // The listing ignores grid availability (`list_candidates`), so this is the
+    // best accuracy PROJ can offer for the pair, not necessarily one that runs
+    // on a machine missing a grid — the same number `available_transformations`
+    // reports for the same candidates.
+    bool have_real = false;
+    double best_accuracy = -1.0;
+    for (int i = 0; i < count; ++i) {
+        PjPtr candidate{proj_list_get(ctx, operations.get(), i)};
+        if (!candidate) {
+            throw Error("no datum transformation from " + quoted(src) + " to " + quoted(dst) +
+                        ": " + proj_context_error(ctx));
+        }
+        if (proj_coordoperation_has_ballpark_transformation(ctx, candidate.get()) == 1) {
+            continue;
+        }
+        have_real = true;
+        const double candidate_accuracy = proj_coordoperation_get_accuracy(ctx, candidate.get());
+        if (candidate_accuracy > 0.0 &&
+            (best_accuracy <= 0.0 || candidate_accuracy < best_accuracy)) {
+            best_accuracy = candidate_accuracy;
+        }
     }
-    *ballpark = proj_coordoperation_has_ballpark_transformation(ctx, first.get()) == 1;
-    *accuracy = proj_coordoperation_get_accuracy(ctx, first.get());
-    if (*accuracy <= 0.0 && !*ballpark) {
-        *accuracy = -1.0;  // PROJ reports 0 for "not stated" on conversions
-    }
-    // No grid diagnosis here. The first listed candidate is *not* what a point
-    // is transformed by — PROJ keeps every candidate in the automatic pipeline
-    // and picks per point — so an absent grid on that candidate does not mean
-    // this pair cannot run. On a machine without OSTN15, OSGB36 -> WGS 84 still
-    // transforms every point (PROJ falls back to a grid-free shift), while the
-    // first candidate needs `uk_os_OSTN15_NTv2_OSGBtoETRS.tif`; refusing here
-    // would reject a transform that works. The diagnosis belongs on the
-    // pipeline actually built — see `select_operation`.
+    *ballpark = !have_real;
+    *accuracy = have_real ? best_accuracy : -1.0;
+    // No grid diagnosis here. A listed candidate is *not* what a point is
+    // transformed by — PROJ keeps every candidate in the automatic pipeline and
+    // picks per point — so an absent grid on one of them does not mean this pair
+    // cannot run. On a machine without OSTN15, OSGB36 -> WGS 84 still transforms
+    // every point (PROJ falls back to a grid-free shift) while a candidate needs
+    // `uk_os_OSTN15_NTv2_OSGBtoETRS.tif`; refusing here would reject a transform
+    // that works. The diagnosis belongs on the pipeline actually built — see
+    // `select_operation`.
 }
 
 /// Choose the operation PROJ should use and capture its accuracy/ballpark
@@ -372,8 +372,8 @@ std::string select_operation(PJ_CONTEXT* ctx, PJ* src_pj, PJ* dst_pj, const Coor
     // A pinned operation is looked up in the pair's candidate list, which keeps
     // every operation (grid availability ignored, areas intersected) so a
     // national operation stays selectable and a missing grid stays diagnosable.
-    // Only this listing uses a wide criterion; the automatic path above never
-    // selects from it.
+    // The automatic path above never selects from a listing; it only diagnoses
+    // with one.
     ObjListPtr operations = list_candidates(ctx, src_pj, dst_pj, src, dst);
     PjPtr chosen = find_operation(ctx, operations.get(), options.preferred_operation);
     if (!chosen) {

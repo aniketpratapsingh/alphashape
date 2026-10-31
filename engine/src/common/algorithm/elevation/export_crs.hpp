@@ -1,0 +1,78 @@
+#pragma once
+
+// Export-time CRS handling for the DEM and orthomosaic writers (M12 §4.10,
+// WP-12.9).
+//
+// An export writes the raster as stored unless `projection`/`crs` names a
+// different coordinate system, in which case the raster is reprojected on the
+// fly (model/raster/reproject.hpp) and the file is georeferenced in the target
+// CRS. `resolution` is the cell size in the TARGET CRS; 0 keeps the source
+// ground sample distance.
+//
+// A target naming the SAME coordinate system is NOT a reprojection: at the
+// source cell it is a bit-identical copy, and at a new cell the grid is
+// re-anchored on the source's own north-west corner (so a real georeference is
+// never shifted by up to a cell and no blank border row appears). Only the
+// resolution differs, and `resample_grid` sizes the new grid, not
+// `suggest_grid`'s outward snapping.
+//
+// Units. A geographic target takes `resolution` in DEGREES. A value that is
+// absurd for a geographic cell (>= 0.01 degrees, about a kilometre, against a
+// source that resolves a few metres) is refused as a likely value in metres,
+// with the degree value to pass instead. A request that would leave a grid
+// smaller than 2x2 cells is refused too.
+//
+// The parameter rules are shared with BuildDem/BuildOrthomosaic so a script that
+// works for one works for the others: `projection` is an Int EPSG code (0 =
+// unset), `crs` is "EPSG:<n>", a bare code, a PROJ string or WKT, and setting
+// both to disagreeing values is a ValueError.
+
+#include <cstdint>
+#include <string>
+
+#include "common/core/types.hpp"
+#include "model/raster/geo_raster.hpp"
+
+namespace alphashape::elevation {
+
+/// A resolved export request.
+struct ExportCrs {
+    /// Requested CRS; unset means "write the raster's own CRS unchanged".
+    CRS crs;
+    /// Cell size in the TARGET CRS. 0 keeps the source GSD.
+    double resolution = 0.0;
+
+    bool requested() const { return crs.is_set(); }
+};
+
+/// Parse an export task's `projection` / `crs` / `resolution` parameters.
+/// `task` names the task in error messages ("ExportDem").
+/// @throws ValueError for a negative EPSG, a negative resolution, or a
+///         `projection`/`crs` pair that disagrees.
+ExportCrs parse_export_crs(std::int64_t projection, const std::string& crs_text,
+                           double resolution, const char* task);
+
+/// The raster in its export form: reprojected into the requested CRS, or the
+/// input unchanged (a copy) when the request is unset. `raster_crs` is the
+/// container's recorded CRS; `nodata_in` is the stored sentinel and `nodata_out`
+/// the one written for uncovered cells (they differ when the caller picked a
+/// custom `nodata`).
+///
+/// @throws ValueError when a reprojection is requested but the raster has no
+///         CRS to reproject FROM, or when the target CRS has no EPSG code (a
+///         custom WKT target is written once WP-12.10 adds WKT GeoKeys), when
+///         `resolution` looks like metres handed to a geographic target, and
+///         when the request would leave a grid smaller than 2x2 cells.
+GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS& raster_crs,
+                                      float nodata_in, float nodata_out,
+                                      const ExportCrs& target, const char* task);
+
+GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& raster,
+                                             const CRS& raster_crs,
+                                             const ExportCrs& target, const char* task);
+
+/// The EPSG code the written GeoTIFF declares: the target's when reprojecting,
+/// else the container's own (0 for the local frame).
+int export_epsg(const CRS& raster_crs, const ExportCrs& target);
+
+}  // namespace alphashape::elevation

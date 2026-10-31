@@ -5,8 +5,6 @@
 add_library(alphashape_model STATIC
     camera/calibration.cpp
     geo/geodesy.cpp
-    geo/transverse_mercator.cpp
-    geo/projection.cpp
     mesh/marching_tetrahedra.cpp
     mesh/mesh_ops.cpp
     mesh/decimate.cpp
@@ -16,6 +14,7 @@ add_library(alphashape_model STATIC
     mesh/atlas_pack.cpp
     mesh/rasterize.cpp
     raster/geotiff.cpp
+    raster/reproject.cpp
 )
 
 target_include_directories(alphashape_model PUBLIC ${ALPHASHAPE_INCLUDE_DIR})

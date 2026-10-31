@@ -4,8 +4,9 @@
 //
 // The task adapter over the ortho core (orthorectify.hpp, seamlines.hpp,
 // blend.hpp). Every enabled camera is rectified onto one north-up grid in the
-// DEM's projection plane, the seamline labeller picks the source camera per
-// cell, and the blender combines the tiles. The result is appended as a NEW
+// OUTPUT projection plane -- the DEM's when no different CRS is requested, else
+// the requested one -- the seamline labeller picks the source camera per cell,
+// and the blender combines the tiles. The result is appended as a NEW
 // orthomosaic asset (made active), with the chunk camera ids in its per-cell
 // label field, so an earlier orthomosaic is never overwritten.
 //
@@ -218,9 +219,17 @@ double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);
 OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input);
 
 /// Build the chunk's orthomosaic from its DEM (surface_data = "elevation") or
-/// from a DSM derived from Chunk::model() (surface_data = "model"). Throws
-/// ValueError when the required surface is missing, when `projection` names a
-/// different CRS than the DEM (reproject the DEM first), or for an unknown
+/// from a DSM derived from Chunk::model() (surface_data = "model").
+///
+/// `projection`/`crs` choose the output plane: unset or the DEM's own builds on
+/// the DEM's grid; naming a DIFFERENT CRS reprojects the DEM surface once (for
+/// surface_data = "elevation") or rasterises the DSM straight into that CRS
+/// (for surface_data = "model"), and the stored orthomosaic is in the requested
+/// CRS. `resolution` is in that CRS's own units: metres for a projected CRS,
+/// DEGREES for a geographic one.
+///
+/// Throws ValueError when the required surface is missing, when the surface
+/// reprojection cannot fit the memory budget, or for an unknown
 /// surface/blending name. Commits with one move, so a failure leaves any
 /// previous orthomosaic untouched.
 class BuildOrthomosaicTask : public AbstractTask {

@@ -92,7 +92,19 @@ TEST(GuiShell, HelpAndVersionExitZero) {
     const RunResult version = run_gui({QStringLiteral("--version")}, 20000);
     ASSERT_TRUE(version.finished);
     EXPECT_EQ(version.exit_code, 0);
-    EXPECT_TRUE(version.out.startsWith(QStringLiteral("alphashape-gui ")));
+    // The program identifies itself on a line of its own. Checked line-wise
+    // rather than as a prefix of the whole capture: on Windows the GUI-subsystem
+    // binary's console adoption can leave a UTF-8 BOM or a blank line ahead of
+    // the text, which says nothing about whether --version printed its line.
+    const QStringList lines = version.out.split(QLatin1Char('\n'));
+    bool identified = false;
+    for (const QString& line : lines) {
+        const QString trimmed = line.trimmed();
+        if (trimmed.startsWith(QStringLiteral("alphashape-gui "))) {
+            identified = true;
+        }
+    }
+    EXPECT_TRUE(identified) << "version output: " << version.out.toStdString();
 }
 
 TEST(GuiShell, OpeningAMissingProjectExits1) {

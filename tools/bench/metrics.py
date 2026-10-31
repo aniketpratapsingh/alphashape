@@ -739,35 +739,74 @@ def phase_correlation_shift(
 
     xs = _highpass(x - x.mean())
     ys = _highpass(y - y.mean())
-    fx = np.fft.rfft2(xs)
-    fy = np.fft.rfft2(ys)
+    shift = _shift_from_arrays(
+        xs, ys, max_shift_fraction=max_shift_fraction, upsample=upsample
+    )
+    # ``_shift_from_arrays`` already reports the coarse whole-pixel peak on the
+    # out-of-bounds path, so the values forward unchanged either way.
+    return {
+        "dx": shift["dx"],
+        "dy": shift["dy"],
+        "peak": shift["peak"],
+        "in_bounds": shift["in_bounds"],
+    }
 
+
+def _normalised_spectrum(x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
+    """Phase-only cross-power spectrum of two prepared 2-D arrays.
+
+    None when either array carries no signal at all (an all-zero tile), which is
+    the case a caller must reject rather than correlate: every lag would be equal
+    and the argmax would be the first cell.
+    """
+    fx = np.fft.rfft2(x)
+    fy = np.fft.rfft2(y)
+    if not (np.any(np.abs(fx) > 1e-12) and np.any(np.abs(fy) > 1e-12)):
+        return None
     cross = fy * np.conj(fx)
     magnitude = np.abs(cross)
     magnitude[magnitude < 1e-12] = 1e-12
-    spectrum = cross / magnitude
-    correlation = np.fft.irfft2(spectrum, s=x.shape)
+    return cross / magnitude
 
+
+def _refine_peak(
+    spectrum: np.ndarray,
+    correlation: np.ndarray,
+    py: int,
+    px: int,
+    dy: int,
+    dx: int,
+    *,
+    upsample: int,
+) -> tuple[float, float]:
+    """Sub-pixel refinement of a coarse peak by band-limited upsampling.
+
+    The exact Guizar-Sicairos zero-padding, not a parabola: a parabola is biased
+    by a wide peak, which is exactly the case for two mosaics of the same scene.
+    The padding factor is capped so the padded transform stays under
+    ``_MAX_PADDED`` cells, which is what keeps a 1200 px comparison affordable.
+    """
     h, w = correlation.shape
-    py, px = (int(v) for v in np.unravel_index(int(np.argmax(correlation)), correlation.shape))
-    dy = py if py <= h // 2 else py - h
-    dx = px if px <= w // 2 else px - w
-    peak = float(correlation.max())
-    if abs(dy) > int(h * max_shift_fraction) or abs(dx) > int(w * max_shift_fraction):
-        return {"dx": float(dx), "dy": float(dy), "peak": peak, "in_bounds": False}
-
     factor = max(1, int(upsample))
     while factor > 1 and h * factor * w * factor > _MAX_PADDED:
         factor //= 2
     if factor <= 1:
-        return {"dx": float(dx), "dy": float(dy), "peak": peak, "in_bounds": True}
+        return float(dy), float(dx)
 
-    # Zero-pad the (complex) spectrum to the upsampled grid, inverse transform,
-    # and read the peak near the coarse one. Padding the unnormalised spectrum by
-    # the factor keeps the transform unitary, but only the argmax matters here.
+    # Zero-pad the spectrum to the upsampled grid, inverse transform, and read the
+    # peak near the coarse one.
+    #
+    # The ROW axis must be padded AROUND the DC bin, not appended after it. Rows of
+    # an rfft2 spectrum run 0, +1, ..., +h/2, -h/2+1, ..., -1, so appending zeros
+    # moves every negative frequency and biases dy by a fraction of a pixel — a
+    # true 2.5 px shift was read as 1.875. fftshift puts DC in the centre, the
+    # zeros go on both sides, ifftshift restores the layout. The COLUMN axis of an
+    # rfft2 keeps only non-negative frequencies, so appending there is correct.
+    shifted = np.fft.fftshift(spectrum, axes=0)
     big = np.zeros((h * factor, w // 2 + 1), dtype=np.complex128)
-    big[:h, :] = spectrum
-    upsampled = np.fft.irfft2(big, s=(h * factor, w * factor))
+    start = (h * factor - h) // 2
+    big[start : start + h, :] = shifted
+    upsampled = np.fft.irfft2(np.fft.ifftshift(big, axes=0), s=(h * factor, w * factor))
 
     # The coarse peak moves to (py*factor, px*factor); search a small window
     # around it for the fine peak.
@@ -790,8 +829,44 @@ def phase_correlation_shift(
     # A refinement that jumps more than half a coarse cell is the padding's
     # periodic image of the true peak, not a refinement; keep the coarse value.
     if abs(fy_px - dy) > 0.5 or abs(fx_px - dx) > 0.5:
-        return {"dx": float(dx), "dy": float(dy), "peak": peak, "in_bounds": True}
-    return {"dx": float(fx_px), "dy": float(fy_px), "peak": peak, "in_bounds": True}
+        return float(dy), float(dx)
+    return float(fy_px), float(fx_px)
+
+
+def _shift_from_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    max_shift_fraction: float = 0.25,
+    upsample: int = 8,
+) -> dict:
+    """Phase correlation of two already-prepared arrays, coerced to canonical peaks.
+
+    Returns ``dx``/``dy`` in pixels, ``peak`` (the coarse correlation maximum) and
+    ``in_bounds``. Shared by the global legacy path and the per-tile path so both
+    have the same sub-pixel behaviour.
+    """
+    spectrum = _normalised_spectrum(x, y)
+    if spectrum is None:
+        return {"dx": 0.0, "dy": 0.0, "peak": 0.0, "in_bounds": False}
+    correlation = np.fft.irfft2(spectrum, s=x.shape)
+    h, w = correlation.shape
+    py, px = (int(v) for v in np.unravel_index(int(np.argmax(correlation)), correlation.shape))
+    dy = py if py <= h // 2 else py - h
+    dx = px if px <= w // 2 else px - w
+    peak = float(correlation.max())
+    if abs(dy) > int(h * max_shift_fraction) or abs(dx) > int(w * max_shift_fraction):
+        return {
+            "dx": float(dx), "dy": float(dy), "peak": peak, "in_bounds": False,
+            "correlation": correlation, "py": py, "px": px,
+        }
+    fy_px, fx_px = _refine_peak(
+        spectrum, correlation, py, px, dy, dx, upsample=upsample
+    )
+    return {
+        "dx": fx_px, "dy": fy_px, "peak": peak, "in_bounds": True,
+        "correlation": correlation, "py": py, "px": px,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2393,16 +2468,263 @@ def compare_dem_to_reference(
     return stats
 
 
+# -- plan-view offset: colour-invariant, tile-robust -------------------------
+#
+# A phase correlation of plain channel means is colour dependent: a per-camera
+# gain changes the luminance histogram, so the correlation peak moves even when
+# the geometry is identical. That was measured on the aerial-nadir reference:
+# a global gain change moved the reported offset 0.985 -> 1.523 m while gradient
+# phase correlation put the true geometry shift at 0.000 px.
+#
+# The representation used instead is the Sobel gradient magnitude of luminance,
+# locally standardised. Gradients cancel a constant offset, magnitude cancels a
+# sign flip, and local standardisation removes a per-region affine gain: if a
+# region is scaled by `a` and shifted by `b`, its gradient magnitude becomes
+# `a * g`, and (g - mean(g)) / std(g) is invariant to `a`. What is left is the
+# structure, which is what the registration is actually about.
+#
+# One global FFT over the whole mosaic is dominated by whichever region has the
+# most texture, so the offset is measured per tile and combined by median. Each
+# tile also reports a confidence (peak / strongest rival lobe); a tile without a
+# clear peak is dropped rather than allowed to drag the median.
+OFFSET_METRIC_VERSION = 2
+
+# Local standardisation window, in pixels of the comparison grid. Wide enough to
+# span a few hundred edge pixels, narrow enough that a per-camera brightness
+# difference (which is regional, not global) is absorbed within the tile.
+OFFSET_LCN_RADIUS = 16
+
+# Tiles are a 3x3 grid of the shared valid area, so a tile is a third of the
+# mosaic on each side and no single tile can outvote the others. Below this side
+# a tile has too few edge samples for a peak to mean anything.
+OFFSET_TILE_MIN_SIDE = 96
+
+# A tile is confident when its correlation peak is this many times the strongest
+# lobe outside the peak neighbourhood. A single strong edge crossing one tile can
+# otherwise produce a peak that is barely above the noise floor of that tile.
+OFFSET_CONFIDENT_RATIO = 2.0
+
+# ...and when the peak itself clears this, so a featureless tile (whose
+# correlation surface is numerical noise at every lag) is rejected even if its
+# strongest cell happens to beat its rivals by the ratio above.
+OFFSET_CONFIDENT_MIN_PEAK = 0.02
+
+# A tile whose mean gradient magnitude is below this fraction of the mosaic's own
+# mean carries no usable structure: standardising it would amplify sensor noise
+# into a confident-looking peak on nothing. Relative, because the same scene is
+# the same picture whether its cells hold 0-1 or 0-255.
+OFFSET_MIN_TEXTURE = 0.1
+
+# Rival lobes within this many pixels of the peak are its own shoulder, not a
+# separate hypothesis, and are ignored when looking for the second-best lobe.
+OFFSET_RIVAL_EXCLUSION_PX = 2
+
+# Fewer confident tiles than this and the offset is reported as unreliable (null)
+# and never gated: two agreeing tiles can agree by chance, three start to mean
+# something.
+OFFSET_MIN_CONFIDENT_TILES = 3
+
+# The gate allows half a decimetre regardless of dispersion, or twice the measured
+# tile MAD when that is larger: a noisier reference gets a proportionally looser
+# gate rather than failing every run on its own scatter. report.py is the single
+# gate authority and imports these; the metric JSON reports the ingredients
+# (offset_dispersion_m) rather than a precomputed limit, so the policy lives in
+# one place.
+OFFSET_GATE_FLOOR_M = 0.05
+OFFSET_GATE_DISPERSION_FACTOR = 2.0
+
+
+def _luminance(rgb: np.ndarray) -> np.ndarray:
+    """Rec.709 luma of the stored colour values, or the single band as-is."""
+    array = np.asarray(rgb, dtype=np.float64)
+    if array.ndim == 2:
+        return array
+    weights = np.asarray(SEAM_LUMA_WEIGHTS[: array.shape[2]], dtype=np.float64)
+    weights = weights / weights.sum()
+    return np.tensordot(array, weights, axes=([2], [0]))
+
+
+def _sobel_magnitude(image: np.ndarray) -> np.ndarray:
+    """Sobel gradient magnitude, edge-padded so every output cell is defined.
+
+    Same kernel normalisation as ``gradient_energy`` (divide by 8) so the two
+    metrics see the same scale; only the magnitude is needed here.
+    """
+    img = np.asarray(image, dtype=np.float64)
+    padded = np.pad(img, 1, mode="edge")
+    gx = (
+        padded[:-2, 2:] + 2 * padded[1:-1, 2:] + padded[2:, 2:]
+        - padded[:-2, :-2] - 2 * padded[1:-1, :-2] - padded[2:, :-2]
+    ) / 8.0
+    gy = (
+        padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]
+        - padded[:-2, :-2] - 2 * padded[:-2, 1:-1] - padded[:-2, 2:]
+    ) / 8.0
+    return np.hypot(gx, gy)
+
+
+def _local_contrast_normalise(gradient: np.ndarray, *, radius: int) -> np.ndarray:
+    """Standardise ``gradient`` in sliding windows: affine-gain invariant.
+
+    A per-region gain ``a`` turns the gradient magnitude into ``a * g``; the
+    windowed mean and standard deviation both scale by ``a``, so the standardised
+    result is unchanged. ``eps`` keeps a flat region (std == 0) from dividing by
+    zero: it becomes a field of zeros, which carries no phase and so cannot
+    produce a peak.
+    """
+    values = np.asarray(gradient, dtype=np.float64)
+    mean = _box_blur(values, radius)
+    mean_square = _box_blur(values * values, radius)
+    variance = np.maximum(mean_square - mean * mean, 0.0)
+    return (values - mean) / (np.sqrt(variance) + 1e-6)
+
+
+def _hann_window_2d(shape: tuple[int, int]) -> np.ndarray:
+    """Separable Hann window, the standard taper for a windowed periodogram.
+
+    Without it the wrap-around of a finite tile puts a step at the border, and
+    that step's own correlation competes with the scene's.
+    """
+    height, width = shape
+    return np.hanning(height)[:, None] * np.hanning(width)[None, :]
+
+
+def _fill_invalid(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Replace the invalid cells with the mean of the valid ones.
+
+    A hole must not be left at zero: its rim would be a hard brightness step, and
+    that step is a coherent edge across the tile — exactly what a phase
+    correlation locks onto. Filling with the mean removes the step while adding no
+    structure of its own.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    if valid.all():
+        return array
+    if not valid.any():
+        return np.zeros_like(array)
+    return np.where(valid, array, float(array[valid].mean()))
+
+
+
+def _tile_shift(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    max_shift_fraction: float = 0.25,
+    upsample: int = 8,
+) -> dict | None:
+    """Windowed phase correlation of one tile; None when the peak is unusable.
+
+    Returns ``{"dx", "dy", "peak", "confidence"}`` with the sub-pixel peak by the
+    same band-limited upsampling ``phase_correlation_shift`` uses, plus the ratio
+    of that peak to the strongest rival lobe outside its neighbourhood. A tile
+    whose peak is out of bounds (aliased) or whose spectrum is identically zero
+    (a featureless tile) gives None: there is no evidence either way.
+    """
+    x = np.asarray(a, dtype=np.float64)
+    y = np.asarray(b, dtype=np.float64)
+    if x.shape != y.shape or x.ndim != 2:
+        return None
+    height, width = x.shape
+    if min(height, width) < 8:
+        return None
+
+    # Drop the mean first: the Hann taper multiplies it down but does not remove
+    # it, and a tile that is 90% flat would otherwise correlate its own flat
+    # plateau into a spurious central peak.
+    window = _hann_window_2d(x.shape)
+    xw = (x - x.mean()) * window
+    yw = (y - y.mean()) * window
+    # One FFT pair and one inverse here; the shared helper reuses this spectrum
+    # both for the coarse argmax and for the sub-pixel refinement.
+    shift = _shift_from_arrays(xw, yw, max_shift_fraction=max_shift_fraction, upsample=upsample)
+    if not shift["in_bounds"]:
+        return None
+    correlation = shift.get("correlation")
+    if correlation is None:
+        return None
+    height, width = correlation.shape
+    py, px = shift["py"], shift["px"]
+    peak = shift["peak"]
+
+    # Confidence: the strongest lobe that is not the peak's own shoulder. Roll the
+    # correlation so the peak sits at (0, 0), blank a square neighbourhood around
+    # it, and take the maximum of what is left.
+    centred = np.roll(np.roll(correlation, -py, axis=0), -px, axis=1)
+    exclusion = max(1, int(OFFSET_RIVAL_EXCLUSION_PX))
+    rows = np.arange(height)
+    cols = np.arange(width)
+    # Wrapped distance from the origin, so the peak's periodic images at the far
+    # edge are excluded along with the peak itself.
+    dist_r = np.minimum(rows, height - rows)
+    dist_c = np.minimum(cols, width - cols)
+    near = (dist_r[:, None] <= exclusion) & (dist_c[None, :] <= exclusion)
+    masked = np.where(near, 0.0, centred)
+    rival = float(masked.max()) if masked.size else 0.0
+    confidence = peak / rival if rival > 0.0 else math.inf
+
+    return {
+        "dx": shift["dx"],
+        "dy": shift["dy"],
+        "peak": peak,
+        "confidence": confidence,
+    }
+
+
+def _tile_boxes(
+    valid: np.ndarray, *, grid: int = 3, min_side: int = OFFSET_TILE_MIN_SIDE
+) -> list[tuple[int, int, int, int]]:
+    """The 3x3 tile boxes of the shared valid area, as (r0, r1, c0, c1).
+
+    Splitting the bounding box of the valid cells — not the whole comparison grid
+    — keeps a mosaic whose data sits in one corner from spending eight of its
+    nine tiles on nodata.
+    """
+    if not valid.any():
+        return []
+    rows, cols = np.nonzero(valid)
+    r0, r1 = int(rows.min()), int(rows.max()) + 1
+    c0, c1 = int(cols.min()), int(cols.max()) + 1
+    boxes: list[tuple[int, int, int, int]] = []
+    for iy in range(grid):
+        ry0 = r0 + (r1 - r0) * iy // grid
+        ry1 = r0 + (r1 - r0) * (iy + 1) // grid
+        for ix in range(grid):
+            cx0 = c0 + (c1 - c0) * ix // grid
+            cx1 = c0 + (c1 - c0) * (ix + 1) // grid
+            if ry1 - ry0 >= min_side and cx1 - cx0 >= min_side:
+                boxes.append((ry0, ry1, cx0, cx1))
+    return boxes
+
+
+def _median_absolute_deviation(values: np.ndarray) -> float:
+    """Median |x - median(x)|; a robust spread that one wild tile cannot inflate."""
+    if values.size == 0:
+        return 0.0
+    centre = float(np.median(values))
+    return float(np.median(np.abs(values - centre)))
+
+
 def compare_ortho_to_reference(
     ours: Raster, reference: Raster, *, max_cells: int = 2_000_000
 ) -> dict:
     """Horizontal offset and overlap against a reference orthomosaic.
 
     The reference is another pipeline's mosaic of the same photographs, so it is
-    registered to the same world frame up to that pipeline's own error. Phase
-    correlation on luminance gives the residual plan-view offset in metres; a
-    nonzero value means our georeferencing disagrees with the publisher's, not
-    that one is wrong, which is why the report labels it "vs reference".
+    registered to the same world frame up to that pipeline's own error. The
+    residual plan-view offset is measured on a COLOUR-INVARIANT representation —
+    locally standardised Sobel gradient magnitude of luminance — so a change to
+    per-camera gains or white balance cannot move it. A plain luminance phase
+    correlation does move under exactly that change; its result is still reported
+    as ``offset_m_legacy`` for one release so the two can be compared.
+
+    The offset is measured per tile on a 3x3 grid of the shared valid area, each
+    tile a Hann-windowed phase correlation with a sub-pixel peak, and combined by
+    the median over tiles whose peak is clearly above its rivals. The spread of
+    those tiles (MAD) is reported alongside the count, and the offset is
+    ``None`` — unreliable, never gated — when fewer than three tiles are
+    confident. A single FFT over a whole mosaic is dominated by whichever region
+    has the most texture, which is how the colour dependence got in.
 
     ``max_cells`` bounds the comparison grid: phase correlation is an FFT, so its
     cost is superlinear in the cell count and a 1200 px grid resolves the offset to
@@ -2421,31 +2743,121 @@ def compare_ortho_to_reference(
     if int(both.sum()) < 256:
         return {"comparable": False, "reason": "too few overlapping pixels"}
 
-    lum_a = a[:, :, : min(3, a.shape[2])].mean(axis=2)
-    lum_b = b[:, :, : min(3, b.shape[2])].mean(axis=2)
+    lum_a = _luminance(a[:, :, : min(3, a.shape[2])])
+    lum_b = _luminance(b[:, :, : min(3, b.shape[2])])
     # Fill holes with each image's own mean before correlating: a nodata region
     # that differs between the two would otherwise dominate as a giant step edge.
     lum_a = np.where(both, lum_a, float(lum_a[both].mean()))
     lum_b = np.where(both, lum_b, float(lum_b[both].mean()))
-    # Zero mean / unit norm so brightness and contrast differences between the
-    # two pipelines do not bias the phase.
-    lum_a = (lum_a - lum_a.mean()) / (lum_a.std() or 1.0)
-    lum_b = (lum_b - lum_b.mean()) / (lum_b.std() or 1.0)
 
-    shift = phase_correlation_shift(lum_a, lum_b)
-    return {
+    result: dict = {
         "comparable": True,
-        "dx_m": shift["dx"] * pixel,
-        "dy_m": shift["dy"] * pixel,
-        "offset_m": math.hypot(shift["dx"], shift["dy"]) * pixel,
-        "dx_px": shift["dx"],
-        "dy_px": shift["dy"],
+        "metric_version": OFFSET_METRIC_VERSION,
         "grid_pixel_m": pixel,
         "grid_size": [int(width), int(height)],
         "overlap_fraction": float(both.sum()) / float(a_valid.sum()) if a_valid.any() else 0.0,
-        "in_bounds": shift["in_bounds"],
-        "peak": shift["peak"],
     }
+
+    # -- legacy value: plain luminance, one global correlation -----------------
+    # Kept for one release so a reader can see what changed and why, and so the
+    # gate's skip of a redefined metric is visibly justified in the report.
+    norm_a = (lum_a - lum_a.mean()) / (lum_a.std() or 1.0)
+    norm_b = (lum_b - lum_b.mean()) / (lum_b.std() or 1.0)
+    legacy = phase_correlation_shift(norm_a, norm_b)
+    result["offset_m_legacy"] = math.hypot(legacy["dx"], legacy["dy"]) * pixel
+
+    # -- current value: gradient magnitude, per-tile --------------------------
+    # The raw magnitudes are kept alongside the standardised fields: the texture
+    # gate below is a statement about absolute gradient energy, which local
+    # standardisation deliberately destroys.
+    magnitude_a = _sobel_magnitude(lum_a)
+    magnitude_b = _sobel_magnitude(lum_b)
+    gradient_a = _local_contrast_normalise(magnitude_a, radius=OFFSET_LCN_RADIUS)
+    gradient_b = _local_contrast_normalise(magnitude_b, radius=OFFSET_LCN_RADIUS)
+    # The scale a "real" edge has in THIS pair of rasters: a synthetic test image
+    # in [0, 1] and a uint8 mosaic on a 0-255 scale are the same picture with
+    # different units, so the gate below is relative to this rather than absolute.
+    both_a = float(magnitude_a[both].mean()) if both.any() else 0.0
+    both_b = float(magnitude_b[both].mean()) if both.any() else 0.0
+    texture_scale = max((both_a + both_b) / 2.0, 1e-12)
+    # A tile needs valid data on both sides, and the local standardisation needs a
+    # margin at the comparison grid's edge, so the tile is eroded by the window.
+    usable = erosion(both, max(1, OFFSET_LCN_RADIUS // 4))
+    tiles: list[dict] = []
+    for r0, r1, c0, c1 in _tile_boxes(usable):
+        tile_valid = usable[r0:r1, c0:c1]
+        # A tile that is largely nodata has no stable phase: its windowed field is
+        # mostly interpolation of the fill value.
+        if float(tile_valid.mean()) < 0.5:
+            continue
+        # Fill invalid cells with the tile's own mean rather than zero: a hole
+        # whose surroundings are bright would otherwise put a hard step at its
+        # rim, and that step is a strong edge the correlation could lock onto.
+        raw_a = _fill_invalid(magnitude_a[r0:r1, c0:c1], tile_valid)
+        raw_b = _fill_invalid(magnitude_b[r0:r1, c0:c1], tile_valid)
+        # A tile with almost no gradient energy carries no structure, and local
+        # standardisation would amplify its sensor noise into a full-scale field:
+        # the correlation then peaks confidently on nothing. Compare both sides
+        # against the shared field's own scale, so this is a statement about
+        # texture rather than about brightness.
+        texture = min(float(raw_a[tile_valid].mean()), float(raw_b[tile_valid].mean()))
+        if texture < OFFSET_MIN_TEXTURE * texture_scale:
+            continue
+        ta = _fill_invalid(gradient_a[r0:r1, c0:c1], tile_valid)
+        tb = _fill_invalid(gradient_b[r0:r1, c0:c1], tile_valid)
+        shift = _tile_shift(ta, tb)
+        if shift is None:
+            continue
+        tiles.append(
+            {
+                "row": r0,
+                "col": c0,
+                "dx_px": shift["dx"],
+                "dy_px": shift["dy"],
+                "peak": shift["peak"],
+                "confidence": shift["confidence"],
+                "offset_m": math.hypot(shift["dx"], shift["dy"]) * pixel,
+                "confident": (
+                    shift["confidence"] >= OFFSET_CONFIDENT_RATIO
+                    and shift["peak"] >= OFFSET_CONFIDENT_MIN_PEAK
+                ),
+            }
+        )
+
+    confident = [tile for tile in tiles if tile["confident"]]
+    result["tiles"] = {
+        "measured": len(tiles),
+        "confident": len(confident),
+        "total": len(_tile_boxes(usable)),
+    }
+    if len(confident) < OFFSET_MIN_CONFIDENT_TILES:
+        # Not enough evidence: report the number as null so the gate cannot fire
+        # on it, and say why rather than leaving a bare null.
+        result["dx_m"] = None
+        result["dy_m"] = None
+        result["offset_m"] = None
+        result["offset_reliable"] = False
+        result["offset_reason"] = (
+            f"only {len(confident)} of {len(tiles)} tiles had a confident peak; "
+            f"{OFFSET_MIN_CONFIDENT_TILES} are needed"
+        )
+        result["offset_dispersion_m"] = None
+        return result
+
+    dx_px = float(np.median([tile["dx_px"] for tile in confident]))
+    dy_px = float(np.median([tile["dy_px"] for tile in confident]))
+    offsets = np.asarray([tile["offset_m"] for tile in confident], dtype=np.float64)
+    dispersion = _median_absolute_deviation(offsets)
+    result["dx_px"] = dx_px
+    result["dy_px"] = dy_px
+    result["dx_m"] = dx_px * pixel
+    result["dy_m"] = dy_px * pixel
+    result["offset_m"] = math.hypot(dx_px, dy_px) * pixel
+    result["offset_reliable"] = True
+    result["offset_dispersion_m"] = dispersion
+    result["peak"] = float(np.median([tile["peak"] for tile in confident]))
+    result["confidence"] = float(np.median([tile["confidence"] for tile in confident]))
+    return result
 
 
 # ---------------------------------------------------------------------------

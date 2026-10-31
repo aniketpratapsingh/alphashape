@@ -1724,6 +1724,102 @@ TEST(BuildDenseParams, DeclaredQualityDefaultsFollowTheBenchmark) {
     EXPECT_EQ(wide.get_int("max_neighbors"), 16);
 }
 
+TEST(BuildDenseParams, DeclaredSearchTuningDefaultsAreTheHistoricalOnes) {
+    // best_k=0 (ceil(n/2)) and min_texture_stddev=1/255 are what every map was
+    // built with before the two fields were selectable. They must stay the
+    // declared defaults, or every stored map is invalidated by an upgrade.
+    const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
+    const Params defaults = make_params(entry);
+    EXPECT_EQ(defaults.get_int("best_k"), 0);
+    EXPECT_DOUBLE_EQ(defaults.get_float("min_texture_stddev"), 1.0 / 255.0);
+}
+
+TEST(BuildDenseParams, RejectsOutOfRangeSearchTuning) {
+    Document document = aligned_document(seq_files(4));
+    for (const std::int64_t k : {std::int64_t{-1}, std::int64_t{256}}) {
+        Params params = make_params(builtin_registry().require("BuildDepthMaps"));
+        params.set("best_k", ParamValue{k});
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError)
+            << "best_k=" << k << " must be rejected";
+    }
+    for (const double stddev : {-0.01, 1.01}) {
+        Params params = make_params(builtin_registry().require("BuildDepthMaps"));
+        params.set("min_texture_stddev", ParamValue{stddev});
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError)
+            << "min_texture_stddev=" << stddev << " must be rejected";
+    }
+    EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
+}
+
+TEST(BuildDenseParams, TextureGateAndBestKReachTheSearch) {
+    // The two fields must reach PatchMatchOptions, not merely be declared. At a
+    // texture gate above any possible intensity stddev (max 0.5) every window is
+    // too flat, so every pixel keeps depth -1 -- a default run leaves most of
+    // them valid. best_k is exercised through the fingerprint test above; here
+    // the gate proves the option is threaded through the task.
+    Document document = aligned_document(seq_files(4));
+    Params params = make_params(builtin_registry().require("BuildDepthMaps"));
+    params.set("downscale", ParamValue{std::int64_t{4}});
+    params.set("min_texture_stddev", ParamValue{1.0});
+    run_task(builtin_registry(), document, "BuildDepthMaps", params);
+
+    const Chunk& chunk = *document.active_chunk();
+    ASSERT_FALSE(chunk.depth_maps().empty());
+    for (const DepthMap& map : chunk.depth_maps()) {
+        EXPECT_FALSE(map.depths.empty());
+        for (const float d : map.depths) {
+            EXPECT_LT(d, 0.0F) << "camera " << map.camera_id
+                               << ": a gate above the maximum stddev must leave no depth";
+        }
+    }
+}
+
+TEST(DepthMapsReuse, FingerprintCoversBestKAndTheTextureGate) {
+    // Both fields change the search's objective or its inputs, so a map built
+    // with another value must not be served. Each is folded ONLY when it is not
+    // the historical default, which is what keeps pre-existing maps reusable.
+    Document document = aligned_document(seq_files(4));
+    const Chunk& chunk = *document.active_chunk();
+    const Camera& camera = chunk.cameras().front();
+    const Sensor& sensor = chunk.sensors().front();
+
+    DepthMapFingerprintContext base;
+    base.max_neighbors = 16;
+    base.neighbour_ids = {1, 2};
+    base.neighbour_poses = {chunk.cameras()[1].pose, chunk.cameras()[2].pose};
+    base.neighbour_calibrations = {sensor.calibration, sensor.calibration};
+    base.depth_min = 5.0;
+    base.depth_max = 40.0;
+    base.image_path = "photos/a.jpg";
+    base.seed = 42;
+
+    const auto hash = [&](const DepthMapFingerprintContext& c) {
+        return depth_map_fingerprint(camera, sensor, kIncrementalDownscale, &c);
+    };
+    const std::uint64_t h = hash(base);
+
+    // The defaults fold nothing: the hash is the one a pre-existing map carries.
+    EXPECT_EQ(base.best_k, 0);
+    EXPECT_DOUBLE_EQ(base.min_texture_stddev, 1.0 / 255.0);
+
+    // A non-default value is a different map.
+    for (const int k : {1, 2}) {
+        DepthMapFingerprintContext changed = base;
+        changed.best_k = k;
+        EXPECT_NE(h, hash(changed)) << "best_k=" << k << " must change the fingerprint";
+        changed.best_k = 0;
+        EXPECT_EQ(h, hash(changed));
+    }
+    for (const double stddev : {0.00196, 0.00098}) {
+        DepthMapFingerprintContext changed = base;
+        changed.min_texture_stddev = stddev;
+        EXPECT_NE(h, hash(changed)) << "min_texture_stddev=" << stddev
+                                    << " must change the fingerprint";
+        changed.min_texture_stddev = 1.0 / 255.0;
+        EXPECT_EQ(h, hash(changed));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 6. The sidecar format: ADM2 round-trips, ADM1 is read but never reusable
 // ---------------------------------------------------------------------------

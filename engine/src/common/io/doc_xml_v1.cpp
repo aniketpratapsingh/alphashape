@@ -273,7 +273,7 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
     if (const XmlNode* elevation = find_child(node, "elevation")) {
         warn_unknown_attrs(*elevation,
                            {"path", "width", "height", "origin", "pixel_size", "epsg",
-                            "nodata", "source", "asset_id", "asset_label"},
+                            "crs_wkt", "nodata", "source", "asset_id", "asset_label"},
                            report);
         const std::string path = require_attr(*elevation, "path");
         Elevation dem = sidecar::decode_elevation(require_entry(archive, path));
@@ -294,9 +294,10 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
             throw ProjectIOError(
                 "doc.xml: <elevation> georeferencing does not match the GeoTIFF");
         }
-        if (parse_int(require_attr(*elevation, "epsg")) != dem.epsg) {
+        if (parse_int(require_attr(*elevation, "epsg")) != dem.epsg()) {
             throw ProjectIOError("doc.xml: <elevation> epsg does not match the GeoTIFF");
         }
+        dem.crs.wkt = attr_or(*elevation, "crs_wkt", std::string());
         dem.nodata = static_cast<float>(parse_double(require_attr(*elevation, "nodata")));
         ElevationAsset& asset = chunk.add_elevation(stored_asset_label(*elevation));
         *asset.data = std::move(dem);
@@ -305,7 +306,8 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
     if (const XmlNode* ortho = find_child(node, "orthomosaic")) {
         warn_unknown_attrs(*ortho,
                            {"path", "labels_path", "width", "height", "origin",
-                            "pixel_size", "epsg", "surface", "asset_id", "asset_label"},
+                            "pixel_size", "epsg", "crs_wkt", "surface", "asset_id",
+                            "asset_label"},
                            report);
         const std::string path = require_attr(*ortho, "path");
         const std::string labels_path = require_attr(*ortho, "labels_path");
@@ -327,9 +329,10 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
             throw ProjectIOError(
                 "doc.xml: <orthomosaic> georeferencing does not match the GeoTIFF");
         }
-        if (parse_int(require_attr(*ortho, "epsg")) != mosaic.epsg) {
+        if (parse_int(require_attr(*ortho, "epsg")) != mosaic.epsg()) {
             throw ProjectIOError("doc.xml: <orthomosaic> epsg does not match the GeoTIFF");
         }
+        mosaic.crs.wkt = attr_or(*ortho, "crs_wkt", std::string());
         mosaic.labels = sidecar::decode_ortho_labels(
             require_entry(archive, labels_path), g.width, g.height);
         OrthomosaicAsset& asset = chunk.add_orthomosaic(stored_asset_label(*ortho));

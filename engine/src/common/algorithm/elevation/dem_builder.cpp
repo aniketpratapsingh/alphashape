@@ -818,7 +818,7 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     }
 
     tick(0.05);
-    const SurfaceFrame frame = SurfaceFrame::for_chunk(chunk, options.epsg);
+    const SurfaceFrame frame = for_options(chunk, options.crs);
 
     // -- collect the plane-frame samples / geometry --------------------------
     std::vector<PlaneSample> samples;
@@ -1142,7 +1142,14 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     elevation.raster.grid = grid;
     elevation.raster.channels = 1;
     elevation.raster.data = std::move(final_values);
-    elevation.epsg = frame.epsg();
+    elevation.set_epsg(frame.epsg());
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Keep the canonical WKT beside the code so a custom (uncoded) CRS survives
+    // a save/load round trip; the local frame stays a bare code 0.
+    if (!frame.is_local()) {
+        elevation.crs.wkt = frame.crs().to_wkt();
+    }
+#endif
     elevation.nodata = -32767.0F;
     elevation.source = source_label;
     tick(1.0);

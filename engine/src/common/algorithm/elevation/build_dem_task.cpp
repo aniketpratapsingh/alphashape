@@ -7,6 +7,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/dem_builder.hpp"
+#include "common/algorithm/elevation/surface_frame.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/document.hpp"
 
@@ -52,7 +53,24 @@ DemOptions resolve_options(const Params& params) {
     if (options.resolution < 0.0) {
         throw ValueError("BuildDem: resolution must be >= 0 (0 selects an automatic value)");
     }
-    options.epsg = static_cast<int>(params.get_int("projection"));
+    // `projection` (Int EPSG, retained) and `crs` (String "EPSG:n" or WKT, new)
+    // are two spellings of the same request; when both are set they must agree.
+    const int projection = static_cast<int>(params.get_int("projection"));
+    if (projection < 0) {
+        throw ValueError("BuildDem: projection must be an EPSG code >= 0");
+    }
+    const std::string crs_text = params.get_string("crs");
+    if (!crs_text.empty()) {
+        options.crs = elevation::parse_crs_param(crs_text);
+        if (projection != 0 && options.crs.is_set() && options.crs.epsg != projection) {
+            throw ValueError(
+                "BuildDem: projection (" + std::to_string(projection) +
+                ") and crs (\"" + crs_text + "\") name different coordinate systems; "
+                "pass only one");
+        }
+    } else if (projection != 0) {
+        options.crs = elevation::parse_crs_param("EPSG:" + std::to_string(projection));
+    }
     options.fill = parse_fill_method(params.get_string("fill_method"));
     options.sibson_exact_max_sites = static_cast<int>(params.get_int("sibson_exact_max_sites"));
     options.max_fill_distance = params.get_float("max_fill_distance");
@@ -98,7 +116,13 @@ void BuildDemTask::declare_params(Params& params) const {
 
     params.declare({"projection", ParamType::Int, std::int64_t{0},
                     "Output EPSG code. 0 selects UTM for a georeferenced chunk, or a "
-                    "chunk-local frame when unreferenced."});
+                    "chunk-local frame when unreferenced. Kept for compatibility; `crs` "
+                    "is the general form, and setting both to disagreeing values is an "
+                    "error."});
+
+    params.declare({"crs", ParamType::String, std::string{},
+                    "Output coordinate system as \"EPSG:<code>\", a PROJ string or WKT. "
+                    "Empty uses `projection`; when both are set they must agree."});
 
     ParamSpec fill_method{"fill_method", ParamType::String, std::string("natural_neighbour"),
                           "Hole-filling interpolation: \"natural_neighbour\", \"idw\" or "
@@ -162,7 +186,7 @@ void BuildDemTask::apply(Document& document, Params& params, const Progress& pro
                                 static_cast<std::size_t>(elevation.raster.grid.height);
     const int width = elevation.raster.grid.width;
     const int height = elevation.raster.grid.height;
-    const int epsg = elevation.epsg;
+    const int epsg = elevation.epsg();
     // Each run APPENDS a new elevation asset and makes it active; the previous
     // elevation (if any) is kept, so a second BuildDem never overwrites a DEM a
     // earlier run produced.
