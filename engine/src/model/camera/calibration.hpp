@@ -13,8 +13,10 @@
 //
 //     x' = x (1 + k1 r^2 + k2 r^4 + k3 r^6 + k4 r^8)
 //              + p1 (r^2 + 2 x^2) + 2 p2 x y
+//              + p3 r^2 (r^2 + 2 x^2) + 2 p4 r^2 x y
 //     y' = y (1 + k1 r^2 + k2 r^4 + k3 r^6 + k4 r^8)
 //              + p2 (r^2 + 2 y^2) + 2 p1 x y
+//              + p4 r^2 (r^2 + 2 y^2) + 2 p3 r^2 x y
 //     u  = W/2 + cx + x' (f + b1) + y' b2        (b1: affinity, b2: skew)
 //     v  = H/2 + cy + y' f
 //
@@ -68,6 +70,8 @@ struct Calibration {
     double k4 = 0.0;      ///< radial
     double p1 = 0.0;      ///< tangential (decentering)
     double p2 = 0.0;      ///< tangential (decentering)
+    double p3 = 0.0;      ///< tangential (decentering), r^2-weighted
+    double p4 = 0.0;      ///< tangential (decentering), r^2-weighted
 
     /// A calibration of the given geometry with every distortion term zero.
     static Calibration initial(CameraType type, int width, int height, double f_pixels);
@@ -93,7 +97,7 @@ struct Calibration {
 /// coordinate u maps to u' = u / ds exactly, so
 ///     width' = W / ds, height' = H / ds   (integer division)
 ///     f' = f / ds,  b1' = b1 / ds,  b2' = b2 / ds
-///     k1..k4, p1, p2 unchanged;  type unchanged
+///     k1..k4, p1..p4 unchanged;  type unchanged
 /// and the principal point is placed exactly: the absolute pp (W/2 + cx) lands
 /// at (W/2 + cx)/ds, so
 ///     cx' = (W/2.0 + cx) / ds - width'/2.0,   cy' likewise.
@@ -102,8 +106,10 @@ struct Calibration {
 Calibration scaled_calibration(const Calibration& full, int downscale);
 
 /// Doubles in the packed parameter vector, order:
-/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2.
-inline constexpr int kCalibrationParamCount = 11;
+/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2, p3, p4.
+/// p3/p4 are appended so every pre-existing index (and every stored 11-double
+/// array) keeps its meaning; old data loads with p3 = p4 = 0.
+inline constexpr int kCalibrationParamCount = 13;
 
 /// Force-inline marker for the forward model. The stereo inner loop evaluates
 /// it once per window sample (millions of times per image) in a loop whose only
@@ -142,6 +148,8 @@ ALPHASHAPE_PROJECT_INLINE bool try_project_point(CameraType type, int width, int
     const T k4 = params[8];
     const T p1 = params[9];
     const T p2 = params[10];
+    const T p3 = params[11];
+    const T p4 = params[12];
 
     const T X = p_cam[0];
     const T Y = p_cam[1];
@@ -173,7 +181,7 @@ ALPHASHAPE_PROJECT_INLINE bool try_project_point(CameraType type, int width, int
         }
     }
 
-    // Undistorted shortcut. With k1..k4 = p1 = p2 = 0 the polynomial below is
+    // Undistorted shortcut. With k1..k4 = p1..p4 = 0 the polynomial below is
     // exactly the identity (radial = 1 and both tangential terms are 0), so this
     // branch reproduces its output value for value while skipping the powers and
     // the polynomial -- the overwhelming case for a clean sensor, and the case
@@ -182,13 +190,14 @@ ALPHASHAPE_PROJECT_INLINE bool try_project_point(CameraType type, int width, int
     // still the only place the maths lives.
     //
     // Restricted to plain scalar types. Under autodiff the shortcut would make
-    // the projection independent of k1..k4 / p1 / p2, so the gradient with
+    // the projection independent of k1..k4 / p1..p4, so the gradient with
     // respect to those coefficients would be identically zero at a zero start
     // and self-calibration could never move them off zero; an autodiff scalar
     // therefore always takes the full polynomial (whose value at zero
     // distortion is bit-identical to the shortcut anyway).
     const bool undistorted = std::is_arithmetic<T>::value && k1 == T(0) && k2 == T(0) &&
-                             k3 == T(0) && k4 == T(0) && p1 == T(0) && p2 == T(0);
+                             k3 == T(0) && k4 == T(0) && p1 == T(0) && p2 == T(0) &&
+                             p3 == T(0) && p4 == T(0);
     T xd = T(0);
     T yd = T(0);
     if (undistorted) {
@@ -201,8 +210,24 @@ ALPHASHAPE_PROJECT_INLINE bool try_project_point(CameraType type, int width, int
         const T r8 = r4 * r4;
         const T radial = T(1) + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
         const T two = T(2);
+        // The historical p1/p2 expression, verbatim. For plain scalars with
+        // p3 = p4 = 0 this is the entire computation, so the forward model is
+        // bit-identical to main. The higher-order pair folds the same template
+        // into q1 = p1 + p3 r^2, q2 = p2 + p4 r^2 and replaces the p1/p2
+        // block. Autodiff always takes the folded form so the gradient with
+        // respect to p3/p4 survives even at a zero starting value.
         xd = xs * radial + p1 * (r2 + two * xs * xs) + two * p2 * xs * ys;
         yd = ys * radial + p2 * (r2 + two * ys * ys) + two * p1 * xs * ys;
+        bool higher_order = true;
+        if constexpr (std::is_arithmetic<T>::value) {
+            higher_order = p3 != T(0) || p4 != T(0);
+        }
+        if (higher_order) {
+            const T q1 = p1 + p3 * r2;
+            const T q2 = p2 + p4 * r2;
+            xd = xs * radial + q1 * (r2 + two * xs * xs) + two * q2 * xs * ys;
+            yd = ys * radial + q2 * (r2 + two * ys * ys) + two * q1 * xs * ys;
+        }
     }
 
     const T half_w = static_cast<T>(width) * T(0.5);

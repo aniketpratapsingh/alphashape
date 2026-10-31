@@ -128,10 +128,10 @@ void keep_bindings_alive() {
 }
 
 // View record layout, one per neighbour.
-const int PM_VIEW_PARAMS = 0;    // 11 floats: f, cx, cy, b1, b2, k1..k4, p1, p2
-const int PM_VIEW_AFFINE = 11;   // 9 floats: M, row-major
-const int PM_VIEW_CENTRE = 20;   // 3 floats: c
-const int PM_VIEW_STRIDE = 24;
+const int PM_VIEW_PARAMS = 0;    // 13 floats: f, cx, cy, b1, b2, k1..k4, p1..p4
+const int PM_VIEW_AFFINE = 13;   // 9 floats: M, row-major
+const int PM_VIEW_CENTRE = 22;   // 3 floats: c
+const int PM_VIEW_STRIDE = 26;
 const int PM_VIEW_INT_STRIDE = 4;  // width, height, type, image pixel offset
 
 // ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ float random_depth(RngKey key, uint index) {
 // plus the affine map; the theta/r0 equidistant scaling for a fisheye).
 // Returns false exactly where the CPU model does (Frame z <= 0, Fisheye origin).
 bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 radial,
-                   vec2 tangential, out vec2 pixel) {
+                   vec4 tangential, out vec2 pixel) {
     float xs = 0.0;
     float ys = 0.0;
     if (type == 0) {
@@ -378,16 +378,27 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
     }
     float k1 = radial.x, k2 = radial.y, k3 = radial.z, k4 = radial.w;
     float p1 = tangential.x, p2 = tangential.y;
+    float p3 = tangential.z, p4 = tangential.w;
     float xd = xs;
     float yd = ys;
-    if (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || k4 != 0.0 || p1 != 0.0 || p2 != 0.0) {
+    if (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || k4 != 0.0 || p1 != 0.0 || p2 != 0.0 ||
+        p3 != 0.0 || p4 != 0.0) {
         float r2 = xs * xs + ys * ys;
         float r4 = r2 * r2;
         float r6 = r4 * r2;
         float r8 = r4 * r4;
         float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+        // Historical p1/p2 expression, verbatim, so p3 = p4 = 0 takes exactly
+        // the arithmetic main did. The higher-order pair folds the same
+        // template into q1 = p1 + p3 r^2, q2 = p2 + p4 r^2 and replaces it.
         xd = xs * radial_scale + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys;
         yd = ys * radial_scale + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys;
+        if (p3 != 0.0 || p4 != 0.0) {
+            float q1 = p1 + p3 * r2;
+            float q2 = p2 + p4 * r2;
+            xd = xs * radial_scale + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys;
+            yd = ys * radial_scale + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys;
+        }
     }
     float f = fcx.x, cx = fcx.y, cy = fcx.z;
     pixel = vec2(float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y,

@@ -40,6 +40,8 @@ struct Projector {
         params[8] = c.k4;
         params[9] = c.p1;
         params[10] = c.p2;
+        params[11] = c.p3;
+        params[12] = c.p4;
     }
 
     /// Project a camera-frame point to pixels; false where the model is

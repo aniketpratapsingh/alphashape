@@ -57,7 +57,7 @@ constexpr int kMaxSamples = 49;       // matches PM_MAX_SAMPLES in pm_math.glsl
 constexpr int kMaxNeighbours = 32;    // matches PM_MAX_NEIGHBOURS
 constexpr int kTileX = 8;
 constexpr int kTileY = 16;
-constexpr int kViewStride = 24;       // fcx(3) b(2) radial(4) tang(2) M(9) c(3)
+constexpr int kViewStride = 26;       // fcx(3) b(2) radial(4) tang(4) M(9) c(3) pad(1)
 constexpr int kViewIntStride = 4;     // width, height, type, image offset
 constexpr std::uint32_t kNoIteration = 0xFFFFFFFFU;
 
@@ -367,17 +367,19 @@ PatchMatchResult run_gpu_level(const std::shared_ptr<g::Context>& context, const
         view_params[base + 8] = static_cast<float>(c.k4);
         view_params[base + 9] = static_cast<float>(c.p1);
         view_params[base + 10] = static_cast<float>(c.p2);
+        view_params[base + 11] = static_cast<float>(c.p3);
+        view_params[base + 12] = static_cast<float>(c.p4);
         const Eigen::Matrix3d m = view.R * rref_t;
         for (int r = 0; r < 3; ++r) {
             for (int col = 0; col < 3; ++col) {
-                view_params[base + 11 + static_cast<std::size_t>(r * 3 + col)] =
+                view_params[base + 13 + static_cast<std::size_t>(r * 3 + col)] =
                     static_cast<float>(m(r, col));
             }
         }
         const Eigen::Vector3d centre = view.t - m * reference.t;
-        view_params[base + 20] = static_cast<float>(centre.x());
-        view_params[base + 21] = static_cast<float>(centre.y());
-        view_params[base + 22] = static_cast<float>(centre.z());
+        view_params[base + 22] = static_cast<float>(centre.x());
+        view_params[base + 23] = static_cast<float>(centre.y());
+        view_params[base + 24] = static_cast<float>(centre.z());
 
         const std::size_t vbase = static_cast<std::size_t>(j) * kViewIntStride;
         view_ints[vbase + 0] = static_cast<std::uint32_t>(c.width);

@@ -571,6 +571,34 @@ TEST_F(ProjectV2, WritesVersionTwo) {
     EXPECT_NE(xml.find("\n  <chunks>\n"), std::string::npos);
 }
 
+TEST_F(ProjectV2, Calibration13ParamsRoundTrip) {
+    // Non-zero p3/p4 must survive save/load...
+    Document document = build_full_document();
+    Calibration& cal = document.active_chunk()->sensors()[0].calibration;
+    cal.p3 = 2.5e-4;
+    cal.p4 = -1.2e-4;
+    const std::string psx = path("p3p4.psx");
+    ProjectIO::save(document, psx);
+    const std::string xml = doc_text(psx);
+    EXPECT_NE(xml.find("p3=\""), std::string::npos);
+    EXPECT_NE(xml.find("p4=\""), std::string::npos);
+
+    std::shared_ptr<Document> loaded = ProjectIO::load(psx);
+    ASSERT_NE(loaded->active_chunk(), nullptr);
+    const Calibration& got = loaded->active_chunk()->sensors()[0].calibration;
+    EXPECT_DOUBLE_EQ(got.p3, 2.5e-4);
+    EXPECT_DOUBLE_EQ(got.p4, -1.2e-4);
+    EXPECT_TRUE(*loaded->active_chunk() == *document.active_chunk());
+
+    // ...and the pre-13 layout stays byte-identical: zero terms are omitted.
+    Document plain = build_full_document();
+    const std::string plain_psx = path("plain.psx");
+    ProjectIO::save(plain, plain_psx);
+    const std::string plain_xml = doc_text(plain_psx);
+    EXPECT_EQ(plain_xml.find("p3=\""), std::string::npos);
+    EXPECT_EQ(plain_xml.find("p4=\""), std::string::npos);
+}
+
 TEST_F(ProjectV2, UntouchedChunkResaveIsByteStable) {
     Document document = build_full_document();
     const std::string first = path("a.psx");

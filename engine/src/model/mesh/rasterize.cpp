@@ -42,7 +42,8 @@ constexpr double kNearZ = 1e-6;
 using PackedParams = std::array<double, kCalibrationParamCount>;
 
 PackedParams pack_calibration(const Calibration& c) {
-    return PackedParams{c.f, c.cx, c.cy, c.b1, c.b2, c.k1, c.k2, c.k3, c.k4, c.p1, c.p2};
+    return PackedParams{c.f, c.cx, c.cy,  c.b1, c.b2, c.k1, c.k2,
+                        c.k3, c.k4, c.p1, c.p2, c.p3, c.p4};
 }
 
 /// A triangle that survived projection, with everything the scan converter

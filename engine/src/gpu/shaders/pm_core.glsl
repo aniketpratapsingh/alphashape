@@ -105,7 +105,7 @@ struct ViewData {
     vec3 fcx;
     vec2 b;
     vec4 radial;
-    vec2 tangential;
+    vec4 tangential;  // p1, p2, p3, p4
     float m[9];
     vec3 c;
     int vw;
@@ -127,11 +127,12 @@ ViewData load_view(int view) {
     v.fcx = vec3(s_views[vpar + 0], s_views[vpar + 1], s_views[vpar + 2]);
     v.b = vec2(s_views[vpar + 3], s_views[vpar + 4]);
     v.radial = vec4(s_views[vpar + 5], s_views[vpar + 6], s_views[vpar + 7], s_views[vpar + 8]);
-    v.tangential = vec2(s_views[vpar + 9], s_views[vpar + 10]);
+    v.tangential = vec4(s_views[vpar + 9], s_views[vpar + 10], s_views[vpar + 11],
+                        s_views[vpar + 12]);
     for (int i = 0; i < 9; ++i) {
-        v.m[i] = s_views[vpar + 11 + i];
+        v.m[i] = s_views[vpar + 13 + i];
     }
-    v.c = vec3(s_views[vpar + 20], s_views[vpar + 21], s_views[vpar + 22]);
+    v.c = vec3(s_views[vpar + 22], s_views[vpar + 23], s_views[vpar + 24]);
     v.max_x = float(v.vw - 1);
     v.max_y = float(v.vh - 1);
     return v;

@@ -3,8 +3,11 @@
 // Suites are prefixed CameraModel so `ctest -R CameraModel` selects them.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -138,10 +141,27 @@ TEST(CameraModelFrame, ProjectRejectsPointsAtOrBehindImagePlane) {
     EXPECT_THROW(c.project(Eigen::Vector3d(0.1, 0.1, -1.0)), ValueError);
 }
 
+/// Pack a calibration in the order try_project_point / project_point expect.
+void pack(const Calibration& c, double* params) {
+    params[0] = c.f;
+    params[1] = c.cx;
+    params[2] = c.cy;
+    params[3] = c.b1;
+    params[4] = c.b2;
+    params[5] = c.k1;
+    params[6] = c.k2;
+    params[7] = c.k3;
+    params[8] = c.k4;
+    params[9] = c.p1;
+    params[10] = c.p2;
+    params[11] = c.p3;
+    params[12] = c.p4;
+}
+
 TEST(CameraModelFrame, ProjectPointTemplateMatchesProject) {
     const Calibration c = realistic_frame();
-    const double params[kCalibrationParamCount] = {c.f,  c.cx, c.cy, c.b1, c.b2, c.k1,
-                                                   c.k2, c.k3, c.k4, c.p1, c.p2};
+    double params[kCalibrationParamCount];
+    pack(c, params);
     const std::vector<Eigen::Vector3d> points = {
         Eigen::Vector3d(0.0, 0.0, 1.0), Eigen::Vector3d(0.4, -0.3, 1.7),
         Eigen::Vector3d(-0.9, 0.6, 3.2)};
@@ -169,20 +189,6 @@ Eigen::Vector3d random_point(std::uint64_t& state) {
         return static_cast<double>(x >> 11) * (1.0 / 9007199254740992.0) * 4.0 - 2.0;
     };
     return Eigen::Vector3d(next(), next(), next());
-}
-
-void pack(const Calibration& c, double* params) {
-    params[0] = c.f;
-    params[1] = c.cx;
-    params[2] = c.cy;
-    params[3] = c.b1;
-    params[4] = c.b2;
-    params[5] = c.k1;
-    params[6] = c.k2;
-    params[7] = c.k3;
-    params[8] = c.k4;
-    params[9] = c.p1;
-    params[10] = c.p2;
 }
 
 /// try_project_point must agree with project_point bit for bit wherever the
@@ -389,6 +395,279 @@ TEST(CameraModelScaled, NonPowerOfTwoThrows) {
     EXPECT_THROW(scaled_calibration(full, 3), ValueError);
     EXPECT_THROW(scaled_calibration(full, 0), ValueError);
     EXPECT_THROW(scaled_calibration(full, -2), ValueError);
+}
+
+// -- p3 / p4 (WP-13.0) -------------------------------------------------------
+
+/// A tiny forward-mode autodiff scalar over the 13 calibration parameters, so
+/// the templated forward model can be differentiated without pulling Ceres into
+/// this translation unit.
+struct Dual13 {
+    double v = 0.0;
+    std::array<double, kCalibrationParamCount> d{};
+
+    Dual13() = default;
+    Dual13(double value) : v(value) {}  // NOLINT(google-explicit-constructor)
+};
+
+Dual13 operator+(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v + b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) r.d[i] = a.d[i] + b.d[i];
+    return r;
+}
+Dual13 operator*(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v * b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = a.d[i] * b.v + a.v * b.d[i];
+    }
+    return r;
+}
+Dual13 operator/(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v / b.v);
+    const double inv = 1.0 / (b.v * b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = (a.d[i] * b.v - a.v * b.d[i]) * inv;
+    }
+    return r;
+}
+bool operator==(const Dual13& a, const Dual13& b) { return a.v == b.v; }
+bool operator>(const Dual13& a, const Dual13& b) { return a.v > b.v; }
+Dual13 sqrt(const Dual13& a) {
+    const double s = std::sqrt(a.v);
+    Dual13 r(s);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = a.d[i] / (2.0 * s);
+    }
+    return r;
+}
+Dual13 atan2(const Dual13& y, const Dual13& x) {
+    const double denom = x.v * x.v + y.v * y.v;
+    Dual13 r(std::atan2(y.v, x.v));
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = (x.v * y.d[i] - y.v * x.d[i]) / denom;
+    }
+    return r;
+}
+
+TEST(CameraModel, P3P4DefaultZeroLeavesProjectionUnchanged) {
+    // With p3 = p4 = 0 the folded q1/q2 form must reproduce the historical
+    // Brown-Conrady expression bit for bit over a large random sample.
+    Calibration c = realistic_frame();
+    c.k3 = 0.011;
+    c.k4 = -0.002;
+    c.p3 = 0.0;
+    c.p4 = 0.0;
+    std::uint64_t state = 0x5EED1234ULL;
+    int checked = 0;
+    for (int i = 0; i < 10000; ++i) {
+        Eigen::Vector3d p = random_point(state);
+        p.z() = 2.0 + std::abs(p.z());  // depth in [2, 4): a sane field of view
+        const double x = p.x() / p.z();
+        const double y = p.y() / p.z();
+        const double r2 = x * x + y * y;
+        const double r4 = r2 * r2;
+        const double r6 = r4 * r2;
+        const double r8 = r4 * r4;
+        const double radial = 1.0 + c.k1 * r2 + c.k2 * r4 + c.k3 * r6 + c.k4 * r8;
+        const double xd = x * radial + c.p1 * (r2 + 2.0 * x * x) + 2.0 * c.p2 * x * y;
+        const double yd = y * radial + c.p2 * (r2 + 2.0 * y * y) + 2.0 * c.p1 * x * y;
+        const double u = c.width * 0.5 + c.cx + xd * (c.f + c.b1) + yd * c.b2;
+        const double v = c.height * 0.5 + c.cy + yd * c.f;
+        const Eigen::Vector2d got = c.project(p);
+        EXPECT_EQ(got.x(), u) << "u differs at (" << p.transpose() << ")";
+        EXPECT_EQ(got.y(), v) << "v differs at (" << p.transpose() << ")";
+        ++checked;
+    }
+    EXPECT_EQ(checked, 10000);
+}
+
+/// main's invert_distortion, kept as an independent reference: Newton on the
+/// historical p1/p2 Jacobian, then the fixed-point fallback, retaining the
+/// estimate with the smallest residual. p3/p4 did not exist there, so the
+/// p3 = p4 = 0 inverse must reproduce this bit for bit.
+Eigen::Vector2d reference_invert(const Calibration& c, double xd, double yd) {
+    constexpr int kMaxIter = 20;
+    constexpr double kTol = 1e-12;
+    double params[kCalibrationParamCount];
+    pack(c, params);
+    params[0] = 1.0;   // f
+    params[1] = 0.0;   // cx
+    params[2] = 0.0;   // cy
+    params[3] = 0.0;   // b1
+    params[4] = 0.0;   // b2
+    params[11] = 0.0;  // p3
+    params[12] = 0.0;  // p4
+    const auto eval = [&params](double x, double y, double& ox, double& oy) {
+        const double p_in[3] = {x, y, 1.0};
+        double out[2];
+        project_point<double>(CameraType::Frame, 0, 0, params, p_in, out);
+        ox = out[0];
+        oy = out[1];
+    };
+    const double k1 = params[5], k2 = params[6], k3 = params[7], k4 = params[8];
+    const double p1 = params[9], p2 = params[10];
+
+    double nx = xd;
+    double ny = yd;
+    double best_x = nx;
+    double best_y = ny;
+    double best_residual = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < kMaxIter; ++i) {
+        const double r2 = nx * nx + ny * ny;
+        const double r4 = r2 * r2;
+        const double r6 = r4 * r2;
+        const double r8 = r4 * r4;
+        const double s = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+        const double q = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4 + 4.0 * k4 * r6;
+        double fx_model = 0.0;
+        double fy_model = 0.0;
+        eval(nx, ny, fx_model, fy_model);
+        const double fx = fx_model - xd;
+        const double fy = fy_model - yd;
+        const double residual = std::hypot(fx, fy);
+        if (residual < best_residual) {
+            best_residual = residual;
+            best_x = nx;
+            best_y = ny;
+        }
+        if (residual < kTol) {
+            return Eigen::Vector2d(nx, ny);
+        }
+        const double j00 = s + 2.0 * nx * nx * q + 6.0 * p1 * nx + 2.0 * p2 * ny;
+        const double j01 = 2.0 * nx * ny * q + 2.0 * p1 * ny + 2.0 * p2 * nx;
+        const double j10 = 2.0 * nx * ny * q + 2.0 * p2 * nx + 2.0 * p1 * ny;
+        const double j11 = s + 2.0 * ny * ny * q + 6.0 * p2 * ny + 2.0 * p1 * nx;
+        const double det = j00 * j11 - j01 * j10;
+        if (std::abs(det) < 1e-300) {
+            break;
+        }
+        nx -= (j11 * fx - j01 * fy) / det;
+        ny -= (j00 * fy - j10 * fx) / det;
+    }
+
+    double px = xd;
+    double py = yd;
+    for (int i = 0; i < kMaxIter; ++i) {
+        const double r2 = px * px + py * py;
+        const double r4 = r2 * r2;
+        const double r6 = r4 * r2;
+        const double r8 = r4 * r4;
+        const double s = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+        if (std::abs(s) < 1e-300) {
+            break;
+        }
+        const double tx = p1 * (r2 + 2.0 * px * px) + 2.0 * p2 * px * py;
+        const double ty = p2 * (r2 + 2.0 * py * py) + 2.0 * p1 * px * py;
+        const double ox = (xd - tx) / s;
+        const double oy = (yd - ty) / s;
+        double exd = 0.0;
+        double eyd = 0.0;
+        eval(ox, oy, exd, eyd);
+        const double residual = std::hypot(exd - xd, eyd - yd);
+        if (residual < best_residual) {
+            best_residual = residual;
+            best_x = ox;
+            best_y = oy;
+        }
+        const bool settled = std::abs(ox - px) < kTol && std::abs(oy - py) < kTol;
+        px = ox;
+        py = oy;
+        if (settled || residual < kTol) {
+            break;
+        }
+    }
+    return Eigen::Vector2d(best_x, best_y);
+}
+
+TEST(CameraModel, P3P4ZeroUndistortBitIdentical) {
+    // With p3 = p4 = 0 the inverse must reproduce main's Jacobian-based
+    // iteration bit for bit: the new terms are skipped entirely, not added as
+    // zero, so no rounding (or signed-zero) difference can creep in.
+    Calibration c = realistic_frame();
+    c.k3 = 0.011;
+    c.k4 = -0.002;
+    c.p3 = 0.0;
+    c.p4 = 0.0;
+    const double half_w = c.width * 0.5;
+    const double half_h = c.height * 0.5;
+    std::uint64_t state = 0x1234ABCDULL;
+    const auto next = [&state]() {
+        state += 0x9E3779B97F4A7C15ULL;
+        std::uint64_t x = state;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        x ^= x >> 31;
+        return static_cast<double>(x >> 11) * (1.0 / 9007199254740992.0);
+    };
+    int checked = 0;
+    for (int i = 0; i < 10000; ++i) {
+        const double u = next() * c.width;
+        const double v = next() * c.height;
+        const double yd = (v - half_h - c.cy) / c.f;
+        const double xd = (u - half_w - c.cx - yd * c.b2) / (c.f + c.b1);
+        const Eigen::Vector2d ref = reference_invert(c, xd, yd);
+        const Eigen::Vector3d want = Eigen::Vector3d(ref.x(), ref.y(), 1.0).normalized();
+        const Eigen::Vector3d got = c.unproject(Eigen::Vector2d(u, v));
+        EXPECT_EQ(got.x(), want.x()) << "pixel (" << u << ", " << v << ")";
+        EXPECT_EQ(got.y(), want.y()) << "pixel (" << u << ", " << v << ")";
+        EXPECT_EQ(got.z(), want.z()) << "pixel (" << u << ", " << v << ")";
+        ++checked;
+    }
+    EXPECT_EQ(checked, 10000);
+}
+
+TEST(CameraModel, P3P4FiniteDifferenceGradientMatchesAutodiff) {
+    Calibration c = realistic_frame();
+    c.k3 = 0.011;
+    c.p3 = 2e-4;
+    c.p4 = -1e-4;
+    double base[kCalibrationParamCount];
+    pack(c, base);
+
+    std::array<Dual13, kCalibrationParamCount> params{};
+    for (int i = 0; i < kCalibrationParamCount; ++i) {
+        params[static_cast<std::size_t>(i)] = Dual13(base[i]);
+    }
+    // Seed the two coefficients under test; the function is exactly linear in
+    // each, so the forward-mode derivative is the analytic one.
+    constexpr std::size_t p3_index = 11;
+    constexpr std::size_t p4_index = 12;
+    params[p3_index].d[p3_index] = 1.0;
+    params[p4_index].d[p4_index] = 1.0;
+
+    const std::vector<Eigen::Vector3d> points = {
+        Eigen::Vector3d(1.0, 0.7, 1.0),  Eigen::Vector3d(-0.9, 0.8, 1.2),
+        Eigen::Vector3d(0.6, -1.1, 1.4), Eigen::Vector3d(-1.2, -0.5, 1.6)};
+    const double h = 1e-5;  // linear in p3/p4: no truncation error
+    for (const Eigen::Vector3d& p : points) {
+        const std::array<Dual13, 3> p_cam{Dual13(p.x()), Dual13(p.y()), Dual13(p.z())};
+        std::array<Dual13, 2> dual_pixel{};
+        ASSERT_TRUE(try_project_point<Dual13>(c.type, c.width, c.height, params.data(),
+                                              p_cam.data(), dual_pixel.data()));
+
+        for (int index = 11; index <= 12; ++index) {
+            double plus[kCalibrationParamCount];
+            double minus[kCalibrationParamCount];
+            for (int i = 0; i < kCalibrationParamCount; ++i) {
+                plus[i] = base[i];
+                minus[i] = base[i];
+            }
+            plus[index] += h;
+            minus[index] -= h;
+            double up[2] = {0.0, 0.0};
+            double um[2] = {0.0, 0.0};
+            ASSERT_TRUE(try_project_point<double>(c.type, c.width, c.height, plus, p.data(), up));
+            ASSERT_TRUE(try_project_point<double>(c.type, c.width, c.height, minus, p.data(), um));
+            for (int out = 0; out < 2; ++out) {
+                const double fd = (up[out] - um[out]) / (2.0 * h);
+                const double ad =
+                    dual_pixel[static_cast<std::size_t>(out)].d[static_cast<std::size_t>(index)];
+                const double rel = std::abs(fd - ad) / std::max(std::abs(ad), 1e-12);
+                EXPECT_LE(rel, 1e-6) << "param " << index << " output " << out
+                                     << " fd " << fd << " autodiff " << ad;
+            }
+        }
+    }
 }
 
 }  // namespace

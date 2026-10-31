@@ -281,6 +281,12 @@ void fold_calibration(std::uint64_t& h, const Calibration& cal) {
                                cal.k4, cal.p1, cal.p2}) {
         h = fold_double(h, value);
     }
+    // p3/p4 are folded only when set, so every existing (11-parameter) project
+    // keeps its fingerprint and its cached depth maps stay reusable.
+    if (cal.p3 != 0.0 || cal.p4 != 0.0) {
+        h = fold_double(h, cal.p3);
+        h = fold_double(h, cal.p4);
+    }
 }
 
 }  // namespace

@@ -49,9 +49,9 @@ namespace alphashape {
 namespace {
 
 /// Calibration coefficient names, in the packed order (calibration.hpp):
-/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2. Matches Sensor::fixed_params.
+/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2, p3, p4. Matches Sensor::fixed_params.
 constexpr std::array<const char*, kCalibrationParamCount> kParamNames = {
-    "f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2"};
+    "f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"};
 
 /// The 4x4 [R t; 0 1] form of a bundle-adjustment pose (X_cam = R X_world + t).
 Transform transform_from_pose(const sfm::BAPose& pose) {
@@ -117,6 +117,10 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
     params.declare({"fit_k4", ParamType::Bool, false, "Adjust the radial distortion k4."});
     params.declare({"fit_p1", ParamType::Bool, true, "Adjust the tangential distortion p1."});
     params.declare({"fit_p2", ParamType::Bool, true, "Adjust the tangential distortion p2."});
+    params.declare(
+        {"fit_p3", ParamType::Bool, false, "Adjust the higher-order tangential distortion p3."});
+    params.declare(
+        {"fit_p4", ParamType::Bool, false, "Adjust the higher-order tangential distortion p4."});
 }
 
 std::vector<Stage> OptimizeCamerasTask::stages() const {

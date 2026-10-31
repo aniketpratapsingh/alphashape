@@ -357,7 +357,8 @@ Mesh extract_and_clean(const meshing::VolumeResult& volume, const ResolvedOption
     return mesh;
 }
 
-/// Pack a calibration's 11 doubles in the order try_project_point expects.
+/// Pack a calibration's kCalibrationParamCount doubles in the order
+/// try_project_point expects.
 void pack_calibration(const Calibration& calibration, double* params) {
     params[0] = calibration.f;
     params[1] = calibration.cx;
@@ -370,6 +371,8 @@ void pack_calibration(const Calibration& calibration, double* params) {
     params[8] = calibration.k4;
     params[9] = calibration.p1;
     params[10] = calibration.p2;
+    params[11] = calibration.p3;
+    params[12] = calibration.p4;
 }
 
 /// Colour every vertex from the source images and count its supporting views.

@@ -1371,7 +1371,21 @@ def _decode_sensors(xml_bytes: bytes) -> dict:
             "width": int(calibration.get("width", 0)),
             "height": int(calibration.get("height", 0)),
         }
-        for field in ("f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2"):
+        for field in (
+            "f",
+            "cx",
+            "cy",
+            "b1",
+            "b2",
+            "k1",
+            "k2",
+            "k3",
+            "k4",
+            "p1",
+            "p2",
+            "p3",
+            "p4",
+        ):
             entry[field] = float(calibration.get(field, 0.0))
         out[int(sensor.get("id"))] = entry
     return out
