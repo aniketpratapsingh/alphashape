@@ -442,7 +442,7 @@ alphashape::crs::GeoidStore& geoid_store() {
 alphashape::crs::CoordinateSystem coordinate_system_from_name(const std::string& name) {
     std::string code;
     if (name.rfind("EPSG::", 0) == 0) {
-        code = name.substr(7);
+        code = name.substr(6);
     } else if (name.rfind("EPSG:", 0) == 0) {
         code = name.substr(5);
     }

@@ -72,7 +72,9 @@ class CoordinateSystemTest(unittest.TestCase):
         # init() is the constructor-by-name path: "EPSG:", a built-in name
         # and WKT all resolve to the same CRS.
         by_code = alphashape.CoordinateSystem.init("EPSG::32633")
+        self.assertEqual(by_code.epsg, UTM_ZONE_33N)
         self.assertEqual(by_code, alphashape.CoordinateSystem(UTM_ZONE_33N))
+        self.assertEqual(alphashape.CoordinateSystem(name="EPSG:32633"), by_code)
         name = next(n for n in names if "WGS 84 / UTM zone" in n)
         cs = alphashape.CoordinateSystem.init(name)
         self.assertIsNotNone(cs.epsg)
