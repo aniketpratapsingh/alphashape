@@ -771,7 +771,7 @@ TEST(Reproject, SameCrsNewCellKeepsTheCorner) {
     // End to end through `reproject`: a same-CRS re-cell is an affine resample,
     // so the source's north-west corner is unmoved and no blank halo appears.
     GeoRaster<float> src = utm_plane(500000.037, 5400000.083,
-                                     [](double x, double y) { return 100.0 + 0.001 * (x - 500000.0); });
+                                     [](double x, double /*y*/) { return 100.0 + 0.001 * (x - 500000.0); });
     src.grid.pixel_size_x = 0.1;
     src.grid.pixel_size_y = 0.1;
     src.grid.width = 200;
