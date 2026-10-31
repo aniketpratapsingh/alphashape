@@ -13,11 +13,18 @@ All notable changes to alphashape are recorded here. The format follows
   CRS is written as its type key plus a name citation, while a custom CRS with
   no EPSG code is written as user-defined (32767) with its complete WKT2
   definition in `GeoAsciiParamsTag`/`PCSCitationGeoKey` (GDAL's convention).
-  The reader reverses the priority — EPSG key, then WKT parsed from the
-  citation, then the local frame — and the DEM and orthomosaic exports pass the
-  asset's CRS through, so a custom-WKT grid round-trips through a GeoTIFF.
-  `GeoTiffOptions` keeps `epsg` as the fallback when no `CoordinateSystem` is
-  supplied, and `GeoTiffInfo` gains the decoded CRS beside the existing `epsg`.
+  A vertical, geocentric or compound CRS (and any code above 65535, which the
+  16-bit type key cannot hold) is never written as a horizontal code: it is
+  user-defined 32767 with its full WKT2 citation. The reader prefers a real
+  projected code, then a real geographic one, then citation WKT (PCS, then
+  geographic, then `GTCitationGeoKey`, accepting GDAL's and ArcGIS's
+  `ESRI PE String = ` prefix), then the local frame. The DEM and orthomosaic
+  sidecars and the export tasks pass the asset's CRS through and restore it on
+  load, so a custom-WKT grid round-trips through a GeoTIFF; a malformed stored
+  WKT now fails the export/save with a message naming it instead of writing a
+  silently local file. `GeoTiffOptions` keeps `epsg` as the fallback when no
+  `CoordinateSystem` is supplied, and `GeoTiffInfo` gains the decoded CRS
+  beside the existing `epsg`.
 
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain
