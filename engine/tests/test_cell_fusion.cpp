@@ -52,7 +52,9 @@ TEST(CellFusion, GaussianNoiseBeatsThePlainMedian) {
     // mean), the median only its middle rank. Over many cells it must be at
     // least 15% better in RMS.
     std::mt19937 rng(123456789U);
-    constexpr int kTrials = 200;
+    // Many trials, so the measured RMS reflects the estimators' variance
+    // instead of one seed's. 2000 is still instantaneous.
+    constexpr int kTrials = 2000;
     constexpr int kSamples = 40;
     double robust_error = 0.0;
     double median_error = 0.0;

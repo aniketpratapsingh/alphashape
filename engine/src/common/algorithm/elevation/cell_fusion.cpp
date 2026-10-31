@@ -104,7 +104,21 @@ FusedCell fuse_cell(std::vector<HeightObservation>& observations, double scale_f
             end = count - trim;
         }
     }
-    fused.kept = end - begin;
+
+    // The rank trim is a floor, not a hard discard: extend the set outward
+    // while the biweight would still accept the observation at this scale (the
+    // same c * scale cutoff the IRLS uses). A clean, Gaussian-like cell then
+    // keeps all its redundancy -- the median of the 70% rank interval alone
+    // throws away usable information -- while a gross outlier stays outside.
+    const double cutoff = kFusionTukeyC * scale;
+    if (cutoff > 0.0) {
+        while (begin > 0U && std::abs(observations[begin - 1U].height - median) < cutoff) {
+            --begin;
+        }
+        while (end < count && std::abs(observations[end].height - median) < cutoff) {
+            ++end;
+        }
+    }
 
     // M-estimate over the kept set: start at its median, refine with IRLS.
     const double kept_median = median_of_sorted(observations, begin, end);
@@ -130,18 +144,24 @@ FusedCell fuse_cell(std::vector<HeightObservation>& observations, double scale_f
     // data weight before the agreement factor.
     double weight_sum = 0.0;
     double residual_square_sum = 0.0;
+    std::size_t contributing = 0U;
     for (std::size_t i = begin; i < end; ++i) {
         const HeightObservation& observation = observations[i];
         const double residual = observation.height - estimate;
         const double weight = tukey_weight(residual, scale, observation.confidence);
         weight_sum += weight;
         residual_square_sum += weight * residual * residual;
+        if (weight > 0.0) {
+            ++contributing;
+        }
     }
     if (!(weight_sum > 0.0)) {
         fused.value = kept_median;  // every observation rejected: keep the median
         fused.weight = 0.0;
+        fused.kept = 0U;
         return fused;
     }
+    fused.kept = contributing;
 
     const double weighted_rms = std::sqrt(residual_square_sum / weight_sum);
     const double reference = scale_floor * kFusionAgreementScale;

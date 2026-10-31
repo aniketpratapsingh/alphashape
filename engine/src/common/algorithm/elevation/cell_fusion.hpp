@@ -11,8 +11,11 @@
 //      independent of rasterisation order;
 //   2. centre at the median, scale s = 1.4826 * MAD, floored at the caller's
 //      scale_floor (a fraction of the cell size);
-//   3. with at least kFusionTrimMinCount observations, keep only the central
-//      kFusionKeepFraction by rank around the median (at least kFusionMinKept);
+//   3. with at least kFusionTrimMinCount observations, keep at least the central
+//      kFusionKeepFraction by rank around the median (at least kFusionMinKept),
+//      then extend the set outward while the biweight still accepts the
+//      observation at c * scale: the rank trim is a floor, so a clean cell
+//      keeps all its redundancy while a gross outlier stays outside;
 //   4. refine the centre with kFusionIrlsIterations IRLS steps of a Tukey
 //      biweight M-estimate, each observation weighted by its confidence;
 //   5. report the summed final weight as the cell's data weight, reduced by an
@@ -38,7 +41,7 @@ struct HeightObservation {
 struct FusedCell {
     double value = 0.0;    ///< fused height
     double weight = 0.0;   ///< data weight for the TGV pass
-    std::size_t kept = 0;  ///< observations the estimator kept
+    std::size_t kept = 0;  ///< observations with a nonzero final weight
 };
 
 /// Scale floor as a fraction of the DEM cell size: the smallest robust spread
