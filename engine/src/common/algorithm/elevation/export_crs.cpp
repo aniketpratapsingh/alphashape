@@ -157,8 +157,7 @@ ReprojectOptions reproject_options(float nodata_in, float nodata_out) {
 /// re-cell), never a reprojection. `suggest_grid`'s outward snapping is for
 /// mapping between planes; on one plane it would shift a real origin by up to a
 /// cell and leave a blank border.
-bool same_coordinate_system(const CRS& raster_crs, const crs::CoordinateSystem& recorded,
-                            const ExportCrs& target) {
+bool same_coordinate_system(const crs::CoordinateSystem& recorded, const ExportCrs& target) {
     if (!target.requested()) {
         return true;
     }
@@ -182,14 +181,14 @@ GeoRaster<float> reproject_for_export(const GeoRaster<float>& raster, const CRS&
                                       float nodata_in, float nodata_out,
                                       const ExportCrs& target, const char* task) {
     const crs::CoordinateSystem recorded = container_crs(raster_crs);
-    if (same_coordinate_system(raster_crs, recorded, target) &&
+    if (same_coordinate_system(recorded, target) &&
         keeps_source_grid(raster.grid, target.resolution)) {
         // Same plane, same cell: a bit-identical copy, with no PROJ call at all.
         // This is the common "export as built" path and the same-CRS export the
         // caller asked for, which must not move the origin.
         return raster;
     }
-    if (same_coordinate_system(raster_crs, recorded, target)) {
+    if (same_coordinate_system(recorded, target)) {
         // Same plane, new cell: anchor the new grid at the source's own corner.
         // A geographic source takes DEGREES here too, so the unit rule applies.
         require_resolution_unit(target.resolution, raster.grid, recorded, recorded, task);
@@ -210,11 +209,11 @@ GeoRaster<std::uint8_t> reproject_for_export(const GeoRaster<std::uint8_t>& rast
                                              const CRS& raster_crs,
                                              const ExportCrs& target, const char* task) {
     const crs::CoordinateSystem recorded = container_crs(raster_crs);
-    if (same_coordinate_system(raster_crs, recorded, target) &&
+    if (same_coordinate_system(recorded, target) &&
         keeps_source_grid(raster.grid, target.resolution)) {
         return raster;
     }
-    if (same_coordinate_system(raster_crs, recorded, target)) {
+    if (same_coordinate_system(recorded, target)) {
         require_resolution_unit(target.resolution, raster.grid, recorded, recorded, task);
         const RasterGrid grid = resample_grid(raster.grid, target.resolution);
         require_usable_grid(grid, task);
