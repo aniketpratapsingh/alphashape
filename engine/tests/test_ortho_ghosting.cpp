@@ -146,6 +146,61 @@ TEST(OrthoGhosting, MajorityObjectIsNotAGhost) {
     }
 }
 
+TEST(OrthoGhosting, MajorityCarSurvivesIntoTheMosaic) {
+    // A car painted in three of five views is the consensus, so the two views
+    // WITHOUT the car are the deviant minority where the car stands. The seam
+    // labeller must keep the car anyway, and the blended mosaic still shows it.
+    constexpr int kWidth = 64;
+    constexpr int kHeight = 48;
+    std::mt19937 rng(515U);
+    std::vector<OrthoTile> tiles;
+    for (int i = 0; i < 5; ++i) {
+        tiles.push_back(make_tile(0, 0, kWidth, kHeight, rng));
+    }
+    for (std::size_t t = 0; t < 3; ++t) {
+        paint(tiles[t], 20, 18, 12, 6, 255, 0, 0);
+    }
+    // The car-less views outscore the car views inside the footprint, so a
+    // plain argmax would hide the car; the filter has to move it back.
+    for (std::size_t t = 3; t < 5; ++t) {
+        for (int row = 18; row < 24; ++row) {
+            for (int col = 20; col < 32; ++col) {
+                tiles[t].score[tiles[t].index(col, row)] = 0.9F;
+            }
+        }
+    }
+    for (std::size_t t = 0; t < 3; ++t) {
+        for (int row = 18; row < 24; ++row) {
+            for (int col = 20; col < 32; ++col) {
+                tiles[t].score[tiles[t].index(col, row)] = 0.4F;
+            }
+        }
+    }
+    const std::vector<std::vector<std::uint8_t>> masks =
+        detect_ghosts(kWidth, kHeight, tiles, GhostOptions{});
+    for (std::size_t t = 0; t < 3; ++t) {
+        EXPECT_EQ(masks[t][tiles[t].index(26, 21)], 0U)
+            << "the car views agree with the consensus";
+    }
+    for (std::size_t t = 3; t < 5; ++t) {
+        EXPECT_GT(masks[t][tiles[t].index(26, 21)], 0U)
+            << "the two car-less cameras are the deviant minority at the car";
+    }
+
+    SeamOptions options;
+    options.avoid = &masks;
+    const std::vector<std::int32_t> labels = assign_seams(kWidth, kHeight, tiles, options);
+    const std::size_t centre =
+        static_cast<std::size_t>(21) * static_cast<std::size_t>(kWidth) + 26U;
+    EXPECT_LT(labels[centre], 3) << "the car must go to a camera that saw it";
+
+    const ortho::OrthoMosaic mosaic =
+        ortho::blend(kWidth, kHeight, tiles, labels, ortho::Blending::Mosaic, 2, &masks);
+    const std::uint8_t* rgb = mosaic.rgb.data() + centre * 3U;
+    EXPECT_GT(static_cast<int>(rgb[0]), 150) << "the mosaic must still show the red car";
+    EXPECT_LT(static_cast<int>(rgb[2]), 80);
+}
+
 TEST(OrthoGhosting, TwoViewsHaveNoConsensus) {
     constexpr int kWidth = 40;
     constexpr int kHeight = 40;
@@ -279,6 +334,70 @@ TEST(OrthoGhosting, SpeckleIsRelabelledAndPinnedCellsAreKept) {
     for (std::size_t t = 0; t < first.size(); ++t) {
         EXPECT_EQ(first[t], second[t]);
     }
+}
+
+TEST(OrthoGhosting, NonSubmodularPairNeverIncreasesEnergy) {
+    // p=(0,0) is labelled by the white tile 1 and q=(1,0) by the black tile 2,
+    // while the expansion target tile 0 covers q but NOT p. Then
+    //   E00 = 2 * 3 seam units (both ends disagree),
+    //   E(alpha,lq) + E(lp,alpha) sees only q (p contributes 0),
+    // so e01 + e10 - e00 < 0: the old crossing edge was negative and add_edge
+    // silently dropped it, breaking the min-cut decomposition. The truncated
+    // surrogate plus true-energy acceptance means no sweep may raise energy.
+    constexpr int kWidth = 8;
+    constexpr int kHeight = 1;
+    std::mt19937 rng(2024U);
+    std::vector<OrthoTile> tiles;
+    for (int i = 0; i < 3; ++i) {
+        tiles.push_back(make_tile(0, 0, kWidth, kHeight, rng));
+    }
+    const auto paint_row = [](OrthoTile& tile, int from, int to, std::uint8_t value) {
+        for (int col = from; col < to; ++col) {
+            const std::size_t cell = tile.index(col, 0);
+            for (int c = 0; c < 3; ++c) {
+                tile.rgb[cell * 3 + static_cast<std::size_t>(c)] = value;
+            }
+        }
+    };
+    paint_row(tiles[0], 0, kWidth, 128);  // alpha: mid grey, covers cols 1..7
+    paint_row(tiles[1], 0, kWidth, 255);  // white, covers cols 0..2
+    paint_row(tiles[2], 0, kWidth, 0);    // black, covers cols 0..2
+    tiles[0].valid[tiles[0].index(0, 0)] = 0;
+    for (int col = 3; col < kWidth; ++col) {
+        tiles[1].valid[tiles[1].index(col, 0)] = 0;
+        tiles[2].valid[tiles[2].index(col, 0)] = 0;
+    }
+    for (int col = 0; col < kWidth; ++col) {
+        tiles[0].score[tiles[0].index(col, 0)] = 0.2F;
+        tiles[1].score[tiles[1].index(col, 0)] = 0.1F;
+        tiles[2].score[tiles[2].index(col, 0)] = 0.1F;
+    }
+    tiles[1].score[tiles[1].index(0, 0)] = 0.9F;
+    tiles[2].score[tiles[2].index(0, 0)] = 0.9F;
+    tiles[2].score[tiles[2].index(1, 0)] = 0.9F;
+    tiles[2].score[tiles[2].index(2, 0)] = 0.9F;
+    // One mark far from the pair only opens the expansion window.
+    std::vector<std::vector<std::uint8_t>> masks(3);
+    for (auto& mask : masks) {
+        mask.assign(static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight), 0);
+    }
+    masks[0][tiles[0].index(7, 0)] = 1;
+
+    SeamOptions base_options;
+    base_options.iterations = 0;
+    base_options.avoid = &masks;
+    const std::vector<std::int32_t> base = assign_seams(kWidth, kHeight, tiles, base_options);
+    ASSERT_EQ(base[0], 1) << "the pair must start as (tile 1, tile 2)";
+    ASSERT_EQ(base[1], 2);
+
+    SeamOptions options;
+    options.coarse_levels = 0;  // isolate the full-resolution expansion
+    options.iterations = 1;
+    options.avoid = &masks;
+    const std::vector<std::int32_t> labels = assign_seams(kWidth, kHeight, tiles, options);
+    EXPECT_LE(ortho::energy(kWidth, kHeight, tiles, labels, options),
+              ortho::energy(kWidth, kHeight, tiles, base, options) + 1e-9)
+        << "an expansion move must never raise the true energy";
 }
 
 TEST(OrthoGhosting, ThreadCountDoesNotChangeTheResult) {

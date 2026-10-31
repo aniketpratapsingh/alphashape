@@ -1779,6 +1779,26 @@ TEST(BuildOrthomosaic, BlockWiseAverageAndDisabledMatchTheWholeGrid) {
     }
 }
 
+TEST(BuildOrthomosaic, GhostingOffIsByteIdenticalToThePlainProduct) {
+    // The ghosting parameter must be inert when off: the product with
+    // `ghosting_filter` ABSENT (the main code path) and with an explicit false
+    // must agree byte for byte, for both blending modes and across a forced
+    // multi-block plan (a 512-cell block splits the 960x720 grid).
+    OrthoSetup& s = setup();
+    for (const char* mode : {"mosaic", "average"}) {
+        for (const std::int64_t side : {std::int64_t{0}, std::int64_t{512}}) {
+            const Orthomosaic plain = run_ortho(s, block_params(mode, 0.125, side, false, true));
+            ASSERT_FALSE(plain.empty()) << mode;
+            Params off = block_params(mode, 0.125, side, false, true);
+            off.set("ghosting_filter", ParamValue{false});
+            const Orthomosaic filtered = run_ortho(s, off);
+            ASSERT_EQ(filtered.raster.grid, plain.raster.grid) << mode << " block " << side;
+            EXPECT_EQ(filtered.labels, plain.labels) << mode << " block " << side;
+            EXPECT_EQ(filtered.raster.data, plain.raster.data) << mode << " block " << side;
+        }
+    }
+}
+
 TEST(BuildOrthomosaic, BlockWiseSeamsStayContinuousAcrossBorders) {
     // Seams on, mosaic blending: the blocked labelling cannot be byte-identical
     // to the whole-grid one (the optimiser is not separable), but it must
