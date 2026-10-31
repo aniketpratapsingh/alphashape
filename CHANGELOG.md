@@ -26,6 +26,46 @@ All notable changes to alphashape are recorded here. The format follows
   `CoordinateSystem` is supplied, and `GeoTiffInfo` gains the decoded CRS
   beside the existing `epsg`.
 
+- **Raster reprojection and CRS-aware DEM/ortho export.** `ExportDem` and
+  `ExportOrthomosaic` gain `projection` (Int EPSG code), `crs` (String: an
+  `EPSG:<code>`, a PROJ string or WKT; setting both to disagreeing values is a
+  `ValueError`) and `resolution` (Float in TARGET-CRS units, 0 keeps the ground
+  sample distance). A target CRS reprojects the raster on the fly and the
+  GeoTIFF's georeferencing and world file are written in that CRS. The new
+  `model/raster/reproject.{hpp,cpp}` drives the mapping from the TARGET grid:
+  the extent comes from a densified source boundary (21 points per edge, so a
+  bowed projected edge is not clipped), the default cell is the source ground
+  sample distance measured at the raster centre, and every target cell centre is
+  inverse-transformed back to the source. The transform is evaluated exactly only
+  on a coarse control lattice (16 px), bilinearly interpolated in between, and
+  the spacing is halved until a midpoint check against exact transforms agrees to
+  0.1 source pixels — else the exact per-pixel mapping is used. Float rasters
+  (DEMs) resample bilinearly and nodata-aware: tags that are out of bounds, the
+  `nodata` sentinel or non-finite carry no weight, the remaining weights
+  renormalise, and a cell whose valid weight is under one half is written as
+  nodata, so a hole stays a hole and never becomes a blended value. 8-bit rasters
+  (orthomosaics) always resample nearest, because a blended colour was never
+  photographed. An identical CRS is a bit-identical copy with no PROJ call; a
+  same-CRS request at a different `resolution` keeps the source's north-west
+  corner rather than snapping the origin to a multiple of the cell, so a real
+  georeference is never shifted and no blank border row appears. A geographic
+  target takes `resolution` in DEGREES, and a value that is plainly metres (a
+  hundredth of a degree or more against a metre-scale source) is refused with
+  the degree value to pass instead; a request that would leave a grid smaller
+  than 2x2 cells is refused too. Float rasters keep every channel, and a lattice
+  cell whose corner a refused transform poisons falls back to the exact
+  per-pixel mapping instead of blanking all 16x16 pixels. Rows are produced in
+  bands and the output is checked against the machine's memory budget before it
+  is allocated. `BuildOrthomosaic` with a `crs` different from
+  the DEM's now reprojects the DEM surface once and builds directly in that CRS,
+  so the photographs are sampled in the requested projection exactly once
+  (previously the mosaic always landed on the DEM's plane and the request was
+  only honoured at export). With `surface_data="model"` the DSM is rasterised
+  straight into the requested CRS, so no DEM reprojection is paid for; the
+  elevation case checks the source DEM plus its reprojected copy against the
+  memory budget before allocating. `BuildDem` already built directly in the
+  requested CRS.
+
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,

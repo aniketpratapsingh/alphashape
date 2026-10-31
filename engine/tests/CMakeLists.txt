@@ -85,7 +85,8 @@ if(ALPHASHAPE_USE_PROJ)
         test_geoid.cpp
         test_euler_angles.cpp
         test_reference_convert.cpp
-        test_surface_frame.cpp)
+        test_surface_frame.cpp
+        test_reproject.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>
     # directly for the raw-API assertions; linking the interface target keeps
     # the include directories available without a second package lookup.

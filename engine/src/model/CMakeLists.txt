@@ -14,6 +14,7 @@ add_library(alphashape_model STATIC
     mesh/atlas_pack.cpp
     mesh/rasterize.cpp
     raster/geotiff.cpp
+    raster/reproject.cpp
 )
 
 target_include_directories(alphashape_model PUBLIC ${ALPHASHAPE_INCLUDE_DIR})

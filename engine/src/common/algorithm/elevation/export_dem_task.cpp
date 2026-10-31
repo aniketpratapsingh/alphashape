@@ -7,6 +7,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
+#include "common/algorithm/elevation/export_crs.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/document.hpp"
 #include "model/raster/geotiff.hpp"
@@ -37,6 +38,20 @@ void ExportDemTask::declare_params(Params& params) const {
                     "Also write an ESRI world file next to the GeoTIFF."});
     params.declare({"asset_id", ParamType::Int, std::int64_t{-1},
                     "Id of the elevation to write. -1 selects the active one."});
+    params.declare({"projection", ParamType::Int, std::int64_t{0},
+                    "Target EPSG code for the written file. 0 keeps the elevation's own "
+                    "CRS. A different CRS reprojects the DEM on the fly; kept for "
+                    "compatibility, `crs` is the general form and setting both to "
+                    "disagreeing values is an error."});
+    params.declare({"crs", ParamType::String, std::string{},
+                    "Target coordinate system as \"EPSG:<code>\", a PROJ string or WKT. "
+                    "Empty keeps the elevation's own CRS; when both `projection` and `crs` "
+                    "are set they must agree."});
+    ParamSpec resolution{"resolution", ParamType::Float, 0.0,
+                         "Output cell size in TARGET CRS units (metres, or degrees for a "
+                         "geographic CRS). 0 keeps the DEM's own ground sample distance."};
+    resolution.minimum = 0.0;
+    params.declare(resolution);
 }
 
 std::vector<Stage> ExportDemTask::stages() const {
@@ -92,19 +107,29 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
     options.deflate = true;
     options.nodata = params.get_float("nodata");
     const bool world_file = params.get_bool("world_file");
+    // The export CRS request (WP-12.9): an unset request writes the raster as
+    // stored; a target CRS reprojects it and the file declares the target.
+    const elevation::ExportCrs target =
+        elevation::parse_export_crs(params.get_int("projection"), params.get_string("crs"),
+                                    params.get_float("resolution"), "ExportDem");
     progress.update("validate", 1.0);
 
     progress.update("write", 0.0);
-    write_geotiff(path, elevation.raster, options);
+    const GeoRaster<float> raster = elevation::reproject_for_export(
+        elevation.raster, elevation.crs, elevation.nodata,
+        static_cast<float>(params.get_float("nodata")), target, "ExportDem");
+    options.epsg = elevation::export_epsg(elevation.crs, target);
+    write_geotiff(path, raster, options);
     if (world_file) {
-        write_world_file(world_file_path(path), elevation.raster.grid);
+        write_world_file(world_file_path(path), raster.grid);
     }
     progress.update("write", 1.0);
 
     if (Log::enabled(LogLevel::Info)) {
-        log(LogLevel::Info) << "ExportDem: " << elevation.raster.grid.width << "x"
-                            << elevation.raster.grid.height << " cells, epsg "
-                            << options.epsg << " (asset " << asset->id << ") -> " << path
+        log(LogLevel::Info) << "ExportDem: " << raster.grid.width << "x"
+                            << raster.grid.height << " cells, epsg " << options.epsg
+                            << (target.requested() ? " (reprojected)" : "")
+                            << " (asset " << asset->id << ") -> " << path
                             << (world_file ? " (+ .tfw)" : "");
     }
 }
