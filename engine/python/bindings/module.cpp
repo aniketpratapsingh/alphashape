@@ -22,10 +22,14 @@
 //     That is the lifetime guarantee; no keep_alive tricks are needed.
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -35,6 +39,8 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
+#include "common/commands/command.hpp"
+#include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
@@ -43,6 +49,9 @@
 #include "common/tasks/registry.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/crs/coordinate_system.hpp"
+#if defined(ALPHASHAPE_USE_PROJ)
+#include "model/crs/geoid.hpp"
+#endif
 
 namespace py = pybind11;
 
@@ -375,6 +384,61 @@ py::object attach_document(py::object document, const std::shared_ptr<alphashape
     return object;
 }
 
+/// Apply the Set Chunk CRS command to the Document that owns `chunk_self`
+/// (every chunk the Document bindings hand out carries `_document`) and discard
+/// it. The GUI owns the document's undo history; a scripted assignment is a
+/// one-shot relabel, not a stack entry (Metashape's Python API has no undo).
+/// Setting the CRS only relabels the chunk; no data is transformed.
+void apply_crs_command(py::object chunk_self, alphashape::CRS crs) {
+    if (!py::hasattr(chunk_self, "_document")) {
+        throw py::type_error("this Chunk is not attached to a Document");
+    }
+    auto document =
+        chunk_self.attr("_document").cast<std::shared_ptr<alphashape::Document>>();
+    const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
+    alphashape::make_set_chunk_crs_command(id, std::move(crs))->apply(*document);
+}
+
+#if defined(ALPHASHAPE_USE_PROJ)
+/// The process-wide geoid registry behind CoordinateSystem.addGeoid/listGeoids.
+/// Seeded with the grids PROJ's data directory has installed; custom grids are
+/// referenced where they are (the store has no directory, so nothing is
+/// copied).
+alphashape::crs::GeoidStore& geoid_store() {
+    static alphashape::crs::GeoidStore store =
+        alphashape::crs::GeoidStore::from_proj_data();
+    return store;
+}
+
+/// CoordinateSystem.init(name): an "EPSG:<code>" / "EPSG::<code>" identifier,
+/// a WKT definition (anything containing '['), or a built-in name. The
+/// engine's from_name() only knows the curated list; this wrapper adds the
+/// two script-facing spellings Metashape accepts.
+alphashape::crs::CoordinateSystem coordinate_system_from_name(const std::string& name) {
+    std::string code;
+    if (name.rfind("EPSG::", 0) == 0) {
+        code = name.substr(6);
+    } else if (name.rfind("EPSG:", 0) == 0) {
+        code = name.substr(5);
+    }
+    if (!code.empty()) {
+        const bool digits = code.size() <= 9 &&
+                            std::all_of(code.begin(), code.end(), [](unsigned char c) {
+                                return std::isdigit(c) != 0;
+                            });
+        if (!digits) {
+            throw alphashape::ValueError("CoordinateSystem.init: '" + name +
+                                         "' is not an EPSG code");
+        }
+        return alphashape::crs::CoordinateSystem::from_epsg(std::stoi(code));
+    }
+    if (name.find('[') != std::string::npos) {
+        return alphashape::crs::CoordinateSystem::from_wkt(name);
+    }
+    return alphashape::crs::CoordinateSystem::from_name(name);
+}
+#endif
+
 }  // namespace
 
 PYBIND11_MODULE(alphashape, m) {
@@ -396,6 +460,148 @@ PYBIND11_MODULE(alphashape, m) {
     g_project = py_project.ptr();
 
     py::register_exception_translator(&translate_alphashape);
+
+#if defined(ALPHASHAPE_USE_PROJ)
+    // -- CoordinateSystem (WP-12.11) -----------------------------------------
+    // A thin value wrapper over crs::CoordinateSystem. Copies are cheap (the
+    // pimpl strings are shared), so pybind returns it BY VALUE; `__eq__` is
+    // PROJ equivalence, not string identity, which is what a script comparing
+    // two definitions of "the same CRS" means.
+    using CoordinateSystem = alphashape::crs::CoordinateSystem;
+
+    py::class_<CoordinateSystem> coordinate_system_class(m, "CoordinateSystem");
+    coordinate_system_class
+        .def(py::init<>(), "The local (unset) engineering CRS.")
+        .def(py::init<const CoordinateSystem&>(), py::arg("other"),
+             "Copy another coordinate system.")
+        .def(py::init([](int epsg) { return CoordinateSystem::from_epsg(epsg); }),
+             py::arg("epsg"), "Build from an EPSG code; ValueError when unknown.")
+        .def(py::init([](py::kwargs kwargs) {
+                 const bool has_wkt = kwargs.contains("wkt");
+                 const bool has_proj = kwargs.contains("proj");
+                 const bool has_name = kwargs.contains("name");
+                 for (auto item : kwargs) {
+                     const std::string key = py::cast<std::string>(item.first);
+                     if (key != "wkt" && key != "proj" && key != "name") {
+                         throw py::type_error("CoordinateSystem: unknown keyword '" + key + "'");
+                     }
+                     if (!py::isinstance<py::str>(item.second)) {
+                         throw py::type_error("CoordinateSystem: '" + key + "' expects a str");
+                     }
+                 }
+                 // Exactly one spelling: the constructor-by-name is name=, so
+                 // any two of wkt= / proj= / name= is ambiguous.
+                 const int provided = static_cast<int>(has_wkt) +
+                                      static_cast<int>(has_proj) +
+                                      static_cast<int>(has_name);
+                 if (provided != 1) {
+                     throw alphashape::ValueError(
+                         "CoordinateSystem: pass exactly one of wkt, proj or name");
+                 }
+                 if (has_wkt) {
+                     return CoordinateSystem::from_wkt(py::cast<std::string>(kwargs["wkt"]));
+                 }
+                 if (has_proj) {
+                     return CoordinateSystem::from_proj(py::cast<std::string>(kwargs["proj"]));
+                 }
+                 if (has_name) {
+                     return coordinate_system_from_name(
+                         py::cast<std::string>(kwargs["name"]));
+                 }
+                 throw alphashape::ValueError(
+                     "CoordinateSystem: pass exactly one of wkt, proj or name");
+             }),
+             "Build from WKT (wkt=), a PROJ string (proj=) or a built-in name "
+             "(name=). Exactly one is required.")
+        .def_property_readonly("name", [](const CoordinateSystem& cs) { return cs.name(); })
+        .def_property_readonly("authority",
+                               [](const CoordinateSystem& cs) { return cs.auth_name(); })
+        .def_property_readonly("epsg", [](const CoordinateSystem& cs) -> py::object {
+            const int code = cs.epsg();
+            return code == 0 ? py::object(py::none()) : py::object(py::int_(code));
+        })
+        .def_property_readonly("wkt", [](const CoordinateSystem& cs) { return cs.to_wkt(); })
+        .def("toWKT", [](const CoordinateSystem& cs) { return cs.to_wkt(); })
+        .def("toProj4", [](const CoordinateSystem& cs) { return cs.to_proj4(); })
+        .def_static("listBuiltinCRS",
+                    []() { return alphashape::crs::builtin_crs_names(); },
+                    "Names of the curated built-in CRS list, in list order.")
+        .def_static(
+            "init",
+            [](const std::string& name) { return coordinate_system_from_name(name); },
+            py::arg("name"),
+            "Build from \"EPSG:<code>\" / \"EPSG::<code>\", a WKT definition "
+            "or a built-in name (the listBuiltinCRS() names).")
+        // The geoid registry is process-wide: seeded from PROJ's data
+        // directory on first use, then custom grids are referenced where they
+        // are. Nothing is copied and nothing is downloaded.
+        .def_static(
+            "addGeoid",
+            [](const std::string& path) {
+                // Register the grid at its canonical absolute path, so the store
+                // and the project file never depend on the caller's cwd.
+                std::error_code ec;
+                std::filesystem::path file =
+                    std::filesystem::absolute(std::filesystem::path(path), ec);
+                if (!ec) {
+                    file = std::filesystem::weakly_canonical(file, ec);
+                }
+                if (ec) {
+                    throw alphashape::ValueError("addGeoid: cannot resolve '" + path +
+                                                 "': " + ec.message());
+                }
+                const std::string id = file.stem().string();
+                if (id.empty() || !file.has_filename()) {
+                    throw alphashape::ValueError("addGeoid: '" + path +
+                                                 "' has no file name");
+                }
+                // Register only a file that really opens as a geoid grid: this
+                // turns a late, confusing failure at evaluation time into a
+                // ValueError at registration.
+                try {
+                    (void)alphashape::crs::GeoidGrid::open(file.string());
+                } catch (const std::exception&) {
+                    throw alphashape::ValueError("addGeoid: '" + path +
+                                                 "' is not a readable geoid grid");
+                }
+                geoid_store().add(id, file.filename().string(), file.string(),
+                                  "custom", "");
+            },
+            py::arg("path"),
+            "Register a geoid grid file. Raises when the file is missing or "
+            "its id is already registered.")
+        .def_static("listGeoids",
+                    []() {
+                        std::vector<std::string> ids;
+                        for (const alphashape::crs::GeoidModel& model :
+                             geoid_store().list()) {
+                            ids.push_back(model.id);
+                        }
+                        return ids;
+                    },
+                    "Ids of the registered geoid grids.")
+        // Equality is PROJ equivalence: the same datum, ellipsoid, axes and
+        // units. Two different definitions of one CRS compare equal; axis
+        // order differences (lat/lon vs lon/lat) do not make them unequal.
+        .def("__repr__",
+             [](const CoordinateSystem& cs) {
+                 return "<CoordinateSystem '" + cs.name() + "'>";
+             })
+        .def(
+            "__eq__",
+            [](const CoordinateSystem& a, py::object other) -> py::object {
+                if (!py::isinstance<CoordinateSystem>(other)) {
+                    return py::reinterpret_borrow<py::object>(Py_NotImplemented);
+                }
+                const CoordinateSystem b = other.cast<CoordinateSystem>();
+                return py::bool_(a.is_equivalent_to(b));
+            },
+            py::is_operator());
+    // Defining __eq__ would otherwise leave pybind's identity __hash__ in
+    // place, breaking the hash/eq contract. A value type that compares by PROJ
+    // equivalence is unhashable, so hash(cs) raises TypeError like tuple does.
+    coordinate_system_class.attr("__hash__") = py::none();
+#endif  // ALPHASHAPE_USE_PROJ
 
     // -- DEM and orthomosaic views (milestone 9) -----------------------------
     // Both are views onto the chunk's own raster, not copies: the chunk is held
@@ -742,18 +948,51 @@ PYBIND11_MODULE(alphashape, m) {
         // The chunk's CRS EPSG code (0 = unset, 4326 = WGS84 geographic once
         // georeferenced). Writable: AlignChunks(method="reference") requires
         // both chunks to be georeferenced, and a script or test needs a way to
-        // declare that. A non-zero code also writes a minimal WKT descriptor so
-        // `is_set()` and CRS equality behave like a project-loaded CRS.
+        // declare that. Assignment goes through the same "Set Chunk CRS"
+        // command as `crs` (EPSG 0 clears to LOCAL), so validation and
+        // semantics are identical to the GUI path.
+        // The setter is wrapped explicitly with py::is_method: its first
+        // parameter is py::object (the Python wrapper that carries
+        // `_document`), which def_property's automatic detection does not cover.
         .def_property(
-            "crs_epsg", [](const Chunk& c) { return c.crs().epsg; },
-            [](Chunk& c, int epsg) {
-                if (epsg < 0) {
-                    throw alphashape::ValueError("crs_epsg must not be negative");
-                }
-                c.crs().epsg = epsg;
-                c.crs().wkt =
-                    epsg == 0 ? std::string{} : "EPSG:" + std::to_string(epsg);
-            })
+            "crs_epsg",
+            py::cpp_function([](const Chunk& c) { return c.crs().epsg; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, int epsg) {
+                    if (epsg < 0) {
+                        throw alphashape::ValueError("crs_epsg must not be negative");
+                    }
+                    alphashape::CRS crs;
+                    if (epsg != 0) {
+                        crs.epsg = epsg;
+                        crs.wkt = "EPSG:" + std::to_string(epsg);
+                    }
+                    apply_crs_command(self, std::move(crs));
+                },
+                py::is_method(m)))
+#if defined(ALPHASHAPE_USE_PROJ)
+        // The chunk CRS as a value (WP-12.11). Assignment goes through the
+        // "Set Chunk CRS" command, which is then discarded: the GUI owns the
+        // document's undo history (Metashape's Python API has no undo). It only
+        // RELABELS the chunk: no reference, pose, tie point or asset is
+        // transformed. Assigning CoordinateSystem() clears to LOCAL.
+        // The getter and setter are wrapped explicitly with py::is_method:
+        // the setter's first parameter is py::object (the Python wrapper that
+        // carries `_document`), which def_property's automatic method
+        // detection does not cover.
+        .def_property(
+            "crs",
+            py::cpp_function([](const Chunk& c) { return c.coordinate_system(); },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, const CoordinateSystem& cs) {
+                    apply_crs_command(self, alphashape::CRS(cs));
+                },
+                py::is_method(m)),
+            "The chunk coordinate system. Assigning one relabels the chunk "
+            "only; data are not transformed.")
+#endif  // ALPHASHAPE_USE_PROJ
         // The effective camera-reference CRS (WP-12.6/WP-12.7): the explicit
         // slot when set, else the chunk CRS. 0 = unset.
         .def_property_readonly("camera_crs_epsg",
