@@ -42,16 +42,20 @@
 // grid), with an ICM polish. The coarsest level is solved from its own argmax,
 // its labels are upsampled to the next level and refined, and so on down to the
 // full grid. Each level runs a few alpha-expansion cycles -- for every label
-// alpha a min-cut (push-relabel max-flow) decides the exact set of cells that
+// alpha a min-cut (push-relabel max-flow) proposes the set of cells that
 // should switch to alpha, which flips whole regions at once where plain ICM
 // cannot, and is the reason seams move off the flat spots instead of sitting
-// where argmax happens to switch. Submodularity holds because the seam term is a
-// metric (a sum of absolute colour differences plus a constant). The full grid
-// is finished by the ICM polish alone: the coarse levels carry the global
-// structure, and a full-resolution min-cut buys almost nothing for most of the
-// runtime. The flow is single-threaded with a fixed edge order and FIFO queue,
-// and the ICM sweep runs in checkerboard order, so the labelling is bit-identical
-// for 1 and 4 threads.
+// where argmax happens to switch. The seam term is a metric only where both
+// tiles cover both ends of an edge; where one does not, E00 is truncated to
+// E(alpha,lq) + E(lp,alpha) so every pair term stays submodular, and each move
+// is accepted only when the TRUE energy falls. The sweep is therefore a
+// monotone descent, not an exact solve. The full grid is finished by the ICM
+// polish alone: the coarse levels carry the global structure, and a
+// full-resolution min-cut buys almost nothing for most of the runtime. The one
+// exception is the ghosting pass, bounded to the marked cells' neighbourhood.
+// The flow is single-threaded with a fixed edge order and FIFO queue, and the
+// ICM sweep runs in checkerboard order, so the labelling is bit-identical for
+// 1 and 4 threads.
 //
 // `iterations == 0` returns the plain per-cell argmax of the score, with no
 // smoothing (useful as the "before" labelling).
@@ -70,6 +74,24 @@ struct SeamOptions {
     double smoothness = 0.30;   ///< constant cost of one label-change edge
     int coarse_levels = 2;      ///< 2x block-mean levels solved before the full grid
     int expansion_cycles = 2;   ///< alpha-expansion passes per pyramid level
+
+    /// Optional per-tile "deviant" masks (ghosting.hpp): one tile-local byte
+    /// mask per tile, non-zero where the multi-view consensus says that camera
+    /// disagrees with the majority. When set, a label on a marked cell pays
+    /// `avoid_cost` in the data term, which is deliberately larger than one
+    /// smoothness edge so the optimiser cuts the object out instead of keeping
+    /// it for the sake of a shorter seam. A marked cell whose tile is the ONLY
+    /// valid one keeps its cell (the cost is not charged), so the filter never
+    /// creates a hole. Nullptr (the default) leaves the labelling unchanged.
+    const std::vector<std::vector<std::uint8_t>>* avoid = nullptr;
+    /// Data-term surcharge for choosing a deviant camera at a cell. When at
+    /// least one cell is marked, a bounded full-resolution alpha-expansion pass
+    /// runs over the marked cells' bounding box (dilated by 32 cells), because
+    /// a single-cell ICM move inside a large object always looks expensive (its
+    /// interior neighbours are object cells too); the expansion cuts the whole
+    /// region at once and pays the seam only on its perimeter. With nothing
+    /// marked the pass is skipped, so runtime matches a plain run.
+    double avoid_cost = 1.0;
 };
 
 /// Label per output cell: the index of the winning tile, or -1 where no tile is

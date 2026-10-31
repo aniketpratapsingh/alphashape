@@ -19,6 +19,7 @@
 #include "common/core/groups.hpp"
 #include "common/core/marker.hpp"
 #include "common/core/mask.hpp"
+#include "common/core/reference_settings.hpp"
 #include "common/core/scalebar.hpp"
 #include "common/core/shapes.hpp"
 #include "common/core/trajectory.hpp"
@@ -453,6 +454,14 @@ public:
     Transform& transform() { return transform_; }
     const Transform& transform() const { return transform_; }
 
+    /// Chunk-level observation accuracies used by georeferencing (WP-13.1).
+    /// Plain data on the chunk; edits go through the undoable command when a
+    /// stack entry is wanted.
+    ReferenceSettings reference_settings() const { return reference_settings_; }
+    void set_reference_settings(const ReferenceSettings& settings) {
+        reference_settings_ = settings;
+    }
+
     Meta& meta() { return meta_; }
     const Meta& meta() const { return meta_; }
 
@@ -562,6 +571,7 @@ private:
     Region region_;
     Transform transform_ = Transform::Identity();
     Meta meta_;
+    ReferenceSettings reference_settings_;
     CRS crs_;
     /// Per-object CRS slots (CRS-04). Nullopt = follow `crs_`; only an
     /// explicitly set slot is persisted.

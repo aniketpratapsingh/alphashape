@@ -32,6 +32,18 @@ float tile_score(const OrthoTile& tile, int col, int row) {
     return tile.contains(col, row) ? tile.score[tile.index(col, row)] : 0.0F;
 }
 
+/// True when the ghosting filter marked tile `t` deviant at (col, row). A mask
+/// that is absent or the wrong size is treated as "not deviant".
+bool tile_deviant(const std::vector<std::vector<std::uint8_t>>* avoid, std::size_t t,
+                  const OrthoTile& tile, int col, int row) {
+    if (avoid == nullptr || t >= avoid->size()) {
+        return false;
+    }
+    const std::vector<std::uint8_t>& mask = (*avoid)[t];
+    const std::size_t index = tile.index(col, row);
+    return index < mask.size() && mask[index] != 0;
+}
+
 /// A single-channel float plane on the output grid (or a pyramid level of it).
 struct Plane {
     int w = 0;
@@ -289,7 +301,8 @@ void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid, int max_pass
 
 OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                   const std::vector<std::int32_t>& labels, Blending mode,
-                  int pyramid_levels) {
+                  int pyramid_levels,
+                  const std::vector<std::vector<std::uint8_t>>* avoid) {
     OrthoMosaic out;
     out.width = width;
     out.height = height;
@@ -327,17 +340,42 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         for (std::size_t cell = 0; cell < cells; ++cell) {
             const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
             const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
+            std::size_t valid_count = 0;
+            if (avoid != nullptr) {
+                for (const OrthoTile& tile : tiles) {
+                    if (tile_valid(tile, col, row)) {
+                        ++valid_count;
+                    }
+                }
+            }
             double weight_sum = 0.0;
             double acc[3] = {0.0, 0.0, 0.0};
-            for (const OrthoTile& tile : tiles) {
-                if (!tile_valid(tile, col, row)) {
-                    continue;
+            const auto accumulate = [&](bool skip_deviant) {
+                for (std::size_t t = 0; t < tiles.size(); ++t) {
+                    const OrthoTile& tile = tiles[t];
+                    if (!tile_valid(tile, col, row)) {
+                        continue;
+                    }
+                    if (skip_deviant && valid_count > 1 &&
+                        tile_deviant(avoid, t, tile, col, row)) {
+                        continue;
+                    }
+                    const double w =
+                        std::max(static_cast<double>(tile_score(tile, col, row)), 1e-6);
+                    weight_sum += w;
+                    for (int c = 0; c < 3; ++c) {
+                        acc[c] += w * static_cast<double>(tile_rgb(tile, col, row, c));
+                    }
                 }
-                const double w = std::max(static_cast<double>(tile_score(tile, col, row)), 1e-6);
-                weight_sum += w;
-                for (int c = 0; c < 3; ++c) {
-                    acc[c] += w * static_cast<double>(tile_rgb(tile, col, row, c));
-                }
+            };
+            accumulate(true);
+            if (weight_sum <= 0.0 && valid_count > 0) {
+                // No valid camera survived the deviant filter. With a lone
+                // valid camera the filter is not applied at all, so this is
+                // the "all valid tiles are deviant" case: excluding them would
+                // punch a hole, so the average keeps them -- the same "never
+                // create a hole" rule the seam filter follows.
+                accumulate(false);
             }
             if (weight_sum <= 0.0) {
                 continue;

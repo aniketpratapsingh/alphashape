@@ -154,6 +154,7 @@ void Chunk::copy_from(const Chunk& other) {
     region_ = other.region_;
     transform_ = other.transform_;
     meta_ = other.meta_;
+    reference_settings_ = other.reference_settings_;
     crs_ = other.crs_;
     camera_crs_ = other.camera_crs_;
     marker_crs_ = other.marker_crs_;
@@ -579,6 +580,7 @@ bool Chunk::operator==(const Chunk& other) const {
         return false;
     }
     if (!(region_ == other.region_) || !(meta_ == other.meta_) ||
+        !(reference_settings_ == other.reference_settings_) ||
         !(crs_ == other.crs_)) {
         return false;
     }
