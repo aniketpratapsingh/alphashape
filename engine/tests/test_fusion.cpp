@@ -373,6 +373,58 @@ TEST(Fusion, MinConfidenceStillFiltersAFilteredMap) {
         << "a filtered map must still respect min_confidence";
 }
 
+TEST(Fusion, RepairedSamplesCarryLessWeightThanMeasuredOnes) {
+    // Two maps of the SAME plane from the same pose, so every back-projected
+    // point merges into one voxel column. Map 0 is measured, map 1 is flagged
+    // repaired. The merged confidence must keep the measured sample's weight
+    // well above the repaired one, so a repaired pixel cannot outvote a
+    // measurement, and the repaired sample still appears (weight > 0).
+    const Calibration cal = map_calibration();
+    const std::size_t n =
+        static_cast<std::size_t>(cal.width) * static_cast<std::size_t>(cal.height);
+    std::vector<DepthMap> maps;
+    maps.push_back(make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 0));
+    maps.push_back(make_plane_map(cal, Matrix3d::Identity(), Vector3d::Zero(), Plane{}, 1));
+    // Both maps carry the SAME face-value confidence, so only the provenance
+    // flag can justify a different weight.
+    maps[0].confidence.assign(n, 1.0F);
+    maps[1].confidence.assign(n, 1.0F);
+    maps[1].flags.assign(n, 0U);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (maps[1].depths[i] > 0.0F) {
+            maps[1].flags[i] = kDepthRepairedFlag;
+        }
+    }
+    std::vector<FusionInput> inputs;
+    for (const DepthMap& map : maps) {
+        FusionInput in;
+        in.map = &map;
+        in.calibration = cal;
+        inputs.push_back(in);
+    }
+
+    // A voxel far smaller than a pixel's ground footprint, so each map's pixel
+    // lands in its own voxel and only the same pixel of the two maps merges.
+    FusionOptions options;
+    options.voxel_size = 0.01;
+    const PointCloud cloud = fuse_depth_maps(inputs, options);
+    ASSERT_FALSE(cloud.points.empty());
+    // One measured + one repaired sample per voxel: 1 + 0.1, not 1 + 0.
+    for (const float c : cloud.confidence) {
+        EXPECT_GT(c, 1.0F) << "a repaired sample must still contribute";
+        EXPECT_LT(c, 1.5F) << "a repaired sample must not weigh as much as a measured one";
+    }
+
+    // With the map carrying NO repaired pixels, the same voxel sums to 1 + 1:
+    // the flag, not the confidence, is what discounts it.
+    std::fill(maps[1].flags.begin(), maps[1].flags.end(), 0U);
+    const PointCloud measured = fuse_depth_maps(inputs, options);
+    ASSERT_FALSE(measured.confidence.empty());
+    for (const float c : measured.confidence) {
+        EXPECT_NEAR(static_cast<double>(c), 2.0, 1e-4);
+    }
+}
+
 TEST(Fusion, DoublingVoxelSizeReducesPointCount) {
     const Calibration cal = map_calibration();
     const Matrix3d R = rot(0.05, 0.1, 0.0);

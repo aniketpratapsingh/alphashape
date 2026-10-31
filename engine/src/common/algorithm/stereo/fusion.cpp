@@ -22,7 +22,22 @@ struct Sample {
     float footprint = -1.0F;
     float confidence = 0.0F;
     bool has_colour = false;
+    /// Synthesised by the post-filter repair pass rather than measured by the
+    /// search. Such a sample is still merged (it is the only evidence some
+    /// voxels have) but it carries a fraction of a measured sample's weight, so
+    /// where both describe one voxel the measurement dominates the support.
+    bool repaired = false;
 };
+
+/// Weight of one repaired sample relative to one measured sample in the merged
+/// point cloud. A repaired depth is a plane's guess, so it must not outvote a
+/// measurement; it is still merged, because for some voxels it is the only
+/// evidence there is. Applied as a fraction of a MEASURED SAMPLE'S OWN weight
+/// (support 1), not of the filtered confidence, so a repaired pixel can never
+/// exceed a measured one whatever the filter's scale. 0.1 keeps a lone repaired
+/// point above min_confidence 0 (so it still appears) while ten measured
+/// samples outweigh a hundred repaired ones.
+constexpr double kRepairedFusionWeight = 0.1;
 
 /// Voxel grid key = floor(world / voxel) per axis.
 struct VoxelKey {
@@ -166,6 +181,9 @@ const DepthMap& validate_input(const FusionInput& in, std::size_t index) {
     if (!map.confidence.empty() && map.confidence.size() != pixels) {
         throw ValueError(prefix + "confidence buffer size does not match the map");
     }
+    if (!map.flags.empty() && map.flags.size() != pixels) {
+        throw ValueError(prefix + "flags buffer size does not match the map");
+    }
     if (in.image != nullptr) {
         const std::size_t need_w = static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.downscale);
         const std::size_t need_h = static_cast<std::size_t>(map.height) * static_cast<std::size_t>(map.downscale);
@@ -205,6 +223,9 @@ PointCloud fuse_depth_maps(const std::vector<FusionInput>& inputs, const FusionO
     // A normal is only emitted when *every* contributing map supplies one;
     // likewise a meaningful summed confidence needs the container everywhere.
     const bool use_normals = any_normals && all_normals;
+    // A repaired pixel is only ever produced on a FILTERED map, which always
+    // carries a confidence buffer, so the weighted sum below (taken only when
+    // every input has one) is where a repaired sample's low weight applies.
     // Colours need both the option and an image on *every* input: a voxel can be
     // fed by several maps, and a map with no image contributes nothing to its
     // colour. Emitting colours while some inputs are image-less would leave
@@ -251,6 +272,8 @@ PointCloud fuse_depth_maps(const std::vector<FusionInput>& inputs, const FusionO
                 if (!unfiltered && conf < options.min_confidence) {
                     continue;
                 }
+                // A repaired pixel IS a filtered one at low confidence; it passes
+                // the filter's gate only when min_confidence admits 0.25.
 
                 Sample s;
                 const Eigen::Vector2d centre(static_cast<double>(ii) + 0.5,
@@ -265,7 +288,8 @@ PointCloud fuse_depth_maps(const std::vector<FusionInput>& inputs, const FusionO
                                                 map.normals[idx * 3 + 2]);
                     s.normal = (Rt * n_cam.cast<double>()).cast<float>();
                 }
-                s.confidence = conf;
+                s.repaired = !map.flags.empty() && (map.flags[idx] & kDepthRepairedFlag) != 0;
+                s.confidence = s.repaired ? static_cast<float>(kRepairedFusionWeight) : conf;
                 if (std::abs(in.calibration.f) > 1e-12) {
                     s.footprint = static_cast<float>(static_cast<double>(depth) / in.calibration.f);
                 }

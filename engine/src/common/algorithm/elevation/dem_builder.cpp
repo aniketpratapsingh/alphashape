@@ -57,7 +57,8 @@ Source parse_source(const std::string& value) {
                      value + "\")");
 }
 
-Interpolation parse_interpolation(const std::string& value) {    if (value == "disabled") {
+Interpolation parse_interpolation(const std::string& value) {
+    if (value == "disabled") {
         return Interpolation::Disabled;
     }
     if (value == "enabled") {
@@ -71,11 +72,29 @@ Interpolation parse_interpolation(const std::string& value) {    if (value == "d
                      value + "\")");
 }
 
+/// Weight a cell whose only samples are repaired depth pixels contributes to
+/// the TGV data term, before the per-cell confidence normalisation. It is the
+/// floating-point epsilon above zero: the smallest weight the solver's data term
+/// still accepts, so such a cell is data but can never outweigh a cell fed by a
+/// measurement (whose summed confidence is at least 1 for a measured pixel).
+constexpr float kRepairedSampleConfidence = 1e-6F;
+
+/// Upper bound on a repaired-only cell's normalised TGV weight, so it can never
+/// reach the weight a measured cell carries after the median-1 normalisation
+/// (measured cells normalise to about 1; this is a tenth of that). It still
+/// carries data, so the solver anchors the cell instead of letting the
+/// regulariser invent it.
+constexpr float kRepairedCellWeightCap = 0.1F;
+
 /// One sample in the plane frame: plane (x, y) plus its height and weight.
 struct PlaneSample {
     Eigen::Vector2d p = Eigen::Vector2d::Zero();
     double h = 0.0;
     float confidence = 1.0F;
+    /// True when the depth map's provenance flag says the post-filter repair
+    /// pass synthesised this pixel. Repaired samples never displace measured
+    /// ones: they only speak for a cell nothing measured (see the median rule).
+    bool repaired = false;
 };
 
 /// The per-map automatic-resolution signal: the ground sample distance of one
@@ -167,6 +186,11 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
             throw ValueError("build_dem: depth map for camera " +
                              std::to_string(map.camera_id) + " has a mismatched depth buffer");
         }
+        if (!map.flags.empty() && map.flags.size() != pixels) {
+            throw ValueError("build_dem: depth map for camera " +
+                             std::to_string(map.camera_id) +
+                             " has a mismatched provenance buffer");
+        }
         const Calibration calibration = scaled_calibration(
             chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration,
             map.downscale);
@@ -207,6 +231,7 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                 s.p = Eigen::Vector2d(plane.x(), plane.y());
                 s.h = plane.z();
                 s.confidence = map.confidence.empty() ? 1.0F : map.confidence[idx];
+                s.repaired = !map.flags.empty() && (map.flags[idx] & kDepthRepairedFlag) != 0;
                 result.samples.push_back(s);
                 if (full_focal > 1e-12) {
                     // Incidence against the plane frame's up (the vertical, the
@@ -463,15 +488,19 @@ Eigen::Vector2i cell_of(const RasterGrid& grid, const Eigen::Vector2d& p) {
 }
 
 /// Per-cell accumulator for the point-cloud / depth-map sources: the heights of
-/// the samples that landed in the cell and their summed confidence.
+/// the MEASURED samples that landed in the cell, the heights of the REPAIRED
+/// ones, and the summed confidence. The two lists are kept apart because a
+/// repaired height is a plane's guess: it may break a tie but must never
+/// outvote a measurement.
 struct CellAccumulator {
-    std::vector<double> heights;
+    std::vector<double> heights;          ///< measured
+    std::vector<double> repaired;         ///< synthesised by the repair pass
     double confidence = 0.0;
 };
 
-/// Rasterise point / depth-map samples into per-cell medians and summed
-/// confidence. Returns the per-cell accumulators (an unordered map keyed by
-/// linear cell index) so the median rule sees every sample.
+/// Rasterise point / depth-map samples into per-cell accumulators (an unordered
+/// map keyed by linear cell index), measured and repaired heights separate, so
+/// the median rule sees every sample and can tell the two apart.
 std::unordered_map<std::size_t, CellAccumulator> rasterise_samples(
     const RasterGrid& grid, const std::vector<PlaneSample>& samples) {
     std::unordered_map<std::size_t, CellAccumulator> cells;
@@ -484,8 +513,12 @@ std::unordered_map<std::size_t, CellAccumulator> rasterise_samples(
             static_cast<std::size_t>(cell.y()) * static_cast<std::size_t>(grid.width) +
             static_cast<std::size_t>(cell.x());
         CellAccumulator& acc = cells[index];
-        acc.heights.push_back(s.h);
-        acc.confidence += static_cast<double>(s.confidence);
+        if (s.repaired) {
+            acc.repaired.push_back(s.h);
+        } else {
+            acc.heights.push_back(s.h);
+            acc.confidence += static_cast<double>(s.confidence);
+        }
     }
     return cells;
 }
@@ -921,6 +954,9 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     surface.values.assign(count, std::numeric_limits<float>::quiet_NaN());
     surface.valid.assign(count, 0U);
     surface.confidence.assign(count, 0.0F);
+    // Cells whose ONLY samples were repaired depth pixels. They are data in the
+    // TGV pass, but at a weight below any measured cell's (see the weights).
+    std::vector<std::uint8_t> repaired_only_cells(count, 0U);
 
     if (source == Source::Model) {
         const std::vector<float> heights = rasterise_model(grid, model);
@@ -935,7 +971,13 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         std::unordered_map<std::size_t, CellAccumulator> cells =
             rasterise_samples(grid, samples);
         for (auto& [index, acc] : cells) {
-            std::vector<double>& heights = acc.heights;
+            // A repaired sample is a plane's guess, so it must not outvote a
+            // measurement: whenever the cell holds a measured sample, the median
+            // is taken over MEASURED heights alone. Only a cell with no measured
+            // sample falls back to the repaired ones, where they are better than
+            // nothing (the alternative is nodata).
+            const bool repaired_only = acc.heights.empty();
+            std::vector<double>& heights = repaired_only ? acc.repaired : acc.heights;
             const std::size_t mid = heights.size() / 2;
             std::nth_element(heights.begin(),
                              heights.begin() + static_cast<std::ptrdiff_t>(mid), heights.end());
@@ -947,7 +989,9 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
             }
             surface.values[index] = static_cast<float>(median);
             surface.valid[index] = 1U;
-            surface.confidence[index] = static_cast<float>(acc.confidence);
+            surface.confidence[index] =
+                repaired_only ? kRepairedSampleConfidence : static_cast<float>(acc.confidence);
+            repaired_only_cells[index] = repaired_only ? std::uint8_t{1} : std::uint8_t{0};
         }
     }
     tick(0.55);
@@ -1090,7 +1134,10 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         std::vector<float> observed_confidences;
         observed_confidences.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
-            if (observed[i] != 0U) {
+            if (observed[i] != 0U && repaired_only_cells[i] == 0U) {
+                // The median is taken over MEASURED cells only: a repaired-only
+                // cell's near-zero confidence must not drag the reference down
+                // and inflate every measured weight to the clamp.
                 observed_confidences.push_back(surface.confidence[i]);
                 weights[i] = surface.confidence[i];
             } else if (filled_valid[i] != 0U) {
@@ -1106,6 +1153,14 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
                     w = static_cast<float>(static_cast<double>(w) / median_confidence);
                     w = std::min(std::max(w, 0.0F), 4.0F);
                 }
+            }
+        }
+        // A repaired-only cell is data, but at a weight below any measured
+        // cell's: cap it after normalisation so the solver anchors it while a
+        // measured cell always outweighs it.
+        for (std::size_t i = 0; i < count; ++i) {
+            if (repaired_only_cells[i] != 0U) {
+                weights[i] = kRepairedCellWeightCap;
             }
         }
         for (std::size_t i = 0; i < count; ++i) {

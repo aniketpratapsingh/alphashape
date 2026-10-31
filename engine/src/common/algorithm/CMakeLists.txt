@@ -33,6 +33,7 @@ add_library(alphashape_algorithms STATIC
     stereo/patch_match.cpp
     stereo/patch_match_gpu.cpp
     stereo/depth_filter.cpp
+    stereo/depth_repair.cpp
     stereo/fusion.cpp
     stereo/build_depth_maps_task.cpp
     stereo/build_point_cloud_task.cpp

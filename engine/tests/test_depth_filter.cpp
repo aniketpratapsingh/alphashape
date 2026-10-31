@@ -6,8 +6,10 @@
 //
 // Suites are prefixed DepthFilter so `ctest -R DepthFilter` selects them.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -21,6 +23,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/stereo/depth_filter.hpp"
+#include "common/algorithm/stereo/depth_repair.hpp"
 #include "common/core/chunk.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -471,6 +474,396 @@ TEST(DepthFilter, ThreadCountDeterminism) {
     EXPECT_EQ(single.depths, multi.depths);
     EXPECT_EQ(single.confidence, multi.confidence);
     EXPECT_EQ(single.normals, multi.normals);
+}
+
+// ---------------------------------------------------------------------------
+// Post-filter hole repair (depth_repair.hpp)
+// ---------------------------------------------------------------------------
+
+void punch(DepthMap& map, int i0, int j0, int i1, int j1) {
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+                       static_cast<std::size_t>(i)] = -1.0f;
+        }
+    }
+}
+
+double index_depth(const DepthMap& map, int i, int j) {
+    return static_cast<double>(map.depths[static_cast<std::size_t>(j) *
+                                          static_cast<std::size_t>(map.width) +
+                                          static_cast<std::size_t>(i)]);
+}
+
+/// The span the boundary ring measured, for a span-guard assertion.
+struct RingSpan {
+    double min = std::numeric_limits<double>::max();
+    double max = 0.0;
+};
+
+/// Put the depth of every measured 4-neighbour of the already-punched rectangle
+/// on the plane n . x = offset, where n is the unit ray through the hole's
+/// centre. The plane is therefore perpendicular to that ray: the centre pixel
+/// sits at the plane's closest distance (offset), while the ring, further off
+/// the ray, measures it at a greater distance. The larger the hole, the wider
+/// that perspective range -- which is what lets a test step over the 1% span
+/// margin deterministically. Returns the ring's measured range.
+RingSpan set_ring_on_oblique_plane(DepthMap& map, const Calibration& calib, int i0, int j0,
+                                   int i1, int j1, double offset) {
+    const Eigen::Vector2d centre(0.5 * static_cast<double>(i0 + i1) + 0.5,
+                                 0.5 * static_cast<double>(j0 + j1) + 0.5);
+    const Eigen::Vector3d normal = calib.unproject(centre);
+    RingSpan span;
+    const auto put = [&](int i, int j) {
+        const Eigen::Vector2d pixel(static_cast<double>(i) + 0.5,
+                                    static_cast<double>(j) + 0.5);
+        const double depth = offset / normal.dot(calib.unproject(pixel));
+        map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+                   static_cast<std::size_t>(i)] = static_cast<float>(depth);
+        span.min = std::min(span.min, depth);
+        span.max = std::max(span.max, depth);
+    };
+    for (int i = i0; i <= i1; ++i) {
+        put(i, j0 - 1);
+        put(i, j1 + 1);
+    }
+    for (int j = j0; j <= j1; ++j) {
+        put(i0 - 1, j);
+        put(i1 + 1, j);
+    }
+    return span;
+}
+
+TEST(DepthRepair, PlaneHoleIsFilled) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const DepthMap before = view.map;
+    punch(view.map, 30, 20, 40, 30);  // 11x11 square (area 121 <= default 2000)
+    ASSERT_LE(index_depth(view.map, 35, 25), 0.0);
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_components, 1u);
+    EXPECT_EQ(stats.filled_pixels, 121u);
+    for (int j = 20; j <= 30; ++j) {
+        for (int i = 30; i <= 40; ++i) {
+            const double got = index_depth(out, i, j);
+            const double want = index_depth(before, i, j);
+            ASSERT_GT(got, 0.0) << "pixel " << i << "," << j;
+            EXPECT_LE(std::abs(got - want) / want, 1e-6)
+                << "pixel " << i << "," << j << " got " << got << " want " << want;
+        }
+    }
+}
+
+TEST(DepthRepair, StepEdgeHoleIsNotFilled) {
+    // Two PARALLEL planes at different depths (a step): scaling the ray depth
+    // moves the surface to another plane parallel to the first. A hole
+    // straddling the step has its ring split between them, so no single plane
+    // explains it and the fill must be refused rather than bridge the gap.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const int edge_i = 35;
+    for (int j = 0; j < kH; ++j) {
+        for (int i = 0; i < kW; ++i) {
+            const double d = index_depth(view.map, i, j);
+            if (d > 0.0) {
+                const double scale = i < edge_i ? 1.0 : 2.0;  // the far half
+                view.map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(kW) +
+                                static_cast<std::size_t>(i)] = static_cast<float>(d * scale);
+            }
+        }
+    }
+    // A hole centred on the step, 21x15.
+    punch(view.map, 25, 22, 45, 36);
+    const std::size_t before_valid = count_valid(view.map);
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_components, 0u) << "a step edge must not be bridged";
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(count_valid(out), before_valid);
+}
+
+/// Punch a rectangular hole and lift every measured pixel at or right of
+/// `edge_i` onto the parallel plane at twice the depth (a step). Returns the
+/// far side's share of the hole's boundary ring, computed exactly: the ring is
+/// the hole's 4-adjacent outline, `2w + 2h` pixels, and the far part of it is
+/// the far end of the top row, the whole right column and the far end of the
+/// bottom row (`2k + h`, where `k` is how many columns of the hole are far).
+double punch_asymmetric_step(DepthMap& map, int i0, int j0, int i1, int j1, int edge_i) {
+    const double total = 2.0 * static_cast<double>(i1 - i0 + 1 + j1 - j0 + 1);
+    const double far = 2.0 * static_cast<double>(i1 - edge_i + 1) +
+                       static_cast<double>(j1 - j0 + 1);
+    punch(map, i0, j0, i1, j1);
+    for (int j = 0; j < map.height; ++j) {
+        for (int i = edge_i; i < map.width; ++i) {
+            float& d = map.depths[static_cast<std::size_t>(j) *
+                                      static_cast<std::size_t>(map.width) +
+                                  static_cast<std::size_t>(i)];
+            if (d > 0.0f) {
+                d *= 2.0f;
+            }
+        }
+    }
+    return far / total;
+}
+
+TEST(DepthRepair, AsymmetricStepIsNotBridged) {
+    // A step whose far side owns less than 30% of the ring slips under the 70%
+    // inlier rule: the near plane still explains 70%+ of the boundary, so the
+    // old code bridged the step with it. The inlier fraction cannot see this;
+    // the boundary ORDER can. Walked along the ring, the far points of a step
+    // are one contiguous arc (far end of the top row, the right column, far
+    // end of the bottom row) while the ragged edge a filter leaves is
+    // scattered. A 70x30 hole has a 200-pixel ring, so 2k + 30 far points
+    // express the shares exactly.
+    const int cases[3] = {5, 10, 14};  // 20%, 25%, 29% of the ring
+    for (const int far_columns : cases) {
+        View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+        const double share = punch_asymmetric_step(view.map, 5, 15, 74, 44, 75 - far_columns);
+        EXPECT_NEAR(share, static_cast<double>(2 * far_columns + 30) / 200.0, 1e-12);
+        ASSERT_GE(share, 0.20 - 1e-9);
+        ASSERT_LT(share, 0.30) << "the case must stay inside the inlier rule's blind spot";
+
+        RepairOptions options;
+        options.max_area = 3000;
+        RepairStats stats;
+        const DepthMap out = repair_depth_map(view.map, view.calib, options, &stats);
+        EXPECT_EQ(stats.filled_pixels, 0u) << "far share " << share;
+        EXPECT_EQ(stats.rejected_plane, 1u) << "far share " << share;
+        EXPECT_EQ(index_depth(out, 40, 30), -1.0) << "far share " << share;
+    }
+}
+
+TEST(DepthRepair, ScatteredRingOutliersAreStillFilled) {
+    // The other side of the same coin: random speckle on the ring is NOT a
+    // second surface. Nine of the 44 ring pixels (20%) are displaced by +-5% of
+    // their depth, alternating above and below the plane, so the longest
+    // outlier arc is one pixel and no side dominates. The fill must still be
+    // accepted, or the coherence test would throw away real repairs.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 30, 20, 40, 30);
+    int ring_index = 0;
+    for (int j = 19; j <= 31; ++j) {
+        for (int i = 29; i <= 41; ++i) {
+            // The ring proper: valid pixels 4-adjacent to the hole, which is the
+            // four sides without the (diagonal) corners.
+            const bool side_top_or_bottom = (j == 19 || j == 31) && i >= 30 && i <= 40;
+            const bool side_left_or_right = (i == 29 || i == 41) && j >= 20 && j <= 30;
+            if (!side_top_or_bottom && !side_left_or_right) {
+                continue;
+            }
+            const int ordinal = ring_index++;
+            if (ordinal % 5 != 0) {
+                continue;  // every fifth ring pixel, in ring walk order
+            }
+            float& d = view.map.depths[static_cast<std::size_t>(j) *
+                                           static_cast<std::size_t>(kW) +
+                                       static_cast<std::size_t>(i)];
+            ASSERT_GT(d, 0.0f);
+            d = static_cast<float>(static_cast<double>(d) *
+                                   ((ordinal / 5) % 2 == 0 ? 1.05 : 0.95));
+        }
+    }
+    ASSERT_EQ(ring_index, 44);
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_components, 1u) << "20% scattered ring outliers must not block a fill";
+    EXPECT_EQ(stats.filled_pixels, 121u);
+    EXPECT_GT(index_depth(out, 35, 25), 0.0);
+}
+
+TEST(DepthRepair, OversizedHoleIsNotFilled) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 20, 15, 60, 45);  // 41*31 = 1271 px
+    RepairOptions options;
+    options.max_area = 500;
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, options, &stats);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(stats.rejected_area, 1u);
+    EXPECT_EQ(index_depth(out, 40, 30), -1.0);
+}
+
+TEST(DepthRepair, BorderTouchingHoleIsNotFilled) {
+    // A hole cut off by the map edge has too little of its perimeter on measured
+    // pixels; a plane fitted to the rest would be extrapolated over ground
+    // nothing measured. This one is 7 wide x 11 tall against the left border:
+    // 11 of its 36 perimeter edges are image border, so only 25/36 = 69% is
+    // measured, under the 75% threshold.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 0, 10, 6, 20);
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(index_depth(out, 3, 15), -1.0);
+
+    // A WIDE, SHALLOW notch leaves most of the ring measured (21 wide x 5 tall:
+    // 5 of 52 edges on the border, 90% measured), so it is a legitimate repair:
+    // the surface is enclosed on three sides and the plane explains the rest.
+    View wide = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(wide.map, 0, 13, 20, 17);
+    RepairStats wide_stats;
+    const DepthMap wide_out = repair_depth_map(wide.map, wide.calib, RepairOptions{}, &wide_stats);
+    EXPECT_EQ(wide_stats.filled_pixels, 105u) << "a 21x5 notch should be filled";
+    EXPECT_GT(index_depth(wide_out, 10, 15), 0.0);
+}
+
+TEST(DepthRepair, IsDeterministicAndMarksConfidence) {
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const std::size_t pixels = static_cast<std::size_t>(kW) * static_cast<std::size_t>(kH);
+    view.map.normals.assign(3 * pixels, 0.0f);
+    view.map.confidence.assign(pixels, 3.0f);
+    punch(view.map, 30, 20, 40, 30);
+
+    const DepthMap a = repair_depth_map(view.map, view.calib, RepairOptions{});
+    const DepthMap b = repair_depth_map(view.map, view.calib, RepairOptions{});
+    EXPECT_EQ(a.depths, b.depths);
+    EXPECT_EQ(a.normals, b.normals);
+    EXPECT_EQ(a.confidence, b.confidence);
+    EXPECT_EQ(a.flags, b.flags);
+
+    // A repaired pixel is marked with the provenance flag and a plane normal; a
+    // measured pixel keeps its own values and is NOT flagged.
+    const std::size_t filled =
+        static_cast<std::size_t>(25) * static_cast<std::size_t>(kW) + std::size_t{35};
+    EXPECT_EQ(a.flags[filled] & kDepthRepairedFlag, kDepthRepairedFlag);
+    EXPECT_FLOAT_EQ(a.confidence[filled], kRepairedConfidence);
+    EXPECT_GT(a.depths[filled], 0.0f);
+    const std::size_t measured =
+        static_cast<std::size_t>(5) * static_cast<std::size_t>(kW) + std::size_t{5};
+    EXPECT_FLOAT_EQ(a.confidence[measured], 3.0f);
+    EXPECT_EQ(a.flags[measured] & kDepthRepairedFlag, 0U);
+}
+
+TEST(DepthRepair, RepairedConfidenceIsBelowEveryMeasuredOne) {
+    // The filter keeps a measured pixel that has NO supporting neighbour at
+    // confidence 0 (depth_filter.cpp sets support_count, and required_support
+    // clamps to 0 when no neighbour exists). So no positive constant can be
+    // below every surviving measurement: kRepairedConfidence must BE that
+    // minimum, and provenance must ride on the flag instead of the value.
+    constexpr float kMinMeasuredConfidence = 0.0F;  // the filter's own floor
+    EXPECT_EQ(kRepairedConfidence, kMinMeasuredConfidence)
+        << "repaired confidence must not exceed the lowest measured confidence";
+
+    // And a map built with confidence 0 on every measured pixel still reports a
+    // repaired pixel distinctly, which the value alone could never do.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    const std::size_t pixels = static_cast<std::size_t>(kW) * static_cast<std::size_t>(kH);
+    view.map.confidence.assign(pixels, 0.0f);
+    punch(view.map, 30, 20, 40, 30);
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{});
+    const std::size_t filled =
+        static_cast<std::size_t>(25) * static_cast<std::size_t>(kW) + std::size_t{35};
+    EXPECT_FLOAT_EQ(out.confidence[filled], 0.0f);
+    EXPECT_EQ(out.flags[filled] & kDepthRepairedFlag, kDepthRepairedFlag)
+        << "the flag must distinguish a repaired pixel from a measured 0-confidence one";
+}
+
+TEST(DepthRepair, FilledDepthStaysInsideTheRingSpan) {
+    // A fill is an interpolation, never an extrapolation. Every repaired depth
+    // must lie inside the range its own ring measured (plus 1%), so a
+    // near-edge-on plane cannot write a depth far outside a surface: on the
+    // aerial block that showed up as a DEM height range of -112..56 m where the
+    // control's was 8..28 m.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 30, 20, 40, 30);
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{});
+
+    // The TRUE ring: every valid pixel 4-adjacent to a hole pixel. Sampling the
+    // hole's own outline instead would read hole pixels (-1) as ring pixels and
+    // silently leave the diagonal corners out.
+    double ring_min = std::numeric_limits<double>::max();
+    double ring_max = 0.0;
+    for (int j = 19; j <= 31; ++j) {
+        for (int i = 29; i <= 41; ++i) {
+            const bool touch = (i == 29 || i == 41) ? (j >= 20 && j <= 30)
+                                                   : (j == 19 || j == 31);
+            if (!touch) {
+                continue;
+            }
+            const double d = index_depth(view.map, i, j);
+            ASSERT_GT(d, 0.0) << "ring pixel " << i << "," << j << " must be measured";
+            ring_min = std::min(ring_min, d);
+            ring_max = std::max(ring_max, d);
+        }
+    }
+    ASSERT_GT(ring_max, 0.0);
+    for (int j = 20; j <= 30; ++j) {
+        for (int i = 30; i <= 40; ++i) {
+            const double d = index_depth(out, i, j);
+            ASSERT_GT(d, 0.0) << "pixel " << i << "," << j;
+            EXPECT_GE(d, ring_min * (1.0 - 0.011)) << "pixel " << i << "," << j;
+            EXPECT_LE(d, ring_max * (1.0 + 0.011)) << "pixel " << i << "," << j;
+        }
+    }
+}
+
+TEST(DepthRepair, RingSpanGuardRefusesFillOutsideTheMeasuredRange) {
+    // The companion to the previous case: there the fill stayed inside the span.
+    // Here it must be REFUSED. A LARGE hole is laid on a plane perpendicular to
+    // the ray through its centre (set_ring_on_oblique_plane). The ring pixels
+    // sit up to ~10 degrees off that ray, so they measure the plane at
+    // 1.427..1.475, while the centre ray runs along the normal and the plane's
+    // true depth there is the offset, 1.400 -- 1.9% BELOW the ring's minimum and
+    // outside the 1% margin. That is an extrapolation the ring never measured.
+    //
+    // This isolates the span guard. The ring lies exactly on one plane, so
+    // fit_ring_plane accepts it (rejected_plane stays 0, most of the hole IS
+    // filled): neither the inlier fraction nor the coherence arc test is the
+    // cause. The centre ray is almost parallel to the plane normal
+    // (|n . b| ~ 1), so the grazing guard is not either. Only the span check can
+    // leave the centre invalid.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 10, 10, 50, 40);  // 41x31 = 1271 px (<= default 2000)
+    const RingSpan span =
+        set_ring_on_oblique_plane(view.map, view.calib, 10, 10, 50, 40, 1.4);
+    ASSERT_LT(1.4, span.min * 0.99) << "the centre fill must be outside the measured span";
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.rejected_plane, 0u) << "one plane explains the ring; the fit must accept it";
+    EXPECT_EQ(stats.filled_components, 1u);
+    EXPECT_GT(stats.filled_pixels, 0u) << "the in-span part of the hole is still filled";
+    EXPECT_GT(stats.unfilled_pixels, 0u);
+    EXPECT_EQ(index_depth(out, 30, 25), -1.0)
+        << "the central fill is outside the ring's measured span";
+    EXPECT_GT(index_depth(out, 10, 10), 0.0) << "a boundary-adjacent fill is inside the span";
+
+    // Companion: a smaller hole covers less of the plane's perspective range, so
+    // the same centre depth (1.400) lands JUST inside the 1% margin and is
+    // filled. (Its allowed minimum is 1.3982; the margin is 0.13%.)
+    View small = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(small.map, 20, 15, 40, 35);  // 21x21 = 441 px
+    const RingSpan small_span =
+        set_ring_on_oblique_plane(small.map, small.calib, 20, 15, 40, 35, 1.4);
+    ASSERT_GE(1.4, small_span.min * 0.99) << "the companion must sit inside the margin";
+    RepairStats small_stats;
+    const DepthMap small_out =
+        repair_depth_map(small.map, small.calib, RepairOptions{}, &small_stats);
+    EXPECT_EQ(small_stats.rejected_plane, 0u);
+    EXPECT_EQ(small_stats.unfilled_pixels, 0u);
+    EXPECT_EQ(small_stats.filled_pixels, 441u);
+    const double centre = index_depth(small_out, 30, 25);
+    ASSERT_GT(centre, 0.0);
+    EXPECT_GE(centre, small_span.min * 0.99);
+    EXPECT_LE(centre, small_span.max * 1.01);
+}
+
+TEST(DepthRepair, ZeroMaxAreaFillsNothing) {
+    // The degenerate configuration of an enabled pass: never modifies the input
+    // and never fills. (The TASK simply does not call the pass when repair_holes
+    // is false; that path is covered by the fingerprint test in the dense suite.)
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 30, 20, 40, 30);
+    const std::vector<float> original = view.map.depths;
+    RepairOptions options;
+    options.max_area = 0;
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, options, &stats);
+    EXPECT_EQ(out.depths, original);
+    EXPECT_EQ(stats.filled_pixels, 0u);
+    EXPECT_EQ(view.map.depths, original) << "the input map must not be modified in place";
 }
 
 }  // namespace

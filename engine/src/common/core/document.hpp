@@ -111,7 +111,14 @@ public:
     /// still bumped so an OLDER build given a v3 project fails with the clear
     /// "newer than this build supports" message rather than the opaque
     /// "depth map file: bad header" its ADM2-less decoder would produce.
-    static constexpr int kFormatVersion = 3;
+    ///
+    /// Version 4 (repair provenance) moved the depth-map sidecar from ADM2 to
+    /// ADM3, which adds an optional per-pixel provenance byte (repaired vs
+    /// measured). A reader given a v3 project decodes ADM2 unchanged and every
+    /// pixel reads as measured. As with v3, the version is bumped only so an
+    /// older build fails with "newer than this build supports" rather than the
+    /// opaque header error; the XML vocabulary is v2's.
+    static constexpr int kFormatVersion = 4;
 
 private:
     std::string path_;
