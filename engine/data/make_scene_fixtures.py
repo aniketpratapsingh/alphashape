@@ -798,6 +798,8 @@ CAL_TRUE_INTRINSICS = {
     "k4": 0.0,
     "p1": 2e-4,
     "p2": -1e-4,
+    "p3": 0.0,
+    "p4": 0.0,
     "b1": 0.0,
     "b2": 0.0,
 }
@@ -809,10 +811,14 @@ def brown_apply(xs, ys, intr):
     """Forward Brown distortion on the normalised plane (vectorised)."""
     k1, k2 = intr["k1"], intr["k2"]
     p1, p2 = intr["p1"], intr["p2"]
+    p3, p4 = intr.get("p3", 0.0), intr.get("p4", 0.0)
     r2 = xs * xs + ys * ys
     radial = 1.0 + k1 * r2 + k2 * r2 * r2
-    xd = xs * radial + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys
-    yd = ys * radial + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys
+    # p3/p4 weight the p1/p2 template by r^2 (q1 = p1 + p3 r^2, q2 = p2 + p4 r^2).
+    q1 = p1 + p3 * r2
+    q2 = p2 + p4 * r2
+    xd = xs * radial + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys
+    yd = ys * radial + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys
     return xd, yd
 
 
@@ -823,22 +829,29 @@ def brown_undistort(xd, yd, intr):
     every element (asserted by the caller)."""
     k1, k2 = intr["k1"], intr["k2"]
     p1, p2 = intr["p1"], intr["p2"]
+    p3, p4 = intr.get("p3", 0.0), intr.get("p4", 0.0)
     x = np.array(xd, dtype=float, copy=True)
     y = np.array(yd, dtype=float, copy=True)
     for _ in range(60):
         r2 = x * x + y * y
         s = 1.0 + k1 * r2 + k2 * r2 * r2
         q = k1 + 2.0 * k2 * r2
-        fx_model = x * s + p1 * (r2 + 2.0 * x * x) + 2.0 * p2 * x * y
-        fy_model = y * s + p2 * (r2 + 2.0 * y * y) + 2.0 * p1 * x * y
+        q1 = p1 + p3 * r2
+        q2 = p2 + p4 * r2
+        fx_model = x * s + q1 * (r2 + 2.0 * x * x) + 2.0 * q2 * x * y
+        fy_model = y * s + q2 * (r2 + 2.0 * y * y) + 2.0 * q1 * x * y
         fx = fx_model - xd
         fy = fy_model - yd
         if max(np.max(np.abs(fx)), np.max(np.abs(fy))) < 1e-14:
             break
-        j00 = s + 2.0 * x * x * q + 6.0 * p1 * x + 2.0 * p2 * y
-        j01 = 2.0 * x * y * q + 2.0 * p1 * y + 2.0 * p2 * x
-        j10 = 2.0 * x * y * q + 2.0 * p2 * x + 2.0 * p1 * y
-        j11 = s + 2.0 * y * y * q + 6.0 * p2 * y + 2.0 * p1 * x
+        j00 = s + 2.0 * x * x * q + 6.0 * x * q1 + 2.0 * y * q2
+        j00 += 2.0 * p3 * x * (r2 + 2.0 * x * x) + 4.0 * p4 * x * x * y
+        j01 = 2.0 * x * y * q + 2.0 * y * q1 + 2.0 * x * q2
+        j01 += 2.0 * p3 * y * (r2 + 2.0 * x * x) + 4.0 * p4 * x * y * y
+        j10 = 2.0 * x * y * q + 2.0 * x * q2 + 2.0 * y * q1
+        j10 += 2.0 * p4 * x * (r2 + 2.0 * y * y) + 4.0 * p3 * x * x * y
+        j11 = s + 2.0 * y * y * q + 6.0 * y * q2 + 2.0 * x * q1
+        j11 += 2.0 * p4 * y * (r2 + 2.0 * y * y) + 4.0 * p3 * x * y * y
         det = j00 * j11 - j01 * j10
         x = x - (j11 * fx - j01 * fy) / det
         y = y - (j00 * fy - j10 * fx) / det

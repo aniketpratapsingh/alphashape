@@ -1406,8 +1406,8 @@ def project_pixels(
 
     ``pose`` is the 4x4 world->camera transform exactly as the project stores it,
     and ``calibration`` carries the Brown-Conrady parameters under the same names
-    the .psx file uses (``f cx cy b1 b2 k1 k2 k3 k4 p1 p2`` plus ``type width
-    height``). Returns ``(pixels, ok)``; ``ok`` is False for a point behind a
+    the .psx file uses (``f cx cy b1 b2 k1 k2 k3 k4 p1 p2 p3 p4`` plus ``type
+    width height``). Returns ``(pixels, ok)``; ``ok`` is False for a point behind a
     frame camera, which has no projection, and those rows are NaN.
 
     This must exist in Python because the reprojection metric has to run on a CI
@@ -1454,12 +1454,22 @@ def project_pixels(
     k4 = float(calibration.get("k4", 0.0))
     p1 = float(calibration.get("p1", 0.0))
     p2 = float(calibration.get("p2", 0.0))
+    p3 = float(calibration.get("p3", 0.0))
+    p4 = float(calibration.get("p4", 0.0))
 
     r2 = xs * xs + ys * ys
     r4 = r2 * r2
     radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r4 * r2 + k4 * r4 * r4
+    # The p1/p2 terms are the historical Brown model; p3/p4 weight the same
+    # template by r^2 (q1 = p1 + p3 r^2, q2 = p2 + p4 r^2) and replace it, so a
+    # projection with p3 = p4 = 0 evaluates exactly the old expression.
     xd = xs * radial + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys
     yd = ys * radial + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys
+    if p3 != 0.0 or p4 != 0.0:
+        q1 = p1 + p3 * r2
+        q2 = p2 + p4 * r2
+        xd = xs * radial + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys
+        yd = ys * radial + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys
 
     width = float(calibration.get("width", 0))
     height = float(calibration.get("height", 0))

@@ -992,6 +992,34 @@ class ProjectionTest(unittest.TestCase):
         distorted, _ = metrics.project_pixels(point, self.identity_pose(), bent)
         self.assertGreater(distorted[0, 0], plain[0, 0])
 
+    def test_higher_order_tangential_terms_fold_into_the_brown_model(self):
+        # p3/p4 weight the p1/p2 template by r^2: q1 = p1 + p3 r^2,
+        # q2 = p2 + p4 r^2. Explicit zeros must leave the projection untouched;
+        # a non-zero pair must move the pixel by the hand-computed amount.
+        straight = {
+            "type": "frame",
+            "width": 100,
+            "height": 100,
+            "f": 50.0,
+            "p1": 1e-3,
+            "p2": -2e-3,
+        }
+        zeroed = dict(straight, p3=0.0, p4=0.0)
+        folded = dict(straight, p3=2e-4, p4=-1e-4)
+        point = np.array([[5.0, 3.0, 10.0]])
+        plain, _ = metrics.project_pixels(point, self.identity_pose(), straight)
+        explicit_zero, _ = metrics.project_pixels(point, self.identity_pose(), zeroed)
+        np.testing.assert_array_equal(explicit_zero, plain)
+        bent, _ = metrics.project_pixels(point, self.identity_pose(), folded)
+        x, y = 0.5, 0.3
+        r2 = x * x + y * y
+        q1 = straight["p1"] + folded["p3"] * r2
+        q2 = straight["p2"] + folded["p4"] * r2
+        xd = x + q1 * (r2 + 2.0 * x * x) + 2.0 * q2 * x * y
+        yd = y + q2 * (r2 + 2.0 * y * y) + 2.0 * q1 * x * y
+        self.assertAlmostEqual(bent[0, 0], 50.0 + xd * 50.0)
+        self.assertAlmostEqual(bent[0, 1], 50.0 + yd * 50.0)
+
     def test_a_point_behind_the_camera_is_not_projected(self):
         calibration = {"type": "frame", "width": 100, "height": 100, "f": 50.0}
         pixels, ok = metrics.project_pixels(
