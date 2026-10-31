@@ -2713,6 +2713,109 @@ TEST(OrthoAffine, blocked_and_whole_grid_apply_the_same_affine_model) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Q4: multi-view consensus ghosting filter
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A ghosting run on the fixture: mosaic blending and no colour correction, so
+/// the only difference between the runs compared below is the ghost filter.
+Params ghosting_params(bool ghosting) {
+    Params params = colour_mode_params(0.125, "none", 0, true, "mosaic");
+    params.set("ghosting_filter", ParamValue{ghosting});
+    return params;
+}
+
+}  // namespace
+
+TEST(BuildOrthomosaic, GhostingAbsentIsByteIdenticalToExplicitFalse) {
+    // The parameter must default OFF and change nothing when absent: a project
+    // or script that predates the filter must produce exactly the same bytes.
+    OrthoSetup& s = setup();
+    Params absent = colour_mode_params(0.125, "none", 0, true, "mosaic");
+    const Orthomosaic a = run_ortho(s, absent);
+    const Orthomosaic b = run_ortho(s, ghosting_params(false));
+    ASSERT_EQ(a.raster.grid, b.raster.grid);
+    EXPECT_EQ(a.raster.data, b.raster.data);
+    EXPECT_EQ(a.labels, b.labels);
+}
+
+TEST(BuildOrthomosaic, GhostingFilterRemovesATransientObjectFromOnePhoto) {
+    // One photograph's private copy gets a saturated object painted into its
+    // centre. Every other camera is unchanged, so the object is a minority
+    // observation. With the filter off the mosaic shows it; with the filter on
+    // the object's cells must read like the unmodified-photos mosaic.
+    OrthoSetup& s = setup();
+    Chunk& chunk = *s.document.active_chunk();
+    const Orthomosaic baseline = run_ortho(s, ghosting_params(false));
+
+    DimmedFlight flight(chunk, 1.0);  // private copies, no dimming
+    std::vector<Frame*> frames;
+    for (const auto& frame : chunk.frames()) {
+        if (frame->camera_id() >= 0) {
+            frames.push_back(frame.get());
+        }
+    }
+    ASSERT_GE(frames.size(), 5U);
+    Frame* target = frames[frames.size() / 2];
+    Image image = read_image(target->path());
+    ASSERT_FALSE(image.empty());
+    const int w = image.width();
+    const int h = image.height();
+    const int box_w = std::max(8, w / 8);
+    const int box_h = std::max(6, h / 12);
+    const int box_col = w / 2 - box_w / 2;
+    const int box_row = h / 2 - box_h / 2;
+    for (int row = box_row; row < box_row + box_h; ++row) {
+        for (int col = box_col; col < box_col + box_w; ++col) {
+            std::uint8_t* px = image.data() +
+                               (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                static_cast<std::size_t>(col)) *
+                                   3U;
+            px[0] = 255;
+            px[1] = 0;
+            px[2] = 255;
+        }
+    }
+    write_png(target->path(), image);
+
+    const Orthomosaic without = run_ortho(s, ghosting_params(false));
+    const Orthomosaic filtered = run_ortho(s, ghosting_params(true));
+    ASSERT_EQ(without.raster.grid, baseline.raster.grid);
+    ASSERT_EQ(filtered.raster.grid, baseline.raster.grid);
+
+    const auto diff = [](const Orthomosaic& a, const Orthomosaic& b, std::size_t i) {
+        double sum = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            sum += std::abs(
+                static_cast<int>(a.raster.data[i * 4 + static_cast<std::size_t>(c)]) -
+                static_cast<int>(b.raster.data[i * 4 + static_cast<std::size_t>(c)]));
+        }
+        return sum / 3.0;
+    };
+    std::size_t object_cells = 0;
+    double filtered_error = 0.0;
+    for (std::size_t i = 0; i + 3 < baseline.raster.data.size(); i += 4) {
+        const std::size_t cell = i / 4;
+        if (baseline.raster.data[cell * 4 + 3] == 0 ||
+            without.raster.data[cell * 4 + 3] == 0 ||
+            filtered.raster.data[cell * 4 + 3] == 0) {
+            continue;
+        }
+        if (diff(without, baseline, cell) > 40.0) {
+            ++object_cells;
+            filtered_error += diff(filtered, baseline, cell);
+        }
+    }
+    std::printf("[BuildOrthomosaic.Ghosting] object cells=%zu mean filtered/base=%.3f\n",
+                object_cells,
+                object_cells == 0 ? 0.0 : filtered_error / static_cast<double>(object_cells));
+    ASSERT_GT(object_cells, 10U) << "ghosting_filter=false should show the painted object";
+    EXPECT_LT(filtered_error / static_cast<double>(object_cells), 15.0)
+        << "the filtered mosaic must take the other cameras' colour at the object";
+}
+
+// ---------------------------------------------------------------------------
 // 7. WP-12.9: build in the requested CRS and reproject at export
 // ---------------------------------------------------------------------------
 
