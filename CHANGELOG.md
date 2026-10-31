@@ -8,6 +8,26 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Python `CoordinateSystem` and `Chunk.crs` (WP-12.11).** The bindings expose
+  the CRS engine as a value type: `CoordinateSystem(epsg)` / `CoordinateSystem()`
+  for the local frame, `CoordinateSystem(wkt=..., proj=..., name=...)`,
+  `CoordinateSystem.init(name)` over the built-in list, and the
+  `name` / `authority` / `epsg` (None when absent) / `wkt` properties plus
+  `toWKT()` and `toProj4()`. `__eq__` is PROJ equivalence rather than string
+  identity, so two definitions of one CRS compare equal, and `repr` is
+  `<CoordinateSystem 'WGS 84 / UTM zone 33N'>`. `listBuiltinCRS()` returns the
+  curated 48-name list; `addGeoid(path)` / `listGeoids()` expose the process
+  geoid registry (a custom grid is referenced where it is, never copied or
+  downloaded). `Chunk.crs` reads and writes the engine CRS; assignment runs
+  the undoable "Set Chunk CRS" command (the first bound command, with
+  `Document.undo` / `redo` / `can_undo` / `undo_name` arriving alongside it)
+  and only relabels the chunk — no reference, pose, tie point or asset is
+  transformed. There is no `datumTransform()`: the engine lists candidate
+  operations per CRS pair (`available_transformations`) and pins one with
+  `with_transformation`, but no single "preferred" operation exists to report.
+  `BuildDem`'s `projection` (EPSG int) and `crs` (text) parameters are covered
+  by the new `python_crs` test.
+
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
   a `color_correction` parameter (off by default). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,
