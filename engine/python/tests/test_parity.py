@@ -178,7 +178,8 @@ class TestDriftInvariant(unittest.TestCase):
                             "ExportOrthomosaic"):
                     doc.run_task("BuildDem")
                 if task in ("BuildOrthomosaic", "ExportOrthomosaic"):
-                    doc.run_task("BuildOrthomosaic", refine_seamlines=False)
+                    doc.run_task("BuildOrthomosaic", refine_seamlines=False,
+                                 color_correction="none")
                 if task in ("ExportModel", "ExportPointCloud"):
                     # The export tasks need a real destination path.
                     with tempfile.TemporaryDirectory() as tmp:

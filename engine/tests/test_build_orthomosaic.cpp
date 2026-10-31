@@ -169,6 +169,12 @@ Params ortho_params(const std::string& blending = "mosaic",
     params.set("refine_seamlines", ParamValue{refine_seamlines});
     params.set("resolution", ParamValue{resolution});
     params.set("projection", ParamValue{projection});
+    // These cases are about geometry, seams or blending, not colour. Affine
+    // correction is the task DEFAULT now, so spell "none" here: it keeps every
+    // such case on the old uncorrected product instead of silently measuring a
+    // different mosaic. Colour-specific cases go through colour_params() or
+    // colour_mode_params(), which overwrite this.
+    params.set("color_correction", ParamValue{std::string("none")});
     return params;
 }
 
@@ -2508,18 +2514,48 @@ TEST(OrthoGain, TaskPathAppliesNonTrivialGainsOnAMismatchedFlight) {
 // the mosaic (sampling, projection and application are all in the path between
 // the two).
 
-TEST(OrthoAffine, none_is_byte_identical_to_the_unparameterised_run) {
-    // The default must not change the product by one grey level. The parameter is
-    // spelled out here rather than left to its default, so a future change of the
-    // default would fail this case instead of silently moving every mosaic.
+TEST(OrthoAffine, default_is_byte_identical_to_an_explicit_affine_run) {
+    // The task default is now "affine". Build the first product from the schema
+    // alone (color_correction left unset so the declared default applies) and
+    // the second with the mode spelled out: they must not differ by one grey
+    // level.
     OrthoSetup& s = setup();
-    const Orthomosaic implicit = run_ortho(s, ortho_params("mosaic", "elevation", 0.125, true, true));
-    Params explicit_none =
-        ortho_params("mosaic", "elevation", 0.125, true, true);
-    explicit_none.set("color_correction", ParamValue{std::string("none")});
-    const Orthomosaic spelled = run_ortho(s, explicit_none);
-    ASSERT_EQ(spelled.raster.grid, implicit.raster.grid);
-    EXPECT_EQ(spelled.raster.data, implicit.raster.data);
+    Params implicit = make_params(builtin_registry().require("BuildOrthomosaic"));
+    implicit.set("resolution", ParamValue{0.125});
+    const Orthomosaic by_default = run_ortho(s, implicit);
+    const Orthomosaic explicit_affine = run_ortho(s, colour_mode_params(0.125, "affine"));
+    ASSERT_EQ(by_default.raster.grid, explicit_affine.raster.grid);
+    EXPECT_EQ(by_default.raster.data, explicit_affine.raster.data);
+}
+
+TEST(OrthoAffine, explicit_none_still_produces_the_uncorrected_mosaic) {
+    // "none" is the escape hatch back to the pre-affine product. The helper's
+    // Bool spelling (false) and the explicit word must agree, and on a flight
+    // with a real exposure spread both must differ from the corrected default,
+    // i.e. the old uncorrected product is still reachable and is not silently
+    // being affine-corrected.
+    OrthoSetup& s = setup();
+    DimmedFlight flight(*s.document.active_chunk(), 0.6);
+    const Orthomosaic via_bool = run_ortho(s, colour_params(0.125, false, 0, false, "disabled"));
+    const Orthomosaic spelled =
+        run_ortho(s, colour_mode_params(0.125, "none", 0, false, "disabled"));
+    ASSERT_EQ(via_bool.raster.grid, spelled.raster.grid);
+    EXPECT_EQ(via_bool.raster.data, spelled.raster.data);
+
+    const Orthomosaic corrected =
+        run_ortho(s, colour_mode_params(0.125, "affine", 0, false, "disabled"));
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i + 3 < spelled.raster.data.size(); i += 4) {
+        if (spelled.raster.data[i + 3] == 0 || corrected.raster.data[i + 3] == 0) {
+            continue;
+        }
+        if (spelled.raster.data[i] != corrected.raster.data[i]) {
+            ++differing;
+        }
+    }
+    EXPECT_GT(differing, 0U)
+        << "explicit \"none\" must leave the old uncorrected product, not the "
+           "affine-corrected default";
 }
 
 TEST(OrthoAffine, a_bool_true_from_an_old_project_selects_the_gain_model) {
