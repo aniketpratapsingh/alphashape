@@ -42,8 +42,14 @@ struct Field {
     std::vector<int> tile_width;
     std::vector<int> tile_height;
     std::vector<int> stride;
+    /// Optional per-tile deviant mask (see SeamOptions::avoid); nullptr entry
+    /// means that tile has no mask. Read through index(t, col, row).
+    std::vector<const std::uint8_t*> avoid;
     std::vector<double> best;
     std::vector<std::uint8_t> any_valid;
+    /// Number of tiles valid at each cell: a lone valid camera is never
+    /// penalised for being deviant, because dropping it would make a hole.
+    std::vector<std::int32_t> valid_count;
     std::vector<std::size_t> parity[2];
 
     std::size_t cells() const {
@@ -83,6 +89,7 @@ void finalize(Field& field) {
     const std::size_t cells = field.cells();
     field.best.assign(cells, 0.0);
     field.any_valid.assign(cells, 0);
+    field.valid_count.assign(cells, 0);
     for (std::size_t t = 0; t < field.tiles(); ++t) {
         const int tw = field.tile_width[t];
         const int th = field.tile_height[t];
@@ -103,6 +110,7 @@ void finalize(Field& field) {
                 const std::size_t cell =
                     cell_row + static_cast<std::size_t>(field.x0[t] + col);
                 field.any_valid[cell] = 1;
+                ++field.valid_count[cell];
                 field.best[cell] = std::max(field.best[cell], static_cast<double>(score[b]));
             }
         }
@@ -140,7 +148,14 @@ double data_cost_at(const Field& field, int label, std::size_t cell, int col, in
         return kForbid;
     }
     const double shortfall = field.best[cell] - static_cast<double>(field.score_at(t, col, row));
-    return options.data_weight * std::max(0.0, shortfall);
+    double cost = options.data_weight * std::max(0.0, shortfall);
+    // Ghosting: prefer a camera the multi-view consensus agrees with. A lone
+    // valid camera is exempt, so a marked cell is never cut into a hole.
+    if (t < field.avoid.size() && field.avoid[t] != nullptr &&
+        field.avoid[t][field.index(t, col, row)] != 0 && field.valid_count[cell] > 1) {
+        cost += options.avoid_cost;
+    }
+    return cost;
 }
 
 /// The same, addressed by a linear cell index.
@@ -199,23 +214,40 @@ double seam_cost(const Field& field, int a, int b, std::size_t p, std::size_t q,
     return seam_cost_at(field, a, b, pcol, prow, qcol, qrow, options);
 }
 
-/// The score-argmax label at one cell, or -1 when nothing covers it.
+/// True when tile `t` is marked deviant at (col, row) and is not the only view
+/// there (the same rule data_cost_at applies).
+bool is_avoided_at(const Field& field, std::size_t t, std::size_t cell, int col, int row) {
+    return t < field.avoid.size() && field.avoid[t] != nullptr &&
+           field.avoid[t][field.index(t, col, row)] != 0 && field.valid_count[cell] > 1;
+}
+
+/// The score-argmax label at one cell, or -1 when nothing covers it. A deviant
+/// camera is skipped when another valid camera exists, so the filter also works
+/// with seam refinement off (which takes this argmax directly).
 int argmax_at(const Field& field, std::size_t cell) {
     const int col = static_cast<int>(cell % static_cast<std::size_t>(field.width));
     const int row = static_cast<int>(cell / static_cast<std::size_t>(field.width));
-    int best_label = -1;
-    double best = 0.0;
-    for (std::size_t t = 0; t < field.tiles(); ++t) {
-        if (!field.valid_at(t, col, row)) {
-            continue;
+    for (int pass = 0; pass < 2; ++pass) {
+        int best_label = -1;
+        double best = 0.0;
+        for (std::size_t t = 0; t < field.tiles(); ++t) {
+            if (!field.valid_at(t, col, row)) {
+                continue;
+            }
+            if (pass == 0 && is_avoided_at(field, t, cell, col, row)) {
+                continue;
+            }
+            const double score = static_cast<double>(field.score_at(t, col, row));
+            if (best_label < 0 || score > best) {
+                best = score;
+                best_label = static_cast<int>(t);
+            }
         }
-        const double score = static_cast<double>(field.score_at(t, col, row));
-        if (best_label < 0 || score > best) {
-            best = score;
-            best_label = static_cast<int>(t);
+        if (best_label >= 0) {
+            return best_label;
         }
     }
-    return best_label;
+    return -1;
 }
 
 std::vector<std::int32_t> argmax_labels(const Field& field) {
@@ -637,23 +669,26 @@ struct Coarse {
     std::vector<std::vector<std::uint8_t>> rgb;
     std::vector<std::vector<float>> score;
     std::vector<std::vector<std::uint8_t>> valid;
+    std::vector<std::vector<std::uint8_t>> avoid;
     Field field;
 };
 
 void build_coarse(Coarse& coarse, const std::vector<OrthoTile>& tiles, int width, int height,
-                  int factor) {
+                  int factor, const std::vector<std::vector<std::uint8_t>>* avoid) {
     const int cw = (width + factor - 1) / factor;
     const int ch = (height + factor - 1) / factor;
     const std::size_t tile_count = tiles.size();
     coarse.rgb.resize(tile_count);
     coarse.score.resize(tile_count);
     coarse.valid.resize(tile_count);
+    coarse.avoid.resize(tile_count);
 
     coarse.field.width = cw;
     coarse.field.height = ch;
     coarse.field.score.resize(tile_count);
     coarse.field.rgb.resize(tile_count);
     coarse.field.valid.resize(tile_count);
+    coarse.field.avoid.assign(tile_count, nullptr);
     coarse.field.x0.resize(tile_count);
     coarse.field.y0.resize(tile_count);
     coarse.field.tile_width.resize(tile_count);
@@ -741,6 +776,29 @@ void build_coarse(Coarse& coarse, const std::vector<OrthoTile>& tiles, int width
         coarse.field.score[t] = coarse.score[t].data();
         coarse.field.rgb[t] = coarse.rgb[t].data();
         coarse.field.valid[t] = coarse.valid[t].data();
+        // The deviant mask follows the same box: a coarse cell is deviant when
+        // any of its fine cells is, which is the conservative direction (a
+        // ghost is kept out, never hidden by downsampling).
+        if (avoid != nullptr && avoid->size() > t && !(*avoid)[t].empty()) {
+            coarse.avoid[t].assign(cells, 0);
+            const std::vector<std::uint8_t>& fine_mask = (*avoid)[t];
+            for (int row = 0; row < tile.height; ++row) {
+                for (int col = 0; col < tile.width; ++col) {
+                    const std::size_t fine = tile.index(col, row);
+                    if (fine >= fine_mask.size() || fine_mask[fine] == 0) {
+                        continue;
+                    }
+                    const int brow = (tile.y0 + row) / factor - ty0;
+                    const int bcol = (tile.x0 + col) / factor - tx0;
+                    if (brow >= 0 && brow < bh && bcol >= 0 && bcol < bw) {
+                        coarse.avoid[t][static_cast<std::size_t>(brow) *
+                                            static_cast<std::size_t>(bw) +
+                                        static_cast<std::size_t>(bcol)] = 1;
+                    }
+                }
+            }
+            coarse.field.avoid[t] = coarse.avoid[t].data();
+        }
     }
     finalize(coarse.field);
 }
@@ -769,6 +827,24 @@ std::vector<std::int32_t> seed_from(const std::vector<std::int32_t>& source, int
         }
     }
     return labels;
+}
+
+/// Attach the optional per-tile deviant masks to a field. A mask whose size
+/// does not match its tile is ignored rather than read out of bounds.
+void attach_avoid(Field& field, const std::vector<OrthoTile>& tiles,
+                  const SeamOptions& options) {
+    if (options.avoid == nullptr || options.avoid->size() != tiles.size()) {
+        return;
+    }
+    field.avoid.assign(tiles.size(), nullptr);
+    for (std::size_t t = 0; t < tiles.size(); ++t) {
+        const std::vector<std::uint8_t>& mask = (*options.avoid)[t];
+        const std::size_t cells = static_cast<std::size_t>(tiles[t].width) *
+                                  static_cast<std::size_t>(tiles[t].height);
+        if (!mask.empty() && mask.size() == cells) {
+            field.avoid[t] = mask.data();
+        }
+    }
 }
 
 /// A full-resolution Field viewing the tiles directly (no copy).
@@ -815,6 +891,7 @@ std::vector<std::int32_t> assign_seams(int width, int height,
     }
 
     Field fine = fine_field(tiles, width, height);
+    attach_avoid(fine, tiles, options);
 
     // A block-wise caller pins the margin cells already decided by an earlier
     // block. A pin only survives when the pinned tile actually covers the cell;
@@ -861,7 +938,7 @@ std::vector<std::int32_t> assign_seams(int width, int height,
     const int levels = std::max(0, options.coarse_levels);
     for (int level = levels; level >= 1; --level) {
         Coarse coarse;
-        build_coarse(coarse, tiles, width, height, 1 << level);
+        build_coarse(coarse, tiles, width, height, 1 << level, options.avoid);
         std::vector<std::int32_t> level_labels =
             previous.empty() ? argmax_labels(coarse.field)
                              : seed_from(previous, previous_width, coarse.field, 2);
@@ -894,7 +971,8 @@ std::vector<std::int32_t> assign_seams(int width, int height,
 
 double energy(int width, int height, const std::vector<OrthoTile>& tiles,
               const std::vector<std::int32_t>& labels, const SeamOptions& options) {
-    const Field field = fine_field(tiles, width, height);
+    Field field = fine_field(tiles, width, height);
+    attach_avoid(field, tiles, options);
     double total = 0.0;
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {

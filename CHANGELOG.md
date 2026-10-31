@@ -29,6 +29,24 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Multi-view consensus ghosting filter for BuildOrthomosaic (Q4).** New
+  `ghosting_filter` parameter (Bool, default `false` while the quality
+  benchmark decides the shipping default). Moving objects — cars, people,
+  transient shadows — seen by only a minority of overlapping views are found
+  before the seams are chosen: at three scales (1x, 4x, 16x) each cell is
+  compared with the per-channel median of the cameras valid there, and a camera
+  further than a robust (MAD) distance plus an absolute grey floor has its cells
+  marked deviant. Per tile the mask is closed then opened and small components
+  are dropped. The seam labeller pays an extra `avoid_cost` on a deviant cell
+  (larger than one smoothness edge, and never charged when the camera is the
+  only valid view, so no hole appears), average blending drops deviant cameras
+  from the mean, and small label islands are relabelled afterwards. The
+  formulation follows robust multi-view deghosting and moving-object removal in
+  mosaics (Jacobs, Loscos & Ward 2008; Gallagher 2005; Davis 1998; Uyttendaele,
+  Eden & Szeliski 2001). New `engine/src/common/algorithm/ortho/ghosting.*`;
+  the masks add 1 byte per tile footprint cell to the block memory estimate and
+  an INFO line reports marked cells and removed speckles.
+
 - **Per-camera, per-channel affine colour correction for the orthomosaic.**
   `BuildOrthomosaic`'s `color_correction="affine"` fits `I' = a_c I + b_c` per
   camera per channel, jointly over all cameras, from observations of the SAME

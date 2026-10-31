@@ -70,6 +70,18 @@ struct SeamOptions {
     double smoothness = 0.30;   ///< constant cost of one label-change edge
     int coarse_levels = 2;      ///< 2x block-mean levels solved before the full grid
     int expansion_cycles = 2;   ///< alpha-expansion passes per pyramid level
+
+    /// Optional per-tile "deviant" masks (ghosting.hpp): one tile-local byte
+    /// mask per tile, non-zero where the multi-view consensus says that camera
+    /// disagrees with the majority. When set, a label on a marked cell pays
+    /// `avoid_cost` in the data term, which is deliberately larger than one
+    /// smoothness edge so the optimiser cuts the object out instead of keeping
+    /// it for the sake of a shorter seam. A marked cell whose tile is the ONLY
+    /// valid one keeps its cell (the cost is not charged), so the filter never
+    /// creates a hole. Nullptr (the default) leaves the labelling unchanged.
+    const std::vector<std::vector<std::uint8_t>>* avoid = nullptr;
+    /// Data-term surcharge for choosing a deviant camera at a cell.
+    double avoid_cost = 1.0;
 };
 
 /// Label per output cell: the index of the winning tile, or -1 where no tile is

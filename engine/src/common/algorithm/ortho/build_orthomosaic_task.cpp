@@ -27,6 +27,7 @@
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/colour_model.hpp"
 #include "common/algorithm/ortho/gain.hpp"
+#include "common/algorithm/ortho/ghosting.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
 #include "common/algorithm/ortho/seamlines.hpp"
 #include "common/core/assets.hpp"
@@ -381,6 +382,7 @@ struct ResolvedOptions {
     ortho::Blending blending = ortho::Blending::Mosaic;
     bool fill_holes = true;
     bool refine_seamlines = true;
+    bool ghosting_filter = false;
     ColourMode colour = ColourMode::None;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
@@ -422,6 +424,7 @@ ResolvedOptions resolve_options(const Params& params) {
     options.blending = ortho::parse_blending(params.get_string("blending_mode"));
     options.fill_holes = params.get_bool("fill_holes");
     options.refine_seamlines = params.get_bool("refine_seamlines");
+    options.ghosting_filter = params.get_bool("ghosting_filter");
     const std::string colour = params.get_string("color_correction");
     options.colour = parse_colour_mode(colour);
     if (options.colour == ColourMode::None && colour != "none" && colour != "false" &&
@@ -617,6 +620,11 @@ constexpr double kBytesPerTileCell = 8.0;/// A coarse seamline pyramid level hol
 constexpr double kCoarseFootprintFraction = 0.25 + 0.0625;
 constexpr double kCoarseFieldBytesPerCell = kBytesPerCellSeamField + kBytesPerCellGridLabels;
 
+/// One deviant-mask byte per tile footprint cell (ghosting.hpp). The seam's
+/// coarse pyramid levels build their own downsampled copy, counted with the
+/// same coarse fraction as the tiles.
+constexpr double kBytesPerGhostMaskCell = 1.0;
+
 /// Per-stage full-grid byte totals.
 struct StageBytes {
     double rectify = 0.0;
@@ -644,12 +652,19 @@ struct StageBytes {
 /// The decoded photograph exists only inside the rectify loop, so it is counted
 /// there and nowhere else: it is released before the seam stage starts.
 double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map,
-                           double photo_cells) {
+                           double photo_cells, bool ghosting = false) {
     const double grid = static_cast<double>(cells);
     const double node_map = has_node_map ? grid * kBytesPerNodeMap : 0.0;
     // The tile set is resident through rectify, seams and blend.
     const double tiles =
         footprint_cells * kBytesPerTileCell * (1.0 + kCoarseFootprintFraction);
+    // The ghosting masks are 1 byte per tile footprint cell, alive from the
+    // rectified tiles through the seam stage; the seam pyramid keeps a coarse
+    // OR of each mask at the same 1/4 + 1/16 fraction as the coarse tiles.
+    const double ghost_masks = ghosting
+                                   ? footprint_cells * kBytesPerGhostMaskCell *
+                                         (1.0 + kCoarseFootprintFraction)
+                                   : 0.0;
     // One decoded photograph, 3 channels of u8, is resident while its tile is
     // built. The image is dropped before the next camera decodes.
     const double photo = photo_cells * 3.0;
@@ -663,9 +678,10 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
     const double coarse = grid * kCoarseFieldBytesPerCell * (1.0 / 4.0 + 1.0 / 16.0);
     const double seam_graph = grid * kSeamGraphBytesPerNode * kSeamGraphCellFraction;
     stages.seams = grid * kBytesPerCellGridLabels + node_map +
-                   grid * kBytesPerCellSeamField + seam_graph + tiles + coarse;
-    stages.blend =
-        grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellBlend + tiles;
+                   grid * kBytesPerCellSeamField + seam_graph + tiles + coarse +
+                   ghost_masks;
+    stages.blend = grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellBlend +
+                   tiles + ghost_masks;
     stages.finalize =
         grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellFinalize;
     return std::max(std::max(stages.rectify, stages.seams),
@@ -1422,13 +1438,14 @@ double estimate_colour_pass_peak_bytes(int camera_count) {
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
-                                 std::uint64_t photo_cache_bytes, bool fill_holes) {
+                                 std::uint64_t photo_cache_bytes, bool fill_holes,
+                                 bool ghosting) {
     // The window's stages are the estimator the whole-grid path already uses,
     // with the window's (block + margin) cell count and its own footprint. The
     // assembled output raster (RGBA, 4 B) plus its seam labels (int32, 4 B) is
     // resident from the first block on and grows to the full output grid.
     const double window = estimate_peak_bytes(window_cells, window_footprint_cells, has_node_map,
-                                              photo_cells);
+                                              photo_cells, ghosting);
     const double assembled = static_cast<double>(output_cells) *
                              (kBytesPerCellGridLabels + 4.0 /* result RGBA */);
     const double staged = window + assembled;
@@ -1493,7 +1510,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         // larger is the block's own peak; the cache comes on top of the larger.
         const double staged =
             estimate_peak_bytes(window_cells, window_footprint, input.has_node_map,
-                                input.photo_cells) +
+                                input.photo_cells, input.ghosting_filter) +
             static_cast<double>(output_cells) * (kBytesPerCellGridLabels + 4.0);
         const double filled =
             input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
@@ -1537,7 +1554,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
         plan.estimated_peak_bytes = std::max(
             estimate_peak_bytes(output_cells, input.footprint_cells, input.has_node_map,
-                                input.photo_cells),
+                                input.photo_cells, input.ghosting_filter),
             colour_peak + static_cast<double>(plan.photo_cache_bytes));
         plan.estimated_window_bytes = plan.estimated_peak_bytes;
         plan.estimated_fill_bytes =
@@ -1546,7 +1563,8 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
     }
     if (input.forced_block_cells <= 0) {
         const double whole = estimate_peak_bytes(output_cells, input.footprint_cells,
-                                                 input.has_node_map, input.photo_cells);
+                                                 input.has_node_map, input.photo_cells,
+                                                 input.ghosting_filter);
         const std::uint64_t one_frame =
             static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
         // The colour pass runs first and holds the cache, so it is a real
@@ -1720,6 +1738,15 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
+    params.declare({"ghosting_filter", ParamType::Bool, false,
+                    "Remove moving objects (cars, people, transient shadows) seen by only "
+                    "a minority of overlapping views. At several scales each cell is "
+                    "compared against the per-channel median of the cameras valid there; "
+                    "a camera more than a robust (MAD) distance from that consensus has its "
+                    "cells marked deviant, and the seam labeller pays to avoid them "
+                    "(average blending also drops them). Needs at least three overlapping "
+                    "views for a majority to exist. Off by default pending the quality "
+                    "benchmark."});
     ParamSpec color_correction{"color_correction", ParamType::String, std::string("affine"),
                                "Per-camera colour compensation applied before seams are chosen: "
                                "\"affine\" (default: a multiplier and an offset per camera per "
@@ -2122,7 +2149,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             predicted_footprint_cells(cameras, candidate_grid, heights, frame);
         const std::uint64_t cells = static_cast<std::uint64_t>(candidate_grid.width) *
                                     static_cast<std::uint64_t>(candidate_grid.height);
-        return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells);
+        return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells,
+                                   options.ghosting_filter);
     };
     const auto grid_at = [&surface](double cell) {
         return ortho_grid_for(surface.grid, cell);
@@ -2143,6 +2171,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.has_node_map = !frame.is_local();
         input.fill_holes = options.fill_holes;
         input.colour_correction = options.colour != ColourMode::None;
+        input.ghosting_filter = options.ghosting_filter;
         input.budget_bytes = budget;
         input.forced_block_cells = 0;
         return plan_ortho_blocks(input);
@@ -2266,6 +2295,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     plan_input.has_node_map = !frame.is_local();
     plan_input.fill_holes = options.fill_holes;
     plan_input.colour_correction = options.colour != ColourMode::None;
+    plan_input.ghosting_filter = options.ghosting_filter;
     plan_input.budget_bytes = budget;
     plan_input.forced_block_cells =
         static_cast<int>(std::max<std::int64_t>(0, params.get_int("block_size")));
@@ -2450,6 +2480,11 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             return reaching;
         };
 
+    // Ghosting diagnostics accumulated over every block (one INFO line at the
+    // end, rather than one per block).
+    std::size_t ghost_deviant_cells = 0;
+    std::size_t ghost_speckles_removed = 0;
+
     for (int br = 0; br < rows; ++br) {
         for (int bc = 0; bc < columns; ++bc, ++block_index) {
             if (progress.is_cancelled()) {
@@ -2570,6 +2605,22 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                                     static_cast<double>(total_blocks));
             }
 
+            // -- multi-view ghosting filter ----------------------------------
+            // Built AFTER rectification and the colour correction, so the
+            // consensus compares the same corrected colours the seam labeller
+            // and the blender see. The masks live until this block's blend.
+            std::vector<std::vector<std::uint8_t>> deviant_masks;
+            if (options.ghosting_filter) {
+                const ortho::GhostOptions ghost_options;
+                deviant_masks =
+                    ortho::detect_ghosts(window.width, window.height, tiles, ghost_options);
+                for (const auto& mask : deviant_masks) {
+                    for (const std::uint8_t value : mask) {
+                        ghost_deviant_cells += value != 0 ? 1U : 0U;
+                    }
+                }
+            }
+
             // -- seam continuity ---------------------------------------------
             // Blocks run in raster order, so every cell above this block or to
             // its left is already decided. Those labels are pinned: the margin
@@ -2663,6 +2714,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             if (!options.refine_seamlines) {
                 seam_options.iterations = 0;
             }
+            if (options.ghosting_filter) {
+                seam_options.avoid = &deviant_masks;
+            }
             labels = ortho::assign_seams(window.width, window.height, tiles, seam_options,
                                         frozen.empty() ? nullptr : &seed,
                                         frozen.empty() ? nullptr : &frozen);
@@ -2695,6 +2749,16 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                                     << pinned_changed << " of " << pinned_cells
                                     << " inherited seam labels";
             }
+            // A ghost cut out by the seam cost can leave a one-camera island
+            // of the wrong label where the object's edge meets the seam. The
+            // speckle pass relabels such islands to a neighbouring label that is
+            // valid at every cell; pinned margin cells are never touched.
+            if (options.ghosting_filter) {
+                const ortho::GhostOptions ghost_options;
+                ghost_speckles_removed += static_cast<std::size_t>(ortho::filter_label_speckles(
+                    window.width, window.height, tiles, labels,
+                    frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells));
+            }
             if (Log::enabled(LogLevel::Info)) {
                 log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="
                                     << pinned_cells << " conflicts=" << pinned_changed
@@ -2704,8 +2768,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             static_cast<double>(block_index + 1) /
                                 static_cast<double>(total_blocks));
 
-            const ortho::OrthoMosaic mosaic = ortho::blend(
-                window.width, window.height, tiles, labels, options.blending, plan.levels);
+            const ortho::OrthoMosaic mosaic =
+                ortho::blend(window.width, window.height, tiles, labels, options.blending,
+                             plan.levels, options.ghosting_filter ? &deviant_masks : nullptr);
             progress.update("blend", static_cast<double>(block_index + 1) /
                                          static_cast<double>(total_blocks));
 
@@ -2735,6 +2800,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 }
             }
         }
+    }
+
+    if (options.ghosting_filter && Log::enabled(LogLevel::Info)) {
+        log(LogLevel::Info) << "BuildOrthomosaic: ghosting filter marked "
+                            << ghost_deviant_cells
+                            << " deviant camera-cell(s) and removed "
+                            << ghost_speckles_removed << " speckle component(s)";
     }
 
     if (options.fill_holes) {
