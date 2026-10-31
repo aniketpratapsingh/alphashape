@@ -2672,7 +2672,7 @@ TEST(OrthoAffine, blocked_and_whole_grid_apply_the_same_affine_model) {
     EXPECT_EQ(differing, 0U)
         << "a per-camera model solved once must make the blocked run identical "
            "to the whole-grid one";
-
+}
 
 // ---------------------------------------------------------------------------
 // 7. WP-12.9: build in the requested CRS and reproject at export
