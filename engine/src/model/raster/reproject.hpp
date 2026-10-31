@@ -35,6 +35,48 @@
 /// centres the transform refuses are written as nodata. Both are out of scope
 /// for the aerial/regional rasters this engine produces, and are why the lattice
 /// error probe measures the mapping rather than assuming a global affinity.
+
+#include <cstdint>
+
+#include "model/crs/coordinate_system.hpp"
+#include "model/raster/geo_raster.hpp"
+
+namespace alphashape {
+
+/// How source samples are combined into a target cell.
+enum class Resampling {
+    Nearest,   ///< the nearest source pixel centre, no mixing (u8 imagery)
+    Bilinear,  ///< nodata-aware bilinear (float DEMs)
+};
+
+/// The lattice spacing the refinement starts from, in target pixels.
+inline constexpr int kLatticeStep = 16;
+/// The largest acceptable source-coordinate error of the lattice, in source
+/// pixels, before the spacing is halved.
+inline constexpr double kMaxLatticeError = 0.1;
+/// Bilinear taps whose total weight falls below this leave the cell nodata.
+inline constexpr double kMinValidWeight = 0.5;
+
+struct ReprojectOptions {
+    /// Target cell size in TARGET CRS units. 0 (default) derives it from the
+    /// source GSD measured at the raster centre.
+    double resolution = 0.0;
+    /// Resampling for float rasters. 8-bit rasters always use nearest.
+    Resampling resampling = Resampling::Bilinear;
+    /// Source sentinel meaning "no measurement" (float rasters).
+    float nodata_in = -32767.0F;
+    /// Written where a target cell has no usable source sample.
+    float nodata_out = -32767.0F;
+    /// 0 (default) refines from `kLatticeStep`; 1 is the exact per-pixel
+    /// mapping; any other positive value pins that spacing.
+    int lattice_step = 0;
+};
+
+/// The target grid for reprojecting `src` from `src_crs` into `dst_crs`: the
+/// extent of the transformed, densified source boundary, its origin snapped
+/// outward to a whole multiple of the cell, and a cell of `resolution`
+/// (0 = the source GSD measured at the raster centre, so a geographic target
+/// gets degrees and a projected one metres).
 ///
 /// @throws ValueError when a CRS is unset/local (nothing to transform between),
 ///         when the transform does not cover the raster, or when no usable cell
