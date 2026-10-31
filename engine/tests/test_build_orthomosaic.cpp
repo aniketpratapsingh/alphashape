@@ -1480,6 +1480,29 @@ TEST(OrthoBlockPlan, WholeGridWhenItFits) {
     EXPECT_FALSE(plan.coarsened);
 }
 
+TEST(OrthoBlockPlan, EstimateGrowsWhenColourCorrectionRuns) {
+    // The colour pass allocates the sampled surface points, their per-camera
+    // colours and the capped observation list BEFORE the block loop. Its peak is
+    // separate in time from a block's, so the plan takes the larger -- but it
+    // must not silently ignore it. With no budget the whole-grid figure is
+    // reported directly, which makes the growth visible.
+    OrthoBlockPlanInput input;
+    input.grid_width = 64;
+    input.grid_height = 64;
+    input.camera_count = 12;
+    input.photo_cells = 480.0 * 360.0;
+    input.footprint_cells = 12.0 * 64.0 * 64.0;
+    input.has_node_map = true;
+    input.budget_bytes = 0;
+    input.colour_correction = false;
+    const OrthoBlockPlan plain = plan_ortho_blocks(input);
+    input.colour_correction = true;
+    const OrthoBlockPlan affine = plan_ortho_blocks(input);
+    EXPECT_GT(affine.estimated_peak_bytes, plain.estimated_peak_bytes)
+        << "the plan must reserve for the colour pass when it is enabled";
+    EXPECT_GT(estimate_colour_pass_peak_bytes(12), 0.0);
+}
+
 TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
     // The estimator itself, on the owner's exact parameters: 36 obliques of
     // 4592x3056 at f ~ 3140 px from 59 m AGL over a 100 m site, planned at the
@@ -2571,6 +2594,21 @@ TEST(OrthoAffine, a_bool_true_from_an_old_project_selects_the_gain_model) {
     const Orthomosaic legacy_product = run_ortho(s, legacy);
     ASSERT_EQ(gain_product.raster.grid, legacy_product.raster.grid);
     EXPECT_EQ(gain_product.raster.data, legacy_product.raster.data);
+}
+
+TEST(OrthoAffine, legacy_zero_and_one_spellings_select_none_and_gain) {
+    // The predecessor's Bool parser also accepted "0"/"1"; a project or script
+    // that recorded those must keep meaning the same thing.
+    OrthoSetup& s = setup();
+    const Orthomosaic none = run_ortho(s, colour_mode_params(0.125, "none"));
+    const Orthomosaic zero = run_ortho(s, colour_mode_params(0.125, "0"));
+    ASSERT_EQ(none.raster.grid, zero.raster.grid);
+    EXPECT_EQ(none.raster.data, zero.raster.data);
+
+    const Orthomosaic gain = run_ortho(s, colour_mode_params(0.125, "gain"));
+    const Orthomosaic one = run_ortho(s, colour_mode_params(0.125, "1"));
+    ASSERT_EQ(gain.raster.grid, one.raster.grid);
+    EXPECT_EQ(gain.raster.data, one.raster.data);
 }
 
 TEST(OrthoAffine, an_unknown_mode_is_refused) {

@@ -500,6 +500,7 @@ namespace {
 using ortho::apply_colour;
 using ortho::CameraColour;
 using ortho::ColourObservation;
+using ortho::pair_observations;
 using ortho::solve_affine_colours;
 
 /// A ground colour (0..1, all channels) that varies over the lattice so `a` and
@@ -626,7 +627,7 @@ TEST(OrthoAffine, recovers_known_gains_and_offsets_within_tolerance) {
 TEST(OrthoAffine, an_outlier_patch_does_not_bias_the_fit) {
     // A moving car: 10% of the lattice points show a different colour in ONE
     // camera. Under an L2 fit those points pull that camera's a and b; under the
-    // Huber loss they are bounded. The recovered coefficients must stay within
+    // Cauchy loss they are down-weighted. The recovered coefficients must stay within
     // 1% of the clean fit, which is what "does not bias" has to mean.
     std::vector<CameraColour> truth(3);
     truth[0].gain = {1.10, 1.00, 0.92};
@@ -755,6 +756,123 @@ TEST(OrthoAffine, apply_scales_and_offsets_only_valid_cells_and_clamps) {
     EXPECT_EQ(tile.rgb[6], 110);
     EXPECT_EQ(tile.rgb[7], 90);
     EXPECT_EQ(tile.rgb[8], 220);
+}
+
+TEST(OrthoAffine, pair_observations_gives_every_camera_a_share) {
+    // A dense flight with a cap small relative to the candidate pairs. A
+    // first-pairs-first cap spends it all on cameras 0 and 1 and leaves the high
+    // indices with no observation (hence the identity); the per-camera share
+    // must reach every camera.
+    constexpr std::size_t kCameras = 8;
+    constexpr std::size_t kPoints = 1000;
+    std::vector<std::vector<int>> points_by_camera(kCameras);
+    std::vector<std::vector<std::array<float, 3>>> colours(kCameras);
+    for (std::size_t k = 0; k < kCameras; ++k) {
+        for (std::size_t p = 0; p < kPoints; ++p) {
+            points_by_camera[k].push_back(static_cast<int>(p));
+            const double v =
+                0.05 + 0.90 * static_cast<double>(p) / static_cast<double>(kPoints - 1);
+            // Odd cameras are half as bright, so their true gain is 2: a camera
+            // that keeps the identity is visible as a gain of exactly 1.
+            const float raw = static_cast<float>(k % 2 == 0 ? v : v * 0.5);
+            colours[k].push_back({raw, raw, raw});
+        }
+    }
+    const std::vector<ColourObservation> observations =
+        pair_observations(points_by_camera, colours, std::size_t{1600});
+    EXPECT_EQ(observations.size(), std::size_t{800});
+    std::vector<bool> seen(kCameras, false);
+    for (const ColourObservation& o : observations) {
+        seen[static_cast<std::size_t>(o.a)] = true;
+        seen[static_cast<std::size_t>(o.b)] = true;
+    }
+    for (std::size_t k = 0; k < kCameras; ++k) {
+        EXPECT_TRUE(seen[k]) << "camera " << k << " must not be starved by the cap";
+    }
+    const std::vector<CameraColour> solved = solve_affine_colours(8, observations);
+    for (std::size_t k = 0; k < kCameras; ++k) {
+        EXPECT_GT(std::abs(solved[k].gain[0] - 1.0), 0.05)
+            << "camera " << k << " kept the identity although its true gain is not 1";
+    }
+}
+
+TEST(OrthoAffine, clipped_samples_do_not_bias_the_fit) {
+    // A clipped 0 or 255 is the sensor's ceiling, not a measurement, and an
+    // affine model fitted to it would be fitting the ceiling. Drop those channel
+    // samples and the recovered coefficients must match the clean solve.
+    std::vector<CameraColour> truth(2);
+    truth[0].gain = {1.15, 1.05, 0.95};
+    truth[0].offset = {8.0, 0.0, -5.0};
+    truth[1].gain = {0.88, 1.00, 1.10};
+    truth[1].offset = {-6.0, 3.0, 4.0};
+    const std::vector<ColourObservation> clean = observations_from_model(truth, 2000);
+    std::vector<ColourObservation> clipped = clean;
+    for (std::size_t i = 0; i < clipped.size(); i += 5) {
+        clipped[i].value_a[0] = 1.0F;
+        clipped[i].value_b[0] = 0.0F;
+    }
+    const std::vector<CameraColour> expected = solve_affine_colours(2, clean);
+    const std::vector<CameraColour> solved = solve_affine_colours(2, clipped);
+    for (std::size_t i = 0; i < truth.size(); ++i) {
+        EXPECT_NEAR(solved[i].gain[0], expected[i].gain[0], 0.02)
+            << "clipped red must not move camera " << i << "'s red gain";
+        EXPECT_NEAR(solved[i].offset[0], expected[i].offset[0], 1.5)
+            << "clipped red must not move camera " << i << "'s red offset";
+        EXPECT_NEAR(solved[i].gain[1], expected[i].gain[1], 1e-9)
+            << "green was untouched, so its solve must be identical";
+    }
+}
+
+TEST(OrthoAffine, a_camera_with_too_few_observations_keeps_the_identity) {
+    // Ten observations cannot pin a two-parameter model; the prior alone would
+    // otherwise invent a correction. The camera must keep the identity instead.
+    std::vector<CameraColour> truth(2);
+    truth[0].gain = {1.2, 1.2, 1.2};
+    truth[1].gain = {0.8, 0.8, 0.8};
+    std::vector<ColourObservation> observations = observations_from_model(truth, 600);
+    for (std::size_t p = 0; p < 10; ++p) {
+        ColourObservation o;
+        o.a = 0;
+        o.b = 2;
+        for (std::size_t ch = 0; ch < 3; ++ch) {
+            o.value_a[ch] = static_cast<float>(scene_colour(p, ch));
+            o.value_b[ch] = static_cast<float>(scene_colour(p, ch) * 0.5);
+        }
+        observations.push_back(o);
+    }
+    const std::vector<CameraColour> solved = solve_affine_colours(3, observations);
+    ASSERT_EQ(solved.size(), 3U);
+    for (int ch = 0; ch < 3; ++ch) {
+        EXPECT_DOUBLE_EQ(solved[2].gain[static_cast<std::size_t>(ch)], 1.0);
+        EXPECT_DOUBLE_EQ(solved[2].offset[static_cast<std::size_t>(ch)], 0.0);
+    }
+    EXPECT_GT(std::abs(solved[0].gain[0] - 1.0), 0.05)
+        << "the well-observed cameras must still be corrected";
+}
+
+TEST(OrthoAffine, a_camera_with_a_flat_channel_keeps_the_identity_there) {
+    // A constant green value has no contrast, so a green gain and offset cannot
+    // be separated. That camera's green channel must stay the identity while its
+    // other channels, which do have spread, are still corrected.
+    std::vector<CameraColour> truth(3);
+    truth[0].gain = {1.10, 1.00, 0.95};
+    truth[0].offset = {5.0, 0.0, -3.0};
+    truth[1].gain = {0.95, 1.05, 1.00};
+    truth[1].offset = {0.0, 2.0, 1.0};
+    truth[2].gain = {1.20, 0.90, 1.05};
+    truth[2].offset = {2.0, -3.0, 4.0};
+    std::vector<ColourObservation> observations = observations_from_model(truth, 800);
+    for (ColourObservation& o : observations) {
+        if (o.b == 2) {
+            o.value_b[1] = 0.5F;
+        }
+    }
+    const std::vector<CameraColour> solved = solve_affine_colours(3, observations);
+    ASSERT_EQ(solved.size(), 3U);
+    EXPECT_DOUBLE_EQ(solved[2].gain[1], 1.0);
+    EXPECT_DOUBLE_EQ(solved[2].offset[1], 0.0);
+    EXPECT_GT(std::abs(solved[2].gain[0] - 1.0), 0.02)
+        << "the channels with real spread must still be corrected";
 }
 
 }  // namespace

@@ -395,10 +395,12 @@ struct ResolvedOptions {
 /// gain solve, and now names it explicitly). Returns None and does not throw on
 /// an unknown word.
 ColourMode parse_colour_mode(const std::string& text) {
-    if (text == "none" || text == "false" || text.empty()) {
+    // "0"/"1" are the spellings the previous Bool written to a project file can
+    // carry (the old parser accepted them), so they mean exactly "false"/"true".
+    if (text == "none" || text == "false" || text == "0" || text.empty()) {
         return ColourMode::None;
     }
-    if (text == "gain" || text == "true") {
+    if (text == "gain" || text == "true" || text == "1") {
         return ColourMode::Gain;
     }
     if (text == "affine") {
@@ -423,7 +425,7 @@ ResolvedOptions resolve_options(const Params& params) {
     const std::string colour = params.get_string("color_correction");
     options.colour = parse_colour_mode(colour);
     if (options.colour == ColourMode::None && colour != "none" && colour != "false" &&
-        !colour.empty()) {
+        colour != "0" && !colour.empty()) {
         throw ValueError("BuildOrthomosaic: color_correction must be \"none\", \"gain\" or "
                          "\"affine\" (got \"" +
                          colour + "\")");
@@ -1146,10 +1148,12 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
         std::max(stride, 1) * std::max(1, static_cast<int>(std::lround(
                                               grid.pixel_size_x / dem_grid.pixel_size_x)));
 
-    // Size the sampling stride from the DEM: the requested stride, then doubled
-    // until the total stays under the cap. Doubling keeps the lattice aligned to
-    // the DEM's own cells (which is what makes the sample set independent of the
-    // output grid's resolution) and converges in a handful of steps.
+    // Size the sampling stride from the DEM: the requested stride scaled by the
+    // output-cell / DEM-cell ratio (so a coarser ortho samples a proportionally
+    // coarser lattice), then doubled until the total stays under the cap.
+    // Doubling keeps the lattice aligned to the DEM's own cells and converges in
+    // a handful of steps; the sample set therefore does follow the output
+    // resolution -- `dem_stride` above already changed with grid.pixel_size.
     std::uint64_t columns = static_cast<std::uint64_t>((dem_grid.width + dem_stride - 1) / dem_stride);
     std::uint64_t rows = static_cast<std::uint64_t>((dem_grid.height + dem_stride - 1) / dem_stride);
     while (columns * rows > static_cast<std::uint64_t>(kAffineMaxPoints) && dem_stride < 4096) {
@@ -1289,56 +1293,14 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
     pixels.shrink_to_fit();
 
     // -- pair extraction and solve --------------------------------------------
-    // Reserve for what this flight can produce, capped: the estimate is
-    // points x pairs-per-point, and reserving the hard ceiling would cost 256 MB
-    // on a run that will never reach it.
-    const std::size_t pairs_per_point =
-        camera_count < 8 ? camera_count * (camera_count - 1) / 2 : 28;
-    const std::size_t estimate = point_count * std::max<std::size_t>(pairs_per_point, 1);
-    std::vector<ortho::ColourObservation> observations;
-    observations.reserve(std::min<std::size_t>(estimate, kAffineMaxObservations));
-    for (std::size_t k = 0; k < colour.size() && observations.size() < kAffineMaxObservations; ++k) {
-        if (points_by_camera[k].empty()) {
-            continue;
-        }
-        for (std::size_t other = k + 1; other < colour.size(); ++other) {
-            if (points_by_camera[other].empty()) {
-                continue;
-            }
-            // Walk both lists in lockstep: both are ascending in point id, so a
-            // merge is linear and needs no bitmap. i and j also index the
-            // per-camera colour vectors, which share the lists' order.
-            std::size_t i = 0;
-            std::size_t j = 0;
-            while (i < points_by_camera[k].size() && j < points_by_camera[other].size() &&
-                   observations.size() < kAffineMaxObservations) {
-                const int a = points_by_camera[k][i];
-                const int b = points_by_camera[other][j];
-                if (a < b) {
-                    ++i;
-                    continue;
-                }
-                if (b < a) {
-                    ++j;
-                    continue;
-                }
-                ortho::ColourObservation observation;
-                observation.a = static_cast<std::int32_t>(k);
-                observation.b = static_cast<std::int32_t>(other);
-                observation.value_a = colour[k][i];
-                observation.value_b = colour[other][j];
-                observations.push_back(observation);
-                ++i;
-                ++j;
-            }
-        }
-        // Release the camera's colour as its pairs are consumed: the model is
-        // solved from the pair list, not from the per-camera arrays.
-        colour[k].clear();
-        colour[k].shrink_to_fit();
-    }
+    // The pairing (with its fair per-camera share of the observation cap) lives
+    // in colour_model.cpp so it can be unit-tested without a flight.
+    std::vector<ortho::ColourObservation> observations =
+        ortho::pair_observations(points_by_camera, colour, kAffineMaxObservations);
     colour.clear();
     colour.shrink_to_fit();
+    points_by_camera.clear();
+    points_by_camera.shrink_to_fit();
 
     if (observations.empty()) {
         // No surface point was seen by two cameras: there is no disagreement to
@@ -1442,6 +1404,21 @@ double estimate_fill_holes_peak_bytes(std::uint64_t output_cells) {
            kFillHolesFixedBytes;
 }
 
+double estimate_colour_pass_peak_bytes(int camera_count) {
+    const double cameras = static_cast<double>(std::max(camera_count, 1));
+    // Worst case: every lattice point is seen by every camera. Each sample holds
+    // its position + score (SurfaceSample), its point id, and its colour (three
+    // floats); then the capped observation list is held. The sampler releases a
+    // camera's sample array as its colours are read, so summing all three per
+    // sample is a conservative upper bound rather than a tight one.
+    const double per_sample = static_cast<double>(sizeof(ortho::SurfaceSample)) + 4.0 +
+                              static_cast<double>(3U * sizeof(float));
+    const double samples = static_cast<double>(kAffineMaxPoints) * cameras;
+    return samples * per_sample +
+           static_cast<double>(kAffineMaxObservations) *
+               static_cast<double>(sizeof(ortho::ColourObservation));
+}
+
 double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footprint_cells,
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
@@ -1467,6 +1444,11 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
     const std::uint64_t width = static_cast<std::uint64_t>(std::max(0, input.grid_width));
     const std::uint64_t height = static_cast<std::uint64_t>(std::max(0, input.grid_height));
     const std::uint64_t output_cells = width * height;
+
+    // The colour pass runs before the block loop and frees almost everything it
+    // allocates, so its peak is a separate candidate for the run's maximum.
+    const double colour_peak =
+        input.colour_correction ? estimate_colour_pass_peak_bytes(input.camera_count) : 0.0;
 
     OrthoBlockPlan plan;
 
@@ -1515,7 +1497,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             static_cast<double>(output_cells) * (kBytesPerCellGridLabels + 4.0);
         const double filled =
             input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
-        const double fixed = std::max(staged, filled);
+        const double fixed = std::max(std::max(staged, filled), colour_peak);
         out.estimated_window_bytes = staged;
         out.estimated_fill_bytes = filled;
 
@@ -1553,9 +1535,10 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         // always held: the cache reuses it across the one block only.
         plan.photo_cache_bytes =
             static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
-        plan.estimated_peak_bytes =
+        plan.estimated_peak_bytes = std::max(
             estimate_peak_bytes(output_cells, input.footprint_cells, input.has_node_map,
-                                input.photo_cells);
+                                input.photo_cells),
+            colour_peak + static_cast<double>(plan.photo_cache_bytes));
         plan.estimated_window_bytes = plan.estimated_peak_bytes;
         plan.estimated_fill_bytes =
             input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
@@ -1564,13 +1547,18 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
     if (input.forced_block_cells <= 0) {
         const double whole = estimate_peak_bytes(output_cells, input.footprint_cells,
                                                  input.has_node_map, input.photo_cells);
-        if (whole <= static_cast<double>(input.budget_bytes)) {
+        const std::uint64_t one_frame =
+            static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
+        // The colour pass runs first and holds the cache, so it is a real
+        // candidate for the one-piece run's peak, not only for a blocked one.
+        const double whole_with_colour =
+            std::max(whole, colour_peak + static_cast<double>(one_frame));
+        if (whole_with_colour <= static_cast<double>(input.budget_bytes)) {
             plan.block_cells = 0;
             plan.levels = -1;
-            plan.photo_cache_bytes =
-                static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
-            plan.estimated_peak_bytes = whole;
-            plan.estimated_window_bytes = whole;
+            plan.photo_cache_bytes = one_frame;
+            plan.estimated_peak_bytes = whole_with_colour;
+            plan.estimated_window_bytes = whole_with_colour;
             plan.estimated_fill_bytes =
                 input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
             return plan;
@@ -2154,6 +2142,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.camera_count = static_cast<int>(cameras.size());
         input.has_node_map = !frame.is_local();
         input.fill_holes = options.fill_holes;
+        input.colour_correction = options.colour != ColourMode::None;
         input.budget_bytes = budget;
         input.forced_block_cells = 0;
         return plan_ortho_blocks(input);
@@ -2276,6 +2265,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     plan_input.camera_count = static_cast<int>(cameras.size());
     plan_input.has_node_map = !frame.is_local();
     plan_input.fill_holes = options.fill_holes;
+    plan_input.colour_correction = options.colour != ColourMode::None;
     plan_input.budget_bytes = budget;
     plan_input.forced_block_cells =
         static_cast<int>(std::max<std::int64_t>(0, params.get_int("block_size")));

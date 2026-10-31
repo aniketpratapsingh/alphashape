@@ -45,6 +45,7 @@
 // pixel; the solve multiplies by 255 on the way out.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -103,6 +104,24 @@ struct ColourObservation {
     std::array<float, 3> value_a{0.0F, 0.0F, 0.0F};
     std::array<float, 3> value_b{0.0F, 0.0F, 0.0F};
 };
+
+/// Extract paired observations from the sampler's per-camera point lists.
+///
+/// `points_by_camera[k][i]` is camera k's i-th shared surface point, ascending,
+/// and `colours[k][i]` is that camera's colour there (same index). Two cameras
+/// contribute one observation wherever their lists name the same point.
+///
+/// The global `max_observations` cap is spent FAIRLY: each camera may contribute
+/// at most max(max_observations / camera_count, 2) observations, and the pairs
+/// are walked in ROUNDS so every camera's first observation is placed before any
+/// camera's second. A plain first-pairs-first cap lets a densely overlapping
+/// flight fill the budget with the low-numbered pairs and leave high-numbered
+/// cameras with none, which silently pins them at the identity. The walk is
+/// deterministic: cameras and points are visited in ascending order only.
+std::vector<ColourObservation> pair_observations(
+    const std::vector<std::vector<int>>& points_by_camera,
+    const std::vector<std::vector<std::array<float, 3>>>& colours,
+    std::size_t max_observations);
 
 /// Solve one (a, b) pair per camera per channel from paired observations.
 ///

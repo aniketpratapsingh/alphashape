@@ -1,16 +1,20 @@
 #include "common/algorithm/ortho/colour_model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <sstream>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
+
+#include "base/utils/log.hpp"
 
 namespace alphashape::ortho {
 namespace {
@@ -104,7 +108,7 @@ struct ChannelState {
     std::vector<double> b;  ///< per camera
 };
 
-/// Huber-weighted sufficient statistics of one camera pair's observations for
+/// Cauchy-weighted sufficient statistics of one camera pair's observations for
 /// one channel, evaluated at the CURRENT coefficients. The residual is the
 /// disagreement of the two corrected colours:
 ///
@@ -123,6 +127,13 @@ PairSums weighted_pair_sums(const ObservationGroup& group,
         const ColourObservation& o = observations[index];
         const double ia = static_cast<double>(o.value_a[ch]);
         const double ib = static_cast<double>(o.value_b[ch]);
+        // A stored value of 0 or 255 is CLIPPED by the camera, not measured: it
+        // may stand for any darker/brighter true colour, so an affine model
+        // fitted to it would be fitting the sensor's ceiling. Drop the channel
+        // for this observation rather than let the clipped end pull the fit.
+        if (!(ia > 0.0 && ia < 1.0) || !(ib > 0.0 && ib < 1.0)) {
+            continue;
+        }
         const double residual =
             (state.a[ia_cam] * ia + state.b[ia_cam]) - (state.a[ib_cam] * ib + state.b[ib_cam]);
         const double w = cauchy_weight(residual, delta);
@@ -137,7 +148,7 @@ PairSums weighted_pair_sums(const ObservationGroup& group,
 }
 
 /// One IRLS Gauss-Newton step for one channel: assemble the sparse normal
-/// equations with the Huber weights frozen at their current values, and take the
+/// equations with the Cauchy weights frozen at their current values, and take the
 /// step. Returns false when the factorisation fails, leaving `state` untouched.
 ///
 /// The residual r = (a_i I_i + b_i) - (a_j I_j + b_j) is HOMOGENEOUS in the
@@ -155,7 +166,8 @@ PairSums weighted_pair_sums(const ObservationGroup& group,
 /// the solution in the gauge the mosaic wants.
 bool irls_step(const std::vector<ObservationGroup>& groups,
                const std::vector<ColourObservation>& observations, int channel,
-               const AffineOptions& options, double delta, ChannelState& state) {
+               const std::vector<char>& usable, const AffineOptions& options, double delta,
+               ChannelState& state) {
     const int n = static_cast<int>(state.a.size());
     const int unknowns = 2 * n;
 
@@ -176,6 +188,13 @@ bool irls_step(const std::vector<ObservationGroup>& groups,
     triplets.reserve(groups.size() * 16U + static_cast<std::size_t>(unknowns));
 
     for (const ObservationGroup& group : groups) {
+        // A camera the channel cannot support (too little data or no usable
+        // intensity spread) contributes nothing, so it cannot drag the cameras it
+        // shares pairs with. It keeps the identity, set by the caller.
+        if (usable[static_cast<std::size_t>(group.a)] == 0 ||
+            usable[static_cast<std::size_t>(group.b)] == 0) {
+            continue;
+        }
         const PairSums sums = weighted_pair_sums(group, observations, channel, state, delta);
         if (!(sums.w > 0.0)) {
             continue;  // every observation of this pair was rejected outright
@@ -259,7 +278,7 @@ bool irls_step(const std::vector<ObservationGroup>& groups,
 /// real camera towards 1 and shrink a genuine correction.
 ///
 /// This runs EVERY iteration, not just at the end: it keeps the iterate in a
-/// physical scale so the Huber threshold is applied to residuals of the size the
+/// physical scale so the Cauchy scale is applied to residuals of the size the
 /// final model will produce. It is a gauge transformation, not a clamp -- no
 /// ratio is destroyed, and no coefficient is bounded here.
 void fix_gauge(ChannelState& state, const std::vector<bool>& observed) {
@@ -311,16 +330,75 @@ std::vector<CameraColour> solve_affine_colours(
         return colours;
     }
 
-    // Which cameras were actually observed. A camera that appears nowhere keeps
-    // the identity: the prior alone would say "1, 0" anyway, but leaving it out
-    // of the gauge means the mean is taken over the cameras the data supports.
-    std::vector<bool> observed(static_cast<std::size_t>(camera_count), false);
+    // -- per-camera, per-channel data strength ------------------------------
+    // Few observations, or a tiny intensity spread, cannot separate a gain from
+    // an offset: the normal equations are near singular and the prior would
+    // quietly invent a correction. Such a camera keeps the identity for that
+    // channel (logged below). Clipped samples (stored 0 or 255) count as seen
+    // but not usable, matching the fit's own rejection of them.
+    struct ChannelSupport {
+        std::size_t seen = 0;    ///< observations naming the camera
+        std::size_t usable = 0;  ///< observations with unclipped values
+        double lo = 1.0;
+        double hi = 0.0;
+    };
+    constexpr std::size_t kMinObservations = 50;
+    constexpr double kMinRangeStored = 8.0 / 255.0;
+    std::vector<std::array<ChannelSupport, 3>> support(
+        static_cast<std::size_t>(camera_count));
     for (const ObservationGroup& group : groups) {
-        observed[static_cast<std::size_t>(group.a)] = true;
-        observed[static_cast<std::size_t>(group.b)] = true;
+        ChannelSupport* const a = support[static_cast<std::size_t>(group.a)].data();
+        ChannelSupport* const b = support[static_cast<std::size_t>(group.b)].data();
+        for (const std::size_t index : group.index) {
+            const ColourObservation& o = observations[index];
+            for (std::size_t ch = 0; ch < 3; ++ch) {
+                ++a[ch].seen;
+                ++b[ch].seen;
+                const double va = static_cast<double>(o.value_a[ch]);
+                const double vb = static_cast<double>(o.value_b[ch]);
+                if (va > 0.0 && va < 1.0) {
+                    ++a[ch].usable;
+                    a[ch].lo = std::min(a[ch].lo, va);
+                    a[ch].hi = std::max(a[ch].hi, va);
+                }
+                if (vb > 0.0 && vb < 1.0) {
+                    ++b[ch].usable;
+                    b[ch].lo = std::min(b[ch].lo, vb);
+                    b[ch].hi = std::max(b[ch].hi, vb);
+                }
+            }
+        }
     }
 
     for (int channel = 0; channel < 3; ++channel) {
+        // Which cameras this channel can support, and hence which take part in
+        // the gauge. A camera that appears nowhere keeps the identity: the
+        // prior alone would say "1, 0" anyway, but leaving it out of the gauge
+        // means the mean is taken over the cameras the data supports.
+        const std::size_t ch = static_cast<std::size_t>(channel);
+        std::vector<bool> observed(static_cast<std::size_t>(camera_count), false);
+        std::vector<char> usable(static_cast<std::size_t>(camera_count), 0);
+        std::ostringstream weak;
+        bool any_weak = false;
+        for (std::size_t i = 0; i < observed.size(); ++i) {
+            const ChannelSupport& s = support[i][ch];
+            const bool ok = s.usable >= kMinObservations && (s.hi - s.lo) >= kMinRangeStored;
+            observed[i] = ok;
+            usable[i] = static_cast<char>(ok ? 1 : 0);
+            if (!ok && s.seen > 0) {
+                if (any_weak) {
+                    weak << ", ";
+                }
+                any_weak = true;
+                weak << i << " (" << s.usable << " usable, range "
+                     << (s.usable > 0 ? (s.hi - s.lo) * 255.0 : 0.0) << " grey)";
+            }
+        }
+        if (any_weak && Log::enabled(LogLevel::Info)) {
+            static const char* const kNames[3] = {"r", "g", "b"};
+            log(LogLevel::Info) << "affine colour camera(s) " << weak.str() << " channel "
+                                << kNames[channel] << ": too weak to fit, using the identity";
+        }
         // Every channel starts at the identity: the correction the model
         // applies when there is nothing to learn. Fixing the gauge here is a
         // no-op on the identity, so it costs one pass and makes the very first
@@ -338,7 +416,8 @@ std::vector<CameraColour> solve_affine_colours(
         int iteration = 0;
         for (; iteration < options.iterations; ++iteration) {
             ChannelState next = state;
-            if (!irls_step(groups, observations, channel, options, options.loss_scale, next)) {
+            if (!irls_step(groups, observations, channel, usable, options, options.loss_scale,
+                           next)) {
                 break;  // singular or non-finite: keep the last usable iterate
             }
             fix_gauge(next, observed);
@@ -384,6 +463,96 @@ std::vector<CameraColour> solve_affine_colours(
         }
     }
     return colours;
+}
+
+std::vector<ColourObservation> pair_observations(
+    const std::vector<std::vector<int>>& points_by_camera,
+    const std::vector<std::vector<std::array<float, 3>>>& colours,
+    std::size_t max_observations) {
+    std::vector<ColourObservation> observations;
+    const std::size_t camera_count = points_by_camera.size();
+    if (camera_count < 2 || max_observations == 0 || colours.size() != camera_count) {
+        return observations;
+    }
+    // Fair share: every camera may appear in at most this many observations, so
+    // the global cap can never be exhausted by the low-numbered pairs alone.
+    // The floor of two matters: with a quota of one, an odd set of cameras
+    // cannot be covered by disjoint pairs and its last camera would starve.
+    const std::size_t per_camera =
+        std::max<std::size_t>(max_observations / camera_count, std::size_t{2});
+    std::vector<std::size_t> emitted(camera_count, 0);
+    // Every pair of cameras that share at least one point, in ascending order.
+    std::vector<std::pair<std::size_t, std::size_t>> pairs;
+    for (std::size_t k = 0; k < camera_count; ++k) {
+        if (points_by_camera[k].empty() || colours[k].size() != points_by_camera[k].size()) {
+            continue;
+        }
+        for (std::size_t other = k + 1; other < camera_count; ++other) {
+            if (points_by_camera[other].empty() ||
+                colours[other].size() != points_by_camera[other].size()) {
+                continue;
+            }
+            pairs.emplace_back(k, other);
+        }
+    }
+    observations.reserve(std::min<std::size_t>(
+        max_observations, per_camera * camera_count / std::size_t{2} + std::size_t{1}));
+    // Each pair's merge cursor: both lists are ascending in point id, so a match
+    // is a straight walk, and the cursor makes the walk resumable across rounds.
+    std::vector<std::size_t> cursor_i(pairs.size(), 0);
+    std::vector<std::size_t> cursor_j(pairs.size(), 0);
+    std::vector<char> touched(camera_count, 0);
+    while (observations.size() < max_observations) {
+        std::fill(touched.begin(), touched.end(), static_cast<char>(0));
+        bool any = false;
+        for (std::size_t p = 0; p < pairs.size() && observations.size() < max_observations;
+             ++p) {
+            const std::size_t k = pairs[p].first;
+            const std::size_t other = pairs[p].second;
+            // One observation per camera per round: every camera's FIRST
+            // observation is placed before any camera's second, so high indices
+            // cannot be crowded out by the low-numbered pairs.
+            if (touched[k] != 0 || touched[other] != 0 || emitted[k] >= per_camera ||
+                emitted[other] >= per_camera) {
+                continue;
+            }
+            const std::vector<int>& ka = points_by_camera[k];
+            const std::vector<int>& kb = points_by_camera[other];
+            bool matched = false;
+            while (cursor_i[p] < ka.size() && cursor_j[p] < kb.size()) {
+                const int a = ka[cursor_i[p]];
+                const int b = kb[cursor_j[p]];
+                if (a < b) {
+                    ++cursor_i[p];
+                } else if (b < a) {
+                    ++cursor_j[p];
+                } else {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                continue;
+            }
+            ColourObservation observation;
+            observation.a = static_cast<std::int32_t>(k);
+            observation.b = static_cast<std::int32_t>(other);
+            observation.value_a = colours[k][cursor_i[p]];
+            observation.value_b = colours[other][cursor_j[p]];
+            ++cursor_i[p];
+            ++cursor_j[p];
+            observations.push_back(observation);
+            ++emitted[k];
+            ++emitted[other];
+            touched[k] = 1;
+            touched[other] = 1;
+            any = true;
+        }
+        if (!any) {
+            break;
+        }
+    }
+    return observations;
 }
 
 void apply_colour(OrthoTile& tile, const CameraColour& colour) {
