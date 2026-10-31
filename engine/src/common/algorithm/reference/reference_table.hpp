@@ -47,7 +47,8 @@ struct ReferenceRow {
 struct ReferenceTable {
     std::vector<ReferenceRow> rows;
     bool georeferenced = false;
-    /// Markers that are control points (role "gcp"); check points excluded.
+    /// Markers that are control points (role "gcp" with a reference source);
+    /// check points and markers without a source are excluded.
     std::size_t control_count() const;
 };
 

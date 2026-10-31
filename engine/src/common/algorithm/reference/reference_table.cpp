@@ -69,7 +69,8 @@ const char* marker_reference_role_name(MarkerReferenceRole role) {
 std::size_t ReferenceTable::control_count() const {
     std::size_t count = 0;
     for (const ReferenceRow& row : rows) {
-        if (row.kind == ReferenceRowKind::Marker) {
+        // A control point needs a surveyed source to constrain anything.
+        if (row.kind == ReferenceRowKind::Marker && row.source.has_value()) {
             ++count;
         }
     }
