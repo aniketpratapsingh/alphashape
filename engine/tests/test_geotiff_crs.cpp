@@ -158,7 +158,7 @@ TEST(Crs, GeoTiffWktGeoKeys) {
     const RawGeoKeys raw = read_raw_geo_keys(path);
     ASSERT_GE(raw.keys.size(), 4U);
     const std::uint16_t entries = raw.keys[3];
-    ASSERT_EQ(raw.keys.size(), 4U + 4U * entries);
+    ASSERT_EQ(raw.keys.size(), 4U + 4U * static_cast<unsigned>(entries));
     std::uint16_t previous = 0;
     bool saw_type = false;
     bool saw_citation = false;
