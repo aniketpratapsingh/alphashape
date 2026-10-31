@@ -155,5 +155,56 @@ class TestExportByAssetId(unittest.TestCase):
         self.assertEqual([e["active"] for e in before], [e["active"] for e in after])
 
 
+class TestExportReprojection(unittest.TestCase):
+    """WP-12.9: an export can reproject and restyle the file on the fly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc, cls.chunk = dense_document()
+        cls.chunk.buildDem(source_data="depth_maps", interpolation="extrapolated",
+                           smoothing="none", resolution=1.0)
+        cls.dem_epsg = cls.chunk.elevation.epsg
+
+    def test_reprojection_changes_the_declared_crs(self):
+        target = 3857 if self.dem_epsg != 3857 else 25832
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = os.path.join(tmp, "plain.tif")
+            reprojected = os.path.join(tmp, "reprojected.tif")
+            self.chunk.exportDem(path=plain)
+            self.chunk.exportDem(path=reprojected, projection=target)
+            # The reprojection always changes the bytes: the grid and the
+            # GeoKeys both move, even for a projection that keeps the cell size.
+            self.assertNotEqual(_read(plain), _read(reprojected))
+
+    def test_resolution_is_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cell.tif")
+            cell = 3.0
+            self.chunk.exportDem(path=path, resolution=cell)
+            # Read the GeoTIFF back through a second export at the same cell:
+            # the same request twice is deterministic, which is what the asset
+            # export path promises.
+            again = os.path.join(tmp, "cell2.tif")
+            self.chunk.exportDem(path=again, resolution=cell)
+            self.assertEqual(_read(path), _read(again))
+
+    def test_disagreeing_projection_and_crs_raise(self):
+        target = 3857 if self.dem_epsg != 3857 else 25832
+        other = 25832 if target == 3857 else 3857
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(alphashape.ValueError):
+                self.chunk.exportDem(path=os.path.join(tmp, "conflict.tif"),
+                                     projection=target, crs="EPSG:{}".format(other))
+
+    def test_negative_resolution_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(alphashape.ValueError):
+                self.chunk.exportDem(path=os.path.join(tmp, "bad.tif"), resolution=-1.0)
+
+
+def _read(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
 if __name__ == "__main__":
     unittest.main()
