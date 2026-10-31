@@ -169,6 +169,108 @@ def accepted_regression(metrics: dict) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _metric_version(metrics: dict, path: str) -> float | None:
+    """The definition version recorded beside a metric, or None when it is unversioned.
+
+    ``reference_based.ortho.metric_version`` describes the whole ``ortho`` block,
+    so a dotted metric path resolves to the version of its enclosing section. A
+    metric's DEFINITION can be redefined in a release — the plan-view offset moved
+    from a global luminance correlation to a per-tile gradient one, and its value
+    changed by design. Comparing the two numbers would fail the first run after
+    the change for a reason no commit caused, so the gate compares only metrics
+    whose version matches on both sides.
+    """
+    section = path.rsplit(".", 1)[0] if "." in path else ""
+    while section:
+        block = metrics
+        for part in section.split("."):
+            block = block.get(part) if isinstance(block, dict) else None
+            if block is None:
+                break
+        if isinstance(block, dict) and "metric_version" in block:
+            value = block.get("metric_version")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            return None
+        section = section.rsplit(".", 1)[0] if "." in section else ""
+    return None
+
+
+def redefined_metrics(current: dict, previous: dict, thresholds: dict) -> list[dict]:
+    """The metric SECTIONS whose definition version differs between the two runs.
+
+    One ``metric_version`` describes a whole section, so the answer is reported per
+    section rather than once per leaf — naming ``ortho.offset_m``, ``ortho.dx_m``,
+    ``ortho.metric_version`` and six more would bury the one fact the reader needs.
+    A section with nothing gated in it is left out: there is no skipped comparison
+    to explain. So is one whose gated values did not actually move — a version
+    bump that changed no number skipped nothing.
+    """
+    if not isinstance(previous, dict):
+        return []
+    current_flat = flatten(current)
+    previous_flat = flatten(previous)
+    sections: dict[str, dict] = {}
+    for path in current_flat:
+        if path not in previous_flat or direction(path, thresholds) is None:
+            continue
+        if current_flat[path] == previous_flat[path]:
+            continue
+        if not _redefined(current, previous, path):
+            continue
+        section = path.rsplit(".", 1)[0] if "." in path else path
+        sections.setdefault(
+            section,
+            {
+                "metric": section,
+                "previous": _metric_version(previous, path),
+                "current": _metric_version(current, path),
+            },
+        )
+    return [sections[key] for key in sorted(sections)]
+
+
+def _redefined(current: dict, previous: dict, path: str) -> bool:
+    """True when the two runs' definition versions for ``path`` are not equal.
+
+    Only EQUAL versions are comparable. A section that declares no version on
+    either side is an ordinary metric and gates exactly as before; a section that
+    declares one on ONE side only is the first run after a version was introduced,
+    whose baseline predates the field — also not comparable, and the same skip.
+    """
+    now = _metric_version(current, path)
+    before = _metric_version(previous, path)
+    if now is None and before is None:
+        return False
+    return now != before
+
+
+def _dispersion_limit(path: str, current: dict, base_limit: float) -> float:
+    """Scale a metric's limit by the dispersion it reported, where it reports one.
+
+    The plan-view offset is measured per tile, so its own scatter says how much of
+    a move is noise on THIS reference. A fixed 5 cm gate is right for a clean one
+    and too tight for a reference that agrees with itself only to 8 cm; the limit
+    is therefore ``max(floor, factor * MAD)``. A metric with no reported
+    dispersion keeps its configured tolerance unchanged.
+    """
+    if path != "reference_based.ortho.offset_m":
+        return base_limit
+    ortho = current.get("reference_based", {}).get("ortho") or {}
+    dispersion = ortho.get("offset_dispersion_m")
+    if not isinstance(dispersion, (int, float)) or isinstance(dispersion, bool):
+        return base_limit
+    try:
+        import metrics as bench_metrics  # noqa: PLC0415 - local: report may run alone
+    except ImportError:  # pragma: no cover - report always runs beside metrics.py
+        return base_limit
+    # The factor is the definition of the policy, and lives with the metric that
+    # reports the ingredients. Keeping it there means one number to change, and
+    # the report cannot drift out of step with the metric's own documentation.
+    scaled = bench_metrics.OFFSET_GATE_DISPERSION_FACTOR * float(dispersion)
+    return max(base_limit, scaled)
+
+
 def regressions(
     current: dict, previous: dict, thresholds: dict
 ) -> tuple[list[dict], list[dict]]:
@@ -183,7 +285,8 @@ def regressions(
 
     A metric absent from the current run (a skipped reference, a dataset change)
     is never a regression: there is nothing to compare, and inventing a failure
-    from a missing number would hide the real cause.
+    from a missing number would hide the real cause. A metric whose DEFINITION
+    changed between the two runs is not one either: see ``_redefined``.
     """
     current_flat = flatten(current)
     previous_flat = flatten(previous)
@@ -198,6 +301,11 @@ def regressions(
             continue
         how = direction(path, thresholds)
         if how is None:
+            continue
+        # A metric that was REDEFINED since the previous run is not comparable to
+        # its old value: the number moved because the definition did. Skip it here
+        # and let the report say so, rather than failing a run no commit regressed.
+        if _redefined(current, previous, path):
             continue
         before = previous_flat[path]
         delta = value - before
@@ -214,6 +322,9 @@ def regressions(
             limit = float(entry["relative"]) * abs(before)
         else:
             limit = float(entry.get("absolute", default_absolute))
+        # A per-tile metric's own scatter says how much of a move is noise on this
+        # reference, so its limit widens with it (never narrows below the floor).
+        limit = _dispersion_limit(path, current, limit)
         # A zero threshold means "report it, never fail on it": a metric with no
         # configured tolerance is a number to watch, not a gate.
         if limit <= 0.0:
@@ -601,8 +712,33 @@ def markdown(
         elif ref_ortho.get("comparable"):
             lines.append("| Orthomosaic vs reference | Value |")
             lines.append("|---|---:|")
-            lines.append(f"| Offset | {_fmt(ref_ortho.get('offset_m'))} m |")
-            lines.append(f"| dx / dy | {_fmt(ref_ortho.get('dx_m'))} / {_fmt(ref_ortho.get('dy_m'))} m |")
+            reliable = ref_ortho.get("offset_reliable", ref_ortho.get("offset_m") is not None)
+            if reliable:
+                lines.append(f"| Offset | {_fmt(ref_ortho.get('offset_m'))} m |")
+                lines.append(
+                    f"| dx / dy | {_fmt(ref_ortho.get('dx_m'))} / {_fmt(ref_ortho.get('dy_m'))} m |"
+                )
+                # The offset is a median over tiles, so its own scatter is part of
+                # the result: a number that agrees across tiles is trustworthy, one
+                # with a wide MAD is a hint rather than a measurement.
+                tiles = ref_ortho.get("tiles") or {}
+                if ref_ortho.get("offset_dispersion_m") is not None:
+                    lines.append(
+                        f"| Tile dispersion (MAD) | {_fmt(ref_ortho.get('offset_dispersion_m'))} m |"
+                    )
+                if tiles:
+                    lines.append(
+                        f"| Confident tiles | {tiles.get('confident')} of "
+                        f"{tiles.get('measured')} measured ({tiles.get('total')} available) |"
+                    )
+            else:
+                # Unreliable: say so in the table rather than showing a bare dash,
+                # so a reader cannot mistake it for "zero".
+                lines.append(f"| Offset | unreliable — {ref_ortho.get('offset_reason', 'not enough confident tiles')} |")
+            if ref_ortho.get("offset_m_legacy") is not None:
+                lines.append(
+                    f"| Offset (legacy luminance) | {_fmt(ref_ortho.get('offset_m_legacy'))} m |"
+                )
             lines.append(f"| Overlap | {_fmt(ref_ortho.get('overlap_fraction'))} |")
             lines.append(f"| Comparison grid | {_fmt(ref_ortho.get('grid_pixel_m'))} m |")
             lines.extend(_crs_rows(ref_ortho.get("crs")))
@@ -741,6 +877,21 @@ def markdown(
                     f"{_fmt(record['current'])} | {_fmt(record['delta'])} | "
                     f"{_fmt(record['limit'])} |"
                 )
+            lines.append("")
+        redefined = redefined_metrics(current, previous, thresholds)
+        if redefined:
+            # Not a regression and not gated: the number moved because the metric
+            # was redefined. Saying so is what stops the silent skip from being
+            # read as "nothing changed".
+            lines.append(
+                "Not compared — redefined since the previous run: "
+                + ", ".join(
+                    f"`{item['metric']}` (v{item['previous'] if item['previous'] is not None else 'unversioned'}"
+                    f" -> v{item['current'] if item['current'] is not None else 'unversioned'})"
+                    for item in redefined
+                )
+                + "."
+            )
             lines.append("")
         if good:
             lines.append(

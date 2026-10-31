@@ -1268,24 +1268,66 @@ class DemMetricsTest(unittest.TestCase):
 
 
 class CompareOrthoTest(unittest.TestCase):
+    """The plan-view offset: colour-invariant, tile-robust, with a null path.
+
+    Every mosaic here is built from one shared texture and shifted by an amount
+    known by construction, so the recovered offset has an exact answer. The
+    ``_scene`` helper is what makes "the same geometry, different colour" a fair
+    test: both sides come from the same array, and only the gains differ.
+    """
+
+    @staticmethod
+    def _scene(size=384, seed=11):
+        """A 1/f texture: energy at every scale, like a real aerial scene.
+
+        Adopted from the module's own conventions (the mask tests build a scene
+        the same way) so the correlation has both fine edges and broad structure
+        to lock onto.
+        """
+        rng = np.random.default_rng(seed)
+        side = size + 64
+        white = rng.random((side, side))
+        spectrum = np.fft.fft2(white)
+        ky = np.fft.fftfreq(side)[:, None]
+        kx = np.fft.fftfreq(side)[None, :]
+        frequency = np.hypot(kx, ky)
+        frequency[0, 0] = 1.0
+        field = np.real(np.fft.ifft2(spectrum / np.maximum(frequency, 1e-6) ** 0.8))
+        field = (field - field.min()) / (field.max() - field.min())
+        margin = 32
+        return field[margin : margin + size, margin : margin + size]
+
+    @staticmethod
+    def _shift(img, dy, dx):
+        """Band-limited shift of ``img`` (a Fourier phase ramp).
+
+        Exact by construction, so a fractional shift is a fractional shift and
+        not the interpolation error of a different resampler.
+        """
+        spectrum = np.fft.fft2(img)
+        ky = np.fft.fftfreq(img.shape[0])[:, None]
+        kx = np.fft.fftfreq(img.shape[1])[None, :]
+        return np.real(np.fft.ifft2(spectrum * np.exp(-2j * np.pi * (dx * kx + dy * ky))))
+
+    def _offset(self, base, shifted, *, pixel=1.0):
+        a = metrics.Raster(base, 0.0, float(base.shape[0]), pixel, pixel)
+        b = metrics.Raster(shifted, 0.0, float(shifted.shape[0]), pixel, pixel)
+        return metrics.compare_ortho_to_reference(a, b)
+
     def test_a_known_pixel_offset_becomes_metres(self):
-        rng = np.random.default_rng(21)
-        size = 96
-        base = metrics._box_blur(rng.random((size, size)), 1)
-        shifted = np.roll(base, (0, 4), axis=(0, 1))
-        a = metrics.Raster(base, 0.0, float(size), 0.5, 0.5)
-        b = metrics.Raster(shifted, 0.0, float(size), 0.5, 0.5)
-        result = metrics.compare_ortho_to_reference(a, b)
+        base = self._scene()
+        shifted = self._shift(base, 0.0, 4.0)
+        result = self._offset(base, shifted, pixel=0.5)
         self.assertTrue(result["comparable"])
         self.assertAlmostEqual(result["dx_px"], 4.0, places=1)
         self.assertAlmostEqual(result["dx_m"], 2.0, delta=0.2)
         self.assertAlmostEqual(result["dy_px"], 0.0, places=1)
+        self.assertTrue(result["offset_reliable"])
 
     def test_identical_rasters_have_zero_offset(self):
-        rng = np.random.default_rng(22)
-        data = metrics._box_blur(rng.random((64, 64)), 1)
-        raster = metrics.Raster(data, 0.0, 64.0, 1.0, 1.0)
-        result = metrics.compare_ortho_to_reference(raster, raster)
+        base = self._scene()
+        result = self._offset(base, base)
+        self.assertTrue(result["offset_reliable"])
         self.assertAlmostEqual(result["offset_m"], 0.0, places=6)
 
     def test_a_tiny_overlap_is_reported_not_scored(self):
@@ -1294,6 +1336,174 @@ class CompareOrthoTest(unittest.TestCase):
         result = metrics.compare_ortho_to_reference(a, b)
         self.assertFalse(result["comparable"])
         self.assertIn("reason", result)
+
+    def test_diagonal_shifts_are_recovered_in_both_axes(self):
+        base = self._scene()
+        shifted = self._shift(base, 3.0, 4.0)
+        result = self._offset(base, shifted)
+        self.assertAlmostEqual(result["dy_px"], 3.0, delta=0.2)
+        self.assertAlmostEqual(result["dx_px"], 4.0, delta=0.2)
+        self.assertAlmostEqual(result["offset_m"], 5.0, delta=0.25)
+
+    def test_the_legacy_value_is_still_reported(self):
+        # One release of comparison: the old luminance number must still be in the
+        # JSON beside the new one, so a reader can see what changed.
+        base = self._scene()
+        result = self._offset(base, self._shift(base, 0.0, 4.0))
+        self.assertIn("offset_m_legacy", result)
+        self.assertAlmostEqual(result["offset_m_legacy"], 4.0, delta=0.3)
+
+    def test_the_metric_carries_its_definition_version(self):
+        # The gate compares only equal versions, so the field itself is load
+        # bearing: a missing version would silently compare a redefinition.
+        result = self._offset(self._scene(), self._scene())
+        self.assertEqual(result["metric_version"], metrics.OFFSET_METRIC_VERSION)
+
+    def test_the_tile_statistics_are_reported(self):
+        base = self._scene()
+        result = self._offset(base, self._shift(base, 2.0, 2.0))
+        tiles = result["tiles"]
+        self.assertGreaterEqual(tiles["confident"], metrics.OFFSET_MIN_CONFIDENT_TILES)
+        self.assertEqual(tiles["measured"], tiles["confident"])
+        self.assertEqual(tiles["total"], 9)
+        self.assertIsNotNone(result["offset_dispersion_m"])
+        self.assertGreaterEqual(result["offset_dispersion_m"], 0.0)
+
+
+class OffsetColourInvarianceTest(unittest.TestCase):
+    """The offset must not move when only the COLOUR moves.
+
+    This is the regression that motivated the metric redefinition: a per-camera
+    gain change with identical geometry flipped the old luminance correlation
+    from 0.985 m to 1.523 m on the aerial-nadir reference. The same scene is used
+    on both sides here, so any movement is colour, not geometry.
+    """
+
+    @staticmethod
+    def _scene(size=384, seed=11):
+        return CompareOrthoTest._scene(size=size, seed=seed)
+
+    @staticmethod
+    def _shift(img, dy, dx):
+        return CompareOrthoTest._shift(img, dy, dx)
+
+    @staticmethod
+    def _patchwork(img, gains):
+        """Multiply each cell by the block gain of its region: a camera patchwork."""
+        out = np.array(img, dtype=np.float64, copy=True)
+        blocks_y, blocks_x = gains.shape
+        h, w = out.shape
+        for iy in range(blocks_y):
+            r0, r1 = h * iy // blocks_y, h * (iy + 1) // blocks_y
+            for ix in range(blocks_x):
+                c0, c1 = w * ix // blocks_x, w * (ix + 1) // blocks_x
+                out[r0:r1, c0:c1] *= gains[iy, ix]
+        return out
+
+    def _offset(self, ours, reference):
+        a = metrics.Raster(ours, 0.0, float(ours.shape[0]), 1.0, 1.0)
+        b = metrics.Raster(reference, 0.0, float(reference.shape[0]), 1.0, 1.0)
+        return metrics.compare_ortho_to_reference(a, b)
+
+    def test_a_per_region_gain_patchwork_does_not_move_the_offset(self):
+        base = self._scene()
+        shifted = self._shift(base, 0.0, 2.5)
+        gains = np.array(
+            [
+                [1.12, 0.87, 1.15, 0.90],
+                [0.85, 1.10, 0.88, 1.13],
+                [1.16, 0.84, 1.09, 0.91],
+                [0.86, 1.14, 0.90, 1.17],
+            ]
+        )
+        plain = self._offset(base, shifted)
+        coloured = self._offset(self._patchwork(base, gains), shifted)
+        self.assertTrue(plain["offset_reliable"])
+        self.assertTrue(coloured["offset_reliable"])
+        self.assertAlmostEqual(coloured["dx_px"], plain["dx_px"], delta=0.2)
+        self.assertAlmostEqual(coloured["offset_m"], plain["offset_m"], delta=0.2)
+
+    def test_a_brightness_ramp_does_not_move_the_offset(self):
+        # A stitching brightness ramp is the same failure mode as a per-camera
+        # gain, spread across the mosaic instead of in blocks.
+        base = self._scene()
+        shifted = self._shift(base, 0.0, 2.5)
+        ramp = np.linspace(0.83, 1.17, base.shape[1])[None, :]
+        plain = self._offset(base, shifted)
+        ramped = self._offset(base * ramp, shifted)
+        self.assertAlmostEqual(ramped["dx_px"], plain["dx_px"], delta=0.2)
+        self.assertAlmostEqual(ramped["dy_px"], plain["dy_px"], delta=0.2)
+
+    def test_a_per_channel_gain_patchwork_does_not_move_the_offset(self):
+        # Colour is three channels; a per-camera white-balance change is a gain
+        # per CHANNEL. The luma weights keep a red/green cast visible, and the
+        # local standardisation then removes it.
+        base = self._scene()
+        shifted = self._shift(base, 0.0, 2.5)
+        gains = np.linspace(0.83, 1.17, 9).reshape(3, 3)
+        ours = np.stack(
+            [self._patchwork(base, gains * (0.90 + 0.10 * c)) for c in range(3)],
+            axis=2,
+        )
+        theirs = np.stack([shifted, shifted, shifted], axis=2)
+        plain = self._offset(base, shifted)
+        coloured = self._offset(ours, theirs)
+        self.assertAlmostEqual(coloured["dx_px"], plain["dx_px"], delta=0.2)
+        self.assertAlmostEqual(coloured["offset_m"], plain["offset_m"], delta=0.2)
+
+    def test_a_featureless_image_is_reported_unreliable(self):
+        # A flat mosaic has no structure to register: the answer must be null and
+        # flagged, never a confident-looking number the gate could act on.
+        flat = np.full((384, 384), 0.5)
+        result = self._offset(flat, flat)
+        self.assertFalse(result["offset_reliable"])
+        self.assertIsNone(result["offset_m"])
+        self.assertIsNone(result["offset_dispersion_m"])
+        self.assertIn("offset_reason", result)
+
+
+class OffsetShiftAccuracyTest(unittest.TestCase):
+    """Known shifts, including fractional ones, recovered to 0.2 px."""
+
+    @staticmethod
+    def _scene(size=384, seed=11):
+        return CompareOrthoTest._scene(size=size, seed=seed)
+
+    @staticmethod
+    def _shift(img, dy, dx):
+        return CompareOrthoTest._shift(img, dy, dx)
+
+    def test_known_shifts_are_recovered_to_a_fifth_of_a_pixel(self):
+        base = self._scene()
+        for dy, dx in ((0.0, 2.5), (7.0, 0.0), (3.0, 4.0)):
+            with self.subTest(dy=dy, dx=dx):
+                result = metrics.compare_ortho_to_reference(
+                    metrics.Raster(base, 0.0, 384.0, 1.0, 1.0),
+                    metrics.Raster(self._shift(base, dy, dx), 0.0, 384.0, 1.0, 1.0),
+                )
+                self.assertTrue(result["offset_reliable"])
+                self.assertAlmostEqual(result["dy_px"], dy, delta=0.2)
+                self.assertAlmostEqual(result["dx_px"], dx, delta=0.2)
+
+    def test_a_seven_pixel_shift_does_not_alias(self):
+        # 7 px is inside the quarter-extent window but far enough that a wrong
+        # spectrum-padding or a wrap-around bug shows up as 7 -> 384-7.
+        base = self._scene()
+        result = metrics.compare_ortho_to_reference(
+            metrics.Raster(base, 0.0, 384.0, 1.0, 1.0),
+            metrics.Raster(self._shift(base, 0.0, 7.0), 0.0, 384.0, 1.0, 1.0),
+        )
+        self.assertAlmostEqual(result["dx_px"], 7.0, delta=0.2)
+
+    def test_unrelated_noise_has_no_confident_tile(self):
+        # Two unrelated textures must not produce a confident offset: every tile's
+        # peak is its own noise floor.
+        rng = np.random.default_rng(1)
+        first = metrics.Raster(rng.random((384, 384)), 0.0, 384.0, 1.0, 1.0)
+        second = metrics.Raster(rng.random((384, 384)), 0.0, 384.0, 1.0, 1.0)
+        result = metrics.compare_ortho_to_reference(first, second)
+        self.assertFalse(result["offset_reliable"])
+        self.assertIsNone(result["offset_m"])
 
 
 class SeamStepTest(unittest.TestCase):

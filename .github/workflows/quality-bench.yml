@@ -559,6 +559,11 @@ jobs:
             # hole placement, filled-cell accuracy) can be answered from the
             # artifact instead of a re-run.
             build/bench/products/dem.tif
+            # The orthomosaic itself, for the same reason: the plan-view offset and
+            # the seam/colour numbers are statistics about this raster, and a
+            # questionable one can be re-measured directly instead of re-running
+            # the whole pipeline.
+            build/bench/products/ortho.tif
           if-no-files-found: warn
           retention-days: 90
 

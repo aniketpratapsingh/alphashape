@@ -32,7 +32,7 @@ only when the publisher ships a matching reference product.
 
 | Metric | Reference | What it says |
 |---|---|---|
-| Ortho offset | a reference orthomosaic | residual plan-view offset in metres, by phase correlation on luminance |
+| Ortho offset | a reference orthomosaic | residual plan-view offset in metres, from Hann-windowed phase correlation of locally standardised Sobel gradient magnitude (colour-invariant) over a 3x3 tile grid, combined by median over confident tiles; reported with the tile MAD and the confident-tile count, and null when fewer than three tiles are confident. The old luminance correlation is kept one release as `offset_m_legacy` |
 | Ortho colour error | a reference orthomosaic | median and p90 local colour residual after one global per-channel affine fit; the fit absorbs a white-balance difference, so a spatially varying gain error survives as the residual |
 | DSM ΔZ | a reference DSM | the raw median offset (a vertical-datum difference, reported with both datums named) and, after removing it, the NMAD and the 68/95 percentiles of \|ΔZ\| — the spread the reconstruction itself contributes, which is what the gate compares |
 | Cloud accuracy / completeness | a laser scan | ETH3D's definition at 2/5/10 cm, after voxel normalisation |
@@ -159,6 +159,18 @@ regression a human has accepted on purpose — see
 
 The first run of a dataset has no baseline, so it always passes and simply establishes
 one.
+
+Two rules keep a redefinition from being mistaken for a regression:
+
+* **A metric with a `metric_version` is only compared when both runs share it.** The
+  ortho offset was redefined once (global luminance correlation -> per-tile gradient
+  one) and its value changed by design; comparing across that would have failed the
+  first run after the change for a reason no commit caused. The report names any metric
+  it skipped for this reason.
+* **A per-tile metric's limit widens with its own scatter.** The ortho offset is a
+  median over tiles, so its limit is `max(0.05 m, 2 x tile MAD)` — a reference that
+  agrees with itself only to 8 cm gets a 16 cm gate rather than failing on its noise.
+  The ingredients (`offset_dispersion_m`, `tiles.confident`) are in the metrics JSON.
 
 ### Measuring a non-default configuration
 
