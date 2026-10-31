@@ -8,6 +8,23 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Robust per-cell height fusion for BuildDem (Q3).** `BuildDem` gains `fusion`
+  (string, default `"median"`; the other value is `"robust"`). The default keeps
+  the historical per-cell median and its output byte-for-byte. With `"robust"`,
+  a cell's measured observations are sorted (height, then confidence) and fused
+  with a Tukey biweight M-estimate: the scale is 1.4826 times the cell's MAD,
+  floored at a quarter of the cell size; when a cell holds at least five
+  observations the estimator keeps the central 70% by rank around the median
+  (never fewer than three); two IRLS steps then refine the centre with
+  per-observation weights of confidence times the biweight (c = 4.685). The
+  cell's TGV data weight becomes the sum of the final weights, reduced by an
+  agreement factor when the kept set's weighted RMS residual is large relative
+  to twice the scale floor, so trimmed or rejected samples do not count and a
+  disagreement-heavy cell weighs less. Repaired depth samples still never enter
+  the estimate: a cell with any measurement fuses measurements only, and a cell
+  with none keeps the repaired median. Unknown values are rejected like the
+  other BuildDem string options. The estimator lives in `cell_fusion.hpp/.cpp`.
+
 - **Post-filter depth-map hole repair.** `BuildDepthMaps` gains `repair_holes`
   (bool, default `false`) and `repair_max_area` (int pixels, default `2000`).
   When enabled, after the cross-view consistency filter each depth map's

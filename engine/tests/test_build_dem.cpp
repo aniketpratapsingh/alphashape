@@ -1799,5 +1799,57 @@ TEST(ExportDem, TooCoarseAGridIsRefused) {
     EXPECT_TRUE(threw);
 }
 
+/// Every cell's stored height, row-major: exact float comparison (the nodata
+/// sentinel is a fixed float, so this is byte-identical, not approximate).
+std::vector<float> dem_values(const Elevation& dem) {
+    std::vector<float> values;
+    const int width = dem.raster.grid.width;
+    const int height = dem.raster.grid.height;
+    values.reserve(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            values.push_back(dem.raster.at(col, row));
+        }
+    }
+    return values;
+}
+
+// ---------------------------------------------------------------------------
+// 13. Q3: robust per-cell height fusion
+// ---------------------------------------------------------------------------
+
+TEST(Dem, RobustFusionIsDeterministicAndDefaultStaysMedian) {
+    const auto build = [](const std::string& fusion, bool set_fusion) {
+        Document document = make_local_chunk_document();
+        fill_truth_point_cloud(*document.active_chunk(), -10.0, 10.0, -10.0, 10.0, 0.25);
+        Params params = dem_params("point_cloud", "disabled", 0.5, 0, "nearest", "none");
+        if (set_fusion) {
+            params.set("fusion", ParamValue{fusion});
+        }
+        run_build_dem(document, params);
+        return document.active_chunk()->elevation();
+    };
+    const Elevation robust_one = build("robust", true);
+    const Elevation robust_two = build("robust", true);
+    const Elevation default_fusion = build("", false);
+    const Elevation explicit_median = build("median", true);
+
+    ASSERT_FALSE(robust_one.empty());
+    EXPECT_EQ(robust_one.raster.grid.width, robust_two.raster.grid.width);
+    EXPECT_EQ(robust_one.raster.grid.height, robust_two.raster.grid.height);
+    EXPECT_EQ(robust_one.raster.grid.width, explicit_median.raster.grid.width);
+    EXPECT_EQ(robust_one.raster.grid.height, explicit_median.raster.grid.height);
+    // Two robust runs are bit-identical ...
+    EXPECT_EQ(dem_values(robust_one), dem_values(robust_two));
+    // ... and the absent parameter is exactly the historical median path.
+    EXPECT_EQ(dem_values(default_fusion), dem_values(explicit_median));
+
+    Document bogus_document = make_local_chunk_document();
+    fill_truth_point_cloud(*bogus_document.active_chunk(), -10.0, 10.0, -10.0, 10.0, 0.25);
+    Params bogus = dem_params("point_cloud", "disabled", 0.5, 0, "nearest", "none");
+    bogus.set("fusion", ParamValue{std::string("bogus")});
+    EXPECT_THROW(run_build_dem(bogus_document, bogus), ValueError);
+}
+
 }  // namespace
 }  // namespace alphashape
