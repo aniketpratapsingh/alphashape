@@ -2793,7 +2793,11 @@ TEST(BuildOrthomosaic, GhostingFilterRemovesATransientObjectFromOnePhoto) {
         }
         return sum / 3.0;
     };
+    const std::int32_t target_camera = target->camera_id();
     std::size_t object_cells = 0;
+    std::size_t labels_changed = 0;
+    std::size_t ghost_kept = 0;
+    double without_error = 0.0;
     double filtered_error = 0.0;
     for (std::size_t i = 0; i + 3 < baseline.raster.data.size(); i += 4) {
         const std::size_t cell = i / 4;
@@ -2804,11 +2808,16 @@ TEST(BuildOrthomosaic, GhostingFilterRemovesATransientObjectFromOnePhoto) {
         }
         if (diff(without, baseline, cell) > 40.0) {
             ++object_cells;
+            without_error += diff(without, baseline, cell);
             filtered_error += diff(filtered, baseline, cell);
+            labels_changed += filtered.labels[cell] != without.labels[cell] ? 1U : 0U;
+            ghost_kept += filtered.labels[cell] == target_camera ? 1U : 0U;
         }
     }
-    std::printf("[BuildOrthomosaic.Ghosting] object cells=%zu mean filtered/base=%.3f\n",
-                object_cells,
+    std::printf("[BuildOrthomosaic.Ghosting] object cells=%zu camera=%d changed=%zu ghost_kept=%zu "
+                "mean without/base=%.3f filtered/base=%.3f\n",
+                object_cells, static_cast<int>(target_camera), labels_changed, ghost_kept,
+                object_cells == 0 ? 0.0 : without_error / static_cast<double>(object_cells),
                 object_cells == 0 ? 0.0 : filtered_error / static_cast<double>(object_cells));
     ASSERT_GT(object_cells, 10U) << "ghosting_filter=false should show the painted object";
     EXPECT_LT(filtered_error / static_cast<double>(object_cells), 15.0)
