@@ -66,6 +66,21 @@ All notable changes to alphashape are recorded here. The format follows
   and their scratch planes are counted in the block memory estimate and an INFO
   line reports marked cells and removed speckles.
 
+- **WP-13.1: chunk reference settings, check points and the reference table
+  (M13).** A chunk now carries `ReferenceSettings` — the six observation
+  accuracies (camera location/rotation, marker location/projection, scale bar,
+  tie point) plus `use_gcp` — exposed in Python under the public API names
+  (`chunk.camera_location_accuracy`, …) and edited through the undoable
+  "Set Reference Settings" command, which rejects non-positive values.
+  Non-default settings persist under a `<reference>` element in doc.xml using
+  those same snake_case names; a default chunk writes no element, so existing
+  projects stay byte-identical. Markers gain a free-form meta map whose `"type"`
+  key is `"gcp"` or `"check_point"` (absent = gcp), and
+  `reference::build_reference_table(chunk, display_crs)` reports one row per
+  camera/marker with source, estimated, signed error, sigma and capture
+  distance, together with `control_count()` (markers excluding check points).
+  `chunk.reference_table()` in Python returns the same rows as dicts.
+
 - **Robust per-cell height fusion for BuildDem (Q3).** `BuildDem` gains `fusion`
   (string, default `"median"`; the other value is `"robust"`). The default keeps
   the historical per-cell median and its output byte-for-byte. With `"robust"`,

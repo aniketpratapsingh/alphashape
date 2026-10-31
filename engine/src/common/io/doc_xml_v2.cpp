@@ -360,6 +360,9 @@ void write_markers(const Chunk& chunk, XmlNode& node) {
                 }
             }
         }
+        if (!marker.meta.items.empty()) {
+            write_meta(marker.meta, e);
+        }
         if (marker.reference.has_value()) {
             const Eigen::Vector3d& r = *marker.reference;
             set_attr(e, "location", vec3(r));
@@ -749,6 +752,53 @@ void read_crs_slots(const XmlNode& parent, Chunk& chunk, ReadReport* report) {
     }
 }
 
+/// Chunk-level reference accuracies (WP-13.1). Written only when a value
+/// differs from the default, so an untouched project carries no <reference>
+/// element and re-saves byte-identically. Attribute names are the public Python
+/// API spellings, which is what scripts already use.
+void write_reference_settings(const Chunk& chunk, XmlNode& parent) {
+    const ReferenceSettings& s = chunk.reference_settings();
+    if (s.is_default()) {
+        return;
+    }
+    XmlNode& e = add_child(parent, "reference");
+    set_attr(e, "camera_location_accuracy", fmt(s.camera_location_accuracy_m));
+    set_attr(e, "camera_rotation_accuracy", fmt(s.camera_rotation_accuracy_deg));
+    set_attr(e, "marker_location_accuracy", fmt(s.marker_location_accuracy_m));
+    set_attr(e, "marker_projection_accuracy", fmt(s.marker_projection_accuracy_px));
+    set_attr(e, "scalebar_accuracy", fmt(s.scalebar_accuracy_m));
+    set_attr(e, "tiepoint_accuracy", fmt(s.tiepoint_accuracy_px));
+    set_attr(e, "use_gcp", fmt_bool(s.use_gcp));
+}
+
+/// Read the element back. Absent fields keep the default; an old project has
+/// no element at all and therefore loads with the defaults unchanged.
+void read_reference_settings(const XmlNode& node, Chunk& chunk, ReadReport* report) {
+    const XmlNode* e = find_child(node, "reference");
+    if (e == nullptr) {
+        return;
+    }
+    warn_unknown_attrs(*e,
+                       {"camera_location_accuracy", "camera_rotation_accuracy",
+                        "marker_location_accuracy", "marker_projection_accuracy",
+                        "scalebar_accuracy", "tiepoint_accuracy", "use_gcp"},
+                       report);
+    ReferenceSettings s;
+    const auto read = [&](const char* name, double& target) {
+        if (const std::string* value = find_attr(*e, name)) {
+            target = parse_double(*value);
+        }
+    };
+    read("camera_location_accuracy", s.camera_location_accuracy_m);
+    read("camera_rotation_accuracy", s.camera_rotation_accuracy_deg);
+    read("marker_location_accuracy", s.marker_location_accuracy_m);
+    read("marker_projection_accuracy", s.marker_projection_accuracy_px);
+    read("scalebar_accuracy", s.scalebar_accuracy_m);
+    read("tiepoint_accuracy", s.tiepoint_accuracy_px);
+    s.use_gcp = parse_bool(attr_or(*e, "use_gcp", "true"));
+    chunk.set_reference_settings(s);
+}
+
 /// The containers every chunk carries, in the fixed order the writer emits
 /// them. The reader dispatches over the same set; anything else inside <chunk>
 /// is a hard error (v2 is strict about elements, §4.4).
@@ -793,6 +843,7 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
     set_attr(add_child(node, "transform"), "matrix", matrix4(chunk.transform()));
     write_crs("crs", chunk.crs(), node);
     write_crs_slots(chunk, node);
+    write_reference_settings(chunk, node);
     write_meta(chunk.meta(), node);
 }
 
@@ -1017,6 +1068,10 @@ void read_markers(const XmlNode& node, Chunk& chunk, ReadReport* report) {
                               : -1;
         marker.type = parse_marker_type(attr_or(e, "type", "regular"));
         for (const XmlNode& proj : e.children) {
+            if (proj.name == "meta") {
+                read_meta(&proj, marker.meta);
+                continue;
+            }
             if (proj.name != "projection") {
                 continue;
             }
@@ -1487,6 +1542,7 @@ void check_chunk_vocabulary(const XmlNode& node) {
         "dense_clouds", "models",  "tiled_models",  "elevations", "orthomosaics",
         "trajectories", "shapes",  "panorama",      "region",     "transform",
         "crs",       "meta",       "camera_crs",    "marker_crs", "world_crs",
+        "reference",
     };
     for (const XmlNode& child : node.children) {
         bool known = false;
@@ -1539,6 +1595,7 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
     }
     read_crs(find_child(node, "crs"), chunk.crs());
     read_crs_slots(node, chunk, report);
+    read_reference_settings(node, chunk, report);
     read_meta(find_child(node, "meta"), chunk.meta());
 
     // The id allocator, when the writer recorded it, and then reserve every

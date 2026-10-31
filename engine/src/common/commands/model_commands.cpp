@@ -2419,6 +2419,51 @@ private:
     CRS previous_;
 };
 
+/// Replace a chunk's reference settings. Every accuracy is a 1-sigma weight, so
+/// a non-positive or non-finite value is meaningless and rejected up front;
+/// `revert()` restores the previous value byte for byte.
+class SetReferenceSettingsCommand : public StagedMutation {
+public:
+    SetReferenceSettingsCommand(std::int32_t chunk_id, ReferenceSettings settings)
+        : chunk_id_(chunk_id), settings_(settings) {}
+
+    std::string name() const override { return "Set Reference Settings"; }
+
+protected:
+    void validate(Document& document) override {
+        (void)require_chunk(document, chunk_id_);
+        const auto positive = [](double value) {
+            return std::isfinite(value) && value > 0.0;
+        };
+        if (!positive(settings_.camera_location_accuracy_m) ||
+            !positive(settings_.camera_rotation_accuracy_deg) ||
+            !positive(settings_.marker_location_accuracy_m) ||
+            !positive(settings_.marker_projection_accuracy_px) ||
+            !positive(settings_.scalebar_accuracy_m) ||
+            !positive(settings_.tiepoint_accuracy_px)) {
+            throw ValueError(
+                "set reference settings: every accuracy must be positive and finite");
+        }
+    }
+
+    void stage(Document& document) override {
+        previous_ = require_chunk(document, chunk_id_).reference_settings();
+    }
+
+    void commit(Document& document) override {
+        require_chunk(document, chunk_id_).set_reference_settings(settings_);
+    }
+
+    void restore(Document& document) override {
+        require_chunk(document, chunk_id_).set_reference_settings(previous_);
+    }
+
+private:
+    std::int32_t chunk_id_;
+    ReferenceSettings settings_;
+    ReferenceSettings previous_;
+};
+
 // --- chunk factories -------------------------------------------------------
 
 }  // namespace
@@ -2539,6 +2584,11 @@ std::unique_ptr<AbstractCommand> make_set_chunk_transform_command(
 std::unique_ptr<AbstractCommand> make_set_chunk_crs_command(std::int32_t chunk_id,
                                                             CRS crs) {
     return std::make_unique<SetChunkCrsCommand>(chunk_id, std::move(crs));
+}
+
+std::unique_ptr<AbstractCommand> make_set_reference_settings_command(
+    std::int32_t chunk_id, ReferenceSettings settings) {
+    return std::make_unique<SetReferenceSettingsCommand>(chunk_id, settings);
 }
 
 std::unique_ptr<AbstractCommand> make_align_chunks_command(std::int32_t chunk_id,

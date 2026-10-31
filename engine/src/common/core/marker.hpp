@@ -14,6 +14,8 @@
 
 #include <Eigen/Core>
 
+#include "common/core/types.hpp"
+
 namespace alphashape {
 
 /// One image measurement of a marker: the pixel it was clicked at in a camera.
@@ -54,9 +56,15 @@ struct Marker {
     bool valid = false;     ///< has enough projections / passed filtering
     bool internal = false;  ///< created by the engine, not the user
 
+    /// Free-form marker properties. WP-13.1 stores the reference role under the
+    /// key "type": "gcp" (control point) or "check_point" (held out of the
+    /// adjustment). Absent means "gcp" when a reference exists.
+    Meta meta;
+
     bool operator==(const Marker& other) const {
         if (id != other.id || label != other.label || group_id != other.group_id ||
-            type != other.type || projections != other.projections) {
+            type != other.type || projections != other.projections ||
+            !(meta == other.meta)) {
             return false;
         }
         if (reference.has_value() != other.reference.has_value() ||

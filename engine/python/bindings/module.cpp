@@ -28,6 +28,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -39,6 +40,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
+#include "common/algorithm/reference/reference_table.hpp"
 #include "common/commands/command.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
@@ -408,6 +410,39 @@ void apply_crs_command(py::object chunk_self, alphashape::CRS crs) {
     const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
     alphashape::make_set_chunk_crs_command(id, std::move(crs))->apply(*document);
 }
+
+/// Replace one accuracy in the owning Document's chunk through the undoable
+/// "Set Reference Settings" command, then discard the command (a scripted
+/// assignment is not a stack entry; the GUI owns undo). `field` names the
+/// member so the six public properties share one implementation.
+void set_reference_accuracy(py::object chunk_self,
+                            double alphashape::ReferenceSettings::*field,
+                            double value) {
+    if (!(value > 0.0)) {
+        throw alphashape::ValueError("reference accuracy must be positive");
+    }
+    if (!py::hasattr(chunk_self, "_document")) {
+        throw py::type_error("this Chunk is not attached to a Document");
+    }
+    auto document =
+        chunk_self.attr("_document").cast<std::shared_ptr<alphashape::Document>>();
+    alphashape::ReferenceSettings settings =
+        chunk_self.cast<const alphashape::Chunk&>().reference_settings();
+    settings.*field = value;
+    const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
+    alphashape::make_set_reference_settings_command(id, settings)->apply(*document);
+}
+
+#if defined(ALPHASHAPE_USE_PROJ)
+/// (x, y, z) tuple or None, the shape every optional vector in the reference
+/// table uses. The table itself needs the CRS engine, so this lives with it.
+py::object optional_vec3(const std::optional<Eigen::Vector3d>& value) {
+    if (!value) {
+        return py::none();
+    }
+    return py::make_tuple(value->x(), value->y(), value->z());
+}
+#endif  // ALPHASHAPE_USE_PROJ
 
 #if defined(ALPHASHAPE_USE_PROJ)
 /// The process-wide geoid registry behind CoordinateSystem.addGeoid/listGeoids.
@@ -1011,6 +1046,132 @@ PYBIND11_MODULE(alphashape, m) {
                                [](const Chunk& c) { return c.camera_crs().epsg; })
         .def_property_readonly("marker_crs_epsg",
                                [](const Chunk& c) { return c.marker_crs().epsg; })
+        // Reference settings (WP-13.1). The names are the public Python API
+        // spellings so scripts that set them keep working. Each assignment goes
+        // through the undoable "Set Reference Settings" command, then the
+        // command is discarded: the GUI owns the history, as with `crs`.
+        .def_property(
+            "camera_location_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    return c.reference_settings().camera_location_accuracy_m;
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::camera_location_accuracy_m, value);
+                },
+                py::is_method(m)))
+        .def_property(
+            "camera_rotation_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    return c.reference_settings().camera_rotation_accuracy_deg;
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::camera_rotation_accuracy_deg, value);
+                },
+                py::is_method(m)))
+        .def_property(
+            "marker_location_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    return c.reference_settings().marker_location_accuracy_m;
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::marker_location_accuracy_m, value);
+                },
+                py::is_method(m)))
+        .def_property(
+            "marker_projection_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    return c.reference_settings().marker_projection_accuracy_px;
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::marker_projection_accuracy_px,
+                        value);
+                },
+                py::is_method(m)))
+        .def_property(
+            "scalebar_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    return c.reference_settings().scalebar_accuracy_m;
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::scalebar_accuracy_m, value);
+                },
+                py::is_method(m)))
+        .def_property(
+            "tiepoint_accuracy",
+            py::cpp_function(
+                [](const Chunk& c) { return c.reference_settings().tiepoint_accuracy_px; },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, double value) {
+                    set_reference_accuracy(
+                        self, &alphashape::ReferenceSettings::tiepoint_accuracy_px, value);
+                },
+                py::is_method(m)))
+        // The reference table (WP-13.1): one dict per camera and per marker
+        // with its measured and adjusted positions in `display_crs` (the
+        // chunk's own CRS when omitted), the signed error, the sigma and the
+        // capture distance. An unreferenced chunk reports chunk-local units.
+#if defined(ALPHASHAPE_USE_PROJ)
+        .def(
+            "reference_table",
+            [](const Chunk& c, py::object display) {
+                alphashape::crs::CoordinateSystem display_crs;
+                if (!display.is_none()) {
+                    display_crs =
+                        display.cast<alphashape::crs::CoordinateSystem>();
+                }
+                const alphashape::reference::ReferenceTable table =
+                    alphashape::reference::build_reference_table(c, display_crs);
+                py::list out;
+                for (const alphashape::reference::ReferenceRow& row : table.rows) {
+                    py::dict entry;
+                    entry[py::str("id")] = py::int_(row.id);
+                    entry[py::str("label")] = py::str(row.label);
+                    const char* kind = "camera";
+                    if (row.kind == alphashape::reference::ReferenceRowKind::Marker) {
+                        kind = "marker";
+                    } else if (row.kind ==
+                               alphashape::reference::ReferenceRowKind::CheckPoint) {
+                        kind = "check_point";
+                    }
+                    entry[py::str("kind")] = py::str(kind);
+                    entry[py::str("enabled")] = py::bool_(row.enabled);
+                    entry[py::str("source")] = optional_vec3(row.source);
+                    entry[py::str("estimated")] = optional_vec3(row.estimated);
+                    entry[py::str("error")] = optional_vec3(row.error);
+                    entry[py::str("sigma")] = py::float_(row.sigma);
+                    if (std::isfinite(row.capture_distance_m)) {
+                        entry[py::str("capture_distance")] =
+                            py::float_(row.capture_distance_m);
+                    } else {
+                        entry[py::str("capture_distance")] = py::none();
+                    }
+                    out.append(std::move(entry));
+                }
+                return out;
+            },
+            py::arg("display_crs") = py::none())
+#endif  // ALPHASHAPE_USE_PROJ
         // Markers (M11 §4.1 / WP-11.7). Each entry is a dict with `id`, `label`,
         // `position` (a chunk-local (x, y, z) tuple, or None while unestimated)
         // and `reference` (a (lon, lat, alt) tuple, or None). AlignChunks pairs
