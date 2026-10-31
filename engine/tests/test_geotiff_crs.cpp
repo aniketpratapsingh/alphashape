@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ CoordinateSystem custom_crs() {
         "+datum=WGS84 +units=m");
 }
 
+/// A geographic CRS with a non-standard prime meridian: no EPSG code exists
+/// for it, so it exercises the user-defined geographic path.
+CoordinateSystem custom_geographic_crs() {
+    return CoordinateSystem::from_proj("+proj=longlat +datum=WGS84 +pm=1.234");
+}
+
 /// The two GeoTIFF directories read back verbatim.
 struct RawGeoKeys {
     std::vector<std::uint16_t> keys;
@@ -76,6 +83,53 @@ RawGeoKeys read_raw_geo_keys(const std::string& path) {
     }
     TIFFClose(tif);
     return out;
+}
+
+/// The inline value of `id`, or nullopt when the key is absent or its value
+/// lives in the ASCII pool (where `value` is an offset, not the code).
+std::optional<std::uint16_t> raw_key_value(const RawGeoKeys& raw, std::uint16_t id) {
+    if (raw.keys.size() < 4U) {
+        return std::nullopt;
+    }
+    const std::uint16_t entries = raw.keys[3];
+    for (std::uint16_t i = 0; i < entries; ++i) {
+        const std::size_t base = 4U + static_cast<std::size_t>(i) * 4U;
+        if (base + 3U >= raw.keys.size()) {
+            return std::nullopt;
+        }
+        if (raw.keys[base] == id) {
+            return raw.keys[base + 3];
+        }
+    }
+    return std::nullopt;
+}
+
+/// The ASCII text an entry points at, or "" when it does not point into the
+/// pool. Copies only the entry's `count` characters.
+std::string raw_citation(const RawGeoKeys& raw, std::uint16_t id) {
+    if (raw.keys.size() < 4U) {
+        return {};
+    }
+    const std::uint16_t entries = raw.keys[3];
+    for (std::uint16_t i = 0; i < entries; ++i) {
+        const std::size_t base = 4U + static_cast<std::size_t>(i) * 4U;
+        if (base + 3U >= raw.keys.size()) {
+            return {};
+        }
+        if (raw.keys[base] != id || raw.keys[base + 1] != kTagGeoAsciiParams) {
+            continue;
+        }
+        const std::size_t offset = raw.keys[base + 3];
+        if (offset >= raw.ascii.size()) {
+            return {};
+        }
+        std::string text = raw.ascii.substr(offset, raw.keys[base + 2]);
+        while (!text.empty() && (text.back() == '|' || text.back() == '\0')) {
+            text.pop_back();
+        }
+        return text;
+    }
+    return {};
 }
 
 /// Writes a valid stripped 8-bit TIFF carrying exactly the given GeoKeys, the
@@ -194,11 +248,138 @@ TEST(Crs, GeoTiffEpsgKeys) {
         write_geotiff(path, make_raster(8, 8), options);
 
         const GeoTiffInfo info = read_geotiff_info(path);
-        EXPECT_EQ(info.epsg, builtin.epsg) << builtin.name;
+        // A geocentric CRS has no horizontal model type, so it is written
+        // user-defined (epsg key 32767) and recovered from its WKT citation.
+        const bool horizontal = builtin.kind == crs::CrsKind::Projected ||
+                                builtin.kind == crs::CrsKind::Geographic2D ||
+                                builtin.kind == crs::CrsKind::Geographic3D;
+        EXPECT_EQ(info.epsg, horizontal ? builtin.epsg : 0) << builtin.name;
         ASSERT_TRUE(info.crs.has_value()) << builtin.name;
         EXPECT_EQ(info.crs->epsg(), builtin.epsg) << builtin.name;
         std::remove(path.c_str());
     }
+}
+
+/// An EPSG projected CRS: 3072 holds the code and 3073 its name, with no
+/// geographic key answering for it.
+TEST(Crs, GeoTiffEpsgProjectedRawKeys) {
+    GeoTiffOptions options;
+    options.crs = CoordinateSystem::from_epsg(32633);
+    const std::string path = temp_path("raw_projected.tif");
+    write_geotiff(path, make_raster(8, 8), options);
+
+    const RawGeoKeys raw = read_raw_geo_keys(path);
+    ASSERT_EQ(raw_key_value(raw, 1024), std::optional<std::uint16_t>(1));
+    ASSERT_EQ(raw_key_value(raw, 3072), std::optional<std::uint16_t>(32633));
+    EXPECT_FALSE(raw_key_value(raw, 2048).has_value());
+    EXPECT_NE(raw_citation(raw, 3073).find("UTM zone 33N"), std::string::npos);
+    std::remove(path.c_str());
+}
+
+/// An EPSG geographic CRS: 2048 holds the code and 2049 its name.
+TEST(Crs, GeoTiffEpsgGeographicRawKeys) {
+    GeoTiffOptions options;
+    options.crs = CoordinateSystem::from_epsg(4326);
+    const std::string path = temp_path("raw_geographic.tif");
+    write_geotiff(path, make_raster(8, 8), options);
+
+    const RawGeoKeys raw = read_raw_geo_keys(path);
+    ASSERT_EQ(raw_key_value(raw, 1024), std::optional<std::uint16_t>(2));
+    ASSERT_EQ(raw_key_value(raw, 2048), std::optional<std::uint16_t>(4326));
+    EXPECT_FALSE(raw_key_value(raw, 3072).has_value());
+    EXPECT_EQ(raw_citation(raw, 2049), "WGS 84");
+    std::remove(path.c_str());
+}
+
+/// A custom geographic CRS: user-defined in 2048 and its WKT2 in 2049.
+TEST(Crs, GeoTiffCustomGeographicRawKeys) {
+    const CoordinateSystem custom = custom_geographic_crs();
+    ASSERT_EQ(custom.epsg(), 0);
+    ASSERT_EQ(custom.kind(), crs::CrsKind::Geographic2D);
+    GeoTiffOptions options;
+    options.crs = custom;
+    const std::string path = temp_path("raw_custom_geographic.tif");
+    write_geotiff(path, make_raster(8, 8), options);
+
+    const RawGeoKeys raw = read_raw_geo_keys(path);
+    ASSERT_EQ(raw_key_value(raw, 2048), std::optional<std::uint16_t>(32767));
+    EXPECT_EQ(raw_citation(raw, 2049), custom.to_wkt());
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_equivalent_to(custom));
+    std::remove(path.c_str());
+}
+
+/// A vertical or compound CRS has no GeoTIFF model type: it is written
+/// user-defined (32767) with its WKT2, never as a horizontal code.
+TEST(Crs, GeoTiffNonHorizontalCrsIsUserDefined) {
+    std::optional<CoordinateSystem> cs;
+    for (int code : {6349, 5703, 5701}) {
+        try {
+            cs = CoordinateSystem::from_epsg(code);
+            break;
+        } catch (const ValueError&) {
+            // Not in this PROJ data set: try the next candidate.
+        }
+    }
+    if (!cs.has_value()) {
+        GTEST_SKIP() << "no vertical/compound CRS in this PROJ data set";
+    }
+    ASSERT_TRUE(cs->kind() == crs::CrsKind::Compound ||
+                cs->kind() == crs::CrsKind::Vertical ||
+                cs->kind() == crs::CrsKind::Geocentric)
+        << cs->name();
+    GeoTiffOptions options;
+    options.crs = *cs;
+    const std::string path = temp_path("raw_nonhorizontal.tif");
+    write_geotiff(path, make_raster(8, 8), options);
+
+    const RawGeoKeys raw = read_raw_geo_keys(path);
+    ASSERT_EQ(raw_key_value(raw, 1024), std::optional<std::uint16_t>(32767));
+    EXPECT_EQ(raw_key_value(raw, 2048), std::optional<std::uint16_t>(32767));
+    EXPECT_FALSE(raw_key_value(raw, 3072).has_value());
+    EXPECT_EQ(raw_citation(raw, 2049), cs->to_wkt());
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_equivalent_to(*cs));
+    std::remove(path.c_str());
+}
+
+/// An EPSG code above the 16-bit type key: user-defined plus WKT2, never a
+/// truncated code. Not every PROJ data set has one, so skip in that case.
+TEST(Crs, GeoTiffEpsgAboveUint16) {
+    std::optional<CoordinateSystem> cs;
+    for (int code : {900913, 102100}) {
+        try {
+            cs = CoordinateSystem::from_epsg(code);
+            if (cs->epsg() > 65535) {
+                break;
+            }
+            cs.reset();
+        } catch (const ValueError&) {
+        }
+    }
+    if (!cs.has_value()) {
+        GTEST_SKIP() << "no EPSG code above 65535 in this PROJ data set";
+    }
+    GeoTiffOptions options;
+    options.crs = *cs;
+    const std::string path = temp_path("raw_large_epsg.tif");
+    write_geotiff(path, make_raster(8, 8), options);
+
+    const RawGeoKeys raw = read_raw_geo_keys(path);
+    EXPECT_EQ(raw_key_value(raw, 3072), std::optional<std::uint16_t>(32767));
+    EXPECT_EQ(raw_citation(raw, 3073), cs->to_wkt());
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_equivalent_to(*cs));
+    std::remove(path.c_str());
 }
 
 /// Files written by GDAL: an EPSG key plus a name citation, and a user-defined
@@ -270,6 +451,123 @@ TEST(Crs, GeoTiffNoCrsWritesUserDefined) {
     EXPECT_EQ(info.epsg, 0);
     ASSERT_TRUE(info.crs.has_value());
     EXPECT_TRUE(info.crs->is_local());
+    std::remove(path.c_str());
+}
+
+/// Hostile inputs: each must be rejected cleanly (the reader falls back to the
+/// local frame) rather than crash or read past a buffer.
+TEST(Crs, ReaderHandlesOverlongKeyCount) {
+    KeyBuilder file;
+    file.inline_key(1024, 1);
+    file.inline_key(1025, 1);
+    file.inline_key(3072, 32633);
+    file.keys[3] = 50;  // claims 50 entries; the array holds three
+    const std::string path = temp_path("hostile_count.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_local());
+    std::remove(path.c_str());
+}
+
+TEST(Crs, ReaderHandlesAsciiOutOfBounds) {
+    KeyBuilder file;
+    file.inline_key(1024, 1);
+    file.inline_key(1025, 1);
+    file.inline_key(3072, 32767);
+    file.ascii = "x|";
+    // Offset past the pool, and a count longer than the pool's remainder.
+    file.keys.insert(file.keys.end(),
+                     {3073, static_cast<std::uint16_t>(kTagGeoAsciiParams), 10, 99});
+    ++file.keys[3];
+    const std::string path = temp_path("hostile_ascii_range.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_local());
+    std::remove(path.c_str());
+}
+
+TEST(Crs, ReaderHandlesMissingAsciiTag) {
+    KeyBuilder file;
+    file.inline_key(1024, 1);
+    file.inline_key(1025, 1);
+    file.inline_key(3072, 32767);
+    // A citation entry pointing at GeoAsciiParams, but 34737 is never written.
+    file.keys.insert(file.keys.end(),
+                     {3073, static_cast<std::uint16_t>(kTagGeoAsciiParams), 5, 0});
+    ++file.keys[3];
+    const std::string path = temp_path("hostile_no_ascii.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_local());
+    std::remove(path.c_str());
+}
+
+/// A citation with no `|` terminator: the entry's count is the whole text, so
+/// the WKT still parses unchanged.
+TEST(Crs, ReaderHandlesUnterminatedCitation) {
+    const CoordinateSystem custom = custom_crs();
+    const std::string wkt = custom.to_wkt();
+    KeyBuilder file;
+    file.inline_key(1024, 1);
+    file.inline_key(1025, 1);
+    file.inline_key(3072, 32767);
+    file.keys.insert(
+        file.keys.end(),
+        {3073, static_cast<std::uint16_t>(kTagGeoAsciiParams),
+         static_cast<std::uint16_t>(wkt.size()), 0});
+    ++file.keys[3];
+    file.ascii = wkt;  // deliberately no trailing '|'
+    const std::string path = temp_path("hostile_unterminated.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_equivalent_to(custom));
+    std::remove(path.c_str());
+}
+
+/// Citation text PROJ refuses to parse: fall back to the local frame.
+TEST(Crs, ReaderHandlesNonWktCitation) {
+    KeyBuilder file;
+    file.inline_key(1024, 1);
+    file.inline_key(1025, 1);
+    file.inline_key(3072, 32767);
+    file.ascii_key(3073, "definitely not a coordinate system");
+    const std::string path = temp_path("hostile_bad_wkt.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_local());
+    std::remove(path.c_str());
+}
+
+/// ArcGIS writes its WKT into GTCitationGeoKey with an "ESRI PE String = "
+/// prefix; with no 2048/3072/2049/3073 present it is the only CRS source.
+TEST(Crs, ReaderReadsEsriGtCitation) {
+    const CoordinateSystem custom = custom_crs();
+    KeyBuilder file;
+    file.inline_key(1024, 32767);
+    file.inline_key(1025, 1);
+    file.ascii_key(1026, "ESRI PE String = " + custom.to_wkt());
+    const std::string path = temp_path("esri_gt_citation.tif");
+    write_raw_geotiff(path, file.keys, file.ascii);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 0);
+    ASSERT_TRUE(info.crs.has_value());
+    EXPECT_TRUE(info.crs->is_equivalent_to(custom));
     std::remove(path.c_str());
 }
 
