@@ -37,15 +37,21 @@ All notable changes to alphashape are recorded here. The format follows
   compared with the per-channel median of the cameras valid there, and a camera
   further than a robust (MAD) distance plus an absolute grey floor has its cells
   marked deviant. Per tile the mask is closed then opened and small components
-  are dropped. The seam labeller pays an extra `avoid_cost` on a deviant cell
-  (larger than one smoothness edge, and never charged when the camera is the
-  only valid view, so no hole appears), average blending drops deviant cameras
-  from the mean, and small label islands are relabelled afterwards. The
-  formulation follows robust multi-view deghosting and moving-object removal in
-  mosaics (Jacobs, Loscos & Ward 2008; Gallagher 2005; Davis 1998; Uyttendaele,
-  Eden & Szeliski 2001). New `engine/src/common/algorithm/ortho/ghosting.*`;
-  the masks add 1 byte per tile footprint cell to the block memory estimate and
-  an INFO line reports marked cells and removed speckles.
+  are dropped (a camera takes part in a coarse cell only when it covers at least
+  half of it, so a sliver of coverage is not compared as a full view). The seam
+  labeller pays an extra `avoid_cost` on a deviant cell (larger than one
+  smoothness edge, and never charged when the camera is the only valid view, so
+  no hole appears); its one full-resolution alpha-expansion pass is bounded to
+  the marked cells' bounding box grown by 32 cells and skipped when nothing is
+  marked, its pair terms are truncated to stay submodular, and each move is
+  accepted only when the true energy falls. Average blending drops deviant
+  cameras from the mean, and only label islands touching a deviant region are
+  relabelled afterwards, preferring a non-deviant neighbour. The formulation
+  follows robust multi-view deghosting and moving-object removal in mosaics
+  (Jacobs, Loscos & Ward 2008; Gallagher 2005; Davis 1998; Uyttendaele, Eden &
+  Szeliski 2001). New `engine/src/common/algorithm/ortho/ghosting.*`; the masks
+  and their scratch planes are counted in the block memory estimate and an INFO
+  line reports marked cells and removed speckles.
 
 - **Per-camera, per-channel affine colour correction for the orthomosaic.**
   `BuildOrthomosaic`'s `color_correction="affine"` fits `I' = a_c I + b_c` per
