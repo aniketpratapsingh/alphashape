@@ -6,6 +6,13 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- **WP-12.12: M12 coordinate-systems close-out.** New `engine/docs/crs-guide.md`,
+  expanded CRS limits in `engine/LIMITATIONS.md` and CRS test notes in
+  `engine/TESTING.md`, plus an opt-in `alphashape_crs_fixtures` CMake target that
+  regenerates the CRS fixtures from their committed generator scripts.
+
 ### Changed
 
 - **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool, and
