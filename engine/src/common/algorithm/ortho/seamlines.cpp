@@ -452,15 +452,39 @@ private:
     int sink_ = -1;
 };
 
+/// A rectangular window of FIELD cells the full-resolution ghosting expansion
+/// may relabel. Everything outside keeps the label the coarse pass gave it, so
+/// the graph is bounded by the marked objects' neighbourhood instead of the
+/// whole mosaic.
+struct Region {
+    int x0 = 0;  ///< inclusive
+    int y0 = 0;  ///< inclusive
+    int x1 = 0;  ///< exclusive
+    int y1 = 0;  ///< exclusive
+    bool contains(int col, int row) const {
+        return col >= x0 && col < x1 && row >= y0 && row < y1;
+    }
+};
+
 /// The objective of `labels` under `options`, evaluated on an existing Field.
 /// The public energy() wraps this after building and de-ghosting the field.
+///
+/// `limit` restricts the sum to a window whose data and pair terms are the only
+/// ones a move inside that window can change. The window must start one cell
+/// left/up of the region (so the pair whose left/up endpoint lies just outside
+/// is counted) and the pair test still uses the full grid edge, so the value is
+/// the true energy up to a constant that cancels in a before/after comparison.
 double total_energy(const Field& field, const std::vector<std::int32_t>& labels,
-                    const SeamOptions& options) {
+                    const SeamOptions& options, const Region* limit = nullptr) {
     const int width = field.width;
     const int height = field.height;
+    const int first_col = limit != nullptr ? std::max(0, limit->x0 - 1) : 0;
+    const int first_row = limit != nullptr ? std::max(0, limit->y0 - 1) : 0;
+    const int last_col = limit != nullptr ? std::min(width, limit->x1) : width;
+    const int last_row = limit != nullptr ? std::min(height, limit->y1) : height;
     double total = 0.0;
-    for (int row = 0; row < height; ++row) {
-        for (int col = 0; col < width; ++col) {
+    for (int row = first_row; row < last_row; ++row) {
+        for (int col = first_col; col < last_col; ++col) {
             const std::size_t cell =
                 static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
                 static_cast<std::size_t>(col);
@@ -484,20 +508,6 @@ double total_energy(const Field& field, const std::vector<std::int32_t>& labels,
     }
     return total;
 }
-
-/// A rectangular window of FIELD cells the full-resolution ghosting expansion
-/// may relabel. Everything outside keeps the label the coarse pass gave it, so
-/// the graph is bounded by the marked objects' neighbourhood instead of the
-/// whole mosaic. A default Region is empty and never gated in.
-struct Region {
-    int x0 = 0;  ///< inclusive
-    int y0 = 0;  ///< inclusive
-    int x1 = 0;  ///< exclusive
-    int y1 = 0;  ///< exclusive
-    bool contains(int col, int row) const {
-        return col >= x0 && col < x1 && row >= y0 && row < y1;
-    }
-};
 
 /// One alpha-expansion move: the min-cut (Boykov, Veksler & Zabih 2001) for the
 /// set of cells to relabel as `alpha`. Cells already carrying `alpha` and cells
@@ -652,11 +662,11 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
     // energy, not necessarily for the true one. Accept the move only when the
     // true energy actually falls; a rejected move restores the previous labels,
     // so the sweep is monotone and can never oscillate.
-    const double before = total_energy(field, labels, options);
+    const double before = total_energy(field, labels, options, region);
     for (const std::size_t cell : switched) {
         labels[cell] = alpha;
     }
-    if (total_energy(field, labels, options) < before) {
+    if (total_energy(field, labels, options, region) < before) {
         return true;
     }
     for (std::size_t i = 0; i < switched.size(); ++i) {

@@ -179,11 +179,11 @@ TEST(OrthoGhosting, MajorityCarSurvivesIntoTheMosaic) {
     const std::vector<std::vector<std::uint8_t>> masks =
         detect_ghosts(kWidth, kHeight, tiles, GhostOptions{});
     for (std::size_t t = 0; t < 3; ++t) {
-        EXPECT_EQ(masks[t][tiles[t].index(26, 21)], 0U)
+        EXPECT_EQ(static_cast<int>(masks[t][tiles[t].index(26, 21)]), 0)
             << "the car views agree with the consensus";
     }
     for (std::size_t t = 3; t < 5; ++t) {
-        EXPECT_GT(masks[t][tiles[t].index(26, 21)], 0U)
+        EXPECT_GT(static_cast<int>(masks[t][tiles[t].index(26, 21)]), 0)
             << "the two car-less cameras are the deviant minority at the car";
     }
 
