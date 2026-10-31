@@ -193,6 +193,10 @@ struct DepthMapFingerprintContext {
     /// a map built before the field became selectable still matches a default
     /// run.
     int best_k = 0;
+    /// Q2 adaptive min+margin width on the cost's interval, 0 = the plain mean
+    /// of the best k. Folded only when non-zero, so every map built before the
+    /// option existed still matches a default run.
+    double cost_margin = 0.0;
     /// Flat-window gate, an intensity stddev on [0, 1]. Folded only when it is
     /// not the historical 1/255, for the same reason as max_cost.
     double min_texture_stddev = 1.0 / 255.0;

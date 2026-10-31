@@ -332,6 +332,24 @@ PatchMatchOptions reduced_options(double dmin, double dmax) {
     return options;
 }
 
+/// Overwrite the pixels of `image` inside `rect` with a rendering of `occluder`,
+/// a nearer surface standing in front of the target. Only this neighbour gets
+/// the occluder: the reference still sees the target plane, so that neighbourhood
+/// is exactly the case a min+margin average is for — a view that cannot see the
+/// surface at this pixel still votes, but with a cost far above a clear view's.
+void punch_occluder(FloatImage& image, const Plane& occluder, const Calibration& calib,
+                    const Eigen::Matrix3d& r, const Eigen::Vector3d& t, int x0, int y0,
+                    int x1, int y1) {
+    const FloatImage patch = render_view(occluder, calib, r, t);
+    const int x_end = std::min(x1, calib.width);
+    const int y_end = std::min(y1, calib.height);
+    for (int y = std::max(0, y0); y < y_end; ++y) {
+        for (int x = std::max(0, x0); x < x_end; ++x) {
+            image.at(x, y) = patch.at(x, y);
+        }
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -381,6 +399,94 @@ TEST(PatchMatch, FrontoParallelPlane) {
     EXPECT_GT(acc.coverage, 0.85);
     EXPECT_LT(acc.median_rel, 0.005);
     EXPECT_LT(acc.p95_rel, 0.02);
+}
+
+// ---------------------------------------------------------------------------
+// Q2: adaptive min+margin multi-view aggregation
+// ---------------------------------------------------------------------------
+
+TEST(PatchMatch, AggregateMultiviewCostsMinPlusMargin) {
+    // The pure rule, on the exact costs the marginal case produces: three views
+    // agree, two are occluded. margin 0 is the plain mean of all five; a small
+    // margin keeps the agreeing three; the full interval span keeps all five.
+    const double sorted[5] = {0.10, 0.12, 0.13, 0.90, 1.20};
+    const double all = (0.10 + 0.12 + 0.13 + 0.90 + 1.20) / 5.0;
+    EXPECT_DOUBLE_EQ(alphashape::stereo::aggregate_multiview_costs(sorted, 5, 0.0), all);
+    EXPECT_NEAR(alphashape::stereo::aggregate_multiview_costs(sorted, 5, 0.05),
+                (0.10 + 0.12 + 0.13) / 3.0, 1e-12);
+    EXPECT_DOUBLE_EQ(alphashape::stereo::aggregate_multiview_costs(sorted, 5, 2.0), all);
+    // A margin below the first gap leaves only the best vote; the adaptive k
+    // never drops below 1.
+    EXPECT_DOUBLE_EQ(alphashape::stereo::aggregate_multiview_costs(sorted, 5, 0.001), 0.10);
+    EXPECT_DOUBLE_EQ(alphashape::stereo::aggregate_multiview_costs(sorted, 1, 0.5), 0.10);
+}
+
+TEST(PatchMatch, CostMarginRecoversFromOccludedNeighbours) {
+    // Front-parallel plane, four neighbours, two of them with a foreground
+    // surface in front of the target over the same image rectangle. On that
+    // strip they still vote (the window projects) but correlate against the
+    // occluder, so their cost is ~2. best_k=4 folds all four votes into the
+    // plain mean, pushing the true plane above max_cost and erasing the strip;
+    // the margin keeps only the two clear views and the strip survives.
+    const Plane plane = make_plane(Eigen::Vector3d(0.0, 0.0, 10.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    Scene scene = build_scene(plane, default_scene(), /*distort=*/false,
+                              Eigen::Vector3d(0.0, 0.0, 10.0));
+    const Plane occluder = make_plane(Eigen::Vector3d(0.0, 0.0, 6.0), Eigen::Vector3d(0.0, 0.0, -1.0));
+    for (const int i : {2, 3}) {
+        punch_occluder(scene.images[static_cast<std::size_t>(i)], occluder,
+                       scene.calibs[static_cast<std::size_t>(i)],
+                       scene.rotations[static_cast<std::size_t>(i)],
+                       scene.translations[static_cast<std::size_t>(i)], 40, 30, 120, 90);
+    }
+    const std::vector<PMView> views = scene.views();
+    const std::vector<PMView> neighbours = {views[1], views[2], views[3], views[4]};
+
+    PatchMatchOptions plain = options_for(5.0, 20.0);
+    plain.best_k = 4;
+    PatchMatchOptions adaptive = plain;
+    adaptive.cost_margin = 0.1;
+
+    const PatchMatchResult plain_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, plain);
+    const PatchMatchResult adaptive_result =
+        alphashape::stereo::run_patch_match(views[0], neighbours, adaptive);
+
+    // Fraction of the occluded strip whose depth is within 1% of the analytic
+    // target. Missing depth counts as wrong, which is the plain mean's failure.
+    const auto good_fraction = [&](const PatchMatchResult& result) {
+        int good = 0;
+        int total = 0;
+        // Inset from the occluder boundary so windows straddling the seam do
+        // not decide the result.
+        for (int y = 38; y < 82; ++y) {
+            for (int x = 48; x < 112; ++x) {
+                const double expected =
+                    ray_plane_depth(scene.plane, scene.calibs[0], scene.rotations[0],
+                                    scene.translations[0], x, y);
+                if (!(expected > 0.0)) {
+                    continue;
+                }
+                ++total;
+                const std::size_t index = static_cast<std::size_t>(y) * kWidth +
+                                          static_cast<std::size_t>(x);
+                const double d = result.depth[index];
+                if (d > 0.0 && std::abs(d - expected) / expected < 0.01) {
+                    ++good;
+                }
+            }
+        }
+        return total > 0 ? static_cast<double>(good) / static_cast<double>(total) : 0.0;
+    };
+    const double plain_good = good_fraction(plain_result);
+    const double adaptive_good = good_fraction(adaptive_result);
+    std::printf("[min+margin] occluded strip: margin 0 -> %.4f good, margin 0.1 -> %.4f good\n",
+                plain_good, adaptive_good);
+
+    // The margin may only narrow the average towards the smallest costs, so it
+    // cannot make the true plane more expensive: never worse, and in this scene
+    // it recovers a strip the plain mean erases.
+    EXPECT_GE(adaptive_good, plain_good);
+    EXPECT_GT(adaptive_good, 0.8);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +681,16 @@ TEST(PatchMatch, InvalidInputsThrow) {
     PatchMatchOptions zero_min = good;
     zero_min.depth_min = 0.0;
     EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, zero_min),
+                 alphashape::ValueError);
+
+    // The min+margin width lives on the selected cost's interval, [0, 2].
+    PatchMatchOptions negative_margin = good;
+    negative_margin.cost_margin = -0.1;
+    EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, negative_margin),
+                 alphashape::ValueError);
+    PatchMatchOptions huge_margin = good;
+    huge_margin.cost_margin = 2.5;
+    EXPECT_THROW(alphashape::stereo::run_patch_match(views[0], neighbours, huge_margin),
                  alphashape::ValueError);
 }
 
