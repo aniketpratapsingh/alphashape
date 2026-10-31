@@ -128,6 +128,46 @@ endif()
 add_executable(make_v1_fixture EXCLUDE_FROM_ALL make_v1_fixture.cpp)
 target_link_libraries(make_v1_fixture PRIVATE alphashape_algorithms)
 
+# tests/fixtures/crs -- regenerating the checked-in M12 fixtures (WP-12.12).
+# Opt-in only: the helper is EXCLUDE_FROM_ALL and the custom target is not ALL,
+# so this is never built by `all` and never registered as a ctest. Defined only
+# for a PROJ build; the Python steps need an interpreter but the target still
+# configures (and the skeleton step still works) without one.
+if(ALPHASHAPE_USE_PROJ)
+    set(_crs_fixture_dir "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/crs")
+
+    # make_skeletons.cpp includes tests/crs_wkt_skeleton.hpp and links PROJ.
+    add_executable(make_crs_skeletons EXCLUDE_FROM_ALL
+        "${_crs_fixture_dir}/make_skeletons.cpp")
+    target_include_directories(make_crs_skeletons PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(make_crs_skeletons PRIVATE alphashape_proj)
+
+    set(_crs_fixture_commands
+        COMMAND "$<TARGET_FILE:make_crs_skeletons>"
+                "${_crs_fixture_dir}/builtin_wkt_skeletons.txt")
+
+    # The two Python generators download their source (cdn.proj.org and the NGS
+    # service respectively); the tests themselves are offline.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        list(APPEND _crs_fixture_commands
+            COMMAND "${Python3_EXECUTABLE}" "${_crs_fixture_dir}/make_egm96_subset.py"
+            COMMAND "${Python3_EXECUTABLE}" "${_crs_fixture_dir}/make_ngs_benchmarks.py")
+    endif()
+
+    # make_cs2cs_reference.sh needs a POSIX shell and cs2cs on PATH.
+    if(UNIX)
+        list(APPEND _crs_fixture_commands
+            COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/make_cs2cs_reference.sh")
+    endif()
+
+    add_custom_target(alphashape_crs_fixtures ${_crs_fixture_commands}
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Regenerating engine/tests/fixtures/crs (EGM96/NGS need network)"
+        VERBATIM)
+endif()
+
 # Under ALPHASHAPE_SANITIZE two third-party environment fixes are needed, and
 # both must apply to *discovery* as well: CMake's gtest_discover_tests() runs the
 # binary with --gtest_list_tests --gtest_output=json:... at build time, and
