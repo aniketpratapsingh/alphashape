@@ -278,8 +278,14 @@ void fold_calibration(std::uint64_t& h, const Calibration& cal) {
     h = fold_int(h, cal.width);
     h = fold_int(h, cal.height);
     for (const double value : {cal.f, cal.cx, cal.cy, cal.b1, cal.b2, cal.k1, cal.k2, cal.k3,
-                               cal.k4, cal.p1, cal.p2, cal.p3, cal.p4}) {
+                               cal.k4, cal.p1, cal.p2}) {
         h = fold_double(h, value);
+    }
+    // p3/p4 are folded only when set, so every existing (11-parameter) project
+    // keeps its fingerprint and its cached depth maps stay reusable.
+    if (cal.p3 != 0.0 || cal.p4 != 0.0) {
+        h = fold_double(h, cal.p3);
+        h = fold_double(h, cal.p4);
     }
 }
 
