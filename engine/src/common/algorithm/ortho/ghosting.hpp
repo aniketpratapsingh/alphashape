@@ -24,10 +24,15 @@
 //     than both k spreads and min_abs_diff. Fewer than min_cameras views means
 //     there is no consensus, so nothing is marked there;
 //   * coarse masks are upsampled and OR-ed with the finer ones, so a large
-//     transient (a shadow) is caught even when its interior is nearly flat;
+//     transient (a shadow) is caught even when its interior is nearly flat; a
+//     camera takes part in a coarse cell only when it covers at least half of
+//     it, so a sliver of coverage is never compared as if it were a full view;
 //   * per tile the mask is closed then opened (radius 1) and components below
 //     min_component_cells are dropped, which removes isolated sensor noise
-//     without eroding a genuine object.
+//     without eroding a genuine object;
+//   * the separate speckle pass only relabels small label islands that touch a
+//     deviant region (dilated by 2 cells), and prefers a neighbour the
+//     consensus does not call deviant there.
 //
 // Everything is deterministic and OpenMP-safe: rows are parallel, each cell
 // writes only its own mask entries, and every tie is broken by index.
@@ -63,9 +68,14 @@ std::vector<std::vector<std::uint8_t>> detect_ghosts(
 /// Relabel small 4-connected label islands (speckles) to the most common
 /// neighbouring label that is valid at every cell of the island. `pinned`
 /// (nullable) marks cells that may never change; an island containing a pinned
-/// cell is left alone. Returns the number of components removed. Deterministic.
+/// cell is left alone. `deviant` (nullable, one tile-local mask per tile) scopes
+/// the pass to the ghosting filter: only islands that touch a deviant region
+/// (dilated by 2 cells) are relabelled, and a neighbouring label that is itself
+/// deviant at the island is used only when no clean neighbour exists. Returns
+/// the number of components removed. Deterministic.
 int filter_label_speckles(int width, int height, const std::vector<OrthoTile>& tiles,
                           std::vector<std::int32_t>& labels,
-                          const std::vector<std::uint8_t>* pinned, int min_component_cells);
+                          const std::vector<std::uint8_t>* pinned, int min_component_cells,
+                          const std::vector<std::vector<std::uint8_t>>* deviant = nullptr);
 
 }  // namespace alphashape::ortho

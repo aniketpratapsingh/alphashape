@@ -545,9 +545,10 @@ constexpr double kBytesPerNodeMap = 20.0;
 ///   * labels int32 (the caller's, counted above)                = -
 ///   * `best` double                                             = 8
 ///   * `any_valid` u8                                            = 1
+///   * `valid_count` int32 (the lone-camera deviant exemption)   = 4
 ///   * the two checkerboard parity lists, size_t per cell        = 8
 ///   * the alpha-expansion graph (see kSeamGraphBytesPerNode)
-constexpr double kBytesPerCellSeamField = 8.0 + 1.0 + 8.0;
+constexpr double kBytesPerCellSeamField = 8.0 + 1.0 + 4.0 + 8.0;
 
 /// Blend stage, full-grid part (`ortho::blend`, Mosaic):
 ///   * out.rgb u8x3                                              = 3
@@ -594,20 +595,22 @@ constexpr double kBytesPerCellFinalize = 4.0 + 8.0 + 21.0;
 /// 5 edges per cell in the worst case. 5 x 32 = 160.
 ///
 /// `node` (int per cell, the cell -> node map) is another 4.
+/// `source_side` (char per node) and its DFS stack (int per node) are alive
+/// with the graph after the flow, another 1 + 4.
 ///
-/// 21 + 160 + 4 = 185 B per NODE. The edge vectors are NOT reserved (their final
-/// size depends on how many cells already carry alpha), so a 1.5x factor covers
-/// the reallocation transient while the old and the new buffer are both alive:
-/// 277.5 B per node.
+/// 21 + 160 + 4 + 5 = 190 B per NODE. The edge vectors are NOT reserved (their
+/// final size depends on how many cells already carry alpha), so a 1.5x factor
+/// covers the reallocation transient while the old and the new buffer are both
+/// alive: 285 B per node.
 ///
-/// WHERE IT RUNS. `assign_seams` calls alpha_expansion only on its COARSE
-/// pyramid levels (default coarse_levels = 2, i.e. 2x and 4x, so 1/4 and 1/16 of
-/// the fine cells); the full-resolution grid is finished by the ICM polish,
-/// which allocates no graph. The seam stage's graph therefore peaks at the 2x
-/// level. Should a future caller solve the fine grid with alpha-expansion
-/// (coarse_levels = 0), the graph would be 4x this figure -- which is exactly
-/// why the estimate keeps the coarse-level assumption visible here.
-constexpr double kSeamGraphBytesPerNode = 1.5 * (21.0 + 5.0 * 32.0 + 4.0);
+/// WHERE IT RUNS. `assign_seams` calls alpha_expansion on its COARSE pyramid
+/// levels (default coarse_levels = 2, i.e. 2x and 4x, so 1/4 and 1/16 of the
+/// fine cells); the full-resolution grid is finished by the ICM polish, which
+/// allocates no graph. The seam stage's graph therefore peaks at the 2x level.
+/// A ghosting run also solves the FULL-resolution grid, but only over the
+/// marked cells' bounding box grown by 32 cells. That box is data-dependent, so
+/// the estimate keeps the worst case (the whole grid) whenever ghosting is on.
+constexpr double kSeamGraphBytesPerNode = 1.5 * (21.0 + 5.0 * 32.0 + 4.0 + 5.0);
 /// The coarsest-so-fine level alpha_expansion actually solves: the 2x level.
 constexpr double kSeamGraphCellFraction = 0.25;
 
@@ -620,10 +623,13 @@ constexpr double kBytesPerTileCell = 8.0;/// A coarse seamline pyramid level hol
 constexpr double kCoarseFootprintFraction = 0.25 + 0.0625;
 constexpr double kCoarseFieldBytesPerCell = kBytesPerCellSeamField + kBytesPerCellGridLabels;
 
-/// One deviant-mask byte per tile footprint cell (ghosting.hpp). The seam's
-/// coarse pyramid levels build their own downsampled copy, counted with the
-/// same coarse fraction as the tiles.
-constexpr double kBytesPerGhostMaskCell = 1.0;
+/// detect_ghosts' per-tile residency (ghosting.hpp / ghosting.cpp): the mask
+/// itself (1 byte) is alive across the whole call, and the morphology output
+/// plane (1) or the component BFS `seen` plane (1) lives beside it -- the two
+/// transients peak in sequence, so 2 more bytes covers them. The seam's coarse
+/// pyramid levels build their own downsampled mask copy, counted with the same
+/// coarse fraction as the tiles.
+constexpr double kBytesPerGhostMaskCell = 3.0;
 
 /// Per-stage full-grid byte totals.
 struct StageBytes {
@@ -677,13 +683,17 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
     // 1/4 and 1/16 of the fine cell count.
     const double coarse = grid * kCoarseFieldBytesPerCell * (1.0 / 4.0 + 1.0 / 16.0);
     // A ghosting run also solves the FULL-resolution grid with alpha expansion
-    // (see SeamOptions::avoid), so its graph is the whole grid rather than the
-    // 2x level's quarter.
+    // (bounded to the marked cells' neighbourhood, but the planner keeps the
+    // whole-grid worst case), so its graph is the whole grid rather than the 2x
+    // level's quarter.
     const double seam_graph =
         grid * kSeamGraphBytesPerNode * (ghosting ? 1.0 : kSeamGraphCellFraction);
+    // filter_label_speckles runs on the full grid after the seams and holds a
+    // flattened deviant plane plus its 2-cell dilation while it works.
+    const double speckle_scratch = ghosting ? grid * 2.0 : 0.0;
     stages.seams = grid * kBytesPerCellGridLabels + node_map +
                    grid * kBytesPerCellSeamField + seam_graph + tiles + coarse +
-                   ghost_masks;
+                   ghost_masks + speckle_scratch;
     stages.blend = grid * kBytesPerCellGridLabels + node_map + grid * kBytesPerCellBlend +
                    tiles + ghost_masks;
     stages.finalize =
@@ -2761,7 +2771,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 const ortho::GhostOptions ghost_options;
                 ghost_speckles_removed += static_cast<std::size_t>(ortho::filter_label_speckles(
                     window.width, window.height, tiles, labels,
-                    frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells));
+                    frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells,
+                    &deviant_masks));
             }
             if (Log::enabled(LogLevel::Info)) {
                 log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="

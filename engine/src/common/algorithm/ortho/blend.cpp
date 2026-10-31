@@ -370,9 +370,11 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
             };
             accumulate(true);
             if (weight_sum <= 0.0 && valid_count > 0) {
-                // Every valid camera here is deviant; excluding them all would
-                // punch a hole, so the average keeps them (the "never create a
-                // hole" rule the seam filter also follows).
+                // No valid camera survived the deviant filter. With a lone
+                // valid camera the filter is not applied at all, so this is
+                // the "all valid tiles are deviant" case: excluding them would
+                // punch a hole, so the average keeps them -- the same "never
+                // create a hole" rule the seam filter follows.
                 accumulate(false);
             }
             if (weight_sum <= 0.0) {

@@ -452,13 +452,65 @@ private:
     int sink_ = -1;
 };
 
-/// One alpha-expansion move: the optimal set of cells to relabel as `alpha`,
-/// found by a min-cut (Boykov, Veksler & Zabih 2001). The seam term is a metric
-/// (a sum of absolute colour differences plus a constant), so every pairwise
-/// term is submodular and the move is exact. Cells already carrying `alpha` are
-/// fixed on the switch side.
+/// The objective of `labels` under `options`, evaluated on an existing Field.
+/// The public energy() wraps this after building and de-ghosting the field.
+double total_energy(const Field& field, const std::vector<std::int32_t>& labels,
+                    const SeamOptions& options) {
+    const int width = field.width;
+    const int height = field.height;
+    double total = 0.0;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t cell =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(col);
+            const int label = labels[cell];
+            total += data_cost_at(field, label, cell, col, row, options);
+            if (label < 0) {
+                continue;  // no valid tile here: no seam contributes
+            }
+            // Count each unordered neighbour pair once (right and down).
+            if (col + 1 < width && labels[cell + 1] != label) {
+                total += seam_cost_at(field, label, labels[cell + 1], col, row, col + 1, row,
+                                      options);
+            }
+            if (row + 1 < height &&
+                labels[cell + static_cast<std::size_t>(width)] != label) {
+                total += seam_cost_at(field, label,
+                                      labels[cell + static_cast<std::size_t>(width)], col, row,
+                                      col, row + 1, options);
+            }
+        }
+    }
+    return total;
+}
+
+/// A rectangular window of FIELD cells the full-resolution ghosting expansion
+/// may relabel. Everything outside keeps the label the coarse pass gave it, so
+/// the graph is bounded by the marked objects' neighbourhood instead of the
+/// whole mosaic. A default Region is empty and never gated in.
+struct Region {
+    int x0 = 0;  ///< inclusive
+    int y0 = 0;  ///< inclusive
+    int x1 = 0;  ///< exclusive
+    int y1 = 0;  ///< exclusive
+    bool contains(int col, int row) const {
+        return col >= x0 && col < x1 && row >= y0 && row < y1;
+    }
+};
+
+/// One alpha-expansion move: the min-cut (Boykov, Veksler & Zabih 2001) for the
+/// set of cells to relabel as `alpha`. Cells already carrying `alpha` and cells
+/// outside `region` (nullptr = whole grid) are fixed on the keep side.
+///
+/// The seam term is a metric only where both tiles cover both ends of an edge.
+/// A cropped tile can be invalid at one end, which makes E00 exceed
+/// E(alpha,lq) + E(lp,alpha); every pair term is therefore truncated to stay
+/// submodular (Rother, Kumar, Kolmogorov & Blake 2005, "Digital tapestry") and
+/// the caller accepts a move only when the TRUE energy falls, so the sweep is a
+/// monotone descent rather than an exact solve.
 bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alpha,
-                  const SeamOptions& options) {
+                  const SeamOptions& options, const Region* region) {
     const int width = field.width;
     const int height = field.height;
     const std::size_t cells = field.cells();
@@ -477,11 +529,21 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
         return false;
     }
 
-    // Graph node per cell that is not already `alpha`; source side = switch.
+    // Graph node per cell that is neither already `alpha` nor fixed by region;
+    // source side = switch.
     std::vector<int> node(cells, -1);
     int count = 0;
-    for (std::size_t cell = 0; cell < cells; ++cell) {
-        if (labels[cell] != alpha) {
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t cell =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(col);
+            if (labels[cell] == alpha) {
+                continue;
+            }
+            if (region != nullptr && !region->contains(col, row)) {
+                continue;
+            }
             node[cell] = count++;
         }
     }
@@ -507,28 +569,40 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
         flow.add_edge(source, p, is_pinned ? 0.0 : data_cost(field, labels[cell], cell, options));
     }
 
-    // Exact pairwise decomposition of E(x_p, x_q), where x = 1 means "switch to
+    // Pairwise decomposition of E(x_p, x_q), where x = 1 means "switch to
     // alpha". With a = E(1,0) = e(alpha,lq), b = E(0,1) = e(lp,alpha) and
     // E(0,0) = e(lp,lq), E(1,1) = 0, the polynomial
     //
     //     E = (E00 - a) * y_p + a * y_q + (b + a - E00) * x_q * y_p,
     //     y = 1 - x ("keeps"),
     //
-    // reproduces all four values exactly. The metric property
-    // E00 + E11 <= E(1,0) + E(0,1) makes b + a - E00 >= 0, so the move is
-    // submodular. The q -> p edge is cut when q switches and p keeps.
+    // reproduces all four values. Where one tile is invalid at an end the
+    // colour sum is 0, so E00 can exceed b + a and the crossing term would be
+    // negative (and add_edge silently drops it). Truncating E00 to b + a
+    // restores E00 + E11 <= E(1,0) + E(0,1) without changing the move.
+    // The q -> p edge is cut when q switches and p keeps.
+    auto add_fixed_unary = [&](int n, double keep_cost, double switch_cost) {
+        if (keep_cost >= switch_cost) {
+            flow.add_edge(source, n, keep_cost - switch_cost);  // cut when keeps
+        } else {
+            flow.add_edge(n, sink, switch_cost - keep_cost);  // cut when switches
+        }
+    };
     auto add_pair = [&](std::size_t pc, std::size_t qc) {
         const int np = node[pc];
         const int nq = node[qc];
         if (np < 0 && nq < 0) {
-            return;  // both already alpha: no cut
+            return;  // both fixed: a constant, no cut
         }
         const int lp = labels[pc];
         const int lq = labels[qc];
         const double e10 = seam_cost(field, alpha, lq, pc, qc, options);
         const double e01 = seam_cost(field, lp, alpha, pc, qc, options);
         if (np >= 0 && nq >= 0) {
-            const double e00 = seam_cost(field, lp, lq, pc, qc, options);
+            double e00 = seam_cost(field, lp, lq, pc, qc, options);
+            if (e00 > e01 + e10) {
+                e00 = e01 + e10;  // non-submodular truncation
+            }
             // p keeps: (E00 - e10) * y_p; a negative capacity is shifted onto
             // p -> t and the constant is dropped (it cannot change the argmin).
             if (e00 >= e10) {
@@ -536,12 +610,14 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
             } else {
                 flow.add_edge(np, sink, e10 - e00);
             }
-            flow.add_edge(source, nq, e10);                 // q keeps
-            flow.add_edge(nq, np, e01 + e10 - e00);         // q switches, p keeps
+            flow.add_edge(source, nq, e10);          // q keeps
+            flow.add_edge(nq, np, e01 + e10 - e00);  // q switches, p keeps
         } else if (np >= 0) {
-            flow.add_edge(source, np, e01);  // q is alpha already: p keeps costs e01
+            // q cannot switch (already alpha or outside the region): p keeps
+            // at e00 and switches at e10.
+            add_fixed_unary(np, seam_cost(field, lp, lq, pc, qc, options), e10);
         } else {
-            flow.add_edge(source, nq, e10);  // p is alpha already: q keeps costs e10
+            add_fixed_unary(nq, seam_cost(field, lp, lq, pc, qc, options), e01);
         }
     };
     for (int row = 0; row < height; ++row) {
@@ -560,25 +636,50 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
 
     flow.run(source, sink);
     const std::vector<char> side = flow.source_side(source);
-    bool changed = false;
+    std::vector<std::size_t> switched;
+    std::vector<std::int32_t> previous;
     for (std::size_t cell = 0; cell < cells; ++cell) {
         const int p = node[cell];
         if (p >= 0 && side[static_cast<std::size_t>(p)] != 0) {
-            labels[cell] = alpha;
-            changed = true;
+            switched.push_back(cell);
+            previous.push_back(labels[cell]);
         }
     }
-    return changed;
+    if (switched.empty()) {
+        return false;
+    }
+    // The truncated pair term makes the min cut optimal for the SURROGATE
+    // energy, not necessarily for the true one. Accept the move only when the
+    // true energy actually falls; a rejected move restores the previous labels,
+    // so the sweep is monotone and can never oscillate.
+    const double before = total_energy(field, labels, options);
+    for (const std::size_t cell : switched) {
+        labels[cell] = alpha;
+    }
+    if (total_energy(field, labels, options) < before) {
+        return true;
+    }
+    for (std::size_t i = 0; i < switched.size(); ++i) {
+        labels[switched[i]] = previous[i];
+    }
+    return false;
 }
 
-/// Sweep every label as the expansion target until a full cycle changes nothing.
+/// Sweep the expansion targets until a full cycle changes nothing. `alphas`
+/// (nullptr = every tile) and `region` (nullptr = the whole grid) bound the
+/// work of the full-resolution ghosting pass; the coarse levels pass both as
+/// nullptr and keep the exact whole-level sweep.
 void alpha_expansion(const Field& field, std::vector<std::int32_t>& labels,
-                     const SeamOptions& options, int max_cycles) {
+                     const SeamOptions& options, int max_cycles,
+                     const Region* region = nullptr,
+                     const std::vector<int>* alphas = nullptr) {
     const int labels_count = static_cast<int>(field.tiles());
+    const int count = alphas != nullptr ? static_cast<int>(alphas->size()) : labels_count;
     for (int cycle = 0; cycle < max_cycles; ++cycle) {
         bool changed = false;
-        for (int alpha = 0; alpha < labels_count; ++alpha) {
-            changed = expand_alpha(field, labels, alpha, options) || changed;
+        for (int i = 0; i < count; ++i) {
+            const int alpha = alphas != nullptr ? (*alphas)[static_cast<std::size_t>(i)] : i;
+            changed = expand_alpha(field, labels, alpha, options, region) || changed;
         }
         if (!changed) {
             break;
@@ -876,6 +977,78 @@ Field fine_field(const std::vector<OrthoTile>& tiles, int width, int height) {
     return field;
 }
 
+/// The active window for the full-resolution ghosting expansion: the bounding
+/// box of every marked, valid mask cell grown by `margin`, plus every label
+/// that covers at least one cell inside it (the labels a ghost region can be
+/// moved TO). Returns false when no mask cell is set -- there is nothing to
+/// remove, so the expansion is skipped entirely and an untouched ghosting run
+/// costs exactly what a plain run does.
+///
+/// One window around all marks rather than one graph per component keeps the
+/// code and the memory estimate simple; marks are normally a few small moving
+/// objects. A scattered mask can widen the box, but never beyond the grid, and
+/// the caller's cycle cap bounds the work.
+bool ghost_expansion_window(const Field& field, const std::vector<OrthoTile>& tiles, int margin,
+                            Region& region, std::vector<int>& alphas) {
+    int min_col = field.width;
+    int min_row = field.height;
+    int max_col = -1;
+    int max_row = -1;
+    for (std::size_t t = 0; t < tiles.size(); ++t) {
+        if (t >= field.avoid.size() || field.avoid[t] == nullptr) {
+            continue;
+        }
+        const OrthoTile& tile = tiles[t];
+        for (int row = tile.y0; row < tile.y0 + tile.height; ++row) {
+            for (int col = tile.x0; col < tile.x0 + tile.width; ++col) {
+                const std::size_t b = tile.index(col, row);
+                if (field.avoid[t][b] == 0 || tile.valid[b] == 0) {
+                    continue;
+                }
+                min_col = std::min(min_col, col);
+                max_col = std::max(max_col, col);
+                min_row = std::min(min_row, row);
+                max_row = std::max(max_row, row);
+            }
+        }
+    }
+    if (max_col < min_col || max_row < min_row) {
+        return false;  // no cell is marked
+    }
+    region.x0 = std::max(0, min_col - margin);
+    region.y0 = std::max(0, min_row - margin);
+    region.x1 = std::min(field.width, max_col + margin + 1);
+    region.y1 = std::min(field.height, max_row + margin + 1);
+    if (region.x1 <= region.x0 || region.y1 <= region.y0) {
+        return false;
+    }
+    // Every camera holding at least one valid cell inside the window is a
+    // candidate target; one that cannot improve any inside cell cannot help.
+    for (std::size_t t = 0; t < tiles.size(); ++t) {
+        const OrthoTile& tile = tiles[t];
+        if (tile.empty()) {
+            continue;
+        }
+        const int c0 = std::max(region.x0, tile.x0);
+        const int r0 = std::max(region.y0, tile.y0);
+        const int c1 = std::min(region.x1, tile.x0 + tile.width);
+        const int r1 = std::min(region.y1, tile.y0 + tile.height);
+        bool covers = false;
+        for (int row = r0; row < r1 && !covers; ++row) {
+            for (int col = c0; col < c1; ++col) {
+                if (tile.valid[tile.index(col, row)] != 0) {
+                    covers = true;
+                    break;
+                }
+            }
+        }
+        if (covers) {
+            alphas.push_back(static_cast<int>(t));
+        }
+    }
+    return !alphas.empty();
+}
+
 }  // namespace
 
 std::vector<std::int32_t> assign_seams(int width, int height,
@@ -967,10 +1140,22 @@ std::vector<std::int32_t> assign_seams(int width, int height,
     // surrounded by object cells whose colour differs from the replacement, so
     // a single-cell move always looks expensive and the object would survive.
     // Alpha expansion flips the whole region at once, where the same seam term
-    // is paid only on the object's perimeter. This is opt-in, so the runtime of
-    // an ordinary run is unchanged.
+    // is paid only on the object's perimeter.
+    //
+    // The pass is bounded twice so it cannot dominate the run: it is skipped
+    // when nothing is marked, it builds a graph only over the marked cells'
+    // bounding box grown by kGhostExpansionMargin (everything outside keeps the
+    // coarse labelling), and it is capped at kGhostExpansionCycles cycles.
     if (options.avoid != nullptr) {
-        alpha_expansion(fine, labels, options, std::max(1, options.expansion_cycles));
+        constexpr int kGhostExpansionMargin = 32;  // cells of slack around a mark
+        constexpr int kGhostExpansionCycles = 2;   // hard cap, independent of options
+        Region region;
+        std::vector<int> alphas;
+        if (ghost_expansion_window(fine, tiles, kGhostExpansionMargin, region, alphas)) {
+            const int cycles =
+                std::min(std::max(1, options.expansion_cycles), kGhostExpansionCycles);
+            alpha_expansion(fine, labels, options, cycles, &region, &alphas);
+        }
     }
     // The coarse levels carry the global structure; from the upsampled labels
     // only the cheap ICM polish runs at full resolution.
@@ -984,35 +1169,7 @@ double energy(int width, int height, const std::vector<OrthoTile>& tiles,
               const std::vector<std::int32_t>& labels, const SeamOptions& options) {
     Field field = fine_field(tiles, width, height);
     attach_avoid(field, tiles, options);
-    double total = 0.0;
-    for (int row = 0; row < height; ++row) {
-        for (int col = 0; col < width; ++col) {
-            const std::size_t cell =
-                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
-                static_cast<std::size_t>(col);
-            const int label = labels[cell];
-            total += data_cost_at(field, label, cell, col, row, options);
-            if (label < 0) {
-                continue;  // no valid tile here: no seam contributes
-            }
-            // Count each unordered neighbour pair once (right and down).
-            if (col + 1 < width) {
-                const int q_label = labels[cell + 1];
-                if (q_label != label) {
-                    total += seam_cost_at(field, label, q_label, col, row, col + 1, row,
-                                          options);
-                }
-            }
-            if (row + 1 < height) {
-                const int q_label = labels[cell + static_cast<std::size_t>(width)];
-                if (q_label != label) {
-                    total += seam_cost_at(field, label, q_label, col, row, col, row + 1,
-                                          options);
-                }
-            }
-        }
-    }
-    return total;
+    return total_energy(field, labels, options);
 }
 
 }  // namespace alphashape::ortho

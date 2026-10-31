@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -40,6 +41,12 @@ void morph(MaskView mask, int radius, bool grow) {
     std::vector<std::uint8_t> out(static_cast<std::size_t>(mask.w) *
                                       static_cast<std::size_t>(mask.h),
                                   0);
+    // Rows are independent: each iteration reads `mask` and writes only its own
+    // row of `out`, so the four passes scale with the tile area on any thread
+    // count and stay deterministic (every cell is computed from unchanged data).
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int row = 0; row < mask.h; ++row) {
         for (int col = 0; col < mask.w; ++col) {
             std::uint8_t value = grow ? 0 : 1;
@@ -199,7 +206,17 @@ void mark_level(int width, int height, int factor, const std::vector<OrthoTile>&
                             ++count;
                         }
                     }
-                    if (count == 0) {
+                    // A camera takes part at a coarse level only when it is
+                    // valid in at least half the fine cells of this coarse
+                    // cell. Comparing a block mean over a sliver of coverage
+                    // against full-coverage means marks the sliver as deviant
+                    // on texture alone (the false positives the coarse levels
+                    // used to produce). Available is the block clipped to the
+                    // grid, so the partial cells at the far edge stay fair.
+                    const int avail_cols = std::min(step, width - ccol * step);
+                    const int avail_rows = std::min(step, height - crow * step);
+                    const int available = std::max(0, avail_cols) * std::max(0, avail_rows);
+                    if (count == 0 || 2 * count < available) {
                         continue;
                     }
                     const double inv = 1.0 / static_cast<double>(count);
@@ -305,7 +322,8 @@ std::vector<std::vector<std::uint8_t>> detect_ghosts(
 
 int filter_label_speckles(int width, int height, const std::vector<OrthoTile>& tiles,
                           std::vector<std::int32_t>& labels,
-                          const std::vector<std::uint8_t>* pinned, int min_component_cells) {
+                          const std::vector<std::uint8_t>* pinned, int min_component_cells,
+                          const std::vector<std::vector<std::uint8_t>>* deviant) {
     const std::size_t cells =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     if (width <= 0 || height <= 0 || labels.size() < cells) {
@@ -318,8 +336,64 @@ int filter_label_speckles(int width, int height, const std::vector<OrthoTile>& t
     std::vector<std::size_t> component;
     std::vector<std::int32_t> candidates;
     std::vector<std::size_t> counts;
+    std::vector<std::uint8_t> clean;  // per candidate: not deviant at the island
     int removed = 0;
     const int steps[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+    const auto tile_deviant_at = [&](std::size_t t, int col, int row) {
+        if (deviant == nullptr || t >= deviant->size()) {
+            return false;
+        }
+        const OrthoTile& tile = tiles[t];
+        if (tile.empty() || (*deviant)[t].size() != tile.valid.size() ||
+            !tile.contains(col, row)) {
+            return false;
+        }
+        return (*deviant)[t][tile.index(col, row)] != 0;
+    };
+
+    // Flatten the per-tile masks onto the output grid once and dilate by two
+    // cells: an island is a candidate only when it touches (or overlaps) a
+    // region the consensus called deviant. Without this the pass would also
+    // relabel harmless argmax speckles anywhere in the mosaic.
+    std::vector<std::uint8_t> deviant_any;
+    if (deviant != nullptr && deviant->size() == tiles.size()) {
+        deviant_any.assign(cells, 0);
+        for (std::size_t t = 0; t < tiles.size(); ++t) {
+            const OrthoTile& tile = tiles[t];
+            if (tile.empty() || (*deviant)[t].size() != tile.valid.size()) {
+                continue;
+            }
+            for (int row = tile.y0; row < tile.y0 + tile.height; ++row) {
+                for (int col = tile.x0; col < tile.x0 + tile.width; ++col) {
+                    const std::size_t b = tile.index(col, row);
+                    if ((*deviant)[t][b] != 0 && tile.valid[b] != 0) {
+                        deviant_any[static_cast<std::size_t>(row) *
+                                        static_cast<std::size_t>(width) +
+                                    static_cast<std::size_t>(col)] = 1;
+                    }
+                }
+            }
+        }
+        std::vector<std::uint8_t> grown(cells, 0);
+        for (int row = 0; row < height; ++row) {
+            for (int col = 0; col < width; ++col) {
+                const std::size_t cell = static_cast<std::size_t>(row) *
+                                             static_cast<std::size_t>(width) +
+                                         static_cast<std::size_t>(col);
+                if (deviant_any[cell] == 0) {
+                    continue;
+                }
+                for (int r = std::max(0, row - 2); r < std::min(height, row + 3); ++r) {
+                    for (int c = std::max(0, col - 2); c < std::min(width, col + 3); ++c) {
+                        grown[static_cast<std::size_t>(r) *
+                                  static_cast<std::size_t>(width) +
+                              static_cast<std::size_t>(c)] = 1;
+                    }
+                }
+            }
+        }
+        deviant_any.swap(grown);
+    }
 
     for (int row = 0; row < height; ++row) {
         for (int col = 0; col < width; ++col) {
@@ -369,8 +443,21 @@ int filter_label_speckles(int width, int height, const std::vector<OrthoTile>& t
                     continue;
                 }
             }
+            if (!deviant_any.empty()) {
+                bool near_deviant = false;
+                for (const std::size_t cell : component) {
+                    if (deviant_any[cell] != 0) {
+                        near_deviant = true;
+                        break;
+                    }
+                }
+                if (!near_deviant) {
+                    continue;  // not a ghosting artefact: leave the label alone
+                }
+            }
             candidates.clear();
             counts.clear();
+            clean.clear();
             for (const std::size_t cell : component) {
                 const int c = static_cast<int>(cell % static_cast<std::size_t>(width));
                 const int r = static_cast<int>(cell / static_cast<std::size_t>(width));
@@ -401,21 +488,52 @@ int filter_label_speckles(int width, int height, const std::vector<OrthoTile>& t
                     if (!valid_everywhere) {
                         continue;
                     }
+                    bool neighbour_deviant = false;
+                    for (const std::size_t member : component) {
+                        const int mc = static_cast<int>(member % static_cast<std::size_t>(width));
+                        const int mr = static_cast<int>(member / static_cast<std::size_t>(width));
+                        if (tile_deviant_at(static_cast<std::size_t>(neighbour), mc, mr)) {
+                            neighbour_deviant = true;
+                            break;
+                        }
+                    }
                     const auto it = std::find(candidates.begin(), candidates.end(), neighbour);
                     if (it == candidates.end()) {
                         candidates.push_back(neighbour);
                         counts.push_back(1);
+                        clean.push_back(
+                            static_cast<std::uint8_t>(neighbour_deviant ? 0 : 1));
                     } else {
-                        ++counts[static_cast<std::size_t>(
-                            std::distance(candidates.begin(), it))];
+                        const std::size_t index =
+                            static_cast<std::size_t>(std::distance(candidates.begin(), it));
+                        ++counts[index];
+                        if (!neighbour_deviant) {
+                            clean[index] = 1;
+                        }
                     }
                 }
             }
             if (candidates.empty()) {
                 continue;
             }
+            // Prefer a neighbour the consensus does NOT call deviant at this
+            // island; fall back to a deviant neighbour only when every
+            // candidate is one, which keeps the "no hole" rule.
+            const bool have_clean =
+                std::any_of(clean.begin(), clean.end(), [](std::uint8_t v) { return v != 0; });
             std::size_t best = 0;
+            if (have_clean) {
+                for (std::size_t i = 0; i < clean.size(); ++i) {
+                    if (clean[i] != 0) {
+                        best = i;
+                        break;
+                    }
+                }
+            }
             for (std::size_t i = 1; i < candidates.size(); ++i) {
+                if (have_clean && clean[i] == 0) {
+                    continue;
+                }
                 if (counts[i] > counts[best] ||
                     (counts[i] == counts[best] && candidates[i] < candidates[best])) {
                     best = i;
