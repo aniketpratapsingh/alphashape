@@ -784,6 +784,14 @@ std::vector<std::uint8_t> encode_elevation(const Elevation& elevation) {
     ScopedTempFile scratch("dem");
     GeoTiffOptions options;
     options.epsg = elevation.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    try {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(elevation.crs));
+    } catch (const ValueError& error) {
+        throw ValueError("elevation sidecar: the stored CRS could not be read (" +
+                         std::string(error.what()) + ")");
+    }
+#endif
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;
@@ -801,7 +809,17 @@ Elevation decode_elevation(const std::vector<std::uint8_t>& bytes) {
     }
     Elevation elevation;
     elevation.raster = read_geotiff_float(scratch.path());
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Keep the full CRS the file records, not just the code the legacy
+    // accessor exposes: a custom WKT would otherwise be lost on the round trip.
+    if (info.crs.has_value()) {
+        elevation.crs = CRS(*info.crs);
+    } else {
+        elevation.set_epsg(info.epsg);
+    }
+#else
     elevation.set_epsg(info.epsg);
+#endif
     elevation.nodata = info.nodata.has_value() ? static_cast<float>(*info.nodata) : -32767.0F;
     return elevation;
 }
@@ -810,6 +828,14 @@ std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho) {
     ScopedTempFile scratch("ortho");
     GeoTiffOptions options;
     options.epsg = ortho.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    try {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(ortho.crs));
+    } catch (const ValueError& error) {
+        throw ValueError("orthomosaic sidecar: the stored CRS could not be read (" +
+                         std::string(error.what()) + ")");
+    }
+#endif
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;
@@ -826,7 +852,15 @@ Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes) {
     }
     Orthomosaic ortho;
     ortho.raster = read_geotiff_u8(scratch.path());
+#if defined(ALPHASHAPE_USE_PROJ)
+    if (info.crs.has_value()) {
+        ortho.crs = CRS(*info.crs);
+    } else {
+        ortho.set_epsg(info.epsg);
+    }
+#else
     ortho.set_epsg(info.epsg);
+#endif
     return ortho;
 }
 

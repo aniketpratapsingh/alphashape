@@ -91,6 +91,17 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
 
     GeoTiffOptions options;
     options.epsg = elevation.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Carry the whole CRS, not just its code: a custom (uncoded) definition
+    // then travels in the citation key as WKT2 instead of being lost. A
+    // malformed stored definition is an error, not a silent local file.
+    try {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(elevation.crs));
+    } catch (const ValueError& error) {
+        throw ValueError("ExportDem: the stored CRS could not be read (" +
+                         std::string(error.what()) + ")");
+    }
+#endif
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;
@@ -108,6 +119,12 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
         elevation.raster, elevation.crs, elevation.nodata,
         static_cast<float>(params.get_float("nodata")), target, "ExportDem");
     options.epsg = elevation::export_epsg(elevation.crs, target);
+#if defined(ALPHASHAPE_USE_PROJ)
+    // A reprojected export declares the TARGET CRS, not the stored one.
+    if (target.requested()) {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(target.crs));
+    }
+#endif
     write_geotiff(path, raster, options);
     if (world_file) {
         write_world_file(world_file_path(path), raster.grid);
