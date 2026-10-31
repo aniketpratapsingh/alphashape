@@ -1129,6 +1129,13 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
     std::vector<ortho::CameraColour> identity(cameras.size());
     if (cameras.size() < 2 || grid.width <= 0 || grid.height <= 0 || stride <= 0 ||
         surface.empty()) {
+        // The affine model needs at least two cameras that see the same surface
+        // point. A single-camera ortho (or an empty surface) has nothing to
+        // solve, so it keeps the identity: the mosaicked colours are exactly the
+        // uncorrected product, never an error.
+        log(LogLevel::Info)
+            << "BuildOrthomosaic: affine colour correction skipped ("
+            << cameras.size() << " camera(s)); using the identity model";
         return identity;
     }
 
@@ -1334,6 +1341,13 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
     colour.shrink_to_fit();
 
     if (observations.empty()) {
+        // No surface point was seen by two cameras: there is no disagreement to
+        // minimise, so the identity model is the correct answer. This covers a
+        // single camera, a flight with no overlap, and a DEM whose valid samples
+        // fall outside every camera.
+        log(LogLevel::Info)
+            << "BuildOrthomosaic: affine colour correction found no overlapping "
+               "camera observations; using the identity model";
         return identity;
     }
 
@@ -1718,16 +1732,19 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
-    ParamSpec color_correction{"color_correction", ParamType::String, std::string("none"),
+    ParamSpec color_correction{"color_correction", ParamType::String, std::string("affine"),
                                "Per-camera colour compensation applied before seams are chosen: "
-                               "\"none\" (default), \"gain\" (one brightness multiplier per camera "
-                               "per channel, Brown & Lowe 2007 section 6) or \"affine\" (a "
-                               "multiplier and an offset per camera per channel, solved jointly "
-                               "over surface points several cameras see, robustly, so a contrast "
-                               "difference is removed too). Off by default: it changes every "
-                               "colour in the mosaic, so it is opt-in until the benchmark shows a "
-                               "clear improvement. A Bool from an older project file is still "
-                               "read (true selects \"gain\")."};
+                               "\"affine\" (default: a multiplier and an offset per camera per "
+                               "channel, solved jointly over surface points several cameras see, "
+                               "robustly, so a contrast difference is removed too), \"gain\" (one "
+                               "brightness multiplier per camera per channel, Brown & Lowe 2007 "
+                               "section 6) or \"none\" (the old uncorrected product). Affine is "
+                               "the default because it visibly reduces the seam colour step; a "
+                               "model that cannot be solved (one camera, no overlap, too few "
+                               "samples) falls back to identity with an info log, so a "
+                               "single-camera orthomosaic still works. A Bool from an older "
+                               "project file is still read (true selects \"gain\", false "
+                               "\"none\")."};
     color_correction.choices = {"none", "gain", "affine"};
     params.declare(color_correction);
 
