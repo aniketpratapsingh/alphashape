@@ -52,6 +52,7 @@ add_library(alphashape_algorithms STATIC
     elevation/surface_frame.cpp
     elevation/dem_builder.cpp
     elevation/build_dem_task.cpp
+    elevation/export_crs.cpp
     elevation/export_dem_task.cpp
     ortho/orthorectify.cpp
     ortho/seamlines.cpp
