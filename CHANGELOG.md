@@ -22,6 +22,26 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Robust per-cell height fusion for BuildDem (Q3).** `BuildDem` gains `fusion`
+  (string, default `"median"`; the other value is `"robust"`). The default keeps
+  the historical per-cell median and its output byte-for-byte. With `"robust"`,
+  a cell's measured observations are sorted (height, then confidence) and fused
+  with a Tukey biweight M-estimate: the scale is 1.4826 times the cell's MAD,
+  floored at a quarter of the cell size; when a cell holds at least five
+  observations the estimator keeps at least the central 70% by rank around the
+  median (never fewer than three), then extends the set outward while the
+  biweight still accepts an observation at its cutoff, so a clean cell keeps
+  all its redundancy while a gross outlier stays out; two IRLS steps then
+  refine the centre with
+  per-observation weights of confidence times the biweight (c = 4.685). The
+  cell's TGV data weight becomes the sum of the final weights, reduced by an
+  agreement factor when the kept set's weighted RMS residual is large relative
+  to twice the scale floor, so trimmed or rejected samples do not count and a
+  disagreement-heavy cell weighs less. Repaired depth samples still never enter
+  the estimate: a cell with any measurement fuses measurements only, and a cell
+  with none keeps the repaired median. Unknown values are rejected like the
+  other BuildDem string options. The estimator lives in `cell_fusion.hpp/.cpp`.
+
 - **Per-camera, per-channel affine colour correction for the orthomosaic.**
   `BuildOrthomosaic`'s `color_correction="affine"` fits `I' = a_c I + b_c` per
   camera per channel, jointly over all cameras, from observations of the SAME

@@ -15,7 +15,9 @@
 //                    into the plane frame, carrying its confidence.
 //
 // Each cell then holds the median of the heights of the samples falling in it
-// (the max height for the model) with the summed confidence, holes are filled
+// (the max height for the model) with the summed confidence, or, when
+// `fusion` is "robust", a confidence-weighted Tukey biweight estimate over the
+// cell's symmetrically trimmed observations (cell_fusion.hpp). Holes are filled
 // per `interpolation` and an optional TGV^2 pass smooths the surface before it
 // is written into Chunk::elevation().
 
@@ -64,6 +66,10 @@ struct DemOptions {
     /// measured cell; farther holes stay nodata. 0 = unlimited. The builder
     /// converts this to cells with the DEM's metres-per-cell before filling.
     double max_fill_distance = 0.0;
+    /// Per-cell height fusion: "median" (default, the plain per-cell median) or
+    /// "robust" (confidence-weighted Tukey biweight M-estimate over the cell's
+    /// symmetrically trimmed observations; see cell_fusion.hpp).
+    std::string fusion = "median";
     /// Run the TGV^2 smoothing / inpainting pass (never for the model source).
     bool tgv = true;
     TgvOptions tgv_options = dem_smoothing_options();
