@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,9 @@
 #include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 #include "model/raster/geotiff.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/crs/transform.hpp"
+#include "model/raster/reproject.hpp"
 
 namespace alphashape {
 namespace {
@@ -1436,6 +1440,363 @@ TEST(BuildDem, MatchesTruthInEtrsLaea) {
     const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
     std::printf("[BuildDem.EtrsLaea] n=%zu RMSE=%.5f m\n", errors.size(), rmse);
     EXPECT_LT(rmse, 0.03);
+}
+
+
+// ---------------------------------------------------------------------------
+// 9. WP-12.9: reprojection at export, and the ≤ 0.5-cell RMS contract
+// ---------------------------------------------------------------------------
+
+TEST(ExportDem, ProjectionParamReprojects) {
+    // The spec's ExportDem.ProjectionParamReprojects: a DEM built in UTM 32N is
+    // exported with `projection = 25832` (ETRS89 / UTM 32N). The file must
+    // declare the TARGET and cover the same ground: the reprojected raster,
+    // sampled back through the target's own frame, still has to meet the truth
+    // within the DEM's accuracy (the export does not degrade the surface).
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
+
+    Params build = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
+    run_build_dem(document, build);
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    ASSERT_EQ(dem.epsg(), 32632);
+
+    const std::string dir = ::testing::TempDir() + "/alphashape_export_reproject";
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/dem_25832.tif";
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{25832}});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 25832);
+    EXPECT_TRUE(info.is_float);
+    // Reprojection changes the grid: it is NOT the source's own.
+    EXPECT_NE(info.grid, dem.raster.grid);
+    // The cell is the source GSD: 0.5 m in UTM is 0.5 m in another UTM zone.
+    EXPECT_NEAR(info.grid.pixel_size_x, 0.5, 0.05);
+
+    // Values survive: read the file back and check the surface against truth in
+    // the TARGET frame. The reprojection is bilinear, so the comparison is the
+    // DEM's own accuracy plus one interpolation, not an exact equality.
+    const GeoRaster<float> back = read_geotiff_float(path);
+    const elevation::SurfaceFrame target_frame =
+        elevation::SurfaceFrame::for_chunk(chunk, 25832);
+    std::vector<double> errors;
+    for (int row = 0; row < back.grid.height; ++row) {
+        for (int col = 0; col < back.grid.width; ++col) {
+            const double value = static_cast<double>(back.at(col, row));
+            if (value == -32767.0) {
+                continue;
+            }
+            const Eigen::Vector2d c = back.grid.pixel_center(col, row);
+            const Eigen::Vector3d local =
+                target_frame.to_local(Eigen::Vector3d(c.x(), c.y(), value));
+            const double lx = local.x(), ly = local.y();
+            if (lx < -50.0 || lx > 50.0 || ly < -38.0 || ly > 38.0 ||
+                near_scene_edge(lx, ly, 1.5)) {
+                continue;
+            }
+            errors.push_back(local.z() - aerial_fixture::truth_height(lx, ly));
+        }
+    }
+    ASSERT_GT(errors.size(), 5000U);
+    double sum_sq = 0.0;
+    for (const double e : errors) {
+        sum_sq += e * e;
+    }
+    const double rmse = std::sqrt(sum_sq / static_cast<double>(errors.size()));
+    std::printf("[ExportDem.ProjectionParam] cells=%dx%d RMSE=%.5f m\n", info.grid.width,
+                info.grid.height, rmse);
+    // The spec's reprojection accuracy bound is 0.5 DEM cell RMS = 0.25 m. The
+    // bilinear resample of a 0.5 m grid onto a 0.5 m grid costs one half-sample;
+    // the point-cloud DEM's own interior error is ~0.02 m, so 0.25 m is the
+    // meaningful ceiling and the surface clearly stays well inside it.
+    EXPECT_LT(rmse, 0.25);
+
+    // `crs` is the general spelling and must give the same file.
+    const std::string path2 = dir + "/dem_crs.tif";
+    params.set("path", ParamValue{path2});
+    params.set("projection", ParamValue{std::int64_t{0}});
+    params.set("crs", ParamValue{std::string("EPSG:25832")});
+    run_task(builtin_registry(), document, "ExportDem", params);
+    const GeoTiffInfo info2 = read_geotiff_info(path2);
+    EXPECT_EQ(info2.epsg, 25832);
+    EXPECT_EQ(info2.grid, info.grid);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(path2);
+}
+
+TEST(ExportDem, ResolutionAppliesInTheTargetCrs) {
+    // `resolution` is a TARGET-CRS cell size. Ask for 1 m cells while
+    // reprojecting to EPSG:25832: the written grid must be 1 m, not 1 m scaled
+    // by the projection.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 1.0);
+    Params build = dem_params("point_cloud", "enabled", 1.0, 0, "natural_neighbour", "none");
+    run_build_dem(document, build);
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_res_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{25832}});
+    params.set("resolution", ParamValue{1.25});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 25832);
+    EXPECT_NEAR(info.grid.pixel_size_x, 1.25, 1e-9);
+    EXPECT_NEAR(info.grid.pixel_size_y, 1.25, 1e-9);
+    std::filesystem::remove(path);
+}
+
+TEST(ExportDem, DisagreeingProjectionAndCrsThrow) {
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -20.0, 20.0, -20.0, 20.0, 1.0);
+    Params build = dem_params("point_cloud", "enabled", 1.0, 0, "natural_neighbour", "none");
+    run_build_dem(document, build);
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{platform::unique_temp_path("alphashape_dem_conflict_", ".tif")});
+    params.set("projection", ParamValue{std::int64_t{25832}});
+    params.set("crs", ParamValue{std::string("EPSG:32633")});
+    EXPECT_THROW(run_task(builtin_registry(), document, "ExportDem", params), ValueError);
+}
+
+// ---------------------------------------------------------------------------
+// 10. BuildDem.ReprojectsToRequestedCrs (end-to-end, <= 0.5 cell RMS)
+// ---------------------------------------------------------------------------
+
+TEST(BuildDem, ReprojectsToRequestedCrs) {
+    // The spec's end-to-end case: build the DEM directly in UTM 32N, export it
+    // to Web Mercator, and compare against an INDEPENDENT reference produced by
+    // mapping every target pixel centre exactly with the CRS engine and
+    // sampling the stored DEM bilinearly. The bound is 0.5 target cell RMS.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    fill_truth_point_cloud(chunk, -55.0, 55.0, -42.0, 42.0, 0.5);
+    Params build = dem_params("point_cloud", "enabled", 0.5, 0, "natural_neighbour", "none");
+    run_build_dem(document, build);
+    const Elevation dem = chunk.elevation();
+    ASSERT_EQ(dem.epsg(), 32632);
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_3857_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{3857}});
+    run_task(builtin_registry(), document, "ExportDem", params);
+    const GeoRaster<float> out = read_geotiff_float(path);
+    ASSERT_FALSE(out.empty());
+
+    // The reference: every pixel centre, exact transform, bilinear sample.
+    const crs::CrsTransform to_source =
+        crs::CrsTransform::create(crs::CoordinateSystem::from_epsg(3857),
+                                  crs::CoordinateSystem::from_epsg(32632));
+    const RasterGrid& grid = dem.raster.grid;
+    std::size_t compared = 0;
+    double sum_sq = 0.0;
+    for (int row = 0; row < out.grid.height; ++row) {
+        for (int col = 0; col < out.grid.width; ++col) {
+            const Eigen::Vector2d centre = out.grid.pixel_center(col, row);
+            const std::optional<crs::CrsPoint> mapped =
+                to_source.forward(crs::CrsPoint{centre.x(), centre.y(), 0.0});
+            if (!mapped.has_value()) {
+                continue;
+            }
+            const Eigen::Vector2d pixel = grid.to_pixel(mapped->x, mapped->y);
+            const double cx = pixel.x() - 0.5;
+            const double cy = pixel.y() - 0.5;
+            const int c0 = static_cast<int>(std::floor(cx));
+            const int r0 = static_cast<int>(std::floor(cy));
+            const double fx = cx - static_cast<double>(c0);
+            const double fy = cy - static_cast<double>(r0);
+            double sum = 0.0;
+            double weight = 0.0;
+            for (int dr = 0; dr <= 1; ++dr) {
+                for (int dc = 0; dc <= 1; ++dc) {
+                    const int scol = c0 + dc;
+                    const int srow = r0 + dr;
+                    if (!grid.contains_pixel(scol, srow)) {
+                        continue;
+                    }
+                    const float h = dem.raster.at(scol, srow);
+                    if (h == dem.nodata || !std::isfinite(h)) {
+                        continue;
+                    }
+                    const double w = (dc == 0 ? 1.0 - fx : fx) * (dr == 0 ? 1.0 - fy : fy);
+                    sum += w * static_cast<double>(h);
+                    weight += w;
+                }
+            }
+            const float got = out.at(col, row);
+            if (weight < 0.5 || got == -32767.0F) {
+                continue;
+            }
+            const double error = static_cast<double>(got) - sum / weight;
+            sum_sq += error * error;
+            ++compared;
+        }
+    }
+    ASSERT_GT(compared, 5000U);
+    const double rms = std::sqrt(sum_sq / static_cast<double>(compared));
+    std::printf("[BuildDem.ReprojectsToRequestedCrs] cells=%dx%d compared=%zu rms=%.4e m "
+                "(cell %.3f m)\n",
+                out.grid.width, out.grid.height, compared, rms, out.grid.pixel_size_x);
+    // 0.5 cell RMS: one target cell is ~0.5 m here, so 0.25 m. The lattice's own
+    // bound is kMaxLatticeError = 0.1 source px, far inside it.
+    EXPECT_LT(rms, 0.5 * out.grid.pixel_size_x);
+    std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// 11. WP-12.9 review: a same-CRS export is a copy, never a re-snapped grid
+// ---------------------------------------------------------------------------
+
+/// A DEM with a real, non-round georeference: an origin whose easting and
+/// northing do not divide by the cell. `reproject_for_export` used to route this
+/// through `suggest_grid`, whose outward snapping moved the origin by up to a
+/// cell and opened a blank border.
+Elevation off_grid_dem(int width, int height, double cell) {
+    Elevation dem;
+    dem.raster.grid.width = width;
+    dem.raster.grid.height = height;
+    dem.raster.grid.origin_x = 500000.037;
+    dem.raster.grid.origin_y = 5400000.083;
+    dem.raster.grid.pixel_size_x = cell;
+    dem.raster.grid.pixel_size_y = cell;
+    dem.raster.channels = 1;
+    dem.raster.data.resize(static_cast<std::size_t>(width) *
+                           static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const Eigen::Vector2d c = dem.raster.grid.pixel_center(col, row);
+            dem.raster.at(col, row) = static_cast<float>(100.0 + 0.01 * (c.x() - 500000.0) +
+                                                         0.02 * (c.y() - 5400000.0));
+        }
+    }
+    dem.set_epsg(32632);
+    dem.nodata = -32767.0F;
+    dem.source = "depth_maps";
+    return dem;
+}
+
+TEST(ExportDem, SameCrsExportIsABitIdenticalCopy) {
+    // A same-CRS export must be a copy: the origin is preserved EXACTLY and
+    // every height is unchanged. The old path snapped the origin and produced
+    // a blank border row, which this catches.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_same_crs_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 32632);
+    EXPECT_EQ(info.grid, dem.raster.grid) << "a same-CRS export must not move the grid";
+
+    const GeoRaster<float> back = read_geotiff_float(path);
+    EXPECT_EQ(back.grid, dem.raster.grid);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < dem.raster.data.size() && i < back.data.size(); ++i) {
+        differing += dem.raster.data[i] != back.data[i] ? 1U : 0U;
+    }
+    EXPECT_EQ(differing, 0U) << "a same-CRS export is a bit-identical copy";
+    std::filesystem::remove(path);
+}
+
+TEST(ExportDem, SameCrsResolutionChangeKeepsTheCorner) {
+    // A same-CRS re-cell at a new resolution must keep the source corner. The
+    // old `suggest_grid` path snapped the origin to a multiple of the new cell,
+    // which on this georeference moves it by most of a cell.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    const std::string path = platform::unique_temp_path("alphashape_dem_recell_", ".tif");
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{path});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    params.set("resolution", ParamValue{0.25});
+    run_task(builtin_registry(), document, "ExportDem", params);
+
+    const GeoTiffInfo info = read_geotiff_info(path);
+    EXPECT_EQ(info.epsg, 32632);
+    EXPECT_NEAR(info.grid.pixel_size_x, 0.25, 1e-9);
+    EXPECT_NEAR(info.grid.origin_x, dem.raster.grid.origin_x, 1e-9)
+        << "a same-CRS re-cell anchors on the source corner";
+    EXPECT_NEAR(info.grid.origin_y, dem.raster.grid.origin_y, 1e-9);
+    // 6 m of extent at 0.25 m: 24 cells, and 4 m -> 16.
+    EXPECT_EQ(info.grid.width, 24);
+    EXPECT_EQ(info.grid.height, 16);
+
+    // The corner cell is covered: a snapped grid would leave it nodata.
+    const GeoRaster<float> back = read_geotiff_float(path);
+    EXPECT_NE(back.at(0, 0), -32767.0F) << "a blank corner cell means the origin moved";
+    std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// 12. WP-12.9 review: the `resolution` unit and a usable result grid
+// ---------------------------------------------------------------------------
+
+TEST(ExportDem, GeographicMetreResolutionIsRefused) {
+    // `resolution` is in DEGREES for a geographic target. 1.0 degree is ~111 km,
+    // absurd next to a 0.1 m source cell, so the export must refuse it with a
+    // message naming the unit and suggesting the degree value.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);
+    chunk.elevation() = dem;
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{platform::unique_temp_path("alphashape_dem_deg_unit_", ".tif")});
+    params.set("projection", ParamValue{std::int64_t{4326}});
+    params.set("resolution", ParamValue{1.0});
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), document, "ExportDem", params);
+    } catch (const ValueError& e) {
+        threw = true;
+        const std::string text = e.what();
+        EXPECT_NE(text.find("DEGREES"), std::string::npos) << text;
+        EXPECT_NE(text.find("metres"), std::string::npos) << text;
+    }
+    EXPECT_TRUE(threw) << "a metre value for a geographic target must be refused";
+}
+
+TEST(ExportDem, TooCoarseAGridIsRefused) {
+    // A cell far coarser than the raster's extent would leave 1x1. Refuse it:
+    // a 1-cell raster is not an output a caller can use.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Elevation dem = off_grid_dem(60, 40, 0.1);  // 6 m x 4 m
+    chunk.elevation() = dem;
+
+    Params params = make_params(builtin_registry().require("ExportDem"));
+    params.set("path", ParamValue{platform::unique_temp_path("alphashape_dem_tiny_", ".tif")});
+    params.set("projection", ParamValue{std::int64_t{32632}});
+    params.set("resolution", ParamValue{10.0});  // 6 / 10 -> 1 cell wide
+    bool threw = false;
+    try {
+        run_task(builtin_registry(), document, "ExportDem", params);
+    } catch (const ValueError& e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("1 x 1"), std::string::npos) << e.what();
+    }
+    EXPECT_TRUE(threw);
 }
 
 }  // namespace

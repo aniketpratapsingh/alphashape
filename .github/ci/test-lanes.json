@@ -4,8 +4,8 @@
   "heavy_on_pr": ["macos"],
   "heavy": [
     { "name": "ortho-truth", "tests": ["BuildOrthomosaic.MatchesTruthOrtho"] },
-    { "name": "ortho-surface", "tests": ["BuildOrthomosaic.ModelSurface", "ExportOrthomosaic.WritesGeoTiff"] },
-    { "name": "dem-plane", "tests": ["BuildDemPipeline.AerialDepthMapsToDem", "BuildOrthomosaic.PlaneToLocalIsExact", "DemAutoResolution.GeographicDepthMapCellIsInDegrees", "BuildOrthomosaic.BuildsInDemCrsWithoutPreprojection"] },
+    { "name": "ortho-surface", "tests": ["BuildOrthomosaic.ModelSurface", "BuildOrthomosaic.ModelSurfaceTakesTheRequestedCrsWithoutReprojectingTheDem", "BuildOrthomosaic.ReprojectsOntoDemCrs", "ExportOrthomosaic.WritesGeoTiff", "ExportOrthomosaic.ReprojectionKeepsEveryColour"] },
+    { "name": "dem-plane", "tests": ["BuildDemPipeline.AerialDepthMapsToDem", "BuildOrthomosaic.PlaneToLocalIsExact", "DemAutoResolution.GeographicDepthMapCellIsInDegrees", "BuildOrthomosaic.BuildsInTheRequestedCrsWithoutPreprojection", "BuildDem.ReprojectsToRequestedCrs", "ExportDem.ProjectionParamReprojects"] },
     { "name": "errors-dense-model", "tests": ["BuildOrthomosaic.Errors", "FullPipelineDenseNoWorseThanSfm.DenseStaysAtLeastAsAccurateAsSfm", "BuildModelEndToEnd.MatchesTheSceneOnTruthPoses"] },
     { "name": "texture-python", "tests": ["BuildTextureEndToEnd.BakesTheSceneOnTruthPoses", "BuildTextureDiagnostics.GroundsTheSeenTexelCoverageGap", "BuildDenseTruthPoses.DenseOnTruthPosesMatchesScene", "python_dem_ortho", "python_mesh", "python_parity"] },
     { "name": "depth-pyramid", "tests": ["PatchMatchPyramid.PyramidFasterOnLarge"] },
