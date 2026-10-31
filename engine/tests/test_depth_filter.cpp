@@ -6,6 +6,7 @@
 //
 // Suites are prefixed DepthFilter so `ctest -R DepthFilter` selects them.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -494,6 +495,45 @@ double index_depth(const DepthMap& map, int i, int j) {
                                           static_cast<std::size_t>(i)]);
 }
 
+/// The span the boundary ring measured, for a span-guard assertion.
+struct RingSpan {
+    double min = std::numeric_limits<double>::max();
+    double max = 0.0;
+};
+
+/// Put the depth of every measured 4-neighbour of the already-punched rectangle
+/// on the plane n . x = offset, where n is the unit ray through the hole's
+/// centre. The plane is therefore perpendicular to that ray: the centre pixel
+/// sits at the plane's closest distance (offset), while the ring, further off
+/// the ray, measures it at a greater distance. The larger the hole, the wider
+/// that perspective range -- which is what lets a test step over the 1% span
+/// margin deterministically. Returns the ring's measured range.
+RingSpan set_ring_on_oblique_plane(DepthMap& map, const Calibration& calib, int i0, int j0,
+                                   int i1, int j1, double offset) {
+    const Eigen::Vector2d centre(0.5 * static_cast<double>(i0 + i1) + 0.5,
+                                 0.5 * static_cast<double>(j0 + j1) + 0.5);
+    const Eigen::Vector3d normal = calib.unproject(centre);
+    RingSpan span;
+    const auto put = [&](int i, int j) {
+        const Eigen::Vector2d pixel(static_cast<double>(i) + 0.5,
+                                    static_cast<double>(j) + 0.5);
+        const double depth = offset / normal.dot(calib.unproject(pixel));
+        map.depths[static_cast<std::size_t>(j) * static_cast<std::size_t>(map.width) +
+                   static_cast<std::size_t>(i)] = static_cast<float>(depth);
+        span.min = std::min(span.min, depth);
+        span.max = std::max(span.max, depth);
+    };
+    for (int i = i0; i <= i1; ++i) {
+        put(i, j0 - 1);
+        put(i, j1 + 1);
+    }
+    for (int j = j0; j <= j1; ++j) {
+        put(i0 - 1, j);
+        put(i1 + 1, j);
+    }
+    return span;
+}
+
 TEST(DepthRepair, PlaneHoleIsFilled) {
     View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
     const DepthMap before = view.map;
@@ -757,6 +797,57 @@ TEST(DepthRepair, FilledDepthStaysInsideTheRingSpan) {
             EXPECT_LE(d, ring_max * (1.0 + 0.011)) << "pixel " << i << "," << j;
         }
     }
+}
+
+TEST(DepthRepair, RingSpanGuardRefusesFillOutsideTheMeasuredRange) {
+    // The companion to the previous case: there the fill stayed inside the span.
+    // Here it must be REFUSED. A LARGE hole is laid on a plane perpendicular to
+    // the ray through its centre (set_ring_on_oblique_plane). The ring pixels
+    // sit up to ~10 degrees off that ray, so they measure the plane at
+    // 1.427..1.475, while the centre ray runs along the normal and the plane's
+    // true depth there is the offset, 1.400 -- 1.9% BELOW the ring's minimum and
+    // outside the 1% margin. That is an extrapolation the ring never measured.
+    //
+    // This isolates the span guard. The ring lies exactly on one plane, so
+    // fit_ring_plane accepts it (rejected_plane stays 0, most of the hole IS
+    // filled): neither the inlier fraction nor the coherence arc test is the
+    // cause. The centre ray is almost parallel to the plane normal
+    // (|n . b| ~ 1), so the grazing guard is not either. Only the span check can
+    // leave the centre invalid.
+    View view = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(view.map, 10, 10, 50, 40);  // 41x31 = 1271 px (<= default 2000)
+    const RingSpan span =
+        set_ring_on_oblique_plane(view.map, view.calib, 10, 10, 50, 40, 1.4);
+    ASSERT_LT(1.4, span.min * 0.99) << "the centre fill must be outside the measured span";
+
+    RepairStats stats;
+    const DepthMap out = repair_depth_map(view.map, view.calib, RepairOptions{}, &stats);
+    EXPECT_EQ(stats.rejected_plane, 0u) << "one plane explains the ring; the fit must accept it";
+    EXPECT_EQ(stats.filled_components, 1u);
+    EXPECT_GT(stats.filled_pixels, 0u) << "the in-span part of the hole is still filled";
+    EXPECT_GT(stats.unfilled_pixels, 0u);
+    EXPECT_EQ(index_depth(out, 30, 25), -1.0)
+        << "the central fill is outside the ring's measured span";
+    EXPECT_GT(index_depth(out, 10, 10), 0.0) << "a boundary-adjacent fill is inside the span";
+
+    // Companion: a smaller hole covers less of the plane's perspective range, so
+    // the same centre depth (1.400) lands JUST inside the 1% margin and is
+    // filled. (Its allowed minimum is 1.3982; the margin is 0.13%.)
+    View small = make_view(kW, kH, kF, 0.0, 0.0, kHeight);
+    punch(small.map, 20, 15, 40, 35);  // 21x21 = 441 px
+    const RingSpan small_span =
+        set_ring_on_oblique_plane(small.map, small.calib, 20, 15, 40, 35, 1.4);
+    ASSERT_GE(1.4, small_span.min * 0.99) << "the companion must sit inside the margin";
+    RepairStats small_stats;
+    const DepthMap small_out =
+        repair_depth_map(small.map, small.calib, RepairOptions{}, &small_stats);
+    EXPECT_EQ(small_stats.rejected_plane, 0u);
+    EXPECT_EQ(small_stats.unfilled_pixels, 0u);
+    EXPECT_EQ(small_stats.filled_pixels, 441u);
+    const double centre = index_depth(small_out, 30, 25);
+    ASSERT_GT(centre, 0.0);
+    EXPECT_GE(centre, small_span.min * 0.99);
+    EXPECT_LE(centre, small_span.max * 1.01);
 }
 
 TEST(DepthRepair, ZeroMaxAreaFillsNothing) {

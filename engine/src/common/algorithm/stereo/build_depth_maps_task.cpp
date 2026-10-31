@@ -394,11 +394,14 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // gratuitous. The parse below resolves the filter mode, so validate after.
     const stereo::FilterMode filter_mode = stereo::parse_filter_mode(filter_mode_text);
     if (repair_holes && filter_mode != stereo::FilterMode::Disabled) {
-        if (repair_max_area < 0) {
-            throw ValueError("repair_max_area must not be negative");
-        }
-        if (repair_max_area > kMaxRepairArea) {
-            throw ValueError("repair_max_area must be at most " + std::to_string(kMaxRepairArea));
+        // Same range-style message as max_neighbors and best_k. 0 is a real
+        // value, not a shorthand: RepairOptions::max_area == 0 makes the pass a
+        // no-op (it returns the map unchanged), so "repair on, fill nothing" is
+        // expressible. The upper bound keeps the value inside the int the task
+        // casts to and refuses a hole too large to be a filter artefact.
+        if (repair_max_area < 0 || repair_max_area > kMaxRepairArea) {
+            throw ValueError("repair_max_area must be in [0, " +
+                             std::to_string(kMaxRepairArea) + "]");
         }
     }
     // -1 means "the cost type's own default", resolved once here so every map of

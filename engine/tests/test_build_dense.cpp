@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1748,6 +1749,47 @@ TEST(BuildDenseParams, RepairDefaultsAreOffAndBounded) {
     EXPECT_FALSE(dead.active_chunk()->depth_maps().empty());
 }
 
+TEST(BuildDenseParams, RepairMaxAreaRejectsOutOfRangeAndAcceptsValid) {
+    const TaskEntry& entry = builtin_registry().require("BuildDepthMaps");
+    const Params defaults = make_params(entry);
+    // Read the declared bound rather than duplicating kMaxRepairArea, so the
+    // schema and the task's own check cannot drift apart.
+    std::int64_t declared_max = 0;
+    for (const ParamSpec& spec : entry.schema.specs()) {
+        if (spec.name == "repair_max_area") {
+            declared_max = std::get<std::int64_t>(spec.maximum);
+        }
+    }
+    ASSERT_GT(declared_max, 0);
+
+    // Invalid: below zero, one past the bound, and an absurd value far beyond
+    // the int the task ultimately stores. Each must fail at the task layer with
+    // the same ValueError every other BuildDepthMaps bound raises.
+    for (const std::int64_t bad :
+         {std::int64_t{-1}, declared_max + 1, std::numeric_limits<std::int64_t>::max()}) {
+        Document document = aligned_document(seq_files(4));
+        Params params = defaults;
+        params.set("repair_holes", ParamValue{true});
+        params.set("repair_max_area", ParamValue{bad});
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError)
+            << "repair_max_area=" << bad << " must be rejected";
+        EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
+    }
+
+    // Valid: 0 is meaningful -- RepairOptions::max_area == 0 makes the pass a
+    // no-op, i.e. "repair on, fill nothing" -- and both the default and the
+    // declared bound are accepted.
+    for (const std::int64_t good : {std::int64_t{0}, std::int64_t{2000}, declared_max}) {
+        Document document = aligned_document(seq_files(4));
+        Params params = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+        params.set("repair_holes", ParamValue{true});
+        params.set("repair_max_area", ParamValue{good});
+        EXPECT_NO_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params))
+            << "repair_max_area=" << good << " must be accepted";
+        EXPECT_FALSE(document.active_chunk()->depth_maps().empty());
+    }
+}
+
 TEST(BuildDenseParams, RepairIsSkippedWhenTheFilterIsDisabled) {
     // The repair pass exists to undo holes the cross-view filter opened. With the
     // filter disabled nothing was deleted as an artefact, so the holes are
@@ -1824,6 +1866,69 @@ TEST(DepthMapsReuse, RepairOffKeepsTheFingerprintUnchanged) {
     ASSERT_EQ(restored.size(), before.size());
     std::sort(restored.begin(), restored.end());
     EXPECT_EQ(before, restored) << "repair_holes=false must stamp the historic fingerprint";
+}
+
+TEST(DepthMapsReuse, RepairMaxAreaIsFoldedOnlyWhenRepairIsOn) {
+    // repair_max_area changes the final depths only through the repair pass, so
+    // it belongs in the fingerprint ONLY when repair_holes is on. With repair
+    // OFF, two different values must stamp the same fingerprint and leave the
+    // stored maps reusable.
+    Document document = aligned_document(seq_files(4));
+    Params off_zero = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    off_zero.set("repair_holes", ParamValue{false});
+    off_zero.set("repair_max_area", ParamValue{std::int64_t{0}});
+    run_task(builtin_registry(), document, "BuildDepthMaps", off_zero);
+    std::vector<std::uint64_t> off_fingerprints;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        off_fingerprints.push_back(map.alignment_fingerprint);
+    }
+    ASSERT_FALSE(off_fingerprints.empty());
+    const std::size_t map_count = off_fingerprints.size();
+
+    reset_depth_map_search_count();
+    Params off_wide = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    off_wide.set("repair_holes", ParamValue{false});
+    off_wide.set("repair_max_area", ParamValue{std::int64_t{5000}});
+    run_task(builtin_registry(), document, "BuildDepthMaps", off_wide);
+    EXPECT_EQ(depth_map_search_count(), 0U)
+        << "repair off must ignore repair_max_area, so every map is reused";
+    std::vector<std::uint64_t> off_wide_fingerprints;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        off_wide_fingerprints.push_back(map.alignment_fingerprint);
+    }
+    std::sort(off_fingerprints.begin(), off_fingerprints.end());
+    std::sort(off_wide_fingerprints.begin(), off_wide_fingerprints.end());
+    EXPECT_EQ(off_fingerprints, off_wide_fingerprints)
+        << "repair off must not fold repair_max_area into the fingerprint";
+
+    // With repair ON the value decides which holes are filled, so changing it
+    // must invalidate every map (a full rebuild) and move the fingerprint.
+    Params on_small = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    on_small.set("repair_holes", ParamValue{true});
+    on_small.set("repair_max_area", ParamValue{std::int64_t{1000}});
+    reset_depth_map_search_count();
+    run_task(builtin_registry(), document, "BuildDepthMaps", on_small);
+    EXPECT_EQ(depth_map_search_count(), map_count);
+    std::vector<std::uint64_t> on_small_fingerprints;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        on_small_fingerprints.push_back(map.alignment_fingerprint);
+    }
+
+    Params on_large = reuse_params(kIncrementalDownscale, /*reuse=*/true);
+    on_large.set("repair_holes", ParamValue{true});
+    on_large.set("repair_max_area", ParamValue{std::int64_t{4000}});
+    reset_depth_map_search_count();
+    run_task(builtin_registry(), document, "BuildDepthMaps", on_large);
+    EXPECT_EQ(depth_map_search_count(), map_count)
+        << "repair on: a different repair_max_area must rebuild every map";
+    std::vector<std::uint64_t> on_large_fingerprints;
+    for (const DepthMap& map : document.active_chunk()->depth_maps()) {
+        on_large_fingerprints.push_back(map.alignment_fingerprint);
+    }
+    std::sort(on_small_fingerprints.begin(), on_small_fingerprints.end());
+    std::sort(on_large_fingerprints.begin(), on_large_fingerprints.end());
+    EXPECT_NE(on_small_fingerprints, on_large_fingerprints)
+        << "repair on: repair_max_area must be part of the fingerprint";
 }
 
 TEST(BuildDenseParams, DeclaredSearchTuningDefaultsAreTheHistoricalOnes) {
