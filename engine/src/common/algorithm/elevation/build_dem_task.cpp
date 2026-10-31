@@ -77,6 +77,11 @@ DemOptions resolve_options(const Params& params) {
     if (!(options.max_fill_distance >= 0.0) || !std::isfinite(options.max_fill_distance)) {
         throw ValueError("BuildDem: max_fill_distance must be a finite value >= 0 (metres)");
     }
+    options.fusion = params.get_string("fusion");
+    if (options.fusion != "median" && options.fusion != "robust") {
+        throw ValueError("BuildDem: fusion must be \"median\" or \"robust\" (got \"" +
+                         options.fusion + "\")");
+    }
     const std::string smoothing = params.get_string("smoothing");
     if (smoothing == "tgv") {
         options.tgv = true;
@@ -149,6 +154,14 @@ void BuildDemTask::declare_params(Params& params) const {
                                 "uncapped default."};
     max_fill_distance.minimum = 0.0;
     params.declare(max_fill_distance);
+
+    ParamSpec fusion{"fusion", ParamType::String, std::string("median"),
+                     "Per-cell height fusion: \"median\" (default, the plain median of the "
+                     "cell's measured heights) or \"robust\" (a confidence-weighted Tukey "
+                     "biweight M-estimate over the symmetrically trimmed observations, with "
+                     "the cell's data weight reduced when the kept samples disagree)."};
+    fusion.choices = {"median", "robust"};
+    params.declare(fusion);
 
     ParamSpec smoothing{"smoothing", ParamType::String, std::string("tgv"),
                         "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "
