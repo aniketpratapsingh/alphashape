@@ -74,8 +74,9 @@ void pack_calibration(const Calibration& c, double* params) {
 
 /// One residual block: reprojection error of a single point in a single camera.
 /// Parameter order is (angle-axis rotation, translation, 3-D point, intrinsics);
-/// the intrinsics arrive as an 11-double parameter block (f, cx, cy, b1, b2,
-/// k1, k2, k3, k4, p1, p2) so self-calibration can free selected coefficients.
+/// the intrinsics arrive as a 13-double parameter block (f, cx, cy, b1, b2,
+/// k1, k2, k3, k4, p1, p2, p3, p4) so self-calibration can free selected
+/// coefficients.
 /// The block is shared by every camera on the same sensor.
 struct ReprojectionCost {
     ReprojectionCost(CameraType type, int width, int height, const Eigen::Vector2d& pixel)

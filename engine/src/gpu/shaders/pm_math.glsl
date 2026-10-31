@@ -388,11 +388,17 @@ bool project_point(int type, int vw, int vh, vec3 p_cam, vec3 fcx, vec2 b, vec4 
         float r6 = r4 * r2;
         float r8 = r4 * r4;
         float radial_scale = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
-        // Higher-order tangential pair, folded exactly as on the CPU.
-        float q1 = p1 + p3 * r2;
-        float q2 = p2 + p4 * r2;
-        xd = xs * radial_scale + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys;
-        yd = ys * radial_scale + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys;
+        // Historical p1/p2 expression, verbatim, so p3 = p4 = 0 takes exactly
+        // the arithmetic main did. The higher-order pair folds the same
+        // template into q1 = p1 + p3 r^2, q2 = p2 + p4 r^2 and replaces it.
+        xd = xs * radial_scale + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys;
+        yd = ys * radial_scale + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys;
+        if (p3 != 0.0 || p4 != 0.0) {
+            float q1 = p1 + p3 * r2;
+            float q2 = p2 + p4 * r2;
+            xd = xs * radial_scale + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys;
+            yd = ys * radial_scale + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys;
+        }
     }
     float f = fcx.x, cx = fcx.y, cy = fcx.z;
     pixel = vec2(float(vw) * 0.5 + cx + xd * (f + b.x) + yd * b.y,

@@ -90,22 +90,28 @@ void invert_distortion(const DistortionPoly& poly, double xd, double yd, double&
             return;
         }
 
-        // Higher-order tangential pair folded the same way as the forward
-        // model: the tangential block uses q1 = p1 + p3 r^2, q2 = p2 + p4 r^2.
-        const double q1 = p1 + p3 * r2;
-        const double q2 = p2 + p4 * r2;
-        const double j00 = s + 2.0 * nx * nx * q + 6.0 * nx * q1 + 2.0 * ny * q2 +
-                           2.0 * p3 * nx * (r2 + 2.0 * nx * nx) +
-                           4.0 * p4 * nx * nx * ny;
-        const double j01 = 2.0 * nx * ny * q + 2.0 * ny * q1 + 2.0 * nx * q2 +
-                           2.0 * p3 * ny * (r2 + 2.0 * nx * nx) +
-                           4.0 * p4 * nx * ny * ny;
-        const double j10 = 2.0 * nx * ny * q + 2.0 * nx * q2 + 2.0 * ny * q1 +
-                           2.0 * p4 * nx * (r2 + 2.0 * ny * ny) +
-                           4.0 * p3 * nx * nx * ny;
-        const double j11 = s + 2.0 * ny * ny * q + 6.0 * ny * q2 + 2.0 * nx * q1 +
-                           2.0 * p4 * ny * (r2 + 2.0 * ny * ny) +
-                           4.0 * p3 * nx * ny * ny;
+        // The historical p1/p2 Jacobian, exactly as it was before p3/p4
+        // existed. With p3 = p4 = 0 these four lines are the whole computation,
+        // so the iteration (and hence the inverse) is bit-identical to main.
+        // The higher-order pair is folded into q1 = p1 + p3 r^2,
+        // q2 = p2 + p4 r^2 and replaces the p1/p2 block wholesale, so no term
+        // is counted twice.
+        double j00 = s + 2.0 * nx * nx * q + 6.0 * p1 * nx + 2.0 * p2 * ny;
+        double j01 = 2.0 * nx * ny * q + 2.0 * p1 * ny + 2.0 * p2 * nx;
+        double j10 = 2.0 * nx * ny * q + 2.0 * p2 * nx + 2.0 * p1 * ny;
+        double j11 = s + 2.0 * ny * ny * q + 6.0 * p2 * ny + 2.0 * p1 * nx;
+        if (p3 != 0.0 || p4 != 0.0) {
+            const double q1 = p1 + p3 * r2;
+            const double q2 = p2 + p4 * r2;
+            j00 = s + 2.0 * nx * nx * q + 6.0 * nx * q1 + 2.0 * ny * q2 +
+                  2.0 * p3 * nx * (r2 + 2.0 * nx * nx) + 4.0 * p4 * nx * nx * ny;
+            j01 = 2.0 * nx * ny * q + 2.0 * ny * q1 + 2.0 * nx * q2 +
+                  2.0 * p3 * ny * (r2 + 2.0 * nx * nx) + 4.0 * p4 * nx * ny * ny;
+            j10 = 2.0 * nx * ny * q + 2.0 * nx * q2 + 2.0 * ny * q1 +
+                  2.0 * p4 * nx * (r2 + 2.0 * ny * ny) + 4.0 * p3 * nx * nx * ny;
+            j11 = s + 2.0 * ny * ny * q + 6.0 * ny * q2 + 2.0 * nx * q1 +
+                  2.0 * p4 * ny * (r2 + 2.0 * ny * ny) + 4.0 * p3 * nx * ny * ny;
+        }
         const double det = j00 * j11 - j01 * j10;
         if (std::abs(det) < 1e-300) {
             break;
@@ -130,10 +136,16 @@ void invert_distortion(const DistortionPoly& poly, double xd, double yd, double&
         if (std::abs(s) < 1e-300) {
             break;
         }
-        const double q1 = p1 + p3 * r2;
-        const double q2 = p2 + p4 * r2;
-        const double tx = q1 * (r2 + 2.0 * px * px) + 2.0 * q2 * px * py;
-        const double ty = q2 * (r2 + 2.0 * py * py) + 2.0 * q1 * px * py;
+        // Historical tangential block; the p3/p4 fold only replaces it when at
+        // least one of them is non-zero, keeping p3 = p4 = 0 bit-identical.
+        double tx = p1 * (r2 + 2.0 * px * px) + 2.0 * p2 * px * py;
+        double ty = p2 * (r2 + 2.0 * py * py) + 2.0 * p1 * px * py;
+        if (p3 != 0.0 || p4 != 0.0) {
+            const double q1 = p1 + p3 * r2;
+            const double q2 = p2 + p4 * r2;
+            tx = q1 * (r2 + 2.0 * px * px) + 2.0 * q2 * px * py;
+            ty = q2 * (r2 + 2.0 * py * py) + 2.0 * q1 * px * py;
+        }
         const double ox = (xd - tx) / s;
         const double oy = (yd - ty) / s;
 

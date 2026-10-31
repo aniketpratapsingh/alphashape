@@ -210,13 +210,24 @@ ALPHASHAPE_PROJECT_INLINE bool try_project_point(CameraType type, int width, int
         const T r8 = r4 * r4;
         const T radial = T(1) + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
         const T two = T(2);
-        // Higher-order tangential pair: the same p1/p2 template pre-multiplied
-        // by r^2, i.e. p3 (r^2 + 2 x^2) r^2 + 2 p4 x y r^2, mirrored for y.
-        // Folding them into p1/p2 keeps the p3 = p4 = 0 result bit-identical.
-        const T q1 = p1 + p3 * r2;
-        const T q2 = p2 + p4 * r2;
-        xd = xs * radial + q1 * (r2 + two * xs * xs) + two * q2 * xs * ys;
-        yd = ys * radial + q2 * (r2 + two * ys * ys) + two * q1 * xs * ys;
+        // The historical p1/p2 expression, verbatim. For plain scalars with
+        // p3 = p4 = 0 this is the entire computation, so the forward model is
+        // bit-identical to main. The higher-order pair folds the same template
+        // into q1 = p1 + p3 r^2, q2 = p2 + p4 r^2 and replaces the p1/p2
+        // block. Autodiff always takes the folded form so the gradient with
+        // respect to p3/p4 survives even at a zero starting value.
+        xd = xs * radial + p1 * (r2 + two * xs * xs) + two * p2 * xs * ys;
+        yd = ys * radial + p2 * (r2 + two * ys * ys) + two * p1 * xs * ys;
+        bool higher_order = true;
+        if constexpr (std::is_arithmetic<T>::value) {
+            higher_order = p3 != T(0) || p4 != T(0);
+        }
+        if (higher_order) {
+            const T q1 = p1 + p3 * r2;
+            const T q2 = p2 + p4 * r2;
+            xd = xs * radial + q1 * (r2 + two * xs * xs) + two * q2 * xs * ys;
+            yd = ys * radial + q2 * (r2 + two * ys * ys) + two * q1 * xs * ys;
+        }
     }
 
     const T half_w = static_cast<T>(width) * T(0.5);
