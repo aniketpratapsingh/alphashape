@@ -256,6 +256,14 @@ class TestKeyboardBinder(unittest.TestCase):
         with self.assertRaises(TypeError):
             doc.run_task("DetectFeatures", keypoint_limit="x")
 
+    def test_bool_is_rejected_for_a_free_form_string_param(self):
+        # The Bool-to-text compatibility hatch is scoped to `color_correction`
+        # (a Bool in an older release). Every other String parameter must reject
+        # a Bool, or `label=True` would silently become the label "true".
+        doc, _ = make_document_with_images(FIXTURE_A)
+        with self.assertRaises(TypeError):
+            doc.run_task("BuildOrthomosaic", label=True)
+
 
 class TestStringListBinder(unittest.TestCase):
     """A StringList parameter binds a list or tuple of str and nothing else."""

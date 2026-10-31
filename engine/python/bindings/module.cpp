@@ -119,14 +119,13 @@ alphashape::ParamValue to_param_value(const alphashape::ParamSpec& spec, py::han
             if (is_str) {
                 return alphashape::ParamValue(py::cast<std::string>(value));
             }
-            // A Bool bound to a String parameter is accepted as its text form.
-            // This is what keeps a call written against the older
-            // `color_correction=True` (a Bool parameter then) working now that
-            // the parameter is a choice: the task's own parser reads "true" as
-            // the mode that Bool selected. For any other String parameter the
-            // value is rejected by that parameter's own validation, so the
-            // compatibility hatch cannot silently widen an unrelated enum.
-            if (is_bool) {
+            // A Bool is accepted for `color_correction` ONLY, as its text form:
+            // that parameter was a Bool in an older release, and the task's own
+            // parser reads "true"/"false" as the modes it then selected. Applying
+            // this to every String parameter would turn `label=True` into the
+            // label "true" and, worse, let a Bool slip past an enum's choices;
+            // every other String parameter therefore rejects a Bool below.
+            if (is_bool && spec.name == "color_correction") {
                 return alphashape::ParamValue(std::string(py::cast<bool>(value) ? "true"
                                                                                : "false"));
             }
