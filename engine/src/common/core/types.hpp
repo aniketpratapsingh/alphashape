@@ -110,7 +110,7 @@ struct Sensor {
     Calibration calibration;
 
     /// Names of coefficients held fixed during adjustment. Any subset of
-    /// {"f","cx","cy","b1","b2","k1","k2","k3","k4","p1","p2"}.
+    /// {"f","cx","cy","b1","b2","k1","k2","k3","k4","p1","p2","p3","p4"}.
     std::vector<std::string> fixed_params;
 
     bool operator==(const Sensor& other) const;

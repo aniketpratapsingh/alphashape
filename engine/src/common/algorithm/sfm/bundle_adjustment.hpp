@@ -90,7 +90,7 @@ struct BAProblem {
     /// Camera -> index into `calibrations`. Empty => calibrations is one per
     /// camera (index = camera), the pre-existing behaviour.
     std::vector<std::size_t> camera_sensor;
-    /// Per entry of `calibrations`: which of the 11 coefficients are free (order
+    /// Per entry of `calibrations`: which of the 13 coefficients are free (order
     /// as in calibration.hpp). Empty => every calibration fully fixed
     /// (pre-existing behaviour). Otherwise size == calibrations.size().
     std::vector<std::array<bool, kCalibrationParamCount>> fit_intrinsics;

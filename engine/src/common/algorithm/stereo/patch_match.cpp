@@ -682,6 +682,8 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         nv.params[8] = c.k4;
         nv.params[9] = c.p1;
         nv.params[10] = c.p2;
+        nv.params[11] = c.p3;
+        nv.params[12] = c.p4;
         nv.M = view.R * rref_t;
         nv.c = view.t - nv.M * reference.t;
         neighbour_views.push_back(nv);

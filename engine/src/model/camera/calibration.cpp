@@ -19,7 +19,7 @@ struct DistortionPoly {
 
     explicit DistortionPoly(const Calibration& c)
         : params{c.f,      c.cx, c.cy, c.b1, c.b2, c.k1,
-                 c.k2,     c.k3, c.k4, c.p1, c.p2} {
+                 c.k2,     c.k3, c.k4, c.p1, c.p2, c.p3, c.p4} {
         params[0] = 1.0;  // f
         params[1] = 0.0;  // cx
         params[2] = 0.0;  // cy
@@ -56,6 +56,8 @@ void invert_distortion(const DistortionPoly& poly, double xd, double yd, double&
     const double k4 = poly.params[8];
     const double p1 = poly.params[9];
     const double p2 = poly.params[10];
+    const double p3 = poly.params[11];
+    const double p4 = poly.params[12];
 
     // -- Newton -------------------------------------------------------------
     double nx = xd;
@@ -88,10 +90,22 @@ void invert_distortion(const DistortionPoly& poly, double xd, double yd, double&
             return;
         }
 
-        const double j00 = s + 2.0 * nx * nx * q + 6.0 * p1 * nx + 2.0 * p2 * ny;
-        const double j01 = 2.0 * nx * ny * q + 2.0 * p1 * ny + 2.0 * p2 * nx;
-        const double j10 = 2.0 * nx * ny * q + 2.0 * p2 * nx + 2.0 * p1 * ny;
-        const double j11 = s + 2.0 * ny * ny * q + 6.0 * p2 * ny + 2.0 * p1 * nx;
+        // Higher-order tangential pair folded the same way as the forward
+        // model: the tangential block uses q1 = p1 + p3 r^2, q2 = p2 + p4 r^2.
+        const double q1 = p1 + p3 * r2;
+        const double q2 = p2 + p4 * r2;
+        const double j00 = s + 2.0 * nx * nx * q + 6.0 * nx * q1 + 2.0 * ny * q2 +
+                           2.0 * p3 * nx * (r2 + 2.0 * nx * nx) +
+                           4.0 * p4 * nx * nx * ny;
+        const double j01 = 2.0 * nx * ny * q + 2.0 * ny * q1 + 2.0 * nx * q2 +
+                           2.0 * p3 * ny * (r2 + 2.0 * nx * nx) +
+                           4.0 * p4 * nx * ny * ny;
+        const double j10 = 2.0 * nx * ny * q + 2.0 * nx * q2 + 2.0 * ny * q1 +
+                           2.0 * p4 * nx * (r2 + 2.0 * ny * ny) +
+                           4.0 * p3 * nx * nx * ny;
+        const double j11 = s + 2.0 * ny * ny * q + 6.0 * ny * q2 + 2.0 * nx * q1 +
+                           2.0 * p4 * ny * (r2 + 2.0 * ny * ny) +
+                           4.0 * p3 * nx * ny * ny;
         const double det = j00 * j11 - j01 * j10;
         if (std::abs(det) < 1e-300) {
             break;
@@ -116,8 +130,10 @@ void invert_distortion(const DistortionPoly& poly, double xd, double yd, double&
         if (std::abs(s) < 1e-300) {
             break;
         }
-        const double tx = p1 * (r2 + 2.0 * px * px) + 2.0 * p2 * px * py;
-        const double ty = p2 * (r2 + 2.0 * py * py) + 2.0 * p1 * px * py;
+        const double q1 = p1 + p3 * r2;
+        const double q2 = p2 + p4 * r2;
+        const double tx = q1 * (r2 + 2.0 * px * px) + 2.0 * q2 * px * py;
+        const double ty = q2 * (r2 + 2.0 * py * py) + 2.0 * q1 * px * py;
         const double ox = (xd - tx) / s;
         const double oy = (yd - ty) / s;
 
@@ -184,12 +200,13 @@ bool Calibration::operator==(const Calibration& other) const {
     return type == other.type && width == other.width && height == other.height &&
            f == other.f && cx == other.cx && cy == other.cy && b1 == other.b1 &&
            b2 == other.b2 && k1 == other.k1 && k2 == other.k2 && k3 == other.k3 &&
-           k4 == other.k4 && p1 == other.p1 && p2 == other.p2;
+           k4 == other.k4 && p1 == other.p1 && p2 == other.p2 && p3 == other.p3 &&
+           p4 == other.p4;
 }
 
 Eigen::Vector2d Calibration::project(const Eigen::Vector3d& p_cam) const {
-    const double params[kCalibrationParamCount] = {f,  cx, cy, b1, b2, k1,
-                                                   k2, k3, k4, p1, p2};
+    const double params[kCalibrationParamCount] = {f,  cx, cy, b1, b2, k1, k2,
+                                                   k3, k4, p1, p2, p3, p4};
     double out[2] = {0.0, 0.0};
     project_point<double>(type, width, height, params, p_cam.data(), out);
     return Eigen::Vector2d(out[0], out[1]);

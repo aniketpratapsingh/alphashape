@@ -747,6 +747,8 @@ PYBIND11_MODULE(alphashape, m) {
         .def_readonly("k4", &alphashape::Calibration::k4)
         .def_readonly("p1", &alphashape::Calibration::p1)
         .def_readonly("p2", &alphashape::Calibration::p2)
+        .def_readonly("p3", &alphashape::Calibration::p3)
+        .def_readonly("p4", &alphashape::Calibration::p4)
         .def("__repr__", [](const alphashape::Calibration& c) {
             return "<alphashape.Calibration " + std::string(camera_type_name(c.type)) + " " +
                    std::to_string(c.width) + "x" + std::to_string(c.height) + " f=" +

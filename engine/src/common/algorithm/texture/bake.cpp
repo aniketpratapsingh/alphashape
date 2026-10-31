@@ -174,6 +174,8 @@ std::vector<PreparedView> prepare_views(const std::vector<TexView>& views) {
         p.params[8] = v.calibration.k4;
         p.params[9] = v.calibration.p1;
         p.params[10] = v.calibration.p2;
+        p.params[11] = v.calibration.p3;
+        p.params[12] = v.calibration.p4;
         out.push_back(p);
     }
     return out;

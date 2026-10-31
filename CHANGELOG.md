@@ -15,6 +15,19 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **WP-13.0: the camera model gains the higher-order tangential terms p3/p4
+  (13 parameters).** `Calibration` packs f, cx, cy, b1, b2, k1..k4, p1..p4 in
+  that order; p3/p4 are appended, so every pre-existing index keeps its meaning
+  and old projects load with p3 = p4 = 0. The r²-weighted tangential pair
+  `p3 r²(r² + 2x²) + 2 p4 r² x y` (mirrored for y) is applied by every
+  projection path — CPU, Ceres autodiff, PatchMatch, depth filtering, mesh
+  colouring, orthorectification, texture baking — and by the Vulkan PatchMatch
+  shader, so CPU and GPU stay identical when the terms are non-zero.
+  `OptimizeCameras` gains `fit_p3`/`fit_p4` (default false) and
+  `fixed_params` accepts `"p3"`/`"p4"`; `Calibration.p3`/`.p4` are read-only in
+  Python. doc.xml writes the two attributes only when non-zero, keeping
+  pre-13 projects byte-identical.
+
 - **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool, and
   defaults to `"affine"`.** The accepted values are `"none"`, `"gain"` and
   `"affine"`, applied per camera per channel before seams are chosen. Affine is

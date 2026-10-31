@@ -103,6 +103,8 @@ void calibration_params(const Calibration& calibration, double params[kCalibrati
     params[8] = calibration.k4;
     params[9] = calibration.p1;
     params[10] = calibration.p2;
+    params[11] = calibration.p3;
+    params[12] = calibration.p4;
 }
 
 /// True when the surface at `z` blocks the segment P->Q by more than `tol`.

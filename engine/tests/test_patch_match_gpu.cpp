@@ -216,11 +216,14 @@ float plane_texture(double a, double b) {
                               0.12 * std::sin(1.1 * a + 1.9 * b + 0.7));
 }
 
-PlaneScene make_plane_scene(int width, int height, double focal, double k1, double k2) {
+PlaneScene make_plane_scene(int width, int height, double focal, double k1, double k2,
+                            double p3 = 0.0, double p4 = 0.0) {
     PlaneScene scene;
     scene.calibration = Calibration::initial(CameraType::Frame, width, height, focal);
     scene.calibration.k1 = k1;
     scene.calibration.k2 = k2;
+    scene.calibration.p3 = p3;
+    scene.calibration.p4 = p4;
     const Eigen::Vector3d centres[5] = {
         Eigen::Vector3d(0.0, 0.0, 0.0), Eigen::Vector3d(0.8, 0.0, 0.0),
         Eigen::Vector3d(-0.6, 0.35, 0.0), Eigen::Vector3d(0.4, -0.9, 0.25),
@@ -415,6 +418,39 @@ TEST(PatchMatchGpu, DistortedCameraMatchesCpu) {
     const PlaneAccuracy cpu_accuracy = measure_plane(scene, cpu_result, 5);
     const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
     std::printf("[gpu distorted] gpu: coverage %.3f median %.5f p90 %.5f | cpu: coverage %.3f "
+                "median %.5f p90 %.5f | agree<1%%: %.1f%% of %zu\n",
+                gpu_accuracy.coverage, gpu_accuracy.median, gpu_accuracy.p90,
+                cpu_accuracy.coverage, cpu_accuracy.median, cpu_accuracy.p90,
+                100.0 * agreement.fraction, agreement.both);
+
+    EXPECT_GT(gpu_accuracy.coverage, 0.85);
+    EXPECT_LT(gpu_accuracy.median, 0.005);
+    EXPECT_LT(gpu_accuracy.p90, 0.02);
+    EXPECT_GT(agreement.fraction, 0.90);
+}
+
+/// WP-13.0: the shader's forward model now carries p3/p4. The GPU must still
+/// agree with the CPU when those higher-order tangential terms are non-zero.
+TEST(PatchMatchGpu, P3P4DistortedCameraMatchesCpu) {
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(160, 120, 150.0, -0.08, 0.02, 2e-4, -1e-4);
+    std::vector<PMView> neighbours = plane_views(scene);
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    const PatchMatchOptions options = plane_options();
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result =
+        stereo::run_patch_match(reference, neighbours, options);
+
+    const PlaneAccuracy gpu_accuracy = measure_plane(scene, gpu_result, 5);
+    const PlaneAccuracy cpu_accuracy = measure_plane(scene, cpu_result, 5);
+    const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
+    std::printf("[gpu p3p4] gpu: coverage %.3f median %.5f p90 %.5f | cpu: coverage %.3f "
                 "median %.5f p90 %.5f | agree<1%%: %.1f%% of %zu\n",
                 gpu_accuracy.coverage, gpu_accuracy.median, gpu_accuracy.p90,
                 cpu_accuracy.coverage, cpu_accuracy.median, cpu_accuracy.p90,

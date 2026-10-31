@@ -278,7 +278,7 @@ void fold_calibration(std::uint64_t& h, const Calibration& cal) {
     h = fold_int(h, cal.width);
     h = fold_int(h, cal.height);
     for (const double value : {cal.f, cal.cx, cal.cy, cal.b1, cal.b2, cal.k1, cal.k2, cal.k3,
-                               cal.k4, cal.p1, cal.p2}) {
+                               cal.k4, cal.p1, cal.p2, cal.p3, cal.p4}) {
         h = fold_double(h, value);
     }
 }

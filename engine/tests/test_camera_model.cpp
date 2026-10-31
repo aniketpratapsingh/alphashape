@@ -3,7 +3,9 @@
 // Suites are prefixed CameraModel so `ctest -R CameraModel` selects them.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -183,6 +185,8 @@ void pack(const Calibration& c, double* params) {
     params[8] = c.k4;
     params[9] = c.p1;
     params[10] = c.p2;
+    params[11] = c.p3;
+    params[12] = c.p4;
 }
 
 /// try_project_point must agree with project_point bit for bit wherever the
@@ -389,6 +393,144 @@ TEST(CameraModelScaled, NonPowerOfTwoThrows) {
     EXPECT_THROW(scaled_calibration(full, 3), ValueError);
     EXPECT_THROW(scaled_calibration(full, 0), ValueError);
     EXPECT_THROW(scaled_calibration(full, -2), ValueError);
+}
+
+// -- p3 / p4 (WP-13.0) -------------------------------------------------------
+
+/// A tiny forward-mode autodiff scalar over the 13 calibration parameters, so
+/// the templated forward model can be differentiated without pulling Ceres into
+/// this translation unit.
+struct Dual13 {
+    double v = 0.0;
+    std::array<double, kCalibrationParamCount> d{};
+
+    Dual13() = default;
+    Dual13(double value) : v(value) {}  // NOLINT(google-explicit-constructor)
+};
+
+Dual13 operator+(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v + b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) r.d[i] = a.d[i] + b.d[i];
+    return r;
+}
+Dual13 operator*(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v * b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = a.d[i] * b.v + a.v * b.d[i];
+    }
+    return r;
+}
+Dual13 operator/(const Dual13& a, const Dual13& b) {
+    Dual13 r(a.v / b.v);
+    const double inv = 1.0 / (b.v * b.v);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = (a.d[i] * b.v - a.v * b.d[i]) * inv;
+    }
+    return r;
+}
+bool operator==(const Dual13& a, const Dual13& b) { return a.v == b.v; }
+bool operator>(const Dual13& a, const Dual13& b) { return a.v > b.v; }
+Dual13 sqrt(const Dual13& a) {
+    const double s = std::sqrt(a.v);
+    Dual13 r(s);
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = a.d[i] / (2.0 * s);
+    }
+    return r;
+}
+Dual13 atan2(const Dual13& y, const Dual13& x) {
+    const double denom = x.v * x.v + y.v * y.v;
+    Dual13 r(std::atan2(y.v, x.v));
+    for (std::size_t i = 0; i < r.d.size(); ++i) {
+        r.d[i] = (x.v * y.d[i] - y.v * x.d[i]) / denom;
+    }
+    return r;
+}
+
+TEST(CameraModel, P3P4DefaultZeroLeavesProjectionUnchanged) {
+    // With p3 = p4 = 0 the folded q1/q2 form must reproduce the historical
+    // Brown-Conrady expression bit for bit over a large random sample.
+    Calibration c = realistic_frame();
+    c.k3 = 0.011;
+    c.k4 = -0.002;
+    c.p3 = 0.0;
+    c.p4 = 0.0;
+    std::uint64_t state = 0x5EED1234ULL;
+    int checked = 0;
+    for (int i = 0; i < 10000; ++i) {
+        Eigen::Vector3d p = random_point(state);
+        p.z() = 2.0 + std::abs(p.z());  // depth in [2, 4): a sane field of view
+        const double x = p.x() / p.z();
+        const double y = p.y() / p.z();
+        const double r2 = x * x + y * y;
+        const double r4 = r2 * r2;
+        const double r6 = r4 * r2;
+        const double r8 = r4 * r4;
+        const double radial = 1.0 + c.k1 * r2 + c.k2 * r4 + c.k3 * r6 + c.k4 * r8;
+        const double xd = x * radial + c.p1 * (r2 + 2.0 * x * x) + 2.0 * c.p2 * x * y;
+        const double yd = y * radial + c.p2 * (r2 + 2.0 * y * y) + 2.0 * c.p1 * x * y;
+        const double u = c.width * 0.5 + c.cx + xd * (c.f + c.b1) + yd * c.b2;
+        const double v = c.height * 0.5 + c.cy + yd * c.f;
+        const Eigen::Vector2d got = c.project(p);
+        EXPECT_EQ(got.x(), u) << "u differs at (" << p.transpose() << ")";
+        EXPECT_EQ(got.y(), v) << "v differs at (" << p.transpose() << ")";
+        ++checked;
+    }
+    EXPECT_EQ(checked, 10000);
+}
+
+TEST(CameraModel, P3P4FiniteDifferenceGradientMatchesAutodiff) {
+    Calibration c = realistic_frame();
+    c.k3 = 0.011;
+    c.p3 = 2e-4;
+    c.p4 = -1e-4;
+    double base[kCalibrationParamCount];
+    pack(c, base);
+
+    std::array<Dual13, kCalibrationParamCount> params{};
+    for (int i = 0; i < kCalibrationParamCount; ++i) {
+        params[static_cast<std::size_t>(i)] = Dual13(base[i]);
+    }
+    // Seed the two coefficients under test; the function is exactly linear in
+    // each, so the forward-mode derivative is the analytic one.
+    constexpr std::size_t p3_index = 11;
+    constexpr std::size_t p4_index = 12;
+    params[p3_index].d[p3_index] = 1.0;
+    params[p4_index].d[p4_index] = 1.0;
+
+    const std::vector<Eigen::Vector3d> points = {
+        Eigen::Vector3d(1.0, 0.7, 1.0),  Eigen::Vector3d(-0.9, 0.8, 1.2),
+        Eigen::Vector3d(0.6, -1.1, 1.4), Eigen::Vector3d(-1.2, -0.5, 1.6)};
+    const double h = 1e-5;  // linear in p3/p4: no truncation error
+    for (const Eigen::Vector3d& p : points) {
+        const std::array<Dual13, 3> p_cam{Dual13(p.x()), Dual13(p.y()), Dual13(p.z())};
+        std::array<Dual13, 2> dual_pixel{};
+        ASSERT_TRUE(try_project_point<Dual13>(c.type, c.width, c.height, params.data(),
+                                              p_cam.data(), dual_pixel.data()));
+
+        for (int index = 11; index <= 12; ++index) {
+            double plus[kCalibrationParamCount];
+            double minus[kCalibrationParamCount];
+            for (int i = 0; i < kCalibrationParamCount; ++i) {
+                plus[i] = base[i];
+                minus[i] = base[i];
+            }
+            plus[index] += h;
+            minus[index] -= h;
+            double up[2] = {0.0, 0.0};
+            double um[2] = {0.0, 0.0};
+            ASSERT_TRUE(try_project_point<double>(c.type, c.width, c.height, plus, p.data(), up));
+            ASSERT_TRUE(try_project_point<double>(c.type, c.width, c.height, minus, p.data(), um));
+            for (int out = 0; out < 2; ++out) {
+                const double fd = (up[out] - um[out]) / (2.0 * h);
+                const double ad =
+                    dual_pixel[static_cast<std::size_t>(out)].d[static_cast<std::size_t>(index)];
+                const double rel = std::abs(fd - ad) / std::max(std::abs(ad), 1e-12);
+                EXPECT_LE(rel, 1e-6) << "param " << index << " output " << out
+                                     << " fd " << fd << " autodiff " << ad;
+            }
+        }
+    }
 }
 
 }  // namespace

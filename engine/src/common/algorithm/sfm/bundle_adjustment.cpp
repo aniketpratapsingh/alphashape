@@ -54,8 +54,8 @@ namespace {
 /// enough that any solution leaving a point behind the camera is rejected.
 constexpr double kBehindCameraErrorPx = 1.0e6;
 
-/// Pack a Calibration into the 11 doubles project_point<T> expects:
-/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2.
+/// Pack a Calibration into the kCalibrationParamCount doubles project_point<T>
+/// expects: f, cx, cy, b1, b2, k1..k4, p1..p4.
 void pack_calibration(const Calibration& c, double* params) {
     params[0] = c.f;
     params[1] = c.cx;
@@ -68,6 +68,8 @@ void pack_calibration(const Calibration& c, double* params) {
     params[8] = c.k4;
     params[9] = c.p1;
     params[10] = c.p2;
+    params[11] = c.p3;
+    params[12] = c.p4;
 }
 
 /// One residual block: reprojection error of a single point in a single camera.
@@ -319,7 +321,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     for (std::size_t i = 0; i < problem.points.size(); ++i) {
         point_blocks[i] = {problem.points[i].x(), problem.points[i].y(), problem.points[i].z()};
     }
-    // One 11-double intrinsics block per calibration, shared by every camera
+    // One kCalibrationParamCount-double intrinsics block per calibration, shared by every camera
     // that maps to it. Unchanged coefficients are held via SubsetManifold below.
     std::vector<std::array<double, kCalibrationParamCount>> intr_blocks(num_calibrations);
     for (std::size_t i = 0; i < num_calibrations; ++i) {
@@ -456,6 +458,8 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
             if (fit[8]) c.k4 = b[8];
             if (fit[9]) c.p1 = b[9];
             if (fit[10]) c.p2 = b[10];
+            if (fit[11]) c.p3 = b[11];
+            if (fit[12]) c.p4 = b[12];
         }
     }
 

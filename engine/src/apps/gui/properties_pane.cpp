@@ -129,7 +129,7 @@ void describe_sensor(const Sensor& sensor, std::size_t index, PropertySheet& she
     const std::pair<const char*, double> params[] = {
         {"f (px)", c.f},   {"cx (px)", c.cx}, {"cy (px)", c.cy}, {"b1", c.b1}, {"b2", c.b2},
         {"k1", c.k1},      {"k2", c.k2},      {"k3", c.k3},      {"k4", c.k4}, {"p1", c.p1},
-        {"p2", c.p2},
+        {"p2", c.p2},      {"p3", c.p3},      {"p4", c.p4},
     };
     for (const auto& [name, value] : params) {
         add(r, QStringLiteral("Calibration %1").arg(QLatin1String(name)), num(value));

@@ -77,7 +77,7 @@ void warn_unknown_children(const XmlNode& node, std::initializer_list<const char
 void warn_unknown_calibration_attrs(const XmlNode& node, ReadReport* report) {
     warn_unknown_attrs(node,
                        {"type", "width", "height", "f", "cx", "cy", "b1", "b2", "k1",
-                        "k2", "k3", "k4", "p1", "p2"},
+                        "k2", "k3", "k4", "p1", "p2", "p3", "p4"},
                        report);
 }
 
@@ -614,6 +614,7 @@ void read_crs(const XmlNode* node, CRS& crs) {
 struct CalibrationField {
     const char* name;
     double Calibration::*member;
+    bool optional_when_zero = false;  // omitted from the XML when exactly 0
 };
 
 constexpr CalibrationField kCalibrationFields[] = {
@@ -621,6 +622,9 @@ constexpr CalibrationField kCalibrationFields[] = {
     {"b1", &Calibration::b1}, {"b2", &Calibration::b2}, {"k1", &Calibration::k1},
     {"k2", &Calibration::k2}, {"k3", &Calibration::k3}, {"k4", &Calibration::k4},
     {"p1", &Calibration::p1}, {"p2", &Calibration::p2},
+    // Appended in WP-13.0. Omitted while zero so every pre-13 project stays
+    // byte-identical; absent on read means zero.
+    {"p3", &Calibration::p3, true}, {"p4", &Calibration::p4, true},
 };
 
 void write_calibration(const Calibration& c, XmlNode& parent) {
@@ -629,6 +633,9 @@ void write_calibration(const Calibration& c, XmlNode& parent) {
     set_attr(node, "width", std::to_string(c.width));
     set_attr(node, "height", std::to_string(c.height));
     for (const CalibrationField& field : kCalibrationFields) {
+        if (field.optional_when_zero && c.*(field.member) == 0.0) {
+            continue;
+        }
         set_attr(node, field.name, fmt(c.*(field.member)));
     }
 }
@@ -642,6 +649,12 @@ Calibration read_calibration(const XmlNode* node) {
     c.width = parse_int(require_attr(*node, "width"));
     c.height = parse_int(require_attr(*node, "height"));
     for (const CalibrationField& field : kCalibrationFields) {
+        if (field.optional_when_zero) {
+            if (const std::string* value = find_attr(*node, field.name)) {
+                c.*(field.member) = parse_double(*value);
+            }
+            continue;
+        }
         c.*(field.member) = parse_double(require_attr(*node, field.name));
     }
     return c;

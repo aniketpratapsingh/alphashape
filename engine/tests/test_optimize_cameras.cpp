@@ -19,9 +19,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -810,6 +812,131 @@ TEST(OptimizeCamerasMeta, RecordsAllFitParamsInMeta) {
         EXPECT_NE(meta.find(std::string("OptimizeCameras/fit_") + name), nullptr)
             << "missing OptimizeCameras/fit_" << name;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Higher-order tangential terms p3/p4 are recoverable (WP-13.0)
+// ---------------------------------------------------------------------------
+
+/// A synthetic wide-angle scene: 10 cameras on a ring looking inward and a grid
+/// of points across a 3-D box, projected noise-free through `truth`. The lateral
+/// extent reaches normalised radii around 0.7-1.0, where p3/p4 are observable
+/// (with f = 1600 the p3 term reaches ~0.5 px), and the varied radii separate
+/// them from the radial coefficients.
+Document make_p3p4_scene(const Calibration& truth) {
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("p3p4");
+    document.set_active_chunk_id(chunk.id());
+
+    Sensor sensor;
+    sensor.label = "synth";
+    sensor.type = CameraType::Frame;
+    sensor.width = truth.width;
+    sensor.height = truth.height;
+    sensor.calibration = truth;
+    chunk.sensors().push_back(sensor);
+
+    constexpr int kCameraCount = 10;
+    std::vector<KeypointSet> sets(static_cast<std::size_t>(kCameraCount));
+    for (int i = 0; i < kCameraCount; ++i) {
+        const double azimuth = 2.0 * kPi * static_cast<double>(i) / kCameraCount;
+        const double radius = 5.0 + 1.5 * static_cast<double>(i % 3);
+        const Eigen::Vector3d centre(radius * std::cos(azimuth),
+                                     (i % 2 == 0) ? 1.5 : -1.5,
+                                     radius * std::sin(azimuth));
+        const Eigen::Vector3d target(0.3 * std::sin(0.7 * i), -0.2 * std::cos(0.5 * i), 0.0);
+        const Eigen::Vector3d z = (target - centre).normalized();
+        const Eigen::Vector3d down(0.0, -1.0, 0.0);
+        const Eigen::Vector3d y = (down - down.dot(z) * z).normalized();
+        const Eigen::Vector3d x = y.cross(z).normalized();
+        Eigen::Matrix3d rotation;
+        rotation.row(0) = x.transpose();
+        rotation.row(1) = y.transpose();
+        rotation.row(2) = z.transpose();
+
+        Camera camera;
+        camera.id = i;
+        camera.sensor_id = 0;
+        camera.label = "cam" + std::to_string(i);
+        camera.enabled = true;
+        camera.pose.block<3, 3>(0, 0) = rotation;
+        camera.pose.block<3, 1>(0, 3) = -rotation * centre;
+        chunk.cameras().push_back(camera);
+        sets[static_cast<std::size_t>(i)].camera_id = i;
+    }
+
+    int point_count = 0;
+    for (int gx = -4; gx <= 4; ++gx) {
+        for (int gy = -4; gy <= 4; ++gy) {
+            for (int gz = -1; gz <= 1; ++gz) {
+                const Eigen::Vector3d point(0.9 * gx, 0.9 * gy, 2.0 * gz);
+                Track track;
+                for (int i = 0; i < kCameraCount; ++i) {
+                    const Transform& pose = chunk.cameras()[static_cast<std::size_t>(i)].pose;
+                    const Eigen::Vector3d p_cam =
+                        pose.block<3, 3>(0, 0) * point + pose.block<3, 1>(0, 3);
+                    if (!(p_cam.z() > 0.6)) {
+                        continue;
+                    }
+                    const double nx = p_cam.x() / p_cam.z();
+                    const double ny = p_cam.y() / p_cam.z();
+                    if (nx * nx + ny * ny > 1.0) {
+                        continue;  // keep the observation inside a sane field
+                    }
+                    const Eigen::Vector2d pixel = truth.project(p_cam);
+                    KeypointSet& set = sets[static_cast<std::size_t>(i)];
+                    Keypoint keypoint;
+                    // keypoint_to_pixel() adds 0.5: store the corner convention.
+                    keypoint.x = static_cast<float>(pixel.x() - 0.5);
+                    keypoint.y = static_cast<float>(pixel.y() - 0.5);
+                    set.keypoints.push_back(keypoint);
+                    Observation observation;
+                    observation.camera_id = i;
+                    observation.keypoint_index =
+                        static_cast<std::uint32_t>(set.keypoints.size() - 1);
+                    track.observations.push_back(observation);
+                }
+                if (track.observations.size() >= 2U) {
+                    track.point = point;
+                    chunk.tie_points().tracks.push_back(track);
+                    ++point_count;
+                }
+            }
+        }
+    }
+    for (KeypointSet& set : sets) {
+        chunk.tie_points().keypoint_sets.push_back(std::move(set));
+    }
+    EXPECT_GT(point_count, 100);
+    return document;
+}
+
+TEST(Optimize, DistortionTermsFitP3P4) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.cx = 3.0;
+    truth.cy = -2.0;
+    truth.k1 = -0.05;
+    truth.p3 = 2e-4;
+    truth.p4 = -1e-4;
+
+    Document document = make_p3p4_scene(truth);
+    // Start from zero p3/p4: the fit has to move them onto the truth.
+    document.active_chunk()->sensors()[0].calibration.p3 = 0.0;
+    document.active_chunk()->sensors()[0].calibration.p4 = 0.0;
+
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    for (const char* name : {"f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2"}) {
+        params.set(std::string("fit_") + name, false);
+    }
+    params.set("fit_p3", true);
+    params.set("fit_p4", true);
+    run_task(builtin_registry(), document, "OptimizeCameras", params);
+
+    const Calibration& cal = document.active_chunk()->sensors()[0].calibration;
+    std::printf("[optimize_cameras] p3p4 fit: p3=%.6e (truth 2e-4) p4=%.6e (truth -1e-4)\n",
+                cal.p3, cal.p4);
+    EXPECT_NEAR(cal.p3, 2e-4, 2e-5) << "p3 = " << cal.p3;
+    EXPECT_NEAR(cal.p4, -1e-4, 1e-5) << "p4 = " << cal.p4;
 }
 
 }  // namespace alphashape
