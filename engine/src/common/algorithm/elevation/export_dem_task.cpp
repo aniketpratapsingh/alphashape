@@ -76,6 +76,11 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
 
     GeoTiffOptions options;
     options.epsg = elevation.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Carry the whole CRS, not just its code: a custom (uncoded) definition
+    // then travels in the citation key as WKT2 instead of being lost.
+    options.crs.emplace(static_cast<crs::CoordinateSystem>(elevation.crs));
+#endif
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;

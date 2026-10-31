@@ -84,6 +84,11 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
 
     GeoTiffOptions options;
     options.epsg = orthomosaic.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    // Carry the whole CRS, not just its code: a custom (uncoded) definition
+    // then travels in the citation key as WKT2 instead of being lost.
+    options.crs.emplace(static_cast<crs::CoordinateSystem>(orthomosaic.crs));
+#endif
     options.tiled = params.get_bool("tiled");
     options.tile_size = static_cast<int>(params.get_int("tile_size"));
     options.deflate = true;

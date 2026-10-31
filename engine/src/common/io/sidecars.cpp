@@ -758,6 +758,9 @@ std::vector<std::uint8_t> encode_elevation(const Elevation& elevation) {
     ScopedTempFile scratch("dem");
     GeoTiffOptions options;
     options.epsg = elevation.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    options.crs.emplace(static_cast<crs::CoordinateSystem>(elevation.crs));
+#endif
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;
@@ -784,6 +787,9 @@ std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho) {
     ScopedTempFile scratch("ortho");
     GeoTiffOptions options;
     options.epsg = ortho.epsg();
+#if defined(ALPHASHAPE_USE_PROJ)
+    options.crs.emplace(static_cast<crs::CoordinateSystem>(ortho.crs));
+#endif
     options.tiled = true;
     options.tile_size = 256;
     options.deflate = true;

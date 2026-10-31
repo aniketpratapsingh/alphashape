@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <tiffio.h>
@@ -34,7 +35,9 @@ namespace {
 constexpr std::uint16_t kKeyGtModelType = 1024;
 constexpr std::uint16_t kKeyGtRasterType = 1025;
 constexpr std::uint16_t kKeyGeographicType = 2048;
+constexpr std::uint16_t kKeyGeogCitation = 2049;
 constexpr std::uint16_t kKeyProjectedCstType = 3072;
+constexpr std::uint16_t kKeyPcsCitation = 3073;
 
 constexpr std::uint16_t kModelProjected = 1;
 constexpr std::uint16_t kModelGeographic = 2;
@@ -133,40 +136,114 @@ void validate_grid(const RasterGrid& g, const char* what) {
     }
 }
 
-/// Builds the 4 + 4*N SHORT GeoKeyDirectory for `epsg`, sorted by key id.
-std::vector<std::uint16_t> build_geo_keys(int epsg) {
-    std::uint16_t model_type = kModelUserDefined;
-    std::uint16_t crs_key = 0;
-    std::uint16_t crs_value = 0;
-    if (epsg != 0) {
-        if (is_geographic_epsg(epsg)) {
-            model_type = kModelGeographic;
-            crs_key = kKeyGeographicType;
-        } else {
-            model_type = kModelProjected;
-            crs_key = kKeyProjectedCstType;
-        }
-        crs_value = static_cast<std::uint16_t>(epsg);
+/// A GeoKey whose value is stored inline in the directory.
+void push_inline_key(std::vector<std::uint16_t>& keys, std::uint16_t id,
+                     std::uint16_t value) {
+    keys.push_back(id);
+    keys.push_back(0);  // TIFFTagLocation: the value is inline
+    keys.push_back(1);  // Count
+    keys.push_back(value);
+}
+
+/// A GeoKey whose value is a string in GeoAsciiParams: the entry points at
+/// `offset`, `count` characters including the `|` terminator (libgeotiff's and
+/// GDAL's convention).
+void push_ascii_key(std::vector<std::uint16_t>& keys, std::string& ascii,
+                    std::uint16_t id, const std::string& text) {
+    if (text.size() + 1 > 0xFFFFU || ascii.size() + text.size() + 1 > 0xFFFFU) {
+        throw ValueError("GeoTIFF: CRS definition is too long for GeoAsciiParams");
     }
-    // Entries must be sorted by KeyID: 1024, 1025, then 2048 or 3072.
+    const auto offset = static_cast<std::uint16_t>(ascii.size());
+    const auto count = static_cast<std::uint16_t>(text.size() + 1);
+    ascii.append(text);
+    ascii.push_back('|');
+    keys.push_back(id);
+    keys.push_back(static_cast<std::uint16_t>(kTagGeoAsciiParams));
+    keys.push_back(count);
+    keys.push_back(offset);
+}
+
+/// The GeoKeyDirectory and the GeoAsciiParams pool it points into.
+struct GeoKeyEncoding {
     std::vector<std::uint16_t> keys;
-    keys.reserve(crs_key == 0 ? 12 : 16);
-    keys.push_back(1);  // KeyDirectoryVersion
-    keys.push_back(1);  // KeyRevision
-    keys.push_back(0);  // MinorRevision
-    keys.push_back(crs_key == 0 ? 2 : 3);  // NumberOfKeys
-    const auto push = [&keys](std::uint16_t id, std::uint16_t value) {
-        keys.push_back(id);
-        keys.push_back(0);  // TIFFTagLocation: value is stored inline
-        keys.push_back(1);  // Count
-        keys.push_back(value);
-    };
-    push(kKeyGtModelType, model_type);
-    push(kKeyGtRasterType, kRasterTypePixelIsArea);
-    if (crs_key != 0) {
-        push(crs_key, crs_value);
+    std::string ascii;
+};
+
+/// How the writer chooses the model type, the type key and its citation.
+struct GeoKeyPlan {
+    std::uint16_t model_type = kModelUserDefined;
+    std::uint16_t type_key = 0;      // 2048/3072; 0 = no CRS key
+    std::uint16_t type_value = 0;    // EPSG code, or 32767 when user-defined
+    std::uint16_t citation_key = 0;  // 2049/3073; 0 = no citation
+    std::string citation;            // CRS name, or full WKT2 for a custom CRS
+};
+
+GeoKeyPlan plan_geo_keys(const GeoTiffOptions& options) {
+    GeoKeyPlan plan;
+    bool have_crs = false;
+    bool projected = false;
+    bool geographic = false;
+    int epsg = 0;
+#if defined(ALPHASHAPE_USE_PROJ)
+    if (options.crs.has_value() && options.crs->is_set()) {
+        const crs::CoordinateSystem& cs = *options.crs;
+        have_crs = true;
+        epsg = cs.epsg();
+        // An authority-coded CRS cites its name; a custom one carries its WKT2
+        // definition in the citation (GDAL's convention).
+        plan.citation = epsg != 0 ? cs.name() : cs.to_wkt();
+        const crs::CrsKind kind = cs.kind();
+        projected = kind == crs::CrsKind::Projected;
+        geographic =
+            kind == crs::CrsKind::Geographic2D || kind == crs::CrsKind::Geographic3D;
     }
-    return keys;
+#endif
+    if (!have_crs) {
+        if (options.epsg == 0) {
+            return plan;  // local: model type 32767 and no CRS key
+        }
+        epsg = options.epsg;
+        geographic = is_geographic_epsg(epsg);
+        projected = !geographic;
+    }
+    if (projected) {
+        plan.model_type = kModelProjected;
+        plan.type_key = kKeyProjectedCstType;
+        plan.citation_key = kKeyPcsCitation;
+    } else if (geographic) {
+        plan.model_type = kModelGeographic;
+        plan.type_key = kKeyGeographicType;
+        plan.citation_key = kKeyGeogCitation;
+    } else {
+        // Vertical/compound/geocentric CRS: no GeoTIFF model type exists, so
+        // stay user-defined and carry the WKT in the geographic citation.
+        plan.type_key = kKeyGeographicType;
+        plan.citation_key = kKeyGeogCitation;
+    }
+    plan.type_value =
+        epsg != 0 ? static_cast<std::uint16_t>(epsg) : kModelUserDefined;
+    return plan;
+}
+
+/// Builds the GeoKeyDirectory (sorted by ascending key id) and the
+/// GeoAsciiParams pool its citation entries point into.
+GeoKeyEncoding build_geo_keys(const GeoTiffOptions& options) {
+    const GeoKeyPlan plan = plan_geo_keys(options);
+    const bool has_type = plan.type_key != 0;
+    const bool has_citation = has_type && !plan.citation.empty();
+    GeoKeyEncoding out;
+    out.keys = {1, 1, 0,
+                static_cast<std::uint16_t>(2 + (has_type ? 1 : 0) +
+                                           (has_citation ? 1 : 0))};
+    push_inline_key(out.keys, kKeyGtModelType, plan.model_type);
+    push_inline_key(out.keys, kKeyGtRasterType, kRasterTypePixelIsArea);
+    if (has_type) {
+        push_inline_key(out.keys, plan.type_key, plan.type_value);
+        if (has_citation) {
+            push_ascii_key(out.keys, out.ascii, plan.citation_key, plan.citation);
+        }
+    }
+    return out;
 }
 
 /// Writes the georeferencing tags shared by all variants.
@@ -177,8 +254,12 @@ void write_geo_tags(TIFF* tif, const RasterGrid& g, const GeoTiffOptions& option
     const double tiepoint[6] = {0.0, 0.0, 0.0, g.origin_x, g.origin_y, 0.0};
     TIFFSetField(tif, kTagModelTiepoint, 6, tiepoint);
 
-    const std::vector<std::uint16_t> keys = build_geo_keys(options.epsg);
-    TIFFSetField(tif, kTagGeoKeyDirectory, static_cast<std::uint32_t>(keys.size()), keys.data());
+    const GeoKeyEncoding keys = build_geo_keys(options);
+    TIFFSetField(tif, kTagGeoKeyDirectory, static_cast<std::uint32_t>(keys.keys.size()),
+                 keys.keys.data());
+    if (!keys.ascii.empty()) {
+        TIFFSetField(tif, kTagGeoAsciiParams, keys.ascii.c_str());
+    }
 
     if (options.nodata.has_value()) {
         char buffer[64];
@@ -515,35 +596,141 @@ RasterGrid read_grid(TIFF* tif, const std::string& path, int width, int height) 
     return grid;
 }
 
-/// Recovers the EPSG code from the GeoKeyDirectory: the GeographicTypeGeoKey
-/// (2048) or ProjectedCSTypeGeoKey (3072) value; 0 when the directory is
-/// absent or user-defined.
-int read_epsg(TIFF* tif) {
+/// The GeoKeys the reader cares about, decoded from the GeoKeyDirectory.
+struct GeoKeys {
+    std::uint16_t model_type = kModelUserDefined;
+    int epsg = 0;
+    std::optional<std::string> citation;  // CRS name or, for a custom CRS, WKT
+};
+
+/// The `count` characters at `offset` of a GeoAsciiParams string, minus the
+/// `|` separator and any NUL padding. Empty when the key does not point there
+/// or the range is out of bounds.
+std::string ascii_value(const char* ascii, std::size_t ascii_len,
+                        std::uint16_t location, std::uint16_t count,
+                        std::uint16_t offset) {
+    if (location != kTagGeoAsciiParams || ascii == nullptr ||
+        static_cast<std::size_t>(offset) >= ascii_len) {
+        return {};
+    }
+    const std::size_t n = std::min<std::size_t>(count, ascii_len - offset);
+    std::string value(ascii + offset, n);
+    while (!value.empty() && (value.back() == '|' || value.back() == '\0')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+/// Reads the directories and resolves the primary type key. An EPSG key wins;
+/// a user-defined (32767) or absent one leaves `epsg` 0 and exposes the
+/// citation so the caller can try to parse WKT from it.
+GeoKeys read_geo_keys(TIFF* tif) {
+    GeoKeys out;
     std::uint16_t count = 0;
     std::uint16_t* keys = nullptr;
-    if (TIFFGetField(tif, kTagGeoKeyDirectory, &count, &keys) == 0 || keys == nullptr) {
-        return 0;
-    }
-    if (count < 4) {
-        return 0;
+    if (TIFFGetField(tif, kTagGeoKeyDirectory, &count, &keys) == 0 || keys == nullptr ||
+        count < 4) {
+        return out;
     }
     const std::uint16_t entries = keys[3];
     // Each entry is 4 SHORTs, following the 4-SHORT header.
     if (static_cast<std::uint32_t>(4) + static_cast<std::uint32_t>(entries) * 4U > count) {
-        return 0;
+        return out;
     }
+    const char* ascii = nullptr;
+    TIFFGetField(tif, kTagGeoAsciiParams, &ascii);
+    const std::size_t ascii_len = ascii != nullptr ? std::strlen(ascii) : 0U;
+    std::uint16_t geographic_type = 0;
+    std::uint16_t projected_type = 0;
+    std::optional<std::string> geog_citation;
+    std::optional<std::string> pcs_citation;
     for (std::uint16_t i = 0; i < entries; ++i) {
         const std::size_t base = 4 + static_cast<std::size_t>(i) * 4;
         const std::uint16_t key_id = keys[base];
-        // TIFFTagLocation must be 0 (value stored inline) for these keys.
-        if (keys[base + 1] != 0 || keys[base + 2] < 1) {
-            continue;
-        }
-        if (key_id == kKeyGeographicType || key_id == kKeyProjectedCstType) {
-            return static_cast<int>(keys[base + 3]);
+        const std::uint16_t location = keys[base + 1];
+        const std::uint16_t n = keys[base + 2];
+        const std::uint16_t value = keys[base + 3];
+        switch (key_id) {
+            case kKeyGtModelType:
+                if (location == 0 && n >= 1) {
+                    out.model_type = value;
+                }
+                break;
+            case kKeyGeographicType:
+                if (location == 0 && n >= 1) {
+                    geographic_type = value;
+                }
+                break;
+            case kKeyProjectedCstType:
+                if (location == 0 && n >= 1) {
+                    projected_type = value;
+                }
+                break;
+            case kKeyGeogCitation: {
+                std::string s = ascii_value(ascii, ascii_len, location, n, value);
+                if (!s.empty()) {
+                    geog_citation = std::move(s);
+                }
+                break;
+            }
+            case kKeyPcsCitation: {
+                std::string s = ascii_value(ascii, ascii_len, location, n, value);
+                if (!s.empty()) {
+                    pcs_citation = std::move(s);
+                }
+                break;
+            }
+            default:
+                break;
         }
     }
-    return 0;
+    // 32767 is "user-defined", not an EPSG code.
+    const std::uint16_t type = projected_type != 0 ? projected_type : geographic_type;
+    out.epsg = (type != 0 && type != kModelUserDefined) ? static_cast<int>(type) : 0;
+    if (projected_type == kModelUserDefined && pcs_citation.has_value()) {
+        out.citation = std::move(pcs_citation);
+    } else if (geog_citation.has_value()) {
+        out.citation = std::move(geog_citation);
+    } else {
+        out.citation = std::move(pcs_citation);
+    }
+    return out;
+}
+
+/// The CRS a file records: EPSG key first, then WKT in the citation, then the
+/// local frame. Always populated in a PROJ-enabled build; a build without the
+/// CRS engine returns the EPSG number only.
+struct ReadCrsInfo {
+    int epsg = 0;
+    std::optional<crs::CoordinateSystem> crs;
+};
+
+ReadCrsInfo read_crs(TIFF* tif) {
+    const GeoKeys keys = read_geo_keys(tif);
+    ReadCrsInfo out;
+    out.epsg = keys.epsg;
+#if defined(ALPHASHAPE_USE_PROJ)
+    if (keys.epsg != 0) {
+        try {
+            out.crs = crs::CoordinateSystem::from_epsg(keys.epsg);
+            return out;
+        } catch (const ValueError&) {
+            // A code this PROJ build does not know: try the citation instead.
+        }
+    }
+    if (keys.citation.has_value() && !keys.citation->empty()) {
+        try {
+            out.crs = crs::CoordinateSystem::from_wkt(*keys.citation);
+            return out;
+        } catch (const ValueError&) {
+            // The citation is a plain name (or malformed WKT): fall back local.
+        }
+    }
+    out.crs = crs::CoordinateSystem::local();
+#else
+    (void)tif;
+#endif
+    return out;
 }
 
 std::optional<double> read_nodata(TIFF* tif) {
@@ -627,7 +814,9 @@ GeoTiffInfo read_geotiff_info(const std::string& path) {
     info.channels = layout.channels;
     info.bits_per_sample = layout.bits_per_sample;
     info.is_float = layout.is_float;
-    info.epsg = read_epsg(tif);
+    ReadCrsInfo crs_info = read_crs(tif);
+    info.epsg = crs_info.epsg;
+    info.crs = std::move(crs_info.crs);
     info.tiled = layout.tiled;
     info.nodata = read_nodata(tif);
     return info;

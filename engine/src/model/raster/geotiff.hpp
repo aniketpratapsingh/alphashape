@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 
+#include "model/crs/coordinate_system.hpp"
 #include "model/raster/geo_raster.hpp"
 
 namespace alphashape {
@@ -17,6 +18,16 @@ namespace alphashape {
 /// geographic (x = lon deg, y = lat deg), any other non-zero code = projected.
 struct GeoTiffOptions {
     int epsg = 0;
+    /// The CRS to record in the GeoKeys. When engaged and set (not the local
+    /// frame), its EPSG code travels in the type key, or, for a custom CRS
+    /// with no code, its full WKT2 definition travels in the citation key
+    /// (GDAL's convention). When absent (or the local frame), `epsg` above is
+    /// the fallback and behaves exactly as before.
+    ///
+    /// Optional rather than a bare `CoordinateSystem` so a build without PROJ
+    /// can still construct `GeoTiffOptions`: an unengaged optional never
+    /// touches the CRS engine's symbols.
+    std::optional<crs::CoordinateSystem> crs;
     bool tiled = true;
     int tile_size = 256;  // multiple of 16
     bool deflate = true;  // ADOBE_DEFLATE + predictor (2 for u8, 3 for float)
@@ -38,7 +49,13 @@ struct GeoTiffInfo {
     int channels = 0;
     int bits_per_sample = 0;
     bool is_float = false;
+    /// EPSG code carried by the GeoKeys, 0 when the file is user-defined/local
+    /// or names a CRS from another authority.
     int epsg = 0;
+    /// The CRS the file records, in reader priority order: an EPSG type key,
+    /// else WKT parsed from the citation key, else the local frame. Absent
+    /// only in a build without PROJ (which has no CRS engine to build one).
+    std::optional<crs::CoordinateSystem> crs;
     bool tiled = false;
     std::optional<double> nodata;
 };
