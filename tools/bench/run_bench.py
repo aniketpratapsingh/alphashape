@@ -1400,7 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ortho-params",
         default="",
-        help='extra BuildOrthomosaic keyword args, e.g. "color_correction=true"; '
+        help='extra BuildOrthomosaic keyword args, e.g. "color_correction=affine"; '
         "marks the run as an experiment (never a baseline, never gated)",
     )
     args = parser.parse_args(argv)

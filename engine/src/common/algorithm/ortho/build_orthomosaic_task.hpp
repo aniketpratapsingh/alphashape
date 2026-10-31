@@ -152,6 +152,10 @@ struct OrthoBlockPlanInput {
     /// plan must know: estimating it for a fill_holes=false run would coarsen a
     /// grid that actually fits.
     bool fill_holes = true;
+    /// True when a colour-correction pass (gain or affine) runs BEFORE the block
+    /// loop. Its sampled points, per-camera colours and observations are a
+    /// separate, earlier peak that the plan has to account for.
+    bool colour_correction = false;
     /// The task's byte budget; 0 means "no limit" (one block).
     std::uint64_t budget_bytes = 0;
     /// Expert/test override: process in blocks of this side (0 = automatic).
@@ -209,6 +213,11 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
 /// The peak of the assembled-grid fill_holes stage alone (labels + RGBA + one
 /// channel's float plane, validity mask, EDT and banded Sibson accumulators).
 double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);
+
+/// The peak of the colour-correction pass that runs BEFORE the block loop, in
+/// bytes. It is a separate peak in time from the block stages (the pass returns
+/// only one small model per camera), so the plan takes the maximum, not a sum.
+double estimate_colour_pass_peak_bytes(int camera_count);
 
 /// Choose the block layout for a run. One block when the whole grid fits the
 /// budget (identical behaviour for small rasters); otherwise the LARGEST block

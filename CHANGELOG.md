@@ -6,6 +6,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`BuildOrthomosaic`'s `color_correction` is now a choice, not a Bool, and
+  defaults to `"affine"`.** The accepted values are `"none"`, `"gain"` and
+  `"affine"`, applied per camera per channel before seams are chosen. Affine is
+  the default because the seam benchmark shows a clear improvement (seam colour
+  step p90 0.0241 → 0.0214, −11%); pass `color_correction="none"` to get the
+  old uncorrected product. A model that cannot be solved (one camera, no
+  overlap, too few samples) logs and falls back to identity, so a single-camera
+  orthomosaic still works. An old project file or script that recorded `true`
+  still works: the value is read as `"gain"`, which is exactly what the Bool
+  selected, and `false` reads as `"none"`. The Python binder likewise accepts a
+  Bool and converts it to its text form.
+
 ### Added
 
 - **Robust per-cell height fusion for BuildDem (Q3).** `BuildDem` gains `fusion`
@@ -27,6 +41,24 @@ All notable changes to alphashape are recorded here. The format follows
   the estimate: a cell with any measurement fuses measurements only, and a cell
   with none keeps the repaired median. Unknown values are rejected like the
   other BuildDem string options. The estimator lives in `cell_fusion.hpp/.cpp`.
+
+- **Per-camera, per-channel affine colour correction for the orthomosaic.**
+  `BuildOrthomosaic`'s `color_correction="affine"` fits `I' = a_c I + b_c` per
+  camera per channel, jointly over all cameras, from observations of the SAME
+  3-D surface point seen by several cameras: a coarse lattice of DEM cells is
+  projected into every camera with the rectifier's own occlusion test and each
+  point's colour is read bilinearly from that photograph. The residual is the
+  disagreement of the two corrected colours and the fit uses an IRLS Cauchy loss
+  (Cauchy 1824), so a moving object, a specular highlight or an occlusion — each a
+  large residual on a minority of points — cannot drag the result; a weak prior
+  pulls `a` toward 1 and `b` toward 0. The model is gauged to mean gain 1 and mean
+  offset 0 and clamped only AFTER that, and it is applied to each camera's
+  rectified pixels BEFORE the seam labeller runs, so seams are chosen on corrected
+  colours and a block-wise mosaic applies the same whole-flight model in every
+  block. The form follows joint radiometric alignment in the published literature
+  (Goldman & Chen 2005; Xiong & Pulli 2010) on top of the gain model Brown & Lowe
+  (2007) give. New `engine/src/common/algorithm/ortho/colour_model.*`; the
+  visibility test it reuses is exposed as `ortho::project_surface_point()`.
 
 - **Post-filter depth-map hole repair.** `BuildDepthMaps` gains `repair_holes`
   (bool, default `false`) and `repair_max_area` (int pixels, default `2000`).
@@ -147,7 +179,8 @@ All notable changes to alphashape are recorded here. The format follows
   requested CRS.
 
 - **Per-camera gain compensation for the orthomosaic.** `BuildOrthomosaic` gains
-  a `color_correction` parameter (off by default). When set, one brightness gain
+  a `color_correction` parameter, now selected as `"gain"` (affine is the
+  default; see Changed). When set, one brightness gain
   per camera per channel is solved over the whole flight (Brown & Lowe 2007,
   "Automatic Panoramic Image Stitching using Invariant Features", section 6):
   each gain minimises a sum over overlapping camera pairs of a data term that

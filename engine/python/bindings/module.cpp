@@ -119,6 +119,16 @@ alphashape::ParamValue to_param_value(const alphashape::ParamSpec& spec, py::han
             if (is_str) {
                 return alphashape::ParamValue(py::cast<std::string>(value));
             }
+            // A Bool is accepted for `color_correction` ONLY, as its text form:
+            // that parameter was a Bool in an older release, and the task's own
+            // parser reads "true"/"false" as the modes it then selected. Applying
+            // this to every String parameter would turn `label=True` into the
+            // label "true" and, worse, let a Bool slip past an enum's choices;
+            // every other String parameter therefore rejects a Bool below.
+            if (is_bool && spec.name == "color_correction") {
+                return alphashape::ParamValue(std::string(py::cast<bool>(value) ? "true"
+                                                                               : "false"));
+            }
             break;
         case alphashape::ParamType::StringList: {
             // A bare str is REJECTED, not iterated: a string IS iterable, so

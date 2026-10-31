@@ -68,7 +68,10 @@ def built_document(fill="enabled"):
     doc.run_task("AlignCameras")
     doc.run_task("BuildDepthMaps", downscale=DOWNSCALE, filter_mode="mild")
     chunk.buildDem(interpolation=fill, smoothing="none")
-    chunk.buildOrthomosaic(refine_seamlines=False, fill_holes=False)
+    # This fixture pins the views/tasks, not colour, so stay on the uncorrected
+    # product now that affine correction is the default.
+    chunk.buildOrthomosaic(refine_seamlines=False, fill_holes=False,
+                           color_correction="none")
     return doc, chunk
 
 
