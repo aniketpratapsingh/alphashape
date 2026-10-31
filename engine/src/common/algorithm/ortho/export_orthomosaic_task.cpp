@@ -128,6 +128,12 @@ void ExportOrthomosaicTask::apply(Document& document, Params& params,
     const GeoRaster<std::uint8_t> raster = elevation::reproject_for_export(
         orthomosaic.raster, orthomosaic.crs, target, "ExportOrthomosaic");
     options.epsg = elevation::export_epsg(orthomosaic.crs, target);
+#if defined(ALPHASHAPE_USE_PROJ)
+    // A reprojected export declares the TARGET CRS, not the stored one.
+    if (target.requested()) {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(target.crs));
+    }
+#endif
     if (alpha) {
         write_geotiff(path, raster, options);
     } else {

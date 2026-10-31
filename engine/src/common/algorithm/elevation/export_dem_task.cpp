@@ -119,6 +119,12 @@ void ExportDemTask::apply(Document& document, Params& params, const Progress& pr
         elevation.raster, elevation.crs, elevation.nodata,
         static_cast<float>(params.get_float("nodata")), target, "ExportDem");
     options.epsg = elevation::export_epsg(elevation.crs, target);
+#if defined(ALPHASHAPE_USE_PROJ)
+    // A reprojected export declares the TARGET CRS, not the stored one.
+    if (target.requested()) {
+        options.crs.emplace(static_cast<crs::CoordinateSystem>(target.crs));
+    }
+#endif
     write_geotiff(path, raster, options);
     if (world_file) {
         write_world_file(world_file_path(path), raster.grid);
