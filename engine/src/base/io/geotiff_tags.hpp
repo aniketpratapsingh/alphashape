@@ -26,11 +26,16 @@ namespace alphashape {
 inline constexpr std::uint32_t kTagModelPixelScale = 33550;
 inline constexpr std::uint32_t kTagModelTiepoint = 33922;
 inline constexpr std::uint32_t kTagGeoKeyDirectory = 34735;
+/// GeoAsciiParams (ASCII): the `|`-separated string pool a GeoKey entry points
+/// into when its TIFFTagLocation is this tag (CRS names and, for a user-defined
+/// CRS, the full WKT2 definition).
+inline constexpr std::uint32_t kTagGeoAsciiParams = 34737;
 /// GDAL_NODATA (ASCII): the value that marks "no sample here".
 inline constexpr std::uint32_t kTagGdalNodata = 42113;
 
 /// Install the tag extender that merges ModelPixelScale, ModelTiepoint,
-/// GeoKeyDirectory and GDAL_NODATA into every TIFF handle opened afterwards.
+/// GeoKeyDirectory, GeoAsciiParams and GDAL_NODATA into every TIFF handle
+/// opened afterwards.
 ///
 /// Idempotent and thread-safe: safe to call from every open path, which is
 /// where it belongs because the extender must be in place before the handle is

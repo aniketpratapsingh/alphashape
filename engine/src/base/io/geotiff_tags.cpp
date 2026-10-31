@@ -13,7 +13,7 @@ namespace {
 /// The extender libtiff installed before us, so the hook can chain to it.
 TIFFExtendProc g_parent_extender = nullptr;
 
-/// Merges the four tags into ONE handle. Field names must have static storage
+/// Merges the tags into ONE handle. Field names must have static storage
 /// because they outlive every handle that refers to them.
 void merge_geotiff_fields(TIFF* tif) {
     // TIFF_VARIABLE read/write counts mean "a count is passed alongside the
@@ -22,6 +22,7 @@ void merge_geotiff_fields(TIFF* tif) {
     static char kNamePixelScale[] = "ModelPixelScaleTag";
     static char kNameTiepoint[] = "ModelTiepointTag";
     static char kNameGeoKeys[] = "GeoKeyDirectoryTag";
+    static char kNameGeoAscii[] = "GeoAsciiParamsTag";
     static char kNameNodata[] = "GDAL_NODATA";
     static const TIFFFieldInfo fields[] = {
         {kTagModelPixelScale, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_DOUBLE, FIELD_CUSTOM, 1, 1,
@@ -30,6 +31,8 @@ void merge_geotiff_fields(TIFF* tif) {
          kNameTiepoint},
         {kTagGeoKeyDirectory, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_SHORT, FIELD_CUSTOM, 1, 1,
          kNameGeoKeys},
+        {kTagGeoAsciiParams, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII, FIELD_CUSTOM, 1, 0,
+         kNameGeoAscii},
         {kTagGdalNodata, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII, FIELD_CUSTOM, 1, 0,
          kNameNodata},
     };
