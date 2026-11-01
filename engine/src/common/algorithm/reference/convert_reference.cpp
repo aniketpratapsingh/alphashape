@@ -320,15 +320,50 @@ const char* reference_kind_name(ReferenceKind kind) {
 
 namespace {
 
+/// A camera reference after conversion: the location always, and the
+/// orientation when the camera has both a position and an orientation. An
+/// orientation without a position cannot be placed on the globe, so it is
+/// carried unchanged (the slot relabel then applies to it too).
+struct ConvertedCameraReference {
+    std::optional<Eigen::Vector3d> location;
+    std::optional<Eigen::Vector3d> orientation;
+};
+
+/// Re-express a stored orientation triple from the source's axes into the
+/// target's. The stored pitch carries a sign flip (see the header contract),
+/// so the triple is turned into the internal Euler form, converted, and turned
+/// back.
+Eigen::Vector3d convert_stored_orientation(const Eigen::Vector3d& stored,
+                                           const CoordinateSystem& source,
+                                           const CoordinateSystem& target,
+                                           const crs::CrsPoint& point,
+                                           crs::RotationOrder order) {
+    const crs::EulerAngles internal{stored.x(), -stored.y(), stored.z(), order};
+    const crs::EulerAngles moved = convert_orientation(internal, source, target, point);
+    return Eigen::Vector3d(moved.yaw, -moved.pitch, moved.roll);
+}
+
 /// Convert every camera reference into a detached list; the chunk is not
 /// touched. Returns nullopt entries for cameras with no reference.
-std::vector<std::optional<Eigen::Vector3d>> converted_camera_locations(
+std::vector<ConvertedCameraReference> converted_camera_references(
     const Chunk& chunk, const CoordinateSystem& target, const crs::GeoidStore* geoids) {
-    const Converter converter = build_converter(chunk.camera_crs(), target, "camera", geoids);
-    std::vector<std::optional<Eigen::Vector3d>> converted;
+    const CoordinateSystem source = chunk.camera_crs();
+    const crs::RotationOrder order = rotation_order_of(chunk);
+    const Converter converter = build_converter(source, target, "camera", geoids);
+    std::vector<ConvertedCameraReference> converted;
     converted.reserve(chunk.cameras().size());
     for (const Camera& camera : chunk.cameras()) {
-        converted.push_back(convert_point(camera.reference.location, converter, where(camera)));
+        ConvertedCameraReference out;
+        out.location = convert_point(camera.reference.location, converter, where(camera));
+        out.orientation = camera.reference.orientation_deg;
+        if (out.orientation.has_value() && camera.reference.location.has_value()) {
+            const Eigen::Vector3d& location = *camera.reference.location;
+            const crs::CrsPoint point{location.x(), location.y(),
+                                      std::isfinite(location.z()) ? location.z() : 0.0};
+            out.orientation =
+                convert_stored_orientation(*out.orientation, source, target, point, order);
+        }
+        converted.push_back(out);
     }
     return converted;
 }
@@ -360,17 +395,18 @@ void convert_reference(Chunk& chunk, const CoordinateSystem& target, ReferenceKi
     const bool markers = kind == ReferenceKind::Markers || kind == ReferenceKind::Both;
     // Compute both slots' new values BEFORE writing either, so a failure in the
     // second slot cannot leave the first one half-converted.
-    std::vector<std::optional<Eigen::Vector3d>> camera_values;
+    std::vector<ConvertedCameraReference> camera_values;
     std::vector<std::optional<Eigen::Vector3d>> marker_values;
     if (cameras) {
-        camera_values = converted_camera_locations(chunk, target, geoids);
+        camera_values = converted_camera_references(chunk, target, geoids);
     }
     if (markers) {
         marker_values = converted_marker_references(chunk, target, geoids);
     }
     if (cameras) {
         for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
-            chunk.cameras()[i].reference.location = camera_values[i];
+            chunk.cameras()[i].reference.location = camera_values[i].location;
+            chunk.cameras()[i].reference.orientation_deg = camera_values[i].orientation;
         }
         chunk.set_camera_crs(CRS(target));
     }

@@ -10,6 +10,13 @@
 #include <string>
 #include <string_view>
 
+#if defined(ALPHASHAPE_USE_PROJ)
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
+#include "model/crs/euler.hpp"
+#endif
+
 namespace alphashape {
 namespace {
 
@@ -357,16 +364,75 @@ XmpReference parse_xmp_reference(std::string_view packet) {
     return state.out;
 }
 
+#if defined(ALPHASHAPE_USE_PROJ)
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDeg = kPi / 180.0;
+
+Eigen::Matrix3d rotation_about(int axis, double degrees) {
+    Eigen::Vector3d unit = Eigen::Vector3d::Zero();
+    unit[axis] = 1.0;
+    return Eigen::AngleAxisd(degrees * kDeg, unit).toRotationMatrix();
+}
+
+/// The fixed body-to-camera rotation of a nadir mount, identical to
+/// `reference::body_to_camera_nadir()`. Repeated as a 3x3 here so this
+/// translation unit does not depend on the CRS conversion module; the geometry
+/// tests cross-check the two definitions.
+Eigen::Matrix3d nadir_mount() {
+    Eigen::Matrix3d mount;
+    mount << 0.0, -1.0, 0.0,   //
+        -1.0, 0.0, 0.0,        //
+        0.0, 0.0, -1.0;
+    return mount;
+}
+
+/// World-from-body for a stored ZYX triple, per the `convert_reference`
+/// contract: `R_wb = Rz(90 deg) * to_matrix({yaw, -pitch, roll})`.
+Eigen::Matrix3d world_from_stored(double yaw_deg, double pitch_deg, double roll_deg) {
+    const crs::EulerAngles internal{yaw_deg, -pitch_deg, roll_deg, crs::RotationOrder::ZYX};
+    return rotation_about(2, 90.0) * crs::to_matrix(internal);
+}
+
+/// The inverse of `world_from_stored`: strip the fixed Rz(90) and put the
+/// pitch sign back so the triple is in the stored convention again.
+XmpOrientation stored_from_world(const Eigen::Matrix3d& world_from_body) {
+    const Eigen::Matrix3d internal = rotation_about(2, -90.0) * world_from_body;
+    const crs::EulerAngles angles = crs::from_matrix(internal, crs::RotationOrder::ZYX);
+    return XmpOrientation{angles.yaw, -angles.pitch, angles.roll};
+}
+
+/// World(ENU)-from-camera for a DJI gimbal triple.
+///
+/// The axes are named explicitly: at heading 0, pitch 0, roll 0 the optical
+/// axis points north and image-up points up, so `R0 = [east | down | north]`.
+/// Heading is a clockwise rotation about the down/up axis, pitch tilts about
+/// the camera's right axis (0 at the horizon, -90 at nadir), and roll spins
+/// about the optical axis. Hence
+///
+///     R_wc = Rz(-heading) * R0 * Rx(pitch) * Rz(roll)
+///
+/// where each right-hand factor acts on the camera's own axes.
+Eigen::Matrix3d world_from_gimbal(double heading_deg, double pitch_deg, double roll_deg) {
+    Eigen::Matrix3d base;
+    base << 1.0, 0.0, 0.0,   // image right = east
+        0.0, 0.0, 1.0,       // image down = down
+        0.0, -1.0, 0.0;      // optical axis = north
+    return rotation_about(2, -heading_deg) * base * rotation_about(0, pitch_deg) *
+           rotation_about(2, roll_deg);
+}
+
+}  // namespace
+#endif
+
 bool XmpReference::has_rtk_fix() const {
     if (!rtk_flag.has_value()) {
         return false;
     }
-    // 1/2 are the documented float/fixed values; 34/50 are the values current
-    // DJI firmware writes for float/fixed. Any other code (notably 0 and 16,
-    // single-point GNSS) is not a trusted RTK solution.
+    // Only 34 (float) and 50 (fixed) are trusted RTK solutions. Codes 0/16
+    // (single-point GNSS) and 1/2 (an unrelated enum some tools emit) are not.
     switch (*rtk_flag) {
-        case 1:
-        case 2:
         case 34:
         case 50:
             return true;
@@ -387,6 +453,28 @@ std::optional<std::array<double, 3>> XmpReference::rtk_accuracy_m() const {
 }
 
 std::optional<XmpOrientation> XmpReference::orientation_zyx() const {
+#if defined(ALPHASHAPE_USE_PROJ)
+    if (gimbal_yaw_deg.has_value() && gimbal_pitch_deg.has_value()) {
+        // The gimbal angles describe the camera, so build the world-from-camera
+        // rotation and undo the fixed nadir mount: R_wb = R_wc * B^T (B is
+        // symmetric, so this equals R_wc * B). The result is then decomposed
+        // into the stored body-attitude convention.
+        const Eigen::Matrix3d world_from_camera = world_from_gimbal(
+            *gimbal_yaw_deg, *gimbal_pitch_deg, gimbal_roll_deg.value_or(0.0));
+        return stored_from_world(world_from_camera * nadir_mount().transpose());
+    }
+    if (flight_yaw_deg.has_value() && flight_pitch_deg.has_value()) {
+        // Flight angles already describe the body; only the compass heading
+        // sign changes. Routing through the same matrix path normalises the
+        // triple (and would catch a fully degenerate decomposition).
+        return stored_from_world(world_from_stored(
+            -*flight_yaw_deg, *flight_pitch_deg, flight_roll_deg.value_or(0.0)));
+    }
+    return std::nullopt;
+#else
+    // Without the CRS engine there is no matrix decomposition available. This
+    // component-wise mapping is only meaningful in the default ZYX order, so
+    // the AddPhotos task skips XMP orientation in such a build.
     if (gimbal_yaw_deg.has_value() && gimbal_pitch_deg.has_value()) {
         return XmpOrientation{-*gimbal_yaw_deg, *gimbal_pitch_deg + 90.0,
                               gimbal_roll_deg.value_or(0.0)};
@@ -396,6 +484,7 @@ std::optional<XmpOrientation> XmpReference::orientation_zyx() const {
                               flight_roll_deg.value_or(0.0)};
     }
     return std::nullopt;
+#endif
 }
 
 }  // namespace alphashape

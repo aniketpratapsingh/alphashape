@@ -7,12 +7,14 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "base/utils/error.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/reference/xmp_reference.hpp"
 #include "common/core/frame.hpp"
 #include "image/io/exif.hpp"
@@ -90,6 +92,15 @@ std::string sensor_label(const std::string& model, double focal_mm) {
     return (has_model ? model : std::string("Unknown")) + " (" + focal_text + " mm)";
 }
 
+/// Warn once per process when XMP orientation cannot be stored safely. The
+/// condition is per photo, so a plain log line per file would flood the console.
+void warn_orientation_skipped(const char* reason) {
+    static std::once_flag once;
+    std::call_once(once, [reason] {
+        log(LogLevel::Warn) << "AddPhotos: XMP orientation skipped: " << reason;
+    });
+}
+
 /// Derive the pixel pitch in micrometres, corrected for a JPEG that was scaled
 /// after the EXIF was written.
 ///
@@ -138,18 +149,46 @@ double initial_focal_pixels(const ExifData& exif, int width, int height,
 }
 
 #if defined(ALPHASHAPE_USE_PROJ)
-/// Re-express the XMP parser's default ZYX yaw/pitch/roll in the chunk's
-/// configured rotation order. The angles describe the same rotation; only the
-/// sequence they are read in changes.
-Eigen::Vector3d orientation_in_chunk_order(const XmpOrientation& angles, const Chunk& chunk) {
-    const crs::RotationOrder order = reference::rotation_order_of(chunk);
-    if (order == crs::RotationOrder::ZYX) {
-        return Eigen::Vector3d(angles.yaw_deg, angles.pitch_deg, angles.roll_deg);
+/// True when the chunk's camera-reference slot is a projected CRS, i.e. one
+/// whose grid north differs from true north by the meridian convergence.
+bool camera_slot_is_projected(const Chunk& chunk) {
+    const CRS& slot = chunk.camera_crs();
+    if (!slot.is_set()) {
+        return false;  // unset means the geographic default AddPhotos assumes
     }
-    const crs::EulerAngles in{angles.yaw_deg, angles.pitch_deg, angles.roll_deg,
-                              crs::RotationOrder::ZYX};
-    const crs::EulerAngles out = crs::from_matrix(crs::to_matrix(in), order);
-    return Eigen::Vector3d(out.yaw, out.pitch, out.roll);
+    const crs::CoordinateSystem cs = slot;
+    return cs.kind() == crs::CrsKind::Projected;
+}
+
+/// Turn the XMP parser's stored ZYX triple into the triple the chunk stores.
+///
+/// The stored convention is `R_wb = Rz(90) * to_matrix({yaw, -pitch, roll})`,
+/// so the pitch sign is flipped before the decomposition and back after it.
+/// When the camera slot is projected the body attitude also has to be
+/// re-expressed from true north (the gimbal heading's frame) to the slot's grid
+/// north, which is exactly `convert_orientation`'s world-frame relabelling.
+Eigen::Vector3d orientation_in_chunk_order(const XmpOrientation& angles, const Chunk& chunk,
+                                           const std::optional<Eigen::Vector2d>& lonlat) {
+    const crs::RotationOrder order = reference::rotation_order_of(chunk);
+    Eigen::Matrix3d body_attitude =
+        crs::to_matrix(crs::EulerAngles{angles.yaw_deg, -angles.pitch_deg, angles.roll_deg,
+                                        crs::RotationOrder::ZYX});
+    bool converged = false;
+    if (camera_slot_is_projected(chunk) && lonlat.has_value()) {
+        const crs::CoordinateSystem geographic = crs::CoordinateSystem::from_epsg(4326);
+        const crs::CoordinateSystem slot = chunk.camera_crs();
+        const crs::EulerAngles internal{angles.yaw_deg, -angles.pitch_deg, angles.roll_deg,
+                                        crs::RotationOrder::ZYX};
+        const crs::EulerAngles moved = reference::convert_orientation(
+            internal, geographic, slot, crs::CrsPoint{lonlat->x(), lonlat->y(), 0.0});
+        body_attitude = crs::to_matrix(moved);
+        converged = true;
+    }
+    const crs::EulerAngles out =
+        (!converged && order == crs::RotationOrder::ZYX)
+            ? crs::EulerAngles{angles.yaw_deg, -angles.pitch_deg, angles.roll_deg, order}
+            : crs::from_matrix(body_attitude, order);
+    return Eigen::Vector3d(out.yaw, -out.pitch, out.roll);
 }
 #endif
 
@@ -191,7 +230,8 @@ void AddPhotosTask::declare_params(Params& params) const {
     params.declare({"filenames", ParamType::StringList, std::monostate{},
                     "Image files to import, as a list of paths."});
     params.declare({"load_reference", ParamType::Bool, true,
-                    "Load each photo's EXIF GPS position into its camera reference."});
+                    "Load each photo's EXIF GPS position into its camera reference, "
+                    "falling back to the XMP position when EXIF GPS is absent."});
     params.declare({"strip_extensions", ParamType::Bool, true,
                     "Label each camera with the file name without its extension."});
     params.declare({"load_xmp_accuracy", ParamType::Bool, false,
@@ -226,7 +266,9 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     // Declared so the schema and Python front end accept it; DewarpData is not
     // applied yet (see the parameter description and the PR notes).
     const bool load_xmp_calibration = params.get_bool("load_xmp_calibration");
-    (void)load_xmp_calibration;
+    // Any of these reads XMP; with all of them off the packet scan is skipped.
+    const bool want_xmp =
+        load_reference || load_xmp_accuracy || load_xmp_orientation || load_xmp_calibration;
 
     // -- resolve and de-duplicate before reading anything --------------------
     std::vector<std::string> absolute;
@@ -291,8 +333,8 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             // XMP is read from the same file: a JPEG APP1 packet or TIFF tag
             // 700. Parsing never throws; an absent packet is an empty result.
             const XmpReference xmp =
-                exif.xmp_packet.has_value() ? parse_xmp_reference(*exif.xmp_packet)
-                                            : XmpReference{};
+                want_xmp && exif.xmp_packet.has_value() ? parse_xmp_reference(*exif.xmp_packet)
+                                                        : XmpReference{};
 
             const std::optional<double> pixel_size_um = corrected_pixel_size_um(exif, info.width);
             const double focal_pixels = initial_focal_pixels(exif, info.width, info.height, pixel_size_um);
@@ -353,16 +395,35 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
                 }
             }
 
+            // A projected camera slot needs the position to turn a true-north
+            // heading into grid north; either EXIF GPS or the XMP fallback is
+            // enough. Without it the stored heading would be mislabelled.
+            std::optional<Eigen::Vector2d> lonlat;
+            if (xmp.has_location()) {
+                lonlat = Eigen::Vector2d(*xmp.longitude_deg, *xmp.latitude_deg);
+            } else if (exif.gps.has_value()) {
+                lonlat = Eigen::Vector2d(exif.gps->longitude_deg, exif.gps->latitude_deg);
+            }
+
             if (load_xmp_orientation) {
                 if (const auto angles = xmp.orientation_zyx()) {
 #if defined(ALPHASHAPE_USE_PROJ)
-                    item.camera.reference.orientation_deg =
-                        orientation_in_chunk_order(*angles, *chunk);
+                    if (camera_slot_is_projected(*chunk) && !lonlat.has_value()) {
+                        warn_orientation_skipped(
+                            "the camera slot is projected but the photo has no position, "
+                            "so the true-north heading cannot be turned into grid north");
+                    } else {
+                        item.camera.reference.orientation_deg =
+                            orientation_in_chunk_order(*angles, *chunk, lonlat);
+                    }
 #else
-                    // Without the CRS engine there is no rotation-order helper;
-                    // the stored ZYX triple is still the documented default.
-                    item.camera.reference.orientation_deg = Eigen::Vector3d(
-                        angles->yaw_deg, angles->pitch_deg, angles->roll_deg);
+                    // Without the CRS engine the chunk's rotation order and the
+                    // meridian convergence cannot be resolved; storing the ZYX
+                    // triple anyway would mislabel it in a non-ZYX chunk.
+                    (void)angles;
+                    (void)lonlat;
+                    warn_orientation_skipped(
+                        "this build has no CRS engine, so the rotation order cannot be resolved");
 #endif
                 }
             }

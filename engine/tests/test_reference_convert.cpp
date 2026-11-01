@@ -508,6 +508,39 @@ TEST(Crs, ConvertReferenceYawGainsMeridianConvergence) {
     EXPECT_NEAR(back.yaw, 0.0, 1e-3);
 }
 
+// WP-13.3 review: convert_reference must carry orientation_deg with the slot,
+// not only the location, so the heading keeps pointing where it did physically
+// when the camera slot changes from geographic to a projected CRS.
+TEST(Reference, ConvertKeepsOrientationGeometry) {
+    const int zone = 32;
+    const double lon = 9.5;  // 0.5 degrees east of the zone's central meridian
+    const double lat = 50.0;
+    Chunk chunk = make_chunk(geographic(), 1, 0, lon, lat);
+    // Stored (0, 0, 0) is a level body whose compass heading is true north.
+    chunk.cameras()[0].reference.orientation_deg = Eigen::Vector3d(0.0, 0.0, 0.0);
+
+    // Independent convergence: the grid azimuth of a northward step, measured
+    // through the projection rather than taken from the code under test.
+    const crs::CrsTransform to_grid = crs::CrsTransform::create(geographic(), utm(zone));
+    const std::optional<crs::CrsPoint> here = to_grid.forward(crs::CrsPoint{lon, lat, 0.0});
+    const std::optional<crs::CrsPoint> north =
+        to_grid.forward(crs::CrsPoint{lon, lat + 1e-6, 0.0});
+    ASSERT_TRUE(here.has_value());
+    ASSERT_TRUE(north.has_value());
+    const double grid_azimuth = std::atan2(north->x - here->x, north->y - here->y);
+    ASSERT_GT(std::fabs(grid_azimuth), 0.002)
+        << "the test point must be far enough from the central meridian";
+
+    convert_reference(chunk, utm(zone), ReferenceKind::Cameras);
+    ASSERT_TRUE(chunk.cameras()[0].reference.orientation_deg.has_value());
+    const Eigen::Vector3d& angles = *chunk.cameras()[0].reference.orientation_deg;
+    // True north reads as yaw = -grid azimuth in the grid frame; with pitch
+    // and roll zero the stored yaw is that same yaw.
+    EXPECT_NEAR(angles.x(), -grid_azimuth / kDeg, 1e-3);
+    EXPECT_NEAR(angles.y(), 0.0, 1e-6);
+    EXPECT_NEAR(angles.z(), 0.0, 1e-6);
+}
+
 // Two projections of the same datum differ by a real rotation of their local
 // axes, not only by the convergence: a direction that is pure east in one zone
 // is not pure east in the next. The frame rotation must be orthonormal and

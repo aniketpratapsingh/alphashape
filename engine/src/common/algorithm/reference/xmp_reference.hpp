@@ -25,29 +25,39 @@
 /// ## Orientation mapping
 ///
 /// `CameraReference::orientation_deg` is a Tait-Bryan yaw/pitch/roll triple in
-/// the chunk's rotation order, interpreted as a body attitude in the local ENU
-/// basis with the fixed nadir camera mount documented in `convert_reference`
-/// (`body_to_camera_nadir()`). A level body with yaw 0 therefore points the
-/// camera straight down with north up; that is the "nadir, north-up" pose.
+/// the chunk's rotation order, interpreted as a BODY attitude in the slot CRS's
+/// local east-north-up basis:
 ///
-/// DJI's gimbal angles describe the camera itself:
+///     R_wb = Rz(90 deg) * to_matrix({yaw, -pitch, roll})
 ///
-///  * `GimbalYawDegree` is a compass heading, clockwise from true north, so it
-///    maps to `yaw = -heading` (the engine's yaw is counter-clockwise from
-///    north).
-///  * `GimbalPitchDegree` is -90 at nadir and 0 at the horizon, while the stored
-///    pitch is the body angle whose -90 mount tilt is already in
-///    `body_to_camera_nadir()`. The mapping is therefore `pitch = gimbal + 90`:
-///    nadir (-90) becomes 0 and the horizon becomes +90.
-///  * Roll is carried through unchanged.
+/// (`convert_reference.hpp` documents the contract). The camera is mounted with
+/// the fixed `body_to_camera_nadir()` rotation B, so world-from-camera is
+/// `R_wc = R_wb * B^T`.
 ///
-/// A nadir camera heading north (`yaw 0`, `pitch -90`, `roll 0`) therefore maps
-/// to `(0, 0, 0)`. When the gimbal angles are absent the aircraft's
-/// `FlightYaw/Pitch/RollDegree` are used instead; those already describe the
-/// body, so `yaw = -flightYaw`, `pitch = flightPitch`, `roll = flightRoll`.
+/// DJI's gimbal angles describe the CAMERA, not the aircraft, so they are
+/// composed into `R_wc` directly. Heading (yaw) is clockwise from true north
+/// about the up/down axis, pitch tilts about the camera's right axis (0 at the
+/// horizon, -90 at nadir), and roll spins about the optical axis. With named
+/// axes and `R0 = [image-right | image-down | optical] = [east | down | north]`
+/// at heading 0 / pitch 0 / roll 0,
+///
+///     R_wc = Rz(-heading) * R0 * Rx(pitch) * Rz(roll)
+///
+/// A nadir camera heading north (heading 0, pitch -90, roll 0) therefore has
+/// `R_wc = diag(1, -1, -1)`, the level body pose (yaw 0, pitch 0, roll 0). The
+/// stored triple is recovered as `from_matrix(Rz(-90) * R_wc * B)` with the
+/// pitch sign flipped back. This is a matrix conversion: the angles are not
+/// remapped component by component, which would be wrong whenever roll is
+/// present off the cardinal poses.
+///
+/// When the gimbal angles are absent the aircraft's `FlightYaw/Pitch/RollDegree`
+/// are used instead; those already describe the body, so the triple is
+/// `yaw = -flightYaw`, `pitch = flightPitch`, `roll = flightRoll`, normalised
+/// through the same matrix decomposition.
 ///
 /// Angles are reported in the default `ZYX` order; the task layer converts them
-/// to the chunk's configured rotation order.
+/// to the chunk's configured rotation order and, when the camera slot is
+/// projected, from true north to grid north.
 
 #include <array>
 #include <optional>
