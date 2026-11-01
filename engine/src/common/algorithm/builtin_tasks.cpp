@@ -18,7 +18,9 @@
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/algorithm/photos/add_photos_task.hpp"
 #if defined(ALPHASHAPE_USE_PROJ)
+#include "common/algorithm/reference/export_markers_task.hpp"
 #include "common/algorithm/reference/export_reference_task.hpp"
+#include "common/algorithm/reference/import_markers_task.hpp"
 #include "common/algorithm/reference/import_reference_task.hpp"
 #endif
 #include "common/algorithm/sfm/align_cameras_task.hpp"
@@ -55,6 +57,10 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MergeChunksTask>());
     registry.register_task(std::make_shared<AppendProjectTask>());
     registry.register_task(std::make_shared<AlignChunksTask>());
+    // WP-13.4: marker projection import/export needs no CRS, so the tasks are
+    // always registered (their sources are compiled unconditionally).
+    registry.register_task(std::make_shared<ImportMarkersTask>());
+    registry.register_task(std::make_shared<ExportMarkersTask>());
 #if defined(ALPHASHAPE_USE_PROJ)
     // WP-13.2: reference import/export depends on the CRS engine, so the tasks
     // exist only in a PROJ build (the sources are compiled in the same guard).

@@ -113,19 +113,25 @@ class TestDriftInvariant(unittest.TestCase):
                 doc.active_chunk = chunk
             _PREPARED_CACHE[task] = (doc, chunk)
             return doc, chunk
-        if task in ("ImportReference", "ExportReference"):
-            # Both need a real path. The export runs on the imported document
-            # (a header-only reference table is still a valid export), and the
-            # import reads a one-row file that creates a marker, so the drift
+        if task in ("ImportReference", "ExportReference", "ImportMarkers",
+                    "ExportMarkers"):
+            # All four need a real path. The exports run on the imported
+            # document (a header-only table is still a valid export), and the
+            # imports read a one-row file that creates a marker, so the drift
             # checks exercise both the chunk mutation and the save/load path.
             doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
             with tempfile.TemporaryDirectory() as tmp:
                 path = os.path.join(tmp, "reference.csv")
-                if task == "ExportReference":
+                if task in ("ExportReference", "ExportMarkers"):
                     doc.run_task(task, path=path)
-                else:
+                elif task == "ImportReference":
                     with open(path, "w", encoding="utf-8") as handle:
                         handle.write("REF1,1,2,3\n")
+                    doc.run_task(task, path=path)
+                else:
+                    # Camera labels come from the image file stems.
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write("marker,camera,u,v\nMARK1,fixture_a,10,20\n")
                     doc.run_task(task, path=path)
             _PREPARED_CACHE[task] = (doc, chunk)
             return doc, chunk

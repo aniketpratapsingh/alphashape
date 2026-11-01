@@ -72,6 +72,7 @@ add_executable(alphashape_tests
     test_build_orthomosaic.cpp
     test_chunk_ops.cpp
     test_align_chunks.cpp
+    test_marker_placement.cpp
     test_gpu.cpp
 )
 

@@ -433,6 +433,75 @@ void set_reference_accuracy(py::object chunk_self,
     alphashape::make_set_reference_settings_command(id, settings)->apply(*document);
 }
 
+/// The Document that owns `chunk_self`, for the command-backed marker edits.
+alphashape::Document& owning_document(py::object chunk_self) {
+    if (!py::hasattr(chunk_self, "_document")) {
+        throw py::type_error("this Chunk is not attached to a Document");
+    }
+    return chunk_self.attr("_document").cast<alphashape::Document&>();
+}
+
+/// The Python view of one marker: a dict, matching the `markers` property.
+py::dict marker_dict(const alphashape::Marker& marker) {
+    py::dict entry;
+    entry[py::str("id")] = py::int_(marker.id);
+    entry[py::str("label")] = py::str(marker.label);
+    if (marker.position.has_value()) {
+        const Eigen::Vector3d& p = *marker.position;
+        entry[py::str("position")] = py::make_tuple(p.x(), p.y(), p.z());
+    } else {
+        entry[py::str("position")] = py::none();
+    }
+    if (marker.reference.has_value()) {
+        const Eigen::Vector3d& r = *marker.reference;
+        entry[py::str("reference")] = py::make_tuple(r.x(), r.y(), r.z());
+    } else {
+        entry[py::str("reference")] = py::none();
+    }
+    return entry;
+}
+
+/// Resolve a marker argument: an int id or an exact label. Throws ValueError
+/// when nothing matches.
+std::int32_t marker_id_from_python(const alphashape::Chunk& chunk, py::handle value) {
+    if (py::isinstance<py::str>(value)) {
+        const std::string label = py::cast<std::string>(value);
+        for (const alphashape::Marker& marker : chunk.markers()) {
+            if (marker.label == label) {
+                return marker.id;
+            }
+        }
+        throw alphashape::ValueError("no marker with label '" + label + "'");
+    }
+    const std::int32_t id = py::cast<std::int32_t>(value);
+    for (const alphashape::Marker& marker : chunk.markers()) {
+        if (marker.id == id) {
+            return id;
+        }
+    }
+    throw alphashape::ValueError("no marker with id " + std::to_string(id));
+}
+
+/// Resolve a camera argument: an int id or an exact label.
+std::int32_t camera_id_from_python(const alphashape::Chunk& chunk, py::handle value) {
+    if (py::isinstance<py::str>(value)) {
+        const std::string label = py::cast<std::string>(value);
+        for (const alphashape::Camera& camera : chunk.cameras()) {
+            if (camera.label == label) {
+                return camera.id;
+            }
+        }
+        throw alphashape::ValueError("no camera with label '" + label + "'");
+    }
+    const std::int32_t id = py::cast<std::int32_t>(value);
+    for (const alphashape::Camera& camera : chunk.cameras()) {
+        if (camera.id == id) {
+            return id;
+        }
+    }
+    throw alphashape::ValueError("no camera with id " + std::to_string(id));
+}
+
 #if defined(ALPHASHAPE_USE_PROJ)
 /// (x, y, z) tuple or None, the shape every optional vector in the reference
 /// table uses. The table itself needs the CRS engine, so this lives with it.
@@ -1180,25 +1249,90 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly("markers", [](const Chunk& c) {
             py::list out;
             for (const alphashape::Marker& marker : c.markers()) {
-                py::dict entry;
-                entry[py::str("id")] = py::int_(marker.id);
-                entry[py::str("label")] = py::str(marker.label);
-                if (marker.position.has_value()) {
-                    const Eigen::Vector3d& p = *marker.position;
-                    entry[py::str("position")] = py::make_tuple(p.x(), p.y(), p.z());
-                } else {
-                    entry[py::str("position")] = py::none();
-                }
-                if (marker.reference.has_value()) {
-                    const Eigen::Vector3d& r = *marker.reference;
-                    entry[py::str("reference")] = py::make_tuple(r.x(), r.y(), r.z());
-                } else {
-                    entry[py::str("reference")] = py::none();
-                }
-                out.append(std::move(entry));
+                out.append(marker_dict(marker));
             }
             return out;
         })
+        // Manual marker placement (WP-13.4). Each edit goes through the same
+        // undoable model command the GUI uses; the command is applied and then
+        // discarded, since the GUI owns the undo history (a scripted edit is
+        // not a stack entry).
+        .def(
+            "addMarker",
+            [](py::object self, py::object label, py::object position) {
+                alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
+                alphashape::Document& document = owning_document(self);
+                std::optional<std::string> marker_label;
+                if (!label.is_none()) {
+                    marker_label = py::cast<std::string>(label);
+                }
+                std::optional<Eigen::Vector3d> marker_position;
+                if (!position.is_none()) {
+                    const auto values = py::cast<std::vector<double>>(position);
+                    if (values.size() != 3) {
+                        throw alphashape::ValueError(
+                            "addMarker: position must be an (x, y, z) tuple");
+                    }
+                    marker_position =
+                        Eigen::Vector3d(values[0], values[1], values[2]);
+                }
+                const std::int32_t new_id = chunk.next_id();
+                alphashape::make_add_marker_command(chunk.id(), std::move(marker_label),
+                                                    marker_position)
+                    ->apply(document);
+                for (const alphashape::Marker& marker : chunk.markers()) {
+                    if (marker.id == new_id) {
+                        return marker_dict(marker);
+                    }
+                }
+                throw alphashape::Error("addMarker: the marker was not created");
+            },
+            py::arg("label") = py::none(), py::arg("position") = py::none(),
+            "Create a marker and return its dict. A missing label generates the "
+            "lowest free \"point N\"; a duplicate label raises ValueError. "
+            "position is an optional chunk-local (x, y, z) tuple.")
+        .def(
+            "setMarkerProjection",
+            [](py::object self, py::object marker, py::object camera, double u,
+               double v) {
+                alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
+                alphashape::Document& document = owning_document(self);
+                const std::int32_t camera_id = camera_id_from_python(chunk, camera);
+                // A string names a marker by label (and may name one that does
+                // not exist yet, which the command creates); a Marker object or
+                // an integer names it by id and must already exist. The two
+                // never shadow each other, so a marker labelled "5" cannot
+                // capture an edit meant for marker id 5.
+                alphashape::MarkerRef reference =
+                    py::isinstance<py::str>(marker)
+                        ? alphashape::MarkerRef(py::cast<std::string>(marker))
+                        : alphashape::MarkerRef(
+                              marker_id_from_python(chunk, marker));
+                alphashape::make_add_marker_with_projection_command(
+                    chunk.id(), std::move(reference), camera_id,
+                    Eigen::Vector2d(u, v),
+                    /*pinned=*/false)
+                    ->apply(document);
+            },
+            py::arg("marker"), py::arg("camera"), py::arg("u"), py::arg("v"),
+            "Set or replace one marker projection. A string `marker` is an exact "
+            "label (creating the marker when absent); a Marker object or int is "
+            "a marker id that must exist. `camera` is an id or exact label.")
+        .def(
+            "removeMarkerProjection",
+            [](py::object self, py::object marker, py::object camera,
+               bool delete_marker) {
+                alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
+                alphashape::Document& document = owning_document(self);
+                const std::int32_t marker_id = marker_id_from_python(chunk, marker);
+                const std::int32_t camera_id = camera_id_from_python(chunk, camera);
+                alphashape::make_remove_marker_projection_command(
+                    chunk.id(), marker_id, camera_id, delete_marker)
+                    ->apply(document);
+            },
+            py::arg("marker"), py::arg("camera"), py::arg("delete_marker") = false,
+            "Remove one projection. With delete_marker a marker whose last "
+            "projection this was is removed too.")
         // Place or move a marker: sets `position` on the marker with `label`,
         // creating the marker (and allocating its id) when the chunk has none
         // with that label. This is the manual placement path WP-11.1 ships
@@ -1455,6 +1589,13 @@ PYBIND11_MODULE(alphashape, m) {
         })
         .def("exportReference", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "ExportReference", std::move(kwargs));
+        })
+        // Marker projection import/export (WP-13.4), the same run_task calls.
+        .def("importMarkers", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ImportMarkers", std::move(kwargs));
+        })
+        .def("exportMarkers", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ExportMarkers", std::move(kwargs));
         })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
