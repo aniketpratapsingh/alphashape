@@ -485,7 +485,7 @@ TEST(Xmp, XmpApp1AfterExifApp1IsRead) {
     tiff[11] = 0x01;
     tiff[12] = 3;                  // SHORT
     tiff[14] = 1;                  // count
-    tiff[16] = 6;                  // Orientation = 6
+    tiff[18] = 6;                  // Orientation value lives in the entry
     std::string exif_payload("Exif\0\0", 6);
     exif_payload.append(reinterpret_cast<const char*>(tiff.data()), tiff.size());
 
@@ -508,7 +508,8 @@ TEST(Xmp, XmpApp1AfterExifApp1IsRead) {
     write_bytes(path, bytes);
     const ExifData exif = read_exif(path);
     // The EXIF block was read, and the later XMP APP1 was not lost with it.
-    EXPECT_EQ(exif.orientation, 6);
+    ASSERT_TRUE(exif.orientation.has_value());
+    EXPECT_EQ(*exif.orientation, 6);
     ASSERT_TRUE(exif.xmp_packet.has_value());
     const XmpReference xmp = parse_xmp_reference(*exif.xmp_packet);
     ASSERT_TRUE(xmp.latitude_deg.has_value());
