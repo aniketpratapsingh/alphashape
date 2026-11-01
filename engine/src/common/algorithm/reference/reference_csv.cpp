@@ -1,9 +1,12 @@
 #include "common/algorithm/reference/reference_csv.hpp"
 
-#include <charconv>
 #include <cmath>
 #include <cstddef>
-#include <system_error>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <sstream>
+#include <string>
 
 #include "base/utils/error.hpp"
 
@@ -163,23 +166,42 @@ double parse_number(const std::string& field, bool decimal_comma,
             }
         }
     }
-    // from_chars rejects a leading '+' on some implementations and does not
-    // skip spaces; a survey export may carry either. An empty field is not 0.
-    std::size_t first = 0;
-    while (first < text.size() && is_space(text[first])) {
-        ++first;
+    std::size_t begin = 0;
+    std::size_t end = text.size();
+    while (begin < end && is_space(text[begin])) {
+        ++begin;
     }
-    if (first == text.size()) {
+    while (end > begin && is_space(text[end - 1])) {
+        --end;
+    }
+    const std::string trimmed = text.substr(begin, end - begin);
+    if (trimmed.empty()) {
         throw ValueError(context + ": expected a number, got an empty field");
     }
-    if (text[first] == '+') {
-        text.erase(first, 1);
+    std::string lowered = trimmed;
+    for (char& c : lowered) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
     }
-    const char* begin = text.data() + first;
-    const char* end = text.data() + text.size();
+    if (lowered == "nan") {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (lowered == "inf" || lowered == "+inf" || lowered == "infinity") {
+        return std::numeric_limits<double>::infinity();
+    }
+    if (lowered == "-inf" || lowered == "-infinity") {
+        return -std::numeric_limits<double>::infinity();
+    }
+    // A classic-locale stream, not `std::from_chars`: libc++ (macOS) does not
+    // implement the floating-point from_chars overload, while the classic
+    // locale is equally independent of the process's C locale and always uses
+    // "." as the decimal point.
+    std::istringstream in(trimmed);
+    in.imbue(std::locale::classic());
     double value = 0.0;
-    const auto result = std::from_chars(begin, end, value);
-    if (result.ec != std::errc{} || result.ptr != end) {
+    in >> value;
+    if (!in || in.peek() != std::char_traits<char>::eof()) {
         throw ValueError(context + ": '" + field + "' is not a number");
     }
     return value;
@@ -198,22 +220,13 @@ std::string format_number(double value, int precision) {
     if (!std::isfinite(value)) {
         return std::isnan(value) ? "nan" : (value > 0.0 ? "inf" : "-inf");
     }
-    // fixed with `precision` digits after the point is what a survey export
-    // means by "6 decimals"; to_chars never consults the C locale.
-    const int digits = precision < 0 ? 0 : precision;
-    char buffer[64];
-    auto result = std::to_chars(buffer, buffer + sizeof(buffer), value,
-                                std::chars_format::fixed, digits);
-    if (result.ec != std::errc{}) {
-        // A value with a huge exponent needs more than `buffer` fixed digits;
-        // fall back to the shortest general form rather than an empty cell.
-        result = std::to_chars(buffer, buffer + sizeof(buffer), value,
-                               std::chars_format::general, 15);
-    }
-    if (result.ec != std::errc{}) {
-        return std::string{};
-    }
-    return std::string(buffer, result.ptr);
+    // Fixed with `precision` digits after the point is what a survey export
+    // means by "6 decimals". The classic locale never consults the C locale
+    // and, unlike libc++'s missing floating-point to_chars, is portable.
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::fixed << std::setprecision(precision < 0 ? 0 : precision) << value;
+    return out.str();
 }
 
 std::string quote_field(const std::string& value, char delimiter) {

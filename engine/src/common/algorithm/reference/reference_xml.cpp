@@ -91,7 +91,7 @@ void append_position(XmlNode& parent, const char* child_name,
     docxml::set_attr(node, "y", docxml::fmt(item.position.y()));
     docxml::set_attr(node, "z", docxml::fmt(item.position.z()));
     docxml::set_attr(node, "sxyz", docxml::fmt(item.accuracy));
-    docxml::set_attr(node, "enabled", item.enabled ? "1" : "0");
+    docxml::set_attr(node, "enabled", docxml::fmt_bool(item.enabled));
 }
 
 }  // namespace
@@ -114,7 +114,7 @@ std::string write_reference_xml(const XmlReferenceDocument& document) {
             docxml::set_attr(node, "label", bar.label);
             docxml::set_attr(node, "distance", docxml::fmt(bar.distance));
             docxml::set_attr(node, "accuracy", docxml::fmt(bar.accuracy));
-            docxml::set_attr(node, "enabled", bar.enabled ? "1" : "0");
+            docxml::set_attr(node, "enabled", docxml::fmt_bool(bar.enabled));
         }
     }
     std::string out;

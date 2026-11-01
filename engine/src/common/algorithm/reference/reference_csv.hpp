@@ -5,9 +5,9 @@
 ///
 /// This is deliberately a small, dependency-free layer: RFC 4180 parsing for
 /// CSV (quoted fields, doubled quotes, embedded newlines), a whitespace-run
-/// reader for TXT, locale-independent number conversion through
-/// `std::from_chars`/`std::to_chars`, and a writer that quotes only when a
-/// field needs it.
+/// reader for TXT, locale-independent number conversion (classic-locale
+/// streams, because libc++ does not implement floating-point `from_chars`), and
+/// a writer that quotes only when a field needs it.
 ///
 /// A parsed row keeps its 1-based starting line number so an importer can name
 /// the offending line in an error, which is what a user needs when a survey
