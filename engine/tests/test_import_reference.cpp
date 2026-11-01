@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -25,6 +27,7 @@
 #include "base/utils/error.hpp"
 #include "common/algorithm/reference/import_reference_task.hpp"
 #include "common/algorithm/reference/reference_table.hpp"
+#include "common/commands/command.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/marker.hpp"
@@ -408,6 +411,247 @@ TEST(Reference, ImportHundredThousandRows) {
     std::error_code error;
     fs::remove(path, error);
 }
+
+TEST(Reference, ApplyFalseDoesNotMutate) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "CAM1");
+    const Chunk pre_state = *chunk;
+
+    TempFile file(".csv");
+    write_text(file.path(), "CAM1,1,2,3\nNEW1,4,5,6\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    params.set("apply", false);
+    run_task_named(document, "ImportReference", params);
+
+    EXPECT_TRUE(*chunk == pre_state) << "apply=false changed the chunk";
+    EXPECT_EQ(chunk->markers().size(), 0U);
+}
+
+TEST(Reference, BadRowLeavesChunkUnchanged) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "C1");
+    add_camera(*chunk, "C2");
+    add_camera(*chunk, "C3");
+    const Chunk pre_state = *chunk;
+
+    TempFile file(".csv");
+    write_text(file.path(), "C1,1,2,3,0.1\nC2,4,5,6,0.2\nC3,7,8,9,-1\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z", "sigma"});
+    try {
+        run_task_named(document, "ImportReference", params);
+        FAIL() << "a non-positive sigma must be rejected";
+    } catch (const ValueError& error) {
+        EXPECT_NE(std::string(error.what()).find("line 3"), std::string::npos);
+    }
+    // Rows 1 and 2 validated first; neither may have been applied.
+    EXPECT_TRUE(*chunk == pre_state) << "a bad row left earlier rows applied";
+    EXPECT_EQ(chunk->markers().size(), 0U);
+}
+
+TEST(Reference, ImportIsUndoable) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "CAM1");
+    const Chunk pre_state = *chunk;
+
+    std::vector<reference::ImportRowPlan> plan;
+    reference::ImportRowPlan camera_row;
+    camera_row.target = reference::ImportRowPlan::Target::Camera;
+    camera_row.index = 0;
+    camera_row.position = Eigen::Vector3d(1.0, 2.0, 3.0);
+    camera_row.accuracy = Eigen::Vector3d(0.1, 0.2, 0.3);
+    camera_row.orientation_deg = Eigen::Vector3d(10.0, 20.0, 30.0);
+    plan.push_back(camera_row);
+    reference::ImportRowPlan marker_row;
+    marker_row.target = reference::ImportRowPlan::Target::NewMarker;
+    marker_row.label = "NEW1";
+    marker_row.position = Eigen::Vector3d(4.0, 5.0, 6.0);
+    marker_row.accuracy = Eigen::Vector3d(0.5, 0.5, 0.5);
+    marker_row.role = reference::MarkerReferenceRole::Gcp;
+    plan.push_back(marker_row);
+
+    UndoStack stack(&document);
+    stack.execute(reference::make_import_reference_command(chunk->id(), std::move(plan)));
+    ASSERT_TRUE(chunk->cameras()[0].reference.location.has_value());
+    EXPECT_EQ(chunk->markers().size(), 1U);
+    const Chunk after = *chunk;
+
+    stack.undo();
+    EXPECT_TRUE(*chunk == pre_state) << "undo did not restore the pre-state";
+    stack.redo();
+    EXPECT_TRUE(*chunk == after) << "redo differs from the first apply";
+}
+
+TEST(Reference, DecimalCommaWithSemicolon) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "CAM1");
+
+    TempFile file(".csv");
+    write_text(file.path(), "CAM1;1,5;2,5;3,5\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("delimiter", ";");
+    params.set("decimal_comma", true);
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    run_task_named(document, "ImportReference", params);
+
+    ASSERT_TRUE(chunk->cameras()[0].reference.location.has_value());
+    EXPECT_NEAR(chunk->cameras()[0].reference.location->x(), 1.5, 1e-12);
+    EXPECT_NEAR(chunk->cameras()[0].reference.location->y(), 2.5, 1e-12);
+    EXPECT_NEAR(chunk->cameras()[0].reference.location->z(), 3.5, 1e-12);
+}
+
+TEST(Reference, DecimalCommaWithCommaDelimiterRejected) {
+    Document document = make_document();
+    TempFile file(".csv");
+    write_text(file.path(), "CAM1,1,2,3\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("decimal_comma", true);
+    EXPECT_THROW(run_task_named(document, "ImportReference", params), ValueError);
+}
+
+TEST(Reference, CrlfAndBomAccepted) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "CAM1");
+
+    TempFile file(".csv");
+    write_text(file.path(), "\xEF\xBB\xBF" "CAM1,1,2,3\r\nP1,4,5,6\r\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    run_task_named(document, "ImportReference", params);
+
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_EQ(chunk->markers()[0].label, "P1");
+    ASSERT_TRUE(chunk->cameras()[0].reference.location.has_value());
+    EXPECT_NEAR(chunk->cameras()[0].reference.location->z(), 3.0, 1e-12);
+}
+
+TEST(Reference, QuotedDelimiterInLabel) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+
+    TempFile file(".csv");
+    write_text(file.path(), "\"GCP,1\",1,2,3\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    run_task_named(document, "ImportReference", params);
+
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_EQ(chunk->markers()[0].label, "GCP,1");
+}
+
+TEST(Reference, NonPositiveSigmaRejected) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "CAM1");
+
+    TempFile file(".csv");
+    write_text(file.path(), "CAM1,1,2,3,0\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z", "sigma"});
+    EXPECT_THROW(run_task_named(document, "ImportReference", params), ValueError);
+    EXPECT_FALSE(chunk->cameras()[0].reference.location.has_value());
+}
+
+TEST(Reference, ExistingCheckPointKeepsRole) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Marker& checkpoint = add_marker(*chunk, "CP1");
+    checkpoint.reference = Eigen::Vector3d(1.0, 2.0, 3.0);
+    reference::set_marker_role(checkpoint, reference::MarkerReferenceRole::CheckPoint);
+
+    TempFile file(".csv");
+    write_text(file.path(), "CP1,4,5,6\nNEW1,7,8,9\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    run_task_named(document, "ImportReference", params);
+
+    // The default `gcp` must not retype an existing check point...
+    EXPECT_EQ(reference::marker_role(chunk->markers()[0]),
+              reference::MarkerReferenceRole::CheckPoint);
+    // ...while a created marker becomes a control point.
+    ASSERT_EQ(chunk->markers().size(), 2U);
+    EXPECT_EQ(reference::marker_role(chunk->markers()[1]),
+              reference::MarkerReferenceRole::Gcp);
+
+    // An explicit marker_type does overwrite it.
+    Params explicit_params = params_for("ImportReference");
+    explicit_params.set("path", file.path());
+    explicit_params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    explicit_params.set("marker_type", "gcp");
+    run_task_named(document, "ImportReference", explicit_params);
+    EXPECT_EQ(reference::marker_role(chunk->markers()[0]),
+              reference::MarkerReferenceRole::Gcp);
+}
+
+TEST(Reference, ExportWritesEmptyForNaN) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Camera& camera = add_camera(*chunk, "CAM1");
+    camera.reference.location =
+        Eigen::Vector3d(1.0, 2.0, std::numeric_limits<double>::quiet_NaN());
+    camera.reference.accuracy = Eigen::Vector3d(0.1, 0.2, 0.3);
+
+    TempFile file(".csv");
+    Params params = params_for("ExportReference");
+    params.set("path", file.path());
+    params.set("columns_order", std::vector<std::string>{"label", "x", "y", "z", "sigma_x",
+                                                         "sigma_y", "sigma_z"});
+    run_task_named(document, "ExportReference", params);
+
+    std::ifstream in(file.path(), std::ios::binary);
+    ASSERT_TRUE(in);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    const std::string text = buffer.str();
+    EXPECT_EQ(text.find("nan"), std::string::npos) << text;
+    EXPECT_EQ(text.find("inf"), std::string::npos) << text;
+    // Empty z; each per-axis sigma is its own value, not the row average.
+    EXPECT_NE(text.find("CAM1,1.000000,2.000000,,0.100000,0.200000,0.300000"),
+              std::string::npos)
+        << text;
+}
+
+#if defined(ALPHASHAPE_USE_PROJ)
+TEST(Reference, ImportIntoExplicitMarkerCrs) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    // The chunk CRS is unset/local; only the marker slot names a CRS.
+    chunk->set_marker_crs(crs::CoordinateSystem::from_epsg(32632));
+
+    TempFile file(".csv");
+    write_text(file.path(), "GCP1,12.0,55.0,100.0\n");
+    Params params = params_for("ImportReference");
+    params.set("path", file.path());
+    params.set("columns", std::vector<std::string>{"label", "x", "y", "z"});
+    params.set("crs", "EPSG:4326");
+    run_task_named(document, "ImportReference", params);
+
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    ASSERT_TRUE(chunk->markers()[0].reference.has_value());
+    const crs::CrsTransform transform = crs::CrsTransform::create(
+        crs::CoordinateSystem::from_epsg(4326), crs::CoordinateSystem::from_epsg(32632));
+    const std::optional<crs::CrsPoint> expected =
+        transform.forward(crs::CrsPoint{12.0, 55.0, 100.0});
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_NEAR(chunk->markers()[0].reference->x(), expected->x, 0.01);
+    EXPECT_NEAR(chunk->markers()[0].reference->y(), expected->y, 0.01);
+    EXPECT_NEAR(chunk->markers()[0].reference->z(), expected->z, 0.01);
+}
+#endif  // ALPHASHAPE_USE_PROJ
 
 }  // namespace
 }  // namespace alphashape

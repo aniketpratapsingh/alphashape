@@ -64,7 +64,8 @@ std::string format_number(double value, int precision);
 /// LF; otherwise return it unchanged.
 std::string quote_field(const std::string& value, char delimiter);
 
-/// Join fields with `delimiter`, quoting each as required, and append CRLF.
+/// Join fields with `delimiter`, quoting each as required, and append LF
+/// (`\n`). The reader accepts both LF and CRLF line endings.
 std::string format_delimited(const std::vector<std::string>& fields, char delimiter);
 
 }  // namespace alphashape::reference

@@ -40,6 +40,17 @@ double mean_accuracy(const Eigen::Vector3d& accuracy) {
     return positive_finite(mean) ? mean : -1.0;
 }
 
+/// One axis of a per-axis accuracy, or `fallback` when that axis is unusable.
+double axis_accuracy(double value, double fallback) {
+    return positive_finite(value) ? value : fallback;
+}
+
+Eigen::Vector3d per_axis_accuracy(const Eigen::Vector3d& accuracy, double fallback) {
+    return Eigen::Vector3d(axis_accuracy(accuracy.x(), fallback),
+                           axis_accuracy(accuracy.y(), fallback),
+                           axis_accuracy(accuracy.z(), fallback));
+}
+
 std::optional<Eigen::Vector3d> as_vector(const std::optional<CrsPoint>& point) {
     if (!point) {
         return std::nullopt;
@@ -104,30 +115,48 @@ ReferenceTable build_reference_table(const Chunk& chunk,
                                           chunk.transform().block<3, 3>(0, 0));
     }
 
-    const auto make_source = [&](const CRS& slot) -> std::optional<crs::CrsTransform> {
-        if (!geo) {
+    // A source is converted from its slot's own CRS, which defaults to the
+    // chunk CRS but may be set explicitly. This is independent of whether the
+    // chunk geometry is georeferenced: an explicitly requested display CRS
+    // still has to be honoured for a chunk whose transform is still identity.
+    const bool displayable = display.is_set() && !display.is_local();
+    const auto slot_source = [&](const CRS& slot) -> std::optional<CoordinateSystem> {
+        if (!displayable) {
             return std::nullopt;
         }
-        const CoordinateSystem source = slot;
+        CoordinateSystem source = slot;
         if (!source.is_set() || source.is_local()) {
             return std::nullopt;
         }
-        return crs::CrsTransform::create(source, display);
+        return source;
     };
-    const std::optional<crs::CrsTransform> camera_src = make_source(chunk.camera_crs());
-    const std::optional<crs::CrsTransform> marker_src = make_source(chunk.marker_crs());
+    const std::optional<CoordinateSystem> camera_cs = slot_source(chunk.camera_crs());
+    const std::optional<CoordinateSystem> marker_cs = slot_source(chunk.marker_crs());
+    const auto make_source = [&](const std::optional<CoordinateSystem>& source)
+        -> std::optional<crs::CrsTransform> {
+        if (!source || *source == display) {
+            return std::nullopt;
+        }
+        return crs::CrsTransform::create(*source, display);
+    };
+    const std::optional<crs::CrsTransform> camera_src = make_source(camera_cs);
+    const std::optional<crs::CrsTransform> marker_src = make_source(marker_cs);
 
     const auto source_of = [&](const std::optional<Eigen::Vector3d>& value,
+                               const std::optional<CoordinateSystem>& source_cs,
                                const std::optional<crs::CrsTransform>& xform)
         -> std::optional<Eigen::Vector3d> {
         if (!value) {
             return std::nullopt;
         }
-        if (!geo) {
-            return value;  // already chunk-local
+        if (!displayable) {
+            return value;  // published in chunk-local units
+        }
+        if (!source_cs) {
+            return std::nullopt;  // the slot CRS is unknown, so no conversion
         }
         if (!xform) {
-            return std::nullopt;
+            return value;  // already in the display CRS
         }
         return as_vector(xform->forward(CrsPoint{value->x(), value->y(), value->z()}));
     };
@@ -185,7 +214,7 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         row.kind = ReferenceRowKind::Camera;
         row.enabled = camera.enabled;
         if (camera.reference.location) {
-            row.source = source_of(camera.reference.location, camera_src);
+            row.source = source_of(camera.reference.location, camera_cs, camera_src);
         }
         if (camera.enabled) {
             row.estimated = estimate_of(centres[ci]);
@@ -193,6 +222,7 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         row.error = error_of(row.estimated, row.source);
         const double sigma = mean_accuracy(camera.reference.accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.camera_location_accuracy_m;
+        row.sigma_xyz = per_axis_accuracy(camera.reference.accuracy, row.sigma);
 
         Eigen::Vector3d mean = Eigen::Vector3d::Zero();
         std::size_t count = 0;
@@ -221,7 +251,7 @@ ReferenceTable build_reference_table(const Chunk& chunk,
                        : ReferenceRowKind::Marker;
         row.enabled = marker.valid;
         if (marker.reference) {
-            row.source = source_of(marker.reference, marker_src);
+            row.source = source_of(marker.reference, marker_cs, marker_src);
         }
         if (marker.position) {
             row.estimated = estimate_of(marker.position);
@@ -229,6 +259,7 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         row.error = error_of(row.estimated, row.source);
         const double sigma = mean_accuracy(marker.reference_accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.marker_location_accuracy_m;
+        row.sigma_xyz = per_axis_accuracy(marker.reference_accuracy, row.sigma);
 
         if (marker.position && !observing_cameras[mi].empty()) {
             double sum = 0.0;

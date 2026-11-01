@@ -52,6 +52,9 @@ std::vector<XmlReferencePosition> read_positions(const XmlNode* container,
                                         docxml::parse_double(require_text(*node, "z")));
         item.accuracy = optional_number(*node, "sxyz", 0.0);
         item.enabled = optional_bool(*node, "enabled", true);
+        if (const std::string* kind = docxml::find_attr(*node, "kind")) {
+            item.kind = *kind;
+        }
         out.push_back(std::move(item));
     }
     return out;
@@ -92,6 +95,9 @@ void append_position(XmlNode& parent, const char* child_name,
     docxml::set_attr(node, "z", docxml::fmt(item.position.z()));
     docxml::set_attr(node, "sxyz", docxml::fmt(item.accuracy));
     docxml::set_attr(node, "enabled", docxml::fmt_bool(item.enabled));
+    if (!item.kind.empty()) {
+        docxml::set_attr(node, "kind", item.kind);
+    }
 }
 
 }  // namespace

@@ -2,10 +2,12 @@
 
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -22,6 +24,7 @@
 #include "common/algorithm/reference/reference_csv.hpp"
 #include "common/algorithm/reference/reference_table.hpp"
 #include "common/algorithm/reference/reference_xml.hpp"
+#include "common/commands/command.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/marker.hpp"
@@ -62,6 +65,7 @@ std::string trim(const std::string& text) {
 enum class Column {
     Skip,
     Label,
+    Kind,
     X,
     Y,
     Z,
@@ -85,6 +89,9 @@ Column column_from_name(const std::string& raw, bool* angle_convention_xyz) {
     if (name == "label" || name == "name" || name == "id" || name == "point" ||
         name == "point_name" || name == "gcp") {
         return Column::Label;
+    }
+    if (name == "kind" || name == "role") {
+        return Column::Kind;
     }
     if (name == "x" || name == "easting" || name == "east" || name == "lon" ||
         name == "longitude") {
@@ -219,6 +226,7 @@ struct Mapping {
 const char* column_name(Column column) {
     switch (column) {
         case Column::Label: return "label";
+        case Column::Kind: return "kind";
         case Column::X: return "x";
         case Column::Y: return "y";
         case Column::Z: return "z";
@@ -312,6 +320,9 @@ struct ParsedRow {
     RowAccuracy accuracy;
     std::optional<Eigen::Vector3d> angles_deg;
     bool enabled = true;
+    /// Role named by the record itself (a `kind` column or XML attribute);
+    /// nullopt leaves the marker's role to the `marker_type` parameter.
+    std::optional<reference::MarkerReferenceRole> role;
 };
 
 bool looks_like_headerless(const DelimitedRow& row, bool decimal_comma) {
@@ -364,6 +375,20 @@ crs::RotationOrder chunk_rotation_order(const Chunk& chunk) {
                             : parse_rotation_order(*value, "chunk rotation order");
 }
 
+/// A role named by a record's own `kind` column or XML attribute. A spelling
+/// that does not name a role ("camera", "marker") yields nullopt, so the
+/// `marker_type` parameter keeps its usual meaning.
+std::optional<reference::MarkerReferenceRole> role_from_kind(const std::string& raw) {
+    const std::string name = lower(trim(raw));
+    if (name == "check_point" || name == "checkpoint" || name == "check") {
+        return reference::MarkerReferenceRole::CheckPoint;
+    }
+    if (name == "gcp" || name == "control" || name == "control_point") {
+        return reference::MarkerReferenceRole::Gcp;
+    }
+    return std::nullopt;
+}
+
 std::vector<ParsedRow> parse_records(const std::vector<DelimitedRow>& rows,
                                      const Mapping& mapping, const std::string& path,
                                      bool decimal_comma, bool radians) {
@@ -384,10 +409,33 @@ std::vector<ParsedRow> parse_records(const std::vector<DelimitedRow>& rows,
             }
             return trim(row.fields[at]);
         };
-        const auto number = [&](Column column) -> std::optional<double> {
-            const std::optional<std::string> text = field(column);
-            if (!text.has_value()) {
+        // An empty (or absent trailing) cell in an optional column means "not
+        // stated". In x/y it is an error; in z it is a reference with no
+        // measured altitude, which the model stores as a NaN component (see
+        // CameraReference in types.hpp).
+        const auto optional_field = [&](Column column) -> std::optional<std::string> {
+            const int index = mapping.index_of(column);
+            if (index < 0) {
                 return std::nullopt;
+            }
+            const std::size_t at = static_cast<std::size_t>(index);
+            if (at >= row.fields.size()) {
+                return std::nullopt;
+            }
+            return trim(row.fields[at]);
+        };
+        const auto optional_number = [&](Column column) -> std::optional<double> {
+            const std::optional<std::string> text = optional_field(column);
+            if (!text.has_value() || text->empty()) {
+                return std::nullopt;
+            }
+            return parse_field(*text, decimal_comma,
+                               context + ": column '" + column_name(column) + "'");
+        };
+        const auto required_number = [&](Column column) -> double {
+            const std::optional<std::string> text = field(column);
+            if (!text.has_value() || text->empty()) {
+                throw ValueError(context + ": missing column '" + column_name(column) + "'");
             }
             return parse_field(*text, decimal_comma,
                                context + ": column '" + column_name(column) + "'");
@@ -396,21 +444,31 @@ std::vector<ParsedRow> parse_records(const std::vector<DelimitedRow>& rows,
         ParsedRow out;
         out.line = row.line;
         const std::optional<std::string> label = field(Column::Label);
-        const std::optional<double> x = number(Column::X);
-        const std::optional<double> y = number(Column::Y);
-        const std::optional<double> z = number(Column::Z);
-        if (!label.has_value() || !x.has_value() || !y.has_value() || !z.has_value()) {
-            throw ValueError(context + ": missing label, x, y or z");
+        if (!label.has_value() || label->empty()) {
+            throw ValueError(context + ": missing label");
         }
         out.label = *label;
-        out.position = Eigen::Vector3d(*x, *y, *z);
-        out.accuracy.x = number(Column::SigmaX);
-        out.accuracy.y = number(Column::SigmaY);
-        out.accuracy.z = number(Column::SigmaZ);
-        out.accuracy.single = number(Column::Sigma);
-        const std::optional<double> a = number(Column::Rot0);
-        const std::optional<double> b = number(Column::Rot1);
-        const std::optional<double> c = number(Column::Rot2);
+        const double x = required_number(Column::X);
+        const double y = required_number(Column::Y);
+        const std::optional<std::string> z_text = field(Column::Z);
+        if (!z_text.has_value()) {
+            throw ValueError(context + ": missing column 'z'");
+        }
+        const double z = z_text->empty()
+                             ? std::numeric_limits<double>::quiet_NaN()
+                             : parse_field(*z_text, decimal_comma, context + ": column 'z'");
+        out.position = Eigen::Vector3d(x, y, z);
+        out.accuracy.x = optional_number(Column::SigmaX);
+        out.accuracy.y = optional_number(Column::SigmaY);
+        out.accuracy.z = optional_number(Column::SigmaZ);
+        out.accuracy.single = optional_number(Column::Sigma);
+        if (const std::optional<std::string> kind = optional_field(Column::Kind);
+            kind.has_value() && !kind->empty()) {
+            out.role = role_from_kind(*kind);
+        }
+        const std::optional<double> a = optional_number(Column::Rot0);
+        const std::optional<double> b = optional_number(Column::Rot1);
+        const std::optional<double> c = optional_number(Column::Rot2);
         const bool any_angle = a.has_value() || b.has_value() || c.has_value();
         if (any_angle) {
             const double scale = radians ? kRadToDeg : 1.0;
@@ -458,36 +516,38 @@ crs::CoordinateSystem parse_crs_text(const std::string& raw) {
 }
 
 #if defined(ALPHASHAPE_USE_PROJ)
-/// Transform from the file CRS into the chunk CRS, or nullopt when the file is
-/// already expressed in it. The chunk CRS is the target because the reference
-/// slots default to it and an explicit slot is the caller's own contract.
+/// Transform from the file CRS into one reference slot's own CRS, or nullopt
+/// when the file is already expressed in it. Camera references live in
+/// `chunk.camera_crs()` and marker references in `chunk.marker_crs()`; each
+/// defaults to the chunk CRS but may be set explicitly. A missing slot CRS is
+/// only an error when a conversion was actually requested for that slot.
 std::optional<crs::CrsTransform> make_import_transform(const std::string& crs_text,
-                                                        const Chunk& chunk) {
+                                                        const CRS& slot,
+                                                        const char* slot_name) {
     if (trim(crs_text).empty()) {
         return std::nullopt;
     }
-    const crs::CoordinateSystem source = parse_crs_text(crs_text);
-    const crs::CoordinateSystem target = chunk.coordinate_system();
+    const crs::CoordinateSystem target = slot;
     if (!target.is_set() || target.is_local()) {
-        throw ValueError(
-            "ImportReference: `crs` was given but the chunk has no coordinate system; "
-            "set the chunk CRS first or leave `crs` empty");
+        throw ValueError(std::string("ImportReference: `crs` was given but the chunk's ") +
+                         slot_name + " CRS is unset or local; set it first or leave "
+                         "`crs` empty");
     }
+    const crs::CoordinateSystem source = parse_crs_text(crs_text);
     return crs::CrsTransform::create(source, target);
 }
 #endif
 
 Eigen::Vector3d convert_position(const std::optional<crs::CrsTransform>& transform,
                                  const Eigen::Vector3d& position,
-                                 const std::string& label) {
+                                 const std::string& context) {
     if (!transform.has_value()) {
         return position;
     }
     const std::optional<crs::CrsPoint> out =
         transform->forward(crs::CrsPoint{position.x(), position.y(), position.z()});
     if (!out.has_value()) {
-        throw ValueError("ImportReference: '" + label +
-                         "' is outside the area of use of the requested CRS");
+        throw ValueError(context + ": outside the area of use of the requested CRS");
     }
     return Eigen::Vector3d(out->x, out->y, out->z);
 }
@@ -497,6 +557,48 @@ Eigen::Vector3d accuracy_of(const RowAccuracy& accuracy, double fallback) {
     const double y = accuracy.y.value_or(accuracy.single.value_or(fallback));
     const double z = accuracy.z.value_or(accuracy.single.value_or(fallback));
     return Eigen::Vector3d(x, y, z);
+}
+
+/// A reference position must be real. A NaN altitude is a legitimate "no
+/// measured height", so only an infinite z is rejected.
+void validate_position(const Eigen::Vector3d& position, const std::string& where,
+                       const std::string& label) {
+    if (!std::isfinite(position.x()) || !std::isfinite(position.y())) {
+        throw ValueError(where + "'" + label + "' has a non-finite horizontal position");
+    }
+    if (std::isinf(position.z())) {
+        throw ValueError(where + "'" + label + "' has a non-finite altitude");
+    }
+}
+
+/// doc.xml refuses to save a non-positive accuracy, so an import that accepted
+/// one would produce a project that cannot be written back.
+void validate_accuracy(const RowAccuracy& accuracy, const std::string& where,
+                       const std::string& label) {
+    const auto check = [&](const std::optional<double>& value) {
+        if (value.has_value() && (!std::isfinite(*value) || *value <= 0.0)) {
+            throw ValueError(where + "'" + label +
+                             "' has an accuracy that is not a positive number");
+        }
+    };
+    check(accuracy.x);
+    check(accuracy.y);
+    check(accuracy.z);
+    check(accuracy.single);
+}
+
+/// The role the `marker_type` parameter names, or nullopt for "leave the role
+/// unstated" (a plain marker, which WP-13.1 reads as gcp once referenced).
+std::optional<reference::MarkerReferenceRole> role_from_marker_type(
+    const std::string& marker_type) {
+    const std::string type = lower(trim(marker_type));
+    if (type == "check_point" || type == "checkpoint") {
+        return reference::MarkerReferenceRole::CheckPoint;
+    }
+    if (type == "gcp" || type == "control") {
+        return reference::MarkerReferenceRole::Gcp;
+    }
+    return std::nullopt;
 }
 
 void apply_marker_type(Marker& marker, const std::string& marker_type) {
@@ -518,26 +620,34 @@ std::vector<ParsedRow> records_from_xml(const reference::XmlReferenceDocument& d
                                         const std::string& path) {
     std::vector<ParsedRow> rows;
     std::map<std::string, std::string> seen;
-    const auto append = [&](const reference::XmlReferencePosition& item) {
+    const auto append = [&](const reference::XmlReferencePosition& item, bool is_marker) {
         if (seen.find(item.label) != seen.end()) {
             throw ValueError("ImportReference: duplicate label '" + item.label +
                              "' in reference XML '" + path + "'");
         }
         seen.emplace(item.label, item.label);
+        if (!std::isfinite(item.accuracy) || item.accuracy < 0.0) {
+            throw ValueError("ImportReference: reference XML: '" + item.label +
+                             "' has a non-finite or negative accuracy");
+        }
         ParsedRow row;
         row.line = 0;
         row.label = item.label;
         row.position = item.position;
+        // Zero is the XML spelling of "not stated": keep the chunk default.
         row.accuracy.single = item.accuracy > 0.0 ? std::optional<double>(item.accuracy)
                                                   : std::nullopt;
         row.enabled = item.enabled;
+        if (is_marker) {
+            row.role = role_from_kind(item.kind);
+        }
         rows.push_back(std::move(row));
     };
     for (const auto& camera : document.cameras) {
-        append(camera);
+        append(camera, false);
     }
     for (const auto& marker : document.markers) {
-        append(marker);
+        append(marker, true);
     }
     return rows;
 }
@@ -609,6 +719,13 @@ void ImportReferenceTask::apply(Document& document, Params& params, const Progre
     const Format format = parse_format(params.get_string("format"), path);
     const std::string delimiter = delimiter_text(params.get_string("delimiter"));
     const bool decimal_comma = params.get_bool("decimal_comma");
+    // A comma cannot be both the field separator and the decimal point.
+    if (decimal_comma && format != Format::Xml && !uses_whitespace(format, delimiter) &&
+        delimiter == ",") {
+        throw ValueError(
+            "ImportReference: decimal_comma cannot be used with a comma delimiter; "
+            "use ';' or whitespace");
+    }
     const std::string encoding = lower(trim(params.get_string("encoding")));
     const bool latin1 = encoding == "latin1" || encoding == "iso-8859-1";
     if (!latin1 && encoding != "utf-8" && encoding != "utf8") {
@@ -674,15 +791,12 @@ void ImportReferenceTask::apply(Document& document, Params& params, const Progre
     progress.update("parse", 1.0);
 
     progress.update("apply", 0.0);
-    const std::string crs_text = params.get_string("crs");
-#if defined(ALPHASHAPE_USE_PROJ)
-    const std::optional<crs::CrsTransform> transform = make_import_transform(crs_text, *chunk);
-#else
-    if (!trim(crs_text).empty()) {
+    const std::string crs_text = trim(params.get_string("crs"));
+#if !defined(ALPHASHAPE_USE_PROJ)
+    if (!crs_text.empty()) {
         throw Error("ImportReference: converting from another CRS needs a build with PROJ "
                     "(ALPHASHAPE_USE_PROJ=ON)");
     }
-    const std::optional<crs::CrsTransform> transform;
 #endif
 
     const bool apply_changes = params.get_bool("apply");
@@ -692,16 +806,58 @@ void ImportReferenceTask::apply(Document& document, Params& params, const Progre
         Marker probe;  // validate the role name before any chunk mutation
         apply_marker_type(probe, marker_type);
     }
+    // An existing marker's role is overwritten only when the caller asked for
+    // it (an explicit `marker_type` or a per-row kind); the default `gcp` must
+    // not quietly turn existing check points into control points.
+    const bool marker_type_given = params.is_set("marker_type");
+    const std::optional<reference::MarkerReferenceRole> marker_type_role =
+        role_from_marker_type(marker_type);
     const crs::RotationOrder chunk_order = chunk_rotation_order(*chunk);
     const crs::RotationOrder file_order =
         angle_convention_xyz
             ? crs::RotationOrder::XYZ
             : parse_rotation_order(params.get_string("rotation_order"), "rotation_order");
 
+    // A row is converted into its own slot's CRS: camera references live in
+    // camera_crs, marker references in marker_crs. Each transform is built
+    // lazily, so a file with only marker rows never demands a camera CRS.
+#if defined(ALPHASHAPE_USE_PROJ)
+    std::optional<crs::CrsTransform> camera_transform;
+    std::optional<crs::CrsTransform> marker_transform;
+    bool camera_transform_built = false;
+    bool marker_transform_built = false;
+    const auto camera_conversion = [&]() -> const std::optional<crs::CrsTransform>& {
+        if (!camera_transform_built) {
+            camera_transform =
+                make_import_transform(crs_text, chunk->camera_crs(), "camera");
+            camera_transform_built = true;
+        }
+        return camera_transform;
+    };
+    const auto marker_conversion = [&]() -> const std::optional<crs::CrsTransform>& {
+        if (!marker_transform_built) {
+            marker_transform =
+                make_import_transform(crs_text, chunk->marker_crs(), "marker");
+            marker_transform_built = true;
+        }
+        return marker_transform;
+    };
+#else
+    const std::optional<crs::CrsTransform> no_transform;
+    const auto camera_conversion = [&]() -> const std::optional<crs::CrsTransform>& {
+        return no_transform;
+    };
+    const auto marker_conversion = [&]() -> const std::optional<crs::CrsTransform>& {
+        return no_transform;
+    };
+#endif
+
     const ReferenceSettings settings = chunk->reference_settings();
     std::size_t camera_count = 0;
     std::size_t marker_count = 0;
     std::size_t created_count = 0;
+    std::vector<reference::ImportRowPlan> plan;
+    plan.reserve(rows.size());
     // Label lookups are built once: a 100 000-row file against a 100 000-marker
     // chunk would otherwise be quadratic. First occurrence wins if a chunk
     // already carries duplicate labels.
@@ -715,61 +871,64 @@ void ImportReferenceTask::apply(Document& document, Params& params, const Progre
         marker_index.emplace(chunk->markers()[i].label, i);
     }
     std::vector<std::string> unmatched;
+    // Pass 1: resolve and validate every row into a detached plan. The chunk is
+    // not touched here, so a bad row on line 500 cannot leave rows 1-499
+    // applied, and `apply=false` mutates nothing at all.
     for (const ParsedRow& row : rows) {
-        Camera* camera = nullptr;
-        if (const auto found = camera_index.find(row.label);
-            found != camera_index.end()) {
-            camera = &chunk->cameras()[found->second];
-        }
-        Marker* marker = nullptr;
-        if (const auto found = marker_index.find(row.label);
-            found != marker_index.end()) {
-            marker = &chunk->markers()[found->second];
-        }
         const std::string where =
             row.line == 0 ? std::string{} : "line " + std::to_string(row.line) + ": ";
-        if (row.angles_deg.has_value() && camera == nullptr) {
+        validate_position(row.position, where, row.label);
+        validate_accuracy(row.accuracy, where, row.label);
+        const auto camera_it = camera_index.find(row.label);
+        const auto marker_it = marker_index.find(row.label);
+        const bool is_camera = camera_it != camera_index.end();
+        if (row.angles_deg.has_value() && !is_camera) {
             throw ValueError("ImportReference: " + where + "'" + row.label +
                              "' carries rotation angles but matches no camera");
         }
-        const Eigen::Vector3d position = convert_position(transform, row.position, row.label);
-        if (!apply_changes) {
-            if (camera != nullptr) {
-                ++camera_count;
-            } else {
-                ++marker_count;
-            }
-            continue;
+        reference::ImportRowPlan item;
+        item.enabled = row.enabled;
+        if (row.angles_deg.has_value()) {
+            item.orientation_deg =
+                rotation_to_chunk_order(*row.angles_deg, file_order, chunk_order);
         }
-        if (camera != nullptr) {
-            camera->reference.location = position;
-            camera->reference.accuracy =
-                accuracy_of(row.accuracy, settings.camera_location_accuracy_m);
-            camera->reference.enabled = row.enabled;
-            if (row.angles_deg.has_value()) {
-                camera->reference.orientation_deg =
-                    rotation_to_chunk_order(*row.angles_deg, file_order, chunk_order);
-            }
+        const std::string at = where + "'" + row.label + "'";
+        if (is_camera) {
+            item.target = reference::ImportRowPlan::Target::Camera;
+            item.index = camera_it->second;
+            item.position = convert_position(camera_conversion(), row.position, at);
+            item.accuracy = accuracy_of(row.accuracy, settings.camera_location_accuracy_m);
             ++camera_count;
-        } else if (marker != nullptr) {
-            marker->reference = position;
-            marker->reference_accuracy =
-                accuracy_of(row.accuracy, settings.marker_location_accuracy_m);
-            apply_marker_type(*marker, marker_type);
+        } else if (marker_it != marker_index.end()) {
+            item.target = reference::ImportRowPlan::Target::Marker;
+            item.index = marker_it->second;
+            item.position = convert_position(marker_conversion(), row.position, at);
+            item.accuracy = accuracy_of(row.accuracy, settings.marker_location_accuracy_m);
+            item.role = row.role;
+            if (!item.role && marker_type_given) {
+                item.role = marker_type_role;
+            }
             ++marker_count;
         } else if (create_markers) {
-            Marker& created = chunk->markers().emplace_back();
-            created.id = chunk->allocate_id();
-            created.label = row.label;
-            created.reference = position;
-            created.reference_accuracy =
-                accuracy_of(row.accuracy, settings.marker_location_accuracy_m);
-            apply_marker_type(created, marker_type);
+            item.target = reference::ImportRowPlan::Target::NewMarker;
+            item.label = row.label;
+            item.position = convert_position(marker_conversion(), row.position, at);
+            item.accuracy = accuracy_of(row.accuracy, settings.marker_location_accuracy_m);
+            item.role = row.role ? row.role : marker_type_role;
             ++marker_count;
             ++created_count;
         } else {
             unmatched.push_back(row.label);
+            continue;
         }
+        plan.push_back(std::move(item));
+    }
+
+    // Pass 2: one undoable mutation, applied only after every row validated.
+    if (apply_changes && !plan.empty()) {
+        CommandTransaction transaction("Import Reference");
+        transaction.add(reference::make_import_reference_command(chunk->id(), std::move(plan)));
+        transaction.apply(document);
     }
 
     if (apply_changes && xml.has_value()) {
@@ -822,5 +981,109 @@ void ImportReferenceTask::apply(Document& document, Params& params, const Progre
         }
     }
 }
+
+namespace reference {
+namespace {
+
+/// Apply a validated plan to an already-resolved chunk.
+void apply_import_rows(Chunk& chunk, const std::vector<ImportRowPlan>& rows) {
+    for (const ImportRowPlan& row : rows) {
+        if (row.target == ImportRowPlan::Target::Camera) {
+            if (row.index >= chunk.cameras().size()) {
+                throw Error("ImportReference: camera index out of range");
+            }
+            Camera& camera = chunk.cameras()[row.index];
+            camera.reference.location = row.position;
+            camera.reference.accuracy = row.accuracy;
+            camera.reference.enabled = row.enabled;
+            if (row.orientation_deg.has_value()) {
+                camera.reference.orientation_deg = row.orientation_deg;
+            }
+            continue;
+        }
+        if (row.target == ImportRowPlan::Target::Marker) {
+            if (row.index >= chunk.markers().size()) {
+                throw Error("ImportReference: marker index out of range");
+            }
+            Marker& marker = chunk.markers()[row.index];
+            marker.reference = row.position;
+            marker.reference_accuracy = row.accuracy;
+            if (row.role.has_value()) {
+                set_marker_role(marker, *row.role);
+            }
+            continue;
+        }
+        Marker& marker = chunk.markers().emplace_back();
+        marker.id = chunk.allocate_id();
+        marker.label = row.label;
+        marker.reference = row.position;
+        marker.reference_accuracy = row.accuracy;
+        if (row.role.has_value()) {
+            set_marker_role(marker, *row.role);
+        }
+    }
+}
+
+/// One undo entry for an import. `stage()` snapshots the camera and marker
+/// containers and the id counter; `commit()` applies the plan and `restore()`
+/// puts the snapshot back, which also removes markers the plan created.
+class ImportReferenceCommand : public StagedMutation {
+public:
+    ImportReferenceCommand(std::int32_t chunk_id, std::vector<ImportRowPlan> rows)
+        : chunk_id_(chunk_id), rows_(std::move(rows)) {}
+
+    std::string name() const override { return "Import Reference"; }
+
+protected:
+    void validate(Document& document) override {
+        if (find(document) == nullptr) {
+            throw ValueError("import references: no chunk with id " +
+                             std::to_string(chunk_id_));
+        }
+    }
+
+    void stage(Document& document) override {
+        Chunk& chunk = *find(document);
+        cameras_ = chunk.cameras();
+        markers_ = chunk.markers();
+        next_id_ = chunk.next_id();
+    }
+
+    void commit(Document& document) override {
+        apply_import_rows(*find(document), rows_);
+    }
+
+    void restore(Document& document) override {
+        Chunk& chunk = *find(document);
+        chunk.cameras() = cameras_;
+        chunk.markers() = markers_;
+        chunk.set_next_id(next_id_);
+    }
+
+private:
+    Chunk* find(Document& document) const {
+        for (auto& workspace : document.workspaces()) {
+            if (Chunk* chunk = workspace->find_chunk(chunk_id_)) {
+                return chunk;
+            }
+        }
+        return nullptr;
+    }
+
+    std::int32_t chunk_id_;
+    std::vector<ImportRowPlan> rows_;
+    std::vector<Camera> cameras_;
+    std::vector<Marker> markers_;
+    std::int32_t next_id_ = 0;
+};
+
+}  // namespace
+
+std::unique_ptr<AbstractCommand> make_import_reference_command(
+    std::int32_t chunk_id, std::vector<ImportRowPlan> rows) {
+    return std::make_unique<ImportReferenceCommand>(chunk_id, std::move(rows));
+}
+
+}  // namespace reference
 
 }  // namespace alphashape

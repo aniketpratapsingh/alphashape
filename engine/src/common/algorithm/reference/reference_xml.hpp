@@ -10,7 +10,8 @@
 ///         <camera label="IMG_0001" x="..." y="..." z="..." sxyz="..." enabled="1"/>
 ///       </cameras>
 ///       <markers>
-///         <marker label="GCP1" x="..." y="..." z="..." sxyz="..." enabled="1"/>
+///         <marker label="GCP1" x="..." y="..." z="..." sxyz="..." enabled="1"
+///                 kind="gcp"/>
 ///       </markers>
 ///       <scalebars>
 ///         <scalebar label="S1" distance="..." accuracy="..." enabled="1"/>
@@ -18,7 +19,8 @@
 ///     </reference>
 ///
 /// Only `label`, `x`, `y` and `z` are required on a camera/marker; `sxyz` is a
-/// single 1-sigma accuracy and `enabled` defaults to true. Scale bars are
+/// single 1-sigma accuracy and `enabled` defaults to true. On a `<marker>`,
+/// `kind` optionally names the role ("gcp" or "check_point"). Scale bars are
 /// optional and carry a measured `distance` (metres) and `accuracy`.
 ///
 /// Coordinates are in whichever CRS the caller's `crs` argument names; this
@@ -38,6 +40,9 @@ struct XmlReferencePosition {
     /// which case the importer keeps the chunk's default accuracy.
     double accuracy = 0.0;
     bool enabled = true;
+    /// Marker role ("gcp" or "check_point"), written as a `kind` attribute on
+    /// `<marker>` only. Empty means "not stated".
+    std::string kind;
 };
 
 struct XmlReferenceScalebar {

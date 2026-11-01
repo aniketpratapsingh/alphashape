@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -175,9 +176,11 @@ std::optional<double> camera_marker_value(const std::string& column,
     if (column == "z") {
         return component(row.source, 2);
     }
-    if (column == "sigma" || column == "sigma_x" || column == "sigma_y" ||
-        column == "sigma_z") {
+    if (column == "sigma") {
         return row.sigma;
+    }
+    if (axis_suffix(column, "sigma", &axis)) {
+        return row.sigma_xyz[axis];
     }
     if (column == "capture_distance") {
         return row.capture_distance_m;
@@ -325,6 +328,9 @@ void ExportReferenceTask::apply(Document& document, Params& params, const Progre
             if (row.kind == reference::ReferenceRowKind::Camera) {
                 document_xml.cameras.push_back(std::move(item));
             } else {
+                item.kind = row.kind == reference::ReferenceRowKind::CheckPoint
+                                ? "check_point"
+                                : "gcp";
                 document_xml.markers.push_back(std::move(item));
             }
         }
@@ -365,8 +371,13 @@ void ExportReferenceTask::apply(Document& document, Params& params, const Progre
             return std::string(kind_name(row.kind));
         }
         const std::optional<double> value = camera_marker_value(column, row);
-        return value.has_value() ? reference::format_number(*value, precision)
-                                 : std::string{};
+        // A NaN/inf value (a capture distance with no geometry, an altitude the
+        // GNSS never reported) is written as an empty field: "nan"/"inf" is not
+        // a number a spreadsheet or another photogrammetry package reads back.
+        if (!value.has_value() || !std::isfinite(*value)) {
+            return std::string{};
+        }
+        return reference::format_number(*value, precision);
     };
     const auto scalebar_cell = [&](const std::string& column, const Scalebar& bar) {
         if (column == "label") {
@@ -376,8 +387,10 @@ void ExportReferenceTask::apply(Document& document, Params& params, const Progre
             return std::string("scalebar");
         }
         const std::optional<double> value = scalebar_value(column, bar);
-        return value.has_value() ? reference::format_number(*value, precision)
-                                 : std::string{};
+        if (!value.has_value() || !std::isfinite(*value)) {
+            return std::string{};
+        }
+        return reference::format_number(*value, precision);
     };
 
     std::string out;
