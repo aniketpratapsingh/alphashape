@@ -17,6 +17,10 @@
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/algorithm/photos/add_photos_task.hpp"
+#if defined(ALPHASHAPE_USE_PROJ)
+#include "common/algorithm/reference/export_reference_task.hpp"
+#include "common/algorithm/reference/import_reference_task.hpp"
+#endif
 #include "common/algorithm/sfm/align_cameras_task.hpp"
 #include "common/algorithm/sfm/optimize_cameras_task.hpp"
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
@@ -51,6 +55,12 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MergeChunksTask>());
     registry.register_task(std::make_shared<AppendProjectTask>());
     registry.register_task(std::make_shared<AlignChunksTask>());
+#if defined(ALPHASHAPE_USE_PROJ)
+    // WP-13.2: reference import/export depends on the CRS engine, so the tasks
+    // exist only in a PROJ build (the sources are compiled in the same guard).
+    registry.register_task(std::make_shared<ImportReferenceTask>());
+    registry.register_task(std::make_shared<ExportReferenceTask>());
+#endif
     // Later milestones append here: ...
 }
 

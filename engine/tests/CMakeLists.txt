@@ -88,6 +88,7 @@ if(ALPHASHAPE_USE_PROJ)
         test_euler_angles.cpp
         test_reference_convert.cpp
         test_reference_settings.cpp
+        test_import_reference.cpp
         test_surface_frame.cpp
         test_reproject.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>

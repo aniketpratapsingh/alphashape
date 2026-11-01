@@ -42,6 +42,23 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.2: `ImportReference` and `ExportReference`.** Reference data now
+  round-trips through CSV, whitespace-delimited TXT and the common
+  photogrammetry reference XML, in the task registry, the Python
+  `chunk.importReference(...)`/`chunk.exportReference(...)` shortcuts and
+  doc.xml. The importer maps header synonyms automatically (`label|name|id`,
+  `x|easting|e|lon|longitude`, …) or takes an explicit `columns` list, handles
+  RFC 4180 quoting, decimal commas, Latin-1 labels, skipped preamble rows and
+  per-axis sigmas; a `crs` value such as `EPSG:4326` converts lon/lat/alt into
+  the chunk CRS, and rotation columns (yaw/pitch/roll or omega/phi/kappa) are
+  stored as `CameraReference::orientation_deg`. Unmatched labels create markers
+  (`create_markers`), and `apply=false` validates without mutating. The exporter
+  writes the WP-13.1 reference table with a configurable column order and
+  precision, including scale bars. Duplicate labels and malformed numbers name
+  the offending line. Camera reference orientations persist as optional
+  `yaw`/`pitch`/`roll` attributes on the existing `<reference>` element, so
+  projects without them stay byte-identical.
+
 - **Multi-view consensus ghosting filter for BuildOrthomosaic (Q4).** New
   `ghosting_filter` parameter (Bool, default `false` while the quality
   benchmark decides the shipping default). Moving objects — cars, people,

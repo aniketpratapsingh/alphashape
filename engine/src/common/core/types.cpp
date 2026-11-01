@@ -107,7 +107,8 @@ bool CameraReference::operator==(const CameraReference& other) const {
     // location compared with the NaN-equals-NaN rule (see types.hpp); accuracy
     // and enabled are exact compares.
     return reference_location_equal(location, other.location) &&
-           accuracy == other.accuracy && enabled == other.enabled;
+           accuracy == other.accuracy && orientation_deg == other.orientation_deg &&
+           enabled == other.enabled;
 }
 
 bool Camera::operator==(const Camera& other) const {
