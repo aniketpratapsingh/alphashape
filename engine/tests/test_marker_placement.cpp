@@ -250,31 +250,37 @@ TEST(Markers, NumericLabelDoesNotShadowId) {
     Document document = make_document();
     Chunk* chunk = document.active_chunk();
     Camera& camera = add_camera(*chunk, "CAM1");
-    // Build ids 0..5 so that one marker is labelled "5" and a DIFFERENT marker
-    // has id 5. This is the ambiguous pair the old label-first resolver picked
-    // the wrong member of.
-    for (int i = 0; i < 3; ++i) {
+    const auto marker_with_id = [chunk](std::int32_t id) -> Marker* {
+        for (Marker& marker : chunk->markers()) {
+            if (marker.id == id) {
+                return &marker;
+            }
+        }
+        return nullptr;
+    };
+    // Six markers guarantee that id 5 exists (the allocator starts at 0 or 1,
+    // so six consecutive ids always cover 5). The seventh is labelled "5" and
+    // therefore does NOT have id 5: the ambiguous pair the old label-first
+    // resolver picked the wrong member of.
+    for (int i = 0; i < 6; ++i) {
         make_add_marker_command(chunk->id(), "p" + std::to_string(i),
                                 std::nullopt)
             ->apply(document);
     }
     make_add_marker_command(chunk->id(), std::string("5"), std::nullopt)
-        ->apply(document);  // id 3
-    make_add_marker_command(chunk->id(), std::string("p4"), std::nullopt)
-        ->apply(document);  // id 4
-    make_add_marker_command(chunk->id(), std::string("target"), std::nullopt)
-        ->apply(document);  // id 5
-    ASSERT_EQ(chunk->markers().size(), 6U);
+        ->apply(document);
+    ASSERT_EQ(chunk->markers().size(), 7U);
     Marker* labelled = find_marker(*chunk, "5");
+    Marker* id_five = marker_with_id(5);
     ASSERT_NE(labelled, nullptr);
-    EXPECT_EQ(labelled->id, 3);
-    EXPECT_EQ(find_marker(*chunk, "target")->id, 5);
+    ASSERT_NE(id_five, nullptr);
+    EXPECT_NE(labelled->id, id_five->id);
 
     // By id 5: only the marker with id 5 gets the projection.
     make_add_marker_with_projection_command(chunk->id(), 5, camera.id,
                                             Eigen::Vector2d(7.0, 8.0), false)
         ->apply(document);
-    ASSERT_EQ(find_marker(*chunk, "target")->projections.size(), 1U);
+    ASSERT_EQ(marker_with_id(5)->projections.size(), 1U);
     EXPECT_TRUE(find_marker(*chunk, "5")->projections.empty());
 
     // By label "5": the marker labelled "5" gets it, id 5 does not.
@@ -285,7 +291,7 @@ TEST(Markers, NumericLabelDoesNotShadowId) {
     ASSERT_EQ(find_marker(*chunk, "5")->projections.size(), 1U);
     expect_vec2(find_marker(*chunk, "5")->projections[0].pixel,
                 Eigen::Vector2d(1.0, 2.0));
-    EXPECT_EQ(find_marker(*chunk, "target")->projections.size(), 1U);
+    EXPECT_EQ(marker_with_id(5)->projections.size(), 1U);
     EXPECT_TRUE(chunk->validate().empty());
 
     // An id that names no marker is an error, not an implicit creation.
@@ -295,7 +301,7 @@ TEST(Markers, NumericLabelDoesNotShadowId) {
                      Eigen::Vector2d(3.0, 4.0), false)
                      ->apply(document),
                  ValueError);
-    EXPECT_EQ(chunk->markers().size(), 6U);
+    EXPECT_EQ(chunk->markers().size(), 7U);
 }
 
 TEST(Markers, DeleteLastProjectionDetachesGroupMember) {
