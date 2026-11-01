@@ -57,15 +57,15 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MergeChunksTask>());
     registry.register_task(std::make_shared<AppendProjectTask>());
     registry.register_task(std::make_shared<AlignChunksTask>());
+    // WP-13.4: marker projection import/export needs no CRS, so the tasks are
+    // always registered (their sources are compiled unconditionally).
+    registry.register_task(std::make_shared<ImportMarkersTask>());
+    registry.register_task(std::make_shared<ExportMarkersTask>());
 #if defined(ALPHASHAPE_USE_PROJ)
     // WP-13.2: reference import/export depends on the CRS engine, so the tasks
     // exist only in a PROJ build (the sources are compiled in the same guard).
     registry.register_task(std::make_shared<ImportReferenceTask>());
     registry.register_task(std::make_shared<ExportReferenceTask>());
-    // WP-13.4: marker projection import/export. They share the reference
-    // CSV/XML helpers, so they live behind the same PROJ guard.
-    registry.register_task(std::make_shared<ImportMarkersTask>());
-    registry.register_task(std::make_shared<ExportMarkersTask>());
 #endif
     // Later milestones append here: ...
 }

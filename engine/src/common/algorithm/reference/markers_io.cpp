@@ -61,13 +61,14 @@ double finite_number(const std::string& field, std::size_t line) {
     return value;
 }
 
-std::string require_attr(const docxml::XmlNode& node, const char* name) {
+std::string require_attr(const docxml::XmlNode& node, const char* name,
+                         bool trim_value = true) {
     const std::string* value = docxml::find_attr(node, name);
     if (value == nullptr) {
         throw ValueError("marker XML: <" + node.name + "> is missing the \"" + name +
                          "\" attribute");
     }
-    return trim(*value);
+    return trim_value ? trim(*value) : *value;
 }
 
 }  // namespace
@@ -147,8 +148,11 @@ std::vector<MarkerIoMarker> parse_marker_csv(const std::string& text) {
             throw ValueError("ImportMarkers: " + line_context(row.line) +
                              ": expected marker, camera, u, v");
         }
-        const std::string label = trim(row.fields[marker_col]);
-        const std::string camera = trim(row.fields[camera_col]);
+        // Labels are significant whitespace and all: a quoted CSV field is the
+        // exact label, so trimming here would silently rename (" A" -> "A")
+        // and fail the round trip.
+        const std::string label = row.fields[marker_col];
+        const std::string camera = row.fields[camera_col];
         if (label.empty() || camera.empty()) {
             throw ValueError("ImportMarkers: " + line_context(row.line) +
                              ": marker and camera labels must not be empty");
@@ -183,7 +187,9 @@ std::vector<MarkerIoMarker> parse_marker_xml(const std::string& text) {
     std::set<std::string> labels;
     for (const docxml::XmlNode* node : docxml::find_children(root, "marker")) {
         MarkerIoMarker marker;
-        marker.label = require_attr(*node, "label");
+        // Attribute values are the exact label; leading and trailing spaces are
+        // part of it, so they must survive the round trip.
+        marker.label = require_attr(*node, "label", /*trim_value=*/false);
         if (marker.label.empty()) {
             throw ValueError("marker XML: <marker> has an empty label");
         }
@@ -206,7 +212,7 @@ std::vector<MarkerIoMarker> parse_marker_xml(const std::string& text) {
         for (const docxml::XmlNode* projection :
              docxml::find_children(*node, "projection")) {
             MarkerIoProjection item;
-            item.camera = require_attr(*projection, "camera");
+            item.camera = require_attr(*projection, "camera", /*trim_value=*/false);
             if (item.camera.empty()) {
                 throw ValueError("marker XML: marker '" + marker.label +
                                  "' has a projection with an empty camera label");

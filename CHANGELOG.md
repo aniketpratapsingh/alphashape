@@ -44,9 +44,10 @@ All notable changes to alphashape are recorded here. The format follows
 
 - **WP-13.4: manual marker placement, the projection API and marker
   import/export.** `project_marker()` maps a chunk-local point through a camera
-  and returns `nullopt` when the camera is unaligned, the point is at or behind
-  the image plane, or the pixel is outside the frame (an optional
-  `clip_to_image` flag relaxes the last condition). New undoable model commands
+  and returns `nullopt` when the camera is unaligned, a Frame-model point is at
+  or behind the image plane (a fisheye maps the whole sphere and is left to the
+  lens model), or the pixel is outside the frame (an optional `clip_to_image`
+  flag relaxes the last condition). New undoable model commands
   place a marker (auto-labelling `"point N"` and rejecting duplicate labels),
   add a marker together with a projection, move a projection, remove one
   projection (deleting the marker with its last projection only when asked) and
@@ -54,9 +55,12 @@ All notable changes to alphashape are recorded here. The format follows
   counter exactly on undo. `ImportMarkers`/`ExportMarkers` move projections to
   and from `marker,camera,u,v` CSV or `<markers>/<marker>/<projection>` XML at
   full double round-trip precision, with cameras matched by exact label and an
-  atomic, line-reporting import. Python gains `Chunk.addMarker`,
+  atomic, line-reporting import; both ends refuse ambiguous camera labels and
+  the exporter refuses duplicate marker labels. Python gains `Chunk.addMarker`,
   `setMarkerProjection`, `removeMarkerProjection`, `importMarkers` and
-  `exportMarkers`; every mutation runs through the command layer.
+  `exportMarkers`; every mutation runs through the command layer. A marker
+  reference is either an id or a label, never "label or id", so a marker
+  labelled "5" cannot capture an edit meant for marker id 5.
 
 - **WP-13.3: XMP reference completion.** The EXIF reader now also returns the
   XMP packet from a JPEG APP1 segment or TIFF tag 700, and `AddPhotos` reads

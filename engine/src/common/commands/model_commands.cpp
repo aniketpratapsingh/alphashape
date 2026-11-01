@@ -130,6 +130,21 @@ bool erase_by_id(std::vector<T>& items, std::int32_t id) {
     return true;
 }
 
+/// Remove `id` from a sorted, unique group member list.
+void drop_member(std::vector<std::int32_t>& members, std::int32_t id) {
+    auto it = std::remove(members.begin(), members.end(), id);
+    members.erase(it, members.end());
+}
+
+/// Detach a marker from every marker group. Deleting a marker without this
+/// leaves a member id that no marker carries, which Chunk::validate() rejects;
+/// the group snapshot in ChunkContainersCommand restores membership on undo.
+void detach_marker_from_groups(Chunk& chunk, std::int32_t marker_id) {
+    for (MarkerGroup& group : chunk.marker_groups()) {
+        drop_member(group.members, marker_id);
+    }
+}
+
 // --- validation helpers ----------------------------------------------------
 
 bool positive_finite(const Eigen::Vector3d& value) {
@@ -789,6 +804,7 @@ protected:
         if (!erase_by_id(chunk.markers(), marker_id_)) {
             throw ValueError("no marker with id " + std::to_string(marker_id_));
         }
+        detach_marker_from_groups(chunk, marker_id_);
     }
 
 private:
@@ -982,37 +998,13 @@ Marker* find_marker_by_label(Chunk& chunk, const std::string& label) {
     return nullptr;
 }
 
-/// Parse a non-negative decimal marker id. False for anything else, including
-/// an empty string and a value that does not fit in int32.
-bool parse_marker_id(const std::string& text, std::int32_t* id) {
-    if (text.empty()) {
-        return false;
+/// Resolve a strict marker reference: an id matches by id only, a label by
+/// label only. Null when the referenced marker does not exist.
+Marker* resolve_marker_ref(Chunk& chunk, const MarkerRef& ref) {
+    if (const auto* id = std::get_if<std::int32_t>(&ref)) {
+        return find_by_id(chunk.markers(), *id);
     }
-    std::int64_t value = 0;
-    for (const char c : text) {
-        if (c < '0' || c > '9') {
-            return false;
-        }
-        value = value * 10 + (c - '0');
-        if (value > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
-            return false;
-        }
-    }
-    *id = static_cast<std::int32_t>(value);
-    return true;
-}
-
-/// Resolve a "label-or-id" argument: an exact label wins, then a decimal id.
-/// Null when neither matches (the caller creates a marker with that label).
-Marker* resolve_marker_label_or_id(Chunk& chunk, const std::string& label_or_id) {
-    if (Marker* by_label = find_marker_by_label(chunk, label_or_id)) {
-        return by_label;
-    }
-    std::int32_t id = -1;
-    if (parse_marker_id(label_or_id, &id)) {
-        return find_by_id(chunk.markers(), id);
-    }
-    return nullptr;
+    return find_marker_by_label(chunk, std::get<std::string>(ref));
 }
 
 /// The lowest free default label "point N", N >= 1.
@@ -1071,12 +1063,11 @@ private:
 /// Create (if absent) then add or replace one projection of a marker.
 class AddMarkerWithProjectionCommand : public ChunkContainersCommand {
 public:
-    AddMarkerWithProjectionCommand(std::int32_t chunk_id,
-                                   std::string marker_label_or_id,
+    AddMarkerWithProjectionCommand(std::int32_t chunk_id, MarkerRef marker,
                                    std::int32_t camera_id, Eigen::Vector2d uv,
                                    bool pinned)
         : ChunkContainersCommand(chunk_id),
-          marker_label_or_id_(std::move(marker_label_or_id)),
+          marker_(std::move(marker)),
           camera_id_(camera_id),
           uv_(uv),
           pinned_(pinned) {}
@@ -1086,8 +1077,16 @@ public:
 protected:
     void validate(Document& document) override {
         Chunk& chunk = target_chunk(document);
-        if (marker_label_or_id_.empty()) {
-            throw ValueError("add marker projection: empty marker label");
+        if (const auto* label = std::get_if<std::string>(&marker_)) {
+            if (label->empty()) {
+                throw ValueError("add marker projection: empty marker label");
+            }
+        } else if (find_by_id(chunk.markers(), std::get<std::int32_t>(marker_)) ==
+                   nullptr) {
+            // An explicit id must name an existing marker: silently creating
+            // one would hide a stale reference.
+            throw ValueError("add marker projection: no marker with id " +
+                             std::to_string(std::get<std::int32_t>(marker_)));
         }
         require_camera(chunk, camera_id_, "add marker projection");
         if (!uv_.allFinite()) {
@@ -1097,14 +1096,19 @@ protected:
 
     void commit(Document& document) override {
         Chunk& chunk = target_chunk(document);
-        Marker* marker = resolve_marker_label_or_id(chunk, marker_label_or_id_);
+        Marker* marker = resolve_marker_ref(chunk, marker_);
         std::int32_t marker_id = -1;
         if (marker != nullptr) {
             marker_id = marker->id;
         } else {
+            const auto* label = std::get_if<std::string>(&marker_);
+            if (label == nullptr) {
+                throw ValueError("add marker projection: no marker with id " +
+                                 std::to_string(std::get<std::int32_t>(marker_)));
+            }
             Marker created;
             created.id = chunk.allocate_id();
-            created.label = marker_label_or_id_;
+            created.label = *label;
             created.pinned = pinned_;
             marker_id = created.id;
             insert_by_id(chunk.markers(), std::move(created));
@@ -1123,7 +1127,7 @@ protected:
     }
 
 private:
-    std::string marker_label_or_id_;
+    MarkerRef marker_;
     std::int32_t camera_id_;
     Eigen::Vector2d uv_;
     bool pinned_;
@@ -1201,6 +1205,8 @@ protected:
             if (!erase_by_id(chunk.markers(), marker_id_)) {
                 throw ValueError("no marker with id " + std::to_string(marker_id_));
             }
+            // The marker is gone; a group that listed it would dangle.
+            detach_marker_from_groups(chunk, marker_id_);
         }
     }
 
@@ -1384,11 +1390,6 @@ void add_member(std::vector<std::int32_t>& members, std::int32_t id) {
     if (it == members.end() || *it != id) {
         members.insert(it, id);
     }
-}
-
-void drop_member(std::vector<std::int32_t>& members, std::int32_t id) {
-    auto it = std::remove(members.begin(), members.end(), id);
-    members.erase(it, members.end());
 }
 
 class AddGroupCommand : public ChunkContainersCommand {
@@ -2795,10 +2796,10 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(
 }
 
 std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
-    std::int32_t chunk_id, std::string marker_label_or_id, std::int32_t camera_id,
+    std::int32_t chunk_id, MarkerRef marker, std::int32_t camera_id,
     Eigen::Vector2d uv, bool pinned) {
     return std::make_unique<AddMarkerWithProjectionCommand>(
-        chunk_id, std::move(marker_label_or_id), camera_id, uv, pinned);
+        chunk_id, std::move(marker), camera_id, uv, pinned);
 }
 
 std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(

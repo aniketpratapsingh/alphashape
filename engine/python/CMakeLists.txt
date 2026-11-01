@@ -116,6 +116,11 @@ alphashape_add_python_test(python_chunk_ops ${CMAKE_CURRENT_SOURCE_DIR}/tests/te
 alphashape_add_python_test(python_align_chunks ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_align_chunks.py
     TIMEOUT 600)
 
+# WP-13.4: manual marker placement (addMarker / setMarkerProjection /
+# removeMarkerProjection) and marker import/export.
+alphashape_add_python_test(python_markers ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_markers.py
+    TIMEOUT 600)
+
 # WP-12.11: the Python CoordinateSystem surface, the undoable Chunk.crs setter,
 # the geoid registry and BuildDem's `projection` parameter. Skips itself when
 # the module was built without PROJ (the binding does not exist then).

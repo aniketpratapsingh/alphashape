@@ -24,9 +24,11 @@ std::optional<Eigen::Vector2d> project_marker(const Eigen::Vector3d& point_local
     // World -> camera: the same split every other projection site uses.
     const Eigen::Vector3d p_cam = camera.pose.block<3, 3>(0, 0) * point_local +
                                   camera.pose.block<3, 1>(0, 3);
-    // Camera convention: +Z is forward. A point at or behind the image plane is
-    // not observable in this image, including through a fisheye lens.
-    if (!(p_cam.z() > 0.0)) {
+    // Camera convention: +Z is forward. Only the Frame model rejects a point at
+    // or behind the image plane; an equidistant fisheye maps the whole sphere
+    // (theta up to pi), so it must see points with z <= 0 and let
+    // Calibration::project decide.
+    if (calibration.type == CameraType::Frame && !(p_cam.z() > 0.0)) {
         return std::nullopt;
     }
     Eigen::Vector2d pixel;

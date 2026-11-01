@@ -1298,25 +1298,26 @@ PYBIND11_MODULE(alphashape, m) {
                 alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
                 alphashape::Document& document = owning_document(self);
                 const std::int32_t camera_id = camera_id_from_python(chunk, camera);
-                // A string marker may name a marker that does not exist yet;
-                // the command then creates it, as ImportMarkers does.
-                std::string label_or_id;
-                if (py::isinstance<py::str>(marker)) {
-                    label_or_id = py::cast<std::string>(marker);
-                } else {
-                    label_or_id =
-                        std::to_string(marker_id_from_python(chunk, marker));
-                }
+                // A string names a marker by label (and may name one that does
+                // not exist yet, which the command creates); a Marker object or
+                // an integer names it by id and must already exist. The two
+                // never shadow each other, so a marker labelled "5" cannot
+                // capture an edit meant for marker id 5.
+                alphashape::MarkerRef reference =
+                    py::isinstance<py::str>(marker)
+                        ? alphashape::MarkerRef(py::cast<std::string>(marker))
+                        : alphashape::MarkerRef(
+                              marker_id_from_python(chunk, marker));
                 alphashape::make_add_marker_with_projection_command(
-                    chunk.id(), std::move(label_or_id), camera_id,
+                    chunk.id(), std::move(reference), camera_id,
                     Eigen::Vector2d(u, v),
                     /*pinned=*/false)
                     ->apply(document);
             },
             py::arg("marker"), py::arg("camera"), py::arg("u"), py::arg("v"),
-            "Set or replace one marker projection. `marker` and `camera` are "
-            "ids or exact labels; a string marker that does not exist yet is "
-            "created.")
+            "Set or replace one marker projection. A string `marker` is an exact "
+            "label (creating the marker when absent); a Marker object or int is "
+            "a marker id that must exist. `camera` is an id or exact label.")
         .def(
             "removeMarkerProjection",
             [](py::object self, py::object marker, py::object camera,

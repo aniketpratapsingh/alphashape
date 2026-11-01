@@ -22,7 +22,9 @@
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
+#if defined(ALPHASHAPE_USE_PROJ)
 #include "common/algorithm/reference/reference_table.hpp"
+#endif
 #include "common/commands/command.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
@@ -226,9 +228,104 @@ TEST(Markers, DeleteLastProjectionDeletesMarkerWhenRequested) {
     ASSERT_EQ(chunk->markers().size(), 1U);
     EXPECT_EQ(chunk->markers()[0].id, marker_id);
     ASSERT_EQ(chunk->markers()[0].projections.size(), 1U);
+
+    // Redo of the delete path removes the marker again, id-for-id.
+    stack.redo();
+    EXPECT_TRUE(chunk->markers().empty());
+    EXPECT_TRUE(chunk->validate().empty());
+
+    stack.undo();
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_EQ(chunk->markers()[0].id, marker_id);
+    ASSERT_EQ(chunk->markers()[0].projections.size(), 1U);
     stack.undo();
     EXPECT_TRUE(chunk->markers().empty());
     EXPECT_EQ(chunk->next_id(), next_id_before);
+}
+
+// A marker may legitimately be labelled "5". An edit addressed to marker id 5
+// must reach id 5 only, and an edit addressed to label "5" must reach the
+// labelled marker only; neither may shadow the other.
+TEST(Markers, NumericLabelDoesNotShadowId) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Camera& camera = add_camera(*chunk, "CAM1");
+    // Build ids 0..5 so that one marker is labelled "5" and a DIFFERENT marker
+    // has id 5. This is the ambiguous pair the old label-first resolver picked
+    // the wrong member of.
+    for (int i = 0; i < 3; ++i) {
+        make_add_marker_command(chunk->id(), "p" + std::to_string(i),
+                                std::nullopt)
+            ->apply(document);
+    }
+    make_add_marker_command(chunk->id(), std::string("5"), std::nullopt)
+        ->apply(document);  // id 3
+    make_add_marker_command(chunk->id(), std::string("p4"), std::nullopt)
+        ->apply(document);  // id 4
+    make_add_marker_command(chunk->id(), std::string("target"), std::nullopt)
+        ->apply(document);  // id 5
+    ASSERT_EQ(chunk->markers().size(), 6U);
+    Marker* labelled = find_marker(*chunk, "5");
+    ASSERT_NE(labelled, nullptr);
+    EXPECT_EQ(labelled->id, 3);
+    EXPECT_EQ(find_marker(*chunk, "target")->id, 5);
+
+    // By id 5: only the marker with id 5 gets the projection.
+    make_add_marker_with_projection_command(chunk->id(), 5, camera.id,
+                                            Eigen::Vector2d(7.0, 8.0), false)
+        ->apply(document);
+    ASSERT_EQ(find_marker(*chunk, "target")->projections.size(), 1U);
+    EXPECT_TRUE(find_marker(*chunk, "5")->projections.empty());
+
+    // By label "5": the marker labelled "5" gets it, id 5 does not.
+    make_add_marker_with_projection_command(chunk->id(), std::string("5"),
+                                            camera.id, Eigen::Vector2d(1.0, 2.0),
+                                            false)
+        ->apply(document);
+    ASSERT_EQ(find_marker(*chunk, "5")->projections.size(), 1U);
+    expect_vec2(find_marker(*chunk, "5")->projections[0].pixel,
+                Eigen::Vector2d(1.0, 2.0));
+    EXPECT_EQ(find_marker(*chunk, "target")->projections.size(), 1U);
+    EXPECT_TRUE(chunk->validate().empty());
+
+    // An id that names no marker is an error, not an implicit creation.
+    const std::int32_t missing_id = chunk->next_id();
+    EXPECT_THROW(make_add_marker_with_projection_command(
+                     chunk->id(), missing_id, camera.id,
+                     Eigen::Vector2d(3.0, 4.0), false)
+                     ->apply(document),
+                 ValueError);
+    EXPECT_EQ(chunk->markers().size(), 6U);
+}
+
+TEST(Markers, DeleteLastProjectionDetachesGroupMember) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Camera& camera = add_camera(*chunk, "CAM1");
+    UndoStack stack(&document);
+
+    stack.execute(make_add_marker_with_projection_command(
+        chunk->id(), "M1", camera.id, Eigen::Vector2d(4.0, 5.0), false));
+    const std::int32_t marker_id = chunk->markers()[0].id;
+    stack.execute(make_add_group_command(GroupKind::Marker, chunk->id(), "G"));
+    const std::int32_t group_id = chunk->marker_groups()[0].id;
+    stack.execute(make_move_to_group_command(GroupKind::Marker, chunk->id(),
+                                             {marker_id}, group_id));
+    ASSERT_EQ(chunk->marker_groups()[0].members.size(), 1U);
+    EXPECT_TRUE(chunk->validate().empty());
+
+    stack.execute(make_remove_marker_projection_command(chunk->id(), marker_id,
+                                                        camera.id, true));
+    ASSERT_TRUE(chunk->markers().empty());
+    EXPECT_TRUE(chunk->marker_groups()[0].members.empty());
+    EXPECT_TRUE(chunk->validate().empty());
+
+    // Undo restores the marker and its group membership together.
+    stack.undo();
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    ASSERT_EQ(chunk->marker_groups()[0].members.size(), 1U);
+    EXPECT_EQ(chunk->marker_groups()[0].members[0], marker_id);
+    EXPECT_TRUE(chunk->validate().empty());
 }
 
 TEST(Markers, AutoLabelPointN) {
@@ -353,6 +450,29 @@ TEST(Markers, ProjectBehindCameraReturnsNullopt) {
         project_marker(far_right, origin, calibration, false);
     ASSERT_TRUE(unclipped.has_value());
     EXPECT_GT(unclipped->x(), 640.0);
+}
+
+TEST(Markers, FisheyeSeesPointsBehindThePlane) {
+    // The equidistant fisheye maps the whole sphere (theta up to pi), so a
+    // point at 153 degrees off-axis is representable even though z < 0. Only
+    // the Frame model has a z <= 0 cut.
+    const Calibration fisheye =
+        Calibration::initial(CameraType::Fisheye, 640, 480, 100.0);
+    Camera camera;
+    camera.enabled = true;
+    camera.pose = Eigen::Matrix4d::Identity();
+    const Eigen::Vector3d behind(5.0, 0.0, -10.0);
+
+    const std::optional<Eigen::Vector2d> pixel =
+        project_marker(behind, camera, fisheye, /*clip_to_image=*/false);
+    ASSERT_TRUE(pixel.has_value());
+    // theta = atan2(5, -10) = 2.6779 rad; u = 320 + theta * f.
+    EXPECT_NEAR(pixel->x(), 320.0 + std::atan2(5.0, -10.0) * 100.0, 1e-9);
+    EXPECT_NEAR(pixel->y(), 240.0, 1e-9);
+
+    const Calibration frame =
+        Calibration::initial(CameraType::Frame, 640, 480, 100.0);
+    EXPECT_FALSE(project_marker(behind, camera, frame, false).has_value());
 }
 
 TEST(Markers, ProjectionRoundTripCsv) {
@@ -483,6 +603,115 @@ TEST(Markers, ImportIsAtomic) {
     EXPECT_EQ(chunk->next_id(), next_id_before);
 }
 
+TEST(Markers, ExportRejectsDuplicateCameraLabels) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    const std::int32_t first = add_camera(*chunk, "dup").id;
+    const std::int32_t second = add_camera(*chunk, "dup").id;
+    make_add_marker_with_projection_command(chunk->id(), std::string("M"), first,
+                                            Eigen::Vector2d(1.0, 2.0), false)
+        ->apply(document);
+    make_add_marker_with_projection_command(chunk->id(), std::string("M"), second,
+                                            Eigen::Vector2d(3.0, 4.0), false)
+        ->apply(document);
+
+    TempFile file(".csv");
+    Params params = params_for("ExportMarkers");
+    params.set("path", file.path());
+    bool threw = false;
+    try {
+        run_task_named(document, "ExportMarkers", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("dup"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw);
+}
+
+TEST(Markers, ImportRejectsAmbiguousCameraLabel) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "dup");
+    add_camera(*chunk, "dup");
+
+    TempFile file(".csv");
+    write_text(file.path(),
+               "marker,camera,u,v\n"
+               "M,dup,1,2\n");
+    Params params = params_for("ImportMarkers");
+    params.set("path", file.path());
+
+    bool threw = false;
+    try {
+        run_task_named(document, "ImportMarkers", params);
+    } catch (const ValueError& error) {
+        threw = true;
+        const std::string message = error.what();
+        EXPECT_NE(message.find("line 2"), std::string::npos) << message;
+        EXPECT_NE(message.find("dup"), std::string::npos) << message;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_TRUE(chunk->markers().empty());
+}
+
+TEST(Markers, ImportStripsUtf8Bom) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    add_camera(*chunk, "cam0");
+
+    TempFile file(".csv");
+    write_text(file.path(),
+               "\xEF\xBB\xBF"
+               "marker,camera,u,v\n"
+               "M,cam0,1,2\n");
+    Params params = params_for("ImportMarkers");
+    params.set("path", file.path());
+    run_task_named(document, "ImportMarkers", params);
+
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_EQ(chunk->markers()[0].label, "M");
+    ASSERT_EQ(chunk->markers()[0].projections.size(), 1U);
+    EXPECT_TRUE(chunk->validate().empty());
+}
+
+// Leading space, an embedded comma and a double quote: the CSV writer quotes
+// the field and the XML writer escapes the attribute, and neither may trim the
+// label on the way back in.
+TEST(Markers, LabelWhitespaceAndQuotesRoundTrip) {
+    const std::string label = " A,\"q\"";
+    for (const char* suffix : {".csv", ".xml"}) {
+        Document source = make_document();
+        Chunk* source_chunk = source.active_chunk();
+        const std::int32_t camera_id = add_camera(*source_chunk, "cam0").id;
+        make_add_marker_with_projection_command(source_chunk->id(), label,
+                                                camera_id,
+                                                Eigen::Vector2d(3.0, 4.0), false)
+            ->apply(source);
+
+        TempFile file(suffix);
+        Params export_params = params_for("ExportMarkers");
+        export_params.set("path", file.path());
+        run_task_named(source, "ExportMarkers", export_params);
+
+        Document destination = make_document();
+        Chunk* destination_chunk = destination.active_chunk();
+        add_camera(*destination_chunk, "cam0");
+        Params import_params = params_for("ImportMarkers");
+        import_params.set("path", file.path());
+        run_task_named(destination, "ImportMarkers", import_params);
+
+        SCOPED_TRACE(suffix);
+        ASSERT_EQ(destination_chunk->markers().size(), 1U);
+        EXPECT_EQ(destination_chunk->markers()[0].label, label);
+        ASSERT_EQ(destination_chunk->markers()[0].projections.size(), 1U);
+        expect_vec2(destination_chunk->markers()[0].projections[0].pixel,
+                    Eigen::Vector2d(3.0, 4.0));
+        EXPECT_TRUE(destination_chunk->validate().empty());
+    }
+}
+
+#if defined(ALPHASHAPE_USE_PROJ)
 TEST(Markers, PlacedMarkerAppearsInReferenceTable) {
     Document document = make_document();
     Chunk* chunk = document.active_chunk();
@@ -510,6 +739,7 @@ TEST(Markers, PlacedMarkerAppearsInReferenceTable) {
     // Placement alone does not mark a marker as adjusted.
     EXPECT_FALSE(row->enabled);
 }
+#endif  // ALPHASHAPE_USE_PROJ
 
 }  // namespace
 }  // namespace alphashape

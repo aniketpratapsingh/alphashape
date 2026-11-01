@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <Eigen/Core>
@@ -110,13 +111,19 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(
     std::int32_t chunk_id, std::optional<std::string> label,
     std::optional<Eigen::Vector3d> position);
 
-/// Create the marker named by `marker_label_or_id` when the chunk has none and
-/// set or replace its projection in `camera_id`. The argument is resolved as a
-/// marker label first, then as a decimal marker id; when neither matches it is
-/// the label of the new marker. A new marker is pinned when `pinned`.
+/// A marker reference for placement edits. The alternatives are resolved
+/// independently: an id names a marker by id only, a string names one by label
+/// only. Keeping them apart means a marker labelled "5" can never capture an
+/// edit addressed to marker id 5 (and vice versa).
+using MarkerRef = std::variant<std::int32_t, std::string>;
+
+/// Set or replace one projection of the referenced marker in `camera_id`.
+///
+/// With an id the marker must already exist; with a label a missing marker is
+/// created with that label. A newly created marker is pinned when `pinned`.
 std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
-    std::int32_t chunk_id, std::string marker_label_or_id,
-    std::int32_t camera_id, Eigen::Vector2d uv, bool pinned = true);
+    std::int32_t chunk_id, MarkerRef marker, std::int32_t camera_id,
+    Eigen::Vector2d uv, bool pinned = true);
 
 /// Remove one projection. When this was the marker's last projection and
 /// `delete_marker` is set, the marker itself is removed; otherwise it stays

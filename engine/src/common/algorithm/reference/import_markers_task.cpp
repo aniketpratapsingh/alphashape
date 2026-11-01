@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -56,6 +57,18 @@ const Camera* find_camera_by_label(const Chunk& chunk, const std::string& label)
         }
     }
     return nullptr;
+}
+
+/// The number of cameras carrying `label`. A file projection names its camera
+/// by label only, so a label shared by two cameras is ambiguous.
+std::size_t count_cameras_by_label(const Chunk& chunk, const std::string& label) {
+    std::size_t count = 0;
+    for (const Camera& camera : chunk.cameras()) {
+        if (camera.label == label) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 const Camera* find_camera_by_id(const Chunk& chunk, std::int32_t id) {
@@ -214,7 +227,12 @@ void ImportMarkersTask::apply(Document& document, Params& params,
     }
     const reference::MarkerIoFormat format =
         reference::marker_io_format(params.get_string("format"), path, "ImportMarkers");
-    const std::string text = read_file(path);
+    std::string text = read_file(path);
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEFU &&
+        static_cast<unsigned char>(text[1]) == 0xBBU &&
+        static_cast<unsigned char>(text[2]) == 0xBFU) {
+        text.erase(0, 3);  // UTF-8 BOM
+    }
     const std::vector<reference::MarkerIoMarker> parsed =
         format == reference::MarkerIoFormat::Csv
             ? reference::parse_marker_csv(text)
@@ -234,6 +252,11 @@ void ImportMarkersTask::apply(Document& document, Params& params,
             ++created_count;
         }
         for (const reference::MarkerIoProjection& projection : marker.projections) {
+            if (count_cameras_by_label(*chunk, projection.camera) > 1) {
+                throw ValueError("ImportMarkers: " + line_prefix(projection.line) +
+                                 "camera label '" + projection.camera +
+                                 "' matches more than one camera");
+            }
             const Camera* camera = find_camera_by_label(*chunk, projection.camera);
             if (camera == nullptr) {
                 throw ValueError("ImportMarkers: " + line_prefix(projection.line) +
@@ -251,11 +274,15 @@ void ImportMarkersTask::apply(Document& document, Params& params,
     }
     progress.update("parse", 1.0);
 
-    // Pass 2: one undoable mutation.
+    // Pass 2: one undoable mutation. A transaction puts the import on the undo
+    // stack exactly like Import Reference; applying the staged command directly
+    // would change the document without a history entry.
     progress.update("apply", 0.0);
     if (!plan.empty()) {
-        ImportMarkersCommand command(chunk->id(), std::move(plan));
-        command.apply(document);
+        CommandTransaction transaction("Import Markers");
+        transaction.add(std::make_unique<ImportMarkersCommand>(chunk->id(),
+                                                               std::move(plan)));
+        transaction.apply(document);
     }
     progress.update("apply", 1.0);
     if (Log::enabled(LogLevel::Info)) {

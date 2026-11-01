@@ -10,7 +10,8 @@
 /// The answer is deliberately "no pixel" rather than an exception or a
 /// wraparound pixel when the point is not observable:
 ///   * the camera is not aligned (`Camera::enabled` false), or
-///   * the point is at or behind the image plane (camera-frame z <= 0), or
+///   * a Frame point is at or behind the image plane (camera-frame z <= 0;
+///     a fisheye sees the whole sphere, so it has no such cut), or
 ///   * the lens model refuses the point, or
 ///   * the pixel is outside [0, w] x [0, h] and `clip_to_image` is set.
 ///

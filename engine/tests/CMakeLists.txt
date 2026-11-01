@@ -72,6 +72,7 @@ add_executable(alphashape_tests
     test_build_orthomosaic.cpp
     test_chunk_ops.cpp
     test_align_chunks.cpp
+    test_marker_placement.cpp
     test_gpu.cpp
 )
 
@@ -90,7 +91,6 @@ if(ALPHASHAPE_USE_PROJ)
         test_reference_convert.cpp
         test_reference_settings.cpp
         test_import_reference.cpp
-        test_marker_placement.cpp
         test_surface_frame.cpp
         test_reproject.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>

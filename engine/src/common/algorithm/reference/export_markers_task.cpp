@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,7 +65,18 @@ void ExportMarkersTask::apply(Document& document, Params& params,
     std::vector<reference::MarkerIoMarker> markers;
     markers.reserve(chunk->markers().size());
     std::size_t projection_count = 0;
+    // The file names a camera by label only, so two cameras that share a label
+    // would be written as the same camera and silently merged on re-import.
+    // Remember which camera id each written label came from.
+    std::map<std::string, std::int32_t> camera_by_label;
+    // Two markers with one label would come back as one: the XML reader rejects
+    // a duplicate and the CSV reader merges the rows. Refuse to write the file.
+    std::set<std::string> marker_labels;
     for (const Marker& marker : chunk->markers()) {
+        if (!marker_labels.insert(marker.label).second) {
+            throw ValueError("ExportMarkers: duplicate marker label '" +
+                             marker.label + "'");
+        }
         reference::MarkerIoMarker out;
         out.label = marker.label;
         out.position = marker.position;
@@ -73,6 +86,12 @@ void ExportMarkersTask::apply(Document& document, Params& params,
                 throw ValueError("ExportMarkers: marker '" + marker.label +
                                  "' projects into missing camera " +
                                  std::to_string(projection.camera_id));
+            }
+            const auto [seen, inserted] =
+                camera_by_label.emplace(camera->label, camera->id);
+            if (!inserted && seen->second != camera->id) {
+                throw ValueError("ExportMarkers: camera label '" + camera->label +
+                                 "' is used by more than one camera");
             }
             reference::MarkerIoProjection item;
             item.camera = camera->label;
