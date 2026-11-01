@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Install dependencies
         uses: ./.github/actions/apt-install
@@ -89,7 +89,7 @@ jobs:
           tar --zstd -cf build.tar.zst --exclude='*.o' --exclude='*.a' --exclude=.ninja_deps build
           ls -lh build.tar.zst
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: build-san
           path: build.tar.zst
@@ -117,7 +117,7 @@ jobs:
           - { lane: slow-gpu, index: 0, total: 0 }
     steps:
       # The build tree holds absolute paths, so the checkout location must match the build job.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       # Mirror rotation + .deb cache live in one composite action, so every job installs the
       # same way. The cache key is derived from the runner image and the package list.
@@ -128,7 +128,7 @@ jobs:
             jq libceres4t64 libproj25 proj-data libtiff6 libjpeg-turbo8 libpng16-16t64
             libvulkan1 mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: build-san
 
@@ -187,7 +187,7 @@ jobs:
         run: |
           grep -E "runtime error:|ERROR: (Address|Leak)Sanitizer|SUMMARY: " ctest.log | sort | uniq -c | sort -rn | head -50 || true
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: sanitizer-logs-${{ matrix.lane }}
