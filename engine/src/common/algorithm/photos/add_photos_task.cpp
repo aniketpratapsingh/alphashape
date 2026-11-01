@@ -13,9 +13,14 @@
 #include <vector>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/reference/xmp_reference.hpp"
 #include "common/core/frame.hpp"
 #include "image/io/exif.hpp"
 #include "image/io/image_io.hpp"
+
+#if defined(ALPHASHAPE_USE_PROJ)
+#include "common/algorithm/reference/convert_reference.hpp"
+#endif
 
 namespace alphashape {
 
@@ -132,6 +137,22 @@ double initial_focal_pixels(const ExifData& exif, int width, int height,
     return kDefaultFocalFactor * static_cast<double>(std::max(width, height));
 }
 
+#if defined(ALPHASHAPE_USE_PROJ)
+/// Re-express the XMP parser's default ZYX yaw/pitch/roll in the chunk's
+/// configured rotation order. The angles describe the same rotation; only the
+/// sequence they are read in changes.
+Eigen::Vector3d orientation_in_chunk_order(const XmpOrientation& angles, const Chunk& chunk) {
+    const crs::RotationOrder order = reference::rotation_order_of(chunk);
+    if (order == crs::RotationOrder::ZYX) {
+        return Eigen::Vector3d(angles.yaw_deg, angles.pitch_deg, angles.roll_deg);
+    }
+    const crs::EulerAngles in{angles.yaw_deg, angles.pitch_deg, angles.roll_deg,
+                              crs::RotationOrder::ZYX};
+    const crs::EulerAngles out = crs::from_matrix(crs::to_matrix(in), order);
+    return Eigen::Vector3d(out.yaw, out.pitch, out.roll);
+}
+#endif
+
 /// Everything one imported photo contributes to the chunk. Built up in locals
 /// so a failure anywhere in the loop leaves the chunk untouched.
 struct PendingCamera {
@@ -173,6 +194,15 @@ void AddPhotosTask::declare_params(Params& params) const {
                     "Load each photo's EXIF GPS position into its camera reference."});
     params.declare({"strip_extensions", ParamType::Bool, true,
                     "Label each camera with the file name without its extension."});
+    params.declare({"load_xmp_accuracy", ParamType::Bool, false,
+                    "Use a fixed/float RTK standard deviation from XMP as the reference "
+                    "accuracy."});
+    params.declare({"load_xmp_orientation", ParamType::Bool, false,
+                    "Store the XMP gimbal (or flight) yaw/pitch/roll as the camera "
+                    "reference orientation."});
+    params.declare({"load_xmp_calibration", ParamType::Bool, false,
+                    "Reserved for XMP lens calibration (DewarpData). Accepted but not yet "
+                    "applied."});
 }
 
 std::vector<Stage> AddPhotosTask::stages() const {
@@ -191,6 +221,12 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     }
     const bool load_reference = params.get_bool("load_reference");
     const bool strip_extensions = params.get_bool("strip_extensions");
+    const bool load_xmp_accuracy = params.get_bool("load_xmp_accuracy");
+    const bool load_xmp_orientation = params.get_bool("load_xmp_orientation");
+    // Declared so the schema and Python front end accept it; DewarpData is not
+    // applied yet (see the parameter description and the PR notes).
+    const bool load_xmp_calibration = params.get_bool("load_xmp_calibration");
+    (void)load_xmp_calibration;
 
     // -- resolve and de-duplicate before reading anything --------------------
     std::vector<std::string> absolute;
@@ -252,6 +288,11 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             // Header-only: we need the dimensions, not the pixels.
             const ImageInfo info = read_image_info(path);
             const ExifData exif = read_exif(path);
+            // XMP is read from the same file: a JPEG APP1 packet or TIFF tag
+            // 700. Parsing never throws; an absent packet is an empty result.
+            const XmpReference xmp =
+                exif.xmp_packet.has_value() ? parse_xmp_reference(*exif.xmp_packet)
+                                            : XmpReference{};
 
             const std::optional<double> pixel_size_um = corrected_pixel_size_um(exif, info.width);
             const double focal_pixels = initial_focal_pixels(exif, info.width, info.height, pixel_size_um);
@@ -288,12 +329,50 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             item.camera.enabled = false;  // not aligned yet
 
             if (load_reference && exif.gps.has_value()) {
+                // EXIF GPS stays primary; XMP position is only the fallback.
                 const GpsPosition& gps = *exif.gps;
                 item.camera.reference.location = Eigen::Vector3d(
                     gps.longitude_deg, gps.latitude_deg,
                     gps.altitude_m.value_or(std::numeric_limits<double>::quiet_NaN()));
                 item.camera.reference.enabled = true;
+            } else if (load_reference && xmp.has_location()) {
+                // AbsoluteAltitude is an ellipsoidal/MSL height we cannot
+                // distinguish; RelativeAltitude is not a georeferenced height,
+                // so it is deliberately not used as the location's z.
+                item.camera.reference.location = Eigen::Vector3d(
+                    *xmp.longitude_deg, *xmp.latitude_deg,
+                    xmp.absolute_altitude_m.value_or(
+                        std::numeric_limits<double>::quiet_NaN()));
+                item.camera.reference.enabled = true;
             }
+
+            if (load_xmp_accuracy) {
+                if (const auto accuracy = xmp.rtk_accuracy_m()) {
+                    item.camera.reference.accuracy =
+                        Eigen::Vector3d((*accuracy)[0], (*accuracy)[1], (*accuracy)[2]);
+                }
+            }
+
+            if (load_xmp_orientation) {
+                if (const auto angles = xmp.orientation_zyx()) {
+#if defined(ALPHASHAPE_USE_PROJ)
+                    item.camera.reference.orientation_deg =
+                        orientation_in_chunk_order(*angles, *chunk);
+#else
+                    // Without the CRS engine there is no rotation-order helper;
+                    // the stored ZYX triple is still the documented default.
+                    item.camera.reference.orientation_deg = Eigen::Vector3d(
+                        angles->yaw_deg, angles->pitch_deg, angles->roll_deg);
+#endif
+                }
+            }
+
+            // load_xmp_calibration is accepted for forward compatibility. DJI
+            // DewarpData mixes a capture date, an image size and a coefficient
+            // list whose exact layout varies by firmware, and this task always
+            // seeds a sensor calibration from EXIF focal length, so applying it
+            // here would be a guess. It is parsed into XmpReference::dewarp_data
+            // but not written to the sensor.
 
             item.frame = std::make_shared<Frame>(path, info.width, info.height);
             item.frame->set_id(frame_id++);

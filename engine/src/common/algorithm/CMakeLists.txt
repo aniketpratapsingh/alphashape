@@ -10,6 +10,7 @@ add_library(alphashape_algorithms STATIC
     chunk/duplicate_chunk_task.cpp
     chunk/merge_chunks_task.cpp
     photos/add_photos_task.cpp
+    reference/xmp_reference.cpp
     feature/dog_detector.cpp
     feature/mldb_descriptor.cpp
     feature/detect_features_task.cpp

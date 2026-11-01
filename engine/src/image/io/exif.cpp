@@ -5,6 +5,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "base/utils/error.hpp"
@@ -321,6 +322,31 @@ private:
         return value;
     }
 
+    /// An opaque BYTE/UNDEFINED value, used for the XMP XMLPacket tag. The
+    /// bytes are returned verbatim except for trailing NUL padding; an XMP
+    /// packet may legitimately contain any other byte because it is UTF-8.
+    std::optional<std::string> read_raw(const Entry& entry) const {
+        if (entry.type != kTypeByte && entry.type != kTypeUndefined) {
+            return std::nullopt;
+        }
+        if (entry.byte_length() == 0 ||
+            !block_.in_range(entry.value_offset, entry.byte_length())) {
+            return std::nullopt;
+        }
+        std::string value;
+        value.reserve(static_cast<std::size_t>(entry.byte_length()));
+        for (std::uint64_t i = 0; i < entry.byte_length(); ++i) {
+            value.push_back(static_cast<char>(block_.u8(entry.value_offset + i)));
+        }
+        while (!value.empty() && value.back() == '\0') {
+            value.pop_back();
+        }
+        if (value.empty()) {
+            return std::nullopt;
+        }
+        return value;
+    }
+
     /// The first byte of an ASCII field, for the one-character GPS refs.
     std::optional<char> read_ascii_char(const Entry& entry) const {
         const std::optional<std::string> text = read_ascii(entry);
@@ -441,6 +467,9 @@ void Parser::handle_entry(const Entry& entry, IfdKind kind) {
     // The Exif IFD carries everything else. Its tags do not collide with
     // IFD0's, so this block runs for both kinds.
     switch (entry.tag) {
+        case 0x02BC:  // XMLPacket: an XMP packet, BYTE/UNDEFINED
+            if (auto v = read_raw(entry)) out_.xmp_packet = std::move(*v);
+            break;
         case 0x9003:  // DateTimeOriginal
             if (auto v = read_ascii(entry)) out_.datetime_original = *v;
             break;
@@ -488,12 +517,18 @@ void Parser::handle_entry(const Entry& entry, IfdKind kind) {
 // Container scanning
 // ---------------------------------------------------------------------------
 
-/// Walks the JPEG marker segments and hands the first Exif APP1 payload to the
-/// parser. Stops at SOS, skips APP1 segments that are not Exif (XMP, etc.) and
-/// treats any structural damage as "no metadata".
+/// The JPEG APP1 identifier that introduces an XMP packet, including its NUL.
+constexpr char kXmpApp1Identifier[] = "http://ns.adobe.com/xap/1.0/";
+constexpr std::size_t kXmpApp1IdentifierLength = sizeof(kXmpApp1Identifier);  // 29 with NUL
+
+/// Walks the JPEG marker segments and takes the first Exif APP1 payload and the
+/// first XMP APP1 payload. Stops at SOS and treats any structural damage as
+/// "no metadata". Both APP1 kinds may appear in either order, so the scan
+/// continues after each rather than returning on the first Exif segment.
 void scan_jpeg(const std::uint8_t* data, std::size_t size, ExifData& out) {
     // SOI must be the first two bytes; the caller has already checked the
     // magic, but re-checking keeps this function self-contained.
+    bool exif_seen = false;
     std::size_t pos = 2;
     while (pos + 4 <= size) {
         if (data[pos] != 0xFF) {
@@ -536,11 +571,32 @@ void scan_jpeg(const std::uint8_t* data, std::size_t size, ExifData& out) {
         }
         if (marker == 0xE1 && payload_length >= 6 &&
             std::memcmp(data + segment_start, "Exif\0\0", 6) == 0) {
-            const std::uint8_t* tiff = data + segment_start + 6;
-            out = parse_exif_tiff_block(tiff, payload_length - 6);
-            return;
+            if (!exif_seen) {
+                const std::uint8_t* tiff = data + segment_start + 6;
+                ExifData exif = parse_exif_tiff_block(tiff, payload_length - 6);
+                // An XMP APP1 may have appeared before this Exif segment; an
+                // XMP carried inside the EXIF block (tag 700) is equally valid,
+                // so only fill a gap rather than overwriting either one.
+                if (!exif.xmp_packet.has_value()) {
+                    exif.xmp_packet = out.xmp_packet;
+                }
+                out = std::move(exif);
+                exif_seen = true;
+            }
+        } else if (marker == 0xE1 && payload_length >= kXmpApp1IdentifierLength &&
+                   std::memcmp(data + segment_start, kXmpApp1Identifier,
+                               kXmpApp1IdentifierLength) == 0) {
+            const char* packet = reinterpret_cast<const char*>(
+                data + segment_start + kXmpApp1IdentifierLength);
+            std::size_t packet_length = payload_length - kXmpApp1IdentifierLength;
+            while (packet_length > 0 && packet[packet_length - 1] == '\0') {
+                --packet_length;
+            }
+            if (packet_length > 0 && !out.xmp_packet.has_value()) {
+                out.xmp_packet = std::string(packet, packet_length);
+            }
         }
-        // Any other APPn (including the XMP APP1) is skipped.
+        // Any other APPn is skipped.
         pos = segment_start + payload_length;
     }
 }
