@@ -416,7 +416,7 @@ TEST(Reference, ApplyFalseDoesNotMutate) {
     Document document = make_document();
     Chunk* chunk = document.active_chunk();
     add_camera(*chunk, "CAM1");
-    const Chunk pre_state = *chunk;
+    const std::int32_t next_id = chunk->next_id();
 
     TempFile file(".csv");
     write_text(file.path(), "CAM1,1,2,3\nNEW1,4,5,6\n");
@@ -426,8 +426,11 @@ TEST(Reference, ApplyFalseDoesNotMutate) {
     params.set("apply", false);
     run_task_named(document, "ImportReference", params);
 
-    EXPECT_TRUE(*chunk == pre_state) << "apply=false changed the chunk";
+    // run_task records the task parameters in chunk meta, so compare the
+    // reference state the import owns rather than the whole chunk.
+    EXPECT_FALSE(chunk->cameras()[0].reference.location.has_value());
     EXPECT_EQ(chunk->markers().size(), 0U);
+    EXPECT_EQ(chunk->next_id(), next_id);
 }
 
 TEST(Reference, BadRowLeavesChunkUnchanged) {
