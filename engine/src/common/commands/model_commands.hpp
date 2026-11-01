@@ -101,6 +101,35 @@ std::unique_ptr<AbstractCommand> make_move_marker_projection_command(
 std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id);
 
+// --- Marker placement (WP-13.4) --------------------------------------------
+
+/// Create a marker. A nullopt `label` generates the lowest free "point N"
+/// (N >= 1); an explicit label that another marker already carries is a
+/// ValueError. `position`, when given, is the chunk-local marker position.
+std::unique_ptr<AbstractCommand> make_add_marker_command(
+    std::int32_t chunk_id, std::optional<std::string> label,
+    std::optional<Eigen::Vector3d> position);
+
+/// Create the marker named by `marker_label_or_id` when the chunk has none and
+/// set or replace its projection in `camera_id`. The argument is resolved as a
+/// marker label first, then as a decimal marker id; when neither matches it is
+/// the label of the new marker. A new marker is pinned when `pinned`.
+std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
+    std::int32_t chunk_id, std::string marker_label_or_id,
+    std::int32_t camera_id, Eigen::Vector2d uv, bool pinned = true);
+
+/// Remove one projection. When this was the marker's last projection and
+/// `delete_marker` is set, the marker itself is removed; otherwise it stays
+/// (with no projections).
+std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
+    bool delete_marker);
+
+/// Set (or clear, with nullopt) the marker's chunk-local position.
+std::unique_ptr<AbstractCommand> make_set_marker_position_command(
+    std::int32_t chunk_id, std::int32_t marker_id,
+    std::optional<Eigen::Vector3d> position);
+
 // --- Scale bars (WP-11.5b) -------------------------------------------------
 
 std::unique_ptr<AbstractCommand> make_add_scalebar_command(

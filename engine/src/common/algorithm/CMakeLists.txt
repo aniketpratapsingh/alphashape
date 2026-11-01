@@ -18,6 +18,7 @@ add_library(alphashape_algorithms STATIC
     match/preselection.cpp
     match/tracks.cpp
     match/match_photos_task.cpp
+    markers/project_markers.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp
@@ -91,6 +92,9 @@ if(TARGET alphashape_crs)
         reference/reference_csv.cpp
         reference/reference_xml.cpp
         reference/import_reference_task.cpp
-        reference/export_reference_task.cpp)
+        reference/export_reference_task.cpp
+        reference/markers_io.cpp
+        reference/import_markers_task.cpp
+        reference/export_markers_task.cpp)
     target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()

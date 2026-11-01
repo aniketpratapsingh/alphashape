@@ -18,7 +18,9 @@
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/algorithm/photos/add_photos_task.hpp"
 #if defined(ALPHASHAPE_USE_PROJ)
+#include "common/algorithm/reference/export_markers_task.hpp"
 #include "common/algorithm/reference/export_reference_task.hpp"
+#include "common/algorithm/reference/import_markers_task.hpp"
 #include "common/algorithm/reference/import_reference_task.hpp"
 #endif
 #include "common/algorithm/sfm/align_cameras_task.hpp"
@@ -60,6 +62,10 @@ void register_builtin_tasks(TaskRegistry& registry) {
     // exist only in a PROJ build (the sources are compiled in the same guard).
     registry.register_task(std::make_shared<ImportReferenceTask>());
     registry.register_task(std::make_shared<ExportReferenceTask>());
+    // WP-13.4: marker projection import/export. They share the reference
+    // CSV/XML helpers, so they live behind the same PROJ guard.
+    registry.register_task(std::make_shared<ImportMarkersTask>());
+    registry.register_task(std::make_shared<ExportMarkersTask>());
 #endif
     // Later milestones append here: ...
 }

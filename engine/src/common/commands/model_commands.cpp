@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -954,6 +955,295 @@ protected:
 private:
     std::int32_t marker_id_;
     std::int32_t camera_id_;
+};
+
+// --- Marker placement commands (WP-13.4) -----------------------------------
+//
+// Manual placement is label-oriented: the Python and GUI front ends name a
+// marker by its user-visible label, while the model commands key by id. The
+// helpers below bridge the two, and the "add" command generates the default
+// "point N" label when the caller supplies none.
+
+const Marker* find_marker_by_label(const Chunk& chunk, const std::string& label) {
+    for (const Marker& marker : chunk.markers()) {
+        if (marker.label == label) {
+            return &marker;
+        }
+    }
+    return nullptr;
+}
+
+Marker* find_marker_by_label(Chunk& chunk, const std::string& label) {
+    for (Marker& marker : chunk.markers()) {
+        if (marker.label == label) {
+            return &marker;
+        }
+    }
+    return nullptr;
+}
+
+/// Parse a non-negative decimal marker id. False for anything else, including
+/// an empty string and a value that does not fit in int32.
+bool parse_marker_id(const std::string& text, std::int32_t* id) {
+    if (text.empty()) {
+        return false;
+    }
+    std::int64_t value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + (c - '0');
+        if (value > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+            return false;
+        }
+    }
+    *id = static_cast<std::int32_t>(value);
+    return true;
+}
+
+/// Resolve a "label-or-id" argument: an exact label wins, then a decimal id.
+/// Null when neither matches (the caller creates a marker with that label).
+Marker* resolve_marker_label_or_id(Chunk& chunk, const std::string& label_or_id) {
+    if (Marker* by_label = find_marker_by_label(chunk, label_or_id)) {
+        return by_label;
+    }
+    std::int32_t id = -1;
+    if (parse_marker_id(label_or_id, &id)) {
+        return find_by_id(chunk.markers(), id);
+    }
+    return nullptr;
+}
+
+/// The lowest free default label "point N", N >= 1.
+std::string free_marker_label(const Chunk& chunk) {
+    for (std::int32_t n = 1;; ++n) {
+        std::string candidate = "point " + std::to_string(n);
+        if (find_marker_by_label(chunk, candidate) == nullptr) {
+            return candidate;
+        }
+    }
+}
+
+/// Create a marker, optionally with an explicit label and position.
+class AddMarkerAtCommand : public ChunkContainersCommand {
+public:
+    AddMarkerAtCommand(std::int32_t chunk_id, std::optional<std::string> label,
+                       std::optional<Eigen::Vector3d> position)
+        : ChunkContainersCommand(chunk_id),
+          label_(std::move(label)),
+          position_(position) {}
+
+    std::string name() const override { return "Add Marker"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (label_.has_value()) {
+            if (label_->empty()) {
+                throw ValueError("add marker: empty label");
+            }
+            if (find_marker_by_label(chunk, *label_) != nullptr) {
+                throw ValueError("add marker: duplicate label '" + *label_ + "'");
+            }
+        }
+        if (position_.has_value() && !position_->allFinite()) {
+            throw ValueError("add marker: position is not finite");
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker marker;
+        marker.id = chunk.allocate_id();
+        marker.label = label_.has_value() ? *label_ : free_marker_label(chunk);
+        if (position_.has_value()) {
+            marker.position = *position_;
+        }
+        insert_by_id(chunk.markers(), std::move(marker));
+    }
+
+private:
+    std::optional<std::string> label_;
+    std::optional<Eigen::Vector3d> position_;
+};
+
+/// Create (if absent) then add or replace one projection of a marker.
+class AddMarkerWithProjectionCommand : public ChunkContainersCommand {
+public:
+    AddMarkerWithProjectionCommand(std::int32_t chunk_id,
+                                   std::string marker_label_or_id,
+                                   std::int32_t camera_id, Eigen::Vector2d uv,
+                                   bool pinned)
+        : ChunkContainersCommand(chunk_id),
+          marker_label_or_id_(std::move(marker_label_or_id)),
+          camera_id_(camera_id),
+          uv_(uv),
+          pinned_(pinned) {}
+
+    std::string name() const override { return "Add Marker Projection"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (marker_label_or_id_.empty()) {
+            throw ValueError("add marker projection: empty marker label");
+        }
+        require_camera(chunk, camera_id_, "add marker projection");
+        if (!uv_.allFinite()) {
+            throw ValueError("add marker projection: pixel is not finite");
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker* marker = resolve_marker_label_or_id(chunk, marker_label_or_id_);
+        std::int32_t marker_id = -1;
+        if (marker != nullptr) {
+            marker_id = marker->id;
+        } else {
+            Marker created;
+            created.id = chunk.allocate_id();
+            created.label = marker_label_or_id_;
+            created.pinned = pinned_;
+            marker_id = created.id;
+            insert_by_id(chunk.markers(), std::move(created));
+        }
+        marker = find_by_id(chunk.markers(), marker_id);
+        for (MarkerProjection& projection : marker->projections) {
+            if (projection.camera_id == camera_id_) {
+                projection.pixel = uv_;
+                return;
+            }
+        }
+        MarkerProjection projection;
+        projection.camera_id = camera_id_;
+        projection.pixel = uv_;
+        insert_projection(marker->projections, projection);
+    }
+
+private:
+    std::string marker_label_or_id_;
+    std::int32_t camera_id_;
+    Eigen::Vector2d uv_;
+    bool pinned_;
+};
+
+/// Remove one projection, optionally deleting the marker with its last one.
+class RemoveMarkerProjectionWithDeleteCommand : public ChunkContainersCommand {
+public:
+    RemoveMarkerProjectionWithDeleteCommand(std::int32_t chunk_id,
+                                            std::int32_t marker_id,
+                                            std::int32_t camera_id,
+                                            bool delete_marker)
+        : ChunkContainersCommand(chunk_id),
+          marker_id_(marker_id),
+          camera_id_(camera_id),
+          delete_marker_(delete_marker) {}
+
+    std::string name() const override { return "Remove Marker Projection"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        const Marker* marker = find_by_id(chunk.markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        const MarkerProjection* existing = nullptr;
+        for (const MarkerProjection& projection : marker->projections) {
+            if (projection.camera_id == camera_id_) {
+                existing = &projection;
+                break;
+            }
+        }
+        if (existing == nullptr) {
+            throw ValueError("no projection of marker " +
+                             std::to_string(marker_id_) + " in camera " +
+                             std::to_string(camera_id_));
+        }
+        // Removing the last projection deletes the marker; a scale bar that
+        // anchors at it would dangle, exactly as with Remove Marker.
+        if (delete_marker_ && marker->projections.size() == 1) {
+            for (const Scalebar& bar : chunk.scalebars()) {
+                const bool uses_marker =
+                    (bar.from.kind == ScalebarEndpoint::Kind::Marker &&
+                     bar.from.id == marker_id_) ||
+                    (bar.to.kind == ScalebarEndpoint::Kind::Marker &&
+                     bar.to.id == marker_id_);
+                if (uses_marker) {
+                    throw ValueError("remove marker projection: scalebar " +
+                                     std::to_string(bar.id) + " references the marker");
+                }
+            }
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker* marker = find_by_id(chunk.markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        auto& projections = marker->projections;
+        const auto it = std::remove_if(
+            projections.begin(), projections.end(),
+            [this](const MarkerProjection& projection) {
+                return projection.camera_id == camera_id_;
+            });
+        if (it == projections.end()) {
+            throw ValueError("no projection of marker " +
+                             std::to_string(marker_id_) + " in camera " +
+                             std::to_string(camera_id_));
+        }
+        projections.erase(it, projections.end());
+        if (projections.empty() && delete_marker_) {
+            if (!erase_by_id(chunk.markers(), marker_id_)) {
+                throw ValueError("no marker with id " + std::to_string(marker_id_));
+            }
+        }
+    }
+
+private:
+    std::int32_t marker_id_;
+    std::int32_t camera_id_;
+    bool delete_marker_;
+};
+
+/// Set or clear the marker's estimated chunk-local position.
+class SetMarkerPositionCommand : public ChunkContainersCommand {
+public:
+    SetMarkerPositionCommand(std::int32_t chunk_id, std::int32_t marker_id,
+                             std::optional<Eigen::Vector3d> position)
+        : ChunkContainersCommand(chunk_id),
+          marker_id_(marker_id),
+          position_(position) {}
+
+    std::string name() const override { return "Set Marker Position"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        if (position_.has_value() && !position_->allFinite()) {
+            throw ValueError("set marker position: position is not finite");
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker* marker = find_by_id(chunk.markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        marker->position = position_;
+    }
+
+private:
+    std::int32_t marker_id_;
+    std::optional<Eigen::Vector3d> position_;
 };
 
 // --- Scale-bar commands ----------------------------------------------------
@@ -2496,6 +2786,32 @@ std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id) {
     return std::make_unique<RemoveMarkerProjectionCommand>(chunk_id, marker_id,
                                                            camera_id);
+}
+
+std::unique_ptr<AbstractCommand> make_add_marker_command(
+    std::int32_t chunk_id, std::optional<std::string> label,
+    std::optional<Eigen::Vector3d> position) {
+    return std::make_unique<AddMarkerAtCommand>(chunk_id, std::move(label), position);
+}
+
+std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
+    std::int32_t chunk_id, std::string marker_label_or_id, std::int32_t camera_id,
+    Eigen::Vector2d uv, bool pinned) {
+    return std::make_unique<AddMarkerWithProjectionCommand>(
+        chunk_id, std::move(marker_label_or_id), camera_id, uv, pinned);
+}
+
+std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
+    bool delete_marker) {
+    return std::make_unique<RemoveMarkerProjectionWithDeleteCommand>(
+        chunk_id, marker_id, camera_id, delete_marker);
+}
+
+std::unique_ptr<AbstractCommand> make_set_marker_position_command(
+    std::int32_t chunk_id, std::int32_t marker_id,
+    std::optional<Eigen::Vector3d> position) {
+    return std::make_unique<SetMarkerPositionCommand>(chunk_id, marker_id, position);
 }
 
 std::unique_ptr<AbstractCommand> make_add_scalebar_command(std::int32_t chunk_id,

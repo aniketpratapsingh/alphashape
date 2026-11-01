@@ -42,6 +42,22 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.4: manual marker placement, the projection API and marker
+  import/export.** `project_marker()` maps a chunk-local point through a camera
+  and returns `nullopt` when the camera is unaligned, the point is at or behind
+  the image plane, or the pixel is outside the frame (an optional
+  `clip_to_image` flag relaxes the last condition). New undoable model commands
+  place a marker (auto-labelling `"point N"` and rejecting duplicate labels),
+  add a marker together with a projection, move a projection, remove one
+  projection (deleting the marker with its last projection only when asked) and
+  set a marker's 3-D position; each restores the marker containers and id
+  counter exactly on undo. `ImportMarkers`/`ExportMarkers` move projections to
+  and from `marker,camera,u,v` CSV or `<markers>/<marker>/<projection>` XML at
+  full double round-trip precision, with cameras matched by exact label and an
+  atomic, line-reporting import. Python gains `Chunk.addMarker`,
+  `setMarkerProjection`, `removeMarkerProjection`, `importMarkers` and
+  `exportMarkers`; every mutation runs through the command layer.
+
 - **WP-13.3: XMP reference completion.** The EXIF reader now also returns the
   XMP packet from a JPEG APP1 segment or TIFF tag 700, and `AddPhotos` reads
   DJI-style `drone-dji` position, gimbal attitude and RTK accuracy from it.
