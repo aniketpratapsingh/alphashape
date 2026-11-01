@@ -42,6 +42,24 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Adaptive min+margin multi-view cost aggregation for PatchMatch depth maps
+  (Q2).** `BuildDepthMaps` gains `cost_margin` (Float, default `0.0`;
+  accepted range `[0, 2]`, on the selected cost's interval: intensity
+  `(1 - ZNCC)` in `[0, 2]`, census in `[0, 1]`). Previously the multi-view cost
+  was the mean of the `best_k` smallest per-neighbour costs, so a neighbour
+  that cannot see the surface (a half-occluded view) could drag a correct
+  hypothesis's average up and cross `max_cost`. With a margin, only the sorted
+  entries within `best_k`-best cost `+ cost_margin` enter the average — an
+  adaptive k between 1 and `min(best_k, votes)` — so an occluded view falls
+  outside while several agreeing views still all count. The rule follows the
+  view-selection argument of Galliani, Lasinger and Schindler (2015, §3.3),
+  Bleyer, Rhemann and Rother (2011) and Schönberger et al. (2016). It is
+  implemented identically on the CPU and in the Vulkan kernel (one float
+  appended to the push-constant block, 84 → 88 bytes). `0.0` reproduces the
+  previous mean bit-for-bit on both paths and is not folded into the depth-map
+  fingerprint, so existing maps stay reusable; a non-zero margin is folded.
+  Default off pending the quality benchmark.
+
 - **Multi-view consensus ghosting filter for BuildOrthomosaic (Q4).** New
   `ghosting_filter` parameter (Bool, default `false` while the quality
   benchmark decides the shipping default). Moving objects — cars, people,

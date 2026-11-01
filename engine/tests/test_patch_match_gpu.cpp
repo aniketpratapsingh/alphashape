@@ -398,6 +398,40 @@ TEST(PatchMatchGpu, PlanarSceneMatchesCpu) {
                 0.05 * static_cast<double>(cpu_valid));
 }
 
+TEST(PatchMatchGpu, CostMarginMatchesCpu) {
+    // Q2: the adaptive min+margin average must exist on the device too, and
+    // agree with the CPU inside the same window when it is on. margin 0 is the
+    // pre-Q2 kernel path and is covered by PlanarSceneMatchesCpu.
+    REQUIRE_GPU_PM();
+    PlaneScene scene = make_plane_scene(160, 120, 150.0, 0.0, 0.0);
+    std::vector<PMView> neighbours = plane_views(scene);
+    PMView reference;
+    reference.image = &scene.reference;
+    reference.calibration = scene.calibration;
+    reference.R = scene.rotations[0];
+    reference.t = scene.translations[0];
+
+    PatchMatchOptions options = plane_options();
+    options.best_k = 4;  // all four votes: give the margin something to narrow
+    options.cost_margin = 0.1;
+    ASSERT_TRUE(stereo::patch_match_gpu_would_run(reference, neighbours, options));
+
+    const PatchMatchResult gpu_result =
+        stereo::run_patch_match_device(reference, neighbours, options);
+    const PatchMatchResult cpu_result =
+        stereo::run_patch_match(reference, neighbours, options);
+
+    const PlaneAccuracy gpu_accuracy = measure_plane(scene, gpu_result, 5);
+    const Agreement agreement = relative_agreement(gpu_result, cpu_result, 0.01);
+    std::printf("[gpu margin] coverage %.3f median %.5f | agree<1%%: %.1f%% of %zu\n",
+                gpu_accuracy.coverage, gpu_accuracy.median, 100.0 * agreement.fraction,
+                agreement.both);
+
+    EXPECT_GT(gpu_accuracy.coverage, 0.85);
+    EXPECT_LT(gpu_accuracy.median, 0.005);
+    EXPECT_GT(agreement.fraction, 0.90);
+}
+
 TEST(PatchMatchGpu, DistortedCameraMatchesCpu) {
     REQUIRE_GPU_PM();
     PlaneScene scene = make_plane_scene(160, 120, 150.0, -0.08, 0.02);

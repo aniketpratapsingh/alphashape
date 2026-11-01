@@ -323,6 +323,20 @@ void BuildDepthMapsTask::declare_params(Params& params) const {
     best_k.maximum = std::int64_t{255};
     params.declare(best_k);
 
+    // Q2 adaptive min+margin aggregation: after taking the best_k smallest
+    // voting costs, average only the entries within cost_margin of the best
+    // one. 0 (default) keeps the plain mean of the best_k, bit-identically.
+    ParamSpec cost_margin{
+        "cost_margin", ParamType::Float, 0.0,
+        "After keeping the best_k smallest neighbour costs, average only those within "
+        "cost_margin of the smallest one (an adaptive k in [1, best_k]). An occluded "
+        "neighbour, whose cost is dragged up, then stops diluting a correct hypothesis. "
+        "0 (default) averages all best_k, the previous behaviour. On the selected cost's "
+        "interval: intensity (1 - ZNCC) in [0, 2], census in [0, 1]."};
+    cost_margin.minimum = 0.0;
+    cost_margin.maximum = 2.0;
+    params.declare(cost_margin);
+
     // Flat-window gate. 1/255 is the historical value (one 8-bit level of
     // intensity); lowering it matches windows that were previously skipped.
     ParamSpec min_texture_stddev{
@@ -352,6 +366,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     const bool repair_holes = params.get_bool("repair_holes");
     const std::int64_t repair_max_area = params.get_int("repair_max_area");
     const std::int64_t best_k_value = params.get_int("best_k");
+    const double cost_margin_value = params.get_float("cost_margin");
     const double min_texture_stddev_value = params.get_float("min_texture_stddev");
 
     if (downscale_value <= 0) {
@@ -416,6 +431,13 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         throw ValueError("best_k must be in [0, 255]");
     }
     const int best_k = static_cast<int>(best_k_value);
+    // The margin lives on the selected cost's interval. Intensity costs span
+    // [0, 2] and census [0, 1]; 2 is the full intensity span, above which the
+    // margin is indistinguishable from "keep every vote". NaN fails the check.
+    if (!(cost_margin_value >= 0.0 && cost_margin_value <= 2.0)) {
+        throw ValueError("cost_margin must be in [0, 2]");
+    }
+    const double cost_margin = cost_margin_value;
     // The texture gate is an intensity stddev on [0, 1]; the maximum such
     // stddev is 0.5, but 1.0 is the honest bound for a value that silently
     // stops every window from matching.
@@ -540,6 +562,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // EFFECTIVE threshold (the resolved default included) is folded too.
         context.max_cost = max_cost;
         context.best_k = best_k;
+        context.cost_margin = cost_margin;
         context.min_texture_stddev = min_texture_stddev;
         const auto hood_it = hood_of.find(camera_id);
         if (hood_it != hood_of.end()) {
@@ -880,6 +903,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             options.cost_type = cost_type;
             options.max_cost = max_cost;
             options.best_k = best_k;
+            options.cost_margin = cost_margin;
             options.min_texture_stddev = min_texture_stddev;
             options.on_sweep = sweep_progress;
 

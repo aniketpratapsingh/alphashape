@@ -221,6 +221,8 @@ float neighbour_cost(int x, int y, int min_valid, float dq[PM_MAX_SAMPLES], View
 // Multi-view cost: mean of the best_k smallest voting costs, with
 // k_eff = min(best_k, votes). Only neighbours that see at least 75% of the
 // window vote; geometric invisibility is never folded in as a phantom 2.0.
+// With pc.cost_margin > 0 (Q2) only the entries within best[0] + margin are
+// averaged, so a half-occluded voting neighbour cannot dilute the mean.
 float multiview_cost(int x, int y, float rho, vec3 plane_normal) {
     int n_samples = int(pc.n_samples);
     int min_valid = (3 * n_samples + 3) / 4;  // ceil(0.75 * n_samples)
@@ -275,11 +277,22 @@ float multiview_cost(int x, int y, float rho, vec3 plane_normal) {
         return PM_NO_MATCH_COST;
     }
     int k_eff = min(want, votes);
+    // Q2 adaptive min+margin: narrow the average to the entries that agree with
+    // the best one. k_eff caps it, so this can only shrink the set. margin 0
+    // skips the branch and reproduces the plain mean bit for bit.
+    int kept = k_eff;
+    if (pc.cost_margin > 0.0) {
+        float limit = best[0] + pc.cost_margin;
+        kept = 1;
+        while (kept < k_eff && best[kept] <= limit) {
+            ++kept;
+        }
+    }
     float total = 0.0;
-    for (int t = 0; t < k_eff; ++t) {
+    for (int t = 0; t < kept; ++t) {
         total += best[t];
     }
-    return total / float(k_eff);
+    return total / float(kept);
 }
 
 // The best hypothesis found for one pixel.

@@ -377,6 +377,12 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
         if (context->best_k != 0) {
             h = fold_int(h, context->best_k);
         }
+        // The margin narrows which neighbour costs enter that average, so a run
+        // with it on is a different objective. Folded only when non-zero: 0 is
+        // the historical plain mean and a pre-Q2 map recorded nothing.
+        if (context->cost_margin != 0.0) {
+            h = fold_double(h, context->cost_margin);
+        }
         // The texture gate decides which windows were searched at all, so it is
         // part of the map's identity. Folded only when it is not the historical
         // 1/255, so every map built before the gate became configurable keeps
