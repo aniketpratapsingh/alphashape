@@ -87,6 +87,7 @@ layout(push_constant) uniform PmParams {
     uint touch;         // always 0: keeps every binding alive through -O
     uint row_offset;    // first output row of this dispatch's row band
     uint seed_mode;     // 0 = random initial planes, 1 = seed from the state buffers
+    float cost_margin;  // Q2 adaptive min+margin width on the cost's interval; 0 = off
 } pc;
 
 layout(binding = 0) buffer RefImage { float ref_img[]; };

@@ -101,15 +101,19 @@ struct PmParams {
     /// inherited (depth, normal) already in the state buffers, which is how a
     /// finer pyramid level starts from the upsampled coarse map.
     std::uint32_t seed_mode;
+    /// Q2 adaptive min+margin width on the selected cost's interval; 0 = the
+    /// plain mean of the best k (bit-identical to the pre-Q2 kernel).
+    float cost_margin;
 };
 
-static_assert(sizeof(PmParams) == 84, "PmParams must match the GLSL push-constant size");
+static_assert(sizeof(PmParams) == 88, "PmParams must match the GLSL push-constant size");
 static_assert(offsetof(PmParams, depth_min) == 32, "PmParams layout drifted");
 static_assert(offsetof(PmParams, radius) == 60, "PmParams layout drifted");
 static_assert(offsetof(PmParams, seed_lo) == 64, "PmParams layout drifted");
 static_assert(offsetof(PmParams, touch) == 72, "PmParams layout drifted");
 static_assert(offsetof(PmParams, row_offset) == 76, "PmParams layout drifted");
 static_assert(offsetof(PmParams, seed_mode) == 80, "PmParams layout drifted");
+static_assert(offsetof(PmParams, cost_margin) == 84, "PmParams layout drifted");
 
 /// Largest pixel count one half-sweep dispatch should cover. A pm_init or
 /// pm_refine over a whole large image is a single multi-second dispatch, which
@@ -207,6 +211,9 @@ void validate_inputs(const PMView& reference, const std::vector<PMView>& neighbo
     }
     if (options.best_k < 0) {
         throw ValueError("stereo::run_patch_match: best_k must be non-negative");
+    }
+    if (!(options.cost_margin >= 0.0 && options.cost_margin <= 2.0)) {
+        throw ValueError("stereo::run_patch_match: cost_margin must be in [0, 2]");
     }
     if (options.pyramid_levels < 0) {
         throw ValueError("stereo::run_patch_match: pyramid_levels must be non-negative");
@@ -452,6 +459,7 @@ PatchMatchResult run_gpu_level(const std::shared_ptr<g::Context>& context, const
     params.n_neighbours = static_cast<std::uint32_t>(n_neighbours);
     params.n_samples = static_cast<std::uint32_t>(n_samples);
     params.best_k = static_cast<std::uint32_t>(best_k);
+    params.cost_margin = static_cast<float>(options.cost_margin);
     params.seed_lo = static_cast<std::uint32_t>(level.seed & 0xFFFFFFFFULL);
     params.seed_hi = static_cast<std::uint32_t>(level.seed >> 32);
     params.depth_min = depth_min;

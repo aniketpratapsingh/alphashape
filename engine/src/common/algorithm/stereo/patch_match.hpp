@@ -66,6 +66,16 @@ struct PatchMatchOptions {
     int window_step = 2;
     int iterations = 6;          // red-black sweeps
     int best_k = 0;              // neighbours averaged per pixel; 0 = ceil(n/2)
+    /// Adaptive min+margin aggregation (Q2). When > 0, the per-pixel average is
+    /// taken over only those of the `best_k` smallest voting costs that lie
+    /// within `cost_margin` of the smallest one (best[0] + cost_margin), so an
+    /// occluded neighbour whose cost is dragged up cannot pull a correct
+    /// hypothesis's average with it; k_adaptive is in [1, k_eff]. 0 (the
+    /// default) keeps the plain mean of the best k, bit-identically: the old
+    /// arithmetic path runs untouched. The margin is on the selected cost's own
+    /// interval (intensity (1 - ZNCC) in [0, 2], census in [0, 1]); valid range
+    /// [0, 2]. On the census interval a margin above 1 behaves like "keep all".
+    double cost_margin = 0.0;
     /// Final pixels whose cost is above this get depth -1. The value is on the
     /// selected cost's interval: intensity (1 - ZNCC) in [0, 2] (1.0 = zero
     /// correlation), census (1 - ZNCC) / 2 in [0, 1]. A task that exposes the
@@ -101,6 +111,19 @@ struct PatchMatchOptions {
     /// persisted; empty means "report nothing".
     SweepProgress on_sweep;
 };
+
+/// Aggregate one pixel's per-neighbour costs for the multi-view term.
+///
+/// `sorted` holds `count` per-neighbour costs in ascending order (the `best_k`
+/// smallest votes, after clamping to the vote count). For `margin <= 0` this is
+/// exactly the plain mean of all `count` entries — the historical arithmetic,
+/// kept untouched so a zero margin stays bit-identical. For `margin > 0` only
+/// the leading entries with `cost <= sorted[0] + margin` are averaged, i.e. an
+/// adaptive k in [1, count]: occluded neighbours fall outside the margin and
+/// stop diluting the average, while several agreeing views still all count.
+/// The sum runs in ascending order so CPU and GPU agree deterministically.
+/// `count` must be at least 1; the returned value is never NaN.
+double aggregate_multiview_costs(const double* sorted, int count, double margin);
 
 /// The iterations each level of the search runs, coarsest first. A run's level
 /// count and per-level budget in one place, so a front end, the replica in the

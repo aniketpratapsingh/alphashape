@@ -43,6 +43,30 @@
 // described where they happen.
 
 namespace alphashape::stereo {
+
+double aggregate_multiview_costs(const double* sorted, int count, double margin) {
+    if (count <= 0) {
+        return 0.0;  // defensive: callers guarantee at least one vote
+    }
+    int kept = count;
+    if (margin > 0.0) {
+        // Occluded views correlate far worse than the best one; keep only the
+        // entries that agree with it to within the margin. The comparison is
+        // non-strict so an entry landing exactly on the boundary counts.
+        const double limit = sorted[0] + margin;
+        kept = 1;
+        while (kept < count && sorted[kept] <= limit) {
+            ++kept;
+        }
+    }
+    // Ascending order, so the running error is the same on CPU and GPU.
+    double total = 0.0;
+    for (int i = 0; i < kept; ++i) {
+        total += sorted[i];
+    }
+    return total / static_cast<double>(kept);
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -211,6 +235,9 @@ struct CostContext {
     double cost_scale = 1.0;
     std::vector<NeighbourView> neighbours;
     int best_k = 1;
+    /// Adaptive min+margin width on the selected cost's interval; 0 = plain
+    /// mean of the best k (the historical path, bit-identical).
+    double cost_margin = 0.0;
 };
 
 /// Per-pixel window state, reused by every candidate evaluation of one pixel
@@ -385,6 +412,11 @@ void fill_window_cache(const CostContext& ctx, WindowCache& wc, int px, int py) 
 /// A neighbour that *does* see the window but correlates badly still returns 2.0
 /// and still counts as a vote, because that is a genuine rejection of the
 /// hypothesis. Only geometric invisibility is discounted.
+///
+/// With ctx.cost_margin > 0 the average is narrowed further (Q2): only the k
+/// smallest entries within `best[0] + cost_margin` are averaged, so a view that
+/// votes but is half-occluded (a high cost) stops diluting an agreeing majority.
+/// A zero margin is the plain mean above, bit for bit.
 double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
                       const Eigen::Vector3d& n) {
     const int nn = wc.n_neighbours;
@@ -399,13 +431,13 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
         return no_match;  // not even the whole plane covers 75% of the window
     }
 
-    // Keep the `best_k` smallest *voting* costs, with their running sum. votes
-    // counts how many neighbours see the pixel; k_eff = min(best_k, votes) is the
-    // divisor once all neighbours are in.
+    // Keep the `best_k` smallest *voting* costs. votes counts how many
+    // neighbours see the pixel; k_eff = min(best_k, votes) is the cap once all
+    // neighbours are in. aggregate_multiview_costs() then applies the optional
+    // min+margin width (ctx.cost_margin) to narrow that average further.
     const int want = ctx.best_k;  // already in [1, nn]
     double best_store[64];
-    double sum = 0.0;
-    int filled = 0;  // how many of the k smallest are accumulated into `sum`
+    int filled = 0;  // how many of the k smallest the prefix holds
     int votes = 0;
 
     // Dozens of neighbours: rare, so a vector + partial_sort instead of the
@@ -460,16 +492,9 @@ double multiview_cost(const CostContext& ctx, WindowCache& wc, double rho,
     const int k_eff = std::min(want, votes);
     if (many_mode) {
         std::partial_sort(many.begin(), many.begin() + k_eff, many.end());
-        double total = 0.0;
-        for (int i = 0; i < k_eff; ++i) {
-            total += many[si(i)];
-        }
-        return total / static_cast<double>(k_eff);
+        return aggregate_multiview_costs(many.data(), k_eff, ctx.cost_margin);
     }
-    for (int t = 0; t < k_eff; ++t) {
-        sum += best_store[t];
-    }
-    return sum / static_cast<double>(k_eff);
+    return aggregate_multiview_costs(best_store, k_eff, ctx.cost_margin);
 }
 
 /// The best hypothesis found for one pixel. A candidate replaces `best` only
@@ -741,6 +766,7 @@ PatchMatchResult run_level(const LevelPlan& plan, const PatchMatchOptions& optio
         int k = options.best_k == 0 ? (n_neighbours + 1) / 2 : options.best_k;  // 0 = ceil(n/2)
         ctx.best_k = std::clamp(k, 1, n_neighbours);
     }
+    ctx.cost_margin = options.cost_margin;
 
     const double depth_min = options.depth_min;
     const double depth_max = options.depth_max;
@@ -1037,6 +1063,9 @@ void validate_run(const PMView& reference, const std::vector<PMView>& neighbours
     }
     if (options.best_k < 0) {
         throw ValueError("stereo::run_patch_match: best_k must be non-negative");
+    }
+    if (!(options.cost_margin >= 0.0 && options.cost_margin <= 2.0)) {
+        throw ValueError("stereo::run_patch_match: cost_margin must be in [0, 2]");
     }
     if (options.pyramid_levels < 0) {
         throw ValueError("stereo::run_patch_match: pyramid_levels must be non-negative");

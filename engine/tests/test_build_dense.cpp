@@ -1939,6 +1939,9 @@ TEST(BuildDenseParams, DeclaredSearchTuningDefaultsAreTheHistoricalOnes) {
     const Params defaults = make_params(entry);
     EXPECT_EQ(defaults.get_int("best_k"), 0);
     EXPECT_DOUBLE_EQ(defaults.get_float("min_texture_stddev"), 1.0 / 255.0);
+    // Q2's adaptive margin is off by default: the plain mean of best_k, the
+    // behaviour every map was built with before the option existed.
+    EXPECT_DOUBLE_EQ(defaults.get_float("cost_margin"), 0.0);
 }
 
 TEST(BuildDenseParams, RejectsOutOfRangeSearchTuning) {
@@ -1954,6 +1957,12 @@ TEST(BuildDenseParams, RejectsOutOfRangeSearchTuning) {
         params.set("min_texture_stddev", ParamValue{stddev});
         EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError)
             << "min_texture_stddev=" << stddev << " must be rejected";
+    }
+    for (const double margin : {-0.01, 2.01}) {
+        Params params = make_params(builtin_registry().require("BuildDepthMaps"));
+        params.set("cost_margin", ParamValue{margin});
+        EXPECT_THROW(run_task(builtin_registry(), document, "BuildDepthMaps", params), ValueError)
+            << "cost_margin=" << margin << " must be rejected";
     }
     EXPECT_TRUE(document.active_chunk()->depth_maps().empty());
 }
@@ -2023,6 +2032,17 @@ TEST(DepthMapsReuse, FingerprintCoversBestKAndTheTextureGate) {
         EXPECT_NE(h, hash(changed)) << "min_texture_stddev=" << stddev
                                     << " must change the fingerprint";
         changed.min_texture_stddev = 1.0 / 255.0;
+        EXPECT_EQ(h, hash(changed));
+    }
+    // Q2: a non-zero margin narrows the average, so it is a different search.
+    // Zero folds nothing, which is what keeps every pre-Q2 map reusable.
+    EXPECT_DOUBLE_EQ(base.cost_margin, 0.0);
+    for (const double margin : {0.05, 0.1}) {
+        DepthMapFingerprintContext changed = base;
+        changed.cost_margin = margin;
+        EXPECT_NE(h, hash(changed)) << "cost_margin=" << margin
+                                    << " must change the fingerprint";
+        changed.cost_margin = 0.0;
         EXPECT_EQ(h, hash(changed));
     }
 }
