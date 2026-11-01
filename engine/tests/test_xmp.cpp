@@ -136,8 +136,9 @@ std::array<double, 3> recover_dji(const Eigen::Matrix3d& world_from_camera) {
     const double heading = std::atan2(world_from_camera(0, 2), world_from_camera(1, 2));
     Eigen::Matrix3d base;
     base << 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0;
+    // atan2 answers in radians; axis_rotation takes degrees.
     const Eigen::Matrix3d residual =
-        base.transpose() * axis_rotation(2, heading) * world_from_camera;
+        base.transpose() * axis_rotation(2, heading / kRadTest) * world_from_camera;
     const double pitch =
         std::atan2(-residual(1, 2), std::hypot(residual(1, 0), residual(1, 1)));
     const double roll = std::atan2(-residual(0, 1), residual(0, 0));
