@@ -130,6 +130,13 @@ struct CameraReference {
     /// adjustment.
     Eigen::Vector3d accuracy = Eigen::Vector3d::Constant(10.0);
 
+    /// Measured orientation as Tait-Bryan angles in degrees, in the chunk's
+    /// configured rotation order (`reference/rotation_order`, default ZYX) and
+    /// in the camera slot CRS's local east/north/up axes. The components are
+    /// positional: x = about the first axis, y = second, z = third, matching
+    /// `crs::EulerAngles`. nullopt means "no orientation reference".
+    std::optional<Eigen::Vector3d> orientation_deg;
+
     bool enabled = true;  ///< used as a constraint in adjustment
 
     bool operator==(const CameraReference& other) const;

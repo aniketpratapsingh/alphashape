@@ -60,8 +60,8 @@ bool same_or_both_nan(double a, double b) {
     return (std::isnan(a) && std::isnan(b)) || a == b;
 }
 
-bool reference_location_equal(const std::optional<Eigen::Vector3d>& a,
-                              const std::optional<Eigen::Vector3d>& b) {
+bool optional_vector_equal(const std::optional<Eigen::Vector3d>& a,
+                           const std::optional<Eigen::Vector3d>& b) {
     if (a.has_value() != b.has_value()) {
         return false;
     }
@@ -71,6 +71,11 @@ bool reference_location_equal(const std::optional<Eigen::Vector3d>& a,
     return same_or_both_nan((*a).x(), (*b).x()) &&
            same_or_both_nan((*a).y(), (*b).y()) &&
            same_or_both_nan((*a).z(), (*b).z());
+}
+
+bool reference_location_equal(const std::optional<Eigen::Vector3d>& a,
+                              const std::optional<Eigen::Vector3d>& b) {
+    return optional_vector_equal(a, b);
 }
 
 }  // namespace
@@ -104,10 +109,12 @@ bool Sensor::operator==(const Sensor& other) const {
 }
 
 bool CameraReference::operator==(const CameraReference& other) const {
-    // location compared with the NaN-equals-NaN rule (see types.hpp); accuracy
-    // and enabled are exact compares.
+    // location and orientation are compared with the NaN-equals-NaN rule (see
+    // types.hpp); accuracy and enabled are exact compares.
     return reference_location_equal(location, other.location) &&
-           accuracy == other.accuracy && enabled == other.enabled;
+           accuracy == other.accuracy &&
+           optional_vector_equal(orientation_deg, other.orientation_deg) &&
+           enabled == other.enabled;
 }
 
 bool Camera::operator==(const Camera& other) const {

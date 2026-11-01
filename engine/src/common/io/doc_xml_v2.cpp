@@ -294,6 +294,15 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
             set_attr(ref, "y", fmt((*c.reference.location).y()));
             set_attr(ref, "z", fmt((*c.reference.location).z()));
             set_attr(ref, "accuracy", vec3(acc));
+            // Optional measured orientation (WP-13.2). Written only when set so
+            // a project without orientation references is byte-identical to an
+            // older build's output. The triple is in the chunk rotation order.
+            if (c.reference.orientation_deg.has_value()) {
+                const Eigen::Vector3d& angles = *c.reference.orientation_deg;
+                set_attr(ref, "yaw", fmt(angles.x()));
+                set_attr(ref, "pitch", fmt(angles.y()));
+                set_attr(ref, "roll", fmt(angles.z()));
+            }
             set_attr(ref, "enabled", c.reference.enabled ? "1" : "0");
         }
     }
@@ -943,6 +952,17 @@ CameraReference read_camera_reference(const XmlNode* ref) {
         throw ProjectIOError(
             "doc.xml: <reference> accuracy must be finite and positive, got '" +
             require_attr(*ref, "accuracy") + "'");
+    }
+    const std::string* yaw = find_attr(*ref, "yaw");
+    const std::string* pitch = find_attr(*ref, "pitch");
+    const std::string* roll = find_attr(*ref, "roll");
+    if (yaw != nullptr || pitch != nullptr || roll != nullptr) {
+        if (yaw == nullptr || pitch == nullptr || roll == nullptr) {
+            throw ProjectIOError(
+                "doc.xml: <reference> orientation needs all of yaw, pitch and roll");
+        }
+        reference.orientation_deg = Eigen::Vector3d(
+            parse_double(*yaw), parse_double(*pitch), parse_double(*roll));
     }
     reference.enabled = parse_int(require_attr(*ref, "enabled")) != 0;
     return reference;

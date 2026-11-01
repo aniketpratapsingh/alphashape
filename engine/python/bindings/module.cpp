@@ -1445,6 +1445,17 @@ PYBIND11_MODULE(alphashape, m) {
         .def("exportOrthomosaic", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "ExportOrthomosaic", std::move(kwargs));
         })
+        // Reference import/export (WP-13.2). The public Python API spellings;
+        // each is the same run_task call as the task names. In a build without
+        // PROJ the tasks are not registered and the call raises
+        // UnsupportedTaskError, which is the honest answer: there is no CRS to
+        // convert into.
+        .def("importReference", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ImportReference", std::move(kwargs));
+        })
+        .def("exportReference", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ExportReference", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"

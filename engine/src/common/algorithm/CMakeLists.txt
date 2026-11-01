@@ -86,6 +86,10 @@ target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
 if(TARGET alphashape_crs)
     target_sources(alphashape_algorithms PRIVATE
         reference/convert_reference.cpp
-        reference/reference_table.cpp)
+        reference/reference_table.cpp
+        reference/reference_csv.cpp
+        reference/reference_xml.cpp
+        reference/import_reference_task.cpp
+        reference/export_reference_task.cpp)
     target_link_libraries(alphashape_algorithms PUBLIC alphashape_crs)
 endif()

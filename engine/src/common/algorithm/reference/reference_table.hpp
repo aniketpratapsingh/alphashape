@@ -41,6 +41,9 @@ struct ReferenceRow {
     std::optional<Eigen::Vector3d> estimated;
     std::optional<Eigen::Vector3d> error;
     double sigma = 0.0;
+    /// Per-axis accuracies (east, north, up) for `source`. Falls back to
+    /// `sigma` on an axis whose stored accuracy is not usable.
+    Eigen::Vector3d sigma_xyz = Eigen::Vector3d::Constant(0.0);
     double capture_distance_m = std::numeric_limits<double>::quiet_NaN();
 };
 
