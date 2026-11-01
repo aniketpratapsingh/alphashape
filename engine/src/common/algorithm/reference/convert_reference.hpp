@@ -56,11 +56,12 @@
 ///   A camera-to-world rotation is `R_wb * body_to_camera().transpose()`.
 ///
 ///   `convert_orientation` re-expresses an orientation in the target's axes;
-///   see its own comment for the exact rule. The current data model has
-///   no per-camera orientation field (M13 adds `orientation_deg` to
-///   `CameraReference`), so `convert_reference` converts positions only until
-///   that field exists; the orientation entry point is already public and is
-///   what the reference importer will call.
+///   see its own comment for the exact rule. `convert_reference` applies it to
+///   every camera orientation as well, so changing the camera slot keeps
+///   headings correct: the world frame is relabelled by the convergence (or
+///   grid) rotation while the body frame stays put. A camera orientation with no
+///   location cannot be tied to a point on the globe and is carried unchanged;
+///   the slot relabel then applies to it too.
 ///
 /// ## Failures
 ///

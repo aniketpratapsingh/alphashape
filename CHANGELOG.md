@@ -42,6 +42,24 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.3: XMP reference completion.** The EXIF reader now also returns the
+  XMP packet from a JPEG APP1 segment or TIFF tag 700, and `AddPhotos` reads
+  DJI-style `drone-dji` position, gimbal attitude and RTK accuracy from it.
+  XMP position fills a camera's reference only when EXIF GPS is absent, so EXIF
+  stays primary; `load_xmp_orientation` stores the gimbal (or airframe)
+  attitude in the chunk's rotation order, and `load_xmp_accuracy` uses only the
+  34/50 (float/fixed) RTK solution's `RtkStdLon/Lat/Hgt` as the per-axis
+  accuracy. Gimbal angles are converted through matrices: the DJI camera frame
+  is composed explicitly and the fixed nadir mount is undone, rather than
+  remapping each angle component, so a nonzero roll at an off-axis pitch stays
+  correct. When the camera slot is projected the heading is turned from true
+  north to grid north by the meridian convergence. `convert_reference` now
+  carries `camera.reference.orientation_deg` with the slot as well, so changing
+  that slot keeps every heading pointing where it physically did.
+  `load_xmp_calibration` is accepted for forward compatibility but `DewarpData`
+  is not applied yet. The scanner is a small prefix-agnostic attribute/element
+  scan, not an XML library, and a malformed packet never throws.
+
 - **WP-13.2: `ImportReference` and `ExportReference`.** Reference data now
   round-trips through CSV, whitespace-delimited TXT and the common
   photogrammetry reference XML, in the task registry, the Python

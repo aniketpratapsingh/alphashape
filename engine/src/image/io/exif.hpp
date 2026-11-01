@@ -60,6 +60,14 @@ struct ExifData {
     /// Present only when both latitude and longitude were parsed.
     std::optional<GpsPosition> gps;
 
+    /// The raw XMP packet, when the file carries one: the payload after the
+    /// "http://ns.adobe.com/xap/1.0/\0" identifier of a JPEG APP1 segment, or
+    /// TIFF tag 700 (XMLPacket, type BYTE/UNDEFINED). Trailing NUL padding is
+    /// removed. Consumers parse it with
+    /// `common/algorithm/reference/xmp_reference.hpp`; the EXIF reader does not
+    /// interpret the XML.
+    std::optional<std::string> xmp_packet;
+
     /// Pixel pitch in micrometres, derived from FocalPlaneXResolution and
     /// FocalPlaneResolutionUnit. Nullopt when either is missing or the
     /// resolution is zero/negative.
@@ -73,9 +81,11 @@ struct ExifData {
 /// Reads the metadata of an image file.
 ///
 ///  * JPEG: walks the marker segments, takes the first APP1 segment whose
-///    payload begins "Exif\0\0", and stops at SOS. Non-Exif APP1 segments
-///    (XMP, "http://ns.adobe.com/xap/1.0/") are skipped.
-///  * TIFF: parses IFD0 in place, then follows 0x8769 and 0x8825.
+///    payload begins "Exif\0\0" and the first whose payload begins
+///    "http://ns.adobe.com/xap/1.0/\0", and stops at SOS. The XMP packet is
+///    returned unparsed in `ExifData::xmp_packet`.
+///  * TIFF: parses IFD0 in place, follows 0x8769 and 0x8825, and returns tag
+///    0x02BC (XMLPacket) in `ExifData::xmp_packet`.
 ///  * PNG: parses the eXIf chunk when one is present.
 ///
 /// Any other container, or a file with no metadata, yields a default ExifData.

@@ -12,6 +12,7 @@ add_executable(alphashape_tests
     test_detector.cpp
     test_image_io.cpp
     test_exif.cpp
+    test_xmp.cpp
     test_camera_model.cpp
     test_downsample.cpp
     test_add_photos.cpp
