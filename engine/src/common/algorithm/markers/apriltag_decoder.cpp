@@ -611,6 +611,8 @@ struct HypothesisResult {
     Eigen::Vector2d center = Eigen::Vector2d::Zero();
     std::array<Eigen::Vector2d, 4> corners{};
     double margin = 0.0;  ///< Smallest payload/border margin, in units of contrast.
+    double tag_scale = 1.0;  ///< Tag-frame extent of the candidate's corners.
+    Homography homography;  ///< Tag frame (at `tag_scale`) to the image.
 };
 
 /// Decode one quad under one scale hypothesis. `scale` is the tag-frame
@@ -780,6 +782,8 @@ std::optional<HypothesisResult> decode_hypothesis(
             quad[static_cast<std::size_t>((corner + match->rotation) % 4)];
     }
     result.margin = std::min(worst_margin, worst_payload);
+    result.tag_scale = scale;
+    result.homography = *homography;
     return result;
 }
 
@@ -1024,15 +1028,39 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
         return std::nullopt;
     }
 
+    // The reported corners always bound the printed silhouette for a
+    // reversed-border family, even when the winning hypothesis interpreted a
+    // candidate as the inner reference square. Projecting the silhouette
+    // through the same homography keeps perspective exact.
+    std::array<Eigen::Vector2d, 4> corners = best->corners;
+    if (family.reversed_border && family.width_at_border > 0) {
+        const double silhouette = static_cast<double>(family.total_width) /
+                                  static_cast<double>(family.width_at_border);
+        if (silhouette > 1.0 + 1e-9) {
+            const std::array<Eigen::Vector2d, 4> unit = {
+                Eigen::Vector2d(-1.0, 1.0), Eigen::Vector2d(1.0, 1.0),
+                Eigen::Vector2d(1.0, -1.0), Eigen::Vector2d(-1.0, -1.0)};
+            for (int corner = 0; corner < 4; ++corner) {
+                const Eigen::Vector2d& frame = unit[static_cast<std::size_t>(
+                    (corner + best->match.rotation) % 4)];
+                Eigen::Vector2d projected;
+                if (best->homography.project(frame.x() * silhouette,
+                                             frame.y() * silhouette, projected)) {
+                    corners[static_cast<std::size_t>(corner)] = projected;
+                }
+            }
+        }
+    }
+
     CodedTarget target;
     target.code = best->match.id;
     target.center = best->center;
     target.bits = family.bits;
     target.hamming = best->match.distance;
-    const double diagonal0 = (best->corners[2] - best->corners[0]).norm();
-    const double diagonal1 = (best->corners[3] - best->corners[1]).norm();
+    const double diagonal0 = (corners[2] - corners[0]).norm();
+    const double diagonal1 = (corners[3] - corners[1]).norm();
     target.radius_px = 0.25 * (diagonal0 + diagonal1);
-    target.corners = best->corners;
+    target.corners = corners;
     target.has_corners = true;
     return target;
 }
