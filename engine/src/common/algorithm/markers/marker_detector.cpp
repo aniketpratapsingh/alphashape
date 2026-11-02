@@ -912,6 +912,47 @@ bool is_convex(const std::array<Eigen::Vector2d, 4>& corners) {
     return true;
 }
 
+/// Oriented bounding rectangle of the traced contour, aligned with the square
+/// orientation the Douglas-Peucker quad found. The quad alone can cut a rounded
+/// corner at the first tolerance that yields four vertices, which turns one side
+/// into a diagonal; the rectangle re-establishes four parallel sides without
+/// losing the DP-derived orientation.
+std::array<Eigen::Vector2d, 4> oriented_bounds(const std::vector<Pixel>& contour,
+                                               const std::array<Eigen::Vector2d, 4>& quad) {
+    double sin_sum = 0.0;
+    double cos_sum = 0.0;
+    for (int side = 0; side < 4; ++side) {
+        const Eigen::Vector2d delta =
+            quad[static_cast<std::size_t>((side + 1) % 4)] - quad[static_cast<std::size_t>(side)];
+        const double angle = std::atan2(delta.y(), delta.x());
+        sin_sum += std::sin(4.0 * angle);
+        cos_sum += std::cos(4.0 * angle);
+    }
+    const double orientation = 0.25 * std::atan2(sin_sum, cos_sum);
+    const Eigen::Vector2d axis(std::cos(orientation), std::sin(orientation));
+    const Eigen::Vector2d normal(-axis.y(), axis.x());
+    double min_u = std::numeric_limits<double>::infinity();
+    double max_u = -std::numeric_limits<double>::infinity();
+    double min_v = std::numeric_limits<double>::infinity();
+    double max_v = -std::numeric_limits<double>::infinity();
+    for (const Pixel& pixel : contour) {
+        const Eigen::Vector2d point(static_cast<double>(pixel.x), static_cast<double>(pixel.y));
+        const double u = point.dot(axis);
+        const double v = point.dot(normal);
+        min_u = std::min(min_u, u);
+        max_u = std::max(max_u, u);
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+    }
+    std::array<Eigen::Vector2d, 4> corners = {Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero(),
+                                               Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero()};
+    corners[0] = axis * min_u + normal * min_v;
+    corners[1] = axis * max_u + normal * min_v;
+    corners[2] = axis * max_u + normal * max_v;
+    corners[3] = axis * min_u + normal * max_v;
+    return corners;
+}
+
 /// Put the corners in screen counter-clockwise order (negative shoelace area in
 /// image coordinates, where Y points down), starting at the top-left corner.
 void orient_corners(std::array<Eigen::Vector2d, 4>& corners) {
@@ -988,10 +1029,11 @@ std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const Qua
             if (simplified.size() < 4) break;
         }
         if (!found || !is_convex(quad)) continue;
+        const std::array<Eigen::Vector2d, 4> initial = oriented_bounds(contour, quad);
 
         double response = 0.0;
         const std::optional<std::array<Eigen::Vector2d, 4>> refined =
-            refine_quad(gray, gradient, quad, response);
+            refine_quad(gray, gradient, initial, response);
         if (!refined) continue;
         std::array<Eigen::Vector2d, 4> corners = *refined;
         if (!is_convex(corners)) continue;
