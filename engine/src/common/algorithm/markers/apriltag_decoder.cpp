@@ -721,6 +721,10 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     // while the long one recovers a thin reference frame when the detector's
     // initial quad sits on its inner edge (the 40 px and thin-frame cases).
     std::vector<std::array<Eigen::Vector2d, 4>> refined_quads;
+    // The detector's own corners are already a subpixel line fit; keep them as
+    // a fallback in case a short side or a notched silhouette makes the extra
+    // refinement jump to a neighbouring edge.
+    refined_quads.push_back(quad);
     refined_quads.push_back(refine_quad_corners(gradient, quad, 0.30, 6.0));
     refined_quads.push_back(refine_quad_corners(gradient, quad, 0.60, 9.0));
     const int allowed = std::min(max_hamming, (family.min_hamming - 1) / 2);
