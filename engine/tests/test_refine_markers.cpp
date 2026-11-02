@@ -437,7 +437,71 @@ RefineMarkersStats run_refine(RefineScene& scene,
     if (plan.command) {
         plan.command->apply(scene.document);
     }
+    std::printf(
+        "[refine stats] refined %zu unchanged %zu failed %zu skipped %zu "
+        "removed %zu rounds %zu peak %zu bytes (%.2f MiB)\n",
+        stats.refined, stats.unchanged, stats.failed, stats.skipped,
+        stats.removed_projections, stats.rounds, stats.peak_bytes,
+        static_cast<double>(stats.peak_bytes) / (1024.0 * 1024.0));
     return stats;
+}
+
+/// Apparent radius of a target in one camera, in full-resolution pixels, from
+/// the projection of the radius along the two ground-plane axes.
+double apparent_radius_px(const RefineScene& scene, std::size_t target_index,
+                          std::size_t camera_index) {
+    const auto truth = scene.truth(target_index, camera_index);
+    if (!truth) {
+        return 0.0;
+    }
+    const Vec3 centre = scene.targets[target_index].centre;
+    const double radius = scene.targets[target_index].radius;
+    double best = 0.0;
+    for (const Vec3& axis : {Vec3(1.0, 0.0, 0.0), Vec3(0.0, 0.0, 1.0)}) {
+        const auto offset = project_marker(centre + radius * axis,
+                                           scene.camera(camera_index),
+                                           scene.calibration(camera_index),
+                                           false);
+        if (offset) {
+            best = std::max(best, (*offset - *truth).norm());
+        }
+    }
+    return best;
+}
+
+void set_projection_enabled(RefineScene& scene, std::int32_t marker_id,
+                            std::int32_t camera_id, bool enabled) {
+    Marker* marker = find_marker(*scene.chunk, marker_id);
+    if (marker == nullptr) {
+        return;
+    }
+    for (MarkerProjection& projection : marker->projections) {
+        if (projection.camera_id == camera_id) {
+            projection.enabled = enabled;
+        }
+    }
+}
+
+/// RMS over a marker's projections excluding one camera.
+double rms_to_truth_excluding(const RefineScene& scene, const Marker& marker,
+                              std::size_t target_index,
+                              std::int32_t excluded_camera) {
+    double squared = 0.0;
+    std::size_t count = 0;
+    for (const MarkerProjection& projection : marker.projections) {
+        if (projection.camera_id == excluded_camera) {
+            continue;
+        }
+        const auto truth =
+            scene.truth(target_index, camera_index(scene, projection.camera_id));
+        if (!truth) {
+            continue;
+        }
+        const double error = (projection.pixel - *truth).norm();
+        squared += error * error;
+        ++count;
+    }
+    return count == 0 ? 0.0 : std::sqrt(squared / static_cast<double>(count));
 }
 
 std::vector<std::int32_t> add_all_markers(RefineScene& scene,
@@ -491,11 +555,14 @@ TEST(Markers, RefineReducesError) {
         std::sqrt(before_squared / static_cast<double>(before.size()));
     std::printf(
         "[refine rms] before %.4f px, after circular %.4f px, "
-        "cross %.4f px; refined %zu unchanged %zu failed %zu\n",
+        "cross %.4f px; refined %zu unchanged %zu failed %zu skipped %zu "
+        "rounds %zu peak %zu bytes\n",
         before_rms, circular_rms, cross_rms, stats.refined, stats.unchanged,
-        stats.failed);
+        stats.failed, stats.skipped, stats.rounds, stats.peak_bytes);
     EXPECT_LT(circular_rms, 0.1);
     EXPECT_LT(cross_rms, 0.1);
+    EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
+              scene.chunk->markers().size());
 }
 
 TEST(Markers, RefineStableOnExactProjection) {
@@ -512,13 +579,23 @@ TEST(Markers, RefineStableOnExactProjection) {
             std::stoul(marker.label.substr(1)));
         rms_to_truth(scene, marker, target, &worst);
     }
-    std::printf("[refine stable] worst %.4f px, refined %zu\n",
-                worst, stats.refined);
+    std::printf("[refine stable] worst %.4f px, refined %zu rounds %zu peak "
+                "%zu bytes\n",
+                worst, stats.refined, stats.rounds, stats.peak_bytes);
     EXPECT_LE(worst, 0.02);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_EQ(stats.skipped, 0U);
+    EXPECT_EQ(stats.refined + stats.unchanged, scene.chunk->markers().size());
+    EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
+              scene.chunk->markers().size());
 }
 
+/// Build a scene whose first projection is displaced by three apparent radii
+/// (plus margin), well beyond the one-radius gate, and report both the applied
+/// offset and the gate so the test can assert the relationship.
 RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
-                                    std::int32_t& outlier_camera) {
+                                    std::int32_t& outlier_camera,
+                                    double& applied_offset, double& gate) {
     SceneSpec spec;
     spec.marker_count = 6;
     RefineScene scene = make_scene(spec, 21U);
@@ -526,9 +603,12 @@ RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
     ids = add_all_markers(scene, 3.0, engine);
     const auto truth = scene.truth(0, 0);
     outlier_camera = scene.chunk->cameras()[0].id;
+    const double radius = apparent_radius_px(scene, 0, 0);
+    gate = std::max(3.0, radius);
+    applied_offset = 3.0 * radius + 6.0;
     if (truth) {
-        // Move along the more foreshortened axis, so 30 px is guaranteed to
-        // leave the printed target and land on unrelated ground texture.
+        // Move along the more foreshortened axis, so the displacement leaves
+        // the printed target and lands on unrelated ground texture.
         const Vec3 centre_point = scene.targets[0].centre;
         const auto along_x = project_marker(
             centre_point + Vec3(0.075, 0.0, 0.0), scene.camera(0),
@@ -545,8 +625,16 @@ RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
                                                   : dz.normalized();
             }
         }
-        set_projection(scene, ids[0], outlier_camera,
-                       *truth + 30.0 * direction);
+        Vec2 outlier = *truth + applied_offset * direction;
+        if (outlier.x() < 2.0 || outlier.x() > 798.0 || outlier.y() < 2.0 ||
+            outlier.y() > 598.0) {
+            Vec2 inward = Vec2(400.0, 300.0) - *truth;
+            if (inward.norm() > 1e-9) {
+                inward.normalize();
+                outlier = *truth + applied_offset * inward;
+            }
+        }
+        set_projection(scene, ids[0], outlier_camera, outlier);
     }
     return scene;
 }
@@ -554,8 +642,13 @@ RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
 TEST(Markers, RefineRemovesContradictedProjection) {
     std::vector<std::int32_t> ids;
     std::int32_t outlier_camera = -1;
+    double applied_offset = 0.0;
+    double gate = 0.0;
     {
-        RefineScene scene = make_contradicted_scene(ids, outlier_camera);
+        RefineScene scene =
+            make_contradicted_scene(ids, outlier_camera, applied_offset, gate);
+        EXPECT_GT(applied_offset, gate)
+            << "the test displacement must exceed the projection gate";
         Marker* marker = find_marker(*scene.chunk, ids[0]);
         ASSERT_NE(marker, nullptr);
         const std::size_t before = marker->projections.size();
@@ -570,7 +663,8 @@ TEST(Markers, RefineRemovesContradictedProjection) {
         EXPECT_LE(rms_to_truth(scene, *marker, 0), 0.1);
     }
     {
-        RefineScene scene = make_contradicted_scene(ids, outlier_camera);
+        RefineScene scene =
+            make_contradicted_scene(ids, outlier_camera, applied_offset, gate);
         Marker* marker = find_marker(*scene.chunk, ids[0]);
         ASSERT_NE(marker, nullptr);
         Vec2 kept = Vec2::Zero();
@@ -727,6 +821,203 @@ TEST(Markers, RefineParamsFilter) {
         }
     }
     EXPECT_EQ(stats.refined, 1U);
+}
+
+TEST(Markers, RefineAtDownscaleTwo) {
+    SceneSpec spec;
+    spec.marker_count = 4;
+    RefineScene scene = make_scene(spec, 81U);
+    std::mt19937 engine(43U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    options.downscale = 2;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine downscale2] marker %zu rms %.4f px\n", i, rms);
+        EXPECT_LE(rms, 0.15) << "marker " << i << " RMS " << rms;
+    }
+    EXPECT_EQ(stats.failed, 0U);
+}
+
+TEST(Markers, RefineWithoutTiePointsUsesFallbackRange) {
+    SceneSpec spec;
+    spec.marker_count = 4;
+    RefineScene scene = make_scene(spec, 82U);
+    scene.chunk->point_cloud().points.clear();
+    std::mt19937 engine(47U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine no-tie-points] marker %zu rms %.4f px\n", i, rms);
+        EXPECT_LE(rms, 0.2) << "marker " << i << " RMS " << rms;
+    }
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_EQ(stats.skipped, 0U);
+}
+
+TEST(Markers, RefineUndoRestoresRemovedProjectionExactly) {
+    std::vector<std::int32_t> ids;
+    std::int32_t outlier_camera = -1;
+    double applied_offset = 0.0;
+    double gate = 0.0;
+    RefineScene scene =
+        make_contradicted_scene(ids, outlier_camera, applied_offset, gate);
+    const std::vector<Marker> original = scene.chunk->markers();
+    RefineMarkersOptions options;
+    RefineMarkersPlan plan =
+        plan_refine_markers(scene.document, scene.chunk->id(), options);
+    ASSERT_TRUE(plan.command);
+    UndoStack stack(&scene.document);
+    stack.execute(std::move(plan.command));
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t removed_size = marker->projections.size();
+    EXPECT_EQ(removed_size + 1U, original[0].projections.size());
+    stack.undo();
+    EXPECT_TRUE(scene.chunk->markers() == original)
+        << "undo must restore every projection, in order";
+    stack.redo();
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_EQ(marker->projections.size(), removed_size);
+}
+
+TEST(Markers, RefineNeverTouchesDisabledProjections) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 83U);
+    std::mt19937 engine(53U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    const std::int32_t disabled_camera = scene.chunk->cameras()[1].id;
+    Vec2 disabled_pixel = Vec2::Zero();
+    bool found_disabled = false;
+    for (const std::int32_t id : ids) {
+        set_projection_enabled(scene, id, disabled_camera, false);
+    }
+    for (const MarkerProjection& projection :
+         find_marker(*scene.chunk, ids[0])->projections) {
+        if (projection.camera_id == disabled_camera) {
+            disabled_pixel = projection.pixel;
+            found_disabled = true;
+        }
+    }
+    ASSERT_TRUE(found_disabled);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    for (const std::int32_t id : ids) {
+        const Marker* marker = find_marker(*scene.chunk, id);
+        ASSERT_NE(marker, nullptr);
+        const MarkerProjection* projection = nullptr;
+        for (const MarkerProjection& candidate : marker->projections) {
+            if (candidate.camera_id == disabled_camera) {
+                projection = &candidate;
+            }
+        }
+        ASSERT_NE(projection, nullptr) << "a disabled projection was removed";
+        EXPECT_FALSE(projection->enabled);
+        if (id == ids[0]) {
+            EXPECT_LE((projection->pixel - disabled_pixel).norm(), 1e-12);
+        }
+    }
+    EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
+              scene.chunk->markers().size());
+}
+
+TEST(Markers, RefineBorderViewIsNonContributor) {
+    SceneSpec spec;
+    spec.marker_count = 2;
+    RefineScene scene = make_scene(spec, 84U);
+    std::mt19937 engine(59U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 1.0, engine);
+    const auto truth = scene.truth(0, 0);
+    ASSERT_TRUE(truth.has_value());
+    const std::int32_t border_camera = scene.chunk->cameras()[0].id;
+    const int width = scene.calibration(0).width;
+    const bool left_is_far = truth->x() >= 0.5 * width;
+    const Vec2 border = left_is_far
+                            ? Vec2(2.0, truth->y())
+                            : Vec2(static_cast<double>(width - 3), truth->y());
+    EXPECT_GT((border - *truth).norm(), 256.0);
+    set_projection(scene, ids[0], border_camera, border);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    const Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const MarkerProjection* border_projection = nullptr;
+    for (const MarkerProjection& projection : marker->projections) {
+        if (projection.camera_id == border_camera) {
+            border_projection = &projection;
+        }
+    }
+    ASSERT_NE(border_projection, nullptr)
+        << "an out-of-window projection must not be removed";
+    EXPECT_LE((border_projection->pixel - border).norm(), 1e-12);
+    EXPECT_GE(marker->projections.size(), 3U);
+    const double rms =
+        rms_to_truth_excluding(scene, *marker, 0, border_camera);
+    std::printf("[refine border] remaining rms %.4f px, %zu projections\n", rms,
+                marker->projections.size());
+    EXPECT_LE(rms, 0.2);
+    EXPECT_EQ(stats.failed, 0U);
+}
+
+TEST(Markers, RefineRemovesCommonModeLateralBias) {
+    SceneSpec spec;
+    spec.marker_count = 4;
+    RefineScene scene = make_scene(spec, 85U);
+    std::mt19937 engine(61U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 0.0, engine);
+    // The same 3-D displacement in the target plane, seen by every camera: a
+    // 0.6-radius lateral error that no single view can detect.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Vec3 displaced =
+            scene.targets[i].centre +
+            Vec3(0.6 * scene.targets[i].radius, 0.0, 0.0);
+        for (const MarkerProjection& projection :
+             find_marker(*scene.chunk, ids[i])->projections) {
+            const std::size_t ci = camera_index(scene, projection.camera_id);
+            const auto pixel = project_marker(displaced, scene.camera(ci),
+                                              scene.calibration(ci), false);
+            if (pixel) {
+                set_projection(scene, ids[i], projection.camera_id, *pixel);
+            }
+        }
+    }
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine common-mode] marker %zu rms %.4f px\n", i, rms);
+        EXPECT_LE(rms, 0.1) << "marker " << i << " RMS " << rms;
+    }
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_GT(stats.rounds, 0U);
+}
+
+TEST(Markers, RefineStatsCountEverySelectedMarkerOnce) {
+    SceneSpec spec;
+    spec.marker_count = 4;
+    RefineScene scene = make_scene(spec, 86U);
+    std::mt19937 engine(67U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    for (const MarkerProjection& projection :
+         find_marker(*scene.chunk, ids[2])->projections) {
+        set_projection_enabled(scene, ids[2], projection.camera_id, false);
+    }
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.skipped, 1U);
+    EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
+              scene.chunk->markers().size());
 }
 
 }  // namespace
