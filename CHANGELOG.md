@@ -52,9 +52,12 @@ All notable changes to alphashape are recorded here. The format follows
   iterating the radial search (dropping rays more than 3 MAD off the fit) and
   duplicates are merged by bounding-circle IoU. `detect_quads()` thresholds
   against a local box mean, traces the component's outer contour, simplifies it
-  with Douglas-Peucker to four vertices, refits each side by gradient-weighted
-  total least squares and intersects adjacent sides for subpixel corners,
-  rejecting non-convex or over-elongated quads. `refine_ellipse_center()`
+  with Douglas-Peucker, uses the simplified quad's orientation for an oriented
+  bounding rectangle of the contour (robust to a rounded corner being cut),
+  locates each side's edge points at the half-intensity crossing, fits the
+  sides by gradient-weighted total least squares and intersects adjacent sides
+  for subpixel corners, rejecting non-convex or over-elongated quads.
+  `refine_ellipse_center()`
   re-runs the subpixel centre estimate and `fit_ellipse()` exposes the direct
   fit. Detected pixels use the engine's pixel-centre convention, the same one
   `project_marker()` uses.
