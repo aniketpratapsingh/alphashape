@@ -634,14 +634,15 @@ std::vector<CrossCandidate> find_bar_crosses(const FloatImage& image,
             std::minmax_element(quadrants.begin(), quadrants.end());
         const double background =
             0.25 * (quadrants[0] + quadrants[1] + quadrants[2] + quadrants[3]);
-        const double arm_a = static_cast<double>(image.sample(
+        const double arm_a_value = static_cast<double>(image.sample(
             static_cast<float>(centre->x() + probe * line_a->tangent.x()),
             static_cast<float>(centre->y() + probe * line_a->tangent.y())));
-        const double arm_b = static_cast<double>(image.sample(
+        const double arm_b_value = static_cast<double>(image.sample(
             static_cast<float>(centre->x() + probe * line_b->tangent.x()),
             static_cast<float>(centre->y() + probe * line_b->tangent.y())));
         const double contrast =
-            std::max(std::abs(background - arm_a), std::abs(background - arm_b));
+            std::max(std::abs(background - arm_a_value),
+                     std::abs(background - arm_b_value));
         if (!(contrast > 0.05) || *high - *low > 0.35 * contrast) {
             continue;
         }
