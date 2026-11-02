@@ -849,6 +849,10 @@ TEST(Markers, RefineAtDownscaleTwo) {
 TEST(Markers, RefineWithoutTiePointsUsesFallbackRange) {
     SceneSpec spec;
     spec.marker_count = 4;
+    // Keep every target away from the image border so its printed disc is
+    // fully visible in every view; this test is about the depth range.
+    spec.spread_x = 0.16;
+    spec.spread_z = 0.16;
     RefineScene scene = make_scene(spec, 82U);
     scene.chunk->point_cloud().points.clear();
     std::mt19937 engine(47U);
@@ -975,6 +979,10 @@ TEST(Markers, RefineBorderViewIsNonContributor) {
 TEST(Markers, RefineRemovesCommonModeLateralBias) {
     SceneSpec spec;
     spec.marker_count = 4;
+    // The common-mode test measures every view, so keep all targets well
+    // inside the frame: a clipped printed disc has no visible centre.
+    spec.spread_x = 0.16;
+    spec.spread_z = 0.16;
     RefineScene scene = make_scene(spec, 85U);
     std::mt19937 engine(61U);
     const std::vector<std::int32_t> ids = add_all_markers(scene, 0.0, engine);

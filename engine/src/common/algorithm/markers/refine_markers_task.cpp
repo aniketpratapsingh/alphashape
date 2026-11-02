@@ -409,27 +409,23 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
                                local.y() - static_cast<double>(y0) + 0.5);
     double max_blob_radius = 0.0;
-    double max_blob_response = 0.0;
     for (const MarkerCandidate& blob : blobs) {
         if (blob.center.allFinite() && std::isfinite(blob.radius_px)) {
             max_blob_radius = std::max(max_blob_radius, blob.radius_px);
-            max_blob_response =
-                std::max(max_blob_response, blob.response);
         }
     }
-    if (!(max_blob_radius > 0.0) || !(max_blob_response > 0.0)) {
+    if (!(max_blob_radius > 0.0)) {
         return std::nullopt;
     }
-    // A coded disc breaks into sector blobs. Keep only blobs that are both
-    // large and strong (ground texture produces small, weak ones), take their
-    // radius-weighted centroid, then re-centre on the compact ring of target
-    // blobs. This lands near the printed centre even when the measurement is
-    // most of a radius away.
+    // A coded disc breaks into sector blobs. Keep the credible ones (ground
+    // texture produces much smaller blobs), take their radius-weighted
+    // centroid, then re-centre on the compact ring of target blobs. This lands
+    // near the printed centre even when the measurement is most of a radius
+    // away.
     std::vector<const MarkerCandidate*> kept;
     for (const MarkerCandidate& blob : blobs) {
         if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
-            blob.radius_px < 0.5 * max_blob_radius ||
-            blob.response < 0.5 * max_blob_response ||
+            blob.radius_px < 0.35 * max_blob_radius ||
             (blob.center - seed).norm() > static_cast<double>(half)) {
             continue;
         }
@@ -1365,7 +1361,10 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.cross = true;
             blend.apparent = std::max(1.0, cross->radius);
             blend.has_scale = true;
-            blend.hint_work = std::max(4.0, blend.apparent / ds);
+            // The saddle fit only needs to search the basin around the
+            // measured centre; a quarter of the arm half-length is the
+            // validated working-scale radius.
+            blend.hint_work = std::max(4.0, 0.25 * blend.apparent / ds);
             const Eigen::Vector2d offset(
                 static_cast<double>(blend.view->offset_x),
                 static_cast<double>(blend.view->offset_y));
@@ -1538,7 +1537,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 blend.apparent = std::max(
                     1.0, physical * focal / std::max(blend.depth, 1e-9));
                 blend.hint_work = std::max(
-                    4.0, blend.apparent /
+                    4.0, 0.25 * blend.apparent /
                              static_cast<double>(std::max(
                                  1, blend.view->downscale)));
                 blend.has_scale = true;
