@@ -74,6 +74,7 @@ add_executable(alphashape_tests
     test_align_chunks.cpp
     test_marker_placement.cpp
     test_marker_detector.cpp
+    test_circular_decoder.cpp
     test_gpu.cpp
 )
 

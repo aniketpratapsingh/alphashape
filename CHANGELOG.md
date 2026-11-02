@@ -42,6 +42,29 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.6: circular coded targets.** Our own concentric target design: a
+  centre dot (black = parity 1, white = parity 0) out to 0.25 R, a white gap to
+  0.5 R, an N-sector coding ring (0.5–0.85 R, black = 1, sector 0 at image-up
+  and sectors advancing clockwise), a white gap to 0.9 R and a black border
+  ring to R, with a white quiet zone beyond. Ring codes are a greedy lexicode
+  over canonical cyclic rotations with minimum Hamming distance 3 between all
+  rotations of all words; table sizes are 13 (N=12), 41 (N=14), 125 (N=16) and
+  1202 (N=20), and the code id packs the ring index and centre parity as
+  `2 * ring_index + parity`. `decode_circular()` locates the outer border from
+  either the centre-dot or border blob reported by the WP-13.5 detector,
+  estimates the ring's angular phase, samples the sectors, applies an Otsu
+  threshold and accepts only a unique table match with a two-bit margin.
+  `max_hamming` is clamped to one. The checked-in tables
+  (`engine/tests/fixtures/markers/circular_codes_N*.txt`) are produced by
+  `tools/markers/make_circular_codes.py`; a test proves the C++ generator
+  reproduces them byte for byte. Known limitations: for a target with a white
+  centre dot (parity 0) the reported centre is the outer-border ellipse centre,
+  which is less accurate under heavy blur than the centre-dot fit used for
+  parity 1; and the ellipse centre is biased for strongly tilted targets under
+  perspective projection. The 0.05 R outer white gap is too narrow to survive a
+  realistic blur, so the wide inner white gap is the validation light
+  reference.
+
 - **WP-13.5: automatic marker detection.** `detect_blobs()` finds circular
   targets with the scale-normalised Hessian determinant (Steger 1998) over a
   geometric scale series, 3x3x3 non-maximum suppression, subpixel boundary
