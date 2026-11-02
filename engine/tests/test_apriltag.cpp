@@ -392,6 +392,66 @@ TEST(Markers, AprilTagDecodeRenderedSet) {
     EXPECT_EQ(correct, total);
 }
 
+TEST(Markers, AprilTagReversedSmallDiagnostic) {
+    const std::array<AprilTagFamily, 2> families = {AprilTagFamily::Standard41h12,
+                                                    AprilTagFamily::Standard52h13};
+    for (AprilTagFamily family : families) {
+        const TagFamily& table = tag_family(family);
+        for (double tag_px : {40.0, 80.0}) {
+            for (double rotation : {0.0, 0.42}) {
+                const test::AprilTagTruth truth =
+                    make_truth(family, 0, tag_px, rotation, 0.012, 0.25, 0.2);
+                const int supersample = tag_px <= 40.0 ? 2 : 1;
+                const FloatImage image =
+                    render_degraded(truth, 0.8, 0.02, 9500U, supersample);
+                const QuadParams params = quad_params_for(tag_px);
+                FloatImage inverted = image;
+                for (float& value : inverted.pixels()) value = 1.0F - value;
+                const std::vector<MarkerCandidate> frame =
+                    detect_quads(inverted, params);
+                const std::vector<MarkerCandidate> dark =
+                    detect_quads(image, params);
+                std::printf("[diag] %s %.0f rot %.2f frame=%d dark=%d\n",
+                            table.name.c_str(), tag_px, rotation,
+                            static_cast<int>(frame.size()),
+                            static_cast<int>(dark.size()));
+                const auto report = [&](const char* what,
+                                        const std::vector<MarkerCandidate>& list) {
+                    for (const MarkerCandidate& candidate : list) {
+                        const std::optional<CodedTarget> target =
+                            decode_tag(image, candidate, table,
+                                       default_max_hamming(family));
+                        std::printf(
+                            "[diag]   %s centre %.1f,%.1f r %.1f corners %d -> "
+                            "%s id %d\n",
+                            what, candidate.center.x(), candidate.center.y(),
+                            candidate.radius_px,
+                            static_cast<int>(candidate.corners.size()),
+                            target ? "yes" : "no", target ? target->code : -1);
+                    }
+                };
+                report("frame", frame);
+                report("dark", dark);
+                for (int silhouette = 0; silhouette < 2; ++silhouette) {
+                    MarkerCandidate ideal;
+                    const std::array<Eigen::Vector2d, 4> corners =
+                        test::april_tag_corners(truth, silhouette != 0);
+                    ideal.corners.assign(corners.begin(), corners.end());
+                    ideal.center = Eigen::Vector2d(truth.cx, truth.cy);
+                    ideal.radius_px = 0.25 * ((corners[2] - corners[0]).norm() +
+                                              (corners[3] - corners[1]).norm());
+                    const std::optional<CodedTarget> target = decode_tag(
+                        image, ideal, table, default_max_hamming(family));
+                    std::printf("[diag]   ideal %s -> %s id %d\n",
+                                silhouette != 0 ? "silhouette" : "frame",
+                                target ? "yes" : "no",
+                                target ? target->code : -1);
+                }
+            }
+        }
+    }
+}
+
 TEST(Markers, AprilTagCentreError) {
     const AprilTagFamily family = AprilTagFamily::Tag36h11;
     const int id = 7;
