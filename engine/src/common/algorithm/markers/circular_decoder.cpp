@@ -498,7 +498,7 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
     // along the minor axis, so the inner gap alone gives a limit the genuine
     // border cannot stay below. A half-light annulus still has bins near the
     // quiet-zone level and is rejected.
-    const std::optional<double> quiet = polar_mean(image, map, 1.05, 1.20, 3, 32);
+    const std::optional<double> quiet = polar_mean(image, map, 1.10, 1.30, 4, 32);
     const double border_light = quiet ? std::max(*inner_gap, *quiet) : *inner_gap;
     const double mid_level = 0.5 * (border_light + *dark_border);
     for (int bin = 0; bin < kAngularBins; ++bin) {
