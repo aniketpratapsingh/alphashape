@@ -341,9 +341,9 @@ TEST(Markers, DetectMixedSheet) {
     const int height = 400;
     FloatImage sheet(width, height, 0.5F);
     // A coded circular target on its own white patch.
-    fill_patch(sheet, 150.0, 200.0, 50.0, 0.95F);
+    fill_patch(sheet, 150.0, 200.0, 65.0, 0.95F);
     const test::CircularTruth circle = test::make_circular_truth(
-        150.0, 200.0, 35.0, 12, read_circular_word(12, 0), 1);
+        150.0, 200.0, 50.0, 12, read_circular_word(12, 0), 1);
     test::draw_circular_target(sheet, circle, 0.95F, 0.05F, 8);
     // A checker cross on the mid-grey sheet.
     const int cross_size = 110;
@@ -368,10 +368,11 @@ TEST(Markers, DetectMixedSheet) {
     paste(sheet, tag_render.image, 750 - tag_size / 2, 200 - tag_size / 2);
 
     const FloatImage image = gaussian_blur(sheet, 0.8F);
-    // minimum_size 20 keeps the other targets' small fiducial cells out of
-    // each decoder's candidate set.
+    // minimum_size keeps the other targets' small fiducial cells out of each
+    // decoder's candidate set; the circle is larger so its own run can use a
+    // tighter floor that also excludes the tag's border blob.
     const std::vector<std::string> circular =
-        detect_labels(image, "Circular12", false, true, 20.0);
+        detect_labels(image, "Circular12", false, true, 40.0);
     ASSERT_EQ(circular.size(), 1U) << "circular run found "
                                    << circular.size() << " targets";
     EXPECT_EQ(circular[0].rfind("target ", 0), 0U);
