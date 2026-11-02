@@ -491,9 +491,12 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
 
     // Half-light/half-dark annuli (a foreign shape straddling the hypothesis)
     // pass a global mean test but fail an angular one. Every inner-gap bin must
-    // be light. Border bins only need to stay below the light-side midpoint:
-    // under heavy blur the narrow dark border is lifted towards the threshold.
-    const double mid_level = 0.5 * (*inner_gap + threshold);
+    // be light. A border bin must stay below the midpoint of the measured
+    // light and dark references. The threshold is not a usable border limit:
+    // under a 2 px blur the 0.1 R border is lifted to roughly that midpoint
+    // (and a tilted border is thinner still along the minor axis), while a
+    // genuinely half-light annulus has bins near the light reference.
+    const double mid_level = 0.5 * (*inner_gap + *dark_border);
     for (int bin = 0; bin < kAngularBins; ++bin) {
         const std::optional<double> gap_bin =
             angular_bin_mean(image, map, 0.30, 0.45, 3, kAngularBins, bin);
