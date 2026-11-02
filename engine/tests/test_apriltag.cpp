@@ -338,8 +338,12 @@ TEST(Markers, AprilTagDecodeRenderedSet) {
                         make_truth(family, id, scales[scale_index],
                                    rotations[rotation_index], perspective,
                                    offset_x, offset_y);
+                    // The 40 px tags have 4-5 px cells, so one sample per pixel
+                    // leaves the edges too aliased for the subpixel fit.
+                    const int supersample =
+                        scales[scale_index] <= 40.0 ? 2 : 1;
                     const FloatImage image =
-                        render_degraded(truth, 0.8, 0.02, seed++, 1);
+                        render_degraded(truth, 0.8, 0.02, seed++, supersample);
                     const QuadParams params = quad_params_for(scales[scale_index]);
                     const std::vector<CodedTarget> decoded = detect_and_decode(
                         image, family, default_max_hamming(family), params);

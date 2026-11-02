@@ -192,7 +192,7 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
     if ((0.5 * (a + b) - center).dot(normal) < 0.0) {
         normal = -normal;
     }
-    const double reach = std::clamp(0.20 * length, 2.0, 6.0);
+    const double reach = std::clamp(0.30 * length, 2.5, 6.0);
     const int steps = static_cast<int>(std::ceil(reach / 0.5));
     const double step = reach / static_cast<double>(steps);
     std::vector<double> profile(static_cast<std::size_t>(2 * steps + 1), 0.0);
@@ -318,7 +318,10 @@ std::array<Eigen::Vector2d, 4> refine_quad_corners(
         if (!intersection || !intersection->allFinite()) {
             continue;
         }
-        if ((*intersection - quad[static_cast<std::size_t>(corner)]).norm() > 3.0) {
+        // A thin frame can put the detector's initial quad on the inner edge
+        // one cell in; the outward fit then legitimately moves the corner by
+        // that cell (up to the search reach). Reject only wild intersections.
+        if ((*intersection - quad[static_cast<std::size_t>(corner)]).norm() > 6.5) {
             continue;
         }
         refined[static_cast<std::size_t>(corner)] = *intersection;
