@@ -16,7 +16,7 @@
 /// published `bit_x/bit_y` centre. The threshold is a bilinear model fitted to
 /// the sampled border ring (the inner reference frame) and to the quiet zone
 /// one cell outside it, so illumination gradients across the tag do not flip
-/// cells. The four 90-degree rotations are tried by sampling each one; the
+/// cells. The four 90-degree rotations are tried on the sampled word, and the
 /// corner order is reported so that corner 0 is the published corner.
 ///
 /// ## Pixel convention
