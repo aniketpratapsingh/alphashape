@@ -60,6 +60,7 @@ struct FixtureFamily {
     int width_at_border = 0;
     int total_width = 0;
     bool reversed_border = false;
+    std::string source_sha256;
     bool loaded = false;
 };
 
@@ -84,6 +85,8 @@ bool parse_metadata(const std::string& line, FixtureFamily& fixture) {
             fixture.total_width = std::stoi(value);
         } else if (key == "reversed_border") {
             fixture.reversed_border = value == "true";
+        } else if (key == "source-sha256") {
+            fixture.source_sha256 = value;
         }
     };
     std::size_t start = 0;
@@ -116,6 +119,8 @@ std::optional<FixtureFamily> read_fixture(const std::string& name) {
         if (line.front() == '#') {
             if (line.rfind("# family=", 0) == 0) {
                 parse_metadata(line.substr(2), fixture);
+            } else if (line.rfind("# source-sha256: ", 0) == 0) {
+                fixture.source_sha256 = line.substr(17);
             }
             continue;
         }
@@ -191,6 +196,149 @@ std::vector<CodedTarget> detect_and_decode(const FloatImage& image,
     return decode_tags(image, family, max_hamming, params);
 }
 
+/// Fill an axis-aligned rectangle, clipped to the image.
+void paint_rect(FloatImage& image, int x0, int y0, int x1, int y1, float value) {
+    x0 = std::max(x0, 0);
+    y0 = std::max(y0, 0);
+    x1 = std::min(x1, image.width());
+    y1 = std::min(y1, image.height());
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            image.at(x, y) = value;
+        }
+    }
+}
+
+/// Fill a rotated rectangle by testing pixel centres in its bounding box.
+void paint_rotated_rect(FloatImage& image, double cx, double cy, double half_w,
+                        double half_h, double angle, float value) {
+    const double extent = std::abs(half_w) + std::abs(half_h) + 1.0;
+    const double c = std::cos(angle);
+    const double s = std::sin(angle);
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx - extent)));
+    const int x1 = std::min(image.width(), static_cast<int>(std::ceil(cx + extent)));
+    const int y0 = std::max(0, static_cast<int>(std::floor(cy - extent)));
+    const int y1 = std::min(image.height(), static_cast<int>(std::ceil(cy + extent)));
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const double dx = static_cast<double>(x) + 0.5 - cx;
+            const double dy = static_cast<double>(y) + 0.5 - cy;
+            const double u = c * dx + s * dy;
+            const double v = -s * dx + c * dy;
+            if (std::abs(u) <= half_w && std::abs(v) <= half_h) {
+                image.at(x, y) = value;
+            }
+        }
+    }
+}
+
+/// A window-like grid: a light pane divided by dark mullions.
+void paint_window(FloatImage& image, int x0, int y0, int size, int cell) {
+    paint_rect(image, x0, y0, x0 + size, y0 + size, 0.92F);
+    for (int line = 0; line <= size; line += cell) {
+        paint_rect(image, x0 + line, y0, x0 + line + 2, y0 + size, 0.06F);
+        paint_rect(image, x0, y0 + line, x0 + size, y0 + line + 2, 0.06F);
+    }
+}
+
+/// A checkerboard of `cell`-pixel cells.
+void paint_checkerboard(FloatImage& image, int x0, int y0, int columns, int rows,
+                        int cell) {
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            const float value = ((row + column) % 2 == 0) ? 0.06F : 0.94F;
+            paint_rect(image, x0 + column * cell, y0 + row * cell,
+                       x0 + (column + 1) * cell, y0 + (row + 1) * cell, value);
+        }
+    }
+}
+
+/// A tag-like square: dark border, random interior cells. It is deliberately
+/// not from any family table.
+void paint_tag_like(FloatImage& image, int x0, int y0, int cells, int cell,
+                    std::mt19937& engine) {
+    const int size = cells * cell;
+    paint_rect(image, x0, y0, x0 + size, y0 + size, 0.06F);
+    for (int row = 1; row < cells - 1; ++row) {
+        for (int column = 1; column < cells - 1; ++column) {
+            const double draw = rng::unit_interval(engine);
+            const float value = draw < 0.5 ? 0.06F : 0.94F;
+            paint_rect(image, x0 + column * cell, y0 + row * cell,
+                       x0 + (column + 1) * cell, y0 + (row + 1) * cell, value);
+        }
+    }
+}
+
+/// A text-like run of short strokes with varied baselines and pitches.
+void paint_text_strokes(FloatImage& image, std::mt19937& engine, int strokes) {
+    for (int i = 0; i < strokes; ++i) {
+        const double x = rng::uniform_real(engine, 20.0, image.width() - 120.0);
+        const double y = rng::uniform_real(engine, 20.0, image.height() - 60.0);
+        const int length = 3 + static_cast<int>(rng::index_below(engine, 26));
+        const int height = 2 + static_cast<int>(rng::index_below(engine, 7));
+        const double angle = rng::uniform_real(engine, -0.6, 0.6);
+        paint_rotated_rect(image, x, y, 0.5 * length, 0.5 * height, angle, 0.08F);
+    }
+}
+
+/// A deterministic ~8 MP clutter scene: hundreds of rectangles in both
+/// polarities, windows, checkerboards, tag-like but foreign squares and text
+/// strokes, then blur, noise and 8-bit quantisation.
+FloatImage make_clutter_scene(int width, int height, std::uint32_t seed) {
+    FloatImage image(width, height, 0.5F);
+    std::mt19937 engine(seed);
+    for (int i = 0; i < 220; ++i) {
+        const int w = 10 + static_cast<int>(rng::index_below(engine, 171));
+        const int h = 10 + static_cast<int>(rng::index_below(engine, 171));
+        const int x = static_cast<int>(rng::index_below(engine,
+            static_cast<std::size_t>(width - w)));
+        const int y = static_cast<int>(rng::index_below(engine,
+            static_cast<std::size_t>(height - h)));
+        paint_rect(image, x, y, x + w, y + h,
+                   rng::unit_interval(engine) < 0.5 ? 0.05F : 0.95F);
+    }
+    for (int i = 0; i < 90; ++i) {
+        paint_rotated_rect(image,
+            rng::uniform_real(engine, 40.0, width - 40.0),
+            rng::uniform_real(engine, 40.0, height - 40.0),
+            rng::uniform_real(engine, 6.0, 70.0),
+            rng::uniform_real(engine, 4.0, 50.0),
+            rng::uniform_real(engine, -1.2, 1.2),
+            rng::unit_interval(engine) < 0.5 ? 0.08F : 0.92F);
+    }
+    for (int i = 0; i < 36; ++i) {
+        const int size = 80 + static_cast<int>(rng::index_below(engine, 161));
+        paint_window(image, static_cast<int>(rng::index_below(engine,
+                       static_cast<std::size_t>(width - size))),
+                     static_cast<int>(rng::index_below(engine,
+                       static_cast<std::size_t>(height - size))),
+                     size, 10 + static_cast<int>(rng::index_below(engine, 21)));
+    }
+    for (int i = 0; i < 30; ++i) {
+        paint_checkerboard(image, static_cast<int>(rng::index_below(engine,
+                              static_cast<std::size_t>(width - 240))),
+                           static_cast<int>(rng::index_below(engine,
+                              static_cast<std::size_t>(height - 240))),
+                           3 + static_cast<int>(rng::index_below(engine, 6)),
+                           3 + static_cast<int>(rng::index_below(engine, 6)),
+                           6 + static_cast<int>(rng::index_below(engine, 19)));
+    }
+    for (int i = 0; i < 28; ++i) {
+        const int cells = 5 + static_cast<int>(rng::index_below(engine, 7));
+        const int cell = 8 + static_cast<int>(rng::index_below(engine, 11));
+        paint_tag_like(image, static_cast<int>(rng::index_below(engine,
+                            static_cast<std::size_t>(width - cells * cell))),
+                       static_cast<int>(rng::index_below(engine,
+                            static_cast<std::size_t>(height - cells * cell))),
+                       cells, cell, engine);
+    }
+    paint_text_strokes(image, engine, 90);
+    image = gaussian_blur(image, 0.8F);
+    test::add_noise(image, 0.02, seed + 1U);
+    test::quantise_to_8bit(image);
+    return image;
+}
+
 }  // namespace
 }  // namespace alphashape
 
@@ -223,14 +371,14 @@ TEST(Markers, AprilTagFamilyTablesMatchPublished) {
     EXPECT_FALSE(parse_tag_family("tag99h99").has_value());
 
     // Chosen defaults: the largest radius whose random-word acceptance is
-    // below 1e-3 (see apriltag_decoder.hpp).
+    // below 1e-4 (see apriltag_decoder.hpp).
     EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag16h5), 0);
-    EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag25h9), 1);
+    EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag25h9), 0);
     EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag36h10), 2);
-    EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag36h11), 3);
+    EXPECT_EQ(default_max_hamming(AprilTagFamily::Tag36h11), 2);
     EXPECT_EQ(default_max_hamming(AprilTagFamily::Circle21h7), 0);
-    EXPECT_EQ(default_max_hamming(AprilTagFamily::Standard41h12), 4);
-    EXPECT_EQ(default_max_hamming(AprilTagFamily::Standard52h13), 5);
+    EXPECT_EQ(default_max_hamming(AprilTagFamily::Standard41h12), 3);
+    EXPECT_EQ(default_max_hamming(AprilTagFamily::Standard52h13), 4);
 }
 
 TEST(Markers, AprilTagFamilyMinHamming) {
@@ -274,6 +422,18 @@ TEST(Markers, AprilTagFamilyMinHamming) {
                     sampled ? " (200 rows sampled)" : "");
         EXPECT_GE(minimum, table.min_hamming) << table.name;
     }
+}
+
+TEST(Markers, AprilTagStandard52FixtureProvenance) {
+    // The fixture carries the SHA-256 the importer computed for the pinned
+    // upstream source. Comparing it with an independent constant here means
+    // the fixture cannot be silently regenerated from a different file.
+    constexpr const char* kStandard52h13SourceSha256 =
+        "d93f9ead23897031c6846f0c0465cbfed1ee95b6d44aa973896ffc869d9769f7";
+    const std::optional<FixtureFamily> fixture = read_fixture("Standard52h13");
+    ASSERT_TRUE(fixture.has_value());
+    EXPECT_EQ(fixture->source_sha256, kStandard52h13SourceSha256);
+    EXPECT_EQ(fixture->source_sha256.size(), 64U);
 }
 
 TEST(Markers, AprilTagDecodeRenderedSet) {
@@ -446,21 +606,23 @@ TEST(Markers, AprilTagCornerOrder) {
                 ++misses;
                 continue;
             }
+            // The documented contract is family-specific: a plain family's
+            // corners bound the black border square, a reversed-border
+            // family's bound the full printed silhouette.
             const std::array<Eigen::Vector2d, 4> border =
                 test::april_tag_corners(truth, false);
             const std::array<Eigen::Vector2d, 4> silhouette =
                 test::april_tag_corners(truth, true);
-            double border_error = 0.0;
-            double silhouette_error = 0.0;
-            for (std::size_t i = 0; i < border.size(); ++i) {
-                border_error = std::max(
-                    border_error, (match->corners[i] - border[i]).norm());
-                silhouette_error = std::max(
-                    silhouette_error, (match->corners[i] - silhouette[i]).norm());
+            const std::array<Eigen::Vector2d, 4>& expected =
+                table.reversed_border ? silhouette : border;
+            double error = 0.0;
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                error = std::max(
+                    error, (match->corners[i] - expected[i]).norm());
             }
-            EXPECT_LE(std::min(border_error, silhouette_error), 1.5)
-                << table.name << " rotation " << rotation << " border "
-                << border_error << " silhouette " << silhouette_error;
+            EXPECT_LE(error, 1.5)
+                << table.name << " rotation " << rotation << " reversed "
+                << table.reversed_border << " error " << error;
             ++checked;
         }
     }
@@ -619,6 +781,108 @@ TEST(Markers, AprilTagDistanceBoundary) {
     ASSERT_FALSE(accepted.empty());
     EXPECT_EQ(accepted.front().code, 0);
     EXPECT_EQ(accepted.front().hamming, allowed + 1);
+}
+
+TEST(Markers, AprilTagDecodeTagsUsesFamilyDefault) {
+    const AprilTagFamily family = AprilTagFamily::Tag36h11;
+    const TagFamily& table = tag_family(family);
+    const int budget = default_max_hamming(family);
+    ASSERT_EQ(budget, 2);
+    const int id = 5;
+    const std::uint64_t code = table.codes[static_cast<std::size_t>(id)];
+    const QuadParams params = quad_params_for(200.0);
+
+    const auto render_word = [&](std::uint64_t word, std::uint32_t seed) {
+        test::AprilTagTruth truth =
+            make_truth(family, id, 200.0, 0.23, 0.010, 0.24, 0.16);
+        truth.use_word = true;
+        truth.word = word;
+        return render_degraded(truth, 0.8, 0.005, seed, 2);
+    };
+
+    std::uint64_t within = code;
+    for (int i = 0; i < budget; ++i) {
+        within ^= std::uint64_t{1} << static_cast<unsigned>(i);
+    }
+    const std::vector<CodedTarget> decoded =
+        decode_tags(render_word(within, 9250U), family, -1, params);
+    ASSERT_EQ(decoded.size(), 1U)
+        << "a word at the family default must decode without an explicit budget";
+    EXPECT_EQ(decoded.front().code, id);
+    EXPECT_EQ(decoded.front().hamming, budget);
+
+    std::uint64_t beyond = code;
+    for (int i = 0; i <= budget; ++i) {
+        beyond ^= std::uint64_t{1} << static_cast<unsigned>(i);
+    }
+    EXPECT_TRUE(decode_tags(render_word(beyond, 9251U), family, -1, params).empty())
+        << "a word one bit past the family default must be rejected";
+}
+
+TEST(Markers, AprilTagDeduplicatesBothPolarities) {
+    // A reversed-border tag is visible to both detector polarities: the dark
+    // outer ring on the dark scan and the white reference frame on the light
+    // scan. The two decodes describe one physical tag and must be merged.
+    const AprilTagFamily family = AprilTagFamily::Standard41h12;
+    const int id = 9;
+    const test::AprilTagTruth truth =
+        make_truth(family, id, 240.0, 0.15, 0.010, 0.24, 0.18);
+    const FloatImage image = render_degraded(truth, 0.8, 0.005, 9300U, 2);
+    const QuadParams params = quad_params_for(240.0);
+    QuadParams bright = params;
+    bright.dark_on_light = false;
+    const std::size_t dark_candidates = detect_quads(image, params).size();
+    const std::size_t bright_candidates = detect_quads(image, bright).size();
+
+    const std::vector<CodedTarget> decoded = decode_tags(image, family, -1, params);
+    int matches = 0;
+    for (const CodedTarget& target : decoded) {
+        if (target.code == id) {
+            ++matches;
+        }
+    }
+    std::printf("[apriltag dedup] candidates dark=%d bright=%d decodes=%d id=%d\n",
+                static_cast<int>(dark_candidates),
+                static_cast<int>(bright_candidates),
+                static_cast<int>(decoded.size()), matches);
+    EXPECT_GT(dark_candidates, 0U);
+    EXPECT_GT(bright_candidates, 0U);
+    ASSERT_FALSE(decoded.empty());
+    EXPECT_EQ(matches, 1) << "both polarities must collapse to one decode";
+}
+
+TEST(AprilTag, ClutterSceneHasNoDecodes) {
+    const FloatImage image = make_clutter_scene(3200, 2500, 424242U);
+    const QuadParams params{};
+    const std::size_t dark_candidates = detect_quads(image, params).size();
+    QuadParams bright = params;
+    bright.dark_on_light = false;
+    const std::size_t bright_candidates = detect_quads(image, bright).size();
+    std::printf("[apriltag clutter] %dx%d dark=%d bright=%d\n", image.width(),
+                image.height(), static_cast<int>(dark_candidates),
+                static_cast<int>(bright_candidates));
+
+    for (AprilTagFamily family : decode_families()) {
+        const TagFamily& table = tag_family(family);
+        const std::vector<CodedTarget> decoded = decode_tags(image, family, -1, params);
+        const std::size_t examined =
+            dark_candidates + (table.reversed_border ? bright_candidates : 0U);
+        std::printf("[apriltag clutter] %-14s examined=%d decodes=%d\n",
+                    table.name.c_str(), static_cast<int>(examined),
+                    static_cast<int>(decoded.size()));
+        if (family == AprilTagFamily::Tag16h5) {
+            // 16h5 is an inherently weak family: even at its default of 0, a
+            // random word is a rotation of a code about 1.8 times in 1000.
+            // A small number of false decodes is documented, not a reason to
+            // relax the default further.
+            EXPECT_LE(decoded.size(), 5U)
+                << "16h5 exceeded its documented clutter allowance";
+        } else {
+            EXPECT_TRUE(decoded.empty())
+                << table.name << " decoded " << decoded.size()
+                << " of " << examined << " candidates";
+        }
+    }
 }
 
 TEST(Markers, AprilTagDecode36h11RealPhotos) {
