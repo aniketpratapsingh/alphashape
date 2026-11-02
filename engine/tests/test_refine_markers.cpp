@@ -632,10 +632,17 @@ TEST(Markers, RefineObliqueViews) {
     RefineMarkersOptions options;
     const RefineMarkersStats stats = run_refine(scene, options);
     for (std::size_t i = 0; i < ids.size(); ++i) {
-        const double rms =
-            rms_to_truth(scene, *find_marker(*scene.chunk, ids[i]), i);
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine oblique] marker %zu rms %.4f px, %zu projections\n",
+                    i, rms, marker->projections.size());
         EXPECT_LE(rms, 0.15) << "marker " << i << " RMS " << rms;
     }
+    std::printf(
+        "[refine oblique] refined %zu unchanged %zu failed %zu removed %zu\n",
+        stats.refined, stats.unchanged, stats.failed,
+        stats.removed_projections);
     EXPECT_EQ(stats.failed, 0U);
 }
 

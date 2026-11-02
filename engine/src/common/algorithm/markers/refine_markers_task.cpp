@@ -776,7 +776,7 @@ struct Winner {
 /// the blob scale widens it for a large target, where a larger displacement is
 /// still a plausible measurement of the same printed target.
 double projection_tolerance(const BlendView& blend) {
-    return std::max(6.0, blend.apparent);
+    return std::max(10.0, blend.apparent);
 }
 
 /// Search depth for the best (candidate, reference view) pair. Up to three
