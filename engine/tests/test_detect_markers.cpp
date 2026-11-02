@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numbers>
@@ -232,6 +233,25 @@ DetectScene make_scene(int width, int height, int camera_count,
     }
     return scene;
 }
+DetectMarkersOptions options_for(const std::string& target_type) {
+    DetectMarkersOptions options;
+    options.target_type = target_type;
+    return options;
+}
+
+DetectMarkersPlan plan_scene(DetectScene& scene,
+                             const DetectMarkersOptions& options) {
+    return plan_detect_markers(scene.document, scene.chunk->id(), options);
+}
+
+int code_from_label(const std::string& label) {
+    const std::string prefix = "target ";
+    if (label.rfind(prefix, 0) != 0) {
+        return -1;
+    }
+    return std::stoi(label.substr(prefix.size()));
+}
+
 std::uint32_t read_circular_word(int bits, std::size_t index) {
     const std::string path = std::string(ALPHASHAPE_TEST_FIXTURE_DIR) +
                              "/markers/circular_codes_N" + std::to_string(bits) +
@@ -323,62 +343,269 @@ std::vector<std::string> detect_labels(const FloatImage& image,
     }
     return labels;
 }
+
+struct AccuracyResult {
+    std::size_t detections = 0;
+    std::size_t markers = 0;
+    double rms = std::numeric_limits<double>::infinity();
+};
+
+std::vector<Eigen::Vector2d> marker_centres(const Chunk& chunk) {
+    std::vector<Eigen::Vector2d> centres;
+    for (const Marker& marker : chunk.markers()) {
+        for (const MarkerProjection& projection : marker.projections) {
+            centres.push_back(projection.pixel);
+        }
+    }
+    return centres;
+}
+
+/// Run one downscaled detection pass and measure the full-resolution centre
+/// error against the published truth centres.
+AccuracyResult measure_accuracy(const FloatImage& image,
+                                const std::string& target_type, int downscale,
+                                const std::vector<Eigen::Vector2d>& truths) {
+    DetectScene scene = make_scene(image.width(), image.height(), 1);
+    write_gray_png(scene.paths[0], image);
+    DetectMarkersOptions options = options_for(target_type);
+    options.marker_downscale = downscale;
+    DetectMarkersPlan plan = plan_scene(scene, options);
+    AccuracyResult result;
+    result.detections = plan.stats.detected;
+    if (plan.command) {
+        plan.command->apply(scene.document);
+    }
+    const std::vector<Eigen::Vector2d> centres = marker_centres(*scene.chunk);
+    result.markers = centres.size();
+    if (truths.empty() || centres.empty()) {
+        return result;
+    }
+    double squared = 0.0;
+    for (const Eigen::Vector2d& truth : truths) {
+        double best = std::numeric_limits<double>::infinity();
+        for (const Eigen::Vector2d& centre : centres) {
+            best = std::min(best, (centre - truth).norm());
+        }
+        squared += best * best;
+    }
+    result.rms = std::sqrt(squared / static_cast<double>(truths.size()));
+    return result;
+}
+
+FloatImage render_bar_cross(int width, int height, double cx, double cy,
+                            double half_length, double half_width, double angle,
+                            float background, float dark, int supersample);
+
 TEST(Markers, DetectMixedSheet) {
-    const int width = 900;
-    const int height = 400;
+    const int width = 1500;
+    const int height = 500;
     FloatImage sheet(width, height, 0.5F);
-    // A non-coded circular target (a filled dark disc) on its own white patch.
-    // Coded rings are exercised by DetectsOnAllCameras and the timing test;
-    // the plain disc makes this mixed-type test independent of ring decoding.
-    const int disc_size = 100;
+    // Plain dark disc: only the non-coded Circular run may report it.
+    const int disc_size = 140;
     test::EllipseTruth disc;
     disc.cx = 0.5 * static_cast<double>(disc_size);
     disc.cy = 0.5 * static_cast<double>(disc_size);
-    disc.a = 45.0;
-    disc.b = 45.0;
+    disc.a = 50.0;
+    disc.b = 50.0;
     paste(sheet,
           test::render_ellipses(disc_size, disc_size, {disc}, 0.95F, 0.05F),
-          150 - disc_size / 2, 200 - disc_size / 2);
-    // A checker cross on the mid-grey sheet.
-    const int cross_size = 110;
-    CrossTruth cross;
-    cross.cx = 0.5 * static_cast<double>(cross_size);
-    cross.cy = 0.5 * static_cast<double>(cross_size);
-    cross.half = 35.0;
-    cross.angle = 0.3;
+          150 - disc_size / 2, height / 2 - disc_size / 2);
+    // Coded circular target: only Circular12 may report it.
+    const int ring_size = 100;
+    const test::CircularTruth ring = test::make_circular_truth(
+        0.5 * ring_size, 0.5 * ring_size, 32.0, 12, read_circular_word(12, 0), 1);
+    paste(sheet, test::render_circular_target(ring_size, ring_size, ring),
+          450 - ring_size / 2, height / 2 - ring_size / 2);
+    // Checker cross.
+    const int cross_size = 120;
+    CrossTruth checker;
+    checker.cx = 0.5 * static_cast<double>(cross_size);
+    checker.cy = 0.5 * static_cast<double>(cross_size);
+    checker.half = 38.0;
+    checker.angle = 0.3;
     paste(sheet,
-          render_checker_crosses(cross_size, cross_size, {cross}),
-          450 - cross_size / 2, 200 - cross_size / 2);
-    // An AprilTag 36h11 with its own white quiet zone.
-    const int tag_size = test::april_tag_canvas_size(80.0);
+          render_checker_crosses(cross_size, cross_size, {checker}),
+          750 - cross_size / 2, height / 2 - cross_size / 2);
+    // Bar cross.
+    paste(sheet,
+          render_bar_cross(cross_size, cross_size, 0.5 * cross_size,
+                           0.5 * cross_size, 40.0, 8.0, 0.2, 0.95F, 0.05F, 4),
+          1050 - cross_size / 2, height / 2 - cross_size / 2);
+    // AprilTag 36h11 with its own white quiet zone.
+    const int tag_size = test::april_tag_canvas_size(72.0);
     test::AprilTagTruth tag;
     tag.cx = 0.5 * static_cast<double>(tag_size);
     tag.cy = 0.5 * static_cast<double>(tag_size);
-    tag.tag_px = 80.0;
+    tag.tag_px = 72.0;
     tag.id = 0;
     tag.family = AprilTagFamily::Tag36h11;
-    const test::AprilTagRender tag_render =
-        test::render_april_tag(tag_size, tag_size, tag, 0.95, 0.05);
-    paste(sheet, tag_render.image, 750 - tag_size / 2, 200 - tag_size / 2);
+    paste(sheet, test::render_april_tag(tag_size, tag_size, tag, 0.95, 0.05).image,
+          1350 - tag_size / 2, height / 2 - tag_size / 2);
 
     const FloatImage image = gaussian_blur(sheet, 0.8F);
-    // minimum_size keeps the other targets' small fiducial cells out of each
-    // decoder's candidate set; the disc is larger so its own run can use a
-    // tighter floor that also excludes the tag's border blob.
     const std::vector<std::string> circular =
-        detect_labels(image, "Circular", false, true, 40.0);
-    ASSERT_EQ(circular.size(), 1U) << "circular run found "
-                                   << circular.size() << " targets";
+        detect_labels(image, "Circular", false, true, 42.0);
+    ASSERT_EQ(circular.size(), 1U)
+        << "Circular reported " << circular.size() << " targets";
     EXPECT_EQ(circular[0], "point 1");
+    const std::vector<std::string> rings =
+        detect_labels(image, "Circular12", false, true, 0.0);
+    ASSERT_EQ(rings.size(), 1U)
+        << "Circular12 reported " << rings.size() << " targets";
+    EXPECT_EQ(rings[0].rfind("target ", 0), 0U);
     const std::vector<std::string> crosses =
         detect_labels(image, "Cross", false, true, 20.0);
-    ASSERT_EQ(crosses.size(), 1U) << "cross run found " << crosses.size();
-    EXPECT_EQ(crosses[0], "point 1");
+    ASSERT_EQ(crosses.size(), 2U)
+        << "Cross reported " << crosses.size() << " targets";
     const std::vector<std::string> tags =
         detect_labels(image, "AprilTag36h11", false, true, 20.0);
-    ASSERT_EQ(tags.size(), 1U) << "tag run found " << tags.size();
+    ASSERT_EQ(tags.size(), 1U)
+        << "AprilTag36h11 reported " << tags.size() << " targets";
     EXPECT_EQ(tags[0], "target 0");
 }
+TEST(Markers, InvertedFindsLightTargetsOnly) {
+    const int width = 400;
+    const int height = 300;
+    test::EllipseTruth disc;
+    disc.cx = 200.0;
+    disc.cy = 150.0;
+    disc.a = 25.0;
+    disc.b = 25.0;
+    const FloatImage image =
+        test::render_ellipses(width, height, {disc}, 0.05F, 0.95F);
+    DetectScene scene = make_scene(width, height, 1);
+    write_gray_png(scene.paths[0], image);
+
+    DetectMarkersOptions options = options_for("Circular");
+    EXPECT_EQ(plan_scene(scene, options).stats.detected, 0U);
+    options.inverted = true;
+    DetectMarkersPlan plan = plan_scene(scene, options);
+    EXPECT_EQ(plan.stats.detected, 1U);
+    ASSERT_TRUE(plan.command);
+    plan.command->apply(scene.document);
+    ASSERT_EQ(scene.chunk->markers().size(), 1U);
+}
+
+TEST(Markers, NoParityReportsEvenCode) {
+    const int width = 400;
+    const int height = 300;
+    const test::CircularTruth truth = test::make_circular_truth(
+        200.0, 150.0, 35.0, 12, read_circular_word(12, 0), 1);
+    const FloatImage image = test::render_circular_target(width, height, truth);
+
+    DetectScene normal = make_scene(width, height, 1);
+    write_gray_png(normal.paths[0], image);
+    DetectMarkersPlan first = plan_scene(normal, options_for("Circular12"));
+    ASSERT_TRUE(first.command);
+    first.command->apply(normal.document);
+    ASSERT_EQ(normal.chunk->markers().size(), 1U);
+    const int code = code_from_label(normal.chunk->markers()[0].label);
+    ASSERT_GE(code, 0);
+
+    DetectScene no_parity = make_scene(width, height, 1);
+    write_gray_png(no_parity.paths[0], image);
+    DetectMarkersOptions options = options_for("Circular12");
+    options.noparity = true;
+    DetectMarkersPlan second = plan_scene(no_parity, options);
+    ASSERT_TRUE(second.command);
+    second.command->apply(no_parity.document);
+    ASSERT_EQ(no_parity.chunk->markers().size(), 1U);
+    EXPECT_EQ(code_from_label(no_parity.chunk->markers()[0].label),
+              (code / 2) * 2);
+}
+
+TEST(Markers, FramesAndCamerasFilters) {
+    const int width = 400;
+    const int height = 300;
+    test::EllipseTruth left;
+    left.cx = 100.0;
+    left.cy = 150.0;
+    left.a = 22.0;
+    left.b = 22.0;
+    test::EllipseTruth right = left;
+    right.cx = 300.0;
+    const FloatImage first_image =
+        test::render_ellipses(width, height, {left}, 0.95F, 0.05F);
+    const FloatImage second_image =
+        test::render_ellipses(width, height, {right}, 0.95F, 0.05F);
+    {
+        DetectScene scene = make_scene(width, height, 2);
+        write_gray_png(scene.paths[0], first_image);
+        write_gray_png(scene.paths[1], second_image);
+        DetectMarkersOptions options = options_for("Circular");
+        options.cameras = {scene.chunk->cameras()[1].label};
+        DetectMarkersPlan plan = plan_scene(scene, options);
+        EXPECT_EQ(plan.stats.detected, 1U);
+        ASSERT_TRUE(plan.command);
+        plan.command->apply(scene.document);
+        ASSERT_EQ(scene.chunk->markers().size(), 1U);
+        ASSERT_EQ(scene.chunk->markers()[0].projections.size(), 1U);
+        EXPECT_EQ(scene.chunk->markers()[0].projections[0].camera_id,
+                  scene.chunk->cameras()[1].id);
+    }
+    {
+        DetectScene scene = make_scene(width, height, 2);
+        write_gray_png(scene.paths[0], first_image);
+        write_gray_png(scene.paths[1], second_image);
+        DetectMarkersOptions options = options_for("Circular");
+        options.frames = {
+            std::filesystem::path(scene.paths[0]).stem().string()};
+        DetectMarkersPlan plan = plan_scene(scene, options);
+        EXPECT_EQ(plan.stats.detected, 1U);
+        ASSERT_TRUE(plan.command);
+        plan.command->apply(scene.document);
+        ASSERT_EQ(scene.chunk->markers().size(), 1U);
+        ASSERT_EQ(scene.chunk->markers()[0].projections.size(), 1U);
+        EXPECT_EQ(scene.chunk->markers()[0].projections[0].camera_id,
+                  scene.chunk->cameras()[0].id);
+    }
+}
+
+TEST(Markers, MaximumResidualControlsAttachment) {
+    const int width = 640;
+    const int height = 480;
+    test::EllipseTruth disc;
+    disc.cx = 323.0;
+    disc.cy = 240.0;
+    disc.a = 20.0;
+    disc.b = 20.0;
+    const FloatImage image =
+        test::render_ellipses(width, height, {disc}, 0.95F, 0.05F);
+
+    const auto make_existing = [](DetectScene& scene) {
+        make_add_marker_command(scene.chunk->id(), std::string("M"),
+                                Eigen::Vector3d(0.0, 0.0, 10.0))
+            ->apply(scene.document);
+    };
+    {
+        DetectScene scene = make_scene(width, height, 1);
+        write_gray_png(scene.paths[0], image);
+        make_existing(scene);
+        DetectMarkersOptions options = options_for("Circular");
+        options.maximum_residual = 5.0;
+        DetectMarkersPlan plan = plan_scene(scene, options);
+        EXPECT_EQ(plan.stats.attached, 1U);
+        EXPECT_EQ(plan.stats.created, 0U);
+        ASSERT_TRUE(plan.command);
+        plan.command->apply(scene.document);
+        ASSERT_EQ(scene.chunk->markers().size(), 1U);
+        EXPECT_EQ(scene.chunk->markers()[0].projections.size(), 1U);
+    }
+    {
+        DetectScene scene = make_scene(width, height, 1);
+        write_gray_png(scene.paths[0], image);
+        make_existing(scene);
+        DetectMarkersOptions options = options_for("Circular");
+        options.maximum_residual = 2.0;
+        DetectMarkersPlan plan = plan_scene(scene, options);
+        EXPECT_EQ(plan.stats.attached, 0U);
+        EXPECT_EQ(plan.stats.created, 1U);
+        ASSERT_TRUE(plan.command);
+        plan.command->apply(scene.document);
+        EXPECT_EQ(scene.chunk->markers().size(), 2U);
+    }
+}
+
 TEST(Markers, NonCodedAttachesToNearestExistingMarker) {
     const int width = 640;
     const int height = 480;
@@ -405,11 +632,12 @@ TEST(Markers, NonCodedAttachesToNearestExistingMarker) {
     write_gray_png(scene.paths[1],
                    test::render_ellipses(width, height, {disc}, 0.95F, 0.05F));
 
-    Params params = params_for("DetectMarkers");
-    params.set("target_type", std::string("Circular"));
-    params.set("cameras",
-               std::vector<std::string>{scene.chunk->cameras()[1].label});
-    run_named(scene.document, "DetectMarkers", params);
+    DetectMarkersOptions options = options_for("Circular");
+    options.cameras = {scene.chunk->cameras()[1].label};
+    DetectMarkersPlan plan = plan_scene(scene, options);
+    EXPECT_EQ(plan.stats.attached, 1U);
+    ASSERT_TRUE(plan.command);
+    plan.command->apply(scene.document);
 
     ASSERT_EQ(scene.chunk->markers().size(), 1U);
     Marker* marker = find_marker(*scene.chunk, "M");
@@ -424,17 +652,7 @@ TEST(Markers, NonCodedAttachesToNearestExistingMarker) {
         }
     }
     EXPECT_TRUE(found);
-    EXPECT_EQ(detect_markers_last_stats().attached, 1U);
 }
-class ScopedSink {
-public:
-    explicit ScopedSink(DetectMarkersCommandSink sink) {
-        set_detect_markers_command_sink(std::move(sink));
-    }
-    ~ScopedSink() { set_detect_markers_command_sink({}); }
-    ScopedSink(const ScopedSink&) = delete;
-    ScopedSink& operator=(const ScopedSink&) = delete;
-};
 
 FloatImage render_one_disc(int width, int height, double cx, double cy) {
     test::EllipseTruth disc;
@@ -449,6 +667,15 @@ TEST(Markers, CreateMarkersFalseDoesNotAdd) {
     const int height = 300;
     DetectScene scene = make_scene(width, height, 1);
     write_gray_png(scene.paths[0], render_one_disc(width, height, 200.0, 150.0));
+    DetectMarkersOptions options = options_for("Circular");
+    options.create_markers = false;
+    const DetectMarkersPlan plan = plan_scene(scene, options);
+    EXPECT_EQ(plan.stats.detected, 1U);
+    EXPECT_EQ(plan.stats.created, 0U);
+    EXPECT_EQ(plan.stats.attached, 0U);
+    EXPECT_EQ(plan.stats.dropped, 1U);
+    EXPECT_FALSE(plan.command);
+
     Params params = params_for("DetectMarkers");
     params.set("target_type", std::string("Circular"));
     params.set("create_markers", false);
@@ -460,13 +687,7 @@ TEST(Markers, CreateMarkersFalseDoesNotAdd) {
     }
     EXPECT_NE(log_text.find("detected 1"), std::string::npos) << log_text;
     EXPECT_NE(log_text.find("dropped 1"), std::string::npos) << log_text;
-
     EXPECT_TRUE(scene.chunk->markers().empty());
-    const DetectMarkersStats stats = detect_markers_last_stats();
-    EXPECT_EQ(stats.detected, 1U);
-    EXPECT_EQ(stats.created, 0U);
-    EXPECT_EQ(stats.attached, 0U);
-    EXPECT_EQ(stats.dropped, 1U);
 }
 
 TEST(Markers, DetectsOnAllCameras) {
@@ -479,15 +700,15 @@ TEST(Markers, DetectsOnAllCameras) {
     for (const std::string& path : scene.paths) {
         write_gray_png(path, image);
     }
-    Params params = params_for("DetectMarkers");
-    params.set("target_type", std::string("Circular12"));
-    run_named(scene.document, "DetectMarkers", params);
+    DetectMarkersPlan plan = plan_scene(scene, options_for("Circular12"));
+    EXPECT_EQ(plan.stats.created, 1U);
+    ASSERT_TRUE(plan.command);
+    plan.command->apply(scene.document);
 
     ASSERT_EQ(scene.chunk->markers().size(), 1U);
     const Marker& marker = scene.chunk->markers()[0];
     EXPECT_EQ(marker.label.rfind("target ", 0), 0U);
     EXPECT_EQ(marker.projections.size(), 3U);
-    EXPECT_EQ(detect_markers_last_stats().created, 1U);
 }
 TEST(Markers, DetectIsUndoable) {
     const int width = 640;
@@ -497,15 +718,11 @@ TEST(Markers, DetectIsUndoable) {
     DetectScene scene = make_scene(width, height, 1);
     write_gray_png(scene.paths[0],
                    test::render_circular_target(width, height, truth));
+    DetectMarkersPlan plan = plan_scene(scene, options_for("Circular12"));
+    ASSERT_TRUE(plan.command);
+    ASSERT_TRUE(scene.chunk->markers().empty());
     UndoStack stack(&scene.document);
-    [[maybe_unused]] ScopedSink sink(
-        [&stack](Document& document, std::unique_ptr<AbstractCommand> command) {
-            (void)document;
-            stack.execute(std::move(command));
-        });
-    Params params = params_for("DetectMarkers");
-    params.set("target_type", std::string("Circular12"));
-    run_named(scene.document, "DetectMarkers", params);
+    stack.execute(std::move(plan.command));
 
     ASSERT_EQ(scene.chunk->markers().size(), 1U);
     ASSERT_EQ(stack.size(), 1U);
@@ -549,14 +766,11 @@ TEST(Markers, FilterMaskSkipsMaskedTargets) {
     }
     scene.chunk->masks().push_back(mask);
 
-    Params params = params_for("DetectMarkers");
-    params.set("target_type", std::string("Circular"));
-    params.set("create_markers", false);
-    run_named(scene.document, "DetectMarkers", params);
-    EXPECT_EQ(detect_markers_last_stats().detected, 1U);
-    params.set("filter_mask", false);
-    run_named(scene.document, "DetectMarkers", params);
-    EXPECT_EQ(detect_markers_last_stats().detected, 2U);
+    DetectMarkersOptions options = options_for("Circular");
+    options.create_markers = false;
+    EXPECT_EQ(plan_scene(scene, options).stats.detected, 1U);
+    options.filter_mask = false;
+    EXPECT_EQ(plan_scene(scene, options).stats.detected, 2U);
 }
 TEST(Markers, ToleranceMapping) {
     EXPECT_EQ(circular_max_hamming(0.0), 0);
@@ -636,6 +850,37 @@ FloatImage render_bar_cross(int width, int height, double cx, double cy,
     return image;
 }
 
+/// Supersampled analytic painter for decoy geometry; `shade` returns the
+/// intended intensity at a continuous image coordinate.
+void paint_pattern(FloatImage& image, double cx, double cy, double extent,
+                   const std::function<float(double, double)>& shade,
+                   int supersample = 4) {
+    const int samples = std::max(1, supersample);
+    const double total = static_cast<double>(samples * samples);
+    const double step = 1.0 / static_cast<double>(samples);
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx - extent)));
+    const int y0 = std::max(0, static_cast<int>(std::floor(cy - extent)));
+    const int x1 = std::min(image.width() - 1,
+                            static_cast<int>(std::ceil(cx + extent)));
+    const int y1 = std::min(image.height() - 1,
+                            static_cast<int>(std::ceil(cy + extent)));
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            double sum = 0.0;
+            for (int sy = 0; sy < samples; ++sy) {
+                for (int sx = 0; sx < samples; ++sx) {
+                    const double px = static_cast<double>(x) +
+                                      (static_cast<double>(sx) + 0.5) * step;
+                    const double py = static_cast<double>(y) +
+                                      (static_cast<double>(sy) + 0.5) * step;
+                    sum += static_cast<double>(shade(px, py));
+                }
+            }
+            image.at(x, y) = static_cast<float>(sum / total);
+        }
+    }
+}
+
 TEST(Markers, DetectBarCross) {
     const FloatImage image =
         render_bar_cross(400, 360, 200.3, 180.6, 42.0, 6.0, 0.4);
@@ -649,6 +894,164 @@ TEST(Markers, DetectBarCross) {
     std::printf("[DetectBarCross] %zu targets, nearest error %.4f px\n",
                 found.size(), best);
     EXPECT_LE(best, 1.0);
+}
+
+TEST(Markers, CrossRejectsDecoyPatterns) {
+    const int width = 1500;
+    const int height = 470;
+    std::vector<CrossTruth> real_truths;
+    for (int i = 0; i < 3; ++i) {
+        CrossTruth truth;
+        truth.cx = 1220.0 + 90.0 * static_cast<double>(i);
+        truth.cy = 120.0 + 130.0 * static_cast<double>(i);
+        truth.half = 35.0;
+        truth.angle = 0.2 + 0.5 * static_cast<double>(i);
+        real_truths.push_back(truth);
+    }
+    FloatImage image = render_checker_crosses(width, height, real_truths);
+    // Square outline.
+    paint_pattern(image, 170.0, 150.0, 75.0, [](double x, double y) {
+        const double d = std::max(std::abs(x - 170.0), std::abs(y - 150.0));
+        return (d >= 50.0 && d <= 60.0) ? 0.05F : 0.5F;
+    });
+    // AprilTag-like bordered square: dark border, light interior, grey quiet zone.
+    paint_pattern(image, 400.0, 150.0, 85.0, [](double x, double y) {
+        const double d = std::max(std::abs(x - 400.0), std::abs(y - 150.0));
+        if (d > 65.0) {
+            return 0.5F;
+        }
+        return d > 49.0 ? 0.05F : 0.95F;
+    });
+    // 8x8 checkerboard texture patch.
+    paint_pattern(image, 660.0, 170.0, 90.0, [](double x, double y) {
+        if (std::abs(x - 660.0) > 80.0 || std::abs(y - 170.0) > 80.0) {
+            return 0.5F;
+        }
+        const int ix = static_cast<int>(std::floor((x - 580.0) / 20.0));
+        const int iy = static_cast<int>(std::floor((y - 90.0) / 20.0));
+        return ((ix + iy) & 1) != 0 ? 0.05F : 0.95F;
+    });
+    // Four window-grid rectangles.
+    paint_pattern(image, 945.0, 240.0, 190.0, [](double x, double y) {
+        constexpr std::array<std::array<double, 4>, 4> rects{{
+            {800.0, 80.0, 930.0, 220.0},
+            {960.0, 80.0, 1090.0, 220.0},
+            {800.0, 260.0, 930.0, 400.0},
+            {960.0, 260.0, 1090.0, 400.0},
+        }};
+        for (const auto& r : rects) {
+            if (x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] &&
+                (x - r[0] < 7.0 || r[2] - x < 7.0 || y - r[1] < 7.0 ||
+                 r[3] - y < 7.0)) {
+                return 0.05F;
+            }
+        }
+        return 0.5F;
+    });
+    image = gaussian_blur(image, 1.0F);
+
+    DetectScene scene = make_scene(width, height, 1);
+    write_gray_png(scene.paths[0], image);
+    DetectMarkersOptions options = options_for("Cross");
+    options.minimum_size = 20.0;
+    DetectMarkersPlan plan = plan_scene(scene, options);
+    ASSERT_TRUE(plan.command);
+    plan.command->apply(scene.document);
+    const std::vector<Eigen::Vector2d> centres = marker_centres(*scene.chunk);
+    for (const CrossTruth& truth : real_truths) {
+        double best = std::numeric_limits<double>::infinity();
+        for (const Eigen::Vector2d& centre : centres) {
+            best = std::min(best, (centre - Eigen::Vector2d(truth.cx, truth.cy)).norm());
+        }
+        EXPECT_LE(best, 2.5) << "real cross at " << truth.cx << ", " << truth.cy;
+    }
+    const std::array<std::array<double, 4>, 4> decoys{{
+        {95.0, 75.0, 245.0, 225.0},    // square outline
+        {320.0, 70.0, 480.0, 230.0},   // bordered square
+        {570.0, 80.0, 750.0, 260.0},   // checkerboard patch
+        {770.0, 50.0, 1120.0, 430.0},  // window rectangles
+    }};
+    std::size_t inside_decoys = 0;
+    for (const Eigen::Vector2d& centre : centres) {
+        for (const auto& box : decoys) {
+            if (centre.x() >= box[0] && centre.x() <= box[2] &&
+                centre.y() >= box[1] && centre.y() <= box[3]) {
+                ++inside_decoys;
+                ADD_FAILURE() << "cross decoy detection at " << centre.x() << ", "
+                              << centre.y();
+            }
+        }
+    }
+    std::printf("[Cross decoys] %zu real crosses in %zu detections, %zu decoy hits\n",
+                real_truths.size(), centres.size(), inside_decoys);
+}
+
+TEST(Markers, DownscaledCrossesRefineAtFullResolution) {
+    const int width = 900;
+    const int height = 700;
+    std::vector<CrossTruth> checker_truths;
+    std::vector<Eigen::Vector2d> truths;
+    for (int i = 0; i < 4; ++i) {
+        CrossTruth truth;
+        truth.cx = (i % 2 == 0) ? 200.0 : 650.0;
+        truth.cy = (i < 2) ? 180.0 : 520.0;
+        truth.half = 40.0;
+        truth.angle = 0.2 + 0.4 * static_cast<double>(i);
+        checker_truths.push_back(truth);
+        truths.emplace_back(truth.cx, truth.cy);
+    }
+    const FloatImage checker_image =
+        gaussian_blur(render_checker_crosses(width, height, checker_truths), 1.0F);
+    FloatImage bar_sheet(width, height, 0.95F);
+    const int patch = 170;
+    for (std::size_t i = 0; i < truths.size(); ++i) {
+        const FloatImage bar = render_bar_cross(
+            patch, patch, 0.5 * patch, 0.5 * patch, 50.0, 18.0,
+            0.25 + 0.3 * static_cast<double>(i), 0.95F, 0.05F, 4);
+        paste(bar_sheet, bar,
+              static_cast<int>(truths[i].x()) - patch / 2,
+              static_cast<int>(truths[i].y()) - patch / 2);
+    }
+    const FloatImage bar_image = gaussian_blur(bar_sheet, 1.0F);
+
+    for (const int downscale : {2, 3}) {
+        const AccuracyResult checker = measure_accuracy(
+            checker_image, "Cross", downscale, truths);
+        const AccuracyResult bar =
+            measure_accuracy(bar_image, "Cross", downscale, truths);
+        std::printf(
+            "[Cross downscale %d] checker %zu/4 RMS %.4f, bar %zu/4 RMS %.4f px\n",
+            downscale, checker.markers, checker.rms, bar.markers, bar.rms);
+        EXPECT_EQ(checker.markers, truths.size());
+        EXPECT_EQ(bar.markers, truths.size());
+        EXPECT_LE(checker.rms, 0.2);
+        EXPECT_LE(bar.rms, 0.2);
+    }
+}
+
+TEST(Markers, DownscaledCircularRefinesAtFullResolution) {
+    const int width = 900;
+    const int height = 700;
+    std::vector<test::CircularTruth> targets;
+    std::vector<Eigen::Vector2d> truths;
+    for (int i = 0; i < 4; ++i) {
+        const double cx = (i % 2 == 0) ? 200.0 : 650.0;
+        const double cy = (i < 2) ? 180.0 : 520.0;
+        targets.push_back(test::make_circular_truth(
+            cx, cy, 55.0, 12, read_circular_word(12, static_cast<std::size_t>(i)),
+            1));
+        truths.emplace_back(cx, cy);
+    }
+    const FloatImage image =
+        gaussian_blur(test::render_circular_targets(width, height, targets), 1.0F);
+    for (const int downscale : {2, 3}) {
+        const AccuracyResult result =
+            measure_accuracy(image, "Circular12", downscale, truths);
+        std::printf("[Circular12 downscale %d] %zu/4 RMS %.4f px\n", downscale,
+                    result.markers, result.rms);
+        EXPECT_EQ(result.markers, truths.size());
+        EXPECT_LE(result.rms, 0.2);
+    }
 }
 TEST(Markers, DetectCircularTiming) {
     const int width = 5472;
@@ -669,11 +1072,18 @@ TEST(Markers, DetectCircularTiming) {
     write_gray_png(scene.paths[0], image);
     Params params = params_for("DetectMarkers");
     params.set("target_type", std::string("Circular12"));
+    std::string log_text;
     const auto started = std::chrono::steady_clock::now();
-    run_named(scene.document, "DetectMarkers", params);
+    {
+        ScopedLogCapture capture;
+        run_named(scene.document, "DetectMarkers", params);
+        log_text = capture.text(LogLevel::Info);
+    }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
+    EXPECT_NE(log_text.find("estimated peak working set"), std::string::npos)
+        << log_text;
     std::printf(
         "[DetectMarkers timing] %.3f s for %dx%d Circular12 (auto downscale)\n",
         seconds, width, height);

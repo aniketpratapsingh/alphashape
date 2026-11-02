@@ -161,7 +161,26 @@ class TestDetectMarkers(unittest.TestCase):
             with self.assertRaises(alphashape.ValueError) as context:
                 chunk.detectMarkers(target_type="NotATarget",
                                     cameras=[chunk.cameras[0].label])
-            self.assertIn("target_type", str(context.exception))
+            message = str(context.exception)
+            self.assertIn("target_type", message)
+            for valid in ("Circular12", "Circular", "Cross", "AprilTag36h11"):
+                self.assertIn(valid, message)
+
+    def test_circle21_reports_the_documented_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "disc.pgm")
+            write_disc_pgm(path)
+            doc = alphashape.Document()
+            chunk = doc.add_chunk("Chunk 1")
+            doc.active_chunk = chunk
+            doc.run_task("AddPhotos", filenames=[path])
+            with self.assertRaises(alphashape.ValueError) as context:
+                chunk.detectMarkers(target_type="AprilTagCircle21h7",
+                                    cameras=[chunk.cameras[0].label])
+            message = str(context.exception)
+            self.assertIn("AprilTagCircle21h7", message)
+            self.assertIn("not supported yet", message)
+            self.assertIn("LIMITATIONS.md", message)
 
 
 if __name__ == "__main__":
