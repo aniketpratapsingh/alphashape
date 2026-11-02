@@ -76,6 +76,7 @@ add_executable(alphashape_tests
     test_marker_detector.cpp
     test_circular_decoder.cpp
     test_apriltag.cpp
+    test_detect_markers.cpp
     test_gpu.cpp
 )
 
@@ -225,7 +226,8 @@ gtest_discover_tests(alphashape_tests
 set(_alphashape_serial_tests "${CMAKE_CURRENT_BINARY_DIR}/alphashape_serial_tests.cmake")
 file(WRITE "${_alphashape_serial_tests}"
     "set_tests_properties(MarkerDetector.TwelveMegapixelTiming PROPERTIES RUN_SERIAL TRUE)\n"
-    "set_tests_properties(Markers.AprilTagDecodeRenderedSet PROPERTIES RUN_SERIAL TRUE)\n")
+    "set_tests_properties(Markers.AprilTagDecodeRenderedSet PROPERTIES RUN_SERIAL TRUE)\n"
+    "set_tests_properties(Markers.DetectCircularTiming PROPERTIES RUN_SERIAL TRUE)\n")
 set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${_alphashape_serial_tests}")
 
 # M12 WP-12.8: geo::Projection (the hand-written Transverse Mercator selector)

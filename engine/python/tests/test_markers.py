@@ -37,6 +37,25 @@ def document_with_photos():
     return doc, chunk
 
 
+def write_disc_pgm(path, width=240, height=180, cx=120.0, cy=90.0, radius=28.0):
+    """A white sheet with one dark filled disc, written as a binary PGM.
+
+    The C++ renderer is not available from Python, but the image decoder reads
+    PGM and the non-coded circular detector only needs a dark blob.
+    """
+    lines = []
+    for y in range(height):
+        row = bytearray()
+        for x in range(width):
+            dx = float(x) + 0.5 - cx
+            dy = float(y) + 0.5 - cy
+            row.append(30 if dx * dx + dy * dy <= radius * radius else 230)
+        lines.append(bytes(row))
+    with open(path, "wb") as handle:
+        handle.write(b"P5\n%d %d\n255\n" % (width, height))
+        handle.writelines(lines)
+
+
 class TestMarkerPlacementApi(unittest.TestCase):
     def test_add_place_remove(self):
         _, chunk = document_with_photos()
@@ -112,6 +131,37 @@ class TestMarkerPlacementApi(unittest.TestCase):
                 with open(path, encoding="utf-8") as first, \
                         open(again, encoding="utf-8") as second:
                     self.assertEqual(first.read(), second.read())
+
+
+class TestDetectMarkers(unittest.TestCase):
+    def test_detects_non_coded_circular(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "disc.pgm")
+            write_disc_pgm(path)
+            doc = alphashape.Document()
+            chunk = doc.add_chunk("Chunk 1")
+            doc.active_chunk = chunk
+            doc.run_task("AddPhotos", filenames=[path])
+            camera = chunk.cameras[0].label
+            # AddPhotos leaves the camera unaligned; naming it explicitly is
+            # what selects it (the default is "all enabled cameras").
+            chunk.detectMarkers(target_type="Circular", cameras=[camera])
+            self.assertEqual(len(chunk.markers), 1)
+            self.assertEqual(chunk.markers[0]["label"], "point 1")
+            self.assertEqual(chunk.meta["DetectMarkers/target_type"], "Circular")
+
+    def test_unknown_target_type_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "disc.pgm")
+            write_disc_pgm(path)
+            doc = alphashape.Document()
+            chunk = doc.add_chunk("Chunk 1")
+            doc.active_chunk = chunk
+            doc.run_task("AddPhotos", filenames=[path])
+            with self.assertRaises(alphashape.ValueError) as context:
+                chunk.detectMarkers(target_type="NotATarget",
+                                    cameras=[chunk.cameras[0].label])
+            self.assertIn("target_type", str(context.exception))
 
 
 if __name__ == "__main__":
