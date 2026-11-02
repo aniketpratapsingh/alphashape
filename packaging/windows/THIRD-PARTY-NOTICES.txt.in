@@ -69,6 +69,19 @@ Copyright (C) the LLVM Project. License: Apache-2.0 with the LLVM exception.
   https://llvm.org/
 
 
+AprilTag family tables
+----------------------
+Copyright (C) 2013-2016, The Regents of The University of Michigan.
+All rights reserved.
+License: BSD-2-Clause. The seven published AprilTag family code tables and bit
+layouts are interoperability data imported verbatim from
+https://github.com/AprilRobotics/apriltag. The complete copyright notice and
+licence text are reproduced in the generated
+engine\src\common\algorithm\markers\tag_family_data.cpp and in every
+engine\tests\fixtures\markers\apriltag_<family>.txt fixture. alphashape's
+detector and decoder are original code.
+
+
 Inter and JetBrains Mono (fonts)
 --------------------------------
 Copyright (C) The Inter Project Authors; JetBrains s.r.o.

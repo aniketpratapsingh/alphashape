@@ -1505,3 +1505,17 @@ close-out (WP-12.12). The engine guide is
 - **There is no vertical-CRS or geoid editing UI yet.** Geoids and vertical
   datums are set through the engine/Python API and recorded in the project; the
   desktop dialogs cannot add, choose or edit one.
+
+## M13 — markers
+
+- **Circle21h7 is table-only.** WP-13.7 imports and verifies its published code
+  table like the other six families, but its published tags are circular, so
+  `detect_quads` cannot produce a candidate square. `decode_tag` therefore does
+  not claim to decode this family; a circular-aware candidate detector is the
+  fix.
+- **Reversed-border decoding expects the outer silhouette.** For
+  `Standard41h12` and `Standard52h13` the detected quad is the dark region's
+  outer boundary. The decoder also accepts a candidate that is exactly the
+  reference `width_at_border` square, but an intermediate square (for example
+  the inner dark blob bounded by the white frame) is rejected by the
+  border-side check rather than decoded.
