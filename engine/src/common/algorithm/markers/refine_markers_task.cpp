@@ -119,11 +119,13 @@ struct CameraView {
     /// Image gradient with respect to a full-resolution pixel shift.
     Eigen::Vector2d gradient(const Eigen::Vector2d& pixel) const {
         const double h = static_cast<double>(downscale);
-        const double dx = (sample(pixel + Eigen::Vector2d(h, 0.0)) -
-                           sample(pixel - Eigen::Vector2d(h, 0.0))) /
+        const double dx = static_cast<double>(
+                              sample(pixel + Eigen::Vector2d(h, 0.0)) -
+                              sample(pixel - Eigen::Vector2d(h, 0.0))) /
                           (2.0 * h);
-        const double dy = (sample(pixel + Eigen::Vector2d(0.0, h)) -
-                           sample(pixel - Eigen::Vector2d(0.0, h))) /
+        const double dy = static_cast<double>(
+                              sample(pixel + Eigen::Vector2d(0.0, h)) -
+                              sample(pixel - Eigen::Vector2d(0.0, h))) /
                           (2.0 * h);
         return Eigen::Vector2d(dx, dy);
     }

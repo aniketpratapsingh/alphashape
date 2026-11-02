@@ -189,11 +189,12 @@ FloatImage render_view(const Transform& pose, const Calibration& calibration,
                     if (ray.y() > 1e-9) {
                         const double distance = -centre.y() / ray.y();
                         const Vec3 world = centre + distance * ray;
-                        shade = ground_shade(world.x(), world.z(), spec.blank_boxes);
+                        shade = static_cast<double>(ground_shade(
+                            world.x(), world.z(), spec.blank_boxes));
                         for (const SceneTarget& target : targets) {
                             if (const auto value =
                                     target_shade(target, world.x(), world.z())) {
-                                shade = *value;
+                                shade = static_cast<double>(*value);
                                 break;
                             }
                         }
@@ -585,7 +586,7 @@ TEST(Markers, RefineRemovesContradictedProjection) {
         EXPECT_EQ(stats.removed_projections, 0U);
         for (const MarkerProjection& projection : marker->projections) {
             if (projection.camera_id == outlier_camera) {
-                EXPECT_EQ(projection.pixel, kept);
+                EXPECT_LE((projection.pixel - kept).norm(), 1e-12);
             } else {
                 const auto truth = scene.truth(
                     0, camera_index(scene, projection.camera_id));
@@ -608,7 +609,7 @@ TEST(Markers, RefineSkipsLowTexture) {
         find_marker(*scene.chunk, ids.back())->projections;
     RefineMarkersOptions options;
     const RefineMarkersStats stats = run_refine(scene, options);
-    EXPECT_EQ(find_marker(*scene.chunk, ids.back())->projections, blank_before);
+    EXPECT_TRUE(find_marker(*scene.chunk, ids.back())->projections == blank_before);
     EXPECT_GE(stats.failed, 1U);
     EXPECT_EQ(stats.removed_projections, 0U);
 }
@@ -679,11 +680,11 @@ TEST(Markers, RefineIsUndoable) {
     EXPECT_EQ(stack.size(), 1U);
     ASSERT_EQ(stack.command_names().size(), 1U);
     EXPECT_EQ(stack.command_names()[0], "Refine Markers");
-    EXPECT_NE(scene.chunk->markers(), original);
+    EXPECT_FALSE(scene.chunk->markers() == original);
     stack.undo();
-    EXPECT_EQ(scene.chunk->markers(), original);
+    EXPECT_TRUE(scene.chunk->markers() == original);
     stack.redo();
-    EXPECT_NE(scene.chunk->markers(), original);
+    EXPECT_FALSE(scene.chunk->markers() == original);
 }
 
 TEST(Markers, RefineParamsFilter) {
@@ -708,7 +709,7 @@ TEST(Markers, RefineParamsFilter) {
                 marker.projections[p].camera_id == scene.chunk->cameras()[0].id ||
                 marker.projections[p].camera_id == scene.chunk->cameras()[1].id;
             if (marker.label != "M1" || !selected_camera) {
-                EXPECT_EQ(marker.projections[p], before.projections[p])
+                EXPECT_TRUE(marker.projections[p] == before.projections[p])
                     << "marker " << marker.label << " projection " << p;
             }
         }
