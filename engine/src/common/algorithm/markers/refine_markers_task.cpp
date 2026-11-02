@@ -833,6 +833,12 @@ struct BlendView {
     std::optional<BlobSeed> seed;
     bool cross = false;
     bool has_scale = false;
+    /// Absolute subpixel centre of the printed target in this view, found once
+    /// from the measurement. The rounds move towards it; they never re-derive
+    /// it from the current 3-D point, which is what lets a common-mode lateral
+    /// error be removed.
+    bool has_anchor = false;
+    Eigen::Vector2d anchor = Eigen::Vector2d::Zero();
     /// Apparent radius in full-resolution pixels.
     double apparent = 1.0;
     /// Cross-refiner radius hint in working-scale pixels.
@@ -840,13 +846,19 @@ struct BlendView {
     double depth = 1.0;
 };
 
-/// Apparent radius of the cross near `pixel`, in full-resolution pixels, from
-/// the cross detector's own extent (`CodedTarget::radius_px`). Nullopt when no
-/// cross is detected near the measurement, in which case the caller falls back
-/// to the projected physical radius.
-std::optional<double> cross_extent(const CameraView& view,
-                                   const Eigen::Vector2d& pixel,
-                                   int patch_size) {
+struct CrossSeed {
+    Eigen::Vector2d pixel = Eigen::Vector2d::Zero();  ///< full-resolution
+    double radius = 0.0;                              ///< full-resolution
+    bool bar = false;                                 ///< bar style, not saddle
+};
+
+/// Locate the cross near `pixel` with the cross detector's own extent, in
+/// full-resolution pixels. Nullopt when no cross is detected near the
+/// measurement, in which case the caller falls back to the projected physical
+/// radius.
+std::optional<CrossSeed> cross_extent(const CameraView& view,
+                                      const Eigen::Vector2d& pixel,
+                                      int patch_size) {
     if (!view.loaded()) {
         return std::nullopt;
     }
@@ -881,6 +893,8 @@ std::optional<double> cross_extent(const CameraView& view,
                                local.y() - static_cast<double>(y0) + 0.5);
     double best = std::numeric_limits<double>::infinity();
     double radius = 0.0;
+    Eigen::Vector2d centre = Eigen::Vector2d::Zero();
+    bool bar = false;
     for (const CrossDetection& detection : detections) {
         if (!detection.target.center.allFinite() ||
             !(detection.target.radius_px > 0.0)) {
@@ -890,13 +904,23 @@ std::optional<double> cross_extent(const CameraView& view,
         if (distance < best) {
             best = distance;
             radius = detection.target.radius_px;
+            centre = detection.target.center;
+            bar = detection.style == CrossStyle::Bar;
         }
     }
     if (!std::isfinite(best) || !(radius > 0.0) ||
-        best > static_cast<double>(half)) {
+        best > static_cast<double>(half) || !centre.allFinite()) {
         return std::nullopt;
     }
-    return radius * static_cast<double>(view.downscale);
+    CrossSeed out;
+    const double ds = static_cast<double>(view.downscale);
+    out.pixel = (centre + Eigen::Vector2d(
+                              static_cast<double>(view.offset_x + x0),
+                              static_cast<double>(view.offset_y + y0))) *
+                ds;
+    out.radius = radius * ds;
+    out.bar = bar;
+    return out;
 }
 
 /// Mean NCC of every other view against the reference patch. Views without
@@ -1151,14 +1175,26 @@ std::optional<RoundOutcome> apply_winner(
         ++projected_inliers;
         projected_centres[index] = *projected;
         const double limit = std::max(2.0, blend.apparent);
-        std::optional<BlobSeed> seed;
-        if (!blend.cross) {
-            seed = circular_seed(*blend.view, *projected, options.patch_size);
+        Eigen::Vector2d anchor = *projected;
+        if (blend.has_anchor && blend.anchor.allFinite()) {
+            Eigen::Vector2d delta = blend.anchor - *projected;
+            const double distance = delta.norm();
+            if (std::isfinite(distance) && distance > limit) {
+                delta *= limit / distance;
+            }
+            anchor = *projected + delta;
+        } else {
+            std::optional<BlobSeed> seed;
+            if (!blend.cross) {
+                seed = circular_seed(*blend.view, *projected,
+                                     options.patch_size);
+            }
+            const auto refined =
+                refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
+                                 blend.hint_work, limit);
+            anchor = refined ? *refined : *projected;
         }
-        const auto refined =
-            refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
-                             blend.hint_work, limit);
-        anchored[index] = refined ? *refined : *projected;
+        anchored[index] = anchor;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
         if (point) {
@@ -1239,23 +1275,37 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         if (!blend.view->loaded()) {
             continue;
         }
-        if (saddle_seed(*blend.view, blend.pixel).has_value()) {
-            if (const auto extent =
-                    cross_extent(*blend.view, blend.pixel, patch_size)) {
-                blend.cross = true;
-                blend.apparent = std::max(1.0, *extent);
-                blend.has_scale = true;
-                blend.hint_work =
-                    std::max(4.0, blend.apparent /
-                                      static_cast<double>(
-                                          std::max(1, blend.view->downscale)));
-                continue;
+        const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+        if (const auto cross =
+                cross_extent(*blend.view, blend.pixel, patch_size)) {
+            blend.cross = true;
+            blend.apparent = std::max(1.0, cross->radius);
+            blend.has_scale = true;
+            blend.hint_work = std::max(4.0, blend.apparent / ds);
+            const Eigen::Vector2d offset(
+                static_cast<double>(blend.view->offset_x),
+                static_cast<double>(blend.view->offset_y));
+            const Eigen::Vector2d local =
+                blend.view->local_of(cross->pixel) +
+                Eigen::Vector2d(0.5, 0.5);
+            blend.anchor = cross->pixel;
+            if (const auto refined =
+                    cross->bar
+                        ? refine_bar_cross_center(blend.view->image, local,
+                                                  blend.hint_work)
+                        : refine_cross_center(blend.view->image, local,
+                                              blend.hint_work)) {
+                blend.anchor = (*refined + offset) * ds;
             }
+            blend.has_anchor = true;
+            continue;
         }
         blend.seed = circular_seed(*blend.view, blend.pixel, patch_size);
         if (blend.seed) {
             blend.apparent = std::max(1.0, blend.seed->radius);
             blend.has_scale = true;
+            blend.anchor = blend.seed->pixel;
+            blend.has_anchor = true;
         }
         blend.hint_work = 8.0;
     }
