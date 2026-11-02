@@ -520,7 +520,7 @@ std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const Blo
         candidate.radius_px = refined->a;
         candidate.angle_rad = refined->angle_rad;
         candidate.axis_ratio = ratio;
-        candidate.response = seed.response;
+        candidate.response = static_cast<double>(seed.response);
         candidates.push_back(std::move(candidate));
     }
     return suppress_overlaps(std::move(candidates));
