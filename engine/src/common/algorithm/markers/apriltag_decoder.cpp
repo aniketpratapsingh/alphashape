@@ -303,36 +303,42 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
     if (samples.size() < 4) {
         return std::nullopt;
     }
-    const std::optional<EdgeLine> first = fit_weighted_tls(samples);
-    if (!first) {
-        return std::nullopt;
-    }
     // A white payload cell touching a reference frame protrudes its edge by a
-    // cell; a notch does the same to a silhouette. Those samples are outliers
-    // of the straight run, so drop points far from the first line and refit.
-    Eigen::Vector2d normal_to_line(-first->direction.y(), first->direction.x());
-    std::vector<double> residuals;
-    residuals.reserve(samples.size());
-    for (const EdgeSample& sample : samples) {
-        residuals.push_back(
-            std::abs((sample.point - first->point).dot(normal_to_line)));
+    // cell, and a notch does the same to a silhouette; a side then carries two
+    // parallel edges. Cluster the per-sample offsets from the initial side and
+    // fit the densest cluster, which is the straight run of the true edge.
+    std::vector<double> offsets(samples.size());
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        offsets[i] = (samples[i].point - a).dot(normal);
     }
-    const double median = median_of(residuals);
-    const double limit = std::max(0.75, 2.5 * median);
+    double best_centre = offsets.front();
+    std::size_t best_count = 0;
+    for (double candidate : offsets) {
+        std::size_t count = 0;
+        for (double offset : offsets) {
+            if (std::abs(offset - candidate) <= 0.6) {
+                ++count;
+            }
+        }
+        if (count > best_count) {
+            best_count = count;
+            best_centre = candidate;
+        }
+    }
     std::vector<EdgeSample> kept;
     kept.reserve(samples.size());
     for (std::size_t i = 0; i < samples.size(); ++i) {
-        if (residuals[i] <= limit) {
+        if (std::abs(offsets[i] - best_centre) <= 1.0) {
             kept.push_back(samples[i]);
         }
     }
     if (kept.size() >= 4 && kept.size() < samples.size()) {
-        const std::optional<EdgeLine> second = fit_weighted_tls(kept);
-        if (second) {
-            return second;
+        const std::optional<EdgeLine> clustered = fit_weighted_tls(kept);
+        if (clustered) {
+            return clustered;
         }
     }
-    return first;
+    return fit_weighted_tls(samples);
 }
 
 std::optional<Eigen::Vector2d> intersect_lines(const EdgeLine& first,
