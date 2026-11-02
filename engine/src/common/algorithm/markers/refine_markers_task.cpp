@@ -279,6 +279,53 @@ std::optional<Eigen::Vector3d> triangulate_observations(
     return point;
 }
 
+/// Robust triangulation (Fischler & Bolles 1981): try every two-view minimal
+/// sample, count the views whose measured projection is within `tolerances`,
+/// and re-triangulate from the largest consistent set. A single grossly wrong
+/// projection therefore cannot bias the starting point; without this step one
+/// 30 px outlier shifts the DLT solution enough to poison the depth search.
+std::optional<Eigen::Vector3d> triangulate_robust(
+    const std::vector<Observation>& observations,
+    const std::vector<double>& tolerances) {
+    if (observations.size() <= 2 || tolerances.size() != observations.size()) {
+        return triangulate_observations(observations);
+    }
+    std::vector<std::size_t> best_inliers;
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+        for (std::size_t j = i + 1; j < observations.size(); ++j) {
+            const std::vector<Observation> pair = {observations[i],
+                                                   observations[j]};
+            const auto estimate = triangulate_observations(pair);
+            if (!estimate) {
+                continue;
+            }
+            std::vector<std::size_t> inliers;
+            for (std::size_t k = 0; k < observations.size(); ++k) {
+                const auto projected =
+                    project_view(*observations[k].view, *estimate);
+                if (projected &&
+                    (*projected - observations[k].pixel).norm() <= tolerances[k]) {
+                    inliers.push_back(k);
+                }
+            }
+            if (inliers.size() > best_inliers.size()) {
+                best_inliers = std::move(inliers);
+            }
+        }
+    }
+    if (best_inliers.size() >= 2) {
+        std::vector<Observation> subset;
+        subset.reserve(best_inliers.size());
+        for (const std::size_t index : best_inliers) {
+            subset.push_back(observations[index]);
+        }
+        if (const auto refined = triangulate_observations(subset)) {
+            return refined;
+        }
+    }
+    return triangulate_observations(observations);
+}
+
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -678,6 +725,17 @@ struct Winner {
     std::vector<std::optional<double>> scores;
 };
 
+/// A view's measured projection has to agree with the candidate's reprojection
+/// within one apparent target radius (or 6 px, whichever is larger). This is
+/// the only signal that can tell a contradicted measurement from a merely
+/// noisy one, because NCC itself always sees the printed target. The floor
+/// absorbs a few pixels of perturbation plus the reference view's own error;
+/// the blob scale widens it for a large target, where a larger displacement is
+/// still a plausible measurement of the same printed target.
+double projection_tolerance(const BlendView& blend) {
+    return std::max(6.0, blend.apparent);
+}
+
 /// Search depth for the best (candidate, reference view) pair. Up to three
 /// reference views are tried, largest apparent target first, because a larger
 /// target carries more texture and less quantisation noise.
@@ -688,8 +746,16 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                                     const CloudSamples& cloud,
                                     double physical_radius, int search_steps,
                                     int patch_size) {
-    std::vector<std::size_t> references(blends.size());
-    std::iota(references.begin(), references.end(), std::size_t{0});
+    std::vector<std::size_t> references;
+    references.reserve(blends.size());
+    for (std::size_t i = 0; i < blends.size(); ++i) {
+        const auto projected = project_view(*blends[i].view, initial);
+        if (projected &&
+            (*projected - blends[i].pixel).norm() <=
+                projection_tolerance(blends[i])) {
+            references.push_back(i);
+        }
+    }
     std::sort(references.begin(), references.end(),
               [&blends](std::size_t a, std::size_t b) {
                   return blends[a].apparent > blends[b].apparent;
@@ -719,6 +785,17 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                 if (!patch.valid) {
                     complete = false;
                     break;
+                }
+                // NCC alone cannot detect a contradicted projection: every
+                // view still shows the printed target at the candidate's
+                // physical patch. A view therefore also has to agree with the
+                // candidate geometrically, within one target radius of its
+                // measured projection. An unrelated 30 px measurement lands
+                // outside this gate and is excluded from the score.
+                const auto projected = project_view(*blend.view, candidate);
+                if (!projected || (*projected - blend.pixel).norm() >
+                                      projection_tolerance(blend)) {
+                    patch = Patch{};
                 }
                 patches.push_back(std::move(patch));
             }
@@ -952,10 +1029,13 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
     if (aligned.size() >= 2) {
         std::vector<Observation> observations;
         observations.reserve(aligned.size());
+        std::vector<double> tolerances;
+        tolerances.reserve(aligned.size());
         for (const BlendView& blend : aligned) {
             observations.push_back({blend.view, blend.pixel});
+            tolerances.push_back(projection_tolerance(blend));
         }
-        const auto initial = triangulate_observations(observations);
+        const auto initial = triangulate_robust(observations, tolerances);
         if (initial) {
             std::vector<double> physical_samples;
             for (BlendView& blend : aligned) {

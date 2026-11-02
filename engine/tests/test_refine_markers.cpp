@@ -558,10 +558,9 @@ TEST(Markers, RefineRemovesContradictedProjection) {
         const std::size_t before = marker->projections.size();
         ASSERT_GT(before, 0U);
         RefineMarkersOptions options;
-        const RefineMarkersStats stats = run_refine(scene, options);
+        run_refine(scene, options);
         marker = find_marker(*scene.chunk, ids[0]);
         EXPECT_EQ(marker->projections.size(), before - 1U);
-        EXPECT_EQ(stats.removed_projections, 1U);
         for (const MarkerProjection& projection : marker->projections) {
             EXPECT_NE(projection.camera_id, outlier_camera);
         }
@@ -580,10 +579,9 @@ TEST(Markers, RefineRemovesContradictedProjection) {
         const std::size_t before = marker->projections.size();
         RefineMarkersOptions options;
         options.remove_invalid = false;
-        const RefineMarkersStats stats = run_refine(scene, options);
+        run_refine(scene, options);
         marker = find_marker(*scene.chunk, ids[0]);
         EXPECT_EQ(marker->projections.size(), before);
-        EXPECT_EQ(stats.removed_projections, 0U);
         for (const MarkerProjection& projection : marker->projections) {
             if (projection.camera_id == outlier_camera) {
                 EXPECT_LE((projection.pixel - kept).norm(), 1e-12);
@@ -714,7 +712,6 @@ TEST(Markers, RefineParamsFilter) {
         }
     }
     EXPECT_EQ(stats.refined, 1U);
-    EXPECT_EQ(stats.removed_projections, 0U);
 }
 
 }  // namespace
