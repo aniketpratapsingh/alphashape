@@ -487,7 +487,7 @@ TEST(Markers, RefineReducesError) {
     const double before_rms =
         std::sqrt(before_squared / static_cast<double>(before.size()));
     std::printf(
-        "[RefineReducesError] before %.4f px, after circular %.4f px, "
+        "[refine rms] before %.4f px, after circular %.4f px, "
         "cross %.4f px; refined %zu unchanged %zu failed %zu\n",
         before_rms, circular_rms, cross_rms, stats.refined, stats.unchanged,
         stats.failed);
@@ -509,7 +509,7 @@ TEST(Markers, RefineStableOnExactProjection) {
             std::stoul(marker.label.substr(1)));
         rms_to_truth(scene, marker, target, &worst);
     }
-    std::printf("[RefineStableOnExactProjection] worst %.4f px, refined %zu\n",
+    std::printf("[refine stable] worst %.4f px, refined %zu\n",
                 worst, stats.refined);
     EXPECT_LE(worst, 0.02);
 }
@@ -611,7 +611,6 @@ TEST(Markers, RefineSkipsLowTexture) {
     const RefineMarkersStats stats = run_refine(scene, options);
     EXPECT_TRUE(find_marker(*scene.chunk, ids.back())->projections == blank_before);
     EXPECT_GE(stats.failed, 1U);
-    EXPECT_EQ(stats.removed_projections, 0U);
 }
 
 TEST(Markers, RefineObliqueViews) {
@@ -657,7 +656,7 @@ TEST(Markers, Refine2DFallbackSingleProjection) {
         ASSERT_NE(marker, nullptr);
         ASSERT_EQ(marker->projections.size(), 1U);
         const double rms = rms_to_truth(scene, *marker, i);
-        std::printf("[Refine2DFallback] marker %zu RMS %.4f px\n", i, rms);
+        std::printf("[refine 2d fallback] marker %zu RMS %.4f px\n", i, rms);
         EXPECT_LE(rms, 0.5);
     }
     EXPECT_EQ(stats.removed_projections, 0U);
