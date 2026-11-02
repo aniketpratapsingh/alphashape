@@ -669,15 +669,19 @@ std::vector<CrossDetection> detect_crosses_styled(const FloatImage& gray,
     // curvature extremum once the bar is blurred by roughly half its width.
     const FloatImage ridge_image = gaussian_blur(image, 3.0F);
     for (const CrossCandidate& bar : find_bar_crosses(ridge_image, params)) {
-        bool duplicate = false;
-        for (const CrossCandidate& kept : candidates) {
+        CrossCandidate* duplicate = nullptr;
+        for (CrossCandidate& kept : candidates) {
             if ((kept.center - bar.center).norm() < params.minimum_dist) {
-                duplicate = true;
+                duplicate = &kept;
                 break;
             }
         }
-        if (!duplicate) {
+        if (duplicate == nullptr) {
             candidates.push_back(bar);
+        } else {
+            // Two fitted ridge lines are direct evidence of a bar target; keep
+            // the bar style so full-resolution refinement re-fits the arms.
+            duplicate->style = CrossStyle::Bar;
         }
     }
     std::sort(candidates.begin(), candidates.end(),
