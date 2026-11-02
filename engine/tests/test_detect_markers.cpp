@@ -453,7 +453,7 @@ TEST(Markers, DetectMixedSheet) {
         << "Circular reported " << circular.size() << " targets";
     EXPECT_EQ(circular[0], "point 1");
     const std::vector<std::string> rings =
-        detect_labels(image, "Circular12", false, true, 48.0);
+        detect_labels(image, "Circular12", false, true, 10.0);
     ASSERT_EQ(rings.size(), 1U)
         << "Circular12 reported " << rings.size() << " targets";
     EXPECT_EQ(rings[0].rfind("target ", 0), 0U);
