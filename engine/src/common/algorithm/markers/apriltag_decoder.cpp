@@ -775,7 +775,9 @@ std::optional<HypothesisResult> decode_hypothesis(
 /// into the enlarged image; `FloatImage::sample` clamps at the borders.
 FloatImage upsample_bilinear(const FloatImage& image, int factor) {
     if (factor < 2 || image.empty()) {
-        return image;
+        // Return a fresh empty image: GCC 13 miscompiles the copy of a
+        // zero-length pixel vector as an out-of-bounds subscript under -O3.
+        return FloatImage();
     }
     const int width = image.width() * factor;
     const int height = image.height() * factor;
