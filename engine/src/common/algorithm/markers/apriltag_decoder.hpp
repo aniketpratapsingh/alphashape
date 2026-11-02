@@ -110,10 +110,11 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
 /// path a task uses: it runs `detect_quads` on the image, and for a
 /// reversed-border family also on the inverted image (where the white
 /// reference frame is a solid dark ring), then decodes each candidate. If
-/// nothing decodes and the shorter image side is under 128 px, it retries on a
-/// 2x bilinear upsampling, where the detector's subpixel line fits are
-/// accurate; the reported centre, corners and radius are mapped back to the
-/// original image.
+/// nothing decodes, a reversed-border family retries on a bilinear upsampling:
+/// 2x when the shorter image side is under 200 px, and 3x when it is under
+/// 128 px. At the doubled or tripled scale the detector's subpixel line fits
+/// are accurate for a small printed tag; the reported centre, corners and
+/// radius are mapped back to the original image.
 std::vector<CodedTarget> decode_tags(const FloatImage& gray,
                                      AprilTagFamily family,
                                      int max_hamming = 1,

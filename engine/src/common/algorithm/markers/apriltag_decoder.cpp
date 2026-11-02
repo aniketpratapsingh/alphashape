@@ -1064,13 +1064,23 @@ std::vector<CodedTarget> decode_tags(const FloatImage& gray,
     };
     scan(gray, params, 1.0);
     const int shortest = std::min(gray.width(), gray.height());
-    if (decoded.empty() && table.reversed_border && shortest > 0 &&
-        shortest < 128) {
-        const FloatImage enlarged = upsample_bilinear(gray, 2);
+    const auto retry = [&](int factor) {
+        if (shortest <= 0 || shortest * factor > 512) {
+            return;
+        }
+        const FloatImage enlarged = upsample_bilinear(gray, factor);
         QuadParams scaled = params;
-        scaled.min_side *= 2;
-        scaled.max_side *= 2;
-        scan(enlarged, scaled, 0.5);
+        scaled.min_side *= factor;
+        scaled.max_side *= factor;
+        scan(enlarged, scaled, 1.0 / static_cast<double>(factor));
+    };
+    if (decoded.empty() && table.reversed_border) {
+        if (shortest < 200) {
+            retry(2);
+        }
+        if (decoded.empty() && shortest < 128) {
+            retry(3);
+        }
     }
     return decoded;
 }
