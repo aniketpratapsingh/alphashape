@@ -73,6 +73,7 @@ add_executable(alphashape_tests
     test_chunk_ops.cpp
     test_align_chunks.cpp
     test_marker_placement.cpp
+    test_marker_detector.cpp
     test_gpu.cpp
 )
 
@@ -213,6 +214,16 @@ gtest_discover_tests(alphashape_tests
     ${_alphashape_discovery_args}
     ${_alphashape_test_args}
     TEST_FILTER ${_alphashape_gpu_ports_filter})
+
+# The 12 MP marker-detector timing needs the whole machine: its wall-clock bound
+# is only meaningful when ctest is not running other tests beside it. The macOS
+# heavy lane runs its tests with --parallel 3, so this one is marked RUN_SERIAL.
+# gtest_discover_tests() creates the test at build time, so the property has to
+# be attached from a file that CTest includes after test discovery.
+set(_alphashape_serial_tests "${CMAKE_CURRENT_BINARY_DIR}/alphashape_serial_tests.cmake")
+file(WRITE "${_alphashape_serial_tests}"
+    "set_tests_properties(MarkerDetector.TwelveMegapixelTiming PROPERTIES RUN_SERIAL TRUE)\n")
+set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${_alphashape_serial_tests}")
 
 # M12 WP-12.8: geo::Projection (the hand-written Transverse Mercator selector)
 # was deleted in favour of the PROJ-backed CRS engine. A stale copy of the
