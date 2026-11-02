@@ -1,5 +1,7 @@
 # AprilTag family 36h10 (published tag36h10).
-# Source: https://github.com/AprilRobotics/apriltag/blob/master/tag36h10.c
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tag36h10.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: 81e90b4a96b8ba78a4306788dd48702287b253915b67ce7ef07624b495bd0166
 # family=36h10 h=10 nbits=36 width_at_border=8 total_width=10 reversed_border=false codes=2320
 #
 # Copyright (C) 2013-2016, The Regents of The University of Michigan.

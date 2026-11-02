@@ -4,6 +4,9 @@
 // repository (BSD-2-Clause). The order of kFamilies matches the order of
 // enum class AprilTagFamily in tag_families.hpp.
 //
+// Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+// Source files: tag16h5.c, tag25h9.c, tag36h10.c, tag36h11.c, tagCircle21h7.c, tagStandard41h12.c, tagStandard52h13.c.
+//
 // Copyright (C) 2013-2016, The Regents of The University of Michigan.
 // All rights reserved.
 //

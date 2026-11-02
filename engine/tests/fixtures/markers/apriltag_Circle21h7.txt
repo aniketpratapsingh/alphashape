@@ -1,5 +1,7 @@
 # AprilTag family Circle21h7 (published tagCircle21h7).
-# Source: https://github.com/AprilRobotics/apriltag/blob/master/tagCircle21h7.c
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tagCircle21h7.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: 1520d133df08a2481c162937dc0732704017e1ef3821749e6b7a316d696ba524
 # family=Circle21h7 h=7 nbits=21 width_at_border=5 total_width=9 reversed_border=true codes=38
 #
 # Copyright (C) 2013-2016, The Regents of The University of Michigan.

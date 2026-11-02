@@ -18,6 +18,7 @@ published data, and the C++ tests compare it against the fixtures.
 """
 
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -65,10 +66,18 @@ The views and conclusions contained in the software and documentation are those
 of the authors and should not be interpreted as representing official policies,
 either expressed or implied, of the Regents of The University of Michigan."""
 
-RAW_URL = "https://raw.githubusercontent.com/AprilRobotics/apriltag/master/{}"
+# Pinned upstream commit. Never replace this with a branch name: the checked-in
+# tables must stay reproducible, and the SHA-256 recorded in every fixture makes
+# the provenance check non-tautological.
+COMMIT = "b7c0ebe9aa20f82ec7a828579004f9e706bfecd9"
+COMMIT_URL = "https://github.com/AprilRobotics/apriltag/commit/{}".format(COMMIT)
+RAW_URL = ("https://raw.githubusercontent.com/AprilRobotics/apriltag/{}/{{}}"
+           .format(COMMIT))
+BLOB_URL = "https://github.com/AprilRobotics/apriltag/blob/{}/{{}}".format(COMMIT)
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SOURCE_DIR = ROOT / "engine/src/common/algorithm/markers"
 FIXTURE_DIR = ROOT / "engine/tests/fixtures/markers"
+LICENSE_PATH = ROOT / "packaging/licenses/BSD-2-Clause-apriltag.txt"
 
 
 def read_source(published, cache):
@@ -117,6 +126,8 @@ def parse_family(text, published):
         sys.exit("missing reversed_border in " + published)
     return {
         "published": published,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "source_url": BLOB_URL.format(published + ".c"),
         "name": published[3:] if published.startswith("tag") else published,
         "hamming": _int_field(text, r"tf->h\s*=\s*(\d+)", "h"),
         "nbits": nbits,
@@ -139,8 +150,9 @@ def emit_fixture(family):
     header = [
         "# AprilTag family {} (published {}).".format(
             family["name"], family["published"]),
-        "# Source: https://github.com/AprilRobotics/apriltag/blob/master/{}.c"
-        .format(family["published"]),
+        "# Source: {}".format(family["source_url"]),
+        "# Source commit: {}".format(COMMIT_URL),
+        "# source-sha256: {}".format(family["sha256"]),
         "# family={} h={} nbits={} width_at_border={} total_width={} "
         "reversed_border={} codes={}".format(
             family["name"], family["hamming"], family["nbits"],
@@ -189,6 +201,11 @@ def emit_cpp(families):
         "// Published AprilTag family tables, from the AprilRobotics/apriltag",
         "// repository (BSD-2-Clause). The order of kFamilies matches the order of",
         "// enum class AprilTagFamily in tag_families.hpp.",
+        "//",
+        "// Source commit: {}".format(COMMIT_URL),
+        "// Source files: " + ", ".join(
+            "tag{}.c".format(published[len("tag"):])
+            for _, published in FAMILIES) + ".",
         "//",
         license_comment("// "),
         "",
@@ -250,6 +267,8 @@ def main():
         path.write_text(emit_fixture(family), encoding="utf-8")
     generated = SOURCE_DIR / "tag_family_data.cpp"
     generated.write_text(emit_cpp(families), encoding="utf-8")
+    LICENSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LICENSE_PATH.write_text(BSD_LICENSE + "\n", encoding="utf-8")
     for family in families:
         print("{:14s} codes={:6d} nbits={} h={}".format(
             family["name"], len(family["codes"]), family["nbits"],

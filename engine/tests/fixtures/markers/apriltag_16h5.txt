@@ -1,5 +1,7 @@
 # AprilTag family 16h5 (published tag16h5).
-# Source: https://github.com/AprilRobotics/apriltag/blob/master/tag16h5.c
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tag16h5.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: 18b775f9b0b246397d6a6313940cae4a27428dfcc3ccd8b9b94c03d65211e7e5
 # family=16h5 h=5 nbits=16 width_at_border=6 total_width=8 reversed_border=false codes=30
 #
 # Copyright (C) 2013-2016, The Regents of The University of Michigan.

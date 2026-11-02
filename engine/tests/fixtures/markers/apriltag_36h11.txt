@@ -1,5 +1,7 @@
 # AprilTag family 36h11 (published tag36h11).
-# Source: https://github.com/AprilRobotics/apriltag/blob/master/tag36h11.c
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tag36h11.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: 38ff6e308067eb32ccf624e9cc5e7a75b45ad82b3cf9f80980cb86ebaa88512b
 # family=36h11 h=11 nbits=36 width_at_border=8 total_width=10 reversed_border=false codes=587
 #
 # Copyright (C) 2013-2016, The Regents of The University of Michigan.

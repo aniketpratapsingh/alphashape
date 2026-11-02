@@ -1,5 +1,7 @@
 # AprilTag family Standard52h13 (published tagStandard52h13).
-# Source: https://github.com/AprilRobotics/apriltag/blob/master/tagStandard52h13.c
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tagStandard52h13.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: d93f9ead23897031c6846f0c0465cbfed1ee95b6d44aa973896ffc869d9769f7
 # family=Standard52h13 h=13 nbits=52 width_at_border=6 total_width=10 reversed_border=true codes=48714
 #
 # Copyright (C) 2013-2016, The Regents of The University of Michigan.
