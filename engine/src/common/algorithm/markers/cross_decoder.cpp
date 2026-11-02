@@ -766,9 +766,12 @@ std::optional<Eigen::Vector2d> refine_bar_cross_center(
             crop.at(x - x0, y - y0) = gray.at(x, y);
         }
     }
-    // Match the blur used before the global bar pass: a flat-topped bar only
-    // becomes a curvature extremum at roughly half its width.
-    const FloatImage smoothed = gaussian_blur(crop, 3.0F);
+    // A flat-topped bar only becomes a curvature extremum once it is blurred
+    // by roughly half its width. The bar width scales with the target, so the
+    // full-resolution pass derives its scale from the detected radius instead
+    // of reusing the global pass's narrow-bar 3 px.
+    const double sigma = std::clamp(0.2 * radius_hint, 2.5, 12.0);
+    const FloatImage smoothed = gaussian_blur(crop, static_cast<float>(sigma));
     const Eigen::Vector2d seed(point.x() - static_cast<double>(x0),
                                point.y() - static_cast<double>(y0));
     const std::vector<RidgePoint> all_points = find_ridge_points(smoothed);
