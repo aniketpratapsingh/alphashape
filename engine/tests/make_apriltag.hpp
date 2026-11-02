@@ -134,10 +134,21 @@ inline bool tag_cell_is_white(const TagFamily& family, std::uint64_t code,
             return ((code >> static_cast<unsigned>(family.bits - 1 - bit)) & 1u) != 0u;
         }
     }
-    if (x == 0 || y == 0 || x == family.width_at_border - 1 ||
-        y == family.width_at_border - 1) {
-        return family.reversed_border;
+    const bool inside = x >= 0 && y >= 0 && x < family.width_at_border &&
+                        y < family.width_at_border;
+    if (inside) {
+        // The reference frame is the perimeter of the width_at_border square,
+        // and only that square; an interior cell that is not payload stays
+        // black in the published image.
+        if (x == 0 || y == 0 || x == family.width_at_border - 1 ||
+            y == family.width_at_border - 1) {
+            return family.reversed_border;
+        }
+        return false;
     }
+    // Outside the reference square: the plain families' total grid has the
+    // one-cell white margin; a reversed family's surrounding ring is black
+    // unless a payload bit (handled above) painted it white.
     return !family.reversed_border;
 }
 
