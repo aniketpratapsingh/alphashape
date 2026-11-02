@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -33,6 +34,7 @@
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
 #include "common/commands/command.hpp"
+#include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
@@ -317,13 +319,15 @@ void paste(FloatImage& sheet, const FloatImage& patch, int x0, int y0) {
 std::vector<std::string> detect_labels(const FloatImage& image,
                                        const std::string& target_type,
                                        bool inverted = false,
-                                       bool create_markers = true) {
+                                       bool create_markers = true,
+                                       double minimum_size = 0.0) {
     DetectScene scene = make_scene(image.width(), image.height(), 1);
     write_gray_png(scene.paths[0], image);
     Params params = params_for("DetectMarkers");
     params.set("target_type", target_type);
     params.set("inverted", inverted);
     params.set("create_markers", create_markers);
+    params.set("minimum_size", minimum_size);
     run_named(scene.document, "DetectMarkers", params);
     std::vector<std::string> labels;
     for (const Marker& marker : scene.chunk->markers()) {
@@ -363,14 +367,19 @@ TEST(Markers, DetectMixedSheet) {
     paste(sheet, tag_render.image, 750 - tag_size / 2, 200 - tag_size / 2);
 
     const FloatImage image = gaussian_blur(sheet, 0.8F);
-    const std::vector<std::string> circular = detect_labels(image, "Circular12");
+    // minimum_size 20 keeps the other targets' small fiducial cells out of
+    // each decoder's candidate set.
+    const std::vector<std::string> circular =
+        detect_labels(image, "Circular12", false, true, 20.0);
     ASSERT_EQ(circular.size(), 1U) << "circular run found "
                                    << circular.size() << " targets";
     EXPECT_EQ(circular[0].rfind("target ", 0), 0U);
-    const std::vector<std::string> crosses = detect_labels(image, "Cross");
+    const std::vector<std::string> crosses =
+        detect_labels(image, "Cross", false, true, 20.0);
     ASSERT_EQ(crosses.size(), 1U) << "cross run found " << crosses.size();
     EXPECT_EQ(crosses[0], "point 1");
-    const std::vector<std::string> tags = detect_labels(image, "AprilTag36h11");
+    const std::vector<std::string> tags =
+        detect_labels(image, "AprilTag36h11", false, true, 20.0);
     ASSERT_EQ(tags.size(), 1U) << "tag run found " << tags.size();
     EXPECT_EQ(tags[0], "target 0");
 }
@@ -493,11 +502,11 @@ TEST(Markers, DetectIsUndoable) {
     write_gray_png(scene.paths[0],
                    test::render_circular_target(width, height, truth));
     UndoStack stack(&scene.document);
-    ScopedSink sink([&stack](Document& document,
-                             std::unique_ptr<AbstractCommand> command) {
-        (void)document;
-        stack.execute(std::move(command));
-    });
+    [[maybe_unused]] ScopedSink sink(
+        [&stack](Document& document, std::unique_ptr<AbstractCommand> command) {
+            (void)document;
+            stack.execute(std::move(command));
+        });
     Params params = params_for("DetectMarkers");
     params.set("target_type", std::string("Circular12"));
     run_named(scene.document, "DetectMarkers", params);

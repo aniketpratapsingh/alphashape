@@ -348,7 +348,7 @@ void refine_full_resolution(std::vector<Detection>& detections, double scale,
             MarkerCandidate quad;
             quad.center = detection.center;
             quad.radius_px = detection.radius;
-            for (std::size_t i = 0; i < 4; ++i) {
+            for (std::size_t i = 0; i < 4U; ++i) {
                 quad.corners.push_back(detection.corners[i] * scale);
             }
             const auto decoded =
@@ -603,13 +603,18 @@ CameraResult process_camera(const Document& document, const CameraJob& job,
         if (scale > 1 && (full->width() / scale < 8 || full->height() / scale < 8)) {
             scale = 1;
         }
+        // minimum_size and minimum_dist are expressed in full-resolution
+        // pixels; the detectors see the reduced image, so scale both.
+        DetectorParams detector = params;
         if (scale > 1) {
             reduced = box_downsample(*full, scale);
             detect_image = &reduced;
+            detector.minimum_size = params.minimum_size / static_cast<double>(scale);
+            detector.minimum_dist = params.minimum_dist / static_cast<double>(scale);
         }
         std::vector<Detection> detections =
-            suppress_duplicates(detect_in_image(*detect_image, spec, params),
-                                params.minimum_dist);
+            suppress_duplicates(detect_in_image(*detect_image, spec, detector),
+                                detector.minimum_dist);
         if (scale > 1) {
             const GradientField gradient = compute_gradient_field(*full);
             refine_full_resolution(detections, scale, spec, *full, gradient,
