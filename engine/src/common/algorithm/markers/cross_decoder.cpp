@@ -595,12 +595,15 @@ std::vector<CrossCandidate> find_bar_crosses(const FloatImage& image,
         }
         const double along_a = (*centre - line_a->centroid).dot(line_a->tangent);
         const double along_b = (*centre - line_b->centroid).dot(line_b->tangent);
-        const double margin_a = std::max(6.0, 0.5 * length_a);
-        const double margin_b = std::max(6.0, 0.5 * length_b);
-        if (along_a < line_a->minimum - margin_a ||
-            along_a > line_a->maximum + margin_a ||
-            along_b < line_b->minimum - margin_b ||
-            along_b > line_b->maximum + margin_b) {
+        // The intersection must be well inside both arms, not at an endpoint.
+        // Without this, two adjacent sides of a square outline (for example an
+        // AprilTag's black border) meet at a corner and look like a cross.
+        const double inset_a = 0.2 * length_a;
+        const double inset_b = 0.2 * length_b;
+        if (along_a < line_a->minimum + inset_a ||
+            along_a > line_a->maximum - inset_a ||
+            along_b < line_b->minimum + inset_b ||
+            along_b > line_b->maximum - inset_b) {
             continue;
         }
         CrossCandidate candidate;
