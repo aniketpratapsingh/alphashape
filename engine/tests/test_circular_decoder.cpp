@@ -479,11 +479,11 @@ TEST(Markers, CentreErrorUnderBlur) {
 
 TEST(Markers, CentreErrorParityZeroUnderBlur) {
     // Mirrors CentreErrorUnderBlur for targets without a centre dot. Their
-    // centre is always the fitted outer-border ellipse: refine_ellipse_center
+    // centre starts from the fitted outer-border ellipse; refine_ellipse_center
     // takes the first radial edge, which for a white sector is the far edge of
-    // the dark ring rather than the inner ring edge. This test measures that
-    // border-only path; it replaced the former 0.10 R refined-centre
-    // substitution, which had no accuracy evidence for parity 0.
+    // the dark ring rather than the inner edge. The refined centre is therefore
+    // substituted only when it stays within 0.10 R of the border centre, and
+    // this test measures that combined path against the same 0.15 px bound.
     const int bits = 12;
     const std::vector<std::uint32_t>& table = circular_codes(bits);
     const std::vector<std::size_t> indices = {0, 6, 12};

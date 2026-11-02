@@ -534,18 +534,17 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
     seed.axis_ratio = border.b / border.a;
     seed.angle_rad = border.angle_rad;
     Eigen::Vector2d centre_calibration = seed.center;
-    if (parity == 1) {
+    const std::optional<Eigen::Vector2d> refined = refine_ellipse_center(gradient, seed);
+    if (refined) {
+        const double shift = (*refined - seed.center).norm();
         // With a centre dot the first radial edge is the dot boundary on every
-        // ray, so its fit is the target's fiducial and is preferred even when
-        // the blurred border ellipse centre is a few tenths of a pixel away.
-        // Without a dot the first edges mix dark sectors at 0.5 R with light
-        // sectors at 0.85 R, so the border ellipse centre is used instead (the
-        // parity-0 centre test measures that path).
-        const std::optional<Eigen::Vector2d> refined =
-            refine_ellipse_center(gradient, seed);
-        if (refined && (*refined - seed.center).norm() <= 0.35 * radius) {
-            centre_calibration = *refined;
-        }
+        // ray, so its fit is the target's fiducial and is preferred. Without a
+        // dot the first edges mix dark sectors at 0.5 R with light sectors at
+        // 0.85 R, so the refinement is trusted only within a tight limit: the
+        // parity-0 centre test measures this path (border-only was 0.1766 px
+        // RMS at 2 px blur, worse than the parity-1 bound of 0.15 px).
+        const double limit = parity == 1 ? 0.35 * radius : 0.10 * radius;
+        if (shift <= limit) centre_calibration = *refined;
     }
 
     CodedTarget target;
