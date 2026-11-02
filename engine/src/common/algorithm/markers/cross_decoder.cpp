@@ -272,24 +272,14 @@ std::vector<CrossCandidate> find_saddles(const FloatImage& image,
 /// checkerboard cell corner and every other dense fiducial corner has at least
 /// one sibling saddle within three target radii. A printed GCP cross is
 /// isolated, so requiring zero such neighbours removes the whole lattice
-/// rather than only the corner with four or more siblings. Duplicates closer
-/// than `minimum_dist` are suppressed afterwards.
+/// rather than only the corner with four or more siblings.
+///
+/// Candidates closer than `minimum_dist` are collapsed first: a quantised peak
+/// can have several adjacent local maxima, and those are one saddle, not a
+/// lattice. Doing the suppression before the neighbourhood test keeps such a
+/// plateau from rejecting itself.
 std::vector<CrossCandidate> filter_saddles(std::vector<CrossCandidate> candidates,
                                             double minimum_dist) {
-    std::vector<char> keep(candidates.size(), 1);
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
-        for (std::size_t j = 0; j < candidates.size(); ++j) {
-            if (i == j) {
-                continue;
-            }
-            const double reach =
-                3.0 * std::max(candidates[i].radius, candidates[j].radius);
-            if ((candidates[i].center - candidates[j].center).norm() <= reach) {
-                keep[i] = 0;
-                break;
-            }
-        }
-    }
     std::vector<std::size_t> order(candidates.size());
     for (std::size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
@@ -297,20 +287,37 @@ std::vector<CrossCandidate> filter_saddles(std::vector<CrossCandidate> candidate
     std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
         return candidates[a].response > candidates[b].response;
     });
-    std::vector<CrossCandidate> out;
+    std::vector<CrossCandidate> unique;
     for (const std::size_t index : order) {
-        if (keep[index] == 0) {
-            continue;
-        }
         bool clear = true;
-        for (const CrossCandidate& kept : out) {
+        for (const CrossCandidate& kept : unique) {
             if ((kept.center - candidates[index].center).norm() < minimum_dist) {
                 clear = false;
                 break;
             }
         }
         if (clear) {
-            out.push_back(candidates[index]);
+            unique.push_back(candidates[index]);
+        }
+    }
+    std::vector<char> keep(unique.size(), 1);
+    for (std::size_t i = 0; i < unique.size(); ++i) {
+        for (std::size_t j = 0; j < unique.size(); ++j) {
+            if (i == j) {
+                continue;
+            }
+            const double reach =
+                3.0 * std::max(unique[i].radius, unique[j].radius);
+            if ((unique[i].center - unique[j].center).norm() <= reach) {
+                keep[i] = 0;
+                break;
+            }
+        }
+    }
+    std::vector<CrossCandidate> out;
+    for (std::size_t i = 0; i < unique.size(); ++i) {
+        if (keep[i] != 0) {
+            out.push_back(unique[i]);
         }
     }
     return out;
