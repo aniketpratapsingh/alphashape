@@ -398,7 +398,7 @@ const Frame* frame_of_camera(const Chunk& chunk, std::int32_t camera_id) {
 
 const Mask* mask_of_camera(const Chunk& chunk, std::int32_t camera_id) {
     for (const Mask& mask : chunk.masks()) {
-        if (mask.camera_id == camera_id) {
+        if (mask.camera_id == camera_id && mask.is_valid()) {
             return &mask;
         }
     }
