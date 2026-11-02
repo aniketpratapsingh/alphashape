@@ -274,19 +274,35 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
                 static_cast<float>(centre.x() + dx * t),
                 static_cast<float>(centre.y() + dy * t)));
         }
-        double best = -1.0;
+        double strongest = 0.0;
+        for (int i = 1; i < steps; ++i) {
+            const double value = values[static_cast<std::size_t>(i)];
+            if (value >= values[static_cast<std::size_t>(i - 1)] &&
+                value > values[static_cast<std::size_t>(i + 1)] && value > strongest) {
+                strongest = value;
+            }
+        }
+        if (!(strongest > kMinEdgeGradient)) {
+            continue;
+        }
+        // Take the FIRST peak that is at least 30% of the strongest one on this
+        // ray. In a marker sheet the strongest peak can belong to a neighbouring
+        // target further out; the first significant peak is this target's own
+        // boundary. Noise peaks are far below the fraction of a real edge.
+        const double acceptance = 0.3 * strongest;
         int best_index = -1;
         for (int i = 1; i < steps; ++i) {
             const double value = values[static_cast<std::size_t>(i)];
             if (value >= values[static_cast<std::size_t>(i - 1)] &&
-                value > values[static_cast<std::size_t>(i + 1)] && value > best) {
-                best = value;
+                value > values[static_cast<std::size_t>(i + 1)] && value >= acceptance) {
                 best_index = i;
+                break;
             }
         }
-        if (best_index <= 0 || best_index >= steps || best < kMinEdgeGradient) {
+        if (best_index <= 0 || best_index >= steps) {
             continue;
         }
+        const double best = values[static_cast<std::size_t>(best_index)];
         const double left = values[static_cast<std::size_t>(best_index - 1)];
         const double mid = values[static_cast<std::size_t>(best_index)];
         const double right = values[static_cast<std::size_t>(best_index + 1)];
@@ -786,9 +802,9 @@ std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& gray
                                                           const FloatImage& gradient,
                                                           const std::array<Eigen::Vector2d, 4>& corners,
                                                           double& response) {
-    constexpr int kNormalSteps = 41;
+    constexpr int kNormalSteps = 49;
     constexpr double kNormalStep = 0.25;
-    constexpr double kNormalExtent = 5.0;
+    constexpr double kNormalExtent = 6.0;
     std::array<Line, 4> lines;
     double response_sum = 0.0;
     int response_count = 0;
