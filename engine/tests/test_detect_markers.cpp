@@ -401,20 +401,20 @@ TEST(Markers, DetectMixedSheet) {
     const int height = 500;
     FloatImage sheet(width, height, 0.5F);
     // Plain dark disc: only the non-coded Circular run may report it.
-    const int disc_size = 160;
+    const int disc_size = 180;
     test::EllipseTruth disc;
     disc.cx = 0.5 * static_cast<double>(disc_size);
     disc.cy = 0.5 * static_cast<double>(disc_size);
-    disc.a = 60.0;
-    disc.b = 60.0;
+    disc.a = 70.0;
+    disc.b = 70.0;
     paste(sheet,
           test::render_ellipses(disc_size, disc_size, {disc}, 0.95F, 0.05F),
           150 - disc_size / 2, height / 2 - disc_size / 2);
     // Coded circular target: only Circular12 may report it.
-    const int ring_size = 120;
+    const int ring_size = 140;
     const test::CircularTruth ring = test::make_circular_truth(
         0.5 * static_cast<double>(ring_size),
-        0.5 * static_cast<double>(ring_size), 45.0, 12,
+        0.5 * static_cast<double>(ring_size), 55.0, 12,
         read_circular_word(12, 0), 1);
     paste(sheet, test::render_circular_target(ring_size, ring_size, ring),
           450 - ring_size / 2, height / 2 - ring_size / 2);
@@ -448,12 +448,12 @@ TEST(Markers, DetectMixedSheet) {
 
     const FloatImage image = gaussian_blur(sheet, 0.8F);
     const std::vector<std::string> circular =
-        detect_labels(image, "Circular", false, true, 52.0);
+        detect_labels(image, "Circular", false, true, 62.0);
     ASSERT_EQ(circular.size(), 1U)
         << "Circular reported " << circular.size() << " targets";
     EXPECT_EQ(circular[0], "point 1");
     const std::vector<std::string> rings =
-        detect_labels(image, "Circular12", false, true, 40.0);
+        detect_labels(image, "Circular12", false, true, 48.0);
     ASSERT_EQ(rings.size(), 1U)
         << "Circular12 reported " << rings.size() << " targets";
     EXPECT_EQ(rings[0].rfind("target ", 0), 0U);
