@@ -295,10 +295,10 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
         const double offset =
             (static_cast<double>(best - steps) + std::clamp(shift, -0.5, 0.5)) * step;
         const Eigen::Vector2d point = base + normal * offset;
-        EdgeSample sample;
-        sample.point = point;
-        sample.weight = middle;
-        samples.push_back(sample);
+        EdgeSample edge_sample;
+        edge_sample.point = point;
+        edge_sample.weight = middle;
+        samples.push_back(edge_sample);
     }
     if (samples.size() < 4) {
         return std::nullopt;
