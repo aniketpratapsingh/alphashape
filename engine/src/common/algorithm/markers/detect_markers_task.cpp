@@ -210,8 +210,15 @@ std::vector<Detection> detect_circular(const FloatImage& image,
                                         const TargetSpec& spec,
                                         const DetectorParams& params) {
     std::vector<Detection> out;
+    // For a coded ring the seed is often its centre dot, which is much smaller
+    // than the target's outer radius. `minimum_size` therefore filters the
+    // decoded radius below, not the blob scale, or a large ring could never be
+    // found when the user asks for large targets only.
+    const double seed_size = spec.kind == MarkerKind::CircularNonCoded
+                                 ? params.minimum_size
+                                 : 0.0;
     const BlobParams blob =
-        blob_params(image.width(), image.height(), params.minimum_size);
+        blob_params(image.width(), image.height(), seed_size);
     const std::vector<MarkerCandidate> candidates = detect_blobs(image, blob);
     if (spec.kind == MarkerKind::CircularNonCoded) {
         for (const MarkerCandidate& candidate : candidates) {
@@ -776,7 +783,9 @@ void DetectMarkersTask::declare_params(Params& params) const {
                     "Circular codes ignore the centre-dot parity bit and report "
                     "code = ring index * 2."});
     ParamSpec minimum_size{"minimum_size", ParamType::Float, 0.0,
-                           "Minimum target radius in pixels (0 = decoder default)."};
+                           "Minimum target radius in pixels (0 = decoder default). "
+                           "For a coded ring this is the decoded outer radius, so "
+                           "the small centre-dot seed does not raise the floor."};
     minimum_size.minimum = 0.0;
     params.declare(minimum_size);
     ParamSpec minimum_dist{"minimum_dist", ParamType::Float, 5.0,
