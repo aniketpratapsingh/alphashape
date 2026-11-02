@@ -586,10 +586,16 @@ std::optional<WordMatch> match_circular_word(std::uint32_t word, int bits,
     return match;
 }
 
-std::optional<CodedTarget> decode_circular(const FloatImage& gray,
-                                           const MarkerCandidate& candidate, int bits,
-                                           int max_hamming) {
-    if (!is_supported_circular_bits(bits) || gray.empty()) return std::nullopt;
+namespace {
+
+std::optional<CodedTarget> decode_circular_impl(const FloatImage& gray,
+                                                const GradientField& gradient,
+                                                const MarkerCandidate& candidate, int bits,
+                                                int max_hamming) {
+    if (!is_supported_circular_bits(bits) || gray.empty() ||
+        gradient.magnitude.empty()) {
+        return std::nullopt;
+    }
     if (!candidate.center.allFinite() || max_hamming < 0) return std::nullopt;
     const int allowed_hamming = std::min(max_hamming, 1);
     const double hint = candidate.radius_px;
@@ -615,7 +621,6 @@ std::optional<CodedTarget> decode_circular(const FloatImage& gray,
         second = border_radius;
     }
 
-    const GradientField gradient = compute_gradient_field(gray);
     const auto attempt = [&](double expected) -> std::optional<CodedTarget> {
         const std::optional<Ellipse> border =
             locate_border(gradient.magnitude, centre, expected);
@@ -636,6 +641,23 @@ std::optional<CodedTarget> decode_circular(const FloatImage& gray,
         if (decoded) return decoded;
     }
     return std::nullopt;
+}
+
+}  // namespace
+
+std::optional<CodedTarget> decode_circular(const FloatImage& gray,
+                                           const MarkerCandidate& candidate, int bits,
+                                           int max_hamming) {
+    if (gray.empty()) return std::nullopt;
+    return decode_circular(gray, compute_gradient_field(gray), candidate, bits,
+                           max_hamming);
+}
+
+std::optional<CodedTarget> decode_circular(const FloatImage& gray,
+                                           const GradientField& gradient,
+                                           const MarkerCandidate& candidate, int bits,
+                                           int max_hamming) {
+    return decode_circular_impl(gray, gradient, candidate, bits, max_hamming);
 }
 
 }  // namespace alphashape

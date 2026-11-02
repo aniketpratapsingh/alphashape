@@ -1531,3 +1531,18 @@ close-out (WP-12.12). The engine guide is
   adjacent sides is not recovered. An intermediate square (for example the
   inner dark blob bounded by the white frame) is rejected by the border-side
   check rather than decoded.
+- **DetectMarkers needs isolated cross targets, and rejects AprilTagCircle21h7.**
+  Cross detection supports the checker (bowtie) style and the bar style. Saddle
+  candidates that belong to a dense fiducial lattice are rejected, so an
+  AprilTag's internal cell corners are never reported as crosses; the same
+  guard also suppresses a printed sheet whose crosses are closer together than
+  about three target radii. The bar path additionally needs each arm to be
+  resolved as a straight ridge, which a very short or heavily occluded arm is
+  not. `AprilTagCircle21h7` is named in the parameter choices but the task
+  refuses it with a "not supported yet" error: its published tags are circular,
+  so `detect_quads` produces no candidate.
+- **Non-coded targets are associated to existing markers only by projection.**
+  A non-coded detection in a camera with no predicted marker position becomes
+  a new marker; the task does not match non-coded targets across cameras. Run
+  it once to seed the markers, place their positions, and run it again to
+  attach the remaining views.

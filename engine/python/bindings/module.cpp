@@ -1597,6 +1597,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def("exportMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "ExportMarkers", std::move(kwargs));
         })
+        // Automatic target detection (WP-13.8), the same run_task call.
+        .def("detectMarkers", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "DetectMarkers", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"

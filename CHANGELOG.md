@@ -42,6 +42,21 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.8: `DetectMarkers`, cross targets and non-coded targets.**
+  `detect_crosses()` finds both printed cross styles: a checker (bowtie) target
+  from its intensity saddle, refined by a weighted quadratic fit, and a bar
+  cross from Hessian ridge points (Steger 1998) paired by near-orthogonal
+  straight-line fits. The `DetectMarkers` task covers `Circular12/14/16/20`,
+  non-coded `Circular`, `Cross` and six published AprilTag families, maps
+  `tolerance` to each decoder's Hamming budget, supports inverted targets,
+  camera masks, per-camera frame filters, non-maximum suppression and an
+  automatic 4096-pixel downscale with full-resolution centre refinement. Coded
+  targets resolve by the `target <code>` label; non-coded detections attach to
+  the nearest projected marker within `maximum_residual` or become a new
+  `point N` marker. The whole run is one undoable `CommandTransaction`, and
+  `chunk.detectMarkers(...)` exposes it in Python. `decode_circular()` gains an
+  overload that reuses a caller-computed gradient field.
+
 - **WP-13.6: circular coded targets.** Our own concentric target design: a
   centre dot (black = parity 1, white = parity 0) out to 0.25 R, a white gap to
   0.5 R, an N-sector coding ring (0.5–0.85 R, black = 1, sector 0 at image-up

@@ -98,4 +98,12 @@ std::optional<CodedTarget> decode_circular(const FloatImage& gray,
                                            const MarkerCandidate& candidate, int bits,
                                            int max_hamming = 0);
 
+/// Same, reusing a caller-computed gradient field. `compute_gradient_field`
+/// dominates the per-candidate cost when a caller decodes many blobs of one
+/// image; this overload computes it once for the whole image instead.
+std::optional<CodedTarget> decode_circular(const FloatImage& gray,
+                                           const GradientField& gradient,
+                                           const MarkerCandidate& candidate, int bits,
+                                           int max_hamming = 0);
+
 }  // namespace alphashape
