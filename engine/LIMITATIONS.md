@@ -1516,6 +1516,9 @@ close-out (WP-12.12). The engine guide is
 - **Reversed-border decoding expects the outer silhouette.** For
   `Standard41h12` and `Standard52h13` the detected quad is the dark region's
   outer boundary. The decoder also accepts a candidate that is exactly the
-  reference `width_at_border` square, but an intermediate square (for example
-  the inner dark blob bounded by the white frame) is rejected by the
-  border-side check rather than decoded.
+  reference `width_at_border` square, and when a white perimeter cell cuts one
+  extreme row or column off the detected component it grows each side by one
+  cell in turn and keeps the side that validates. A component missing two
+  adjacent sides is not recovered. An intermediate square (for example the
+  inner dark blob bounded by the white frame) is rejected by the border-side
+  check rather than decoded.

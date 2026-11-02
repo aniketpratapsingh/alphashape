@@ -724,23 +724,80 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
             scales.push_back(silhouette);
         }
     }
-    std::optional<HypothesisResult> best;
-    for (double scale : scales) {
-        std::optional<HypothesisResult> result =
-            decode_hypothesis(gray, refined, family, scale, allowed);
-        if (!result) {
-            continue;
+    const auto evaluate = [&](const std::array<Eigen::Vector2d, 4>& candidate_quad,
+                              std::vector<HypothesisResult>& results) {
+        for (double scale : scales) {
+            std::optional<HypothesisResult> result =
+                decode_hypothesis(gray, candidate_quad, family, scale, allowed);
+            if (result) {
+                results.push_back(std::move(*result));
+            }
         }
-        if (!best) {
-            best = std::move(result);
-            continue;
-        }
-        if (best->match.id != result->match.id) {
+    };
+    const auto choose = [](const std::vector<HypothesisResult>& results)
+        -> std::optional<HypothesisResult> {
+        if (results.empty()) {
             return std::nullopt;
         }
-        if (result->margin > best->margin) {
-            best = std::move(result);
+        int minimum = results.front().match.distance;
+        for (const HypothesisResult& result : results) {
+            minimum = std::min(minimum, result.match.distance);
         }
+        std::optional<HypothesisResult> chosen;
+        for (const HypothesisResult& result : results) {
+            if (result.match.distance != minimum) {
+                continue;
+            }
+            if (!chosen) {
+                chosen = result;
+                continue;
+            }
+            if (chosen->match.id != result.match.id) {
+                return std::nullopt;  // equally close to two codes
+            }
+            if (result.margin > chosen->margin) {
+                chosen = result;
+            }
+        }
+        return chosen;
+    };
+
+    std::vector<HypothesisResult> results;
+    evaluate(refined, results);
+    std::optional<HypothesisResult> best = choose(results);
+    if (!best && family.reversed_border && family.total_width > 0) {
+        // A reversed status tag's dark outer ring is only two cells wide. A
+        // white payload cell on the perimeter can cut the extreme row or
+        // column off the detected component, shrinking the candidate by one
+        // cell on that side. The published white reference frame is always
+        // intact, so grow each side by one cell in turn and retry; only the
+        // side that was missing produces a valid tag.
+        const double pair0 = 0.5 * ((refined[1] - refined[0]).norm() +
+                                    (refined[2] - refined[3]).norm());
+        const double pair1 = 0.5 * ((refined[2] - refined[1]).norm() +
+                                    (refined[3] - refined[0]).norm());
+        const double cell = std::max(pair0, pair1) /
+                            static_cast<double>(family.total_width);
+        Eigen::Vector2d center = Eigen::Vector2d::Zero();
+        for (const Eigen::Vector2d& corner : refined) {
+            center += corner;
+        }
+        center *= 0.25;
+        for (int side = 0; side < 4; ++side) {
+            const Eigen::Vector2d& a = refined[static_cast<std::size_t>(side)];
+            const Eigen::Vector2d& b =
+                refined[static_cast<std::size_t>((side + 1) % 4)];
+            const Eigen::Vector2d direction = (b - a).normalized();
+            Eigen::Vector2d normal(-direction.y(), direction.x());
+            if ((0.5 * (a + b) - center).dot(normal) < 0.0) {
+                normal = -normal;
+            }
+            std::array<Eigen::Vector2d, 4> grown = refined;
+            grown[static_cast<std::size_t>(side)] = a + normal * cell;
+            grown[static_cast<std::size_t>((side + 1) % 4)] = b + normal * cell;
+            evaluate(grown, results);
+        }
+        best = choose(results);
     }
     if (!best) {
         return std::nullopt;
@@ -751,10 +808,10 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     target.center = best->center;
     target.bits = family.bits;
     target.hamming = best->match.distance;
-    const double diagonal0 = (refined[2] - refined[0]).norm();
-    const double diagonal1 = (refined[3] - refined[1]).norm();
+    const double diagonal0 = (best->corners[2] - best->corners[0]).norm();
+    const double diagonal1 = (best->corners[3] - best->corners[1]).norm();
     target.radius_px = 0.25 * (diagonal0 + diagonal1);
-    target.corners = refined;
+    target.corners = best->corners;
     target.has_corners = true;
     return target;
 }
