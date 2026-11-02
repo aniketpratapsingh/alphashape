@@ -1261,8 +1261,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     }
 }
 
-MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
-                            const RefineMarkersOptions& options) {
+MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
     MarkerEdit edit;
     bool any = false;
     bool success = false;
@@ -1463,7 +1462,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         failed.failed = true;
         return failed;
     }
-    return refine_2d_marker(blends, options);
+    return refine_2d_marker(blends);
 }
 
 /// Build the pose/calibration/scale record for every selected camera. No image
