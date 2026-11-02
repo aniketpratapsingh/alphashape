@@ -6,6 +6,7 @@ tools/*
 !tools/*.sh
 !tools/sample/
 !tools/bench/
+!tools/markers/
 run/
 work/
 .claude/

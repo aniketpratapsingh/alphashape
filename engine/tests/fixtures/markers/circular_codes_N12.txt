@@ -1,0 +1,17 @@
+# Circular target ring codes for N=12.
+# count=13
+# construction=greedy lexicode over canonical cyclic rotations, minimum Hamming distance 3 between all rotations of all words.
+# One word per line, 12 characters, MSB = sector 0 (12 o'clock, clockwise).
+000000001011
+000000011101
+000001010011
+000001100111
+000010111111
+000011010101
+000100100011
+000101111001
+000110100101
+000111011011
+000111101111
+001010010111
+010110110111

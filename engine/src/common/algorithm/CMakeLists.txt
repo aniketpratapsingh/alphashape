@@ -20,6 +20,8 @@ add_library(alphashape_algorithms STATIC
     match/match_photos_task.cpp
     markers/project_markers.cpp
     markers/marker_detector.cpp
+    markers/target_patterns.cpp
+    markers/circular_decoder.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp
