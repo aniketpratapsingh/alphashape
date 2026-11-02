@@ -776,11 +776,19 @@ std::optional<Eigen::Vector2d> intersect(const Line& a, const Line& b) {
     return point;
 }
 
-std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& gradient,
+/// Locate each side's edge points at the half-intensity crossing along the side
+/// normal. A crossing of a linearly interpolated intensity profile is unbiased
+/// to O(pixel^2), whereas the peak of a bilinearly interpolated per-pixel
+/// gradient field can be biased by a fifth of a pixel. The edge points are
+/// weighted by the gradient magnitude at the crossing and fitted with a
+/// weighted line; adjacent intersections are the subpixel corners.
+std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& gray,
+                                                          const FloatImage& gradient,
                                                           const std::array<Eigen::Vector2d, 4>& corners,
                                                           double& response) {
-    constexpr int kNormalSteps = 25;
+    constexpr int kNormalSteps = 41;
     constexpr double kNormalStep = 0.25;
+    constexpr double kNormalExtent = 5.0;
     std::array<Line, 4> lines;
     double response_sum = 0.0;
     int response_count = 0;
@@ -802,37 +810,55 @@ std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& grad
                 0.15 + 0.7 * (static_cast<double>(k) + 0.5) / static_cast<double>(count);
             const Eigen::Vector2d base = a + fraction * delta;
             std::array<double, kNormalSteps> values{};
-            double best = -1.0;
-            int best_index = -1;
+            double minimum = std::numeric_limits<double>::infinity();
+            double maximum = -std::numeric_limits<double>::infinity();
             for (int i = 0; i < kNormalSteps; ++i) {
-                const double t = -3.0 + kNormalStep * static_cast<double>(i);
+                const double t = -kNormalExtent + kNormalStep * static_cast<double>(i);
                 const Eigen::Vector2d probe = base + t * normal;
                 const double value = static_cast<double>(
-                    gradient.sample(static_cast<float>(probe.x()), static_cast<float>(probe.y())));
+                    gray.sample(static_cast<float>(probe.x()), static_cast<float>(probe.y())));
                 values[static_cast<std::size_t>(i)] = value;
-                if (value > best) {
-                    best = value;
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+            }
+            if (!(maximum - minimum > 2.0 * kMinEdgeGradient)) {
+                continue;
+            }
+            const double midpoint = 0.5 * (minimum + maximum);
+            int best_index = -1;
+            double best_slope = 0.0;
+            for (int i = 0; i + 1 < kNormalSteps; ++i) {
+                const double lower = values[static_cast<std::size_t>(i)];
+                const double upper = values[static_cast<std::size_t>(i + 1)];
+                const double low = std::min(lower, upper);
+                const double high = std::max(lower, upper);
+                if (midpoint < low || midpoint > high) continue;
+                const double difference = upper - lower;
+                if (std::abs(difference) < 1e-12) continue;
+                const double slope = std::abs(difference) / kNormalStep;
+                if (slope > best_slope) {
+                    best_slope = slope;
                     best_index = i;
                 }
             }
-            if (best_index <= 0 || best_index + 1 >= kNormalSteps || best < kMinEdgeGradient) {
+            if (best_index < 0 || best_slope < kMinEdgeGradient) {
                 continue;
             }
-            const double left = values[static_cast<std::size_t>(best_index - 1)];
-            const double mid = values[static_cast<std::size_t>(best_index)];
-            const double right = values[static_cast<std::size_t>(best_index + 1)];
-            const double denominator = left - 2.0 * mid + right;
-            double shift = 0.0;
-            if (denominator < -1e-12) {
-                shift = 0.5 * (left - right) / denominator;
-            }
-            shift = std::clamp(shift, -0.5, 0.5);
-            const double t = -3.0 + kNormalStep * (static_cast<double>(best_index) + shift);
+            const double crossing =
+                -kNormalExtent + kNormalStep *
+                    (static_cast<double>(best_index) +
+                     (midpoint - values[static_cast<std::size_t>(best_index)]) /
+                         (values[static_cast<std::size_t>(best_index + 1)] -
+                          values[static_cast<std::size_t>(best_index)]));
             WeightedPoint sample;
-            sample.point = base + t * normal;
-            sample.weight = best;
+            sample.point = base + crossing * normal;
+            sample.weight = static_cast<double>(gradient.sample(
+                static_cast<float>(sample.point.x()), static_cast<float>(sample.point.y())));
+            if (!(sample.weight > 0.0)) {
+                sample.weight = best_slope;
+            }
             points.push_back(sample);
-            response_sum += best;
+            response_sum += best_slope;
             ++response_count;
         }
         if (points.size() < 5) {
@@ -965,7 +991,7 @@ std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const Qua
 
         double response = 0.0;
         const std::optional<std::array<Eigen::Vector2d, 4>> refined =
-            refine_quad(gradient, quad, response);
+            refine_quad(gray, gradient, quad, response);
         if (!refined) continue;
         std::array<Eigen::Vector2d, 4> corners = *refined;
         if (!is_convex(corners)) continue;
