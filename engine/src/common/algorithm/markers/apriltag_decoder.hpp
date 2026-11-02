@@ -73,6 +73,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
@@ -104,5 +105,18 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
                                       const MarkerCandidate& quad,
                                       const TagFamily& family,
                                       int max_hamming = 1);
+
+/// Detect and decode every tag of `family` in `gray`. This is the convenience
+/// path a task uses: it runs `detect_quads` on the image, and for a
+/// reversed-border family also on the inverted image (where the white
+/// reference frame is a solid dark ring), then decodes each candidate. If
+/// nothing decodes and the shorter image side is under 128 px, it retries on a
+/// 2x bilinear upsampling, where the detector's subpixel line fits are
+/// accurate; the reported centre, corners and radius are mapped back to the
+/// original image.
+std::vector<CodedTarget> decode_tags(const FloatImage& gray,
+                                     AprilTagFamily family,
+                                     int max_hamming = 1,
+                                     const QuadParams& params = {});
 
 }  // namespace alphashape

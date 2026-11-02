@@ -771,6 +771,28 @@ std::optional<HypothesisResult> decode_hypothesis(
     return result;
 }
 
+/// Bilinear resampling by an integer factor. The original pixel centres map
+/// into the enlarged image; `FloatImage::sample` clamps at the borders.
+FloatImage upsample_bilinear(const FloatImage& image, int factor) {
+    if (factor < 2 || image.empty()) {
+        return image;
+    }
+    const int width = image.width() * factor;
+    const int height = image.height() * factor;
+    FloatImage out(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const double source_x =
+                (static_cast<double>(x) + 0.5) / static_cast<double>(factor) - 0.5;
+            const double source_y =
+                (static_cast<double>(y) + 0.5) / static_cast<double>(factor) - 0.5;
+            out.at(x, y) = image.sample(static_cast<float>(source_x),
+                                        static_cast<float>(source_y));
+        }
+    }
+    return out;
+}
+
 /// Layout-order word to the published integer (most significant bit first).
 std::uint64_t layout_to_published(std::uint64_t word, int bits) {
     std::uint64_t out = 0;
@@ -999,6 +1021,58 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     target.corners = best->corners;
     target.has_corners = true;
     return target;
+}
+
+std::vector<CodedTarget> decode_tags(const FloatImage& gray,
+                                     AprilTagFamily family, int max_hamming,
+                                     const QuadParams& params) {
+    const TagFamily& table = tag_family(family);
+    std::vector<CodedTarget> decoded;
+    if (gray.empty()) {
+        return decoded;
+    }
+    const auto scan = [&](const FloatImage& image, const QuadParams& quad_params,
+                          double factor_back) {
+        std::vector<MarkerCandidate> candidates;
+        if (table.reversed_border) {
+            FloatImage inverted = image;
+            for (float& value : inverted.pixels()) {
+                value = 1.0F - value;
+            }
+            const std::vector<MarkerCandidate> frames =
+                detect_quads(inverted, quad_params);
+            candidates.insert(candidates.end(), frames.begin(), frames.end());
+        }
+        const std::vector<MarkerCandidate> dark =
+            detect_quads(image, quad_params);
+        candidates.insert(candidates.end(), dark.begin(), dark.end());
+        for (const MarkerCandidate& candidate : candidates) {
+            std::optional<CodedTarget> target =
+                decode_tag(image, candidate, table, max_hamming);
+            if (!target) {
+                continue;
+            }
+            if (factor_back != 1.0) {
+                target->center *= factor_back;
+                for (Eigen::Vector2d& corner : target->corners) {
+                    corner *= factor_back;
+                }
+                target->radius_px *= factor_back;
+            }
+            decoded.push_back(*target);
+        }
+    };
+    scan(gray, params, 1.0);
+    const int shortest = std::min(gray.width(), gray.height());
+    if (decoded.empty() && table.reversed_border && shortest > 0 &&
+        shortest < 128) {
+        const FloatImage enlarged = upsample_bilinear(gray, 2);
+        QuadParams scaled = params;
+        scaled.min_side *= 2;
+        scaled.max_side *= 2;
+        scan(enlarged, scaled, 0.5);
+    }
+    return decoded;
 }
 
 }  // namespace alphashape

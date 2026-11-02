@@ -188,35 +188,7 @@ FloatImage render_degraded(const test::AprilTagTruth& truth, double blur, double
 std::vector<CodedTarget> detect_and_decode(const FloatImage& image,
                                            AprilTagFamily family, int max_hamming,
                                            const QuadParams& params) {
-    std::vector<CodedTarget> decoded;
-    const TagFamily& table = tag_family(family);
-    std::vector<MarkerCandidate> candidates;
-    if (table.reversed_border) {
-        // The white reference frame is the published quad. On the inverted
-        // image it is a solid dark ring, so the same detector finds the exact
-        // width_at_border square even when perimeter payload cells notch the
-        // dark silhouette.
-        FloatImage inverted = image;
-        for (float& value : inverted.pixels()) {
-            value = 1.0F - value;
-        }
-        const std::vector<MarkerCandidate> frame_candidates =
-            detect_quads(inverted, params);
-        candidates.insert(candidates.end(), frame_candidates.begin(),
-                          frame_candidates.end());
-    }
-    const std::vector<MarkerCandidate> dark_candidates =
-        detect_quads(image, params);
-    candidates.insert(candidates.end(), dark_candidates.begin(),
-                      dark_candidates.end());
-    for (const MarkerCandidate& candidate : candidates) {
-        std::optional<CodedTarget> target =
-            decode_tag(image, candidate, table, max_hamming);
-        if (target) {
-            decoded.push_back(*target);
-        }
-    }
-    return decoded;
+    return decode_tags(image, family, max_hamming, params);
 }
 
 }  // namespace
@@ -459,6 +431,15 @@ TEST(Markers, AprilTagReversedSmallDiagnostic) {
                     }
                     std::printf("\n");
                 }
+                const std::vector<CodedTarget> all =
+                    decode_tags(image, family, default_max_hamming(family),
+                                params);
+                std::printf("[diag]   decode_tags count=%d ids:",
+                            static_cast<int>(all.size()));
+                for (const CodedTarget& target : all) {
+                    std::printf(" %d", target.code);
+                }
+                std::printf("\n");
             }
         }
     }
