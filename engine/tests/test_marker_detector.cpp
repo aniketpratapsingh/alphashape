@@ -136,6 +136,8 @@ AccuracySummary centre_accuracy(const FloatImage& image,
                                 const std::vector<test::EllipseTruth>& truths,
                                 const BlobParams& params) {
     const std::vector<MarkerCandidate> candidates = detect_blobs(image, params);
+    // One gradient field for every refinement in this sheet.
+    const GradientField gradient = compute_gradient_field(image);
     AccuracySummary summary;
     double squared = 0.0;
     for (const test::EllipseTruth& truth : truths) {
@@ -390,6 +392,29 @@ TEST(MarkerDetector, QuadCornersAccurate) {
     EXPECT_LE(rms, 0.1);
 }
 
+TEST(MarkerDetector, ParallelBlurMatchesSerialBits) {
+    // The DoG detector consumes the blur outputs, so the row-parallel passes
+    // must reproduce the serial arithmetic exactly, not merely closely.
+    const int width = 97;
+    const int height = 83;
+    FloatImage image(width, height, 0.0F);
+    std::mt19937 engine(20261106U);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const double value = rng::uniform_real(engine, 0.0, 1.0);
+            image.at(x, y) = static_cast<float>(value);
+        }
+    }
+    const FloatImage parallel_result = gaussian_blur(image, 2.7F);
+    const FloatImage serial_result = serial_gaussian_blur(image, 2.7F);
+    ASSERT_EQ(parallel_result.width(), serial_result.width());
+    ASSERT_EQ(parallel_result.height(), serial_result.height());
+    ASSERT_EQ(parallel_result.pixels().size(), serial_result.pixels().size());
+    for (std::size_t i = 0; i < serial_result.pixels().size(); ++i) {
+        EXPECT_EQ(parallel_result.pixels()[i], serial_result.pixels()[i]) << "index " << i;
+    }
+}
+
 TEST(MarkerDetector, TwelveMegapixelTiming) {
     const int width = 4000;
     const int height = 3000;
@@ -423,21 +448,61 @@ TEST(MarkerDetector, TwelveMegapixelTiming) {
     BlobParams params;
     params.min_radius = 4;
     params.max_radius = 24;
+    DetectionTimings timings;
     const auto start = std::chrono::steady_clock::now();
-    const std::vector<MarkerCandidate> candidates = detect_blobs(image, params);
+    const std::vector<MarkerCandidate> candidates = detect_blobs(image, params, &timings);
     const auto finish = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(finish - start).count();
-    int matched = 0;
-    for (const test::EllipseTruth& truth : truths) {
-        const Eigen::Vector2d expected(truth.cx, truth.cy);
-        const MarkerCandidate* candidate = nearest_candidate(candidates, expected);
-        if (candidate != nullptr && (candidate->center - expected).norm() < 3.0) {
-            ++matched;
+
+    DetectionTimings quad_timings;
+    const std::vector<MarkerCandidate> quads = detect_quads(image, QuadParams{}, &quad_timings);
+
+    // Greedy one-to-one matching, shortest pair first: a candidate may stand
+    // for at most one truth and every unassigned candidate is a false positive.
+    struct Pair {
+        double distance = 0.0;
+        int truth = 0;
+        int candidate = 0;
+    };
+    std::vector<Pair> pairs;
+    for (int t = 0; t < static_cast<int>(truths.size()); ++t) {
+        for (int c = 0; c < static_cast<int>(candidates.size()); ++c) {
+            const Eigen::Vector2d expected(truths[static_cast<std::size_t>(t)].cx,
+                                           truths[static_cast<std::size_t>(t)].cy);
+            const double distance =
+                (candidates[static_cast<std::size_t>(c)].center - expected).norm();
+            if (distance < 3.0) pairs.push_back({distance, t, c});
         }
     }
-    std::printf("[marker 12mp] seconds=%.3f candidates=%d matched=%d\n", seconds,
-                static_cast<int>(candidates.size()), matched);
+    std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+        if (a.distance != b.distance) return a.distance < b.distance;
+        if (a.truth != b.truth) return a.truth < b.truth;
+        return a.candidate < b.candidate;
+    });
+    std::vector<char> truth_used(truths.size(), 0);
+    std::vector<char> candidate_used(candidates.size(), 0);
+    int matched = 0;
+    for (const Pair& pair : pairs) {
+        if (truth_used[static_cast<std::size_t>(pair.truth)] != 0 ||
+            candidate_used[static_cast<std::size_t>(pair.candidate)] != 0) {
+            continue;
+        }
+        truth_used[static_cast<std::size_t>(pair.truth)] = 1;
+        candidate_used[static_cast<std::size_t>(pair.candidate)] = 1;
+        ++matched;
+    }
+    int false_positives = 0;
+    for (char used : candidate_used) {
+        if (used == 0) ++false_positives;
+    }
+    std::printf(
+        "[marker 12mp] seconds=%.3f blur=%.3f hessian=%.3f nms=%.3f rays=%.3f quads=%.3f "
+        "candidates=%d matched=%d false_positives=%d quad_candidates=%d\n",
+        seconds, timings.blur_seconds, timings.hessian_seconds, timings.nms_seconds,
+        timings.refine_seconds, quad_timings.quad_seconds, static_cast<int>(candidates.size()),
+        matched, false_positives, static_cast<int>(quads.size()));
     EXPECT_GE(matched, 95);
+    EXPECT_LE(false_positives, 2);
     if (test::perf_asserts_enabled()) {
         EXPECT_LE(seconds, 1.5);
     }

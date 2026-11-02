@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 
+#include "base/utils/omp.hpp"
 #include "common/algorithm/feature/dog_detector.hpp"
 
 namespace alphashape {
@@ -413,6 +415,7 @@ struct Seed {
     int y = 0;
     float response = 0.0F;
     double radius = 0.0;
+    int factor = 1;  ///< Full-resolution pixels per detector-level pixel
 };
 
 /// Strict 3x3x3 maximum across the two neighbouring scales.
@@ -432,7 +435,7 @@ bool is_scale_maximum(const FloatImage& current, const FloatImage* previous,
 }
 
 void scan_scale(const FloatImage& current, const FloatImage* previous, const FloatImage* next,
-                float threshold, double radius, std::vector<Seed>& seeds) {
+                float threshold, double radius, int factor, std::vector<Seed>& seeds) {
     const int w = current.width();
     const int h = current.height();
     for (int y = 1; y + 1 < h; ++y) {
@@ -440,9 +443,30 @@ void scan_scale(const FloatImage& current, const FloatImage* previous, const Flo
             const float value = current.at(x, y);
             if (!(value >= threshold)) continue;
             if (!is_scale_maximum(current, previous, next, x, y, value)) continue;
-            seeds.push_back({x, y, value, radius});
+            seeds.push_back({x, y, value, radius, factor});
         }
     }
+}
+
+/// Decimate by two, keeping every second pixel. The image is already blurred
+/// far beyond the half-pixel Nyquist limit before this is called (the pyramid
+/// only engages at sigma >= 4), so plain decimation avoids extra alias-free
+/// filtering. With `FloatImage::sample` addressing pixel centres at integer
+/// coordinates, level pixel x is full-resolution pixel 2x, so a level position
+/// maps back to full resolution exactly by multiplying by the level factor.
+FloatImage decimate_by_two(const FloatImage& in) {
+    FloatImage out(std::max(1, in.width() / 2), std::max(1, in.height() / 2));
+    const int w = out.width();
+    const int h = out.height();
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            out.at(x, y) = in.at(2 * x, 2 * y);
+        }
+    }
+    return out;
 }
 
 double circle_intersection_area(double radius_a, double radius_b, double distance) {
@@ -510,7 +534,8 @@ std::vector<MarkerCandidate> suppress_overlaps(std::vector<MarkerCandidate> cand
     return kept;
 }
 
-std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const BlobParams& params) {
+std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const BlobParams& params,
+                                               DetectionTimings* timings) {
     std::vector<MarkerCandidate> candidates;
     if (gray.empty() || params.max_radius < params.min_radius || params.min_radius < 1) {
         return candidates;
@@ -521,44 +546,122 @@ std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const Blo
          radius <= static_cast<double>(params.max_radius) + 1e-9; radius *= growth) {
         radii.push_back(radius);
     }
-    if (radii.empty()) {
-        radii.push_back(static_cast<double>(params.min_radius));
+    // The geometric series can stop just short of max_radius; the largest
+    // target the caller allowed still needs a scale of its own.
+    if (radii.empty() || radii.back() < static_cast<double>(params.max_radius) - 1e-9) {
+        radii.push_back(static_cast<double>(params.max_radius));
     }
     const int scale_count = static_cast<int>(radii.size());
+    // Plan the Gaussian pyramid: once the requested sigma reaches ~4 pixels at
+    // the current resolution the image is decimated by two and the remaining
+    // scales run at half the pixels (sigma halved with them). A factor of four
+    // is the cap so a seed never lands more than a few full-resolution pixels
+    // away from the true centre before the full-resolution refit.
+    constexpr double kPyramidSigma = 4.0;
+    constexpr int kMaxLevelFactor = 4;
+    constexpr int kMinPyramidSide = 16;
+    std::vector<double> sigmas(radii.size());
+    std::vector<int> factors(radii.size(), 1);
+    for (std::size_t i = 0; i < radii.size(); ++i) {
+        sigmas[i] = radii[i] / growth;
+        // The first scale is always evaluated at full resolution: there is no
+        // already-blurred lower level to decimate from.
+        int factor = i == 0 ? 1 : factors[i - 1];
+        while (i > 0 && sigmas[i] / static_cast<double>(factor) >= kPyramidSigma &&
+               factor < kMaxLevelFactor &&
+               gray.width() / (2 * factor) >= kMinPyramidSide &&
+               gray.height() / (2 * factor) >= kMinPyramidSide) {
+            factor *= 2;
+        }
+        factors[i] = factor;
+    }
+    // One gradient image serves both the boundary search here and any later
+    // refine_ellipse_center() call that receives this field.
     const FloatImage gradient = gradient_magnitude(gray);
     std::vector<Seed> seeds;
+    using Clock = std::chrono::steady_clock;
+    double blur_seconds = 0.0;
+    double hessian_seconds = 0.0;
+    double nms_seconds = 0.0;
 
-    // The scale-space response for three consecutive scales is kept: the 3x3x3
-    // maximum test needs both neighbours. Blurring incrementally (each level by
-    // the difference in sigma) costs less than filtering the original each time.
+    // Keep only three consecutive response images: the 3x3x3 maximum test
+    // needs both neighbours and older scales are never read again. A level
+    // change starts a new octave, so there is no cross-octave neighbour; each
+    // scale is still examined, with a 2D maximum test at an octave boundary.
     std::array<FloatImage, 3> response;
-    double sigma = radii[0] / growth;
-    FloatImage blurred = gaussian_blur(gray, static_cast<float>(sigma));
-    response[0] = hessian_response(blurred, sigma, params.dark_on_light);
-    for (int index = 0; index < scale_count; ++index) {
-        if (index + 1 < scale_count) {
-            const double next_sigma = radii[static_cast<std::size_t>(index + 1)] / growth;
-            const double increment =
-                std::sqrt(std::max(0.0, next_sigma * next_sigma - sigma * sigma));
-            blurred = gaussian_blur(blurred, static_cast<float>(increment));
-            sigma = next_sigma;
-            response[static_cast<std::size_t>((index + 1) % 3)] =
-                hessian_response(blurred, sigma, params.dark_on_light);
+    int level = 1;
+    double sigma_cur = sigmas[0];
+    const auto initial_blur_start = Clock::now();
+    FloatImage blurred = gaussian_blur(gray, static_cast<float>(sigma_cur));
+    blur_seconds +=
+        std::chrono::duration<double>(Clock::now() - initial_blur_start).count();
+    int prepared = -1;
+    const auto ensure = [&](int index) {
+        if (index <= prepared) {
+            return;
         }
+        while (level < factors[static_cast<std::size_t>(index)]) {
+            const auto start = Clock::now();
+            blurred = decimate_by_two(blurred);
+            sigma_cur *= 0.5;
+            level *= 2;
+            blur_seconds += std::chrono::duration<double>(Clock::now() - start).count();
+        }
+        const double target =
+            sigmas[static_cast<std::size_t>(index)] / static_cast<double>(level);
+        if (target > sigma_cur + 1e-9) {
+            // Incremental blur: variance adds, so the increment is the root of
+            // the difference of squares.
+            const double increment = std::sqrt(target * target - sigma_cur * sigma_cur);
+            const auto start = Clock::now();
+            blurred = gaussian_blur(blurred, static_cast<float>(increment));
+            blur_seconds += std::chrono::duration<double>(Clock::now() - start).count();
+            sigma_cur = target;
+        }
+        const auto start = Clock::now();
+        response[static_cast<std::size_t>(index % 3)] =
+            hessian_response(blurred, sigma_cur, params.dark_on_light);
+        hessian_seconds += std::chrono::duration<double>(Clock::now() - start).count();
+        prepared = index;
+    };
+    for (int index = 0; index < scale_count; ++index) {
+        ensure(index);
+        const bool same_next =
+            index + 1 < scale_count &&
+            factors[static_cast<std::size_t>(index + 1)] ==
+                factors[static_cast<std::size_t>(index)];
+        if (same_next) {
+            ensure(index + 1);
+        }
+        const bool same_previous =
+            index > 0 && factors[static_cast<std::size_t>(index - 1)] ==
+                              factors[static_cast<std::size_t>(index)];
         const FloatImage& current = response[static_cast<std::size_t>(index % 3)];
         const FloatImage* previous =
-            index > 0 ? &response[static_cast<std::size_t>((index + 2) % 3)] : nullptr;
-        const FloatImage* next = index + 1 < scale_count
-                                     ? &response[static_cast<std::size_t>((index + 1) % 3)]
-                                     : nullptr;
+            same_previous ? &response[static_cast<std::size_t>((index + 2) % 3)] : nullptr;
+        const FloatImage* next =
+            same_next ? &response[static_cast<std::size_t>((index + 1) % 3)] : nullptr;
+        const auto start = Clock::now();
         scan_scale(current, previous, next, params.threshold,
-                   radii[static_cast<std::size_t>(index)], seeds);
+                   radii[static_cast<std::size_t>(index)],
+                   factors[static_cast<std::size_t>(index)], seeds);
+        nms_seconds += std::chrono::duration<double>(Clock::now() - start).count();
     }
 
-    for (const Seed& seed : seeds) {
-        std::optional<Ellipse> fit = fit_boundary(
-            gradient, Eigen::Vector2d(static_cast<double>(seed.x), static_cast<double>(seed.y)),
-            seed.radius);
+    // Boundary search runs only on the surviving maxima and always on the
+    // full-resolution gradient, so the pyramid level costs nothing in accuracy.
+    const auto refine_start = Clock::now();
+    std::vector<std::optional<MarkerCandidate>> fitted(seeds.size());
+    const int seed_count = static_cast<int>(seeds.size());
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+#pragma omp parallel for schedule(dynamic, 4)
+#endif
+    for (int s = 0; s < seed_count; ++s) {
+        const Seed& seed = seeds[static_cast<std::size_t>(s)];
+        const Eigen::Vector2d seed_centre(
+            static_cast<double>(seed.x) * static_cast<double>(seed.factor),
+            static_cast<double>(seed.y) * static_cast<double>(seed.factor));
+        std::optional<Ellipse> fit = fit_boundary(gradient, seed_centre, seed.radius);
         if (!fit) {
             continue;
         }
@@ -587,7 +690,20 @@ std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const Blo
         candidate.angle_rad = refined->angle_rad;
         candidate.axis_ratio = ratio;
         candidate.response = static_cast<double>(seed.response);
-        candidates.push_back(std::move(candidate));
+        fitted[static_cast<std::size_t>(s)] = std::move(candidate);
+    }
+    for (std::optional<MarkerCandidate>& slot : fitted) {
+        if (slot) {
+            candidates.push_back(std::move(*slot));
+        }
+    }
+    const double refine_seconds =
+        std::chrono::duration<double>(Clock::now() - refine_start).count();
+    if (timings != nullptr) {
+        timings->blur_seconds = blur_seconds;
+        timings->hessian_seconds = hessian_seconds;
+        timings->nms_seconds = nms_seconds;
+        timings->refine_seconds = refine_seconds;
     }
     return suppress_overlaps(std::move(candidates));
 }
@@ -643,8 +759,13 @@ std::vector<std::uint8_t> threshold_mask(const FloatImage& gray,
     return mask;
 }
 
+/// Summary of one 4-connected component. The pixel list itself is not kept:
+/// only the count, bounds and the topmost-then-leftmost seed pixel are needed,
+/// and the area filter can then reject a component before any per-component
+/// vector is allocated.
 struct Component {
-    std::vector<int> pixels;
+    std::size_t pixel_count = 0;
+    int start_index = 0;
     int min_x = 0;
     int max_x = 0;
     int min_y = 0;
@@ -654,25 +775,31 @@ struct Component {
 std::vector<Component> connected_components(const std::vector<std::uint8_t>& mask, int w, int h) {
     std::vector<std::uint8_t> visited(mask.size(), std::uint8_t{0});
     std::vector<Component> components;
-    std::vector<int> stack;
+    std::vector<std::size_t> stack;
     const std::size_t width = static_cast<std::size_t>(w);
-    for (int start = 0; start < w * h; ++start) {
-        const std::size_t seed = static_cast<std::size_t>(start);
-        if (!mask[seed] || visited[seed] != 0) continue;
+    const std::size_t total = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+    for (std::size_t start = 0; start < total; ++start) {
+        if (!mask[start] || visited[start] != 0) continue;
         Component component;
         component.min_x = w;
         component.min_y = h;
         component.max_x = -1;
         component.max_y = -1;
+        int start_x = std::numeric_limits<int>::max();
+        int start_y = std::numeric_limits<int>::max();
         stack.clear();
         stack.push_back(start);
-        visited[seed] = std::uint8_t{1};
+        visited[start] = std::uint8_t{1};
         while (!stack.empty()) {
-            const int index = stack.back();
+            const std::size_t index = stack.back();
             stack.pop_back();
-            const int x = index % w;
-            const int y = index / w;
-            component.pixels.push_back(index);
+            const int x = static_cast<int>(index % width);
+            const int y = static_cast<int>(index / width);
+            ++component.pixel_count;
+            if (y < start_y || (y == start_y && x < start_x)) {
+                start_x = x;
+                start_y = y;
+            }
             component.min_x = std::min(component.min_x, x);
             component.max_x = std::max(component.max_x, x);
             component.min_y = std::min(component.min_y, y);
@@ -685,11 +812,12 @@ std::vector<Component> connected_components(const std::vector<std::uint8_t>& mas
                     static_cast<std::size_t>(ny[k]) * width + static_cast<std::size_t>(nx[k]);
                 if (mask[neighbour] != 0 && visited[neighbour] == 0) {
                     visited[neighbour] = std::uint8_t{1};
-                    stack.push_back(ny[k] * w + nx[k]);
+                    stack.push_back(neighbour);
                 }
             }
         }
-        components.push_back(std::move(component));
+        component.start_index = start_y * w + start_x;
+        components.push_back(component);
     }
     return components;
 }
@@ -1040,21 +1168,44 @@ void orient_corners(std::array<Eigen::Vector2d, 4>& corners) {
                 corners.end());
 }
 
-std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const QuadParams& params) {
+std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const QuadParams& params,
+                                               DetectionTimings* timings) {
     std::vector<MarkerCandidate> candidates;
+    const auto stage_start = std::chrono::steady_clock::now();
     if (gray.empty() || params.max_side < params.min_side || params.min_side < 2) {
         return candidates;
     }
     const int w = gray.width();
     const int h = gray.height();
+    // A pixel can differ from a box mean by at most the global intensity range.
+    // If that range does not even reach the threshold there can be no
+    // foreground, so skip the integral image and everything after it.
+    float minimum = gray.pixels().front();
+    float maximum = minimum;
+    for (float value : gray.pixels()) {
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    if (!(maximum - minimum > params.threshold)) {
+        if (timings != nullptr) {
+            timings->quad_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_start)
+                    .count();
+        }
+        return candidates;
+    }
     const int window = std::max(4, params.max_side / 4);
     const std::vector<double> means = box_means(gray, window);
     const std::vector<std::uint8_t> mask =
         threshold_mask(gray, means, params.threshold, params.dark_on_light);
     const std::vector<Component> components = connected_components(mask, w, h);
-    const FloatImage gradient = gradient_magnitude(gray);
     const std::size_t area_limit =
         static_cast<std::size_t>(params.max_side) * static_cast<std::size_t>(params.max_side);
+    // Apply the area/size filters first. A component outside them can never
+    // reach the contour stage, and the gradient image is the expensive part of
+    // this detector, so do not build it when nothing survives.
+    std::vector<const Component*> plausible;
+    plausible.reserve(components.size());
     for (const Component& component : components) {
         const int component_width = component.max_x - component.min_x + 1;
         const int component_height = component.max_y - component.min_y + 1;
@@ -1063,19 +1214,21 @@ std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const Qua
             component_height > params.max_side + params.max_side / 2) {
             continue;
         }
-        if (component.pixels.size() < 12 || component.pixels.size() > area_limit * 2U) continue;
-        int start_index = component.pixels.front();
-        int start_x = start_index % w;
-        int start_y = start_index / w;
-        for (int index : component.pixels) {
-            const int x = index % w;
-            const int y = index / w;
-            if (y < start_y || (y == start_y && x < start_x)) {
-                start_index = index;
-                start_x = x;
-                start_y = y;
-            }
+        if (component.pixel_count < 12 || component.pixel_count > area_limit * 2U) continue;
+        plausible.push_back(&component);
+    }
+    if (plausible.empty()) {
+        if (timings != nullptr) {
+            timings->quad_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_start)
+                    .count();
         }
+        return candidates;
+    }
+    const FloatImage gradient = gradient_magnitude(gray);
+    for (const Component* component_ptr : plausible) {
+        const Component& component = *component_ptr;
+        const int start_index = component.start_index;
         const std::vector<Pixel> contour = trace_contour(mask, w, h, start_index);
         if (contour.size() < 8) continue;
         std::vector<Eigen::Vector2d> points;
@@ -1135,6 +1288,11 @@ std::vector<MarkerCandidate> detect_quads_impl(const FloatImage& gray, const Qua
         candidate.corners.assign(corners.begin(), corners.end());
         candidates.push_back(std::move(candidate));
     }
+    if (timings != nullptr) {
+        timings->quad_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - stage_start)
+                .count();
+    }
     return suppress_overlaps(std::move(candidates));
 }
 
@@ -1149,22 +1307,24 @@ std::optional<Ellipse> fit_ellipse(const std::vector<Eigen::Vector2d>& points) {
     return fit_ellipse_points(samples);
 }
 
-std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
-                                                     const MarkerCandidate& seed,
-                                                     bool dark_on_light) {
+GradientField compute_gradient_field(const FloatImage& gray) {
+    return GradientField{gradient_magnitude(gray)};
+}
+
+std::optional<Eigen::Vector2d> refine_ellipse_center(const GradientField& gradient,
+                                                     const MarkerCandidate& seed) {
     // The boundary is located from the gradient magnitude, which is the same
-    // whichever side of the edge is brighter, so the polarity does not enter
-    // the subpixel search.
-    static_cast<void>(dark_on_light);
-    if (gray.empty() || !seed.center.allFinite()) {
+    // whichever side of the edge is brighter, so polarity plays no part in the
+    // subpixel search.
+    if (gradient.magnitude.empty() || !seed.center.allFinite()) {
         return std::nullopt;
     }
-    const FloatImage gradient = gradient_magnitude(gray);
+    const FloatImage& field = gradient.magnitude;
     Eigen::Vector2d centre = seed.center - Eigen::Vector2d(0.5, 0.5);
     double radius = seed.radius_px > 1.0 ? seed.radius_px : 8.0;
     std::optional<Ellipse> last;
     for (int iteration = 0; iteration < 3; ++iteration) {
-        const std::optional<Ellipse> fit = fit_boundary(gradient, centre, radius);
+        const std::optional<Ellipse> fit = fit_boundary(field, centre, radius);
         if (!fit) break;
         last = fit;
         const double move = (fit->center - centre).norm();
@@ -1178,12 +1338,19 @@ std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
     return centre + Eigen::Vector2d(0.5, 0.5);
 }
 
-std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params) {
-    return detect_blobs_impl(gray, params);
+std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
+                                                     const MarkerCandidate& seed) {
+    return refine_ellipse_center(compute_gradient_field(gray), seed);
 }
 
-std::vector<MarkerCandidate> detect_quads(const FloatImage& gray, const QuadParams& params) {
-    return detect_quads_impl(gray, params);
+std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params,
+                                          DetectionTimings* timings) {
+    return detect_blobs_impl(gray, params, timings);
+}
+
+std::vector<MarkerCandidate> detect_quads(const FloatImage& gray, const QuadParams& params,
+                                          DetectionTimings* timings) {
+    return detect_quads_impl(gray, params, timings);
 }
 
 }  // namespace alphashape
