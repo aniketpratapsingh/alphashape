@@ -171,14 +171,58 @@ struct EdgeLine {
     Eigen::Vector2d direction = Eigen::Vector2d(1.0, 0.0);
 };
 
+struct EdgeSample {
+    Eigen::Vector2d point = Eigen::Vector2d::Zero();
+    double weight = 0.0;
+};
+
+double median_of(std::vector<double> values);
+
+/// Weighted total-least-squares line through the samples.
+std::optional<EdgeLine> fit_weighted_tls(const std::vector<EdgeSample>& samples) {
+    double weight_sum = 0.0;
+    Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
+    for (const EdgeSample& sample : samples) {
+        weight_sum += sample.weight;
+        centroid += sample.point * sample.weight;
+    }
+    if (!(weight_sum > 0.0)) {
+        return std::nullopt;
+    }
+    centroid /= weight_sum;
+    double sxx = 0.0;
+    double sxy = 0.0;
+    double syy = 0.0;
+    for (const EdgeSample& sample : samples) {
+        const Eigen::Vector2d delta = sample.point - centroid;
+        sxx += sample.weight * delta.x() * delta.x();
+        sxy += sample.weight * delta.x() * delta.y();
+        syy += sample.weight * delta.y() * delta.y();
+    }
+    Eigen::Matrix2d covariance;
+    covariance << sxx / weight_sum, sxy / weight_sum,
+                  sxy / weight_sum, syy / weight_sum;
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> solver(covariance);
+    if (solver.info() != Eigen::Success ||
+        !(solver.eigenvalues()(1) > 1e-6)) {
+        return std::nullopt;
+    }
+    EdgeLine line;
+    line.point = centroid;
+    line.direction = solver.eigenvectors().col(1).normalized();
+    return line;
+}
+
 /// Fit the gradient-magnitude ridge along one side. Each of the samples along
 /// the side searches a short distance across it; the peak positions are fitted
 /// with a weighted total-least-squares line, the weight being the gradient
 /// magnitude. Notches and foreign edges therefore contribute weakly.
+enum class PeakChoice { Outermost, Strongest };
+
 std::optional<EdgeLine> fit_edge(const GradientField& gradient,
                                  const Eigen::Vector2d& a, const Eigen::Vector2d& b,
                                  const Eigen::Vector2d& center, double reach_factor,
-                                 double reach_cap) {
+                                 double reach_cap, PeakChoice choice) {
     const Eigen::Vector2d delta = b - a;
     const double length = delta.norm();
     if (!(length > 2.0 * kMinSidePx)) {
@@ -197,12 +241,8 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
     const int steps = static_cast<int>(std::ceil(reach / 0.5));
     const double step = reach / static_cast<double>(steps);
     std::vector<double> profile(static_cast<std::size_t>(2 * steps + 1), 0.0);
-    double weight_sum = 0.0;
-    Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
-    double sxx = 0.0;
-    double sxy = 0.0;
-    double syy = 0.0;
-    int kept = 0;
+    std::vector<EdgeSample> samples;
+    samples.reserve(static_cast<std::size_t>(kCornerSamples));
     for (int sample = 0; sample < kCornerSamples; ++sample) {
         const double alpha =
             (static_cast<double>(sample) + 0.5) / static_cast<double>(kCornerSamples);
@@ -225,14 +265,20 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
         const double floor =
             std::max(kEdgeMinMagnitude, 0.45 * peak_magnitude);
         int best = -1;
+        double best_magnitude = 0.0;
         for (int index = 1; index < 2 * steps; ++index) {
             const double value = profile[static_cast<std::size_t>(index)];
             if (value >= profile[static_cast<std::size_t>(index - 1)] &&
                 value > profile[static_cast<std::size_t>(index + 1)] &&
                 value >= floor) {
-                // The profile runs inward to outward; keeping the last
-                // qualifying maximum selects the outermost edge.
-                best = index;
+                if (choice == PeakChoice::Outermost) {
+                    // The profile runs inward to outward; keeping the last
+                    // qualifying maximum selects the outermost edge.
+                    best = index;
+                } else if (best < 0 || value > best_magnitude) {
+                    best = index;
+                    best_magnitude = value;
+                }
             }
         }
         if (best <= 0 || best >= 2 * steps) {
@@ -249,32 +295,44 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
         const double offset =
             (static_cast<double>(best - steps) + std::clamp(shift, -0.5, 0.5)) * step;
         const Eigen::Vector2d point = base + normal * offset;
-        const double weight = middle;
-        weight_sum += weight;
-        centroid += point * weight;
-        sxx += weight * point.x() * point.x();
-        sxy += weight * point.x() * point.y();
-        syy += weight * point.y() * point.y();
-        ++kept;
+        EdgeSample sample;
+        sample.point = point;
+        sample.weight = middle;
+        samples.push_back(sample);
     }
-    if (kept < 4 || !(weight_sum > 0.0)) {
+    if (samples.size() < 4) {
         return std::nullopt;
     }
-    centroid /= weight_sum;
-    sxx = sxx / weight_sum - centroid.x() * centroid.x();
-    sxy = sxy / weight_sum - centroid.x() * centroid.y();
-    syy = syy / weight_sum - centroid.y() * centroid.y();
-    Eigen::Matrix2d covariance;
-    covariance << sxx, sxy, sxy, syy;
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> solver(covariance);
-    if (solver.info() != Eigen::Success ||
-        !(solver.eigenvalues()(1) > 1e-6)) {
+    const std::optional<EdgeLine> first = fit_weighted_tls(samples);
+    if (!first) {
         return std::nullopt;
     }
-    EdgeLine line;
-    line.point = centroid;
-    line.direction = solver.eigenvectors().col(1).normalized();
-    return line;
+    // A white payload cell touching a reference frame protrudes its edge by a
+    // cell; a notch does the same to a silhouette. Those samples are outliers
+    // of the straight run, so drop points far from the first line and refit.
+    Eigen::Vector2d normal_to_line(-first->direction.y(), first->direction.x());
+    std::vector<double> residuals;
+    residuals.reserve(samples.size());
+    for (const EdgeSample& sample : samples) {
+        residuals.push_back(
+            std::abs((sample.point - first->point).dot(normal_to_line)));
+    }
+    const double median = median_of(residuals);
+    const double limit = std::max(0.75, 2.5 * median);
+    std::vector<EdgeSample> kept;
+    kept.reserve(samples.size());
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        if (residuals[i] <= limit) {
+            kept.push_back(samples[i]);
+        }
+    }
+    if (kept.size() >= 4 && kept.size() < samples.size()) {
+        const std::optional<EdgeLine> second = fit_weighted_tls(kept);
+        if (second) {
+            return second;
+        }
+    }
+    return first;
 }
 
 std::optional<Eigen::Vector2d> intersect_lines(const EdgeLine& first,
@@ -294,7 +352,7 @@ std::optional<Eigen::Vector2d> intersect_lines(const EdgeLine& first,
 /// sides meeting there. A side that cannot be fitted keeps the original corner.
 std::array<Eigen::Vector2d, 4> refine_quad_corners(
     const GradientField& gradient, const std::array<Eigen::Vector2d, 4>& quad,
-    double reach_factor, double reach_cap) {
+    double reach_factor, double reach_cap, PeakChoice choice) {
     Eigen::Vector2d center = Eigen::Vector2d::Zero();
     for (const Eigen::Vector2d& corner : quad) {
         center += corner;
@@ -305,7 +363,7 @@ std::array<Eigen::Vector2d, 4> refine_quad_corners(
         lines[static_cast<std::size_t>(side)] = fit_edge(
             gradient, quad[static_cast<std::size_t>(side)],
             quad[static_cast<std::size_t>((side + 1) % 4)], center,
-            reach_factor, reach_cap);
+            reach_factor, reach_cap, choice);
     }
     std::array<Eigen::Vector2d, 4> refined = quad;
     for (int corner = 0; corner < 4; ++corner) {
@@ -725,8 +783,15 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     // a fallback in case a short side or a notched silhouette makes the extra
     // refinement jump to a neighbouring edge.
     refined_quads.push_back(quad);
-    refined_quads.push_back(refine_quad_corners(gradient, quad, 0.30, 6.0));
-    refined_quads.push_back(refine_quad_corners(gradient, quad, 0.60, 9.0));
+    refined_quads.push_back(
+        refine_quad_corners(gradient, quad, 0.30, 6.0, PeakChoice::Outermost));
+    refined_quads.push_back(
+        refine_quad_corners(gradient, quad, 0.60, 9.0, PeakChoice::Outermost));
+    // The strongest-peak search can move a side inward as well as outward, which
+    // recovers a reference square whose detected edge was pushed out by a white
+    // payload cell touching the frame.
+    refined_quads.push_back(
+        refine_quad_corners(gradient, quad, 0.60, 9.0, PeakChoice::Strongest));
     const int allowed = std::min(max_hamming, (family.min_hamming - 1) / 2);
 
     std::vector<double> scales{1.0};
