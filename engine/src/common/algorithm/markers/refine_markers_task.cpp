@@ -594,7 +594,9 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
     const Eigen::Vector2d index = view.index_of(pixel);
     const int centre_x = static_cast<int>(std::lround(index.x()));
     const int centre_y = static_cast<int>(std::lround(index.y()));
-    const int scan = std::max(4, patch_size / 2);
+    // Small window: the candidate is a few pixels off at most, and a wider
+    // scan would start locking onto unrelated texture saddles.
+    const int scan = std::max(3, std::min(6, patch_size / 4));
     double best = 0.0;
     int best_x = 0;
     int best_y = 0;
@@ -637,9 +639,21 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
         }
         return candidate;
     };
-    const std::optional<Eigen::Vector2d> ellipse =
-        seed ? accept(seed->pixel) : std::nullopt;
     const double ds = static_cast<double>(view.downscale);
+    // Refit the ellipse at the candidate, using the blob only for its scale.
+    // Trusting the blob's centre would accept a nearby texture blob; the
+    // printed target is centred at the candidate to within a few pixels, so
+    // the radial search converges to the real boundary from there.
+    std::optional<Eigen::Vector2d> ellipse;
+    if (seed) {
+        MarkerCandidate ellipse_seed;
+        ellipse_seed.center = pixel / ds;
+        ellipse_seed.radius_px = seed->radius / ds;
+        if (const auto fitted =
+                refine_ellipse_center(view.image, ellipse_seed)) {
+            ellipse = accept(*fitted * ds);
+        }
+    }
     const double hint = std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
     Eigen::Vector2d start = pixel;
     if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
