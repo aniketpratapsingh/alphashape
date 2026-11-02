@@ -53,8 +53,11 @@ All notable changes to alphashape are recorded here. The format follows
   `2 * ring_index + parity`. `decode_circular()` locates the outer border from
   either the centre-dot or border blob reported by the WP-13.5 detector,
   estimates the ring's angular phase, samples the sectors, applies an Otsu
-  threshold and accepts only a unique table match with a two-bit margin.
-  `max_hamming` is clamped to one. The checked-in tables
+  threshold and accepts a table match within `max_hamming` (default 0, exact;
+  clamped to one). Distance 3 between all rotations already makes the nearest
+  code unique, so there is no runner-up margin. Structural checks reject
+  sectors near the threshold, rings lacking both intensity classes, and
+  non-uniform inner-gap or border annuli. The checked-in tables
   (`engine/tests/fixtures/markers/circular_codes_N*.txt`) are produced by
   `tools/markers/make_circular_codes.py`; a test proves the C++ generator
   reproduces them byte for byte. Known limitations: for a target with a white
