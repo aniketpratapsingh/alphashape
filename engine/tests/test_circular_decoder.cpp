@@ -303,7 +303,6 @@ TEST(Markers, RejectsForeignCode) {
     const int bits = 12;
     const std::vector<std::uint32_t>& table = circular_codes(bits);
     ASSERT_FALSE(table.empty());
-    const std::uint32_t valid = table.front();
 
     // A one-bit corruption is accepted only when the runner-up *ring code* is
     // at least two bits farther away. Not every flip has that margin (the
