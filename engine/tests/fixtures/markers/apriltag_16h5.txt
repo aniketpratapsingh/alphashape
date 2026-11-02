@@ -1,0 +1,68 @@
+# AprilTag family 16h5 (published tag16h5).
+# Source: https://github.com/AprilRobotics/apriltag/blob/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9/tag16h5.c
+# Source commit: https://github.com/AprilRobotics/apriltag/commit/b7c0ebe9aa20f82ec7a828579004f9e706bfecd9
+# source-sha256: 18b775f9b0b246397d6a6313940cae4a27428dfcc3ccd8b9b94c03d65211e7e5
+# family=16h5 h=5 nbits=16 width_at_border=6 total_width=8 reversed_border=false codes=30
+#
+# Copyright (C) 2013-2016, The Regents of The University of Michigan.
+# All rights reserved.
+#
+# This software was developed in the APRIL Robotics Lab under the
+# direction of Edwin Olson, ebolson@umich.edu. This software may be
+# available under alternative licensing terms; contact the address above.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# The views and conclusions contained in the software and documentation are those
+# of the authors and should not be interpreted as representing official policies,
+# either expressed or implied, of the Regents of The University of Michigan.
+#
+# One published code per line, hexadecimal, in published order.
+
+0x00000000000027c8
+0x00000000000031b6
+0x0000000000003859
+0x000000000000569c
+0x0000000000006c76
+0x0000000000007ddb
+0x000000000000af09
+0x000000000000f5a1
+0x000000000000fb8b
+0x0000000000001cb9
+0x00000000000028ca
+0x000000000000e8dc
+0x0000000000001426
+0x0000000000005770
+0x0000000000009253
+0x000000000000b702
+0x000000000000063a
+0x0000000000008f34
+0x000000000000b4c0
+0x00000000000051ec
+0x000000000000e6f0
+0x0000000000005fa4
+0x000000000000dd43
+0x0000000000001aaa
+0x000000000000e62f
+0x0000000000006dbc
+0x000000000000b6eb
+0x000000000000de10
+0x000000000000154d
+0x000000000000b57a

@@ -50,6 +50,7 @@
 /// it is not used as an accept/reject reference; this keeps decoding working
 /// under the blur and tilt required by the WP-13.6 tests.
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -66,6 +67,12 @@ struct CodedTarget {
     int bits = 0;                         ///< Ring width N.
     int hamming = 0;                      ///< Distance to the accepted ring code.
     double radius_px = 0.0;               ///< Outer-border semi-major radius.
+    /// Optional square corners in the calibration convention, ordered
+    /// counter-clockwise from the published corner 0. Only square targets
+    /// (AprilTag) fill these in; `has_corners` says whether they are valid so
+    /// the circular decoder's flat result is unchanged.
+    std::array<Eigen::Vector2d, 4> corners{};
+    bool has_corners = false;
 };
 
 /// Result of looking a ring word up in the table.

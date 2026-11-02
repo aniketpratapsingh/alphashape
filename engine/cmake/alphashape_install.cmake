@@ -60,6 +60,7 @@ install(FILES ${ALPHASHAPE_REPO_ROOT}/README.md ${ALPHASHAPE_REPO_ROOT}/LICENSE
               ${PROJECT_SOURCE_DIR}/LIMITATIONS.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT runtime)
 install(FILES ${ALPHASHAPE_PACKAGING_DIR}/copyright
+              ${ALPHASHAPE_PACKAGING_DIR}/../licenses/BSD-2-Clause-apriltag.txt
         DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT runtime)
 
 # ---- PROJ data (packages that cannot rely on the distribution's proj-data) -------------------------

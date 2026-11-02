@@ -104,6 +104,15 @@ sections below give the engineering detail behind each item.
   `set_marker_position`). Scale bars exist in the data model and the
   commands, but have no Python binding yet. No interface for either is in
   this release.
+- **AprilTag 16h5 is an inherently weak family.** The published 16h5 codes
+  are only 16 bits with a minimum distance of 5, so even with zero error
+  correction a random 16-bit word is a rotation of a code about 1.8 times in
+  1000. The decoder's default stays at 0 (the least permissive setting), but
+  cluttered scenes can still yield false positives; prefer 36h10, 36h11 or a
+  Standard family where the printed size allows. The other families default
+  to the largest correction radius whose random-word acceptance is below
+  1e-4 per candidate (36h10 and 36h11: 2; Standard41h12: 3;
+  Standard52h13: 4; 25h9 and Circle21h7: 0).
 - **Depth maps are slow at fine settings.** The search is coarse-to-fine (see
   below), which moves most of the sweeps to reduced resolutions, but the
   reference-resolution level still runs over every pixel and the default
@@ -1505,3 +1514,20 @@ close-out (WP-12.12). The engine guide is
 - **There is no vertical-CRS or geoid editing UI yet.** Geoids and vertical
   datums are set through the engine/Python API and recorded in the project; the
   desktop dialogs cannot add, choose or edit one.
+
+## M13 — markers
+
+- **Circle21h7 is table-only.** WP-13.7 imports and verifies its published code
+  table like the other six families, but its published tags are circular, so
+  `detect_quads` cannot produce a candidate square. `decode_tag` therefore does
+  not claim to decode this family; a circular-aware candidate detector is the
+  fix.
+- **Reversed-border decoding expects the outer silhouette.** For
+  `Standard41h12` and `Standard52h13` the detected quad is the dark region's
+  outer boundary. The decoder also accepts a candidate that is exactly the
+  reference `width_at_border` square, and when a white perimeter cell cuts one
+  extreme row or column off the detected component it grows each side by one
+  cell in turn and keeps the side that validates. A component missing two
+  adjacent sides is not recovered. An intermediate square (for example the
+  inner dark blob bounded by the white frame) is rejected by the border-side
+  check rather than decoded.

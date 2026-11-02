@@ -488,6 +488,18 @@ endif()
 install(FILES "${ALPHASHAPE_LIBOMP_LICENSE}"
         DESTINATION LICENSES/third-party RENAME "libomp.txt" COMPONENT core)
 
+# The AprilTag family tables are compiled-in data, so no vcpkg port supplies
+# their text. Ship the vendored BSD-2-Clause text beside the other licences.
+set(ALPHASHAPE_APRILTAG_LICENSE
+    "${ALPHASHAPE_VENDORED_LICENSE_DIR}/BSD-2-Clause-apriltag.txt")
+if(NOT EXISTS "${ALPHASHAPE_APRILTAG_LICENSE}")
+    message(FATAL_ERROR
+        "alphashape: ${ALPHASHAPE_APRILTAG_LICENSE} is missing; the AprilTag "
+        "family tables are compiled into the binaries and need their licence.")
+endif()
+install(FILES "${ALPHASHAPE_APRILTAG_LICENSE}"
+        DESTINATION LICENSES/third-party RENAME "apriltag.txt" COMPONENT core)
+
 # The fonts are compiled into alphashape.exe; their OFL texts must ship with it.
 install(FILES ${PROJECT_SOURCE_DIR}/src/apps/gui/fonts/OFL-Inter.txt
               ${PROJECT_SOURCE_DIR}/src/apps/gui/fonts/OFL-JetBrainsMono.txt

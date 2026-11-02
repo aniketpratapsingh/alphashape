@@ -43,7 +43,8 @@ for m in $modules; do cp "$m" "$contents/Resources/python/"; done
 
 echo "== icon, documentation"
 "$here/make-icns.sh" "$repo/packaging/linux/org.alphashape.app.svg" "$contents/Resources/alphashape.icns"
-cp "$repo/README.md" "$repo/LICENSE" "$repo/engine/LIMITATIONS.md" "$contents/Resources/doc/"
+cp "$repo/README.md" "$repo/LICENSE" "$repo/engine/LIMITATIONS.md" \
+   "$repo/packaging/licenses/BSD-2-Clause-apriltag.txt" "$contents/Resources/doc/"
 cp "$here/python-usage.txt" "$contents/Resources/python/README.txt"
 
 echo "== PROJ data"

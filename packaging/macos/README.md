@@ -53,7 +53,7 @@ alphashape.app/Contents/
   Resources/python/           alphashape.cpython-3XX-darwin.so  (use with PYTHONPATH)
   Resources/share/proj/       proj.db and the curated PROJ data subset (see Size budget)
   Resources/vulkan/icd.d/     MoltenVK_icd.json (library_path is relative to the manifest)
-  Resources/doc/              README, LICENSE, limitations
+  Resources/doc/              README, LICENSE, limitations, BSD-2-Clause-apriltag.txt
 ```
 
 The GUI target is not a `MACOSX_BUNDLE` target; the bundle is assembled from the finished build

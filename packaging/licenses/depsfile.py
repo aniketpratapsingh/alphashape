@@ -12,6 +12,7 @@ Fields:
     spdx        str            required, an SPDX licence expression
     url         str            required, where the component comes from
     version     str | None     only when every platform ships the same one
+    license_file str | None    file in packaging/licenses holding the full text
     platforms   list[str]      subset of linux, macos, windows; default all three
     note        str | None     one line of prose for NOTICE.txt
 

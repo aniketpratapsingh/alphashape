@@ -48,6 +48,14 @@
   platforms: [linux, macos, windows]
   note: Header-only library compiled into the binaries.
 
+- name: AprilTag family tables
+  copyright: The Regents of The University of Michigan.
+  spdx: BSD-2-Clause
+  url: https://github.com/AprilRobotics/apriltag
+  license_file: BSD-2-Clause-apriltag.txt
+  platforms: [linux, macos, windows]
+  note: The seven published family code tables and bit layouts are imported verbatim as data; the detector and decoder are original code, and the full licence text ships as BSD-2-Clause-apriltag.txt and is reproduced in the generated table source and the test fixtures.
+
 - name: glog
   copyright: Google Inc. and the glog contributors.
   spdx: BSD-3-Clause
