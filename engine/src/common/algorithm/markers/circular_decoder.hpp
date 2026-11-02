@@ -37,11 +37,12 @@
 /// The centre comes from the outer-border ellipse. When the target has a black
 /// centre dot (parity 1) the refinement runs from that dot, which is the
 /// precise fiducial and is preferred within 0.35 R. A target without a dot
-/// (parity 0) keeps the border-ellipse centre unless the refinement moves it by
-/// at most 0.10 R: its first radial edges mix dark sectors at 0.5 R with light
-/// sectors at 0.85 R. The ellipse-centre bias of a strongly tilted target is a
-/// known limitation and is not corrected (the centre is the ellipse centre, not
-/// a perspective-corrected projection).
+/// (parity 0) always keeps the border-ellipse centre: its first radial edges
+/// mix dark sectors at 0.5 R with light sectors at 0.85 R, and measuring that
+/// refinement gave 0.3774 px RMS at 2 px blur against 0.1766 px for the border
+/// centre. The ellipse-centre bias of a strongly tilted target is a known
+/// limitation and is not corrected (the centre is the ellipse centre, not a
+/// perspective-corrected projection).
 ///
 /// Ring validation uses the wide inner white gap (0.3..0.45 R) as the light
 /// reference and the dark outer border as the dark reference. The design's
