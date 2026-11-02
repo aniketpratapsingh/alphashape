@@ -15,20 +15,32 @@
 ///
 /// ## Error control
 ///
-/// A single misread sector plus an unknown rotation must still decode. The
-/// tables have minimum Hamming distance 3 between all rotations of all words,
-/// so the decoder accepts only when the best match is at most `max_hamming`
-/// away and the runner-up *ring code* is at least two bits farther away.
-/// Because distance 3 corrects one error, `max_hamming` is clamped to 1 here
-/// regardless of the caller's value; the marker-parameter `tolerance` mapped by
-/// a later work package is clamped to the same bound.
+/// A ring word is accepted when its Hamming distance to the nearest rotation of
+/// a table word is at most `max_hamming`, with `max_hamming` clamped to 1. The
+/// tables keep every rotation of every word at least three bits apart, so the
+/// nearest code is unique: a word within one bit of a code is at least two bits
+/// from every other code, and no runner-up margin is needed.
+///
+/// The default is an exact match (`max_hamming = 0`). One-sector correction is
+/// opt-in because it is expensive in false positives: a uniformly random N-bit
+/// word is within one bit of some rotation of some code for 45.7% of the words
+/// at N=12, 49.0% at N=14, 48.8% at N=16 and 45.9% at N=20. An exact match
+/// accepts only 3.81%, 3.50%, 3.05% and 2.29% respectively (the fraction of
+/// words that are themselves a rotation of a table word). A caller that enables
+/// correction therefore needs a clean sector read.
+///
+/// Ring validation also rejects structurally invalid candidates: sectors that
+/// sit within 20% of the light-minus-dark contrast of the threshold, a ring
+/// with only one intensity class, and annuli whose eight angular bins are not
+/// uniformly light (inner gap) or dark (border).
 ///
 /// The centre comes from the outer-border ellipse. When the target has a black
 /// centre dot (parity 1) the refinement runs from that dot, which is the
 /// precise fiducial and is preferred; a target without a dot (parity 0) keeps
-/// the border-ellipse centre. The ellipse-centre bias of a strongly tilted
-/// target is a known limitation and is not corrected (the centre is the ellipse
-/// centre, not a perspective-corrected projection of the target centre).
+/// the border-ellipse centre because its first radial edges come from mixing
+/// dark and light sectors at different radii. The ellipse-centre bias of a
+/// strongly tilted target is a known limitation and is not corrected (the
+/// centre is the ellipse centre, not a perspective-corrected projection).
 ///
 /// Ring validation uses the wide inner white gap (0.3..0.45 R) as the light
 /// reference and the dark outer border as the dark reference. The design's
@@ -36,6 +48,7 @@
 /// it is not used as an accept/reject reference; this keeps decoding working
 /// under the blur and tilt required by the WP-13.6 tests.
 
+#include <cstdint>
 #include <optional>
 
 #include <Eigen/Core>
@@ -53,12 +66,27 @@ struct CodedTarget {
     double radius_px = 0.0;               ///< Outer-border semi-major radius.
 };
 
+/// Result of looking a ring word up in the table.
+struct WordMatch {
+    int index = -1;    ///< Table index, so code = 2 * index + parity.
+    int distance = 0;  ///< Hamming distance to the nearest rotated table word.
+};
+
+/// Look up `word` in the table for `bits`. Returns nullopt for an unsupported
+/// width, a negative `max_hamming`, or when the nearest rotation is farther
+/// than `min(max_hamming, 1)`. Exposed so the distance rules can be tested
+/// without rendering a target.
+std::optional<WordMatch> match_circular_word(std::uint32_t word, int bits,
+                                             int max_hamming);
+
 /// Decode one candidate. The candidate may be the centre dot or the outer
 /// border; the decoder locates the outer-border ellipse from the candidate's
 /// centre. Targets below 6 px outer radius for N >= 16, or 4 px otherwise, are
 /// rejected. Returns nullopt when the candidate is not a valid coded target.
+/// `max_hamming = 0` (the default) requires an exact ring-word match; 1 enables
+/// one-sector correction (larger values are clamped to 1).
 std::optional<CodedTarget> decode_circular(const FloatImage& gray,
                                            const MarkerCandidate& candidate, int bits,
-                                           int max_hamming);
+                                           int max_hamming = 0);
 
 }  // namespace alphashape

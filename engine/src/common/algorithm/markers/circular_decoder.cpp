@@ -25,6 +25,10 @@ constexpr double kEdgePeakFraction = 0.3;     ///< The border edge is the last
 constexpr double kMinContrast = 0.08;         ///< Light gap minus dark border.
 constexpr double kCentreDotContrast = 0.15;   ///< Dark ring at 4r versus gap.
 constexpr double kMinInBoundsFraction = 0.6;
+constexpr int kAngularBins = 8;         ///< Uniformity check bins per annulus.
+constexpr double kSectorSeparation = 0.2;  ///< Fraction of light-dark contrast a
+                                           ///< sector mean must clear the
+                                           ///< threshold by.
 
 /// Bilinear read at image coordinates where integer values are pixel centres.
 bool sample_pixel(const FloatImage& image, double x, double y, double& value) {
@@ -130,12 +134,16 @@ std::optional<Ellipse> robust_border_fit(const std::vector<Eigen::Vector2d>& poi
 /// ratio down to 0.5) stays inside.
 std::optional<Ellipse> locate_border(const FloatImage& magnitude,
                                      const Eigen::Vector2d& centre, double expected) {
-    if (!(expected >= 2.0) || !centre.allFinite()) return std::nullopt;
+    if (!std::isfinite(expected) || !(expected >= 2.0) || !centre.allFinite()) {
+        return std::nullopt;
+    }
     const double lower = 0.35 * expected;
     const double upper = 1.60 * expected;
-    if (!(upper - lower >= 2.0)) return std::nullopt;
-    const int steps =
-        std::max(16, static_cast<int>(std::ceil((upper - lower) / 0.5)));
+    const double span = upper - lower;
+    if (!(span >= 2.0) || !std::isfinite(span)) return std::nullopt;
+    // Cap before the cast: a caller-supplied radius close to the int range
+    // would otherwise overflow the conversion (UB).
+    const int steps = std::max(16, static_cast<int>(std::min(std::ceil(span / 0.5), 4096.0)));
     std::vector<Eigen::Vector2d> points;
     points.reserve(static_cast<std::size_t>(kBorderRays));
     std::vector<double> values;
@@ -209,6 +217,40 @@ std::optional<double> polar_mean(const FloatImage& image, const EllipseMap& map,
             ++count;
         }
     }
+    if (static_cast<double>(count) < kMinInBoundsFraction * static_cast<double>(total)) {
+        return std::nullopt;
+    }
+    return sum / static_cast<double>(count);
+}
+
+/// Mean intensity of one angular bin of an annulus. `bins` equal bins span the
+/// full turn; this samples bin `index` only. Used to prove that the light gap
+/// and dark border are uniform around the whole target.
+std::optional<double> angular_bin_mean(const FloatImage& image, const EllipseMap& map,
+                                       double inner, double outer, int radii, int bins,
+                                       int index) {
+    if (radii < 1 || bins < 1 || index < 0 || index >= bins) return std::nullopt;
+    constexpr int kAnglesPerBin = 6;
+    const double width = kTwoPi / static_cast<double>(bins);
+    const double begin = width * static_cast<double>(index);
+    double sum = 0.0;
+    int count = 0;
+    for (int ai = 0; ai < kAnglesPerBin; ++ai) {
+        const double phi = begin + width * (static_cast<double>(ai) + 0.5) /
+                                       static_cast<double>(kAnglesPerBin);
+        for (int ri = 0; ri < radii; ++ri) {
+            const double rho = radii == 1
+                                   ? inner
+                                   : inner + (outer - inner) * static_cast<double>(ri) /
+                                                 static_cast<double>(radii - 1);
+            const Eigen::Vector2d p = map.to_image(rho * std::cos(phi), rho * std::sin(phi));
+            double value = 0.0;
+            if (!sample_pixel(image, p.x(), p.y(), value)) continue;
+            sum += value;
+            ++count;
+        }
+    }
+    const int total = radii * kAnglesPerBin;
     if (static_cast<double>(count) < kMinInBoundsFraction * static_cast<double>(total)) {
         return std::nullopt;
     }
@@ -391,7 +433,8 @@ int rotation_distance(std::uint32_t word, std::uint32_t table_word, int bits) {
 }
 
 /// Decode using a known outer-border ellipse. Returns nullopt if the ring
-/// validation fails, the table lookup is ambiguous, or the target is too small.
+/// validation fails, the table lookup exceeds the allowed distance, or the
+/// target is too small.
 std::optional<CodedTarget> decode_with_border(const FloatImage& image,
                                               const GradientField& gradient,
                                               const Ellipse& border, int bits,
@@ -428,6 +471,38 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
     // threshold, while the contrast check above already proves it is dark.
     if (!(*inner_gap > threshold)) return std::nullopt;
 
+    // A sector whose mean is close to the threshold is a coin flip; rejecting
+    // it stops a partially covered (foreign) candidate from decoding. The
+    // contrast gate above guarantees a positive light-minus-dark span.
+    const double separation = kSectorSeparation * (*inner_gap - *dark_border);
+    int dark_sectors = 0;
+    int light_sectors = 0;
+    for (double mean : means) {
+        if (std::abs(mean - threshold) < separation) return std::nullopt;
+        if (mean < threshold) {
+            ++dark_sectors;
+        } else {
+            ++light_sectors;
+        }
+    }
+    // The tables exclude the all-zero and all-one words (checked by
+    // CircularCodesMinDistance), so a genuine ring always has both classes.
+    if (dark_sectors == 0 || light_sectors == 0) return std::nullopt;
+
+    // Half-light/half-dark annuli (a foreign shape straddling the hypothesis)
+    // pass a global mean test but fail an angular one. Every inner-gap bin must
+    // be light. Border bins only need to stay below the light-side midpoint:
+    // under heavy blur the narrow dark border is lifted towards the threshold.
+    const double mid_level = 0.5 * (*inner_gap + threshold);
+    for (int bin = 0; bin < kAngularBins; ++bin) {
+        const std::optional<double> gap_bin =
+            angular_bin_mean(image, map, 0.30, 0.45, 3, kAngularBins, bin);
+        if (!gap_bin || !(*gap_bin > threshold)) return std::nullopt;
+        const std::optional<double> border_bin =
+            angular_bin_mean(image, map, 0.92, 0.98, 3, kAngularBins, bin);
+        if (!border_bin || !(*border_bin < mid_level)) return std::nullopt;
+    }
+
     const std::optional<double> centre = polar_mean(image, map, 0.02, 0.20, 4, 24);
     if (!centre) return std::nullopt;
     const int parity = (*centre < threshold) ? 1 : 0;
@@ -439,25 +514,13 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
         }
     }
 
-    const std::vector<std::uint32_t>& table = circular_codes(bits);
-    if (table.empty()) return std::nullopt;
-    int best_distance = bits + 1;
-    int second_distance = bits + 1;
-    int best_index = -1;
-    for (std::size_t index = 0; index < table.size(); ++index) {
-        const int distance = rotation_distance(word, table[index], bits);
-        if (distance < best_distance) {
-            second_distance = best_distance;
-            best_distance = distance;
-            best_index = static_cast<int>(index);
-        } else if (distance < second_distance) {
-            second_distance = distance;
-        }
-    }
-    if (best_index < 0) return std::nullopt;
-    if (best_distance > allowed_hamming || second_distance < best_distance + 2) {
-        return std::nullopt;
-    }
+    // Distance 3 between all rotations makes the nearest code unique, so the
+    // accept test is a plain bound on the best distance. There is no runner-up
+    // margin: that margin would reject nearly every genuine one-sector error.
+    const std::optional<WordMatch> match = match_circular_word(word, bits, allowed_hamming);
+    if (!match) return std::nullopt;
+    const int best_distance = match->distance;
+    const int best_index = match->index;
 
     // Centre refinement: `refine_ellipse_center` fits the first radial edge
     // from the centre, which is the centre dot for parity 1 and a mixture of
@@ -468,16 +531,18 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
     seed.axis_ratio = border.b / border.a;
     seed.angle_rad = border.angle_rad;
     Eigen::Vector2d centre_calibration = seed.center;
-    const std::optional<Eigen::Vector2d> refined = refine_ellipse_center(gradient, seed);
-    if (refined) {
-        const double shift = (*refined - seed.center).norm();
+    if (parity == 1) {
         // With a centre dot the first radial edge is the dot boundary on every
         // ray, so its fit is the target's fiducial and is preferred even when
         // the blurred border ellipse centre is a few tenths of a pixel away.
-        // Without a dot the first edges come from different ring sectors and
-        // the border ellipse centre is the more reliable one.
-        const double limit = parity == 1 ? 0.35 * radius : 0.10 * radius;
-        if (shift <= limit) centre_calibration = *refined;
+        // Without a dot the first edges mix dark sectors at 0.5 R with light
+        // sectors at 0.85 R, so the border ellipse centre is used instead (the
+        // parity-0 centre test measures that path).
+        const std::optional<Eigen::Vector2d> refined =
+            refine_ellipse_center(gradient, seed);
+        if (refined && (*refined - seed.center).norm() <= 0.35 * radius) {
+            centre_calibration = *refined;
+        }
     }
 
     CodedTarget target;
@@ -491,6 +556,28 @@ std::optional<CodedTarget> decode_with_border(const FloatImage& image,
 
 }  // namespace
 
+std::optional<WordMatch> match_circular_word(std::uint32_t word, int bits,
+                                             int max_hamming) {
+    if (!is_supported_circular_bits(bits) || max_hamming < 0) return std::nullopt;
+    const int allowed = std::min(max_hamming, 1);
+    const std::vector<std::uint32_t>& table = circular_codes(bits);
+    if (table.empty()) return std::nullopt;
+    int best_distance = bits + 1;
+    int best_index = -1;
+    for (std::size_t index = 0; index < table.size(); ++index) {
+        const int distance = rotation_distance(word, table[index], bits);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = static_cast<int>(index);
+        }
+    }
+    if (best_index < 0 || best_distance > allowed) return std::nullopt;
+    WordMatch match;
+    match.index = best_index;
+    match.distance = best_distance;
+    return match;
+}
+
 std::optional<CodedTarget> decode_circular(const FloatImage& gray,
                                            const MarkerCandidate& candidate, int bits,
                                            int max_hamming) {
@@ -498,7 +585,12 @@ std::optional<CodedTarget> decode_circular(const FloatImage& gray,
     if (!candidate.center.allFinite() || max_hamming < 0) return std::nullopt;
     const int allowed_hamming = std::min(max_hamming, 1);
     const double hint = candidate.radius_px;
-    if (!(hint > 0.5)) return std::nullopt;
+    // A non-finite or absurd hint would make the border search and its step
+    // count meaningless (and the conversion to int undefined).
+    if (!std::isfinite(hint) || !(hint > 0.5)) return std::nullopt;
+    if (hint > 0.5 * static_cast<double>(std::max(gray.width(), gray.height()))) {
+        return std::nullopt;
+    }
     const Eigen::Vector2d centre = candidate.center - Eigen::Vector2d(0.5, 0.5);
     if (!(centre.x() >= 0.0) || !(centre.y() >= 0.0) ||
         centre.x() > static_cast<double>(gray.width() - 1) ||
@@ -520,6 +612,12 @@ std::optional<CodedTarget> decode_circular(const FloatImage& gray,
         const std::optional<Ellipse> border =
             locate_border(gradient.magnitude, centre, expected);
         if (!border) return std::nullopt;
+        // The located border must be consistent with the hypothesis. Without
+        // this, a hypothesis near the centre dot can lock onto an unrelated
+        // edge and decode a foreign pattern as a valid target.
+        if (!(border->a >= expected / 1.5) || !(border->a <= expected * 1.5)) {
+            return std::nullopt;
+        }
         return decode_with_border(gray, gradient, *border, bits, allowed_hamming);
     };
 

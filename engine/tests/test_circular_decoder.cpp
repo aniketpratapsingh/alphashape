@@ -304,57 +304,91 @@ TEST(Markers, RejectsForeignCode) {
     const std::vector<std::uint32_t>& table = circular_codes(bits);
     ASSERT_FALSE(table.empty());
 
-    // A one-bit corruption is accepted only when the runner-up *ring code* is
-    // at least two bits farther away. Not every flip has that margin (the
-    // table distance is 3), so search every word and bit for one that does.
-    std::uint32_t corrupted = 0;
-    int corrupted_index = -1;
-    for (std::size_t index = 0; index < table.size() && corrupted_index < 0; ++index) {
-        for (int position = 0; position < bits; ++position) {
+    // Near-boundary distances, tested on the lookup itself. A one-bit error is
+    // accepted only when correction is requested; a two-bit error is never
+    // accepted, even when the caller asks for five (the clamp to one applies).
+    std::uint32_t distance_two = 0;
+    for (int a = 0; a < bits && distance_two == 0; ++a) {
+        for (int b = a + 1; b < bits; ++b) {
             const std::uint32_t candidate =
-                table[index] ^ (1u << static_cast<unsigned>(position));
-            int second = 0;
-            const int distance = nearest_code_distance(candidate, table, bits, nullptr, &second);
-            if (distance == 1 && second >= distance + 2) {
-                corrupted = candidate;
-                corrupted_index = static_cast<int>(index);
+                table[0] ^ (1u << static_cast<unsigned>(a)) ^
+                (1u << static_cast<unsigned>(b));
+            if (nearest_code_distance(candidate, table, bits) == 2) {
+                distance_two = candidate;
                 break;
             }
         }
     }
-    ASSERT_GE(corrupted_index, 0) << "no unambiguous single-bit corruption exists";
+    const std::uint32_t distance_one = table[0] ^ 1u;
+    ASSERT_EQ(nearest_code_distance(distance_one, table, bits), 1);
+    ASSERT_NE(distance_two, 0u) << "no word at distance 2 from every code";
+
+    EXPECT_TRUE(match_circular_word(table[0], bits, 0).has_value());
+    EXPECT_TRUE(match_circular_word(distance_one, bits, 1).has_value());
+    EXPECT_TRUE(match_circular_word(distance_one, bits, 5).has_value());
+    EXPECT_FALSE(match_circular_word(distance_one, bits, 0).has_value());
+    EXPECT_FALSE(match_circular_word(distance_two, bits, 1).has_value());
+    EXPECT_FALSE(match_circular_word(distance_two, bits, 2).has_value());
+    EXPECT_FALSE(match_circular_word(distance_two, bits, 5).has_value());
 
     RenderOptions options;
     options.blur_sigma = 0.8;
     options.noise_sigma = 0.004;
     options.seed = 4001U;
+    // The same one-bit ring is rejected at the default and corrected only when
+    // the caller opts in.
     const test::CircularTruth corrupt_truth =
-        test::make_circular_truth(0.0, 0.0, 16.0, bits, corrupted, 1);
+        test::make_circular_truth(0.0, 0.0, 16.0, bits, distance_one, 1);
+    const std::optional<CodedTarget> default_rejected =
+        render_and_decode(corrupt_truth, 0, options);
     const std::optional<CodedTarget> decoded = render_and_decode(corrupt_truth, 1, options);
-    ASSERT_TRUE(decoded.has_value()) << "one-bit corruption " << word_string(corrupted, bits)
+    EXPECT_FALSE(default_rejected.has_value());
+    ASSERT_TRUE(decoded.has_value()) << "one-bit corruption "
+                                     << word_string(distance_one, bits)
                                      << " was not corrected";
-    EXPECT_EQ(decoded->code, 2 * corrupted_index + 1);
+    EXPECT_EQ(decoded->code, 1);
     EXPECT_EQ(decoded->hamming, 1);
 
-    std::uint32_t foreign = 0;
-    bool found_foreign = false;
-    for (std::uint32_t word = 1; word + 1 < (1u << static_cast<unsigned>(bits)); ++word) {
-        if (nearest_code_distance(word, table, bits) >= 2) {
-            foreign = word;
-            found_foreign = true;
-            break;
-        }
-    }
-    ASSERT_TRUE(found_foreign) << "no word at distance 2 from every code";
     options.seed = 4002U;
     const test::CircularTruth foreign_truth =
-        test::make_circular_truth(0.0, 0.0, 16.0, bits, foreign, 1);
+        test::make_circular_truth(0.0, 0.0, 16.0, bits, distance_two, 1);
     const std::optional<CodedTarget> rejected = render_and_decode(foreign_truth, 1, options);
-    std::printf("[circular foreign] corrupted=%s hamming=%d foreign=%s rejected=%d\n",
-                word_string(corrupted, bits).c_str(),
-                decoded ? decoded->hamming : -1, word_string(foreign, bits).c_str(),
+    std::printf("[circular foreign] one_bit=%s hamming=%d distance2=%s default=%d corrected=%d "
+                "distance2_rejected=%d\n",
+                word_string(distance_one, bits).c_str(), decoded ? decoded->hamming : -1,
+                word_string(distance_two, bits).c_str(),
+                default_rejected.has_value() ? 0 : 1, decoded.has_value() ? 1 : 0,
                 rejected.has_value() ? 0 : 1);
     EXPECT_FALSE(rejected.has_value());
+}
+
+TEST(Markers, OneBitErrorsResolveToTheirCode) {
+    // The table keeps every rotation of every word three bits apart, so every
+    // single-bit flip of a code is uniquely closest to that code. This is a
+    // pure lookup property; no corruption hunt is needed or allowed.
+    for (int bits : {12, 14}) {
+        const std::vector<std::uint32_t>& table = circular_codes(bits);
+        ASSERT_FALSE(table.empty()) << "N=" << bits;
+        int checked = 0;
+        int failures = 0;
+        for (std::size_t index = 0; index < table.size(); ++index) {
+            for (int position = 0; position < bits; ++position) {
+                const std::uint32_t flipped =
+                    table[index] ^ (1u << static_cast<unsigned>(position));
+                const std::optional<WordMatch> match =
+                    match_circular_word(flipped, bits, 1);
+                ++checked;
+                if (!match || match->index != static_cast<int>(index) ||
+                    match->distance != 1) {
+                    ++failures;
+                }
+            }
+        }
+        std::printf("[circular one-bit] N=%d checked=%d failures=%d\n", bits, checked,
+                    failures);
+        EXPECT_EQ(failures, 0) << "N=" << bits;
+        EXPECT_EQ(checked, static_cast<int>(table.size()) * bits) << "N=" << bits;
+    }
 }
 
 TEST(Markers, Decode14_16_20Bit) {
@@ -437,6 +471,56 @@ TEST(Markers, CentreErrorUnderBlur) {
                            ? std::sqrt(squared / static_cast<double>(decoded_count))
                            : 1e9;
     std::printf("[circular centre] total=%d decoded=%d wrong=%d rms=%.4f px\n", total,
+                decoded_count, wrong, rms);
+    EXPECT_EQ(wrong, 0);
+    EXPECT_EQ(decoded_count, total);
+    EXPECT_LE(rms, 0.15);
+}
+
+TEST(Markers, CentreErrorParityZeroUnderBlur) {
+    // Mirrors CentreErrorUnderBlur for targets without a centre dot. Their
+    // centre is always the fitted outer-border ellipse: refine_ellipse_center
+    // takes the first radial edge, which for a white sector is the far edge of
+    // the dark ring rather than the inner ring edge. This test measures that
+    // border-only path; it replaced the former 0.10 R refined-centre
+    // substitution, which had no accuracy evidence for parity 0.
+    const int bits = 12;
+    const std::vector<std::uint32_t>& table = circular_codes(bits);
+    const std::vector<std::size_t> indices = {0, 6, 12};
+    const double expected_x = static_cast<double>(render_half(16.0));
+    const double expected_y = expected_x;
+    int total = 0;
+    int decoded_count = 0;
+    int wrong = 0;
+    double squared = 0.0;
+    std::uint32_t seed = 8000U;
+    for (int degrees = 0; degrees < 360; degrees += 30) {
+        for (double sigma : {0.5, 1.0, 1.5, 2.0}) {
+            for (std::size_t index : indices) {
+                const test::CircularTruth truth = test::make_circular_truth(
+                    0.0, 0.0, 16.0, bits, table[index], 0,
+                    static_cast<double>(degrees) * kPi / 180.0);
+                RenderOptions options;
+                options.blur_sigma = sigma;
+                options.noise_sigma = 0.005;
+                options.seed = seed++;
+                options.centre_dot_candidate = false;
+                const std::optional<CodedTarget> decoded =
+                    render_and_decode(truth, 1, options);
+                ++total;
+                if (!decoded) continue;
+                ++decoded_count;
+                if (decoded->code != 2 * static_cast<int>(index)) ++wrong;
+                const double dx = decoded->center.x() - expected_x;
+                const double dy = decoded->center.y() - expected_y;
+                squared += dx * dx + dy * dy;
+            }
+        }
+    }
+    const double rms = decoded_count > 0
+                           ? std::sqrt(squared / static_cast<double>(decoded_count))
+                           : 1e9;
+    std::printf("[circular centre parity0] total=%d decoded=%d wrong=%d rms=%.4f px\n", total,
                 decoded_count, wrong, rms);
     EXPECT_EQ(wrong, 0);
     EXPECT_EQ(decoded_count, total);
@@ -570,18 +654,19 @@ TEST(Markers, DetectAndDecodeSheet) {
             worst_error = std::max(worst_error, best_error[i]);
         }
     }
+    // Every decode must be a printed code. The remaining extras are repeat
+    // detections of the same target (two blobs on one printed target), so the
+    // count is stated rather than merely bounded.
+    const int duplicates = decodes - recovered - foreign;
     std::printf(
-        "[circular sheet] blobs=%d decodes=%d recovered=%d/%d extra_codes=%d worst_centre=%.3f "
-        "px\n",
-        static_cast<int>(blobs.size()), decodes, recovered, target_count, foreign, worst_error);
-    // The requirement here is recall: every printed target is found with the
-    // right code and a subpixel centre. A detector candidate that is not a
-    // real target can still decode in principle; the dedicated rotation, tilt
-    // and all-code tests assert that zero misdecodes occur on rendered
-    // targets, so any extra code here is a detection false positive and is
-    // reported rather than hidden.
+        "[circular sheet] blobs=%d decodes=%d recovered=%d/%d duplicates=%d extra_codes=%d "
+        "worst_centre=%.3f px\n",
+        static_cast<int>(blobs.size()), decodes, recovered, target_count, duplicates, foreign,
+        worst_error);
+    EXPECT_EQ(foreign, 0);
     EXPECT_EQ(recovered, target_count);
-    EXPECT_LE(worst_error, 2.0);
+    EXPECT_EQ(duplicates, 2);
+    EXPECT_LE(worst_error, 0.5) << "max centre error " << worst_error << " px";
 }
 
 }  // namespace alphashape

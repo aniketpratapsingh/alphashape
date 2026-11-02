@@ -40,9 +40,10 @@
 /// against everything accepted so far. The resulting size is whatever the
 /// greedy construction yields; it is not forced to a round number.
 ///
-/// With distance 3 between rotated words a single corrupted sector plus an
-/// unknown rotation is still uniquely decodable (the decoder additionally
-/// requires a two-bit margin to the runner-up ring code).
+/// With distance 3 between rotated words, a word within one bit of a code is
+/// at least two bits from every other code, so the nearest code is unique. The
+/// decoder's default is an exact match; one-sector correction is opt-in (see
+/// circular_decoder.hpp for the false-positive trade-off).
 
 #include <cstdint>
 #include <optional>
