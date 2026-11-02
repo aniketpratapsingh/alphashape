@@ -36,10 +36,15 @@ struct Hessian {
 
 Hessian hessian_at(const FloatImage& image, int x, int y) {
     Hessian h;
-    h.xx = image.at(x + 1, y) - 2.0 * image.at(x, y) + image.at(x - 1, y);
-    h.yy = image.at(x, y + 1) - 2.0 * image.at(x, y) + image.at(x, y - 1);
-    h.xy = 0.25 * (image.at(x + 1, y + 1) - image.at(x + 1, y - 1) -
-                   image.at(x - 1, y + 1) + image.at(x - 1, y - 1));
+    const double centre = static_cast<double>(image.at(x, y));
+    h.xx = static_cast<double>(image.at(x + 1, y)) - 2.0 * centre +
+           static_cast<double>(image.at(x - 1, y));
+    h.yy = static_cast<double>(image.at(x, y + 1)) - 2.0 * centre +
+           static_cast<double>(image.at(x, y - 1));
+    h.xy = 0.25 * (static_cast<double>(image.at(x + 1, y + 1)) -
+                   static_cast<double>(image.at(x + 1, y - 1)) -
+                   static_cast<double>(image.at(x - 1, y + 1)) +
+                   static_cast<double>(image.at(x - 1, y - 1)));
     return h;
 }
 
@@ -62,8 +67,9 @@ std::optional<QuadraticFit> fit_quadratic(const FloatImage& image,
         for (int dx = -radius; dx <= radius; ++dx) {
             const double fx = static_cast<double>(dx);
             const double fy = static_cast<double>(dy);
-            const double value = image.sample(static_cast<float>(centre.x() + fx),
-                                              static_cast<float>(centre.y() + fy));
+            const double value = static_cast<double>(
+                image.sample(static_cast<float>(centre.x() + fx),
+                             static_cast<float>(centre.y() + fy)));
             if (!std::isfinite(value)) {
                 return std::nullopt;
             }
@@ -166,15 +172,15 @@ std::optional<CrossCandidate> evaluate_saddle(const FloatImage& image,
         // 6 px clears the blur transition for every supported scale; the scan
         // then starts beyond it so the first departure is the far edge of the
         // quadrant rather than the end of that transition.
-        const double reference = image.sample(
+        const double reference = static_cast<double>(image.sample(
             static_cast<float>(refined->position.x() + 6.0 * q.x()),
-            static_cast<float>(refined->position.y() + 6.0 * q.y()));
+            static_cast<float>(refined->position.y() + 6.0 * q.y())));
         plateau[static_cast<std::size_t>(i)] = reference;
         double distance = limit;
         for (double r = 7.0; r <= limit; r += 0.5) {
-            const double value = image.sample(
+            const double value = static_cast<double>(image.sample(
                 static_cast<float>(refined->position.x() + r * q.x()),
-                static_cast<float>(refined->position.y() + r * q.y()));
+                static_cast<float>(refined->position.y() + r * q.y())));
             if (std::abs(value - reference) > 0.3 * contrast) {
                 distance = r;
                 break;
@@ -234,7 +240,7 @@ std::vector<CrossCandidate> find_saddles(const FloatImage& image,
     }
     for (int y = 1; y + 1 < height; ++y) {
         for (int x = 1; x + 1 < width; ++x) {
-            const float value = response.at(x, y);
+            const double value = static_cast<double>(response.at(x, y));
             if (value < threshold) {
                 continue;
             }
@@ -244,7 +250,8 @@ std::vector<CrossCandidate> find_saddles(const FloatImage& image,
                     if (dx == 0 && dy == 0) {
                         continue;
                     }
-                    if (response.at_clamped(x + dx, y + dy) > value) {
+                    if (static_cast<double>(response.at_clamped(x + dx, y + dy)) >
+                        value) {
                         is_maximum = false;
                         break;
                     }
@@ -342,8 +349,10 @@ std::vector<RidgePoint> find_ridge_points(const FloatImage& image) {
             const Eigen::Vector2d normal =
                 solver.eigenvectors().col(first_is_major ? 0 : 1);
             const Eigen::Vector2d gradient(
-                0.5 * (image.at(x + 1, y) - image.at(x - 1, y)),
-                0.5 * (image.at(x, y + 1) - image.at(x, y - 1)));
+                0.5 * (static_cast<double>(image.at(x + 1, y)) -
+                       static_cast<double>(image.at(x - 1, y))),
+                0.5 * (static_cast<double>(image.at(x, y + 1)) -
+                       static_cast<double>(image.at(x, y - 1))));
             // Steger's subpixel step along the ridge normal: the centre line
             // is where the first directional derivative vanishes.
             const double step = -gradient.dot(normal) / major;
@@ -645,6 +654,10 @@ std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
         target.code = -1;
         target.center = candidate.center;
         target.radius_px = candidate.radius;
+        // GCC 13 reports a false "maybe uninitialized" on the four Eigen
+        // vectors when this object is copied into the vector; filling them
+        // makes the write explicit and silences it (the member is `{}`).
+        target.corners.fill(Eigen::Vector2d::Zero());
         out.push_back(target);
     }
     return out;

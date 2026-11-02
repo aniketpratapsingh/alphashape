@@ -162,7 +162,8 @@ FloatImage box_downsample(const FloatImage& source, int factor) {
             double sum = 0.0;
             for (int dy = 0; dy < factor; ++dy) {
                 for (int dx = 0; dx < factor; ++dx) {
-                    sum += source.at(x * factor + dx, y * factor + dy);
+                    sum += static_cast<double>(
+                        source.at(x * factor + dx, y * factor + dy));
                 }
             }
             out.at(x, y) = static_cast<float>(sum / total);

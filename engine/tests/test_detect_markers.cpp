@@ -91,9 +91,10 @@ FloatImage render_checker_crosses(int width, int height,
                         const double u = dx * c + dy * s;
                         const double v = -dx * s + dy * c;
                         if (std::abs(u) > target.half || std::abs(v) > target.half) {
-                            sum += background;
+                            sum += static_cast<double>(background);
                         } else {
-                            sum += (u > 0.0) == (v > 0.0) ? light : dark;
+                            sum += static_cast<double>(
+                                (u > 0.0) == (v > 0.0) ? light : dark);
                         }
                     }
                 }
@@ -629,7 +630,7 @@ FloatImage render_bar_cross(int width, int height, double cx, double cy,
                     const bool inside =
                         (std::abs(u) <= half_length && std::abs(v) <= half_width) ||
                         (std::abs(u) <= half_width && std::abs(v) <= half_length);
-                    sum += inside ? dark : background;
+                    sum += static_cast<double>(inside ? dark : background);
                 }
             }
             image.at(x, y) = static_cast<float>(sum / total);
