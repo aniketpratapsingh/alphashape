@@ -684,6 +684,20 @@ std::vector<MarkerCandidate> detect_blobs_impl(const FloatImage& gray, const Blo
         if (refined->a > 4.0 * static_cast<double>(params.max_radius)) {
             continue;
         }
+        // Reject a target whose fitted boundary is not wholly inside the
+        // image. A clipped target can still yield a clean fit from the visible
+        // arc, but the missing arc leaves the centre under-determined; the
+        // documented policy is to drop such detections rather than report a
+        // centre whose accuracy depends on how much of the target was cut.
+        constexpr double kBorderMargin = 1.0;
+        if (refined->center.x() - refined->a < kBorderMargin ||
+            refined->center.y() - refined->a < kBorderMargin ||
+            refined->center.x() + refined->a >
+                static_cast<double>(gray.width() - 1) - kBorderMargin ||
+            refined->center.y() + refined->a >
+                static_cast<double>(gray.height() - 1) - kBorderMargin) {
+            continue;
+        }
         MarkerCandidate candidate;
         candidate.center = refined->center + Eigen::Vector2d(0.5, 0.5);
         candidate.radius_px = refined->a;

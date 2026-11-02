@@ -226,8 +226,12 @@ TEST(MarkerDetector, AxisRatioMatchesTruth) {
 /// Straightforward single-threaded version of `gaussian_blur`, used to prove
 /// that the parallel passes produce bit-identical values.
 FloatImage serial_gaussian_blur(const FloatImage& image, float sigma) {
-    if (sigma <= 0.0F || image.empty()) {
-        return image;
+    // Returning the input by value here makes GCC 13 inline a vector copy of a
+    // possibly-empty image and issue a spurious -Warray-bounds under -Werror.
+    // The helper is only used with a non-zero sigma and a non-empty image, so
+    // an empty result is the correct answer for the degenerate inputs anyway.
+    if (!(sigma > 0.0F) || image.empty()) {
+        return FloatImage();
     }
     const int radius = std::max(1, static_cast<int>(std::ceil(3.0F * sigma)));
     std::vector<float> kernel(static_cast<std::size_t>(2 * radius + 1));
@@ -278,16 +282,22 @@ TEST(MarkerDetector, RejectsSaddles) {
     // polarity filter wants. The old response multiplication turned those
     // points positive, so this sheet used to yield spurious blobs.
     const int size = 256;
-    const int cell = 64;
+    const int margin = 64;
+    const int cell = 32;
     FloatImage image(size, size, 0.5F);
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            const bool dark = ((x / cell) + (y / cell)) % 2 == 0;
+    // Keep the checkerboard away from the image border: a cell touching the
+    // border is a quarter-plane after clamping and can look like a real blob,
+    // which would make the test about border artefacts instead of saddles.
+    for (int y = margin; y < size - margin; ++y) {
+        for (int x = margin; x < size - margin; ++x) {
+            const bool dark = (((x - margin) / cell) + ((y - margin) / cell)) % 2 == 0;
             image.at(x, y) = dark ? 0.1F : 0.9F;
         }
     }
     image = gaussian_blur(image, 1.0F);
-    const std::vector<MarkerCandidate> candidates = detect_blobs(image);
+    BlobParams params;
+    params.threshold = 0.1F;
+    const std::vector<MarkerCandidate> candidates = detect_blobs(image, params);
     std::printf("[marker saddles] candidates=%d\n", static_cast<int>(candidates.size()));
     EXPECT_TRUE(candidates.empty());
 }
@@ -405,8 +415,13 @@ TEST(MarkerDetector, ParallelBlurMatchesSerialBits) {
             image.at(x, y) = static_cast<float>(value);
         }
     }
-    const FloatImage parallel_result = gaussian_blur(image, 2.7F);
-    const FloatImage serial_result = serial_gaussian_blur(image, 2.7F);
+    // Keep sigma opaque: with a literal the optimiser can fold the Gaussian
+    // kernel in one translation unit but not the other, and a sub-ulp
+    // difference in the weights would defeat a bit-exact comparison.
+    volatile float sigma_storage = 2.7F;
+    const float sigma = sigma_storage;
+    const FloatImage parallel_result = gaussian_blur(image, sigma);
+    const FloatImage serial_result = serial_gaussian_blur(image, sigma);
     ASSERT_EQ(parallel_result.width(), serial_result.width());
     ASSERT_EQ(parallel_result.height(), serial_result.height());
     ASSERT_EQ(parallel_result.pixels().size(), serial_result.pixels().size());
