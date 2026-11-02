@@ -78,8 +78,9 @@ const TagFamily& tag_family(AprilTagFamily family);
 std::optional<AprilTagFamily> parse_tag_family(std::string_view name);
 
 /// Largest error-correction radius whose random-word acceptance stays below
-/// 1e-3 (and never above `(min_hamming - 1) / 2`). See the table in
-/// apriltag_decoder.hpp for the underlying fractions.
+/// 1e-4 (and never above `(min_hamming - 1) / 2`). See the table in
+/// apriltag_decoder.hpp for the underlying fractions. 16h5 cannot reach 1e-4
+/// even at radius 0 and is an inherently weak family.
 int default_max_hamming(const TagFamily& family);
 
 /// Convenience overload.

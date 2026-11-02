@@ -104,6 +104,15 @@ sections below give the engineering detail behind each item.
   `set_marker_position`). Scale bars exist in the data model and the
   commands, but have no Python binding yet. No interface for either is in
   this release.
+- **AprilTag 16h5 is an inherently weak family.** The published 16h5 codes
+  are only 16 bits with a minimum distance of 5, so even with zero error
+  correction a random 16-bit word is a rotation of a code about 1.8 times in
+  1000. The decoder's default stays at 0 (the least permissive setting), but
+  cluttered scenes can still yield false positives; prefer 36h10, 36h11 or a
+  Standard family where the printed size allows. The other families default
+  to the largest correction radius whose random-word acceptance is below
+  1e-4 per candidate (36h10 and 36h11: 2; Standard41h12: 3;
+  Standard52h13: 4; 25h9 and Circle21h7: 0).
 - **Depth maps are slow at fine settings.** The search is coarse-to-fine (see
   below), which moves most of the sweeps to reduced resolutions, but the
   reference-resolution level still runs over every pixel and the default

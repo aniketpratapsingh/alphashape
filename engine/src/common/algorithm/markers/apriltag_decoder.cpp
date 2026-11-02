@@ -116,8 +116,14 @@ std::optional<Homography> fit_homography(
         design(row + 1, 7) = -v * y;
         rhs(row + 1) = y;
     }
-    const Eigen::Matrix<double, 8, 1> h =
-        design.fullPivLu().solve(rhs);
+    // A degenerate quad (three collinear corners, or a repeated corner) makes
+    // the 8x8 system rank-deficient; a least-squares solve then returns a
+    // plausible-looking but arbitrary H. Reject it explicitly.
+    const Eigen::FullPivLU<Eigen::Matrix<double, 8, 8>> decomposition(design);
+    if (decomposition.rank() < 8) {
+        return std::nullopt;
+    }
+    const Eigen::Matrix<double, 8, 1> h = decomposition.solve(rhs);
     if (!h.allFinite()) {
         return std::nullopt;
     }
@@ -133,6 +139,12 @@ std::optional<Homography> fit_homography(
         return std::nullopt;
     }
     homography.matrix /= homography.matrix(2, 2);
+    for (std::size_t i = 0; i < tag.size(); ++i) {
+        Eigen::Vector2d projected;
+        if (!homography.project(tag[i].x(), tag[i].y(), projected)) {
+            return std::nullopt;
+        }
+    }
     return homography;
 }
 
@@ -843,12 +855,12 @@ std::optional<TagMatch> match_tag_word(std::uint64_t word,
 }
 
 std::optional<CodedTarget> decode_tag(const FloatImage& gray,
+                                      const GradientField& gradient,
                                       const MarkerCandidate& quad_candidate,
                                       const TagFamily& family,
                                       int max_hamming) {
     if (gray.empty() || family.codes.empty() || family.bits <= 0 ||
-        family.bits > 64 || max_hamming < 0 ||
-        family.width_at_border < 3) {
+        family.bits > 64 || family.width_at_border < 3) {
         return std::nullopt;
     }
     if (quad_candidate.corners.size() != 4) {
@@ -881,7 +893,6 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
         return std::nullopt;
     }
 
-    const GradientField gradient = compute_gradient_field(gray);
     // Two search reaches: the short one stays on a wide border's outer edge,
     // while the long one recovers a thin reference frame when the detector's
     // initial quad sits on its inner edge (the 40 px and thin-frame cases).
@@ -910,7 +921,8 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
         rectified_quads.push_back(
             regularise_square(short_reach, longest_side(short_reach)));
     }
-    const int allowed = std::min(max_hamming, (family.min_hamming - 1) / 2);
+    const int budget = max_hamming < 0 ? default_max_hamming(family) : max_hamming;
+    const int allowed = std::min(budget, (family.min_hamming - 1) / 2);
 
     std::vector<double> scales{1.0};
     if (family.reversed_border && family.width_at_border > 0) {
@@ -1025,6 +1037,17 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     return target;
 }
 
+std::optional<CodedTarget> decode_tag(const FloatImage& gray,
+                                      const MarkerCandidate& quad_candidate,
+                                      const TagFamily& family,
+                                      int max_hamming) {
+    if (gray.empty()) {
+        return std::nullopt;
+    }
+    return decode_tag(gray, compute_gradient_field(gray), quad_candidate, family,
+                      max_hamming);
+}
+
 std::vector<CodedTarget> decode_tags(const FloatImage& gray,
                                      AprilTagFamily family, int max_hamming,
                                      const QuadParams& params) {
@@ -1035,14 +1058,18 @@ std::vector<CodedTarget> decode_tags(const FloatImage& gray,
     }
     const auto scan = [&](const FloatImage& image, const QuadParams& quad_params,
                           double factor_back) {
+        // One gradient field per image: every candidate's subpixel refinement
+        // reads the same field.
+        const GradientField gradient = compute_gradient_field(image);
         std::vector<MarkerCandidate> candidates;
         if (table.reversed_border) {
-            FloatImage inverted = image;
-            for (float& value : inverted.pixels()) {
-                value = 1.0F - value;
-            }
+            // A reversed family's white reference frame is light on dark. The
+            // detector's polarity option finds that foreground directly, so
+            // the full image no longer needs copying and inverting.
+            QuadParams inverted_params = quad_params;
+            inverted_params.dark_on_light = !quad_params.dark_on_light;
             const std::vector<MarkerCandidate> frames =
-                detect_quads(inverted, quad_params);
+                detect_quads(image, inverted_params);
             candidates.insert(candidates.end(), frames.begin(), frames.end());
         }
         const std::vector<MarkerCandidate> dark =
@@ -1050,7 +1077,7 @@ std::vector<CodedTarget> decode_tags(const FloatImage& gray,
         candidates.insert(candidates.end(), dark.begin(), dark.end());
         for (const MarkerCandidate& candidate : candidates) {
             std::optional<CodedTarget> target =
-                decode_tag(image, candidate, table, max_hamming);
+                decode_tag(image, gradient, candidate, table, max_hamming);
             if (!target) {
                 continue;
             }
@@ -1084,7 +1111,38 @@ std::vector<CodedTarget> decode_tags(const FloatImage& gray,
             retry(3);
         }
     }
-    return decoded;
+
+    // Both polarities can yield the same physical tag: its black border gives
+    // a dark-square candidate and its light reference ring a bright one. Keep
+    // one decode per physical tag: same id and overlapping centres. The lower
+    // Hamming distance wins, then the larger radius (a corner-to-corner quad
+    // is the more complete measurement).
+    std::vector<CodedTarget> unique;
+    unique.reserve(decoded.size());
+    for (const CodedTarget& target : decoded) {
+        bool merged = false;
+        for (CodedTarget& kept : unique) {
+            if (kept.code != target.code) {
+                continue;
+            }
+            const double separation = (kept.center - target.center).norm();
+            const double scale = 0.5 * std::max(kept.radius_px, target.radius_px);
+            if (!(separation <= scale)) {
+                continue;
+            }
+            if (target.hamming < kept.hamming ||
+                (target.hamming == kept.hamming &&
+                 target.radius_px > kept.radius_px)) {
+                kept = target;
+            }
+            merged = true;
+            break;
+        }
+        if (!merged) {
+            unique.push_back(target);
+        }
+    }
+    return unique;
 }
 
 }  // namespace alphashape

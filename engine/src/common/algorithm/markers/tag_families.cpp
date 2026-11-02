@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -63,6 +64,7 @@ std::uint64_t rotate_with_map(std::uint64_t word, const std::vector<int>& map) {
     std::uint64_t out = 0;
     for (std::size_t i = 0; i < map.size(); ++i) {
         if (((word >> i) & 1u) != 0u) {
+            assert(map[i] >= 0 && map[i] < 64);
             out |= std::uint64_t{1} << static_cast<unsigned>(map[i]);
         }
     }
@@ -85,14 +87,20 @@ std::size_t distinct_rotations(const TagFamily& family, const std::vector<int>& 
     return pool.size();
 }
 
-/// Largest correction radius whose random-word acceptance is below 1e-3.
+/// Largest correction radius whose random-word acceptance is below 1e-4.
 /// The balls of radius d around distinct rotated codes are disjoint while
 /// d <= (h-1)/2, so the count is exact: |rotations| * sum_{i<=d} C(bits, i).
 int compute_default(const TagFamily& family, const std::vector<int>& map) {
+    // A family outside 1..64 bits cannot be rotated or matched in a 64-bit
+    // word, and its binomial row would not fit; such a table is rejected here
+    // rather than reading past the array.
+    if (family.bits < 1 || family.bits > 64) {
+        return 0;
+    }
     const std::size_t rotations = distinct_rotations(family, map);
     const double total = std::ldexp(1.0, family.bits);
     const int allowed = (family.min_hamming - 1) / 2;
-    std::array<double, 64> binomial{};
+    std::array<double, 65> binomial{};
     binomial[0] = 1.0;
     for (int i = 1; i <= family.bits; ++i) {
         binomial[static_cast<std::size_t>(i)] =
@@ -104,7 +112,7 @@ int compute_default(const TagFamily& family, const std::vector<int>& map) {
     for (int d = 0; d <= allowed; ++d) {
         ball += binomial[static_cast<std::size_t>(d)];
         const double acceptance = static_cast<double>(rotations) * ball / total;
-        if (acceptance < 1e-3) best = d;
+        if (acceptance < 1e-4) best = d;
     }
     return best;
 }
