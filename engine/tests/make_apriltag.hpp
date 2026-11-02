@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/LU>
 
 #include "common/algorithm/markers/tag_families.hpp"
 #include "image/image.hpp"
