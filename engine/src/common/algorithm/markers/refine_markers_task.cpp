@@ -562,23 +562,21 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
     return candidates;
 }
 
-/// Hessian determinant of the reduced image at a full-resolution pixel. A
-/// checker cross is a saddle (negative determinant); a disc or ring is not.
-double hessian_determinant(const CameraView& view, const Eigen::Vector2d& pixel) {
-    const Eigen::Vector2d index = view.index_of(pixel);
-    const float* data = view.image.pixels().data();
-    const int width = view.image.width();
-    const auto at = [&](int x, int y) {
-        return static_cast<double>(
-            data[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-                 static_cast<std::size_t>(x)]);
-    };
-    const int x = static_cast<int>(std::lround(index.x()));
-    const int y = static_cast<int>(std::lround(index.y()));
+/// Hessian determinant of the reduced image at an integer pixel index. A
+/// checker cross has a negative determinant at its saddle; a disc or ring does
+/// not. Edge pixels return 0.
+double hessian_determinant_at(const CameraView& view, int x, int y) {
     if (x < 1 || y < 1 || x + 1 >= view.image.width() ||
         y + 1 >= view.image.height()) {
         return 0.0;
     }
+    const float* data = view.image.pixels().data();
+    const int width = view.image.width();
+    const auto at = [&](int px, int py) {
+        return static_cast<double>(
+            data[static_cast<std::size_t>(py) * static_cast<std::size_t>(width) +
+                 static_cast<std::size_t>(px)]);
+    };
     const double ixx = at(x + 1, y) - 2.0 * at(x, y) + at(x - 1, y);
     const double iyy = at(x, y + 1) - 2.0 * at(x, y) + at(x, y - 1);
     const double ixy = (at(x + 1, y + 1) - at(x + 1, y - 1) -
@@ -586,11 +584,49 @@ double hessian_determinant(const CameraView& view, const Eigen::Vector2d& pixel)
     return ixx * iyy - ixy * ixy;
 }
 
-/// 2-D-only refinement for a marker with fewer than two usable views. The
-/// refiner is chosen by the local structure (saddle -> cross, otherwise
-/// ellipse) and the other one is tried when the first fails. An update that
-/// would move further than the limit is rejected, which is what keeps a blank
-/// patch from wandering onto unrelated texture.
+/// Strongest saddle within a small window around `pixel`, in full-resolution
+/// pixels. The candidate reprojection can be a few pixels off the printed
+/// centre, and the saddle quadratic fit only converges from inside the
+/// saddle's basin, so finding the basin first makes the cross refiner robust.
+std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
+                                           const Eigen::Vector2d& pixel,
+                                           int patch_size) {
+    const Eigen::Vector2d index = view.index_of(pixel);
+    const int centre_x = static_cast<int>(std::lround(index.x()));
+    const int centre_y = static_cast<int>(std::lround(index.y()));
+    const int scan = std::max(4, patch_size / 2);
+    double best = 0.0;
+    int best_x = 0;
+    int best_y = 0;
+    bool found = false;
+    for (int dy = -scan; dy <= scan; ++dy) {
+        for (int dx = -scan; dx <= scan; ++dx) {
+            const int x = centre_x + dx;
+            const int y = centre_y + dy;
+            const double determinant = hessian_determinant_at(view, x, y);
+            if (determinant < best) {
+                best = determinant;
+                best_x = x;
+                best_y = y;
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        return std::nullopt;
+    }
+    const double ds = static_cast<double>(view.downscale);
+    return Eigen::Vector2d((static_cast<double>(best_x) + 0.5) * ds,
+                           (static_cast<double>(best_y) + 0.5) * ds);
+}
+
+/// 2-D-only refinement for a marker with fewer than two usable views. Both
+/// target-specific refiners run; whichever converges with the smaller movement
+/// from the seed wins, because the correct refiner locks onto the printed
+/// centre in a pixel or two while the wrong one lands on a quadrant or a
+/// neighbouring blob far away. An update that would move further than the
+/// limit is rejected, which is what keeps a blank patch from wandering onto
+/// unrelated texture.
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
     const std::optional<BlobSeed>& seed, int patch_size, double limit) {
@@ -601,31 +637,24 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
         }
         return candidate;
     };
-    const auto ellipse = [&]() -> std::optional<Eigen::Vector2d> {
-        if (!seed) {
-            return std::nullopt;
-        }
-        return accept(seed->pixel);
-    };
-    const auto cross = [&]() -> std::optional<Eigen::Vector2d> {
-        const double ds = static_cast<double>(view.downscale);
-        const double hint = std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
-        const auto refined = refine_cross_center(view.image, pixel / ds, hint);
-        if (!refined) {
-            return std::nullopt;
-        }
-        return accept(*refined * ds);
-    };
-    if (hessian_determinant(view, pixel) < 0.0) {
-        if (auto found = cross()) {
-            return found;
-        }
-        return ellipse();
+    const std::optional<Eigen::Vector2d> ellipse =
+        seed ? accept(seed->pixel) : std::nullopt;
+    const double ds = static_cast<double>(view.downscale);
+    const double hint = std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
+    Eigen::Vector2d start = pixel;
+    if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
+        start = *saddle;
     }
-    if (auto found = ellipse()) {
-        return found;
+    std::optional<Eigen::Vector2d> cross;
+    if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
+        cross = accept(*refined * ds);
     }
-    return cross();
+    if (ellipse &&
+        (!cross ||
+         (*ellipse - pixel).squaredNorm() <= (*cross - pixel).squaredNorm())) {
+        return ellipse;
+    }
+    return cross;
 }
 
 /// Lucas-Kanade translation-only alignment of a view's patch to the mean
