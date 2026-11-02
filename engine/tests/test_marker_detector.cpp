@@ -87,6 +87,16 @@ TEST(MarkerDetector, FitEllipseExactOnSamples) {
         collinear.emplace_back(3.0 + static_cast<double>(i), 7.0 + 2.0 * static_cast<double>(i));
     }
     EXPECT_FALSE(fit_ellipse(collinear).has_value());
+    // Non-finite samples are filtered before the five-point minimum is counted,
+    // so four NaNs plus one usable point is not a five-sample fit.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<Eigen::Vector2d> mostly_nan = {
+        {nan, 4.0}, {4.0, nan}, {inf, 9.0}, {9.0, -inf}, {31.0, 12.0}};
+    EXPECT_FALSE(fit_ellipse(mostly_nan).has_value());
+    std::vector<Eigen::Vector2d> two_valid = {
+        {nan, 4.0}, {4.0, nan}, {inf, 9.0}, {9.0, -inf}, {31.0, 12.0}, {34.0, 18.0}};
+    EXPECT_FALSE(fit_ellipse(two_valid).has_value());
 }
 
 /// Deterministic ellipses on a rectangular grid of cells, jittered inside each
@@ -135,7 +145,7 @@ AccuracySummary centre_accuracy(const FloatImage& image,
             ++summary.missed;
             continue;
         }
-        const auto refined = refine_ellipse_center(image, *candidate, true);
+        const auto refined = refine_ellipse_center(gradient, *candidate);
         if (!refined) {
             ++summary.missed;
             continue;
@@ -211,6 +221,44 @@ TEST(MarkerDetector, AxisRatioMatchesTruth) {
     EXPECT_LE(worst_relative, 0.02);
 }
 
+/// Straightforward single-threaded version of `gaussian_blur`, used to prove
+/// that the parallel passes produce bit-identical values.
+FloatImage serial_gaussian_blur(const FloatImage& image, float sigma) {
+    if (sigma <= 0.0F || image.empty()) {
+        return image;
+    }
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0F * sigma)));
+    std::vector<float> kernel(static_cast<std::size_t>(2 * radius + 1));
+    float sum = 0.0F;
+    for (int i = -radius; i <= radius; ++i) {
+        const float w = std::exp(-static_cast<float>(i * i) / (2.0F * sigma * sigma));
+        kernel[static_cast<std::size_t>(i + radius)] = w;
+        sum += w;
+    }
+    for (float& w : kernel) w /= sum;
+    FloatImage tmp(image.width(), image.height());
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            float acc = 0.0F;
+            for (int i = -radius; i <= radius; ++i) {
+                acc += kernel[static_cast<std::size_t>(i + radius)] * image.at_clamped(x + i, y);
+            }
+            tmp.at(x, y) = acc;
+        }
+    }
+    FloatImage out(image.width(), image.height());
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            float acc = 0.0F;
+            for (int i = -radius; i <= radius; ++i) {
+                acc += kernel[static_cast<std::size_t>(i + radius)] * tmp.at_clamped(x, y + i);
+            }
+            out.at(x, y) = acc;
+        }
+    }
+    return out;
+}
+
 TEST(MarkerDetector, RejectsNoise) {
     FloatImage image(1024, 1024, 0.5F);
     test::add_noise(image, 0.05, 20261103U);
@@ -220,6 +268,43 @@ TEST(MarkerDetector, RejectsNoise) {
     std::printf("[marker noise] candidates=%d threshold=%.3f\n",
                 static_cast<int>(candidates.size()), static_cast<double>(params.threshold));
     EXPECT_LE(candidates.size(), static_cast<std::size_t>(1));
+}
+
+TEST(MarkerDetector, RejectsSaddles) {
+    // A checkerboard has a saddle at every interior cell corner: the Hessian
+    // determinant is negative there, even where the trace takes the sign the
+    // polarity filter wants. The old response multiplication turned those
+    // points positive, so this sheet used to yield spurious blobs.
+    const int size = 256;
+    const int cell = 64;
+    FloatImage image(size, size, 0.5F);
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const bool dark = ((x / cell) + (y / cell)) % 2 == 0;
+            image.at(x, y) = dark ? 0.1F : 0.9F;
+        }
+    }
+    image = gaussian_blur(image, 1.0F);
+    const std::vector<MarkerCandidate> candidates = detect_blobs(image);
+    std::printf("[marker saddles] candidates=%d\n", static_cast<int>(candidates.size()));
+    EXPECT_TRUE(candidates.empty());
+}
+
+TEST(MarkerDetector, BorderBlobRejectedOrAccurate) {
+    // A target clipped by the image border must not be reported with a centre
+    // biased by the clamping of the edge search. Policy: the 60% in-bounds ray
+    // requirement drops it; if one is reported anyway, it must still be exact.
+    const int size = 256;
+    const std::vector<test::EllipseTruth> truth = {{2.0, 128.0, 16.0, 16.0, 0.0}};
+    FloatImage image = test::render_ellipses(size, size, truth, 0.95F, 0.05F);
+    image = gaussian_blur(image, 1.0F);
+    const std::vector<MarkerCandidate> candidates = detect_blobs(image);
+    const Eigen::Vector2d expected(truth.front().cx, truth.front().cy);
+    std::printf("[marker border] candidates=%d\n", static_cast<int>(candidates.size()));
+    EXPECT_LE(candidates.size(), static_cast<std::size_t>(1));
+    for (const MarkerCandidate& candidate : candidates) {
+        EXPECT_LE((candidate.center - expected).norm(), 0.1);
+    }
 }
 
 TEST(MarkerDetector, LightOnDarkPolarity) {

@@ -74,14 +74,24 @@ FloatImage gradient_magnitude(const FloatImage& gray) {
 /// the design matrix stays well conditioned; the geometry is transformed back
 /// afterwards. A non-positive weight means "ignored".
 std::optional<Ellipse> fit_ellipse_points(const std::vector<WeightedPoint>& samples) {
-    if (samples.size() < 5) {
+    // Drop unusable samples up front: a non-finite coordinate or a
+    // non-positive weight cannot contribute, and counting them towards the
+    // five-point minimum would let a handful of real samples masquerade as a
+    // well-constrained fit.
+    std::vector<WeightedPoint> valid;
+    valid.reserve(samples.size());
+    for (const WeightedPoint& sample : samples) {
+        if (sample.point.allFinite() && sample.weight > 0.0) {
+            valid.push_back(sample);
+        }
+    }
+    if (valid.size() < 5) {
         return std::nullopt;
     }
     double weight_sum = 0.0;
     double mean_x = 0.0;
     double mean_y = 0.0;
-    for (const WeightedPoint& sample : samples) {
-        if (!sample.point.allFinite() || !(sample.weight > 0.0)) continue;
+    for (const WeightedPoint& sample : valid) {
         weight_sum += sample.weight;
         mean_x += sample.weight * sample.point.x();
         mean_y += sample.weight * sample.point.y();
@@ -92,8 +102,7 @@ std::optional<Ellipse> fit_ellipse_points(const std::vector<WeightedPoint>& samp
     mean_x /= weight_sum;
     mean_y /= weight_sum;
     double spread = 0.0;
-    for (const WeightedPoint& sample : samples) {
-        if (!sample.point.allFinite() || !(sample.weight > 0.0)) continue;
+    for (const WeightedPoint& sample : valid) {
         const double dx = sample.point.x() - mean_x;
         const double dy = sample.point.y() - mean_y;
         spread += sample.weight * (dx * dx + dy * dy);
@@ -105,8 +114,7 @@ std::optional<Ellipse> fit_ellipse_points(const std::vector<WeightedPoint>& samp
     }
 
     Eigen::Matrix<double, 6, 6> scatter = Eigen::Matrix<double, 6, 6>::Zero();
-    for (const WeightedPoint& sample : samples) {
-        if (!sample.point.allFinite() || !(sample.weight > 0.0)) continue;
+    for (const WeightedPoint& sample : valid) {
         const double x = (sample.point.x() - mean_x) / scale;
         const double y = (sample.point.y() - mean_y) / scale;
         Eigen::Matrix<double, 6, 1> row;
@@ -249,9 +257,28 @@ std::optional<Ellipse> robust_fit(std::vector<WeightedPoint> samples) {
     return second ? second : first;
 }
 
+/// Sample only when the coordinate falls on the image's pixel-centre grid.
+/// `FloatImage::sample` clamps outside the image, so sampling past the border
+/// would repeat the last edge pixel and invent a gradient step there.
+bool sample_inside(const FloatImage& image, double x, double y, double& value) {
+    if (!(x >= 0.0) || !(y >= 0.0) || x > static_cast<double>(image.width() - 1) ||
+        y > static_cast<double>(image.height() - 1)) {
+        return false;
+    }
+    value = static_cast<double>(
+        image.sample(static_cast<float>(x), static_cast<float>(y)));
+    return true;
+}
+
 /// Sample gradient-magnitude maxima along rays from `centre`. Each accepted
 /// maximum gets a parabolic subpixel correction, so the returned points sit on
 /// the target boundary to a fraction of a pixel.
+///
+/// A ray that reaches the image border before its edge peak is discarded rather
+/// than clamped. If fewer than 60% of the rays contribute a sample, the target
+/// is too close to the border to constrain an ellipse and the whole candidate
+/// is rejected; a clipped target therefore produces no detection instead of a
+/// systematically biased centre.
 std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
                                                const Eigen::Vector2d& centre,
                                                double radius) {
@@ -268,14 +295,21 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
             kTwoPi * (static_cast<double>(ray) + 0.5) / static_cast<double>(kRadialRays);
         const double dx = std::cos(angle);
         const double dy = std::sin(angle);
+        int last = -1;
         for (int i = 0; i <= steps; ++i) {
             const double t = kEdgeStep + static_cast<double>(i) * kEdgeStep;
-            values[static_cast<std::size_t>(i)] = static_cast<double>(gradient.sample(
-                static_cast<float>(centre.x() + dx * t),
-                static_cast<float>(centre.y() + dy * t)));
+            double value = 0.0;
+            if (!sample_inside(gradient, centre.x() + dx * t, centre.y() + dy * t, value)) {
+                break;  // left the image: no peak beyond this point is real
+            }
+            values[static_cast<std::size_t>(i)] = value;
+            last = i;
+        }
+        if (last < 2) {
+            continue;
         }
         double strongest = 0.0;
-        for (int i = 1; i < steps; ++i) {
+        for (int i = 1; i < last; ++i) {
             const double value = values[static_cast<std::size_t>(i)];
             if (value >= values[static_cast<std::size_t>(i - 1)] &&
                 value > values[static_cast<std::size_t>(i + 1)] && value > strongest) {
@@ -291,7 +325,7 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
         // boundary. Noise peaks are far below the fraction of a real edge.
         const double acceptance = 0.3 * strongest;
         int best_index = -1;
-        for (int i = 1; i < steps; ++i) {
+        for (int i = 1; i < last; ++i) {
             const double value = values[static_cast<std::size_t>(i)];
             if (value >= values[static_cast<std::size_t>(i - 1)] &&
                 value > values[static_cast<std::size_t>(i + 1)] && value >= acceptance) {
@@ -299,7 +333,7 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
                 break;
             }
         }
-        if (best_index <= 0 || best_index >= steps) {
+        if (best_index <= 0 || best_index >= last) {
             continue;
         }
         const double best = values[static_cast<std::size_t>(best_index)];
@@ -318,6 +352,12 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
         sample.weight = best;
         samples.push_back(sample);
     }
+    constexpr double kMinInBoundsFraction = 0.6;
+    const std::size_t minimum = static_cast<std::size_t>(
+        std::ceil(kMinInBoundsFraction * static_cast<double>(kRadialRays)));
+    if (samples.size() < minimum) {
+        samples.clear();
+    }
     return samples;
 }
 
@@ -331,8 +371,10 @@ std::optional<Ellipse> fit_boundary(const FloatImage& gradient, const Eigen::Vec
 /// makes the response scale invariant (Steger 1998). The determinant is
 /// positive for both intensity minima and maxima, so polarity is selected from
 /// the trace: a dark-on-light target is a minimum (positive-definite Hessian),
-/// a light-on-dark target is a maximum (negative-definite Hessian). The wrong
-/// polarity becomes a negative response and is rejected by the threshold.
+/// a light-on-dark target is a maximum (negative-definite Hessian). Any point
+/// whose determinant is not positive, or whose trace has the wrong polarity,
+/// gets a zero response: in particular a saddle (det < 0) never becomes a
+/// blob, regardless of the sign of its trace.
 FloatImage hessian_response(const FloatImage& blurred, double sigma, bool dark_on_light) {
     const int w = blurred.width();
     const int h = blurred.height();
@@ -355,7 +397,12 @@ FloatImage hessian_response(const FloatImage& blurred, double sigma, bool dark_o
             const float determinant = nxx * nyy - nxy * nxy;
             const float trace = nxx + nyy;
             const bool matches_polarity = dark_on_light ? trace > 0.0F : trace < 0.0F;
-            out.at(x, y) = (matches_polarity ? 1.0F : -1.0F) * determinant;
+            // Only a definite-sign Hessian is a blob. At a saddle point the
+            // determinant is negative even though the trace can have either
+            // sign; multiplying by the polarity sign used to turn such a point
+            // into a positive response, so require det > 0 explicitly.
+            out.at(x, y) =
+                (determinant > 0.0F && matches_polarity) ? determinant : 0.0F;
         }
     }
     return out;
@@ -828,16 +875,20 @@ std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& gray
             std::array<double, kNormalSteps> values{};
             double minimum = std::numeric_limits<double>::infinity();
             double maximum = -std::numeric_limits<double>::infinity();
+            bool inside = true;
             for (int i = 0; i < kNormalSteps; ++i) {
                 const double t = -kNormalExtent + kNormalStep * static_cast<double>(i);
                 const Eigen::Vector2d probe = base + t * normal;
-                const double value = static_cast<double>(
-                    gray.sample(static_cast<float>(probe.x()), static_cast<float>(probe.y())));
+                double value = 0.0;
+                if (!sample_inside(gray, probe.x(), probe.y(), value)) {
+                    inside = false;  // clamped samples would fake an edge
+                    break;
+                }
                 values[static_cast<std::size_t>(i)] = value;
                 minimum = std::min(minimum, value);
                 maximum = std::max(maximum, value);
             }
-            if (!(maximum - minimum > 2.0 * kMinEdgeGradient)) {
+            if (!inside || !(maximum - minimum > 2.0 * kMinEdgeGradient)) {
                 continue;
             }
             const double midpoint = 0.5 * (minimum + maximum);
@@ -868,8 +919,11 @@ std::optional<std::array<Eigen::Vector2d, 4>> refine_quad(const FloatImage& gray
                           values[static_cast<std::size_t>(best_index)]));
             WeightedPoint sample;
             sample.point = base + crossing * normal;
-            sample.weight = static_cast<double>(gradient.sample(
-                static_cast<float>(sample.point.x()), static_cast<float>(sample.point.y())));
+            double gradient_value = 0.0;
+            if (!sample_inside(gradient, sample.point.x(), sample.point.y(), gradient_value)) {
+                continue;
+            }
+            sample.weight = gradient_value;
             if (!(sample.weight > 0.0)) {
                 sample.weight = best_slope;
             }

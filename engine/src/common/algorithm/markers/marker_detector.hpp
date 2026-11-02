@@ -56,6 +56,23 @@ struct QuadParams {
     bool dark_on_light = true;
 };
 
+/// Per-stage wall-clock seconds, filled only when a caller asks for them. All
+/// values are zero otherwise. `quads` is the whole of `detect_quads`; the four
+/// blob stages partition `detect_blobs`.
+struct DetectionTimings {
+    double blur_seconds = 0.0;    ///< Gaussian pyramid / incremental blur
+    double hessian_seconds = 0.0; ///< scale-normalised Hessian responses
+    double nms_seconds = 0.0;     ///< threshold + 3x3x3 maxima scan
+    double refine_seconds = 0.0;  ///< radial ray search + ellipse fits
+    double quad_seconds = 0.0;    ///< quad detection, end to end
+};
+
+/// Gradient magnitude of an image, computed once and shared by the blob
+/// detector and every subpixel refinement.
+struct GradientField {
+    FloatImage magnitude;
+};
+
 /// Conic parameters of a fitted ellipse. `a >= b`; `angle_rad` is the
 /// major-axis direction in image coordinates (X right, Y down).
 struct Ellipse {
@@ -65,17 +82,28 @@ struct Ellipse {
     double angle_rad = 0.0;
 };
 
-/// Detect circular targets. Results are sorted by centre y then x.
-std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params = {});
+/// Detect circular targets. Results are sorted by centre y then x. When
+/// `timings` is not null, the per-stage wall-clock seconds are written to it.
+std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params = {},
+                                          DetectionTimings* timings = nullptr);
 
-/// Detect square targets. Results are sorted by centre y then x.
-std::vector<MarkerCandidate> detect_quads(const FloatImage& gray, const QuadParams& params = {});
+/// Detect square targets. Results are sorted by centre y then x. When
+/// `timings` is not null, `quad_seconds` receives the end-to-end time.
+std::vector<MarkerCandidate> detect_quads(const FloatImage& gray, const QuadParams& params = {},
+                                          DetectionTimings* timings = nullptr);
+
+/// Gradient magnitude of `gray`, for callers that refine many centres.
+GradientField compute_gradient_field(const FloatImage& gray);
 
 /// Re-estimate the centre of an already detected ellipse by iterating the
-/// radial edge search and refit. Returns nullopt if the refit fails.
+/// radial edge search and refit, reusing a precomputed gradient field. Returns
+/// nullopt if the refit fails.
+std::optional<Eigen::Vector2d> refine_ellipse_center(const GradientField& gradient,
+                                                     const MarkerCandidate& seed);
+
+/// Convenience overload that computes the gradient field first.
 std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
-                                                     const MarkerCandidate& seed,
-                                                     bool dark_on_light);
+                                                     const MarkerCandidate& seed);
 
 /// Direct least-squares ellipse fit (Fitzgibbon/Pilu/Fisher, numerically
 /// stable split form). Returns nullopt for fewer than 5 points, degenerate or
