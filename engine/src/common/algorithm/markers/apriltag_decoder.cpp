@@ -177,7 +177,8 @@ struct EdgeLine {
 /// magnitude. Notches and foreign edges therefore contribute weakly.
 std::optional<EdgeLine> fit_edge(const GradientField& gradient,
                                  const Eigen::Vector2d& a, const Eigen::Vector2d& b,
-                                 const Eigen::Vector2d& center) {
+                                 const Eigen::Vector2d& center, double reach_factor,
+                                 double reach_cap) {
     const Eigen::Vector2d delta = b - a;
     const double length = delta.norm();
     if (!(length > 2.0 * kMinSidePx)) {
@@ -192,7 +193,7 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
     if ((0.5 * (a + b) - center).dot(normal) < 0.0) {
         normal = -normal;
     }
-    const double reach = std::clamp(0.30 * length, 2.5, 6.0);
+    const double reach = std::clamp(reach_factor * length, 2.5, reach_cap);
     const int steps = static_cast<int>(std::ceil(reach / 0.5));
     const double step = reach / static_cast<double>(steps);
     std::vector<double> profile(static_cast<std::size_t>(2 * steps + 1), 0.0);
@@ -292,8 +293,8 @@ std::optional<Eigen::Vector2d> intersect_lines(const EdgeLine& first,
 /// Replace each quad corner by the intersection of the lines fitted to the two
 /// sides meeting there. A side that cannot be fitted keeps the original corner.
 std::array<Eigen::Vector2d, 4> refine_quad_corners(
-    const GradientField& gradient,
-    const std::array<Eigen::Vector2d, 4>& quad) {
+    const GradientField& gradient, const std::array<Eigen::Vector2d, 4>& quad,
+    double reach_factor, double reach_cap) {
     Eigen::Vector2d center = Eigen::Vector2d::Zero();
     for (const Eigen::Vector2d& corner : quad) {
         center += corner;
@@ -303,7 +304,8 @@ std::array<Eigen::Vector2d, 4> refine_quad_corners(
     for (int side = 0; side < 4; ++side) {
         lines[static_cast<std::size_t>(side)] = fit_edge(
             gradient, quad[static_cast<std::size_t>(side)],
-            quad[static_cast<std::size_t>((side + 1) % 4)], center);
+            quad[static_cast<std::size_t>((side + 1) % 4)], center,
+            reach_factor, reach_cap);
     }
     std::array<Eigen::Vector2d, 4> refined = quad;
     for (int corner = 0; corner < 4; ++corner) {
@@ -321,7 +323,8 @@ std::array<Eigen::Vector2d, 4> refine_quad_corners(
         // A thin frame can put the detector's initial quad on the inner edge
         // one cell in; the outward fit then legitimately moves the corner by
         // that cell (up to the search reach). Reject only wild intersections.
-        if ((*intersection - quad[static_cast<std::size_t>(corner)]).norm() > 6.5) {
+        if ((*intersection - quad[static_cast<std::size_t>(corner)]).norm() >
+            reach_cap + 2.5) {
             continue;
         }
         refined[static_cast<std::size_t>(corner)] = *intersection;
@@ -714,8 +717,12 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     }
 
     const GradientField gradient = compute_gradient_field(gray);
-    const std::array<Eigen::Vector2d, 4> refined =
-        refine_quad_corners(gradient, quad);
+    // Two search reaches: the short one stays on a wide border's outer edge,
+    // while the long one recovers a thin reference frame when the detector's
+    // initial quad sits on its inner edge (the 40 px and thin-frame cases).
+    std::vector<std::array<Eigen::Vector2d, 4>> refined_quads;
+    refined_quads.push_back(refine_quad_corners(gradient, quad, 0.30, 6.0));
+    refined_quads.push_back(refine_quad_corners(gradient, quad, 0.60, 9.0));
     const int allowed = std::min(max_hamming, (family.min_hamming - 1) / 2);
 
     std::vector<double> scales{1.0};
@@ -766,7 +773,9 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     };
 
     std::vector<HypothesisResult> results;
-    evaluate(refined, results);
+    for (const std::array<Eigen::Vector2d, 4>& refined : refined_quads) {
+        evaluate(refined, results);
+    }
     std::optional<HypothesisResult> best = choose(results);
     if (!best && family.reversed_border && family.total_width > 0) {
         // A reversed status tag's dark outer ring is only two cells wide. A
@@ -775,30 +784,34 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
         // cell on that side. The published white reference frame is always
         // intact, so grow each side by one cell in turn and retry; only the
         // side that was missing produces a valid tag.
-        const double pair0 = 0.5 * ((refined[1] - refined[0]).norm() +
-                                    (refined[2] - refined[3]).norm());
-        const double pair1 = 0.5 * ((refined[2] - refined[1]).norm() +
-                                    (refined[3] - refined[0]).norm());
-        const double cell = std::max(pair0, pair1) /
-                            static_cast<double>(family.total_width);
-        Eigen::Vector2d center = Eigen::Vector2d::Zero();
-        for (const Eigen::Vector2d& corner : refined) {
-            center += corner;
-        }
-        center *= 0.25;
-        for (int side = 0; side < 4; ++side) {
-            const Eigen::Vector2d& a = refined[static_cast<std::size_t>(side)];
-            const Eigen::Vector2d& b =
-                refined[static_cast<std::size_t>((side + 1) % 4)];
-            const Eigen::Vector2d direction = (b - a).normalized();
-            Eigen::Vector2d normal(-direction.y(), direction.x());
-            if ((0.5 * (a + b) - center).dot(normal) < 0.0) {
-                normal = -normal;
+        for (const std::array<Eigen::Vector2d, 4>& refined : refined_quads) {
+            const double pair0 = 0.5 * ((refined[1] - refined[0]).norm() +
+                                        (refined[2] - refined[3]).norm());
+            const double pair1 = 0.5 * ((refined[2] - refined[1]).norm() +
+                                        (refined[3] - refined[0]).norm());
+            const double cell = std::max(pair0, pair1) /
+                                static_cast<double>(family.total_width);
+            Eigen::Vector2d center = Eigen::Vector2d::Zero();
+            for (const Eigen::Vector2d& corner : refined) {
+                center += corner;
             }
-            std::array<Eigen::Vector2d, 4> grown = refined;
-            grown[static_cast<std::size_t>(side)] = a + normal * cell;
-            grown[static_cast<std::size_t>((side + 1) % 4)] = b + normal * cell;
-            evaluate(grown, results);
+            center *= 0.25;
+            for (int side = 0; side < 4; ++side) {
+                const Eigen::Vector2d& a =
+                    refined[static_cast<std::size_t>(side)];
+                const Eigen::Vector2d& b =
+                    refined[static_cast<std::size_t>((side + 1) % 4)];
+                const Eigen::Vector2d direction = (b - a).normalized();
+                Eigen::Vector2d normal(-direction.y(), direction.x());
+                if ((0.5 * (a + b) - center).dot(normal) < 0.0) {
+                    normal = -normal;
+                }
+                std::array<Eigen::Vector2d, 4> grown = refined;
+                grown[static_cast<std::size_t>(side)] = a + normal * cell;
+                grown[static_cast<std::size_t>((side + 1) % 4)] =
+                    b + normal * cell;
+                evaluate(grown, results);
+            }
         }
         best = choose(results);
     }
