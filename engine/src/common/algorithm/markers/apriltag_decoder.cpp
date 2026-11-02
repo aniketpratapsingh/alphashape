@@ -303,42 +303,72 @@ std::optional<EdgeLine> fit_edge(const GradientField& gradient,
     if (samples.size() < 4) {
         return std::nullopt;
     }
-    // A white payload cell touching a reference frame protrudes its edge by a
-    // cell, and a notch does the same to a silhouette; a side then carries two
-    // parallel edges. Cluster the per-sample offsets from the initial side and
-    // fit the densest cluster, which is the straight run of the true edge.
-    std::vector<double> offsets(samples.size());
-    for (std::size_t i = 0; i < samples.size(); ++i) {
-        offsets[i] = (samples[i].point - a).dot(normal);
-    }
-    double best_centre = offsets.front();
-    std::size_t best_count = 0;
-    for (double candidate : offsets) {
-        std::size_t count = 0;
-        for (double offset : offsets) {
-            if (std::abs(offset - candidate) <= 0.6) {
-                ++count;
+    if (choice == PeakChoice::Strongest) {
+        // A white payload cell touching a reference frame protrudes its edge
+        // by a cell, and a notch does the same to a silhouette, so a side can
+        // carry two parallel edges. Cluster the per-sample offsets from the
+        // initial side and fit the densest cluster, the straight run of the
+        // true edge. Only the symmetric search needs this: it may choose
+        // either edge, while the outermost search is already on the outer one.
+        std::vector<double> offsets(samples.size());
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            offsets[i] = (samples[i].point - a).dot(normal);
+        }
+        double best_centre = offsets.front();
+        std::size_t best_count = 0;
+        for (double candidate : offsets) {
+            std::size_t count = 0;
+            for (double offset : offsets) {
+                if (std::abs(offset - candidate) <= 0.6) {
+                    ++count;
+                }
+            }
+            if (count > best_count) {
+                best_count = count;
+                best_centre = candidate;
             }
         }
-        if (count > best_count) {
-            best_count = count;
-            best_centre = candidate;
+        std::vector<EdgeSample> clustered;
+        clustered.reserve(samples.size());
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            if (std::abs(offsets[i] - best_centre) <= 1.0) {
+                clustered.push_back(samples[i]);
+            }
         }
+        if (clustered.size() >= 4 && clustered.size() < samples.size()) {
+            const std::optional<EdgeLine> line = fit_weighted_tls(clustered);
+            if (line) {
+                return line;
+            }
+        }
+        return fit_weighted_tls(samples);
     }
+    const std::optional<EdgeLine> first = fit_weighted_tls(samples);
+    if (!first) {
+        return std::nullopt;
+    }
+    Eigen::Vector2d normal_to_line(-first->direction.y(), first->direction.x());
+    std::vector<double> residuals;
+    residuals.reserve(samples.size());
+    for (const EdgeSample& sample : samples) {
+        residuals.push_back(
+            std::abs((sample.point - first->point).dot(normal_to_line)));
+    }
+    const double limit = std::max(0.75, 2.5 * median_of(residuals));
     std::vector<EdgeSample> kept;
     kept.reserve(samples.size());
     for (std::size_t i = 0; i < samples.size(); ++i) {
-        if (std::abs(offsets[i] - best_centre) <= 1.0) {
+        if (residuals[i] <= limit) {
             kept.push_back(samples[i]);
         }
     }
     if (kept.size() >= 4 && kept.size() < samples.size()) {
-        const std::optional<EdgeLine> clustered = fit_weighted_tls(kept);
-        if (clustered) {
-            return clustered;
+        const std::optional<EdgeLine> second = fit_weighted_tls(kept);
+        if (second) {
+            return second;
         }
     }
-    return fit_weighted_tls(samples);
+    return first;
 }
 
 std::optional<Eigen::Vector2d> intersect_lines(const EdgeLine& first,
@@ -401,6 +431,53 @@ struct GraySample {
     double v = 0.0;
     double value = 0.0;
 };
+
+/// Average the four side lengths and directions into an exact square with the
+/// same centroid and cyclic order. A small reversed tag's detected quad can be
+/// skewed or stretched by protruding payload cells; the published tag is a
+/// square (the perspective is mild at these scales), so this removes the
+/// per-side error at once.
+std::array<Eigen::Vector2d, 4> regularise_square(
+    const std::array<Eigen::Vector2d, 4>& quad, double side) {
+    Eigen::Vector2d center = Eigen::Vector2d::Zero();
+    for (const Eigen::Vector2d& corner : quad) {
+        center += corner;
+    }
+    center *= 0.25;
+    Eigen::Vector2d along = (quad[1] - quad[0]).normalized() +
+                            (quad[2] - quad[3]).normalized();
+    if (!(along.norm() > 1e-9)) {
+        return quad;
+    }
+    along.normalize();
+    Eigen::Vector2d across = (quad[3] - quad[0]).normalized() +
+                             (quad[2] - quad[1]).normalized();
+    across -= across.dot(along) * along;
+    if (!(across.norm() > 1e-9)) {
+        return quad;
+    }
+    across.normalize();
+    const Eigen::Vector2d half_along = along * (0.5 * side);
+    const Eigen::Vector2d half_across = across * (0.5 * side);
+    return {center - half_along - half_across,
+            center + half_along - half_across,
+            center + half_along + half_across,
+            center - half_along + half_across};
+}
+
+double average_side(const std::array<Eigen::Vector2d, 4>& quad) {
+    return 0.25 * ((quad[1] - quad[0]).norm() + (quad[2] - quad[1]).norm() +
+                   (quad[3] - quad[2]).norm() + (quad[0] - quad[3]).norm());
+}
+
+double longest_side(const std::array<Eigen::Vector2d, 4>& quad) {
+    double longest = 0.0;
+    for (std::size_t i = 0; i < quad.size(); ++i) {
+        longest = std::max(
+            longest, (quad[(i + 1) % 4] - quad[i]).norm());
+    }
+    return longest;
+}
 
 /// Bilinear intensity model `c0 + c1*u + c2*v + c3*u*v`. A plane or a
 /// threshold read from the whole tag would be fooled by a lighting gradient;
@@ -785,19 +862,30 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
     // while the long one recovers a thin reference frame when the detector's
     // initial quad sits on its inner edge (the 40 px and thin-frame cases).
     std::vector<std::array<Eigen::Vector2d, 4>> refined_quads;
+    std::vector<std::array<Eigen::Vector2d, 4>> rectified_quads;
     // The detector's own corners are already a subpixel line fit; keep them as
     // a fallback in case a short side or a notched silhouette makes the extra
     // refinement jump to a neighbouring edge.
     refined_quads.push_back(quad);
-    refined_quads.push_back(
-        refine_quad_corners(gradient, quad, 0.30, 6.0, PeakChoice::Outermost));
-    refined_quads.push_back(
-        refine_quad_corners(gradient, quad, 0.60, 9.0, PeakChoice::Outermost));
-    // The strongest-peak search can move a side inward as well as outward, which
-    // recovers a reference square whose detected edge was pushed out by a white
-    // payload cell touching the frame.
-    refined_quads.push_back(
-        refine_quad_corners(gradient, quad, 0.60, 9.0, PeakChoice::Strongest));
+    const std::array<Eigen::Vector2d, 4> short_reach =
+        refine_quad_corners(gradient, quad, 0.30, 6.0, PeakChoice::Outermost);
+    const std::array<Eigen::Vector2d, 4> long_reach =
+        refine_quad_corners(gradient, quad, 0.60, 9.0, PeakChoice::Outermost);
+    refined_quads.push_back(short_reach);
+    refined_quads.push_back(long_reach);
+    if (family.reversed_border) {
+        // The strongest-peak search can move a side inward as well as outward,
+        // recovering a reference square whose detected edge a protruding cell
+        // pushed out. The rectified squares then remove the per-side skew that
+        // a small tag's notched silhouette and protruding payload cells leave.
+        refined_quads.push_back(
+            refine_quad_corners(gradient, quad, 0.60, 9.0,
+                                PeakChoice::Strongest));
+        rectified_quads.push_back(
+            regularise_square(short_reach, average_side(short_reach)));
+        rectified_quads.push_back(
+            regularise_square(short_reach, longest_side(short_reach)));
+    }
     const int allowed = std::min(max_hamming, (family.min_hamming - 1) / 2);
 
     std::vector<double> scales{1.0};
@@ -852,6 +940,12 @@ std::optional<CodedTarget> decode_tag(const FloatImage& gray,
         evaluate(refined, results);
     }
     std::optional<HypothesisResult> best = choose(results);
+    if (!best) {
+        for (const std::array<Eigen::Vector2d, 4>& rectified : rectified_quads) {
+            evaluate(rectified, results);
+        }
+        best = choose(results);
+    }
     if (!best && family.reversed_border && family.total_width > 0) {
         // A reversed status tag's dark outer ring is only two cells wide. A
         // white payload cell on the perimeter can cut the extreme row or
