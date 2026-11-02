@@ -255,19 +255,6 @@ std::uint32_t read_circular_word(int bits, std::size_t index) {
     return index < words.size() ? words[index] : 0U;
 }
 
-/// Fill a square patch, so a target drawn with a light background keeps its
-/// own quiet zone inside a mid-grey sheet.
-void fill_patch(FloatImage& image, double cx, double cy, double half, float value) {
-    const int x0 = std::max(0, static_cast<int>(std::floor(cx - half)));
-    const int y0 = std::max(0, static_cast<int>(std::floor(cy - half)));
-    const int x1 = std::min(image.width() - 1, static_cast<int>(std::ceil(cx + half)));
-    const int y1 = std::min(image.height() - 1, static_cast<int>(std::ceil(cy + half)));
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            image.at(x, y) = value;
-        }
-    }
-}
 TEST(Markers, DetectCrossSheet) {
     const int width = 1500;
     const int height = 1200;
@@ -340,11 +327,18 @@ TEST(Markers, DetectMixedSheet) {
     const int width = 900;
     const int height = 400;
     FloatImage sheet(width, height, 0.5F);
-    // A coded circular target on its own white patch.
-    fill_patch(sheet, 150.0, 200.0, 65.0, 0.95F);
-    const test::CircularTruth circle = test::make_circular_truth(
-        150.0, 200.0, 50.0, 12, read_circular_word(12, 0), 1);
-    test::draw_circular_target(sheet, circle, 0.95F, 0.05F, 8);
+    // A non-coded circular target (a filled dark disc) on its own white patch.
+    // Coded rings are exercised by DetectsOnAllCameras and the timing test;
+    // the plain disc makes this mixed-type test independent of ring decoding.
+    const int disc_size = 100;
+    test::EllipseTruth disc;
+    disc.cx = 0.5 * static_cast<double>(disc_size);
+    disc.cy = 0.5 * static_cast<double>(disc_size);
+    disc.a = 45.0;
+    disc.b = 45.0;
+    paste(sheet,
+          test::render_ellipses(disc_size, disc_size, {disc}, 0.95F, 0.05F),
+          150 - disc_size / 2, 200 - disc_size / 2);
     // A checker cross on the mid-grey sheet.
     const int cross_size = 110;
     CrossTruth cross;
@@ -369,13 +363,13 @@ TEST(Markers, DetectMixedSheet) {
 
     const FloatImage image = gaussian_blur(sheet, 0.8F);
     // minimum_size keeps the other targets' small fiducial cells out of each
-    // decoder's candidate set; the circle is larger so its own run can use a
+    // decoder's candidate set; the disc is larger so its own run can use a
     // tighter floor that also excludes the tag's border blob.
     const std::vector<std::string> circular =
-        detect_labels(image, "Circular12", false, true, 40.0);
+        detect_labels(image, "Circular", false, true, 40.0);
     ASSERT_EQ(circular.size(), 1U) << "circular run found "
                                    << circular.size() << " targets";
-    EXPECT_EQ(circular[0].rfind("target ", 0), 0U);
+    EXPECT_EQ(circular[0], "point 1");
     const std::vector<std::string> crosses =
         detect_labels(image, "Cross", false, true, 20.0);
     ASSERT_EQ(crosses.size(), 1U) << "cross run found " << crosses.size();
