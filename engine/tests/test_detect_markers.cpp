@@ -413,7 +413,9 @@ TEST(Markers, DetectMixedSheet) {
     // Coded circular target: only Circular12 may report it.
     const int ring_size = 120;
     const test::CircularTruth ring = test::make_circular_truth(
-        0.5 * ring_size, 0.5 * ring_size, 45.0, 12, read_circular_word(12, 0), 1);
+        0.5 * static_cast<double>(ring_size),
+        0.5 * static_cast<double>(ring_size), 45.0, 12,
+        read_circular_word(12, 0), 1);
     paste(sheet, test::render_circular_target(ring_size, ring_size, ring),
           450 - ring_size / 2, height / 2 - ring_size / 2);
     // Checker cross.
@@ -428,8 +430,10 @@ TEST(Markers, DetectMixedSheet) {
           750 - cross_size / 2, height / 2 - cross_size / 2);
     // Bar cross.
     paste(sheet,
-          render_bar_cross(cross_size, cross_size, 0.5 * cross_size,
-                           0.5 * cross_size, 40.0, 8.0, 0.2, 0.95F, 0.05F, 4),
+          render_bar_cross(
+              cross_size, cross_size, 0.5 * static_cast<double>(cross_size),
+              0.5 * static_cast<double>(cross_size), 40.0, 8.0, 0.2, 0.95F,
+              0.05F, 4),
           1050 - cross_size / 2, height / 2 - cross_size / 2);
     // AprilTag 36h11 with its own white quiet zone.
     const int tag_size = test::april_tag_canvas_size(72.0);
@@ -1006,7 +1010,8 @@ TEST(Markers, DownscaledCrossesRefineAtFullResolution) {
     const int patch = 170;
     for (std::size_t i = 0; i < truths.size(); ++i) {
         const FloatImage bar = render_bar_cross(
-            patch, patch, 0.5 * patch, 0.5 * patch, 50.0, 18.0,
+            patch, patch, 0.5 * static_cast<double>(patch),
+            0.5 * static_cast<double>(patch), 50.0, 18.0,
             0.25 + 0.3 * static_cast<double>(i), 0.95F, 0.05F, 4);
         paste(bar_sheet, bar,
               static_cast<int>(truths[i].x()) - patch / 2,

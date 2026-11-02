@@ -680,9 +680,10 @@ std::size_t estimate_peak_working_set(int width, int height, int scale,
     const std::size_t reduced = scale > 1
                                     ? luminance_bytes(detect_width, detect_height)
                                     : 0;
-    const std::size_t copies = kind == MarkerKind::Cross
-                                   ? 3
-                                   : (kind == MarkerKind::AprilTag ? 2 : 1);
+    const std::size_t copies =
+        kind == MarkerKind::Cross
+            ? std::size_t{3}
+            : (kind == MarkerKind::AprilTag ? std::size_t{2} : std::size_t{1});
     return full + reduced + copies * luminance_bytes(detect_width, detect_height);
 }
 
@@ -942,6 +943,7 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
             document, jobs[static_cast<std::size_t>(i)], parsed.spec, detector,
             options.inverted, options.filter_mask, mask);
     }
+    (void)parallel_cameras;  // used only by the OpenMP `if` clause
     for (const CameraResult& result : results) {
         if (!result.error.empty()) {
             throw Error("DetectMarkers: " + result.error);
