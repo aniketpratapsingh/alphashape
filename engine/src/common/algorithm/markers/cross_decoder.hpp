@@ -22,6 +22,22 @@
 ///     orientation clusters, fitted with total least squares, and the two
 ///     near-orthogonal lines are intersected.
 ///
+/// ## Rejected look-alikes
+///
+/// Four patterns can resemble a cross without being one:
+///
+///   * **AprilTag cell corners** and **dense checkerboards** produce many
+///     adjacent saddles. A saddle is kept only when no other saddle lies
+///     within `3 * max(radius)`, so a lattice rejects itself while an isolated
+///     printed cross, whose neighbours are far away, survives.
+///   * **Square outlines, bordered squares and window rectangles** turn their
+///     corners into two perpendicular bar arms. Requiring the intersection to
+///     lie between 20 % and 80 % of both arms rejects an endpoint (a corner).
+///   * **Checkerboard crossings** can still form two perpendicular ridge
+///     lines. A bar cross additionally requires the four diagonal quadrants to
+///     be a uniform background; a checkerboard's quadrants alternate and fail
+///     that test.
+///
 /// The image is expected in [0, 1]. `inverted` selects light targets on a dark
 /// background; the detector inverts the image internally, so callers never
 /// have to do it. `detect_crosses` returns `CodedTarget` values with
@@ -53,7 +69,23 @@ struct CrossParams {
     double min_response = 0.0;
 };
 
-/// Detect every cross target in `gray`. Results are sorted by centre y then x.
+/// How a cross was found, which decides its full-resolution refinement.
+enum class CrossStyle {
+    Saddle,  ///< Checker/bowtie cross, refined by a quadratic saddle fit.
+    Bar,     ///< Two fitted ridge lines, refined by re-fitting them locally.
+};
+
+struct CrossDetection {
+    CodedTarget target;
+    CrossStyle style = CrossStyle::Saddle;
+};
+
+/// Detect every cross target in `gray`, tagging each with its style. Results
+/// are sorted by centre y then x.
+std::vector<CrossDetection> detect_crosses_styled(
+    const FloatImage& gray, const CrossParams& params = {});
+
+/// Same detections without the style tags.
 std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
                                         const CrossParams& params = {});
 
@@ -64,5 +96,12 @@ std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
 std::optional<Eigen::Vector2d> refine_cross_center(const FloatImage& gray,
                                                     const Eigen::Vector2d& approximate,
                                                     double radius_hint);
+
+/// Re-refine one bar cross at `approximate`. The local window is blurred,
+/// Steger ridge points are re-found near each arm, the two lines are fitted
+/// and intersected. Returns nullopt when either line cannot be recovered.
+std::optional<Eigen::Vector2d> refine_bar_cross_center(
+    const FloatImage& gray, const Eigen::Vector2d& approximate,
+    double radius_hint);
 
 }  // namespace alphashape

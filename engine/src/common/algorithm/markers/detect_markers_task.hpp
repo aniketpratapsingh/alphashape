@@ -5,7 +5,10 @@
 /// (WP-13.8).
 ///
 /// The task detects printed targets in each selected camera, resolves them to
-/// markers and adds the image measurements as ONE undoable CommandTransaction.
+/// markers and builds ONE CommandTransaction("Detect Markers"). Like
+/// ImportMarkers, the task applies that transaction directly to the document;
+/// it is a single atomic mutation, and a host that wants an undo entry can call
+/// plan_detect_markers() and execute the returned command on its UndoStack.
 ///
 /// ## Tolerances
 ///
@@ -39,9 +42,10 @@
 /// on the reduced image and the centre is refined again at full resolution.
 
 #include <cstddef>
-#include <functional>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/algorithm/markers/tag_families.hpp"
 #include "common/commands/command.hpp"
@@ -58,14 +62,45 @@ struct DetectMarkersStats {
     std::size_t attached = 0;
     std::size_t dropped = 0;
 };
-DetectMarkersStats detect_markers_last_stats();
 
-/// Host/test hook. When set, the task hands its single undoable command here
-/// instead of applying it, so the host can execute it on an UndoStack and make
-/// the whole run one undo step. An empty function restores direct application.
-using DetectMarkersCommandSink =
-    std::function<void(Document&, std::unique_ptr<AbstractCommand>)>;
-void set_detect_markers_command_sink(DetectMarkersCommandSink sink);
+/// Everything the task reads from `Params`, resolved and converted. Hosts can
+/// build this directly to stage a detection without a task run.
+struct DetectMarkersOptions {
+    std::string target_type = "Circular12";
+    double tolerance = 50.0;
+    bool inverted = false;
+    bool noparity = false;
+    double minimum_size = 0.0;
+    double minimum_dist = 5.0;
+    double maximum_residual = 5.0;
+    bool create_markers = true;
+    std::vector<std::string> cameras;
+    std::vector<std::string> frames;
+    bool filter_mask = true;
+    int marker_downscale = 0;
+};
+
+/// The staged result of one detection pass. `command` is a single
+/// CommandTransaction("Detect Markers") holding every added marker and
+/// projection, or null when the pass produced no assignment. The caller owns
+/// it: the task applies it directly, exactly like ImportMarkers, while a host
+/// or test may instead pass it to an UndoStack to make the run one undo step.
+struct DetectMarkersPlan {
+    std::unique_ptr<AbstractCommand> command;
+    DetectMarkersStats stats;
+    int max_hamming = 0;
+};
+
+/// Detect, resolve and stage a command for `chunk_id`. Pure with respect to the
+/// document: it reads frames and the chunk but never applies `command`.
+///
+/// Memory rule: an image above 8 MP makes the camera loop run one camera at a
+/// time (the outer OpenMP `if` is false), so only one full-resolution buffer
+/// per large camera exists; each camera's internal image passes may still use
+/// all threads. A smaller image keeps the normal parallel camera loop.
+DetectMarkersPlan plan_detect_markers(const Document& document,
+                                      std::int32_t chunk_id,
+                                      const DetectMarkersOptions& options);
 
 class DetectMarkersTask : public AbstractTask {
 public:

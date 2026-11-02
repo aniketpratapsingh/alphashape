@@ -139,17 +139,15 @@ std::string valid_target_names() {
     return text;
 }
 
-FloatImage invert_luminance(const FloatImage& gray) {
-    FloatImage out(gray.width(), gray.height(), 0.0F);
-    for (int y = 0; y < gray.height(); ++y) {
-        for (int x = 0; x < gray.width(); ++x) {
-            out.at(x, y) = 1.0F - gray.at(x, y);
-        }
+void invert_in_place(FloatImage& gray) {
+    for (float& value : gray.pixels()) {
+        value = 1.0F - value;
     }
-    return out;
 }
 
-FloatImage box_downsample(const FloatImage& source, int factor) {
+/// Box average. `invert` folds the polarity change into the same pass, so a
+/// full-resolution luminance and its inverted copy never coexist.
+FloatImage box_downsample(const FloatImage& source, int factor, bool invert = false) {
     if (factor <= 1) {
         return source;
     }
@@ -166,7 +164,8 @@ FloatImage box_downsample(const FloatImage& source, int factor) {
                         source.at(x * factor + dx, y * factor + dy));
                 }
             }
-            out.at(x, y) = static_cast<float>(sum / total);
+            const double value = sum / total;
+            out.at(x, y) = static_cast<float>(invert ? 1.0 - value : value);
         }
     }
     return out;
@@ -177,6 +176,7 @@ struct Detection {
     double radius = 0.0;
     int hamming = 0;
     bool coded = false;
+    CrossStyle cross_style = CrossStyle::Saddle;
     // Eigen's default constructor leaves its scalars uninitialised, and a
     // plain `corners{}` therefore still holds indeterminate doubles; GCC's
     // -Wmaybe-uninitialized reports that when a Detection is copied. List all
@@ -272,13 +272,14 @@ std::vector<Detection> detect_cross_targets(const FloatImage& image,
     cross.minimum_size = params.minimum_size;
     cross.minimum_dist = params.minimum_dist;
     std::vector<Detection> out;
-    for (const CodedTarget& target : detect_crosses(image, cross)) {
-        if (target.radius_px < params.minimum_size) {
+    for (const CrossDetection& found : detect_crosses_styled(image, cross)) {
+        if (found.target.radius_px < params.minimum_size) {
             continue;
         }
         Detection detection;
-        detection.center = target.center;
-        detection.radius = target.radius_px;
+        detection.center = found.target.center;
+        detection.radius = found.target.radius_px;
+        detection.cross_style = found.style;
         out.push_back(detection);
     }
     return out;
@@ -334,46 +335,116 @@ std::vector<Detection> suppress_duplicates(std::vector<Detection> detections,
     });
     return out;
 }
-void refine_full_resolution(std::vector<Detection>& detections, double scale,
-                            const TargetSpec& spec, const FloatImage& full,
-                            const GradientField& gradient, int max_hamming) {
-    if (!(scale > 1.0)) {
-        return;
+struct RefinementWindow {
+    FloatImage image;
+    int x0 = 0;
+    int y0 = 0;
+};
+
+int window_half(const TargetSpec& spec, double radius) {
+    const double margin = spec.kind == MarkerKind::AprilTag
+                              ? 2.5 * radius + 10.0
+                              : 2.2 * radius + 10.0;
+    return static_cast<int>(std::ceil(std::max(10.0, margin)));
+}
+
+RefinementWindow crop_refinement_window(const FloatImage& source,
+                                        const Eigen::Vector2d& center,
+                                        double radius, const TargetSpec& spec,
+                                        bool invert) {
+    RefinementWindow window;
+    const Eigen::Vector2d point = center - Eigen::Vector2d(0.5, 0.5);
+    const int half = window_half(spec, radius);
+    int x0 = static_cast<int>(std::floor(point.x())) - half;
+    int y0 = static_cast<int>(std::floor(point.y())) - half;
+    x0 = std::clamp(x0, 0, std::max(0, source.width() - 1));
+    y0 = std::clamp(y0, 0, std::max(0, source.height() - 1));
+    const int x1 = std::min(source.width() - 1, x0 + 2 * half);
+    const int y1 = std::min(source.height() - 1, y0 + 2 * half);
+    window.x0 = x0;
+    window.y0 = y0;
+    window.image = FloatImage(std::max(0, x1 - x0 + 1),
+                              std::max(0, y1 - y0 + 1), 0.0F);
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            const float value = source.at(x, y);
+            window.image.at(x - x0, y - y0) = invert ? 1.0F - value : value;
+        }
     }
+    return window;
+}
+
+/// Map reduced-image detections to full resolution and copy only the small
+/// windows refinement will read. The caller may then release the full image.
+void map_and_crop_refinement(std::vector<Detection>& detections, double scale,
+                             const TargetSpec& spec, const FloatImage& full,
+                             bool invert,
+                             std::vector<RefinementWindow>& windows) {
+    windows.clear();
+    windows.reserve(detections.size());
     for (Detection& detection : detections) {
         detection.center *= scale;
         detection.radius *= scale;
+        if (spec.kind == MarkerKind::AprilTag) {
+            for (Eigen::Vector2d& corner : detection.corners) {
+                corner *= scale;
+            }
+        }
+        windows.push_back(crop_refinement_window(full, detection.center,
+                                                 detection.radius, spec, invert));
+    }
+}
+
+void refine_from_windows(std::vector<Detection>& detections,
+                         const TargetSpec& spec,
+                         const std::vector<RefinementWindow>& windows,
+                         int max_hamming) {
+    for (std::size_t i = 0; i < detections.size(); ++i) {
+        Detection& detection = detections[i];
+        const RefinementWindow& window = windows[i];
+        const Eigen::Vector2d offset(static_cast<double>(window.x0),
+                                     static_cast<double>(window.y0));
+        const Eigen::Vector2d local = detection.center - offset;
         if (spec.kind == MarkerKind::Cross) {
-            if (auto refined =
-                    refine_cross_center(full, detection.center, detection.radius)) {
-                detection.center = *refined;
+            const auto refined = detection.cross_style == CrossStyle::Bar
+                                     ? refine_bar_cross_center(
+                                           window.image, local, detection.radius)
+                                     : refine_cross_center(window.image, local,
+                                                           detection.radius);
+            if (refined) {
+                detection.center = *refined + offset;
             }
         } else if (spec.kind == MarkerKind::AprilTag) {
             if (!detection.has_corners) {
                 continue;
             }
             MarkerCandidate quad;
-            quad.center = detection.center;
+            quad.center = local;
             quad.radius_px = detection.radius;
-            for (std::size_t i = 0; i < 4U; ++i) {
-                quad.corners.push_back(detection.corners[i] * scale);
+            for (const Eigen::Vector2d& corner : detection.corners) {
+                quad.corners.push_back(corner - offset);
             }
-            const auto decoded =
-                decode_tag(full, gradient, quad, tag_family(spec.family), max_hamming);
+            const GradientField gradient = compute_gradient_field(window.image);
+            const auto decoded = decode_tag(window.image, gradient, quad,
+                                            tag_family(spec.family), max_hamming);
             if (decoded) {
-                detection.center = decoded->center;
+                detection.center = decoded->center + offset;
                 detection.radius = decoded->radius_px;
                 detection.hamming = decoded->hamming;
-                detection.corners = decoded->corners;
+                for (std::size_t corner = 0; corner < 4U; ++corner) {
+                    detection.corners[corner] =
+                        decoded->corners[corner] + offset;
+                }
                 detection.has_corners = decoded->has_corners;
             }
         } else {
             MarkerCandidate seed;
-            seed.center = detection.center;
+            seed.center = local;
             seed.radius_px = detection.radius;
             seed.axis_ratio = 1.0;
+            const GradientField gradient = compute_gradient_field(window.image);
             if (auto refined = refine_ellipse_center(gradient, seed)) {
-                detection.center = *refined;
+                detection.center = *refined + offset;
             }
         }
     }
@@ -385,6 +456,20 @@ std::filesystem::path resolve_frame_path(const Document& document,
         return recorded;
     }
     return std::filesystem::path(document.path()).parent_path() / recorded;
+}
+
+const Chunk* find_chunk_by_id(const Document& document, std::int32_t chunk_id) {
+    for (const auto& workspace : document.workspaces()) {
+        if (!workspace) {
+            continue;
+        }
+        for (const auto& chunk : workspace->chunks()) {
+            if (chunk && chunk->id() == chunk_id) {
+                return chunk.get();
+            }
+        }
+    }
+    return nullptr;
 }
 
 const Frame* frame_of_camera(const Chunk& chunk, std::int32_t camera_id) {
@@ -559,19 +644,6 @@ int apriltag_max_hamming(double tolerance, AprilTagFamily family) {
 }
 
 namespace {
-DetectMarkersStats g_last_stats;
-DetectMarkersCommandSink g_command_sink;
-}  // namespace
-
-DetectMarkersStats detect_markers_last_stats() {
-    return g_last_stats;
-}
-
-void set_detect_markers_command_sink(DetectMarkersCommandSink sink) {
-    g_command_sink = std::move(sink);
-}
-
-namespace {
 
 struct CameraJob {
     const Camera* camera = nullptr;
@@ -590,42 +662,78 @@ int auto_scale(int width, int height) {
     return std::max(1, (long_side + 4095) / 4096);
 }
 
+std::size_t luminance_bytes(int width, int height) {
+    return static_cast<std::size_t>(width) * static_cast<std::size_t>(height) *
+           sizeof(float);
+}
+
+/// Buffers that coexist while one camera is detected: the full luminance, the
+/// reduced detection image (when downscaled), and the detector's own working
+/// copies at detection size. Windows used for full-resolution refinement are
+/// allocated only after the full image and its reduced copy are released, so
+/// they are bounded by a few thousand pixels each and do not add a full image.
+std::size_t estimate_peak_working_set(int width, int height, int scale,
+                                      MarkerKind kind) {
+    const std::size_t full = luminance_bytes(width, height);
+    const int detect_width = scale > 1 ? width / scale : width;
+    const int detect_height = scale > 1 ? height / scale : height;
+    const std::size_t reduced = scale > 1
+                                    ? luminance_bytes(detect_width, detect_height)
+                                    : 0;
+    const std::size_t copies = kind == MarkerKind::Cross
+                                   ? 3
+                                   : (kind == MarkerKind::AprilTag ? 2 : 1);
+    return full + reduced + copies * luminance_bytes(detect_width, detect_height);
+}
+
 CameraResult process_camera(const Document& document, const CameraJob& job,
                             const TargetSpec& spec, const DetectorParams& params,
                             bool inverted, bool filter_mask, const Mask* mask) {
     CameraResult result;
     try {
-        const FloatImage luminance =
+        FloatImage luminance =
             read_image(resolve_frame_path(document, job.frame->path()).string())
                 .to_luminance();
-        FloatImage inverted_image;
-        const FloatImage* full = &luminance;
-        if (inverted) {
-            inverted_image = invert_luminance(luminance);
-            full = &inverted_image;
-        }
-        FloatImage reduced;
-        const FloatImage* detect_image = full;
-        int scale = job.scale > 0 ? job.scale : auto_scale(full->width(), full->height());
-        if (scale > 1 && (full->width() / scale < 8 || full->height() / scale < 8)) {
+        const int width = luminance.width();
+        const int height = luminance.height();
+        int scale = job.scale > 0 ? job.scale : auto_scale(width, height);
+        if (scale > 1 && (width / scale < 8 || height / scale < 8)) {
             scale = 1;
+        }
+        const std::size_t estimated =
+            estimate_peak_working_set(width, height, scale, spec.kind);
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info)
+                << "DetectMarkers: " << job.camera->label << " " << width << "x"
+                << height << " estimated peak working set " << estimated
+                << " bytes (" << (static_cast<double>(estimated) /
+                                  (1024.0 * 1024.0))
+                << " MB)";
         }
         // minimum_size and minimum_dist are expressed in full-resolution
         // pixels; the detectors see the reduced image, so scale both.
         DetectorParams detector = params;
+        FloatImage reduced;
+        FloatImage* detect_image = &luminance;
         if (scale > 1) {
-            reduced = box_downsample(*full, scale);
+            reduced = box_downsample(luminance, scale, inverted);
             detect_image = &reduced;
             detector.minimum_size = params.minimum_size / static_cast<double>(scale);
             detector.minimum_dist = params.minimum_dist / static_cast<double>(scale);
+        } else if (inverted) {
+            // Invert the only full-resolution buffer in place: no second copy.
+            invert_in_place(luminance);
         }
         std::vector<Detection> detections =
             suppress_duplicates(detect_in_image(*detect_image, spec, detector),
                                 detector.minimum_dist);
         if (scale > 1) {
-            const GradientField gradient = compute_gradient_field(*full);
-            refine_full_resolution(detections, scale, spec, *full, gradient,
-                                   params.max_hamming);
+            std::vector<RefinementWindow> windows;
+            map_and_crop_refinement(detections, scale, spec, luminance, inverted,
+                                    windows);
+            luminance = FloatImage();  // release the full-resolution buffer
+            reduced = FloatImage();
+            refine_from_windows(detections, spec, windows, params.max_hamming);
         }
         if (filter_mask && mask != nullptr) {
             detections.erase(
@@ -692,8 +800,11 @@ void DetectMarkersTask::declare_params(Params& params) const {
                     "Skip detections whose centre is excluded by the camera mask."});
     ParamSpec downscale{"marker_downscale", ParamType::Int, std::int64_t{0},
                         "Detection downscale factor. 0 selects the smallest integer d "
-                        "with long_side / d <= 4096; the centre is refined at full "
-                        "resolution either way."};
+                        "with long_side / d <= 4096. Every style is then refined at "
+                        "full resolution in a small local window: circular centres by "
+                        "an ellipse fit, checker crosses by a saddle fit, bar crosses "
+                        "by re-fitting both ridge lines, and AprilTags by re-decoding "
+                        "the quad."};
     downscale.minimum = std::int64_t{0};
     downscale.maximum = std::int64_t{1024};
     params.declare(downscale);
@@ -703,9 +814,11 @@ std::vector<Stage> DetectMarkersTask::stages() const {
     return {Stage{"detect", 0}, Stage{"apply", 0}};
 }
 
-void DetectMarkersTask::apply(Document& document, Params& params,
-                              const Progress& progress) {
-    const std::string target_text = params.get_string("target_type");
+DetectMarkersPlan plan_detect_markers(const Document& document,
+                                      std::int32_t chunk_id,
+                                      const DetectMarkersOptions& options) {
+    DetectMarkersPlan plan;
+    const std::string& target_text = options.target_type;
     const ParsedTarget parsed = parse_target(target_text);
     if (parsed.circle21_unsupported) {
         throw ValueError(
@@ -717,49 +830,40 @@ void DetectMarkersTask::apply(Document& document, Params& params,
         throw ValueError("DetectMarkers: unknown target_type '" + target_text +
                          "'; valid values are: " + valid_target_names());
     }
-    const double tolerance = params.get_float("tolerance");
-    if (!(tolerance >= 0.0 && tolerance <= 100.0)) {
+    if (!(options.tolerance >= 0.0 && options.tolerance <= 100.0)) {
         throw ValueError("DetectMarkers: tolerance must be in [0, 100]");
     }
-    const double minimum_size = params.get_float("minimum_size");
-    if (!(minimum_size >= 0.0)) {
+    if (!(options.minimum_size >= 0.0)) {
         throw ValueError("DetectMarkers: minimum_size must be non-negative");
     }
-    const double minimum_dist = params.get_float("minimum_dist");
-    if (!(minimum_dist >= 0.0)) {
+    if (!(options.minimum_dist >= 0.0)) {
         throw ValueError("DetectMarkers: minimum_dist must be non-negative");
     }
-    const double maximum_residual = params.get_float("maximum_residual");
-    if (!(maximum_residual >= 0.0)) {
+    if (!(options.maximum_residual >= 0.0)) {
         throw ValueError("DetectMarkers: maximum_residual must be non-negative");
     }
-    const std::int64_t downscale_value = params.get_int("marker_downscale");
-    if (downscale_value < 0 || downscale_value > 1024) {
+    if (options.marker_downscale < 0 || options.marker_downscale > 1024) {
         throw ValueError("DetectMarkers: marker_downscale must be in [0, 1024]");
     }
-    const bool inverted = params.get_bool("inverted");
-    const bool noparity = params.get_bool("noparity");
-    const bool create_markers = params.get_bool("create_markers");
-    const bool filter_mask = params.get_bool("filter_mask");
 
     DetectorParams detector;
-    detector.noparity = noparity;
-    detector.minimum_size = minimum_size;
-    detector.minimum_dist = minimum_dist;
+    detector.noparity = options.noparity;
+    detector.minimum_size = options.minimum_size;
+    detector.minimum_dist = options.minimum_dist;
     if (parsed.spec.kind == MarkerKind::AprilTag) {
-        detector.max_hamming = apriltag_max_hamming(tolerance, parsed.spec.family);
+        detector.max_hamming =
+            apriltag_max_hamming(options.tolerance, parsed.spec.family);
     } else if (parsed.spec.kind == MarkerKind::CircularCoded) {
-        detector.max_hamming = circular_max_hamming(tolerance);
+        detector.max_hamming = circular_max_hamming(options.tolerance);
     }
+    plan.max_hamming = detector.max_hamming;
 
-    Chunk* chunk = document.active_chunk();
+    const Chunk* chunk = find_chunk_by_id(document, chunk_id);
     if (chunk == nullptr) {
         throw Error("DetectMarkers needs an active chunk");
     }
-    const std::vector<std::string> camera_filter =
-        params.get_string_list("cameras");
-    const std::vector<std::string> frame_filter =
-        params.get_string_list("frames");
+    const std::vector<std::string>& camera_filter = options.cameras;
+    const std::vector<std::string>& frame_filter = options.frames;
     std::vector<std::string> problems;
     for (const std::string& label : camera_filter) {
         bool found = false;
@@ -801,7 +905,7 @@ void DetectMarkersTask::apply(Document& document, Params& params,
         job.frame = frame;
         job.calibration =
             &chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
-        job.scale = static_cast<int>(downscale_value);
+        job.scale = options.marker_downscale;
         jobs.push_back(job);
     }
     if (!problems.empty()) {
@@ -811,28 +915,38 @@ void DetectMarkersTask::apply(Document& document, Params& params,
         throw ValueError("DetectMarkers: frames filter matched no camera");
     }
 
-    progress.update("detect", 0.0);
-    const auto started = std::chrono::steady_clock::now();
+    // Memory rule: a camera above 8 MP is processed alone so only one
+    // full-resolution luminance buffer is live. The `if` clause keeps the
+    // loop serial in that case, and each camera's internal OpenMP image passes
+    // can still use every thread because no outer parallel region is open.
+    bool parallel_cameras = true;
+    for (const CameraJob& job : jobs) {
+        if (job.frame != nullptr &&
+            static_cast<std::int64_t>(job.frame->width()) *
+                    static_cast<std::int64_t>(job.frame->height()) >
+                8ll * 1024ll * 1024ll) {
+            parallel_cameras = false;
+            break;
+        }
+    }
     std::vector<CameraResult> results(jobs.size());
     const int count = static_cast<int>(jobs.size());
 #if defined(ALPHASHAPE_HAVE_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1) if(parallel_cameras)
 #endif
     for (int i = 0; i < count; ++i) {
         const Camera& camera = *jobs[static_cast<std::size_t>(i)].camera;
-        const Mask* mask = filter_mask ? mask_of_camera(*chunk, camera.id) : nullptr;
+        const Mask* mask =
+            options.filter_mask ? mask_of_camera(*chunk, camera.id) : nullptr;
         results[static_cast<std::size_t>(i)] = process_camera(
             document, jobs[static_cast<std::size_t>(i)], parsed.spec, detector,
-            inverted, filter_mask, mask);
+            options.inverted, options.filter_mask, mask);
     }
     for (const CameraResult& result : results) {
         if (!result.error.empty()) {
             throw Error("DetectMarkers: " + result.error);
         }
     }
-    progress.update("detect", 1.0);
-
-    progress.update("apply", 0.0);
     std::map<std::string, std::int32_t> ids;
     ProjectedCameras projected;
     LabelState labels;
@@ -843,12 +957,11 @@ void DetectMarkersTask::apply(Document& document, Params& params,
             projected[marker.label].insert(projection.camera_id);
         }
     }
-    DetectMarkersStats stats;
     std::vector<Assignment> commands;
     for (std::size_t i = 0; i < jobs.size(); ++i) {
         const CameraJob& job = jobs[i];
         const std::vector<Detection>& detections = results[i].detections;
-        stats.detected += detections.size();
+        plan.stats.detected += detections.size();
         Predictions predictions;
         for (const Marker& marker : chunk->markers()) {
             if (!marker.position.has_value()) {
@@ -860,43 +973,72 @@ void DetectMarkersTask::apply(Document& document, Params& params,
                 predictions.emplace_back(marker.label, *pixel);
             }
         }
-        const CameraPlan plan =
+        const CameraPlan camera_plan =
             plan_camera(detections, job.camera->id, predictions, ids, projected,
-                        maximum_residual, create_markers, labels);
-        stats.created += plan.created;
-        stats.dropped += plan.dropped;
-        for (const Assignment& assignment : plan.assignments) {
+                        options.maximum_residual, options.create_markers, labels);
+        plan.stats.created += camera_plan.created;
+        plan.stats.dropped += camera_plan.dropped;
+        for (const Assignment& assignment : camera_plan.assignments) {
             if (assignment.existing) {
-                ++stats.attached;
+                ++plan.stats.attached;
             }
             commands.push_back(assignment);
         }
     }
     if (!commands.empty()) {
-        auto transaction = std::make_unique<CommandTransaction>("Detect Markers");
+        auto transaction =
+            std::make_unique<CommandTransaction>("Detect Markers");
         for (const Assignment& assignment : commands) {
             transaction->add(make_add_marker_with_projection_command(
                 chunk->id(), assignment.label, assignment.camera_id,
                 assignment.pixel, false));
         }
-        if (g_command_sink) {
-            g_command_sink(document, std::move(transaction));
-        } else {
-            transaction->apply(document);
-        }
+        plan.command = std::move(transaction);
+    }
+    return plan;
+}
+
+void DetectMarkersTask::apply(Document& document, Params& params,
+                              const Progress& progress) {
+    DetectMarkersOptions options;
+    options.target_type = params.get_string("target_type");
+    options.tolerance = params.get_float("tolerance");
+    options.inverted = params.get_bool("inverted");
+    options.noparity = params.get_bool("noparity");
+    options.minimum_size = params.get_float("minimum_size");
+    options.minimum_dist = params.get_float("minimum_dist");
+    options.maximum_residual = params.get_float("maximum_residual");
+    options.create_markers = params.get_bool("create_markers");
+    options.cameras = params.get_string_list("cameras");
+    options.frames = params.get_string_list("frames");
+    options.filter_mask = params.get_bool("filter_mask");
+    const std::int64_t downscale = params.get_int("marker_downscale");
+    if (downscale < 0 || downscale > 1024) {
+        throw ValueError("DetectMarkers: marker_downscale must be in [0, 1024]");
+    }
+    options.marker_downscale = static_cast<int>(downscale);
+
+    progress.update("detect", 0.0);
+    const auto started = std::chrono::steady_clock::now();
+    DetectMarkersPlan plan =
+        plan_detect_markers(document, document.active_chunk_id(), options);
+    progress.update("detect", 1.0);
+
+    progress.update("apply", 0.0);
+    if (plan.command) {
+        plan.command->apply(document);
     }
     progress.update("apply", 1.0);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
-    g_last_stats = stats;
     if (Log::enabled(LogLevel::Info)) {
-        log(LogLevel::Info) << "DetectMarkers: target " << target_text
-                            << " max_hamming " << detector.max_hamming;
-        log(LogLevel::Info) << "DetectMarkers: detected " << stats.detected
-                            << ", created " << stats.created << ", attached "
-                            << stats.attached << ", dropped " << stats.dropped
-                            << " in " << seconds << " s";
+        log(LogLevel::Info) << "DetectMarkers: target " << options.target_type
+                            << " max_hamming " << plan.max_hamming;
+        log(LogLevel::Info) << "DetectMarkers: detected " << plan.stats.detected
+                            << ", created " << plan.stats.created << ", attached "
+                            << plan.stats.attached << ", dropped "
+                            << plan.stats.dropped << " in " << seconds << " s";
     }
 }
 

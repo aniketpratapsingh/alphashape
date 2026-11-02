@@ -142,6 +142,7 @@ struct CrossCandidate {
     Eigen::Vector2d center = Eigen::Vector2d::Zero();  ///< Calibration convention.
     double radius = 0.0;
     double response = 0.0;
+    CrossStyle style = CrossStyle::Saddle;
 };
 
 std::optional<CrossCandidate> evaluate_saddle(const FloatImage& image,
@@ -267,15 +268,16 @@ std::vector<CrossCandidate> find_saddles(const FloatImage& image,
     }
     return out;
 }
-/// Reject saddles that belong to a dense lattice: an AprilTag cell corner has
-/// four or more sibling saddles within three target radii. A printed GCP cross
-/// is isolated, so this guard is what keeps fiducial cell corners out of the
-/// Cross result. Then suppress duplicates closer than `minimum_dist`.
+/// Reject saddles that belong to a lattice. An AprilTag cell corner, a
+/// checkerboard cell corner and every other dense fiducial corner has at least
+/// one sibling saddle within three target radii. A printed GCP cross is
+/// isolated, so requiring zero such neighbours removes the whole lattice
+/// rather than only the corner with four or more siblings. Duplicates closer
+/// than `minimum_dist` are suppressed afterwards.
 std::vector<CrossCandidate> filter_saddles(std::vector<CrossCandidate> candidates,
                                             double minimum_dist) {
     std::vector<char> keep(candidates.size(), 1);
     for (std::size_t i = 0; i < candidates.size(); ++i) {
-        int neighbours = 0;
         for (std::size_t j = 0; j < candidates.size(); ++j) {
             if (i == j) {
                 continue;
@@ -283,11 +285,9 @@ std::vector<CrossCandidate> filter_saddles(std::vector<CrossCandidate> candidate
             const double reach =
                 3.0 * std::max(candidates[i].radius, candidates[j].radius);
             if ((candidates[i].center - candidates[j].center).norm() <= reach) {
-                ++neighbours;
+                keep[i] = 0;
+                break;
             }
-        }
-        if (neighbours >= 4) {
-            keep[i] = 0;
         }
     }
     std::vector<std::size_t> order(candidates.size());
@@ -612,16 +612,50 @@ std::vector<CrossCandidate> find_bar_crosses(const FloatImage& image,
         if (candidate.radius < std::max(6.0, params.minimum_size)) {
             continue;
         }
+        // A bar cross has dark pixels along both arms and one uniform
+        // background in all four quadrants. A checkerboard crossing has the
+        // same two ridge lines but alternating quadrants, so its four
+        // diagonal samples span nearly the full contrast.
+        const Eigen::Vector2d diagonal_a =
+            (line_a->tangent + line_b->tangent).normalized();
+        const Eigen::Vector2d diagonal_b =
+            (line_a->tangent - line_b->tangent).normalized();
+        const double probe = 0.5 * candidate.radius;
+        std::array<double, 4> quadrants{};
+        for (int i = 0; i < 4; ++i) {
+            const Eigen::Vector2d direction =
+                (i & 1) == 0 ? diagonal_a : diagonal_b;
+            const double sign = (i & 2) == 0 ? 1.0 : -1.0;
+            quadrants[static_cast<std::size_t>(i)] = static_cast<double>(
+                image.sample(static_cast<float>(centre->x() + sign * probe * direction.x()),
+                             static_cast<float>(centre->y() + sign * probe * direction.y())));
+        }
+        const auto [low, high] =
+            std::minmax_element(quadrants.begin(), quadrants.end());
+        const double background =
+            0.25 * (quadrants[0] + quadrants[1] + quadrants[2] + quadrants[3]);
+        const double arm_a = static_cast<double>(image.sample(
+            static_cast<float>(centre->x() + probe * line_a->tangent.x()),
+            static_cast<float>(centre->y() + probe * line_a->tangent.y())));
+        const double arm_b = static_cast<double>(image.sample(
+            static_cast<float>(centre->x() + probe * line_b->tangent.x()),
+            static_cast<float>(centre->y() + probe * line_b->tangent.y())));
+        const double contrast =
+            std::max(std::abs(background - arm_a), std::abs(background - arm_b));
+        if (!(contrast > 0.05) || *high - *low > 0.35 * contrast) {
+            continue;
+        }
         candidate.response = static_cast<double>(group.size());
+        candidate.style = CrossStyle::Bar;
         out.push_back(candidate);
     }
     return out;
 }
 }  // namespace
 
-std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
-                                        const CrossParams& params) {
-    std::vector<CodedTarget> out;
+std::vector<CrossDetection> detect_crosses_styled(const FloatImage& gray,
+                                                  const CrossParams& params) {
+    std::vector<CrossDetection> out;
     if (gray.width() < 9 || gray.height() < 9) {
         return out;
     }
@@ -661,7 +695,19 @@ std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
         // vectors when this object is copied into the vector; filling them
         // makes the write explicit and silences it (the member is `{}`).
         target.corners.fill(Eigen::Vector2d::Zero());
-        out.push_back(target);
+        CrossDetection detection;
+        detection.target = target;
+        detection.style = candidate.style;
+        out.push_back(detection);
+    }
+    return out;
+}
+
+std::vector<CodedTarget> detect_crosses(const FloatImage& gray,
+                                        const CrossParams& params) {
+    std::vector<CodedTarget> out;
+    for (const CrossDetection& detection : detect_crosses_styled(gray, params)) {
+        out.push_back(detection.target);
     }
     return out;
 }
@@ -694,6 +740,117 @@ std::optional<Eigen::Vector2d> refine_cross_center(const FloatImage& gray,
     }
     return refined->position + Eigen::Vector2d(static_cast<double>(x0) + 0.5,
                                                static_cast<double>(y0) + 0.5);
+}
+
+std::optional<Eigen::Vector2d> refine_bar_cross_center(
+    const FloatImage& gray, const Eigen::Vector2d& approximate,
+    double radius_hint) {
+    const Eigen::Vector2d point = approximate - Eigen::Vector2d(0.5, 0.5);
+    const int half =
+        static_cast<int>(std::ceil(std::max(12.0, 2.0 * radius_hint + 8.0)));
+    const int x0 = std::max(0, static_cast<int>(std::floor(point.x())) - half);
+    const int y0 = std::max(0, static_cast<int>(std::floor(point.y())) - half);
+    const int x1 = std::min(gray.width() - 1, x0 + 2 * half);
+    const int y1 = std::min(gray.height() - 1, y0 + 2 * half);
+    if (x1 <= x0 || y1 <= y0) {
+        return std::nullopt;
+    }
+    FloatImage crop(x1 - x0 + 1, y1 - y0 + 1, 0.0F);
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            crop.at(x - x0, y - y0) = gray.at(x, y);
+        }
+    }
+    // Match the blur used before the global bar pass: a flat-topped bar only
+    // becomes a curvature extremum at roughly half its width.
+    const FloatImage smoothed = gaussian_blur(crop, 3.0F);
+    const Eigen::Vector2d seed(point.x() - static_cast<double>(x0),
+                               point.y() - static_cast<double>(y0));
+    const std::vector<RidgePoint> all_points = find_ridge_points(smoothed);
+    const double reach = 1.6 * std::max(radius_hint, 8.0) + 10.0;
+    std::vector<int> points;
+    for (std::size_t i = 0; i < all_points.size(); ++i) {
+        if ((all_points[i].position - seed).norm() <= reach) {
+            points.push_back(static_cast<int>(i));
+        }
+    }
+    if (points.size() < 16U) {
+        return std::nullopt;
+    }
+    const std::vector<int> arm_a = select_line(all_points, points, 1.5);
+    if (arm_a.size() < 8U) {
+        return std::nullopt;
+    }
+    std::vector<int> remaining;
+    for (const int index : points) {
+        if (std::find(arm_a.begin(), arm_a.end(), index) == arm_a.end()) {
+            remaining.push_back(index);
+        }
+    }
+    const std::vector<int> arm_b = select_line(all_points, remaining, 1.5);
+    if (arm_b.size() < 8U) {
+        return std::nullopt;
+    }
+    const auto line_a = fit_ridge_line(all_points, arm_a);
+    const auto line_b = fit_ridge_line(all_points, arm_b);
+    if (!line_a || !line_b || line_a->rms > 1.5 || line_b->rms > 1.5) {
+        return std::nullopt;
+    }
+    if (std::abs(line_a->tangent.dot(line_b->tangent)) > 0.258819) {
+        return std::nullopt;
+    }
+    const auto first_centre = intersect_lines(*line_a, *line_b);
+    if (!first_centre) {
+        return std::nullopt;
+    }
+    // Refit both lines without the central region, where ridge points from one
+    // arm contaminate the other arm's fit.
+    const double exclusion = std::max(6.0, 0.25 * radius_hint);
+    const auto outside = [&](const std::vector<int>& group,
+                             const LineFit& line) {
+        std::vector<int> kept;
+        for (const int index : group) {
+            const double along =
+                (all_points[static_cast<std::size_t>(index)].position -
+                 *first_centre)
+                    .dot(line.tangent);
+            if (std::abs(along) >= exclusion) {
+                kept.push_back(index);
+            }
+        }
+        return kept;
+    };
+    const std::vector<int> clean_a = outside(arm_a, *line_a);
+    const std::vector<int> clean_b = outside(arm_b, *line_b);
+    const auto refined_a = fit_ridge_line(all_points, clean_a);
+    const auto refined_b = fit_ridge_line(all_points, clean_b);
+    if (!refined_a || !refined_b || refined_a->rms > 1.5 ||
+        refined_b->rms > 1.5) {
+        return std::nullopt;
+    }
+    const auto centre = intersect_lines(*refined_a, *refined_b);
+    if (!centre) {
+        return std::nullopt;
+    }
+    const double length_a = refined_a->maximum - refined_a->minimum;
+    const double length_b = refined_b->maximum - refined_b->minimum;
+    if (length_a < 8.0 || length_b < 8.0) {
+        return std::nullopt;
+    }
+    const double ratio = length_a / length_b;
+    if (ratio < 0.2 || ratio > 5.0) {
+        return std::nullopt;
+    }
+    const double along_a = (*centre - refined_a->centroid).dot(refined_a->tangent);
+    const double along_b = (*centre - refined_b->centroid).dot(refined_b->tangent);
+    if (along_a < refined_a->minimum + 0.2 * length_a ||
+        along_a > refined_a->maximum - 0.2 * length_a ||
+        along_b < refined_b->minimum + 0.2 * length_b ||
+        along_b > refined_b->maximum - 0.2 * length_b) {
+        return std::nullopt;
+    }
+    return *centre + Eigen::Vector2d(static_cast<double>(x0) + 0.5,
+                                     static_cast<double>(y0) + 0.5);
 }
 
 }  // namespace alphashape
