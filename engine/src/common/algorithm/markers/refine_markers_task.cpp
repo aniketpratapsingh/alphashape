@@ -409,52 +409,94 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
                                local.y() - static_cast<double>(y0) + 0.5);
     double max_blob_radius = 0.0;
+    double max_blob_response = 0.0;
     for (const MarkerCandidate& blob : blobs) {
         if (blob.center.allFinite() && std::isfinite(blob.radius_px)) {
             max_blob_radius = std::max(max_blob_radius, blob.radius_px);
+            max_blob_response =
+                std::max(max_blob_response, blob.response);
         }
     }
-    if (!(max_blob_radius > 0.0)) {
+    if (!(max_blob_radius > 0.0) || !(max_blob_response > 0.0)) {
         return std::nullopt;
     }
-    // A coded disc breaks into similar-sized sector blobs, so the ensemble is
-    // a far better estimate of the printed centre than the nearest blob: its
-    // radius-weighted centroid sits near the disc centre even when the
-    // measurement is a fraction of a radius off.
-    double weight_sum = 0.0;
-    Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
+    // A coded disc breaks into sector blobs. Keep only blobs that are both
+    // large and strong (ground texture produces small, weak ones), take their
+    // radius-weighted centroid, then re-centre on the compact ring of target
+    // blobs. This lands near the printed centre even when the measurement is
+    // most of a radius away.
+    std::vector<const MarkerCandidate*> kept;
     for (const MarkerCandidate& blob : blobs) {
         if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
-            blob.radius_px < 0.35 * max_blob_radius ||
+            blob.radius_px < 0.5 * max_blob_radius ||
+            blob.response < 0.5 * max_blob_response ||
             (blob.center - seed).norm() > static_cast<double>(half)) {
             continue;
         }
-        const double weight =
-            std::max(blob.response, 1e-6) * blob.radius_px;
-        centroid += blob.center * weight;
-        weight_sum += weight;
+        kept.push_back(&blob);
     }
-    if (!(weight_sum > 0.0)) {
+    if (kept.empty()) {
         return std::nullopt;
     }
-    centroid /= weight_sum;
-    std::vector<double> extents;
-    for (const MarkerCandidate& blob : blobs) {
-        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
-            blob.radius_px < 0.35 * max_blob_radius ||
-            (blob.center - seed).norm() > static_cast<double>(half)) {
-            continue;
+    const auto centroid_of =
+        [](const std::vector<const MarkerCandidate*>& set)
+        -> std::optional<Eigen::Vector2d> {
+        double weight_sum = 0.0;
+        Eigen::Vector2d sum = Eigen::Vector2d::Zero();
+        for (const MarkerCandidate* blob : set) {
+            const double weight =
+                std::max(blob->response, 1e-6) * blob->radius_px;
+            sum += blob->center * weight;
+            weight_sum += weight;
         }
-        extents.push_back((blob.center - centroid).norm() + blob.radius_px);
-    }
-    if (extents.empty() || !centroid.allFinite()) {
+        if (!(weight_sum > 0.0) || !sum.allFinite()) {
+            return std::nullopt;
+        }
+        const Eigen::Vector2d centroid = sum / weight_sum;
+        return centroid;
+    };
+    const auto first = centroid_of(kept);
+    if (!first) {
         return std::nullopt;
     }
-    const std::size_t middle = extents.size() / 2;
-    std::nth_element(extents.begin(),
-                     extents.begin() + static_cast<std::ptrdiff_t>(middle),
-                     extents.end());
-    const double outer = std::max(4.0, extents[middle]);
+    const auto median_extent =
+        [](const std::vector<const MarkerCandidate*>& set,
+           const Eigen::Vector2d& centre) {
+        std::vector<double> values;
+        values.reserve(set.size());
+        for (const MarkerCandidate* blob : set) {
+            values.push_back((blob->center - centre).norm() +
+                             blob->radius_px);
+        }
+        if (values.empty()) {
+            return 0.0;
+        }
+        const std::size_t middle = values.size() / 2;
+        std::nth_element(
+            values.begin(),
+            values.begin() + static_cast<std::ptrdiff_t>(middle),
+            values.end());
+        return values[middle];
+    };
+    const double first_extent = median_extent(kept, *first);
+    if (!(first_extent > 0.0)) {
+        return std::nullopt;
+    }
+    std::vector<const MarkerCandidate*> ring;
+    for (const MarkerCandidate* blob : kept) {
+        if ((blob->center - *first).norm() <= 1.25 * first_extent) {
+            ring.push_back(blob);
+        }
+    }
+    if (ring.empty()) {
+        return std::nullopt;
+    }
+    const auto second = centroid_of(ring);
+    if (!second) {
+        return std::nullopt;
+    }
+    const Eigen::Vector2d centroid = *second;
+    const double outer = std::max(4.0, median_extent(ring, centroid));
     if (!std::isfinite(outer)) {
         return std::nullopt;
     }
@@ -1327,15 +1369,25 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             const Eigen::Vector2d offset(
                 static_cast<double>(blend.view->offset_x),
                 static_cast<double>(blend.view->offset_y));
-            const Eigen::Vector2d local =
+            Eigen::Vector2d start =
                 blend.view->local_of(cross->pixel) +
                 Eigen::Vector2d(0.5, 0.5);
+            if (!cross->bar) {
+                // Prefer the local saddle scan when it finds one: starting the
+                // quadratic fit from the strongest nearby saddle is what the
+                // 2-D refiner was validated with.
+                if (const auto saddle =
+                        saddle_seed(*blend.view, blend.pixel)) {
+                    start = blend.view->local_of(*saddle) +
+                            Eigen::Vector2d(0.5, 0.5);
+                }
+            }
             blend.anchor = cross->pixel;
             if (const auto refined =
                     cross->bar
-                        ? refine_bar_cross_center(blend.view->image, local,
+                        ? refine_bar_cross_center(blend.view->image, start,
                                                   blend.hint_work)
-                        : refine_cross_center(blend.view->image, local,
+                        : refine_cross_center(blend.view->image, start,
                                               blend.hint_work)) {
                 blend.anchor = (*refined + offset) * ds;
             }
