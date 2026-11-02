@@ -544,10 +544,12 @@ TEST(Markers, FilterMaskSkipsMaskedTargets) {
     mask.width = width;
     mask.height = height;
     mask.invert = false;
-    mask.data.assign(static_cast<std::size_t>(width * height), 255);
+    mask.data.assign(static_cast<std::size_t>(width * height),
+                     std::uint8_t{255});
     for (int y = 120; y < 180; ++y) {
         for (int x = 270; x < 330; ++x) {
-            mask.data[static_cast<std::size_t>(y * width + x)] = 0;
+            mask.data[static_cast<std::size_t>(y * width + x)] =
+                std::uint8_t{0};
         }
     }
     scene.chunk->masks().push_back(mask);
