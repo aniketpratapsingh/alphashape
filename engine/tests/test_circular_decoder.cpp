@@ -313,10 +313,9 @@ TEST(Markers, RejectsForeignCode) {
         for (int position = 0; position < bits; ++position) {
             const std::uint32_t candidate =
                 table[index] ^ (1u << static_cast<unsigned>(position));
-            int best = 0;
             int second = 0;
-            nearest_code_distance(candidate, table, bits, &best, &second);
-            if (best == 1 && second >= best + 2) {
+            const int distance = nearest_code_distance(candidate, table, bits, nullptr, &second);
+            if (distance == 1 && second >= distance + 2) {
                 corrupted = candidate;
                 corrupted_index = static_cast<int>(index);
                 break;
