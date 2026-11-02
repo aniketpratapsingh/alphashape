@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/LU>
 
 #include "image/image.hpp"
 
