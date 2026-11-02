@@ -421,13 +421,21 @@ TEST(Markers, AprilTagReversedSmallDiagnostic) {
                         const std::optional<CodedTarget> target =
                             decode_tag(image, candidate, table,
                                        default_max_hamming(family));
+                        const std::optional<CodedTarget> loose = decode_tag(
+                            image, candidate, table, table.min_hamming);
                         std::printf(
                             "[diag]   %s centre %.1f,%.1f r %.1f corners %d -> "
-                            "%s id %d\n",
+                            "%s id %d loose id %d d %d\n",
                             what, candidate.center.x(), candidate.center.y(),
                             candidate.radius_px,
                             static_cast<int>(candidate.corners.size()),
-                            target ? "yes" : "no", target ? target->code : -1);
+                            target ? "yes" : "no", target ? target->code : -1,
+                            loose ? loose->code : -1, loose ? loose->hamming : -1);
+                        std::printf("[diag]     corners:");
+                        for (const Eigen::Vector2d& corner : candidate.corners) {
+                            std::printf(" (%.1f,%.1f)", corner.x(), corner.y());
+                        }
+                        std::printf("\n");
                     }
                 };
                 report("frame", frame);
@@ -442,10 +450,14 @@ TEST(Markers, AprilTagReversedSmallDiagnostic) {
                                               (corners[3] - corners[1]).norm());
                     const std::optional<CodedTarget> target = decode_tag(
                         image, ideal, table, default_max_hamming(family));
-                    std::printf("[diag]   ideal %s -> %s id %d\n",
+                    std::printf("[diag]   ideal %s -> %s id %d corners:",
                                 silhouette != 0 ? "silhouette" : "frame",
                                 target ? "yes" : "no",
                                 target ? target->code : -1);
+                    for (const Eigen::Vector2d& corner : corners) {
+                        std::printf(" (%.1f,%.1f)", corner.x(), corner.y());
+                    }
+                    std::printf("\n");
                 }
             }
         }

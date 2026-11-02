@@ -23,7 +23,7 @@ constexpr double kMinContrast = 0.08;       ///< Light minus dark, at the centre
 constexpr double kDecisionMargin = 0.2;     ///< Fraction of contrast a cell must
                                             ///< clear the threshold by.
 constexpr int kCornerSamples = 16;          ///< Samples along each refined side.
-constexpr double kCellSampleHalf = 0.18;    ///< Cell half-extent sampled, in cells.
+constexpr double kCellSampleHalf = 0.10;    ///< Cell half-extent sampled, in cells.
 constexpr double kMinSidePx = 6.0;
 constexpr int kMinSamplesPerCell = 5;       ///< Of the 3x3 cell samples.
 
