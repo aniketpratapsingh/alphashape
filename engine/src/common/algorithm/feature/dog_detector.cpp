@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 
 #include "base/utils/error.hpp"
+#include "base/utils/omp.hpp"
 
 namespace alphashape {
 
@@ -62,7 +63,14 @@ FloatImage gaussian_blur(const FloatImage& image, float sigma) {
     }
     for (float& w : kernel) w /= sum;
 
+    // Both passes are parallel over output rows: each row reads (never writes)
+    // its neighbours and writes only its own output row, so every pixel is
+    // computed by exactly the same sequence of operations as the serial
+    // version and the result is bit-identical.
     FloatImage tmp(image.width(), image.height());
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < image.height(); ++y) {
         for (int x = 0; x < image.width(); ++x) {
             float acc = 0.0F;
@@ -73,6 +81,9 @@ FloatImage gaussian_blur(const FloatImage& image, float sigma) {
         }
     }
     FloatImage out(image.width(), image.height());
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < image.height(); ++y) {
         for (int x = 0; x < image.width(); ++x) {
             float acc = 0.0F;

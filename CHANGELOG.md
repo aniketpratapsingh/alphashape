@@ -42,6 +42,26 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.5: automatic marker detection.** `detect_blobs()` finds circular
+  targets with the scale-normalised Hessian determinant (Steger 1998) over a
+  geometric scale series, 3x3x3 non-maximum suppression, subpixel boundary
+  points along 64 radial gradient rays (parabolic peak interpolation) and a
+  weighted direct ellipse fit (Fitzgibbon, Pilu & Fisher 1999, numerically
+  stable Halir/Flusser split form). Each result carries the ellipse centre,
+  semi-major radius, major-axis angle and axis ratio; the fit is refined by
+  iterating the radial search (dropping rays more than 3 MAD off the fit) and
+  duplicates are merged by bounding-circle IoU. `detect_quads()` thresholds
+  against a local box mean, traces the component's outer contour, simplifies it
+  with Douglas-Peucker, uses the simplified quad's orientation for an oriented
+  bounding rectangle of the contour (robust to a rounded corner being cut),
+  locates each side's edge points at the half-intensity crossing, fits the
+  sides by gradient-weighted total least squares and intersects adjacent sides
+  for subpixel corners, rejecting non-convex or over-elongated quads.
+  `refine_ellipse_center()`
+  re-runs the subpixel centre estimate and `fit_ellipse()` exposes the direct
+  fit. Detected pixels use the engine's pixel-centre convention, the same one
+  `project_marker()` uses.
+
 - **WP-13.4: manual marker placement, the projection API and marker
   import/export.** `project_marker()` maps a chunk-local point through a camera
   and returns `nullopt` when the camera is unaligned, a Frame-model point is at
