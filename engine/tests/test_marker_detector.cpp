@@ -75,7 +75,7 @@ TEST(MarkerDetector, FitEllipseExactOnSamples) {
     EXPECT_NEAR(fit->a, semi_major, 1e-9);
     EXPECT_NEAR(fit->b, semi_minor, 1e-9);
     EXPECT_NEAR(angle_distance_mod_pi(fit->angle_rad, angle), 0.0, 1e-9);
-    std::printf("[FitEllipseExact] centre=(%.12f, %.12f) a=%.12f b=%.12f angle=%.12f\n",
+    std::printf("[marker fit-ellipse] centre=(%.12f, %.12f) a=%.12f b=%.12f angle=%.12f\n",
                 fit->center.x(), fit->center.y(), fit->a, fit->b, fit->angle_rad);
 
     // Fewer than five points is not enough for a conic.
@@ -162,7 +162,7 @@ TEST(MarkerDetector, CentersAccurateToSubpixel) {
 
     const BlobParams params;
     const AccuracySummary summary = centre_accuracy(image, truths, params);
-    std::printf("[CentersAccurate] matched=%d missed=%d RMS=%.6f px\n", summary.matched,
+    std::printf("[marker centres] matched=%d missed=%d RMS=%.6f px\n", summary.matched,
                 summary.missed, summary.rms);
     EXPECT_EQ(summary.missed, 0);
     EXPECT_LE(summary.rms, 0.05);
@@ -170,7 +170,7 @@ TEST(MarkerDetector, CentersAccurateToSubpixel) {
     // Baseline JPEG quality 70: block DCT quantisation on top of the noise.
     const FloatImage degraded = test::degrade_like_jpeg(image, 70);
     const AccuracySummary degraded_summary = centre_accuracy(degraded, truths, params);
-    std::printf("[CentersAccurateJpeg70] matched=%d missed=%d RMS=%.6f px\n",
+    std::printf("[marker centres jpeg70] matched=%d missed=%d RMS=%.6f px\n",
                 degraded_summary.matched, degraded_summary.missed, degraded_summary.rms);
     EXPECT_EQ(degraded_summary.missed, 0);
     EXPECT_LE(degraded_summary.rms, 0.1);
@@ -205,8 +205,8 @@ TEST(MarkerDetector, AxisRatioMatchesTruth) {
         ++matched;
     }
     const double mean_relative = matched > 0 ? sum_relative / static_cast<double>(matched) : 1.0;
-    std::printf("[AxisRatio] matched=%d missed=%d mean=%.5f worst=%.5f\n", matched, missed,
-                mean_relative, worst_relative);
+    std::printf("[marker axis-ratio] matched=%d missed=%d mean=%.5f worst=%.5f\n", matched,
+                missed, mean_relative, worst_relative);
     EXPECT_EQ(missed, 0);
     EXPECT_LE(worst_relative, 0.02);
 }
@@ -217,7 +217,7 @@ TEST(MarkerDetector, RejectsNoise) {
     BlobParams params;
     params.max_radius = 32;
     const std::vector<MarkerCandidate> candidates = detect_blobs(image, params);
-    std::printf("[RejectsNoise] candidates=%d threshold=%.3f\n",
+    std::printf("[marker noise] candidates=%d threshold=%.3f\n",
                 static_cast<int>(candidates.size()), static_cast<double>(params.threshold));
     EXPECT_LE(candidates.size(), static_cast<std::size_t>(1));
 }
@@ -299,7 +299,7 @@ TEST(MarkerDetector, QuadCornersAccurate) {
     }
     const double rms =
         corner_count > 0 ? std::sqrt(squared / static_cast<double>(corner_count)) : 1e9;
-    std::printf("[QuadCorners] matched=%d missed=%d corners=%d RMS=%.6f px\n",
+    std::printf("[marker quad-corners] matched=%d missed=%d corners=%d RMS=%.6f px\n",
                 static_cast<int>(truths.size()) - missed, missed, corner_count, rms);
     EXPECT_EQ(missed, 0);
     EXPECT_LE(rms, 0.1);
@@ -350,7 +350,7 @@ TEST(MarkerDetector, TwelveMegapixelTiming) {
             ++matched;
         }
     }
-    std::printf("[TwelveMegapixel] seconds=%.3f candidates=%d matched=%d\n", seconds,
+    std::printf("[marker 12mp] seconds=%.3f candidates=%d matched=%d\n", seconds,
                 static_cast<int>(candidates.size()), matched);
     EXPECT_GE(matched, 95);
     if (test::perf_asserts_enabled()) {
