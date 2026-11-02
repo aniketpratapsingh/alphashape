@@ -1011,7 +1011,7 @@ TEST(Markers, DownscaledCrossesRefineAtFullResolution) {
     for (std::size_t i = 0; i < truths.size(); ++i) {
         const FloatImage bar = render_bar_cross(
             patch, patch, 0.5 * static_cast<double>(patch),
-            0.5 * static_cast<double>(patch), 50.0, 18.0,
+            0.5 * static_cast<double>(patch), 50.0, 10.0,
             0.25 + 0.3 * static_cast<double>(i), 0.95F, 0.05F, 4);
         paste(bar_sheet, bar,
               static_cast<int>(truths[i].x()) - patch / 2,
