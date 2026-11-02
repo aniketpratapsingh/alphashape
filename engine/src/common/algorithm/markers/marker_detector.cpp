@@ -312,16 +312,16 @@ std::optional<Ellipse> fit_boundary(const FloatImage& gradient, const Eigen::Vec
 
 /// Scale-normalised Hessian determinant. The derivatives are of the image
 /// already smoothed at `sigma`; multiplying both second derivatives by sigma^2
-/// makes the response scale invariant (Steger 1998). A dark blob is an intensity
-/// minimum, so its positive-definite Hessian has a positive determinant; a
-/// light blob is a maximum, whose negative-definite Hessian is selected by
-/// flipping the sign.
+/// makes the response scale invariant (Steger 1998). The determinant is
+/// positive for both intensity minima and maxima, so polarity is selected from
+/// the trace: a dark-on-light target is a minimum (positive-definite Hessian),
+/// a light-on-dark target is a maximum (negative-definite Hessian). The wrong
+/// polarity becomes a negative response and is rejected by the threshold.
 FloatImage hessian_response(const FloatImage& blurred, double sigma, bool dark_on_light) {
     const int w = blurred.width();
     const int h = blurred.height();
     FloatImage out(w, h, 0.0F);
     const float scale = static_cast<float>(sigma * sigma);
-    const float sign = dark_on_light ? 1.0F : -1.0F;
     const int last_row = h - 1;
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #pragma omp parallel for schedule(static)
@@ -336,7 +336,10 @@ FloatImage hessian_response(const FloatImage& blurred, double sigma, bool dark_o
             const float nxx = scale * dxx;
             const float nyy = scale * dyy;
             const float nxy = scale * dxy;
-            out.at(x, y) = sign * (nxx * nyy - nxy * nxy);
+            const float determinant = nxx * nyy - nxy * nxy;
+            const float trace = nxx + nyy;
+            const bool matches_polarity = dark_on_light ? trace > 0.0F : trace < 0.0F;
+            out.at(x, y) = (matches_polarity ? 1.0F : -1.0F) * determinant;
         }
     }
     return out;

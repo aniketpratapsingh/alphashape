@@ -229,7 +229,7 @@ TEST(MarkerDetector, LightOnDarkPolarity) {
     light_on_dark.dark_on_light = false;
 
     const std::vector<test::EllipseTruth> dark_dot = {{80.0, 128.0, 12.0, 12.0, 0.0}};
-    FloatImage bright = test::render_ellipses(size, size, dark_dot, 0.9F, 0.0F);
+    FloatImage bright = test::render_ellipses(size, size, dark_dot, 0.9F, 0.1F);
     bright = gaussian_blur(bright, 1.0F);
     const std::vector<MarkerCandidate> found_dark = detect_blobs(bright, dark_on_light);
     ASSERT_EQ(found_dark.size(), static_cast<std::size_t>(1));
@@ -238,7 +238,7 @@ TEST(MarkerDetector, LightOnDarkPolarity) {
     EXPECT_TRUE(detect_blobs(bright, light_on_dark).empty());
 
     const std::vector<test::EllipseTruth> light_dot = {{176.0, 128.0, 12.0, 12.0, 0.0}};
-    FloatImage dark = test::render_ellipses(size, size, light_dot, 0.1F, 1.0F);
+    FloatImage dark = test::render_ellipses(size, size, light_dot, 0.1F, 0.9F);
     dark = gaussian_blur(dark, 1.0F);
     const std::vector<MarkerCandidate> found_light = detect_blobs(dark, light_on_dark);
     ASSERT_EQ(found_light.size(), static_cast<std::size_t>(1));
