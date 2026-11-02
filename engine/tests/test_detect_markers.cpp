@@ -411,7 +411,10 @@ TEST(Markers, DetectMixedSheet) {
           test::render_ellipses(disc_size, disc_size, {disc}, 0.95F, 0.05F),
           150 - disc_size / 2, height / 2 - disc_size / 2);
     // Coded circular target: only Circular12 may report it.
-    const int ring_size = 140;
+    // The quiet zone must extend beyond locate_border's 1.6x scan range for
+    // the expected radius (88 px), or the patch's outer step becomes the
+    // "outermost edge" and the decode locks onto the wrong ellipse.
+    const int ring_size = 200;
     const test::CircularTruth ring = test::make_circular_truth(
         0.5 * static_cast<double>(ring_size),
         0.5 * static_cast<double>(ring_size), 55.0, 12,
