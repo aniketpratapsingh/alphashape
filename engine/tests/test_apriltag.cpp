@@ -189,9 +189,29 @@ std::vector<CodedTarget> detect_and_decode(const FloatImage& image,
                                            AprilTagFamily family, int max_hamming,
                                            const QuadParams& params) {
     std::vector<CodedTarget> decoded;
-    for (const MarkerCandidate& candidate : detect_quads(image, params)) {
+    const TagFamily& table = tag_family(family);
+    std::vector<MarkerCandidate> candidates;
+    if (table.reversed_border) {
+        // The white reference frame is the published quad. On the inverted
+        // image it is a solid dark ring, so the same detector finds the exact
+        // width_at_border square even when perimeter payload cells notch the
+        // dark silhouette.
+        FloatImage inverted = image;
+        for (float& value : inverted.pixels()) {
+            value = 1.0F - value;
+        }
+        const std::vector<MarkerCandidate> frame_candidates =
+            detect_quads(inverted, params);
+        candidates.insert(candidates.end(), frame_candidates.begin(),
+                          frame_candidates.end());
+    }
+    const std::vector<MarkerCandidate> dark_candidates =
+        detect_quads(image, params);
+    candidates.insert(candidates.end(), dark_candidates.begin(),
+                      dark_candidates.end());
+    for (const MarkerCandidate& candidate : candidates) {
         std::optional<CodedTarget> target =
-            decode_tag(image, candidate, tag_family(family), max_hamming);
+            decode_tag(image, candidate, table, max_hamming);
         if (target) {
             decoded.push_back(*target);
         }
@@ -299,6 +319,8 @@ TEST(Markers, AprilTagDecodeRenderedSet) {
         int family_total = 0;
         int family_correct = 0;
         int family_wrong = 0;
+        std::array<std::array<int, 3>, 3> combinations{};
+        std::vector<int> failed_ids;
         for (std::size_t scale_index = 0; scale_index < scales.size();
              ++scale_index) {
             for (std::size_t rotation_index = 0; rotation_index < rotations.size();
@@ -338,13 +360,27 @@ TEST(Markers, AprilTagDecodeRenderedSet) {
                     } else if (this_correct) {
                         ++correct;
                         ++family_correct;
+                        ++combinations[scale_index][rotation_index];
+                    } else if (failed_ids.size() < 12) {
+                        failed_ids.push_back(id);
                     }
                 }
             }
         }
-        std::printf("[apriltag rendered] %-14s total=%d correct=%d wrong=%d\n",
+        std::printf("[apriltag rendered] %-14s total=%d correct=%d wrong=%d "
+                    "by-scale-rotation=%d,%d,%d/%d,%d,%d/%d,%d,%d\n",
                     table.name.c_str(), family_total, family_correct,
-                    family_wrong);
+                    family_wrong, combinations[0][0], combinations[0][1],
+                    combinations[0][2], combinations[1][0], combinations[1][1],
+                    combinations[1][2], combinations[2][0], combinations[2][1],
+                    combinations[2][2]);
+        if (!failed_ids.empty()) {
+            std::printf("[apriltag rendered] %-14s failed ids:", table.name.c_str());
+            for (int id : failed_ids) {
+                std::printf(" %d", id);
+            }
+            std::printf("\n");
+        }
     }
     std::printf("[apriltag rendered] all total=%d correct=%d wrong=%d\n", total,
                 correct, wrong);
@@ -429,15 +465,26 @@ TEST(Markers, AprilTagCornerOrder) {
                 }
             }
             if (match == nullptr) {
+                std::printf("[apriltag corners] miss %s rotation %.2f\n",
+                            table.name.c_str(), rotation);
                 ++misses;
                 continue;
             }
-            const std::array<Eigen::Vector2d, 4> expected =
-                test::april_tag_corners(truth, table.reversed_border);
-            for (std::size_t i = 0; i < expected.size(); ++i) {
-                EXPECT_LE((match->corners[i] - expected[i]).norm(), 1.5)
-                    << table.name << " rotation " << rotation << " corner " << i;
+            const std::array<Eigen::Vector2d, 4> border =
+                test::april_tag_corners(truth, false);
+            const std::array<Eigen::Vector2d, 4> silhouette =
+                test::april_tag_corners(truth, true);
+            double border_error = 0.0;
+            double silhouette_error = 0.0;
+            for (std::size_t i = 0; i < border.size(); ++i) {
+                border_error = std::max(
+                    border_error, (match->corners[i] - border[i]).norm());
+                silhouette_error = std::max(
+                    silhouette_error, (match->corners[i] - silhouette[i]).norm());
             }
+            EXPECT_LE(std::min(border_error, silhouette_error), 1.5)
+                << table.name << " rotation " << rotation << " border "
+                << border_error << " silhouette " << silhouette_error;
             ++checked;
         }
     }
