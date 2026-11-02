@@ -71,6 +71,8 @@ struct SceneSpec {
     int camera_count = 5;
     double ring_radius = 1.5;
     double height = 1.0;
+    double spread_x = 0.28;
+    double spread_z = 0.32;
     double start_angle = 0.0;
     bool include_blank_target = false;
     std::vector<BlankBox> blank_boxes;
@@ -278,8 +280,9 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.cross = (i % 2) == 1;
         const int column = i % 3;
         const int row = i / 3;
-        target.centre = Vec3((static_cast<double>(column) - 1.0) * 0.28, 0.0,
-                             (static_cast<double>(row) - 0.5) * 0.32);
+        target.centre = Vec3((static_cast<double>(column) - 1.0) * spec.spread_x,
+                             0.0,
+                             (static_cast<double>(row) - 0.5) * spec.spread_z);
         target.radius = 0.075;
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
@@ -613,10 +616,15 @@ TEST(Markers, RefineSkipsLowTexture) {
 
 TEST(Markers, RefineObliqueViews) {
     SceneSpec spec;
-    spec.marker_count = 4;
+    spec.marker_count = 3;
     spec.camera_count = 4;
     spec.ring_radius = 1.3;
     spec.height = 0.95;
+    // Keep the targets near the optical axis so their rays really are at the
+    // 50-60 degree obliquity this test is about; an off-centre target adds its
+    // own angular offset on top of the camera tilt.
+    spec.spread_x = 0.16;
+    spec.spread_z = 0.0;
     RefineScene scene = make_scene(spec, 41U);
     for (const Transform& pose : scene.poses) {
         const Vec3 forward = pose.block<3, 3>(0, 0).row(2).transpose();
