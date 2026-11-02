@@ -183,5 +183,21 @@ class TestDetectMarkers(unittest.TestCase):
             self.assertIn("LIMITATIONS.md", message)
 
 
+class TestRefineMarkers(unittest.TestCase):
+    """The RefineMarkers task is bound and its parameters reach the project."""
+
+    def test_binds_and_records_parameters(self):
+        doc, chunk = document_with_photos()
+        chunk.refineMarkers(patch_size=15, search_steps=4)
+        self.assertEqual(chunk.meta["RefineMarkers/patch_size"], "15")
+        self.assertEqual(chunk.meta["RefineMarkers/search_steps"], "4")
+
+    def test_unknown_marker_label_is_rejected(self):
+        doc, chunk = document_with_photos()
+        with self.assertRaises(alphashape.ValueError) as context:
+            chunk.refineMarkers(markers=["NO_SUCH_MARKER"])
+        self.assertIn("NO_SUCH_MARKER", str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,7 @@ add_executable(alphashape_tests
     test_circular_decoder.cpp
     test_apriltag.cpp
     test_detect_markers.cpp
+    test_refine_markers.cpp
     test_gpu.cpp
 )
 
