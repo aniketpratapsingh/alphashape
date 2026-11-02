@@ -177,7 +177,13 @@ struct Detection {
     double radius = 0.0;
     int hamming = 0;
     bool coded = false;
-    std::array<Eigen::Vector2d, 4> corners{};
+    // Eigen's default constructor leaves its scalars uninitialised, and a
+    // plain `corners{}` therefore still holds indeterminate doubles; GCC's
+    // -Wmaybe-uninitialized reports that when a Detection is copied. List all
+    // four explicitly so the storage is written on every construction.
+    std::array<Eigen::Vector2d, 4> corners{
+        Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero(),
+        Eigen::Vector2d::Zero(), Eigen::Vector2d::Zero()};
     bool has_corners = false;
 };
 
