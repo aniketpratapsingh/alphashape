@@ -432,7 +432,7 @@ TEST(Markers, DetectMixedSheet) {
     paste(sheet,
           render_bar_cross(
               cross_size, cross_size, 0.5 * static_cast<double>(cross_size),
-              0.5 * static_cast<double>(cross_size), 40.0, 8.0, 0.2, 0.95F,
+              0.5 * static_cast<double>(cross_size), 30.0, 8.0, 0.2, 0.95F,
               0.05F, 4),
           1050 - cross_size / 2, height / 2 - cross_size / 2);
     // AprilTag 36h11 with its own white quiet zone.
@@ -986,7 +986,7 @@ TEST(Markers, CrossRejectsDecoyPatterns) {
             }
         }
     }
-    std::printf("[Cross decoys] %zu real crosses in %zu detections, %zu decoy hits\n",
+    std::printf("[cross decoys] %zu real crosses in %zu detections, %zu decoy hits\n",
                 real_truths.size(), centres.size(), inside_decoys);
 }
 
@@ -1025,7 +1025,7 @@ TEST(Markers, DownscaledCrossesRefineAtFullResolution) {
         const AccuracyResult bar =
             measure_accuracy(bar_image, "Cross", downscale, truths);
         std::printf(
-            "[Cross downscale %d] checker %zu/4 RMS %.4f, bar %zu/4 RMS %.4f px\n",
+            "[cross downscale %d] checker %zu/4 RMS %.4f, bar %zu/4 RMS %.4f px\n",
             downscale, checker.markers, checker.rms, bar.markers, bar.rms);
         EXPECT_EQ(checker.markers, truths.size());
         EXPECT_EQ(bar.markers, truths.size());
@@ -1052,7 +1052,7 @@ TEST(Markers, DownscaledCircularRefinesAtFullResolution) {
     for (const int downscale : {2, 3}) {
         const AccuracyResult result =
             measure_accuracy(image, "Circular12", downscale, truths);
-        std::printf("[Circular12 downscale %d] %zu/4 RMS %.4f px\n", downscale,
+        std::printf("[circular12 downscale %d] %zu/4 RMS %.4f px\n", downscale,
                     result.markers, result.rms);
         EXPECT_EQ(result.markers, truths.size());
         EXPECT_LE(result.rms, 0.2);
@@ -1087,10 +1087,16 @@ TEST(Markers, DetectCircularTiming) {
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
-    EXPECT_NE(log_text.find("estimated peak working set"), std::string::npos)
-        << log_text;
+    const std::string memory_tag = "estimated peak working set ";
+    const std::size_t memory_at = log_text.find(memory_tag);
+    EXPECT_NE(memory_at, std::string::npos) << log_text;
+    if (memory_at != std::string::npos) {
+        const std::size_t end = log_text.find('\n', memory_at);
+        std::printf("[detectmarkers memory] %s\n",
+                    log_text.substr(memory_at, end - memory_at).c_str());
+    }
     std::printf(
-        "[DetectMarkers timing] %.3f s for %dx%d Circular12 (auto downscale)\n",
+        "[detectmarkers timing] %.3f s for %dx%d Circular12 (auto downscale)\n",
         seconds, width, height);
     EXPECT_EQ(scene.chunk->markers().size(), targets.size());
     if (test::perf_asserts_enabled()) {
