@@ -12,6 +12,7 @@
 #include "common/algorithm/elevation/export_dem_task.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"
 #include "common/algorithm/markers/detect_markers_task.hpp"
+#include "common/algorithm/markers/refine_markers_task.hpp"
 #include "common/algorithm/match/match_photos_task.hpp"
 #include "common/algorithm/mesh/build_model_task.hpp"
 #include "common/algorithm/mesh/export_tasks.hpp"
@@ -63,6 +64,7 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<ImportMarkersTask>());
     registry.register_task(std::make_shared<ExportMarkersTask>());
     registry.register_task(std::make_shared<DetectMarkersTask>());
+    registry.register_task(std::make_shared<RefineMarkersTask>());
 #if defined(ALPHASHAPE_USE_PROJ)
     // WP-13.2: reference import/export depends on the CRS engine, so the tasks
     // exist only in a PROJ build (the sources are compiled in the same guard).

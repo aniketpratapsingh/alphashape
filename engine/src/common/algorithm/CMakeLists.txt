@@ -27,6 +27,7 @@ add_library(alphashape_algorithms STATIC
     markers/apriltag_decoder.cpp
     markers/cross_decoder.cpp
     markers/detect_markers_task.cpp
+    markers/refine_markers_task.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp
