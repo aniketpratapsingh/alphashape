@@ -298,13 +298,13 @@ FloatImage make_clutter_scene(int width, int height, std::uint32_t seed) {
                    rng::unit_interval(engine) < 0.5 ? 0.05F : 0.95F);
     }
     for (int i = 0; i < 90; ++i) {
-        paint_rotated_rect(image,
-            rng::uniform_real(engine, 40.0, width - 40.0),
-            rng::uniform_real(engine, 40.0, height - 40.0),
-            rng::uniform_real(engine, 6.0, 70.0),
-            rng::uniform_real(engine, 4.0, 50.0),
-            rng::uniform_real(engine, -1.2, 1.2),
-            rng::unit_interval(engine) < 0.5 ? 0.08F : 0.92F);
+        const double cx = rng::uniform_real(engine, 40.0, width - 40.0);
+        const double cy = rng::uniform_real(engine, 40.0, height - 40.0);
+        const double half_w = rng::uniform_real(engine, 6.0, 70.0);
+        const double half_h = rng::uniform_real(engine, 4.0, 50.0);
+        const double angle = rng::uniform_real(engine, -1.2, 1.2);
+        const float value = rng::unit_interval(engine) < 0.5 ? 0.08F : 0.92F;
+        paint_rotated_rect(image, cx, cy, half_w, half_h, angle, value);
     }
     for (int i = 0; i < 36; ++i) {
         const int size = 80 + static_cast<int>(rng::index_below(engine, 161));
