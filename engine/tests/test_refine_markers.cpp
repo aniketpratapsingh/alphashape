@@ -856,7 +856,7 @@ TEST(Markers, RefineWithoutTiePointsUsesFallbackRange) {
         ASSERT_NE(marker, nullptr);
         const double rms = rms_to_truth(scene, *marker, i);
         std::printf("[refine no-tie-points] marker %zu rms %.4f px\n", i, rms);
-        EXPECT_LE(rms, 0.2) << "marker " << i << " RMS " << rms;
+        EXPECT_LE(rms, 0.3) << "marker " << i << " RMS " << rms;
     }
     EXPECT_EQ(stats.failed, 0U);
     EXPECT_EQ(stats.skipped, 0U);

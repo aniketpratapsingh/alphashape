@@ -26,6 +26,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
+#include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/cross_decoder.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
@@ -362,6 +363,7 @@ std::optional<Eigen::Vector3d> triangulate_robust(
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
+    bool decoded = false;  ///< a coded ring word was decoded
 };
 
 /// Locate the circular target around `pixel` in the window. The blob's scale
@@ -377,7 +379,9 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!local.allFinite()) {
         return std::nullopt;
     }
-    const int half = std::max(32, patch_size);
+    // The crop covers the whole target even when the measurement is up to one
+    // radius from its printed centre.
+    const int half = std::max(48, patch_size);
     const int centre_x = static_cast<int>(std::floor(std::clamp(
         local.x(), -1.0e6, 1.0e6)));
     const int centre_y = static_cast<int>(std::floor(std::clamp(
@@ -406,35 +410,85 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
     const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
                                local.y() - static_cast<double>(y0) + 0.5);
-    const MarkerCandidate* best = nullptr;
-    double best_distance = static_cast<double>(half) * 0.75;
+    double max_blob_radius = 0.0;
     for (const MarkerCandidate& blob : blobs) {
-        if (!blob.center.allFinite()) {
-            continue;
-        }
-        const double distance = (blob.center - seed).norm();
-        if (distance <= best_distance) {
-            best_distance = distance;
-            best = &blob;
+        if (blob.center.allFinite() && std::isfinite(blob.radius_px)) {
+            max_blob_radius = std::max(max_blob_radius, blob.radius_px);
         }
     }
-    if (best == nullptr) {
+    if (!(max_blob_radius > 0.0)) {
         return std::nullopt;
     }
-    MarkerCandidate refined = *best;
-    Eigen::Vector2d centre = best->center;
-    if (const auto fitted = refine_ellipse_center(crop, refined)) {
-        centre = *fitted;
+    // A coded disc breaks into similar-sized sector blobs, so the ensemble is
+    // a far better estimate of the printed centre than the nearest blob: its
+    // radius-weighted centroid sits near the disc centre even when the
+    // measurement is a fraction of a radius off.
+    double weight_sum = 0.0;
+    Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
+    for (const MarkerCandidate& blob : blobs) {
+        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
+            blob.radius_px < 0.35 * max_blob_radius ||
+            (blob.center - seed).norm() > static_cast<double>(half)) {
+            continue;
+        }
+        const double weight =
+            std::max(blob.response, 1e-6) * blob.radius_px;
+        centroid += blob.center * weight;
+        weight_sum += weight;
     }
-    if (!centre.allFinite()) {
+    if (!(weight_sum > 0.0)) {
+        return std::nullopt;
+    }
+    centroid /= weight_sum;
+    double outer = 4.0;
+    for (const MarkerCandidate& blob : blobs) {
+        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
+            blob.radius_px < 0.35 * max_blob_radius ||
+            (blob.center - seed).norm() > static_cast<double>(half)) {
+            continue;
+        }
+        outer = std::max(outer, (blob.center - centroid).norm() +
+                                    blob.radius_px);
+    }
+    if (!centroid.allFinite() || !std::isfinite(outer)) {
+        return std::nullopt;
+    }
+    const Eigen::Vector2d window_centre(
+        centroid.x() + static_cast<double>(x0),
+        centroid.y() + static_cast<double>(y0));
+    MarkerCandidate candidate;
+    candidate.center = window_centre;
+    candidate.radius_px = outer;
+    Eigen::Vector2d centre = window_centre;
+    double radius = outer;
+    bool decoded = false;
+    for (const int bits : {12, 14, 16, 20}) {
+        if (const auto target =
+                decode_circular(view.image, candidate, bits, 0)) {
+            if (target->center.allFinite() && target->radius_px > 0.0) {
+                centre = target->center;
+                radius = target->radius_px;
+                decoded = true;
+                break;
+            }
+        }
+    }
+    if (!decoded) {
+        if (const auto fitted =
+                refine_ellipse_center(view.image, candidate)) {
+            centre = *fitted;
+        }
+    }
+    if (!centre.allFinite() || !(radius > 0.0)) {
         return std::nullopt;
     }
     BlobSeed out;
     out.pixel = (centre + Eigen::Vector2d(
-                             static_cast<double>(view.offset_x + x0),
-                             static_cast<double>(view.offset_y + y0))) *
+                             static_cast<double>(view.offset_x),
+                             static_cast<double>(view.offset_y))) *
                 static_cast<double>(view.downscale);
-    out.radius = best->radius_px * static_cast<double>(view.downscale);
+    out.radius = radius * static_cast<double>(view.downscale);
+    out.decoded = decoded;
     return out;
 }
 
@@ -1276,6 +1330,22 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             continue;
         }
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+        const auto circle =
+            circular_seed(*blend.view, blend.pixel, patch_size);
+        const auto apply_circle = [&]() {
+            blend.seed = circle;
+            blend.apparent = std::max(1.0, circle->radius);
+            blend.has_scale = true;
+            blend.anchor = circle->pixel;
+            blend.has_anchor = true;
+        };
+        // A decoded coded ring is conclusive: the target is circular even if
+        // the generic cross detector also found a saddle in its pattern. The
+        // circular refiner is never used for a cross.
+        if (circle && circle->decoded) {
+            apply_circle();
+            continue;
+        }
         if (const auto cross =
                 cross_extent(*blend.view, blend.pixel, patch_size)) {
             blend.cross = true;
@@ -1300,12 +1370,9 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.has_anchor = true;
             continue;
         }
-        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size);
-        if (blend.seed) {
-            blend.apparent = std::max(1.0, blend.seed->radius);
-            blend.has_scale = true;
-            blend.anchor = blend.seed->pixel;
-            blend.has_anchor = true;
+        if (circle) {
+            apply_circle();
+            continue;
         }
         blend.hint_work = 8.0;
     }
