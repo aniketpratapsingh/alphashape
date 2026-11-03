@@ -1171,6 +1171,32 @@ std::optional<RoundOutcome> apply_winner(
     if (inliers.size() < 2) {
         return std::nullopt;
     }
+    // Common mode: most views agree that the printed centre is far from the
+    // current projection. A lone false cross on a circular target does not
+    // move the median, so it keeps the validated per-round refiner.
+    std::vector<double> gaps;
+    for (const std::size_t index : inliers) {
+        const auto projected =
+            project_view(*blends[index].view, winner.point);
+        if (!projected) {
+            continue;
+        }
+        if (const auto cross = cross_extent(
+                *blends[index].view, blends[index].pixel,
+                options.patch_size)) {
+            gaps.push_back((cross->pixel - *projected).norm());
+        }
+    }
+    double median_gap = 0.0;
+    if (!gaps.empty()) {
+        const std::size_t middle = gaps.size() / 2;
+        std::nth_element(
+            gaps.begin(),
+            gaps.begin() + static_cast<std::ptrdiff_t>(middle),
+            gaps.end());
+        median_gap = gaps[middle];
+    }
+    const bool common_mode = median_gap > 4.0;
     // A common lateral offset of the physical patch is invisible to NCC (every
     // view samples the same world points), so consistency alone cannot remove
     // the reference view's own bias. Each inlier is therefore anchored at the
@@ -1207,7 +1233,7 @@ std::optional<RoundOutcome> apply_winner(
         // A normal cross detector centre sits on the projected point. A
         // common-mode offset leaves it most of a radius away; walk towards it,
         // clamped per round, and let the rounds converge.
-        if (blend.cross) {
+        if (common_mode && blend.cross) {
             if (const auto cross = cross_extent(
                     *blend.view, blend.pixel, options.patch_size)) {
                 const double gap = (cross->pixel - *projected).norm();
