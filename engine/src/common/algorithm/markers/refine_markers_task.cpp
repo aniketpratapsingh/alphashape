@@ -1259,6 +1259,11 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
         for (const MarkerProjection& projection : marker.projections) {
+            // A disabled projection is not evidence: it is never refined,
+            // moved or removed, exactly as if it were absent.
+            if (!projection.enabled) {
+                continue;
+            }
             const CameraView* view = camera_view(projection.camera_id);
             if (view == nullptr) {
                 continue;

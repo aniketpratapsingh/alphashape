@@ -729,5 +729,35 @@ TEST(Markers, RefineParamsFilter) {
     EXPECT_EQ(stats.refined, 1U);
 }
 
+TEST(Markers, RefineIgnoresDisabledProjections) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 81U);
+    std::mt19937 engine(43U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_GE(marker->projections.size(), 2U);
+    // A grossly wrong disabled measurement must stay exactly as it was: not
+    // used for the consensus, not moved, not removed.
+    marker->projections.back().enabled = false;
+    marker->projections.back().pixel += Vec2(120.0, 90.0);
+    const std::vector<MarkerProjection> before = marker->projections;
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_EQ(marker->projections.size(), before.size());
+    for (std::size_t p = 0; p < marker->projections.size(); ++p) {
+        if (!before[p].enabled) {
+            EXPECT_TRUE(marker->projections[p] == before[p])
+                << "projection " << p << " was touched";
+        }
+    }
+    EXPECT_GE(stats.refined, 1U);
+}
+
 }  // namespace
 }  // namespace alphashape
