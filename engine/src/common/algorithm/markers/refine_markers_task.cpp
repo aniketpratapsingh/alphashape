@@ -104,9 +104,6 @@ struct CameraView {
     /// Crop at `downscale`; pixel (x, y) here is reduced-image index
     /// (offset_x + x, offset_y + y).
     FloatImage image;
-    /// dI/d(reduced index), computed once when the crop is cut.
-    FloatImage gradient_x;
-    FloatImage gradient_y;
     int downscale = 1;
     int offset_x = 0;
     int offset_y = 0;
@@ -145,19 +142,18 @@ struct CameraView {
         return image.sample(static_cast<float>(p.x()), static_cast<float>(p.y()));
     }
 
-    /// Image gradient with respect to a full-resolution pixel shift, from the
-    /// gradient stored for this window.
+    /// Image gradient with respect to a full-resolution pixel shift, computed
+    /// from this window only (one reduced-image pixel either side).
     Eigen::Vector2d gradient(const Eigen::Vector2d& pixel) const {
-        const Eigen::Vector2d p = local_of(pixel);
-        const double ds = static_cast<double>(std::max(1, downscale));
-        const double dx = static_cast<double>(
-                              gradient_x.sample(static_cast<float>(p.x()),
-                                                static_cast<float>(p.y()))) /
-                          ds;
-        const double dy = static_cast<double>(
-                              gradient_y.sample(static_cast<float>(p.x()),
-                                                static_cast<float>(p.y()))) /
-                          ds;
+        const double h = static_cast<double>(std::max(1, downscale));
+        const double dx =
+            (static_cast<double>(sample(pixel + Eigen::Vector2d(h, 0.0))) -
+             static_cast<double>(sample(pixel - Eigen::Vector2d(h, 0.0)))) /
+            (2.0 * h);
+        const double dy =
+            (static_cast<double>(sample(pixel + Eigen::Vector2d(0.0, h))) -
+             static_cast<double>(sample(pixel - Eigen::Vector2d(0.0, h)))) /
+            (2.0 * h);
         return Eigen::Vector2d(dx, dy);
     }
 };
@@ -420,13 +416,14 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                            local.y() - static_cast<double>(y0) + 0.5);
     double radius =
         std::max(8.0, 0.25 * static_cast<double>(2 * half + 1));
-    std::vector<Eigen::Vector2d> points;
+    std::vector<std::pair<Eigen::Vector2d, double>> points;
     for (int iteration = 0; iteration < 3; ++iteration) {
         points.clear();
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 const double value = static_cast<double>(crop.at(x, y));
-                if (!(std::abs(value - background) > 0.35)) {
+                const double deviation = std::abs(value - background);
+                if (!(deviation > 0.35)) {
                     continue;
                 }
                 const Eigen::Vector2d point(
@@ -436,50 +433,43 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                     (point - centre).norm() > 1.35 * radius) {
                     continue;
                 }
-                points.push_back(point);
+                points.emplace_back(point, deviation);
             }
         }
         if (points.size() < 64U) {
             return std::nullopt;
         }
         Eigen::Vector2d sum = Eigen::Vector2d::Zero();
-        for (const Eigen::Vector2d& point : points) {
-            sum += point;
+        double weight_sum = 0.0;
+        for (const auto& [point, weight] : points) {
+            sum += point * weight;
+            weight_sum += weight;
         }
-        centre = sum / static_cast<double>(points.size());
+        if (!(weight_sum > 0.0)) {
+            return std::nullopt;
+        }
+        centre = sum / weight_sum;
         std::vector<double> distances;
         distances.reserve(points.size());
-        for (const Eigen::Vector2d& point : points) {
+        for (const auto& [point, weight] : points) {
+            (void)weight;
             distances.push_back((point - centre).norm());
         }
-        const std::size_t middle =
-            (distances.size() * 9U) / 10U;
+        const std::size_t middle = (distances.size() * 3U) / 4U;
         std::nth_element(
             distances.begin(),
             distances.begin() + static_cast<std::ptrdiff_t>(middle),
             distances.end());
-        radius = std::max(3.0, distances[middle]);
+        // For a uniformly filled disc the 75th percentile is 0.866 R.
+        radius = std::max(3.0, 1.15 * distances[middle]);
     }
-    if (!centre.allFinite() || !(radius > 3.0)) {
-        return std::nullopt;
-    }
-    const Eigen::Vector2d window_centre(
-        centre.x() + static_cast<double>(x0),
-        centre.y() + static_cast<double>(y0));
-    MarkerCandidate candidate;
-    candidate.center = window_centre;
-    candidate.radius_px = radius;
-    Eigen::Vector2d fitted_centre = window_centre;
-    if (const auto fitted = refine_ellipse_center(view.image, candidate)) {
-        fitted_centre = *fitted;
-    }
-    if (!fitted_centre.allFinite() || !std::isfinite(radius)) {
+    if (!centre.allFinite() || !(radius > 3.0) || !std::isfinite(radius)) {
         return std::nullopt;
     }
     BlobSeed out;
-    out.pixel = (fitted_centre + Eigen::Vector2d(
-                                    static_cast<double>(view.offset_x),
-                                    static_cast<double>(view.offset_y))) *
+    out.pixel = (centre + Eigen::Vector2d(
+                              static_cast<double>(view.offset_x + x0),
+                              static_cast<double>(view.offset_y + y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
     return out;
@@ -1790,37 +1780,14 @@ WindowPlan build_window_requests(const Chunk& chunk,
     return plan;
 }
 
-/// Copy one crop out of a reduced image and compute dI/d(reduced index) there.
+/// Copy one crop out of a reduced image. Gradients are derived from this crop
+/// on demand, so the whole image can be released immediately.
 void cut_window(const FloatImage& image, int x0, int y0, int width, int height,
                 CameraView& window) {
     window.image = FloatImage(width, height, 0.0F);
-    window.gradient_x = FloatImage(width, height, 0.0F);
-    window.gradient_y = FloatImage(width, height, 0.0F);
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             window.image.at(x, y) = image.at(x0 + x, y0 + y);
-        }
-    }
-    for (int y = 0; y < height; ++y) {
-        const int ym = std::max(0, y - 1);
-        const int yp = std::min(height - 1, y + 1);
-        for (int x = 0; x < width; ++x) {
-            const int xm = std::max(0, x - 1);
-            const int xp = std::min(width - 1, x + 1);
-            const double dx = static_cast<double>(xp - xm);
-            const double dy = static_cast<double>(yp - ym);
-            window.gradient_x.at(x, y) =
-                dx > 0.0 ? static_cast<float>(
-                               (static_cast<double>(window.image.at(xp, y)) -
-                                static_cast<double>(window.image.at(xm, y))) /
-                               dx)
-                         : 0.0F;
-            window.gradient_y.at(x, y) =
-                dy > 0.0 ? static_cast<float>(
-                               (static_cast<double>(window.image.at(x, yp)) -
-                                static_cast<double>(window.image.at(x, ym))) /
-                               dy)
-                         : 0.0F;
         }
     }
     window.offset_x = x0;
@@ -1963,7 +1930,7 @@ std::vector<CameraView> load_windows(const Document& document,
     }
     std::size_t window_bytes = 0;
     for (const CameraView& window : windows) {
-        window_bytes += window.image.pixels().size() * sizeof(float) * 3;
+        window_bytes += window.image.pixels().size() * sizeof(float);
     }
     int threads = 1;
 #if defined(ALPHASHAPE_HAVE_OPENMP)
