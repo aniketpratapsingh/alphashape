@@ -1197,7 +1197,7 @@ std::optional<RoundOutcome> apply_winner(
         out.inlier[index] = true;
         ++projected_inliers;
         projected_centres[index] = *projected;
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
         const std::optional<BlobSeed> seed =
             circular_seed(*blend.view, *projected, options.patch_size);
         const auto refined =
@@ -1215,9 +1215,10 @@ std::optional<RoundOutcome> apply_winner(
                     std::max(2.0, cross->radius)) {
                     Eigen::Vector2d delta = cross->pixel - *projected;
                     const double distance = delta.norm();
+                    const double anchor_limit = std::max(2.0, blend.apparent);
                     if (std::isfinite(distance)) {
-                        if (distance > limit) {
-                            delta *= limit / distance;
+                        if (distance > anchor_limit) {
+                            delta *= anchor_limit / distance;
                         }
                         anchor = *projected + delta;
                         used_absolute = true;
@@ -1265,7 +1266,7 @@ std::optional<RoundOutcome> apply_winner(
         }
         const BlendView& blend = blends[i];
         Eigen::Vector2d refined = anchored[i];
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
         if (mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
@@ -1310,17 +1311,20 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
         const auto circle =
             circular_seed(*blend.view, blend.pixel, patch_size);
-        // A saddle at the measurement identifies a cross; everything else is
-        // treated as circular. This is the validated type test. The blob seed
-        // is kept as the ellipse alternative for both types; the cross refiner
-        // is tried first for a cross.
-        if (saddle_seed(*blend.view, blend.pixel).has_value()) {
-            // A saddle is evidence of a cross even when the full detector
-            // cannot return an extent (a grazing arm); keep the cross refiner
-            // and fall back to the blob or physical scale.
+        // A saddle at the measurement, or a detected cross whose centre is
+        // within one target radius of it, identifies a cross. The second test
+        // is what recognises a common-mode offset that moved the saddle out
+        // of the local scan. The blob seed stays as the ellipse alternative.
+        const bool saddle =
+            saddle_seed(*blend.view, blend.pixel).has_value();
+        const auto cross =
+            cross_extent(*blend.view, blend.pixel, patch_size);
+        const bool close =
+            cross && (cross->pixel - blend.pixel).norm() <=
+                         std::max(1.0, cross->radius);
+        if (saddle || close) {
             blend.cross = true;
-            if (const auto cross =
-                    cross_extent(*blend.view, blend.pixel, patch_size)) {
+            if (cross) {
                 blend.apparent = std::max(1.0, cross->radius);
                 blend.has_scale = true;
             } else if (circle) {
@@ -1346,7 +1350,7 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
     bool success = false;
     for (BlendView& blend : blends) {
         any = true;
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, blend.cross, blend.hint_work,
             limit);
