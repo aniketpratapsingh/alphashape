@@ -993,5 +993,26 @@ TEST(Markers, RefineDownscaleTwoStaysAccurate) {
     EXPECT_LE(worst, 0.15);
 }
 
+TEST(Markers, RefineWithoutTiePointsUsesFallbackRange) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 141U);
+    std::mt19937 engine(71U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    // Neither a dense cloud nor marker positions: the symmetric +/-search_steps
+    // window is the only depth range.
+    scene.chunk->point_cloud() = PointCloud{};
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine no cloud] marker %zu RMS %.4f px\n", i, rms);
+        EXPECT_LE(rms, 0.2);
+    }
+}
+
 }  // namespace
 }  // namespace alphashape
