@@ -450,6 +450,21 @@ std::optional<double> cross_radius(const CameraView& view,
             crop.at(x, y) = view.image.at(x0 + x, y0 + y);
         }
     }
+    // A completely flat crop has no cross. It is also the one input that can
+    // send the adaptive-threshold contour search through an unbounded number
+    // of passes, so the low-texture fixture must exit here.
+    double sum = 0.0;
+    double sum_squared = 0.0;
+    for (const float value : crop.pixels()) {
+        const double v = static_cast<double>(value);
+        sum += v;
+        sum_squared += v * v;
+    }
+    const double count = static_cast<double>(crop.pixels().size());
+    const double variance = sum_squared / count - (sum / count) * (sum / count);
+    if (!(variance > 1e-8)) {
+        return std::nullopt;
+    }
     CrossParams params;
     params.minimum_size = 2.0;
     params.minimum_dist = 8.0;
