@@ -42,6 +42,22 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-13.9: `RefineMarkers`, multi-view consensus refinement.**
+  The decision unit is the marker, not an individual patch: the task
+  triangulates the marker from its projections (DLT + Gauss-Newton), fits the
+  local target plane from nearby tie/cloud points, searches a depth range
+  proportional to the physical target radius, and scores every view with
+  zero-mean NCC against a reference view at the same physical plane patch.
+  Views within `correlation_margin` of the best correlation and above
+  `min_correlation` form the consensus; their projections are refined with
+  translation-only Lucas-Kanade and outliers are removed when
+  `remove_invalid` is set. Markers with fewer than two aligned views fall back
+  to a 2-D refiner chosen by local structure (ellipse fit for circular
+  targets, saddle fit for crosses). The run is one undoable
+  `CommandTransaction("Refine Markers")`; marker work is parallel and the
+  mutations are applied serially in marker order. `chunk.refineMarkers(...)`
+  exposes it in Python.
+
 - **WP-13.8: `DetectMarkers`, cross targets and non-coded targets.**
   `detect_crosses()` finds both printed cross styles: a checker (bowtie) target
   from its intensity saddle, refined by a weighted quadratic fit, and a bar

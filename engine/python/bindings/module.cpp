@@ -1601,6 +1601,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def("detectMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "DetectMarkers", std::move(kwargs));
         })
+        // Multi-view consensus refinement (WP-13.9), the same run_task call.
+        .def("refineMarkers", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "RefineMarkers", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"
