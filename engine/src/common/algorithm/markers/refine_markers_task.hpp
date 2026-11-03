@@ -11,8 +11,8 @@
 /// inlier projections. A projection whose measured position disagrees with the
 /// refined candidate by more than about one apparent target radius is a
 /// contradiction, not noise: it is removed rather than repaired. Markers with
-/// a single projection fall back to 2-D-only refinement. Everything is staged
-/// as one CommandTransaction("Refine Markers").
+/// a single projection fall back to 2-D-only refinement. The whole run is one
+/// snapshot-backed undo step.
 
 #include <cstddef>
 #include <cstdint>

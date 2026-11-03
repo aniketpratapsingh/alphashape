@@ -744,6 +744,37 @@ TEST(Markers, RefineIsUndoable) {
     EXPECT_FALSE(scene.chunk->markers() == original);
 }
 
+TEST(Markers, RefineUndoRestoresRemovedProjection) {
+    std::vector<std::int32_t> ids;
+    std::int32_t outlier_camera = -1;
+    RefineScene scene = make_contradicted_scene(ids, outlier_camera);
+    const Marker* before = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(before, nullptr);
+    const Marker original = *before;
+    ASSERT_GE(original.projections.size(), 3U);
+
+    RefineMarkersOptions options;
+    RefineMarkersPlan plan =
+        plan_refine_markers(scene.document, scene.chunk->id(), options);
+    ASSERT_TRUE(plan.command);
+    UndoStack stack(&scene.document);
+    stack.execute(std::move(plan.command));
+    const Marker* removed = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(removed, nullptr);
+    ASSERT_EQ(removed->projections.size(), original.projections.size() - 1U);
+
+    // The single staged snapshot restores order, enabled flags and metadata.
+    stack.undo();
+    const Marker* restored = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(restored, nullptr);
+    EXPECT_TRUE(*restored == original);
+    EXPECT_TRUE(restored->projections == original.projections);
+
+    stack.redo();
+    EXPECT_EQ(find_marker(*scene.chunk, ids[0])->projections.size(),
+              original.projections.size() - 1U);
+}
+
 TEST(Markers, RefineParamsFilter) {
     SceneSpec spec;
     spec.marker_count = 6;

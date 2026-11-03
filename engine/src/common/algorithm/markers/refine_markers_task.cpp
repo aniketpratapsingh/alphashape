@@ -769,6 +769,7 @@ struct ProjectionEdit {
 };
 
 struct MarkerEdit {
+    std::int32_t marker_id = -1;
     std::vector<ProjectionEdit> moves;
     std::vector<std::int32_t> removals;
     bool failed = false;
@@ -1252,6 +1253,128 @@ std::vector<CameraView> load_selected_views(const Document& document,
     return views;
 }
 
+Marker* find_marker_by_id(Chunk& chunk, std::int32_t marker_id) {
+    for (Marker& marker : chunk.markers()) {
+        if (marker.id == marker_id) {
+            return &marker;
+        }
+    }
+    return nullptr;
+}
+
+const Marker* find_marker_by_id(const Chunk& chunk, std::int32_t marker_id) {
+    for (const Marker& marker : chunk.markers()) {
+        if (marker.id == marker_id) {
+            return &marker;
+        }
+    }
+    return nullptr;
+}
+
+const MarkerProjection* find_projection(const Marker& marker,
+                                        std::int32_t camera_id) {
+    for (const MarkerProjection& projection : marker.projections) {
+        if (projection.camera_id == camera_id) {
+            return &projection;
+        }
+    }
+    return nullptr;
+}
+
+/// One staged command for the whole run. Its snapshot covers the marker
+/// container once, so undo memory is linear in markers rather than quadratic in
+/// projections, and revert restores the container exactly, order included.
+class RefineMarkersCommand : public StagedMutation {
+public:
+    RefineMarkersCommand(std::int32_t chunk_id, std::vector<MarkerEdit> edits)
+        : chunk_id_(chunk_id), edits_(std::move(edits)) {}
+
+    std::string name() const override { return "Refine Markers"; }
+
+    std::size_t retained_bytes() const override {
+        return snapshot_.capacity() * sizeof(Marker);
+    }
+
+protected:
+    void validate(Document& document) override {
+        const Chunk& chunk = target(document);
+        for (const MarkerEdit& edit : edits_) {
+            const Marker* marker = find_marker_by_id(chunk, edit.marker_id);
+            if (marker == nullptr) {
+                throw ValueError("RefineMarkers: no marker with id " +
+                                 std::to_string(edit.marker_id));
+            }
+            for (const ProjectionEdit& move : edit.moves) {
+                if (!move.pixel.allFinite()) {
+                    throw ValueError("RefineMarkers: projection pixel is not finite");
+                }
+                if (find_projection(*marker, move.camera_id) == nullptr) {
+                    throw ValueError("RefineMarkers: projection has no matching camera");
+                }
+            }
+            for (const std::int32_t camera_id : edit.removals) {
+                if (find_projection(*marker, camera_id) == nullptr) {
+                    throw ValueError("RefineMarkers: projection has no matching camera");
+                }
+            }
+        }
+    }
+
+    void stage(Document& document) override {
+        snapshot_ = target(document).markers();
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target(document);
+        for (const MarkerEdit& edit : edits_) {
+            Marker* marker = find_marker_by_id(chunk, edit.marker_id);
+            if (marker == nullptr) {
+                throw ValueError("RefineMarkers: no marker with id " +
+                                 std::to_string(edit.marker_id));
+            }
+            for (const ProjectionEdit& move : edit.moves) {
+                for (MarkerProjection& projection : marker->projections) {
+                    if (projection.camera_id == move.camera_id) {
+                        projection.pixel = move.pixel;
+                        break;
+                    }
+                }
+            }
+            for (const std::int32_t camera_id : edit.removals) {
+                auto& projections = marker->projections;
+                projections.erase(
+                    std::remove_if(projections.begin(), projections.end(),
+                                   [camera_id](const MarkerProjection& projection) {
+                                       return projection.camera_id == camera_id;
+                                   }),
+                    projections.end());
+            }
+        }
+    }
+
+    void restore(Document& document) override {
+        target(document).markers() = snapshot_;
+    }
+
+private:
+    Chunk& target(Document& document) const {
+        for (auto& workspace : document.workspaces()) {
+            if (!workspace) {
+                continue;
+            }
+            if (Chunk* chunk = workspace->find_chunk(chunk_id_)) {
+                return *chunk;
+            }
+        }
+        throw Error("RefineMarkers: no chunk with id " +
+                    std::to_string(chunk_id_));
+    }
+
+    std::int32_t chunk_id_;
+    std::vector<MarkerEdit> edits_;
+    std::vector<Marker> snapshot_;
+};
+
 }  // namespace
 
 RefineMarkersPlan plan_refine_markers(const Document& document,
@@ -1350,6 +1473,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             blend.pixel = projection.pixel;
             blends.push_back(blend);
         }
+        edits[static_cast<std::size_t>(i)].marker_id = marker.id;
         try {
             edits[static_cast<std::size_t>(i)] =
                 refine_marker(std::move(blends), cloud, options);
@@ -1363,13 +1487,12 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         }
     }
 
-    // Mutations are staged in marker order even though refinement ran in
-    // parallel, so the command sequence (and therefore undo/redo) is
-    // deterministic.
-    auto transaction = std::make_unique<CommandTransaction>("Refine Markers");
+    // Every selected marker is counted exactly once, and mutations are
+    // collected in marker order even though refinement ran in parallel, so the
+    // staged command (and therefore undo/redo) is deterministic.
+    std::vector<MarkerEdit> staged;
     for (std::size_t i = 0; i < selected.size(); ++i) {
-        const Marker& marker = chunk->markers()[selected[i]];
-        const MarkerEdit& edit = edits[i];
+        MarkerEdit& edit = edits[i];
         if (edit.skipped) {
             ++plan.stats.skipped;
             continue;
@@ -1378,23 +1501,19 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             ++plan.stats.failed;
             continue;
         }
-        for (const ProjectionEdit& move : edit.moves) {
-            transaction->add(make_move_marker_projection_command(
-                chunk->id(), marker.id, move.camera_id, move.pixel));
-        }
-        for (const std::int32_t camera_id : edit.removals) {
-            transaction->add(make_remove_marker_projection_command(
-                chunk->id(), marker.id, camera_id, false));
-            ++plan.stats.removed_projections;
-        }
+        plan.stats.removed_projections += edit.removals.size();
         if (edit.touched) {
             ++plan.stats.refined;
         } else {
             ++plan.stats.unchanged;
         }
+        if (!edit.moves.empty() || !edit.removals.empty()) {
+            staged.push_back(std::move(edit));
+        }
     }
-    if (!transaction->empty()) {
-        plan.command = std::move(transaction);
+    if (!staged.empty()) {
+        plan.command = std::make_unique<RefineMarkersCommand>(
+            chunk->id(), std::move(staged));
     }
     return plan;
 }
