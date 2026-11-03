@@ -368,10 +368,14 @@ struct BlobSeed {
     double radius = 0.0;
 };
 
-/// Locate the circular target around `pixel` in the window. The blob's scale
-/// supplies the apparent radius in full-resolution pixels; the ellipse refit
-/// supplies a seed for the 2-D fallback. Crosses never call this: their radius
-/// comes from the cross detector, or from the projected physical radius.
+/// Locate the circular target around `pixel` in the window. The printed
+/// target's black and white regions both differ strongly from the local
+/// background, so their combined centroid is the disc centre and their
+/// distance spread is its outer radius; the gradient ellipse fit then refines
+/// it. This is independent of the coded sector arrangement, which breaks a
+/// blob detector into several off-centre sectors. Crosses never call this:
+/// their radius comes from the cross detector, or from the projected physical
+/// radius.
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel, int patch_size) {
     if (!view.loaded()) {
@@ -403,122 +407,81 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
             crop.at(x, y) = view.image.at(x0 + x, y0 + y);
         }
     }
-    BlobParams params;
-    params.dark_on_light = true;
-    params.min_radius = 2;
-    params.max_radius = std::max(4, half);
-    params.threshold = 0.02F;
-    params.min_axis_ratio = 0.3;
-    const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
-    const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
-                               local.y() - static_cast<double>(y0) + 0.5);
-    double max_blob_radius = 0.0;
-    for (const MarkerCandidate& blob : blobs) {
-        if (blob.center.allFinite() && std::isfinite(blob.radius_px)) {
-            max_blob_radius = std::max(max_blob_radius, blob.radius_px);
-        }
-    }
-    if (!(max_blob_radius > 0.0)) {
+    // The median is the local background; both target polarities stand far
+    // from it, so the mask is independent of the coded word.
+    std::vector<float> sorted = crop.pixels();
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted.empty()) {
         return std::nullopt;
     }
-    // A coded disc breaks into sector blobs. Keep the credible ones (ground
-    // texture produces much smaller blobs), take their radius-weighted
-    // centroid, then re-centre on the compact ring of target blobs. This lands
-    // near the printed centre even when the measurement is most of a radius
-    // away.
-    std::vector<const MarkerCandidate*> kept;
-    for (const MarkerCandidate& blob : blobs) {
-        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px) ||
-            blob.radius_px < 0.35 * max_blob_radius ||
-            (blob.center - seed).norm() > static_cast<double>(half)) {
-            continue;
+    const double background =
+        static_cast<double>(sorted[sorted.size() / 2]);
+    Eigen::Vector2d centre(local.x() - static_cast<double>(x0) + 0.5,
+                           local.y() - static_cast<double>(y0) + 0.5);
+    double radius =
+        std::max(8.0, 0.25 * static_cast<double>(2 * half + 1));
+    std::vector<Eigen::Vector2d> points;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        points.clear();
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const double value = static_cast<double>(crop.at(x, y));
+                if (!(std::abs(value - background) > 0.35)) {
+                    continue;
+                }
+                const Eigen::Vector2d point(
+                    static_cast<double>(x) + 0.5,
+                    static_cast<double>(y) + 0.5);
+                if (iteration > 0 &&
+                    (point - centre).norm() > 1.35 * radius) {
+                    continue;
+                }
+                points.push_back(point);
+            }
         }
-        kept.push_back(&blob);
-    }
-    if (kept.empty()) {
-        return std::nullopt;
-    }
-    const auto centroid_of =
-        [](const std::vector<const MarkerCandidate*>& set)
-        -> std::optional<Eigen::Vector2d> {
-        double weight_sum = 0.0;
-        Eigen::Vector2d sum = Eigen::Vector2d::Zero();
-        for (const MarkerCandidate* blob : set) {
-            const double weight =
-                std::max(blob->response, 1e-6) * blob->radius_px;
-            sum += blob->center * weight;
-            weight_sum += weight;
-        }
-        if (!(weight_sum > 0.0) || !sum.allFinite()) {
+        if (points.size() < 64U) {
             return std::nullopt;
         }
-        const Eigen::Vector2d centroid = sum / weight_sum;
-        return centroid;
-    };
-    const auto first = centroid_of(kept);
-    if (!first) {
-        return std::nullopt;
-    }
-    const auto median_extent =
-        [](const std::vector<const MarkerCandidate*>& set,
-           const Eigen::Vector2d& centre) {
-        std::vector<double> values;
-        values.reserve(set.size());
-        for (const MarkerCandidate* blob : set) {
-            values.push_back((blob->center - centre).norm() +
-                             blob->radius_px);
+        Eigen::Vector2d sum = Eigen::Vector2d::Zero();
+        for (const Eigen::Vector2d& point : points) {
+            sum += point;
         }
-        if (values.empty()) {
-            return 0.0;
+        centre = sum / static_cast<double>(points.size());
+        std::vector<double> distances;
+        distances.reserve(points.size());
+        for (const Eigen::Vector2d& point : points) {
+            distances.push_back((point - centre).norm());
         }
-        const std::size_t middle = values.size() / 2;
+        const std::size_t middle =
+            (distances.size() * 9U) / 10U;
         std::nth_element(
-            values.begin(),
-            values.begin() + static_cast<std::ptrdiff_t>(middle),
-            values.end());
-        return values[middle];
-    };
-    const double first_extent = median_extent(kept, *first);
-    if (!(first_extent > 0.0)) {
-        return std::nullopt;
+            distances.begin(),
+            distances.begin() + static_cast<std::ptrdiff_t>(middle),
+            distances.end());
+        radius = std::max(3.0, distances[middle]);
     }
-    std::vector<const MarkerCandidate*> ring;
-    for (const MarkerCandidate* blob : kept) {
-        if ((blob->center - *first).norm() <= 1.25 * first_extent) {
-            ring.push_back(blob);
-        }
-    }
-    if (ring.empty()) {
-        return std::nullopt;
-    }
-    const auto second = centroid_of(ring);
-    if (!second) {
-        return std::nullopt;
-    }
-    const Eigen::Vector2d centroid = *second;
-    const double outer = std::max(4.0, median_extent(ring, centroid));
-    if (!std::isfinite(outer)) {
+    if (!centre.allFinite() || !(radius > 3.0)) {
         return std::nullopt;
     }
     const Eigen::Vector2d window_centre(
-        centroid.x() + static_cast<double>(x0),
-        centroid.y() + static_cast<double>(y0));
+        centre.x() + static_cast<double>(x0),
+        centre.y() + static_cast<double>(y0));
     MarkerCandidate candidate;
     candidate.center = window_centre;
-    candidate.radius_px = outer;
-    Eigen::Vector2d centre = window_centre;
+    candidate.radius_px = radius;
+    Eigen::Vector2d fitted_centre = window_centre;
     if (const auto fitted = refine_ellipse_center(view.image, candidate)) {
-        centre = *fitted;
+        fitted_centre = *fitted;
     }
-    if (!centre.allFinite() || !(outer > 0.0)) {
+    if (!fitted_centre.allFinite() || !std::isfinite(radius)) {
         return std::nullopt;
     }
     BlobSeed out;
-    out.pixel = (centre + Eigen::Vector2d(
-                             static_cast<double>(view.offset_x),
-                             static_cast<double>(view.offset_y))) *
+    out.pixel = (fitted_centre + Eigen::Vector2d(
+                                    static_cast<double>(view.offset_x),
+                                    static_cast<double>(view.offset_y))) *
                 static_cast<double>(view.downscale);
-    out.radius = outer * static_cast<double>(view.downscale);
+    out.radius = radius * static_cast<double>(view.downscale);
     return out;
 }
 
