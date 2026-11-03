@@ -1,0 +1,49 @@
+#pragma once
+
+// Opt-in step-edge refinement for a DEM height field.
+//
+// Stereo matching plus smoothing turns a sharp roof/building outline into a
+// ramp several cells wide; orthorectifying with that DEM then smears the
+// outline. This pass finds long straight height discontinuities and rebuilds a
+// sharp step across them:
+//
+//   1. Sobel gradient magnitude of the height field, in metres per metre.
+//   2. Candidate cells: gradient above min_height / (2 cells) and a height
+//      step >= min_height between the samples +-2..3 cells along it.
+//   3. Orientation region growing (+-15 degrees) groups the candidates; a
+//      total-least-squares line (PCA of the cell centres) is fitted to each.
+//   4. One plane per side of the line, fitted by Huber IRLS over the band's
+//      non-transition cells (Huber 1964, Ann. Math. Stat. 35(1)).
+//   5. Accepted segments snap each band cell to its side's plane, blended over
+//      the last cell toward the original surface and clamped to the band's
+//      original height range. Nodata/filled cells are never touched.
+//
+// The grouping follows the LSD idea of chaining aligned gradient evidence
+// (von Gioi et al. 2010, "LSD: a fast line segment detector", IEEE TPAMI
+// 32(4)) before the robust two-plane model.
+//
+// Every option and the return value are in metres: heights are metres, the
+// cell size is metres per cell, `min_height` and `min_length` are metres.
+
+#include <cstdint>
+#include <vector>
+
+namespace alphashape::elevation {
+
+struct StepEdgeOptions {
+    double min_height = 1.5;   ///< metres; smallest accepted height step
+    double min_length = 3.0;   ///< metres; shortest accepted segment
+    int band_half_width = 5;   ///< cells fitted/snapped on each side of a line
+};
+
+/// Refine `heights` (row-major, width*height, metres) in place. `valid[i] == 0`
+/// marks nodata or hole-filled cells, which are never read as evidence nor
+/// written. Returns the number of accepted straight segments.
+///
+/// Throws ValueError when the sizes disagree, width or height is < 3, or
+/// cell_size is not positive and finite.
+int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_t>& valid,
+                      int width, int height, double cell_size,
+                      const StepEdgeOptions& options);
+
+}  // namespace alphashape::elevation

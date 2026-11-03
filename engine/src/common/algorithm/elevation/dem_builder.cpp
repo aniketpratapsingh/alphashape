@@ -17,6 +17,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/cell_fusion.hpp"
+#include "common/algorithm/elevation/step_edges.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -1212,6 +1213,20 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
                         static_cast<float>(static_cast<double>(u[i]) * cell_size);
                 }
             }
+        }
+    }
+    // -- step-edge refinement -------------------------------------------------
+    // Only measured cells are evidence and only they are rewritten: hole-filled
+    // cells are not a real surface and must keep whatever the fill produced.
+    if (options.refine_edges && (source == Source::DepthMaps || source == Source::PointCloud)) {
+        StepEdgeOptions step_options;
+        step_options.min_height = options.step_min_height;
+        step_options.min_length = options.step_min_length;
+        const int segments = refine_step_edges(final_values, observed, grid.width, grid.height,
+                                                fusion_cell_size, step_options);
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildDem: step-edge refinement accepted " << segments
+                                << " segment(s)";
         }
     }
     // Re-apply the interpolation mask: cells that were neither observed nor

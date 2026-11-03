@@ -62,6 +62,7 @@ add_library(alphashape_algorithms STATIC
     elevation/cell_fusion.cpp
     elevation/sibson.cpp
     elevation/tgv_denoise.cpp
+    elevation/step_edges.cpp
     elevation/surface_frame.cpp
     elevation/dem_builder.cpp
     elevation/build_dem_task.cpp

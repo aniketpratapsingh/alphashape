@@ -64,6 +64,7 @@ add_executable(alphashape_tests
     test_geotiff.cpp
     test_interpolate.cpp
     test_tgv_denoise.cpp
+    test_step_edges.cpp
     test_aerial_fixture.cpp
     test_build_dem.cpp
     test_ortho.cpp

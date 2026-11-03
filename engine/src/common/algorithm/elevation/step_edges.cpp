@@ -1,0 +1,556 @@
+#include "common/algorithm/elevation/step_edges.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+#include "base/utils/error.hpp"
+
+namespace alphashape::elevation {
+namespace {
+
+/// cos(15 degrees): the orientation tolerance for chaining candidates.
+constexpr double kCos15 = 0.96592582628906831;
+
+/// A fitted plane h = a*x + b*y + c over (cell-column, cell-row) coordinates.
+struct PlaneFit {
+    bool ok = false;
+    double a = 0.0;
+    double b = 0.0;
+    double c = 0.0;
+    double rms = 0.0;
+};
+
+/// One accepted discontinuity: a line (point + unit direction), the height
+/// range along it, and the plane on each side (left = negative signed
+/// distance, right = positive).
+struct Segment {
+    double px = 0.0;
+    double py = 0.0;
+    double dx = 1.0;
+    double dy = 0.0;
+    double tmin = 0.0;
+    double tmax = 0.0;
+    PlaneFit left;
+    PlaneFit right;
+    double lo = 0.0;
+    double hi = 0.0;
+};
+
+/// Solve the 3x3 system m*x = rhs by Gaussian elimination with partial
+/// pivoting. Returns false when the matrix is numerically singular.
+bool solve3(double m[3][3], double rhs[3], double out[3]) {
+    for (int col = 0; col < 3; ++col) {
+        int pivot = col;
+        for (int row = col + 1; row < 3; ++row) {
+            if (std::abs(m[row][col]) > std::abs(m[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (std::abs(m[pivot][col]) < 1e-12) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int k = col; k < 3; ++k) {
+                std::swap(m[col][k], m[pivot][k]);
+            }
+            std::swap(rhs[col], rhs[pivot]);
+        }
+        const double inv = 1.0 / m[col][col];
+        for (int row = col + 1; row < 3; ++row) {
+            const double f = m[row][col] * inv;
+            if (f == 0.0) {
+                continue;
+            }
+            for (int k = col; k < 3; ++k) {
+                m[row][k] -= f * m[col][k];
+            }
+            rhs[row] -= f * rhs[col];
+        }
+    }
+    for (int row = 2; row >= 0; --row) {
+        double sum = rhs[row];
+        for (int k = row + 1; k < 3; ++k) {
+            sum -= m[row][k] * out[k];
+        }
+        out[row] = sum / m[row][row];
+    }
+    return true;
+}
+
+/// Weighted least-squares plane fit. An empty `w` means unit weights.
+bool solve_plane(const std::vector<double>& x, const std::vector<double>& y,
+                 const std::vector<double>& h, const std::vector<double>& w, double out[3]) {
+    double a[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    double rhs[3] = {0.0, 0.0, 0.0};
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        const double wi = w.empty() ? 1.0 : w[i];
+        const double row[3] = {x[i], y[i], 1.0};
+        for (int r = 0; r < 3; ++r) {
+            rhs[r] += wi * row[r] * h[i];
+            for (int c = 0; c < 3; ++c) {
+                a[r][c] += wi * row[r] * row[c];
+            }
+        }
+    }
+    return solve3(a, rhs, out);
+}
+
+double median_of(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    const std::size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid),
+                     values.end());
+    double value = values[mid];
+    if (values.size() % 2 == 0) {
+        const auto lower_end =
+            values.begin() + static_cast<std::ptrdiff_t>(mid);
+        value = 0.5 * (value + *std::max_element(values.begin(), lower_end));
+    }
+    return value;
+}
+
+/// Huber IRLS plane fit (Huber 1964). The robust scale is the MAD of the
+/// residuals with a floor, so an exact plane does not get an infinite weight.
+PlaneFit fit_plane_huber(const std::vector<double>& x, const std::vector<double>& y,
+                         const std::vector<double>& h) {
+    PlaneFit fit;
+    const std::size_t n = x.size();
+    if (n < 6) {
+        return fit;
+    }
+    double p[3] = {0.0, 0.0, 0.0};
+    if (!solve_plane(x, y, h, {}, p)) {
+        return fit;
+    }
+    std::vector<double> w(n, 1.0);
+    std::vector<double> r(n, 0.0);
+    for (int iter = 0; iter < 8; ++iter) {
+        std::vector<double> abs_r(n, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            r[i] = p[0] * x[i] + p[1] * y[i] + p[2] - h[i];
+            abs_r[i] = std::abs(r[i]);
+        }
+        const double scale = std::max(0.05, 1.4826 * median_of(abs_r));
+        const double delta = 2.0 * scale;
+        bool changed = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            const double next = std::abs(r[i]) <= delta ? 1.0 : delta / std::abs(r[i]);
+            changed = changed || std::abs(next - w[i]) > 1e-6;
+            w[i] = next;
+        }
+        if (!solve_plane(x, y, h, w, p)) {
+            return fit;
+        }
+        if (!changed) {
+            break;
+        }
+    }
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double ri = p[0] * x[i] + p[1] * y[i] + p[2] - h[i];
+        sum_sq += ri * ri;
+    }
+    fit.ok = true;
+    fit.a = p[0];
+    fit.b = p[1];
+    fit.c = p[2];
+    fit.rms = std::sqrt(sum_sq / static_cast<double>(n));
+    return fit;
+}
+
+/// Read-only view of the height field used by the segment builder.
+struct Grid {
+    int width = 0;
+    int height = 0;
+    double cell_size = 1.0;
+    const std::vector<double>* h = nullptr;
+    const std::vector<std::uint8_t>* valid = nullptr;
+
+    bool inside(int col, int row) const {
+        return col >= 0 && row >= 0 && col < width && row < height;
+    }
+    bool is_valid(int col, int row) const {
+        return inside(col, row) &&
+               (*valid)[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                        static_cast<std::size_t>(col)] != 0U;
+    }
+    double height_at(int col, int row) const {
+        return (*h)[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                    static_cast<std::size_t>(col)];
+    }
+};
+
+double plane_value(const PlaneFit& plane, double x, double y) {
+    return plane.a * x + plane.b * y + plane.c;
+}
+
+/// Turn one orientation-grown component into a validated segment: a total
+/// least-squares line (PCA of the cell centres) and one Huber plane per side.
+bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_height,
+                   double min_length, int band, Segment& out) {
+    if (cells.size() < 6U) {
+        return false;
+    }
+    double mx = 0.0;
+    double my = 0.0;
+    for (const int index : cells) {
+        mx += static_cast<double>(index % grid.width);
+        my += static_cast<double>(index / grid.width);
+    }
+    const double n = static_cast<double>(cells.size());
+    mx /= n;
+    my /= n;
+    double sxx = 0.0;
+    double syy = 0.0;
+    double sxy = 0.0;
+    for (const int index : cells) {
+        const double dx = static_cast<double>(index % grid.width) - mx;
+        const double dy = static_cast<double>(index / grid.width) - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    const double angle = 0.5 * std::atan2(2.0 * sxy, sxx - syy);
+    const double dx = std::cos(angle);
+    const double dy = std::sin(angle);
+    const double nx = -dy;
+    const double ny = dx;
+    double tmin = std::numeric_limits<double>::infinity();
+    double tmax = -std::numeric_limits<double>::infinity();
+    int inliers = 0;
+    for (const int index : cells) {
+        const double px = static_cast<double>(index % grid.width) - mx;
+        const double py = static_cast<double>(index / grid.width) - my;
+        if (std::abs(px * nx + py * ny) > 2.5) {
+            continue;
+        }
+        const double t = px * dx + py * dy;
+        tmin = std::min(tmin, t);
+        tmax = std::max(tmax, t);
+        ++inliers;
+    }
+    if (inliers < 5 || (tmax - tmin) * grid.cell_size < min_length) {
+        return false;
+    }
+    int col0 = grid.width;
+    int row0 = grid.height;
+    int col1 = -1;
+    int row1 = -1;
+    for (const int index : cells) {
+        const int col = index % grid.width;
+        const int row = index / grid.width;
+        col0 = std::min(col0, col - band - 1);
+        col1 = std::max(col1, col + band + 1);
+        row0 = std::min(row0, row - band - 1);
+        row1 = std::max(row1, row + band + 1);
+    }
+    std::vector<double> lx;
+    std::vector<double> ly;
+    std::vector<double> lh;
+    std::vector<double> rx;
+    std::vector<double> ry;
+    std::vector<double> rh;
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -lo;
+    for (int row = std::max(0, row0); row <= std::min(grid.height - 1, row1); ++row) {
+        for (int col = std::max(0, col0); col <= std::min(grid.width - 1, col1); ++col) {
+            if (!grid.is_valid(col, row)) {
+                continue;
+            }
+            const double px = static_cast<double>(col) - mx;
+            const double py = static_cast<double>(row) - my;
+            const double s = px * nx + py * ny;
+            const double t = px * dx + py * dy;
+            if (t < tmin - 0.5 || t > tmax + 0.5 || std::abs(s) > static_cast<double>(band)) {
+                continue;
+            }
+            const double value = grid.height_at(col, row);
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+            // The cell at the line plus its two neighbours still carry most
+            // of the blur ramp: fitting them would pull both planes toward
+            // each other, leaving soft shoulders on the rebuilt step.
+            if (std::abs(s) < 3.0) {
+                continue;
+            }
+            if (s < 0.0) {
+                lx.push_back(static_cast<double>(col));
+                ly.push_back(static_cast<double>(row));
+                lh.push_back(value);
+            } else {
+                rx.push_back(static_cast<double>(col));
+                ry.push_back(static_cast<double>(row));
+                rh.push_back(value);
+            }
+        }
+    }
+    const PlaneFit left = fit_plane_huber(lx, ly, lh);
+    const PlaneFit right = fit_plane_huber(rx, ry, rh);
+    if (!left.ok || !right.ok || !(hi > lo)) {
+        return false;
+    }
+    const double residual_limit = std::max(0.10, 0.35 * min_height);
+    if (left.rms > residual_limit || right.rms > residual_limit) {
+        return false;
+    }
+    int sign = 0;
+    for (int k = 0; k < 3; ++k) {
+        const double t = tmin + 0.5 * static_cast<double>(k) * (tmax - tmin);
+        const double px = mx + dx * t;
+        const double py = my + dy * t;
+        const double step = plane_value(left, px, py) - plane_value(right, px, py);
+        // A real discontinuity cannot be taller than the whole band's height
+        // range; a larger extrapolated step means the two plane fits latched
+        // onto different features.
+        if (std::abs(step) < min_height || std::abs(step) > hi - lo) {
+            return false;
+        }
+        const int this_sign = step > 0.0 ? 1 : -1;
+        if (sign == 0) {
+            sign = this_sign;
+        } else if (sign != this_sign) {
+            return false;
+        }
+    }
+    out.px = mx;
+    out.py = my;
+    out.dx = dx;
+    out.dy = dy;
+    out.tmin = tmin;
+    out.tmax = tmax;
+    out.left = left;
+    out.right = right;
+    out.lo = lo;
+    out.hi = hi;
+    return true;
+}
+
+/// Record one accepted segment's snapped values. `best_dist` keeps the nearest
+/// segment per cell, so overlaps (building corners) resolve without fighting.
+void snap_segment(const Segment& segment, const Grid& grid, int band,
+                  std::vector<double>& best_h, std::vector<double>& best_dist) {
+    const double nx = -segment.dy;
+    const double ny = segment.dx;
+    const double s_max = static_cast<double>(band - 1);
+    const double ax = segment.px + segment.dx * segment.tmin;
+    const double ay = segment.py + segment.dy * segment.tmin;
+    const double bx = segment.px + segment.dx * segment.tmax;
+    const double by = segment.py + segment.dy * segment.tmax;
+    const int margin = band + 1;
+    const int col0 = std::max(0, static_cast<int>(std::floor(std::min(ax, bx))) - margin);
+    const int col1 =
+        std::min(grid.width - 1, static_cast<int>(std::ceil(std::max(ax, bx))) + margin);
+    const int row0 = std::max(0, static_cast<int>(std::floor(std::min(ay, by))) - margin);
+    const int row1 =
+        std::min(grid.height - 1, static_cast<int>(std::ceil(std::max(ay, by))) + margin);
+    for (int row = row0; row <= row1; ++row) {
+        for (int col = col0; col <= col1; ++col) {
+            if (!grid.is_valid(col, row)) {
+                continue;
+            }
+            const double px = static_cast<double>(col) - segment.px;
+            const double py = static_cast<double>(row) - segment.py;
+            const double s = px * nx + py * ny;
+            const double t = px * segment.dx + py * segment.dy;
+            const double as = std::abs(s);
+            if (t < segment.tmin - 1.0 || t > segment.tmax + 1.0 || as > s_max) {
+                continue;
+            }
+            const PlaneFit& plane = s < 0.0 ? segment.left : segment.right;
+            double value = plane_value(plane, static_cast<double>(col), static_cast<double>(row));
+            value = std::min(std::max(value, segment.lo), segment.hi);
+            // One-cell linear blend at the outer edge: no new discontinuity.
+            const double weight = as > s_max - 1.0 ? std::max(0.0, s_max - as) : 1.0;
+            const double original = grid.height_at(col, row);
+            const double blended = weight * value + (1.0 - weight) * original;
+            const std::size_t index = static_cast<std::size_t>(row) *
+                                          static_cast<std::size_t>(grid.width) +
+                                      static_cast<std::size_t>(col);
+            if (as < best_dist[index]) {
+                best_dist[index] = as;
+                best_h[index] = blended;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_t>& valid,
+                      int width, int height, double cell_size,
+                      const StepEdgeOptions& options) {
+    if (width < 3 || height < 3) {
+        throw ValueError("refine_step_edges: the grid must be at least 3x3 cells");
+    }
+    if (!(cell_size > 0.0) || !std::isfinite(cell_size)) {
+        throw ValueError("refine_step_edges: cell_size must be positive and finite");
+    }
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    if (heights.size() != count || valid.size() != count) {
+        throw ValueError("refine_step_edges: heights and valid must hold width*height cells");
+    }
+    const double min_height = std::max(1e-6, options.min_height);
+    const double min_length = std::max(0.0, options.min_length);
+    const int band = std::max(2, options.band_half_width);
+    const auto at = [width](int col, int row) {
+        return static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+               static_cast<std::size_t>(col);
+    };
+
+    // -- 1. gradient and step evidence ---------------------------------------
+    std::vector<double> h(count, 0.0);
+    for (std::size_t i = 0; i < count; ++i) {
+        h[i] = static_cast<double>(heights[i]);
+    }
+    std::vector<double> gx(count, 0.0);
+    std::vector<double> gy(count, 0.0);
+    std::vector<double> gm(count, 0.0);
+    for (int row = 1; row + 1 < height; ++row) {
+        for (int col = 1; col + 1 < width; ++col) {
+            bool complete = true;
+            for (int dy = -1; dy <= 1 && complete; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (valid[at(col + dx, row + dy)] == 0U) {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if (!complete) {
+                continue;
+            }
+            // Sobel divided by 8: a derivative in metres per CELL.
+            gx[at(col, row)] =
+                (h[at(col + 1, row - 1)] + 2.0 * h[at(col + 1, row)] + h[at(col + 1, row + 1)] -
+                 h[at(col - 1, row - 1)] - 2.0 * h[at(col - 1, row)] - h[at(col - 1, row + 1)]) /
+                8.0;
+            gy[at(col, row)] =
+                (h[at(col - 1, row + 1)] + 2.0 * h[at(col, row + 1)] + h[at(col + 1, row + 1)] -
+                 h[at(col - 1, row - 1)] - 2.0 * h[at(col, row - 1)] - h[at(col + 1, row - 1)]) /
+                8.0;
+            gm[at(col, row)] = std::hypot(gx[at(col, row)], gy[at(col, row)]);
+        }
+    }
+
+    std::vector<std::uint8_t> candidate(count, 0U);
+    for (int row = 1; row + 1 < height; ++row) {
+        for (int col = 1; col + 1 < width; ++col) {
+            const std::size_t index = at(col, row);
+            // Slope threshold min_height / (2 cells), expressed per cell.
+            if (gm[index] < 0.5 * min_height) {
+                continue;
+            }
+            const double ux = gx[index] / gm[index];
+            const double uy = gy[index] / gm[index];
+            double negative_sum = 0.0;
+            double positive_sum = 0.0;
+            int negative_n = 0;
+            int positive_n = 0;
+            for (int k = 2; k <= 3; ++k) {
+                for (int sign = -1; sign <= 1; sign += 2) {
+                    const int sx = col + static_cast<int>(std::lround(sign * k * ux));
+                    const int sy = row + static_cast<int>(std::lround(sign * k * uy));
+                    if (sx < 0 || sy < 0 || sx >= width || sy >= height ||
+                        valid[at(sx, sy)] == 0U) {
+                        continue;
+                    }
+                    if (sign < 0) {
+                        negative_sum += h[at(sx, sy)];
+                        ++negative_n;
+                    } else {
+                        positive_sum += h[at(sx, sy)];
+                        ++positive_n;
+                    }
+                }
+            }
+            if (negative_n == 0 || positive_n == 0) {
+                continue;
+            }
+            const double step = positive_sum / positive_n - negative_sum / negative_n;
+            if (std::abs(step) >= min_height) {
+                candidate[index] = 1U;
+            }
+        }
+    }
+    // -- 2. orientation region growing (+-15 degrees) ------------------------
+    std::vector<int> label(count, -1);
+    std::vector<std::vector<int>> components;
+    std::vector<int> stack;
+    for (std::size_t seed = 0; seed < count; ++seed) {
+        if (candidate[seed] == 0U || label[seed] >= 0) {
+            continue;
+        }
+        const int id = static_cast<int>(components.size());
+        components.emplace_back();
+        label[seed] = id;
+        // Grow against the SEED orientation, not the neighbour's: at a blurred
+        // corner the gradient rotates continuously, and a neighbour-to-
+        // neighbour test would walk around the whole building as one curve.
+        const double seed_x = gx[seed] / gm[seed];
+        const double seed_y = gy[seed] / gm[seed];
+        stack.assign(1, static_cast<int>(seed));
+        while (!stack.empty()) {
+            const int current = stack.back();
+            stack.pop_back();
+            components[static_cast<std::size_t>(id)].push_back(current);
+            const int col = current % width;
+            const int row = current / width;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nc = col + dx;
+                    const int nr = row + dy;
+                    if (nc < 0 || nr < 0 || nc >= width || nr >= height) {
+                        continue;
+                    }
+                    const std::size_t ni = at(nc, nr);
+                    if (candidate[ni] == 0U || label[ni] >= 0) {
+                        continue;
+                    }
+                    const double vx = gx[ni] / gm[ni];
+                    const double vy = gy[ni] / gm[ni];
+                    if (vx * seed_x + vy * seed_y < kCos15) {
+                        continue;
+                    }
+                    label[ni] = id;
+                    stack.push_back(static_cast<int>(ni));
+                }
+            }
+        }
+    }
+
+    // -- 3. two-plane fit, acceptance, snap ----------------------------------
+    Grid grid;
+    grid.width = width;
+    grid.height = height;
+    grid.cell_size = cell_size;
+    grid.h = &h;
+    grid.valid = &valid;
+    std::vector<double> best_h(count, 0.0);
+    std::vector<double> best_dist(count, std::numeric_limits<double>::infinity());
+    int accepted = 0;
+    for (const std::vector<int>& component : components) {
+        Segment segment;
+        if (!build_segment(component, grid, min_height, min_length, band, segment)) {
+            continue;
+        }
+        snap_segment(segment, grid, band, best_h, best_dist);
+        ++accepted;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (std::isfinite(best_dist[i])) {
+            heights[i] = static_cast<float>(best_h[i]);
+        }
+    }
+    return accepted;
+}
+
+}  // namespace alphashape::elevation
