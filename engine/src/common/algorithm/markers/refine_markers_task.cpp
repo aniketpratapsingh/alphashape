@@ -26,6 +26,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
+#include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/cross_decoder.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
@@ -1289,10 +1290,10 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             continue;
         }
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+        const auto circle =
+            circular_seed(*blend.view, blend.pixel, patch_size);
         // A cross must be confirmed either by a saddle at the measurement or
         // by a detection whose centre lies within one target radius of it.
-        // Without this, a coded disc's sector pattern can be misread as a
-        // cross and lose its validated circular anchor.
         const bool saddle =
             saddle_seed(*blend.view, blend.pixel).has_value();
         if (const auto cross =
@@ -1301,18 +1302,38 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
                 (cross->pixel - blend.pixel).norm() <=
                 std::max(1.0, cross->radius);
             if (saddle || close) {
-                blend.cross = true;
-                blend.apparent = std::max(1.0, cross->radius);
-                blend.has_scale = true;
-                blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
-                // The detector's subpixel saddle fit is the absolute centre.
-                blend.anchor = cross->pixel;
-                blend.has_anchor = true;
-                continue;
+                // A coded ring word is conclusive: a disc misread as a cross
+                // keeps its validated circular refinement.
+                bool coded_circle = false;
+                if (circle) {
+                    MarkerCandidate candidate;
+                    candidate.center =
+                        blend.view->local_of(circle->pixel) +
+                        Eigen::Vector2d(0.5, 0.5);
+                    candidate.radius_px = circle->radius / ds;
+                    for (const int bits : {12, 14, 16, 20}) {
+                        if (decode_circular(blend.view->image, candidate,
+                                            bits, 0)) {
+                            coded_circle = true;
+                            break;
+                        }
+                    }
+                }
+                if (!coded_circle) {
+                    blend.cross = true;
+                    blend.apparent = std::max(1.0, cross->radius);
+                    blend.has_scale = true;
+                    blend.hint_work =
+                        std::max(6.0, 0.25 * blend.apparent / ds);
+                    // The detector's subpixel saddle fit is the absolute
+                    // centre.
+                    blend.anchor = cross->pixel;
+                    blend.has_anchor = true;
+                    continue;
+                }
             }
         }
-        if (const auto circle =
-                circular_seed(*blend.view, blend.pixel, patch_size)) {
+        if (circle) {
             // Circular targets are re-anchored each round around the current
             // projected point, exactly as the validated 2-D refiner runs.
             blend.seed = circle;
