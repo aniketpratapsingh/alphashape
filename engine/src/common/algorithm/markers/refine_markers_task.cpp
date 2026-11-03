@@ -1197,7 +1197,7 @@ std::optional<RoundOutcome> apply_winner(
         // 2-D refiner is more accurate.
         const bool absolute_anchor =
             blend.has_anchor && blend.anchor.allFinite() &&
-            (blend.pixel - *projected).norm() > 0.25 * blend.apparent;
+            (blend.pixel - *projected).norm() > 0.5 * blend.apparent;
         if (absolute_anchor) {
             Eigen::Vector2d delta = blend.anchor - *projected;
             const double distance = delta.norm();
