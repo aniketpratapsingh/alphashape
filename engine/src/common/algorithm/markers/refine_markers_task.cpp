@@ -1193,13 +1193,14 @@ std::optional<RoundOutcome> apply_winner(
             Eigen::Vector2d delta = blend.anchor - *projected;
             const double distance = delta.norm();
             // A cross detector gives a reliable absolute centre across most
-            // of a radius; the circular blob scale is less certain, so only
-            // accept it close to the projected point and otherwise let the
-            // depth search and LK carry the view.
+            // of a radius. Clamp the per-round movement to it so a larger
+            // common-mode offset walks in over the next rounds.
             const double accepted =
                 blend.cross ? limit : std::min(limit, 0.6 * blend.apparent);
-            if (!std::isfinite(distance) || distance > accepted) {
+            if (!std::isfinite(distance)) {
                 delta = Eigen::Vector2d::Zero();
+            } else if (distance > accepted) {
+                delta *= accepted / distance;
             }
             anchor = *projected + delta;
         } else {
@@ -1515,6 +1516,17 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                     }
                     last = std::move(outcome);
                     ++rounds_used;
+                    // Circular anchors are re-derived each round and their
+                    // jitter would accumulate; they keep the validated
+                    // single-pass behaviour. Crosses carry an absolute anchor
+                    // and use the rounds to remove a common-mode offset.
+                    bool any_cross = false;
+                    for (const BlendView& blend : aligned) {
+                        any_cross = any_cross || blend.cross;
+                    }
+                    if (!any_cross) {
+                        break;
+                    }
                     std::vector<Observation> refined;
                     std::vector<double> refined_tolerances;
                     for (std::size_t i = 0; i < aligned.size(); ++i) {
