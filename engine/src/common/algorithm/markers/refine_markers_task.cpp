@@ -93,6 +93,9 @@ struct CameraView {
     const Camera* camera = nullptr;
     const Calibration* calibration = nullptr;
     FloatImage image;
+    /// Gradient magnitude of `image`, computed once when the view is decoded
+    /// and reused by every marker that refines against this view.
+    GradientField gradient;
     int downscale = 1;
 
     bool aligned() const { return camera != nullptr && camera->enabled; }
@@ -702,7 +705,7 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
         ellipse_seed.center = pixel / ds;
         ellipse_seed.radius_px = seed->radius / ds;
         if (const auto fitted =
-                refine_ellipse_center(view.image, ellipse_seed)) {
+                refine_ellipse_center(view.gradient, ellipse_seed)) {
             ellipse = accept(*fitted * ds);
         }
     }
@@ -1210,16 +1213,16 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
     return refine_2d_marker(blends, options);
 }
 
-/// Load every selected camera's luminance once, reduced by `downscale`. The
-/// image is shared read-only by all marker jobs. An explicit camera list is
-/// strict: a name with no camera, no frame or no sensor is a ValueError, and an
-/// unreadable image is an Error. The implicit "all enabled" list skips a camera
-/// it cannot use, logging it and counting it in `stats.unreadable_cameras`.
-std::vector<CameraView> load_selected_views(const Document& document,
-                                            const Chunk& chunk,
-                                            const std::vector<std::string>& filters,
-                                            int downscale,
-                                            RefineMarkersStats& stats) {
+/// Decode every referenced camera once, reduced by `downscale`, and compute its
+/// gradient field once. A camera that no selected marker projects into is never
+/// read. An explicit camera list is strict: a name with no camera, no frame or
+/// no sensor is a ValueError, and an unreadable image is an Error. The implicit
+/// "all enabled" list skips a camera it cannot use, logging it and counting it
+/// in `stats.unreadable_cameras`.
+std::vector<CameraView> load_selected_views(
+    const Document& document, const Chunk& chunk,
+    const std::vector<std::string>& filters, int downscale,
+    const std::vector<std::int32_t>& needed, RefineMarkersStats& stats) {
     for (const std::string& label : filters) {
         bool found = false;
         for (const Camera& camera : chunk.cameras()) {
@@ -1257,6 +1260,9 @@ std::vector<CameraView> load_selected_views(const Document& document,
         if (calibration.width <= 0 || calibration.height <= 0) {
             continue;
         }
+        if (std::find(needed.begin(), needed.end(), camera.id) == needed.end()) {
+            continue;
+        }
         try {
             FloatImage image =
                 read_image(resolve_frame_path(document, frame->path()).string())
@@ -1269,6 +1275,7 @@ std::vector<CameraView> load_selected_views(const Document& document,
             view.calibration = &calibration;
             view.image = std::move(image);
             view.downscale = downscale;
+            view.gradient = compute_gradient_field(view.image);
             views.push_back(std::move(view));
         } catch (const std::exception& error) {
             const std::string message =
@@ -1437,9 +1444,6 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     if (chunk == nullptr) {
         throw Error("RefineMarkers needs an active chunk");
     }
-    const std::vector<CameraView> views = load_selected_views(
-        document, *chunk, options.cameras, options.downscale, plan.stats);
-
     std::vector<std::size_t> selected;
     for (std::size_t i = 0; i < chunk->markers().size(); ++i) {
         const Marker& marker = chunk->markers()[i];
@@ -1459,6 +1463,25 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     if (selected.empty()) {
         return plan;
     }
+    // Only a camera that some selected, enabled projection references is worth
+    // decoding (memory: the review's residency blocker).
+    std::vector<std::int32_t> needed_cameras;
+    for (const std::size_t index : selected) {
+        for (const MarkerProjection& projection :
+             chunk->markers()[index].projections) {
+            if (!projection.enabled || !projection.pixel.allFinite()) {
+                continue;
+            }
+            if (std::find(needed_cameras.begin(), needed_cameras.end(),
+                          projection.camera_id) == needed_cameras.end()) {
+                needed_cameras.push_back(projection.camera_id);
+            }
+        }
+    }
+    const std::vector<CameraView> views = load_selected_views(
+        document, *chunk, options.cameras, options.downscale, needed_cameras,
+        plan.stats);
+
     std::vector<MarkerEdit> edits(selected.size());
     const PointCloud& point_cloud = chunk->point_cloud();
     std::vector<Eigen::Vector3d> marker_positions;
