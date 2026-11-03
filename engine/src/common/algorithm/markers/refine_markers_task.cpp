@@ -790,7 +790,11 @@ struct BlendView {
     const CameraView* view = nullptr;
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     std::optional<BlobSeed> seed;
+    /// Apparent target radius in full-resolution pixels.
     double apparent = 1.0;
+    /// True when `apparent` came from a detected blob; otherwise it is filled
+    /// from the projected physical radius after the initial triangulation.
+    bool has_scale = false;
     double depth = 1.0;
 };
 
@@ -1129,14 +1133,21 @@ double median(std::vector<double> values) {
     return values[middle];
 }
 
-/// Fill the per-view apparent radius. The blob scale supplies it for circular
-/// targets; patch_size / 4 is the documented fallback (crosses have no blob).
+/// Fill the per-view apparent radius from the blob scale when a circular target
+/// yields one. A cross has no blob, so its radius is left for the projected
+/// physical radius, filled once the marker has been triangulated: patch_size is
+/// a sample count, never a pixel scale.
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
         blend.seed = circular_seed(*blend.view, blend.pixel, patch_size);
-        blend.apparent = blend.seed ? blend.seed->radius
-                                    : static_cast<double>(patch_size) / 4.0;
-        blend.apparent = std::max(blend.apparent, 1.0);
+        if (blend.seed && std::isfinite(blend.seed->radius) &&
+            blend.seed->radius > 0.0) {
+            blend.apparent = std::max(1.0, blend.seed->radius);
+            blend.has_scale = true;
+        } else {
+            blend.apparent = 1.0;
+            blend.has_scale = false;
+        }
     }
 }
 
@@ -1192,13 +1203,21 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         tolerances.reserve(aligned.size());
         for (const BlendView& blend : aligned) {
             observations.push_back({blend.view, blend.pixel});
-            tolerances.push_back(projection_tolerance(blend));
+            const double ds =
+                static_cast<double>(std::max(1, blend.view->downscale));
+            tolerances.push_back(blend.has_scale ? projection_tolerance(blend)
+                                                 : 8.0 * ds);
         }
-        const auto initial = triangulate_robust(observations, tolerances);
+        auto initial = triangulate_robust(observations, tolerances);
         if (initial && initial->allFinite()) {
             std::vector<double> physical_samples;
+            std::vector<double> depths;
             for (BlendView& blend : aligned) {
                 blend.depth = depth_in_view(*blend.view, *initial);
+                depths.push_back(blend.depth);
+                if (!blend.has_scale) {
+                    continue;
+                }
                 const double focal = std::max(blend.view->calibration->f, 1e-6);
                 const double sample = blend.apparent * blend.depth / focal;
                 if (std::isfinite(sample) && sample > 0.0) {
@@ -1207,7 +1226,29 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
             }
             double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
-                physical = static_cast<double>(options.patch_size) / 4.0;
+                // No view reported a radius: assume the printed target spans
+                // 10 % of the viewing distance (5 % radius). This is a physical
+                // length, never a sample count.
+                physical = 0.05 * std::max(median(depths), 1e-9);
+            }
+            // Every view now carries a pixel radius: measured or projected.
+            for (BlendView& blend : aligned) {
+                if (blend.has_scale) {
+                    continue;
+                }
+                const double focal = std::max(blend.view->calibration->f, 1e-6);
+                const double projected_radius =
+                    physical * focal / std::max(blend.depth, 1e-9);
+                blend.apparent = std::max(1.0, projected_radius);
+                blend.has_scale = true;
+            }
+            for (std::size_t i = 0; i < aligned.size(); ++i) {
+                tolerances[i] = projection_tolerance(aligned[i]);
+            }
+            const auto refined_initial =
+                triangulate_robust(observations, tolerances);
+            if (refined_initial && refined_initial->allFinite()) {
+                initial = refined_initial;
             }
             const Eigen::Vector3d normal = target_normal(
                 *initial, observations, cloud, std::max(0.15, 6.0 * physical));

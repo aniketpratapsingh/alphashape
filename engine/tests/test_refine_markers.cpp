@@ -974,5 +974,24 @@ TEST(Markers, RefineUpdatesEstimatedPosition) {
     }
 }
 
+TEST(Markers, RefineDownscaleTwoStaysAccurate) {
+    SceneSpec spec;
+    spec.marker_count = 6;
+    RefineScene scene = make_scene(spec, 121U);
+    std::mt19937 engine(67U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    options.downscale = 2;
+    run_refine(scene, options);
+    double worst = 0.0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        worst = std::max(worst, rms_to_truth(scene, *marker, i));
+    }
+    std::printf("[refine downscale2] worst %.4f px at full resolution\n", worst);
+    EXPECT_LE(worst, 0.15);
+}
+
 }  // namespace
 }  // namespace alphashape
