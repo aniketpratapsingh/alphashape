@@ -44,15 +44,6 @@ Marker* find_marker(Chunk& chunk, std::int32_t marker_id) {
     return nullptr;
 }
 
-const Marker* find_marker(const Chunk& chunk, std::int32_t marker_id) {
-    for (const Marker& marker : chunk.markers()) {
-        if (marker.id == marker_id) {
-            return &marker;
-        }
-    }
-    return nullptr;
-}
-
 const MarkerProjection* projection_for(const Marker& marker,
                                        std::int32_t camera_id) {
     for (const MarkerProjection& projection : marker.projections) {
@@ -233,7 +224,8 @@ TEST(Markers, TrackStopsAtOcclusion) {
     const TrackMarkersStats stats = run_track(scene, options);
     const Marker* marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
-    for (int temporal = 8; temporal < kFrames; ++temporal) {
+    for (std::size_t temporal = 8; temporal < static_cast<std::size_t>(kFrames);
+         ++temporal) {
         const std::int32_t camera_id = scene.frames[temporal].camera_id;
         EXPECT_EQ(projection_for(*marker, camera_id), nullptr)
             << "occluded frame " << temporal;
@@ -266,12 +258,13 @@ TEST(Markers, TrackRedetectRecovers) {
     const TrackMarkersStats stats = run_track(scene, options);
     const Marker* marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
-    for (int temporal = 8; temporal <= 10; ++temporal) {
+    for (std::size_t temporal = 8; temporal <= 10; ++temporal) {
         EXPECT_EQ(projection_for(*marker, scene.frames[temporal].camera_id),
                   nullptr)
             << "occluded frame " << temporal;
     }
-    for (int temporal = 11; temporal < kFrames; ++temporal) {
+    for (std::size_t temporal = 11;
+         temporal < static_cast<std::size_t>(kFrames); ++temporal) {
         EXPECT_NE(projection_for(*marker, scene.frames[temporal].camera_id),
                   nullptr)
             << "recovered frame " << temporal;
@@ -299,7 +292,8 @@ TEST(Markers, TrackBackward) {
         const Marker* marker = find_marker(*scene.chunk, ids[target]);
         ASSERT_NE(marker, nullptr);
         EXPECT_EQ(marker->projections.size(), 11U) << "target " << target;
-        for (int temporal = 11; temporal < kFrames; ++temporal) {
+        for (std::size_t temporal = 11;
+             temporal < static_cast<std::size_t>(kFrames); ++temporal) {
             EXPECT_EQ(projection_for(*marker,
                                      scene.frames[temporal].camera_id),
                       nullptr)
