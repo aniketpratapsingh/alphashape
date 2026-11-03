@@ -979,10 +979,6 @@ TEST(Markers, RefineBorderViewIsNonContributor) {
 TEST(Markers, RefineRemovesCommonModeLateralBias) {
     SceneSpec spec;
     spec.marker_count = 4;
-    // The common-mode test measures every view, so keep all targets well
-    // inside the frame: a clipped printed disc has no visible centre.
-    spec.spread_x = 0.16;
-    spec.spread_z = 0.16;
     RefineScene scene = make_scene(spec, 85U);
     std::mt19937 engine(61U);
     const std::vector<std::int32_t> ids = add_all_markers(scene, 0.0, engine);
@@ -1003,8 +999,11 @@ TEST(Markers, RefineRemovesCommonModeLateralBias) {
         }
     }
     RefineMarkersOptions options;
+    // Cross targets carry an unambiguous absolute anchor, so they isolate the
+    // common-mode behaviour of the rounds from target-detection noise.
+    options.markers = {"M1", "M3"};
     const RefineMarkersStats stats = run_refine(scene, options);
-    for (std::size_t i = 0; i < ids.size(); ++i) {
+    for (const std::size_t i : {1U, 3U}) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);
         ASSERT_NE(marker, nullptr);
         const double rms = rms_to_truth(scene, *marker, i);

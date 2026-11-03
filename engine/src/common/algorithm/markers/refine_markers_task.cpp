@@ -1315,11 +1315,13 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         }
         if (const auto circle =
                 circular_seed(*blend.view, blend.pixel, patch_size)) {
-            // Circular targets are re-anchored each round around the current
-            // projected point, so a common-mode offset walks in over rounds.
+            // The absolute anchor is fixed at the measured point; repeating
+            // the per-round refiner would let its noise accumulate.
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
+            blend.anchor = circle->pixel;
+            blend.has_anchor = true;
             continue;
         }
         blend.hint_work = 8.0;
