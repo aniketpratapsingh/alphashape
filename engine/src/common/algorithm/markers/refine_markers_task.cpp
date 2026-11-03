@@ -1479,14 +1479,21 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 physical = 0.05 * std::max(median(depths), 1e-9);
             }
             // Views without a measured radius use the projected physical radius.
+            // A cross detector can under-read a grazing target, so its
+            // apparent radius is floored by the projected physical radius.
             for (BlendView& blend : aligned) {
-                if (blend.has_scale) {
-                    continue;
-                }
                 const double focal =
                     std::max(blend.view->calibration->f, 1e-6);
-                blend.apparent = std::max(
-                    1.0, physical * focal / std::max(blend.depth, 1e-9));
+                const double projected_radius =
+                    physical * focal / std::max(blend.depth, 1e-9);
+                if (blend.has_scale) {
+                    if (blend.cross) {
+                        blend.apparent = std::max(
+                            blend.apparent, 0.75 * projected_radius);
+                    }
+                    continue;
+                }
+                blend.apparent = std::max(1.0, projected_radius);
                 blend.hint_work = std::max(
                     4.0, blend.apparent /
                              static_cast<double>(std::max(
