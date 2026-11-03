@@ -1289,20 +1289,27 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             continue;
         }
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+        // A cross must be confirmed either by a saddle at the measurement or
+        // by a detection whose centre lies within one target radius of it.
+        // Without this, a coded disc's sector pattern can be misread as a
+        // cross and lose its validated circular anchor.
+        const bool saddle =
+            saddle_seed(*blend.view, blend.pixel).has_value();
         if (const auto cross =
                 cross_extent(*blend.view, blend.pixel, patch_size)) {
-            blend.cross = true;
-            blend.apparent = std::max(1.0, cross->radius);
-            blend.has_scale = true;
-            // The saddle fit only needs to search the basin around the
-            // measured centre; a quarter of the arm half-length is the
-            // validated working-scale radius.
-            blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
-            // The detector's subpixel saddle fit is already the absolute
-            // centre; re-refining from a nearby seed biases it.
-            blend.anchor = cross->pixel;
-            blend.has_anchor = true;
-            continue;
+            const bool close =
+                (cross->pixel - blend.pixel).norm() <=
+                std::max(1.0, cross->radius);
+            if (saddle || close) {
+                blend.cross = true;
+                blend.apparent = std::max(1.0, cross->radius);
+                blend.has_scale = true;
+                blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
+                // The detector's subpixel saddle fit is the absolute centre.
+                blend.anchor = cross->pixel;
+                blend.has_anchor = true;
+                continue;
+            }
         }
         if (const auto circle =
                 circular_seed(*blend.view, blend.pixel, patch_size)) {
