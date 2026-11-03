@@ -364,14 +364,10 @@ struct BlobSeed {
     double radius = 0.0;
 };
 
-/// Locate the circular target around `pixel` in the window. The printed
-/// target's black and white regions both differ strongly from the local
-/// background, so their combined centroid is the disc centre and their
-/// distance spread is its outer radius; the gradient ellipse fit then refines
-/// it. This is independent of the coded sector arrangement, which breaks a
-/// blob detector into several off-centre sectors. Crosses never call this:
-/// their radius comes from the cross detector, or from the projected physical
-/// radius.
+/// Locate the circular target around `pixel` in the window. The blob's scale
+/// supplies the apparent radius in full-resolution pixels; the ellipse refit
+/// supplies its centre. Crosses never call this: their radius comes from the
+/// cross detector, or from the projected physical radius.
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel, int patch_size) {
     if (!view.loaded()) {
@@ -381,9 +377,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!local.allFinite()) {
         return std::nullopt;
     }
-    // The crop covers the whole target even when the measurement is up to one
-    // radius from its printed centre.
-    const int half = std::max(48, patch_size);
+    const int half = std::max(32, patch_size);
     const int centre_x = static_cast<int>(std::floor(std::clamp(
         local.x(), -1.0e6, 1.0e6)));
     const int centre_y = static_cast<int>(std::floor(std::clamp(
@@ -403,75 +397,44 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
             crop.at(x, y) = view.image.at(x0 + x, y0 + y);
         }
     }
-    // The median is the local background; both target polarities stand far
-    // from it, so the mask is independent of the coded word.
-    std::vector<float> sorted = crop.pixels();
-    std::sort(sorted.begin(), sorted.end());
-    if (sorted.empty()) {
+    BlobParams params;
+    params.dark_on_light = true;
+    params.min_radius = 2;
+    params.max_radius = std::max(4, half);
+    params.threshold = 0.02F;
+    params.min_axis_ratio = 0.3;
+    const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
+    const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
+                               local.y() - static_cast<double>(y0) + 0.5);
+    const MarkerCandidate* best = nullptr;
+    double best_distance = static_cast<double>(half) * 0.75;
+    for (const MarkerCandidate& blob : blobs) {
+        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px)) {
+            continue;
+        }
+        const double distance = (blob.center - seed).norm();
+        if (distance <= best_distance) {
+            best_distance = distance;
+            best = &blob;
+        }
+    }
+    if (best == nullptr) {
         return std::nullopt;
     }
-    const double background =
-        static_cast<double>(sorted[sorted.size() / 2]);
-    Eigen::Vector2d centre(local.x() - static_cast<double>(x0) + 0.5,
-                           local.y() - static_cast<double>(y0) + 0.5);
-    double radius =
-        std::max(8.0, 0.25 * static_cast<double>(2 * half + 1));
-    std::vector<std::pair<Eigen::Vector2d, double>> points;
-    for (int iteration = 0; iteration < 3; ++iteration) {
-        points.clear();
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                const double value = static_cast<double>(crop.at(x, y));
-                const double deviation = std::abs(value - background);
-                if (!(deviation > 0.35)) {
-                    continue;
-                }
-                const Eigen::Vector2d point(
-                    static_cast<double>(x) + 0.5,
-                    static_cast<double>(y) + 0.5);
-                if (iteration > 0 &&
-                    (point - centre).norm() > 1.35 * radius) {
-                    continue;
-                }
-                points.emplace_back(point, deviation);
-            }
-        }
-        if (points.size() < 64U) {
-            return std::nullopt;
-        }
-        Eigen::Vector2d sum = Eigen::Vector2d::Zero();
-        double weight_sum = 0.0;
-        for (const auto& [point, weight] : points) {
-            sum += point * weight;
-            weight_sum += weight;
-        }
-        if (!(weight_sum > 0.0)) {
-            return std::nullopt;
-        }
-        centre = sum / weight_sum;
-        std::vector<double> distances;
-        distances.reserve(points.size());
-        for (const auto& [point, weight] : points) {
-            (void)weight;
-            distances.push_back((point - centre).norm());
-        }
-        const std::size_t middle = (distances.size() * 3U) / 4U;
-        std::nth_element(
-            distances.begin(),
-            distances.begin() + static_cast<std::ptrdiff_t>(middle),
-            distances.end());
-        // For a uniformly filled disc the 75th percentile is 0.866 R.
-        radius = std::max(3.0, 1.15 * distances[middle]);
+    MarkerCandidate refined = *best;
+    Eigen::Vector2d centre = best->center;
+    if (const auto fitted = refine_ellipse_center(crop, refined)) {
+        centre = *fitted;
     }
-    if (!centre.allFinite() || !(radius > 3.0) || !std::isfinite(radius)) {
+    if (!centre.allFinite()) {
         return std::nullopt;
     }
     BlobSeed out;
     out.pixel = (centre + Eigen::Vector2d(
-                              static_cast<double>(view.offset_x + x0),
-                              static_cast<double>(view.offset_y + y0))) *
+                             static_cast<double>(view.offset_x + x0),
+                             static_cast<double>(view.offset_y + y0))) *
                 static_cast<double>(view.downscale);
-    out.radius = radius * static_cast<double>(view.downscale);
+    out.radius = best->radius_px * static_cast<double>(view.downscale);
     return out;
 }
 
@@ -1321,7 +1284,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             // The saddle fit only needs to search the basin around the
             // measured centre; a quarter of the arm half-length is the
             // validated working-scale radius.
-            blend.hint_work = std::max(4.0, 0.25 * blend.apparent / ds);
+            blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
             const Eigen::Vector2d offset(
                 static_cast<double>(blend.view->offset_x),
                 static_cast<double>(blend.view->offset_y));
@@ -1352,11 +1315,11 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         }
         if (const auto circle =
                 circular_seed(*blend.view, blend.pixel, patch_size)) {
+            // Circular targets are re-anchored each round around the current
+            // projected point, so a common-mode offset walks in over rounds.
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
-            blend.anchor = circle->pixel;
-            blend.has_anchor = true;
             continue;
         }
         blend.hint_work = 8.0;
@@ -1494,7 +1457,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 blend.apparent = std::max(
                     1.0, physical * focal / std::max(blend.depth, 1e-9));
                 blend.hint_work = std::max(
-                    4.0, 0.25 * blend.apparent /
+                    6.0, 0.25 * blend.apparent /
                              static_cast<double>(std::max(
                                  1, blend.view->downscale)));
                 blend.has_scale = true;
