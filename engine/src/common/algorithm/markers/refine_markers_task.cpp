@@ -95,7 +95,7 @@ struct CameraView {
     FloatImage image;
     /// Gradient magnitude of `image`, computed once when the view is decoded
     /// and reused by every marker that refines against this view.
-    GradientField gradient;
+    GradientField gradient_field;
     int downscale = 1;
 
     bool aligned() const { return camera != nullptr && camera->enabled; }
@@ -705,7 +705,7 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
         ellipse_seed.center = pixel / ds;
         ellipse_seed.radius_px = seed->radius / ds;
         if (const auto fitted =
-                refine_ellipse_center(view.gradient, ellipse_seed)) {
+                refine_ellipse_center(view.gradient_field, ellipse_seed)) {
             ellipse = accept(*fitted * ds);
         }
     }
@@ -1275,7 +1275,7 @@ std::vector<CameraView> load_selected_views(
             view.calibration = &calibration;
             view.image = std::move(image);
             view.downscale = downscale;
-            view.gradient = compute_gradient_field(view.image);
+            view.gradient_field = compute_gradient_field(view.image);
             views.push_back(std::move(view));
         } catch (const std::exception& error) {
             const std::string message =
