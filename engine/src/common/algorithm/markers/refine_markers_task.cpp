@@ -1174,9 +1174,7 @@ std::optional<RoundOutcome> apply_winner(
         out.inlier[index] = true;
         ++projected_inliers;
         projected_centres[index] = *projected;
-        const double limit =
-            blend.cross ? std::max(2.0, blend.apparent)
-                        : std::max(2.0, 0.5 * blend.apparent);
+        const double limit = std::max(2.0, blend.apparent);
         Eigen::Vector2d anchor = *projected;
         if (blend.has_anchor && blend.anchor.allFinite()) {
             Eigen::Vector2d delta = blend.anchor - *projected;
@@ -1243,9 +1241,7 @@ std::optional<RoundOutcome> apply_winner(
         }
         const BlendView& blend = blends[i];
         Eigen::Vector2d refined = anchored[i];
-        const double limit =
-            blend.cross ? std::max(2.0, blend.apparent)
-                        : std::max(2.0, 0.5 * blend.apparent);
+        const double limit = std::max(2.0, blend.apparent);
         if (mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
@@ -1321,9 +1317,7 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
     bool success = false;
     for (BlendView& blend : blends) {
         any = true;
-        const double limit =
-            blend.cross ? std::max(2.0, blend.apparent)
-                        : std::max(2.0, 0.5 * blend.apparent);
+        const double limit = std::max(2.0, blend.apparent);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, blend.cross, blend.hint_work,
             limit);
