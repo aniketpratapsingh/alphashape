@@ -377,7 +377,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!local.allFinite()) {
         return std::nullopt;
     }
-    const int half = std::max(32, patch_size);
+    const int half = std::max(48, patch_size);
     const int centre_x = static_cast<int>(std::floor(std::clamp(
         local.x(), -1.0e6, 1.0e6)));
     const int centre_y = static_cast<int>(std::floor(std::clamp(
@@ -1176,7 +1176,13 @@ std::optional<RoundOutcome> apply_winner(
         projected_centres[index] = *projected;
         const double limit = std::max(2.0, blend.apparent);
         Eigen::Vector2d anchor = *projected;
-        if (blend.has_anchor && blend.anchor.allFinite()) {
+        // A view whose measurement is far from the current projection needs
+        // the detector's absolute centre; otherwise the validated per-round
+        // 2-D refiner is more accurate.
+        const bool absolute_anchor =
+            blend.has_anchor && blend.anchor.allFinite() &&
+            (blend.pixel - *projected).norm() > 0.25 * blend.apparent;
+        if (absolute_anchor) {
             Eigen::Vector2d delta = blend.anchor - *projected;
             const double distance = delta.norm();
             // A cross detector gives a reliable absolute centre across most
@@ -1477,17 +1483,6 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                     }
                     last = std::move(outcome);
                     ++rounds_used;
-                    // Circular anchors are re-derived each round and their
-                    // jitter would accumulate; they keep the validated
-                    // single-pass behaviour. Crosses carry an absolute anchor
-                    // and use the rounds to remove a common-mode offset.
-                    bool any_cross = false;
-                    for (const BlendView& blend : aligned) {
-                        any_cross = any_cross || blend.cross;
-                    }
-                    if (!any_cross) {
-                        break;
-                    }
                     std::vector<Observation> refined;
                     std::vector<double> refined_tolerances;
                     for (std::size_t i = 0; i < aligned.size(); ++i) {
