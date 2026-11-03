@@ -865,8 +865,21 @@ struct BlendView {
     /// True when `apparent` came from a detected blob; otherwise it is filled
     /// from the projected physical radius after the initial triangulation.
     bool has_scale = false;
+    /// True when the scale is a blob radius. A cross-extent scale is real but
+    /// carries no blob, so the refiners keep the tighter movement guard.
+    bool blob_scale = false;
     double depth = 1.0;
 };
+
+/// Movement guard for the 2-D refiners. A blob-scale view keeps half its
+/// apparent radius; a cross-extent (or currently unscaled) view is capped at
+/// three full-resolution pixels. The cap is a correction bound, not a target
+/// radius: the physical patch scale no longer widens it.
+double refinement_limit(const BlendView& blend) {
+    const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+    const double scale = blend.blob_scale ? blend.apparent : 6.0 * ds;
+    return std::max(2.0, 0.5 * scale);
+}
 
 /// Mean NCC of every other view against the reference patch. Views without
 /// evidence (no overlap or a flat patch) do not contribute; if none has
@@ -1111,7 +1124,7 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             return std::nullopt;
         }
         projected_centres[index] = *projected;
-        const double limit = std::max(2.0, 0.5 * blend.apparent);
+        const double limit = refinement_limit(blend);
         const auto seed =
             circular_seed(*blend.view, *projected, options.patch_size);
         const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
@@ -1166,7 +1179,7 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             continue;
         }
         Eigen::Vector2d refined = anchored[i];
-        const double limit = std::max(2.0, 0.5 * blend.apparent);
+        const double limit = refinement_limit(blend);
         if (mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
@@ -1214,6 +1227,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.seed->radius > 0.0) {
             blend.apparent = std::max(1.0, blend.seed->radius);
             blend.has_scale = true;
+            blend.blob_scale = true;
         } else if (const auto cross =
                        cross_radius(*blend.view, blend.pixel, patch_size)) {
             blend.apparent = std::max(1.0, *cross);
@@ -1232,7 +1246,7 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
     bool success = false;
     for (BlendView& blend : blends) {
         any = true;
-        const double limit = std::max(2.0, 0.5 * blend.apparent);
+        const double limit = refinement_limit(blend);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, options.patch_size, limit);
         if (!refined) {
