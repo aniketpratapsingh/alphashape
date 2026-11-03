@@ -1467,7 +1467,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 blend.apparent = std::max(
                     1.0, physical * focal / std::max(blend.depth, 1e-9));
                 blend.hint_work = std::max(
-                    6.0, 0.25 * blend.apparent /
+                    4.0, blend.apparent /
                              static_cast<double>(std::max(
                                  1, blend.view->downscale)));
                 blend.has_scale = true;
