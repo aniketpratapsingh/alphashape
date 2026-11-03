@@ -749,36 +749,25 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     // Circular targets: refit the ellipse at the candidate, using the blob
     // only for its scale. Trusting the blob's centre would accept a nearby
     // texture blob; the printed target is centred at the candidate to within a
-    // few pixels, so the radial search converges to the real boundary. Run the
-    // cross refiner too and keep whichever lands closer to the candidate: a
-    // coded disc's centre is also a saddle, so the two refiners can disagree.
-    std::optional<Eigen::Vector2d> ellipse;
+    // few pixels, so the radial search converges to the real boundary.
     if (seed) {
         MarkerCandidate ellipse_seed;
         ellipse_seed.center = local_calibration;
         ellipse_seed.radius_px = seed->radius / ds;
         if (const auto fitted =
                 refine_ellipse_center(view.image, ellipse_seed)) {
-            ellipse = accept(to_pixel(*fitted));
+            if (const auto accepted = accept(to_pixel(*fitted))) {
+                return accepted;
+            }
         }
     }
+    // No usable blob: try the cross refiner from the candidate itself.
     const double hint = std::max(4.0, hint_work);
-    Eigen::Vector2d start = local_calibration;
-    if (const auto saddle = saddle_seed(view, pixel)) {
-        start = *saddle / ds - offset;
-    }
-    std::optional<Eigen::Vector2d> cross_fit;
     if (const auto refined =
-            refine_cross_center(view.image, start, hint)) {
-        cross_fit = accept(to_pixel(*refined));
+            refine_cross_center(view.image, local_calibration, hint)) {
+        return accept(to_pixel(*refined));
     }
-    if (ellipse &&
-        (!cross_fit ||
-         (*ellipse - pixel).squaredNorm() <=
-             (*cross_fit - pixel).squaredNorm())) {
-        return ellipse;
-    }
-    return cross_fit;
+    return std::nullopt;
 }
 
 /// Lucas-Kanade translation-only alignment of a view's patch to the mean
@@ -1307,31 +1296,9 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             // measured centre; a quarter of the arm half-length is the
             // validated working-scale radius.
             blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
-            const Eigen::Vector2d offset(
-                static_cast<double>(blend.view->offset_x),
-                static_cast<double>(blend.view->offset_y));
-            Eigen::Vector2d start =
-                blend.view->local_of(cross->pixel) +
-                Eigen::Vector2d(0.5, 0.5);
-            if (!cross->bar) {
-                // Prefer the local saddle scan when it finds one: starting the
-                // quadratic fit from the strongest nearby saddle is what the
-                // 2-D refiner was validated with.
-                if (const auto saddle =
-                        saddle_seed(*blend.view, blend.pixel)) {
-                    start = blend.view->local_of(*saddle) +
-                            Eigen::Vector2d(0.5, 0.5);
-                }
-            }
-            if (const auto refined =
-                    cross->bar
-                        ? refine_bar_cross_center(blend.view->image, start,
-                                                  blend.hint_work)
-                        : refine_cross_center(blend.view->image, start,
-                                              blend.hint_work)) {
-                start = *refined;
-            }
-            blend.anchor = (start + offset) * ds;
+            // The detector's subpixel saddle fit is already the absolute
+            // centre; re-refining from a nearby seed biases it.
+            blend.anchor = cross->pixel;
             blend.has_anchor = true;
             continue;
         }
