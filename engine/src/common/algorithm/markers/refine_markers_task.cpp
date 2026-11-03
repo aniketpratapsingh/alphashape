@@ -1473,7 +1473,6 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             blend.pixel = projection.pixel;
             blends.push_back(blend);
         }
-        edits[static_cast<std::size_t>(i)].marker_id = marker.id;
         try {
             edits[static_cast<std::size_t>(i)] =
                 refine_marker(std::move(blends), cloud, options);
@@ -1485,6 +1484,8 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             failed.failed = true;
             edits[static_cast<std::size_t>(i)] = failed;
         }
+        // Assigned after the edit: the assignment above replaces every field.
+        edits[static_cast<std::size_t>(i)].marker_id = marker.id;
     }
 
     // Every selected marker is counted exactly once, and mutations are
