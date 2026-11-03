@@ -375,20 +375,37 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!local.allFinite()) {
         return std::nullopt;
     }
+    const int half = std::max(32, patch_size);
+    const int centre_x = static_cast<int>(std::floor(std::clamp(
+        local.x(), -1.0e6, 1.0e6)));
+    const int centre_y = static_cast<int>(std::floor(std::clamp(
+        local.y(), -1.0e6, 1.0e6)));
+    const int x0 = std::clamp(centre_x - half, 0,
+                              std::max(0, view.image.width() - 2 * half - 1));
+    const int y0 = std::clamp(centre_y - half, 0,
+                              std::max(0, view.image.height() - 2 * half - 1));
+    const int width = std::min(2 * half + 1, view.image.width() - x0);
+    const int height = std::min(2 * half + 1, view.image.height() - y0);
+    if (width < 16 || height < 16) {
+        return std::nullopt;
+    }
+    FloatImage crop(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            crop.at(x, y) = view.image.at(x0 + x, y0 + y);
+        }
+    }
     BlobParams params;
     params.dark_on_light = true;
     params.min_radius = 2;
-    params.max_radius =
-        std::max(4, std::min(48, view.image.width() / 2));
+    params.max_radius = std::max(4, half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
-    // Detect in the whole window so the scale-space sees the same context as
-    // the original full-image implementation around the crop boundary.
-    const std::vector<MarkerCandidate> blobs =
-        detect_blobs(view.image, params);
-    const Eigen::Vector2d seed = local + Eigen::Vector2d(0.5, 0.5);
+    const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
+    const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
+                               local.y() - static_cast<double>(y0) + 0.5);
     const MarkerCandidate* best = nullptr;
-    double best_distance = 24.0;
+    double best_distance = static_cast<double>(half) * 0.75;
     for (const MarkerCandidate& blob : blobs) {
         if (!blob.center.allFinite() || !std::isfinite(blob.radius_px)) {
             continue;
@@ -404,7 +421,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     }
     MarkerCandidate refined = *best;
     Eigen::Vector2d centre = best->center;
-    if (const auto fitted = refine_ellipse_center(view.image, refined)) {
+    if (const auto fitted = refine_ellipse_center(crop, refined)) {
         centre = *fitted;
     }
     if (!centre.allFinite()) {
@@ -412,8 +429,8 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     }
     BlobSeed out;
     out.pixel = (centre + Eigen::Vector2d(
-                             static_cast<double>(view.offset_x),
-                             static_cast<double>(view.offset_y))) *
+                             static_cast<double>(view.offset_x + x0),
+                             static_cast<double>(view.offset_y + y0))) *
                 static_cast<double>(view.downscale);
     out.radius = best->radius_px * static_cast<double>(view.downscale);
     return out;
