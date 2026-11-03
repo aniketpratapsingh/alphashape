@@ -1185,7 +1185,9 @@ std::optional<RoundOutcome> apply_winner(
         out.inlier[index] = true;
         ++projected_inliers;
         projected_centres[index] = *projected;
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit =
+            blend.cross ? std::max(2.0, blend.apparent)
+                        : std::max(2.0, 0.5 * blend.apparent);
         Eigen::Vector2d anchor = *projected;
         if (blend.has_anchor && blend.anchor.allFinite()) {
             Eigen::Vector2d delta = blend.anchor - *projected;
@@ -1251,7 +1253,9 @@ std::optional<RoundOutcome> apply_winner(
         }
         const BlendView& blend = blends[i];
         Eigen::Vector2d refined = anchored[i];
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit =
+            blend.cross ? std::max(2.0, blend.apparent)
+                        : std::max(2.0, 0.5 * blend.apparent);
         if (mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
@@ -1332,19 +1336,11 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         }
         if (const auto circle =
                 circular_seed(*blend.view, blend.pixel, patch_size)) {
-            // Anchor once at the measured point, using the same min-movement
-            // ellipse/cross choice as the validated 2-D refiner. Repeating it
-            // per round would let its noise accumulate.
+            // Circular targets are re-anchored each round around the current
+            // projected point, exactly as the validated 2-D refiner runs.
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
-            const double limit = std::max(2.0, 0.5 * blend.apparent);
-            if (const auto refined =
-                    refined_2d_pixel(*blend.view, blend.pixel, circle, false,
-                                     blend.hint_work, limit)) {
-                blend.anchor = *refined;
-                blend.has_anchor = true;
-            }
             continue;
         }
         blend.hint_work = 8.0;
@@ -1357,7 +1353,9 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
     bool success = false;
     for (BlendView& blend : blends) {
         any = true;
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit =
+            blend.cross ? std::max(2.0, blend.apparent)
+                        : std::max(2.0, 0.5 * blend.apparent);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, blend.cross, blend.hint_work,
             limit);
