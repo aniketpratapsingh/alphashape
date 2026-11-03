@@ -767,17 +767,18 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     if (const auto saddle = saddle_seed(view, pixel)) {
         start = *saddle / ds - offset;
     }
-    std::optional<Eigen::Vector2d> cross;
+    std::optional<Eigen::Vector2d> cross_fit;
     if (const auto refined =
             refine_cross_center(view.image, start, hint)) {
-        cross = accept(to_pixel(*refined));
+        cross_fit = accept(to_pixel(*refined));
     }
     if (ellipse &&
-        (!cross ||
-         (*ellipse - pixel).squaredNorm() <= (*cross - pixel).squaredNorm())) {
+        (!cross_fit ||
+         (*ellipse - pixel).squaredNorm() <=
+             (*cross_fit - pixel).squaredNorm())) {
         return ellipse;
     }
-    return cross;
+    return cross_fit;
 }
 
 /// Lucas-Kanade translation-only alignment of a view's patch to the mean
