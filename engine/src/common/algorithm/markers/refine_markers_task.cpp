@@ -757,10 +757,7 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
                 ellipse = accept(to_pixel(*fitted));
             }
         }
-        if (cross_fit &&
-            (!ellipse ||
-             (*cross_fit - pixel).squaredNorm() <=
-                 (*ellipse - pixel).squaredNorm())) {
+        if (cross_fit) {
             return cross_fit;
         }
         return ellipse;
