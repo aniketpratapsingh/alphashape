@@ -1320,10 +1320,15 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             saddle_seed(*blend.view, blend.pixel).has_value();
         const auto cross =
             cross_extent(*blend.view, blend.pixel, patch_size);
-        const bool close =
-            cross && (cross->pixel - blend.pixel).norm() <=
-                         std::max(1.0, cross->radius);
-        if (saddle || close) {
+        // A detection away from the measurement (but within a target radius)
+        // is the common-mode signature; a false cross on a circular target
+        // sits on the measurement and must not change its type.
+        const double gap =
+            cross ? (cross->pixel - blend.pixel).norm() : 0.0;
+        const bool common_detection =
+            cross && gap > 4.0 &&
+            gap <= std::max(1.0, 2.0 * cross->radius);
+        if (saddle || common_detection) {
             blend.cross = true;
             if (cross) {
                 blend.apparent = std::max(1.0, cross->radius);
