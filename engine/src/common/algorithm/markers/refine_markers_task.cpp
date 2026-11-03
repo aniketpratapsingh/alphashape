@@ -56,10 +56,6 @@ constexpr double kDepthStepFraction = 0.5;
 constexpr double kPatchHalfWidth = 1.5;
 /// Samples used to characterise the plane around the initial estimate.
 constexpr int kMinPlanePoints = 6;
-/// Below this round-to-round movement the target refiner's own noise dominates;
-/// another round only adds jitter, so the iteration stops. This is a floor on
-/// the caller's `tolerance_px`, never a replacement for it.
-constexpr double kRoundStopNoisePx = 0.05;
 
 bool contains(const std::vector<std::string>& list, const std::string& value) {
     return std::find(list.begin(), list.end(), value) != list.end();
@@ -1526,9 +1522,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                         break;
                     }
                     point = *next;
-                    const double stop =
-                        std::max(options.tolerance_px, kRoundStopNoisePx);
-                    if (last->max_movement < stop) {
+                    if (last->max_movement < options.tolerance_px) {
                         break;
                     }
                 }
