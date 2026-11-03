@@ -1204,15 +1204,14 @@ std::optional<RoundOutcome> apply_winner(
             refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
                              blend.hint_work, limit);
         Eigen::Vector2d anchor = refined ? *refined : *projected;
-        // A cross refiner cannot reach a printed centre most of a radius away
-        // (common mode). When it did not move, fall back to the cross
-        // detector's absolute centre and walk towards it, clamped per round.
-        const double moved = refined ? (*refined - *projected).norm() : 0.0;
-        if (blend.cross && moved < 1.0) {
+        // A normal cross detector centre sits on the projected point. A
+        // common-mode offset leaves it most of a radius away; walk towards it,
+        // clamped per round, and let the rounds converge.
+        if (blend.cross) {
             if (const auto cross = cross_extent(
                     *blend.view, blend.pixel, options.patch_size)) {
-                if ((cross->pixel - *projected).norm() <=
-                    std::max(2.0, cross->radius)) {
+                const double gap = (cross->pixel - *projected).norm();
+                if (gap > 4.0 && gap <= std::max(2.0, 2.0 * cross->radius)) {
                     Eigen::Vector2d delta = cross->pixel - *projected;
                     const double distance = delta.norm();
                     const double anchor_limit = std::max(2.0, blend.apparent);
@@ -1271,7 +1270,9 @@ std::optional<RoundOutcome> apply_winner(
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
                          options.max_iterations, options.tolerance_px);
-            if (shift &&
+            // Below a tenth of a pixel the LK shift is the template's own
+            // noise; applying it only moves the answer away from the anchor.
+            if (shift && shift->norm() >= 0.1 &&
                 (refined + *shift - projected_centres[i]).norm() <= limit) {
                 refined += *shift;
             }
