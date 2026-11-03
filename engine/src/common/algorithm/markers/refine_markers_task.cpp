@@ -1165,6 +1165,27 @@ std::optional<RoundOutcome> apply_winner(
     if (inliers.size() < 2) {
         return std::nullopt;
     }
+    // A large, consistent measurement-to-projection offset in most views is
+    // the common-mode signature. Only then is the detector's absolute centre
+    // needed; a single noisy or foreshortened view keeps the validated
+    // per-round refiner.
+    std::vector<double> offsets;
+    for (const std::size_t index : inliers) {
+        if (const auto projected =
+                project_view(*blends[index].view, winner.point)) {
+            offsets.push_back((blends[index].pixel - *projected).norm());
+        }
+    }
+    double median_offset = 0.0;
+    if (!offsets.empty()) {
+        const std::size_t middle = offsets.size() / 2;
+        std::nth_element(
+            offsets.begin(),
+            offsets.begin() + static_cast<std::ptrdiff_t>(middle),
+            offsets.end());
+        median_offset = offsets[middle];
+    }
+    const bool common_mode = median_offset > 8.0;
     // A common lateral offset of the physical patch is invisible to NCC (every
     // view samples the same world points), so consistency alone cannot remove
     // the reference view's own bias. Each inlier is therefore anchored at the
@@ -1196,7 +1217,7 @@ std::optional<RoundOutcome> apply_winner(
         // the detector's absolute centre; otherwise the validated per-round
         // 2-D refiner is more accurate.
         const bool absolute_anchor =
-            blend.has_anchor && blend.anchor.allFinite() &&
+            common_mode && blend.has_anchor && blend.anchor.allFinite() &&
             (blend.pixel - *projected).norm() >
                 std::max(0.5 * blend.apparent, 8.0);
         if (absolute_anchor) {
