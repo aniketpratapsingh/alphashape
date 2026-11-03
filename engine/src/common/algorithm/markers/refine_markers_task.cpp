@@ -727,10 +727,26 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
                 cross_fit = accept(to_pixel(*refined));
             }
         }
-        if (cross_fit) {
-            return cross_fit;
+        // The ellipse is the alternative refiner, not the cross scale: when
+        // it lands closer to the measurement it wins, exactly as the
+        // validated min-movement choice.
+        std::optional<Eigen::Vector2d> ellipse;
+        if (seed) {
+            MarkerCandidate ellipse_seed;
+            ellipse_seed.center = local_calibration;
+            ellipse_seed.radius_px = seed->radius / ds;
+            if (const auto fitted =
+                    refine_ellipse_center(view.image, ellipse_seed)) {
+                ellipse = accept(to_pixel(*fitted));
+            }
         }
-        return std::nullopt;
+        if (ellipse &&
+            (!cross_fit ||
+             (*ellipse - pixel).squaredNorm() <=
+                 (*cross_fit - pixel).squaredNorm())) {
+            return ellipse;
+        }
+        return cross_fit;
     }
     // Circular targets: refit the ellipse at the candidate, using the blob
     // only for its scale. Trusting the blob's centre would accept a nearby
@@ -1298,20 +1314,24 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             continue;
         }
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+        const auto circle =
+            circular_seed(*blend.view, blend.pixel, patch_size);
         // A saddle at the measurement identifies a cross; everything else is
-        // treated as circular. This is the validated type test.
+        // treated as circular. This is the validated type test. The blob seed
+        // is kept as the ellipse alternative for both types; the cross refiner
+        // is tried first for a cross.
         if (saddle_seed(*blend.view, blend.pixel).has_value()) {
             if (const auto cross =
                     cross_extent(*blend.view, blend.pixel, patch_size)) {
                 blend.cross = true;
                 blend.apparent = std::max(1.0, cross->radius);
                 blend.has_scale = true;
+                blend.seed = circle;
                 blend.hint_work = std::max(4.0, blend.apparent / ds);
                 continue;
             }
         }
-        if (const auto circle =
-                circular_seed(*blend.view, blend.pixel, patch_size)) {
+        if (circle) {
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
