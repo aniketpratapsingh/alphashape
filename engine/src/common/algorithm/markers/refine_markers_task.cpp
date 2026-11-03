@@ -812,6 +812,11 @@ std::optional<double> score_patches(const std::vector<Patch>& patches,
     return sum / static_cast<double>(count);
 }
 
+/// Per-view outcome of a candidate: Unused means the patch leaves the window,
+/// so the projection is not evidence either way; Gated means the patch exists
+/// but the measured projection is outside the gate; Usable means it scored.
+enum class ViewStatus : std::uint8_t { Unused = 0, Gated = 1, Usable = 2 };
+
 struct Winner {
     bool found = false;
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
@@ -819,6 +824,7 @@ struct Winner {
     double score = -2.0;
     std::vector<Patch> patches;
     std::vector<std::optional<double>> scores;
+    std::vector<ViewStatus> status;
 };
 
 /// A view's measured projection has to agree with the candidate's reprojection
@@ -879,30 +885,49 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                 continue;
             }
             std::vector<Patch> patches;
+            std::vector<ViewStatus> status;
             patches.reserve(blends.size());
-            bool complete = true;
-            for (const BlendView& blend : blends) {
+            status.reserve(blends.size());
+            int usable_other = 0;
+            bool reference_usable = false;
+            for (std::size_t index = 0; index < blends.size(); ++index) {
+                const BlendView& blend = blends[index];
                 Patch patch = sample_patch(*blend.view, candidate, u, v,
                                            half_width, patch_size);
                 if (!patch.valid) {
-                    complete = false;
-                    break;
+                    // The patch leaves this view's window: a non-contributor,
+                    // not a contradiction. It must not invalidate the
+                    // candidate, which only needs the reference view and at
+                    // least one other usable view.
+                    patches.push_back(Patch{});
+                    status.push_back(ViewStatus::Unused);
+                    continue;
                 }
                 // NCC alone cannot detect a contradicted projection: every
                 // view still shows the printed target at the candidate's
                 // physical patch. A view therefore also has to agree with the
                 // candidate geometrically, within one target radius of its
-                // measured projection. An unrelated 30 px measurement lands
-                // outside this gate and is excluded from the score.
+                // measured projection. An unrelated measurement lands outside
+                // this gate and is excluded from the score.
                 const auto projected = project_view(*blend.view, candidate);
                 if (!projected || !projected->allFinite() ||
                     (*projected - blend.pixel).norm() >
                         projection_tolerance(blend)) {
-                    patch = Patch{};
+                    patches.push_back(Patch{});
+                    status.push_back(ViewStatus::Gated);
+                    continue;
                 }
                 patches.push_back(std::move(patch));
+                status.push_back(ViewStatus::Usable);
+                if (index == reference) {
+                    reference_usable = true;
+                } else {
+                    ++usable_other;
+                }
             }
-            if (!complete || patches[reference].stddev < kMinPatchStdDev) {
+            if (!reference_usable ||
+                patches[reference].stddev < kMinPatchStdDev ||
+                usable_other < 1) {
                 continue;
             }
             std::vector<std::optional<double>> scores;
@@ -916,6 +941,7 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
             best.score = *score;
             best.patches = std::move(patches);
             best.scores = std::move(scores);
+            best.status = std::move(status);
         }
     }
     if (!best.found) {
@@ -1045,7 +1071,11 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         const bool inlier = std::find(inliers.begin(), inliers.end(), i) !=
                             inliers.end();
         if (!inlier) {
-            if (options.remove_invalid) {
+            // A view whose patch left the window was not evidence for or
+            // against this candidate; leave it alone instead of deleting it.
+            const bool unused = i < winner.status.size() &&
+                                winner.status[i] == ViewStatus::Unused;
+            if (options.remove_invalid && !unused) {
                 edit.removals.push_back(blend.view->camera->id);
                 edit.touched = true;
             }

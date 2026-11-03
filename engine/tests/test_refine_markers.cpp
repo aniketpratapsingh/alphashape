@@ -917,5 +917,40 @@ TEST(Markers, RefineSkipsUnreadableCameraUnlessExplicit) {
                  Error);
 }
 
+TEST(Markers, RefineAcceptsCandidateWhenAViewPatchLeavesTheImage) {
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.camera_count = 4;
+    spec.ring_radius = 1.2;
+    spec.height = 0.8;
+    spec.spread_x = 0.5;
+    spec.spread_z = 0.32;
+    RefineScene scene = make_scene(spec, 101U);
+    std::mt19937 engine(53U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_EQ(marker->projections.size(), 4U);
+    // The last ring camera sees the target 33 px above the bottom edge while
+    // the sampled patch extends past it: that view is a non-contributor.
+    const std::int32_t border_camera = scene.chunk->cameras()[3].id;
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_EQ(marker->projections.size(), 4U);
+    for (const MarkerProjection& projection : marker->projections) {
+        if (projection.camera_id == border_camera) {
+            continue;  // non-contributor: never a reason to remove it
+        }
+        const auto truth =
+            scene.truth(0, camera_index(scene, projection.camera_id));
+        ASSERT_TRUE(truth.has_value());
+        EXPECT_LE((projection.pixel - *truth).norm(), 0.1)
+            << "camera " << projection.camera_id;
+    }
+}
+
 }  // namespace
 }  // namespace alphashape
