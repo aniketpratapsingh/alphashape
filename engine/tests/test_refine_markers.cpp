@@ -430,6 +430,29 @@ double rms_to_truth(const RefineScene& scene, const Marker& marker,
     return count == 0 ? 0.0 : std::sqrt(squared / static_cast<double>(count));
 }
 
+/// Projected semi-major radius of the printed target in one camera, in
+/// full-resolution pixels. Two ground-plane offsets span the target's ellipse,
+/// so the larger projection approximates the detector's radius.
+double apparent_radius(const RefineScene& scene, std::size_t target_index,
+                       std::size_t camera_index) {
+    const SceneTarget& target = scene.targets[target_index];
+    const auto truth = scene.truth(target_index, camera_index);
+    if (!truth) {
+        return 0.0;
+    }
+    double best = 0.0;
+    for (const Vec3 offset : {Vec3(target.radius, 0.0, 0.0),
+                              Vec3(0.0, 0.0, target.radius)}) {
+        const auto edge = project_marker(
+            target.centre + offset, scene.camera(camera_index),
+            scene.calibration(camera_index), false);
+        if (edge) {
+            best = std::max(best, (*edge - *truth).norm());
+        }
+    }
+    return best;
+}
+
 RefineMarkersStats run_refine(RefineScene& scene,
                               const RefineMarkersOptions& options) {
     RefineMarkersPlan plan =
@@ -523,7 +546,9 @@ TEST(Markers, RefineStableOnExactProjection) {
 }
 
 RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
-                                    std::int32_t& outlier_camera) {
+                                    std::int32_t& outlier_camera,
+                                    double* displacement = nullptr,
+                                    double* apparent = nullptr) {
     SceneSpec spec;
     spec.marker_count = 6;
     RefineScene scene = make_scene(spec, 21U);
@@ -550,8 +575,17 @@ RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
                                                   : dz.normalized();
             }
         }
-        set_projection(scene, ids[0], outlier_camera,
-                       *truth + 30.0 * direction);
+        // Three and a half apparent radii: unmistakably beyond the one-radius
+        // gate, while still landing inside the image.
+        const double radius = std::max(1.0, apparent_radius(scene, 0, 0));
+        const double moved = 3.5 * radius;
+        if (apparent != nullptr) {
+            *apparent = radius;
+        }
+        if (displacement != nullptr) {
+            *displacement = moved;
+        }
+        set_projection(scene, ids[0], outlier_camera, *truth + moved * direction);
     }
     return scene;
 }
@@ -559,12 +593,18 @@ RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
 TEST(Markers, RefineRemovesContradictedProjection) {
     std::vector<std::int32_t> ids;
     std::int32_t outlier_camera = -1;
+    double displacement = 0.0;
+    double apparent = 0.0;
     {
-        RefineScene scene = make_contradicted_scene(ids, outlier_camera);
+        RefineScene scene =
+            make_contradicted_scene(ids, outlier_camera, &displacement, &apparent);
         Marker* marker = find_marker(*scene.chunk, ids[0]);
         ASSERT_NE(marker, nullptr);
         const std::size_t before = marker->projections.size();
         ASSERT_GT(before, 0U);
+        // The contradiction must clear the one-radius gate by a wide margin.
+        EXPECT_GE(displacement, 3.0 * apparent);
+        EXPECT_GT(displacement, std::max(3.0, apparent));
         RefineMarkersOptions options;
         run_refine(scene, options);
         marker = find_marker(*scene.chunk, ids[0]);

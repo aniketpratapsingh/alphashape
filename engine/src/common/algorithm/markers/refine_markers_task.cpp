@@ -821,14 +821,17 @@ struct Winner {
 };
 
 /// A view's measured projection has to agree with the candidate's reprojection
-/// within one apparent target radius (or 6 px, whichever is larger). This is
-/// the only signal that can tell a contradicted measurement from a merely
-/// noisy one, because NCC itself always sees the printed target. The floor
-/// absorbs a few pixels of perturbation plus the reference view's own error;
-/// the blob scale widens it for a large target, where a larger displacement is
-/// still a plausible measurement of the same printed target.
+/// within one apparent target radius, with a floor of three full-resolution
+/// pixels scaled by the working downscale. This is the only signal that can
+/// tell a contradicted measurement from a merely noisy one, because NCC itself
+/// always sees the printed target. The floor absorbs a few pixels of
+/// perturbation plus the reference view's own error; the target scale widens it
+/// for a large target. A projection displaced by more than about one radius is
+/// therefore removed, not repaired.
 double projection_tolerance(const BlendView& blend) {
-    return std::max(10.0, blend.apparent);
+    const double floor_px =
+        3.0 * static_cast<double>(std::max(1, blend.view->downscale));
+    return std::max(floor_px, std::max(1.0, blend.apparent));
 }
 
 /// Search depth for the best (candidate, reference view) pair. Up to three

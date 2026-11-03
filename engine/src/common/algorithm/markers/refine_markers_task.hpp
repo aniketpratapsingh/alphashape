@@ -8,8 +8,11 @@
 /// triangulates the marker from its projections, searches a depth-normalised
 /// range for the physical target plane, scores every view against a reference
 /// view with zero-mean normalised cross-correlation, and only then moves the
-/// inlier projections. Markers with a single projection fall back to 2-D-only
-/// refinement. Everything is staged as one CommandTransaction("Refine Markers").
+/// inlier projections. A projection whose measured position disagrees with the
+/// refined candidate by more than about one apparent target radius is a
+/// contradiction, not noise: it is removed rather than repaired. Markers with
+/// a single projection fall back to 2-D-only refinement. Everything is staged
+/// as one CommandTransaction("Refine Markers").
 
 #include <cstddef>
 #include <cstdint>
