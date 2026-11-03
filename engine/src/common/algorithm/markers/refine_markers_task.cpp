@@ -1184,9 +1184,7 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
                          options.max_iterations, options.tolerance_px);
-            // Below a tenth of a pixel the LK shift is template noise; applying
-            // it only moves the answer away from the anchored centre.
-            if (shift && shift->norm() >= 0.1 &&
+            if (shift &&
                 (refined + *shift - projected_centres[i]).norm() <= limit) {
                 refined += *shift;
             }
