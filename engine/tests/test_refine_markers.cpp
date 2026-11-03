@@ -515,6 +515,10 @@ TEST(Markers, RefineStableOnExactProjection) {
     std::printf("[refine stable] worst %.4f px, refined %zu\n",
                 worst, stats.refined);
     EXPECT_LE(worst, 0.02);
+    // Exact projections must be processed, not silently skipped.
+    EXPECT_EQ(stats.skipped, 0U);
+    EXPECT_EQ(stats.refined + stats.unchanged, scene.chunk->markers().size());
+    EXPECT_GT(stats.refined + stats.unchanged, 0U);
 }
 
 RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,
@@ -793,6 +797,30 @@ TEST(Markers, RefineRejectsNonFiniteInput) {
     EXPECT_FALSE(std::isfinite(marker->projections[1].pixel.x()));
     EXPECT_EQ(marker->projections[1].pixel.y(), 7.0);
     EXPECT_GE(stats.refined + stats.unchanged, 1U);
+}
+
+TEST(Markers, RefineStatsCountEverySelectedMarkerOnce) {
+    SceneSpec spec;
+    spec.marker_count = 4;
+    spec.include_blank_target = true;
+    RefineScene scene = make_scene(spec, 111U);
+    std::mt19937 engine(59U);
+    add_all_markers(scene, 3.0, engine);
+    // A single-projection marker takes the 2-D fallback; a marker with no
+    // projection at all is skipped, not failed.
+    add_scene_marker(scene, 0, "Single", 1.5, engine, {0});
+    Marker empty;
+    empty.id = scene.chunk->allocate_id();
+    empty.label = "Empty";
+    empty.type = MarkerType::Fiducial;
+    scene.chunk->markers().push_back(std::move(empty));
+    const std::size_t selected = scene.chunk->markers().size();
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
+              selected);
+    EXPECT_GE(stats.skipped, 1U);
 }
 
 }  // namespace

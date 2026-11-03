@@ -22,11 +22,13 @@
 
 namespace alphashape {
 
-/// Counts reported by one RefineMarkers run.
+/// Counts reported by one RefineMarkers run. Every selected marker is counted
+/// exactly once: refined, unchanged, failed or skipped.
 struct RefineMarkersStats {
     std::size_t refined = 0;
     std::size_t unchanged = 0;
     std::size_t failed = 0;
+    std::size_t skipped = 0;
     std::size_t removed_projections = 0;
 };
 

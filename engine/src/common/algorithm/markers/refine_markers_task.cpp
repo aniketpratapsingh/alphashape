@@ -1361,6 +1361,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         const Marker& marker = chunk->markers()[selected[i]];
         const MarkerEdit& edit = edits[i];
         if (edit.skipped) {
+            ++plan.stats.skipped;
             continue;
         }
         if (edit.failed) {
@@ -1475,6 +1476,7 @@ void RefineMarkersTask::apply(Document& document, Params& params,
         log(LogLevel::Info)
             << "RefineMarkers: refined " << plan.stats.refined << ", unchanged "
             << plan.stats.unchanged << ", failed " << plan.stats.failed
+            << ", skipped " << plan.stats.skipped
             << ", removed projections " << plan.stats.removed_projections
             << " in " << seconds << " s";
     }
