@@ -1605,6 +1605,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def("refineMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "RefineMarkers", std::move(kwargs));
         })
+        // Pyramidal projection tracking (WP-13.10), the same run_task call.
+        .def("trackMarkers", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "TrackMarkers", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"
