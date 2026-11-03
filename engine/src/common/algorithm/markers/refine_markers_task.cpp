@@ -19,14 +19,9 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
-#if defined(ALPHASHAPE_HAVE_OPENMP)
-#include <omp.h>
-#endif
-
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
-#include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/cross_decoder.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
@@ -93,64 +88,45 @@ std::filesystem::path resolve_frame_path(const Document& document,
     return std::filesystem::path(document.path()).parent_path() / recorded;
 }
 
-/// One marker's local window in one camera. Only the reduced-resolution crop
-/// around that marker and its gradients are kept, never a whole image.
+/// One selected camera with its pose, calibration and reduced-resolution image.
 struct CameraView {
     const Camera* camera = nullptr;
     const Calibration* calibration = nullptr;
-    /// Crop at `downscale`; pixel (x, y) here is reduced-image index
-    /// (offset_x + x, offset_y + y).
     FloatImage image;
     int downscale = 1;
-    int offset_x = 0;
-    int offset_y = 0;
-    int full_width = 0;   ///< reduced-image width (window origin is relative to it)
-    int full_height = 0;
 
     bool aligned() const { return camera != nullptr && camera->enabled; }
-    bool loaded() const { return !image.empty(); }
 
-    /// Reduced-image index of a full-resolution pixel coordinate. The reduced
-    /// image keeps the calibration convention u' = u / downscale.
+    /// Image-index coordinate of a full-resolution pixel coordinate. The
+    /// reduced image keeps the calibration convention u' = u / downscale.
     Eigen::Vector2d index_of(const Eigen::Vector2d& pixel) const {
         const double ds = static_cast<double>(downscale);
         return pixel / ds - Eigen::Vector2d(0.5, 0.5);
     }
 
-    /// Reduced-image index relative to this window's top-left pixel.
-    Eigen::Vector2d local_of(const Eigen::Vector2d& pixel) const {
-        return index_of(pixel) -
-               Eigen::Vector2d(static_cast<double>(offset_x),
-                               static_cast<double>(offset_y));
-    }
-
     bool contains_pixel(const Eigen::Vector2d& pixel, double margin = 1.0) const {
-        if (!loaded()) {
-            return false;
-        }
-        const Eigen::Vector2d p = local_of(pixel);
+        const Eigen::Vector2d p = index_of(pixel);
         return p.x() >= margin && p.y() >= margin &&
                p.x() <= static_cast<double>(image.width() - 1) - margin &&
                p.y() <= static_cast<double>(image.height() - 1) - margin;
     }
 
     float sample(const Eigen::Vector2d& pixel) const {
-        const Eigen::Vector2d p = local_of(pixel);
+        const Eigen::Vector2d p = index_of(pixel);
         return image.sample(static_cast<float>(p.x()), static_cast<float>(p.y()));
     }
 
-    /// Image gradient with respect to a full-resolution pixel shift, computed
-    /// from this window only (one reduced-image pixel either side).
+    /// Image gradient with respect to a full-resolution pixel shift.
     Eigen::Vector2d gradient(const Eigen::Vector2d& pixel) const {
-        const double h = static_cast<double>(std::max(1, downscale));
-        const double dx =
-            (static_cast<double>(sample(pixel + Eigen::Vector2d(h, 0.0))) -
-             static_cast<double>(sample(pixel - Eigen::Vector2d(h, 0.0)))) /
-            (2.0 * h);
-        const double dy =
-            (static_cast<double>(sample(pixel + Eigen::Vector2d(0.0, h))) -
-             static_cast<double>(sample(pixel - Eigen::Vector2d(0.0, h)))) /
-            (2.0 * h);
+        const double h = static_cast<double>(downscale);
+        const double dx = static_cast<double>(
+                              sample(pixel + Eigen::Vector2d(h, 0.0)) -
+                              sample(pixel - Eigen::Vector2d(h, 0.0))) /
+                          (2.0 * h);
+        const double dy = static_cast<double>(
+                              sample(pixel + Eigen::Vector2d(0.0, h)) -
+                              sample(pixel - Eigen::Vector2d(0.0, h))) /
+                          (2.0 * h);
         return Eigen::Vector2d(dx, dy);
     }
 };
@@ -165,20 +141,14 @@ struct CloudSamples {
 
 template <typename Function>
 void for_each_cloud_point(const CloudSamples& samples, Function&& function) {
-    // Non-finite samples are rejected here, before any floor/ceil/lround or
-    // sort that would turn them into undefined behaviour.
     if (samples.dense != nullptr) {
         for (const Eigen::Vector3d& point : *samples.dense) {
-            if (point.allFinite()) {
-                function(point);
-            }
+            function(point);
         }
     }
     if (samples.markers != nullptr) {
         for (const Eigen::Vector3d& point : *samples.markers) {
-            if (point.allFinite()) {
-                function(point);
-            }
+            function(point);
         }
     }
 }
@@ -361,28 +331,17 @@ struct BlobSeed {
     double radius = 0.0;
 };
 
-/// Locate the circular target around `pixel` in the window. The blob's scale
-/// supplies the apparent radius in full-resolution pixels; the ellipse refit
-/// supplies its centre. Crosses never call this: their radius comes from the
-/// cross detector, or from the projected physical radius.
+/// Locate the circular target around `pixel` in the (possibly reduced) image.
+/// The blob's scale supplies the physical radius; the ellipse refit supplies a
+/// seed for the 2-D fallback. A cross has no blob, so this returns nullopt and
+/// the caller falls back to patch_size / 4.
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel, int patch_size) {
-    (void)patch_size;
-    if (!view.loaded()) {
-        return std::nullopt;
-    }
-    const Eigen::Vector2d local = view.local_of(pixel);
-    if (!local.allFinite()) {
-        return std::nullopt;
-    }
+    const Eigen::Vector2d index = view.index_of(pixel);
     const int half = std::max(32, patch_size);
-    const int centre_x = static_cast<int>(std::floor(std::clamp(
-        local.x(), -1.0e6, 1.0e6)));
-    const int centre_y = static_cast<int>(std::floor(std::clamp(
-        local.y(), -1.0e6, 1.0e6)));
-    const int x0 = std::clamp(centre_x - half, 0,
+    const int x0 = std::clamp(static_cast<int>(std::floor(index.x())) - half, 0,
                               std::max(0, view.image.width() - 2 * half - 1));
-    const int y0 = std::clamp(centre_y - half, 0,
+    const int y0 = std::clamp(static_cast<int>(std::floor(index.y())) - half, 0,
                               std::max(0, view.image.height() - 2 * half - 1));
     const int width = std::min(2 * half + 1, view.image.width() - x0);
     const int height = std::min(2 * half + 1, view.image.height() - y0);
@@ -402,14 +361,11 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
     const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
-    const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
-                               local.y() - static_cast<double>(y0) + 0.5);
+    const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
+                               index.y() - static_cast<double>(y0) + 0.5);
     const MarkerCandidate* best = nullptr;
     double best_distance = static_cast<double>(half) * 0.75;
     for (const MarkerCandidate& blob : blobs) {
-        if (!blob.center.allFinite() || !std::isfinite(blob.radius_px)) {
-            continue;
-        }
         const double distance = (blob.center - seed).norm();
         if (distance <= best_distance) {
             best_distance = distance;
@@ -424,13 +380,9 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (const auto fitted = refine_ellipse_center(crop, refined)) {
         centre = *fitted;
     }
-    if (!centre.allFinite()) {
-        return std::nullopt;
-    }
     BlobSeed out;
-    out.pixel = (centre + Eigen::Vector2d(
-                             static_cast<double>(view.offset_x + x0),
-                             static_cast<double>(view.offset_y + y0))) *
+    out.pixel = (centre + Eigen::Vector2d(static_cast<double>(x0),
+                                          static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = best->radius_px * static_cast<double>(view.downscale);
     return out;
@@ -571,19 +523,12 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
                                      double physical_radius, int search_steps) {
     const double step = std::max(kDepthStepFraction * physical_radius, 1e-9);
     const double reach = std::max(8.0 * physical_radius, 0.3);
-    if (!point.allFinite() || !ray.allFinite() || !std::isfinite(step)) {
-        return {};
-    }
     std::vector<double> offsets;
     for_each_cloud_point(cloud, [&](const Eigen::Vector3d& sample) {
-        if (!sample.allFinite()) {
-            return;
-        }
         const Eigen::Vector3d difference = sample - point;
         const double along = difference.dot(ray);
         const double perpendicular = (difference - along * ray).norm();
-        if (std::isfinite(along) && std::isfinite(perpendicular) &&
-            perpendicular <= reach) {
+        if (perpendicular <= reach) {
             offsets.push_back(along);
         }
     });
@@ -597,20 +542,12 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
         const double spread = high - low;
         double from = low - 0.5 * spread;
         double to = high + 0.5 * spread;
-        if (!std::isfinite(from) || !std::isfinite(to)) {
-            from = -static_cast<double>(maximum) * step;
-            to = static_cast<double>(maximum) * step;
-        }
         if (to - from < step) {
             from -= step;
             to += step;
         }
-        const double count_d = std::ceil((to - from) / step) + 1.0;
         const int count = std::clamp(
-            std::isfinite(count_d) ? static_cast<int>(std::min(
-                count_d, static_cast<double>(maximum)))
-                                   : maximum,
-            5, maximum);
+            static_cast<int>(std::ceil((to - from) / step)) + 1, 5, maximum);
         for (int i = 0; i < count; ++i) {
             candidates.push_back(from + (to - from) *
                                             static_cast<double>(i) /
@@ -652,24 +589,14 @@ double hessian_determinant_at(const CameraView& view, int x, int y) {
 /// centre, and the saddle quadratic fit only converges from inside the
 /// saddle's basin, so finding the basin first makes the cross refiner robust.
 std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
-                                           const Eigen::Vector2d& pixel) {
-    if (!view.loaded()) {
-        return std::nullopt;
-    }
-    const Eigen::Vector2d local = view.local_of(pixel);
-    if (!local.allFinite()) {
-        return std::nullopt;
-    }
-    const double max_x = static_cast<double>(std::max(0, view.image.width() - 1));
-    const double max_y = static_cast<double>(std::max(0, view.image.height() - 1));
-    const int centre_x = static_cast<int>(
-        std::lround(std::clamp(local.x(), 0.0, max_x)));
-    const int centre_y = static_cast<int>(
-        std::lround(std::clamp(local.y(), 0.0, max_y)));
-    // Small scan in working-scale pixels: the candidate is a few pixels off at
-    // most, and a wider scan would start locking onto unrelated texture.
-    constexpr int kScanPx = 6;
-    const int scan = kScanPx;
+                                           const Eigen::Vector2d& pixel,
+                                           int patch_size) {
+    const Eigen::Vector2d index = view.index_of(pixel);
+    const int centre_x = static_cast<int>(std::lround(index.x()));
+    const int centre_y = static_cast<int>(std::lround(index.y()));
+    // Small window: the candidate is a few pixels off at most, and a wider
+    // scan would start locking onto unrelated texture saddles.
+    const int scan = std::max(3, std::min(6, patch_size / 4));
     double best = 0.0;
     int best_x = 0;
     int best_y = 0;
@@ -691,9 +618,8 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
         return std::nullopt;
     }
     const double ds = static_cast<double>(view.downscale);
-    return Eigen::Vector2d(
-        (static_cast<double>(best_x + view.offset_x) + 0.5) * ds,
-        (static_cast<double>(best_y + view.offset_y) + 0.5) * ds);
+    return Eigen::Vector2d((static_cast<double>(best_x) + 0.5) * ds,
+                           (static_cast<double>(best_y) + 0.5) * ds);
 }
 
 /// 2-D-only refinement for a marker with fewer than two usable views. Both
@@ -705,11 +631,7 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
 /// unrelated texture.
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
-    const std::optional<BlobSeed>& seed, bool cross, double hint_work,
-    double limit) {
-    if (!view.loaded()) {
-        return std::nullopt;
-    }
+    const std::optional<BlobSeed>& seed, int patch_size, double limit) {
     const auto accept = [&](const Eigen::Vector2d& candidate)
         -> std::optional<Eigen::Vector2d> {
         if (!candidate.allFinite() || (candidate - pixel).norm() > limit) {
@@ -718,75 +640,35 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
         return candidate;
     };
     const double ds = static_cast<double>(view.downscale);
-    const Eigen::Vector2d offset(static_cast<double>(view.offset_x),
-                                 static_cast<double>(view.offset_y));
-    const auto to_pixel = [&](const Eigen::Vector2d& local_calibration) {
-        return (local_calibration + offset) * ds;
-    };
-    const Eigen::Vector2d local_calibration = pixel / ds - offset;
-    // Crosses are refined by the saddle/bar refiner first. The ellipse is a
-    // fallback only when the cross result is farther from the measurement; it
-    // is never allowed to define the cross scale.
-    if (cross) {
-        Eigen::Vector2d start = local_calibration;
-        if (const auto saddle = saddle_seed(view, pixel)) {
-            start = *saddle / ds - offset;
-        }
-        const double hint = std::max(4.0, hint_work);
-        std::optional<Eigen::Vector2d> cross_fit;
-        if (const auto refined =
-                refine_cross_center(view.image, start, hint)) {
-            cross_fit = accept(to_pixel(*refined));
-        }
-        if (!cross_fit) {
-            if (const auto refined =
-                    refine_bar_cross_center(view.image, start, hint)) {
-                cross_fit = accept(to_pixel(*refined));
-            }
-        }
-        // The ellipse is the alternative refiner, not the cross scale: when
-        // it lands closer to the measurement it wins, exactly as the
-        // validated min-movement choice.
-        std::optional<Eigen::Vector2d> ellipse;
-        if (seed) {
-            MarkerCandidate ellipse_seed;
-            ellipse_seed.center = local_calibration;
-            ellipse_seed.radius_px = seed->radius / ds;
-            if (const auto fitted =
-                    refine_ellipse_center(view.image, ellipse_seed)) {
-                ellipse = accept(to_pixel(*fitted));
-            }
-        }
-        if (ellipse &&
-            (!cross_fit ||
-             (*ellipse - pixel).squaredNorm() <=
-                 (*cross_fit - pixel).squaredNorm())) {
-            return ellipse;
-        }
-        return cross_fit;
-    }
-    // Circular targets: refit the ellipse at the candidate, using the blob
-    // only for its scale. Trusting the blob's centre would accept a nearby
-    // texture blob; the printed target is centred at the candidate to within a
-    // few pixels, so the radial search converges to the real boundary.
+    // Refit the ellipse at the candidate, using the blob only for its scale.
+    // Trusting the blob's centre would accept a nearby texture blob; the
+    // printed target is centred at the candidate to within a few pixels, so
+    // the radial search converges to the real boundary from there.
+    std::optional<Eigen::Vector2d> ellipse;
     if (seed) {
         MarkerCandidate ellipse_seed;
-        ellipse_seed.center = local_calibration;
+        ellipse_seed.center = pixel / ds;
         ellipse_seed.radius_px = seed->radius / ds;
         if (const auto fitted =
                 refine_ellipse_center(view.image, ellipse_seed)) {
-            if (const auto accepted = accept(to_pixel(*fitted))) {
-                return accepted;
-            }
+            ellipse = accept(*fitted * ds);
         }
     }
-    // No usable blob: try the cross refiner from the candidate itself.
-    const double hint = std::max(4.0, hint_work);
-    if (const auto refined =
-            refine_cross_center(view.image, local_calibration, hint)) {
-        return accept(to_pixel(*refined));
+    const double hint = std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
+    Eigen::Vector2d start = pixel;
+    if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
+        start = *saddle;
     }
-    return std::nullopt;
+    std::optional<Eigen::Vector2d> cross;
+    if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
+        cross = accept(*refined * ds);
+    }
+    if (ellipse &&
+        (!cross ||
+         (*ellipse - pixel).squaredNorm() <= (*cross - pixel).squaredNorm())) {
+        return ellipse;
+    }
+    return cross;
 }
 
 /// Lucas-Kanade translation-only alignment of a view's patch to the mean
@@ -835,14 +717,11 @@ struct ProjectionEdit {
 };
 
 struct MarkerEdit {
-    std::int32_t marker_id = -1;
     std::vector<ProjectionEdit> moves;
     std::vector<std::int32_t> removals;
-    std::optional<Eigen::Vector3d> position;
     bool failed = false;
     bool touched = false;
     bool skipped = false;
-    int rounds = 0;
 };
 
 /// One view's data for a marker: its measurement, apparent scale and depth.
@@ -850,97 +729,9 @@ struct BlendView {
     const CameraView* view = nullptr;
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     std::optional<BlobSeed> seed;
-    bool cross = false;
-    bool has_scale = false;
-    /// Absolute subpixel centre of the printed target in this view, found once
-    /// from the measurement. The rounds move towards it; they never re-derive
-    /// it from the current 3-D point, which is what lets a common-mode lateral
-    /// error be removed.
-    bool has_anchor = false;
-    Eigen::Vector2d anchor = Eigen::Vector2d::Zero();
-    /// Apparent radius in full-resolution pixels.
     double apparent = 1.0;
-    /// Cross-refiner radius hint in working-scale pixels.
-    double hint_work = 8.0;
     double depth = 1.0;
 };
-
-struct CrossSeed {
-    Eigen::Vector2d pixel = Eigen::Vector2d::Zero();  ///< full-resolution
-    double radius = 0.0;                              ///< full-resolution
-    bool bar = false;                                 ///< bar style, not saddle
-};
-
-/// Locate the cross near `pixel` with the cross detector's own extent, in
-/// full-resolution pixels. Nullopt when no cross is detected near the
-/// measurement, in which case the caller falls back to the projected physical
-/// radius.
-std::optional<CrossSeed> cross_extent(const CameraView& view,
-                                      const Eigen::Vector2d& pixel,
-                                      int patch_size) {
-    if (!view.loaded()) {
-        return std::nullopt;
-    }
-    const Eigen::Vector2d local = view.local_of(pixel);
-    if (!local.allFinite()) {
-        return std::nullopt;
-    }
-    const int half = std::max(48, 2 * patch_size);
-    const int x0 = std::clamp(
-        static_cast<int>(std::floor(std::clamp(local.x(), -1.0e6, 1.0e6))) - half,
-        0, std::max(0, view.image.width() - 2 * half - 1));
-    const int y0 = std::clamp(
-        static_cast<int>(std::floor(std::clamp(local.y(), -1.0e6, 1.0e6))) - half,
-        0, std::max(0, view.image.height() - 2 * half - 1));
-    const int width = std::min(2 * half + 1, view.image.width() - x0);
-    const int height = std::min(2 * half + 1, view.image.height() - y0);
-    if (width < 16 || height < 16) {
-        return std::nullopt;
-    }
-    FloatImage crop(width, height, 0.0F);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            crop.at(x, y) = view.image.at(x0 + x, y0 + y);
-        }
-    }
-    CrossParams params;
-    params.minimum_size = 2.0;
-    params.minimum_dist = 8.0;
-    const std::vector<CrossDetection> detections =
-        detect_crosses_styled(crop, params);
-    const Eigen::Vector2d seed(local.x() - static_cast<double>(x0) + 0.5,
-                               local.y() - static_cast<double>(y0) + 0.5);
-    double best = std::numeric_limits<double>::infinity();
-    double radius = 0.0;
-    Eigen::Vector2d centre = Eigen::Vector2d::Zero();
-    bool bar = false;
-    for (const CrossDetection& detection : detections) {
-        if (!detection.target.center.allFinite() ||
-            !(detection.target.radius_px > 0.0)) {
-            continue;
-        }
-        const double distance = (detection.target.center - seed).norm();
-        if (distance < best) {
-            best = distance;
-            radius = detection.target.radius_px;
-            centre = detection.target.center;
-            bar = detection.style == CrossStyle::Bar;
-        }
-    }
-    if (!std::isfinite(best) || !(radius > 0.0) ||
-        best > static_cast<double>(half) || !centre.allFinite()) {
-        return std::nullopt;
-    }
-    CrossSeed out;
-    const double ds = static_cast<double>(view.downscale);
-    out.pixel = (centre + Eigen::Vector2d(
-                              static_cast<double>(view.offset_x + x0),
-                              static_cast<double>(view.offset_y + y0))) *
-                ds;
-    out.radius = radius * ds;
-    out.bar = bar;
-    return out;
-}
 
 /// Mean NCC of every other view against the reference patch. Views without
 /// evidence (no overlap or a flat patch) do not contribute; if none has
@@ -968,12 +759,6 @@ std::optional<double> score_patches(const std::vector<Patch>& patches,
     return sum / static_cast<double>(count);
 }
 
-/// Per-view outcome of a candidate: 0 = non-contributor (the patch leaves the
-/// window, so the projection is not used but is not contradicted either),
-/// 1 = the patch is in the window but its projection is outside the gate,
-/// 2 = the patch is usable and its projection agrees with the candidate.
-enum class ViewStatus : std::uint8_t { Unused = 0, Gated = 1, Usable = 2 };
-
 struct Winner {
     bool found = false;
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
@@ -981,22 +766,17 @@ struct Winner {
     double score = -2.0;
     std::vector<Patch> patches;
     std::vector<std::optional<double>> scores;
-    std::vector<ViewStatus> status;
 };
 
 /// A view's measured projection has to agree with the candidate's reprojection
-/// within one apparent target radius, and never less than 3 full-resolution
-/// pixels (scaled by the working downscale). This is the only signal that can
-/// tell a contradicted measurement from a merely noisy one, because NCC itself
-/// always sees the printed target. The floor absorbs the reference view's own
-/// error and a few pixels of perturbation; the target scale widens it for a
-/// large target, where a larger displacement is still a plausible measurement
-/// of the same printed target. A projection displaced by more than about one
-/// radius is removed, never repaired.
+/// within one apparent target radius (or 6 px, whichever is larger). This is
+/// the only signal that can tell a contradicted measurement from a merely
+/// noisy one, because NCC itself always sees the printed target. The floor
+/// absorbs a few pixels of perturbation plus the reference view's own error;
+/// the blob scale widens it for a large target, where a larger displacement is
+/// still a plausible measurement of the same printed target.
 double projection_tolerance(const BlendView& blend) {
-    const double floor_px =
-        3.0 * static_cast<double>(std::max(1, blend.view->downscale));
-    return std::max(floor_px, blend.apparent);
+    return std::max(10.0, blend.apparent);
 }
 
 /// Search depth for the best (candidate, reference view) pair. Up to three
@@ -1039,26 +819,15 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
             initial, ray_unit, cloud, physical_radius, search_steps);
         for (const double offset : offsets) {
             const Eigen::Vector3d candidate = initial + ray_unit * offset;
-            if (!candidate.allFinite()) {
-                continue;
-            }
             std::vector<Patch> patches;
-            std::vector<ViewStatus> status;
             patches.reserve(blends.size());
-            status.reserve(blends.size());
-            int usable_other = 0;
-            for (std::size_t index = 0; index < blends.size(); ++index) {
-                const BlendView& blend = blends[index];
+            bool complete = true;
+            for (const BlendView& blend : blends) {
                 Patch patch = sample_patch(*blend.view, candidate, u, v,
                                            half_width, patch_size);
                 if (!patch.valid) {
-                    // The patch leaves this view's window: a non-contributor,
-                    // not a contradiction. It must not invalidate the
-                    // candidate, which only needs the reference view and at
-                    // least one other usable view.
-                    patches.push_back(Patch{});
-                    status.push_back(ViewStatus::Unused);
-                    continue;
+                    complete = false;
+                    break;
                 }
                 // NCC alone cannot detect a contradicted projection: every
                 // view still shows the printed target at the candidate's
@@ -1069,19 +838,11 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                 const auto projected = project_view(*blend.view, candidate);
                 if (!projected || (*projected - blend.pixel).norm() >
                                       projection_tolerance(blend)) {
-                    patches.push_back(Patch{});
-                    status.push_back(ViewStatus::Gated);
-                    continue;
+                    patch = Patch{};
                 }
                 patches.push_back(std::move(patch));
-                status.push_back(ViewStatus::Usable);
-                if (index != reference) {
-                    ++usable_other;
-                }
             }
-            if (status[reference] != ViewStatus::Usable ||
-                patches[reference].stddev < kMinPatchStdDev ||
-                usable_other < 1) {
+            if (!complete || patches[reference].stddev < kMinPatchStdDev) {
                 continue;
             }
             std::vector<std::optional<double>> scores;
@@ -1095,7 +856,6 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
             best.score = *score;
             best.patches = std::move(patches);
             best.scores = std::move(scores);
-            best.status = std::move(status);
         }
     }
     if (!best.found) {
@@ -1126,31 +886,18 @@ std::optional<Eigen::Vector3d> intersect_plane(const CameraView& view,
     return centre + distance * ray;
 }
 
-/// Result of one refinement round: the accepted projection of every view
-/// (updated for inliers, unchanged otherwise) plus the view statuses of the
-/// winning candidate.
-struct RoundOutcome {
-    std::vector<Eigen::Vector2d> pixels;
-    std::vector<bool> inlier;
-    std::vector<ViewStatus> status;
-    double max_movement = 0.0;
-    /// True when this round found the consistent large offset that the
-    /// multi-round walk exists for; otherwise one round is the validated path.
-    bool common_mode = false;
-};
-
 /// Consensus (Fischler & Bolles 1981) at the winning candidate, then subpixel
 /// refinement of every inlier. A view is an inlier when its correlation is
 /// within `correlation_margin` of the best non-reference view and above
-/// `min_correlation`; two inliers are required. Each inlier is anchored at the
-/// printed centre by the type-specific 2-D refiner, and the movement accepted
-/// in this round is clamped relative to this round's anchor.
-std::optional<RoundOutcome> apply_winner(
-    const std::vector<BlendView>& blends, const Winner& winner,
-    const std::vector<Eigen::Vector2d>& current, const Eigen::Vector3d& u,
-    const Eigen::Vector3d& v, double half_width,
-    const RefineMarkersOptions& options) {
-    const std::vector<std::optional<double>>& scores = winner.scores;
+/// `min_correlation`; two inliers are required. Outliers are deleted only when
+/// `remove_invalid` is set, and are never moved otherwise.
+std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
+                                       const Winner& winner,
+                                       const Eigen::Vector3d& u,
+                                       const Eigen::Vector3d& v,
+                                       double half_width,
+                                       const RefineMarkersOptions& options) {
+    std::vector<std::optional<double>> scores = winner.scores;
     double best_other = -2.0;
     for (std::size_t i = 0; i < scores.size(); ++i) {
         if (i != winner.reference && scores[i]) {
@@ -1171,87 +918,30 @@ std::optional<RoundOutcome> apply_winner(
     if (inliers.size() < 2) {
         return std::nullopt;
     }
-    // Common mode: most views agree that the printed centre is far from the
-    // current projection. A lone false cross on a circular target does not
-    // move the median, so it keeps the validated per-round refiner.
-    std::vector<double> gaps;
-    for (const std::size_t index : inliers) {
-        const auto projected =
-            project_view(*blends[index].view, winner.point);
-        if (!projected) {
-            continue;
-        }
-        if (const auto cross = cross_extent(
-                *blends[index].view, blends[index].pixel,
-                options.patch_size)) {
-            gaps.push_back((cross->pixel - *projected).norm());
-        }
-    }
-    double median_gap = 0.0;
-    if (!gaps.empty()) {
-        const std::size_t middle = gaps.size() / 2;
-        std::nth_element(
-            gaps.begin(),
-            gaps.begin() + static_cast<std::ptrdiff_t>(middle),
-            gaps.end());
-        median_gap = gaps[middle];
-    }
-    const bool common_mode = median_gap > 4.0;
     // A common lateral offset of the physical patch is invisible to NCC (every
     // view samples the same world points), so consistency alone cannot remove
     // the reference view's own bias. Each inlier is therefore anchored at the
     // centre of its printed target by the type-specific 2-D refiner, and the
     // Lucas-Kanade step then aligns those anchored patches to their mean. This
     // keeps the multi-view gate while giving the template an absolute anchor.
-    RoundOutcome out;
-    out.pixels = current;
-    out.inlier.assign(blends.size(), false);
-    out.status = winner.status;
-    bool used_absolute = false;
     const Eigen::Vector3d normal = u.cross(v).normalized();
     std::vector<Eigen::Vector2d> anchored(blends.size());
     std::vector<Eigen::Vector2d> projected_centres(blends.size());
     std::vector<Patch> anchored_patches(blends.size());
     std::vector<bool> usable(blends.size(), false);
-    int projected_inliers = 0;
     for (const std::size_t index : inliers) {
         const BlendView& blend = blends[index];
         const auto projected = project_view(*blend.view, winner.point);
-        if (!projected || !projected->allFinite()) {
-            continue;
+        if (!projected) {
+            return std::nullopt;
         }
-        out.inlier[index] = true;
-        ++projected_inliers;
         projected_centres[index] = *projected;
-        const double limit = std::max(2.0, blend.apparent);
-        const std::optional<BlobSeed> seed =
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
+        const auto seed =
             circular_seed(*blend.view, *projected, options.patch_size);
-        const auto refined =
-            refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
-                             blend.hint_work, limit);
-        Eigen::Vector2d anchor = refined ? *refined : *projected;
-        // A normal cross detector centre sits on the projected point. A
-        // common-mode offset leaves it most of a radius away; walk towards it,
-        // clamped per round, and let the rounds converge.
-        if (common_mode && blend.cross) {
-            if (const auto cross = cross_extent(
-                    *blend.view, blend.pixel, options.patch_size)) {
-                const double gap = (cross->pixel - *projected).norm();
-                if (gap > 4.0 && gap <= std::max(2.0, 2.0 * cross->radius)) {
-                    Eigen::Vector2d delta = cross->pixel - *projected;
-                    const double distance = delta.norm();
-                    const double anchor_limit = std::max(2.0, blend.apparent);
-                    if (std::isfinite(distance)) {
-                        if (distance > anchor_limit) {
-                            delta *= anchor_limit / distance;
-                        }
-                        anchor = *projected + delta;
-                        used_absolute = true;
-                    }
-                }
-            }
-        }
-        anchored[index] = anchor;
+        const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
+                                              options.patch_size, limit);
+        anchored[index] = refined ? *refined : *projected;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
         if (point) {
@@ -1259,9 +949,6 @@ std::optional<RoundOutcome> apply_winner(
                 *blend.view, *point, u, v, half_width, options.patch_size);
             usable[index] = anchored_patches[index].valid;
         }
-    }
-    if (projected_inliers < 2) {
-        return std::nullopt;
     }
     std::vector<double> mean(static_cast<std::size_t>(options.patch_size) *
                                  static_cast<std::size_t>(options.patch_size),
@@ -1285,33 +972,35 @@ std::optional<RoundOutcome> apply_winner(
             value /= static_cast<double>(mean_count);
         }
     }
+    MarkerEdit edit;
     for (std::size_t i = 0; i < blends.size(); ++i) {
-        if (!out.inlier[i]) {
+        const BlendView& blend = blends[i];
+        const bool inlier = std::find(inliers.begin(), inliers.end(), i) !=
+                            inliers.end();
+        if (!inlier) {
+            if (options.remove_invalid) {
+                edit.removals.push_back(blend.view->camera->id);
+                edit.touched = true;
+            }
             continue;
         }
-        const BlendView& blend = blends[i];
         Eigen::Vector2d refined = anchored[i];
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
         if (mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
                          options.max_iterations, options.tolerance_px);
-            // Below a tenth of a pixel the LK shift is the template's own
-            // noise; applying it only moves the answer away from the anchor.
-            if (shift && shift->norm() >= 0.1 &&
+            if (shift &&
                 (refined + *shift - projected_centres[i]).norm() <= limit) {
                 refined += *shift;
             }
         }
-        if (!refined.allFinite()) {
-            refined = projected_centres[i];
+        if ((refined - blend.pixel).norm() > 1e-9) {
+            edit.moves.push_back({blend.view->camera->id, refined});
+            edit.touched = true;
         }
-        out.pixels[i] = refined;
-        out.max_movement =
-            std::max(out.max_movement, (refined - current[i]).norm());
     }
-    out.common_mode = used_absolute;
-    return out;
+    return edit;
 }
 
 double median(std::vector<double> values) {
@@ -1324,68 +1013,27 @@ double median(std::vector<double> values) {
     return values[middle];
 }
 
-/// Detect the target type and fill the apparent radius, in full-resolution
-/// pixels. A saddle at the measurement means a cross: its extent comes from the
-/// cross detector, and the circular blob scale is never used for it. Circular
-/// targets use the blob's semi-major axis. A view whose radius cannot be
-/// measured is left for the projected physical radius, filled once the marker
-/// has been triangulated.
+/// Fill the per-view apparent radius. The blob scale supplies it for circular
+/// targets; patch_size / 4 is the documented fallback (crosses have no blob).
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
-        if (!blend.view->loaded()) {
-            continue;
-        }
-        const double ds = static_cast<double>(std::max(1, blend.view->downscale));
-        const auto circle =
-            circular_seed(*blend.view, blend.pixel, patch_size);
-        // A saddle at the measurement, or a detected cross whose centre is
-        // within one target radius of it, identifies a cross. The second test
-        // is what recognises a common-mode offset that moved the saddle out
-        // of the local scan. The blob seed stays as the ellipse alternative.
-        const bool saddle =
-            saddle_seed(*blend.view, blend.pixel).has_value();
-        const auto cross =
-            cross_extent(*blend.view, blend.pixel, patch_size);
-        // A detection away from the measurement (but within a target radius)
-        // is the common-mode signature; a false cross on a circular target
-        // sits on the measurement and must not change its type.
-        const double gap =
-            cross ? (cross->pixel - blend.pixel).norm() : 0.0;
-        const bool common_detection =
-            cross && gap > 4.0 &&
-            gap <= std::max(1.0, 2.0 * cross->radius);
-        if (saddle || common_detection) {
-            blend.cross = true;
-            if (cross) {
-                blend.apparent = std::max(1.0, cross->radius);
-                blend.has_scale = true;
-            } else if (circle) {
-                blend.apparent = std::max(1.0, circle->radius);
-                blend.has_scale = true;
-            }
-            blend.seed = circle;
-            blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
-            continue;
-        }
-        if (circle) {
-            blend.seed = circle;
-            blend.apparent = std::max(1.0, circle->radius);
-            blend.has_scale = true;
-        }
-        blend.hint_work = 6.25;
+        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size);
+        blend.apparent = blend.seed ? blend.seed->radius
+                                    : static_cast<double>(patch_size) / 4.0;
+        blend.apparent = std::max(blend.apparent, 1.0);
     }
 }
 
-MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
+MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
+                            const RefineMarkersOptions& options) {
     MarkerEdit edit;
     bool any = false;
     bool success = false;
     for (BlendView& blend : blends) {
         any = true;
-        const double limit = std::max(2.0, blend.apparent);
+        const double limit = std::max(2.0, 0.5 * blend.apparent);
         const auto refined = refined_2d_pixel(
-            *blend.view, blend.pixel, blend.seed, blend.cross, blend.hint_work,
-            limit);
+            *blend.view, blend.pixel, blend.seed, options.patch_size, limit);
         if (!refined) {
             continue;
         }
@@ -1397,46 +1045,6 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends) {
     }
     if (any && !success) {
         edit.failed = true;
-    }
-    return edit;
-}
-
-/// Turn the last round into edits. Out-of-window views (`Unused`) are left
-/// untouched: they were non-contributors, not contradictions. Every other
-/// non-inlier is removed when `remove_invalid` is set. The marker's estimated
-/// position is re-triangulated from the accepted refined projections; the
-/// reference/source coordinates are never touched.
-MarkerEdit finalize_round(const std::vector<BlendView>& aligned,
-                          const RoundOutcome& outcome,
-                          const RefineMarkersOptions& options) {
-    MarkerEdit edit;
-    for (std::size_t i = 0; i < aligned.size(); ++i) {
-        const BlendView& blend = aligned[i];
-        if (outcome.inlier[i]) {
-            if ((outcome.pixels[i] - blend.pixel).norm() > 1e-9) {
-                edit.moves.push_back(
-                    {blend.view->camera->id, outcome.pixels[i]});
-                edit.touched = true;
-            }
-        } else if (outcome.status[i] != ViewStatus::Unused &&
-                   options.remove_invalid) {
-            edit.removals.push_back(blend.view->camera->id);
-            edit.touched = true;
-        }
-    }
-    std::vector<Observation> accepted;
-    std::vector<double> tolerances;
-    for (std::size_t i = 0; i < aligned.size(); ++i) {
-        if (!outcome.inlier[i]) {
-            continue;
-        }
-        accepted.push_back({aligned[i].view, outcome.pixels[i]});
-        tolerances.push_back(projection_tolerance(aligned[i]));
-    }
-    if (accepted.size() >= 2) {
-        if (const auto position = triangulate_robust(accepted, tolerances)) {
-            edit.position = *position;
-        }
     }
     return edit;
 }
@@ -1466,122 +1074,32 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         observations.reserve(aligned.size());
         std::vector<double> tolerances;
         tolerances.reserve(aligned.size());
-        std::vector<Eigen::Vector2d> current;
-        current.reserve(aligned.size());
         for (const BlendView& blend : aligned) {
             observations.push_back({blend.view, blend.pixel});
-            const double ds = static_cast<double>(
-                std::max(1, blend.view->downscale));
-            tolerances.push_back(blend.has_scale ? projection_tolerance(blend)
-                                                 : 8.0 * ds);
-            current.push_back(blend.pixel);
+            tolerances.push_back(projection_tolerance(blend));
         }
-        auto initial = triangulate_robust(observations, tolerances);
+        const auto initial = triangulate_robust(observations, tolerances);
         if (initial) {
             std::vector<double> physical_samples;
-            std::vector<double> depths;
             for (BlendView& blend : aligned) {
                 blend.depth = depth_in_view(*blend.view, *initial);
-                depths.push_back(blend.depth);
-                if (!blend.has_scale) {
-                    continue;
-                }
-                const double focal =
-                    std::max(blend.view->calibration->f, 1e-6);
+                const double focal = std::max(blend.view->calibration->f, 1e-6);
                 physical_samples.push_back(blend.apparent * blend.depth / focal);
             }
             double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
-                // No view reported a radius: assume the printed target spans
-                // 10 % of the viewing distance (5 % radius). This is a physical
-                // length, never a sample count.
-                physical = 0.05 * std::max(median(depths), 1e-9);
+                physical = static_cast<double>(options.patch_size) / 4.0;
             }
-            // Views without a measured radius use the projected physical radius.
-            // A cross detector can under-read a grazing target, so its
-            // apparent radius is floored by the projected physical radius.
-            for (BlendView& blend : aligned) {
-                const double focal =
-                    std::max(blend.view->calibration->f, 1e-6);
-                const double projected_radius =
-                    physical * focal / std::max(blend.depth, 1e-9);
-                if (blend.has_scale) {
-                    if (blend.cross) {
-                        blend.apparent = std::max(
-                            blend.apparent, 0.75 * projected_radius);
-                    }
-                    continue;
-                }
-                blend.apparent = std::max(1.0, projected_radius);
-                blend.hint_work = std::max(
-                    6.0, 0.25 * blend.apparent /
-                             static_cast<double>(std::max(
-                                 1, blend.view->downscale)));
-                blend.has_scale = true;
-            }
-            for (std::size_t i = 0; i < aligned.size(); ++i) {
-                tolerances[i] = projection_tolerance(aligned[i]);
-            }
-            initial = triangulate_robust(observations, tolerances);
-            if (initial) {
-                const Eigen::Vector3d normal = target_normal(
-                    *initial, observations, cloud, std::max(0.15, 6.0 * physical));
-                const auto axes = plane_axes(normal);
-                Eigen::Vector3d point = *initial;
-                std::optional<RoundOutcome> last;
-                int rounds_used = 0;
-                // Up to three rounds: the depth search and LK are repeated
-                // around the point re-triangulated from the previous round's
-                // refined centres, which removes a common-mode lateral bias
-                // that no single view can see.
-                for (int round = 0; round < 3; ++round) {
-                    const auto winner = search_winner(
-                        point, axes.first, axes.second, aligned, cloud, physical,
-                        options.search_steps, options.patch_size);
-                    if (!winner) {
-                        break;
-                    }
-                    auto outcome = apply_winner(
-                        aligned, *winner, current, axes.first, axes.second,
-                        kPatchHalfWidth * physical, options);
-                    if (!outcome) {
-                        break;
-                    }
-                    last = std::move(outcome);
-                    ++rounds_used;
-                    // Only a consistent large offset needs more rounds; the
-                    // validated single-pass path is exact for normal data.
-                    if (!last->common_mode) {
-                        break;
-                    }
-                    std::vector<Observation> refined;
-                    std::vector<double> refined_tolerances;
-                    for (std::size_t i = 0; i < aligned.size(); ++i) {
-                        if (!last->inlier[i]) {
-                            continue;
-                        }
-                        refined.push_back({aligned[i].view, last->pixels[i]});
-                        refined_tolerances.push_back(
-                            projection_tolerance(aligned[i]));
-                    }
-                    current = last->pixels;
-                    if (refined.size() < 2) {
-                        break;
-                    }
-                    const auto next =
-                        triangulate_robust(refined, refined_tolerances);
-                    if (!next) {
-                        break;
-                    }
-                    point = *next;
-                    if (last->max_movement < options.tolerance_px) {
-                        break;
-                    }
-                }
-                if (last) {
-                    MarkerEdit edit = finalize_round(aligned, *last, options);
-                    edit.rounds = rounds_used;
-                    return edit;
+            const Eigen::Vector3d normal = target_normal(
+                *initial, observations, cloud, std::max(0.15, 6.0 * physical));
+            const auto axes = plane_axes(normal);
+            if (const auto winner = search_winner(
+                    *initial, axes.first, axes.second, aligned, cloud,
+                    physical, options.search_steps, options.patch_size)) {
+                if (const auto edit =
+                        apply_winner(aligned, *winner, axes.first, axes.second,
+                                     kPatchHalfWidth * physical, options)) {
+                    return *edit;
                 }
             }
         }
@@ -1589,16 +1107,18 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         failed.failed = true;
         return failed;
     }
-    return refine_2d_marker(blends);
+    return refine_2d_marker(blends, options);
 }
 
-/// Build the pose/calibration/scale record for every selected camera. No image
-/// is read here. An explicit camera list is strict: a selected camera with no
-/// frame or no sensor is a ValueError, matching DetectMarkers; the implicit
-/// "all enabled" list silently skips cameras that cannot contribute.
-std::vector<CameraView> build_camera_views(const Chunk& chunk,
-                                           const std::vector<std::string>& filters,
-                                           int downscale) {
+/// Load every selected camera's luminance once, reduced by `downscale`. The
+/// image is shared read-only by all marker jobs. An explicit camera list is
+/// strict: a name with no camera, no frame or no sensor is a ValueError,
+/// matching DetectMarkers; the implicit "all enabled" list silently skips
+/// cameras that cannot contribute.
+std::vector<CameraView> load_selected_views(const Document& document,
+                                            const Chunk& chunk,
+                                            const std::vector<std::string>& filters,
+                                            int downscale) {
     for (const std::string& label : filters) {
         bool found = false;
         for (const Camera& camera : chunk.cameras()) {
@@ -1623,7 +1143,6 @@ std::vector<CameraView> build_camera_views(const Chunk& chunk,
             }
             continue;
         }
-        (void)frame;
         if (camera.sensor_id < 0 ||
             camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
             if (!filters.empty()) {
@@ -1637,471 +1156,25 @@ std::vector<CameraView> build_camera_views(const Chunk& chunk,
         if (calibration.width <= 0 || calibration.height <= 0) {
             continue;
         }
-        CameraView view;
-        view.camera = &camera;
-        view.calibration = &calibration;
-        view.downscale = std::max(1, downscale);
-        view.full_width = std::max(1, calibration.width / view.downscale);
-        view.full_height = std::max(1, calibration.height / view.downscale);
-        views.push_back(std::move(view));
+        try {
+            FloatImage image =
+                read_image(resolve_frame_path(document, frame->path()).string())
+                    .to_luminance();
+            if (downscale > 1) {
+                image = downsample_box(image, downscale);
+            }
+            CameraView view;
+            view.camera = &camera;
+            view.calibration = &calibration;
+            view.image = std::move(image);
+            view.downscale = downscale;
+            views.push_back(std::move(view));
+        } catch (const std::exception& error) {
+            throw Error("RefineMarkers: " + camera.label + ": " + error.what());
+        }
     }
     return views;
 }
-/// One local window to cut for one projection of one selected marker.
-struct WindowRequest {
-    std::size_t camera = 0;      ///< index into the camera-view list
-    std::size_t marker = 0;      ///< index into the selected-marker list
-    std::size_t projection = 0;  ///< index into that marker's projections
-    Eigen::Vector2d centre = Eigen::Vector2d::Zero();  ///< full-res pixels
-    double half_px = 0.0;                              ///< full-res half extent
-};
-
-struct WindowLoadResult {
-    bool ok = true;
-    std::string error;
-};
-
-std::optional<std::size_t> view_index(const std::vector<CameraView>& views,
-                                      std::int32_t camera_id) {
-    for (std::size_t i = 0; i < views.size(); ++i) {
-        if (views[i].camera != nullptr && views[i].camera->id == camera_id) {
-            return i;
-        }
-    }
-    return std::nullopt;
-}
-
-/// Rough physical target radius, used only to bound a window. The nearest tie
-/// point gives the local sampling scale; without a cloud, 5 % of the viewing
-/// distance is assumed. Never used as an accuracy scale.
-double estimate_physical_radius(const Eigen::Vector3d& point,
-                                const std::vector<Observation>& observations,
-                                const CloudSamples& cloud) {
-    double nearest = std::numeric_limits<double>::infinity();
-    for_each_cloud_point(cloud, [&](const Eigen::Vector3d& sample) {
-        if (!sample.allFinite() || !point.allFinite()) {
-            return;
-        }
-        nearest = std::min(nearest, (sample - point).norm());
-    });
-    if (std::isfinite(nearest) && nearest > 0.0) {
-        return 2.0 * nearest;
-    }
-    std::vector<double> depths;
-    for (const Observation& observation : observations) {
-        depths.push_back(depth_in_view(*observation.view, point));
-    }
-    const double depth = median(depths);
-    return 0.05 * (std::isfinite(depth) && depth > 0.0 ? depth : 1.0);
-}
-
-struct WindowPlan {
-    std::vector<WindowRequest> requests;
-    /// [selected marker][projection] -> request index, or npos when the
-    /// projection has no usable window.
-    std::vector<std::vector<std::size_t>> marker_windows;
-};
-
-/// Plan one window per usable projection. Windows are centred on the measured
-/// projection and sized from the projected extent of the whole depth-search
-/// range plus the patch footprint, capped at 512 working-scale pixels per side
-/// (256 half extent). A candidate whose patch leaves the window is treated as
-/// out of the image, never as a contradiction.
-WindowPlan build_window_requests(const Chunk& chunk,
-                                 const std::vector<std::size_t>& selected,
-                                 const std::vector<CameraView>& views,
-                                 const CloudSamples& cloud,
-                                 const RefineMarkersOptions& options) {
-    const std::size_t npos = std::numeric_limits<std::size_t>::max();
-    // The floor covers the patch footprint and the 2-D refiner's local window
-    // for markers that cannot be triangulated (one view, no search extent).
-    const double floor_work =
-        std::max(96.0, static_cast<double>(options.patch_size) + 16.0);
-    WindowPlan plan;
-    plan.marker_windows.resize(selected.size());
-    for (std::size_t slot = 0; slot < selected.size(); ++slot) {
-        const Marker& marker = chunk.markers()[selected[slot]];
-        std::vector<std::size_t>& mapping = plan.marker_windows[slot];
-        mapping.assign(marker.projections.size(), npos);
-        std::vector<std::size_t> chosen;
-        std::vector<Observation> observations;
-        for (std::size_t p = 0; p < marker.projections.size(); ++p) {
-            const MarkerProjection& projection = marker.projections[p];
-            if (!projection.enabled || !projection.pixel.allFinite()) {
-                continue;
-            }
-            const auto index = view_index(views, projection.camera_id);
-            if (!index) {
-                continue;
-            }
-            chosen.push_back(p);
-            observations.push_back({&views[*index], projection.pixel});
-        }
-        if (chosen.empty()) {
-            continue;
-        }
-        std::optional<Eigen::Vector3d> initial;
-        if (observations.size() >= 2) {
-            std::vector<double> tolerances;
-            for (const Observation& observation : observations) {
-                tolerances.push_back(
-                    8.0 * static_cast<double>(std::max(
-                              1, observation.view->downscale)));
-            }
-            initial = triangulate_robust(observations, tolerances);
-        }
-        const double physical =
-            initial ? estimate_physical_radius(*initial, observations, cloud)
-                    : 0.05;
-        for (std::size_t k = 0; k < chosen.size(); ++k) {
-            const MarkerProjection& projection = marker.projections[chosen[k]];
-            const CameraView& view = *observations[k].view;
-            const double ds =
-                static_cast<double>(std::max(1, view.downscale));
-            double half_work = floor_work;
-            if (initial) {
-                const Eigen::Vector3d ray =
-                    *initial - camera_centre(*view.camera);
-                if (ray.allFinite() && ray.norm() > 1e-12) {
-                    const Eigen::Vector3d unit = ray.normalized();
-                    const auto offsets = depth_candidates(
-                        *initial, unit, cloud, physical, options.search_steps);
-                    double extent = 0.0;
-                    for (const double offset : offsets) {
-                        const auto projected =
-                            project_view(view, *initial + unit * offset);
-                        if (projected && projected->allFinite()) {
-                            extent = std::max(
-                                extent, (*projected - projection.pixel).norm());
-                        }
-                    }
-                    const double depth = depth_in_view(view, *initial);
-                    const double focal =
-                        std::max(view.calibration->f, 1e-6);
-                    const double patch_radius =
-                        physical * focal / std::max(depth, 1e-9);
-                    half_work =
-                        std::max(floor_work, extent / ds +
-                                                 1.5 * patch_radius / ds + 16.0);
-                }
-            }
-            half_work = std::clamp(half_work, floor_work, 256.0);
-            const auto camera_index = view_index(views, projection.camera_id);
-            if (!camera_index) {
-                continue;
-            }
-            WindowRequest request;
-            request.camera = *camera_index;
-            request.marker = slot;
-            request.projection = chosen[k];
-            request.centre = projection.pixel;
-            request.half_px = half_work * ds;
-            mapping[chosen[k]] = plan.requests.size();
-            plan.requests.push_back(request);
-        }
-    }
-    return plan;
-}
-
-/// Copy one crop out of a reduced image. Gradients are derived from this crop
-/// on demand, so the whole image can be released immediately.
-void cut_window(const FloatImage& image, int x0, int y0, int width, int height,
-                CameraView& window) {
-    window.image = FloatImage(width, height, 0.0F);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            window.image.at(x, y) = image.at(x0 + x, y0 + y);
-        }
-    }
-    window.offset_x = x0;
-    window.offset_y = y0;
-    window.full_width = image.width();
-    window.full_height = image.height();
-}
-
-/// Pass 1 for one camera: decode and reduce the image once, cut every requested
-/// window and its gradients, then release the image. Only this camera's crops
-/// survive.
-WindowLoadResult load_camera_windows(
-    const Document& document, const Chunk& chunk, std::size_t camera_index,
-    const std::vector<CameraView>& geometry,
-    const std::vector<std::size_t>& request_indices,
-    const std::vector<WindowRequest>& requests,
-    std::vector<CameraView>& windows) {
-    const CameraView& view = geometry[camera_index];
-    const Frame* frame = frame_of_camera(chunk, view.camera->id);
-    if (frame == nullptr) {
-        return WindowLoadResult{false, "no linked frame"};
-    }
-    WindowLoadResult result;
-    try {
-        FloatImage image =
-            read_image(resolve_frame_path(document, frame->path()).string())
-                .to_luminance();
-        if (view.downscale > 1) {
-            image = downsample_box(image, view.downscale);
-        }
-        const double ds = static_cast<double>(std::max(1, view.downscale));
-        if (image.width() < 2 || image.height() < 2) {
-            return WindowLoadResult{false, "image is empty"};
-        }
-        const int max_x = image.width() - 1;
-        const int max_y = image.height() - 1;
-        for (const std::size_t request_index : request_indices) {
-            const WindowRequest& request = requests[request_index];
-            CameraView& window = windows[request_index];
-            const Eigen::Vector2d centre =
-                request.centre / ds - Eigen::Vector2d(0.5, 0.5);
-            if (!centre.allFinite() || !std::isfinite(request.half_px)) {
-                continue;
-            }
-            const double half = request.half_px / ds;
-            const double left = std::clamp(centre.x() - half, -1.0e9, 1.0e9);
-            const double right = std::clamp(centre.x() + half, -1.0e9, 1.0e9);
-            const double top = std::clamp(centre.y() - half, -1.0e9, 1.0e9);
-            const double bottom = std::clamp(centre.y() + half, -1.0e9, 1.0e9);
-            const int x0 = std::clamp(static_cast<int>(std::floor(left)), 0,
-                                      max_x);
-            const int x1 = std::clamp(static_cast<int>(std::ceil(right)), 0,
-                                      max_x);
-            const int y0 = std::clamp(static_cast<int>(std::floor(top)), 0,
-                                      max_y);
-            const int y1 = std::clamp(static_cast<int>(std::ceil(bottom)), 0,
-                                      max_y);
-            if (x1 <= x0 || y1 <= y0) {
-                continue;
-            }
-            cut_window(image, x0, y0, x1 - x0 + 1, y1 - y0 + 1, window);
-        }
-    } catch (const std::exception& error) {
-        result.ok = false;
-        result.error = error.what();
-    }
-    return result;
-}
-
-/// Pass 1 over cameras. Cameras run serially when any frame exceeds 8 MP (the
-/// DetectMarkers rule), so at most one full-resolution luminance buffer is
-/// live. An unreadable image is fatal only for an explicit camera list;
-/// otherwise the camera is logged and skipped.
-std::vector<CameraView> load_windows(const Document& document,
-                                     const Chunk& chunk,
-                                     const std::vector<CameraView>& geometry,
-                                     const std::vector<WindowRequest>& requests,
-                                     bool explicit_cameras,
-                                     RefineMarkersStats& stats) {
-    std::vector<std::vector<std::size_t>> groups(geometry.size());
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-        groups[requests[i].camera].push_back(i);
-    }
-    std::vector<CameraView> windows(requests.size());
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-        windows[i] = geometry[requests[i].camera];
-    }
-    bool serial = false;
-    std::size_t max_image_bytes = 0;
-    for (std::size_t c = 0; c < geometry.size(); ++c) {
-        if (groups[c].empty()) {
-            continue;
-        }
-        const CameraView& view = geometry[c];
-        const Frame* frame = frame_of_camera(chunk, view.camera->id);
-        const std::int64_t ds = std::max(1, view.downscale);
-        const std::int64_t width =
-            frame != nullptr && frame->width() > 0 ? frame->width()
-                                                   : view.full_width * ds;
-        const std::int64_t height =
-            frame != nullptr && frame->height() > 0 ? frame->height()
-                                                    : view.full_height * ds;
-        if (width * height > 8ll * 1024ll * 1024ll) {
-            serial = true;
-        }
-        const std::size_t full = static_cast<std::size_t>(width * height);
-        const std::size_t reduced = static_cast<std::size_t>(
-            (width / ds) * (height / ds));
-        const std::size_t bytes =
-            full * 3 + full * sizeof(float) +
-            (ds > 1 ? reduced * sizeof(float) : 0);
-        max_image_bytes = std::max(max_image_bytes, bytes);
-    }
-    std::vector<WindowLoadResult> results(geometry.size());
-    const int count = static_cast<int>(geometry.size());
-#if defined(ALPHASHAPE_HAVE_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1) if(!serial)
-#endif
-    for (int c = 0; c < count; ++c) {
-        if (groups[static_cast<std::size_t>(c)].empty()) {
-            continue;
-        }
-        results[static_cast<std::size_t>(c)] = load_camera_windows(
-            document, chunk, static_cast<std::size_t>(c), geometry,
-            groups[static_cast<std::size_t>(c)], requests, windows);
-    }
-    for (std::size_t c = 0; c < geometry.size(); ++c) {
-        if (results[c].ok) {
-            continue;
-        }
-        const std::string message =
-            "RefineMarkers: " +
-            std::string(geometry[c].camera != nullptr ? geometry[c].camera->label
-                                                      : std::string("camera")) +
-            ": " + results[c].error;
-        if (explicit_cameras) {
-            throw Error(message);
-        }
-        log(LogLevel::Warn) << message;
-    }
-    std::size_t window_bytes = 0;
-    for (const CameraView& window : windows) {
-        window_bytes += window.image.pixels().size() * sizeof(float);
-    }
-    int threads = 1;
-#if defined(ALPHASHAPE_HAVE_OPENMP)
-    threads = std::max(1, omp_get_max_threads());
-#endif
-    const std::size_t images = serial || count <= 0
-                                   ? 1
-                                   : std::min<std::size_t>(
-                                         static_cast<std::size_t>(threads),
-                                         static_cast<std::size_t>(count));
-    stats.peak_bytes = window_bytes + max_image_bytes * images;
-    return windows;
-}
-
-Marker* find_marker_by_id(Chunk& chunk, std::int32_t marker_id) {
-    for (Marker& marker : chunk.markers()) {
-        if (marker.id == marker_id) {
-            return &marker;
-        }
-    }
-    return nullptr;
-}
-
-const Marker* find_marker_by_id(const Chunk& chunk, std::int32_t marker_id) {
-    for (const Marker& marker : chunk.markers()) {
-        if (marker.id == marker_id) {
-            return &marker;
-        }
-    }
-    return nullptr;
-}
-
-const MarkerProjection* find_projection(const Marker& marker,
-                                        std::int32_t camera_id) {
-    for (const MarkerProjection& projection : marker.projections) {
-        if (projection.camera_id == camera_id) {
-            return &projection;
-        }
-    }
-    return nullptr;
-}
-
-/// One staged command for the whole run: its snapshot covers the marker
-/// container once, so the undo memory is linear in the number of markers, not
-/// quadratic in the number of projections. Revert restores that snapshot
-/// exactly, including every projection's order.
-class RefineMarkersCommand : public StagedMutation {
-public:
-    RefineMarkersCommand(std::int32_t chunk_id, std::vector<MarkerEdit> edits)
-        : chunk_id_(chunk_id), edits_(std::move(edits)) {}
-
-    std::string name() const override { return "Refine Markers"; }
-
-    std::size_t retained_bytes() const override {
-        return snapshot_.capacity() * sizeof(Marker);
-    }
-
-protected:
-    void validate(Document& document) override {
-        const Chunk& chunk = target(document);
-        for (const MarkerEdit& edit : edits_) {
-            if (edit.skipped || edit.failed) {
-                continue;
-            }
-            const Marker* marker = find_marker_by_id(chunk, edit.marker_id);
-            if (marker == nullptr) {
-                throw ValueError("RefineMarkers: no marker with id " +
-                                 std::to_string(edit.marker_id));
-            }
-            for (const ProjectionEdit& move : edit.moves) {
-                if (!move.pixel.allFinite()) {
-                    throw ValueError("RefineMarkers: projection pixel is not finite");
-                }
-                if (find_projection(*marker, move.camera_id) == nullptr) {
-                    throw ValueError("RefineMarkers: projection has no matching camera");
-                }
-            }
-            for (const std::int32_t camera_id : edit.removals) {
-                if (find_projection(*marker, camera_id) == nullptr) {
-                    throw ValueError("RefineMarkers: projection has no matching camera");
-                }
-            }
-            if (edit.position.has_value() && !edit.position->allFinite()) {
-                throw ValueError("RefineMarkers: marker position is not finite");
-            }
-        }
-    }
-
-    void stage(Document& document) override {
-        snapshot_ = target(document).markers();
-    }
-
-    void commit(Document& document) override {
-        Chunk& chunk = target(document);
-        for (const MarkerEdit& edit : edits_) {
-            if (edit.skipped || edit.failed) {
-                continue;
-            }
-            Marker* marker = find_marker_by_id(chunk, edit.marker_id);
-            if (marker == nullptr) {
-                throw ValueError("RefineMarkers: no marker with id " +
-                                 std::to_string(edit.marker_id));
-            }
-            for (const ProjectionEdit& move : edit.moves) {
-                for (MarkerProjection& projection : marker->projections) {
-                    if (projection.camera_id == move.camera_id) {
-                        projection.pixel = move.pixel;
-                        break;
-                    }
-                }
-            }
-            for (const std::int32_t camera_id : edit.removals) {
-                auto& projections = marker->projections;
-                projections.erase(
-                    std::remove_if(projections.begin(), projections.end(),
-                                   [camera_id](const MarkerProjection& p) {
-                                       return p.camera_id == camera_id;
-                                   }),
-                    projections.end());
-            }
-            if (edit.position.has_value()) {
-                marker->position = edit.position;
-            }
-        }
-    }
-
-    void restore(Document& document) override {
-        target(document).markers() = snapshot_;
-    }
-
-private:
-    Chunk& target(Document& document) const {
-        for (auto& workspace : document.workspaces()) {
-            if (!workspace) {
-                continue;
-            }
-            if (Chunk* chunk = workspace->find_chunk(chunk_id_)) {
-                return *chunk;
-            }
-        }
-        throw Error("RefineMarkers: no chunk with id " +
-                    std::to_string(chunk_id_));
-    }
-
-    std::int32_t chunk_id_;
-    std::vector<MarkerEdit> edits_;
-    std::vector<Marker> snapshot_;
-};
 
 }  // namespace
 
@@ -2135,10 +1208,8 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     if (chunk == nullptr) {
         throw Error("RefineMarkers needs an active chunk");
     }
-    // Geometry only: no image is read for a camera that no selected marker
-    // references. Images become per-marker windows in pass 1.
-    const std::vector<CameraView> geometry = build_camera_views(
-        *chunk, options.cameras, options.downscale);
+    const std::vector<CameraView> views = load_selected_views(
+        document, *chunk, options.cameras, options.downscale);
 
     std::vector<std::size_t> selected;
     for (std::size_t i = 0; i < chunk->markers().size(); ++i) {
@@ -2171,32 +1242,29 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     CloudSamples cloud;
     cloud.dense = &point_cloud.points;
     cloud.markers = &marker_positions;
-    const WindowPlan window_plan =
-        build_window_requests(*chunk, selected, geometry, cloud, options);
-    std::vector<CameraView> windows =
-        load_windows(document, *chunk, geometry, window_plan.requests,
-                     !options.cameras.empty(), plan.stats);
-    const std::size_t npos = std::numeric_limits<std::size_t>::max();
+    const auto camera_view = [&views](std::int32_t camera_id) -> const CameraView* {
+        for (const CameraView& view : views) {
+            if (view.camera->id == camera_id) {
+                return &view;
+            }
+        }
+        return nullptr;
+    };
     const int count = static_cast<int>(selected.size());
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int i = 0; i < count; ++i) {
-        const Marker& marker =
-            chunk->markers()[selected[static_cast<std::size_t>(i)]];
-        const std::vector<std::size_t>& mapping =
-            window_plan.marker_windows[static_cast<std::size_t>(i)];
+        const Marker& marker = chunk->markers()[selected[static_cast<std::size_t>(i)]];
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
-        for (std::size_t p = 0; p < marker.projections.size(); ++p) {
-            const MarkerProjection& projection = marker.projections[p];
-            if (!projection.enabled || !projection.pixel.allFinite() ||
-                p >= mapping.size() || mapping[p] == npos ||
-                !windows[mapping[p]].loaded()) {
+        for (const MarkerProjection& projection : marker.projections) {
+            const CameraView* view = camera_view(projection.camera_id);
+            if (view == nullptr) {
                 continue;
             }
             BlendView blend;
-            blend.view = &windows[mapping[p]];
+            blend.view = view;
             blend.pixel = projection.pixel;
             blends.push_back(blend);
         }
@@ -2211,45 +1279,39 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             failed.failed = true;
             edits[static_cast<std::size_t>(i)] = failed;
         }
-        edits[static_cast<std::size_t>(i)].marker_id = marker.id;
     }
 
-    // One staged command for the whole run: a single marker-container snapshot
-    // keeps undo memory linear in markers rather than quadratic in the number
-    // of projections, and revert restores every container exactly.
-    std::vector<MarkerEdit> staged;
+    // Mutations are staged in marker order even though refinement ran in
+    // parallel, so the command sequence (and therefore undo/redo) is
+    // deterministic.
+    auto transaction = std::make_unique<CommandTransaction>("Refine Markers");
     for (std::size_t i = 0; i < selected.size(); ++i) {
         const Marker& marker = chunk->markers()[selected[i]];
-        MarkerEdit& edit = edits[i];
+        const MarkerEdit& edit = edits[i];
         if (edit.skipped) {
-            ++plan.stats.skipped;
             continue;
         }
         if (edit.failed) {
             ++plan.stats.failed;
             continue;
         }
-        if (edit.position.has_value() && marker.position.has_value() &&
-            (*edit.position - *marker.position).norm() <= 1e-12) {
-            edit.position.reset();
+        for (const ProjectionEdit& move : edit.moves) {
+            transaction->add(make_move_marker_projection_command(
+                chunk->id(), marker.id, move.camera_id, move.pixel));
         }
-        plan.stats.removed_projections += edit.removals.size();
-        if (edit.rounds > 0) {
-            plan.stats.rounds += static_cast<std::size_t>(edit.rounds);
+        for (const std::int32_t camera_id : edit.removals) {
+            transaction->add(make_remove_marker_projection_command(
+                chunk->id(), marker.id, camera_id, false));
+            ++plan.stats.removed_projections;
         }
         if (edit.touched) {
             ++plan.stats.refined;
         } else {
             ++plan.stats.unchanged;
         }
-        if (!edit.moves.empty() || !edit.removals.empty() ||
-            edit.position.has_value()) {
-            staged.push_back(std::move(edit));
-        }
     }
-    if (!staged.empty()) {
-        plan.command = std::make_unique<RefineMarkersCommand>(
-            chunk->id(), std::move(staged));
+    if (!transaction->empty()) {
+        plan.command = std::move(transaction);
     }
     return plan;
 }
@@ -2341,11 +1403,8 @@ void RefineMarkersTask::apply(Document& document, Params& params,
         log(LogLevel::Info)
             << "RefineMarkers: refined " << plan.stats.refined << ", unchanged "
             << plan.stats.unchanged << ", failed " << plan.stats.failed
-            << ", skipped " << plan.stats.skipped << ", removed projections "
-            << plan.stats.removed_projections << ", rounds "
-            << plan.stats.rounds << ", peak "
-            << plan.stats.peak_bytes / (1024 * 1024) << " MiB in " << seconds
-            << " s";
+            << ", removed projections " << plan.stats.removed_projections
+            << " in " << seconds << " s";
     }
 }
 
