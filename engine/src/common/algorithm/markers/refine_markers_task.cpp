@@ -1203,25 +1203,28 @@ std::optional<RoundOutcome> apply_winner(
         projected_centres[index] = *projected;
         const double limit = std::max(2.0, blend.apparent);
         Eigen::Vector2d anchor = *projected;
-        // A view whose measurement is far from the current projection needs
-        // the detector's absolute centre; otherwise the validated per-round
-        // 2-D refiner is more accurate.
-        const bool absolute_anchor =
-            common_mode && blend.has_anchor && blend.anchor.allFinite() &&
-            (blend.pixel - *projected).norm() >
-                std::max(0.5 * blend.apparent, 8.0);
-        if (absolute_anchor) {
-            Eigen::Vector2d delta = blend.anchor - *projected;
+        // In common mode, find the cross detector's absolute centre and walk
+        // towards it, clamped per round. Outside common mode the validated
+        // per-round 2-D refiner is more accurate.
+        bool absolute = false;
+        Eigen::Vector2d absolute_pixel = Eigen::Vector2d::Zero();
+        if (common_mode) {
+            if (const auto cross = cross_extent(
+                    *blend.view, blend.pixel, options.patch_size)) {
+                if ((cross->pixel - *projected).norm() <=
+                    std::max(2.0, cross->radius)) {
+                    absolute = true;
+                    absolute_pixel = cross->pixel;
+                }
+            }
+        }
+        if (absolute) {
+            Eigen::Vector2d delta = absolute_pixel - *projected;
             const double distance = delta.norm();
-            // A cross detector gives a reliable absolute centre across most
-            // of a radius. Clamp the per-round movement to it so a larger
-            // common-mode offset walks in over the next rounds.
-            const double accepted =
-                blend.cross ? limit : std::min(limit, 0.6 * blend.apparent);
             if (!std::isfinite(distance)) {
                 delta = Eigen::Vector2d::Zero();
-            } else if (distance > accepted) {
-                delta *= accepted / distance;
+            } else if (distance > limit) {
+                delta *= limit / distance;
             }
             anchor = *projected + delta;
         } else {
@@ -1315,65 +1318,23 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             continue;
         }
         const double ds = static_cast<double>(std::max(1, blend.view->downscale));
-        const auto circle =
-            circular_seed(*blend.view, blend.pixel, patch_size);
-        // A cross must be confirmed either by a saddle at the measurement or
-        // by a detection whose centre lies within one target radius of it.
-        const bool saddle =
-            saddle_seed(*blend.view, blend.pixel).has_value();
-        if (const auto cross =
-                cross_extent(*blend.view, blend.pixel, patch_size)) {
-            const bool close =
-                (cross->pixel - blend.pixel).norm() <=
-                std::max(1.0, cross->radius);
-            if (saddle || close) {
-                // A coded ring word is conclusive: a disc misread as a cross
-                // keeps its validated circular refinement.
-                bool coded_circle = false;
-                const GradientField gradient =
-                    compute_gradient_field(blend.view->image);
-                MarkerCandidate candidate;
-                candidate.center =
-                    blend.view->local_of(blend.pixel) +
-                    Eigen::Vector2d(0.5, 0.5);
-                for (const double hint :
-                     {8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 40.0}) {
-                    candidate.radius_px = hint;
-                    for (const int bits : {12, 14, 16, 20}) {
-                        if (decode_circular(blend.view->image, gradient,
-                                            candidate, bits, 0)) {
-                            coded_circle = true;
-                            break;
-                        }
-                    }
-                    if (coded_circle) {
-                        break;
-                    }
-                }
-                if (!coded_circle) {
-                    blend.cross = true;
-                    blend.apparent = std::max(1.0, cross->radius);
-                    blend.has_scale = true;
-                    blend.hint_work =
-                        std::max(6.0, 0.25 * blend.apparent / ds);
-                    // Keep the blob seed for the ellipse fallback; the cross
-                    // refiner still runs first.
-                    blend.seed = circle;
-                    // The detector's subpixel saddle fit is the absolute
-                    // centre.
-                    blend.anchor = cross->pixel;
-                    blend.has_anchor = true;
-                    continue;
-                }
+        // A saddle at the measurement identifies a cross; everything else is
+        // treated as circular. This is the validated type test.
+        if (saddle_seed(*blend.view, blend.pixel).has_value()) {
+            if (const auto cross =
+                    cross_extent(*blend.view, blend.pixel, patch_size)) {
+                blend.cross = true;
+                blend.apparent = std::max(1.0, cross->radius);
+                blend.has_scale = true;
+                blend.hint_work = std::max(4.0, blend.apparent / ds);
+                continue;
             }
         }
-        if (circle) {
-            // Circular targets are re-anchored each round around the current
-            // projected point, exactly as the validated 2-D refiner runs.
+        if (const auto circle =
+                circular_seed(*blend.view, blend.pixel, patch_size)) {
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
-            continue;
         }
         blend.hint_work = 8.0;
     }
