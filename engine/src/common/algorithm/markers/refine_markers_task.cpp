@@ -1305,18 +1305,24 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
                 // A coded ring word is conclusive: a disc misread as a cross
                 // keeps its validated circular refinement.
                 bool coded_circle = false;
-                if (circle) {
-                    MarkerCandidate candidate;
-                    candidate.center =
-                        blend.view->local_of(circle->pixel) +
-                        Eigen::Vector2d(0.5, 0.5);
-                    candidate.radius_px = circle->radius / ds;
+                const GradientField gradient =
+                    compute_gradient_field(blend.view->image);
+                MarkerCandidate candidate;
+                candidate.center =
+                    blend.view->local_of(blend.pixel) +
+                    Eigen::Vector2d(0.5, 0.5);
+                for (const double hint :
+                     {8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 40.0}) {
+                    candidate.radius_px = hint;
                     for (const int bits : {12, 14, 16, 20}) {
-                        if (decode_circular(blend.view->image, candidate,
-                                            bits, 0)) {
+                        if (decode_circular(blend.view->image, gradient,
+                                            candidate, bits, 0)) {
                             coded_circle = true;
                             break;
                         }
+                    }
+                    if (coded_circle) {
+                        break;
                     }
                 }
                 if (!coded_circle) {
