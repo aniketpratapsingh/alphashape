@@ -1179,8 +1179,14 @@ std::optional<RoundOutcome> apply_winner(
         if (blend.has_anchor && blend.anchor.allFinite()) {
             Eigen::Vector2d delta = blend.anchor - *projected;
             const double distance = delta.norm();
-            if (std::isfinite(distance) && distance > limit) {
-                delta *= limit / distance;
+            // A cross detector gives a reliable absolute centre across most
+            // of a radius; the circular blob scale is less certain, so only
+            // accept it close to the projected point and otherwise let the
+            // depth search and LK carry the view.
+            const double accepted =
+                blend.cross ? limit : std::min(limit, 0.35 * blend.apparent);
+            if (!std::isfinite(distance) || distance > accepted) {
+                delta = Eigen::Vector2d::Zero();
             }
             anchor = *projected + delta;
         } else {
@@ -1301,15 +1307,23 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
                             Eigen::Vector2d(0.5, 0.5);
                 }
             }
-            blend.anchor = cross->pixel;
-            if (const auto refined =
+            // Two local passes: the quadratic saddle fit is not idempotent,
+            // and the second pass removes the residual start-point bias.
+            Eigen::Vector2d local_start = start;
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto refined =
                     cross->bar
-                        ? refine_bar_cross_center(blend.view->image, start,
+                        ? refine_bar_cross_center(blend.view->image,
+                                                  local_start,
                                                   blend.hint_work)
-                        : refine_cross_center(blend.view->image, start,
-                                              blend.hint_work)) {
-                blend.anchor = (*refined + offset) * ds;
+                        : refine_cross_center(blend.view->image, local_start,
+                                              blend.hint_work);
+                if (!refined) {
+                    break;
+                }
+                local_start = *refined;
             }
+            blend.anchor = (local_start + offset) * ds;
             blend.has_anchor = true;
             continue;
         }
