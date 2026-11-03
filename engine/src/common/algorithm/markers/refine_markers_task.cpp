@@ -421,6 +421,61 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     return out;
 }
 
+/// Radius of a detected cross near `pixel`, in full-resolution pixels. A cross
+/// has no blob scale, so its printed extent is what the physical target radius
+/// is derived from. Nullopt when no cross is detected near the seed, which is
+/// also how an unpainted region is recognised: it has no printed target.
+std::optional<double> cross_radius(const CameraView& view,
+                                   const Eigen::Vector2d& pixel,
+                                   int patch_size) {
+    const Eigen::Vector2d index = view.index_of(pixel);
+    if (!index.allFinite()) {
+        return std::nullopt;
+    }
+    const int half = std::max(48, 2 * patch_size);
+    const int x0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.x(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.width() - 2 * half - 1));
+    const int y0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.y(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.height() - 2 * half - 1));
+    const int width = std::min(2 * half + 1, view.image.width() - x0);
+    const int height = std::min(2 * half + 1, view.image.height() - y0);
+    if (width < 16 || height < 16) {
+        return std::nullopt;
+    }
+    FloatImage crop(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            crop.at(x, y) = view.image.at(x0 + x, y0 + y);
+        }
+    }
+    CrossParams params;
+    params.minimum_size = 2.0;
+    params.minimum_dist = 8.0;
+    const std::vector<CrossDetection> detections =
+        detect_crosses_styled(crop, params);
+    const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
+                               index.y() - static_cast<double>(y0) + 0.5);
+    double best = static_cast<double>(half);
+    double radius = 0.0;
+    for (const CrossDetection& detection : detections) {
+        if (!detection.target.center.allFinite() ||
+            !(detection.target.radius_px > 0.0)) {
+            continue;
+        }
+        const double distance = (detection.target.center - seed).norm();
+        if (distance < best) {
+            best = distance;
+            radius = detection.target.radius_px;
+        }
+    }
+    if (!(radius > 0.0)) {
+        return std::nullopt;
+    }
+    return radius * static_cast<double>(std::max(1, view.downscale));
+}
+
 /// Local target-plane normal. A plane fitted to nearby cloud points follows a
 /// tilted target; without enough points the marker is assumed fronto-parallel
 /// to the average view (the negated mean viewing direction).
@@ -1144,6 +1199,10 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.seed->radius > 0.0) {
             blend.apparent = std::max(1.0, blend.seed->radius);
             blend.has_scale = true;
+        } else if (const auto cross =
+                       cross_radius(*blend.view, blend.pixel, patch_size)) {
+            blend.apparent = std::max(1.0, *cross);
+            blend.has_scale = true;
         } else {
             blend.apparent = 1.0;
             blend.has_scale = false;
@@ -1211,10 +1270,8 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         auto initial = triangulate_robust(observations, tolerances);
         if (initial && initial->allFinite()) {
             std::vector<double> physical_samples;
-            std::vector<double> depths;
             for (BlendView& blend : aligned) {
                 blend.depth = depth_in_view(*blend.view, *initial);
-                depths.push_back(blend.depth);
                 if (!blend.has_scale) {
                     continue;
                 }
@@ -1224,12 +1281,19 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                     physical_samples.push_back(sample);
                 }
             }
-            double physical = median(physical_samples);
+            if (physical_samples.empty()) {
+                // No view shows a measurable printed target (neither a blob
+                // nor a cross), so there is no physical scale to sample. The
+                // marker carries no evidence and is left untouched.
+                MarkerEdit failed;
+                failed.failed = true;
+                return failed;
+            }
+            const double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
-                // No view reported a radius: assume the printed target spans
-                // 10 % of the viewing distance (5 % radius). This is a physical
-                // length, never a sample count.
-                physical = 0.05 * std::max(median(depths), 1e-9);
+                MarkerEdit failed;
+                failed.failed = true;
+                return failed;
             }
             // Every view now carries a pixel radius: measured or projected.
             for (BlendView& blend : aligned) {
