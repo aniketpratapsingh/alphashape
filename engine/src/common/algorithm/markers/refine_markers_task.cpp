@@ -1336,7 +1336,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
         }
-        blend.hint_work = 6.0;
+        blend.hint_work = 6.25;
     }
 }
 
