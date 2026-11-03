@@ -441,8 +441,8 @@ double apparent_radius(const RefineScene& scene, std::size_t target_index,
         return 0.0;
     }
     double best = 0.0;
-    for (const Vec3 offset : {Vec3(target.radius, 0.0, 0.0),
-                              Vec3(0.0, 0.0, target.radius)}) {
+    for (const Vec3& offset : {Vec3(target.radius, 0.0, 0.0),
+                               Vec3(0.0, 0.0, target.radius)}) {
         const auto edge = project_marker(
             target.centre + offset, scene.camera(camera_index),
             scene.calibration(camera_index), false);
