@@ -199,5 +199,21 @@ class TestRefineMarkers(unittest.TestCase):
         self.assertIn("NO_SUCH_MARKER", str(context.exception))
 
 
+class TestTrackMarkers(unittest.TestCase):
+    """The TrackMarkers task is bound and its parameters reach the project."""
+
+    def test_binds_and_records_parameters(self):
+        doc, chunk = document_with_photos()
+        chunk.trackMarkers(window=15, direction="backward")
+        self.assertEqual(chunk.meta["TrackMarkers/window"], "15")
+        self.assertEqual(chunk.meta["TrackMarkers/direction"], "backward")
+
+    def test_unknown_direction_is_rejected(self):
+        doc, chunk = document_with_photos()
+        with self.assertRaises(alphashape.ValueError) as context:
+            chunk.trackMarkers(direction="sideways")
+        self.assertIn("direction", str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
