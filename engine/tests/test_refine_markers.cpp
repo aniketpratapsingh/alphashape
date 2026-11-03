@@ -941,6 +941,9 @@ TEST(Markers, RefineNeverTouchesDisabledProjections) {
 TEST(Markers, RefineBorderViewIsNonContributor) {
     SceneSpec spec;
     spec.marker_count = 2;
+    // Six cameras give the marker enough well-centred views to triangulate
+    // and refine while one projection sits at the image border.
+    spec.camera_count = 6;
     RefineScene scene = make_scene(spec, 84U);
     std::mt19937 engine(59U);
     const std::vector<std::int32_t> ids = add_all_markers(scene, 1.0, engine);
@@ -955,6 +958,7 @@ TEST(Markers, RefineBorderViewIsNonContributor) {
     EXPECT_GT((border - *truth).norm(), 256.0);
     set_projection(scene, ids[0], border_camera, border);
     RefineMarkersOptions options;
+    options.markers = {"M0"};
     const RefineMarkersStats stats = run_refine(scene, options);
     const Marker* marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
