@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 
 #include "base/platform/temp.hpp"
+#include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
 #include "common/algorithm/feature/dog_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
@@ -821,6 +822,28 @@ TEST(Markers, RefineStatsCountEverySelectedMarkerOnce) {
     EXPECT_EQ(stats.refined + stats.unchanged + stats.failed + stats.skipped,
               selected);
     EXPECT_GE(stats.skipped, 1U);
+}
+
+TEST(Markers, RefineSkipsUnreadableCameraUnlessExplicit) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 131U);
+    std::mt19937 engine(61U);
+    add_all_markers(scene, 2.0, engine);
+    ASSERT_FALSE(scene.chunk->frames().empty());
+    Frame* broken = scene.chunk->frames().front().get();
+    ASSERT_NE(broken, nullptr);
+    broken->set_path(broken->path() + ".missing");
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.unreadable_cameras, 1U);
+    EXPECT_EQ(stats.failed, 0U);
+
+    // An explicit camera list must not silently drop the broken view.
+    options.cameras = {scene.chunk->cameras()[0].label};
+    EXPECT_THROW(plan_refine_markers(scene.document, scene.chunk->id(), options),
+                 Error);
 }
 
 }  // namespace

@@ -1178,13 +1178,14 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
 
 /// Load every selected camera's luminance once, reduced by `downscale`. The
 /// image is shared read-only by all marker jobs. An explicit camera list is
-/// strict: a name with no camera, no frame or no sensor is a ValueError,
-/// matching DetectMarkers; the implicit "all enabled" list silently skips
-/// cameras that cannot contribute.
+/// strict: a name with no camera, no frame or no sensor is a ValueError, and an
+/// unreadable image is an Error. The implicit "all enabled" list skips a camera
+/// it cannot use, logging it and counting it in `stats.unreadable_cameras`.
 std::vector<CameraView> load_selected_views(const Document& document,
                                             const Chunk& chunk,
                                             const std::vector<std::string>& filters,
-                                            int downscale) {
+                                            int downscale,
+                                            RefineMarkersStats& stats) {
     for (const std::string& label : filters) {
         bool found = false;
         for (const Camera& camera : chunk.cameras()) {
@@ -1236,7 +1237,13 @@ std::vector<CameraView> load_selected_views(const Document& document,
             view.downscale = downscale;
             views.push_back(std::move(view));
         } catch (const std::exception& error) {
-            throw Error("RefineMarkers: " + camera.label + ": " + error.what());
+            const std::string message =
+                "RefineMarkers: " + camera.label + ": " + error.what();
+            if (!filters.empty()) {
+                throw Error(message);
+            }
+            log(LogLevel::Warn) << message;
+            ++stats.unreadable_cameras;
         }
     }
     return views;
@@ -1275,7 +1282,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         throw Error("RefineMarkers needs an active chunk");
     }
     const std::vector<CameraView> views = load_selected_views(
-        document, *chunk, options.cameras, options.downscale);
+        document, *chunk, options.cameras, options.downscale, plan.stats);
 
     std::vector<std::size_t> selected;
     for (std::size_t i = 0; i < chunk->markers().size(); ++i) {
@@ -1477,6 +1484,7 @@ void RefineMarkersTask::apply(Document& document, Params& params,
             << "RefineMarkers: refined " << plan.stats.refined << ", unchanged "
             << plan.stats.unchanged << ", failed " << plan.stats.failed
             << ", skipped " << plan.stats.skipped
+            << ", unreadable cameras " << plan.stats.unreadable_cameras
             << ", removed projections " << plan.stats.removed_projections
             << " in " << seconds << " s";
     }

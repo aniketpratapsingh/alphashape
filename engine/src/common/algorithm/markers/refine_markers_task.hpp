@@ -29,6 +29,9 @@ struct RefineMarkersStats {
     std::size_t unchanged = 0;
     std::size_t failed = 0;
     std::size_t skipped = 0;
+    /// Implicit camera lists skip an unreadable image and count it here; an
+    /// explicit list fails instead.
+    std::size_t unreadable_cameras = 0;
     std::size_t removed_projections = 0;
 };
 
