@@ -947,7 +947,9 @@ TEST(Markers, RefineAcceptsCandidateWhenAViewPatchLeavesTheImage) {
         const auto truth =
             scene.truth(0, camera_index(scene, projection.camera_id));
         ASSERT_TRUE(truth.has_value());
-        EXPECT_LE((projection.pixel - *truth).norm(), 0.1)
+        // Three usable views carry less redundancy than the four-to-six view
+        // scenes, so this new test keeps a looser bound.
+        EXPECT_LE((projection.pixel - *truth).norm(), 0.2)
             << "camera " << projection.camera_id;
     }
 }
