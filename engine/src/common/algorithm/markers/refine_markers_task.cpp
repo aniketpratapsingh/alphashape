@@ -377,7 +377,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!local.allFinite()) {
         return std::nullopt;
     }
-    const int half = std::max(48, patch_size);
+    const int half = std::max(32, patch_size);
     const int centre_x = static_cast<int>(std::floor(std::clamp(
         local.x(), -1.0e6, 1.0e6)));
     const int centre_y = static_cast<int>(std::floor(std::clamp(
