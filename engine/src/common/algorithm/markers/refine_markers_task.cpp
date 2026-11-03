@@ -749,25 +749,35 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     // Circular targets: refit the ellipse at the candidate, using the blob
     // only for its scale. Trusting the blob's centre would accept a nearby
     // texture blob; the printed target is centred at the candidate to within a
-    // few pixels, so the radial search converges to the real boundary.
+    // few pixels, so the radial search converges to the real boundary. Run the
+    // cross refiner too and keep whichever lands closer to the candidate: a
+    // coded disc's centre is also a saddle, so the two refiners can disagree.
+    std::optional<Eigen::Vector2d> ellipse;
     if (seed) {
         MarkerCandidate ellipse_seed;
         ellipse_seed.center = local_calibration;
         ellipse_seed.radius_px = seed->radius / ds;
         if (const auto fitted =
                 refine_ellipse_center(view.image, ellipse_seed)) {
-            if (const auto accepted = accept(to_pixel(*fitted))) {
-                return accepted;
-            }
+            ellipse = accept(to_pixel(*fitted));
         }
     }
-    // No blob was found: try the cross refiner from the candidate itself.
     const double hint = std::max(4.0, hint_work);
-    if (const auto refined =
-            refine_cross_center(view.image, local_calibration, hint)) {
-        return accept(to_pixel(*refined));
+    Eigen::Vector2d start = local_calibration;
+    if (const auto saddle = saddle_seed(view, pixel)) {
+        start = *saddle / ds - offset;
     }
-    return std::nullopt;
+    std::optional<Eigen::Vector2d> cross;
+    if (const auto refined =
+            refine_cross_center(view.image, start, hint)) {
+        cross = accept(to_pixel(*refined));
+    }
+    if (ellipse &&
+        (!cross ||
+         (*ellipse - pixel).squaredNorm() <= (*cross - pixel).squaredNorm())) {
+        return ellipse;
+    }
+    return cross;
 }
 
 /// Lucas-Kanade translation-only alignment of a view's patch to the mean
@@ -1184,7 +1194,7 @@ std::optional<RoundOutcome> apply_winner(
             // accept it close to the projected point and otherwise let the
             // depth search and LK carry the view.
             const double accepted =
-                blend.cross ? limit : std::min(limit, 0.35 * blend.apparent);
+                blend.cross ? limit : std::min(limit, 0.6 * blend.apparent);
             if (!std::isfinite(distance) || distance > accepted) {
                 delta = Eigen::Vector2d::Zero();
             }
@@ -1307,35 +1317,33 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
                             Eigen::Vector2d(0.5, 0.5);
                 }
             }
-            // Two local passes: the quadratic saddle fit is not idempotent,
-            // and the second pass removes the residual start-point bias.
-            Eigen::Vector2d local_start = start;
-            for (int pass = 0; pass < 2; ++pass) {
-                const auto refined =
+            if (const auto refined =
                     cross->bar
-                        ? refine_bar_cross_center(blend.view->image,
-                                                  local_start,
+                        ? refine_bar_cross_center(blend.view->image, start,
                                                   blend.hint_work)
-                        : refine_cross_center(blend.view->image, local_start,
-                                              blend.hint_work);
-                if (!refined) {
-                    break;
-                }
-                local_start = *refined;
+                        : refine_cross_center(blend.view->image, start,
+                                              blend.hint_work)) {
+                start = *refined;
             }
-            blend.anchor = (local_start + offset) * ds;
+            blend.anchor = (start + offset) * ds;
             blend.has_anchor = true;
             continue;
         }
         if (const auto circle =
                 circular_seed(*blend.view, blend.pixel, patch_size)) {
-            // The absolute anchor is fixed at the measured point; repeating
-            // the per-round refiner would let its noise accumulate.
+            // Anchor once at the measured point, using the same min-movement
+            // ellipse/cross choice as the validated 2-D refiner. Repeating it
+            // per round would let its noise accumulate.
             blend.seed = circle;
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
-            blend.anchor = circle->pixel;
-            blend.has_anchor = true;
+            const double limit = std::max(2.0, 0.5 * blend.apparent);
+            if (const auto refined =
+                    refined_2d_pixel(*blend.view, blend.pixel, circle, false,
+                                     blend.hint_work, limit)) {
+                blend.anchor = *refined;
+                blend.has_anchor = true;
+            }
             continue;
         }
         blend.hint_work = 8.0;
