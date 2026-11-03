@@ -1134,6 +1134,9 @@ struct RoundOutcome {
     std::vector<bool> inlier;
     std::vector<ViewStatus> status;
     double max_movement = 0.0;
+    /// True when this round found the consistent large offset that the
+    /// multi-round walk exists for; otherwise one round is the validated path.
+    bool common_mode = false;
 };
 
 /// Consensus (Fischler & Bolles 1981) at the winning candidate, then subpixel
@@ -1199,6 +1202,7 @@ std::optional<RoundOutcome> apply_winner(
     out.pixels = current;
     out.inlier.assign(blends.size(), false);
     out.status = winner.status;
+    out.common_mode = common_mode;
     const Eigen::Vector3d normal = u.cross(v).normalized();
     std::vector<Eigen::Vector2d> anchored(blends.size());
     std::vector<Eigen::Vector2d> projected_centres(blends.size());
@@ -1530,6 +1534,11 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                     }
                     last = std::move(outcome);
                     ++rounds_used;
+                    // Only a consistent large offset needs more rounds; the
+                    // validated single-pass path is exact for normal data.
+                    if (!last->common_mode) {
+                        break;
+                    }
                     std::vector<Observation> refined;
                     std::vector<double> refined_tolerances;
                     for (std::size_t i = 0; i < aligned.size(); ++i) {
