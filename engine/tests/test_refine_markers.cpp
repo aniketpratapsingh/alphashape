@@ -954,5 +954,25 @@ TEST(Markers, RefineAcceptsCandidateWhenAViewPatchLeavesTheImage) {
     }
 }
 
+TEST(Markers, RefineUpdatesEstimatedPosition) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 151U);
+    std::mt19937 engine(73U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        ASSERT_TRUE(marker->position.has_value());
+        EXPECT_LE((*marker->position - scene.targets[i].centre).norm(), 0.05)
+            << "marker " << i;
+        // The geodetic reference is not invented or modified.
+        EXPECT_FALSE(marker->reference.has_value());
+    }
+}
+
 }  // namespace
 }  // namespace alphashape

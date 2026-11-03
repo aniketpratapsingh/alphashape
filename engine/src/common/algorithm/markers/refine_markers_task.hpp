@@ -10,8 +10,10 @@
 /// view with zero-mean normalised cross-correlation, and only then moves the
 /// inlier projections. A projection whose measured position disagrees with the
 /// refined candidate by more than about one apparent target radius is a
-/// contradiction, not noise: it is removed rather than repaired. Markers with
-/// a single projection fall back to 2-D-only refinement. The whole run is one
+/// contradiction, not noise: it is removed rather than repaired. The marker's
+/// estimated chunk-local position is re-triangulated from the accepted refined
+/// projections; its geodetic reference is never touched. Markers with a single
+/// projection fall back to 2-D-only refinement. The whole run is one
 /// snapshot-backed undo step.
 
 #include <cstddef>

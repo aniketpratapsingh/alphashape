@@ -778,6 +778,8 @@ struct MarkerEdit {
     std::int32_t marker_id = -1;
     std::vector<ProjectionEdit> moves;
     std::vector<std::int32_t> removals;
+    /// Re-triangulated estimated position, never the geodetic reference.
+    std::optional<Eigen::Vector3d> position;
     bool failed = false;
     bool touched = false;
     bool skipped = false;
@@ -1072,6 +1074,8 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
     }
     MarkerEdit edit;
+    std::vector<Observation> accepted;
+    std::vector<double> tolerances;
     for (std::size_t i = 0; i < blends.size(); ++i) {
         const BlendView& blend = blends[i];
         const bool inlier = std::find(inliers.begin(), inliers.end(), i) !=
@@ -1101,6 +1105,15 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         if ((refined - blend.pixel).norm() > 1e-9) {
             edit.moves.push_back({blend.view->camera->id, refined});
             edit.touched = true;
+        }
+        accepted.push_back({blend.view, refined});
+        tolerances.push_back(projection_tolerance(blend));
+    }
+    // Re-triangulate the estimated position from the accepted refined
+    // projections. The marker's geodetic reference is never touched.
+    if (accepted.size() >= 2) {
+        if (const auto position = triangulate_robust(accepted, tolerances)) {
+            edit.position = *position;
         }
     }
     return edit;
@@ -1472,6 +1485,9 @@ protected:
                     throw ValueError("RefineMarkers: projection has no matching camera");
                 }
             }
+            if (edit.position.has_value() && !edit.position->allFinite()) {
+                throw ValueError("RefineMarkers: marker position is not finite");
+            }
         }
     }
 
@@ -1503,6 +1519,9 @@ protected:
                                        return projection.camera_id == camera_id;
                                    }),
                     projections.end());
+            }
+            if (edit.position.has_value()) {
+                marker->position = edit.position;
             }
         }
     }
@@ -1692,13 +1711,21 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             ++plan.stats.failed;
             continue;
         }
+        if (edit.position.has_value()) {
+            const Marker& marker = chunk->markers()[selected[i]];
+            if (marker.position.has_value() &&
+                (*edit.position - *marker.position).norm() <= 1e-12) {
+                edit.position.reset();
+            }
+        }
         plan.stats.removed_projections += edit.removals.size();
         if (edit.touched) {
             ++plan.stats.refined;
         } else {
             ++plan.stats.unchanged;
         }
-        if (!edit.moves.empty() || !edit.removals.empty()) {
+        if (!edit.moves.empty() || !edit.removals.empty() ||
+            edit.position.has_value()) {
             staged.push_back(std::move(edit));
         }
     }
