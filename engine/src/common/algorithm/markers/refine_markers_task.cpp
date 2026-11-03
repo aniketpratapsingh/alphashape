@@ -747,20 +747,10 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
                 cross_fit = accept(to_pixel(*refined));
             }
         }
-        std::optional<Eigen::Vector2d> ellipse;
-        if (seed) {
-            MarkerCandidate ellipse_seed;
-            ellipse_seed.center = local_calibration;
-            ellipse_seed.radius_px = seed->radius / ds;
-            if (const auto fitted =
-                    refine_ellipse_center(view.image, ellipse_seed)) {
-                ellipse = accept(to_pixel(*fitted));
-            }
-        }
         if (cross_fit) {
             return cross_fit;
         }
-        return ellipse;
+        return std::nullopt;
     }
     // Circular targets: refit the ellipse at the candidate, using the blob
     // only for its scale. Trusting the blob's centre would accept a nearby
