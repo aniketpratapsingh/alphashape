@@ -782,8 +782,16 @@ TEST(Markers, RefineRejectsNonFiniteInput) {
     marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
     ASSERT_EQ(marker->projections.size(), before.size());
-    EXPECT_TRUE(marker->projections[0] == before[0]);
-    EXPECT_TRUE(marker->projections[1] == before[1]);
+    // NaN never compares equal to itself, so compare the fields that prove
+    // the measurement was neither moved nor replaced.
+    EXPECT_EQ(marker->projections[0].camera_id, before[0].camera_id);
+    EXPECT_EQ(marker->projections[1].camera_id, before[1].camera_id);
+    EXPECT_EQ(marker->projections[0].enabled, before[0].enabled);
+    EXPECT_EQ(marker->projections[1].enabled, before[1].enabled);
+    EXPECT_FALSE(std::isfinite(marker->projections[0].pixel.x()));
+    EXPECT_EQ(marker->projections[0].pixel.y(), 5.0);
+    EXPECT_FALSE(std::isfinite(marker->projections[1].pixel.x()));
+    EXPECT_EQ(marker->projections[1].pixel.y(), 7.0);
     EXPECT_GE(stats.refined + stats.unchanged, 1U);
 }
 
