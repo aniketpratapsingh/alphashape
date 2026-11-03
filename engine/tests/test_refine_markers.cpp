@@ -759,5 +759,33 @@ TEST(Markers, RefineIgnoresDisabledProjections) {
     EXPECT_GE(stats.refined, 1U);
 }
 
+TEST(Markers, RefineRejectsNonFiniteInput) {
+    SceneSpec spec;
+    spec.marker_count = 3;
+    RefineScene scene = make_scene(spec, 91U);
+    std::mt19937 engine(47U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_GE(marker->projections.size(), 3U);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    // Two unusable measurements and two unusable tie points: none of them may
+    // reach a floor/lround cast or a sort comparator.
+    marker->projections[0].pixel = Vec2(nan, 5.0);
+    marker->projections[1].pixel = Vec2(inf, 7.0);
+    const std::vector<MarkerProjection> before = marker->projections;
+    scene.chunk->point_cloud().points.emplace_back(nan, nan, nan);
+    scene.chunk->point_cloud().points.emplace_back(inf, 0.0, 0.0);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_EQ(marker->projections.size(), before.size());
+    EXPECT_TRUE(marker->projections[0] == before[0]);
+    EXPECT_TRUE(marker->projections[1] == before[1]);
+    EXPECT_GE(stats.refined + stats.unchanged, 1U);
+}
+
 }  // namespace
 }  // namespace alphashape

@@ -141,13 +141,21 @@ struct CloudSamples {
 
 template <typename Function>
 void for_each_cloud_point(const CloudSamples& samples, Function&& function) {
+    // Non-finite samples are rejected here, before any floor/ceil/lround or
+    // sort that would turn them into undefined behaviour.
     if (samples.dense != nullptr) {
         for (const Eigen::Vector3d& point : *samples.dense) {
+            if (!point.allFinite()) {
+                continue;
+            }
             function(point);
         }
     }
     if (samples.markers != nullptr) {
         for (const Eigen::Vector3d& point : *samples.markers) {
+            if (!point.allFinite()) {
+                continue;
+            }
             function(point);
         }
     }
@@ -207,6 +215,9 @@ std::optional<Eigen::Vector3d> triangulate_observations(
     poses.reserve(observations.size());
     bearings.reserve(observations.size());
     for (const Observation& observation : observations) {
+        if (!observation.pixel.allFinite()) {
+            return std::nullopt;
+        }
         sfm::AbsolutePose pose;
         pose.R = observation.view->camera->pose.block<3, 3>(0, 0);
         pose.t = observation.view->camera->pose.block<3, 1>(0, 3);
@@ -225,6 +236,9 @@ std::optional<Eigen::Vector3d> triangulate_observations(
         return std::nullopt;
     }
     Eigen::Vector3d point = *estimate;
+    if (!point.allFinite()) {
+        return std::nullopt;
+    }
     double cost = reprojection_cost(observations, point);
     if (!std::isfinite(cost)) {
         return std::nullopt;
@@ -338,11 +352,24 @@ struct BlobSeed {
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel, int patch_size) {
     const Eigen::Vector2d index = view.index_of(pixel);
+    if (!index.allFinite()) {
+        return std::nullopt;
+    }
     const int half = std::max(32, patch_size);
-    const int x0 = std::clamp(static_cast<int>(std::floor(index.x())) - half, 0,
-                              std::max(0, view.image.width() - 2 * half - 1));
-    const int y0 = std::clamp(static_cast<int>(std::floor(index.y())) - half, 0,
-                              std::max(0, view.image.height() - 2 * half - 1));
+    const double max_x =
+        static_cast<double>(std::max(0, view.image.width() - 1));
+    const double max_y =
+        static_cast<double>(std::max(0, view.image.height() - 1));
+    const int centre_x = static_cast<int>(
+        std::floor(std::clamp(index.x(), 0.0, max_x)));
+    const int centre_y = static_cast<int>(
+        std::floor(std::clamp(index.y(), 0.0, max_y)));
+    const int x0 =
+        std::clamp(centre_x - half, 0,
+                   std::max(0, view.image.width() - 2 * half - 1));
+    const int y0 =
+        std::clamp(centre_y - half, 0,
+                   std::max(0, view.image.height() - 2 * half - 1));
     const int width = std::min(2 * half + 1, view.image.width() - x0);
     const int height = std::min(2 * half + 1, view.image.height() - y0);
     if (width < 16 || height < 16) {
@@ -523,12 +550,16 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
                                      double physical_radius, int search_steps) {
     const double step = std::max(kDepthStepFraction * physical_radius, 1e-9);
     const double reach = std::max(8.0 * physical_radius, 0.3);
+    if (!point.allFinite() || !ray.allFinite() || !std::isfinite(step)) {
+        return {};
+    }
     std::vector<double> offsets;
     for_each_cloud_point(cloud, [&](const Eigen::Vector3d& sample) {
         const Eigen::Vector3d difference = sample - point;
         const double along = difference.dot(ray);
         const double perpendicular = (difference - along * ray).norm();
-        if (perpendicular <= reach) {
+        if (std::isfinite(along) && std::isfinite(perpendicular) &&
+            perpendicular <= reach) {
             offsets.push_back(along);
         }
     });
@@ -542,12 +573,21 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
         const double spread = high - low;
         double from = low - 0.5 * spread;
         double to = high + 0.5 * spread;
+        if (!std::isfinite(from) || !std::isfinite(to)) {
+            from = -static_cast<double>(maximum) * step;
+            to = static_cast<double>(maximum) * step;
+        }
         if (to - from < step) {
             from -= step;
             to += step;
         }
+        const double count_d = std::ceil((to - from) / step) + 1.0;
         const int count = std::clamp(
-            static_cast<int>(std::ceil((to - from) / step)) + 1, 5, maximum);
+            std::isfinite(count_d)
+                ? static_cast<int>(std::min(count_d,
+                                             static_cast<double>(maximum)))
+                : maximum,
+            5, maximum);
         for (int i = 0; i < count; ++i) {
             candidates.push_back(from + (to - from) *
                                             static_cast<double>(i) /
@@ -592,8 +632,17 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
                                            const Eigen::Vector2d& pixel,
                                            int patch_size) {
     const Eigen::Vector2d index = view.index_of(pixel);
-    const int centre_x = static_cast<int>(std::lround(index.x()));
-    const int centre_y = static_cast<int>(std::lround(index.y()));
+    if (!index.allFinite()) {
+        return std::nullopt;
+    }
+    const double max_x =
+        static_cast<double>(std::max(0, view.image.width() - 1));
+    const double max_y =
+        static_cast<double>(std::max(0, view.image.height() - 1));
+    const int centre_x = static_cast<int>(
+        std::lround(std::clamp(index.x(), 0.0, max_x)));
+    const int centre_y = static_cast<int>(
+        std::lround(std::clamp(index.y(), 0.0, max_y)));
     // Small window: the candidate is a few pixels off at most, and a wider
     // scan would start locking onto unrelated texture saddles.
     const int scan = std::max(3, std::min(6, patch_size / 4));
@@ -632,6 +681,9 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
     const std::optional<BlobSeed>& seed, int patch_size, double limit) {
+    if (!pixel.allFinite() || !std::isfinite(limit)) {
+        return std::nullopt;
+    }
     const auto accept = [&](const Eigen::Vector2d& candidate)
         -> std::optional<Eigen::Vector2d> {
         if (!candidate.allFinite() || (candidate - pixel).norm() > limit) {
@@ -793,7 +845,7 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
     references.reserve(blends.size());
     for (std::size_t i = 0; i < blends.size(); ++i) {
         const auto projected = project_view(*blends[i].view, initial);
-        if (projected &&
+        if (projected && projected->allFinite() &&
             (*projected - blends[i].pixel).norm() <=
                 projection_tolerance(blends[i])) {
             references.push_back(i);
@@ -819,6 +871,9 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
             initial, ray_unit, cloud, physical_radius, search_steps);
         for (const double offset : offsets) {
             const Eigen::Vector3d candidate = initial + ray_unit * offset;
+            if (!candidate.allFinite()) {
+                continue;
+            }
             std::vector<Patch> patches;
             patches.reserve(blends.size());
             bool complete = true;
@@ -836,8 +891,9 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                 // measured projection. An unrelated 30 px measurement lands
                 // outside this gate and is excluded from the score.
                 const auto projected = project_view(*blend.view, candidate);
-                if (!projected || (*projected - blend.pixel).norm() >
-                                      projection_tolerance(blend)) {
+                if (!projected || !projected->allFinite() ||
+                    (*projected - blend.pixel).norm() >
+                        projection_tolerance(blend)) {
                     patch = Patch{};
                 }
                 patches.push_back(std::move(patch));
@@ -871,9 +927,16 @@ std::optional<Eigen::Vector3d> intersect_plane(const CameraView& view,
                                                const Eigen::Vector2d& pixel,
                                                const Eigen::Vector3d& plane_point,
                                                const Eigen::Vector3d& normal) {
+    if (!pixel.allFinite() || !plane_point.allFinite() ||
+        !normal.allFinite()) {
+        return std::nullopt;
+    }
     const Eigen::Matrix3d rotation = view.camera->pose.block<3, 3>(0, 0);
     const Eigen::Vector3d ray = rotation.transpose() *
                                 view.calibration->unproject(pixel);
+    if (!ray.allFinite()) {
+        return std::nullopt;
+    }
     const double denominator = ray.dot(normal);
     if (std::abs(denominator) < 1e-9) {
         return std::nullopt;
@@ -932,7 +995,7 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
     for (const std::size_t index : inliers) {
         const BlendView& blend = blends[index];
         const auto projected = project_view(*blend.view, winner.point);
-        if (!projected) {
+        if (!projected || !projected->allFinite()) {
             return std::nullopt;
         }
         projected_centres[index] = *projected;
@@ -1079,12 +1142,15 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
             tolerances.push_back(projection_tolerance(blend));
         }
         const auto initial = triangulate_robust(observations, tolerances);
-        if (initial) {
+        if (initial && initial->allFinite()) {
             std::vector<double> physical_samples;
             for (BlendView& blend : aligned) {
                 blend.depth = depth_in_view(*blend.view, *initial);
                 const double focal = std::max(blend.view->calibration->f, 1e-6);
-                physical_samples.push_back(blend.apparent * blend.depth / focal);
+                const double sample = blend.apparent * blend.depth / focal;
+                if (std::isfinite(sample) && sample > 0.0) {
+                    physical_samples.push_back(sample);
+                }
             }
             double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
@@ -1260,8 +1326,9 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         blends.reserve(marker.projections.size());
         for (const MarkerProjection& projection : marker.projections) {
             // A disabled projection is not evidence: it is never refined,
-            // moved or removed, exactly as if it were absent.
-            if (!projection.enabled) {
+            // moved or removed, exactly as if it were absent. A non-finite
+            // pixel is equally unusable and never reaches a cast.
+            if (!projection.enabled || !projection.pixel.allFinite()) {
                 continue;
             }
             const CameraView* view = camera_view(projection.camera_id);
