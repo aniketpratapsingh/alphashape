@@ -36,6 +36,8 @@ struct RefineMarkersStats {
     /// explicit list fails instead.
     std::size_t unreadable_cameras = 0;
     std::size_t removed_projections = 0;
+    /// Estimated peak resident bytes of decoded views plus their gradients.
+    std::size_t peak_bytes = 0;
 };
 
 /// Everything the task reads from `Params`, resolved and converted.

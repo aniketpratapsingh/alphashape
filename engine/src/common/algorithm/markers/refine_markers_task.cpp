@@ -8,9 +8,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <list>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1213,16 +1216,12 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
     return refine_2d_marker(blends, options);
 }
 
-/// Decode every referenced camera once, reduced by `downscale`, and compute its
-/// gradient field once. A camera that no selected marker projects into is never
-/// read. An explicit camera list is strict: a name with no camera, no frame or
-/// no sensor is a ValueError, and an unreadable image is an Error. The implicit
-/// "all enabled" list skips a camera it cannot use, logging it and counting it
-/// in `stats.unreadable_cameras`.
-std::vector<CameraView> load_selected_views(
-    const Document& document, const Chunk& chunk,
-    const std::vector<std::string>& filters, int downscale,
-    const std::vector<std::int32_t>& needed, RefineMarkersStats& stats) {
+/// Validate the selected cameras and keep only those referenced by a selected
+/// marker. No image is read here; the cache decodes a view on demand. An
+/// explicit camera list is strict about names, frames and sensors.
+std::vector<CameraView> build_selected_views(
+    const Chunk& chunk, const std::vector<std::string>& filters, int downscale,
+    const std::vector<std::int32_t>& needed) {
     for (const std::string& label : filters) {
         bool found = false;
         for (const Camera& camera : chunk.cameras()) {
@@ -1263,32 +1262,151 @@ std::vector<CameraView> load_selected_views(
         if (std::find(needed.begin(), needed.end(), camera.id) == needed.end()) {
             continue;
         }
-        try {
-            FloatImage image =
-                read_image(resolve_frame_path(document, frame->path()).string())
-                    .to_luminance();
-            if (downscale > 1) {
-                image = downsample_box(image, downscale);
-            }
-            CameraView view;
-            view.camera = &camera;
-            view.calibration = &calibration;
-            view.image = std::move(image);
-            view.downscale = downscale;
-            view.gradient_field = compute_gradient_field(view.image);
-            views.push_back(std::move(view));
-        } catch (const std::exception& error) {
-            const std::string message =
-                "RefineMarkers: " + camera.label + ": " + error.what();
-            if (!filters.empty()) {
-                throw Error(message);
-            }
-            log(LogLevel::Warn) << message;
-            ++stats.unreadable_cameras;
-        }
+        CameraView view;
+        view.camera = &camera;
+        view.calibration = &calibration;
+        view.downscale = downscale;
+        views.push_back(std::move(view));
     }
     return views;
 }
+
+/// Decode one view and compute its gradient field. An implicit camera list
+/// logs and counts an unreadable image and returns null; an explicit list
+/// throws.
+std::shared_ptr<CameraView> decode_view(
+    const Document& document, const Chunk& chunk, const CameraView& geometry,
+    const std::vector<std::string>& filters, RefineMarkersStats& stats) {
+    const Camera& camera = *geometry.camera;
+    const Frame* frame = frame_of_camera(chunk, camera.id);
+    if (frame == nullptr) {
+        return nullptr;
+    }
+    try {
+        FloatImage image =
+            read_image(resolve_frame_path(document, frame->path()).string())
+                .to_luminance();
+        if (geometry.downscale > 1) {
+            image = downsample_box(image, geometry.downscale);
+        }
+        auto view = std::make_shared<CameraView>(geometry);
+        view->image = std::move(image);
+        view->gradient_field = compute_gradient_field(view->image);
+        return view;
+    } catch (const std::exception& error) {
+        const std::string message =
+            "RefineMarkers: " + camera.label + ": " + error.what();
+        if (!filters.empty()) {
+            throw Error(message);
+        }
+        log(LogLevel::Warn) << message;
+        ++stats.unreadable_cameras;
+        return nullptr;
+    }
+}
+
+/// Bounded LRU cache of decoded views. The full image (and its gradient) is
+/// kept, never a crop: a crop would change the sampled patch. The byte budget
+/// caps how many views are resident at once, and a miss reloads the image.
+/// Markers are processed in camera-set order so adjacent markers reuse views.
+class ViewCache {
+public:
+    static constexpr std::size_t kBudgetBytes = 1500ull * 1024ull * 1024ull;
+
+    ViewCache(const Document& document, const Chunk& chunk,
+              const std::vector<CameraView>& geometry,
+              const std::vector<std::string>& filters,
+              RefineMarkersStats& stats)
+        : document_(document), chunk_(chunk), geometry_(geometry),
+          filters_(filters), stats_(stats) {}
+
+    /// Bytes a resident view occupies: luminance plus gradient magnitude.
+    std::size_t bytes_of(std::int32_t camera_id) const {
+        const CameraView* view = geometry_of(camera_id);
+        if (view == nullptr || view->calibration == nullptr) {
+            return 0;
+        }
+        const std::size_t ds =
+            static_cast<std::size_t>(std::max(1, view->downscale));
+        const std::size_t width = static_cast<std::size_t>(std::max(
+            1, view->calibration->width / static_cast<int>(ds)));
+        const std::size_t height = static_cast<std::size_t>(std::max(
+            1, view->calibration->height / static_cast<int>(ds)));
+        return width * height * sizeof(float) * 2;
+    }
+
+    /// Evict least-recently-used views until `incoming` more bytes fit.
+    void make_room(std::size_t incoming) {
+        while (!order_.empty() && bytes_ + incoming > kBudgetBytes) {
+            const std::int32_t victim = order_.back();
+            auto entry = entries_.find(victim);
+            if (entry != entries_.end()) {
+                bytes_ -= bytes_of(victim);
+                entries_.erase(entry);
+            }
+            order_.pop_back();
+        }
+    }
+
+    std::shared_ptr<CameraView> get(std::int32_t camera_id) {
+        auto entry = entries_.find(camera_id);
+        if (entry != entries_.end()) {
+            if (entry->second.order != order_.begin()) {
+                order_.splice(order_.begin(), order_, entry->second.order);
+            }
+            return entry->second.view;
+        }
+        if (std::find(failed_.begin(), failed_.end(), camera_id) !=
+            failed_.end()) {
+            return nullptr;
+        }
+        const CameraView* geometry = geometry_of(camera_id);
+        if (geometry == nullptr) {
+            return nullptr;
+        }
+        std::shared_ptr<CameraView> view =
+            decode_view(document_, chunk_, *geometry, filters_, stats_);
+        if (!view) {
+            failed_.push_back(camera_id);
+            return nullptr;
+        }
+        const std::size_t bytes = bytes_of(camera_id);
+        make_room(bytes);
+        entries_[camera_id] =
+            Entry{view, order_.insert(order_.begin(), camera_id)};
+        bytes_ += bytes;
+        peak_bytes_ = std::max(peak_bytes_, bytes_);
+        return view;
+    }
+
+    std::size_t peak_bytes() const { return peak_bytes_; }
+
+private:
+    struct Entry {
+        std::shared_ptr<CameraView> view;
+        std::list<std::int32_t>::iterator order;
+    };
+
+    const CameraView* geometry_of(std::int32_t camera_id) const {
+        for (const CameraView& view : geometry_) {
+            if (view.camera != nullptr && view.camera->id == camera_id) {
+                return &view;
+            }
+        }
+        return nullptr;
+    }
+
+    const Document& document_;
+    const Chunk& chunk_;
+    const std::vector<CameraView>& geometry_;
+    const std::vector<std::string>& filters_;
+    RefineMarkersStats& stats_;
+    std::list<std::int32_t> order_;
+    std::unordered_map<std::int32_t, Entry> entries_;
+    std::vector<std::int32_t> failed_;
+    std::size_t bytes_ = 0;
+    std::size_t peak_bytes_ = 0;
+};
 
 Marker* find_marker_by_id(Chunk& chunk, std::int32_t marker_id) {
     for (Marker& marker : chunk.markers()) {
@@ -1464,23 +1582,42 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         return plan;
     }
     // Only a camera that some selected, enabled projection references is worth
-    // decoding (memory: the review's residency blocker).
+    // decoding. Sort the markers so that ones sharing a camera set are
+    // adjacent, which lets the view cache reuse them.
+    std::vector<std::vector<std::int32_t>> marker_cameras(selected.size());
+    std::vector<std::size_t> marker_bytes(selected.size(), 0);
+    std::vector<std::string> keys(selected.size());
     std::vector<std::int32_t> needed_cameras;
-    for (const std::size_t index : selected) {
+    for (std::size_t slot = 0; slot < selected.size(); ++slot) {
+        std::vector<std::int32_t>& ids = marker_cameras[slot];
         for (const MarkerProjection& projection :
-             chunk->markers()[index].projections) {
+             chunk->markers()[selected[slot]].projections) {
             if (!projection.enabled || !projection.pixel.allFinite()) {
                 continue;
             }
+            if (std::find(ids.begin(), ids.end(), projection.camera_id) !=
+                ids.end()) {
+                continue;
+            }
+            ids.push_back(projection.camera_id);
             if (std::find(needed_cameras.begin(), needed_cameras.end(),
                           projection.camera_id) == needed_cameras.end()) {
                 needed_cameras.push_back(projection.camera_id);
             }
         }
+        std::sort(ids.begin(), ids.end());
+        for (const std::int32_t camera_id : ids) {
+            keys[slot] += std::to_string(camera_id) + ",";
+        }
     }
-    const std::vector<CameraView> views = load_selected_views(
-        document, *chunk, options.cameras, options.downscale, needed_cameras,
-        plan.stats);
+    std::vector<std::size_t> order(selected.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(),
+                     [&keys](std::size_t a, std::size_t b) {
+                         return keys[a] < keys[b];
+                     });
+    const std::vector<CameraView> geometry = build_selected_views(
+        *chunk, options.cameras, options.downscale, needed_cameras);
 
     std::vector<MarkerEdit> edits(selected.size());
     const PointCloud& point_cloud = chunk->point_cloud();
@@ -1494,20 +1631,20 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     CloudSamples cloud;
     cloud.dense = &point_cloud.points;
     cloud.markers = &marker_positions;
-    const auto camera_view = [&views](std::int32_t camera_id) -> const CameraView* {
-        for (const CameraView& view : views) {
-            if (view.camera->id == camera_id) {
-                return &view;
-            }
+    ViewCache cache(document, *chunk, geometry, options.cameras, plan.stats);
+    for (std::size_t slot = 0; slot < selected.size(); ++slot) {
+        for (const std::int32_t camera_id : marker_cameras[slot]) {
+            marker_bytes[slot] += cache.bytes_of(camera_id);
         }
-        return nullptr;
-    };
-    const int count = static_cast<int>(selected.size());
-#if defined(ALPHASHAPE_HAVE_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-    for (int i = 0; i < count; ++i) {
-        const Marker& marker = chunk->markers()[selected[static_cast<std::size_t>(i)]];
+        // A marker whose own set exceeds the budget cannot be split without a
+        // crop; report the unavoidable peak.
+        plan.stats.peak_bytes =
+            std::max(plan.stats.peak_bytes, marker_bytes[slot]);
+    }
+    for (const std::size_t slot : order) {
+        cache.make_room(marker_bytes[slot]);
+        const Marker& marker = chunk->markers()[selected[slot]];
+        std::vector<std::shared_ptr<CameraView>> held;
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
         for (const MarkerProjection& projection : marker.projections) {
@@ -1517,33 +1654,33 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             if (!projection.enabled || !projection.pixel.allFinite()) {
                 continue;
             }
-            const CameraView* view = camera_view(projection.camera_id);
-            if (view == nullptr) {
+            std::shared_ptr<CameraView> view = cache.get(projection.camera_id);
+            if (!view) {
                 continue;
             }
+            // `held` keeps the view alive even if the LRU evicts it while the
+            // remaining views of this marker are loaded.
+            held.push_back(std::move(view));
             BlendView blend;
-            blend.view = view;
+            blend.view = held.back().get();
             blend.pixel = projection.pixel;
             blends.push_back(blend);
         }
         try {
-            edits[static_cast<std::size_t>(i)] =
-                refine_marker(std::move(blends), cloud, options);
+            edits[slot] = refine_marker(std::move(blends), cloud, options);
         } catch (const std::exception&) {
-            // An exception must not escape an OpenMP parallel region, which
-            // would terminate the process. A marker that cannot be refined is
-            // reported as failed and left untouched, like a failed consensus.
             MarkerEdit failed;
             failed.failed = true;
-            edits[static_cast<std::size_t>(i)] = failed;
+            edits[slot] = failed;
         }
-        // Assigned after the edit: the assignment above replaces every field.
-        edits[static_cast<std::size_t>(i)].marker_id = marker.id;
+        edits[slot].marker_id = marker.id;
     }
+    plan.stats.peak_bytes =
+        std::max(plan.stats.peak_bytes, cache.peak_bytes());
 
     // Every selected marker is counted exactly once, and mutations are
-    // collected in marker order even though refinement ran in parallel, so the
-    // staged command (and therefore undo/redo) is deterministic.
+    // collected in marker order, so the staged command (and therefore
+    // undo/redo) is deterministic.
     std::vector<MarkerEdit> staged;
     for (std::size_t i = 0; i < selected.size(); ++i) {
         MarkerEdit& edit = edits[i];
@@ -1662,6 +1799,7 @@ void RefineMarkersTask::apply(Document& document, Params& params,
             << ", skipped " << plan.stats.skipped
             << ", unreadable cameras " << plan.stats.unreadable_cameras
             << ", removed projections " << plan.stats.removed_projections
+            << ", peak " << plan.stats.peak_bytes / (1024 * 1024) << " MiB"
             << " in " << seconds << " s";
     }
 }
