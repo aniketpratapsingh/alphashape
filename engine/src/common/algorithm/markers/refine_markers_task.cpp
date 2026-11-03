@@ -1171,27 +1171,6 @@ std::optional<RoundOutcome> apply_winner(
     if (inliers.size() < 2) {
         return std::nullopt;
     }
-    // A large, consistent measurement-to-projection offset in most views is
-    // the common-mode signature. Only then is the detector's absolute centre
-    // needed; a single noisy or foreshortened view keeps the validated
-    // per-round refiner.
-    std::vector<double> offsets;
-    for (const std::size_t index : inliers) {
-        if (const auto projected =
-                project_view(*blends[index].view, winner.point)) {
-            offsets.push_back((blends[index].pixel - *projected).norm());
-        }
-    }
-    double median_offset = 0.0;
-    if (!offsets.empty()) {
-        const std::size_t middle = offsets.size() / 2;
-        std::nth_element(
-            offsets.begin(),
-            offsets.begin() + static_cast<std::ptrdiff_t>(middle),
-            offsets.end());
-        median_offset = offsets[middle];
-    }
-    const bool common_mode = median_offset > 8.0;
     // A common lateral offset of the physical patch is invisible to NCC (every
     // view samples the same world points), so consistency alone cannot remove
     // the reference view's own bias. Each inlier is therefore anchored at the
@@ -1202,7 +1181,7 @@ std::optional<RoundOutcome> apply_winner(
     out.pixels = current;
     out.inlier.assign(blends.size(), false);
     out.status = winner.status;
-    out.common_mode = common_mode;
+    bool used_absolute = false;
     const Eigen::Vector3d normal = u.cross(v).normalized();
     std::vector<Eigen::Vector2d> anchored(blends.size());
     std::vector<Eigen::Vector2d> projected_centres(blends.size());
@@ -1219,39 +1198,32 @@ std::optional<RoundOutcome> apply_winner(
         ++projected_inliers;
         projected_centres[index] = *projected;
         const double limit = std::max(2.0, blend.apparent);
-        Eigen::Vector2d anchor = *projected;
-        // In common mode, find the cross detector's absolute centre and walk
-        // towards it, clamped per round. Outside common mode the validated
-        // per-round 2-D refiner is more accurate.
-        bool absolute = false;
-        Eigen::Vector2d absolute_pixel = Eigen::Vector2d::Zero();
-        if (common_mode) {
+        const std::optional<BlobSeed> seed =
+            circular_seed(*blend.view, *projected, options.patch_size);
+        const auto refined =
+            refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
+                             blend.hint_work, limit);
+        Eigen::Vector2d anchor = refined ? *refined : *projected;
+        // A cross refiner cannot reach a printed centre most of a radius away
+        // (common mode). When it did not move, fall back to the cross
+        // detector's absolute centre and walk towards it, clamped per round.
+        const double moved = refined ? (*refined - *projected).norm() : 0.0;
+        if (blend.cross && moved < 1.0) {
             if (const auto cross = cross_extent(
                     *blend.view, blend.pixel, options.patch_size)) {
                 if ((cross->pixel - *projected).norm() <=
                     std::max(2.0, cross->radius)) {
-                    absolute = true;
-                    absolute_pixel = cross->pixel;
+                    Eigen::Vector2d delta = cross->pixel - *projected;
+                    const double distance = delta.norm();
+                    if (std::isfinite(distance)) {
+                        if (distance > limit) {
+                            delta *= limit / distance;
+                        }
+                        anchor = *projected + delta;
+                        used_absolute = true;
+                    }
                 }
             }
-        }
-        if (absolute) {
-            Eigen::Vector2d delta = absolute_pixel - *projected;
-            const double distance = delta.norm();
-            if (!std::isfinite(distance)) {
-                delta = Eigen::Vector2d::Zero();
-            } else if (distance > limit) {
-                delta *= limit / distance;
-            }
-            anchor = *projected + delta;
-        } else {
-            const std::optional<BlobSeed> seed =
-                circular_seed(*blend.view, *projected,
-                              options.patch_size);
-            const auto refined =
-                refined_2d_pixel(*blend.view, *projected, seed, blend.cross,
-                                 blend.hint_work, limit);
-            anchor = refined ? *refined : *projected;
         }
         anchored[index] = anchor;
         const auto point = intersect_plane(*blend.view, anchored[index],
@@ -1310,6 +1282,7 @@ std::optional<RoundOutcome> apply_winner(
         out.max_movement =
             std::max(out.max_movement, (refined - current[i]).norm());
     }
+    out.common_mode = used_absolute;
     return out;
 }
 
@@ -1363,7 +1336,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.apparent = std::max(1.0, circle->radius);
             blend.has_scale = true;
         }
-        blend.hint_work = 8.0;
+        blend.hint_work = 6.0;
     }
 }
 
