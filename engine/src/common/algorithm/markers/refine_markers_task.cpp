@@ -1342,15 +1342,21 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         // is kept as the ellipse alternative for both types; the cross refiner
         // is tried first for a cross.
         if (saddle_seed(*blend.view, blend.pixel).has_value()) {
+            // A saddle is evidence of a cross even when the full detector
+            // cannot return an extent (a grazing arm); keep the cross refiner
+            // and fall back to the blob or physical scale.
+            blend.cross = true;
             if (const auto cross =
                     cross_extent(*blend.view, blend.pixel, patch_size)) {
-                blend.cross = true;
                 blend.apparent = std::max(1.0, cross->radius);
                 blend.has_scale = true;
-                blend.seed = circle;
-                blend.hint_work = std::max(4.0, blend.apparent / ds);
-                continue;
+            } else if (circle) {
+                blend.apparent = std::max(1.0, circle->radius);
+                blend.has_scale = true;
             }
+            blend.seed = circle;
+            blend.hint_work = std::max(6.0, 0.25 * blend.apparent / ds);
+            continue;
         }
         if (circle) {
             blend.seed = circle;
@@ -1499,7 +1505,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 }
                 blend.apparent = std::max(1.0, projected_radius);
                 blend.hint_work = std::max(
-                    4.0, blend.apparent /
+                    6.0, 0.25 * blend.apparent /
                              static_cast<double>(std::max(
                                  1, blend.view->downscale)));
                 blend.has_scale = true;
