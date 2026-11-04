@@ -524,7 +524,7 @@ inline MarkerSequence make_marker_sequence(const MarkerSequenceSpec& spec) {
             spec.reverse_capture_times ? spec.frames - 1 - temporal : temporal;
         if (spec.burst_capture_times) {
             when = "2026:05:01 10:00:00";
-            char fraction[8];
+            char fraction[16];
             std::snprintf(fraction, sizeof(fraction), "%02d", 1 + time_index);
             subsec = std::string(fraction);
         } else if (temporal != spec.missing_time_temporal) {
