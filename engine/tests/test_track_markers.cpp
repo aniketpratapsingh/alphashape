@@ -353,6 +353,50 @@ TEST(Markers, TrackRedetectRecovers) {
     EXPECT_LE((recovered->pixel - *truth).norm(), 1.0);
 }
 
+TEST(Markers, TrackRedetectsAcrossSuddenJump) {
+    MarkerSequenceSpec spec;
+    spec.frames = kFrames;
+    spec.occlude_first = 8;
+    spec.occlude_last = 10;
+    spec.occluded_target = 0;
+    spec.jump_frame = 11;
+    spec.jump_px = 25.0;
+    MarkerSequence scene = make_marker_sequence(spec);
+    const std::vector<std::int32_t> ids = seed_all(scene, 0);
+    // Normal LK settings: the 25 px jump at frame 11 is outside the window,
+    // so only redetection can recover the marker.
+    TrackMarkersOptions options = base_options();
+    options.redetect = true;
+    options.window = 21;
+    options.pyramid_levels = 3;
+    options.max_error_px = 1.0;
+    options.max_gap = 3;
+    const TrackMarkersStats stats = run_track(scene, options);
+    const Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_GT(stats.tracked, 0U);
+    EXPECT_GE(stats.redetected, 1U);
+    EXPECT_EQ(marker->label,
+              "target " + std::to_string(scene.targets[0].code));
+    double squared = 0.0;
+    std::size_t count = 0;
+    for (std::size_t temporal = 11; temporal < static_cast<std::size_t>(kFrames);
+         ++temporal) {
+        const std::optional<Vec2> truth = scene.truth(0, temporal);
+        ASSERT_TRUE(truth.has_value());
+        const MarkerProjection* projection =
+            projection_for(*marker, scene.frames[temporal].camera_id);
+        ASSERT_NE(projection, nullptr) << "recovered frame " << temporal;
+        const double error = (projection->pixel - *truth).norm();
+        squared += error * error;
+        ++count;
+    }
+    ASSERT_GT(count, 0U);
+    const double rms = std::sqrt(squared / static_cast<double>(count));
+    std::printf("[track jump] RMS after recovery %.4f px\n", rms);
+    EXPECT_LE(rms, 0.3);
+}
+
 TEST(Markers, TrackBackward) {
     MarkerSequenceSpec spec;
     spec.frames = kFrames;

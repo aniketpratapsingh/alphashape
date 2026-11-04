@@ -73,6 +73,10 @@ struct MarkerSequenceSpec {
     bool burst_capture_times = false;
     /// Temporal index whose DateTimeOriginal is deliberately malformed.
     int malformed_time_temporal = -1;
+    /// A sudden camera shift of `jump_px` from `jump_frame` onwards, simulating
+    /// motion that Lucas-Kanade cannot follow in one step.
+    int jump_frame = -1;
+    double jump_px = 0.0;
     int occlude_first = -1;
     int occlude_last = -1;
     int occluded_target = 0;
@@ -487,7 +491,15 @@ inline MarkerSequence make_marker_sequence(const MarkerSequenceSpec& spec) {
         if (temporal < 0 || temporal >= spec.frames) {
             continue;
         }
-        const Transform pose = sequence_pose(temporal, spec.frames, 1.15);
+        Transform pose = sequence_pose(temporal, spec.frames, 1.15);
+        if (spec.jump_frame >= 0 && temporal >= spec.jump_frame) {
+            // Translate the camera in the ground plane by the distance that
+            // projects to `jump_px` at the nominal height.
+            const double metres =
+                spec.jump_px * 1.15 / static_cast<double>(spec.focal);
+            const Vec3 shift(0.0, 0.0, metres);
+            pose.block<3, 1>(0, 3) -= pose.block<3, 3>(0, 0) * shift;
+        }
         const Calibration calibration = chunk.sensors()[0].calibration;
         Camera camera;
         camera.id = chunk.allocate_id();
