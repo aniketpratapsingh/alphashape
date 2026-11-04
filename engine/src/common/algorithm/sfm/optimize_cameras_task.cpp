@@ -273,6 +273,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // one BA point. Its projections are stored in the Calibration pixel
     // convention (top-left pixel centre (0.5, 0.5)), the same convention as
     // BAObservation, so they are copied without the keypoint +0.5 shift.
+    // BAObservation carries no per-observation sigma, so a
+    // marker_projection_accuracy parameter is deferred until it does.
     constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
     std::size_t markers_skipped = 0;
