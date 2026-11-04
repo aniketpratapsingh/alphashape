@@ -424,41 +424,142 @@ struct GrownLattice {
     std::vector<std::optional<LatticeLabel>> labels;
 };
 
+/// Uniform spatial hash over the verified corners. Growth looks up the 3x3
+/// block of cells around a predicted position instead of scanning every
+/// corner, so its cost no longer grows quadratically with the corner count.
+class CornerGrid {
+public:
+    CornerGrid(const std::vector<Candidate>& corners, double cell_size)
+        : corners_(corners) {
+        cell_ = std::max(cell_size, 1e-3);
+        for (int i = 0; i < static_cast<int>(corners.size()); ++i) {
+            const std::pair<int, int> key = cell_key(
+                corners[static_cast<std::size_t>(i)].x,
+                corners[static_cast<std::size_t>(i)].y);
+            const int cx = key.first;
+            const int cy = key.second;
+            min_cx_ = std::min(min_cx_, cx);
+            max_cx_ = std::max(max_cx_, cx);
+            min_cy_ = std::min(min_cy_, cy);
+            max_cy_ = std::max(max_cy_, cy);
+            cells_[std::make_pair(cx, cy)].push_back(i);
+        }
+    }
+
+    double cell() const { return cell_; }
+
+    int cell_coord(double value) const {
+        return static_cast<int>(std::floor(value / cell_));
+    }
+
+    int max_ring(int cx, int cy) const {
+        if (cells_.empty()) {
+            return 0;
+        }
+        return std::max(std::max(std::abs(min_cx_ - cx), std::abs(max_cx_ - cx)),
+                        std::max(std::abs(min_cy_ - cy), std::abs(max_cy_ - cy)));
+    }
+
+    /// Invoke `fn(index)` for every corner in the 3x3 cell block around the
+    /// cell containing (x, y).
+    template <typename Fn>
+    void visit_near(double x, double y, Fn&& fn) const {
+        const int cx = cell_coord(x);
+        const int cy = cell_coord(y);
+        for (int gy = cy - 1; gy <= cy + 1; ++gy) {
+            for (int gx = cx - 1; gx <= cx + 1; ++gx) {
+                const auto found = cells_.find(std::make_pair(gx, gy));
+                if (found == cells_.end()) {
+                    continue;
+                }
+                for (int index : found->second) {
+                    fn(index);
+                }
+            }
+        }
+    }
+
+    /// Invoke `fn(index)` for every corner in cell ring `ring` around (cx, cy).
+    template <typename Fn>
+    void visit_ring(int cx, int cy, int ring, Fn&& fn) const {
+        for (int gy = cy - ring; gy <= cy + ring; ++gy) {
+            for (int gx = cx - ring; gx <= cx + ring; ++gx) {
+                if (std::max(std::abs(gx - cx), std::abs(gy - cy)) != ring) {
+                    continue;
+                }
+                const auto found = cells_.find(std::make_pair(gx, gy));
+                if (found == cells_.end()) {
+                    continue;
+                }
+                for (int index : found->second) {
+                    fn(index);
+                }
+            }
+        }
+    }
+
+private:
+    std::pair<int, int> cell_key(double x, double y) const {
+        return std::make_pair(cell_coord(x), cell_coord(y));
+    }
+
+    const std::vector<Candidate>& corners_;
+    double cell_ = 1.0;
+    int min_cx_ = 0;
+    int max_cx_ = 0;
+    int min_cy_ = 0;
+    int max_cy_ = 0;
+    std::map<std::pair<int, int>, std::vector<int>> cells_;
+};
+
 /// Nearest verified corner lying roughly along `direction` (mod pi) from the
-/// seed. On success `step` is the measured offset.
-bool find_seed_step(const std::vector<Candidate>& corners, int seed, double direction,
-                    double tolerance, Eigen::Vector2d& step) {
+/// seed. On success `step` is the measured offset. Expands cell rings only
+/// until no closer corner can remain.
+bool find_seed_step(const std::vector<Candidate>& corners, const CornerGrid& grid, int seed,
+                    double direction, double tolerance, Eigen::Vector2d& step) {
+    const Candidate& seed_corner = corners[static_cast<std::size_t>(seed)];
+    const int cx = grid.cell_coord(seed_corner.x);
+    const int cy = grid.cell_coord(seed_corner.y);
     double best_distance = std::numeric_limits<double>::infinity();
     int best_index = -1;
-    for (int i = 0; i < static_cast<int>(corners.size()); ++i) {
-        if (i == seed) {
-            continue;
-        }
-        const double dx = corners[static_cast<std::size_t>(i)].x - corners[static_cast<std::size_t>(seed)].x;
-        const double dy = corners[static_cast<std::size_t>(i)].y - corners[static_cast<std::size_t>(seed)].y;
-        const double distance = std::hypot(dx, dy);
-        if (distance < 1e-6) {
-            continue;
-        }
-        if (angle_diff_pi(std::atan2(dy, dx), direction) <= tolerance &&
-            distance < best_distance) {
-            best_distance = distance;
-            best_index = i;
+    const int max_ring = grid.max_ring(cx, cy);
+    for (int ring = 0; ring <= max_ring; ++ring) {
+        grid.visit_ring(cx, cy, ring, [&](int i) {
+            if (i == seed || i < 0) {
+                return;
+            }
+            const Candidate& other = corners[static_cast<std::size_t>(i)];
+            const double dx = other.x - seed_corner.x;
+            const double dy = other.y - seed_corner.y;
+            const double distance = std::hypot(dx, dy);
+            if (distance < 1e-6) {
+                return;
+            }
+            if (angle_diff_pi(std::atan2(dy, dx), direction) <= tolerance &&
+                distance < best_distance) {
+                best_distance = distance;
+                best_index = i;
+            }
+        });
+        if (best_index >= 0 &&
+            static_cast<double>(ring) * grid.cell() >= best_distance) {
+            break;  // any corner in a farther ring is at least this far away
         }
     }
     if (best_index < 0) {
         return false;
     }
     step = Eigen::Vector2d(corners[static_cast<std::size_t>(best_index)].x -
-                               corners[static_cast<std::size_t>(seed)].x,
+                               seed_corner.x,
                            corners[static_cast<std::size_t>(best_index)].y -
-                               corners[static_cast<std::size_t>(seed)].y);
+                               seed_corner.y);
     return true;
 }
 
 /// Greedy, geometry-gated breadth-first lattice growth.
 std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, int seed,
-                                         double angle_tolerance, double spacing_tolerance) {
+                                         double angle_tolerance, double spacing_tolerance,
+                                         double min_distance) {
     const std::size_t n = corners.size();
     GrownLattice lattice;
     lattice.labels.resize(n);
@@ -467,19 +568,26 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
     lattice.labels[static_cast<std::size_t>(seed)] = LatticeLabel{0, 0};
     std::set<std::pair<int, int>> occupied;
     occupied.insert(std::make_pair(0, 0));
+    // Before a step is known, qualify the seeding search by the NMS spacing.
+    const CornerGrid seed_grid(corners, std::max(2.0 * min_distance, 1.0));
     Eigen::Vector2d first;
     Eigen::Vector2d second;
-    if (!find_seed_step(corners, seed, corners[static_cast<std::size_t>(seed)].dir0,
-                        angle_tolerance, first)) {
+    if (!find_seed_step(corners, seed_grid, seed,
+                        corners[static_cast<std::size_t>(seed)].dir0, angle_tolerance,
+                        first)) {
         return std::nullopt;
     }
-    if (!find_seed_step(corners, seed, corners[static_cast<std::size_t>(seed)].dir1,
-                        angle_tolerance, second)) {
+    if (!find_seed_step(corners, seed_grid, seed,
+                        corners[static_cast<std::size_t>(seed)].dir1, angle_tolerance,
+                        second)) {
         return std::nullopt;
     }
     if (!(first.norm() > 1e-6) || !(second.norm() > 1e-6)) {
         return std::nullopt;
     }
+    // Once the seed steps are measured, bucket on their median length so every
+    // growth lookup only needs the 3x3 block around the prediction.
+    const CornerGrid grid(corners, std::max(0.5 * (first.norm() + second.norm()), 1.0));
     // Name the more horizontal edge "col" and orient it rightwards, the other
     // "row" and orient it downwards. The label origin stays arbitrary for a
     // partial view, but its axes then follow the image, so lattice differences
@@ -517,9 +625,9 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
                 const Eigen::Vector2d predicted = position + predicted_step;
                 int best_index = -1;
                 double best_distance = std::numeric_limits<double>::infinity();
-                for (int i = 0; i < static_cast<int>(n); ++i) {
+                grid.visit_near(predicted.x(), predicted.y(), [&](int i) {
                     if (i == current) {
-                        continue;
+                        return;
                     }
                     const Eigen::Vector2d measured(
                         corners[static_cast<std::size_t>(i)].x - position.x(),
@@ -529,19 +637,19 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
                     // step, then take the nearest such candidate.
                     const double distance = (measured - predicted_step).norm();
                     if (distance > spacing_tolerance * length) {
-                        continue;
+                        return;
                     }
                     if (angle_diff_pi(std::atan2(measured.y(), measured.x()),
                                       std::atan2(predicted_step.y(),
                                                  predicted_step.x())) >
                         angle_tolerance) {
-                        continue;
+                        return;
                     }
                     if (distance < best_distance) {
                         best_distance = distance;
                         best_index = i;
                     }
-                }
+                });
                 if (best_index < 0) {
                     continue;
                 }
@@ -911,8 +1019,8 @@ std::optional<BoardView> detect_board(const FloatImage& gray, const BoardSpec& s
     if (seed < 0) {
         return std::nullopt;
     }
-    const std::optional<GrownLattice> lattice =
-        grow_lattice(verified, seed, angle_tolerance, options.spacing_tol);
+    const std::optional<GrownLattice> lattice = grow_lattice(
+        verified, seed, angle_tolerance, options.spacing_tol, options.min_distance_px);
     if (!lattice) {
         return std::nullopt;
     }
