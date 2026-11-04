@@ -171,7 +171,7 @@ std::vector<Candidate> suppress_candidates(const std::vector<Candidate>& candida
     if (candidates.empty() || !(min_distance > 0.0)) {
         return accepted;
     }
-    const double cell = std::max(1.0, min_distance);
+    const double cell = std::max(4.0, std::ceil(min_distance));
     int max_x = 0;
     int max_y = 0;
     for (const Candidate& candidate : candidates) {
@@ -998,6 +998,9 @@ std::optional<BoardView> detect_board(const FloatImage& gray, const BoardSpec& s
         non_positive(options.angle_tol_deg) || non_positive(options.spacing_tol) ||
         options.refine_radius <= 0 || options.min_corners <= 0) {
         throw ValueError("BoardDetectOptions values must be positive");
+    }
+    if (options.min_distance_px < 1.0) {
+        throw ValueError("BoardDetectOptions.min_distance_px must be at least 1");
     }
     if (gray.empty() || gray.width() < 3 || gray.height() < 3) {
         return std::nullopt;

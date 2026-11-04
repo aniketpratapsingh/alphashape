@@ -340,6 +340,9 @@ TEST(Board, InvalidOptionsRejected) {
     bad.min_distance_px = -1.0;
     expect_rejected(bad);
     bad = BoardDetectOptions{};
+    bad.min_distance_px = 0.5;
+    expect_rejected(bad);
+    bad = BoardDetectOptions{};
     bad.response_fraction = 0.0;
     expect_rejected(bad);
     bad = BoardDetectOptions{};
