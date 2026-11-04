@@ -17,6 +17,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/elevation/cell_fusion.hpp"
+#include "common/algorithm/elevation/step_edges.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -967,6 +968,12 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     if (!(fusion_cell_size > 0.0) || !std::isfinite(fusion_cell_size)) {
         fusion_cell_size = grid.pixel_size_x;
     }
+    // The grid axes have independent scales (a geographic plane is in
+    // degrees, where x and y metres-per-degree differ by cos(latitude)).
+    double fusion_cell_size_y = grid.pixel_size_y * fusion_metres_per_unit.y();
+    if (!(fusion_cell_size_y > 0.0) || !std::isfinite(fusion_cell_size_y)) {
+        fusion_cell_size_y = grid.pixel_size_y;
+    }
 
     // -- rasterise into per-cell observations ---------------------------------
     AssembledSurface surface;
@@ -1212,6 +1219,28 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
                         static_cast<float>(static_cast<double>(u[i]) * cell_size);
                 }
             }
+        }
+    }
+    // -- step-edge refinement -------------------------------------------------
+    // Only MEASURED cells are evidence and only they are rewritten: hole-filled
+    // cells are not a real surface, and repaired-only cells are a plane's guess
+    // even though the TGV pass uses them as weak data.
+    if (options.refine_edges && (source == Source::DepthMaps || source == Source::PointCloud)) {
+        std::vector<std::uint8_t> measured_cells = observed;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (repaired_only_cells[i] != 0U) {
+                measured_cells[i] = 0U;
+            }
+        }
+        StepEdgeOptions step_options;
+        step_options.min_height = options.step_min_height;
+        step_options.min_length = options.step_min_length;
+        const int segments = refine_step_edges(final_values, measured_cells, grid.width,
+                                                grid.height, fusion_cell_size,
+                                                fusion_cell_size_y, step_options);
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildDem: step-edge refinement accepted " << segments
+                                << " segment(s)";
         }
     }
     // Re-apply the interpolation mask: cells that were neither observed nor

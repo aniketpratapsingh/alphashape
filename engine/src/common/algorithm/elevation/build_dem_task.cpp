@@ -91,6 +91,15 @@ DemOptions resolve_options(const Params& params) {
         throw ValueError("BuildDem: smoothing must be \"tgv\" or \"none\" (got \"" + smoothing +
                          "\")");
     }
+    options.refine_edges = params.get_bool("refine_edges");
+    options.step_min_height = params.get_float("step_min_height");
+    if (!(options.step_min_height > 0.0) || !std::isfinite(options.step_min_height)) {
+        throw ValueError("BuildDem: step_min_height must be a finite value > 0 (metres)");
+    }
+    options.step_min_length = params.get_float("step_min_length");
+    if (!(options.step_min_length > 0.0) || !std::isfinite(options.step_min_length)) {
+        throw ValueError("BuildDem: step_min_length must be a finite value > 0 (metres)");
+    }
     return options;
 }
 
@@ -162,6 +171,22 @@ void BuildDemTask::declare_params(Params& params) const {
                      "the cell's data weight reduced when the kept samples disagree)."};
     fusion.choices = {"median", "robust"};
     params.declare(fusion);
+
+    params.declare({"refine_edges", ParamType::Bool, false,
+                    "Rebuild sharp height steps across long, straight discontinuities such as "
+                    "building and roof outlines after smoothing. Applies to the depth_maps and "
+                    "point_cloud sources only; the model source is never refined. Off by "
+                    "default until the quality benchmark decides."});
+    ParamSpec step_min_height{"step_min_height", ParamType::Float, 1.5,
+                              "refine_edges: smallest height step in metres that a "
+                              "discontinuity must show to be refined."};
+    step_min_height.minimum = 0.0;
+    params.declare(step_min_height);
+    ParamSpec step_min_length{"step_min_length", ParamType::Float, 3.0,
+                              "refine_edges: shortest straight segment, in metres, that is "
+                              "refined."};
+    step_min_length.minimum = 0.0;
+    params.declare(step_min_length);
 
     ParamSpec smoothing{"smoothing", ParamType::String, std::string("tgv"),
                         "Surface smoothing: \"tgv\" (TGV^2) or \"none\". The model source is "
