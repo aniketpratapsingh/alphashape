@@ -174,6 +174,48 @@ TEST(Optimize, GcpNetworkRecoversTransform) {
     }
 }
 
+TEST(Optimize, GcpNetworkRecoversTransformWithCauchy) {
+    std::mt19937 rng(20261104);
+    const SyntheticScene truth = make_scene(rng);
+
+    BAProblem problem = truth.problem;
+    const Eigen::Matrix3d q = rotation_from_angle_axis(Eigen::Vector3d(0.2, -0.3, 0.15));
+    apply_similarity(problem, 1.3, q, Eigen::Vector3d(2.0, -1.0, 3.0));
+
+    const std::array<std::size_t, 5> control = {0, 17, 42, 88, 150};
+    for (const std::size_t index : control) {
+        BAControlPoint cp;
+        cp.point = index;
+        cp.reference = truth.true_points[index];
+        cp.sigma = Eigen::Vector3d::Constant(0.01);
+        problem.control_points.push_back(cp);
+    }
+
+    // Default options: the shared Cauchy loss is active. Observations of the
+    // control points switch to Huber, so the rays keep pulling the poses and the
+    // exact-similarity start converges to the truth instead of stalling with the
+    // markers detached from their rays.
+    BAOptions options;
+    options.max_iterations = 1000;
+    options.function_tolerance = 1e-12;
+    const BAReport report = bundle_adjust(problem, options);
+    ASSERT_TRUE(report.usable);
+    EXPECT_EQ(report.control_points, control.size());
+    EXPECT_LT(report.control_rms_m, 0.02);
+
+    Eigen::Vector3d lo = truth.true_points[0];
+    Eigen::Vector3d hi = lo;
+    for (const Eigen::Vector3d& p : truth.true_points) {
+        lo = lo.cwiseMin(p);
+        hi = hi.cwiseMax(p);
+    }
+    const double scene_size = (hi - lo).norm();
+    for (std::size_t i = 0; i < problem.poses.size(); ++i) {
+        const Eigen::Vector3d centre = -problem.poses[i].R.transpose() * problem.poses[i].t;
+        EXPECT_LT((centre - truth.true_centres[i]).norm(), 1e-3 * scene_size);
+    }
+}
+
 TEST(Optimize, ScalebarFixesScale) {
     std::mt19937 rng(20261105);
     const SyntheticScene truth = make_scene(rng);
