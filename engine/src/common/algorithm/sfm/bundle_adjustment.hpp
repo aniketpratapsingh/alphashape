@@ -18,6 +18,7 @@
 
 #include <Eigen/Core>
 
+#include "common/algorithm/sfm/control_points.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape::sfm {
@@ -80,6 +81,14 @@ struct BACentrePrior {
 /// every pose free and set no scale anchor. Otherwise the caller must keep
 /// fixing a camera plus the scale anchor, as above. `bundle_adjust` itself only
 /// obeys the flags: it never auto-detects whether the priors suffice.
+///
+/// Gauge with control points. Three or more non-collinear non-check control
+/// points whose three axes are all constrained pin the same 7 similarity
+/// degrees of freedom as three non-collinear centre priors: their references
+/// fix position, orientation and scale in the problem frame, so callers may
+/// leave every pose free and set no scale anchor. A single scale bar fixes only
+/// the scale, replacing the scale anchor; the caller still fixes one camera for
+/// the other 6 DoF. As with priors, `bundle_adjust` only obeys the flags.
 struct BAProblem {
     std::vector<Calibration> calibrations;  ///< one per camera; fixed unless fit_intrinsics frees terms
     std::vector<BAPose> poses;
@@ -98,6 +107,16 @@ struct BAProblem {
     /// GPS-like camera-centre priors. Empty => no priors (pre-existing
     /// behaviour). See BACentrePrior and the gauge note above.
     std::vector<BACentrePrior> centre_priors;
+
+    /// Known 3-D positions. Marker observations are ordinary BAObservations of
+    /// the marker's point; no separate observation type is needed.
+    std::vector<BAControlPoint> control_points;
+    /// Measured distances between points (scale constraints).
+    std::vector<BAScalebar> scalebars;
+    /// Optional per point: 1 marks a check point, whose image observations are
+    /// EXCLUDED from the solve. Empty => no check points. Size must be either 0
+    /// or points.size().
+    std::vector<std::uint8_t> checkpoint_point;
 
     /// Scale gauge: if scale_anchor_camera >= 0, that camera's world->camera
     /// translation component scale_anchor_axis (0..2) is held constant
@@ -125,6 +144,21 @@ struct BAReport {
     /// RMS of the normalised prior residuals (C[k] - centre[k]) / sigma[k] after
     /// the solve, over every constrained axis. 0 when there are none.
     double prior_rms_sigma = 0;
+
+    /// Number of non-check control points, check control points, and non-check
+    /// scale bars with valid length/sigma respectively.
+    std::size_t control_points = 0, checkpoints = 0, scalebars = 0;
+    /// 3-D RMS of X - reference over non-check control points (metres).
+    double control_rms_m = 0;
+    /// 3-D RMS of the re-triangulated X - reference over check control points,
+    /// finite ones only (metres). 0 when there are none.
+    double checkpoint_rms_m = 0;
+    /// RMS of the length error (|Xa - Xb| - length) over non-check scale bars
+    /// with valid length/sigma (metres). 0 when there are none.
+    double scalebar_rms_m = 0;
+    /// One residual per check control point, in input order; NaN when that
+    /// point has fewer than two usable observations.
+    std::vector<Eigen::Vector3d> checkpoint_residuals;
 };
 
 /// Validates indices/sizes (ValueError from base/utils/error.hpp on any
