@@ -146,6 +146,9 @@ struct BAReport {
     /// scored only after re-triangulation).
     double initial_rms_px = 0, final_rms_px = 0;
     std::size_t observations = 0;
+    /// Robust objective value (the sum of 0.5 * rho(r^2) the solver minimised).
+    /// Adaptive model selection compares successive solves with it.
+    double robust_cost = 0;
 
     /// Number of constrained prior axes (sigma finite and > 0) over all priors.
     std::size_t priors = 0;

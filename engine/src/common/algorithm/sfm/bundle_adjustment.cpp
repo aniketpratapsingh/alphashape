@@ -906,6 +906,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
 
     report.usable = summary.IsSolutionUsable();
     report.iterations = static_cast<int>(summary.iterations.size());
+    report.robust_cost = summary.final_cost;
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
     fill_constraint_report(problem, check_mask, &report);
