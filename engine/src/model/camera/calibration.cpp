@@ -213,7 +213,10 @@ bool Calibration::operator==(const Calibration& other) const {
            f == other.f && cx == other.cx && cy == other.cy && b1 == other.b1 &&
            b2 == other.b2 && k1 == other.k1 && k2 == other.k2 && k3 == other.k3 &&
            k4 == other.k4 && p1 == other.p1 && p2 == other.p2 && p3 == other.p3 &&
-           p4 == other.p4;
+           p4 == other.p4 && covariance_params == other.covariance_params &&
+           covariance.rows() == other.covariance.rows() &&
+           covariance.cols() == other.covariance.cols() &&
+           (covariance.array() == other.covariance.array()).all();
 }
 
 Eigen::Vector2d Calibration::project(const Eigen::Vector3d& p_cam) const {

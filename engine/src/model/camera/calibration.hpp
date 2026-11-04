@@ -77,8 +77,9 @@ struct Calibration {
 
     /// Posterior covariance of the packed coefficients in kCalibrationParamNames
     /// order (kCalibrationParamCount square), sigma0^2-scaled. Empty when
-    /// unknown. Held coefficients have zero rows/columns. Derived data: not
-    /// persisted yet, so it is deliberately excluded from operator==.
+    /// unknown. Held coefficients have zero rows/columns. Persisted as the
+    /// optional <covariance> child of <calibration> (WP-13.13b) and compared by
+    /// operator==.
     Eigen::MatrixXd covariance;
     /// Row/column names of `covariance`; the packed order when non-empty.
     std::vector<std::string> covariance_params;
