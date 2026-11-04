@@ -44,6 +44,55 @@ bool all_finite(const Eigen::Vector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
 }
 
+/// Rewrite the chunk by one similarity `t_sim` (already composed with any old
+/// transform map) and adopt `origin` as the new ENU origin. Poses, track points
+/// and the region always move; marker positions move only when asked, because
+/// georeference_chunk historically left the marker slot alone.
+///
+/// The pose update is derived in georeference.hpp: R_c' = R_c R^T,
+/// t_c' = s t_c - R_c' t. The camera centre then maps as C' = s R C + t.
+void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
+                               const geo::Geodetic& origin, bool transform_markers) {
+    for (Camera& camera : chunk.cameras()) {
+        if (!camera.enabled) {
+            continue;  // unregistered cameras keep their identity pose
+        }
+        const Eigen::Matrix3d r_c = camera.pose.block<3, 3>(0, 0);
+        const Eigen::Vector3d t_c = camera.pose.block<3, 1>(0, 3);
+        const Eigen::Matrix3d r_c_new = r_c * t_sim.R.transpose();
+        const Eigen::Vector3d t_c_new = t_sim.scale * t_c - r_c_new * t_sim.t;
+        camera.pose.block<3, 3>(0, 0) = r_c_new;
+        camera.pose.block<3, 1>(0, 3) = t_c_new;
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point = t_sim.apply(*track.point);
+        }
+    }
+    // Region: axis-aligned, no rotation -- the centre maps like a point and the
+    // size is scaled by the similarity scale.
+    chunk.region().centre = t_sim.apply(chunk.region().centre);
+    chunk.region().size *= t_sim.scale;
+
+    if (transform_markers) {
+        for (Marker& marker : chunk.markers()) {
+            if (marker.position.has_value()) {
+                *marker.position = t_sim.apply(*marker.position);
+            }
+        }
+    }
+
+    chunk.transform() = geo::enu_to_ecef(origin);
+    chunk.crs().epsg = 4326;
+    // The GNSS references this fit consumed are lon/lat/alt in that CRS, and the
+    // chunk's local frame is now metric ENU expressible in it, so the camera and
+    // world slots name it explicitly (M12 §4.4, WP-12.6). The slots only label
+    // the numbers; nothing below converts them. The marker slot keeps following
+    // the chunk CRS unless the caller explicitly transformed marker positions.
+    chunk.set_camera_crs(chunk.crs());
+    chunk.set_world_crs(chunk.crs());
+}
+
 }  // namespace
 
 GeoreferenceReport georeference_chunk(Chunk& chunk) {
@@ -154,36 +203,9 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     }
 
     // -- rewrite the chunk ---------------------------------------------------
-    for (Camera& camera : chunk.cameras()) {
-        if (!camera.enabled) {
-            continue;  // unregistered cameras keep their identity pose
-        }
-        const Eigen::Matrix3d r_c = camera.pose.block<3, 3>(0, 0);
-        const Eigen::Vector3d t_c = camera.pose.block<3, 1>(0, 3);
-        const Eigen::Matrix3d r_c_new = r_c * t_sim.R.transpose();
-        const Eigen::Vector3d t_c_new = t_sim.scale * t_c - r_c_new * t_sim.t;
-        camera.pose.block<3, 3>(0, 0) = r_c_new;
-        camera.pose.block<3, 1>(0, 3) = t_c_new;
-    }
-    for (Track& track : chunk.tie_points().tracks) {
-        if (track.point.has_value()) {
-            *track.point = t_sim.apply(*track.point);
-        }
-    }
-    // Region: axis-aligned, no rotation -- the centre maps like a point and the
-    // size is scaled by the similarity scale.
-    chunk.region().centre = t_sim.apply(chunk.region().centre);
-    chunk.region().size *= t_sim.scale;
-
-    chunk.transform() = geo::enu_to_ecef(origin);
-    chunk.crs().epsg = 4326;
-    // The GNSS references this fit consumed are lon/lat/alt in that CRS, and the
-    // chunk's local frame is now metric ENU expressible in it, so the camera and
-    // world slots name it explicitly (M12 §4.4, WP-12.6). The slots only label
-    // the numbers; nothing below converts them, and the marker slot keeps
-    // following the chunk CRS because nothing here touched markers.
-    chunk.set_camera_crs(chunk.crs());
-    chunk.set_world_crs(chunk.crs());
+    // Result-identical to the previous inline block; marker positions stay put
+    // because this path never touched them.
+    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/false);
 
     report.applied = true;
     report.references_used = inliers;
