@@ -410,5 +410,50 @@ TEST(Optimize, ScalebarJacobianMatchesAutodiff) {
     EXPECT_GT(compared, 0);
 }
 
+TEST(Optimize, CheckPointTriangulationInvertsDistortion) {
+    // A check point imaged by lenses with k1 = -0.1 must be re-triangulated
+    // through the full distortion model, not the bare pinhole.
+    Calibration cal = frame_calibration();
+    cal.k1 = -0.1;
+    const std::array<Eigen::Vector3d, 3> centres = {Eigen::Vector3d(-3.0, 0.0, 0.0),
+                                                    Eigen::Vector3d(3.0, 0.0, 0.0),
+                                                    Eigen::Vector3d(0.0, 0.0, -3.0)};
+    const Eigen::Vector3d x = Eigen::Vector3d(0.4, -0.3, 0.15);
+
+    BAProblem problem;
+    problem.calibrations.assign(centres.size(), cal);
+    for (const Eigen::Vector3d& centre : centres) {
+        const Eigen::Vector3d forward = (-centre).normalized();
+        const Eigen::Vector3d right = forward.cross(Eigen::Vector3d::UnitY()).normalized();
+        const Eigen::Vector3d up = right.cross(forward);
+        Eigen::Matrix3d r_wc;
+        r_wc.col(0) = right;
+        r_wc.col(1) = -up;
+        r_wc.col(2) = forward;
+        BAPose pose;
+        pose.R = r_wc.transpose();
+        pose.t = -pose.R * centre;
+        problem.poses.push_back(pose);
+        problem.fixed_pose.push_back(1);
+    }
+    problem.points.push_back(x);
+    for (std::size_t cam = 0; cam < centres.size(); ++cam) {
+        const Eigen::Vector3d p_cam = problem.poses[cam].R * x + problem.poses[cam].t;
+        problem.observations.push_back(BAObservation{cam, 0, cal.project(p_cam)});
+    }
+    BAControlPoint cp;
+    cp.point = 0;
+    cp.reference = x;
+    cp.sigma = Eigen::Vector3d::Constant(0.01);
+    cp.checkpoint = true;
+    problem.control_points.push_back(cp);
+
+    BAOptions options;
+    const BAReport report = bundle_adjust(problem, options);
+    ASSERT_EQ(report.checkpoints, 1u);
+    ASSERT_EQ(report.checkpoint_residuals.size(), 1u);
+    EXPECT_LT(report.checkpoint_rms_m, 1e-6);
+}
+
 }  // namespace
 }  // namespace alphashape::sfm

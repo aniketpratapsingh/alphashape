@@ -13,8 +13,8 @@
 // point is a check point when it is flagged in BAProblem::checkpoint_point OR
 // carries a BAControlPoint with `checkpoint == true`; the two spellings are
 // combined so they can never disagree. After the solve the point is
-// re-triangulated from the final poses and compared with its reference; the
-// error is reported in BAReport.
+// re-triangulated from the final poses (inverting distortion and fisheye) and
+// compared with its reference; the error is reported in BAReport.
 
 #include <cstddef>
 

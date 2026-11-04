@@ -241,10 +241,24 @@ std::size_t sensor_index(const BAProblem& problem, std::size_t camera) {
     return problem.camera_sensor.empty() ? camera : problem.camera_sensor[camera];
 }
 
+/// Cross-product matrix [v]_x, i.e. [v]_x w == v.cross(w).
+Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
+    Eigen::Matrix3d m;
+    m << 0.0, -v.z(), v.y(),
+         v.z(), 0.0, -v.x(),
+         -v.y(), v.x(), 0.0;
+    return m;
+}
+
 /// Triangulate one point from its observations with the final poses, using the
-/// linear pinhole DLT (2x3 normal equations per observation). Distortion terms
-/// are ignored: check points are only scored, never allowed to move the solve.
-/// Returns false for fewer than two usable observations or a degenerate system.
+/// linear pinhole DLT (2x3 normal equations per observation). Each pixel is
+/// turned back into a camera-frame ray with Calibration::unproject, so
+/// distortion, affine terms and fisheye are all inverted. Rays with z > 0 use
+/// the normalised form (x/z, y/z); a ray at or behind the image plane (a
+/// fisheye ray beyond 90 degrees) uses the equivalent cross-product form
+/// [ray]_x (R X + t) = 0. Check points are only scored, never allowed to move
+/// the solve. Returns false for fewer than two usable observations or a
+/// degenerate system.
 bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vector3d* out) {
     Eigen::Matrix3d ata = Eigen::Matrix3d::Zero();
     Eigen::Vector3d atb = Eigen::Vector3d::Zero();
@@ -257,21 +271,31 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
         if (!std::isfinite(cal.f) || cal.f == 0.0) {
             continue;
         }
-        // Calibration::cx/cy are offsets from the image centre.
-        const double cx = 0.5 * static_cast<double>(cal.width) + cal.cx;
-        const double cy = 0.5 * static_cast<double>(cal.height) + cal.cy;
-        const double xn = (obs.pixel.x() - cx) / cal.f;
-        const double yn = (obs.pixel.y() - cy) / cal.f;
+        const Eigen::Vector3d ray = cal.unproject(obs.pixel);
+        if (!ray.allFinite()) {
+            continue;
+        }
         const BAPose& pose = problem.poses[obs.camera];
-        const Eigen::Vector3d r0 = pose.R.row(0).transpose();
-        const Eigen::Vector3d r1 = pose.R.row(1).transpose();
-        const Eigen::Vector3d r2 = pose.R.row(2).transpose();
-        const Eigen::Vector3d row_a = xn * r2 - r0;
-        const Eigen::Vector3d row_b = yn * r2 - r1;
-        const double rhs_a = pose.t.x() - xn * pose.t.z();
-        const double rhs_b = pose.t.y() - yn * pose.t.z();
-        ata += row_a * row_a.transpose() + row_b * row_b.transpose();
-        atb += row_a * rhs_a + row_b * rhs_b;
+        if (ray.z() > 0.0) {
+            const double xn = ray.x() / ray.z();
+            const double yn = ray.y() / ray.z();
+            const Eigen::Vector3d r0 = pose.R.row(0).transpose();
+            const Eigen::Vector3d r1 = pose.R.row(1).transpose();
+            const Eigen::Vector3d r2 = pose.R.row(2).transpose();
+            const Eigen::Vector3d row_a = xn * r2 - r0;
+            const Eigen::Vector3d row_b = yn * r2 - r1;
+            const double rhs_a = pose.t.x() - xn * pose.t.z();
+            const double rhs_b = pose.t.y() - yn * pose.t.z();
+            ata += row_a * row_a.transpose() + row_b * row_b.transpose();
+            atb += row_a * rhs_a + row_b * rhs_b;
+        } else {
+            // [ray]_x (R X + t) = 0, i.e. (ray_x R) X = -ray_x t. The third
+            // row is linearly dependent; the normal equations only add rank 2.
+            const Eigen::Matrix3d a = skew(ray) * pose.R;
+            const Eigen::Vector3d b = -(skew(ray) * pose.t);
+            ata += a.transpose() * a;
+            atb += a.transpose() * b;
+        }
         ++used;
     }
     if (used < 2) {
