@@ -125,9 +125,8 @@ std::string meta_number(double value) {
 }  // namespace
 
 void OptimizeCamerasTask::declare_params(Params& params) const {
-    // Defaults follow Metashape's public Python API: the principal-point and
-    // low-order radial/tangential terms are fit, the affine pair and the highest
-    // radial term are not.
+    // Defaults fit the principal point and the low-order radial/tangential
+    // terms; the affine pair and the highest radial term stay fixed.
     params.declare({"fit_f", ParamType::Bool, true, "Adjust the focal length."});
     params.declare({"fit_cx", ParamType::Bool, true, "Adjust the principal point X offset."});
     params.declare({"fit_cy", ParamType::Bool, true, "Adjust the principal point Y offset."});
