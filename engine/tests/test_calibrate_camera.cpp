@@ -292,6 +292,12 @@ TEST(Calibrate, HomographyFromFourPoints) {
     }
     Eigen::Matrix3d recovered;
     ASSERT_TRUE(homography_dlt(board_points, pixels, recovered));
+    // A homography is defined up to scale, and the DLT returns unit Frobenius
+    // norm. Dividing by the (2,2) entry is the identity map but keeps the
+    // homogeneous third coordinate O(1), so the residual measures the DLT's
+    // accuracy instead of amplifying its gauge by the scale factor.
+    ASSERT_GT(std::abs(recovered(2, 2)), 0.0);
+    recovered *= truth(2, 2) / recovered(2, 2);
     for (std::size_t i = 0; i < board.size(); ++i) {
         const Eigen::Vector3d q =
             recovered * Eigen::Vector3d(board[i].x(), board[i].y(), 1.0);
@@ -366,16 +372,20 @@ TEST(Calibrate, SigmaMatchesEmpiricalSpread) {
 }
 
 TEST(Calibrate, NearFrontoParallelFailsCleanly) {
-    const Calibration truth = truth_calibration();
+    // Distortion-free on purpose: the closed form works from a homography, so
+    // a distorted board breaks the homography model by ~1% and would inject
+    // signal that this test is trying to rule out.
+    const Calibration truth =
+        Calibration::initial(CameraType::Frame, kWidth, kHeight, 1200.0);
     const Eigen::Vector3d centre(
         0.5 * static_cast<double>(kCols) * kSquare,
         0.5 * static_cast<double>(kRows) * kSquare, 0.0);
     std::vector<CalibrationView> views;
     for (int i = 0; i < 6; ++i) {
-        // Every board stays within half a degree of the image plane, where the
-        // two Zhang constraints carry no usable signal.
-        const double ax = 0.003 + 0.001 * static_cast<double>(i);
-        const double ay = 0.002 + 0.0005 * static_cast<double>(i);
+        // Every board stays well within half a degree of the image plane, where
+        // the two Zhang constraints carry no usable signal.
+        const double ax = 0.0012 + 0.0004 * static_cast<double>(i);
+        const double ay = 0.0009 + 0.0002 * static_cast<double>(i);
         const Eigen::Matrix3d rotation =
             (Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
              Eigen::AngleAxisd(ax, Eigen::Vector3d::UnitX()))
