@@ -125,11 +125,13 @@ FloatImage hessian_response(const FloatImage& smooth) {
 /// pixel centres (a half-pixel symmetry), where the two samples have equal
 /// response. Requiring a strictly greater value than every neighbour would
 /// then reject both, so equal-valued neighbours are accepted as a plateau as
-/// long as at least one neighbour is lower (which excludes flat regions).
+/// long as at least one neighbour is lower (which excludes flat regions). Each
+/// 8-connected plateau is then merged into a single candidate at its centroid,
+/// so refinement starts at the true half-pixel position.
 std::vector<Candidate> local_maxima(const FloatImage& response) {
     const int w = response.width();
     const int h = response.height();
-    std::vector<Candidate> out;
+    std::vector<Candidate> peaks;
     for (int y = 1; y + 1 < h; ++y) {
         for (int x = 1; x + 1 < w; ++x) {
             const float v = response.at(x, y);
@@ -158,9 +160,63 @@ std::vector<Candidate> local_maxima(const FloatImage& response) {
                 candidate.x = static_cast<double>(x);
                 candidate.y = static_cast<double>(y);
                 candidate.response = static_cast<double>(v);
-                out.push_back(candidate);
+                peaks.push_back(candidate);
             }
         }
+    }
+    if (peaks.size() < 2) {
+        return peaks;
+    }
+    std::map<std::pair<int, int>, std::size_t> lookup;
+    for (std::size_t i = 0; i < peaks.size(); ++i) {
+        lookup.emplace(std::make_pair(static_cast<int>(peaks[i].x),
+                                      static_cast<int>(peaks[i].y)),
+                       i);
+    }
+    std::vector<char> visited(peaks.size(), 0);
+    std::vector<Candidate> out;
+    for (std::size_t start = 0; start < peaks.size(); ++start) {
+        if (visited[start] != 0) {
+            continue;
+        }
+        const double value = peaks[start].response;
+        std::vector<std::size_t> stack;
+        stack.push_back(start);
+        visited[start] = 1;
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        std::size_t count = 0;
+        while (!stack.empty()) {
+            const std::size_t index = stack.back();
+            stack.pop_back();
+            sum_x += peaks[index].x;
+            sum_y += peaks[index].y;
+            ++count;
+            const int px = static_cast<int>(peaks[index].x);
+            const int py = static_cast<int>(peaks[index].y);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const auto found = lookup.find(std::make_pair(px + dx, py + dy));
+                    if (found == lookup.end()) {
+                        continue;
+                    }
+                    const std::size_t other = found->second;
+                    if (visited[other] != 0 || peaks[other].response != value) {
+                        continue;
+                    }
+                    visited[other] = 1;
+                    stack.push_back(other);
+                }
+            }
+        }
+        Candidate merged;
+        merged.x = sum_x / static_cast<double>(count);
+        merged.y = sum_y / static_cast<double>(count);
+        merged.response = value;
+        out.push_back(merged);
     }
     return out;
 }
