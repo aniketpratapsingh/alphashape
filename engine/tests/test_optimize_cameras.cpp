@@ -1288,4 +1288,53 @@ TEST(OptimizeMarkers, UnitScaleRespected) {
     EXPECT_LT(std::abs(rms_two - rms_one), 1e-6 * rms_one);
 }
 
+TEST(OptimizeMarkers, HorizontalOnlyControlKeepsGauge) {
+    // Horizontal-only anchors (no altitude) cannot replace the fixed-camera
+    // gauge: three of them would leave vertical translation free. With no GNSS
+    // priors at all the task must keep camera 0 fully fixed and stay finite.
+    Document document = aligned_document(geo_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_GT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+    for (Camera& camera : chunk.cameras()) {
+        camera.reference.enabled = false;  // no centre priors
+    }
+
+    const TruthOrigin origin = parse_geo_origin("geo_seq_truth.json");
+    const geo::Geodetic enu_origin{origin.lon, origin.lat, origin.height};
+    std::mt19937 rng(20261109u);
+    std::size_t added = 0;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value() || added == 4) {
+            continue;
+        }
+        const Eigen::Vector3d local = *track.point;
+        const geo::Geodetic geodetic = geo::enu_to_geodetic(local, enu_origin);
+        const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
+                                        std::numeric_limits<double>::quiet_NaN()};
+        add_marker(chunk, project_marker(chunk, local, 0.0, rng), reference, 0.05);
+        ++added;
+    }
+    ASSERT_EQ(added, 4U);
+
+    const Transform pose0_before = chunk.cameras()[0].pose;
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+
+    const double pose0_move =
+        (solved.cameras()[0].pose - pose0_before).cwiseAbs().maxCoeff();
+    std::printf("[optimize_markers] horizontal-only control: camera 0 move %.3e, "
+                "markers %g skipped %g\n",
+                pose0_move, meta_value(solved, "optimize_cameras.markers"),
+                meta_value(solved, "optimize_cameras.markers_skipped"));
+    EXPECT_LE(pose0_move, 1e-12) << "camera 0 was not held as the gauge";
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
+    for (const Camera& camera : solved.cameras()) {
+        EXPECT_TRUE(camera.pose.allFinite());
+    }
+    for (const Marker& marker : solved.markers()) {
+        ASSERT_TRUE(marker.position.has_value());
+        EXPECT_TRUE(marker.position->allFinite());
+    }
+}
+
 }  // namespace alphashape

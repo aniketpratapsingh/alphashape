@@ -14,11 +14,13 @@
 //     the local ENU frame -- inverse(transform) * geodetic_to_ecef(lon, lat, alt)
 //     -- weighted by reference.accuracy. A NaN altitude leaves the up axis
 //     unconstrained and is converted as alt = 0.
-//   * Gauge: when >= 3 priors have both horizontal axes constrained and their
-//     centres are not collinear, the priors pin all 7 similarity DoF, so every
-//     pose is left free and no scale anchor is set. Otherwise the first aligned
-//     camera is held fully constant and the scale is anchored on the aligned
-//     camera with the largest baseline to it (choose_scale_anchor_axis).
+//   * Gauge: when >= 3 anchors have all three axes constrained (finite sigma
+//     > 0 on x, y AND z) and their centres are not collinear, they pin all 7
+//     similarity DoF, so every pose is left free and no scale anchor is set.
+//     Horizontal-only anchors (for example a reference without altitude) do
+//     not count: they leave vertical translation free. Otherwise the first
+//     aligned camera is held fully constant and the scale is anchored on the
+//     aligned camera with the largest baseline to it (choose_scale_anchor_axis).
 //
 //   * Markers: every marker with >= 2 enabled projections in aligned cameras
 //     becomes a BA point whose observations are its projections. A referenced
@@ -479,20 +481,23 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
 
     // -- gauge --------------------------------------------------------------
-    // Count priors with both horizontal axes constrained and collect their
-    // centres; three non-collinear ones pin the whole similarity, otherwise fall
-    // back to fixing a camera and anchoring the scale.
+    // An anchor can replace the fixed-camera gauge only when it constrains all
+    // three axes: three horizontal-only anchors leave vertical translation a
+    // null direction. Collect the centres of fully constrained priors; three
+    // non-collinear ones pin the whole similarity, otherwise fall back to
+    // fixing a camera and anchoring the scale.
     std::vector<Eigen::Vector3d> prior_centres;
     for (const sfm::BACentrePrior& prior : problem.centre_priors) {
         const bool east = std::isfinite(prior.sigma.x()) && prior.sigma.x() > 0.0;
         const bool north = std::isfinite(prior.sigma.y()) && prior.sigma.y() > 0.0;
-        if (east && north) {
+        const bool up = std::isfinite(prior.sigma.z()) && prior.sigma.z() > 0.0;
+        if (east && north && up) {
             prior_centres.push_back(prior.centre);
         }
     }
 
-    // Non-check control points with both horizontal axes constrained count as
-    // gauge anchors alongside the camera priors. Their references are already in
+    // Non-check control points with all three axes constrained count as gauge
+    // anchors alongside the camera priors. Their references are already in
     // the same chunk-local frame.
     for (const sfm::BAControlPoint& control : problem.control_points) {
         if (control.checkpoint) {
@@ -500,7 +505,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
         const bool east = std::isfinite(control.sigma.x()) && control.sigma.x() > 0.0;
         const bool north = std::isfinite(control.sigma.y()) && control.sigma.y() > 0.0;
-        if (east && north) {
+        const bool up = std::isfinite(control.sigma.z()) && control.sigma.z() > 0.0;
+        if (east && north && up) {
             prior_centres.push_back(control.reference);
         }
     }
