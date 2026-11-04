@@ -485,31 +485,59 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
     }
 
+    // Non-check control points with both horizontal axes constrained count as
+    // gauge anchors alongside the camera priors. Their references are already in
+    // the same chunk-local frame.
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        const bool east = std::isfinite(control.sigma.x()) && control.sigma.x() > 0.0;
+        const bool north = std::isfinite(control.sigma.y()) && control.sigma.y() > 0.0;
+        if (east && north) {
+            prior_centres.push_back(control.reference);
+        }
+    }
+
     problem.fixed_pose.assign(problem.poses.size(), 0);
     if (prior_centres.size() >= 3 && centres_not_collinear(prior_centres)) {
         // The priors pin rotation, translation and scale: leave every pose free.
         problem.scale_anchor_camera = -1;
     } else {
         problem.fixed_pose[0] = 1;
-        // Anchor the scale on the aligned camera with the largest baseline to
-        // camera 0 (its centre is farthest).
-        const Eigen::Vector3d centre0 = -problem.poses[0].R.transpose() * problem.poses[0].t;
-        std::size_t anchor = 0;
-        double best = -1.0;
-        for (std::size_t b = 1; b < problem.poses.size(); ++b) {
-            const Eigen::Vector3d centre = -problem.poses[b].R.transpose() * problem.poses[b].t;
-            const double d = (centre - centre0).norm();
-            if (d > best) {
-                best = d;
-                anchor = b;
+        // A real (non-check) scale bar fixes the scale itself, so pinning a
+        // translation component as well would over-constrain the gauge.
+        bool scalebar_fixes_scale = false;
+        for (const sfm::BAScalebar& bar : problem.scalebars) {
+            const bool valid_sigma = std::isfinite(bar.sigma) && bar.sigma > 0.0;
+            if (!bar.checkpoint && valid_sigma && bar.length > 0.0) {
+                scalebar_fixes_scale = true;
+                break;
             }
         }
-        if (anchor != 0) {
-            problem.scale_anchor_camera = static_cast<int>(anchor);
-            problem.scale_anchor_axis =
-                sfm::choose_scale_anchor_axis(problem.poses[0], problem.poses[anchor]);
+        if (scalebar_fixes_scale) {
+            problem.scale_anchor_camera = -1;
         } else {
-            problem.scale_anchor_camera = -1;  // degenerate: no usable anchor
+            // Anchor the scale on the aligned camera with the largest baseline
+            // to camera 0 (its centre is farthest).
+            const Eigen::Vector3d centre0 = -problem.poses[0].R.transpose() * problem.poses[0].t;
+            std::size_t anchor = 0;
+            double best = -1.0;
+            for (std::size_t b = 1; b < problem.poses.size(); ++b) {
+                const Eigen::Vector3d centre = -problem.poses[b].R.transpose() * problem.poses[b].t;
+                const double d = (centre - centre0).norm();
+                if (d > best) {
+                    best = d;
+                    anchor = b;
+                }
+            }
+            if (anchor != 0) {
+                problem.scale_anchor_camera = static_cast<int>(anchor);
+                problem.scale_anchor_axis =
+                    sfm::choose_scale_anchor_axis(problem.poses[0], problem.poses[anchor]);
+            } else {
+                problem.scale_anchor_camera = -1;  // degenerate: no usable anchor
+            }
         }
     }
 
