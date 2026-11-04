@@ -410,8 +410,14 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
 
     // -- 1. gradient and step evidence ---------------------------------------
     std::vector<double> h(count, 0.0);
+    // A non-finite height is not evidence: it would poison every plane fit it
+    // touches (NaN comparisons are all false, so no later gate would catch it).
+    std::vector<std::uint8_t> usable = valid;
     for (std::size_t i = 0; i < count; ++i) {
         h[i] = static_cast<double>(heights[i]);
+        if (!std::isfinite(h[i])) {
+            usable[i] = 0U;
+        }
     }
     std::vector<double> gx(count, 0.0);
     std::vector<double> gy(count, 0.0);
@@ -421,7 +427,7 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
             bool complete = true;
             for (int dy = -1; dy <= 1 && complete; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
-                    if (valid[at(col + dx, row + dy)] == 0U) {
+                    if (usable[at(col + dx, row + dy)] == 0U) {
                         complete = false;
                         break;
                     }
@@ -447,8 +453,10 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     for (int row = 1; row + 1 < height; ++row) {
         for (int col = 1; col + 1 < width; ++col) {
             const std::size_t index = at(col, row);
-            // Slope threshold min_height / (2 cells), expressed per cell.
-            if (gm[index] < 0.5 * min_height) {
+            // Slope threshold min_height / (2 cells), expressed per cell. The
+            // negated test also rejects NaN: both `gm < t` and `gm >= t` are
+            // false for NaN, so only this form cannot let it through.
+            if (!(gm[index] >= 0.5 * min_height) || !std::isfinite(h[index])) {
                 continue;
             }
             const double ux = gx[index] / gm[index];
@@ -462,7 +470,7 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
                     const int sx = col + static_cast<int>(std::lround(sign * k * ux));
                     const int sy = row + static_cast<int>(std::lround(sign * k * uy));
                     if (sx < 0 || sy < 0 || sx >= width || sy >= height ||
-                        valid[at(sx, sy)] == 0U) {
+                        usable[at(sx, sy)] == 0U) {
                         continue;
                     }
                     if (sign < 0) {
@@ -538,7 +546,7 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     grid.height = height;
     grid.cell_size = cell_size;
     grid.h = &h;
-    grid.valid = &valid;
+    grid.valid = &usable;
     std::vector<double> best_h(count, 0.0);
     std::vector<double> best_dist(count, std::numeric_limits<double>::infinity());
     int accepted = 0;
