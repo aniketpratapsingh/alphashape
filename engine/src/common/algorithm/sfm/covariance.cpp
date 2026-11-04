@@ -291,6 +291,15 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                          " columns, expected " + std::to_string(layout.total);
             return out;
         }
+        if (row_count > 0) {
+            std::fprintf(stderr, "[cov] row0 cols:");
+            for (int j = row_begin[0]; j < row_begin[1]; ++j) {
+                std::fprintf(stderr, " %d", entry_cols[static_cast<std::size_t>(j)]);
+            }
+            std::fprintf(stderr, "\n[cov] reduced=%d first_point_col=%d\n",
+                         layout.reduced,
+                         layout.point_start.empty() ? -1 : layout.point_start[0]);
+        }
 
         // Hpp for every point, from its own three Jacobian columns.
         std::vector<Eigen::Matrix3d> point_normal(point_count,
