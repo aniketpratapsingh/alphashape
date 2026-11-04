@@ -36,10 +36,12 @@ std::uint8_t texture_byte(int x, int y, int channel) {
 }
 
 std::vector<std::uint8_t> make_texture() {
-    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(kSize) * kSize * 4U, 0);
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(kSize) * static_cast<std::size_t>(kSize) * 4U, 0);
     for (int y = 0; y < kSize; ++y) {
         for (int x = 0; x < kSize; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4U;
+            const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x)) * 4U;
             for (int c = 0; c < 3; ++c) {
                 rgba[i + static_cast<std::size_t>(c)] = texture_byte(x, y, c);
             }
@@ -62,7 +64,8 @@ Stats region_stats(const std::vector<std::uint8_t>& rgba, int x0, int y0, int w,
     const double n = static_cast<double>(w) * static_cast<double>(h);
     for (int y = y0; y < y0 + h; ++y) {
         for (int x = x0; x < x0 + w; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4U;
+            const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x)) * 4U;
             for (int c = 0; c < 3; ++c) {
                 const double v = static_cast<double>(rgba[i + static_cast<std::size_t>(c)]);
                 sum[static_cast<std::size_t>(c)] += v;
@@ -86,7 +89,8 @@ double region_mae(const std::vector<std::uint8_t>& a, const std::vector<std::uin
     double count = 0.0;
     for (int y = y0; y < y0 + h; ++y) {
         for (int x = x0; x < x0 + w; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4U;
+            const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x)) * 4U;
             for (int c = 0; c < 3; ++c) {
                 total += std::abs(static_cast<double>(a[i + static_cast<std::size_t>(c)]) -
                                   static_cast<double>(b[i + static_cast<std::size_t>(c)]));
@@ -105,7 +109,8 @@ TEST(TextureFill, ReproducesTexture) {
     std::array<double, 3> mean{};
     for (int y = kHoleY; y < kHoleY + kHole; ++y) {
         for (int x = kHoleX; x < kHoleX + kHole; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4U;
+            const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x)) * 4U;
             for (int c = 0; c < 3; ++c) {
                 mean[static_cast<std::size_t>(c)] +=
                     static_cast<double>(truth[i + static_cast<std::size_t>(c)]);
@@ -115,11 +120,13 @@ TEST(TextureFill, ReproducesTexture) {
     for (double& value : mean) {
         value /= static_cast<double>(kHole) * static_cast<double>(kHole);
     }
-    const std::size_t cells = static_cast<std::size_t>(kSize) * kSize;
+    const std::size_t cells =
+        static_cast<std::size_t>(kSize) * static_cast<std::size_t>(kSize);
     std::vector<std::uint8_t> mask(cells, 0);
     for (int y = kHoleY; y < kHoleY + kHole; ++y) {
         for (int x = kHoleX; x < kHoleX + kHole; ++x) {
-            const std::size_t cell = static_cast<std::size_t>(y) * kSize + x;
+            const std::size_t cell = static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x);
             const std::size_t i = cell * 4U;
             for (int c = 0; c < 3; ++c) {
                 started[i + static_cast<std::size_t>(c)] = static_cast<std::uint8_t>(
@@ -169,7 +176,8 @@ std::vector<std::uint8_t> make_centre_hole(std::vector<std::uint8_t>& image) {
     std::array<double, 3> mean{};
     for (int y = kHoleY; y < kHoleY + kHole; ++y) {
         for (int x = kHoleX; x < kHoleX + kHole; ++x) {
-            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4U;
+            const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x)) * 4U;
             for (int c = 0; c < 3; ++c) {
                 mean[static_cast<std::size_t>(c)] +=
                     static_cast<double>(image[i + static_cast<std::size_t>(c)]);
@@ -179,10 +187,12 @@ std::vector<std::uint8_t> make_centre_hole(std::vector<std::uint8_t>& image) {
     for (double& value : mean) {
         value /= static_cast<double>(kHole) * static_cast<double>(kHole);
     }
-    std::vector<std::uint8_t> mask(static_cast<std::size_t>(kSize) * kSize, 0);
+    std::vector<std::uint8_t> mask(
+        static_cast<std::size_t>(kSize) * static_cast<std::size_t>(kSize), 0);
     for (int y = kHoleY; y < kHoleY + kHole; ++y) {
         for (int x = kHoleX; x < kHoleX + kHole; ++x) {
-            const std::size_t cell = static_cast<std::size_t>(y) * kSize + x;
+            const std::size_t cell = static_cast<std::size_t>(y) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(x);
             for (int c = 0; c < 3; ++c) {
                 image[cell * 4U + static_cast<std::size_t>(c)] = static_cast<std::uint8_t>(
                     std::lround(mean[static_cast<std::size_t>(c)]));
@@ -211,14 +221,17 @@ TEST(TextureFill, Deterministic) {
 TEST(TextureFill, LargeComponentSkipped) {
     constexpr int width = 40;
     constexpr int height = 40;
-    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4U, 120);
-    std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * height, 0);
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U, 120);
+    std::vector<std::uint8_t> mask(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
     for (std::size_t i = 0; i < mask.size(); ++i) {
         rgba[i * 4U + 3U] = 255;
     }
     for (int y = 5; y < 35; ++y) {
         for (int x = 5; x < 35; ++x) {
-            mask[static_cast<std::size_t>(y) * width + x] = 1;
+            mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x)] = 1;
         }
     }
     const std::vector<std::uint8_t> before = rgba;
@@ -254,11 +267,14 @@ TEST(TextureFill, ValidCellsUntouched) {
 TEST(TextureFill, NoSourceSkips) {
     constexpr int width = 64;
     constexpr int height = 64;
-    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4U, 0);
-    std::vector<std::uint8_t> mask(static_cast<std::size_t>(width) * height, 0);
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U, 0);
+    std::vector<std::uint8_t> mask(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
     for (int y = 20; y < 40; ++y) {
         for (int x = 20; x < 40; ++x) {
-            const std::size_t cell = static_cast<std::size_t>(y) * width + x;
+            const std::size_t cell = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
             for (std::size_t c = 0; c < 3; ++c) {
                 rgba[cell * 4U + c] = 90;
             }
