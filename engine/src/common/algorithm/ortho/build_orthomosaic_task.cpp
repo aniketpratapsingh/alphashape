@@ -2809,9 +2809,17 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             // the same pinned margin cells, which it never relabels. A null
             // `deviant` scopes it to every island, not only ghosting artefacts.
             if (options.seam_min_region > 0) {
+                // filter_label_speckles works on this window only, so a region can
+                // never be larger than its cell count: cap the bound (in 64-bit,
+                // so the width*height product cannot overflow the int parameter).
+                const std::int64_t window_cells =
+                    static_cast<std::int64_t>(window.width) *
+                    static_cast<std::int64_t>(window.height);
+                const int region_cap = static_cast<int>(
+                    std::min<std::int64_t>(options.seam_min_region, window_cells));
                 const std::size_t removed = static_cast<std::size_t>(ortho::filter_label_speckles(
                     window.width, window.height, tiles, labels,
-                    frozen.empty() ? nullptr : &frozen, options.seam_min_region, nullptr));
+                    frozen.empty() ? nullptr : &frozen, region_cap, nullptr));
                 seam_regions_removed += removed;
                 if (Log::enabled(LogLevel::Info)) {
                     log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index
