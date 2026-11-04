@@ -160,6 +160,9 @@ TEST(TextureFill, ReproducesTexture) {
             << "the mean-colour initialisation should be almost flat";
     }
     EXPECT_LT(texture_mae, mean_mae);
+    // Not merely better than a flat mean: the completed texture must be close
+    // to the truth in absolute terms.
+    EXPECT_LT(texture_mae, 0.25 * mean_mae);
     std::printf("[texture fill] std in %.2f %.2f %.2f vs out %.2f %.2f %.2f; "
                 "MAE texture %.2f vs mean %.2f; %.3f s\n",
                 inside.stddev[0], inside.stddev[1], inside.stddev[2], texture.stddev[0],

@@ -1780,6 +1780,49 @@ TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
     EXPECT_EQ(block_margin_cells(0, 6), 0);
 }
 
+TEST(BuildOrthomosaic, TextureHoleFillRunsOnInteriorHoles) {
+    // End-to-end: "texture" must actually complete the holes the smooth pass
+    // fills, and touch nothing else. A cell with no camera label but an opaque
+    // result is exactly a hole the smooth fill completed.
+    OrthoSetup& s = setup();
+    Params params = ortho_params("average", "elevation", 0.125, true, false);
+    const Orthomosaic smooth = run_ortho(s, params);
+    ASSERT_FALSE(smooth.empty());
+    params.set("hole_fill_method", ParamValue{std::string("texture")});
+    const Orthomosaic texture = run_ortho(s, params);
+    ASSERT_EQ(texture.raster.grid, smooth.raster.grid);
+    ASSERT_EQ(texture.labels.size(), smooth.labels.size());
+
+    std::size_t holes = 0;
+    std::size_t changed = 0;
+    std::size_t touched_outside = 0;
+    for (std::size_t i = 0; i < smooth.labels.size(); ++i) {
+        const std::uint8_t* a = smooth.raster.data.data() + i * 4U;
+        const std::uint8_t* b = texture.raster.data.data() + i * 4U;
+        bool differs = false;
+        for (std::size_t c = 0; c < 4U; ++c) {
+            differs = differs || a[c] != b[c];
+        }
+        if (smooth.labels[i] >= 0 || a[3] == 0) {
+            touched_outside += differs ? 1U : 0U;
+            continue;
+        }
+        ++holes;
+        if (differs) {
+            ++changed;
+        }
+        EXPECT_EQ(static_cast<int>(b[3]), 255) << "a completed hole must be opaque";
+    }
+    std::printf("[BuildOrthomosaic.TextureFill] interior holes=%zu changed=%zu "
+                "touched-outside=%zu\n",
+                holes, changed, touched_outside);
+    if (holes == 0U) {
+        GTEST_SKIP() << "the aerial fixture has no interior hole to complete";
+    }
+    EXPECT_GT(changed, 0U) << "the texture pass never modified a hole";
+    EXPECT_EQ(touched_outside, 0U) << "texture fill must touch only smooth-filled cells";
+}
+
 TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {
     // A block side larger than the grid degenerates to the previous single-piece
     // run: the window is clipped to the whole grid, nothing is pinned, and the
