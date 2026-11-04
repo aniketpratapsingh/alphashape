@@ -223,9 +223,8 @@ TEST(TextureFill, Deterministic) {
 }
 
 TEST(TextureFill, WindowCapSkipsThinDiagonalComponent) {
-    // A diagonal is the bounding-box trap the old estimate missed: 64 cells, but
-    // its margin-dilated window is the whole raster. The window cap, not the
-    // cell count, decides, so this component must be skipped.
+    // A staircase is the bounding-box trap the old estimate missed: few cells,
+    // but its margin-dilated window is the whole raster.
     constexpr int width = 64;
     constexpr int height = 64;
     std::vector<std::uint8_t> rgba(
@@ -235,9 +234,16 @@ TEST(TextureFill, WindowCapSkipsThinDiagonalComponent) {
     for (std::size_t i = 0; i < mask.size(); ++i) {
         rgba[i * 4U + 3U] = 255;
     }
+    // A staircase is 4-connected but still spans the raster corner to corner:
+    // 127 cells whose margin-dilated window is the whole 64x64 = 4096 cells.
+    // The window cap, not the cell count, must decide, so it is skipped.
     for (int k = 0; k < width; ++k) {
         mask[static_cast<std::size_t>(k) * static_cast<std::size_t>(width) +
              static_cast<std::size_t>(k)] = 1;
+        if (k + 1 < width) {
+            mask[static_cast<std::size_t>(k) * static_cast<std::size_t>(width) +
+                 static_cast<std::size_t>(k + 1)] = 1;
+        }
     }
     const std::vector<std::uint8_t> before = rgba;
     ortho::TextureFillOptions options;
