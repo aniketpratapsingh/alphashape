@@ -163,8 +163,22 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     // bundle_adjust keeps the problem construction (free masks, manifolds and
     // robust losses) identical to the selection solves. It is a covariance
     // pass rather than a new selection solve, so it is not counted in solves.
+    // The pass is evaluation-only (max_iterations = 0): a real re-solve would
+    // round-trip the accepted poses through angle-axis and move them by ~1e-16,
+    // so the geometry is restored exactly and only the covariance fields are
+    // taken from that pass.
     if (want_covariance) {
-        report = bundle_adjust(problem, options.solve_options);
+        const BAProblem accepted_state = problem;
+        BAOptions covariance_options = options.solve_options;
+        covariance_options.max_iterations = 0;
+        const BAReport covariance_report = bundle_adjust(problem, covariance_options);
+        problem = accepted_state;
+        report.covariance_valid = covariance_report.covariance_valid;
+        report.covariance_reason = covariance_report.covariance_reason;
+        report.sigma0_squared = covariance_report.sigma0_squared;
+        report.camera_covariance = covariance_report.camera_covariance;
+        report.point_covariance = covariance_report.point_covariance;
+        report.calibration_covariance = covariance_report.calibration_covariance;
     }
     result.report = report;
     return result;
