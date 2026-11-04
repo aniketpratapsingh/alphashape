@@ -160,8 +160,15 @@ CalibrateCameraPlan plan_calibrate_camera(const Document& document,
         std::vector<CalibrationView> views;
         int width = 0;
         int height = 0;
-        entry.skipped = collect_sensor_views(document, *chunk, sensor, s, spec,
-                                             width, height, views);
+        // A frame that cannot be read, or a sensor whose frames disagree on
+        // size, disqualifies this sensor only; the remaining sensors still get
+        // their chance to calibrate.
+        try {
+            entry.skipped = collect_sensor_views(document, *chunk, sensor, s,
+                                                 spec, width, height, views);
+        } catch (const std::exception& error) {
+            entry.skipped = error.what();
+        }
         if (entry.skipped.empty() &&
             views.size() < static_cast<std::size_t>(kMinimumViews)) {
             entry.skipped = "need at least 3 views with a detected board";
