@@ -248,6 +248,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                                    keypoint_to_pixel(set->keypoints[observation.keypoint_index])});
         }
     }
+    const Transform& transform = chunk->transform();
+    const bool georeferenced =
+        (transform - Transform::Identity()).cwiseAbs().maxCoeff() > 1e-9;
     // -- marker points and their image observations -------------------------
     // A marker with at least two enabled projections in aligned cameras becomes
     // one BA point. Its projections are stored in the Calibration pixel
@@ -317,19 +320,77 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             problem.observations.push_back(sfm::BAObservation{camera, slot, pixel});
         }
     }
+    // -- control and check points -------------------------------------------
+    // Only a georeferenced chunk can tie a marker reference to the chunk-local
+    // frame. A referenced marker is control unless its meta role is
+    // "check_point"; a point without a reference stays a free point.
+    std::size_t control_markers = 0;
+    std::size_t checkpoint_markers = 0;
+    std::vector<std::size_t> check_marker;  // marker index per check control point
+    if (georeferenced) {
+        const Transform inverse = transform.inverse();
+        for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+            const Marker& marker = chunk->markers()[m];
+            if (!marker.reference.has_value() || marker_point[m] == kNoPoint) {
+                continue;
+            }
+            const Eigen::Vector3d& loc = *marker.reference;
+            if (!std::isfinite(loc.x()) || !std::isfinite(loc.y())) {
+                continue;  // no usable horizontal reference
+            }
+            const bool has_alt = std::isfinite(loc.z());
+            const geo::Geodetic geodetic{loc.x(), loc.y(), has_alt ? loc.z() : 0.0};
+            const Eigen::Vector3d ecef = geo::geodetic_to_ecef(geodetic);
+            sfm::BAControlPoint control;
+            control.point = marker_point[m];
+            control.reference =
+                (inverse.block<3, 3>(0, 0) * ecef) + inverse.block<3, 1>(0, 3);
+            control.sigma = marker.reference_accuracy;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double sigma = control.sigma[axis];
+                if (!std::isfinite(sigma) || sigma <= 0.0) {
+                    control.sigma[axis] = 0.0;  // unconstrained axis
+                }
+            }
+            if (!has_alt) {
+                control.sigma.z() = 0.0;  // no altitude: leave the up axis free
+            }
+            const std::string* role = marker.meta.find("type");
+            control.checkpoint = role != nullptr && *role == "check_point";
+            if (control.checkpoint) {
+                ++checkpoint_markers;
+                check_marker.push_back(m);
+            } else {
+                ++control_markers;
+            }
+            problem.control_points.push_back(control);
+        }
+    } else {
+        std::size_t ungeoreferenced = 0;
+        for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+            if (chunk->markers()[m].reference.has_value() && marker_point[m] != kNoPoint) {
+                ++ungeoreferenced;
+            }
+        }
+        if (ungeoreferenced > 0) {
+            log(LogLevel::Info)
+                << "OptimizeCameras: markers have references but the chunk is not "
+                   "georeferenced; run georeferencing first";
+        }
+    }
     (void)marker_point;  // consumed by the control-point and write-back stages
+    (void)check_marker;  // consumed by the write-back stage
     if (Log::enabled(LogLevel::Info)) {
         log(LogLevel::Info) << "OptimizeCameras: "
                             << (chunk->markers().size() - markers_skipped) << " marker points, "
                             << markers_skipped
-                            << " markers skipped (fewer than 2 projections or no triangulation)";
+                            << " markers skipped (fewer than 2 projections or no triangulation), "
+                            << control_markers << " control points, " << checkpoint_markers
+                            << " check points";
     }
     progress.update("prepare", 1.0);
 
     // -- GNSS centre priors (georeferenced chunks only) ---------------------
-    const Transform& transform = chunk->transform();
-    const bool georeferenced =
-        (transform - Transform::Identity()).cwiseAbs().maxCoeff() > 1e-9;
     if (georeferenced) {
         const Transform inverse = transform.inverse();
         for (std::size_t b = 0; b < camera_index.size(); ++b) {
