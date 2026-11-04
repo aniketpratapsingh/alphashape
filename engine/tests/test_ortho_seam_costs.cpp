@@ -80,6 +80,112 @@ std::size_t cell_at(int width, int col, int row) {
            static_cast<std::size_t>(col);
 }
 
+/// Independent restatement of the objective in seamlines.hpp: the score
+/// shortfall data term plus the pairwise seam cost, written as plain loops over
+/// the OrthoTile accessors (no Field, no shared helpers) so a drift in
+/// energy()/pair_cost_at() shows up here. It follows the executable scaling in
+/// pair_cost_at(): the grey disagreement is the channel sum over kGreyRange =
+/// 255, and a tile that does not cover an edge end contributes no colour there
+/// while the pair still pays its smoothness (the uncovered-end rule).
+double reference_energy(int width, int height, const std::vector<OrthoTile>& tiles,
+                        const std::vector<std::int32_t>& labels, const SeamOptions& options) {
+    const auto valid_at = [](const OrthoTile& tile, int col, int row) {
+        return tile.contains(col, row) && tile.valid[tile.index(col, row)] != 0;
+    };
+    const auto score_at = [](const OrthoTile& tile, int col, int row) {
+        return static_cast<double>(tile.score[tile.index(col, row)]);
+    };
+    const auto best_at = [&](int col, int row) {
+        double best = 0.0;
+        for (const OrthoTile& tile : tiles) {
+            if (valid_at(tile, col, row)) {
+                best = std::max(best, score_at(tile, col, row));
+            }
+        }
+        return best;
+    };
+    const auto colour_sum = [&](std::int32_t a, std::int32_t b, int col, int row) {
+        if (a < 0 || b < 0) {
+            return 0.0;
+        }
+        const OrthoTile& ta = tiles[static_cast<std::size_t>(a)];
+        const OrthoTile& tb = tiles[static_cast<std::size_t>(b)];
+        if (!valid_at(ta, col, row) || !valid_at(tb, col, row)) {
+            return 0.0;
+        }
+        const std::size_t ia = ta.index(col, row) * 3U;
+        const std::size_t ib = tb.index(col, row) * 3U;
+        double sum = 0.0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            sum += std::abs(static_cast<int>(ta.rgb[ia + c]) -
+                            static_cast<int>(tb.rgb[ib + c]));
+        }
+        return sum;
+    };
+    const auto gradient = [&](std::int32_t a, std::int32_t b, int pcol, int prow, int qcol,
+                              int qrow) {
+        if (a < 0 || b < 0) {
+            return 0.0;
+        }
+        const OrthoTile& ta = tiles[static_cast<std::size_t>(a)];
+        const OrthoTile& tb = tiles[static_cast<std::size_t>(b)];
+        if (!valid_at(ta, pcol, prow) || !valid_at(ta, qcol, qrow) ||
+            !valid_at(tb, pcol, prow) || !valid_at(tb, qcol, qrow)) {
+            return 0.0;
+        }
+        const std::size_t ap = ta.index(pcol, prow) * 3U;
+        const std::size_t aq = ta.index(qcol, qrow) * 3U;
+        const std::size_t bp = tb.index(pcol, prow) * 3U;
+        const std::size_t bq = tb.index(qcol, qrow) * 3U;
+        double sum = 0.0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const int da =
+                static_cast<int>(ta.rgb[aq + c]) - static_cast<int>(ta.rgb[ap + c]);
+            const int db =
+                static_cast<int>(tb.rgb[bq + c]) - static_cast<int>(tb.rgb[bp + c]);
+            sum += std::abs(da - db);
+        }
+        return sum / (3.0 * 255.0);
+    };
+    double total = 0.0;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t cell = cell_at(width, col, row);
+            const std::int32_t label = labels[cell];
+            // Callers pass only valid labels, so no infinite data cost arises.
+            if (label >= 0) {
+                const OrthoTile& tile = tiles[static_cast<std::size_t>(label)];
+                if (valid_at(tile, col, row)) {
+                    total +=
+                        options.data_weight * (best_at(col, row) - score_at(tile, col, row));
+                }
+            }
+            // Count each unordered 4-neighbour edge once: right, then down.
+            for (int dir = 0; dir < 2; ++dir) {
+                const int qcol = dir == 0 ? col + 1 : col;
+                const int qrow = dir == 0 ? row : row + 1;
+                if (qcol >= width || qrow >= height) {
+                    continue;
+                }
+                const std::int32_t other = labels[cell_at(width, qcol, qrow)];
+                if (label == other || label < 0 || other < 0) {
+                    continue;
+                }
+                total += options.seam_weight *
+                         (colour_sum(label, other, col, row) +
+                          colour_sum(label, other, qcol, qrow)) /
+                         255.0;
+                total += options.smoothness;
+                if (options.gradient_weight > 0.0) {
+                    total += options.gradient_weight *
+                             gradient(label, other, col, row, qcol, qrow);
+                }
+            }
+        }
+    }
+    return total;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -203,6 +309,39 @@ TEST(SeamCosts, DefaultIsByteIdentical) {
     Params params = make_params(builtin_registry().require("BuildOrthomosaic"));
     EXPECT_DOUBLE_EQ(params.get_float("seam_gradient_weight"), 0.0);
     EXPECT_EQ(params.get_int("seam_min_region"), std::int64_t{0});
+}
+
+// The optimiser and the independent restatement must agree on the objective,
+// for the labelling assign_seams returns and for a random valid one. This is
+// what gives the byte-identical check above its meaning: both sides there run
+// the same new code, so only an independent evaluation can catch a drift.
+TEST(SeamCosts, EnergyMatchesIndependentReference) {
+    constexpr int kWidth = 64;
+    constexpr int kHeight = 64;
+    constexpr double kTolerance = 1e-9;
+    std::mt19937 rng(20261104U);
+    std::vector<OrthoTile> tiles;
+    tiles.push_back(make_noise_tile(kWidth, kHeight, 0.55F, rng));
+    tiles.push_back(make_noise_tile(kWidth, kHeight, 0.60F, rng));
+    tiles.push_back(make_noise_tile(kWidth, kHeight, 0.65F, rng));
+
+    const SeamOptions defaults;
+    const std::vector<std::int32_t> optimised = assign_seams(kWidth, kHeight, tiles, defaults);
+    const double got = energy(kWidth, kHeight, tiles, optimised, defaults);
+    const double expected = reference_energy(kWidth, kHeight, tiles, optimised, defaults);
+    EXPECT_LE(std::abs(got - expected), kTolerance * std::max(1.0, std::abs(expected)));
+
+    // Every cell picks a random tile; all three cover the whole grid, so no
+    // infinite data cost is involved. One rng() call per statement.
+    std::vector<std::int32_t> random_labels(cell_at(kWidth, 0, kHeight));
+    for (std::int32_t& label : random_labels) {
+        label = static_cast<std::int32_t>(rng() % tiles.size());
+    }
+    const double random_got = energy(kWidth, kHeight, tiles, random_labels, defaults);
+    const double random_expected =
+        reference_energy(kWidth, kHeight, tiles, random_labels, defaults);
+    EXPECT_LE(std::abs(random_got - random_expected),
+              kTolerance * std::max(1.0, std::abs(random_expected)));
 }
 
 // ---------------------------------------------------------------------------
