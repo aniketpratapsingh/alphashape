@@ -650,6 +650,70 @@ int apriltag_max_hamming(double tolerance, AprilTagFamily family) {
     return std::clamp(value, 0, cap);
 }
 
+bool is_known_target_type(const std::string& target_type) {
+    return parse_target(target_type).valid;
+}
+
+bool is_coded_target_type(const std::string& target_type) {
+    const ParsedTarget parsed = parse_target(target_type);
+    if (!parsed.valid) {
+        return false;
+    }
+    return parsed.spec.kind == MarkerKind::CircularCoded ||
+           parsed.spec.kind == MarkerKind::AprilTag;
+}
+
+std::string valid_target_type_names() { return valid_target_names(); }
+
+std::vector<ImageDetection> detect_targets_in_image(
+    const FloatImage& image, const std::string& target_type, double tolerance,
+    bool inverted, bool noparity, double minimum_size, double minimum_dist) {
+    const ParsedTarget parsed = parse_target(target_type);
+    if (parsed.circle21_unsupported) {
+        throw ValueError(
+            "DetectMarkers: target_type \"AprilTagCircle21h7\" is not supported "
+            "yet: its published tags are circular, so no quad candidate exists "
+            "(see LIMITATIONS.md)");
+    }
+    if (!parsed.valid) {
+        throw ValueError("DetectMarkers: unknown target_type '" + target_type +
+                         "'; valid values are: " + valid_target_names());
+    }
+    if (!(tolerance >= 0.0 && tolerance <= 100.0)) {
+        throw ValueError("DetectMarkers: tolerance must be in [0, 100]");
+    }
+    if (!(minimum_size >= 0.0) || !(minimum_dist >= 0.0)) {
+        throw ValueError(
+            "DetectMarkers: minimum_size and minimum_dist must be non-negative");
+    }
+    DetectorParams params;
+    params.noparity = noparity;
+    params.minimum_size = minimum_size;
+    params.minimum_dist = minimum_dist;
+    if (parsed.spec.kind == MarkerKind::AprilTag) {
+        params.max_hamming =
+            apriltag_max_hamming(tolerance, parsed.spec.family);
+    } else if (parsed.spec.kind == MarkerKind::CircularCoded) {
+        params.max_hamming = circular_max_hamming(tolerance);
+    }
+    FloatImage inverted_image;
+    const FloatImage* source = &image;
+    if (inverted) {
+        inverted_image = image;
+        invert_in_place(inverted_image);
+        source = &inverted_image;
+    }
+    std::vector<Detection> found = suppress_duplicates(
+        detect_in_image(*source, parsed.spec, params), minimum_dist);
+    std::vector<ImageDetection> out;
+    out.reserve(found.size());
+    for (const Detection& detection : found) {
+        out.push_back({detection.code, detection.center, detection.radius,
+                       detection.coded});
+    }
+    return out;
+}
+
 namespace {
 
 struct CameraJob {

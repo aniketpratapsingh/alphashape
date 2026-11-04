@@ -1,5 +1,6 @@
 #include "image/io/exif.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -473,6 +474,9 @@ void Parser::handle_entry(const Entry& entry, IfdKind kind) {
         case 0x9003:  // DateTimeOriginal
             if (auto v = read_ascii(entry)) out_.datetime_original = *v;
             break;
+        case 0x9291:  // SubSecTimeOriginal
+            if (auto v = read_ascii(entry)) out_.subsec_time_original = *v;
+            break;
         case 0x920A:  // FocalLength
             if (auto v = read_rational(entry, 0)) out_.focal_length_mm = *v;
             break;
@@ -628,6 +632,111 @@ void scan_png(const std::uint8_t* data, std::size_t size, ExifData& out) {
     }
 }
 
+/// Bytes read from a TIFF before falling back to the whole file.
+constexpr std::size_t kExifPrefixBytes = 256U * 1024U;
+
+/// Re-reads up to `limit` bytes from the start. Returns false on a short read.
+bool read_prefix(std::ifstream& in, std::size_t limit,
+                 std::vector<std::uint8_t>& out) {
+    out.assign(limit, std::uint8_t{0});
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    if (limit == 0) {
+        return true;
+    }
+    in.read(reinterpret_cast<char*>(out.data()),
+            static_cast<std::streamsize>(limit));
+    return static_cast<std::size_t>(in.gcount()) == limit;
+}
+
+/// Streams a JPEG's marker segments and materialises only the first APP1 Exif
+/// payload. Nothing beyond that segment is read.
+std::optional<std::vector<std::uint8_t>> stream_jpeg_exif(std::ifstream& in) {
+    in.clear();
+    in.seekg(2, std::ios::beg);
+    std::uint8_t pair[2];
+    while (in.read(reinterpret_cast<char*>(pair), 2)) {
+        if (pair[0] != 0xFF) {
+            return std::nullopt;
+        }
+        std::uint8_t marker = pair[1];
+        while (marker == 0xFF) {  // fill bytes
+            if (!in.read(reinterpret_cast<char*>(pair), 1)) {
+                return std::nullopt;
+            }
+            marker = pair[0];
+        }
+        if (marker == 0xD8) {  // SOI
+            continue;
+        }
+        if (marker == 0xDA || marker == 0xD9) {  // SOS / EOI
+            return std::nullopt;
+        }
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;  // TEM and RSTn carry no length
+        }
+        std::uint8_t length_bytes[2];
+        if (!in.read(reinterpret_cast<char*>(length_bytes), 2)) {
+            return std::nullopt;
+        }
+        const std::size_t length =
+            (static_cast<std::size_t>(length_bytes[0]) << 8) |
+            static_cast<std::size_t>(length_bytes[1]);
+        if (length < 2) {
+            return std::nullopt;
+        }
+        const std::size_t payload = length - 2;
+        if (marker == 0xE1 && payload >= 6) {
+            std::uint8_t header[6];
+            if (!in.read(reinterpret_cast<char*>(header), 6)) {
+                return std::nullopt;
+            }
+            if (std::memcmp(header, "Exif\0\0", 6) == 0) {
+                std::vector<std::uint8_t> block(payload - 6);
+                if (!in.read(reinterpret_cast<char*>(block.data()),
+                             static_cast<std::streamsize>(block.size()))) {
+                    return std::nullopt;
+                }
+                return block;
+            }
+            in.seekg(static_cast<std::streamoff>(payload - 6), std::ios::cur);
+            continue;
+        }
+        in.seekg(static_cast<std::streamoff>(payload), std::ios::cur);
+    }
+    return std::nullopt;
+}
+
+/// Streams PNG chunk headers and materialises only the eXIf payload.
+std::optional<std::vector<std::uint8_t>> stream_png_exif(std::ifstream& in) {
+    in.clear();
+    in.seekg(8, std::ios::beg);
+    std::uint8_t header[8];
+    while (in.read(reinterpret_cast<char*>(header), 8)) {
+        const std::uint32_t length =
+            (static_cast<std::uint32_t>(header[0]) << 24) |
+            (static_cast<std::uint32_t>(header[1]) << 16) |
+            (static_cast<std::uint32_t>(header[2]) << 8) |
+            static_cast<std::uint32_t>(header[3]);
+        if (std::memcmp(header + 4, "eXIf", 4) == 0) {
+            if (length > kMaxValueBytes) {
+                return std::nullopt;
+            }
+            std::vector<std::uint8_t> block(length);
+            if (!in.read(reinterpret_cast<char*>(block.data()),
+                         static_cast<std::streamsize>(block.size()))) {
+                return std::nullopt;
+            }
+            return block;
+        }
+        if (std::memcmp(header + 4, "IEND", 4) == 0) {
+            return std::nullopt;
+        }
+        in.seekg(static_cast<std::streamoff>(length) + 4, std::ios::cur);
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -703,6 +812,56 @@ ExifData read_exif(const std::string& path) {
     // Any other container yields a default ExifData; malformed metadata never
     // throws, only a failure to open the file does (handled above).
     return out;
+}
+
+std::optional<CaptureTime> read_capture_time(const std::string& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        throw ProjectIOError("cannot open image '" + path + "'");
+    }
+    const std::streamoff end = in.tellg();
+    if (end < 0) {
+        throw ProjectIOError("cannot determine size of '" + path + "'");
+    }
+    in.seekg(0, std::ios::beg);
+    std::uint8_t magic[8] = {};
+    in.read(reinterpret_cast<char*>(magic), 8);
+    const std::size_t got = static_cast<std::size_t>(in.gcount());
+    ExifData data;
+    std::optional<std::vector<std::uint8_t>> block;
+    if (got >= 4 && magic[0] == 0xFF && magic[1] == 0xD8) {
+        block = stream_jpeg_exif(in);
+    } else if (got >= 8 && magic[0] == 0x89 && magic[1] == 'P' &&
+               magic[2] == 'N' && magic[3] == 'G') {
+        block = stream_png_exif(in);
+    } else if (got >= 8 && ((magic[0] == 'I' && magic[1] == 'I') ||
+                            (magic[0] == 'M' && magic[1] == 'M'))) {
+        const std::size_t size = static_cast<std::size_t>(end);
+        const std::size_t prefix =
+            std::min<std::size_t>(size, kExifPrefixBytes);
+        std::vector<std::uint8_t> bytes;
+        if (read_prefix(in, prefix, bytes)) {
+            data = parse_exif_tiff_block(bytes.data(), bytes.size());
+        }
+        if (!data.datetime_original && size > prefix) {
+            bytes.assign(size, std::uint8_t{0});
+            if (read_prefix(in, size, bytes)) {
+                data = parse_exif_tiff_block(bytes.data(), bytes.size());
+            }
+        }
+    } else {
+        return std::nullopt;
+    }
+    if (block) {
+        if (block->empty()) {
+            return std::nullopt;
+        }
+        data = parse_exif_tiff_block(block->data(), block->size());
+    }
+    if (!data.datetime_original || data.datetime_original->empty()) {
+        return std::nullopt;
+    }
+    return CaptureTime{*data.datetime_original, data.subsec_time_original};
 }
 
 }  // namespace alphashape

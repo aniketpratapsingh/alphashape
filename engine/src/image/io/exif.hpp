@@ -49,6 +49,7 @@ struct ExifData {
     std::optional<std::string> body_serial;        // 0xA431
     std::optional<std::string> lens_model;         // 0xA434
     std::optional<std::string> datetime_original;  // 0x9003
+    std::optional<std::string> subsec_time_original;  // 0x9291
     std::optional<double> focal_length_mm;             // 0x920A RATIONAL
     std::optional<double> focal_length_35mm;           // 0xA405 SHORT, widened to double
     std::optional<double> focal_plane_x_resolution;    // 0xA20E RATIONAL
@@ -91,6 +92,24 @@ struct ExifData {
 /// Any other container, or a file with no metadata, yields a default ExifData.
 /// Throws Error only when the file itself cannot be opened.
 ExifData read_exif(const std::string& path);
+
+/// The two EXIF fields needed to order a sequence, without loading the image.
+struct CaptureTime {
+    std::string datetime_original;                     // 0x9003, raw text
+    std::optional<std::string> subsec_time_original;   // 0x9291, raw text
+};
+
+/// Reads only capture-time metadata, leaving the pixel data unread.
+///
+///  * JPEG: streams the marker segments and materialises only the first APP1
+///    Exif payload. Stops at SOS.
+///  * PNG: streams chunk headers and materialises only the eXIf payload.
+///  * TIFF: reads a bounded prefix (256 KiB) and falls back to the whole file
+///    only when the prefix did not reach DateTimeOriginal.
+///
+/// Returns nullopt when the file has no usable DateTimeOriginal. Throws Error
+/// only when the file itself cannot be opened, like `read_exif`.
+std::optional<CaptureTime> read_capture_time(const std::string& path);
 
 /// Parses a raw TIFF-structured block: the block must begin with a TIFF header
 /// ("II*\0" or "MM\0*"). This is what `read_exif` hands to the parser once it

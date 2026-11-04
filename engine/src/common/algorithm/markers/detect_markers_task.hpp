@@ -47,14 +47,39 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/Core>
+
 #include "common/algorithm/markers/tag_families.hpp"
 #include "common/commands/command.hpp"
 #include "common/tasks/task.hpp"
+#include "image/image.hpp"
 
 namespace alphashape {
 
 int circular_max_hamming(double tolerance);
 int apriltag_max_hamming(double tolerance, AprilTagFamily family);
+
+/// One target found by the same per-image detection pass DetectMarkers uses.
+/// `code` is -1 for a non-coded target.
+struct ImageDetection {
+    int code = -1;
+    Eigen::Vector2d center = Eigen::Vector2d::Zero();
+    double radius = 0.0;
+    bool coded = false;
+};
+
+/// Detect targets of `target_type` in one already-decoded luminance image.
+/// This is the exact detector DetectMarkers runs, exposed for TrackMarkers'
+/// local redetection (and any other caller that must not re-implement it).
+/// Throws ValueError for an unknown style or an out-of-range tolerance.
+std::vector<ImageDetection> detect_targets_in_image(
+    const FloatImage& image, const std::string& target_type,
+    double tolerance = 50.0, bool inverted = false, bool noparity = false,
+    double minimum_size = 0.0, double minimum_dist = 5.0);
+
+bool is_known_target_type(const std::string& target_type);
+bool is_coded_target_type(const std::string& target_type);
+std::string valid_target_type_names();
 
 struct DetectMarkersStats {
     std::size_t detected = 0;
