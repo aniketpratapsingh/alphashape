@@ -64,13 +64,17 @@ const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
     return nullptr;
 }
 
-const Frame* frame_of_camera(const Chunk& chunk, std::int32_t camera_id) {
+/// Builds the camera id -> frame map once, so resolving every selected camera
+/// is a lookup instead of a scan over the chunk's frames.
+std::unordered_map<std::int32_t, const Frame*> frames_by_camera(
+    const Chunk& chunk) {
+    std::unordered_map<std::int32_t, const Frame*> frames;
     for (const auto& frame : chunk.frames()) {
-        if (frame && frame->camera_id() == camera_id) {
-            return frame.get();
+        if (frame) {
+            frames.emplace(frame->camera_id(), frame.get());
         }
     }
-    return nullptr;
+    return frames;
 }
 
 std::filesystem::path resolve_frame_path(const Document& document,
@@ -208,6 +212,8 @@ std::vector<SequenceCamera> selected_sequence(
             throw ValueError("TrackMarkers: no camera with label '" + label + "'");
         }
     }
+    const std::unordered_map<std::int32_t, const Frame*> frames =
+        frames_by_camera(chunk);
     std::vector<SequenceCamera> sequence;
     for (std::size_t index = 0; index < chunk.cameras().size(); ++index) {
         const Camera& camera = chunk.cameras()[index];
@@ -216,7 +222,9 @@ std::vector<SequenceCamera> selected_sequence(
         if (!selected) {
             continue;
         }
-        const Frame* frame = frame_of_camera(chunk, camera.id);
+        const auto linked = frames.find(camera.id);
+        const Frame* frame =
+            linked == frames.end() ? nullptr : linked->second;
         if (frame == nullptr) {
             if (!filters.empty()) {
                 throw ValueError("TrackMarkers: camera '" + camera.label +
@@ -871,14 +879,15 @@ struct LocalProjection {
     bool enabled = true;
 };
 
+/// Camera id -> index into the marker's projection state, built once per
+/// marker. Both passes append to `state` and keep the index in step.
+using ProjectionIndex = std::unordered_map<std::int32_t, std::size_t>;
+
 const LocalProjection* find_projection(const std::vector<LocalProjection>& state,
+                                       const ProjectionIndex& index,
                                        std::int32_t camera_id) {
-    for (const LocalProjection& projection : state) {
-        if (projection.camera_id == camera_id) {
-            return &projection;
-        }
-    }
-    return nullptr;
+    const auto found = index.find(camera_id);
+    return found == index.end() ? nullptr : &state[found->second];
 }
 
 struct TrackStep {
@@ -935,11 +944,11 @@ void track_marker_pass(const Chunk& chunk, const Marker& marker,
                        const std::vector<std::size_t>& order,
                        FrameCache& cache, const TrackMarkersOptions& options,
                        std::vector<LocalProjection>& state,
-                       MarkerTrackResult& result) {
+                       ProjectionIndex& index, MarkerTrackResult& result) {
     int start = -1;
     for (std::size_t pos = 0; pos < order.size(); ++pos) {
         const LocalProjection* projection = find_projection(
-            state, sequence[order[pos]].camera->id);
+            state, index, sequence[order[pos]].camera->id);
         if (projection && projection->enabled) {
             start = static_cast<int>(pos);
             break;
@@ -950,12 +959,13 @@ void track_marker_pass(const Chunk& chunk, const Marker& marker,
     }
     std::size_t anchor_pos = static_cast<std::size_t>(start);
     Eigen::Vector2d anchor =
-        find_projection(state, sequence[order[anchor_pos]].camera->id)->pixel;
+        find_projection(state, index, sequence[order[anchor_pos]].camera->id)
+            ->pixel;
     int misses = 0;
     for (std::size_t pos = anchor_pos + 1; pos < order.size(); ++pos) {
         const SequenceCamera& next = sequence[order[pos]];
         const LocalProjection* existing =
-            find_projection(state, next.camera->id);
+            find_projection(state, index, next.camera->id);
         if (existing) {
             if (existing->enabled) {
                 anchor_pos = pos;
@@ -968,6 +978,7 @@ void track_marker_pass(const Chunk& chunk, const Marker& marker,
             track_step(chunk, marker, sequence[order[anchor_pos]], anchor,
                        next, cache, options);
         if (step.ok) {
+            index.emplace(next.camera->id, state.size());
             state.push_back({next.camera->id, step.pixel, true});
             result.adds.push_back({next.camera->id, step.pixel});
             if (step.redetected) {
@@ -997,6 +1008,7 @@ MarkerTrackResult track_marker(const Chunk& chunk, const Marker& marker,
     result.marker_id = marker.id;
     std::vector<LocalProjection> state;
     state.reserve(marker.projections.size());
+    ProjectionIndex index;
     for (const MarkerProjection& projection : marker.projections) {
         // A non-finite pixel is unusable as an anchor and unsafe to cast when
         // redetection crops around it. Skipping the marker keeps the same
@@ -1005,13 +1017,16 @@ MarkerTrackResult track_marker(const Chunk& chunk, const Marker& marker,
             result.skipped = true;
             return result;
         }
-        state.push_back({projection.camera_id, projection.pixel,
-                         projection.enabled});
+        if (index.find(projection.camera_id) == index.end()) {
+            index.emplace(projection.camera_id, state.size());
+            state.push_back({projection.camera_id, projection.pixel,
+                             projection.enabled});
+        }
     }
     bool anchored = false;
     for (const SequenceCamera& entry : sequence) {
         const LocalProjection* projection =
-            find_projection(state, entry.camera->id);
+            find_projection(state, index, entry.camera->id);
         if (projection && projection->enabled) {
             anchored = true;
             break;
@@ -1025,12 +1040,12 @@ MarkerTrackResult track_marker(const Chunk& chunk, const Marker& marker,
     std::iota(order.begin(), order.end(), std::size_t{0});
     if (options.direction == "forward" || options.direction == "both") {
         track_marker_pass(chunk, marker, sequence, order, cache, options,
-                          state, result);
+                          state, index, result);
     }
     if (options.direction == "backward" || options.direction == "both") {
         std::reverse(order.begin(), order.end());
         track_marker_pass(chunk, marker, sequence, order, cache, options,
-                          state, result);
+                          state, index, result);
     }
     return result;
 }
