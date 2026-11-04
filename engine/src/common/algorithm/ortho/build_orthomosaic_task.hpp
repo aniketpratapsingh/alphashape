@@ -152,6 +152,10 @@ struct OrthoBlockPlanInput {
     /// plan must know: estimating it for a fill_holes=false run would coarsen a
     /// grid that actually fits.
     bool fill_holes = true;
+    /// True when those holes are completed by the exemplar texture pass. Only
+    /// then does a per-component window stay resident, so only then is the
+    /// texture window charged; the smooth default keeps the old estimate.
+    bool texture_fill = false;
     /// True when a colour-correction pass (gain or affine) runs BEFORE the block
     /// loop. Its sampled points, per-camera colours and observations are a
     /// separate, earlier peak that the plan has to account for.
@@ -218,10 +222,13 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
                                  std::uint64_t photo_cache_bytes, bool fill_holes = true,
-                                 bool ghosting = false, bool seam_merge = false);
+                                 bool ghosting = false, bool seam_merge = false,
+                                 bool texture_fill = false);
 /// The peak of the assembled-grid fill_holes stage alone (labels + RGBA + one
 /// channel's float plane, validity mask, EDT and banded Sibson accumulators).
-double estimate_fill_holes_peak_bytes(std::uint64_t output_cells);
+/// `texture_fill` adds the resident per-component texture window; the smooth
+/// fill alone is byte-for-byte the estimate it always was.
+double estimate_fill_holes_peak_bytes(std::uint64_t output_cells, bool texture_fill = false);
 
 /// The peak of the colour-correction pass that runs BEFORE the block loop, in
 /// bytes. It is a separate peak in time from the block stages (the pass returns

@@ -1629,6 +1629,15 @@ TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
     const double staged = small.estimated_window_bytes;
     const double fill = small.estimated_fill_bytes;
     EXPECT_GT(fill, 0.0) << "the assembled-grid fill_holes stage must be in the plan";
+    // The default SMOOTH method pays no texture window: the plan's fill figure
+    // is the function's smooth value exactly (the value origin/main computed),
+    // and asking for texture only adds.
+    const std::uint64_t output_cells =
+        static_cast<std::uint64_t>(kSide) * static_cast<std::uint64_t>(kSide);
+    EXPECT_DOUBLE_EQ(fill, estimate_fill_holes_peak_bytes(output_cells));
+    EXPECT_DOUBLE_EQ(fill, estimate_fill_holes_peak_bytes(output_cells, false));
+    EXPECT_GT(estimate_fill_holes_peak_bytes(output_cells, true), fill)
+        << "the texture method must charge its window";
     EXPECT_GT(staged, assembled) << "the window stages must be there on top of the assembled grid";
     EXPECT_DOUBLE_EQ(small.estimated_peak_bytes,
                      std::max(staged, fill) + static_cast<double>(small.photo_cache_bytes));
