@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -185,24 +186,71 @@ double colour_sum_at(const Field& field, int a, int b, int col, int row) {
     return sum;
 }
 
-/// The seam penalty of one grid edge p--q between labels a and b: zero when the
-/// labels agree or either is the empty label, else the mean per-channel grey
-/// disagreement over the two ends (sum of channel differences / 255, in [0, 3])
-/// scaled by seam_weight, plus the constant `smoothness` change penalty.
-double seam_cost_at(const Field& field, int a, int b, int pcol, int prow, int qcol, int qrow,
-                    const SeamOptions& options) {
+/// The along-edge gradient mismatch of the two tiles at grid edge p--q:
+///
+///     ( 1/3 * sum_c | ( I_a(q,c) - I_a(p,c) ) - ( I_b(q,c) - I_b(p,c) ) | ) / 255
+///
+/// in [0, 1]. Zero when the tiles differ only by a constant brightness offset
+/// (a seam crossing them costs nothing extra); large where the structure they
+/// show disagrees, as parallax on a building edge or a misaligned line does.
+/// Defined only where BOTH tiles cover BOTH ends; elsewhere it is zero, which
+/// keeps the gradient term exactly aligned with the colour term and leaves the
+/// existing truncation/submodularity logic untouched. It reads only the four
+/// pixel values the colour term already reads, so nothing extra is stored, and
+/// it works unchanged on the coarse levels' block-mean tiles.
+inline double gradient_term_at(const Field& field, int a, int b, int pcol, int prow, int qcol,
+                               int qrow) {
+    if (a < 0 || b < 0) {
+        return 0.0;  // the colour term is zero here too
+    }
+    const std::size_t ta = static_cast<std::size_t>(a);
+    const std::size_t tb = static_cast<std::size_t>(b);
+    if (!field.valid_at(ta, pcol, prow) || !field.valid_at(ta, qcol, qrow) ||
+        !field.valid_at(tb, pcol, prow) || !field.valid_at(tb, qcol, qrow)) {
+        return 0.0;
+    }
+    const std::uint8_t* ap = field.rgb_at(ta, pcol, prow);
+    const std::uint8_t* aq = field.rgb_at(ta, qcol, qrow);
+    const std::uint8_t* bp = field.rgb_at(tb, pcol, prow);
+    const std::uint8_t* bq = field.rgb_at(tb, qcol, qrow);
+    double sum = 0.0;
+    for (int c = 0; c < 3; ++c) {
+        const int da = static_cast<int>(aq[c]) - static_cast<int>(ap[c]);
+        const int db = static_cast<int>(bq[c]) - static_cast<int>(bp[c]);
+        sum += std::abs(da - db);
+    }
+    return sum / (3.0 * kGreyRange);
+}
+
+/// The SINGLE source of truth for the pair cost of one grid edge p--q between
+/// labels a and b: zero when the labels agree or either is the empty label,
+/// else the mean per-channel grey disagreement over the two ends (sum of
+/// channel differences / 255, in [0, 3]) scaled by seam_weight, plus the
+/// constant `smoothness` change penalty.
+///
+/// Alpha-expansion, ICM and energy() all reach this function (the linear-cell
+/// `pair_cost()` below is only a coordinate wrapper), so the three can never
+/// drift apart. The gradient-matching term lives here too.
+inline double pair_cost_at(const Field& field, int a, int b, int pcol, int prow, int qcol,
+                           int qrow, const SeamOptions& options) {
     if (a == b || a < 0 || b < 0) {
         return 0.0;
     }
     const double disagreement =
         (colour_sum_at(field, a, b, pcol, prow) + colour_sum_at(field, a, b, qcol, qrow)) /
         kGreyRange;
-    return options.seam_weight * disagreement + options.smoothness;
+    double cost = options.seam_weight * disagreement + options.smoothness;
+    // Opt-in, and bit-identical to the old objective when off: the extra term is
+    // not even evaluated, so a zero weight cannot change any arithmetic.
+    if (options.gradient_weight > 0.0) {
+        cost += options.gradient_weight * gradient_term_at(field, a, b, pcol, prow, qcol, qrow);
+    }
+    return cost;
 }
 
-/// The linear-cell form of seam_cost_at(), for the callers that only have cell
+/// The linear-cell form of pair_cost_at(), for the callers that only have cell
 /// indices (the alpha-expansion graph and the energy report).
-double seam_cost(const Field& field, int a, int b, std::size_t p, std::size_t q,
+double pair_cost(const Field& field, int a, int b, std::size_t p, std::size_t q,
                  const SeamOptions& options) {
     if (a == b || a < 0 || b < 0) {
         return 0.0;
@@ -211,7 +259,7 @@ double seam_cost(const Field& field, int a, int b, std::size_t p, std::size_t q,
     const int prow = static_cast<int>(p / static_cast<std::size_t>(field.width));
     const int qcol = static_cast<int>(q % static_cast<std::size_t>(field.width));
     const int qrow = static_cast<int>(q / static_cast<std::size_t>(field.width));
-    return seam_cost_at(field, a, b, pcol, prow, qcol, qrow, options);
+    return pair_cost_at(field, a, b, pcol, prow, qcol, qrow, options);
 }
 
 /// True when tile `t` is marked deviant at (col, row) and is not the only view
@@ -495,12 +543,12 @@ double total_energy(const Field& field, const std::vector<std::int32_t>& labels,
             }
             // Count each unordered neighbour pair once (right and down).
             if (col + 1 < width && labels[cell + 1] != label) {
-                total += seam_cost_at(field, label, labels[cell + 1], col, row, col + 1, row,
+                total += pair_cost_at(field, label, labels[cell + 1], col, row, col + 1, row,
                                       options);
             }
             if (row + 1 < height &&
                 labels[cell + static_cast<std::size_t>(width)] != label) {
-                total += seam_cost_at(field, label,
+                total += pair_cost_at(field, label,
                                       labels[cell + static_cast<std::size_t>(width)], col, row,
                                       col, row + 1, options);
             }
@@ -606,10 +654,10 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
         }
         const int lp = labels[pc];
         const int lq = labels[qc];
-        const double e10 = seam_cost(field, alpha, lq, pc, qc, options);
-        const double e01 = seam_cost(field, lp, alpha, pc, qc, options);
+        const double e10 = pair_cost(field, alpha, lq, pc, qc, options);
+        const double e01 = pair_cost(field, lp, alpha, pc, qc, options);
         if (np >= 0 && nq >= 0) {
-            double e00 = seam_cost(field, lp, lq, pc, qc, options);
+            double e00 = pair_cost(field, lp, lq, pc, qc, options);
             if (e00 > e01 + e10) {
                 e00 = e01 + e10;  // non-submodular truncation
             }
@@ -625,9 +673,9 @@ bool expand_alpha(const Field& field, std::vector<std::int32_t>& labels, int alp
         } else if (np >= 0) {
             // q cannot switch (already alpha or outside the region): p keeps
             // at e00 and switches at e10.
-            add_fixed_unary(np, seam_cost(field, lp, lq, pc, qc, options), e10);
+            add_fixed_unary(np, pair_cost(field, lp, lq, pc, qc, options), e10);
         } else {
-            add_fixed_unary(nq, seam_cost(field, lp, lq, pc, qc, options), e01);
+            add_fixed_unary(nq, pair_cost(field, lp, lq, pc, qc, options), e01);
         }
     };
     for (int row = 0; row < height; ++row) {
@@ -741,7 +789,7 @@ void icm_sweep(const Field& field, std::vector<std::int32_t>& labels,
                     static_cast<int>(neighbours[n] % static_cast<std::size_t>(width));
                 const int nrow =
                     static_cast<int>(neighbours[n] / static_cast<std::size_t>(width));
-                current_seam[n] = seam_cost_at(field, current, labels[neighbours[n]], col, row,
+                current_seam[n] = pair_cost_at(field, current, labels[neighbours[n]], col, row,
                                                ncol, nrow, options);
             }
 
@@ -758,7 +806,7 @@ void icm_sweep(const Field& field, std::vector<std::int32_t>& labels,
                         static_cast<int>(neighbours[n] % static_cast<std::size_t>(width));
                     const int nrow =
                         static_cast<int>(neighbours[n] / static_cast<std::size_t>(width));
-                    delta += seam_cost_at(field, label, labels[neighbours[n]], col, row, ncol,
+                    delta += pair_cost_at(field, label, labels[neighbours[n]], col, row, ncol,
                                           nrow, options) -
                              current_seam[n];
                 }
