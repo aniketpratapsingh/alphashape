@@ -560,6 +560,8 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         }
         Eigen::SparseMatrix<double> normal;
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+        /// Jacobi equilibration factors, one per reduced column.
+        Eigen::VectorXd scale;
         if (layout.reduced > 0) {
             const std::size_t block_count = layout.blocks.size();
             std::vector<Eigen::Triplet<double>> triplets;
@@ -588,6 +590,25 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             normal = Eigen::SparseMatrix<double>(layout.reduced, layout.reduced);
             normal.setFromTriplets(triplets.begin(), triplets.end());
             normal.makeCompressed();
+            // Jacobi equilibration. Rotation, translation and intrinsic columns
+            // differ by many orders of magnitude, so the raw Schur complement is
+            // badly scaled and a plain factorisation loses several digits of the
+            // inverse. Solve D S D y = D b with D = diag(1/sqrt(S_ii)) and
+            // x = D y instead; the scaled system has a unit diagonal and its
+            // solution matches a fully pivoted dense inverse much more closely.
+            scale = Eigen::VectorXd::Ones(layout.reduced);
+            for (int i = 0; i < layout.reduced; ++i) {
+                const double diagonal = normal.coeff(i, i);
+                if (diagonal > 0.0 && std::isfinite(diagonal)) {
+                    scale[i] = 1.0 / std::sqrt(diagonal);
+                }
+            }
+            for (int k = 0; k < normal.outerSize(); ++k) {
+                for (Eigen::SparseMatrix<double>::InnerIterator it(normal, k); it;
+                     ++it) {
+                    it.valueRef() *= scale[it.row()] * scale[it.col()];
+                }
+            }
             ldlt.compute(normal);
             if (ldlt.info() != Eigen::Success) {
                 out.reason =
@@ -633,7 +654,13 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 for (std::size_t k = 0; k < global_columns.size(); ++k) {
                     rhs(global_columns[k], static_cast<Eigen::Index>(k)) = 1.0;
                 }
-                const Eigen::MatrixXd solution = ldlt.solve(rhs);
+                Eigen::MatrixXd solution;
+                if (scale.size() == layout.reduced) {
+                    solution = ldlt.solve(scale.asDiagonal() * rhs);
+                    solution = scale.asDiagonal() * solution;
+                } else {
+                    solution = ldlt.solve(rhs);
+                }
                 Eigen::Matrix<double, 6, 6> block =
                     Eigen::Matrix<double, 6, 6>::Zero();
                 for (std::size_t a = 0; a < global_columns.size(); ++a) {
@@ -666,7 +693,13 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 for (int k = 0; k < block->size; ++k) {
                     rhs(block->start + k, k) = 1.0;
                 }
-                const Eigen::MatrixXd solution = ldlt.solve(rhs);
+                Eigen::MatrixXd solution;
+                if (scale.size() == layout.reduced) {
+                    solution = ldlt.solve(scale.asDiagonal() * rhs);
+                    solution = scale.asDiagonal() * solution;
+                } else {
+                    solution = ldlt.solve(rhs);
+                }
                 Eigen::MatrixXd covariance = Eigen::MatrixXd::Zero(n, n);
                 for (int a = 0; a < block->size; ++a) {
                     for (int b = 0; b < block->size; ++b) {
@@ -688,7 +721,13 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                         rhs.row(work.columns[k]) =
                             work.weight.row(static_cast<Eigen::Index>(k));
                     }
-                    const Eigen::MatrixXd solution = ldlt.solve(rhs);
+                    Eigen::MatrixXd solution;
+                    if (scale.size() == layout.reduced) {
+                        solution = ldlt.solve(scale.asDiagonal() * rhs);
+                        solution = scale.asDiagonal() * solution;
+                    } else {
+                        solution = ldlt.solve(rhs);
+                    }
                     for (std::size_t k = 0; k < work.columns.size(); ++k) {
                         covariance +=
                             work.weight.row(static_cast<Eigen::Index>(k))
