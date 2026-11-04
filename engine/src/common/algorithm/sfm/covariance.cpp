@@ -472,6 +472,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             Eigen::MatrixXd weight;  // Hcp * Hpp^-1, one row per column
         };
         std::vector<PointWork> point_work;
+        double weight_norm = 0.0;
         for (std::size_t p = 0; p < point_count; ++p) {
             if (point_included[p] == 0) {
                 continue;
@@ -535,6 +536,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                     cross[order[t]].transpose();
             }
             work.weight = work.weight * work.inverse;
+            weight_norm += work.weight.norm();
             std::vector<std::pair<int, std::vector<int>>> by_block;
             for (std::size_t t = 0; t < work.columns.size(); ++t) {
                 const int b =
@@ -569,9 +571,9 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         }
         std::fprintf(stderr,
                      "[cov] included=%zu work=%zu accum_blocks=%zu dropped=%zu "
-                     "hcc_norm=%g schur_norm=%g\n",
+                     "hcc_norm=%g schur_norm=%g weight_norm=%g\n",
                      included_count, point_work.size(), accumulator.size(),
-                     out.points_dropped, hcc_norm, accumulator_norm());
+                     out.points_dropped, hcc_norm, accumulator_norm(), weight_norm);
         Eigen::SparseMatrix<double> normal;
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
         if (layout.reduced > 0) {
