@@ -273,9 +273,14 @@ bool solve_refinement(const std::vector<CalibrationView>& views,
                       const CalibrationFitFlags& fit,
                       const std::vector<std::array<double, 6>>& start_poses,
                       int max_iterations, Refinement& out) {
+    // The pruning re-solve passes this same Refinement's blocks back in as the
+    // start, so copy them before resetting `out` or the inputs alias the
+    // storage that the reset clears.
+    const Packed start_copy = start;
+    const std::vector<std::array<double, 6>> poses_copy = start_poses;
     out = Refinement{};
-    out.intrinsics = start;
-    out.poses = start_poses;
+    out.intrinsics = start_copy;
+    out.poses = poses_copy;
     ceres::Problem problem;
     std::vector<int> held;
     for (int k = 0; k < kCalibrationParamCount; ++k) {
