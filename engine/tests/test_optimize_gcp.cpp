@@ -38,8 +38,7 @@ Calibration frame_calibration() {
     c.width = 640;
     c.height = 480;
     c.f = 600.0;
-    c.cx = 320.0;
-    c.cy = 240.0;
+    // cx/cy are offsets from the image centre; 0 is a centred principal point.
     return c;
 }
 
@@ -133,6 +132,16 @@ TEST(Optimize, GcpNetworkRecoversTransform) {
     apply_similarity(problem, 1.3, q, Eigen::Vector3d(2.0, -1.0, 3.0));
 
     const std::array<std::size_t, 5> control = {0, 17, 42, 88, 150};
+    ASSERT_FALSE(truth.problem.observations.empty());
+    for (const std::size_t index : control) {
+        std::size_t seen = 0;
+        for (const BAObservation& obs : truth.problem.observations) {
+            if (obs.point == index) {
+                ++seen;
+            }
+        }
+        ASSERT_GE(seen, 2u);
+    }
     for (const std::size_t index : control) {
         BAControlPoint cp;
         cp.point = index;

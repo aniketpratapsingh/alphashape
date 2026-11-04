@@ -231,8 +231,11 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
         if (!std::isfinite(cal.f) || cal.f == 0.0) {
             continue;
         }
-        const double xn = (obs.pixel.x() - cal.cx) / cal.f;
-        const double yn = (obs.pixel.y() - cal.cy) / cal.f;
+        // Calibration::cx/cy are offsets from the image centre.
+        const double cx = 0.5 * static_cast<double>(cal.width) + cal.cx;
+        const double cy = 0.5 * static_cast<double>(cal.height) + cal.cy;
+        const double xn = (obs.pixel.x() - cx) / cal.f;
+        const double yn = (obs.pixel.y() - cy) / cal.f;
         const BAPose& pose = problem.poses[obs.camera];
         const Eigen::Vector3d r0 = pose.R.row(0).transpose();
         const Eigen::Vector3d r1 = pose.R.row(1).transpose();
