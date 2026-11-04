@@ -379,7 +379,9 @@ public:
             pending_.erase(camera_id);
             if (!error) {
                 if (!view) {
+                    // Counted under the lock: decodes now run in parallel.
                     failed_.push_back(camera_id);
+                    ++stats_.unreadable_cameras;
                 } else {
                     insert_locked(view);
                 }
@@ -451,7 +453,6 @@ std::shared_ptr<SequenceView> FrameCache::decode(const SequenceCamera& entry) {
             throw Error(message);
         }
         log(LogLevel::Warn) << message;
-        ++stats_.unreadable_cameras;
         return nullptr;
     }
 }
