@@ -252,6 +252,11 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
     if (ts.size() < 5U) {
         return false;
     }
+    // Straightness: a merged clutter component (e.g. a wavy natural edge)
+    // leaves many candidates away from the fitted line.
+    if (static_cast<double>(ts.size()) < 0.9 * static_cast<double>(cells.size())) {
+        return false;
+    }
     const double tmin = percentile(ts, 0.05);
     const double tmax = percentile(ts, 0.95);
     if ((tmax - tmin) * grid.cell_size < min_length) {
@@ -314,8 +319,13 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
     if (!left.ok || !right.ok || !(hi > lo)) {
         return false;
     }
-    const double residual_limit = std::max(0.10, 0.35 * min_height);
-    if (left.rms > residual_limit || right.rms > residual_limit) {
+    // The sides of a genuine step are planar; a curved roof or rough natural
+    // terrain is not, and its fitted planes would smear the snap. Compare the
+    // rms with the robust step between the side medians: the full band range
+    // would let roughness inflate its own tolerance.
+    const double measured_step = std::abs(median_of(rh) - median_of(lh));
+    const double residual_limit = std::max(0.05, 0.15 * measured_step);
+    if (!(left.rms <= residual_limit) || !(right.rms <= residual_limit)) {
         return false;
     }
     int sign = 0;
@@ -326,8 +336,9 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
         const double step = plane_value(left, px, py) - plane_value(right, px, py);
         // A real discontinuity cannot be taller than the whole band's height
         // range; a larger extrapolated step means the two plane fits latched
-        // onto different features.
-        if (std::abs(step) < min_height || std::abs(step) > hi - lo) {
+        // onto different features. The step must also keep the same sign and
+        // clear step_min_height at both ends and the middle.
+        if (!(std::abs(step) >= min_height) || std::abs(step) > hi - lo) {
             return false;
         }
         const int this_sign = step > 0.0 ? 1 : -1;

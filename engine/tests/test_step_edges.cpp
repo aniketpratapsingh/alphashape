@@ -209,6 +209,42 @@ std::vector<double> gaussian_blur(const std::vector<double>& in, int width, int 
     return out;
 }
 
+/// Smooth deterministic value noise in [-1, 1].
+double value_noise(double x, double y, std::uint32_t seed) {
+    const auto hash = [seed](int ix, int iy) {
+        std::uint32_t h = static_cast<std::uint32_t>(ix) * 374761393U +
+                          static_cast<std::uint32_t>(iy) * 668265263U + seed;
+        h = (h ^ (h >> 13U)) * 1274126177U;
+        h ^= h >> 16U;
+        return static_cast<double>(h & 0xffffU) / 32767.5 - 1.0;
+    };
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+    const double sx = fx * fx * (3.0 - 2.0 * fx);
+    const double sy = fy * fy * (3.0 - 2.0 * fy);
+    const double a = hash(x0, y0) + (hash(x0 + 1, y0) - hash(x0, y0)) * sx;
+    const double b =
+        hash(x0, y0 + 1) + (hash(x0 + 1, y0 + 1) - hash(x0, y0 + 1)) * sx;
+    return a + (b - a) * sy;
+}
+
+/// Three octaves of value noise; `x` and `y` are in base-feature cells.
+double fractal_noise(double x, double y, std::uint32_t seed) {
+    double sum = 0.0;
+    double amplitude = 1.0;
+    double norm = 0.0;
+    for (int octave = 0; octave < 3; ++octave) {
+        sum += amplitude * value_noise(x, y, seed + static_cast<std::uint32_t>(octave) * 7919U);
+        norm += amplitude;
+        x *= 2.0;
+        y *= 2.0;
+        amplitude *= 0.5;
+    }
+    return sum / norm;
+}
+
 /// One synthetic observation: the truth surface, the blurred-and-noisy input
 /// the pass sees, and the true outlines for the error bands.
 struct Scene {
@@ -539,7 +575,97 @@ TEST(StepEdges, SegmentEndsAreNotExtended) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. BuildDem integration: the parameter is opt-in, and when enabled it only
+// ---------------------------------------------------------------------------
+// 8. A natural cliff is wavy and rough, not a straight two-plane step. The
+//    tightened gates must reject every segment and leave the surface alone.
+// ---------------------------------------------------------------------------
+
+TEST(StepEdges, NaturalCliffIsUntouched) {
+    const int width = 160;
+    const int height = 160;
+    const std::size_t count =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    std::vector<double> rough(count, 0.0);
+    double mean = 0.0;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(col);
+            rough[index] = fractal_noise(static_cast<double>(col) / 8.0,
+                                         static_cast<double>(row) / 8.0, 17U);
+            mean += rough[index];
+        }
+    }
+    mean /= static_cast<double>(count);
+    double variance = 0.0;
+    for (const double value : rough) {
+        variance += (value - mean) * (value - mean);
+    }
+    const double sigma = std::sqrt(variance / static_cast<double>(count));
+    std::vector<double> surface(count, 0.0);
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(col);
+            const double x = static_cast<double>(col) * kCell;
+            const double y = static_cast<double>(row) * kCell;
+            // The cliff line waves by 3 cells with a 12 m wavelength.
+            const double cliff_x = 20.0 + 3.0 * kCell * std::sin(2.0 * kPi * y / 12.0);
+            const double step = x < cliff_x ? 1.5 : 0.0;
+            const double noise = 0.30 * (rough[index] - mean) / sigma;  // sigma 0.3 m
+            surface[index] = ground_height(x) + step + noise;
+        }
+    }
+    const std::vector<double> blurred = gaussian_blur(surface, width, height, 1.0);
+    std::vector<float> values(blurred.begin(), blurred.end());
+    const std::vector<float> original = values;
+    const std::vector<std::uint8_t> valid = all_valid(values.size());
+    StepEdgeOptions options;
+    options.min_height = 1.0;  // the cliff step is 1.5 m
+    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    EXPECT_EQ(segments, 0);
+    EXPECT_TRUE(values == original);
+}
+
+// ---------------------------------------------------------------------------
+// 9. A barrel-vault roof meets the ground with a curved, vertical-tangent
+//    side. Its upper "plane" is not a plane, so the rms gate rejects it.
+// ---------------------------------------------------------------------------
+
+TEST(StepEdges, CurvedRoofEdgeIsRejectedByRms) {
+    const int width = 200;
+    const int height = 120;
+    std::vector<double> surface(static_cast<std::size_t>(width) *
+                                static_cast<std::size_t>(height), 0.0);
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const double x = static_cast<double>(col) * kCell;
+            double value = ground_height(x);
+            // A 10 m radius semicircular vault spanning x = 20..40 m.
+            if (x >= 20.0 && x <= 40.0) {
+                const double u = x - 30.0;
+                value += std::sqrt(std::max(0.0, 100.0 - u * u));
+            }
+            surface[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                    static_cast<std::size_t>(col)] = value;
+        }
+    }
+    const std::vector<double> blurred = gaussian_blur(surface, width, height, 1.5);
+    std::vector<float> values(blurred.begin(), blurred.end());
+    const std::vector<float> original = values;
+    const std::vector<std::uint8_t> valid = all_valid(values.size());
+    StepEdgeOptions options;
+    options.min_height = 1.5;
+    // A wide fit band sees the curvature the default 5-cell band misses.
+    options.band_half_width = 40;
+    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    EXPECT_EQ(segments, 0);
+    EXPECT_TRUE(values == original);
+}
+
+// 10. BuildDem integration: the parameter is opt-in, and when enabled it only
 //    rewrites the band around a detected step.
 // ---------------------------------------------------------------------------
 
