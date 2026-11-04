@@ -395,6 +395,11 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     if (heights.size() != count || valid.size() != count) {
         throw ValueError("refine_step_edges: heights and valid must hold width*height cells");
     }
+    // Component labels are int (one label per cell); beyond this the labelled
+    // pass cannot run. Such a DEM (2^31 cells) is far outside the product.
+    if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return 0;
+    }
     const double min_height = std::max(1e-6, options.min_height);
     const double min_length = std::max(0.0, options.min_length);
     const int band = std::max(2, options.band_half_width);

@@ -297,7 +297,8 @@ TEST(StepEdges, RebuildsBuildingOutlines) {
     const int segments = refine_step_edges(values, valid, width, height, kCell, options);
     const BandErrors after = measure_band_error(values, scene, width, height);
 
-    std::printf("step edges: band-error %.4f -> %.4f m (%.1f%%), away %.4f -> %.4f m\n",
+    // The bracketed lowercase tag surfaces this line from the CI test log.
+    std::printf("[step edges] band-error %.4f -> %.4f m (%.1f%%), away %.4f -> %.4f m\n",
                 before.band, after.band, 100.0 * (1.0 - after.band / before.band), before.away,
                 after.away);
     EXPECT_GE(segments, 6);
@@ -478,9 +479,9 @@ TEST(StepEdges, CornersStayWithinTheBandRange) {
                     if (nr < 0 || nc < 0 || nr >= height || nc >= width) {
                         continue;
                     }
-                    const double value = original[static_cast<std::size_t>(nr) *
-                                                      static_cast<std::size_t>(width) +
-                                                  static_cast<std::size_t>(nc)];
+                    const double value = static_cast<double>(
+                        original[static_cast<std::size_t>(nr) * static_cast<std::size_t>(width) +
+                                 static_cast<std::size_t>(nc)]);
                     lo = std::min(lo, value);
                     hi = std::max(hi, value);
                 }
