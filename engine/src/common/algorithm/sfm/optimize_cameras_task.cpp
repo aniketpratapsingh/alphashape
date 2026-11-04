@@ -251,6 +251,14 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     const Transform& transform = chunk->transform();
     const bool georeferenced =
         (transform - Transform::Identity()).cwiseAbs().maxCoeff() > 1e-9;
+    // Local->ECEF scale. Chunk-local units are metres only when this is 1; every
+    // metre-valued sigma and length below is divided by it, and every reported
+    // metre-valued RMS is multiplied by it.
+    const double local_scale =
+        std::cbrt(std::abs(transform.block<3, 3>(0, 0).determinant()));
+    if (!std::isfinite(local_scale) || local_scale <= 0.0) {
+        throw ValueError("OptimizeCameras: chunk transform has no usable scale");
+    }
     // -- marker points and their image observations -------------------------
     // A marker with at least two enabled projections in aligned cameras becomes
     // one BA point. Its projections are stored in the Calibration pixel
@@ -454,7 +462,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             sfm::BACentrePrior prior;
             prior.camera = b;
             prior.centre = (inverse.block<3, 3>(0, 0) * ecef) + inverse.block<3, 1>(0, 3);
-            prior.sigma = camera.reference.accuracy;
+            prior.sigma = camera.reference.accuracy / local_scale;
             if (!has_alt) {
                 prior.sigma.z() = 0.0;  // no altitude: leave the up axis unconstrained
             }
