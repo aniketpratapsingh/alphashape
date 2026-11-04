@@ -1609,6 +1609,11 @@ PYBIND11_MODULE(alphashape, m) {
         .def("trackMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "TrackMarkers", std::move(kwargs));
         })
+        // Weighted similarity update from references and control points
+        // (WP-13.12): the same run_task call as the UpdateTransform task.
+        .def("updateTransform", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "UpdateTransform", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"

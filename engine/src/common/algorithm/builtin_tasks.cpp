@@ -28,6 +28,7 @@
 #endif
 #include "common/algorithm/sfm/align_cameras_task.hpp"
 #include "common/algorithm/sfm/optimize_cameras_task.hpp"
+#include "common/algorithm/sfm/update_transform_task.hpp"
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
 #include "common/algorithm/stereo/build_point_cloud_task.hpp"
 #include "common/algorithm/texture/build_texture_task.hpp"
@@ -45,6 +46,7 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MatchPhotosTask>());
     registry.register_task(std::make_shared<AlignCamerasTask>());
     registry.register_task(std::make_shared<OptimizeCamerasTask>());
+    registry.register_task(std::make_shared<UpdateTransformTask>());
     registry.register_task(std::make_shared<BuildDepthMapsTask>());
     registry.register_task(std::make_shared<BuildPointCloudTask>());
     registry.register_task(std::make_shared<BuildModelTask>());
