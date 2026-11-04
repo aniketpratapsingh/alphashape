@@ -138,7 +138,9 @@ struct BAOptions {
 struct BAReport {
     bool usable = false;  ///< Ceres returned a usable solution
     int iterations = 0;
-    double initial_rms_px = 0, final_rms_px = 0;  ///< plain (non-robust) RMS over all observations
+    /// Plain (non-robust) RMS over the non-check observations (check points are
+    /// scored only after re-triangulation).
+    double initial_rms_px = 0, final_rms_px = 0;
     std::size_t observations = 0;
 
     /// Number of constrained prior axes (sigma finite and > 0) over all priors.
@@ -169,8 +171,9 @@ struct BAReport {
 BAReport bundle_adjust(BAProblem& problem, const BAOptions& options);
 
 /// RMS reprojection error in pixels (no Ceres; usable anywhere). Observations
-/// whose point falls behind a Frame camera count as a fixed large error (see
-/// kBehindCameraErrorPx in the .cpp).
+/// of check points are excluded (they are scored only after re-triangulation,
+/// see BAReport). Observations whose point falls behind a Frame camera count as
+/// a fixed large error (see kBehindCameraErrorPx in the .cpp).
 double reprojection_rms_px(const BAProblem& problem);
 
 /// The translation axis of `pose1` best suited as the scale anchor when `pose0`

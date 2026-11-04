@@ -439,9 +439,17 @@ double reprojection_rms_px(const BAProblem& problem) {
     if (problem.observations.empty()) {
         return 0.0;
     }
+    // Check-point observations are scored separately (and only after
+    // re-triangulation), so they must not dilute the image-space RMS.
+    const std::vector<std::uint8_t> check = effective_check_mask(problem);
     double sum_sq = 0.0;
+    std::size_t used = 0;
     double params[kCalibrationParamCount] = {};
     for (const BAObservation& obs : problem.observations) {
+        if (is_check_point(check, obs.point)) {
+            continue;
+        }
+        ++used;
         const Calibration& cal = problem.calibrations[sensor_index(problem, obs.camera)];
         pack_calibration(cal, params);
 
@@ -465,8 +473,7 @@ double reprojection_rms_px(const BAProblem& problem) {
         }
         sum_sq += err * err;
     }
-    const double n = static_cast<double>(problem.observations.size());
-    return std::sqrt(sum_sq / n);
+    return used == 0 ? 0.0 : std::sqrt(sum_sq / static_cast<double>(used));
 }
 
 int choose_scale_anchor_axis(const BAPose& pose0, const BAPose& pose1) {
