@@ -613,8 +613,9 @@ TEST(StepEdges, NaturalCliffIsUntouched) {
                 static_cast<std::size_t>(col);
             const double x = static_cast<double>(col) * kCell;
             const double y = static_cast<double>(row) * kCell;
-            // The cliff line waves by 3 cells with a 12 m wavelength.
-            const double cliff_x = 20.0 + 3.0 * kCell * std::sin(2.0 * kPi * y / 12.0);
+            // The cliff line waves by 3 cells with an 8 m wavelength, so no
+            // locally straight arc reaches the 3 m minimum segment length.
+            const double cliff_x = 20.0 + 3.0 * kCell * std::sin(2.0 * kPi * y / 8.0);
             const double step = x < cliff_x ? 1.5 : 0.0;
             const double noise = 0.30 * (rough[index] - mean) / sigma;  // sigma 0.3 m
             surface[index] = ground_height(x) + step + noise;
