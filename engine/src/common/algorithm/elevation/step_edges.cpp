@@ -184,7 +184,8 @@ PlaneFit fit_plane_huber(const std::vector<double>& x, const std::vector<double>
 struct Grid {
     int width = 0;
     int height = 0;
-    double cell_size = 1.0;
+    double cell_size_x = 1.0;
+    double cell_size_y = 1.0;
     const std::vector<double>* h = nullptr;
     const std::vector<std::uint8_t>* valid = nullptr;
 
@@ -260,7 +261,9 @@ bool build_segment(std::span<const int> cells, const Grid& grid, double min_heig
     }
     const double tmin = percentile(ts, 0.05);
     const double tmax = percentile(ts, 0.95);
-    if ((tmax - tmin) * grid.cell_size < min_length) {
+    if ((tmax - tmin) *
+            std::hypot(dx * grid.cell_size_x, dy * grid.cell_size_y) <
+        min_length) {
         return false;
     }
     std::vector<double> lx;
@@ -428,13 +431,14 @@ void snap_segment(const Segment& segment, const Grid& grid, int band,
 }  // namespace
 
 int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_t>& valid,
-                      int width, int height, double cell_size,
+                      int width, int height, double cell_size_x, double cell_size_y,
                       const StepEdgeOptions& options) {
     if (width < 3 || height < 3) {
         throw ValueError("refine_step_edges: the grid must be at least 3x3 cells");
     }
-    if (!(cell_size > 0.0) || !std::isfinite(cell_size)) {
-        throw ValueError("refine_step_edges: cell_size must be positive and finite");
+    if (!(cell_size_x > 0.0) || !std::isfinite(cell_size_x) ||
+        !(cell_size_y > 0.0) || !std::isfinite(cell_size_y)) {
+        throw ValueError("refine_step_edges: cell sizes must be positive and finite");
     }
     const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     if (heights.size() != count || valid.size() != count) {
@@ -624,7 +628,8 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     Grid grid;
     grid.width = width;
     grid.height = height;
-    grid.cell_size = cell_size;
+    grid.cell_size_x = cell_size_x;
+    grid.cell_size_y = cell_size_y;
     grid.h = &h;
     grid.valid = &usable;
     std::vector<float> best_h(count, 0.0F);

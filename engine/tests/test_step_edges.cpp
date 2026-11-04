@@ -332,7 +332,7 @@ TEST(StepEdges, RebuildsBuildingOutlines) {
     StepEdgeOptions options;
     options.min_height = 1.5;
     options.min_length = 3.0;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     const BandErrors after = measure_band_error(values, scene, width, height);
 
     // The bracketed lowercase tag surfaces this line from the CI test log.
@@ -366,7 +366,7 @@ TEST(StepEdges, SmoothTerrainIsUntouched) {
     const std::vector<float> original = values;
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
 }
@@ -393,7 +393,7 @@ TEST(StepEdges, SubThresholdStepIsLeftAlone) {
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
     options.min_height = 1.5;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
 }
@@ -423,7 +423,7 @@ TEST(StepEdges, ShortSegmentIsRejected) {
     StepEdgeOptions options;
     options.min_height = 1.5;
     options.min_length = 3.0;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
 }
@@ -459,7 +459,7 @@ TEST(StepEdges, NodataCellsAreNeverTouched) {
     const std::vector<float> original = values;
 
     StepEdgeOptions options;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_GE(segments, 1);
     int changed_valid = 0;
     for (std::size_t i = 0; i < values.size(); ++i) {
@@ -495,7 +495,7 @@ TEST(StepEdges, CornersStayWithinTheBandRange) {
     const std::vector<float> original = values;
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_GT(segments, 0);
 
     int changed = 0;
@@ -555,7 +555,7 @@ TEST(StepEdges, SegmentEndsAreNotExtended) {
     StepEdgeOptions options;
     // The 3 m end faces are shorter than this; only the 10 m sides qualify.
     options.min_length = 4.0;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_GE(segments, 1);
 
     int changed = 0;
@@ -626,7 +626,7 @@ TEST(StepEdges, NaturalCliffIsUntouched) {
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
     options.min_height = 1.0;  // the cliff step is 1.5 m
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
 }
@@ -662,7 +662,7 @@ TEST(StepEdges, CurvedRoofEdgeIsRejectedByRms) {
     options.min_height = 1.5;
     // A wide fit band sees the curvature the default 5-cell band misses.
     options.band_half_width = 40;
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
 }
@@ -747,7 +747,7 @@ TEST(StepEdges, LargeGridIsFast) {
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
     const auto start = std::chrono::steady_clock::now();
-    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     const auto stop = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(stop - start).count();
     std::printf("[step edges] 2000x2000 45-degree step: %d segment(s) in %.3f s\n", segments,

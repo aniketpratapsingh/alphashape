@@ -25,8 +25,9 @@
 // (von Gioi et al. 2010, "LSD: a fast line segment detector", IEEE TPAMI
 // 32(4)) before the robust two-plane model.
 //
-// Every option and the return value are in metres: heights are metres, the
-// cell size is metres per cell, `min_height` and `min_length` are metres.
+// Every option and the return value are in metres: heights are metres,
+// `cell_size_x` and `cell_size_y` are metres per cell along the grid axes,
+// and `min_height` and `min_length` are metres.
 //
 // Memory: peak is about 38 bytes per cell plus the caller's inputs -- an
 // 8-byte double height copy, a 1-byte usability mask, three float gradient
@@ -51,10 +52,10 @@ struct StepEdgeOptions {
 /// height guesses), which are never read as evidence nor written. Returns the
 /// number of accepted straight segments.
 ///
-/// Throws ValueError when the sizes disagree, width or height is < 3, or
-/// cell_size is not positive and finite.
+/// Throws ValueError when the sizes disagree, width or height is < 3, or a
+/// cell size is not positive and finite.
 int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_t>& valid,
-                      int width, int height, double cell_size,
+                      int width, int height, double cell_size_x, double cell_size_y,
                       const StepEdgeOptions& options);
 
 }  // namespace alphashape::elevation

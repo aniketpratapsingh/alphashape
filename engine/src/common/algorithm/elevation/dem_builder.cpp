@@ -968,6 +968,12 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     if (!(fusion_cell_size > 0.0) || !std::isfinite(fusion_cell_size)) {
         fusion_cell_size = grid.pixel_size_x;
     }
+    // The grid axes have independent scales (a geographic plane is in
+    // degrees, where x and y metres-per-degree differ by cos(latitude)).
+    double fusion_cell_size_y = grid.pixel_size_y * fusion_metres_per_unit.y();
+    if (!(fusion_cell_size_y > 0.0) || !std::isfinite(fusion_cell_size_y)) {
+        fusion_cell_size_y = grid.pixel_size_y;
+    }
 
     // -- rasterise into per-cell observations ---------------------------------
     AssembledSurface surface;
@@ -1230,7 +1236,8 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
         step_options.min_height = options.step_min_height;
         step_options.min_length = options.step_min_length;
         const int segments = refine_step_edges(final_values, measured_cells, grid.width,
-                                                grid.height, fusion_cell_size, step_options);
+                                                grid.height, fusion_cell_size,
+                                                fusion_cell_size_y, step_options);
         if (Log::enabled(LogLevel::Info)) {
             log(LogLevel::Info) << "BuildDem: step-edge refinement accepted " << segments
                                 << " segment(s)";
