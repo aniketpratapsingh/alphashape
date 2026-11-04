@@ -22,11 +22,13 @@
 //     aligned camera is held fully constant and the scale is anchored on the
 //     aligned camera with the largest baseline to it (choose_scale_anchor_axis).
 //
-//   * Markers: every marker with >= 2 enabled projections in aligned cameras
-//     becomes a BA point whose observations are its projections. A referenced
-//     marker becomes a control point (or a check point, held out of the solve)
-//     when the chunk is georeferenced. Scale bars between marker points enter as
-//     BAScalebar constraints and fix scale even in a non-georeferenced chunk.
+//   * Markers: every regular marker with >= 2 enabled projections in distinct
+//     aligned cameras becomes a BA point whose observations are its projections
+//     (one per camera). Vertex and fiducial markers are image-space target
+//     marks, not ground points, and are skipped. A referenced marker becomes a
+//     control point (or a check point, held out of the solve) when the chunk is
+//     georeferenced. Scale bars between marker points enter as BAScalebar
+//     constraints and fix scale even in a non-georeferenced chunk.
 //
 // Everything is computed into a staged copy and committed with one move, so an
 // exception anywhere leaves the chunk untouched.
@@ -280,9 +282,20 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
     std::size_t markers_skipped = 0;
+    std::size_t markers_non_regular = 0;
     for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
         const Marker& marker = chunk->markers()[m];
+        // Vertex and fiducial markers are image-space target marks, not ground
+        // points: they never become BA points.
+        if (marker.type != MarkerType::Regular) {
+            ++markers_non_regular;
+            ++markers_skipped;
+            continue;
+        }
         std::vector<std::pair<std::size_t, Eigen::Vector2d>> projections;
+        // One observation per camera: a duplicated projection must not
+        // double-weight the residual. Keep the first enabled entry.
+        std::unordered_map<std::int32_t, bool> seen_camera;
         for (const MarkerProjection& projection : marker.projections) {
             if (!projection.enabled || !projection.pixel.allFinite()) {
                 continue;
@@ -290,6 +303,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             const auto camera = camera_slot.find(projection.camera_id);
             if (camera == camera_slot.end()) {
                 continue;  // not aligned: not part of this refinement
+            }
+            if (!seen_camera.emplace(projection.camera_id, true).second) {
+                continue;  // duplicate observation of the same camera
             }
             projections.emplace_back(camera->second, projection.pixel);
         }
@@ -480,7 +496,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         log(LogLevel::Info) << "OptimizeCameras: "
                             << (chunk->markers().size() - markers_skipped) << " marker points, "
                             << markers_skipped
-                            << " markers skipped (fewer than 2 projections or no triangulation), "
+                            << " markers skipped (non-regular, fewer than 2 projections, or "
+                               "no triangulation; "
+                            << markers_non_regular << " non-regular), "
                             << control_markers << " control points, " << checkpoint_markers
                             << " check points, " << problem.scalebars.size() << " scale bars ("
                             << camera_scalebars << " with a camera endpoint skipped, "
@@ -666,6 +684,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("optimize_cameras.markers", std::to_string(marker_points));
     staged.meta().set("optimize_cameras.markers_skipped",
                       std::to_string(chunk->markers().size() - marker_points));
+    staged.meta().set("optimize_cameras.markers_non_regular",
+                      std::to_string(markers_non_regular));
     staged.meta().set("optimize_cameras.scalebars_skipped",
                       std::to_string(scalebars_skipped));
 

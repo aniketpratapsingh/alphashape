@@ -1306,10 +1306,54 @@ TEST(OptimizeMarkers, NotGeoreferencedSkipsControl) {
     EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 0.0);
     EXPECT_EQ(meta_value(solved, "optimize_cameras.checkpoints"), 0.0);
     EXPECT_EQ(meta_value(solved, "optimize_cameras.markers"), 3.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
     for (const Marker& marker : solved.markers()) {
         ASSERT_TRUE(marker.position.has_value());
         EXPECT_TRUE(marker.position->allFinite());
     }
+}
+
+TEST(OptimizeMarkers, NonRegularMarkersSkippedAndDuplicatesDeduped) {
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    std::mt19937 rng(20261111u);
+
+    std::vector<MarkerProjection> projections;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        projections = project_marker(chunk, *track.point, 0.0, rng);
+        if (projections.size() >= 2U) {
+            break;
+        }
+    }
+    ASSERT_GE(projections.size(), 2U);
+
+    add_marker(chunk, projections);
+    // A repeated projection of the same camera must not double-weight a residual.
+    chunk.markers()[0].projections.push_back(chunk.markers()[0].projections.front());
+    add_marker(chunk, projections);
+    chunk.markers()[1].type = MarkerType::Vertex;
+    add_marker(chunk, projections);
+    chunk.markers()[2].type = MarkerType::Fiducial;
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    std::printf("[optimize_markers] marker types: %g points, %g non-regular, "
+                "%g skipped, %g bars skipped\n",
+                meta_value(solved, "optimize_cameras.markers"),
+                meta_value(solved, "optimize_cameras.markers_non_regular"),
+                meta_value(solved, "optimize_cameras.markers_skipped"),
+                meta_value(solved, "optimize_cameras.scalebars_skipped"));
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers"), 1.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_non_regular"), 2.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 2.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
+    ASSERT_TRUE(solved.markers()[0].position.has_value());
+    EXPECT_TRUE(solved.markers()[0].position->allFinite());
+    EXPECT_FALSE(solved.markers()[1].position.has_value());
+    EXPECT_FALSE(solved.markers()[2].position.has_value());
 }
 
 TEST(OptimizeMarkers, UnitScaleRespected) {
