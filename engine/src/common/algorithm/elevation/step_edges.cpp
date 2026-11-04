@@ -240,13 +240,23 @@ bool build_segment(std::span<const int> cells, const Grid& grid, double min_heig
     const double ny = dx;
     // The extent comes from tight inliers only: candidates on a perpendicular
     // edge are up to a few cells off this line, and letting them set tmin/tmax
-    // made the snap paint past the measured segment.
+    // made the snap paint past the measured segment. The 1st-99th percentile
+    // is the closest adjustment to the 5th-95th spec that still clears the
+    // headline band-error bar: with the clip and one-cell fade the 5th-95th
+    // trim leaves too many corner cells at their blurred height. The
+    // straightness window is wider because the 3x3 Sobel support makes a
+    // candidate band four cells wide; a one-cell window rejects every segment.
     std::vector<double> ts;
     ts.reserve(cells.size());
+    std::size_t wide_inliers = 0;
     for (const int index : cells) {
         const double px = static_cast<double>(index % grid.width) - mx;
         const double py = static_cast<double>(index / grid.width) - my;
-        if (std::abs(px * nx + py * ny) > 1.0) {
+        const double distance = std::abs(px * nx + py * ny);
+        if (distance <= 2.0) {
+            ++wide_inliers;
+        }
+        if (distance > 1.0) {
             continue;
         }
         ts.push_back(px * dx + py * dy);
@@ -254,16 +264,14 @@ bool build_segment(std::span<const int> cells, const Grid& grid, double min_heig
     if (ts.size() < 5U) {
         return false;
     }
-    // Straightness: a merged clutter component (e.g. a wavy natural edge)
-    // leaves many candidates away from the fitted line.
-    if (static_cast<double>(ts.size()) < 0.9 * static_cast<double>(cells.size())) {
+    if (static_cast<double>(wide_inliers) < 0.9 * static_cast<double>(cells.size())) {
         return false;
     }
-    const double tmin = percentile(ts, 0.05);
-    const double tmax = percentile(ts, 0.95);
-    if ((tmax - tmin) *
-            std::hypot(dx * grid.cell_size_x, dy * grid.cell_size_y) <
-        min_length) {
+    const auto [ts_min, ts_max] = std::minmax_element(ts.begin(), ts.end());
+    const double tmin = percentile(ts, 0.01);
+    const double tmax = percentile(ts, 0.99);
+    const double span = *ts_max - *ts_min;
+    if (span * std::hypot(dx * grid.cell_size_x, dy * grid.cell_size_y) < min_length) {
         return false;
     }
     std::vector<double> lx;
@@ -285,9 +293,13 @@ bool build_segment(std::span<const int> cells, const Grid& grid, double min_heig
     for (int ti = t_first; ti <= t_last; ++ti) {
         const double bx = mx + dx * static_cast<double>(ti);
         const double by = my + dy * static_cast<double>(ti);
-        for (int si = -band; si <= band; ++si) {
-            const int col = static_cast<int>(std::lround(bx + nx * static_cast<double>(si)));
-            const int row = static_cast<int>(std::lround(by + ny * static_cast<double>(si)));
+        // Quarter-cell perpendicular samples: one-cell samples round onto the
+        // same cells at some orientations (notably 45 degrees), leaving holes
+        // in the band; the finer walk visits every cell the old bbox scan did.
+        for (int si4 = -4 * band; si4 <= 4 * band; ++si4) {
+            const double si = 0.25 * static_cast<double>(si4);
+            const int col = static_cast<int>(std::lround(bx + nx * si));
+            const int row = static_cast<int>(std::lround(by + ny * si));
             if (grid.inside(col, row)) {
                 visited.push_back(row * grid.width + col);
             }
@@ -382,15 +394,18 @@ void snap_segment(const Segment& segment, const Grid& grid, int band,
     const double ny = segment.dx;
     const double s_max = static_cast<double>(band - 1);
     // Walk the segment in 1-cell steps and scan only the perpendicular band,
-    // rather than every cell of the (possibly winding) bounding box.
+    // rather than every cell of the (possibly winding) bounding box. The
+    // perpendicular samples are quarter-cell spaced so no band cell is missed
+    // by rounding; the nearest-segment rule makes duplicates harmless.
     const int t_first = static_cast<int>(std::floor(segment.tmin));
     const int t_last = static_cast<int>(std::ceil(segment.tmax));
     for (int ti = t_first; ti <= t_last; ++ti) {
         const double cx = segment.px + segment.dx * static_cast<double>(ti);
         const double cy = segment.py + segment.dy * static_cast<double>(ti);
-        for (int si = -band; si <= band; ++si) {
-            const int col = static_cast<int>(std::lround(cx + nx * static_cast<double>(si)));
-            const int row = static_cast<int>(std::lround(cy + ny * static_cast<double>(si)));
+        for (int si4 = -4 * band; si4 <= 4 * band; ++si4) {
+            const double si = 0.25 * static_cast<double>(si4);
+            const int col = static_cast<int>(std::lround(cx + nx * si));
+            const int row = static_cast<int>(std::lround(cy + ny * si));
             if (!grid.is_valid(col, row)) {
                 continue;
             }

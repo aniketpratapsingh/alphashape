@@ -16,7 +16,9 @@
 //      non-transition cells (Huber 1964, Ann. Math. Stat. 35(1)).
 //   5. Accepted segments snap each band cell to its side's plane, blended over
 //      the last cell toward the original surface and clamped to the band's
-//      original height range. Only measured cells are evidence or written.
+//      original height range. The extent is the 1st-99th percentile of cells
+//      within one cell of the line, so the snap cannot run past a wall that
+//      ends on open ground. Only measured cells are evidence or written.
 //
 // The caller runs this pass on the final DEM surface, i.e. after hole filling
 // and TGV smoothing, so the heights it sharpens are the ones that get written.
