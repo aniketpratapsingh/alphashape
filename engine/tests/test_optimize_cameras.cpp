@@ -1096,6 +1096,8 @@ TEST(OptimizeMarkers, GcpsImproveAccuracy) {
             worst_marker, (*solved.markers()[m].position - scene.local_truth[m]).norm());
     }
     const double with_error = mean_camera_error_m(solved, truth, scene.enu_to_ecef);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
 
     chunk = baseline;
     chunk.markers().clear();
@@ -1134,12 +1136,19 @@ TEST(OptimizeMarkers, CheckPointNotUsed) {
     }
     const double rms_moved = meta_value(chunk, "optimize_cameras.checkpoint_rms_m");
 
+    // The held-out marker is written back from its re-triangulated position, so
+    // it must follow the projections (the true point), not the moved reference.
+    ASSERT_TRUE(chunk.markers()[0].position.has_value());
+    const double truth_error =
+        (*chunk.markers()[0].position - scene.local_truth[0]).norm();
+
     std::printf(
         "[optimize_markers] check point: worst pose change %.3e, checkpoint RMS %.4f -> "
-        "%.4f m\n",
-        worst_pose_change, rms_first, rms_moved);
+        "%.4f m, position error %.4f m\n",
+        worst_pose_change, rms_first, rms_moved, truth_error);
     EXPECT_LE(worst_pose_change, 1e-9);
     EXPECT_GT(rms_moved, 5.0);
+    EXPECT_LT(truth_error, 0.05) << "check marker followed the moved reference";
 }
 
 TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {
@@ -1220,6 +1229,7 @@ TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {
                 estimated);
     EXPECT_LT(std::abs(distance - 10.0), 1e-3 * 10.0);
     EXPECT_NEAR(estimated, distance, 1e-9);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
 }
 
 TEST(OptimizeMarkers, SelfReferencingScalebarIsSkipped) {
@@ -1276,6 +1286,90 @@ TEST(OptimizeMarkers, SelfReferencingScalebarIsSkipped) {
     EXPECT_EQ(skipped, 1.0);
     EXPECT_EQ(used, 0.0);
     EXPECT_LE(worst, 1e-9) << "the degenerate bar changed the solve (scale anchor lost)";
+}
+
+TEST(OptimizeMarkers, ScalebarReportsMetresAtLocalScaleTwo) {
+    // The same bar-and-markers scene as ScalebarSetsScaleWithoutGeoref, but the
+    // chunk frame's local unit is half a metre (linear part x2). The computed
+    // length is a metric quantity, so it must come back as 10 m, not 5.
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_LT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+
+    std::vector<Eigen::Vector3d> candidates;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            candidates.push_back(*track.point);
+        }
+        if (candidates.size() == 64) {
+            break;
+        }
+    }
+    ASSERT_GE(candidates.size(), 2U);
+    std::size_t far = 1;
+    double best = -1.0;
+    for (std::size_t i = 1; i < candidates.size(); ++i) {
+        const double d = (candidates[i] - candidates[0]).squaredNorm();
+        if (d > best) {
+            best = d;
+            far = i;
+        }
+    }
+    ASSERT_GT(best, 0.0);
+    const double to_ten = 10.0 / std::sqrt(best);
+
+    // Local unit = 0.5 m: transform x2, every local position x0.5.
+    chunk.transform().block<3, 3>(0, 0) *= 2.0;
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5 * to_ten;
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5 * to_ten;
+        }
+    }
+    const Eigen::Vector3d truth_a = candidates[0] * 0.5 * to_ten;
+    const Eigen::Vector3d truth_b = candidates[far] * 0.5 * to_ten;
+
+    std::mt19937 rng(20261112u);
+    const std::int32_t id_a = add_marker(chunk, project_marker(chunk, truth_a, 0.0, rng));
+    const std::int32_t id_b = add_marker(chunk, project_marker(chunk, truth_b, 0.0, rng));
+    ASSERT_GE(chunk.markers()[0].projections.size(), 2U);
+    ASSERT_GE(chunk.markers()[1].projections.size(), 2U);
+
+    Scalebar bar;
+    bar.id = chunk.allocate_id();
+    bar.from = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_a};
+    bar.to = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_b};
+    bar.reference_length_m = 10.0;
+    bar.reference_accuracy_m = 0.001;
+    chunk.scalebars().push_back(bar);
+
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5;  // start at half the true scale
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5;
+        }
+    }
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    ASSERT_TRUE(solved.markers()[0].position.has_value());
+    ASSERT_TRUE(solved.markers()[1].position.has_value());
+    const double local_scale =
+        std::cbrt(std::abs(solved.transform().block<3, 3>(0, 0).determinant()));
+    const double distance =
+        (*solved.markers()[0].position - *solved.markers()[1].position).norm() * local_scale;
+    const double estimated = solved.scalebars()[0].estimated_length_m;
+
+    std::printf("[optimize_markers] scale bar at s=2: %.6f m (estimated %.6f m)\n",
+                distance, estimated);
+    EXPECT_NEAR(local_scale, 2.0, 1e-12);
+    EXPECT_LT(std::abs(distance - 10.0), 1e-3 * 10.0);
+    EXPECT_LT(std::abs(estimated - 10.0), 1e-3 * 10.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
 }
 
 TEST(OptimizeMarkers, NotGeoreferencedSkipsControl) {
