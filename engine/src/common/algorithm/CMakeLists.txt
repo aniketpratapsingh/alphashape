@@ -34,6 +34,7 @@ add_library(alphashape_algorithms STATIC
     sfm/absolute_pose.cpp
     sfm/triangulation.cpp
     sfm/bundle_adjustment.cpp
+    sfm/covariance.cpp
     sfm/adaptive_fit.cpp
     sfm/structure_builder.cpp
     sfm/align_cameras_task.cpp

@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <Eigen/Core>
@@ -137,6 +138,18 @@ struct BAOptions {
     int max_iterations = 100;    ///< ours
     int num_threads = 0;         ///< 0 => hardware concurrency
     double function_tolerance = 1e-8;
+
+    /// Posterior covariance (Triggs et al. 2000, "Bundle Adjustment -- A Modern
+    /// Synthesis", sec. 4): sigma0^2 * (J^T J)^-1 at the solution, computed for
+    /// selected blocks only with ceres::Covariance. Off by default: a solve with
+    /// every flag false does no covariance work and is bit-identical.
+    bool compute_camera_covariance = false;
+    bool compute_point_covariance = false;
+    bool compute_calibration_covariance = false;
+    /// Ours: above these counts the corresponding covariance is skipped (the
+    /// report says why) rather than spending unbounded time and memory.
+    std::size_t covariance_max_cameras = 2000;
+    std::size_t covariance_max_points = 50000;
 };
 
 struct BAReport {
@@ -191,6 +204,24 @@ struct BAReport {
     /// One residual per check control point, in input order; NaN when that
     /// point has fewer than two usable observations.
     std::vector<Eigen::Vector3d> checkpoint_residuals;
+
+    /// Posterior covariance. `covariance_valid` is true only when every
+    /// requested block was computed; otherwise `covariance_reason` says why
+    /// (rank-deficient solve, cap exceeded, no free parameters, ...) and the
+    /// vectors below stay empty. `sigma0_squared` is the redundancy-corrected
+    /// variance factor 2 * robust_cost / (residual_count - free_parameter_count)
+    /// (0 when the redundancy is not positive). Blocks are already scaled by it.
+    bool covariance_valid = false;
+    std::string covariance_reason;
+    double sigma0_squared = 0;
+    /// Per camera, order rotation angle-axis (3) then translation (3), in the
+    /// chunk-local frame the problem uses.
+    std::vector<Eigen::Matrix<double, 6, 6>> camera_covariance;
+    /// Per point in BAProblem::points order.
+    std::vector<Eigen::Matrix3d> point_covariance;
+    /// Per calibration: kCalibrationParamCount square in the packed order.
+    /// Rows/columns held by a SubsetManifold (or a constant block) are zero.
+    std::vector<Eigen::MatrixXd> calibration_covariance;
 };
 
 /// Validates indices/sizes (ValueError from base/utils/error.hpp on any

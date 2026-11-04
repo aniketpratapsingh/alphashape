@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 // Ceres (and its Eigen/glog/suite-sparse headers) is pulled in here only — never
@@ -48,6 +49,7 @@
 #endif
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/sfm/covariance.hpp"
 
 namespace alphashape::sfm {
 namespace {
@@ -928,6 +930,45 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;
     report.residual_count = static_cast<std::size_t>(ceres_problem.NumResiduals());
     report.free_parameter_count = free_parameter_count;
+    const std::size_t redundancy =
+        report.residual_count > report.free_parameter_count
+            ? report.residual_count - report.free_parameter_count
+            : 0;
+    report.sigma0_squared =
+        (report.cost_valid && redundancy > 0)
+            ? 2.0 * report.robust_cost / static_cast<double>(redundancy)
+            : 0.0;
+
+    if (options.compute_camera_covariance || options.compute_point_covariance ||
+        options.compute_calibration_covariance) {
+        CovarianceRequest request;
+        request.cameras = options.compute_camera_covariance;
+        request.points = options.compute_point_covariance;
+        request.calibrations = options.compute_calibration_covariance;
+        request.max_cameras = options.covariance_max_cameras;
+        request.max_points = options.covariance_max_points;
+        CovarianceBlocks blocks;
+        blocks.cameras.reserve(num_cameras);
+        for (std::array<double, 6>& block : cam_blocks) {
+            blocks.cameras.push_back(block.data());
+        }
+        blocks.points.reserve(point_blocks.size());
+        for (std::array<double, 3>& block : point_blocks) {
+            blocks.points.push_back(block.data());
+        }
+        blocks.calibrations.reserve(num_calibrations);
+        for (std::array<double, kCalibrationParamCount>& block : intr_blocks) {
+            blocks.calibrations.push_back(block.data());
+        }
+        CovarianceOutput covariance =
+            compute_covariance(ceres_problem, blocks, request, report.sigma0_squared);
+        report.covariance_valid = covariance.valid;
+        report.covariance_reason = std::move(covariance.reason);
+        report.camera_covariance = std::move(covariance.camera_covariance);
+        report.point_covariance = std::move(covariance.point_covariance);
+        report.calibration_covariance = std::move(covariance.calibration_covariance);
+    }
+
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
     fill_constraint_report(problem, check_mask, &report);
