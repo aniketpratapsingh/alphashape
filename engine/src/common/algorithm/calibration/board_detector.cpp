@@ -343,12 +343,24 @@ bool edge_match(double a0, double a1, double b0, double b1, double tolerance) {
 
 /// Saddle-point refinement (Lucchese & Mitra 2001). Fits a quadratic to a
 /// window around `point` and moves to where its gradient vanishes. Returns
-/// nullopt when the surface is not a saddle or the step is implausibly large.
+/// nullopt when the surface is not a saddle, the total move exceeds the
+/// window radius, or the window would touch the image border (clamped samples
+/// would bias the fit, so the raw corner is left unrefined instead).
 std::optional<Eigen::Vector2d> refine_saddle(const FloatImage& smooth,
                                              const Eigen::Vector2d& start,
                                              int radius) {
+    const double reach = static_cast<double>(radius);
+    const double last_x = static_cast<double>(smooth.width() - 1);
+    const double last_y = static_cast<double>(smooth.height() - 1);
+    const auto window_inside = [&](const Eigen::Vector2d& point) {
+        return point.x() - reach >= 0.0 && point.y() - reach >= 0.0 &&
+               point.x() + reach <= last_x && point.y() + reach <= last_y;
+    };
     Eigen::Vector2d point = start;
     for (int iteration = 0; iteration < 3; ++iteration) {
+        if (!window_inside(point)) {
+            return std::nullopt;
+        }
         Eigen::Matrix<double, 6, 6> normal = Eigen::Matrix<double, 6, 6>::Zero();
         Eigen::Matrix<double, 6, 1> rhs = Eigen::Matrix<double, 6, 1>::Zero();
         for (int dy = -radius; dy <= radius; ++dy) {
@@ -385,6 +397,13 @@ std::optional<Eigen::Vector2d> refine_saddle(const FloatImage& smooth,
         }
         point.x() += shift_x;
         point.y() += shift_y;
+        if (!std::isfinite(point.x()) || !std::isfinite(point.y()) ||
+            (point - start).norm() > reach) {
+            return std::nullopt;
+        }
+    }
+    if (!window_inside(point)) {
+        return std::nullopt;
     }
     return point;
 }
