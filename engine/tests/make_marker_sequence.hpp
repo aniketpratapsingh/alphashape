@@ -166,15 +166,15 @@ inline std::vector<std::uint8_t> datetime_tiff_block(
         put16(40, 0x9291);
         put16(42, 2);
         put32(44, static_cast<std::uint32_t>(subsec.size() + 1));
-        put32(48, 76);
+        // A value of 4 bytes or fewer lives inline in its entry's value field.
+        for (std::size_t i = 0; i < subsec.size(); ++i) {
+            block[48 + i] = static_cast<std::uint8_t>(subsec[i]);
+        }
         put32(52, 0);
     }
     const std::string text = when.substr(0, 19);
     for (std::size_t i = 0; i < text.size(); ++i) {
         block[56 + i] = static_cast<std::uint8_t>(text[i]);
-    }
-    for (std::size_t i = 0; i < subsec.size(); ++i) {
-        block[76 + i] = static_cast<std::uint8_t>(subsec[i]);
     }
     return block;
 }
