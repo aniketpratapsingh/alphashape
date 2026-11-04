@@ -37,9 +37,12 @@ struct BAControlPoint {
 };
 
 /// A measured distance between two points. The residual is
-/// (|Xa - Xb| - length) / sigma. Skipped when `checkpoint` is true or when
-/// `length`/`sigma` is non-positive or non-finite. `point_a` and `point_b`
-/// index BAProblem::points.
+/// (|Xa - Xb| - length) / sigma. Skipped as a solve constraint when `checkpoint`
+/// is true or when either endpoint is a check point; such a bar is scored after
+/// re-triangulation and reported separately (BAReport::checkbars). A bar with
+/// invalid length/sigma is ignored. `point_a` and `point_b` index
+/// BAProblem::points. When the endpoints coincide the residual is the honest
+/// -length/sigma with a zero Jacobian.
 struct BAScalebar {
     std::size_t point_a = 0;
     std::size_t point_b = 0;

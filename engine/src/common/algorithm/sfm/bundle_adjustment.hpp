@@ -149,9 +149,11 @@ struct BAReport {
     /// the solve, over every constrained axis. 0 when there are none.
     double prior_rms_sigma = 0;
 
-    /// Number of non-check control points, check control points, and non-check
-    /// scale bars with valid length/sigma respectively.
-    std::size_t control_points = 0, checkpoints = 0, scalebars = 0;
+    /// Number of non-check control points, check control points, non-check
+    /// scale bars and check scale bars with valid length/sigma respectively.
+    /// A bar is a check bar when it is flagged `checkpoint` or either endpoint
+    /// is a check point; it is scored after re-triangulation, like a check point.
+    std::size_t control_points = 0, checkpoints = 0, scalebars = 0, checkbars = 0;
     /// 3-D RMS of X - reference over non-check control points (metres).
     double control_rms_m = 0;
     /// 3-D RMS of the re-triangulated X - reference over check control points,
@@ -160,6 +162,10 @@ struct BAReport {
     /// RMS of the length error (|Xa - Xb| - length) over non-check scale bars
     /// with valid length/sigma (metres). 0 when there are none.
     double scalebar_rms_m = 0;
+    /// RMS of the length error over check scale bars, using the re-triangulated
+    /// position of any check endpoint (metres). 0 when there are none, or none
+    /// could be re-triangulated.
+    double checkbar_rms_m = 0;
     /// One residual per check control point, in input order; NaN when that
     /// point has fewer than two usable observations.
     std::vector<Eigen::Vector3d> checkpoint_residuals;

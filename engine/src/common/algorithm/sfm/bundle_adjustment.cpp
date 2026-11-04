@@ -310,14 +310,18 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
 }
 
 /// Fill the control/check/scale-bar part of the report from the final state.
-/// Check points are re-triangulated from their observations; one with fewer
-/// than two observations gets a NaN residual and is left out of the RMS.
+/// Check points are re-triangulated from their observations and their positions
+/// cached, so a check scale bar scores against re-triangulated endpoints; one
+/// with fewer than two observations gets a NaN residual and is left out of the
+/// RMS.
 void fill_constraint_report(const BAProblem& problem,
                             const std::vector<std::uint8_t>& check, BAReport* report) {
     double control_sq = 0.0;
     double check_sq = 0.0;
     std::size_t control_n = 0;
     std::size_t check_n = 0;
+    std::vector<Eigen::Vector3d> checked_pos(problem.points.size());
+    std::vector<std::uint8_t> checked_ok(problem.points.size(), 0);
     for (const BAControlPoint& cp : problem.control_points) {
         if (!cp.checkpoint) {
             ++report->control_points;
@@ -332,6 +336,8 @@ void fill_constraint_report(const BAProblem& problem,
                 Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
             continue;
         }
+        checked_pos[cp.point] = x;
+        checked_ok[cp.point] = 1;
         const Eigen::Vector3d r = x - cp.reference;
         report->checkpoint_residuals.push_back(r);
         check_sq += r.squaredNorm();
@@ -339,13 +345,49 @@ void fill_constraint_report(const BAProblem& problem,
     }
     double bar_sq = 0.0;
     std::size_t bar_n = 0;
+    double checkbar_sq = 0.0;
+    std::size_t checkbar_n = 0;
+    // A check endpoint is scored at its re-triangulated position; a free
+    // endpoint keeps the solved position.
+    const auto bar_endpoint = [&](std::size_t i, Eigen::Vector3d* out) {
+        if (is_check_point(check, i)) {
+            if (i >= checked_ok.size() || checked_ok[i] == 0) {
+                return false;
+            }
+            *out = checked_pos[i];
+            return true;
+        }
+        *out = problem.points[i];
+        return true;
+    };
     for (const BAScalebar& bar : problem.scalebars) {
+        const bool usable = std::isfinite(bar.length) && bar.length > 0.0 &&
+                            valid_sigma(bar.sigma);
+        if (!usable) {
+            continue;
+        }
+        const bool check_bar = bar.checkpoint || is_check_point(check, bar.point_a) ||
+                               is_check_point(check, bar.point_b);
+        Eigen::Vector3d xa = Eigen::Vector3d::Zero();
+        Eigen::Vector3d xb = Eigen::Vector3d::Zero();
+        const bool ok_a = bar_endpoint(bar.point_a, &xa);
+        const bool ok_b = bar_endpoint(bar.point_b, &xb);
+        const bool ok = ok_a && ok_b;
+        if (check_bar) {
+            ++report->checkbars;
+            if (!ok) {
+                continue;
+            }
+            const double e = (xa - xb).norm() - bar.length;
+            checkbar_sq += e * e;
+            ++checkbar_n;
+            continue;
+        }
         if (!scalebar_active(check, bar)) {
             continue;
         }
         ++report->scalebars;
-        const double e =
-            (problem.points[bar.point_a] - problem.points[bar.point_b]).norm() - bar.length;
+        const double e = (xa - xb).norm() - bar.length;
         bar_sq += e * e;
         ++bar_n;
     }
@@ -355,6 +397,7 @@ void fill_constraint_report(const BAProblem& problem,
     report->control_rms_m = rms(control_sq, control_n);
     report->checkpoint_rms_m = rms(check_sq, check_n);
     report->scalebar_rms_m = rms(bar_sq, bar_n);
+    report->checkbar_rms_m = rms(checkbar_sq, checkbar_n);
 }
 
 /// Number of constrained prior axes (finite sigma > 0) over every prior.
@@ -402,10 +445,7 @@ void scalebar_residual_and_jacobian(const double* a, const double* b, double len
     const double d1 = a[1] - b[1];
     const double d2 = a[2] - b[2];
     const double dist = std::sqrt(d0 * d0 + d1 * d1 + d2 * d2);
-    const bool usable = dist > 1e-12 && std::isfinite(dist) && valid_sigma(sigma) &&
-                        std::isfinite(length) && length > 0.0;
-    if (!usable) {
-        residual[0] = 0.0;
+    const auto zero_jacobians = [&]() {
         for (int k = 0; k < 3; ++k) {
             if (jac_a != nullptr) {
                 jac_a[k] = 0.0;
@@ -414,6 +454,20 @@ void scalebar_residual_and_jacobian(const double* a, const double* b, double len
                 jac_b[k] = 0.0;
             }
         }
+    };
+    if (!std::isfinite(length) || length <= 0.0 || !valid_sigma(sigma) ||
+        !std::isfinite(dist)) {
+        residual[0] = 0.0;
+        zero_jacobians();
+        return;
+    }
+    if (!(dist > 1e-12)) {
+        // Coincident endpoints: the distance has no usable gradient, but the
+        // honest residual is still (0 - length)/sigma. Keeping it with a zero
+        // Jacobian reports the truth without letting the solve chase a
+        // direction it cannot observe.
+        residual[0] = -length / sigma;
+        zero_jacobians();
         return;
     }
     residual[0] = (dist - length) / sigma;
