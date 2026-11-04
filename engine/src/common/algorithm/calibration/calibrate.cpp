@@ -284,6 +284,9 @@ bool solve_refinement(const std::vector<CalibrationView>& views,
         }
     }
     if (!held.empty()) {
+        // SetManifold requires the parameter block to be registered already;
+        // AddResidualBlock would otherwise register it only afterwards.
+        problem.AddParameterBlock(out.intrinsics.data(), kCalibrationParamCount);
         problem.SetManifold(
             out.intrinsics.data(),
             new ceres::SubsetManifold(kCalibrationParamCount, held));
