@@ -43,8 +43,10 @@
 // project_point() is the thin throwing wrapper kept for callers that want the
 // ValueError semantics.
 
+#include <array>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -73,10 +75,18 @@ struct Calibration {
     double p3 = 0.0;      ///< tangential (decentering), r^2-weighted
     double p4 = 0.0;      ///< tangential (decentering), r^2-weighted
 
+    /// Posterior covariance of the packed coefficients in kCalibrationParamNames
+    /// order (kCalibrationParamCount square), sigma0^2-scaled. Empty when
+    /// unknown. Held coefficients have zero rows/columns. Derived data: not
+    /// persisted yet, so it is deliberately excluded from operator==.
+    Eigen::MatrixXd covariance;
+    /// Row/column names of `covariance`; the packed order when non-empty.
+    std::vector<std::string> covariance_params;
+
     /// A calibration of the given geometry with every distortion term zero.
     static Calibration initial(CameraType type, int width, int height, double f_pixels);
 
-    /// Exact (bitwise) comparison of every field.
+    /// Exact (bitwise) comparison of every persisted field.
     bool operator==(const Calibration& other) const;
 
     /// Project a camera-frame point to pixels. Throws ValueError for a Frame
@@ -110,6 +120,11 @@ Calibration scaled_calibration(const Calibration& full, int downscale);
 /// p3/p4 are appended so every pre-existing index (and every stored 11-double
 /// array) keeps its meaning; old data loads with p3 = p4 = 0.
 inline constexpr int kCalibrationParamCount = 13;
+
+/// Coefficient names in the packed order above. Shared by the self-calibration
+/// task's fit flags and the covariance row/column labels.
+inline constexpr std::array<const char*, kCalibrationParamCount> kCalibrationParamNames = {
+    "f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"};
 
 /// Force-inline marker for the forward model. The stereo inner loop evaluates
 /// it once per window sample (millions of times per image) in a loop whose only
