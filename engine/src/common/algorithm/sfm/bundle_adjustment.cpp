@@ -42,6 +42,7 @@
 #endif
 #include "ceres/ceres.h"
 #include "ceres/rotation.h"
+#include "common/algorithm/sfm/covariance.hpp"
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
@@ -49,7 +50,6 @@
 #endif
 
 #include "base/utils/error.hpp"
-#include "common/algorithm/sfm/covariance.hpp"
 
 namespace alphashape::sfm {
 namespace {
