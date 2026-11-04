@@ -4,22 +4,33 @@
 // through a known Calibration from random poses, then perturbed by 0.1 px of
 // Gaussian noise. A deterministic portable RNG supplies both poses and noise.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <memory>
 #include <random>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <gtest/gtest.h>
 
+#include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
 #include "common/algorithm/calibration/calibrate.hpp"
+#include "common/core/chunk.hpp"
+#include "common/core/document.hpp"
+#include "common/core/frame.hpp"
+#include "common/tasks/registry.hpp"
+#include "image/io/image_io.hpp"
+#include "make_chessboard.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape {
@@ -233,6 +244,129 @@ TEST(Calibrate, NeedsThreeViews) {
         EXPECT_STREQ(error.what(),
                      "calibrate_camera: need at least 3 views with a detected board");
     }
+}
+
+namespace {
+
+constexpr int kTaskWidth = 640;
+constexpr int kTaskHeight = 480;
+constexpr double kTaskFocal = 600.0;
+
+void write_gray_png(const std::string& path, const FloatImage& image) {
+    Image out(image.width(), image.height(), 1);
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const double value = static_cast<double>(image.at(x, y)) * 255.0;
+            out.at(x, y, 0) = static_cast<std::uint8_t>(
+                std::lround(std::clamp(value, 0.0, 255.0)));
+        }
+    }
+    write_png(path, out);
+}
+
+/// A document with one sensor and `count` enabled cameras, each with a rendered
+/// chessboard on its frame path.
+struct CalibrateScene {
+    Document document;
+    Chunk* chunk = nullptr;
+    std::vector<std::string> paths;
+
+    CalibrateScene() = default;
+    CalibrateScene(CalibrateScene&&) = default;
+    CalibrateScene& operator=(CalibrateScene&&) = default;
+    CalibrateScene(const CalibrateScene&) = delete;
+    CalibrateScene& operator=(const CalibrateScene&) = delete;
+    ~CalibrateScene() {
+        for (const std::string& path : paths) {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        }
+    }
+};
+
+CalibrateScene make_calibrate_scene(std::uint32_t seed, int count) {
+    CalibrateScene scene;
+    Chunk& chunk = scene.document.workspace().add_chunk("Chunk 1");
+    scene.document.set_active_chunk_id(chunk.id());
+    scene.chunk = &chunk;
+    Sensor sensor;
+    sensor.label = "sensor";
+    sensor.type = CameraType::Frame;
+    sensor.width = kTaskWidth;
+    sensor.height = kTaskHeight;
+    sensor.calibration =
+        Calibration::initial(CameraType::Frame, kTaskWidth, kTaskHeight, 500.0);
+    chunk.sensors().push_back(sensor);
+    std::mt19937 engine(seed);
+    for (int i = 0; i < count; ++i) {
+        Camera camera;
+        camera.id = chunk.allocate_id();
+        camera.sensor_id = 0;
+        camera.label = "cam" + std::to_string(i);
+        camera.enabled = true;
+        chunk.cameras().push_back(camera);
+        const std::string path =
+            platform::unique_temp_path("alphashape_calib_", ".png");
+        auto frame = std::make_shared<Frame>(path, kTaskWidth, kTaskHeight);
+        frame->set_id(chunk.allocate_id());
+        frame->set_camera_id(camera.id);
+        chunk.frames().push_back(frame);
+        test::ChessboardPose pose;
+        pose.width = kTaskWidth;
+        pose.height = kTaskHeight;
+        pose.cols = kCols;
+        pose.rows = kRows;
+        pose.square_m = kSquare;
+        pose.f = kTaskFocal;
+        pose.k1 = 0.0;
+        const double ax = rng::uniform_real(engine, -0.22, 0.22);
+        const double ay = rng::uniform_real(engine, -0.18, 0.18);
+        const double az = rng::uniform_real(engine, -0.25, 0.25);
+        pose.rotation =
+            (Eigen::AngleAxisd(az, Eigen::Vector3d::UnitZ()) *
+             Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
+             Eigen::AngleAxisd(ax, Eigen::Vector3d::UnitX()))
+                .toRotationMatrix();
+        const Eigen::Vector3d centre(
+            0.5 * static_cast<double>(kCols) * kSquare,
+            0.5 * static_cast<double>(kRows) * kSquare, 0.0);
+        pose.translation =
+            -pose.rotation * centre + Eigen::Vector3d(0.0, 0.0, 0.45);
+        pose.translation.x() += rng::uniform_real(engine, -0.02, 0.02);
+        pose.translation.y() += rng::uniform_real(engine, -0.015, 0.015);
+        write_gray_png(path, test::render_chessboard(pose).image);
+        scene.paths.push_back(path);
+    }
+    return scene;
+}
+
+}  // namespace
+
+TEST(CalibrateCamera, ApplyWritesSensor) {
+    CalibrateScene scene = make_calibrate_scene(81U, 5);
+    const Calibration before = scene.chunk->sensors()[0].calibration;
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    const Calibration& after = scene.chunk->sensors()[0].calibration;
+    std::printf("[CalibrateCamera.ApplyWritesSensor] f %.3f (truth %.1f)\n",
+                after.f, kTaskFocal);
+    EXPECT_NEAR(after.f, kTaskFocal, 0.01 * kTaskFocal);
+    EXPECT_NE(before.f, after.f);
+    const std::string* rms =
+        scene.chunk->meta().find("calibrate_camera.sensor.rms_px");
+    ASSERT_NE(rms, nullptr);
+    EXPECT_GT(std::stod(*rms), 0.0);
+
+    CalibrateScene retained = make_calibrate_scene(82U, 5);
+    const Calibration original = retained.chunk->sensors()[0].calibration;
+    Params dry = make_params(builtin_registry().require("CalibrateCamera"));
+    dry.set("apply", false);
+    run_task(builtin_registry(), retained.document, "CalibrateCamera", dry);
+    EXPECT_TRUE(retained.chunk->sensors()[0].calibration == original);
+    const std::string* dry_rms =
+        retained.chunk->meta().find("calibrate_camera.sensor.rms_px");
+    ASSERT_NE(dry_rms, nullptr);
+    EXPECT_GT(std::stod(*dry_rms), 0.0);
 }
 
 }  // namespace alphashape
