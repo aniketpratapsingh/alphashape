@@ -8,6 +8,7 @@
 #include <numbers>
 #include <optional>
 #include <queue>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -464,6 +465,8 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
     std::vector<Eigen::Vector2d> e1(n, Eigen::Vector2d::Zero());
     std::vector<Eigen::Vector2d> e2(n, Eigen::Vector2d::Zero());
     lattice.labels[static_cast<std::size_t>(seed)] = LatticeLabel{0, 0};
+    std::set<std::pair<int, int>> occupied;
+    occupied.insert(std::make_pair(0, 0));
     Eigen::Vector2d first;
     Eigen::Vector2d second;
     if (!find_seed_step(corners, seed, corners[static_cast<std::size_t>(seed)].dir0,
@@ -544,6 +547,10 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
                 }
                 const LatticeLabel wanted{label.col + (axis == 0 ? sign : 0),
                                           label.row + (axis == 1 ? sign : 0)};
+                const std::pair<int, int> wanted_key{wanted.col, wanted.row};
+                if (occupied.count(wanted_key) != 0) {
+                    continue;  // a label is never assigned twice
+                }
                 if (lattice.labels[static_cast<std::size_t>(best_index)]) {
                     const LatticeLabel existing =
                         *lattice.labels[static_cast<std::size_t>(best_index)];
@@ -556,6 +563,7 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
                     continue;
                 }
                 lattice.labels[static_cast<std::size_t>(best_index)] = wanted;
+                occupied.insert(wanted_key);
                 if (axis == 0) {
                     e1[static_cast<std::size_t>(best_index)] =
                         static_cast<double>(sign) * measured;
@@ -741,6 +749,24 @@ std::optional<BoardView> build_view(const std::vector<Candidate>& corners,
         max_col = std::max(max_col, corner.col);
         max_row = std::max(max_row, corner.row);
     }
+    // Labels must be a bijection onto distinct grid coordinates. Growth never
+    // reuses a label, so a duplicate means two candidates claimed the same
+    // cell: keep the first and drop the duplicate corner (never the view).
+    std::set<std::pair<int, int>> seen_labels;
+    std::vector<LabelledCorner> unique;
+    unique.reserve(labelled.size());
+    for (const LabelledCorner& corner : labelled) {
+        if (seen_labels.insert(std::make_pair(corner.col, corner.row)).second) {
+            unique.push_back(corner);
+        } else {
+            log(LogLevel::Debug) << "board_detector: dropping duplicate label ("
+                                 << corner.col << "," << corner.row << ")";
+        }
+    }
+    labelled.swap(unique);
+    if (static_cast<int>(labelled.size()) < options.min_corners) {
+        return std::nullopt;
+    }
     const int extent_cols = max_col + 1;
     const int extent_rows = max_row + 1;
     const bool fits = extent_cols <= spec.cols && extent_rows <= spec.rows;
@@ -757,20 +783,6 @@ std::optional<BoardView> build_view(const std::vector<Candidate>& corners,
     const int final_rows = fits ? extent_rows : extent_cols;
     bool complete = static_cast<int>(labelled.size()) == spec.cols * spec.rows &&
                     final_cols == spec.cols && final_rows == spec.rows;
-    if (complete) {
-        // A complete view must be a bijection onto the spec grid. A duplicate
-        // label would leave a hole and make the canonical lookup invalid.
-        std::vector<char> seen(static_cast<std::size_t>(spec.cols * spec.rows), 0);
-        for (const LabelledCorner& corner : labelled) {
-            const int index = corner.col * spec.rows + corner.row;
-            if (index < 0 || index >= spec.cols * spec.rows ||
-                seen[static_cast<std::size_t>(index)] != 0) {
-                complete = false;
-                break;
-            }
-            seen[static_cast<std::size_t>(index)] = 1;
-        }
-    }
     if (!canonicalise_labels(labelled, corners, smooth, spec, complete)) {
         return std::nullopt;
     }
