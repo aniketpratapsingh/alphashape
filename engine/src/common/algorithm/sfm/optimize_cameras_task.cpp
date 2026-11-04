@@ -353,7 +353,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             control.point = marker_point[m];
             control.reference =
                 (inverse.block<3, 3>(0, 0) * ecef) + inverse.block<3, 1>(0, 3);
-            control.sigma = marker.reference_accuracy;
+            // Per-axis accuracy applied along the local axes, exactly as the
+            // camera priors do; metres -> chunk-local units.
+            control.sigma = marker.reference_accuracy / local_scale;
             for (int axis = 0; axis < 3; ++axis) {
                 const double sigma = control.sigma[axis];
                 if (!std::isfinite(sigma) || sigma <= 0.0) {
@@ -425,8 +427,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         sfm::BAScalebar out;
         out.point_a = marker_point[from->second];
         out.point_b = marker_point[to->second];
-        out.length = bar.reference_length_m;
-        out.sigma = bar.reference_accuracy_m;
+        out.length = bar.reference_length_m / local_scale;  // metres -> local units
+        out.sigma = bar.reference_accuracy_m / local_scale;
         out.checkpoint = (role_a != nullptr && *role_a == "check_point") ||
                          (role_b != nullptr && *role_b == "check_point");
         problem.scalebars.push_back(out);
