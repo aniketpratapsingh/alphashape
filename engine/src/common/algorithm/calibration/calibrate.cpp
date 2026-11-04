@@ -314,7 +314,6 @@ bool solve_refinement(const std::vector<CalibrationView>& views,
     out.cost = summary.final_cost;
     ceres::Covariance::Options covariance_options;
     covariance_options.algorithm_type = ceres::DENSE_SVD;
-    covariance_options.num_threads = 1;
     ceres::Covariance covariance(covariance_options);
     const std::vector<std::pair<const double*, const double*>> blocks = {
         {out.intrinsics.data(), out.intrinsics.data()}};
