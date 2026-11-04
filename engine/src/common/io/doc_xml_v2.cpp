@@ -212,6 +212,23 @@ Eigen::Matrix3d parse_covariance9(const std::string& s) {
     return m;
 }
 
+/// Exact-zero test used to decide whether an optional covariance is written.
+/// A component that is merely tiny still counts as data.
+bool covariance_is_zero(const Eigen::Matrix3d& m) {
+    return m.cwiseAbs().maxCoeff() == 0.0;
+}
+
+bool covariance_is_finite(const Eigen::Matrix3d& m) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(m(r, c))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // -- writer: identity attributes shared by every asset element ---------------
 
 /// Write the slot's identity (id, label, group, enabled, meta) on its element.
@@ -276,6 +293,14 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
         set_attr(e, "enabled", fmt_bool(c.enabled));
         set_attr(e, "orientation", std::to_string(c.orientation));
         set_attr(e, "transform", matrix4(c.pose));
+        // Posterior covariances (WP-13.13b). Written only when non-zero, so a
+        // project without covariance is byte-identical to an older build's.
+        if (!covariance_is_zero(c.location_covariance)) {
+            set_attr(e, "location_covariance", covariance9(c.location_covariance));
+        }
+        if (!covariance_is_zero(c.rotation_covariance)) {
+            set_attr(e, "rotation_covariance", covariance9(c.rotation_covariance));
+        }
         // A reference is written only when a location was set. z may be nan
         // (no GNSS altitude); fmt() emits "nan", which parse_double accepts.
         // Every accuracy component must be finite and strictly positive: a
@@ -975,7 +1000,8 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
     }
     for (const XmlNode& e : cameras->children) {
         warn_unknown_attrs(e, {"id", "sensor_id", "label", "enabled", "orientation",
-                               "transform"},
+                               "transform", "location_covariance",
+                               "rotation_covariance"},
                            report);
         Camera c;
         c.id = parse_i32(require_attr(e, "id"));
@@ -984,6 +1010,20 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         c.enabled = parse_bool(require_attr(e, "enabled"));
         c.orientation = parse_int(require_attr(e, "orientation"));
         c.pose = parse_matrix4(require_attr(e, "transform"));
+        if (const std::string* s = find_attr(e, "location_covariance")) {
+            c.location_covariance = parse_covariance9(*s);
+            if (!covariance_is_finite(c.location_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": location_covariance is not finite");
+            }
+        }
+        if (const std::string* s = find_attr(e, "rotation_covariance")) {
+            c.rotation_covariance = parse_covariance9(*s);
+            if (!covariance_is_finite(c.rotation_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": rotation_covariance is not finite");
+            }
+        }
         c.reference = read_camera_reference(find_child(e, "reference"));
         chunk.cameras().push_back(std::move(c));
     }
