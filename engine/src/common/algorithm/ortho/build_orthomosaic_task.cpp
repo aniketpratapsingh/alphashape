@@ -26,6 +26,7 @@
 #include "model/raster/reproject.hpp"
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/colour_model.hpp"
+#include "common/algorithm/ortho/fill_holes_detail.hpp"
 #include "common/algorithm/ortho/gain.hpp"
 #include "common/algorithm/ortho/ghosting.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
@@ -2950,24 +2951,11 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 was_hole[i] = result.raster.data[i * 4 + 3] == 0 ? 1 : 0;
             }
         }
-        for (int channel = 0; channel < 3; ++channel) {
-            std::vector<float> values(output_cells, 0.0F);
-            std::vector<std::uint8_t> channel_valid(output_cells, 0);
-            for (std::size_t i = 0; i < output_cells; ++i) {
-                values[i] = static_cast<float>(result.raster.data[i * 4 +
-                                                                  static_cast<std::size_t>(channel)]);
-                channel_valid[i] = result.raster.data[i * 4 + 3] != 0 ? 1 : 0;
-            }
-            elevation::fill_holes(grid.width, grid.height, values, channel_valid, fill);
-            for (std::size_t i = 0; i < output_cells; ++i) {
-                if (channel_valid[i] != 0) {
-                    const float c = std::clamp(values[i], 0.0F, 255.0F);
-                    result.raster.data[i * 4 + static_cast<std::size_t>(channel)] =
-                        static_cast<std::uint8_t>(std::lround(c));
-                    result.raster.data[i * 4 + 3] = 255;
-                }
-            }
-        }
+        // One validity snapshot for all three channels: rebuilding it per
+        // channel would read the alpha this loop sets, so after channel 0 every
+        // filled cell would look valid and G and B would stay 0 (red holes).
+        ortho::detail::fill_smooth_rgba_holes(grid.width, grid.height, result.raster.data,
+                                              fill);
         if (use_texture) {
             // The mask is exactly the cells the smooth pass just filled: a
             // pre-existing pixel (opaque before this stage) is never touched.

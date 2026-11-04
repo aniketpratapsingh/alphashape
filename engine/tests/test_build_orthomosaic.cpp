@@ -43,6 +43,7 @@
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
+#include "common/algorithm/ortho/fill_holes_detail.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
 #include "common/io/project_io.hpp"
@@ -330,6 +331,50 @@ void expect_grid_covers_dem(const RasterGrid& ortho, const RasterGrid& dem,
 // ---------------------------------------------------------------------------
 // 1. The orthomosaic against the truth orthophoto, all three blending modes
 // ---------------------------------------------------------------------------
+
+TEST(BuildOrthomosaic, SmoothHoleFillWritesEveryColourChannel) {
+    // Regression: the validity mask used to be rebuilt from alpha inside the
+    // channel loop, so after channel 0 every filled cell read as valid and G and
+    // B were never written. A uniform grey hole came out red.
+    constexpr int kWidth = 21;
+    constexpr int kHeight = 21;
+    constexpr int kHole = 5;
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight) * 4U, 0);
+    for (std::size_t i = 0; i < rgba.size(); i += 4U) {
+        rgba[i] = 120;
+        rgba[i + 1U] = 120;
+        rgba[i + 2U] = 120;
+        rgba[i + 3U] = 255;
+    }
+    const int hole_x0 = (kWidth - kHole) / 2;
+    const int hole_y0 = (kHeight - kHole) / 2;
+    for (int y = hole_y0; y < hole_y0 + kHole; ++y) {
+        for (int x = hole_x0; x < hole_x0 + kHole; ++x) {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+                 static_cast<std::size_t>(x)) * 4U;
+            rgba[i + 3U] = 0;
+        }
+    }
+    elevation::HoleFillOptions fill;
+    fill.method = elevation::HoleFill::NaturalNeighbour;
+    fill.interior_only = true;
+    ortho::detail::fill_smooth_rgba_holes(kWidth, kHeight, rgba, fill);
+    for (int y = hole_y0; y < hole_y0 + kHole; ++y) {
+        for (int x = hole_x0; x < hole_x0 + kHole; ++x) {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+                 static_cast<std::size_t>(x)) * 4U;
+            EXPECT_EQ(static_cast<int>(rgba[i + 3U]), 255) << "hole not made opaque";
+            for (int c = 0; c < 3; ++c) {
+                EXPECT_NEAR(
+                    static_cast<int>(rgba[i + static_cast<std::size_t>(c)]), 120, 2)
+                    << "channel " << c << " was not filled";
+            }
+        }
+    }
+}
 
 TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     OrthoSetup& s = setup();
