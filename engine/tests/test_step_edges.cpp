@@ -8,6 +8,7 @@
 // the pass, and check that far-from-outline cells are untouched.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
 #include "model/camera/calibration.hpp"
+#include "perf_gate.hpp"
 
 namespace alphashape {
 namespace {
@@ -724,6 +726,36 @@ TEST(StepEdges, BuildDemRefineEdgesIsOptIn) {
         }
     }
     EXPECT_GT(changed, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 11. A 45-degree step across a 2000x2000 DEM: the walk must stay linear in
+//     the number of cells, not quadratic in a component's bounding box.
+// ---------------------------------------------------------------------------
+
+TEST(StepEdges, LargeGridIsFast) {
+    const int width = 2000;
+    const int height = 2000;
+    std::vector<float> values(static_cast<std::size_t>(width) *
+                              static_cast<std::size_t>(height));
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            values[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
+                   static_cast<std::size_t>(col)] = col >= row ? 5.0F : 0.0F;
+        }
+    }
+    const std::vector<std::uint8_t> valid = all_valid(values.size());
+    StepEdgeOptions options;
+    const auto start = std::chrono::steady_clock::now();
+    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    const auto stop = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(stop - start).count();
+    std::printf("[step edges] 2000x2000 45-degree step: %d segment(s) in %.3f s\n", segments,
+                seconds);
+    EXPECT_GE(segments, 1);
+    if (test::perf_asserts_enabled()) {
+        EXPECT_LT(seconds, 2.0);
+    }
 }
 
 }  // namespace

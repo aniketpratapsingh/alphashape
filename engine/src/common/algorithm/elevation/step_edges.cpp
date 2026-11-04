@@ -262,18 +262,6 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
     if ((tmax - tmin) * grid.cell_size < min_length) {
         return false;
     }
-    int col0 = grid.width;
-    int row0 = grid.height;
-    int col1 = -1;
-    int row1 = -1;
-    for (const int index : cells) {
-        const int col = index % grid.width;
-        const int row = index / grid.width;
-        col0 = std::min(col0, col - band - 1);
-        col1 = std::max(col1, col + band + 1);
-        row0 = std::min(row0, row - band - 1);
-        row1 = std::max(row1, row + band + 1);
-    }
     std::vector<double> lx;
     std::vector<double> ly;
     std::vector<double> lh;
@@ -282,36 +270,57 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
     std::vector<double> rh;
     double lo = std::numeric_limits<double>::infinity();
     double hi = -lo;
-    for (int row = std::max(0, row0); row <= std::min(grid.height - 1, row1); ++row) {
-        for (int col = std::max(0, col0); col <= std::min(grid.width - 1, col1); ++col) {
-            if (!grid.is_valid(col, row)) {
-                continue;
+    // Walk the segment in 1-cell tangential steps, visiting only the band on
+    // each side, instead of scanning the component's bounding box (which a
+    // winding component makes quadratic). Two (t, s) samples can round onto
+    // the same cell, so deduplicate; the result is the same cell set up to
+    // summation order.
+    std::vector<int> visited;
+    const int t_first = static_cast<int>(std::floor(tmin)) - 1;
+    const int t_last = static_cast<int>(std::ceil(tmax)) + 1;
+    for (int ti = t_first; ti <= t_last; ++ti) {
+        const double bx = mx + dx * static_cast<double>(ti);
+        const double by = my + dy * static_cast<double>(ti);
+        for (int si = -band; si <= band; ++si) {
+            const int col = static_cast<int>(std::lround(bx + nx * static_cast<double>(si)));
+            const int row = static_cast<int>(std::lround(by + ny * static_cast<double>(si)));
+            if (grid.inside(col, row)) {
+                visited.push_back(row * grid.width + col);
             }
-            const double px = static_cast<double>(col) - mx;
-            const double py = static_cast<double>(row) - my;
-            const double s = px * nx + py * ny;
-            const double t = px * dx + py * dy;
-            if (t < tmin - 0.5 || t > tmax + 0.5 || std::abs(s) > static_cast<double>(band)) {
-                continue;
-            }
-            const double value = grid.height_at(col, row);
-            lo = std::min(lo, value);
-            hi = std::max(hi, value);
-            // The cell at the line plus its two neighbours still carry most
-            // of the blur ramp: fitting them would pull both planes toward
-            // each other, leaving soft shoulders on the rebuilt step.
-            if (std::abs(s) < 3.0) {
-                continue;
-            }
-            if (s < 0.0) {
-                lx.push_back(static_cast<double>(col));
-                ly.push_back(static_cast<double>(row));
-                lh.push_back(value);
-            } else {
-                rx.push_back(static_cast<double>(col));
-                ry.push_back(static_cast<double>(row));
-                rh.push_back(value);
-            }
+        }
+    }
+    std::sort(visited.begin(), visited.end());
+    visited.erase(std::unique(visited.begin(), visited.end()), visited.end());
+    for (const int index : visited) {
+        const int col = index % grid.width;
+        const int row = index / grid.width;
+        if (!grid.is_valid(col, row)) {
+            continue;
+        }
+        const double px = static_cast<double>(col) - mx;
+        const double py = static_cast<double>(row) - my;
+        const double s = px * nx + py * ny;
+        const double t = px * dx + py * dy;
+        if (t < tmin - 0.5 || t > tmax + 0.5 || std::abs(s) > static_cast<double>(band)) {
+            continue;
+        }
+        const double value = grid.height_at(col, row);
+        lo = std::min(lo, value);
+        hi = std::max(hi, value);
+        // The cell at the line plus its two neighbours still carry most of the
+        // blur ramp: fitting them would pull both planes toward each other,
+        // leaving soft shoulders on the rebuilt step.
+        if (std::abs(s) < 3.0) {
+            continue;
+        }
+        if (s < 0.0) {
+            lx.push_back(static_cast<double>(col));
+            ly.push_back(static_cast<double>(row));
+            lh.push_back(value);
+        } else {
+            rx.push_back(static_cast<double>(col));
+            ry.push_back(static_cast<double>(row));
+            rh.push_back(value);
         }
     }
     const PlaneFit left = fit_plane_huber(lx, ly, lh);
@@ -368,19 +377,16 @@ void snap_segment(const Segment& segment, const Grid& grid, int band,
     const double nx = -segment.dy;
     const double ny = segment.dx;
     const double s_max = static_cast<double>(band - 1);
-    const double ax = segment.px + segment.dx * segment.tmin;
-    const double ay = segment.py + segment.dy * segment.tmin;
-    const double bx = segment.px + segment.dx * segment.tmax;
-    const double by = segment.py + segment.dy * segment.tmax;
-    const int margin = band + 1;
-    const int col0 = std::max(0, static_cast<int>(std::floor(std::min(ax, bx))) - margin);
-    const int col1 =
-        std::min(grid.width - 1, static_cast<int>(std::ceil(std::max(ax, bx))) + margin);
-    const int row0 = std::max(0, static_cast<int>(std::floor(std::min(ay, by))) - margin);
-    const int row1 =
-        std::min(grid.height - 1, static_cast<int>(std::ceil(std::max(ay, by))) + margin);
-    for (int row = row0; row <= row1; ++row) {
-        for (int col = col0; col <= col1; ++col) {
+    // Walk the segment in 1-cell steps and scan only the perpendicular band,
+    // rather than every cell of the (possibly winding) bounding box.
+    const int t_first = static_cast<int>(std::floor(segment.tmin));
+    const int t_last = static_cast<int>(std::ceil(segment.tmax));
+    for (int ti = t_first; ti <= t_last; ++ti) {
+        const double cx = segment.px + segment.dx * static_cast<double>(ti);
+        const double cy = segment.py + segment.dy * static_cast<double>(ti);
+        for (int si = -band; si <= band; ++si) {
+            const int col = static_cast<int>(std::lround(cx + nx * static_cast<double>(si)));
+            const int row = static_cast<int>(std::lround(cy + ny * static_cast<double>(si)));
             if (!grid.is_valid(col, row)) {
                 continue;
             }
