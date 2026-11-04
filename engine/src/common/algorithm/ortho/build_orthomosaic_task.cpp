@@ -1783,7 +1783,11 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
     params.declare(seam_gradient_weight);
     ParamSpec seam_min_region{
         "seam_min_region", ParamType::Int, std::int64_t{0},
-        "Merge seam label regions smaller than this many cells into a neighbour; 0 = off"};
+        "Merge seam label regions smaller than this many cells into a neighbour; 0 = off. "
+        "Known interaction: when ghosting_filter is also on, the merge decision looks only at "
+        "the labels and a neighbouring camera, not at the per-camera deviant masks, so an "
+        "island that the ghost pass cut out can be relabelled onto a deviant camera. Fixing "
+        "that is deferred; if it matters, enable only one of the two features at a time."};
     seam_min_region.minimum = std::int64_t{0};
     params.declare(seam_min_region);
     ParamSpec color_correction{"color_correction", ParamType::String, std::string("affine"),
