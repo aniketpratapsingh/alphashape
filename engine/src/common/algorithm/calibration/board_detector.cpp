@@ -512,17 +512,31 @@ std::optional<GrownLattice> grow_lattice(const std::vector<Candidate>& corners, 
                 continue;
             }
             for (int sign = -1; sign <= 1; sign += 2) {
-                const Eigen::Vector2d predicted =
-                    position + static_cast<double>(sign) * step;
+                const Eigen::Vector2d predicted_step =
+                    static_cast<double>(sign) * step;
+                const Eigen::Vector2d predicted = position + predicted_step;
                 int best_index = -1;
-                double best_distance = 0.3 * length;
+                double best_distance = std::numeric_limits<double>::infinity();
                 for (int i = 0; i < static_cast<int>(n); ++i) {
                     if (i == current) {
                         continue;
                     }
-                    const double distance =
-                        std::hypot(corners[static_cast<std::size_t>(i)].x - predicted.x(),
-                                   corners[static_cast<std::size_t>(i)].y - predicted.y());
+                    const Eigen::Vector2d measured(
+                        corners[static_cast<std::size_t>(i)].x - position.x(),
+                        corners[static_cast<std::size_t>(i)].y - position.y());
+                    // Accept only within a spacing-scaled radius of the
+                    // prediction and within the angle gate of the predicted
+                    // step, then take the nearest such candidate.
+                    const double distance = (measured - predicted_step).norm();
+                    if (distance > spacing_tolerance * length) {
+                        continue;
+                    }
+                    if (angle_diff_pi(std::atan2(measured.y(), measured.x()),
+                                      std::atan2(predicted_step.y(),
+                                                 predicted_step.x())) >
+                        angle_tolerance) {
+                        continue;
+                    }
                     if (distance < best_distance) {
                         best_distance = distance;
                         best_index = i;
