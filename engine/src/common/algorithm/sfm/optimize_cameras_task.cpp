@@ -298,7 +298,24 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             continue;
         }
         Eigen::Vector3d point;
+        // An existing position is only a usable seed when it lies in front of
+        // every camera that observes the marker; a stale position (for example
+        // from a previous alignment) would start the solve behind a camera.
+        bool usable_seed = false;
         if (marker.position.has_value() && marker.position->allFinite()) {
+            usable_seed = true;
+            for (const std::pair<std::size_t, Eigen::Vector2d>& projection : projections) {
+                const Camera& camera = chunk->cameras()[camera_index[projection.first]];
+                const Eigen::Vector3d camera_point =
+                    camera.pose.block<3, 3>(0, 0) * *marker.position +
+                    camera.pose.block<3, 1>(0, 3);
+                if (!(camera_point.z() > 0.0)) {
+                    usable_seed = false;
+                    break;
+                }
+            }
+        }
+        if (usable_seed) {
             point = *marker.position;
         } else {
             // Linear multi-view triangulation from the current poses. The
