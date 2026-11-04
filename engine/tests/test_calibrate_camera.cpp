@@ -53,18 +53,6 @@ Calibration truth_calibration() {
     return calibration;
 }
 
-std::vector<Eigen::Vector2d> physical_board_points() {
-    std::vector<Eigen::Vector2d> points;
-    points.reserve(static_cast<std::size_t>(kCols * kRows));
-    for (int row = 0; row < kRows; ++row) {
-        for (int col = 0; col < kCols; ++col) {
-            points.emplace_back(static_cast<double>(col) * kSquare,
-                                static_cast<double>(row) * kSquare);
-        }
-    }
-    return points;
-}
-
 /// One view's observations. A partial view keeps a subset of corners and an
 /// arbitrary right-handed lattice origin / 90-degree rotation, exactly what
 /// BoardView reports for an incomplete board.
