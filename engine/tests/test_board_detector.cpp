@@ -171,10 +171,11 @@ TEST(Board, CornerOrderingCorrect) {
 TEST(Board, PartialViewAccepted) {
     const BoardSpec spec;
     const BoardDetectOptions options;
-    // Same small spin as the ordering test: it keeps lattice differences
-    // comparable while avoiding the coherent box-supersample phase of edges
-    // that are exactly parallel to the pixel grid.
-    const test::ChessboardPose pose = posed_board(20.0, 0.0, 8.0, 0.6);
+    // A small spin keeps lattice differences comparable and avoids the
+    // coherent box-supersample phase of edges exactly parallel to the pixel
+    // grid. At 3 degrees the crop boundary still falls in the gap between rows
+    // two and three, so no visible corner sits next to the image border.
+    const test::ChessboardPose pose = posed_board(20.0, 0.0, 3.0, 0.6);
     const test::ChessboardRender rendered = test::render_chessboard(pose);
     const int crop_height = rendered.image.height() / 2;
     FloatImage cropped(rendered.image.width(), crop_height, 0.0F);
