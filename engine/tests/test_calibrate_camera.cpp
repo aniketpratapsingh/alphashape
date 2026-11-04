@@ -58,10 +58,10 @@ Calibration truth_calibration() {
 /// BoardView reports for an incomplete board.
 CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
     const Calibration truth = truth_calibration();
-    const double ax = rng::uniform_real(engine, -0.55, 0.55);
-    const double ay = rng::uniform_real(engine, -0.45, 0.45);
-    const double az = rng::uniform_real(engine, -0.60, 0.60);
-    const double depth = rng::uniform_real(engine, 0.50, 0.65);
+    const double ax = rng::uniform_real(engine, -0.90, 0.90);
+    const double ay = rng::uniform_real(engine, -0.70, 0.70);
+    const double az = rng::uniform_real(engine, -0.80, 0.80);
+    const double depth = rng::uniform_real(engine, 0.50, 0.70);
     const Eigen::Matrix3d rotation =
         (Eigen::AngleAxisd(az, Eigen::Vector3d::UnitZ()) *
          Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
@@ -72,8 +72,8 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
         0.5 * static_cast<double>(kRows) * kSquare, 0.0);
     Eigen::Vector3d translation =
         -rotation * centre + Eigen::Vector3d(0.0, 0.0, depth);
-    translation.x() += rng::uniform_real(engine, -0.13, 0.13);
-    translation.y() += rng::uniform_real(engine, -0.075, 0.075);
+    translation.x() += rng::uniform_real(engine, -0.18, 0.18);
+    translation.y() += rng::uniform_real(engine, -0.10, 0.10);
     const int quarter_turns = partial ? static_cast<int>(rng::uniform_below(engine, 3U))
                                       : 0;
     CalibrationView view;
