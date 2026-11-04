@@ -26,10 +26,12 @@
 #include "model/raster/reproject.hpp"
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/colour_model.hpp"
+#include "common/algorithm/ortho/fill_holes_detail.hpp"
 #include "common/algorithm/ortho/gain.hpp"
 #include "common/algorithm/ortho/ghosting.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
 #include "common/algorithm/ortho/seamlines.hpp"
+#include "common/algorithm/ortho/texture_fill.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
@@ -376,11 +378,18 @@ namespace {
 /// difference rather than only a brightness one.
 enum class ColourMode { None, Gain, Affine };
 
+/// How the interior holes are completed. Smooth is the natural-neighbour
+/// interpolation the product has always used; Texture additionally copies
+/// texture from the valid surroundings (exemplar completion). Smooth stays the
+/// default so existing projects are byte-identical.
+enum class HoleFillMethod { Smooth, Texture };
+
 /// The validated parameter bundle.
 struct ResolvedOptions {
     std::string surface = "elevation";
     ortho::Blending blending = ortho::Blending::Mosaic;
     bool fill_holes = true;
+    HoleFillMethod hole_fill_method = HoleFillMethod::Smooth;
     bool refine_seamlines = true;
     bool ghosting_filter = false;
     /// Opt-in seam costs (both default off, so the product is unchanged).
@@ -426,6 +435,16 @@ ResolvedOptions resolve_options(const Params& params) {
     // contract the task inherits.
     options.blending = ortho::parse_blending(params.get_string("blending_mode"));
     options.fill_holes = params.get_bool("fill_holes");
+    const std::string hole_method = params.get_string("hole_fill_method");
+    if (hole_method == "smooth") {
+        options.hole_fill_method = HoleFillMethod::Smooth;
+    } else if (hole_method == "texture") {
+        options.hole_fill_method = HoleFillMethod::Texture;
+    } else {
+        throw ValueError("BuildOrthomosaic: hole_fill_method must be \"smooth\" or \"texture\" "
+                         "(got \"" +
+                         hole_method + "\")");
+    }
     options.refine_seamlines = params.get_bool("refine_seamlines");
     options.ghosting_filter = params.get_bool("ghosting_filter");
     options.seam_gradient_weight = params.get_float("seam_gradient_weight");
@@ -1443,11 +1462,32 @@ int block_margin_cells(int block_cells, int pyramid_levels) {
 /// peak, not an afterthought: the assembled labels and RGBA stay alive while one
 /// channel's float plane, validity mask, EDT and Sibson accumulators are built,
 /// and on a big grid that is several hundred megabytes.
-double estimate_fill_holes_peak_bytes(std::uint64_t output_cells) {
+double estimate_fill_holes_peak_bytes(std::uint64_t output_cells, bool texture_fill) {
     const double cells = static_cast<double>(output_cells);
+    double texture_window_bytes = 0.0;
+    if (texture_fill) {
+        // Texture completion is per component and only one component window is
+        // resident at a time. The window is capped directly by max_window_cells
+        // -- a sqrt(N) bounding box is NOT a bound, because a thin diagonal
+        // component of few cells can span the whole raster. Per window cell,
+        // straight from the implementation:
+        //   Level rgb + hole + valid                3 + 1 + 1 = 5 B
+        //   source_mask                                        1 B
+        //   int32 nearest-neighbour field                      4 B
+        //   sources + targets (std::size_t each)         8 + 8 = 16 B
+        //   vote sums (3 double) + counts (uint32)      24 + 4 = 28 B
+        //                                                    = 54 B
+        // The coarser pyramid levels add at most a third of the finest again, so
+        // the peak is 54 * 4/3 = 72 B per window cell. No run can use more
+        // windows than the output has cells, hence min(cap, output_cells).
+        const ortho::TextureFillOptions texture_defaults;
+        const double window_cells =
+            std::min(static_cast<double>(texture_defaults.max_window_cells), cells);
+        texture_window_bytes = window_cells * 72.0 /* bytes per window cell, see above */;
+    }
     return cells * (kBytesPerCellGridLabels + 4.0 /* result RGBA */ +
                     kBytesPerCellFillHoles) +
-           kFillHolesFixedBytes;
+           kFillHolesFixedBytes + texture_window_bytes;
 }
 
 double estimate_colour_pass_peak_bytes(int camera_count) {
@@ -1469,7 +1509,7 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
                                  std::uint64_t photo_cache_bytes, bool fill_holes,
-                                 bool ghosting, bool seam_merge) {
+                                 bool ghosting, bool seam_merge, bool texture_fill) {
     // The window's stages are the estimator the whole-grid path already uses,
     // with the window's (block + margin) cell count and its own footprint. The
     // assembled output raster (RGBA, 4 B) plus its seam labels (int32, 4 B) is
@@ -1482,7 +1522,7 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
     // fill_holes runs after the last block on the assembled grid, so its own
     // peak is a separate candidate for the run's maximum, not a summand.
     const double filled =
-        fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+        fill_holes ? estimate_fill_holes_peak_bytes(output_cells, texture_fill) : 0.0;
     // The photo cache is alive through all of it.
     return std::max(staged, filled) + static_cast<double>(photo_cache_bytes);
 }
@@ -1542,8 +1582,10 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             estimate_peak_bytes(window_cells, window_footprint, input.has_node_map,
                                 input.photo_cells, input.ghosting_filter, input.seam_merge) +
             static_cast<double>(output_cells) * (kBytesPerCellGridLabels + 4.0);
-        const double filled =
-            input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+        const double filled = input.fill_holes
+                                  ? estimate_fill_holes_peak_bytes(output_cells,
+                                                                   input.texture_fill)
+                                  : 0.0;
         const double fixed = std::max(std::max(staged, filled), colour_peak);
         out.estimated_window_bytes = staged;
         out.estimated_fill_bytes = filled;
@@ -1587,8 +1629,10 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
                                 input.photo_cells, input.ghosting_filter, input.seam_merge),
             colour_peak + static_cast<double>(plan.photo_cache_bytes));
         plan.estimated_window_bytes = plan.estimated_peak_bytes;
-        plan.estimated_fill_bytes =
-            input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+        plan.estimated_fill_bytes = input.fill_holes
+                                        ? estimate_fill_holes_peak_bytes(
+                                              output_cells, input.texture_fill)
+                                        : 0.0;
         return plan;
     }
     if (input.forced_block_cells <= 0) {
@@ -1608,7 +1652,9 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             plan.estimated_peak_bytes = whole_with_colour;
             plan.estimated_window_bytes = whole_with_colour;
             plan.estimated_fill_bytes =
-                input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
+                input.fill_holes
+                    ? estimate_fill_holes_peak_bytes(output_cells, input.texture_fill)
+                    : 0.0;
             return plan;
         }
     }
@@ -1765,6 +1811,15 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
 
     params.declare({"fill_holes", ParamType::Bool, true,
                     "Fill interior nodata holes of the colour image from the surroundings."});
+    ParamSpec hole_fill_method{
+        "hole_fill_method", ParamType::String, std::string("smooth"),
+        "How fill_holes completes interior holes: \"smooth\" (natural-neighbour "
+        "interpolation, the default) or \"texture\" (exemplar completion that copies texture "
+        "from the valid surroundings, for grass, gravel or roofs where a smooth patch is "
+        "visibly wrong). Texture runs the smooth fill first as its initialisation and "
+        "fallback."};
+    hole_fill_method.choices = {"smooth", "texture"};
+    params.declare(hole_fill_method);
     params.declare({"refine_seamlines", ParamType::Bool, true,
                     "Optimise the seam paths (alpha-expansion). False takes the per-cell "
                     "best-score camera, seams visible where the score steps."});
@@ -2213,6 +2268,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.camera_count = static_cast<int>(cameras.size());
         input.has_node_map = !frame.is_local();
         input.fill_holes = options.fill_holes;
+        input.texture_fill =
+            options.fill_holes && options.hole_fill_method == HoleFillMethod::Texture;
         input.colour_correction = options.colour != ColourMode::None;
         input.ghosting_filter = options.ghosting_filter;
         input.seam_merge = options.seam_min_region > 0;
@@ -2338,6 +2395,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     plan_input.camera_count = static_cast<int>(cameras.size());
     plan_input.has_node_map = !frame.is_local();
     plan_input.fill_holes = options.fill_holes;
+    plan_input.texture_fill =
+        options.fill_holes && options.hole_fill_method == HoleFillMethod::Texture;
     plan_input.colour_correction = options.colour != ColourMode::None;
     plan_input.ghosting_filter = options.ghosting_filter;
     plan_input.seam_merge = options.seam_min_region > 0;
@@ -2895,22 +2954,37 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         elevation::HoleFillOptions fill;
         fill.method = elevation::HoleFill::NaturalNeighbour;
         fill.interior_only = true;
-        for (int channel = 0; channel < 3; ++channel) {
-            std::vector<float> values(output_cells, 0.0F);
-            std::vector<std::uint8_t> channel_valid(output_cells, 0);
+        // Smooth always runs: for "texture" it is both the initial image the
+        // exemplar completion starts from and the fallback for a hole it
+        // cannot source. Record which cells it is about to change so the
+        // texture pass touches exactly those and no pre-existing pixels.
+        const bool use_texture = options.hole_fill_method == HoleFillMethod::Texture;
+        std::vector<std::uint8_t> was_hole;
+        if (use_texture) {
+            was_hole.assign(output_cells, 0);
             for (std::size_t i = 0; i < output_cells; ++i) {
-                values[i] = static_cast<float>(result.raster.data[i * 4 +
-                                                                  static_cast<std::size_t>(channel)]);
-                channel_valid[i] = result.raster.data[i * 4 + 3] != 0 ? 1 : 0;
+                was_hole[i] = result.raster.data[i * 4 + 3] == 0 ? 1 : 0;
             }
-            elevation::fill_holes(grid.width, grid.height, values, channel_valid, fill);
+        }
+        // One validity snapshot for all three channels: rebuilding it per
+        // channel would read the alpha this loop sets, so after channel 0 every
+        // filled cell would look valid and G and B would stay 0 (red holes).
+        ortho::detail::fill_smooth_rgba_holes(grid.width, grid.height, result.raster.data,
+                                              fill);
+        if (use_texture) {
+            // The mask is exactly the cells the smooth pass just filled: a
+            // pre-existing pixel (opaque before this stage) is never touched.
+            std::vector<std::uint8_t> mask(output_cells, 0);
             for (std::size_t i = 0; i < output_cells; ++i) {
-                if (channel_valid[i] != 0) {
-                    const float c = std::clamp(values[i], 0.0F, 255.0F);
-                    result.raster.data[i * 4 + static_cast<std::size_t>(channel)] =
-                        static_cast<std::uint8_t>(std::lround(c));
-                    result.raster.data[i * 4 + 3] = 255;
-                }
+                mask[i] =
+                    was_hole[i] != 0 && result.raster.data[i * 4 + 3] != 0 ? 1 : 0;
+            }
+            const ortho::TextureFillReport report = ortho::texture_fill(
+                grid.width, grid.height, result.raster.data, mask, ortho::TextureFillOptions{});
+            if (Log::enabled(LogLevel::Info)) {
+                log(LogLevel::Info) << "BuildOrthomosaic: texture hole fill completed "
+                                    << report.filled_cells << " of " << report.components
+                                    << " component(s), skipped " << report.skipped_large;
             }
         }
     }

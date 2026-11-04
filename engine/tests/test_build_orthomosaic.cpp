@@ -43,6 +43,7 @@
 #include "common/algorithm/ortho/blend.hpp"
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
+#include "common/algorithm/ortho/fill_holes_detail.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
 #include "common/io/project_io.hpp"
@@ -330,6 +331,50 @@ void expect_grid_covers_dem(const RasterGrid& ortho, const RasterGrid& dem,
 // ---------------------------------------------------------------------------
 // 1. The orthomosaic against the truth orthophoto, all three blending modes
 // ---------------------------------------------------------------------------
+
+TEST(BuildOrthomosaic, SmoothHoleFillWritesEveryColourChannel) {
+    // Regression: the validity mask used to be rebuilt from alpha inside the
+    // channel loop, so after channel 0 every filled cell read as valid and G and
+    // B were never written. A uniform grey hole came out red.
+    constexpr int kWidth = 21;
+    constexpr int kHeight = 21;
+    constexpr int kHole = 5;
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight) * 4U, 0);
+    for (std::size_t i = 0; i < rgba.size(); i += 4U) {
+        rgba[i] = 120;
+        rgba[i + 1U] = 120;
+        rgba[i + 2U] = 120;
+        rgba[i + 3U] = 255;
+    }
+    const int hole_x0 = (kWidth - kHole) / 2;
+    const int hole_y0 = (kHeight - kHole) / 2;
+    for (int y = hole_y0; y < hole_y0 + kHole; ++y) {
+        for (int x = hole_x0; x < hole_x0 + kHole; ++x) {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+                 static_cast<std::size_t>(x)) * 4U;
+            rgba[i + 3U] = 0;
+        }
+    }
+    elevation::HoleFillOptions fill;
+    fill.method = elevation::HoleFill::NaturalNeighbour;
+    fill.interior_only = true;
+    ortho::detail::fill_smooth_rgba_holes(kWidth, kHeight, rgba, fill);
+    for (int y = hole_y0; y < hole_y0 + kHole; ++y) {
+        for (int x = hole_x0; x < hole_x0 + kHole; ++x) {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
+                 static_cast<std::size_t>(x)) * 4U;
+            EXPECT_EQ(static_cast<int>(rgba[i + 3U]), 255) << "hole not made opaque";
+            for (int c = 0; c < 3; ++c) {
+                EXPECT_NEAR(
+                    static_cast<int>(rgba[i + static_cast<std::size_t>(c)]), 120, 2)
+                    << "channel " << c << " was not filled";
+            }
+        }
+    }
+}
 
 TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     OrthoSetup& s = setup();
@@ -658,6 +703,11 @@ TEST(BuildOrthomosaic, Errors) {
     Params bad_blend = ortho_params("bogus");
     EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_blend),
                  ValueError);
+
+    Params bad_hole_fill = ortho_params();
+    bad_hole_fill.set("hole_fill_method", ParamValue{std::string("bogus")});
+    EXPECT_THROW(
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_hole_fill), ValueError);
 
     Params bad_surface = ortho_params("mosaic", "bogus");
     EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_surface),
@@ -1579,6 +1629,15 @@ TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
     const double staged = small.estimated_window_bytes;
     const double fill = small.estimated_fill_bytes;
     EXPECT_GT(fill, 0.0) << "the assembled-grid fill_holes stage must be in the plan";
+    // The default SMOOTH method pays no texture window: the plan's fill figure
+    // is the function's smooth value exactly (the value origin/main computed),
+    // and asking for texture only adds.
+    const std::uint64_t output_cells =
+        static_cast<std::uint64_t>(kSide) * static_cast<std::uint64_t>(kSide);
+    EXPECT_DOUBLE_EQ(fill, estimate_fill_holes_peak_bytes(output_cells));
+    EXPECT_DOUBLE_EQ(fill, estimate_fill_holes_peak_bytes(output_cells, false));
+    EXPECT_GT(estimate_fill_holes_peak_bytes(output_cells, true), fill)
+        << "the texture method must charge its window";
     EXPECT_GT(staged, assembled) << "the window stages must be there on top of the assembled grid";
     EXPECT_DOUBLE_EQ(small.estimated_peak_bytes,
                      std::max(staged, fill) + static_cast<double>(small.photo_cache_bytes));
@@ -1719,6 +1778,49 @@ TEST(OrthoBlockPlan, MarginCoversTheMosaicPyramidSupport) {
         EXPECT_EQ(plan.levels, 6) << "block " << side << " lost the whole grid's depth";
     }
     EXPECT_EQ(block_margin_cells(0, 6), 0);
+}
+
+TEST(BuildOrthomosaic, TextureHoleFillRunsOnInteriorHoles) {
+    // End-to-end: "texture" must actually complete the holes the smooth pass
+    // fills, and touch nothing else. A cell with no camera label but an opaque
+    // result is exactly a hole the smooth fill completed.
+    OrthoSetup& s = setup();
+    Params params = ortho_params("average", "elevation", 0.125, true, false);
+    const Orthomosaic smooth = run_ortho(s, params);
+    ASSERT_FALSE(smooth.empty());
+    params.set("hole_fill_method", ParamValue{std::string("texture")});
+    const Orthomosaic texture = run_ortho(s, params);
+    ASSERT_EQ(texture.raster.grid, smooth.raster.grid);
+    ASSERT_EQ(texture.labels.size(), smooth.labels.size());
+
+    std::size_t holes = 0;
+    std::size_t changed = 0;
+    std::size_t touched_outside = 0;
+    for (std::size_t i = 0; i < smooth.labels.size(); ++i) {
+        const std::uint8_t* a = smooth.raster.data.data() + i * 4U;
+        const std::uint8_t* b = texture.raster.data.data() + i * 4U;
+        bool differs = false;
+        for (std::size_t c = 0; c < 4U; ++c) {
+            differs = differs || a[c] != b[c];
+        }
+        if (smooth.labels[i] >= 0 || a[3] == 0) {
+            touched_outside += differs ? 1U : 0U;
+            continue;
+        }
+        ++holes;
+        if (differs) {
+            ++changed;
+        }
+        EXPECT_EQ(static_cast<int>(b[3]), 255) << "a completed hole must be opaque";
+    }
+    std::printf("[BuildOrthomosaic.TextureFill] interior holes=%zu changed=%zu "
+                "touched-outside=%zu\n",
+                holes, changed, touched_outside);
+    if (holes == 0U) {
+        GTEST_SKIP() << "the aerial fixture has no interior hole to complete";
+    }
+    EXPECT_GT(changed, 0U) << "the texture pass never modified a hole";
+    EXPECT_EQ(touched_outside, 0U) << "texture fill must touch only smooth-filled cells";
 }
 
 TEST(BuildOrthomosaic, BlockWiseSingleBlockIsByteIdentical) {

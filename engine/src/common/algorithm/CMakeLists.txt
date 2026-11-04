@@ -75,6 +75,7 @@ add_library(alphashape_algorithms STATIC
     ortho/gain.cpp
     ortho/colour_model.cpp
     ortho/ghosting.cpp
+    ortho/texture_fill.cpp
     ortho/build_orthomosaic_task.cpp
     ortho/export_orthomosaic_task.cpp
 )
