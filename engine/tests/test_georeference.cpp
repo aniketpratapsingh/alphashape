@@ -321,8 +321,9 @@ TEST(Georeference, TrackCovarianceFollowsSimilarity) {
     // is bad^-1: scale 1/bad.scale and rotation bad.R^T.
     const sfm::Similarity bad = bad_similarity();
     const double scale = 1.0 / bad.scale;
-    const Eigen::Matrix3f expected = Eigen::Matrix3f(
-        (scale * scale) * bad.R.transpose() * covariance.cast<double>() * bad.R);
+    const Eigen::Matrix3f expected =
+        ((scale * scale) * bad.R.transpose() * covariance.cast<double>() * bad.R)
+            .cast<float>();
 
     ASSERT_TRUE(chunk.tie_points().tracks[0].covariance.has_value());
     const Eigen::Matrix3f& got = *chunk.tie_points().tracks[0].covariance;
