@@ -117,6 +117,7 @@ endif()
 
 target_link_libraries(alphashape_tests PRIVATE
     alphashape_algorithms
+    Ceres::ceres
     GTest::gtest
     GTest::gtest_main)
 
