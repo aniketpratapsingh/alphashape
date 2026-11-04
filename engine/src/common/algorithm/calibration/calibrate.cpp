@@ -79,10 +79,11 @@ bool similarity_normalisation(const std::vector<Eigen::Vector2d>& points,
     return true;
 }
 
+}  // namespace
+
 /// Normalised DLT homography from board-plane XY to pixels (Hartley &
-/// Zisserman 2004, 4.1). Returns false for fewer than four correspondences or
-/// a design matrix whose rank is below eight (three collinear points, repeated
-/// points).
+/// Zisserman 2004, 4.1). Works for the four-correspondence minimum as well as
+/// longer lists; see the declaration for the failure conditions.
 bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
                     const std::vector<Eigen::Vector2d>& pixels,
                     Eigen::Matrix3d& homography) {
@@ -148,6 +149,8 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
     homography /= norm;
     return true;
 }
+
+namespace {
 
 /// Zhang's two orthogonality constraints with the principal point fixed at the
 /// image centre, zero skew and unit aspect reduce to one scalar per view in

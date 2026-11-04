@@ -72,6 +72,16 @@ inline constexpr std::array<const char*, kCalibrationParamCount>
 
 using CalibrationFitFlags = std::array<bool, kCalibrationParamCount>;
 
+/// Normalised DLT homography from board-plane XY to pixels (Hartley &
+/// Zisserman 2004, 4.1). Accepts any correspondences from four upwards, i.e.
+/// the minimal case is supported. Returns false for fewer than four
+/// correspondences, for non-finite points or a degenerate point set, and for
+/// a design matrix whose rank is below eight (three collinear points,
+/// repeated points). The returned matrix has unit Frobenius norm.
+bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
+                    const std::vector<Eigen::Vector2d>& pixels,
+                    Eigen::Matrix3d& homography);
+
 /// Fit flags matching the task defaults: f, cx, cy, k1, k2, k3, p1, p2 free;
 /// b1, b2, k4, p3, p4 held.
 CalibrationFitFlags default_calibration_fit_flags();

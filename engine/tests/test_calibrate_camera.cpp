@@ -55,13 +55,16 @@ Calibration truth_calibration() {
 
 /// One view's observations. A partial view keeps a subset of corners and an
 /// arbitrary right-handed lattice origin / 90-degree rotation, exactly what
-/// BoardView reports for an incomplete board.
-CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
-    const Calibration truth = truth_calibration();
-    const double ax = rng::uniform_real(engine, -0.90, 0.90);
-    const double ay = rng::uniform_real(engine, -0.70, 0.70);
-    const double az = rng::uniform_real(engine, -0.80, 0.80);
-    const double depth = rng::uniform_real(engine, 0.30, 0.42);
+/// BoardView reports for an incomplete board. Poses come from `pose_engine`
+/// and per-corner noise from `noise_engine`, so a caller can hold the poses
+/// fixed while varying the noise draw.
+CalibrationView make_view_impl(std::mt19937& pose_engine,
+                               std::mt19937& noise_engine, int camera_id,
+                               bool partial, const Calibration& truth) {
+    const double ax = rng::uniform_real(pose_engine, -0.90, 0.90);
+    const double ay = rng::uniform_real(pose_engine, -0.70, 0.70);
+    const double az = rng::uniform_real(pose_engine, -0.80, 0.80);
+    const double depth = rng::uniform_real(pose_engine, 0.30, 0.42);
     const Eigen::Matrix3d rotation =
         (Eigen::AngleAxisd(az, Eigen::Vector3d::UnitZ()) *
          Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
@@ -72,10 +75,10 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
         0.5 * static_cast<double>(kRows) * kSquare, 0.0);
     Eigen::Vector3d translation =
         -rotation * centre + Eigen::Vector3d(0.0, 0.0, depth);
-    translation.x() += rng::uniform_real(engine, -0.07, 0.07);
-    translation.y() += rng::uniform_real(engine, -0.045, 0.045);
-    const int quarter_turns = partial ? static_cast<int>(rng::uniform_below(engine, 3U))
-                                      : 0;
+    translation.x() += rng::uniform_real(pose_engine, -0.07, 0.07);
+    translation.y() += rng::uniform_real(pose_engine, -0.045, 0.045);
+    const int quarter_turns =
+        partial ? static_cast<int>(rng::uniform_below(pose_engine, 3U)) : 0;
     CalibrationView view;
     view.camera_id = camera_id;
     for (int row = 0; row < kRows; ++row) {
@@ -87,8 +90,8 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
                                         static_cast<double>(row) * kSquare, 0.0);
             const Eigen::Vector3d camera = rotation * world + translation;
             Eigen::Vector2d pixel = truth.project(camera);
-            pixel.x() += 0.1 * rng::normal(engine);
-            pixel.y() += 0.1 * rng::normal(engine);
+            pixel.x() += 0.1 * rng::normal(noise_engine);
+            pixel.y() += 0.1 * rng::normal(noise_engine);
             int label_col = col;
             int label_row = row;
             for (int turn = 0; turn < quarter_turns; ++turn) {
@@ -104,6 +107,31 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
                 static_cast<double>(label_col) * kSquare,
                 static_cast<double>(label_row) * kSquare);
             view.pixels.push_back(pixel);
+        }
+    }
+    return view;
+}
+
+/// Single-engine wrapper: poses and noise share one stream, which keeps the
+/// draw order of the original helper unchanged.
+CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
+    return make_view_impl(engine, engine, camera_id, partial,
+                          truth_calibration());
+}
+
+/// A full, noise-free board view seen from the given board-to-camera pose.
+CalibrationView make_exact_view(int camera_id, const Calibration& truth,
+                                const Eigen::Matrix3d& rotation,
+                                const Eigen::Vector3d& translation) {
+    CalibrationView view;
+    view.camera_id = camera_id;
+    for (int row = 0; row < kRows; ++row) {
+        for (int col = 0; col < kCols; ++col) {
+            view.board_points.emplace_back(static_cast<double>(col) * kSquare,
+                                           static_cast<double>(row) * kSquare);
+            const Eigen::Vector3d world(static_cast<double>(col) * kSquare,
+                                        static_cast<double>(row) * kSquare, 0.0);
+            view.pixels.push_back(truth.project(rotation * world + translation));
         }
     }
     return view;
@@ -234,6 +262,143 @@ TEST(Calibrate, NeedsThreeViews) {
     }
 }
 
+TEST(Calibrate, DefaultPruningKeepsSignificantTerms) {
+    // Truth k2 is 0.05 and the default fit frees it; one standard error is far
+    // below the estimate, so the default threshold must keep it.
+    const CalibrationResult result = solve(synthetic_views(41U, 12));
+    std::printf("[calibrate default pruning] k2 %.6f sigma %.6f pruned %zu\n",
+                result.calibration.k2, result.sigma[6], result.pruned.size());
+    EXPECT_FALSE(contains(result.pruned, "k2"));
+    EXPECT_LT(std::abs(result.calibration.k2 - 0.05), 0.025);
+}
+
+TEST(Calibrate, HomographyFromFourPoints) {
+    // Four non-degenerate correspondences give the eight-equation minimum; the
+    // padded design must still return the exact homography on those points.
+    const std::array<Eigen::Vector2d, 4> board = {
+        Eigen::Vector2d(0.02, 0.01), Eigen::Vector2d(0.18, 0.02),
+        Eigen::Vector2d(0.20, 0.15), Eigen::Vector2d(0.01, 0.14)};
+    Eigen::Matrix3d truth;
+    truth << 900.0, 30.0, 640.0,
+             -12.0, 870.0, 480.0,
+             0.02, -0.01, 1.0;
+    const std::vector<Eigen::Vector2d> board_points(board.begin(), board.end());
+    std::vector<Eigen::Vector2d> pixels;
+    pixels.reserve(board.size());
+    for (const Eigen::Vector2d& point : board) {
+        const Eigen::Vector3d q =
+            truth * Eigen::Vector3d(point.x(), point.y(), 1.0);
+        pixels.emplace_back(q.x() / q.z(), q.y() / q.z());
+    }
+    Eigen::Matrix3d recovered;
+    ASSERT_TRUE(homography_dlt(board_points, pixels, recovered));
+    for (std::size_t i = 0; i < board.size(); ++i) {
+        const Eigen::Vector3d q =
+            recovered * Eigen::Vector3d(board[i].x(), board[i].y(), 1.0);
+        ASSERT_GT(std::abs(q.z()), 1e-9);
+        const Eigen::Vector2d mapped(q.x() / q.z(), q.y() / q.z());
+        EXPECT_LE((mapped - pixels[i]).norm(), 1e-9) << i;
+    }
+}
+
+TEST(Calibrate, SigmaMatchesEmpiricalSpread) {
+    // Well-specified model: the truth carries exactly the terms the fit frees,
+    // so the estimator is unbiased and the empirical spread checks the
+    // reported covariance rather than model error.
+    Calibration truth =
+        Calibration::initial(CameraType::Frame, kWidth, kHeight, 1200.0);
+    truth.cx = 6.0;
+    truth.cy = -4.0;
+    truth.k1 = -0.10;
+    truth.k2 = 0.04;
+    truth.p1 = 4e-4;
+    truth.p2 = -2e-4;
+    CalibrationFitFlags fit{};
+    fit[0] = true;   // f
+    fit[1] = true;   // cx
+    fit[2] = true;   // cy
+    fit[5] = true;   // k1
+    fit[6] = true;   // k2
+    fit[9] = true;   // p1
+    fit[10] = true;  // p2
+    CalibrateOptions options;
+    options.prune_t_ratio = 0.0;  // fit the same terms in every draw
+
+    constexpr int kDraws = 20;
+    constexpr int kViewCount = 6;
+    std::array<double, static_cast<std::size_t>(kDraws)> focal{};
+    double sigma_sum = 0.0;
+    const Calibration initial =
+        Calibration::initial(CameraType::Frame, kWidth, kHeight, 1000.0);
+    for (int draw = 0; draw < kDraws; ++draw) {
+        // Identical poses every draw; only the noise seeds change.
+        std::mt19937 pose_engine(900U);
+        std::mt19937 noise_engine(1000U + static_cast<std::uint32_t>(draw));
+        std::vector<CalibrationView> views;
+        views.reserve(static_cast<std::size_t>(kViewCount));
+        for (int i = 0; i < kViewCount; ++i) {
+            views.push_back(
+                make_view_impl(pose_engine, noise_engine, 100 + i, false, truth));
+        }
+        const CalibrationResult result =
+            calibrate_camera(kWidth, kHeight, views, initial, fit, options);
+        focal[static_cast<std::size_t>(draw)] = result.calibration.f;
+        sigma_sum += result.sigma[0];
+    }
+    double mean = 0.0;
+    for (const double value : focal) {
+        mean += value;
+    }
+    mean /= static_cast<double>(kDraws);
+    double spread = 0.0;
+    for (const double value : focal) {
+        spread += (value - mean) * (value - mean);
+    }
+    const double empirical =
+        std::sqrt(spread / static_cast<double>(kDraws - 1));
+    const double reported = sigma_sum / static_cast<double>(kDraws);
+    ASSERT_GT(reported, 0.0);
+    const double ratio = empirical / reported;
+    std::printf("[calibrate sigma] empirical %.5f reported %.5f ratio %.3f\n",
+                empirical, reported, ratio);
+    EXPECT_GE(ratio, 0.6);
+    EXPECT_LE(ratio, 1.6);
+}
+
+TEST(Calibrate, NearFrontoParallelFailsCleanly) {
+    const Calibration truth = truth_calibration();
+    const Eigen::Vector3d centre(
+        0.5 * static_cast<double>(kCols) * kSquare,
+        0.5 * static_cast<double>(kRows) * kSquare, 0.0);
+    std::vector<CalibrationView> views;
+    for (int i = 0; i < 6; ++i) {
+        // Every board stays within half a degree of the image plane, where the
+        // two Zhang constraints carry no usable signal.
+        const double ax = 0.003 + 0.001 * static_cast<double>(i);
+        const double ay = 0.002 + 0.0005 * static_cast<double>(i);
+        const Eigen::Matrix3d rotation =
+            (Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
+             Eigen::AngleAxisd(ax, Eigen::Vector3d::UnitX()))
+                .toRotationMatrix();
+        const Eigen::Vector3d translation =
+            -rotation * centre +
+            Eigen::Vector3d(0.004 * static_cast<double>(i),
+                            0.003 * static_cast<double>(i), 0.35);
+        views.push_back(make_exact_view(i, truth, rotation, translation));
+    }
+    std::string message;
+    try {
+        solve(views);
+    } catch (const Error& error) {
+        message = error.what();
+    }
+    std::printf("[calibrate fronto-parallel] %s\n", message.c_str());
+    ASSERT_FALSE(message.empty()) << "a fronto-parallel set must be rejected";
+    EXPECT_TRUE(message.find("fronto-parallel") != std::string::npos ||
+                message.find("out of range") != std::string::npos)
+        << message;
+}
+
 namespace {
 
 constexpr int kTaskWidth = 640;
@@ -328,6 +493,76 @@ CalibrateScene make_calibrate_scene(std::uint32_t seed, int count) {
     return scene;
 }
 
+/// Add one camera with a rendered chessboard on its frame path.
+void add_board_camera(CalibrateScene& scene, std::mt19937& engine,
+                      int sensor_index, const std::string& label, int width,
+                      int height) {
+    Chunk& chunk = *scene.chunk;
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.sensor_id = sensor_index;
+    camera.label = label;
+    camera.enabled = true;
+    chunk.cameras().push_back(camera);
+    const std::string path =
+        platform::unique_temp_path("alphashape_calib_", ".png");
+    auto frame = std::make_shared<Frame>(path, width, height);
+    frame->set_id(chunk.allocate_id());
+    frame->set_camera_id(camera.id);
+    chunk.frames().push_back(frame);
+    test::ChessboardPose pose;
+    pose.width = width;
+    pose.height = height;
+    pose.cols = kCols;
+    pose.rows = kRows;
+    pose.square_m = kSquare;
+    pose.f = kTaskFocal;
+    pose.k1 = 0.0;
+    const double ax = rng::uniform_real(engine, -0.22, 0.22);
+    const double ay = rng::uniform_real(engine, -0.18, 0.18);
+    const double az = rng::uniform_real(engine, -0.25, 0.25);
+    pose.rotation =
+        (Eigen::AngleAxisd(az, Eigen::Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
+         Eigen::AngleAxisd(ax, Eigen::Vector3d::UnitX()))
+            .toRotationMatrix();
+    const Eigen::Vector3d centre(
+        0.5 * static_cast<double>(kCols) * kSquare,
+        0.5 * static_cast<double>(kRows) * kSquare, 0.0);
+    pose.translation = -pose.rotation * centre + Eigen::Vector3d(0.0, 0.0, 0.45);
+    pose.translation.x() += rng::uniform_real(engine, -0.02, 0.02);
+    pose.translation.y() += rng::uniform_real(engine, -0.015, 0.015);
+    write_gray_png(path, test::render_chessboard(pose).image);
+    scene.paths.push_back(path);
+}
+
+/// Two sensors: "good" has `good_count` consistently sized frames, "mixed" has
+/// two frames that disagree on size so that sensor alone must be skipped.
+CalibrateScene make_mixed_size_scene(std::uint32_t seed, int good_count) {
+    CalibrateScene scene;
+    Chunk& chunk = scene.document.workspace().add_chunk("Chunk 1");
+    scene.document.set_active_chunk_id(chunk.id());
+    scene.chunk = &chunk;
+    for (int s = 0; s < 2; ++s) {
+        Sensor sensor;
+        sensor.label = s == 0 ? "good" : "mixed";
+        sensor.type = CameraType::Frame;
+        sensor.width = kTaskWidth;
+        sensor.height = kTaskHeight;
+        sensor.calibration =
+            Calibration::initial(CameraType::Frame, kTaskWidth, kTaskHeight, 500.0);
+        chunk.sensors().push_back(sensor);
+    }
+    std::mt19937 engine(seed);
+    for (int i = 0; i < good_count; ++i) {
+        add_board_camera(scene, engine, 0, "good" + std::to_string(i),
+                         kTaskWidth, kTaskHeight);
+    }
+    add_board_camera(scene, engine, 1, "mixed0", kTaskWidth, kTaskHeight);
+    add_board_camera(scene, engine, 1, "mixed1", kTaskWidth / 2, kTaskHeight / 2);
+    return scene;
+}
+
 }  // namespace
 
 TEST(CalibrateCamera, ApplyWritesSensor) {
@@ -355,6 +590,22 @@ TEST(CalibrateCamera, ApplyWritesSensor) {
         retained.chunk->meta().find("calibrate_camera.sensor.rms_px");
     ASSERT_NE(dry_rms, nullptr);
     EXPECT_GT(std::stod(*dry_rms), 0.0);
+}
+
+TEST(CalibrateCamera, MixedSizesSkipOnlyThatSensor) {
+    CalibrateScene scene = make_mixed_size_scene(91U, 5);
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    const Calibration& good = scene.chunk->sensors()[0].calibration;
+    const std::string* skipped =
+        scene.chunk->meta().find("calibrate_camera.mixed.skipped");
+    std::printf("[calibrate camera mixed sizes] good f %.3f skipped \"%s\"\n",
+                good.f, skipped != nullptr ? skipped->c_str() : "(none)");
+    EXPECT_NEAR(good.f, kTaskFocal, 0.01 * kTaskFocal);
+    EXPECT_EQ(scene.chunk->meta().find("calibrate_camera.good.skipped"), nullptr);
+    ASSERT_NE(skipped, nullptr);
+    EXPECT_TRUE(skipped->find("differing image sizes") != std::string::npos)
+        << *skipped;
 }
 
 }  // namespace alphashape
