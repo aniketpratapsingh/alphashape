@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -151,6 +152,14 @@ private:
 /// 3 sigma are downweighted linearly, so a single bad GPS fix cannot drag the
 /// solution.
 constexpr double kPriorLossScaleSigma = 3.0;
+
+/// Robust loss scale for observations of a point that carries a control or
+/// scale-bar residual, as a multiple of the caller's reprojection loss scale
+/// (ours). Cauchy's influence collapses to zero for a large residual, so a
+/// control residual that moves only the marker's point block can detach that
+/// point from its rays and stall the poses; Huber's influence never collapses,
+/// so the rays keep pulling the poses along.
+constexpr double kControlObservationLossScale = 3.0;
 
 /// An axis with sigma <= 0 or non-finite is unconstrained.
 bool valid_sigma(double s) { return std::isfinite(s) && s > 0.0; }
@@ -553,6 +562,39 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     }
     ceres::Problem ceres_problem;
 
+    // Observations of a point that carries a control residual (or is an
+    // endpoint of an active scale bar) get a Huber loss instead of the shared
+    // Cauchy one, scaled to kControlObservationLossScale * loss_scale_px.
+    // Cauchy's influence falls to ~0 for a large residual, which would let the
+    // point detach from its rays; Huber keeps a constant influence so the rays
+    // keep pulling the poses along.
+    std::vector<std::uint8_t> control_observation(problem.points.size(), 0);
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (!cp.checkpoint) {
+            control_observation[cp.point] = 1;
+        }
+    }
+    for (const BAScalebar& bar : problem.scalebars) {
+        if (scalebar_active(problem, bar)) {
+            control_observation[bar.point_a] = 1;
+            control_observation[bar.point_b] = 1;
+        }
+    }
+    // Lazily allocated so a problem with no control observations (or a run
+    // without a robust loss) never leaks one. The Problem takes ownership once
+    // a block is added, same as the shared Cauchy loss above.
+    ceres::LossFunction* control_observation_loss = nullptr;
+    const auto control_observation_loss_ptr = [&]() -> ceres::LossFunction* {
+        if (options.loss_scale_px <= 0.0) {
+            return nullptr;
+        }
+        if (control_observation_loss == nullptr) {
+            control_observation_loss =
+                new ceres::HuberLoss(kControlObservationLossScale * options.loss_scale_px);
+        }
+        return control_observation_loss;
+    };
+
     for (const BAObservation& obs : problem.observations) {
         // Check points must have zero influence on the estimate.
         if (is_check_point(problem, obs.point)) {
@@ -562,7 +604,9 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         const Calibration& cal = problem.calibrations[sensor];
         auto* cost = new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 3, kCalibrationParamCount>(
             new ReprojectionCost(cal.type, cal.width, cal.height, obs.pixel));
-        ceres_problem.AddResidualBlock(cost, loss, cam_blocks[obs.camera].data(),
+        ceres::LossFunction* obs_loss =
+            control_observation[obs.point] != 0 ? control_observation_loss_ptr() : loss;
+        ceres_problem.AddResidualBlock(cost, obs_loss, cam_blocks[obs.camera].data(),
                                        cam_blocks[obs.camera].data() + 3, point_blocks[obs.point].data(),
                                        intr_blocks[sensor].data());
     }
