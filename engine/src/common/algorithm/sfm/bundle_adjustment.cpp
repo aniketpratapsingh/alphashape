@@ -689,10 +689,18 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
 
     // The Problem takes ownership of the loss function (allocated once, shared
     // by every residual block, freed by the Problem), so no smart pointer here.
+    // Allocate lazily: a problem whose observations are all check points adds no
+    // reprojection block, and an eagerly allocated loss would leak.
     ceres::LossFunction* loss = nullptr;
-    if (options.loss_scale_px > 0.0) {
-        loss = new ceres::CauchyLoss(options.loss_scale_px);
-    }
+    const auto loss_ptr = [&]() -> ceres::LossFunction* {
+        if (options.loss_scale_px <= 0.0) {
+            return nullptr;
+        }
+        if (loss == nullptr) {
+            loss = new ceres::CauchyLoss(options.loss_scale_px);
+        }
+        return loss;
+    };
     // Priors use their own robust loss (Huber, 3 sigma), owned by the Problem.
     ceres::LossFunction* prior_loss = nullptr;
     if (!problem.centre_priors.empty()) {
@@ -743,7 +751,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         auto* cost = new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 3, kCalibrationParamCount>(
             new ReprojectionCost(cal.type, cal.width, cal.height, obs.pixel));
         ceres::LossFunction* obs_loss =
-            control_observation[obs.point] != 0 ? control_observation_loss_ptr() : loss;
+            control_observation[obs.point] != 0 ? control_observation_loss_ptr() : loss_ptr();
         ceres_problem.AddResidualBlock(cost, obs_loss, cam_blocks[obs.camera].data(),
                                        cam_blocks[obs.camera].data() + 3, point_blocks[obs.point].data(),
                                        intr_blocks[sensor].data());
