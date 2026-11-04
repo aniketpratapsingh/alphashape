@@ -34,7 +34,10 @@
 // scaled by s.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/core/chunk.hpp"
 
@@ -47,6 +50,20 @@ struct GeoreferenceReport {
     std::size_t references_total = 0;  ///< aligned cameras with a usable reference
     double rms_error_m = 0.0;          ///< residual of the camera-centre fit, inliers only
     std::string reason;                ///< why not applied, if not
+
+    // -- update_transform (WP-13.12) ----------------------------------------
+    std::size_t control_points_used = 0;  ///< inlier control markers in the fit
+    std::size_t cameras_used = 0;         ///< inlier camera references in the fit
+    std::size_t check_points_used = 0;    ///< check points measured after the fit
+    double rms_control_m = 0.0;           ///< residual over the control inliers
+    double rms_check_m = 0.0;             ///< RMS of the held-out check-point errors
+    double max_check_m = 0.0;             ///< largest held-out check-point error
+    double scale = 1.0;                   ///< recovered similarity scale
+    /// Held-out check-point errors, (marker id, 3-D error in metres), measured
+    /// on the marker's position AFTER the transform is applied.
+    std::vector<std::pair<std::int32_t, double>> check_errors;
+    /// Ids of control markers that the robust fit rejected as outliers.
+    std::vector<std::int32_t> rejected_markers;
 };
 
 /// Places `chunk` into a metric ENU frame from its aligned cameras' GNSS
@@ -66,5 +83,29 @@ struct GeoreferenceReport {
 /// local frame is first carried through the old transform to ECEF and into the
 /// new ENU, so repeated calls are stable.
 GeoreferenceReport georeference_chunk(Chunk& chunk);
+
+/// Fits ONE 7-parameter similarity from the chunk's current local frame to the
+/// reference frame and applies it uniformly (WP-13.12). Unlike
+/// georeference_chunk this uses control markers as well as camera references,
+/// and unlike OptimizeCameras it never changes the internal shape of the block.
+///
+/// Correspondences are (local point -> ENU reference) pairs from
+///   * aligned enabled cameras with a full lon/lat/alt reference (centre), and
+///   * Regular markers that carry both a local position and a full reference
+///     and whose meta role is not "check_point".
+/// Both kinds share one weighted system: weight = 1/sigma^2, sigma = the mean
+/// per-axis accuracy (falling back to 10 m when it is non-finite or non-positive).
+/// Check-point markers are measured after the fit and reported, never used.
+///
+/// The robust fit uses estimate_similarity_ransac with a deterministic seed and
+/// threshold = max(camera rule, 5 x median marker sigma, 0.05 m), then refits the
+/// inliers with estimate_similarity_weighted. The result is applied to the
+/// aligned poses, every track point, the region and every marker position, and
+/// the chunk transform/CRS slots are set exactly as georeference_chunk does.
+///
+/// At least three non-collinear correspondences are required; otherwise
+/// `applied` is false and `reason` explains why. A second call changes the chunk
+/// by no more than numerical noise.
+GeoreferenceReport update_transform(Chunk& chunk);
 
 }  // namespace alphashape::sfm

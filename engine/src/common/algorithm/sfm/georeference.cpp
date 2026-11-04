@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -42,6 +45,40 @@ double median(std::vector<double> values) {
 
 bool all_finite(const Eigen::Vector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
+/// True when the points are not collinear: the farthest pair defines a line and
+/// at least one other point deviates from it by more than a relative tolerance.
+/// Mirrors the gauge test used by OptimizeCameras.
+bool points_not_collinear(const std::vector<Eigen::Vector3d>& points) {
+    if (points.size() < 3) {
+        return false;
+    }
+    std::size_t a = 0;
+    std::size_t b = 1;
+    double best = -1.0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        for (std::size_t j = i + 1; j < points.size(); ++j) {
+            const double d = (points[i] - points[j]).squaredNorm();
+            if (d > best) {
+                best = d;
+                a = i;
+                b = j;
+            }
+        }
+    }
+    const Eigen::Vector3d dir = points[a] - points[b];
+    const double len = dir.norm();
+    if (!(len > 0.0)) {
+        return false;
+    }
+    const Eigen::Vector3d u = dir / len;
+    double max_perp = 0.0;
+    for (const Eigen::Vector3d& p : points) {
+        const Eigen::Vector3d v = p - points[a];
+        max_perp = std::max(max_perp, (v - v.dot(u) * u).norm());
+    }
+    return max_perp > 1e-3 * len;
 }
 
 /// Rewrite the chunk by one similarity `t_sim` (already composed with any old
@@ -210,6 +247,222 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     report.applied = true;
     report.references_used = inliers;
     report.rms_error_m = std::sqrt(sum_sq / static_cast<double>(inliers));
+    return report;
+}
+
+GeoreferenceReport update_transform(Chunk& chunk) {
+    GeoreferenceReport report;
+
+    struct Sample {
+        Eigen::Vector3d local;
+        Eigen::Vector3d reference;  ///< lon_deg, lat_deg, alt_m
+        double sigma = kFallbackHorizontalAccuracy;
+        std::int32_t marker_id = -1;  ///< -1 for a camera reference
+    };
+    struct CheckSample {
+        std::int32_t marker_id = -1;
+        Eigen::Vector3d reference;      ///< lon_deg, lat_deg, alt_m
+        Eigen::Vector3d reference_enu;  ///< in the new frame
+    };
+    std::vector<Sample> samples;
+    std::vector<CheckSample> checks;
+
+    const bool already_georeferenced =
+        (chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff() > 1e-12;
+    const auto sigma_of = [](const Eigen::Vector3d& accuracy) {
+        const double s = accuracy.mean();
+        return std::isfinite(s) && s > 0.0 ? s : kFallbackHorizontalAccuracy;
+    };
+
+    // (a) aligned cameras with a full, finite reference: centre <-> reference.
+    for (const Camera& camera : chunk.cameras()) {
+        if (!camera.enabled || !camera.reference.enabled ||
+            !camera.reference.location.has_value()) {
+            continue;
+        }
+        const Eigen::Vector3d& loc = *camera.reference.location;
+        if (!all_finite(loc)) {
+            continue;
+        }
+        samples.push_back(
+            {camera_centre(camera.pose), loc, sigma_of(camera.reference.accuracy), -1});
+    }
+    // (b) Regular control markers with a position and a full reference. Check
+    // points are held out of the fit and measured only after it.
+    for (const Marker& marker : chunk.markers()) {
+        if (marker.type != MarkerType::Regular || !marker.position.has_value() ||
+            !marker.reference.has_value()) {
+            continue;
+        }
+        const Eigen::Vector3d& loc = *marker.reference;
+        if (!all_finite(loc)) {
+            continue;
+        }
+        const std::string* role = marker.meta.find("type");
+        if (role != nullptr && *role == "check_point") {
+            checks.push_back({marker.id, loc, Eigen::Vector3d::Zero()});
+            continue;
+        }
+        samples.push_back(
+            {*marker.position, loc, sigma_of(marker.reference_accuracy), marker.id});
+    }
+
+    if (samples.size() < 3) {
+        report.reason =
+            "need 3 non-collinear reference points (cameras or markers); scale bars alone "
+            "cannot georeference";
+        return report;
+    }
+
+    // -- origin from the fit references (check points never move it) ---------
+    Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
+    for (const Sample& s : samples) {
+        mean_ecef += geo::geodetic_to_ecef(
+            geo::Geodetic{s.reference.x(), s.reference.y(), s.reference.z()});
+    }
+    mean_ecef /= static_cast<double>(samples.size());
+    const geo::Geodetic origin = geo::ecef_to_geodetic(mean_ecef);
+    const Transform ecef_to_local = geo::ecef_to_enu(origin);
+
+    Transform map = Transform::Identity();
+    if (already_georeferenced) {
+        map = ecef_to_local * chunk.transform();
+    }
+    std::vector<Eigen::Vector3d> source;
+    std::vector<Eigen::Vector3d> reference_enu;
+    std::vector<double> weights;
+    source.reserve(samples.size());
+    reference_enu.reserve(samples.size());
+    weights.reserve(samples.size());
+    for (const Sample& s : samples) {
+        source.push_back((map * s.local.homogeneous()).head<3>());
+        const Eigen::Vector3d ecef = geo::geodetic_to_ecef(
+            geo::Geodetic{s.reference.x(), s.reference.y(), s.reference.z()});
+        reference_enu.push_back((ecef_to_local * ecef.homogeneous()).head<3>());
+        weights.push_back(1.0 / (s.sigma * s.sigma));
+    }
+    for (CheckSample& c : checks) {
+        const Eigen::Vector3d ecef = geo::geodetic_to_ecef(
+            geo::Geodetic{c.reference.x(), c.reference.y(), c.reference.z()});
+        c.reference_enu = (ecef_to_local * ecef.homogeneous()).head<3>();
+    }
+
+    if (!points_not_collinear(source)) {
+        report.reason = "reference points are collinear";
+        return report;
+    }
+
+    // -- threshold: max(camera rule, 5 x median marker sigma, 0.05 m) --------
+    std::vector<double> horizontal;
+    for (const Camera& camera : chunk.cameras()) {
+        if (!camera.enabled || !camera.reference.enabled ||
+            !camera.reference.location.has_value() ||
+            !all_finite(*camera.reference.location)) {
+            continue;
+        }
+        const Eigen::Vector3d& a = camera.reference.accuracy;
+        const double h = std::hypot(a.x(), a.y());
+        horizontal.push_back(std::isfinite(h) && h > 0.0 ? h : kFallbackHorizontalAccuracy);
+    }
+    std::vector<double> marker_sigmas;
+    for (const Sample& s : samples) {
+        if (s.marker_id >= 0) {
+            marker_sigmas.push_back(s.sigma);
+        }
+    }
+    double threshold = 0.05;
+    if (!horizontal.empty()) {
+        threshold = std::max(threshold, std::max(0.5, 5.0 * median(horizontal)));
+    }
+    if (!marker_sigmas.empty()) {
+        threshold = std::max(threshold, 5.0 * median(marker_sigmas));
+    }
+
+    constexpr std::uint64_t kSeed = 0x5eed;
+    const SimilarityRansacResult ransac =
+        estimate_similarity_ransac(source, reference_enu, threshold, kSeed);
+
+    // -- refit on the inliers with the per-point weights ---------------------
+    std::vector<Eigen::Vector3d> in_source;
+    std::vector<Eigen::Vector3d> in_reference;
+    std::vector<double> in_weight;
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (ransac.inliers[i] == 0) {
+            if (samples[i].marker_id >= 0) {
+                report.rejected_markers.push_back(samples[i].marker_id);
+            }
+            continue;
+        }
+        in_source.push_back(source[i]);
+        in_reference.push_back(reference_enu[i]);
+        in_weight.push_back(weights[i]);
+    }
+    if (in_source.size() < 3) {
+        report.reason = "reference points are collinear";
+        return report;
+    }
+    const std::optional<Similarity> refit =
+        estimate_similarity_weighted(in_source, in_reference, in_weight);
+    if (!refit.has_value()) {
+        report.reason = "reference points are collinear";
+        return report;
+    }
+    const Similarity& s = *refit;
+
+    // Composite similarity applied to the STORED local coordinates: T = S o map.
+    const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
+    const Eigen::Vector3d map_t = map.block<3, 1>(0, 3);
+    Similarity t_sim;
+    t_sim.scale = s.scale;
+    t_sim.R = s.R * map_r;
+    t_sim.t = s.scale * (s.R * map_t) + s.t;
+
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (ransac.inliers[i] == 0) {
+            continue;
+        }
+        sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
+        if (samples[i].marker_id >= 0) {
+            ++report.control_points_used;
+        } else {
+            ++report.cameras_used;
+        }
+    }
+    report.rms_control_m = std::sqrt(sum_sq / static_cast<double>(in_source.size()));
+    report.references_total = samples.size();
+    report.references_used = in_source.size();
+    report.rms_error_m = report.rms_control_m;
+
+    // -- apply uniformly, including every marker position -------------------
+    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/true);
+
+    // -- check-point errors, measured on the transformed positions ----------
+    double check_sum = 0.0;
+    for (const CheckSample& c : checks) {
+        const Marker* marker = nullptr;
+        for (const Marker& m : chunk.markers()) {
+            if (m.id == c.marker_id) {
+                marker = &m;
+                break;
+            }
+        }
+        if (marker == nullptr || !marker->position.has_value()) {
+            continue;
+        }
+        const double error = (*marker->position - c.reference_enu).norm();
+        report.check_errors.emplace_back(c.marker_id, error);
+        check_sum += error * error;
+        report.max_check_m = std::max(report.max_check_m, error);
+    }
+    report.check_points_used = report.check_errors.size();
+    if (!report.check_errors.empty()) {
+        report.rms_check_m =
+            std::sqrt(check_sum / static_cast<double>(report.check_errors.size()));
+    }
+
+    report.scale = t_sim.scale;
+    report.applied = true;
     return report;
 }
 
