@@ -36,8 +36,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -107,6 +109,13 @@ bool centres_not_collinear(const std::vector<Eigen::Vector3d>& centres) {
         max_perp = std::max(max_perp, (v - v.dot(u) * u).norm());
     }
     return max_perp > 1e-3 * len;
+}
+
+/// Full-precision text for a metadata value.
+std::string meta_number(double value) {
+    std::ostringstream out;
+    out << std::setprecision(17) << value;
+    return out.str();
 }
 
 }  // namespace
@@ -334,7 +343,6 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // "check_point"; a point without a reference stays a free point.
     std::size_t control_markers = 0;
     std::size_t checkpoint_markers = 0;
-    std::vector<std::size_t> check_marker;  // marker index per check control point
     if (georeferenced) {
         const Transform inverse = transform.inverse();
         for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
@@ -369,7 +377,6 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             control.checkpoint = role != nullptr && *role == "check_point";
             if (control.checkpoint) {
                 ++checkpoint_markers;
-                check_marker.push_back(m);
             } else {
                 ++control_markers;
             }
@@ -434,9 +441,6 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         problem.scalebars.push_back(out);
         scalebar_entry.push_back({s, from->second, to->second});
     }
-    (void)scalebar_entry;  // consumed by the write-back stage
-    (void)marker_point;  // consumed by the control-point and write-back stages
-    (void)check_marker;  // consumed by the write-back stage
     if (Log::enabled(LogLevel::Info)) {
         log(LogLevel::Info) << "OptimizeCameras: "
                             << (chunk->markers().size() - markers_skipped) << " marker points, "
@@ -565,6 +569,64 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
     }
 
+    // -- markers and scale bars ---------------------------------------------
+    // A check point is re-triangulated after the solve; checkpoint_residuals is
+    // X - reference, so its position is reference + residual. Every other
+    // marker takes its solved point.
+    std::unordered_map<std::size_t, Eigen::Vector3d> rechecked_position;
+    std::size_t check_index = 0;
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (!control.checkpoint) {
+            continue;
+        }
+        if (check_index < report.checkpoint_residuals.size()) {
+            const Eigen::Vector3d& residual = report.checkpoint_residuals[check_index];
+            if (residual.allFinite()) {
+                rechecked_position[control.point] = control.reference + residual;
+            }
+        }
+        ++check_index;
+    }
+    std::size_t marker_points = 0;
+    for (std::size_t m = 0; m < marker_point.size(); ++m) {
+        if (marker_point[m] == kNoPoint) {
+            continue;
+        }
+        ++marker_points;
+        const auto checked = rechecked_position.find(marker_point[m]);
+        staged.markers()[m].position = checked != rechecked_position.end()
+                                           ? checked->second
+                                           : problem.points[marker_point[m]];
+    }
+    for (const ScalebarEntry& entry : scalebar_entry) {
+        const auto& a = staged.markers()[entry.marker_a].position;
+        const auto& b = staged.markers()[entry.marker_b].position;
+        if (a.has_value() && b.has_value()) {
+            staged.scalebars()[entry.index].estimated_length_m =
+                (*a - *b).norm() * local_scale;
+        }
+    }
+
+    // -- report statistics (metres) -----------------------------------------
+    // The solver reports in chunk-local units; multiply by the local->ECEF
+    // scale so the stored and logged values are metres.
+    const double control_rms_m = report.control_rms_m * local_scale;
+    const double checkpoint_rms_m = report.checkpoint_rms_m * local_scale;
+    const double scalebar_rms_m = report.scalebar_rms_m * local_scale;
+    const double checkbar_rms_m = report.checkbar_rms_m * local_scale;
+    staged.meta().set("optimize_cameras.control_rms_m", meta_number(control_rms_m));
+    staged.meta().set("optimize_cameras.checkpoint_rms_m", meta_number(checkpoint_rms_m));
+    staged.meta().set("optimize_cameras.scalebar_rms_m", meta_number(scalebar_rms_m));
+    staged.meta().set("optimize_cameras.checkbar_rms_m", meta_number(checkbar_rms_m));
+    staged.meta().set("optimize_cameras.control_points",
+                      std::to_string(report.control_points));
+    staged.meta().set("optimize_cameras.checkpoints", std::to_string(report.checkpoints));
+    staged.meta().set("optimize_cameras.scalebars", std::to_string(report.scalebars));
+    staged.meta().set("optimize_cameras.checkbars", std::to_string(report.checkbars));
+    staged.meta().set("optimize_cameras.markers", std::to_string(marker_points));
+    staged.meta().set("optimize_cameras.markers_skipped",
+                      std::to_string(chunk->markers().size() - marker_points));
+
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
 
@@ -573,7 +635,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                             << report.final_rms_px << " px (" << report.observations
                             << " observations, " << report.iterations << " iterations, prior RMS "
                             << report.prior_rms_sigma << " sigma, " << report.priors
-                            << " prior axes)";
+                            << " prior axes; control RMS " << control_rms_m << " m over "
+                            << report.control_points << ", check-point RMS " << checkpoint_rms_m
+                            << " m over " << report.checkpoints << ", scale-bar RMS "
+                            << scalebar_rms_m << " m over " << report.scalebars << ", check-bar RMS "
+                            << checkbar_rms_m << " m over " << report.checkbars << ")";
     }
 }
 
