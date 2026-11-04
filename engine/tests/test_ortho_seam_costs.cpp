@@ -10,6 +10,7 @@
 #include "aerial_fixture.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -271,6 +272,13 @@ TEST(SeamCosts, NegativeParamsRejected) {
     Params bad_gradient = make_params(builtin_registry().require("BuildOrthomosaic"));
     bad_gradient.set("seam_gradient_weight", ParamValue{-1.0});
     EXPECT_THROW(run_task(builtin_registry(), document, "BuildOrthomosaic", bad_gradient),
+                 ValueError);
+
+    // Non-finite is not a weight either: NaN compares false against every
+    // bound, so the check needs an explicit isfinite(), not just "< 0".
+    Params nan_gradient = make_params(builtin_registry().require("BuildOrthomosaic"));
+    nan_gradient.set("seam_gradient_weight", ParamValue{std::nan("")});
+    EXPECT_THROW(run_task(builtin_registry(), document, "BuildOrthomosaic", nan_gradient),
                  ValueError);
 
     Params bad_region = make_params(builtin_registry().require("BuildOrthomosaic"));

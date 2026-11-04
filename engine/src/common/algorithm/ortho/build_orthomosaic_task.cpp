@@ -429,8 +429,8 @@ ResolvedOptions resolve_options(const Params& params) {
     options.refine_seamlines = params.get_bool("refine_seamlines");
     options.ghosting_filter = params.get_bool("ghosting_filter");
     options.seam_gradient_weight = params.get_float("seam_gradient_weight");
-    if (options.seam_gradient_weight < 0.0) {
-        throw ValueError("BuildOrthomosaic: seam_gradient_weight must be >= 0");
+    if (!std::isfinite(options.seam_gradient_weight) || options.seam_gradient_weight < 0.0) {
+        throw ValueError("BuildOrthomosaic: seam_gradient_weight must be a finite value >= 0");
     }
     const std::int64_t min_region = params.get_int("seam_min_region");
     if (min_region < 0) {
