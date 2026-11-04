@@ -105,7 +105,7 @@ std::int64_t days_from_civil(int year, unsigned month, unsigned day) {
 /// integer that sorts the same as the real instant. Anything else is nullopt.
 std::optional<std::int64_t> parse_datetime(const std::string& text) {
     constexpr const char* kPattern = "dddd:dd:dd dd:dd:dd";
-    if (text.size() < 19U) {
+    if (text.size() != 19U) {
         return std::nullopt;
     }
     for (std::size_t i = 0; i < 19U; ++i) {
