@@ -147,8 +147,22 @@ struct BAReport {
     double initial_rms_px = 0, final_rms_px = 0;
     std::size_t observations = 0;
     /// Robust objective value (the sum of 0.5 * rho(r^2) the solver minimised).
-    /// Adaptive model selection compares successive solves with it.
+    /// Only meaningful when `cost_valid` is true.
     double robust_cost = 0;
+
+    /// Dimension of the residual vector Ceres actually assembled. Exact: points
+    /// with no observations are never added, and check observations are skipped
+    /// inside their residual block, so this is the number the solver reports.
+    std::size_t residual_count = 0;
+    /// Tangent-space dimension of the non-constant parameter blocks as Ceres
+    /// sees them, so SubsetManifold-held intrinsic components, fixed poses and
+    /// constant blocks are all excluded. residual_count - free_parameter_count is
+    /// the exact number of degrees of freedom the solve used.
+    std::size_t free_parameter_count = 0;
+    /// True when the solve produced an objective value that may be compared with
+    /// another solve's (the solver's final cost is only meaningful for a usable
+    /// solution).
+    bool cost_valid = false;
 
     /// Number of constrained prior axes (sigma finite and > 0) over all priors.
     std::size_t priors = 0;

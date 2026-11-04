@@ -3,9 +3,8 @@
 
 #include "common/algorithm/sfm/adaptive_fit.hpp"
 
-#include <cmath>
+#include <array>
 #include <cstddef>
-#include <cstdint>
 #include <vector>
 
 #include "base/utils/error.hpp"
@@ -13,85 +12,9 @@
 namespace alphashape::sfm {
 namespace {
 
-/// Dimension of the residual vector the solver actually minimises: two per
-/// non-check observation, three per non-check control point, one per non-check
-/// scale bar and one per constrained prior axis.
-std::size_t count_residuals(const BAProblem& problem) {
-    std::vector<std::uint8_t> is_check(problem.points.size(), 0);
-    for (std::size_t i = 0;
-         i < problem.checkpoint_point.size() && i < is_check.size(); ++i) {
-        if (problem.checkpoint_point[i] != 0) {
-            is_check[i] = 1;
-        }
-    }
-    for (const BAControlPoint& control : problem.control_points) {
-        if (control.checkpoint && control.point < is_check.size()) {
-            is_check[control.point] = 1;
-        }
-    }
-    std::size_t n = 0;
-    for (const BAObservation& observation : problem.observations) {
-        const bool check = observation.point < is_check.size() &&
-                           is_check[observation.point] != 0;
-        if (!check) {
-            n += 2;
-        }
-    }
-    for (const BACentrePrior& prior : problem.centre_priors) {
-        for (int axis = 0; axis < 3; ++axis) {
-            const double sigma = prior.sigma[static_cast<Eigen::Index>(axis)];
-            if (std::isfinite(sigma) && sigma > 0.0) {
-                ++n;
-            }
-        }
-    }
-    for (const BAControlPoint& control : problem.control_points) {
-        if (!control.checkpoint) {
-            n += 3;
-        }
-    }
-    for (const BAScalebar& bar : problem.scalebars) {
-        if (!bar.checkpoint) {
-            ++n;
-        }
-    }
-    return n;
-}
-
-/// Number of free parameters in the problem: free intrinsics, six per free pose,
-/// three per point, minus the pinned scale-anchor component.
-std::size_t count_free_parameters(const BAProblem& problem) {
-    std::size_t n = 0;
-    for (const std::array<bool, kCalibrationParamCount>& mask : problem.fit_intrinsics) {
-        for (const bool free_term : mask) {
-            if (free_term) {
-                ++n;
-            }
-        }
-    }
-    for (std::size_t i = 0; i < problem.poses.size(); ++i) {
-        const bool fixed =
-            !problem.fixed_pose.empty() && problem.fixed_pose[i] != 0;
-        if (!fixed) {
-            n += 6;
-        }
-    }
-    n += 3 * problem.points.size();
-    if (problem.scale_anchor_camera >= 0 && n > 0) {
-        --n;  // the anchor pins one translation component
-    }
-    return n;
-}
-
-/// Robust objective value of a solve, falling back to the plain squared
-/// reprojection error when the solver did not report a cost.
-double cost_of(const BAReport& report) {
-    if (report.robust_cost > 0.0) {
-        return report.robust_cost;
-    }
-    return 0.5 * report.final_rms_px * report.final_rms_px *
-           static_cast<double>(report.observations);
-}
+/// Robust objective value of a solve. The solver's final cost may only be
+/// compared when it actually produced one; there is no regression fallback.
+double cost_of(const BAReport& report) { return report.robust_cost; }
 
 /// Writes the free masks for `active` into the problem: a term is free only when
 /// the sensor allows it AND it is in the active set.
@@ -143,12 +66,10 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     std::array<bool, kCalibrationParamCount> base = {};
     base[0] = base[1] = base[2] = base[5] = true;  // f, cx, cy, k1
 
-    const std::size_t residuals = count_residuals(problem);
-
     set_free_mask(problem, sensor_allowed, base);
     BAReport report = bundle_adjust(problem, BAOptions{});
     result.solves = 1;
-    if (!report.usable) {
+    if (!report.usable || !report.cost_valid) {
         throw Error(
             "AdaptiveFit: base bundle adjustment did not produce a usable solution");
     }
@@ -179,15 +100,15 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
 
         const BAProblem saved = problem;
         set_free_mask(problem, sensor_allowed, next);
-        const std::size_t free_parameters = count_free_parameters(problem);
-        const std::size_t dof =
-            residuals > free_parameters ? residuals - free_parameters : 0;
         const BAReport candidate = bundle_adjust(problem, BAOptions{});
         ++result.solves;
         bool accept = false;
-        if (candidate.usable && dof > 0) {
+        if (candidate.usable && candidate.cost_valid &&
+            candidate.residual_count > candidate.free_parameter_count) {
             const double candidate_cost = cost_of(candidate);
-            if (candidate_cost > 0.0 && candidate_cost < accepted_cost) {
+            if (candidate_cost < accepted_cost) {
+                const std::size_t dof =
+                    candidate.residual_count - candidate.free_parameter_count;
                 const double statistic = (accepted_cost - candidate_cost) /
                                          (candidate_cost / static_cast<double>(dof));
                 const bool significant =

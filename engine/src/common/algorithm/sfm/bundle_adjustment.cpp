@@ -862,6 +862,23 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     ceres::Solver::Summary summary;
     ceres::Solve(solver_options, &ceres_problem, &summary);
 
+    // Exact dimensions of the solve. Ceres knows which blocks are constant and
+    // removes manifold-held components from each block's tangent space, so this
+    // respects SubsetManifold-held intrinsics, fixed poses and blocks that were
+    // never added because nothing observed them.
+    std::vector<double*> parameter_blocks;
+    ceres_problem.GetParameterBlocks(&parameter_blocks);
+    std::size_t free_parameter_count = 0;
+    for (double* block : parameter_blocks) {
+        if (ceres_problem.IsParameterBlockConstant(block)) {
+            continue;
+        }
+        const int tangent_size = ceres_problem.ParameterBlockTangentSize(block);
+        if (tangent_size > 0) {
+            free_parameter_count += static_cast<std::size_t>(tangent_size);
+        }
+    }
+
     // ---- Write back ------------------------------------------------------
     // Fixed cameras are restored bitwise, not round-tripped through Ceres:
     // R -> angle-axis -> R is only accurate to ~1e-16, and a fixed pose must
@@ -907,6 +924,10 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     report.usable = summary.IsSolutionUsable();
     report.iterations = static_cast<int>(summary.iterations.size());
     report.robust_cost = summary.final_cost;
+    report.cost_valid =
+        std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;
+    report.residual_count = static_cast<std::size_t>(ceres_problem.NumResiduals());
+    report.free_parameter_count = free_parameter_count;
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
     fill_constraint_report(problem, check_mask, &report);
