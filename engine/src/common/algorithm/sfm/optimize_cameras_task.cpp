@@ -429,15 +429,29 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             ++scalebars_skipped;
             continue;
         }
+        const std::size_t point_a = marker_point[from->second];
+        const std::size_t point_b = marker_point[to->second];
+        // A bar whose endpoints resolve to the same point carries no direction
+        // and must not fix the scale. A bar without a usable measured length or
+        // accuracy cannot constrain anything either. Each counts once.
+        if (point_a == point_b) {
+            ++scalebars_skipped;
+            continue;
+        }
         if (!std::isfinite(bar.reference_length_m) || !(bar.reference_length_m > 0.0)) {
+            ++scalebars_skipped;
+            continue;
+        }
+        if (!std::isfinite(bar.reference_accuracy_m) ||
+            !(bar.reference_accuracy_m > 0.0)) {
             ++scalebars_skipped;
             continue;
         }
         const std::string* role_a = chunk->markers()[from->second].meta.find("type");
         const std::string* role_b = chunk->markers()[to->second].meta.find("type");
         sfm::BAScalebar out;
-        out.point_a = marker_point[from->second];
-        out.point_b = marker_point[to->second];
+        out.point_a = point_a;
+        out.point_b = point_b;
         out.length = bar.reference_length_m / local_scale;  // metres -> local units
         out.sigma = bar.reference_accuracy_m / local_scale;
         out.checkpoint = (role_a != nullptr && *role_a == "check_point") ||
@@ -518,11 +532,12 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     } else {
         problem.fixed_pose[0] = 1;
         // A real (non-check) scale bar fixes the scale itself, so pinning a
-        // translation component as well would over-constrain the gauge.
+        // translation component as well would over-constrain the gauge. Every
+        // bar still in problem.scalebars has already passed the degenerate,
+        // length and accuracy filters.
         bool scalebar_fixes_scale = false;
         for (const sfm::BAScalebar& bar : problem.scalebars) {
-            const bool valid_sigma = std::isfinite(bar.sigma) && bar.sigma > 0.0;
-            if (!bar.checkpoint && valid_sigma && bar.length > 0.0) {
+            if (!bar.checkpoint) {
                 scalebar_fixes_scale = true;
                 break;
             }
@@ -634,6 +649,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("optimize_cameras.markers", std::to_string(marker_points));
     staged.meta().set("optimize_cameras.markers_skipped",
                       std::to_string(chunk->markers().size() - marker_points));
+    staged.meta().set("optimize_cameras.scalebars_skipped",
+                      std::to_string(scalebars_skipped));
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);

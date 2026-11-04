@@ -1222,6 +1222,62 @@ TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {
     EXPECT_NEAR(estimated, distance, 1e-9);
 }
 
+TEST(OptimizeMarkers, SelfReferencingScalebarIsSkipped) {
+    // A bar whose two endpoints are the same marker has no length signal. It
+    // must be counted as skipped and must NOT free the scale gauge, so the
+    // solve has to match the same scene without the bar.
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_LT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+
+    std::mt19937 rng(20261110u);
+    std::int32_t marker_id = -1;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        std::vector<MarkerProjection> projections =
+            project_marker(chunk, *track.point, 0.0, rng);
+        if (projections.size() < 2U) {
+            continue;
+        }
+        marker_id = add_marker(chunk, projections);
+        break;
+    }
+    ASSERT_GE(marker_id, 0);
+    const Chunk no_bar = chunk;
+
+    Scalebar bar;
+    bar.id = chunk.allocate_id();
+    bar.from = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, marker_id};
+    bar.to = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, marker_id};
+    bar.reference_length_m = 10.0;
+    bar.reference_accuracy_m = 0.001;
+    chunk.scalebars().push_back(bar);
+
+    run_optimize_cameras(document);
+    std::vector<Transform> with_bar;
+    for (const Camera& camera : chunk.cameras()) {
+        with_bar.push_back(camera.pose);
+    }
+    const double skipped = meta_value(chunk, "optimize_cameras.scalebars_skipped");
+    const double used = meta_value(chunk, "optimize_cameras.scalebars");
+
+    chunk = no_bar;
+    run_optimize_cameras(document);
+    double worst = 0.0;
+    for (std::size_t k = 0; k < chunk.cameras().size(); ++k) {
+        worst = std::max(worst,
+                         (chunk.cameras()[k].pose - with_bar[k]).cwiseAbs().maxCoeff());
+    }
+    std::printf("[optimize_markers] self-referencing bar: skipped %g, used %g, "
+                "worst solve difference %.3e\n",
+                skipped, used, worst);
+    EXPECT_EQ(skipped, 1.0);
+    EXPECT_EQ(used, 0.0);
+    EXPECT_LE(worst, 1e-9) << "the degenerate bar changed the solve (scale anchor lost)";
+}
+
 TEST(OptimizeMarkers, NotGeoreferencedSkipsControl) {
     Document document = aligned_document(cal_seq_files());
     Chunk& chunk = *document.active_chunk();
