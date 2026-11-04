@@ -126,7 +126,7 @@ TEST(Board, DetectsChessboard9x6Synthetic) {
         }
     }
     const double rms = std::sqrt(sum_squared / static_cast<double>(compared));
-    std::printf("[Board] 9x6 synthetic: RMS %.4f px, max %.4f px over %d corners\n", rms,
+    std::printf("[board] 9x6 synthetic: RMS %.4f px, max %.4f px over %d corners\n", rms,
                 max_error, compared);
     EXPECT_LE(rms, 0.05);
     EXPECT_LE(max_error, 0.15);
@@ -277,7 +277,7 @@ TEST(Board, HandlesBlurAndNoise) {
         }
     }
     const double rms = std::sqrt(sum_squared / static_cast<double>(compared));
-    std::printf("[Board] blur+noise: RMS %.4f px, max %.4f px\n", rms, max_error);
+    std::printf("[board] blur+noise: RMS %.4f px, max %.4f px\n", rms, max_error);
     EXPECT_LE(rms, 0.15);
 }
 
@@ -330,7 +330,7 @@ TEST(Board, OneFrameUnderHalfSecond) {
     ASSERT_TRUE(result.has_value());
     const double seconds =
         std::chrono::duration<double>(end - start).count();
-    std::printf("[Board] one 1280x960 detection: %.4f s\n", seconds);
+    std::printf("[board] one 1280x960 detection: %.4f s\n", seconds);
     if (test::perf_asserts_enabled()) {
         EXPECT_LT(seconds, 0.5);
     }

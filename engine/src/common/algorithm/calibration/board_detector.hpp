@@ -13,11 +13,15 @@
 /// centres at integer coordinates, so the detector converts by half a pixel.
 ///
 /// Partial views carry a per-view unknown lattice origin: the labels are only
-/// defined relative to the grown seed corner. Only a complete view (every inner
-/// corner of a `cols` x `rows` board) has canonical labels, with (0, 0) at the
-/// corner nearest the image top-left and a right-handed label basis in image
-/// coordinates (X right, Y down). A calibration solve that mixes partial views
-/// must account for this.
+/// defined relative to the grown seed corner. The two label axes are chosen
+/// from the seed's edge directions (the more horizontal one becomes `col`,
+/// oriented rightwards, and the other `row`, oriented downwards), so lattice
+/// differences are comparable across views even though the origin is not.
+/// Only a complete view (every inner corner of a `cols` x `rows` board) has
+/// canonical labels, with (0, 0) at the corner nearest the image top-left and
+/// a right-handed label basis in image coordinates (X right, Y down). A
+/// calibration solve that mixes partial views must account for the per-view
+/// origin.
 
 #include <optional>
 #include <vector>

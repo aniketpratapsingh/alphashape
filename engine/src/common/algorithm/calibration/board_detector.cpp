@@ -252,7 +252,7 @@ double circular_mean_pair(double a, double b) {
 std::optional<std::pair<double, double>> ring_directions(const FloatImage& smooth,
                                                          double cx, double cy,
                                                          double radius) {
-    std::vector<double> values(kRingSamples, 0.0);
+    std::vector<double> values(static_cast<std::size_t>(kRingSamples), 0.0);
     double mean = 0.0;
     for (int i = 0; i < kRingSamples; ++i) {
         const double angle = 2.0 * kPi * static_cast<double>(i) /
@@ -282,7 +282,7 @@ std::optional<std::pair<double, double>> ring_directions(const FloatImage& smoot
             return std::nullopt;  // crossings not roughly 90 degrees apart
         }
     }
-    std::vector<double> angles(4, 0.0);
+    std::vector<double> angles(static_cast<std::size_t>(4), 0.0);
     for (std::size_t k = 0; k < changes.size(); ++k) {
         const int index = changes[k];
         const double here =
