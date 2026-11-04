@@ -144,7 +144,13 @@ TEST(Board, CornerOrderingCorrect) {
     // board must not need a rotated fixture to work.
     const double spins[2] = {0.0, 8.0};
     for (double spin : spins) {
-        const test::ChessboardPose pose = posed_board(15.0, 0.0, spin, 0.6);
+        test::ChessboardPose pose = posed_board(15.0, 0.0, spin, 0.6);
+        if (spin == 0.0) {
+            // A 4x4 box supersample has a coherent +-1/8 px phase bias when the
+            // board edges are exactly grid-aligned. Raise the sampling for the
+            // axis-aligned case rather than rotating the fixture away from it.
+            pose.supersample = 16;
+        }
         const test::ChessboardRender rendered = test::render_chessboard(pose);
         const std::optional<BoardView> result =
             detect_board(rendered.image, spec, options);
