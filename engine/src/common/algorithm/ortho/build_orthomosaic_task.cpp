@@ -383,6 +383,9 @@ struct ResolvedOptions {
     bool fill_holes = true;
     bool refine_seamlines = true;
     bool ghosting_filter = false;
+    /// Opt-in seam costs (both default off, so the product is unchanged).
+    double seam_gradient_weight = 0.0;  ///< weight of the gradient-matching term
+    int seam_min_region = 0;            ///< merge seam regions smaller than this (cells)
     ColourMode colour = ColourMode::None;
     double resolution = 0.0;  ///< 0 = automatic
     int projection = 0;
@@ -425,6 +428,17 @@ ResolvedOptions resolve_options(const Params& params) {
     options.fill_holes = params.get_bool("fill_holes");
     options.refine_seamlines = params.get_bool("refine_seamlines");
     options.ghosting_filter = params.get_bool("ghosting_filter");
+    options.seam_gradient_weight = params.get_float("seam_gradient_weight");
+    if (options.seam_gradient_weight < 0.0) {
+        throw ValueError("BuildOrthomosaic: seam_gradient_weight must be >= 0");
+    }
+    const std::int64_t min_region = params.get_int("seam_min_region");
+    if (min_region < 0) {
+        throw ValueError("BuildOrthomosaic: seam_min_region must be >= 0");
+    }
+    const std::int64_t int_max = std::numeric_limits<int>::max();
+    const std::int64_t capped = std::min<std::int64_t>(min_region, int_max);
+    options.seam_min_region = static_cast<int>(capped);
     const std::string colour = params.get_string("color_correction");
     options.colour = parse_colour_mode(colour);
     if (options.colour == ColourMode::None && colour != "none" && colour != "false" &&
@@ -658,7 +672,8 @@ struct StageBytes {
 /// The decoded photograph exists only inside the rectify loop, so it is counted
 /// there and nowhere else: it is released before the seam stage starts.
 double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has_node_map,
-                           double photo_cells, bool ghosting = false) {
+                           double photo_cells, bool ghosting = false,
+                           bool seam_merge = false) {
     const double grid = static_cast<double>(cells);
     const double node_map = has_node_map ? grid * kBytesPerNodeMap : 0.0;
     // The tile set is resident through rectify, seams and blend.
@@ -689,8 +704,9 @@ double estimate_peak_bytes(std::uint64_t cells, double footprint_cells, bool has
     const double seam_graph =
         grid * kSeamGraphBytesPerNode * (ghosting ? 1.0 : kSeamGraphCellFraction);
     // filter_label_speckles runs on the full grid after the seams and holds a
-    // flattened deviant plane plus its 2-cell dilation while it works.
-    const double speckle_scratch = ghosting ? grid * 2.0 : 0.0;
+    // flattened deviant plane plus its 2-cell dilation while it works. Either
+    // pass (ghosting or the small-region merge) needs the same scratch.
+    const double speckle_scratch = (ghosting || seam_merge) ? grid * 2.0 : 0.0;
     stages.seams = grid * kBytesPerCellGridLabels + node_map +
                    grid * kBytesPerCellSeamField + seam_graph + tiles + coarse +
                    ghost_masks + speckle_scratch;
@@ -1453,13 +1469,13 @@ double estimate_block_peak_bytes(std::uint64_t window_cells, double window_footp
                                  bool has_node_map, double photo_cells,
                                  std::uint64_t output_cells,
                                  std::uint64_t photo_cache_bytes, bool fill_holes,
-                                 bool ghosting) {
+                                 bool ghosting, bool seam_merge) {
     // The window's stages are the estimator the whole-grid path already uses,
     // with the window's (block + margin) cell count and its own footprint. The
     // assembled output raster (RGBA, 4 B) plus its seam labels (int32, 4 B) is
     // resident from the first block on and grows to the full output grid.
     const double window = estimate_peak_bytes(window_cells, window_footprint_cells, has_node_map,
-                                              photo_cells, ghosting);
+                                              photo_cells, ghosting, seam_merge);
     const double assembled = static_cast<double>(output_cells) *
                              (kBytesPerCellGridLabels + 4.0 /* result RGBA */);
     const double staged = window + assembled;
@@ -1524,7 +1540,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
         // larger is the block's own peak; the cache comes on top of the larger.
         const double staged =
             estimate_peak_bytes(window_cells, window_footprint, input.has_node_map,
-                                input.photo_cells, input.ghosting_filter) +
+                                input.photo_cells, input.ghosting_filter, input.seam_merge) +
             static_cast<double>(output_cells) * (kBytesPerCellGridLabels + 4.0);
         const double filled =
             input.fill_holes ? estimate_fill_holes_peak_bytes(output_cells) : 0.0;
@@ -1568,7 +1584,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
             static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
         plan.estimated_peak_bytes = std::max(
             estimate_peak_bytes(output_cells, input.footprint_cells, input.has_node_map,
-                                input.photo_cells, input.ghosting_filter),
+                                input.photo_cells, input.ghosting_filter, input.seam_merge),
             colour_peak + static_cast<double>(plan.photo_cache_bytes));
         plan.estimated_window_bytes = plan.estimated_peak_bytes;
         plan.estimated_fill_bytes =
@@ -1578,7 +1594,7 @@ OrthoBlockPlan plan_ortho_blocks(const OrthoBlockPlanInput& input) {
     if (input.forced_block_cells <= 0) {
         const double whole = estimate_peak_bytes(output_cells, input.footprint_cells,
                                                  input.has_node_map, input.photo_cells,
-                                                 input.ghosting_filter);
+                                                 input.ghosting_filter, input.seam_merge);
         const std::uint64_t one_frame =
             static_cast<std::uint64_t>(std::ceil(3.0 * std::max(1.0, input.photo_cells)));
         // The colour pass runs first and holds the cache, so it is a real
@@ -1761,6 +1777,15 @@ void BuildOrthomosaicTask::declare_params(Params& params) const {
                     "(average blending also drops them). Needs at least three overlapping "
                     "views for a majority to exist. Off by default pending the quality "
                     "benchmark."});
+    ParamSpec seam_gradient_weight{"seam_gradient_weight", ParamType::Float, 0.0,
+                                   "Weight of the gradient-matching seam term; 0 = off"};
+    seam_gradient_weight.minimum = 0.0;
+    params.declare(seam_gradient_weight);
+    ParamSpec seam_min_region{
+        "seam_min_region", ParamType::Int, std::int64_t{0},
+        "Merge seam label regions smaller than this many cells into a neighbour; 0 = off"};
+    seam_min_region.minimum = std::int64_t{0};
+    params.declare(seam_min_region);
     ParamSpec color_correction{"color_correction", ParamType::String, std::string("affine"),
                                "Per-camera colour compensation applied before seams are chosen: "
                                "\"affine\" (default: a multiplier and an offset per camera per "
@@ -2164,7 +2189,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         const std::uint64_t cells = static_cast<std::uint64_t>(candidate_grid.width) *
                                     static_cast<std::uint64_t>(candidate_grid.height);
         return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells,
-                                   options.ghosting_filter);
+                                   options.ghosting_filter, options.seam_min_region > 0);
     };
     const auto grid_at = [&surface](double cell) {
         return ortho_grid_for(surface.grid, cell);
@@ -2186,6 +2211,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.fill_holes = options.fill_holes;
         input.colour_correction = options.colour != ColourMode::None;
         input.ghosting_filter = options.ghosting_filter;
+        input.seam_merge = options.seam_min_region > 0;
         input.budget_bytes = budget;
         input.forced_block_cells = 0;
         return plan_ortho_blocks(input);
@@ -2310,6 +2336,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     plan_input.fill_holes = options.fill_holes;
     plan_input.colour_correction = options.colour != ColourMode::None;
     plan_input.ghosting_filter = options.ghosting_filter;
+    plan_input.seam_merge = options.seam_min_region > 0;
     plan_input.budget_bytes = budget;
     plan_input.forced_block_cells =
         static_cast<int>(std::max<std::int64_t>(0, params.get_int("block_size")));
@@ -2498,6 +2525,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // end, rather than one per block).
     std::size_t ghost_deviant_cells = 0;
     std::size_t ghost_speckles_removed = 0;
+    std::size_t seam_regions_removed = 0;
 
     for (int br = 0; br < rows; ++br) {
         for (int bc = 0; bc < columns; ++bc, ++block_index) {
@@ -2725,6 +2753,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
 
             std::vector<std::int32_t> labels;
             ortho::SeamOptions seam_options;
+            seam_options.gradient_weight = options.seam_gradient_weight;
             if (!options.refine_seamlines) {
                 seam_options.iterations = 0;
             }
@@ -2774,6 +2803,21 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells,
                     &deviant_masks));
             }
+            // Topology polish: merge seam regions smaller than the requested
+            // size into a neighbouring label. Runs AFTER the ghosting pass (so
+            // it can also smooth the islands that pass leaves behind) and reuses
+            // the same pinned margin cells, which it never relabels. A null
+            // `deviant` scopes it to every island, not only ghosting artefacts.
+            if (options.seam_min_region > 0) {
+                const std::size_t removed = static_cast<std::size_t>(ortho::filter_label_speckles(
+                    window.width, window.height, tiles, labels,
+                    frozen.empty() ? nullptr : &frozen, options.seam_min_region, nullptr));
+                seam_regions_removed += removed;
+                if (Log::enabled(LogLevel::Info)) {
+                    log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index
+                                        << " merged " << removed << " small seam region(s)";
+                }
+            }
             if (Log::enabled(LogLevel::Info)) {
                 log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="
                                     << pinned_cells << " conflicts=" << pinned_changed
@@ -2822,6 +2866,11 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             << ghost_deviant_cells
                             << " deviant camera-cell(s) and removed "
                             << ghost_speckles_removed << " speckle component(s)";
+    }
+    if (options.seam_min_region > 0 && Log::enabled(LogLevel::Info)) {
+        log(LogLevel::Info) << "BuildOrthomosaic: merged " << seam_regions_removed
+                            << " small seam region(s) (seam_min_region="
+                            << options.seam_min_region << ")";
     }
 
     if (options.fill_holes) {
