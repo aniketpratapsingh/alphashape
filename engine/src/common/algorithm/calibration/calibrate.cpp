@@ -156,12 +156,17 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
 ///     g (h1x^2 + h1y^2 - h2x^2 - h2y^2) + (h1z^2 - h2z^2) = 0
 /// with h1, h2 the first two columns of the homography in centred pixels.
 bool closed_form_focal(const std::vector<Eigen::Matrix3d>& homographies,
-                       double& focal) {
+                       int width, int height, double& focal) {
     if (homographies.size() < std::size_t{3}) {
         return false;
     }
     double normal = 0.0;
     double rhs = 0.0;
+    // Data scale for the conditioning test: (|h1|^2 + |h2|^2)^2, which is
+    // (2 f^2)^2 for a well-conditioned view. The constraint coefficients grow
+    // as f^2 sin^2(tilt) while this scale grows as f^4, so their ratio
+    // behaves like sin^4(tilt) / 4.
+    double scale = 0.0;
     for (const Eigen::Matrix3d& h : homographies) {
         const double a1 = h(0, 0) * h(0, 1) + h(1, 0) * h(1, 1);
         const double b1 = h(2, 0) * h(2, 1);
@@ -170,16 +175,39 @@ bool closed_form_focal(const std::vector<Eigen::Matrix3d>& homographies,
         const double b2 = h(2, 0) * h(2, 0) - h(2, 1) * h(2, 1);
         normal += a1 * a1 + a2 * a2;
         rhs += a1 * b1 + a2 * b2;
+        const double level = h.col(0).squaredNorm() + h.col(1).squaredNorm();
+        scale += level * level;
     }
-    if (!(normal > 0.0) || !std::isfinite(normal) || !std::isfinite(rhs)) {
+    if (!std::isfinite(normal) || !std::isfinite(rhs) ||
+        !std::isfinite(scale)) {
         return false;
+    }
+    // The relative floor 1e-8 sits at sin^4(tilt)/4 = 1e-8, i.e. a combined
+    // board tilt of about 0.8 degrees: below that the two Zhang constraints
+    // are indistinguishable from rounding noise and the focal length is not
+    // recoverable, while any usable calibration set tilts by tens of degrees
+    // and clears the floor by more than six orders of magnitude.
+    if (!(normal > 1e-8 * scale)) {
+        throw Error(
+            "calibrate_camera: views are too close to fronto-parallel to "
+            "initialise the focal length");
     }
     const double g = -rhs / normal;
     if (!(g > 0.0) || !std::isfinite(g)) {
-        return false;
+        throw Error(
+            "calibrate_camera: closed-form focal length is out of range");
     }
     focal = 1.0 / std::sqrt(g);
-    return std::isfinite(focal) && focal > 0.0;
+    // A focal length shorter than a tenth of the image or longer than a
+    // hundred times it cannot belong to a real lens on this sensor; the ill
+    // conditioning that produces such values is a failure, not a result.
+    const double extent =
+        0.1 * static_cast<double>(std::max(width, height));
+    if (!std::isfinite(focal) || focal < extent || focal > 1000.0 * extent) {
+        throw Error(
+            "calibrate_camera: closed-form focal length is out of range");
+    }
+    return true;
 }
 
 /// Pose from K^-1 H (Zhang 2000, 3.3), with R projected onto SO(3) by SVD and
@@ -372,7 +400,7 @@ bool initialise_views(const std::vector<CalibrationView>& views, int width,
         pairs.emplace_back(view, centre_shift * homography);
         homographies.push_back(centre_shift * homography);
     }
-    if (!closed_form_focal(homographies, out.focal)) {
+    if (!closed_form_focal(homographies, width, height, out.focal)) {
         return false;
     }
     for (const auto& [view, homography] : pairs) {
