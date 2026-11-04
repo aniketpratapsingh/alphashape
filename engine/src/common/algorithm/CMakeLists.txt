@@ -30,6 +30,7 @@ add_library(alphashape_algorithms STATIC
     markers/refine_markers_task.cpp
     markers/track_markers_task.cpp
     calibration/board_detector.cpp
+    calibration/calibrate.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp
