@@ -14,7 +14,9 @@
 // carries a BAControlPoint with `checkpoint == true`; the two spellings are
 // combined so they can never disagree. After the solve the point is
 // re-triangulated from the final poses (inverting distortion and fisheye) and
-// compared with its reference; the error is reported in BAReport.
+// compared with its reference; the error is reported in BAReport. Observations
+// of control and scale-bar points use a non-collapsing Huber loss, so a control
+// residual that moves only the point block cannot detach it from its rays.
 
 #include <cstddef>
 
@@ -55,10 +57,11 @@ namespace detail {
 
 /// Evaluate the scale-bar residual and its analytic Jacobian. `a` and `b` are
 /// the two points (3 doubles each); `residual` receives 1 value, `jac_a` and
-/// `jac_b` 3 values each (may be null). A distance below 1e-12, or an invalid
-/// length/sigma, yields a zero residual and zero Jacobians. Declared here so
-/// tests can compare the analytic derivative with autodiff without pulling
-/// Ceres into the public header.
+/// `jac_b` 3 values each (may be null). An invalid length/sigma or a non-finite
+/// distance yields a zero residual and zero Jacobians. Coincident endpoints keep
+/// the honest residual -length/sigma with a zero Jacobian. Declared here so
+/// tests can compare the analytic derivative with finite differences without
+/// pulling Ceres into the public header.
 void scalebar_residual_and_jacobian(const double* a, const double* b, double length,
                                     double sigma, double* residual, double* jac_a,
                                     double* jac_b);

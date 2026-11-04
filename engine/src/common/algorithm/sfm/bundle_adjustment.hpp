@@ -129,7 +129,11 @@ struct BAProblem {
 };
 
 struct BAOptions {
-    double loss_scale_px = 1.0;  ///< ours: Cauchy loss scale in pixels; <= 0 => plain least squares
+    /// Ours: Cauchy loss scale in pixels; <= 0 => plain least squares.
+    /// Observations of a point that carries a control or scale-bar residual use
+    /// a Huber loss at 3x this scale instead, so their influence never collapses
+    /// and the rays keep pulling the poses along.
+    double loss_scale_px = 1.0;
     int max_iterations = 100;    ///< ours
     int num_threads = 0;         ///< 0 => hardware concurrency
     double function_tolerance = 1e-8;

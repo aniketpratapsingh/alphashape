@@ -2,6 +2,7 @@
 
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -619,6 +620,18 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         }
         if (!has_control) {
             throw ValueError("bundle_adjust: checkpoint_point entry has no control point");
+        }
+    }
+    // Two non-check control points for one point would weight it twice.
+    for (std::size_t a = 0; a < problem.control_points.size(); ++a) {
+        if (problem.control_points[a].checkpoint) {
+            continue;
+        }
+        for (std::size_t b = a + 1; b < problem.control_points.size(); ++b) {
+            if (!problem.control_points[b].checkpoint &&
+                problem.control_points[b].point == problem.control_points[a].point) {
+                throw ValueError("bundle_adjust: duplicate control point");
+            }
         }
     }
     for (const BAControlPoint& cp : problem.control_points) {

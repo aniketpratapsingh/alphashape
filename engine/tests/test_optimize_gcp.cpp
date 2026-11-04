@@ -160,6 +160,7 @@ TEST(Optimize, GcpNetworkRecoversTransform) {
     const BAReport report = bundle_adjust(problem, options);
     ASSERT_TRUE(report.usable);
     EXPECT_EQ(report.control_points, control.size());
+    EXPECT_LT(report.control_rms_m, 0.02);
 
     Eigen::Vector3d lo = truth.true_points[0];
     Eigen::Vector3d hi = lo;
@@ -360,7 +361,7 @@ TEST(Optimize, CheckPointsReportedButNotUsed) {
     }
 }
 
-TEST(Optimize, ScalebarJacobianMatchesAutodiff) {
+TEST(Optimize, ScalebarJacobianMatchesFiniteDifference) {
     // Ceres is a private dependency of the algorithms layer, so autodiff is not
     // reachable from this test; compare the analytic Jacobian with central
     // differences of the same residual instead.
@@ -382,6 +383,9 @@ TEST(Optimize, ScalebarJacobianMatchesAutodiff) {
         double jac_b[3] = {};
         detail::scalebar_residual_and_jacobian(a.data(), b.data(), kLength, kSigma,
                                                &residual, jac_a, jac_b);
+        // The residual value itself must be (|a-b| - length)/sigma.
+        const double expected = ((a - b).norm() - kLength) / kSigma;
+        EXPECT_LT(std::abs(residual - expected), 1e-12);
         for (int k = 0; k < 3; ++k) {
             double rp = 0.0;
             double rm = 0.0;
@@ -453,6 +457,20 @@ TEST(Optimize, CheckPointTriangulationInvertsDistortion) {
     ASSERT_EQ(report.checkpoints, 1u);
     ASSERT_EQ(report.checkpoint_residuals.size(), 1u);
     EXPECT_LT(report.checkpoint_rms_m, 1e-6);
+}
+
+TEST(Optimize, DuplicateControlPointRejected) {
+    std::mt19937 rng(20261110);
+    const SyntheticScene truth = make_scene(rng);
+    BAProblem problem = truth.problem;
+    BAControlPoint cp;
+    cp.point = 5;
+    cp.reference = truth.true_points[5];
+    cp.sigma = Eigen::Vector3d::Constant(0.01);
+    problem.control_points.push_back(cp);
+    problem.control_points.push_back(cp);
+    BAOptions options;
+    EXPECT_THROW(bundle_adjust(problem, options), ValueError);
 }
 
 }  // namespace
