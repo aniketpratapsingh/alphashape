@@ -28,6 +28,7 @@ add_executable(alphashape_tests
     test_structure_builder.cpp
     test_align_cameras.cpp
     test_optimize_cameras.cpp
+    test_optimize_gcp.cpp
     test_geodesy.cpp
     test_similarity.cpp
     test_georeference.cpp
