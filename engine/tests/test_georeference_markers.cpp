@@ -638,5 +638,93 @@ TEST(Georeference, RegionAndMarkerCovarianceFollowTheTransform) {
     EXPECT_NEAR(chunk.markers()[0].position_covariance(2, 2), expected_var, 1e-12);
 }
 
+// ---------------------------------------------------------------------------
+// 13. Exactly three points are enough for the fit
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, ThreePointsSuffice) {
+    Scene scene;
+    scene.marker_count = 3;
+    scene.camera_count = 0;
+    Chunk chunk = make_scene(scene);
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+    EXPECT_EQ(report.control_points_used, 3U);
+    EXPECT_EQ(report.cameras_used, 0U);
+    EXPECT_NEAR(report.scale, 1.0 / 0.37, 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Zero, negative and NaN accuracies fall back to the default sigma
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, UnusableAccuracyFallsBack) {
+    Scene scene;
+    scene.marker_count = 3;
+    scene.camera_count = 0;
+    Chunk chunk = make_scene(scene);
+    chunk.markers()[0].reference_accuracy = Eigen::Vector3d::Zero();
+    chunk.markers()[1].reference_accuracy = Eigen::Vector3d::Constant(-1.0);
+    chunk.markers()[2].reference_accuracy =
+        Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+    EXPECT_TRUE(std::isfinite(report.scale));
+    EXPECT_TRUE(std::isfinite(report.rms_control_m));
+    EXPECT_EQ(report.control_points_used, 3U);
+    EXPECT_NEAR(report.scale, 1.0 / 0.37, 1e-6);
+    for (const Marker& marker : chunk.markers()) {
+        ASSERT_TRUE(marker.position.has_value());
+        EXPECT_TRUE(marker.position->allFinite());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. A refusal leaves the chunk bit-identical
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, RefusalLeavesChunkUntouched) {
+    Scene scene;
+    scene.marker_count = 5;
+    Chunk chunk = make_scene(scene);
+    const Eigen::Vector3d location = *chunk.markers()[2].reference;
+    for (Marker& marker : chunk.markers()) {
+        marker.reference = location;  // coincident references: degenerate
+    }
+
+    const Transform transform = chunk.transform();
+    std::vector<Transform> poses;
+    for (const Camera& camera : chunk.cameras()) {
+        poses.push_back(camera.pose);
+    }
+    std::vector<std::optional<Eigen::Vector3d>> positions;
+    for (const Marker& marker : chunk.markers()) {
+        positions.push_back(marker.position);
+    }
+    const Eigen::Vector3d region_centre = chunk.region().centre;
+    const Eigen::Vector3d region_size = chunk.region().size;
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    EXPECT_FALSE(report.applied);
+
+    EXPECT_EQ((chunk.transform() - transform).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ(chunk.crs().epsg, 0);
+    EXPECT_EQ(chunk.camera_crs().epsg, 0);
+    EXPECT_EQ(chunk.marker_crs().epsg, 0);
+    EXPECT_EQ((chunk.region().centre - region_centre).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ((chunk.region().size - region_size).cwiseAbs().maxCoeff(), 0.0);
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        EXPECT_EQ((chunk.cameras()[i].pose - poses[i]).cwiseAbs().maxCoeff(), 0.0)
+            << "camera " << i;
+    }
+    for (std::size_t i = 0; i < chunk.markers().size(); ++i) {
+        ASSERT_EQ(chunk.markers()[i].position.has_value(), positions[i].has_value());
+        EXPECT_EQ((*chunk.markers()[i].position - *positions[i]).norm(), 0.0)
+            << "marker " << i;
+    }
+}
+
 }  // namespace
 }  // namespace alphashape

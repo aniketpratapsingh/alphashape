@@ -121,6 +121,12 @@ alphashape_add_python_test(python_align_chunks ${CMAKE_CURRENT_SOURCE_DIR}/tests
 alphashape_add_python_test(python_markers ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_markers.py
     TIMEOUT 600)
 
+# WP-13.12: Chunk.updateTransform (the UpdateTransform task) and its refusal
+# contract (applied=0 plus a reason, geometry untouched).
+alphashape_add_python_test(python_update_transform
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_update_transform.py
+    TIMEOUT 600)
+
 # WP-12.11: the Python CoordinateSystem surface, the undoable Chunk.crs setter,
 # the geoid registry and BuildDem's `projection` parameter. Skips itself when
 # the module was built without PROJ (the binding does not exist then).
