@@ -242,14 +242,21 @@ inline std::optional<float> sequence_target_shade(
     const double s = std::sin(target.rotation);
     const double u = dx * c + dz * s;
     const double v = -dx * s + dz * c;
+    // A camera above the ground sees image x follow -z and image y follow -x
+    // (the pixel Jacobian of the plane homography), so the camera-facing
+    // (right, down) frame is (-v, -u). Its determinant against image (x right,
+    // y down) is positive: a printed target is only rotated by the view, never
+    // mirrored. The ring, the cross and the target rotation all use this one
+    // basis.
+    const Vec2 local(-v / target.radius, -u / target.radius);
     if (target.cross) {
-        const double half = target.radius * 0.9;
-        if (std::abs(u) > half || std::abs(v) > half) {
+        const double half = 0.9;
+        if (std::abs(local.x()) > half || std::abs(local.y()) > half) {
             return std::nullopt;
         }
-        return (u > 0.0) == (v > 0.0) ? 0.95F : 0.05F;
+        return local.x() * local.y() > 0.0 ? 0.95F : 0.05F;
     }
-    const double rho = std::sqrt(u * u + v * v) / target.radius;
+    const double rho = local.norm();
     if (rho > 1.0) {
         return std::nullopt;
     }
@@ -257,10 +264,6 @@ inline std::optional<float> sequence_target_shade(
     truth.bits = target.bits;
     truth.word = target.word;
     truth.parity = 1;
-    // A camera looking down at the world (x, z) plane sees the target frame
-    // reflected relative to the decoder's image-space frame. Flipping v here
-    // makes the printed word a rotation, not a reflection, of a table entry.
-    const Vec2 local(u / target.radius, -v / target.radius);
     const double sector_width =
         2.0 * std::numbers::pi_v<double> / static_cast<double>(target.bits);
     return circular_black_at(local, truth, sector_width) ? 0.05F : 0.95F;
