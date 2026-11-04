@@ -417,5 +417,44 @@ TEST(Georeference, MarkerPositionsTransformed) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 8. A projected marker CRS is refused before any mutation
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, ProjectedMarkerCrsRefused) {
+    Scene scene;
+    scene.marker_count = 5;
+    Chunk chunk = make_scene(scene);
+    CRS projected;
+    projected.epsg = 32633;  // UTM zone 33N: projected, not lon/lat
+    chunk.set_marker_crs(projected);
+
+    const Transform transform_before = chunk.transform();
+    std::vector<Eigen::Vector3d> positions_before;
+    for (const Marker& marker : chunk.markers()) {
+        positions_before.push_back(*marker.position);
+    }
+    std::vector<Transform> poses_before;
+    for (const Camera& camera : chunk.cameras()) {
+        poses_before.push_back(camera.pose);
+    }
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+
+    EXPECT_FALSE(report.applied);
+    EXPECT_NE(report.reason.find("not geographic"), std::string::npos) << report.reason;
+    EXPECT_LT((chunk.transform() - transform_before).cwiseAbs().maxCoeff(), 1e-12);
+    EXPECT_EQ(chunk.crs().epsg, 0);
+    for (std::size_t i = 0; i < chunk.markers().size(); ++i) {
+        ASSERT_TRUE(chunk.markers()[i].position.has_value());
+        EXPECT_LT((*chunk.markers()[i].position - positions_before[i]).norm(), 1e-12)
+            << "marker " << i;
+    }
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        EXPECT_LT((chunk.cameras()[i].pose - poses_before[i]).cwiseAbs().maxCoeff(), 1e-12)
+            << "camera " << i;
+    }
+}
+
 }  // namespace
 }  // namespace alphashape

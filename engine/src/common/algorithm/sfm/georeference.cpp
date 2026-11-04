@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,26 @@ double median(std::vector<double> values) {
 
 bool all_finite(const Eigen::Vector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
+/// True when a slot's CRS is unset or declares a geographic (lon/lat) datum.
+/// update_transform reads references as lon/lat/ellipsoidal height, so a slot
+/// naming a projected CRS cannot be consumed. epsg 0 means "unset": nothing
+/// contradicts the numbers. 4326 is the canonical geographic code and the
+/// 4000-4999 block is the geographic EPSG range that contains it.
+bool crs_is_geographic(const auto& crs) {
+    const int code = static_cast<int>(crs.epsg);
+    if (code != 0) {
+        return code == 4326 || (code >= 4000 && code <= 4999);
+    }
+    // No EPSG code: a WKT that names a projected CRS is still a refusal, and an
+    // empty slot declares nothing.
+    const std::string& wkt = crs.wkt;
+    if (!wkt.empty()) {
+        return wkt.find("PROJCRS") == std::string::npos &&
+               wkt.find("PROJECTEDCRS") == std::string::npos;
+    }
+    return true;
 }
 
 /// True when the points are not collinear: the farthest pair defines a line and
@@ -305,6 +326,27 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         }
         samples.push_back(
             {*marker.position, loc, sigma_of(marker.reference_accuracy), marker.id});
+    }
+
+    // -- reference CRS guard ------------------------------------------------
+    // The numbers gathered above are interpreted as lon/lat/ellipsoidal height.
+    // A slot that names a projected CRS cannot be consumed here, so refuse
+    // before any mutation. Only the slots that actually contribute are checked:
+    // a lone camera reference must not be blocked by a projected marker slot,
+    // and vice versa.
+    const bool uses_cameras = std::any_of(
+        samples.begin(), samples.end(), [](const Sample& s) { return s.marker_id < 0; });
+    const bool uses_markers =
+        !checks.empty() || std::any_of(samples.begin(), samples.end(),
+                                       [](const Sample& s) { return s.marker_id >= 0; });
+    if (uses_cameras && !crs_is_geographic(chunk.camera_crs())) {
+        report.reason =
+            "camera reference CRS is not geographic; references must be lon/lat";
+        return report;
+    }
+    if (uses_markers && !crs_is_geographic(chunk.marker_crs())) {
+        report.reason = "marker reference CRS is not geographic; references must be lon/lat";
+        return report;
     }
 
     if (samples.size() < 3) {
