@@ -257,7 +257,10 @@ inline std::optional<float> sequence_target_shade(
     truth.bits = target.bits;
     truth.word = target.word;
     truth.parity = 1;
-    const Vec2 local(u / target.radius, v / target.radius);
+    // A camera looking down at the world (x, z) plane sees the target frame
+    // reflected relative to the decoder's image-space frame. Flipping v here
+    // makes the printed word a rotation, not a reflection, of a table entry.
+    const Vec2 local(u / target.radius, -v / target.radius);
     const double sector_width =
         2.0 * std::numbers::pi_v<double> / static_cast<double>(target.bits);
     return circular_black_at(local, truth, sector_width) ? 0.05F : 0.95F;

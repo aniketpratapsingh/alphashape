@@ -270,6 +270,10 @@ TEST(Markers, TrackRedetectRecovers) {
     }
     std::printf("; expected code %d, found %d\n", scene.targets[0].code,
                 code_found ? 1 : 0);
+    const std::vector<ImageDetection> probe_blobs =
+        detect_targets_in_image(probe, "Circular");
+    std::printf("[track redetect] frame 1 non-coded blobs %zu\n",
+                probe_blobs.size());
     ASSERT_TRUE(code_found);
     TrackMarkersOptions options = base_options();
     options.redetect = true;
