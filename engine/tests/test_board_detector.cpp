@@ -321,6 +321,30 @@ TEST(Board, HandlesBlurAndNoise) {
     EXPECT_LE(rms, 0.15);
 }
 
+TEST(Board, RejectsUniformAndNoiseImages) {
+    const BoardSpec spec;
+    const BoardDetectOptions options;
+    const int width = 320;
+    const int height = 240;
+    const FloatImage uniform(width, height, 0.5F);
+    std::mt19937 engine(777u);
+    FloatImage noise(width, height, 0.0F);
+    for (float& value : noise.pixels()) {
+        value = static_cast<float>(rng::uniform_real(engine, 0.0, 1.0));
+    }
+    const std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+    EXPECT_FALSE(detect_board(uniform, spec, options).has_value());
+    EXPECT_FALSE(detect_board(noise, spec, options).has_value());
+    const double seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    std::printf("[board] uniform+noise rejection: %.4f s\n", seconds);
+    if (test::perf_asserts_enabled()) {
+        EXPECT_LT(seconds, 0.5);
+    }
+}
+
 TEST(Board, InvalidOptionsRejected) {
     const FloatImage image(64, 64, 0.5F);
     BoardSpec spec;

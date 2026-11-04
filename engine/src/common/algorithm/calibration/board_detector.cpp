@@ -991,6 +991,32 @@ int select_seed(const std::vector<Candidate>& corners, int width, int height) {
     return best;
 }
 
+/// Cheap board-absence test on a coarse pixel stride. A (near) uniform image
+/// cannot carry the alternating black/white squares of a chessboard, so the
+/// expensive blur and response passes are skipped for it.
+bool looks_uniform(const FloatImage& image) {
+    const int w = image.width();
+    const int h = image.height();
+    const int stride = std::max(1, std::min(w, h) / 64);
+    double sum = 0.0;
+    double sum_squared = 0.0;
+    std::size_t count = 0;
+    for (int y = 0; y < h; y += stride) {
+        for (int x = 0; x < w; x += stride) {
+            const double value = static_cast<double>(image.at(x, y));
+            sum += value;
+            sum_squared += value * value;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        return true;
+    }
+    const double mean = sum / static_cast<double>(count);
+    const double variance = sum_squared / static_cast<double>(count) - mean * mean;
+    return variance < 1e-6;
+}
+
 }  // namespace
 
 std::vector<Eigen::Vector2d> BoardView::board_points() const {
@@ -1022,6 +1048,9 @@ std::optional<BoardView> detect_board(const FloatImage& gray, const BoardSpec& s
         throw ValueError("BoardDetectOptions.min_distance_px must be at least 1");
     }
     if (gray.empty() || gray.width() < 3 || gray.height() < 3) {
+        return std::nullopt;
+    }
+    if (looks_uniform(gray)) {
         return std::nullopt;
     }
     const FloatImage smooth = gaussian_blur(gray, options.sigma_px);
