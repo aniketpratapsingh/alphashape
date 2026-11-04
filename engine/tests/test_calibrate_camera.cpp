@@ -503,6 +503,24 @@ CalibrateScene make_calibrate_scene(std::uint32_t seed, int count) {
     return scene;
 }
 
+/// True when the comma-separated report list names this coefficient.
+bool pruned_contains(const std::string& list, const std::string& name) {
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const std::size_t comma = list.find(',', start);
+        const std::string token = list.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (token == name) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
 /// Add one camera with a rendered chessboard on its frame path.
 void add_board_camera(CalibrateScene& scene, std::mt19937& engine,
                       int sensor_index, const std::string& label, int width,
@@ -589,6 +607,24 @@ TEST(CalibrateCamera, ApplyWritesSensor) {
         scene.chunk->meta().find("calibrate_camera.sensor.rms_px");
     ASSERT_NE(rms, nullptr);
     EXPECT_GT(std::stod(*rms), 0.0);
+
+    // A pruned term is not reported with a sigma: it was zeroed and held for
+    // the final solve, so publishing 0 would read as perfect confidence.
+    const std::string* pruned =
+        scene.chunk->meta().find("calibrate_camera.sensor.pruned");
+    ASSERT_NE(pruned, nullptr);
+    const std::string pruned_list = *pruned;
+    for (int k = 0; k < kCalibrationParamCount; ++k) {
+        const std::string name =
+            kCalibrationParamNames[static_cast<std::size_t>(k)];
+        if (!pruned_contains(pruned_list, name)) {
+            continue;
+        }
+        EXPECT_EQ(
+            scene.chunk->meta().find("calibrate_camera.sensor.sigma." + name),
+            nullptr)
+            << name;
+    }
 
     CalibrateScene retained = make_calibrate_scene(82U, 5);
     const Calibration original = retained.chunk->sensors()[0].calibration;
