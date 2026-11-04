@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <vector>
 
 #include "base/utils/error.hpp"
@@ -207,7 +208,7 @@ double plane_value(const PlaneFit& plane, double x, double y) {
 
 /// Turn one orientation-grown component into a validated segment: a total
 /// least-squares line (PCA of the cell centres) and one Huber plane per side.
-bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_height,
+bool build_segment(std::span<const int> cells, const Grid& grid, double min_height,
                    double min_length, int band, Segment& out) {
     if (cells.size() < 6U) {
         return false;
@@ -373,7 +374,7 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
 /// Record one accepted segment's snapped values. `best_dist` keeps the nearest
 /// segment per cell, so overlaps (building corners) resolve without fighting.
 void snap_segment(const Segment& segment, const Grid& grid, int band,
-                  std::vector<double>& best_h, std::vector<double>& best_dist) {
+                  std::vector<float>& best_h, std::vector<float>& best_dist) {
     const double nx = -segment.dy;
     const double ny = segment.dx;
     const double s_max = static_cast<double>(band - 1);
@@ -416,9 +417,9 @@ void snap_segment(const Segment& segment, const Grid& grid, int band,
             const std::size_t index = static_cast<std::size_t>(row) *
                                           static_cast<std::size_t>(grid.width) +
                                       static_cast<std::size_t>(col);
-            if (as < best_dist[index]) {
-                best_dist[index] = as;
-                best_h[index] = blended;
+            if (as < static_cast<double>(best_dist[index])) {
+                best_dist[index] = static_cast<float>(as);
+                best_h[index] = static_cast<float>(blended);
             }
         }
     }
@@ -463,9 +464,12 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
             usable[i] = 0U;
         }
     }
-    std::vector<double> gx(count, 0.0);
-    std::vector<double> gy(count, 0.0);
-    std::vector<double> gm(count, 0.0);
+    // The gradient planes are float: their precision is far beyond what the
+    // candidate threshold and orientation tests need, and they are released
+    // before the plane stage.
+    std::vector<float> gx(count, 0.0F);
+    std::vector<float> gy(count, 0.0F);
+    std::vector<float> gm(count, 0.0F);
     for (int row = 1; row + 1 < height; ++row) {
         for (int col = 1; col + 1 < width; ++col) {
             bool complete = true;
@@ -481,15 +485,19 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
                 continue;
             }
             // Sobel divided by 8: a derivative in metres per CELL.
-            gx[at(col, row)] =
-                (h[at(col + 1, row - 1)] + 2.0 * h[at(col + 1, row)] + h[at(col + 1, row + 1)] -
-                 h[at(col - 1, row - 1)] - 2.0 * h[at(col - 1, row)] - h[at(col - 1, row + 1)]) /
-                8.0;
-            gy[at(col, row)] =
-                (h[at(col - 1, row + 1)] + 2.0 * h[at(col, row + 1)] + h[at(col + 1, row + 1)] -
-                 h[at(col - 1, row - 1)] - 2.0 * h[at(col, row - 1)] - h[at(col + 1, row - 1)]) /
-                8.0;
-            gm[at(col, row)] = std::hypot(gx[at(col, row)], gy[at(col, row)]);
+            gx[at(col, row)] = static_cast<float>(
+                (h[at(col + 1, row - 1)] + 2.0 * h[at(col + 1, row)] +
+                 h[at(col + 1, row + 1)] - h[at(col - 1, row - 1)] -
+                 2.0 * h[at(col - 1, row)] - h[at(col - 1, row + 1)]) /
+                8.0);
+            gy[at(col, row)] = static_cast<float>(
+                (h[at(col - 1, row + 1)] + 2.0 * h[at(col, row + 1)] +
+                 h[at(col + 1, row + 1)] - h[at(col - 1, row - 1)] -
+                 2.0 * h[at(col, row - 1)] - h[at(col + 1, row - 1)]) /
+                8.0);
+            gm[at(col, row)] = static_cast<float>(std::hypot(
+                static_cast<double>(gx[at(col, row)]),
+                static_cast<double>(gy[at(col, row)])));
         }
     }
 
@@ -500,11 +508,13 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
             // Slope threshold min_height / (2 cells), expressed per cell. The
             // negated test also rejects NaN: both `gm < t` and `gm >= t` are
             // false for NaN, so only this form cannot let it through.
-            if (!(gm[index] >= 0.5 * min_height) || !std::isfinite(h[index])) {
+            if (!(static_cast<double>(gm[index]) >= 0.5 * min_height) ||
+                !std::isfinite(h[index])) {
                 continue;
             }
-            const double ux = gx[index] / gm[index];
-            const double uy = gy[index] / gm[index];
+            const double magnitude = static_cast<double>(gm[index]);
+            const double ux = static_cast<double>(gx[index]) / magnitude;
+            const double uy = static_cast<double>(gy[index]) / magnitude;
             double negative_sum = 0.0;
             double positive_sum = 0.0;
             int negative_n = 0;
@@ -537,25 +547,26 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     }
     // -- 2. orientation region growing (+-15 degrees) ------------------------
     std::vector<int> label(count, -1);
-    std::vector<std::vector<int>> components;
+    std::vector<int> counts;
     std::vector<int> stack;
     for (std::size_t seed = 0; seed < count; ++seed) {
         if (candidate[seed] == 0U || label[seed] >= 0) {
             continue;
         }
-        const int id = static_cast<int>(components.size());
-        components.emplace_back();
+        const int id = static_cast<int>(counts.size());
+        counts.push_back(0);
         label[seed] = id;
         // Grow against the SEED orientation, not the neighbour's: at a blurred
         // corner the gradient rotates continuously, and a neighbour-to-
         // neighbour test would walk around the whole building as one curve.
-        const double seed_x = gx[seed] / gm[seed];
-        const double seed_y = gy[seed] / gm[seed];
+        const double seed_magnitude = static_cast<double>(gm[seed]);
+        const double seed_x = static_cast<double>(gx[seed]) / seed_magnitude;
+        const double seed_y = static_cast<double>(gy[seed]) / seed_magnitude;
         stack.assign(1, static_cast<int>(seed));
         while (!stack.empty()) {
             const int current = stack.back();
             stack.pop_back();
-            components[static_cast<std::size_t>(id)].push_back(current);
+            ++counts[static_cast<std::size_t>(id)];
             const int col = current % width;
             const int row = current / width;
             for (int dy = -1; dy <= 1; ++dy) {
@@ -572,8 +583,9 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
                     if (candidate[ni] == 0U || label[ni] >= 0) {
                         continue;
                     }
-                    const double vx = gx[ni] / gm[ni];
-                    const double vy = gy[ni] / gm[ni];
+                    const double neighbour_magnitude = static_cast<double>(gm[ni]);
+                    const double vx = static_cast<double>(gx[ni]) / neighbour_magnitude;
+                    const double vy = static_cast<double>(gy[ni]) / neighbour_magnitude;
                     if (vx * seed_x + vy * seed_y < kCos15) {
                         continue;
                     }
@@ -585,18 +597,44 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     }
 
     // -- 3. two-plane fit, acceptance, snap ----------------------------------
+    // One CSR layout (offsets plus a single cell array) instead of a vector
+    // per component. Within a component the cells are in row-major order.
+    std::vector<int> offsets(counts.size() + 1, 0);
+    for (std::size_t c = 0; c < counts.size(); ++c) {
+        offsets[c + 1] = offsets[c] + counts[c];
+    }
+    std::vector<int> order(static_cast<std::size_t>(offsets.back()), 0);
+    std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
+    for (std::size_t i = 0; i < count; ++i) {
+        const int id = label[i];
+        if (id >= 0) {
+            order[static_cast<std::size_t>(cursor[static_cast<std::size_t>(id)]++)] =
+                static_cast<int>(i);
+        }
+    }
+    // Release the working arrays the plane stage does not read before
+    // allocating its per-cell best-height arrays.
+    std::vector<int>().swap(label);
+    std::vector<int>().swap(cursor);
+    std::vector<std::uint8_t>().swap(candidate);
+    std::vector<float>().swap(gx);
+    std::vector<float>().swap(gy);
+    std::vector<float>().swap(gm);
+
     Grid grid;
     grid.width = width;
     grid.height = height;
     grid.cell_size = cell_size;
     grid.h = &h;
     grid.valid = &usable;
-    std::vector<double> best_h(count, 0.0);
-    std::vector<double> best_dist(count, std::numeric_limits<double>::infinity());
+    std::vector<float> best_h(count, 0.0F);
+    std::vector<float> best_dist(count, std::numeric_limits<float>::infinity());
     int accepted = 0;
-    for (const std::vector<int>& component : components) {
+    for (std::size_t c = 0; c < counts.size(); ++c) {
         Segment segment;
-        if (!build_segment(component, grid, min_height, min_length, band, segment)) {
+        const std::span<const int> cells(order.data() + offsets[c],
+                                         static_cast<std::size_t>(counts[c]));
+        if (!build_segment(cells, grid, min_height, min_length, band, segment)) {
             continue;
         }
         snap_segment(segment, grid, band, best_h, best_dist);
@@ -604,7 +642,7 @@ int refine_step_edges(std::vector<float>& heights, const std::vector<std::uint8_
     }
     for (std::size_t i = 0; i < count; ++i) {
         if (std::isfinite(best_dist[i])) {
-            heights[i] = static_cast<float>(best_h[i]);
+            heights[i] = best_h[i];
         }
     }
     return accepted;

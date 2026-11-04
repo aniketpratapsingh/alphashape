@@ -27,6 +27,13 @@
 //
 // Every option and the return value are in metres: heights are metres, the
 // cell size is metres per cell, `min_height` and `min_length` are metres.
+//
+// Memory: peak is about 38 bytes per cell plus the caller's inputs -- an
+// 8-byte double height copy, a 1-byte usability mask, three float gradient
+// planes (12), a 1-byte candidate mask, one int32 label and one int32 CSR
+// cell array (8), and float best-height/best-distance arrays (8). The
+// gradient, candidate and label working sets are released after grouping, so
+// the plane stage holds about 21 bytes per cell plus the inputs.
 
 #include <cstdint>
 #include <vector>
