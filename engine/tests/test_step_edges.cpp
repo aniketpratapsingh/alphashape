@@ -494,7 +494,52 @@ TEST(StepEdges, CornersStayWithinTheBandRange) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. BuildDem integration: the parameter is opt-in, and when enabled it only
+// 7. A wall edge that ends on flat ground must stop at its ends: no full-height
+//    ridge is painted past the measured segment.
+// ---------------------------------------------------------------------------
+
+TEST(StepEdges, SegmentEndsAreNotExtended) {
+    const int width = 160;
+    const int height = 160;
+    Building wall;
+    wall.rect = Rect{14.0, 15.0, 1.5, 5.0, 0.0};  // 3 m x 10 m, ends at y = 10, 20
+    wall.flat_height = 4.0;
+    const std::vector<double> truth =
+        truth_surface(std::vector<Building>{wall}, width, height);
+    const std::vector<double> blurred = gaussian_blur(truth, width, height, 1.5);
+    Noise noise;
+    std::vector<float> values(blurred.size());
+    for (std::size_t i = 0; i < blurred.size(); ++i) {
+        values[i] = static_cast<float>(blurred[i] + 0.05 * noise.normal());
+    }
+    const std::vector<float> original = values;
+    const std::vector<std::uint8_t> valid = all_valid(values.size());
+    StepEdgeOptions options;
+    // The 3 m end faces are shorter than this; only the 10 m sides qualify.
+    options.min_length = 4.0;
+    const int segments = refine_step_edges(values, valid, width, height, kCell, options);
+    EXPECT_GE(segments, 1);
+
+    int changed = 0;
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t index = static_cast<std::size_t>(row) *
+                                          static_cast<std::size_t>(width) +
+                                      static_cast<std::size_t>(col);
+            if (values[index] == original[index]) {
+                continue;
+            }
+            ++changed;
+            const double y = static_cast<double>(row) * kCell;
+            EXPECT_GE(y, 10.0 - kCell - 1e-4) << "row " << row;
+            EXPECT_LE(y, 20.0 + kCell + 1e-4) << "row " << row;
+        }
+    }
+    EXPECT_GT(changed, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 8. BuildDem integration: the parameter is opt-in, and when enabled it only
 //    rewrites the band around a detected step.
 // ---------------------------------------------------------------------------
 

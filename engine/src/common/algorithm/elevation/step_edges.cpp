@@ -115,6 +115,21 @@ double median_of(std::vector<double> values) {
     return value;
 }
 
+/// Linear-interpolated percentile `q` in [0, 1]. Sorts the passed copy.
+double percentile(std::vector<double> values, double q) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double clamped = std::min(std::max(q, 0.0), 1.0);
+    const double position =
+        clamped * static_cast<double>(values.size() - 1);
+    const std::size_t lo = static_cast<std::size_t>(std::floor(position));
+    const std::size_t hi = std::min(lo + 1, values.size() - 1);
+    const double fraction = position - static_cast<double>(lo);
+    return values[lo] + (values[hi] - values[lo]) * fraction;
+}
+
 /// Huber IRLS plane fit (Huber 1964). The robust scale is the MAD of the
 /// residuals with a floor, so an exact plane does not get an infinite weight.
 PlaneFit fit_plane_huber(const std::vector<double>& x, const std::vector<double>& y,
@@ -221,21 +236,25 @@ bool build_segment(const std::vector<int>& cells, const Grid& grid, double min_h
     const double dy = std::sin(angle);
     const double nx = -dy;
     const double ny = dx;
-    double tmin = std::numeric_limits<double>::infinity();
-    double tmax = -std::numeric_limits<double>::infinity();
-    int inliers = 0;
+    // The extent comes from tight inliers only: candidates on a perpendicular
+    // edge are up to a few cells off this line, and letting them set tmin/tmax
+    // made the snap paint past the measured segment.
+    std::vector<double> ts;
+    ts.reserve(cells.size());
     for (const int index : cells) {
         const double px = static_cast<double>(index % grid.width) - mx;
         const double py = static_cast<double>(index / grid.width) - my;
-        if (std::abs(px * nx + py * ny) > 2.5) {
+        if (std::abs(px * nx + py * ny) > 1.0) {
             continue;
         }
-        const double t = px * dx + py * dy;
-        tmin = std::min(tmin, t);
-        tmax = std::max(tmax, t);
-        ++inliers;
+        ts.push_back(px * dx + py * dy);
     }
-    if (inliers < 5 || (tmax - tmin) * grid.cell_size < min_length) {
+    if (ts.size() < 5U) {
+        return false;
+    }
+    const double tmin = percentile(ts, 0.05);
+    const double tmax = percentile(ts, 0.95);
+    if ((tmax - tmin) * grid.cell_size < min_length) {
         return false;
     }
     int col0 = grid.width;
@@ -359,14 +378,22 @@ void snap_segment(const Segment& segment, const Grid& grid, int band,
             const double s = px * nx + py * ny;
             const double t = px * segment.dx + py * segment.dy;
             const double as = std::abs(s);
-            if (t < segment.tmin - 1.0 || t > segment.tmax + 1.0 || as > s_max) {
+            if (t < segment.tmin || t > segment.tmax || as > s_max) {
                 continue;
             }
             const PlaneFit& plane = s < 0.0 ? segment.left : segment.right;
             double value = plane_value(plane, static_cast<double>(col), static_cast<double>(row));
             value = std::min(std::max(value, segment.lo), segment.hi);
             // One-cell linear blend at the outer edge: no new discontinuity.
-            const double weight = as > s_max - 1.0 ? std::max(0.0, s_max - as) : 1.0;
+            double weight = as > s_max - 1.0 ? std::max(0.0, s_max - as) : 1.0;
+            // Fade over the first and last cell along the segment, so the snap
+            // cannot paint a full-height ridge beyond its measured extent.
+            const double along =
+                std::min(t - segment.tmin, segment.tmax - t);
+            weight *= std::min(std::max(along, 0.0), 1.0);
+            if (!(weight > 0.0)) {
+                continue;
+            }
             const double original = grid.height_at(col, row);
             const double blended = weight * value + (1.0 - weight) * original;
             const std::size_t index = static_cast<std::size_t>(row) *
