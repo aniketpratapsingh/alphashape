@@ -73,8 +73,9 @@ struct DemOptions {
     /// Run the TGV^2 smoothing / inpainting pass (never for the model source).
     bool tgv = true;
     TgvOptions tgv_options = dem_smoothing_options();
-    /// Rebuild sharp height steps over roof/building outlines after smoothing
-    /// and before hole filling (step_edges.hpp). Opt-in.
+    /// Rebuild sharp height steps over roof/building outlines on the final
+    /// surface, i.e. after hole filling and TGV smoothing (step_edges.hpp).
+    /// Opt-in.
     bool refine_edges = false;
     /// Minimum height step, in metres, for a discontinuity to be refined.
     double step_min_height = 1.5;

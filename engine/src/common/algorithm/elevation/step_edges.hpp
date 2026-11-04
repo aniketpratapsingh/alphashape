@@ -7,7 +7,7 @@
 // outline. This pass finds long straight height discontinuities and rebuilds a
 // sharp step across them:
 //
-//   1. Sobel gradient magnitude of the height field, in metres per metre.
+//   1. Sobel gradient magnitude of the height field, in metres per cell.
 //   2. Candidate cells: gradient above min_height / (2 cells) and a height
 //      step >= min_height between the samples +-2..3 cells along it.
 //   3. Orientation region growing (+-15 degrees) groups the candidates; a
@@ -16,7 +16,10 @@
 //      non-transition cells (Huber 1964, Ann. Math. Stat. 35(1)).
 //   5. Accepted segments snap each band cell to its side's plane, blended over
 //      the last cell toward the original surface and clamped to the band's
-//      original height range. Nodata/filled cells are never touched.
+//      original height range. Only measured cells are evidence or written.
+//
+// The caller runs this pass on the final DEM surface, i.e. after hole filling
+// and TGV smoothing, so the heights it sharpens are the ones that get written.
 //
 // The grouping follows the LSD idea of chaining aligned gradient evidence
 // (von Gioi et al. 2010, "LSD: a fast line segment detector", IEEE TPAMI
@@ -37,8 +40,9 @@ struct StepEdgeOptions {
 };
 
 /// Refine `heights` (row-major, width*height, metres) in place. `valid[i] == 0`
-/// marks nodata or hole-filled cells, which are never read as evidence nor
-/// written. Returns the number of accepted straight segments.
+/// marks cells that are not measurements (nodata, hole-filled, or repaired-only
+/// height guesses), which are never read as evidence nor written. Returns the
+/// number of accepted straight segments.
 ///
 /// Throws ValueError when the sizes disagree, width or height is < 3, or
 /// cell_size is not positive and finite.
