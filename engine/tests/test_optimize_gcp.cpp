@@ -230,6 +230,10 @@ TEST(Optimize, RobustLossRejectsBlunder) {
     BAOptions options;
     options.max_iterations = 1000;
     options.function_tolerance = 1e-12;
+    // The blunder is in a control reference, not in an observation. Plain least
+    // squares keeps the bad point pinned by its (noise-free) observations so the
+    // test isolates the Huber loss on the control residual.
+    options.loss_scale_px = 0.0;
     const BAReport report = bundle_adjust(problem, options);
     ASSERT_TRUE(report.usable);
 
