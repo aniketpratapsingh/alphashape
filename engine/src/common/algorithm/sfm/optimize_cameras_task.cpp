@@ -137,7 +137,7 @@ Eigen::Matrix3d rotation_from_rotation_vector(const Eigen::Vector3d& vector) {
 /// by central differences on the rotation vector. Chunk-local, like the pose.
 Eigen::Matrix3d camera_location_covariance(const sfm::BAPose& pose,
                                            const Eigen::Matrix<double, 6, 6>& covariance) {
-    Eigen::Matrix3d jacobian = Eigen::Matrix3d::Zero();
+    Eigen::Matrix<double, 3, 6> jacobian = Eigen::Matrix<double, 3, 6>::Zero();
     jacobian.block<3, 3>(0, 3) = -pose.R.transpose();
     const Eigen::AngleAxisd angle_axis(pose.R);
     const Eigen::Vector3d omega = angle_axis.angle() * angle_axis.axis();
