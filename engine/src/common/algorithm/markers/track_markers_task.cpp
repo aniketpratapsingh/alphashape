@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <list>
 #include <memory>
@@ -219,10 +221,14 @@ public:
                const std::vector<std::string>& filters, TrackMarkersStats& stats,
                int pyramid_levels)
         : document_(document), sequence_(sequence), filters_(filters),
-          stats_(stats), pyramid_levels_(pyramid_levels) {}
+          stats_(stats), pyramid_levels_(pyramid_levels) {
+        for (const SequenceCamera& entry : sequence_) {
+            by_camera_.emplace(entry.camera->id, &entry);
+        }
+    }
 
     std::shared_ptr<const SequenceView> get(std::int32_t camera_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         auto found = entries_.find(camera_id);
         if (found != entries_.end()) {
             order_.splice(order_.begin(), order_, found->second.order);
@@ -232,35 +238,48 @@ public:
             failed_.end()) {
             return nullptr;
         }
-        const SequenceCamera* entry = nullptr;
-        for (const SequenceCamera& candidate : sequence_) {
-            if (candidate.camera->id == camera_id) {
-                entry = &candidate;
-                break;
-            }
+        // Another thread is already decoding this camera. Wait for its result
+        // outside the lock rather than serialising every decode on it.
+        const auto in_flight = pending_.find(camera_id);
+        if (in_flight != pending_.end()) {
+            const std::shared_future<std::shared_ptr<SequenceView>> future =
+                in_flight->second;
+            lock.unlock();
+            return future.get();
         }
-        if (entry == nullptr) {
+        const auto known = by_camera_.find(camera_id);
+        if (known == by_camera_.end()) {
             return nullptr;
         }
-        std::shared_ptr<SequenceView> view = decode(*entry);
-        if (!view) {
-            failed_.push_back(camera_id);
-            return nullptr;
+        const SequenceCamera* entry = known->second;
+        std::promise<std::shared_ptr<SequenceView>> promise;
+        const std::shared_future<std::shared_ptr<SequenceView>> future =
+            promise.get_future().share();
+        pending_.emplace(camera_id, future);
+        lock.unlock();
+        std::shared_ptr<SequenceView> view;
+        std::exception_ptr error;
+        try {
+            view = decode(*entry);
+        } catch (...) {
+            error = std::current_exception();
         }
-        const std::size_t bytes = view->bytes();
-        while (!order_.empty() && bytes_ + bytes > kBudgetBytes) {
-            const std::int32_t victim = order_.back();
-            auto victim_entry = entries_.find(victim);
-            if (victim_entry != entries_.end()) {
-                bytes_ -= victim_entry->second.view->bytes();
-                entries_.erase(victim_entry);
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            pending_.erase(camera_id);
+            if (!error) {
+                if (!view) {
+                    failed_.push_back(camera_id);
+                } else {
+                    insert_locked(view);
+                }
             }
-            order_.pop_back();
         }
-        bytes_ += bytes;
-        peak_bytes_ = std::max(peak_bytes_, bytes_);
-        entries_[camera_id] = Entry{
-            view, order_.insert(order_.begin(), camera_id)};
+        if (error) {
+            promise.set_exception(error);
+            std::rethrow_exception(error);
+        }
+        promise.set_value(view);
         return view;
     }
 
@@ -274,6 +293,11 @@ private:
 
     std::shared_ptr<SequenceView> decode(const SequenceCamera& entry);
 
+    /// Inserts a freshly decoded view, evicting only views nobody else holds
+    /// (use_count 1). Pinned views count against the budget, so a temporary
+    /// overshoot is allowed and recorded in `peak_bytes_`. Caller holds mutex_.
+    void insert_locked(const std::shared_ptr<SequenceView>& view);
+
     const Document& document_;
     const std::vector<SequenceCamera>& sequence_;
     const std::vector<std::string>& filters_;
@@ -282,6 +306,10 @@ private:
     std::mutex mutex_;
     std::list<std::int32_t> order_;
     std::unordered_map<std::int32_t, Entry> entries_;
+    std::unordered_map<std::int32_t, const SequenceCamera*> by_camera_;
+    std::unordered_map<std::int32_t,
+                       std::shared_future<std::shared_ptr<SequenceView>>>
+        pending_;
     std::vector<std::int32_t> failed_;
     std::size_t bytes_ = 0;
     std::size_t peak_bytes_ = 0;
@@ -316,6 +344,33 @@ std::shared_ptr<SequenceView> FrameCache::decode(const SequenceCamera& entry) {
         ++stats_.unreadable_cameras;
         return nullptr;
     }
+}
+
+void FrameCache::insert_locked(const std::shared_ptr<SequenceView>& view) {
+    const std::int32_t camera_id = view->entry->camera->id;
+    const std::size_t incoming = view->bytes();
+    // Walk from the least recently used end. A pinned view (use_count > 1) is
+    // in use by another tracking thread and must stay resident, so the cache
+    // may overshoot the budget until that thread drops its reference.
+    auto cursor = order_.end();
+    while (bytes_ + incoming > kBudgetBytes && cursor != order_.begin()) {
+        --cursor;
+        const auto victim = entries_.find(*cursor);
+        if (victim == entries_.end()) {
+            cursor = order_.erase(cursor);
+            continue;
+        }
+        if (victim->second.view.use_count() > 1) {
+            continue;
+        }
+        bytes_ -= victim->second.view->bytes();
+        entries_.erase(victim);
+        cursor = order_.erase(cursor);
+    }
+    entries_[camera_id] = Entry{
+        view, order_.insert(order_.begin(), camera_id)};
+    bytes_ += incoming;
+    peak_bytes_ = std::max(peak_bytes_, bytes_);
 }
 
 bool inside_sample(const FloatImage& image, double x, double y,
