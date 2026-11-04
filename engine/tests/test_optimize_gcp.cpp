@@ -144,6 +144,10 @@ TEST(Optimize, GcpNetworkRecoversTransform) {
     BAOptions options;
     options.max_iterations = 1000;
     options.function_tolerance = 1e-12;
+    // The start is an exact similarity, so every reprojection is zero. A robust
+    // reprojection loss can then prefer a spurious local minimum where only the
+    // control points move; this test is noise-free, so plain least squares.
+    options.loss_scale_px = 0.0;
     const BAReport report = bundle_adjust(problem, options);
     ASSERT_TRUE(report.usable);
     EXPECT_EQ(report.control_points, control.size());
@@ -271,6 +275,7 @@ TEST(Optimize, CheckPointsReportedButNotUsed) {
     BAOptions options;
     options.max_iterations = 1000;
     options.function_tolerance = 1e-12;
+    options.loss_scale_px = 0.0;  // noise-free, exact-similarity start (see above)
     const BAReport report = bundle_adjust(with_check, options);
     ASSERT_TRUE(report.usable);
     ASSERT_EQ(report.checkpoints, 1u);
