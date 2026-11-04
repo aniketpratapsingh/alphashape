@@ -161,10 +161,10 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     }
     // Posterior covariance is computed once, on the accepted state only. Reusing
     // bundle_adjust keeps the problem construction (free masks, manifolds and
-    // robust losses) identical to the selection solves.
+    // robust losses) identical to the selection solves. It is a covariance
+    // pass rather than a new selection solve, so it is not counted in solves.
     if (want_covariance) {
         report = bundle_adjust(problem, options.solve_options);
-        ++result.solves;
     }
     result.report = report;
     return result;
