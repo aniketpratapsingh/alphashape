@@ -1720,5 +1720,89 @@ TEST_F(TempDir, OlderProjectWithoutProductElementsStillLoads) {
     EXPECT_TRUE(got == *document.workspace().chunks().front());
 }
 
+// WP-13.13b: posterior covariance is persisted but never synthesised. These
+// three tests cover the round trip, the byte-compatibility rule and the strict
+// reader.
+TEST_F(TempDir, CovarianceRoundTrips) {
+    Document original = build_rich_document();
+    Chunk& chunk = *original.workspace().chunks().front();
+
+    // A 4-parameter SPD calibration covariance (f, cx, cy, k1).
+    Eigen::MatrixXd cal(4, 4);
+    cal << 0.25, 0.02, -0.01, 0.0,
+           0.02, 0.04, 0.0, 0.001,
+           -0.01, 0.0, 0.05, 0.002,
+           0.0, 0.001, 0.002, 0.0004;
+    chunk.sensors()[0].calibration.covariance = cal;
+    chunk.sensors()[0].calibration.covariance_params = {"f", "cx", "cy", "k1"};
+
+    chunk.cameras()[0].location_covariance << 0.1, 0.01, 0.0,
+                                              0.01, 0.2, 0.02,
+                                              0.0, 0.02, 0.3;
+    chunk.cameras()[0].rotation_covariance << 1e-4, 0.0, 0.0,
+                                              0.0, 2e-4, 0.0,
+                                              0.0, 0.0, 3e-4;
+    // One track with a covariance, one without: both flag branches.
+    chunk.tie_points().tracks[0].covariance = Eigen::Matrix3f::Identity() * 0.03F;
+    chunk.tie_points().tracks[1].covariance.reset();
+
+    ProjectIO::save(original, path("x.psx"));
+    std::shared_ptr<Document> loaded = ProjectIO::load(path("x.psx"));
+
+    ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
+    EXPECT_TRUE(*loaded->workspace().chunks().front() == chunk);
+
+    const Chunk& back = *loaded->workspace().chunks().front();
+    EXPECT_EQ(back.cameras()[0].location_covariance(1, 2), 0.02);
+    EXPECT_EQ(back.cameras()[0].rotation_covariance(2, 2), 3e-4);
+    EXPECT_EQ(back.sensors()[0].calibration.covariance(3, 3), 0.0004);
+    EXPECT_EQ(back.sensors()[0].calibration.covariance_params.size(), 4U);
+    ASSERT_TRUE(back.tie_points().tracks[0].covariance.has_value());
+    EXPECT_EQ((*back.tie_points().tracks[0].covariance)(2, 2), 0.03F);
+    EXPECT_FALSE(back.tie_points().tracks[1].covariance.has_value());
+}
+
+TEST_F(TempDir, NoCovarianceKeepsLayout) {
+    const Document document = build_rich_document();
+    ProjectIO::save(document, path("x.psx"));
+
+    std::ifstream in(path("x.files/project.zip"), std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+    const ZipArchive archive = ZipArchive::parse(bytes);
+    EXPECT_FALSE(archive.contains(rich_entry("tie_points/track_covariance.bin")));
+    const std::string xml = archive.get_text("doc.xml");
+    EXPECT_EQ(xml.find("location_covariance"), std::string::npos);
+    EXPECT_EQ(xml.find("rotation_covariance"), std::string::npos);
+    EXPECT_EQ(xml.find("<covariance"), std::string::npos);
+    EXPECT_EQ(xml.find("covariance_path"), std::string::npos);
+}
+
+TEST_F(TempDir, RejectsMalformedCalibrationCovariance) {
+    Document original = build_rich_document();
+    Calibration& cal = original.workspace().chunks().front()->sensors()[0].calibration;
+    cal.covariance = Eigen::MatrixXd::Identity(4, 4);
+    cal.covariance_params = {"f", "cx", "cy", "k1"};
+    ProjectIO::save(original, path("x.psx"));
+
+    // Rewrite the covariance text with one value too few (15, not 4*4).
+    std::ifstream in(path("x.files/project.zip"), std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+    std::string xml = ZipArchive::parse(bytes).get_text("doc.xml");
+    const std::string open = "<covariance params=\"f cx cy k1\">";
+    const std::size_t at = xml.find(open);
+    ASSERT_NE(at, std::string::npos);
+    const std::size_t text_at = at + open.size();
+    const std::size_t close = xml.find("</covariance>", text_at);
+    ASSERT_NE(close, std::string::npos);
+    xml.replace(text_at, close - text_at, "1 0 0 0 1 0 0 0 1 0 0 0 1 0 0");
+    rewrite_zip_entry(path("x.files/project.zip"), "doc.xml", xml);
+
+    EXPECT_THROW(ProjectIO::load(path("x.psx")), ProjectIOError);
+}
+
 }  // namespace
 }  // namespace alphashape
