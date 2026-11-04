@@ -449,8 +449,7 @@ struct GrownLattice {
 /// corner, so its cost no longer grows quadratically with the corner count.
 class CornerGrid {
 public:
-    CornerGrid(const std::vector<Candidate>& corners, double cell_size)
-        : corners_(corners) {
+    CornerGrid(const std::vector<Candidate>& corners, double cell_size) {
         cell_ = std::max(cell_size, 1e-3);
         for (int i = 0; i < static_cast<int>(corners.size()); ++i) {
             const std::pair<int, int> key = cell_key(
@@ -523,7 +522,6 @@ private:
         return std::make_pair(cell_coord(x), cell_coord(y));
     }
 
-    const std::vector<Candidate>& corners_;
     double cell_ = 1.0;
     int min_cx_ = 0;
     int max_cx_ = 0;
