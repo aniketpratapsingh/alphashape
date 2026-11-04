@@ -213,6 +213,49 @@ TEST(Markers, TrackOrdersByCaptureTime) {
     EXPECT_EQ(stats.stopped_markers, 0U);
 }
 
+TEST(Markers, TrackOrdersBySubsecond) {
+    MarkerSequenceSpec spec;
+    spec.frames = kFrames;
+    spec.burst_capture_times = true;
+    // Every frame has the same whole second, so only SubSecTimeOriginal can
+    // put temporal order ahead of this import order.
+    spec.import_order = {7,  3,  15, 0,  11, 18, 5,  1,  14, 9,
+                         2,  19, 6,  12, 4,  17, 8,  10, 16, 13};
+    MarkerSequence scene = make_marker_sequence(spec);
+    const std::vector<std::int32_t> ids = seed_all(scene, 0);
+    const TrackMarkersStats stats = run_track(scene, base_options());
+    for (std::size_t target = 0; target < ids.size(); ++target) {
+        const Marker* marker = find_marker(*scene.chunk, ids[target]);
+        ASSERT_NE(marker, nullptr);
+        EXPECT_EQ(marker->projections.size(),
+                  static_cast<std::size_t>(kFrames))
+            << "subsecond order, target " << target;
+        EXPECT_LE(errors_for(scene, *marker, target).rms, 0.3);
+    }
+    EXPECT_EQ(stats.stopped_markers, 0U);
+}
+
+TEST(Markers, TrackFallsBackOnMalformedTime) {
+    MarkerSequenceSpec spec;
+    spec.frames = kFrames;
+    spec.reverse_capture_times = true;
+    spec.malformed_time_temporal = 5;
+    MarkerSequence scene = make_marker_sequence(spec);
+    const std::vector<std::int32_t> ids = seed_all(scene, 0);
+    const TrackMarkersStats stats = run_track(scene, base_options());
+    // One malformed stamp rejects the whole time ordering, so the run uses
+    // import order (temporal order here) rather than the reversed times.
+    for (std::size_t target = 0; target < ids.size(); ++target) {
+        const Marker* marker = find_marker(*scene.chunk, ids[target]);
+        ASSERT_NE(marker, nullptr);
+        EXPECT_EQ(marker->projections.size(),
+                  static_cast<std::size_t>(kFrames))
+            << "malformed-time fallback, target " << target;
+        EXPECT_LE(errors_for(scene, *marker, target).rms, 0.3);
+    }
+    EXPECT_EQ(stats.stopped_markers, 0U);
+}
+
 TEST(Markers, TrackStopsAtOcclusion) {
     MarkerSequenceSpec spec;
     spec.frames = kFrames;

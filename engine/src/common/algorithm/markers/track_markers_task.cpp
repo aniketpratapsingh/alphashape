@@ -82,19 +82,94 @@ std::filesystem::path resolve_frame_path(const Document& document,
     return std::filesystem::path(document.path()).parent_path() / recorded;
 }
 
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// civil-from-days inverse). Only the ordering matters, so no timezone is
+/// applied: EXIF date-times are local wall-clock.
+std::int64_t days_from_civil(int year, unsigned month, unsigned day) {
+    year -= month <= 2 ? 1 : 0;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
+    const unsigned day_of_year =
+        (153U * (month + (month > 2 ? -3U : 9U)) + 2U) / 5U + day - 1U;
+    const unsigned day_of_era =
+        year_of_era * 365U + year_of_era / 4U - year_of_era / 100U + day_of_year;
+    return static_cast<std::int64_t>(era) * 146097 +
+           static_cast<std::int64_t>(day_of_era) - 719468;
+}
+
+/// Strict "YYYY:MM:DD HH:MM:SS" (exactly 19 characters), returned as an
+/// integer that sorts the same as the real instant. Anything else is nullopt.
+std::optional<std::int64_t> parse_datetime(const std::string& text) {
+    constexpr const char* kPattern = "dddd:dd:dd dd:dd:dd";
+    if (text.size() < 19U) {
+        return std::nullopt;
+    }
+    for (std::size_t i = 0; i < 19U; ++i) {
+        if (kPattern[i] == 'd') {
+            if (text[i] < '0' || text[i] > '9') {
+                return std::nullopt;
+            }
+        } else if (text[i] != kPattern[i]) {
+            return std::nullopt;
+        }
+    }
+    const auto number = [&text](std::size_t at, std::size_t count) {
+        int value = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            value = value * 10 + (text[at + i] - '0');
+        }
+        return value;
+    };
+    const int year = number(0U, 4U);
+    const int month = number(5U, 2U);
+    const int day = number(8U, 2U);
+    const int hour = number(11U, 2U);
+    const int minute = number(14U, 2U);
+    const int second = number(17U, 2U);
+    if (year < 1970 || year > 9999 || month < 1 || month > 12 || day < 1 ||
+        day > 31 || hour > 23 || minute > 59 || second > 60) {
+        return std::nullopt;
+    }
+    const std::int64_t days = days_from_civil(
+        year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+    return ((days * 24 + hour) * 60 + minute) * 60 + second;
+}
+
+/// SubSecTimeOriginal as microseconds. A non-numeric field is ignored (zero)
+/// rather than invalidating an otherwise good timestamp.
+std::int64_t subsecond_micros(const std::optional<std::string>& subsec) {
+    if (!subsec) {
+        return 0;
+    }
+    std::int64_t value = 0;
+    int digits = 0;
+    for (const char c : *subsec) {
+        if (digits == 6) {
+            break;
+        }
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+        value = value * 10 + (c - '0');
+        ++digits;
+    }
+    while (digits < 6) {
+        value *= 10;
+        ++digits;
+    }
+    return value;
+}
+
 /// Capture time as EXIF records it. The model has no time field, so it is read
 /// from the frame file. Missing or malformed metadata is "no time", which
 /// makes the whole ordering fall back to import order.
-std::optional<std::string> capture_time_of(const Document& document,
+std::optional<CaptureTime> capture_time_of(const Document& document,
                                            const Frame& frame) {
     try {
         // Only the metadata is read: JPEG/PNG segments are streamed and a TIFF
         // uses a bounded prefix, so plan time never loads the pixel data.
-        const std::optional<CaptureTime> time = read_capture_time(
+        return read_capture_time(
             resolve_frame_path(document, frame.path()).string());
-        if (time) {
-            return time->datetime_original;
-        }
     } catch (const std::exception&) {
         // An unreadable file is not an ordering problem; the decode step
         // reports it (and an explicit camera list throws there).
@@ -107,7 +182,11 @@ struct SequenceCamera {
     const Camera* camera = nullptr;
     const Calibration* calibration = nullptr;
     const Frame* frame = nullptr;
-    std::optional<std::string> capture_time;
+    /// Sortable capture instant (seconds since epoch scaled by 1e6 plus
+    /// SubSecTimeOriginal microseconds); nullopt when unusable.
+    std::optional<std::int64_t> capture_key;
+    /// Set when the file had no timestamp or it did not parse strictly.
+    bool capture_time_bad = false;
     /// Position in `Chunk::cameras()`, which is import order.
     std::size_t import_index = 0;
 };
@@ -171,26 +250,43 @@ std::vector<SequenceCamera> selected_sequence(
         entry.import_index = index;
         sequence.push_back(std::move(entry));
     }
-    // Capture times are independent per frame, so read the metadata in
-    // parallel: even a bounded read is file I/O per camera.
+    // Capture times are independent per frame, so read and parse the metadata
+    // in parallel: even the bounded read is file I/O per camera.
     const int count = static_cast<int>(sequence.size());
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int i = 0; i < count; ++i) {
         SequenceCamera& entry = sequence[static_cast<std::size_t>(i)];
-        entry.capture_time = capture_time_of(document, *entry.frame);
+        const std::optional<CaptureTime> time =
+            capture_time_of(document, *entry.frame);
+        if (!time) {
+            entry.capture_time_bad = true;
+            continue;
+        }
+        const std::optional<std::int64_t> seconds =
+            parse_datetime(time->datetime_original);
+        if (!seconds) {
+            entry.capture_time_bad = true;
+            continue;
+        }
+        entry.capture_key =
+            *seconds * 1000000 + subsecond_micros(time->subsec_time_original);
     }
-    const bool all_timed =
-        !sequence.empty() &&
-        std::all_of(sequence.begin(), sequence.end(),
-                    [](const SequenceCamera& entry) {
-                        return entry.capture_time.has_value();
-                    });
+    bool all_timed = !sequence.empty();
+    for (const SequenceCamera& entry : sequence) {
+        if (!entry.capture_key) {
+            all_timed = false;
+            log(LogLevel::Warn)
+                << "TrackMarkers: camera '" << entry.camera->label
+                << "' has a missing or malformed capture time; using import "
+                   "order";
+        }
+    }
     if (all_timed) {
         std::stable_sort(sequence.begin(), sequence.end(),
                          [](const SequenceCamera& a, const SequenceCamera& b) {
-                             return *a.capture_time < *b.capture_time;
+                             return *a.capture_key < *b.capture_key;
                          });
     }
     return sequence;

@@ -68,6 +68,11 @@ struct MarkerSequenceSpec {
     /// time-ordered run and an import-ordered run differ.
     bool reverse_capture_times = false;
     int missing_time_temporal = -1;
+    /// Every frame shares one whole second; SubSecTimeOriginal carries the
+    /// temporal index, so ordering depends on the subsecond field.
+    bool burst_capture_times = false;
+    /// Temporal index whose DateTimeOriginal is deliberately malformed.
+    int malformed_time_temporal = -1;
     int occlude_first = -1;
     int occlude_last = -1;
     int occluded_target = 0;
@@ -117,10 +122,12 @@ inline std::uint32_t crc32_of(const std::uint8_t* data, std::size_t size) {
     return crc ^ 0xFFFFFFFFu;
 }
 
-/// Minimal little-endian TIFF block with IFD0 -> ExifIFD -> DateTimeOriginal.
+/// Minimal little-endian TIFF block with IFD0 -> ExifIFD -> DateTimeOriginal
+/// and, when `subsec` is non-empty, SubSecTimeOriginal.
 inline std::vector<std::uint8_t> datetime_tiff_block(
-    const std::string& when) {
-    std::vector<std::uint8_t> block(64, 0);
+    const std::string& when,
+    const std::string& subsec = std::string()) {
+    std::vector<std::uint8_t> block(96, 0);
     const auto put16 = [&block](std::size_t at, std::uint16_t value) {
         block[at] = static_cast<std::uint8_t>(value & 0xFFu);
         block[at + 1] = static_cast<std::uint8_t>(value >> 8);
@@ -142,16 +149,27 @@ inline std::vector<std::uint8_t> datetime_tiff_block(
     put32(14, 1);
     put32(18, 26);
     put32(22, 0);
-    // ExifIFD: one entry, DateTimeOriginal ASCII (19 characters + NUL).
-    put16(26, 1);
+    // ExifIFD: DateTimeOriginal, then optionally SubSecTimeOriginal.
+    const std::uint16_t entries = subsec.empty() ? 1 : 2;
+    put16(26, entries);
     put16(28, 0x9003);
     put16(30, 2);
     put32(32, 20);
-    put32(36, 44);
+    put32(36, 56);
     put32(40, 0);
+    if (!subsec.empty()) {
+        put16(40, 0x9291);
+        put16(42, 2);
+        put32(44, static_cast<std::uint32_t>(subsec.size() + 1));
+        put32(48, 76);
+        put32(52, 0);
+    }
     const std::string text = when.substr(0, 19);
     for (std::size_t i = 0; i < text.size(); ++i) {
-        block[44 + i] = static_cast<std::uint8_t>(text[i]);
+        block[56 + i] = static_cast<std::uint8_t>(text[i]);
+    }
+    for (std::size_t i = 0; i < subsec.size(); ++i) {
+        block[76 + i] = static_cast<std::uint8_t>(subsec[i]);
     }
     return block;
 }
@@ -161,7 +179,8 @@ inline std::vector<std::uint8_t> datetime_tiff_block(
 /// capture-time path a real photo uses.
 inline void write_gray_png_with_time(
     const std::string& path, const FloatImage& image,
-    const std::optional<std::string>& when) {
+    const std::optional<std::string>& when,
+    const std::optional<std::string>& subsec = std::nullopt) {
     Image out(image.width(), image.height(), 1);
     for (int y = 0; y < image.height(); ++y) {
         for (int x = 0; x < image.width(); ++x) {
@@ -186,7 +205,8 @@ inline void write_gray_png_with_time(
     in.seekg(0, std::ios::beg);
     in.read(reinterpret_cast<char*>(bytes.data()),
             static_cast<std::streamsize>(bytes.size()));
-    const std::vector<std::uint8_t> tiff = datetime_tiff_block(*when);
+    const std::vector<std::uint8_t> tiff =
+        datetime_tiff_block(*when, subsec.value_or(std::string()));
     std::vector<std::uint8_t> chunk;
     const std::uint32_t length = static_cast<std::uint32_t>(tiff.size());
     for (int i = 3; i >= 0; --i) {
@@ -486,9 +506,15 @@ inline MarkerSequence make_marker_sequence(const MarkerSequenceSpec& spec) {
             render_sequence_view(pose, calibration, scene.targets, temporal,
                                  spec);
         std::optional<std::string> when;
+        std::optional<std::string> subsec;
         const int time_index =
             spec.reverse_capture_times ? spec.frames - 1 - temporal : temporal;
-        if (temporal != spec.missing_time_temporal) {
+        if (spec.burst_capture_times) {
+            when = "2026:05:01 10:00:00";
+            char fraction[8];
+            std::snprintf(fraction, sizeof(fraction), "%02d", 1 + time_index);
+            subsec = std::string(fraction);
+        } else if (temporal != spec.missing_time_temporal) {
             char stamp[32];
             const int hours = 10 + time_index / 3600;
             const int minutes = (time_index / 60) % 60;
@@ -497,7 +523,11 @@ inline MarkerSequence make_marker_sequence(const MarkerSequenceSpec& spec) {
                           hours, minutes, seconds);
             when = std::string(stamp);
         }
-        write_gray_png_with_time(path, image, when);
+        if (temporal == spec.malformed_time_temporal) {
+            when = "not a valid stamp";
+            subsec.reset();
+        }
+        write_gray_png_with_time(path, image, when, subsec);
         MarkerSequenceFrame record;
         record.temporal_index = temporal;
         record.camera_id = camera.id;
