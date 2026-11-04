@@ -659,8 +659,22 @@ std::optional<BoardView> build_view(const std::vector<Candidate>& corners,
     }
     const int final_cols = fits ? extent_cols : extent_rows;
     const int final_rows = fits ? extent_rows : extent_cols;
-    const bool complete = static_cast<int>(labelled.size()) == spec.cols * spec.rows &&
-                          final_cols == spec.cols && final_rows == spec.rows;
+    bool complete = static_cast<int>(labelled.size()) == spec.cols * spec.rows &&
+                    final_cols == spec.cols && final_rows == spec.rows;
+    if (complete) {
+        // A complete view must be a bijection onto the spec grid. A duplicate
+        // label would leave a hole and make the canonical lookup invalid.
+        std::vector<char> seen(static_cast<std::size_t>(spec.cols * spec.rows), 0);
+        for (const LabelledCorner& corner : labelled) {
+            const int index = corner.col * spec.rows + corner.row;
+            if (index < 0 || index >= spec.cols * spec.rows ||
+                seen[static_cast<std::size_t>(index)] != 0) {
+                complete = false;
+                break;
+            }
+            seen[static_cast<std::size_t>(index)] = 1;
+        }
+    }
     if (complete) {
         canonicalise_labels(labelled, corners, spec.cols, spec.rows);
     }
