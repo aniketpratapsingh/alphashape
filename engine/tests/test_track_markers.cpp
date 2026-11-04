@@ -262,9 +262,13 @@ TEST(Markers, TrackRedetectRecovers) {
                      (detection.coded &&
                       detection.code == scene.targets[0].code);
     }
-    std::printf("[track redetect] frame 1 detections %zu, expected code %d, "
-                "found %d\n",
-                probe_detections.size(), scene.targets[0].code,
+    std::printf("[track redetect] frame 1 detections %zu:",
+                probe_detections.size());
+    for (const ImageDetection& detection : probe_detections) {
+        std::printf(" code=%d coded=%d r=%.2f", detection.code,
+                    detection.coded ? 1 : 0, detection.radius);
+    }
+    std::printf("; expected code %d, found %d\n", scene.targets[0].code,
                 code_found ? 1 : 0);
     ASSERT_TRUE(code_found);
     TrackMarkersOptions options = base_options();
