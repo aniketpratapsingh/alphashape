@@ -1,5 +1,6 @@
 #include "common/algorithm/sfm/update_transform_task.hpp"
 
+#include <cstddef>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -44,6 +45,11 @@ void UpdateTransformTask::apply(Document& document, Params& params, const Progre
     progress.update("update", 1.0);
 
     if (!report.applied) {
+        // The fit touched no geometry on the staged copy, so committing now
+        // records the refusal in meta without changing the chunk's geometry.
+        staged.meta().set("update_transform.applied", "0");
+        staged.meta().set("update_transform.reason", report.reason);
+        *chunk = std::move(staged);
         if (Log::enabled(LogLevel::Info)) {
             log(LogLevel::Info) << "UpdateTransform: not applied (" << report.reason << ")";
         }
@@ -51,6 +57,7 @@ void UpdateTransformTask::apply(Document& document, Params& params, const Progre
     }
 
     staged.meta().set("update_transform.applied", "1");
+    staged.meta().set("update_transform.reason", "");
     staged.meta().set("update_transform.control_points",
                       std::to_string(report.control_points_used));
     staged.meta().set("update_transform.cameras", std::to_string(report.cameras_used));
@@ -60,6 +67,21 @@ void UpdateTransformTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("update_transform.rms_check_m", meta_number(report.rms_check_m));
     staged.meta().set("update_transform.max_check_m", meta_number(report.max_check_m));
     staged.meta().set("update_transform.scale", meta_number(report.scale));
+
+    // Rejected control markers, comma-separated, and one key per check point so
+    // a front end can show the error next to the marker id.
+    std::string rejected;
+    for (std::size_t i = 0; i < report.rejected_markers.size(); ++i) {
+        if (i != 0) {
+            rejected += ',';
+        }
+        rejected += std::to_string(report.rejected_markers[i]);
+    }
+    staged.meta().set("update_transform.rejected_markers", rejected);
+    for (const auto& [marker_id, error] : report.check_errors) {
+        staged.meta().set("update_transform.check_error_" + std::to_string(marker_id) + "_m",
+                          meta_number(error));
+    }
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
