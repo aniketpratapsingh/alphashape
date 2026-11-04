@@ -71,6 +71,7 @@ add_executable(alphashape_tests
     test_ortho_gain.cpp
     test_ortho_ghosting.cpp
     test_ortho_seam_costs.cpp
+    test_ortho_texture_fill.cpp
     test_build_orthomosaic.cpp
     test_chunk_ops.cpp
     test_align_chunks.cpp

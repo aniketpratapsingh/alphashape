@@ -659,6 +659,11 @@ TEST(BuildOrthomosaic, Errors) {
     EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_blend),
                  ValueError);
 
+    Params bad_hole_fill = ortho_params();
+    bad_hole_fill.set("hole_fill_method", ParamValue{std::string("bogus")});
+    EXPECT_THROW(
+        run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_hole_fill), ValueError);
+
     Params bad_surface = ortho_params("mosaic", "bogus");
     EXPECT_THROW(run_task(builtin_registry(), s.document, "BuildOrthomosaic", bad_surface),
                  ValueError);

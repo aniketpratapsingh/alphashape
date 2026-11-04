@@ -306,7 +306,8 @@ void refine_nnf(Level& level, std::vector<std::int32_t>& nnf,
                 const int sx = static_cast<int>(neighbour % level.width) - step_x[n];
                 const int sy = static_cast<int>(neighbour / level.width) - step_y[n];
                 if (sx < radius || sx >= level.width - radius || sy < radius ||
-                    sy >= level.height - radius || source_mask[cell_index(level.width, sx, sy)] == 0) {
+                    sy >= level.height - radius ||
+                    source_mask[cell_index(level.width, sx, sy)] == 0) {
                     continue;
                 }
                 const double cost = patch_cost(level, tx, ty, sx, sy, radius, known_only);
