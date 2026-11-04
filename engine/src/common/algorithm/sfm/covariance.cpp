@@ -22,6 +22,7 @@
 #include <Eigen/SparseCholesky>
 
 #include <ceres/crs_matrix.h>
+#include <ceres/manifold.h>
 
 #include "model/camera/calibration.hpp"
 
