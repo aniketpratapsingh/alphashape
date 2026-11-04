@@ -88,11 +88,12 @@ std::filesystem::path resolve_frame_path(const Document& document,
 std::optional<std::string> capture_time_of(const Document& document,
                                            const Frame& frame) {
     try {
-        const std::string path =
-            resolve_frame_path(document, frame.path()).string();
-        const ExifData exif = read_exif(path);
-        if (exif.datetime_original && !exif.datetime_original->empty()) {
-            return exif.datetime_original;
+        // Only the metadata is read: JPEG/PNG segments are streamed and a TIFF
+        // uses a bounded prefix, so plan time never loads the pixel data.
+        const std::optional<CaptureTime> time = read_capture_time(
+            resolve_frame_path(document, frame.path()).string());
+        if (time) {
+            return time->datetime_original;
         }
     } catch (const std::exception&) {
         // An unreadable file is not an ordering problem; the decode step
@@ -167,9 +168,18 @@ std::vector<SequenceCamera> selected_sequence(
         entry.camera = &camera;
         entry.calibration = &calibration;
         entry.frame = frame;
-        entry.capture_time = capture_time_of(document, *frame);
         entry.import_index = index;
         sequence.push_back(std::move(entry));
+    }
+    // Capture times are independent per frame, so read the metadata in
+    // parallel: even a bounded read is file I/O per camera.
+    const int count = static_cast<int>(sequence.size());
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int i = 0; i < count; ++i) {
+        SequenceCamera& entry = sequence[static_cast<std::size_t>(i)];
+        entry.capture_time = capture_time_of(document, *entry.frame);
     }
     const bool all_timed =
         !sequence.empty() &&
