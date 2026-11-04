@@ -67,8 +67,20 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     std::array<bool, kCalibrationParamCount> base = {};
     base[0] = base[1] = base[2] = base[5] = true;  // f, cx, cy, k1
 
+    // Selection solves never compute posterior covariance: it would be paid on
+    // every candidate and thrown away. The caller's request is remembered and
+    // served once on the final accepted state (see the end of this function).
+    BAOptions solve_options = options.solve_options;
+    const bool want_covariance =
+        solve_options.compute_camera_covariance ||
+        solve_options.compute_point_covariance ||
+        solve_options.compute_calibration_covariance;
+    solve_options.compute_camera_covariance = false;
+    solve_options.compute_point_covariance = false;
+    solve_options.compute_calibration_covariance = false;
+
     set_free_mask(problem, sensor_allowed, base);
-    BAReport report = bundle_adjust(problem, options.solve_options);
+    BAReport report = bundle_adjust(problem, solve_options);
     result.solves = 1;
     if (!report.usable || !report.cost_valid) {
         throw Error(
@@ -108,7 +120,7 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
 
         const BAProblem saved = problem;
         set_free_mask(problem, sensor_allowed, next);
-        const BAReport candidate = bundle_adjust(problem, options.solve_options);
+        const BAReport candidate = bundle_adjust(problem, solve_options);
         ++result.solves;
         bool accept = false;
         if (candidate.usable && candidate.cost_valid &&
@@ -146,6 +158,13 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
                 result.selected[kk] = true;
             }
         }
+    }
+    // Posterior covariance is computed once, on the accepted state only. Reusing
+    // bundle_adjust keeps the problem construction (free masks, manifolds and
+    // robust losses) identical to the selection solves.
+    if (want_covariance) {
+        report = bundle_adjust(problem, options.solve_options);
+        ++result.solves;
     }
     result.report = report;
     return result;

@@ -181,9 +181,11 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
     // groups whose likelihood-ratio gain pays for their degrees of freedom.
     params.declare({"adaptive_fitting", ParamType::Bool, false,
                     "Select the distortion terms automatically (ordered forward selection)."});
-    // Camera and calibration posterior covariance are always computed (subject
-    // to the BA caps); tie-point covariance is opt-in because it is O(points)
-    // dense output a caller rarely needs.
+    // Posterior covariance of the cameras and calibration is on by default
+    // (subject to the BA caps); tie-point covariance is opt-in because it is
+    // O(points) dense output a caller rarely needs.
+    params.declare({"camera_covariance", ParamType::Bool, true,
+                    "Store the posterior covariance of the cameras and calibration."});
     params.declare({"tiepoint_covariance", ParamType::Bool, false,
                     "Store the posterior covariance of every tie point."});
 }
@@ -649,9 +651,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // -- solve --------------------------------------------------------------
     progress.update("optimize", 0.0);
     const bool adaptive_fitting = params.get_bool("adaptive_fitting");
+    const bool camera_covariance = params.get_bool("camera_covariance");
     sfm::BAOptions ba_options;
-    ba_options.compute_camera_covariance = true;
-    ba_options.compute_calibration_covariance = true;
+    ba_options.compute_camera_covariance = camera_covariance;
+    ba_options.compute_calibration_covariance = camera_covariance;
     ba_options.compute_point_covariance = params.get_bool("tiepoint_covariance");
     sfm::BAReport report;
     std::string adaptive_selected;
@@ -749,8 +752,12 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         staged.markers()[m].position = checked != rechecked_position.end()
                                            ? checked->second
                                            : problem.points[marker_point[m]];
-        staged.markers()[m].position_covariance.setZero();
-        if (marker_point[m] < report.point_covariance.size()) {
+        // Only replace a stored covariance when this run actually produced a
+        // valid block for the point. A dropped point (or a run with tie-point
+        // covariance off) leaves the previously stored value untouched.
+        if (report.covariance_valid &&
+            marker_point[m] < report.point_covariance.size() &&
+            !report.point_covariance[marker_point[m]].isZero(0.0)) {
             staged.markers()[m].position_covariance =
                 report.point_covariance[marker_point[m]];
         }
@@ -794,8 +801,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                       std::to_string(adaptive_solves));
     staged.meta().set("optimize_cameras.sigma0", meta_number(std::sqrt(report.sigma0_squared)));
     staged.meta().set("optimize_cameras.covariance",
-                      report.covariance_reason.empty() ? "not computed"
-                                                       : report.covariance_reason);
+                      report.covariance_reason.empty()
+                          ? "covariance skipped: not requested"
+                          : report.covariance_reason);
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
