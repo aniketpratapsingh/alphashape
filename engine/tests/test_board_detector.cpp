@@ -99,9 +99,13 @@ TEST(Board, DetectsChessboard9x6Synthetic) {
     int compared = 0;
     for (int view = 0; view < 30; ++view) {
         const double tilt = rng::uniform_real(engine, 0.0, 45.0);
-        const double axis = rng::uniform_real(engine, 0.0, 360.0);
-        const double spin = rng::uniform_real(engine, -20.0, 20.0);
+        double axis = rng::uniform_real(engine, 0.0, 360.0);
+        double spin = rng::uniform_real(engine, -20.0, 20.0);
         const double distance = rng::uniform_real(engine, 0.55, 0.65);
+        if (view == 0) {
+            axis = 0.0;
+            spin = 0.0;  // an axis-aligned board must be detected too
+        }
         const test::ChessboardPose pose = posed_board(tilt, axis, spin, distance);
         const test::ChessboardRender rendered = test::render_chessboard(pose);
         const std::optional<BoardView> result = detect_board(rendered.image, spec, options);
@@ -110,19 +114,20 @@ TEST(Board, DetectsChessboard9x6Synthetic) {
         ASSERT_EQ(result->corners.size(),
                   static_cast<std::size_t>(spec.cols * spec.rows))
             << "view " << view;
-        for (int row = 0; row < spec.rows; ++row) {
-            for (int col = 0; col < spec.cols; ++col) {
-                const Eigen::Vector2d truth = rendered.corner(col, row);
-                double best = std::numeric_limits<double>::infinity();
-                for (const BoardCorner& corner : result->corners) {
-                    best = std::min(best, (corner.pixel - truth).norm());
-                }
-                sum_squared += best * best;
-                max_error = std::max(max_error, best);
-                ++compared;
-                EXPECT_LE(best, 0.15) << "view " << view << " corner " << col << ","
-                                      << row;
-            }
+        // Match by canonical (col, row) label, not by nearest pixel: a
+        // nearest-pixel match would hide a wrongly oriented label grid.
+        for (const BoardCorner& corner : result->corners) {
+            ASSERT_GE(corner.col, 0) << "view " << view;
+            ASSERT_LT(corner.col, spec.cols) << "view " << view;
+            ASSERT_GE(corner.row, 0) << "view " << view;
+            ASSERT_LT(corner.row, spec.rows) << "view " << view;
+            const Eigen::Vector2d truth = rendered.corner(corner.col, corner.row);
+            const double error = (corner.pixel - truth).norm();
+            sum_squared += error * error;
+            max_error = std::max(max_error, error);
+            ++compared;
+            EXPECT_LE(error, 0.15) << "view " << view << " corner " << corner.col
+                                   << "," << corner.row;
         }
     }
     const double rms = std::sqrt(sum_squared / static_cast<double>(compared));
@@ -135,37 +140,43 @@ TEST(Board, DetectsChessboard9x6Synthetic) {
 TEST(Board, CornerOrderingCorrect) {
     const BoardSpec spec;
     const BoardDetectOptions options;
-    // A small in-plane spin keeps the origin rule checkable while avoiding
-    // perfectly grid-aligned edges: there, a regular 4x4 box supersample has a
-    // coherent phase bias (a renderer artefact, not a real camera condition).
-    const test::ChessboardPose pose = posed_board(15.0, 0.0, 8.0, 0.6);
-    const test::ChessboardRender rendered = test::render_chessboard(pose);
-    const std::optional<BoardView> result = detect_board(rendered.image, spec, options);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_TRUE(result->complete);
-    ASSERT_EQ(result->corners.size(), static_cast<std::size_t>(spec.cols * spec.rows));
-    for (const BoardCorner& corner : result->corners) {
-        ASSERT_GE(corner.col, 0);
-        ASSERT_LT(corner.col, spec.cols);
-        ASSERT_GE(corner.row, 0);
-        ASSERT_LT(corner.row, spec.rows);
-        const Eigen::Vector2d truth = rendered.corner(corner.col, corner.row);
-        EXPECT_LE((corner.pixel - truth).norm(), 0.1)
-            << "label " << corner.col << "," << corner.row;
-    }
-    Eigen::Vector2d origin = Eigen::Vector2d::Zero();
-    Eigen::Vector2d along_col = Eigen::Vector2d::Zero();
-    Eigen::Vector2d along_row = Eigen::Vector2d::Zero();
-    for (const BoardCorner& corner : result->corners) {
-        if (corner.col == 0 && corner.row == 0) {
-            origin = corner.pixel;
-        } else if (corner.col == 1 && corner.row == 0) {
-            along_col = corner.pixel - origin;
-        } else if (corner.col == 0 && corner.row == 1) {
-            along_row = corner.pixel - origin;
+    // Both an axis-aligned board and the mildly rotated one: a grid-aligned
+    // board must not need a rotated fixture to work.
+    const double spins[2] = {0.0, 8.0};
+    for (double spin : spins) {
+        const test::ChessboardPose pose = posed_board(15.0, 0.0, spin, 0.6);
+        const test::ChessboardRender rendered = test::render_chessboard(pose);
+        const std::optional<BoardView> result =
+            detect_board(rendered.image, spec, options);
+        ASSERT_TRUE(result.has_value()) << "spin " << spin;
+        ASSERT_TRUE(result->complete) << "spin " << spin;
+        ASSERT_EQ(result->corners.size(),
+                  static_cast<std::size_t>(spec.cols * spec.rows))
+            << "spin " << spin;
+        for (const BoardCorner& corner : result->corners) {
+            ASSERT_GE(corner.col, 0) << "spin " << spin;
+            ASSERT_LT(corner.col, spec.cols) << "spin " << spin;
+            ASSERT_GE(corner.row, 0) << "spin " << spin;
+            ASSERT_LT(corner.row, spec.rows) << "spin " << spin;
+            const Eigen::Vector2d truth = rendered.corner(corner.col, corner.row);
+            EXPECT_LE((corner.pixel - truth).norm(), 0.1)
+                << "spin " << spin << " label " << corner.col << "," << corner.row;
         }
+        Eigen::Vector2d origin = Eigen::Vector2d::Zero();
+        Eigen::Vector2d along_col = Eigen::Vector2d::Zero();
+        Eigen::Vector2d along_row = Eigen::Vector2d::Zero();
+        for (const BoardCorner& corner : result->corners) {
+            if (corner.col == 0 && corner.row == 0) {
+                origin = corner.pixel;
+            } else if (corner.col == 1 && corner.row == 0) {
+                along_col = corner.pixel - origin;
+            } else if (corner.col == 0 && corner.row == 1) {
+                along_row = corner.pixel - origin;
+            }
+        }
+        EXPECT_GT(along_col.x() * along_row.y() - along_col.y() * along_row.x(), 0.0)
+            << "spin " << spin;
     }
-    EXPECT_GT(along_col.x() * along_row.y() - along_col.y() * along_row.x(), 0.0);
 }
 
 TEST(Board, LabelsCompleteBoardAtEveryRotation) {
@@ -248,6 +259,51 @@ TEST(Board, PartialViewAccepted) {
     }
 }
 
+TEST(Board, PartialViewCutBySideBorder) {
+    const BoardSpec spec;
+    const BoardDetectOptions options;
+    // Crop a gap between board columns, not through a corner: the right half
+    // of the board falls outside the image, so only a partial lattice remains.
+    const test::ChessboardPose pose = posed_board(18.0, 45.0, 6.0, 0.6);
+    const test::ChessboardRender rendered = test::render_chessboard(pose);
+    const int crop_width = rendered.image.width() / 2 - 20;
+    FloatImage cropped(crop_width, rendered.image.height(), 0.0F);
+    for (int y = 0; y < cropped.height(); ++y) {
+        for (int x = 0; x < cropped.width(); ++x) {
+            cropped.at(x, y) = rendered.image.at(x, y);
+        }
+    }
+    const std::optional<BoardView> result = detect_board(cropped, spec, options);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->complete);
+    ASSERT_GE(result->corners.size(), static_cast<std::size_t>(options.min_corners));
+    std::vector<int> truth_col(result->corners.size(), -1);
+    std::vector<int> truth_row(result->corners.size(), -1);
+    for (std::size_t i = 0; i < result->corners.size(); ++i) {
+        double best = std::numeric_limits<double>::infinity();
+        for (int row = 0; row < spec.rows; ++row) {
+            for (int col = 0; col < spec.cols; ++col) {
+                const double distance =
+                    (result->corners[i].pixel - rendered.corner(col, row)).norm();
+                if (distance < best) {
+                    best = distance;
+                    truth_col[i] = col;
+                    truth_row[i] = row;
+                }
+            }
+        }
+        EXPECT_LE(best, 0.15) << "corner " << i;
+    }
+    for (std::size_t i = 0; i < result->corners.size(); ++i) {
+        for (std::size_t j = i + 1; j < result->corners.size(); ++j) {
+            EXPECT_EQ(result->corners[i].col - result->corners[j].col,
+                      truth_col[i] - truth_col[j]);
+            EXPECT_EQ(result->corners[i].row - result->corners[j].row,
+                      truth_row[i] - truth_row[j]);
+        }
+    }
+}
+
 TEST(Board, RejectsClutter) {
     const BoardSpec spec;
     const BoardDetectOptions options;
@@ -304,17 +360,13 @@ TEST(Board, HandlesBlurAndNoise) {
     double sum_squared = 0.0;
     double max_error = 0.0;
     int compared = 0;
-    for (int row = 0; row < spec.rows; ++row) {
-        for (int col = 0; col < spec.cols; ++col) {
-            const Eigen::Vector2d truth = rendered.corner(col, row);
-            double best = std::numeric_limits<double>::infinity();
-            for (const BoardCorner& corner : result->corners) {
-                best = std::min(best, (corner.pixel - truth).norm());
-            }
-            sum_squared += best * best;
-            max_error = std::max(max_error, best);
-            ++compared;
-        }
+    // Compare by canonical (col, row) label, not by nearest detected pixel.
+    for (const BoardCorner& corner : result->corners) {
+        const Eigen::Vector2d truth = rendered.corner(corner.col, corner.row);
+        const double error = (corner.pixel - truth).norm();
+        sum_squared += error * error;
+        max_error = std::max(max_error, error);
+        ++compared;
     }
     const double rms = std::sqrt(sum_squared / static_cast<double>(compared));
     std::printf("[board] blur+noise: RMS %.4f px, max %.4f px\n", rms, max_error);
