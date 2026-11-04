@@ -378,6 +378,53 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                    "georeferenced; run georeferencing first";
         }
     }
+    // -- scale bars ---------------------------------------------------------
+    // Only marker-to-marker bars with two BA points and a positive measured
+    // length participate. Camera endpoints are a later item. A bar with a
+    // check-point endpoint validates only and contributes no constraint.
+    struct ScalebarEntry {
+        std::size_t index = 0;     ///< index into chunk->scalebars()
+        std::size_t marker_a = 0;  ///< index into chunk->markers()
+        std::size_t marker_b = 0;
+    };
+    std::unordered_map<std::int32_t, std::size_t> marker_by_id;
+    for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+        marker_by_id[chunk->markers()[m].id] = m;
+    }
+    std::vector<ScalebarEntry> scalebar_entry;
+    std::size_t camera_scalebars = 0;
+    std::size_t scalebars_skipped = 0;
+    for (std::size_t s = 0; s < chunk->scalebars().size(); ++s) {
+        const Scalebar& bar = chunk->scalebars()[s];
+        if (bar.from.kind != ScalebarEndpoint::Kind::Marker ||
+            bar.to.kind != ScalebarEndpoint::Kind::Marker) {
+            ++camera_scalebars;  // camera endpoints: not wired yet
+            continue;
+        }
+        const auto from = marker_by_id.find(bar.from.id);
+        const auto to = marker_by_id.find(bar.to.id);
+        if (from == marker_by_id.end() || to == marker_by_id.end() ||
+            marker_point[from->second] == kNoPoint || marker_point[to->second] == kNoPoint) {
+            ++scalebars_skipped;
+            continue;
+        }
+        if (!std::isfinite(bar.reference_length_m) || !(bar.reference_length_m > 0.0)) {
+            ++scalebars_skipped;
+            continue;
+        }
+        const std::string* role_a = chunk->markers()[from->second].meta.find("type");
+        const std::string* role_b = chunk->markers()[to->second].meta.find("type");
+        sfm::BAScalebar out;
+        out.point_a = marker_point[from->second];
+        out.point_b = marker_point[to->second];
+        out.length = bar.reference_length_m;
+        out.sigma = bar.reference_accuracy_m;
+        out.checkpoint = (role_a != nullptr && *role_a == "check_point") ||
+                         (role_b != nullptr && *role_b == "check_point");
+        problem.scalebars.push_back(out);
+        scalebar_entry.push_back({s, from->second, to->second});
+    }
+    (void)scalebar_entry;  // consumed by the write-back stage
     (void)marker_point;  // consumed by the control-point and write-back stages
     (void)check_marker;  // consumed by the write-back stage
     if (Log::enabled(LogLevel::Info)) {
@@ -386,7 +433,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                             << markers_skipped
                             << " markers skipped (fewer than 2 projections or no triangulation), "
                             << control_markers << " control points, " << checkpoint_markers
-                            << " check points";
+                            << " check points, " << problem.scalebars.size() << " scale bars ("
+                            << camera_scalebars << " with a camera endpoint skipped, "
+                            << scalebars_skipped << " skipped)";
     }
     progress.update("prepare", 1.0);
 
