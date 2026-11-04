@@ -1531,4 +1531,128 @@ TEST(OptimizeMarkers, HorizontalOnlyControlKeepsGauge) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive camera-model fitting (WP-13.11c)
+// ---------------------------------------------------------------------------
+
+/// Every calibration term allowed, with adaptive fitting switched on or off.
+Params all_fit_params(bool adaptive) {
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    for (const char* name :
+         {"f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"}) {
+        params.set(std::string("fit_") + name, true);
+    }
+    params.set("adaptive_fitting", adaptive);
+    return params;
+}
+
+/// The p3/p4 scene with zero starting distortion, uniform pixel noise and a
+/// deterministic rng (one draw per statement).
+Document make_adaptive_scene(const Calibration& truth, double noise_px,
+                             std::uint32_t seed) {
+    Document document = make_p3p4_scene(truth);
+    Chunk& chunk = *document.active_chunk();
+    std::mt19937 rng(seed);
+    for (KeypointSet& set : chunk.tie_points().keypoint_sets) {
+        for (Keypoint& keypoint : set.keypoints) {
+            const double dx = rng::uniform_real(rng, -noise_px, noise_px);
+            const double dy = rng::uniform_real(rng, -noise_px, noise_px);
+            keypoint.x += static_cast<float>(dx);
+            keypoint.y += static_cast<float>(dy);
+        }
+    }
+    chunk.sensors()[0].calibration =
+        Calibration::initial(CameraType::Frame, truth.width, truth.height, truth.f);
+    return document;
+}
+
+/// True when the recorded adaptive selection names `term`.
+bool selected_term(const Chunk& chunk, const std::string& term) {
+    const std::string* value = chunk.meta().find("optimize.adaptive_selected");
+    if (value == nullptr) {
+        return false;
+    }
+    std::stringstream stream(*value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item == term) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(OptimizeCameras, AdaptiveFittingSelectsSignificantTerms) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.k1 = -0.05;
+    Document document = make_adaptive_scene(truth, 0.4, 20261104u);
+    Params params = all_fit_params(true);
+    run_task(builtin_registry(), document, "OptimizeCameras", params);
+
+    Chunk& chunk = *document.active_chunk();
+    for (const char* term : {"f", "cx", "cy", "k1"}) {
+        EXPECT_TRUE(selected_term(chunk, term)) << term << " should be selected";
+    }
+    for (const char* term : {"k4", "p3", "p4", "b1", "b2"}) {
+        EXPECT_FALSE(selected_term(chunk, term)) << term << " should be rejected";
+    }
+    const std::string* solves = chunk.meta().find("optimize.adaptive_solves");
+    ASSERT_NE(solves, nullptr);
+    EXPECT_GE(std::stoi(*solves), 1);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingRespectsDisallowedTerms) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.k1 = -0.05;
+    truth.k2 = 0.04;
+    Document document = make_adaptive_scene(truth, 0.4, 20261105u);
+    const double initial_k2 = document.active_chunk()->sensors()[0].calibration.k2;
+
+    Params params = all_fit_params(true);
+    params.set("fit_k2", false);
+    run_task(builtin_registry(), document, "OptimizeCameras", params);
+
+    Chunk& chunk = *document.active_chunk();
+    EXPECT_FALSE(selected_term(chunk, "k2"));
+    EXPECT_EQ(chunk.sensors()[0].calibration.k2, initial_k2);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingOffIsUnchanged) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.k1 = -0.05;
+    Document without_param = make_adaptive_scene(truth, 0.4, 20261106u);
+    Document explicit_off = make_adaptive_scene(truth, 0.4, 20261106u);
+
+    Params neutral = make_params(builtin_registry().require("OptimizeCameras"));
+    run_task(builtin_registry(), without_param, "OptimizeCameras", neutral);
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    params.set("adaptive_fitting", false);
+    run_task(builtin_registry(), explicit_off, "OptimizeCameras", params);
+
+    const Chunk& a = *without_param.active_chunk();
+    const Chunk& b = *explicit_off.active_chunk();
+    EXPECT_TRUE(a.sensors()[0].calibration == b.sensors()[0].calibration);
+    ASSERT_EQ(a.cameras().size(), b.cameras().size());
+    for (std::size_t i = 0; i < a.cameras().size(); ++i) {
+        EXPECT_EQ((a.cameras()[i].pose - b.cameras()[i].pose).cwiseAbs().maxCoeff(), 0.0);
+    }
+    EXPECT_EQ(a.meta().find("optimize.adaptive_selected"), nullptr);
+    EXPECT_EQ(b.meta().find("optimize.adaptive_selected"), nullptr);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingAcceptsNeededTerm) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.k1 = -0.05;
+    truth.k2 = 0.04;
+    Document document = make_adaptive_scene(truth, 0.4, 20261107u);
+    Params params = all_fit_params(true);
+    run_task(builtin_registry(), document, "OptimizeCameras", params);
+
+    Chunk& chunk = *document.active_chunk();
+    EXPECT_TRUE(selected_term(chunk, "k2")) << "k2 carries a real signal";
+    EXPECT_GT(std::abs(chunk.sensors()[0].calibration.k2), 1e-3);
+}
+
 }  // namespace alphashape
+
+
