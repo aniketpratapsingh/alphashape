@@ -794,7 +794,11 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     // ---- Gauge fixes -----------------------------------------------------
     for (std::size_t i = 0; i < num_cameras; ++i) {
         const bool fixed = !problem.fixed_pose.empty() && problem.fixed_pose[i] != 0;
-        if (fixed) {
+        // A camera whose every observation was excluded (e.g. all on check
+        // points) has no residual, so Ceres never registered its blocks and
+        // would abort on SetParameterBlockConstant. Such a block is untouched
+        // by the solve anyway.
+        if (fixed && ceres_problem.HasParameterBlock(cam_blocks[i].data())) {
             ceres_problem.SetParameterBlockConstant(cam_blocks[i].data());
             ceres_problem.SetParameterBlockConstant(cam_blocks[i].data() + 3);
         }
@@ -802,7 +806,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     if (problem.scale_anchor_camera >= 0) {
         const std::size_t cam = static_cast<std::size_t>(problem.scale_anchor_camera);
         const bool pose_fixed = !problem.fixed_pose.empty() && problem.fixed_pose[cam] != 0;
-        if (!pose_fixed) {
+        if (!pose_fixed && ceres_problem.HasParameterBlock(cam_blocks[cam].data() + 3)) {
             ceres_problem.SetManifold(cam_blocks[cam].data() + 3,
                                       new ceres::SubsetManifold(
                                           3, {problem.scale_anchor_axis}));
@@ -812,6 +816,9 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     // fixed indices are pinned with a SubsetManifold, leaving the free ones to
     // the solver. f (index 0), when free, gets a lower bound of 1e-3 * max(W, H).
     for (std::size_t s = 0; s < num_calibrations; ++s) {
+        if (!ceres_problem.HasParameterBlock(intr_blocks[s].data())) {
+            continue;  // no residual uses this calibration (see the pose note above)
+        }
         if (problem.fit_intrinsics.empty()) {
             ceres_problem.SetParameterBlockConstant(intr_blocks[s].data());
             continue;
