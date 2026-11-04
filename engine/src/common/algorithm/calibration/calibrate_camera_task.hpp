@@ -3,9 +3,9 @@
 /// @file calibrate_camera_task.hpp
 /// @brief CalibrateCamera: chessboard calibration per sensor (WP-13.15a).
 ///
-/// For every sensor in the active chunk, the enabled cameras' frames are
-/// decoded, a chessboard is detected in each, and one shared interior
-/// orientation is solved together with one pose per view. The result is
+/// For every sensor in the active chunk, each camera's frame is decoded, a
+/// chessboard is detected in it, and one shared interior orientation is solved
+/// together with one pose per view. Alignment is not required. The result is
 /// written back to the sensor in a staged chunk copy when `apply` is true, so
 /// an exception leaves the document untouched.
 ///

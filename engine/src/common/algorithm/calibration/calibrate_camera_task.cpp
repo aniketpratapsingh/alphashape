@@ -77,7 +77,9 @@ std::string joined(const std::vector<std::string>& values) {
     return text;
 }
 
-/// Decode and detect the boards of one sensor's enabled cameras. Returns an
+/// Decode and detect the boards of every camera on one sensor that has a
+/// frame. Alignment is not required: AddPhotos leaves `Camera::enabled` false
+/// until SfM runs, and calibration from a chessboard needs no pose. Returns an
 /// empty string on success, or a reason when no image/board was usable. Throws
 /// for unreadable images and for cameras on the sensor that disagree on the
 /// image size.
@@ -87,8 +89,7 @@ std::string collect_sensor_views(const Document& document, const Chunk& chunk,
                                  std::vector<CalibrationView>& views) {
     bool sized = false;
     for (const Camera& camera : chunk.cameras()) {
-        if (camera.sensor_id != static_cast<std::int32_t>(sensor_index) ||
-            !camera.enabled) {
+        if (camera.sensor_id != static_cast<std::int32_t>(sensor_index)) {
             continue;
         }
         const Frame* frame = frame_of_camera(chunk, camera.id);
@@ -127,7 +128,7 @@ std::string collect_sensor_views(const Document& document, const Chunk& chunk,
         }
     }
     if (!sized) {
-        return "no enabled camera with a decoded frame";
+        return "no camera with a decoded frame";
     }
     return {};
 }
@@ -239,6 +240,13 @@ void CalibrateCameraTask::apply(Document& document, Params& params,
         plan_calibrate_camera(document, document.active_chunk_id(), options);
     progress.update("calibrate", 1.0);
     if (plan.solved == 0) {
+        if (Log::enabled(LogLevel::Info)) {
+            for (const SensorCalibration& entry : plan.sensors) {
+                log(LogLevel::Info)
+                    << "CalibrateCamera: sensor '" << entry.label
+                    << "' skipped: " << entry.skipped;
+            }
+        }
         throw Error("calibrate_camera: need at least 3 views with a detected board");
     }
     progress.update("apply", 0.0);
