@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -381,6 +382,28 @@ TEST(Markers, TrackDoesNotOverwriteExisting) {
     // An existing projection re-anchors the run, so the next frame is tracked
     // from the preserved pixel rather than from a fresh LK estimate.
     EXPECT_NE(projection_for(*marker, scene.frames[2].camera_id), nullptr);
+}
+
+TEST(Markers, TrackSkipsNonFiniteProjection) {
+    MarkerSequenceSpec spec;
+    spec.frames = kFrames;
+    MarkerSequence scene = make_marker_sequence(spec);
+    const std::vector<std::int32_t> ids = seed_all(scene, 0);
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    ASSERT_EQ(marker->projections.size(), 1U);
+    marker->projections[0].pixel =
+        Vec2(std::numeric_limits<double>::quiet_NaN(), 0.0);
+    const TrackMarkersStats stats = run_track(scene, base_options());
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    // The marker is skipped before any cast or crop, and its existing (bad)
+    // projection is left untouched.
+    EXPECT_EQ(marker->projections.size(), 1U);
+    EXPECT_EQ(stats.markers_skipped, 1U);
+    // The rest of the sequence still tracks normally.
+    EXPECT_EQ(stats.markers_extended, 3U);
+    EXPECT_EQ(stats.tracked, 3U * 19U);
 }
 
 TEST(Markers, TrackIsUndoable) {

@@ -624,6 +624,18 @@ std::optional<Eigen::Vector2d> redetect_marker(
         return std::nullopt;
     }
     const FloatImage& image = view.level_image(0);
+    // A projection can be NaN or outside the image when it was imported or
+    // carried over from another run. Casting that to int is undefined
+    // behaviour, so reject it here like any other failed redetection.
+    if (!anchor.allFinite() || image.width() <= 0 || image.height() <= 0) {
+        return std::nullopt;
+    }
+    const double max_x = static_cast<double>(image.width() - 1);
+    const double max_y = static_cast<double>(image.height() - 1);
+    if (anchor.x() < 0.0 || anchor.y() < 0.0 || anchor.x() > max_x ||
+        anchor.y() > max_y) {
+        return std::nullopt;
+    }
     const int half = std::max(8, 4 * std::max(1, window));
     const int x0 = std::clamp(static_cast<int>(std::floor(anchor.x())) - half,
                               0, std::max(0, image.width() - 1));
@@ -823,6 +835,13 @@ MarkerTrackResult track_marker(const Chunk& chunk, const Marker& marker,
     std::vector<LocalProjection> state;
     state.reserve(marker.projections.size());
     for (const MarkerProjection& projection : marker.projections) {
+        // A non-finite pixel is unusable as an anchor and unsafe to cast when
+        // redetection crops around it. Skipping the marker keeps the same
+        // contract as any other marker that cannot be tracked.
+        if (projection.enabled && !projection.pixel.allFinite()) {
+            result.skipped = true;
+            return result;
+        }
         state.push_back({projection.camera_id, projection.pixel,
                          projection.enabled});
     }
