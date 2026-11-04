@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
@@ -528,6 +529,113 @@ TEST(Georeference, PerPointGateRejectsBlunderWithCoarseCameras) {
         const Eigen::Vector3d expected = expected_new_frame(truth_enu()[i], references);
         EXPECT_LT((*chunk.markers()[i].position - expected).norm(), 0.05) << "marker " << i;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 11. Derived geometry follows the new similarity
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, DerivedGeometryFollowsTheTransform) {
+    Scene scene;
+    Chunk chunk = make_scene(scene);
+    const sfm::Similarity truth = truth_similarity();
+
+    auto cloud = std::make_shared<PointCloud>();
+    cloud->points = {truth.apply(truth_enu()[0]), truth.apply(truth_enu()[1])};
+    PointCloudAsset cloud_slot;
+    cloud_slot.data = cloud;
+    chunk.point_clouds().push_back(cloud_slot);
+
+    auto mesh = std::make_shared<Mesh>();
+    mesh->vertices = {truth.apply(truth_enu()[2]), truth.apply(truth_enu()[3])};
+    ModelAsset model_slot;
+    model_slot.data = mesh;
+    chunk.models().push_back(model_slot);
+
+    Shape shape;
+    shape.type = ShapeType::Polyline;
+    shape.vertices = {truth.apply(truth_enu()[4]), truth.apply(truth_enu()[5])};
+    chunk.shapes().features.push_back(shape);
+
+    Trajectory trajectory;
+    TrajectoryPoint point;
+    point.position = truth.apply(truth_enu()[0]);
+    trajectory.points.push_back(point);
+    chunk.trajectories().push_back(trajectory);
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+    const std::vector<Eigen::Vector3d> references = reference_points(scene);
+
+    ASSERT_EQ(chunk.point_clouds().size(), 1U);
+    ASSERT_NE(chunk.point_clouds()[0].data, nullptr);
+    EXPECT_LT((chunk.point_clouds()[0].data->points[0] -
+               expected_new_frame(truth_enu()[0], references)).norm(), 1e-6);
+    EXPECT_LT((chunk.point_clouds()[0].data->points[1] -
+               expected_new_frame(truth_enu()[1], references)).norm(), 1e-6);
+
+    ASSERT_EQ(chunk.models().size(), 1U);
+    ASSERT_NE(chunk.models()[0].data, nullptr);
+    EXPECT_LT((chunk.models()[0].data->vertices[0] -
+               expected_new_frame(truth_enu()[2], references)).norm(), 1e-6);
+    EXPECT_LT((chunk.models()[0].data->vertices[1] -
+               expected_new_frame(truth_enu()[3], references)).norm(), 1e-6);
+
+    ASSERT_EQ(chunk.shapes().features.size(), 1U);
+    ASSERT_EQ(chunk.shapes().features[0].vertices.size(), 2U);
+    EXPECT_LT((chunk.shapes().features[0].vertices[0] -
+               expected_new_frame(truth_enu()[4], references)).norm(), 1e-6);
+    EXPECT_LT((chunk.shapes().features[0].vertices[1] -
+               expected_new_frame(truth_enu()[5], references)).norm(), 1e-6);
+
+    ASSERT_EQ(chunk.trajectories().size(), 1U);
+    ASSERT_EQ(chunk.trajectories()[0].points.size(), 1U);
+    EXPECT_LT((chunk.trajectories()[0].points[0].position -
+               expected_new_frame(truth_enu()[0], references)).norm(), 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Region becomes the mapped-corner AABB and marker covariance scales
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, RegionAndMarkerCovarianceFollowTheTransform) {
+    Scene scene;
+    Chunk chunk = make_scene(scene);
+    const sfm::Similarity truth = truth_similarity();
+    const Eigen::Vector3d corner_centre = truth.apply(Eigen::Vector3d(1.0, 2.0, 3.0));
+    const Eigen::Vector3d corner_size(30.0, 20.0, 10.0);
+    chunk.region().centre = corner_centre;
+    chunk.region().size = corner_size;
+    chunk.markers()[0].position_covariance = 0.04 * Eigen::Matrix3d::Identity();
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+
+    const std::vector<Eigen::Vector3d> references = reference_points(scene);
+    const auto local_to_true = [&](const Eigen::Vector3d& local) {
+        return truth.R.transpose() * (local - truth.t) / truth.scale;
+    };
+    const Eigen::Vector3d half = 0.5 * corner_size;
+    Eigen::Vector3d low = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+    Eigen::Vector3d high = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+    for (int corner = 0; corner < 8; ++corner) {
+        Eigen::Vector3d offset;
+        offset.x() = (corner & 1) != 0 ? half.x() : -half.x();
+        offset.y() = (corner & 2) != 0 ? half.y() : -half.y();
+        offset.z() = (corner & 4) != 0 ? half.z() : -half.z();
+        const Eigen::Vector3d enu = local_to_true(corner_centre + offset);
+        const Eigen::Vector3d mapped = expected_new_frame(enu, references);
+        low = low.cwiseMin(mapped);
+        high = high.cwiseMax(mapped);
+    }
+    EXPECT_LT((chunk.region().centre - 0.5 * (low + high)).norm(), 1e-6);
+    EXPECT_LT((chunk.region().size - (high - low)).norm(), 1e-6);
+
+    // Isotropic covariance: C' = s^2 R C R^T collapses to s^2 C.
+    const double expected_var = report.scale * report.scale * 0.04;
+    EXPECT_NEAR(chunk.markers()[0].position_covariance(0, 0), expected_var, 1e-12);
+    EXPECT_NEAR(chunk.markers()[0].position_covariance(1, 1), expected_var, 1e-12);
+    EXPECT_NEAR(chunk.markers()[0].position_covariance(2, 2), expected_var, 1e-12);
 }
 
 }  // namespace

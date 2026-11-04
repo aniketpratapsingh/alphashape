@@ -15,7 +15,9 @@
 
 #include <Eigen/Core>
 
+#include "common/algorithm/chunk/align_chunks_task.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
+#include "common/core/chunk_geometry.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape::sfm {
@@ -109,8 +111,54 @@ bool points_not_collinear(const std::vector<Eigen::Vector3d>& points) {
 ///
 /// The pose update is derived in georeference.hpp: R_c' = R_c R^T,
 /// t_c' = s t_c - R_c' t. The camera centre then maps as C' = s R C + t.
+///
+/// `transform_geometry` is the update_transform path: derived geometry (shapes,
+/// trajectories, point-cloud and mesh payloads) follows the same similarity,
+/// through the AlignChunks helper, and the region becomes the axis-aligned
+/// bound of the mapped corners. georeference_chunk passes false so its results
+/// stay bit-identical.
 void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
-                               const geo::Geodetic& origin, bool transform_markers) {
+                               const geo::Geodetic& origin, bool transform_markers,
+                               bool transform_geometry) {
+    if (transform_geometry) {
+        // Reuse the AlignChunks transform on a snapshot, then correct the two
+        // conventions that differ here: its camera pose rule post-multiplies by
+        // S^-1 (scaling the rotation), and its transform is a composition,
+        // whereas this path installs a fresh ENU placement.
+        ChunkGeometry geometry = capture_geometry(chunk);
+        apply_similarity_to_geometry(geometry, t_sim);
+        for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+            const Camera& camera = chunk.cameras()[i];
+            if (!camera.enabled) {
+                geometry.camera_poses[i] = camera.pose;
+                continue;
+            }
+            const Eigen::Matrix3d r_c = camera.pose.block<3, 3>(0, 0);
+            const Eigen::Vector3d t_c = camera.pose.block<3, 1>(0, 3);
+            const Eigen::Matrix3d r_c_new = r_c * t_sim.R.transpose();
+            geometry.camera_poses[i].block<3, 3>(0, 0) = r_c_new;
+            geometry.camera_poses[i].block<3, 1>(0, 3) =
+                t_sim.scale * t_c - r_c_new * t_sim.t;
+        }
+        // The helper already replaced the region with the axis-aligned bound of
+        // the eight mapped corners, which is what a rotating similarity needs.
+        geometry.transform = geo::enu_to_ecef(origin);
+        apply_geometry(chunk, geometry);
+        chunk.crs().epsg = 4326;
+        if (transform_markers) {
+            // A covariance transforms as C' = s^2 R C R^T.
+            const double scale_sq = t_sim.scale * t_sim.scale;
+            for (Marker& marker : chunk.markers()) {
+                marker.position_covariance = scale_sq * t_sim.R *
+                                             marker.position_covariance *
+                                             t_sim.R.transpose();
+            }
+        }
+        chunk.set_camera_crs(chunk.crs());
+        chunk.set_world_crs(chunk.crs());
+        return;
+    }
+
     for (Camera& camera : chunk.cameras()) {
         if (!camera.enabled) {
             continue;  // unregistered cameras keep their identity pose
@@ -263,7 +311,8 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     // -- rewrite the chunk ---------------------------------------------------
     // Result-identical to the previous inline block; marker positions stay put
     // because this path never touched them.
-    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/false);
+    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/false,
+                              /*transform_geometry=*/false);
 
     report.applied = true;
     report.references_used = inliers;
@@ -520,7 +569,8 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     report.rms_error_m = report.rms_control_m;
 
     // -- apply uniformly, including every marker position -------------------
-    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/true);
+    apply_similarity_to_chunk(chunk, t_sim, origin, /*transform_markers=*/true,
+                              /*transform_geometry=*/true);
 
     // -- check-point errors, measured on the transformed positions ----------
     double check_sum = 0.0;
