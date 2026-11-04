@@ -55,6 +55,7 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
+#include "common/algorithm/sfm/adaptive_fit.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
 #include "model/camera/calibration.hpp"
@@ -142,6 +143,11 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
         {"fit_p3", ParamType::Bool, false, "Adjust the higher-order tangential distortion p3."});
     params.declare(
         {"fit_p4", ParamType::Bool, false, "Adjust the higher-order tangential distortion p4."});
+    // Adaptive mode treats the fit_* flags above as permission rather than
+    // instruction: it frees only the base coefficients plus the higher-order
+    // groups whose likelihood-ratio gain pays for their degrees of freedom.
+    params.declare({"adaptive_fitting", ParamType::Bool, false,
+                    "Select the distortion terms automatically (ordered forward selection)."});
 }
 
 std::vector<Stage> OptimizeCamerasTask::stages() const {
@@ -604,8 +610,29 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
 
     // -- solve --------------------------------------------------------------
     progress.update("optimize", 0.0);
-    const sfm::BAReport report = sfm::bundle_adjust(problem, sfm::BAOptions{});
-    if (!report.usable) {
+    const bool adaptive_fitting = params.get_bool("adaptive_fitting");
+    sfm::BAReport report;
+    std::string adaptive_selected;
+    int adaptive_solves = 0;
+    if (adaptive_fitting) {
+        // The fit flags are the allowed set; adaptive_fit narrows them further.
+        const sfm::AdaptiveFitResult adaptive =
+            sfm::adaptive_fit(problem, fit, sfm::AdaptiveFitOptions{});
+        report = adaptive.report;
+        adaptive_solves = adaptive.solves;
+        for (int k = 0; k < kCalibrationParamCount; ++k) {
+            const std::size_t kk = static_cast<std::size_t>(k);
+            if (!adaptive.selected[kk]) {
+                continue;
+            }
+            if (!adaptive_selected.empty()) {
+                adaptive_selected += ",";
+            }
+            adaptive_selected += kParamNames[kk];
+        }
+    } else {
+        report = sfm::bundle_adjust(problem, sfm::BAOptions{});
+    }    if (!report.usable) {
         throw Error("OptimizeCameras: bundle adjustment did not produce a usable solution");
     }
     progress.update("optimize", 1.0);
@@ -687,6 +714,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                       std::to_string(markers_non_regular));
     staged.meta().set("optimize_cameras.scalebars_skipped",
                       std::to_string(scalebars_skipped));
+    if (adaptive_fitting) {
+        staged.meta().set("optimize.adaptive_selected", adaptive_selected);
+        staged.meta().set("optimize.adaptive_solves", std::to_string(adaptive_solves));
+    }
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
