@@ -12,16 +12,25 @@
 /// the same convention as `Calibration`. `FloatImage::sample()` addresses pixel
 /// centres at integer coordinates, so the detector converts by half a pixel.
 ///
-/// Partial views carry a per-view unknown lattice origin: the labels are only
-/// defined relative to the grown seed corner. The two label axes are chosen
-/// from the seed's edge directions (the more horizontal one becomes `col`,
-/// oriented rightwards, and the other `row`, oriented downwards), so lattice
-/// differences are comparable across views even though the origin is not.
+/// Partial views carry a per-view unknown lattice origin: labels are relative
+/// and, once the minimum on each axis is shifted to zero, are only defined up
+/// to a translation (WP-13.15 resolves the per-view offset). The label axes
+/// are always right-handed in image coordinates (X right, Y down) and are
+/// never transposed relative to the spec extents, so lattice differences are
+/// comparable across views. A calibration solve that mixes partial views must
+/// account for the per-view origin.
+///
 /// Only a complete view (every inner corner of a `cols` x `rows` board) has
-/// canonical labels, with (0, 0) at the corner nearest the image top-left and
-/// a right-handed label basis in image coordinates (X right, Y down). A
-/// calibration solve that mixes partial views must account for the per-view
-/// origin.
+/// canonical labels. The origin is the corner whose diagonally-outside square
+/// is dark. When `cols + rows` is odd the board is colour-asymmetric under a
+/// 180 degree rotation, so that rule pins the labelling uniquely; when
+/// `cols + rows` is even the board looks identical after 180 degrees, so the
+/// tie is broken deterministically by choosing whichever of the two diagonal
+/// corners (0, 0) / (cols - 1, rows - 1) lies nearer the image top-left.
+/// Square boards (`cols == rows`) are additionally ambiguous under 90 degrees;
+/// they use the same deterministic tie-break and are therefore not guaranteed
+/// to agree across views. Every complete view is asserted to span exactly
+/// `[0, cols) x [0, rows)`.
 
 #include <optional>
 #include <vector>

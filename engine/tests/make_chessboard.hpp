@@ -59,6 +59,17 @@ struct ChessboardRender {
         return corners[static_cast<std::size_t>(row) * static_cast<std::size_t>(cols) +
                        static_cast<std::size_t>(col)];
     }
+
+    /// Whether the square diagonally outside the given physical corner is
+    /// dark. The outside direction is away from the board on both axes, so
+    /// physical corner (0, 0) probes cell (-1, -1) and (cols - 1, rows - 1)
+    /// probes cell (cols, rows).
+    bool outside_diagonal_dark(int col, int row) const {
+        const int cell_x = col == 0 ? -1 : cols;
+        const int cell_y = row == 0 ? -1 : rows;
+        return board_cell_black(static_cast<double>(cell_x),
+                                static_cast<double>(cell_y));
+    }
 };
 
 /// Camera-frame ray through a calibration-convention pixel, with radial k1.
@@ -85,11 +96,14 @@ inline double background_at(double u, double v, const ChessboardPose& pose) {
                                  std::cos(0.029 * v - 0.4);
 }
 
-/// Cell parity of a board-plane point given in square units.
+/// Cell parity of a board-plane point given in square units. The convention is
+/// fixed so that the square diagonally outside physical corner (0, 0) -- cell
+/// (-1, -1) -- is black/dark; the detector's canonical origin is defined as
+/// the corner with a dark outside-diagonal square.
 inline bool board_cell_black(double u, double v) {
     const int cell_x = static_cast<int>(std::floor(u));
     const int cell_y = static_cast<int>(std::floor(v));
-    return ((cell_x + cell_y) % 2) != 0;
+    return ((cell_x + cell_y) % 2) == 0;
 }
 
 inline ChessboardRender render_chessboard(const ChessboardPose& pose) {

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <numbers>
 #include <optional>
 #include <queue>
@@ -577,51 +578,136 @@ struct LabelledCorner {
     int row = 0;
 };
 
-/// For a complete board, move (0, 0) to the corner nearest the image top-left
-/// and make det[col step, row step] > 0 in image coordinates.
-void canonicalise_labels(std::vector<LabelledCorner>& labelled,
-                         const std::vector<Candidate>& corners, int cols, int rows) {
-    std::vector<int> lookup(static_cast<std::size_t>(cols * rows), -1);
-    for (std::size_t k = 0; k < labelled.size(); ++k) {
-        lookup[static_cast<std::size_t>(labelled[k].col * rows + labelled[k].row)] =
-            static_cast<int>(k);
+/// Labelled corner pixels keyed by (col, row).
+using LabelGrid = std::map<std::pair<int, int>, Eigen::Vector2d>;
+
+/// Mean pixel offset from a labelled corner to its col+1 (axis 0) or row+1
+/// (axis 1) neighbour, averaged over every pair present.
+Eigen::Vector2d mean_lattice_step(const LabelGrid& grid, int axis) {
+    Eigen::Vector2d sum = Eigen::Vector2d::Zero();
+    int count = 0;
+    for (const auto& entry : grid) {
+        const std::pair<int, int> next =
+            axis == 0 ? std::make_pair(entry.first.first + 1, entry.first.second)
+                      : std::make_pair(entry.first.first, entry.first.second + 1);
+        const auto found = grid.find(next);
+        if (found == grid.end()) {
+            continue;
+        }
+        sum += found->second - entry.second;
+        ++count;
     }
-    auto pixel_of = [&](int col, int row) {
-        const int k = lookup[static_cast<std::size_t>(col * rows + row)];
-        const Candidate& candidate =
-            corners[static_cast<std::size_t>(labelled[static_cast<std::size_t>(k)].candidate_index)];
-        return Eigen::Vector2d(candidate.x, candidate.y);
+    if (count == 0) {
+        return Eigen::Vector2d::Zero();
+    }
+    return sum / static_cast<double>(count);
+}
+
+/// Sample the blurred image at `point` when it lies inside the pixel extent.
+std::optional<double> sample_inside(const FloatImage& image,
+                                    const Eigen::Vector2d& point) {
+    const double last_x = static_cast<double>(image.width() - 1);
+    const double last_y = static_cast<double>(image.height() - 1);
+    if (point.x() < 0.0 || point.y() < 0.0 || point.x() > last_x ||
+        point.y() > last_y) {
+        return std::nullopt;
+    }
+    return static_cast<double>(
+        image.sample(static_cast<float>(point.x()), static_cast<float>(point.y())));
+}
+
+struct OrientationVote {
+    bool decided = false;
+    bool keep = false;
+};
+
+/// Decide whether the origin corner is the one whose outside-diagonal square
+/// is dark. Returns undecided when neither diagonal pair is fully inside the
+/// image. Only meaningful when the board is colour-asymmetric under 180 deg.
+OrientationVote vote_origin_dark(const LabelGrid& grid, const FloatImage& smooth,
+                                 int cols, int rows) {
+    const Eigen::Vector2d origin = grid.at(std::make_pair(0, 0));
+    const Eigen::Vector2d last = grid.at(std::make_pair(cols - 1, rows - 1));
+    const Eigen::Vector2d u0 = grid.at(std::make_pair(1, 0)) - origin;
+    const Eigen::Vector2d w0 = grid.at(std::make_pair(0, 1)) - origin;
+    const Eigen::Vector2d u1 = last - grid.at(std::make_pair(cols - 2, rows - 1));
+    const Eigen::Vector2d w1 = last - grid.at(std::make_pair(cols - 1, rows - 2));
+    const std::optional<double> outside_origin =
+        sample_inside(smooth, origin - 0.5 * (u0 + w0));
+    const std::optional<double> outside_last =
+        sample_inside(smooth, last + 0.5 * (u1 + w1));
+    if (outside_origin && outside_last) {
+        return OrientationVote{true, *outside_origin <= *outside_last};
+    }
+    // The outside square is off-image: the inside diagonal square across the
+    // corner carries the same colour, so compare those instead.
+    const std::optional<double> inside_origin =
+        sample_inside(smooth, origin + 0.5 * (u0 + w0));
+    const std::optional<double> inside_last =
+        sample_inside(smooth, last - 0.5 * (u1 + w1));
+    if (inside_origin && inside_last) {
+        return OrientationVote{true, *inside_origin <= *inside_last};
+    }
+    return OrientationVote{};
+}
+
+/// Orient a view's labels: make the label basis right-handed in image
+/// coordinates for every view, then resolve the complete-board 180 degree
+/// ambiguity. Returns false when a complete label lies outside the spec grid.
+bool canonicalise_labels(std::vector<LabelledCorner>& labelled,
+                         const std::vector<Candidate>& corners, const FloatImage& smooth,
+                         const BoardSpec& spec, bool complete) {
+    LabelGrid grid;
+    const auto refill = [&]() {
+        grid.clear();
+        for (const LabelledCorner& corner : labelled) {
+            const Candidate& source =
+                corners[static_cast<std::size_t>(corner.candidate_index)];
+            grid.emplace(std::make_pair(corner.col, corner.row),
+                         Eigen::Vector2d(source.x, source.y));
+        }
     };
-    const int col_choices[2] = {0, cols - 1};
-    const int row_choices[2] = {0, rows - 1};
-    int origin_col = 0;
-    int origin_row = 0;
-    double best_distance = std::numeric_limits<double>::infinity();
-    for (int a = 0; a < 2; ++a) {
-        for (int b = 0; b < 2; ++b) {
-            const double distance = pixel_of(col_choices[a], row_choices[b]).squaredNorm();
-            if (distance < best_distance) {
-                best_distance = distance;
-                origin_col = col_choices[a];
-                origin_row = row_choices[b];
+    refill();
+    int max_col = 0;
+    for (const LabelledCorner& corner : labelled) {
+        max_col = std::max(max_col, corner.col);
+    }
+    const Eigen::Vector2d u = mean_lattice_step(grid, 0);
+    const Eigen::Vector2d w = mean_lattice_step(grid, 1);
+    if (u.x() * w.y() - u.y() * w.x() < 0.0) {
+        // Image y grows downwards, so a left-handed label basis is mirrored.
+        for (LabelledCorner& corner : labelled) {
+            corner.col = max_col - corner.col;
+        }
+        refill();
+    }
+    if (complete) {
+        bool keep = false;
+        bool decided = false;
+        if ((spec.cols + spec.rows) % 2 != 0) {
+            const OrientationVote vote =
+                vote_origin_dark(grid, smooth, spec.cols, spec.rows);
+            decided = vote.decided;
+            keep = vote.keep;
+        }
+        if (!decided) {
+            keep = grid.at(std::make_pair(0, 0)).squaredNorm() <=
+                   grid.at(std::make_pair(spec.cols - 1, spec.rows - 1)).squaredNorm();
+        }
+        if (!keep) {
+            for (LabelledCorner& corner : labelled) {
+                corner.col = spec.cols - 1 - corner.col;
+                corner.row = spec.rows - 1 - corner.row;
+            }
+        }
+        for (const LabelledCorner& corner : labelled) {
+            if (corner.col < 0 || corner.col >= spec.cols || corner.row < 0 ||
+                corner.row >= spec.rows) {
+                return false;
             }
         }
     }
-    const Eigen::Vector2d origin = pixel_of(origin_col, origin_row);
-    const int col_step = origin_col == 0 ? origin_col + 1 : origin_col - 1;
-    const int row_step = origin_row == 0 ? origin_row + 1 : origin_row - 1;
-    const Eigen::Vector2d u = pixel_of(col_step, origin_row) - origin;
-    const Eigen::Vector2d w = pixel_of(origin_col, row_step) - origin;
-    const bool swap_axes = u.x() * w.y() - u.y() * w.x() < 0.0;
-    for (LabelledCorner& corner : labelled) {
-        int col = origin_col == 0 ? corner.col : cols - 1 - corner.col;
-        int row = origin_row == 0 ? corner.row : rows - 1 - corner.row;
-        if (swap_axes) {
-            std::swap(col, row);
-        }
-        corner.col = col;
-        corner.row = row;
-    }
+    return true;
 }
 
 /// Shift, orient and assemble the final view. Returns nullopt when the grown
@@ -629,7 +715,8 @@ void canonicalise_labels(std::vector<LabelledCorner>& labelled,
 /// corners.
 std::optional<BoardView> build_view(const std::vector<Candidate>& corners,
                                     const GrownLattice& lattice, const BoardSpec& spec,
-                                    const BoardDetectOptions& options) {
+                                    const BoardDetectOptions& options,
+                                    const FloatImage& smooth) {
     std::vector<LabelledCorner> labelled;
     int min_col = std::numeric_limits<int>::max();
     int min_row = std::numeric_limits<int>::max();
@@ -684,8 +771,16 @@ std::optional<BoardView> build_view(const std::vector<Candidate>& corners,
             seen[static_cast<std::size_t>(index)] = 1;
         }
     }
-    if (complete) {
-        canonicalise_labels(labelled, corners, spec.cols, spec.rows);
+    if (!canonicalise_labels(labelled, corners, smooth, spec, complete)) {
+        return std::nullopt;
+    }
+    for (const LabelledCorner& corner : labelled) {
+        if (corner.col < 0 || corner.col >= final_cols || corner.row < 0 ||
+            corner.row >= final_rows) {
+            log(LogLevel::Error) << "board_detector: label (" << corner.col << ","
+                                 << corner.row << ") outside the fitted view";
+            return std::nullopt;
+        }
     }
     BoardView view;
     view.complete = complete;
@@ -795,7 +890,7 @@ std::optional<BoardView> detect_board(const FloatImage& gray, const BoardSpec& s
     if (!lattice) {
         return std::nullopt;
     }
-    return build_view(verified, *lattice, spec, options);
+    return build_view(verified, *lattice, spec, options, smooth);
 }
 
 }  // namespace alphashape

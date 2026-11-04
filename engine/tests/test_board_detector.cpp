@@ -168,6 +168,39 @@ TEST(Board, CornerOrderingCorrect) {
     EXPECT_GT(along_col.x() * along_row.y() - along_col.y() * along_row.x(), 0.0);
 }
 
+TEST(Board, LabelsCompleteBoardAtEveryRotation) {
+    const BoardSpec spec;
+    const BoardDetectOptions options;
+    // In-plane spins covering grid-aligned, quarter-turn and oblique boards.
+    // A +90 degree spin puts physical corner (0, rows - 1) nearest the image
+    // top-left, and 180/270 put the other diagonal corners there, so this also
+    // exercises the origin choice when the nearest-top-left corner is not
+    // physical (0, 0).
+    const double spins[6] = {0.0, 90.0, 180.0, 270.0, 45.0, -90.0};
+    for (double spin : spins) {
+        const test::ChessboardPose pose = posed_board(12.0, 30.0, spin, 0.62);
+        const test::ChessboardRender rendered = test::render_chessboard(pose);
+        ASSERT_TRUE(rendered.outside_diagonal_dark(0, 0))
+            << "renderer convention, spin " << spin;
+        const std::optional<BoardView> result =
+            detect_board(rendered.image, spec, options);
+        ASSERT_TRUE(result.has_value()) << "spin " << spin;
+        ASSERT_TRUE(result->complete) << "spin " << spin;
+        ASSERT_EQ(result->corners.size(),
+                  static_cast<std::size_t>(spec.cols * spec.rows))
+            << "spin " << spin;
+        for (const BoardCorner& corner : result->corners) {
+            ASSERT_GE(corner.col, 0) << "spin " << spin;
+            ASSERT_LT(corner.col, spec.cols) << "spin " << spin;
+            ASSERT_GE(corner.row, 0) << "spin " << spin;
+            ASSERT_LT(corner.row, spec.rows) << "spin " << spin;
+            const Eigen::Vector2d truth = rendered.corner(corner.col, corner.row);
+            EXPECT_LE((corner.pixel - truth).norm(), 0.15)
+                << "spin " << spin << " label " << corner.col << "," << corner.row;
+        }
+    }
+}
+
 TEST(Board, PartialViewAccepted) {
     const BoardSpec spec;
     const BoardDetectOptions options;
