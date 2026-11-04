@@ -135,7 +135,10 @@ TEST(Board, DetectsChessboard9x6Synthetic) {
 TEST(Board, CornerOrderingCorrect) {
     const BoardSpec spec;
     const BoardDetectOptions options;
-    const test::ChessboardPose pose = posed_board(15.0, 0.0, 0.0, 0.6);
+    // A small in-plane spin keeps the origin rule checkable while avoiding
+    // perfectly grid-aligned edges: there, a regular 4x4 box supersample has a
+    // coherent phase bias (a renderer artefact, not a real camera condition).
+    const test::ChessboardPose pose = posed_board(15.0, 0.0, 8.0, 0.6);
     const test::ChessboardRender rendered = test::render_chessboard(pose);
     const std::optional<BoardView> result = detect_board(rendered.image, spec, options);
     ASSERT_TRUE(result.has_value());
@@ -168,7 +171,10 @@ TEST(Board, CornerOrderingCorrect) {
 TEST(Board, PartialViewAccepted) {
     const BoardSpec spec;
     const BoardDetectOptions options;
-    const test::ChessboardPose pose = posed_board(20.0, 0.0, 0.0, 0.6);
+    // Same small spin as the ordering test: it keeps lattice differences
+    // comparable while avoiding the coherent box-supersample phase of edges
+    // that are exactly parallel to the pixel grid.
+    const test::ChessboardPose pose = posed_board(20.0, 0.0, 8.0, 0.6);
     const test::ChessboardRender rendered = test::render_chessboard(pose);
     const int crop_height = rendered.image.height() / 2;
     FloatImage cropped(rendered.image.width(), crop_height, 0.0F);
