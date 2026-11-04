@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -185,6 +186,42 @@ double colour_sum_at(const Field& field, int a, int b, int col, int row) {
     return sum;
 }
 
+/// The along-edge gradient mismatch of the two tiles at grid edge p--q:
+///
+///     ( 1/3 * sum_c | ( I_a(q,c) - I_a(p,c) ) - ( I_b(q,c) - I_b(p,c) ) | ) / 255
+///
+/// in [0, 1]. Zero when the tiles differ only by a constant brightness offset
+/// (a seam crossing them costs nothing extra); large where the structure they
+/// show disagrees, as parallax on a building edge or a misaligned line does.
+/// Defined only where BOTH tiles cover BOTH ends; elsewhere it is zero, which
+/// keeps the gradient term exactly aligned with the colour term and leaves the
+/// existing truncation/submodularity logic untouched. It reads only the four
+/// pixel values the colour term already reads, so nothing extra is stored, and
+/// it works unchanged on the coarse levels' block-mean tiles.
+inline double gradient_term_at(const Field& field, int a, int b, int pcol, int prow, int qcol,
+                               int qrow) {
+    if (a < 0 || b < 0) {
+        return 0.0;  // the colour term is zero here too
+    }
+    const std::size_t ta = static_cast<std::size_t>(a);
+    const std::size_t tb = static_cast<std::size_t>(b);
+    if (!field.valid_at(ta, pcol, prow) || !field.valid_at(ta, qcol, qrow) ||
+        !field.valid_at(tb, pcol, prow) || !field.valid_at(tb, qcol, qrow)) {
+        return 0.0;
+    }
+    const std::uint8_t* ap = field.rgb_at(ta, pcol, prow);
+    const std::uint8_t* aq = field.rgb_at(ta, qcol, qrow);
+    const std::uint8_t* bp = field.rgb_at(tb, pcol, prow);
+    const std::uint8_t* bq = field.rgb_at(tb, qcol, qrow);
+    double sum = 0.0;
+    for (int c = 0; c < 3; ++c) {
+        const int da = static_cast<int>(aq[c]) - static_cast<int>(ap[c]);
+        const int db = static_cast<int>(bq[c]) - static_cast<int>(bp[c]);
+        sum += std::abs(da - db);
+    }
+    return sum / (3.0 * kGreyRange);
+}
+
 /// The SINGLE source of truth for the pair cost of one grid edge p--q between
 /// labels a and b: zero when the labels agree or either is the empty label,
 /// else the mean per-channel grey disagreement over the two ends (sum of
@@ -202,7 +239,13 @@ inline double pair_cost_at(const Field& field, int a, int b, int pcol, int prow,
     const double disagreement =
         (colour_sum_at(field, a, b, pcol, prow) + colour_sum_at(field, a, b, qcol, qrow)) /
         kGreyRange;
-    return options.seam_weight * disagreement + options.smoothness;
+    double cost = options.seam_weight * disagreement + options.smoothness;
+    // Opt-in, and bit-identical to the old objective when off: the extra term is
+    // not even evaluated, so a zero weight cannot change any arithmetic.
+    if (options.gradient_weight > 0.0) {
+        cost += options.gradient_weight * gradient_term_at(field, a, b, pcol, prow, qcol, qrow);
+    }
+    return cost;
 }
 
 /// The linear-cell form of pair_cost_at(), for the callers that only have cell
