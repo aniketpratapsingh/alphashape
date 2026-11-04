@@ -154,7 +154,8 @@ inline std::vector<std::uint8_t> datetime_tiff_block(
     put32(18, 26);
     put32(22, 0);
     // ExifIFD: DateTimeOriginal, then optionally SubSecTimeOriginal.
-    const std::uint16_t entries = subsec.empty() ? 1 : 2;
+    const std::uint16_t entries =
+        static_cast<std::uint16_t>(subsec.empty() ? 1 : 2);
     put16(26, entries);
     put16(28, 0x9003);
     put16(30, 2);
