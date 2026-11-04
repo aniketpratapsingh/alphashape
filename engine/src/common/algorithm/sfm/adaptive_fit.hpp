@@ -60,6 +60,15 @@ struct AdaptiveFitResult {
 /// start from the current accepted state; a rejected group restores the
 /// problem exactly. Returns the final report, the selected mask and the solve
 /// count. Throws Error if the base solve is unusable.
+///
+/// Coefficients outside the active set are held at their input values, not
+/// zeroed: a group rejected here keeps whatever the camera's calibration already
+/// contained.
+///
+/// Selection is joint across sensors: a group is freed for every sensor that
+/// allows it, so one accepted group is one entry in the model shared by all
+/// sensors. Per-sensor selection would be a possible follow-up but is not
+/// attempted here.
 AdaptiveFitResult adaptive_fit(BAProblem& problem,
                                const std::array<bool, kCalibrationParamCount>& allowed,
                                const AdaptiveFitOptions& options = {});
