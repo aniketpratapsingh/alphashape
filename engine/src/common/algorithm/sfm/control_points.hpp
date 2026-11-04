@@ -9,10 +9,12 @@
 // priors use, so one blundered point cannot drag the solution.
 //
 // Check points only validate. A check point contributes no control or scale-bar
-// residual, and every image observation of a point flagged in
-// BAProblem::checkpoint_point is excluded from the solve. After the solve its
-// position is re-triangulated from the final poses and compared with its
-// reference; the error is reported in BAReport.
+// residual, and every image observation of it is excluded from the solve. A
+// point is a check point when it is flagged in BAProblem::checkpoint_point OR
+// carries a BAControlPoint with `checkpoint == true`; the two spellings are
+// combined so they can never disagree. After the solve the point is
+// re-triangulated from the final poses and compared with its reference; the
+// error is reported in BAReport.
 
 #include <cstddef>
 
@@ -24,7 +26,9 @@ namespace alphashape::sfm {
 /// `point` indexes BAProblem::points. Each axis carries its own sigma, so
 /// horizontal and vertical accuracy may differ; an axis with sigma <= 0 or
 /// non-finite is unconstrained (residual 0). `checkpoint == true` makes this a
-/// validation-only control point.
+/// validation-only control point: it contributes no control residual and also
+/// marks `point` as a check point (equivalent to setting
+/// BAProblem::checkpoint_point[point]).
 struct BAControlPoint {
     std::size_t point = 0;
     Eigen::Vector3d reference = Eigen::Vector3d::Zero();

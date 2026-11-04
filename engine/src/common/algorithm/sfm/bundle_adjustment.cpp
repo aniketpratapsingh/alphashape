@@ -164,16 +164,33 @@ constexpr double kControlObservationLossScale = 3.0;
 /// An axis with sigma <= 0 or non-finite is unconstrained.
 bool valid_sigma(double s) { return std::isfinite(s) && s > 0.0; }
 
-/// True when `point` is flagged in checkpoint_point (and the map is present).
-bool is_check_point(const BAProblem& problem, std::size_t point) {
-    return point < problem.checkpoint_point.size() && problem.checkpoint_point[point] != 0;
+/// True when `point` is flagged in a check mask (and the mask covers it).
+bool is_check_point(const std::vector<std::uint8_t>& check, std::size_t point) {
+    return point < check.size() && check[point] != 0;
+}
+
+/// The effective check mask: BAProblem::checkpoint_point (when given) OR every
+/// point carrying a BAControlPoint with checkpoint == true. Both spellings of
+/// "this point only validates" therefore agree, and the solve excludes the
+/// point's observations whichever one the caller used.
+std::vector<std::uint8_t> effective_check_mask(const BAProblem& problem) {
+    std::vector<std::uint8_t> mask(problem.points.size(), 0);
+    if (!problem.checkpoint_point.empty()) {
+        mask = problem.checkpoint_point;
+    }
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (cp.checkpoint && cp.point < mask.size()) {
+            mask[cp.point] = 1;
+        }
+    }
+    return mask;
 }
 
 /// A scale bar takes part in the solve only when it is not itself a check bar,
 /// neither endpoint is a check point, and its length/sigma are usable.
-bool scalebar_active(const BAProblem& problem, const BAScalebar& bar) {
-    return !bar.checkpoint && !is_check_point(problem, bar.point_a) &&
-           !is_check_point(problem, bar.point_b) && std::isfinite(bar.length) &&
+bool scalebar_active(const std::vector<std::uint8_t>& check, const BAScalebar& bar) {
+    return !bar.checkpoint && !is_check_point(check, bar.point_a) &&
+           !is_check_point(check, bar.point_b) && std::isfinite(bar.length) &&
            bar.length > 0.0 && valid_sigma(bar.sigma);
 }
 
@@ -271,7 +288,8 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
 /// Fill the control/check/scale-bar part of the report from the final state.
 /// Check points are re-triangulated from their observations; one with fewer
 /// than two observations gets a NaN residual and is left out of the RMS.
-void fill_constraint_report(const BAProblem& problem, BAReport* report) {
+void fill_constraint_report(const BAProblem& problem,
+                            const std::vector<std::uint8_t>& check, BAReport* report) {
     double control_sq = 0.0;
     double check_sq = 0.0;
     std::size_t control_n = 0;
@@ -298,7 +316,7 @@ void fill_constraint_report(const BAProblem& problem, BAReport* report) {
     double bar_sq = 0.0;
     std::size_t bar_n = 0;
     for (const BAScalebar& bar : problem.scalebars) {
-        if (!scalebar_active(problem, bar)) {
+        if (!scalebar_active(check, bar)) {
             continue;
         }
         ++report->scalebars;
@@ -497,7 +515,29 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         if (cp.point >= problem.points.size()) {
             throw ValueError("bundle_adjust: control point index out of range");
         }
-        if (!cp.checkpoint && is_check_point(problem, cp.point)) {
+    }
+    // One effective mask for both spellings of "check point": an entry in
+    // checkpoint_point or a BAControlPoint with checkpoint == true.
+    const std::vector<std::uint8_t> check_mask = effective_check_mask(problem);
+    // A checkpoint_point entry with no BAControlPoint at all would drop the
+    // point's observations and then have no reference to report it against.
+    for (std::size_t i = 0; i < problem.checkpoint_point.size(); ++i) {
+        if (problem.checkpoint_point[i] == 0) {
+            continue;
+        }
+        bool has_control = false;
+        for (const BAControlPoint& cp : problem.control_points) {
+            if (cp.point == i) {
+                has_control = true;
+                break;
+            }
+        }
+        if (!has_control) {
+            throw ValueError("bundle_adjust: checkpoint_point entry has no control point");
+        }
+    }
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (!cp.checkpoint && is_check_point(check_mask, cp.point)) {
             throw ValueError("bundle_adjust: control point refers to a check point");
         }
     }
@@ -519,7 +559,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         report.initial_rms_px = reprojection_rms_px(problem);
         report.final_rms_px = report.initial_rms_px;
         report.prior_rms_sigma = prior_rms_sigma(problem);
-        fill_constraint_report(problem, &report);
+        fill_constraint_report(problem, check_mask, &report);
         return report;
     }
 
@@ -575,7 +615,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         }
     }
     for (const BAScalebar& bar : problem.scalebars) {
-        if (scalebar_active(problem, bar)) {
+        if (scalebar_active(check_mask, bar)) {
             control_observation[bar.point_a] = 1;
             control_observation[bar.point_b] = 1;
         }
@@ -597,7 +637,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
 
     for (const BAObservation& obs : problem.observations) {
         // Check points must have zero influence on the estimate.
-        if (is_check_point(problem, obs.point)) {
+        if (is_check_point(check_mask, obs.point)) {
             continue;
         }
         const std::size_t sensor = sensor_index(problem, obs.camera);
@@ -636,7 +676,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         ceres_problem.AddResidualBlock(cost, constraint_loss_ptr(), point_blocks[cp.point].data());
     }
     for (const BAScalebar& bar : problem.scalebars) {
-        if (!scalebar_active(problem, bar)) {
+        if (!scalebar_active(check_mask, bar)) {
             continue;
         }
         auto* cost = new ScalebarCost(bar.length, bar.sigma);
@@ -755,7 +795,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     report.iterations = static_cast<int>(summary.iterations.size());
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
-    fill_constraint_report(problem, &report);
+    fill_constraint_report(problem, check_mask, &report);
     return report;
 }
 

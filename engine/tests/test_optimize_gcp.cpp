@@ -327,6 +327,12 @@ TEST(Optimize, CheckPointsReportedButNotUsed) {
     }
     without.observations = kept;
 
+    // Same inputs, but the check point is expressed ONLY through
+    // BAControlPoint::checkpoint: the mask is left empty. The derived effective
+    // mask must make this solve identical to the masked run.
+    BAProblem flag_only = with_check;
+    flag_only.checkpoint_point.clear();
+
     BAOptions options;
     options.max_iterations = 1000;
     options.function_tolerance = 1e-12;
@@ -337,6 +343,14 @@ TEST(Optimize, CheckPointsReportedButNotUsed) {
     ASSERT_EQ(report.checkpoint_residuals.size(), 1u);
     EXPECT_TRUE(std::isfinite(report.checkpoint_rms_m));
     EXPECT_LT(report.checkpoint_rms_m, 1e-3);
+
+    const BAReport flag_report = bundle_adjust(flag_only, options);
+    ASSERT_TRUE(flag_report.usable);
+    ASSERT_EQ(flag_report.checkpoints, 1u);
+    for (std::size_t i = 0; i < with_check.poses.size(); ++i) {
+        EXPECT_LT((with_check.poses[i].R - flag_only.poses[i].R).norm(), 1e-9);
+        EXPECT_LT((with_check.poses[i].t - flag_only.poses[i].t).norm(), 1e-9);
+    }
 
     const BAReport plain = bundle_adjust(without, options);
     ASSERT_TRUE(plain.usable);

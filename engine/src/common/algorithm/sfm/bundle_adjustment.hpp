@@ -114,8 +114,10 @@ struct BAProblem {
     /// Measured distances between points (scale constraints).
     std::vector<BAScalebar> scalebars;
     /// Optional per point: 1 marks a check point, whose image observations are
-    /// EXCLUDED from the solve. Empty => no check points. Size must be either 0
-    /// or points.size().
+    /// EXCLUDED from the solve. Empty => no check-point mask. Size must be
+    /// either 0 or points.size(). This mask is combined (OR) with every
+    /// BAControlPoint whose `checkpoint` is true, so the two spellings agree;
+    /// an entry here must have a BAControlPoint, or bundle_adjust throws.
     std::vector<std::uint8_t> checkpoint_point;
 
     /// Scale gauge: if scale_anchor_camera >= 0, that camera's world->camera
