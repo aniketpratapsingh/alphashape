@@ -325,7 +325,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             options.min_parallax_rad = 0.5 * 3.14159265358979323846 / 180.0;
             const auto estimate =
                 usable ? sfm::triangulate_multiview(poses, bearings, options)
-                       : std::nullopt;
+                       : std::optional<Eigen::Vector3d>{};
             if (!estimate || !estimate->allFinite()) {
                 ++markers_skipped;
                 continue;
