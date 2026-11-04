@@ -1614,6 +1614,28 @@ TEST(OrthoBlockPlan, EstimatorOwnerCaseUnderTwoGigabytes) {
         << "not running fill_holes must not shrink the block";
 }
 
+TEST(OrthoBlockPlan, EstimatorCountsSeamMergeScratch) {
+    // filter_label_speckles holds 2 bytes per window cell, and the small-region
+    // merge reaches it even with ghosting off. The seam stage is the planned
+    // peak for this shape (its graph alone is ~129 B/cell), so the scratch is
+    // visible as an exact 2 B/cell increase.
+    constexpr std::uint64_t kWindowCells = 1024ULL * 1024ULL;
+    constexpr double kWindowFootprint = 4.0 * static_cast<double>(kWindowCells);
+    constexpr double kPhotoCells = 480.0 * 360.0;
+    const auto peak_with = [&](bool ghosting, bool seam_merge) {
+        return estimate_block_peak_bytes(kWindowCells, kWindowFootprint, true, kPhotoCells,
+                                         kWindowCells, 0, true, ghosting, seam_merge);
+    };
+    const double plain = peak_with(false, false);
+    const double merged = peak_with(false, true);
+    EXPECT_NEAR(merged - plain, 2.0 * static_cast<double>(kWindowCells), 1e-6)
+        << "the merge scratch is exactly 2 bytes per window cell";
+
+    // Ghosting already pays the same scratch, so turning the merge on must not
+    // count it twice.
+    EXPECT_DOUBLE_EQ(peak_with(true, true), peak_with(true, false));
+}
+
 TEST(OrthoBlockPlan, OwnerCaseFitsUnderTwoGigabytes) {
     // The reported dataset: 36 obliques, 28 M cells, 1.9 cm, which peaked at
     // ~8 GB before. An 8 GB machine's own budget must plan blocks that fit it
