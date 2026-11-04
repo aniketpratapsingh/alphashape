@@ -187,10 +187,8 @@ struct SequenceCamera {
     const Calibration* calibration = nullptr;
     const Frame* frame = nullptr;
     /// Sortable capture instant (seconds since epoch scaled by 1e6 plus
-    /// SubSecTimeOriginal microseconds); nullopt when unusable.
+    /// SubSecTimeOriginal microseconds); nullopt when missing or malformed.
     std::optional<std::int64_t> capture_key;
-    /// Set when the file had no timestamp or it did not parse strictly.
-    bool capture_time_bad = false;
     /// Position in `Chunk::cameras()`, which is import order.
     std::size_t import_index = 0;
 };
@@ -269,13 +267,11 @@ std::vector<SequenceCamera> selected_sequence(
         const std::optional<CaptureTime> time =
             capture_time_of(document, *entry.frame);
         if (!time) {
-            entry.capture_time_bad = true;
             continue;
         }
         const std::optional<std::int64_t> seconds =
             parse_datetime(time->datetime_original);
         if (!seconds) {
-            entry.capture_time_bad = true;
             continue;
         }
         entry.capture_key =

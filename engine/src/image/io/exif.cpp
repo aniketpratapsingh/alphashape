@@ -638,7 +638,7 @@ constexpr std::size_t kExifPrefixBytes = 256U * 1024U;
 /// Re-reads up to `limit` bytes from the start. Returns false on a short read.
 bool read_prefix(std::ifstream& in, std::size_t limit,
                  std::vector<std::uint8_t>& out) {
-    out.assign(limit, 0);
+    out.assign(limit, std::uint8_t{0});
     in.clear();
     in.seekg(0, std::ios::beg);
     if (limit == 0) {
@@ -844,7 +844,7 @@ std::optional<CaptureTime> read_capture_time(const std::string& path) {
             data = parse_exif_tiff_block(bytes.data(), bytes.size());
         }
         if (!data.datetime_original && size > prefix) {
-            bytes.assign(size, 0);
+            bytes.assign(size, std::uint8_t{0});
             if (read_prefix(in, size, bytes)) {
                 data = parse_exif_tiff_block(bytes.data(), bytes.size());
             }
