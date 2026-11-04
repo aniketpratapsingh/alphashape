@@ -320,7 +320,12 @@ std::vector<double> dense_residuals(const DenseModel& model,
 
 /// Central-difference Jacobian of the residual vector over the free parameters.
 Eigen::MatrixXd dense_jacobian(const DenseModel& model, const BAProblem& problem) {
-    constexpr double kStep = 1e-6;
+    // Rounding noise in a central difference is eps * |pixel| / (2 * step); at
+    // 1e-6 that noise reaches ~1e-6 relative on the low-sensitivity intrinsic
+    // columns, i.e. the same order as the tolerance this reference is compared
+    // against. A decade larger keeps the noise well below the h^2 truncation
+    // floor (the residual is exactly linear in the intrinsic coefficients).
+    constexpr double kStep = 1e-5;
     const std::vector<double> base = dense_residuals(model, model.x, problem);
     Eigen::MatrixXd jacobian(
         static_cast<Eigen::Index>(base.size()),
