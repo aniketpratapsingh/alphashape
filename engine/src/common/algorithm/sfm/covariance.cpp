@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <exception>
 #include <string>
 #include <unordered_map>
@@ -280,25 +279,11 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         const std::vector<int>& row_begin = jacobian.rows;
         const std::vector<int>& entry_cols = jacobian.cols;
         const std::vector<double>& entry_values = jacobian.values;
-        std::fprintf(stderr,
-                     "[cov] cols=%d layout_total=%d reduced=%d blocks=%zu points=%zu "
-                     "registered=%zu rows=%d\n",
-                     jacobian.num_cols, layout.total, layout.reduced,
-                     layout.blocks.size(), point_count, eval_blocks.size(), row_count);
         if (jacobian.num_cols != layout.total) {
             out.reason = "covariance computation failed: Jacobian has " +
                          std::to_string(jacobian.num_cols) +
                          " columns, expected " + std::to_string(layout.total);
             return out;
-        }
-        if (row_count > 0) {
-            std::fprintf(stderr, "[cov] row0 cols:");
-            for (int j = row_begin[0]; j < row_begin[1]; ++j) {
-                std::fprintf(stderr, " %d", entry_cols[static_cast<std::size_t>(j)]);
-            }
-            std::fprintf(stderr, "\n[cov] reduced=%d first_point_col=%d\n",
-                         layout.reduced,
-                         layout.point_start.empty() ? -1 : layout.point_start[0]);
         }
 
         // Hpp for every point, from its own three Jacobian columns.
@@ -338,7 +323,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         // Drop rank-deficient point blocks (for example a point seen by one
         // camera) together with their contribution to the normal equations.
         std::vector<std::uint8_t> point_included(point_count, 0);
-        std::size_t included_count = 0;
         for (std::size_t p = 0; p < point_count; ++p) {
             if (layout.point_start[p] < 0) {
                 continue;
@@ -349,7 +333,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             const double smallest = eigen.eigenvalues().minCoeff();
             if (largest > 0.0 && smallest > kPointRankTolerance * largest) {
                 point_included[p] = 1;
-                ++included_count;
             } else {
                 ++out.points_dropped;
             }
@@ -432,13 +415,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             block_sizes[b] = layout.blocks[b].size;
         }
         BlockMap accumulator;
-        const auto accumulator_norm = [&accumulator]() {
-            double sum = 0.0;
-            for (const auto& entry : accumulator) {
-                sum += entry.second.cwiseAbs().sum();
-            }
-            return sum;
-        };
         for (int r = 0; r < row_count; ++r) {
             if (row_included[static_cast<std::size_t>(r)] == 0) {
                 continue;
@@ -473,7 +449,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 }
             }
         }
-        const double hcc_norm = accumulator_norm();
         struct PointWork {
             std::size_t point = 0;
             Eigen::Matrix3d inverse = Eigen::Matrix3d::Zero();
@@ -481,7 +456,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             Eigen::MatrixXd weight;  // Hcp * Hpp^-1, one row per column
         };
         std::vector<PointWork> point_work;
-        double weight_norm = 0.0;
         for (std::size_t p = 0; p < point_count; ++p) {
             if (point_included[p] == 0) {
                 continue;
@@ -534,6 +508,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             work.point = p;
             work.columns.resize(columns.size());
             work.weight.resize(static_cast<Eigen::Index>(columns.size()), 3);
+            Eigen::MatrixXd hcp(static_cast<Eigen::Index>(columns.size()), 3);
             const Eigen::LLT<Eigen::Matrix3d> llt(point_normal[p]);
             if (llt.info() != Eigen::Success) {
                 continue;
@@ -541,11 +516,10 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             work.inverse = llt.solve(Eigen::Matrix3d::Identity());
             for (std::size_t t = 0; t < order.size(); ++t) {
                 work.columns[t] = columns[order[t]];
-                work.weight.row(static_cast<Eigen::Index>(t)) =
+                hcp.row(static_cast<Eigen::Index>(t)) =
                     cross[order[t]].transpose();
             }
-            work.weight = work.weight * work.inverse;
-            weight_norm += work.weight.norm();
+            work.weight = hcp * work.inverse;
             std::vector<std::pair<int, std::vector<int>>> by_block;
             for (std::size_t t = 0; t < work.columns.size(); ++t) {
                 const int b =
@@ -555,34 +529,35 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 }
                 by_block.back().second.push_back(static_cast<int>(t));
             }
-            std::vector<Eigen::MatrixXd> local(by_block.size());
+            std::vector<Eigen::MatrixXd> weight_local(by_block.size());
+            std::vector<Eigen::MatrixXd> hcp_local(by_block.size());
             for (std::size_t i = 0; i < by_block.size(); ++i) {
                 const ReducedBlock& block =
                     layout.blocks[static_cast<std::size_t>(by_block[i].first)];
-                local[i] = Eigen::MatrixXd::Zero(block.size, 3);
+                weight_local[i] = Eigen::MatrixXd::Zero(block.size, 3);
+                hcp_local[i] = Eigen::MatrixXd::Zero(block.size, 3);
                 for (const int t : by_block[i].second) {
                     const int row =
                         work.columns[static_cast<std::size_t>(t)] - block.start;
-                    local[i].row(row) = work.weight.row(t);
+                    weight_local[i].row(row) = work.weight.row(t);
+                    hcp_local[i].row(row) = hcp.row(t);
                 }
             }
+            // S = Hcc - Hcp Hpp^-1 Hpc: the (a, b) block subtracts
+            // W_a Hcp_b^T, not W_a W_b^T (which would carry a second Hpp^-1).
             for (std::size_t i = 0; i < by_block.size(); ++i) {
                 for (std::size_t j = i; j < by_block.size(); ++j) {
                     add_gram(&accumulator, block_sizes,
-                             static_cast<std::size_t>(by_block[i].first), local[i],
-                             static_cast<std::size_t>(by_block[j].first), local[j],
-                             -1.0);
+                             static_cast<std::size_t>(by_block[i].first),
+                             weight_local[i],
+                             static_cast<std::size_t>(by_block[j].first),
+                             hcp_local[j], -1.0);
                 }
             }
             if (want_points) {
                 point_work.push_back(std::move(work));
             }
         }
-        std::fprintf(stderr,
-                     "[cov] included=%zu work=%zu accum_blocks=%zu dropped=%zu "
-                     "hcc_norm=%g schur_norm=%g weight_norm=%g\n",
-                     included_count, point_work.size(), accumulator.size(),
-                     out.points_dropped, hcc_norm, accumulator_norm(), weight_norm);
         Eigen::SparseMatrix<double> normal;
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
         if (layout.reduced > 0) {
@@ -621,8 +596,6 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             }
             const auto& diagonal = ldlt.vectorD();
             const double largest = diagonal.cwiseAbs().maxCoeff();
-            std::fprintf(stderr, "[cov] pivot_ratio=%g\n",
-                         largest > 0.0 ? diagonal.minCoeff() / largest : 0.0);
             if (!(largest > 0.0) ||
                 diagonal.minCoeff() <= kPointRankTolerance * largest) {
                 out.reason =

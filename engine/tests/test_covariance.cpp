@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <iostream>
 #include <optional>
 #include <random>
 #include <string>
@@ -595,14 +594,9 @@ TEST(Covariance, RobustLossMatchesDenseInverse) {
     ASSERT_GT(reference.normal.rows(), 0);
     Eigen::FullPivLU<Eigen::MatrixXd> lu(reference.normal);
     ASSERT_TRUE(lu.isInvertible());
-    // Ceres applies a curvature correction to the Jacobian and its cost
-    // convention for a robust loss need not match the solver's final_cost, so
-    // the reference blocks are normalised with the report's sigma0 (the plain
-    // dense test above verifies sigma0 independently). The record properties
-    // expose both values and the shape residual if this ever drifts.
-    RecordProperty("evaluate_sigma0", reference.sigma0_squared);
-    RecordProperty("report_sigma0", report.sigma0_squared);
-    const Eigen::MatrixXd dense = lu.inverse() * report.sigma0_squared;
+    // The reference owns its sigma0^2: Evaluate returns the same robust cost
+    // the solver reports as final_cost, over the reference's own dof.
+    const Eigen::MatrixXd dense = lu.inverse() * reference.sigma0_squared;
     ASSERT_EQ(report.camera_covariance.size(), scene.problem.poses.size());
     ASSERT_EQ(report.point_covariance.size(), scene.problem.points.size());
 
@@ -614,16 +608,6 @@ TEST(Covariance, RobustLossMatchesDenseInverse) {
             expected = dense.block<6, 6>(base, base);
         }
         const double scale = std::max(expected.norm(), 1e-300);
-        const double norm_sq = report.camera_covariance[c].squaredNorm();
-        const double fitted =
-            norm_sq > 0.0
-                ? (expected.array() * report.camera_covariance[c].array()).sum() /
-                      norm_sq
-                : 0.0;
-        std::cout << "[robust] camera " << c << " fit=" << fitted
-                  << " shape="
-                  << (expected - fitted * report.camera_covariance[c]).norm() / scale
-                  << "\n";
         const double relative =
             (expected - report.camera_covariance[c]).norm() / scale;
         EXPECT_LE(relative, 1e-6) << "camera " << c;
@@ -633,19 +617,6 @@ TEST(Covariance, RobustLossMatchesDenseInverse) {
             6 * reference.free_cameras + 3 * p);
         const Eigen::Matrix3d expected = dense.block<3, 3>(base, base);
         const double scale = std::max(expected.norm(), 1e-300);
-        if (p < 3) {
-            const double norm_sq = report.point_covariance[p].squaredNorm();
-            const double fitted =
-                norm_sq > 0.0
-                    ? (expected.array() * report.point_covariance[p].array()).sum() /
-                          norm_sq
-                    : 0.0;
-            std::cout << "[robust] point " << p << " fit=" << fitted
-                      << " shape="
-                      << (expected - fitted * report.point_covariance[p]).norm() /
-                             scale
-                      << "\n";
-        }
         const double relative =
             (expected - report.point_covariance[p]).norm() / scale;
         EXPECT_LE(relative, 1e-6) << "point " << p;
