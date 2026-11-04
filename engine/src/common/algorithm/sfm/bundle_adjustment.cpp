@@ -941,32 +941,42 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
 
     if (options.compute_camera_covariance || options.compute_point_covariance ||
         options.compute_calibration_covariance) {
-        CovarianceRequest request;
-        request.cameras = options.compute_camera_covariance;
-        request.points = options.compute_point_covariance;
-        request.calibrations = options.compute_calibration_covariance;
-        request.max_cameras = options.covariance_max_cameras;
-        request.max_points = options.covariance_max_points;
-        CovarianceBlocks blocks;
-        blocks.cameras.reserve(num_cameras);
-        for (std::array<double, 6>& block : cam_blocks) {
-            blocks.cameras.push_back(block.data());
+        if (!report.usable || !report.cost_valid ||
+            report.residual_count <= report.free_parameter_count) {
+            // sigma0^2 is only defined when the solve produced a usable cost
+            // and the residual count exceeds the free parameters; without it a
+            // posterior covariance would be meaningless (or negative).
+            report.covariance_valid = false;
+            report.covariance_reason =
+                "covariance skipped: the solve has no usable redundancy";
+        } else {
+            CovarianceRequest request;
+            request.cameras = options.compute_camera_covariance;
+            request.points = options.compute_point_covariance;
+            request.calibrations = options.compute_calibration_covariance;
+            request.max_cameras = options.covariance_max_cameras;
+            request.max_points = options.covariance_max_points;
+            CovarianceBlocks blocks;
+            blocks.cameras.reserve(num_cameras);
+            for (std::array<double, 6>& block : cam_blocks) {
+                blocks.cameras.push_back(block.data());
+            }
+            blocks.points.reserve(point_blocks.size());
+            for (std::array<double, 3>& block : point_blocks) {
+                blocks.points.push_back(block.data());
+            }
+            blocks.calibrations.reserve(num_calibrations);
+            for (std::array<double, kCalibrationParamCount>& block : intr_blocks) {
+                blocks.calibrations.push_back(block.data());
+            }
+            CovarianceOutput covariance =
+                compute_covariance(ceres_problem, blocks, request, report.sigma0_squared);
+            report.covariance_valid = covariance.valid;
+            report.covariance_reason = std::move(covariance.reason);
+            report.camera_covariance = std::move(covariance.camera_covariance);
+            report.point_covariance = std::move(covariance.point_covariance);
+            report.calibration_covariance = std::move(covariance.calibration_covariance);
         }
-        blocks.points.reserve(point_blocks.size());
-        for (std::array<double, 3>& block : point_blocks) {
-            blocks.points.push_back(block.data());
-        }
-        blocks.calibrations.reserve(num_calibrations);
-        for (std::array<double, kCalibrationParamCount>& block : intr_blocks) {
-            blocks.calibrations.push_back(block.data());
-        }
-        CovarianceOutput covariance =
-            compute_covariance(ceres_problem, blocks, request, report.sigma0_squared);
-        report.covariance_valid = covariance.valid;
-        report.covariance_reason = std::move(covariance.reason);
-        report.camera_covariance = std::move(covariance.camera_covariance);
-        report.point_covariance = std::move(covariance.point_covariance);
-        report.calibration_covariance = std::move(covariance.calibration_covariance);
     }
 
     report.final_rms_px = reprojection_rms_px(problem);
