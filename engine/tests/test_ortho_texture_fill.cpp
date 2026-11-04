@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "base/utils/error.hpp"
 #include "common/algorithm/ortho/texture_fill.hpp"
 
 namespace alphashape {
@@ -316,6 +317,48 @@ TEST(TextureFill, NoSourceSkips) {
     EXPECT_EQ(report.filled_cells, 0U);
     EXPECT_EQ(report.skipped_large, 1U);
     EXPECT_EQ(rgba, before);
+}
+
+TEST(TextureFill, RejectsInvalidOptions) {
+    // The options are public, so each bound is checked, not assumed. Validation
+    // runs before any component is touched (the mask here is empty).
+    constexpr int width = 16;
+    constexpr int height = 16;
+    const std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U, 255);
+    const std::vector<std::uint8_t> mask(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
+    const auto fills = [&](const ortho::TextureFillOptions& options) {
+        std::vector<std::uint8_t> image = rgba;
+        return ortho::texture_fill(width, height, image, mask, options);
+    };
+    ortho::TextureFillOptions options;
+    options.patch_radius = 0;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.patch_radius = 17;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.pyramid_levels = 0;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.pyramid_levels = 9;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.em_iterations = 0;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.patchmatch_iterations = 65;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.source_margin = -1;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.max_component_cells = 0;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
+    options = {};
+    options.max_window_cells = 0;
+    EXPECT_THROW(static_cast<void>(fills(options)), ValueError);
 }
 
 }  // namespace alphashape

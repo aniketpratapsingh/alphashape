@@ -532,10 +532,21 @@ TextureFillReport texture_fill(int width, int height, std::vector<std::uint8_t>&
     if (rgba.size() != cells * 4U || fill_mask.size() != cells) {
         throw ValueError("texture_fill: buffer sizes do not match width*height");
     }
-    if (options.patch_radius < 0 || options.max_component_cells < 0 ||
-        options.source_margin < 0 || options.pyramid_levels < 0 ||
-        options.em_iterations < 0 || options.patchmatch_iterations < 0) {
-        throw ValueError("texture_fill: options must be non-negative");
+    if (options.patch_radius < 1 || options.patch_radius > 16) {
+        throw ValueError("texture_fill: patch_radius must be in [1, 16]");
+    }
+    if (options.pyramid_levels < 1 || options.pyramid_levels > 8) {
+        throw ValueError("texture_fill: pyramid_levels must be in [1, 8]");
+    }
+    if (options.em_iterations < 1 || options.em_iterations > 64 ||
+        options.patchmatch_iterations < 1 || options.patchmatch_iterations > 64) {
+        throw ValueError("texture_fill: iteration counts must be in [1, 64]");
+    }
+    if (options.source_margin < 0) {
+        throw ValueError("texture_fill: source_margin must be >= 0");
+    }
+    if (options.max_component_cells <= 0 || options.max_window_cells <= 0) {
+        throw ValueError("texture_fill: max_component_cells and max_window_cells must be positive");
     }
 
     TextureFillReport report;
@@ -573,10 +584,17 @@ TextureFillReport texture_fill(int width, int height, std::vector<std::uint8_t>&
         // The window, not the component size, bounds the memory this component's
         // completion needs. A thin diagonal component can own few cells but span
         // the raster, so cap the window itself (see TextureFillOptions).
-        if (static_cast<std::int64_t>(ww) * static_cast<std::int64_t>(wh) >
-            static_cast<std::int64_t>(options.max_window_cells)) {
+        const std::int64_t window_cells =
+            static_cast<std::int64_t>(ww) * static_cast<std::int64_t>(wh);
+        if (window_cells > static_cast<std::int64_t>(options.max_window_cells)) {
             ++report.skipped_large;
             continue;
+        }
+        // The nearest-neighbour field indexes window cells with int32. Refuse a
+        // window that cannot be addressed before any cast can truncate it; with
+        // the default cap this is unreachable, but the options are public.
+        if (window_cells >= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw ValueError("texture_fill: window exceeds int32 cell indexing");
         }
         std::vector<std::uint8_t> window_hole(
             static_cast<std::size_t>(ww) * static_cast<std::size_t>(wh), 0);
