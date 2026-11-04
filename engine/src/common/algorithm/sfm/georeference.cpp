@@ -157,6 +157,18 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
                                          camera.location_covariance *
                                          t_sim.R.transpose();
         }
+        // Track covariances follow the same s^2 R C R^T rule; the stored matrix
+        // is float, so the transform runs in float (WP-13.13b).
+        const Eigen::Matrix3f track_rotation = t_sim.R.cast<float>();
+        const float track_scale_sq = static_cast<float>(camera_scale_sq);
+        for (Track& track : chunk.tie_points().tracks) {
+            if (!track.covariance.has_value()) {
+                continue;
+            }
+            track.covariance = Eigen::Matrix3f(track_scale_sq * track_rotation *
+                                               (*track.covariance) *
+                                               track_rotation.transpose());
+        }
         if (transform_markers) {
             // A covariance transforms as C' = s^2 R C R^T.
             const double scale_sq = t_sim.scale * t_sim.scale;
@@ -188,9 +200,18 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         camera.location_covariance = t_sim.scale * t_sim.scale * t_sim.R *
                                      camera.location_covariance * t_sim.R.transpose();
     }
+    const Eigen::Matrix3f track_rotation = t_sim.R.cast<float>();
+    const float track_scale_sq =
+        static_cast<float>(t_sim.scale) * static_cast<float>(t_sim.scale);
     for (Track& track : chunk.tie_points().tracks) {
         if (track.point.has_value()) {
             *track.point = t_sim.apply(*track.point);
+            if (track.covariance.has_value()) {
+                // C' = s^2 R C R^T, in float like the stored matrix.
+                track.covariance =
+                    Eigen::Matrix3f(track_scale_sq * track_rotation *
+                                    (*track.covariance) * track_rotation.transpose());
+            }
         }
     }
     // Region: axis-aligned, no rotation -- the centre maps like a point and the
