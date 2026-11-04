@@ -68,7 +68,7 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     base[0] = base[1] = base[2] = base[5] = true;  // f, cx, cy, k1
 
     set_free_mask(problem, sensor_allowed, base);
-    BAReport report = bundle_adjust(problem, BAOptions{});
+    BAReport report = bundle_adjust(problem, options.solve_options);
     result.solves = 1;
     if (!report.usable || !report.cost_valid) {
         throw Error(
@@ -108,7 +108,7 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
 
         const BAProblem saved = problem;
         set_free_mask(problem, sensor_allowed, next);
-        const BAReport candidate = bundle_adjust(problem, BAOptions{});
+        const BAReport candidate = bundle_adjust(problem, options.solve_options);
         ++result.solves;
         bool accept = false;
         if (candidate.usable && candidate.cost_valid &&
