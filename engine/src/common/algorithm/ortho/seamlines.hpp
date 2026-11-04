@@ -15,13 +15,23 @@
 //
 //     best(p)   = the largest score of any tile valid at p,
 //     w(a, b)   = 0                                            if a == b, or a < 0, or b < 0,
-//               = seam_weight * ( d_{a,b}(p) + d_{a,b}(q) ) + smoothness   otherwise,
+//               = seam_weight * ( d_{a,b}(p) + d_{a,b}(q) ) + smoothness
+//                 + gradient_weight * g_{a,b}(p, q)         otherwise,
 //     d_{a,b}(x) = ( 1/3 * sum_c | I_a(x, c) - I_b(x, c) | ) / 255  in [0, 1],
+//     g_{a,b}(p,q) = ( 1/3 * sum_c | ( I_a(q,c) - I_a(p,c) )
+//                                  - ( I_b(q,c) - I_b(p,c) ) | ) / 255  in [0, 1],
 //
-// the mean per-channel grey-level disagreement, over the 255-level range, that
-// the two tiles show at x. A label that does not cover a cell carries an
-// infinite data cost, so every coverable cell stays labelled and no label ever
-// escapes the region where its tile is valid.
+// `d` is the mean per-channel grey-level disagreement, over the 255-level
+// range, that the two tiles show at x. `g` (only added when gradient_weight >
+// 0, and only where both tiles cover both p and q) is the disagreement of the
+// two tiles' finite-difference gradients ALONG the edge: it is zero when the
+// tiles differ only by a constant brightness offset, and large where the
+// structure they show disagrees, as parallax on a building edge or a
+// misaligned line does. It reuses the four pixel values the colour term reads,
+// so nothing extra is stored, and it applies at every pyramid level (the
+// coarse levels carry block-mean tiles). A label that does not cover a cell
+// carries an infinite data cost, so every coverable cell stays labelled and no
+// label ever escapes the region where its tile is valid.
 //
 // The data term is a *preference*, not the dominant cost: the best tile at a
 // cell is free and any other costs only its score shortfall against `best`,
@@ -70,6 +80,12 @@ namespace alphashape::ortho {
 struct SeamOptions {
     int iterations = 2;         ///< ICM polish sweeps per level (0 = argmax only)
     double seam_weight = 2.0;   ///< weight of the colour-agreement seam term
+    /// Weight of the gradient-matching seam term (Agarwala et al. 2004,
+    /// "Interactive Digital Photomontage"; Kwatra et al. 2003): the two tiles'
+    /// along-edge finite differences must agree. Zero when they differ only by a
+    /// constant brightness offset; large where structure disagrees (parallax).
+    /// 0 (the default) leaves the objective, and the output, exactly unchanged.
+    double gradient_weight = 0.0;
     double data_weight = 0.02;  ///< weight of the score-shortfall preference term
     double smoothness = 0.30;   ///< constant cost of one label-change edge
     int coarse_levels = 2;      ///< 2x block-mean levels solved before the full grid
