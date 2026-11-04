@@ -96,8 +96,15 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
         !similarity_normalisation(pixels, pixel_transform)) {
         return false;
     }
-    Eigen::MatrixXd design = Eigen::MatrixXd::Zero(
-        static_cast<Eigen::Index>(2 * count), 9);
+    // The four-point case yields only eight rows, so the thin SVD would return
+    // eight right singular vectors and there would be no second-smallest
+    // value to test. Pad with zero rows up to nine: a zero row carries no
+    // information and leaves the null space (and therefore the homography)
+    // unchanged, while giving the rank test the same quantity it has for
+    // longer systems.
+    const Eigen::Index rows =
+        std::max<Eigen::Index>(static_cast<Eigen::Index>(2 * count), 9);
+    Eigen::MatrixXd design = Eigen::MatrixXd::Zero(rows, 9);
     for (std::size_t i = 0; i < count; ++i) {
         const Eigen::Vector3d p =
             board_transform * Eigen::Vector3d(board[i].x(), board[i].y(), 1.0);
@@ -121,9 +128,13 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
     const Eigen::VectorXd& singular = svd.singularValues();
     // The homography is the smallest right singular vector, so the smallest
     // value is expected to be (near) zero; rank deficiency shows up in the
-    // second-smallest value.
+    // second-smallest value. 1e-8 of the largest value is far above the
+    // normalised DLT's rounding noise (typically 1e-15) yet far below the
+    // 1e-3-or-worse conditioning of a genuinely usable board, so it rejects
+    // only configurations that really are rank deficient (three collinear
+    // points, repeated points).
     if (singular.size() < 9 || !(singular(0) > 0.0) ||
-        !(singular(7) > 1e-12 * singular(0))) {
+        !(singular(7) > 1e-8 * singular(0))) {
         return false;
     }
     const Eigen::VectorXd h = svd.matrixV().col(8);
