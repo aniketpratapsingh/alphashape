@@ -143,7 +143,7 @@ bool contains(const std::vector<std::string>& values, const std::string& value) 
 
 TEST(Calibrate, RecoversSyntheticDistortion) {
     const CalibrationResult result = solve(synthetic_views(13U, 12));
-    std::printf("[Calibrate.RecoversSyntheticDistortion] f %.4f cx %.4f cy %.4f "
+    std::printf("[calibrate recovers] f %.4f cx %.4f cy %.4f "
                 "k1 %.6f rms %.4f max %.4f views %d\n",
                 result.calibration.f, result.calibration.cx,
                 result.calibration.cy, result.calibration.k1, result.rms_px,
@@ -163,14 +163,14 @@ TEST(Calibrate, FocalRepeatability) {
     const double focal_b = solve(second).calibration.f;
     const double relative =
         std::abs(focal_a - focal_b) / (0.5 * (focal_a + focal_b));
-    std::printf("[Calibrate.FocalRepeatability] %.4f vs %.4f (%.5f relative)\n",
+    std::printf("[calibrate focal] %.4f vs %.4f (%.5f relative)\n",
                 focal_a, focal_b, relative);
     EXPECT_LE(relative, 0.005);
 }
 
 TEST(Calibrate, PartialViewsContribute) {
     const CalibrationResult result = solve(synthetic_views(31U, 9, 3));
-    std::printf("[Calibrate.PartialViewsContribute] f %.4f cx %.4f cy %.4f "
+    std::printf("[calibrate partial views] f %.4f cx %.4f cy %.4f "
                 "k1 %.6f rms %.4f views %d\n",
                 result.calibration.f, result.calibration.cx,
                 result.calibration.cy, result.calibration.k1, result.rms_px,
@@ -189,7 +189,7 @@ TEST(Calibrate, PrunesInsignificantTerms) {
     options.prune_t_ratio = 3.0;
     const CalibrationResult result =
         solve(synthetic_views(41U, 12), default_calibration_fit_flags(), options);
-    std::printf("[Calibrate.PrunesInsignificantTerms] k3 %.6f pruned %s\n",
+    std::printf("[calibrate prunes] k3 %.6f pruned %s\n",
                 result.calibration.k3,
                 result.pruned.empty() ? "(none)" : result.pruned.front().c_str());
     EXPECT_TRUE(contains(result.pruned, "k3"));
@@ -336,7 +336,7 @@ TEST(CalibrateCamera, ApplyWritesSensor) {
     Params params = make_params(builtin_registry().require("CalibrateCamera"));
     run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
     const Calibration& after = scene.chunk->sensors()[0].calibration;
-    std::printf("[CalibrateCamera.ApplyWritesSensor] f %.3f (truth %.1f)\n",
+    std::printf("[calibrate camera apply] f %.3f (truth %.1f)\n",
                 after.f, kTaskFocal);
     EXPECT_NEAR(after.f, kTaskFocal, 0.01 * kTaskFocal);
     EXPECT_NE(before.f, after.f);
