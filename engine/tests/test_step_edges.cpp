@@ -620,7 +620,7 @@ TEST(StepEdges, NaturalCliffIsUntouched) {
             surface[index] = ground_height(x) + step + noise;
         }
     }
-    const std::vector<double> blurred = gaussian_blur(surface, width, height, 1.0);
+    const std::vector<double> blurred = gaussian_blur(surface, width, height, 0.75);
     std::vector<float> values(blurred.begin(), blurred.end());
     const std::vector<float> original = values;
     const std::vector<std::uint8_t> valid = all_valid(values.size());
@@ -632,8 +632,8 @@ TEST(StepEdges, NaturalCliffIsUntouched) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. A barrel-vault roof meets the ground with a curved, vertical-tangent
-//    side. Its upper "plane" is not a plane, so the rms gate rejects it.
+// 9. A curved (sinusoidal barrel-vault) roof edge rises and falls over the
+//    fit band, so its upper "plane" is not a plane and the rms gate rejects it.
 // ---------------------------------------------------------------------------
 
 TEST(StepEdges, CurvedRoofEdgeIsRejectedByRms) {
@@ -645,10 +645,10 @@ TEST(StepEdges, CurvedRoofEdgeIsRejectedByRms) {
         for (int col = 0; col < width; ++col) {
             const double x = static_cast<double>(col) * kCell;
             double value = ground_height(x);
-            // A 10 m radius semicircular vault spanning x = 20..40 m.
-            if (x >= 20.0 && x <= 40.0) {
-                const double u = x - 30.0;
-                value += std::sqrt(std::max(0.0, 100.0 - u * u));
+            // A 1.5 m step into a vault that rises 3 m over a 3 m period.
+            if (x >= 20.0) {
+                const double u = x - 20.0;
+                value += 1.5 + 1.5 * (1.0 - std::cos(2.0 * kPi * u / 3.0));
             }
             surface[static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
                     static_cast<std::size_t>(col)] = value;
@@ -660,8 +660,8 @@ TEST(StepEdges, CurvedRoofEdgeIsRejectedByRms) {
     const std::vector<std::uint8_t> valid = all_valid(values.size());
     StepEdgeOptions options;
     options.min_height = 1.5;
-    // A wide fit band sees the curvature the default 5-cell band misses.
-    options.band_half_width = 40;
+    // A wide fit band spans more than one vault period, exposing the curvature.
+    options.band_half_width = 20;
     const int segments = refine_step_edges(values, valid, width, height, kCell, kCell, options);
     EXPECT_EQ(segments, 0);
     EXPECT_TRUE(values == original);
