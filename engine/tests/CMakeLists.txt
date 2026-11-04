@@ -32,6 +32,7 @@ add_executable(alphashape_tests
     test_geodesy.cpp
     test_similarity.cpp
     test_georeference.cpp
+    test_georeference_markers.cpp
     test_view_selection.cpp
     test_fusion.cpp
     test_depth_filter.cpp
