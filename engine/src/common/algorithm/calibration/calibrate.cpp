@@ -51,7 +51,7 @@ void unpack_calibration(const Packed& packed, Calibration& calibration) {
 /// Similarity normalisation: centroid to the origin, mean radius sqrt(2).
 bool similarity_normalisation(const std::vector<Eigen::Vector2d>& points,
                               Eigen::Matrix3d& transform) {
-    if (points.size() < 4) {
+    if (points.size() < std::size_t{4}) {
         return false;
     }
     Eigen::Vector2d centre = Eigen::Vector2d::Zero();
@@ -87,7 +87,7 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
                     const std::vector<Eigen::Vector2d>& pixels,
                     Eigen::Matrix3d& homography) {
     const std::size_t count = board.size();
-    if (count < 4 || pixels.size() != count) {
+    if (count < std::size_t{4} || pixels.size() != count) {
         return false;
     }
     Eigen::Matrix3d board_transform;
@@ -146,7 +146,7 @@ bool homography_dlt(const std::vector<Eigen::Vector2d>& board,
 /// with h1, h2 the first two columns of the homography in centred pixels.
 bool closed_form_focal(const std::vector<Eigen::Matrix3d>& homographies,
                        double& focal) {
-    if (homographies.size() < 3) {
+    if (homographies.size() < std::size_t{3}) {
         return false;
     }
     double normal = 0.0;
@@ -376,7 +376,7 @@ bool initialise_views(const std::vector<CalibrationView>& views, int width,
         out.views.push_back(view);
         out.poses.push_back(pose);
     }
-    return out.views.size() >= 3;
+    return out.views.size() >= std::size_t{3};
 }
 
 }  // namespace
@@ -517,8 +517,10 @@ ErrorSummary measure_errors(const std::vector<CalibrationView>& views,
         total_corners += static_cast<std::size_t>(counted);
         out.views.push_back(error);
     }
-    out.rms_px =
-        total_corners > 0 ? std::sqrt(total_squared / (2.0 * total_corners)) : 0.0;
+    out.rms_px = total_corners > 0
+                     ? std::sqrt(total_squared /
+                                 (2.0 * static_cast<double>(total_corners)))
+                     : 0.0;
     out.max_px = std::sqrt(global_max_squared);
     return out;
 }
