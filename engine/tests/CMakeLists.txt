@@ -85,6 +85,7 @@ add_executable(alphashape_tests
     test_refine_markers.cpp
     test_track_markers.cpp
     test_board_detector.cpp
+    test_calibrate_camera.cpp
     test_gpu.cpp
 )
 
