@@ -13,6 +13,7 @@
 // empty asset of that kind, which is how an in-memory empty asset slot keeps
 // its identity across a round-trip.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -56,6 +57,10 @@ std::string matches_entry(const Chunk& chunk) {
 
 std::string tracks_entry(const Chunk& chunk) {
     return chunk_prefix(chunk) + "/tie_points/tracks.bin";
+}
+
+std::string track_covariance_entry(const Chunk& chunk) {
+    return chunk_prefix(chunk) + "/tie_points/track_covariance.bin";
 }
 
 std::string depth_maps_entry(const Chunk& chunk, std::int32_t asset_id) {
@@ -476,6 +481,16 @@ void write_tie_points(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
         XmlNode& e = add_child(container, "tracks");
         set_attr(e, "count", std::to_string(tie_points.tracks.size()));
         set_attr(e, "path", tracks_entry(chunk));
+        // The covariance companion exists only when at least one track has
+        // one, so a project without covariance gains no entry and no attribute.
+        const bool any_covariance = std::any_of(
+            tie_points.tracks.begin(), tie_points.tracks.end(),
+            [](const Track& track) { return track.covariance.has_value(); });
+        if (any_covariance) {
+            const std::string entry = track_covariance_entry(chunk);
+            archive.add(entry, sidecar::encode_track_covariance(tie_points.tracks));
+            set_attr(e, "covariance_path", entry);
+        }
     }
 }
 
@@ -1217,12 +1232,22 @@ void read_tie_points(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
                 throw ProjectIOError("matches count mismatch in doc.xml");
             }
         } else {
-            warn_unknown_attrs(e, {"count", "path"}, report);
+            warn_unknown_attrs(e, {"count", "path", "covariance_path"}, report);
             chunk.tie_points().tracks =
                 sidecar::decode_tracks(require_entry(archive, path));
             if (chunk.tie_points().tracks.size() !=
                 static_cast<std::size_t>(parse_ll(require_attr(e, "count")))) {
                 throw ProjectIOError("tracks count mismatch in doc.xml");
+            }
+            if (const std::string* cov_path = find_attr(e, "covariance_path")) {
+                const std::vector<std::optional<Eigen::Matrix3f>> covariance =
+                    sidecar::decode_track_covariance(require_entry(archive, *cov_path));
+                if (covariance.size() != chunk.tie_points().tracks.size()) {
+                    throw ProjectIOError("track covariance count mismatch in doc.xml");
+                }
+                for (std::size_t i = 0; i < covariance.size(); ++i) {
+                    chunk.tie_points().tracks[i].covariance = covariance[i];
+                }
             }
         }
     }

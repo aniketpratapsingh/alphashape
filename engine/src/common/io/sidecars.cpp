@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -353,6 +354,76 @@ std::vector<Track> decode_tracks(const std::vector<std::uint8_t>& in) {
     }
     if (!r.at_end()) {
         throw ProjectIOError("tracks file: trailing bytes");
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Track covariance: "ATC1", u32 track count, then per track a u8 has_covariance
+// flag and, when 1, six f32 holding the upper triangle of the 3x3 posterior
+// covariance in row-major order: xx xy xz yy yz zz. float, matching
+// Track::covariance.
+// ---------------------------------------------------------------------------
+std::vector<std::uint8_t> encode_track_covariance(const std::vector<Track>& tracks) {
+    std::vector<std::uint8_t> out = with_magic(kTrackCovarianceMagic);
+    put_u32(out, static_cast<std::uint32_t>(tracks.size()));
+    for (const Track& track : tracks) {
+        if (!track.covariance.has_value()) {
+            out.push_back(0);
+            continue;
+        }
+        out.push_back(1);
+        const Eigen::Matrix3f& c = *track.covariance;
+        put_f32(out, c(0, 0));
+        put_f32(out, c(0, 1));
+        put_f32(out, c(0, 2));
+        put_f32(out, c(1, 1));
+        put_f32(out, c(1, 2));
+        put_f32(out, c(2, 2));
+    }
+    return out;
+}
+
+std::vector<std::optional<Eigen::Matrix3f>> decode_track_covariance(
+    const std::vector<std::uint8_t>& in) {
+    if (!magic_is(in, kTrackCovarianceMagic) || in.size() < 8) {
+        throw ProjectIOError("track covariance file: bad header");
+    }
+    ByteReader r(in, 4, "track covariance file");
+    // Each track occupies at least its u8 flag.
+    const std::uint32_t track_count = r.count(1);
+    std::vector<std::optional<Eigen::Matrix3f>> out;
+    out.reserve(track_count);
+    for (std::uint32_t i = 0; i < track_count; ++i) {
+        const std::uint8_t has_covariance = r.u8();
+        if (has_covariance > 1) {
+            throw ProjectIOError("track covariance file: flag is not 0 or 1");
+        }
+        if (has_covariance == 0) {
+            out.push_back(std::nullopt);
+            continue;
+        }
+        float values[6];
+        for (float& value : values) {
+            value = r.f32();
+            if (!std::isfinite(value)) {
+                throw ProjectIOError("track covariance file: value is not finite");
+            }
+        }
+        Eigen::Matrix3f c;
+        c(0, 0) = values[0];
+        c(0, 1) = values[1];
+        c(0, 2) = values[2];
+        c(1, 0) = values[1];
+        c(1, 1) = values[3];
+        c(1, 2) = values[4];
+        c(2, 0) = values[2];
+        c(2, 1) = values[4];
+        c(2, 2) = values[5];
+        out.push_back(c);
+    }
+    if (!r.at_end()) {
+        throw ProjectIOError("track covariance file: trailing bytes");
     }
     return out;
 }
