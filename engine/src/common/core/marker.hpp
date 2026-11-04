@@ -52,7 +52,10 @@ struct Marker {
     std::optional<Eigen::Vector3d> position;
     Eigen::Matrix3d position_covariance = Eigen::Matrix3d::Zero();
 
-    bool pinned = false;    ///< excluded from adjustment (stationary control)
+    /// True for a marker created through the interactive placement command (a
+    /// user-placed marker); persisted with the project. It is informational: it
+    /// does NOT exclude the marker from adjustment.
+    bool pinned = false;
     bool valid = false;     ///< has enough projections / passed filtering
     bool internal = false;  ///< created by the engine, not the user
 

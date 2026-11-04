@@ -14,11 +14,21 @@
 //     the local ENU frame -- inverse(transform) * geodetic_to_ecef(lon, lat, alt)
 //     -- weighted by reference.accuracy. A NaN altitude leaves the up axis
 //     unconstrained and is converted as alt = 0.
-//   * Gauge: when >= 3 priors have both horizontal axes constrained and their
-//     centres are not collinear, the priors pin all 7 similarity DoF, so every
-//     pose is left free and no scale anchor is set. Otherwise the first aligned
-//     camera is held fully constant and the scale is anchored on the aligned
-//     camera with the largest baseline to it (choose_scale_anchor_axis).
+//   * Gauge: when >= 3 anchors have all three axes constrained (finite sigma
+//     > 0 on x, y AND z) and their centres are not collinear, they pin all 7
+//     similarity DoF, so every pose is left free and no scale anchor is set.
+//     Horizontal-only anchors (for example a reference without altitude) do
+//     not count: they leave vertical translation free. Otherwise the first
+//     aligned camera is held fully constant and the scale is anchored on the
+//     aligned camera with the largest baseline to it (choose_scale_anchor_axis).
+//
+//   * Markers: every regular marker with >= 2 enabled projections in distinct
+//     aligned cameras becomes a BA point whose observations are its projections
+//     (one per camera). Vertex and fiducial markers are image-space target
+//     marks, not ground points, and are skipped. A referenced marker becomes a
+//     control point (or a check point, held out of the solve) when the chunk is
+//     georeferenced. Scale bars between marker points enter as BAScalebar
+//     constraints and fix scale even in a non-georeferenced chunk.
 //
 // Everything is computed into a staged copy and committed with one move, so an
 // exception anywhere leaves the chunk untouched.
@@ -30,6 +40,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +56,7 @@
 #include "base/utils/log.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
+#include "common/algorithm/sfm/triangulation.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 
@@ -100,12 +115,18 @@ bool centres_not_collinear(const std::vector<Eigen::Vector3d>& centres) {
     return max_perp > 1e-3 * len;
 }
 
+/// Full-precision text for a metadata value.
+std::string meta_number(double value) {
+    std::ostringstream out;
+    out << std::setprecision(17) << value;
+    return out.str();
+}
+
 }  // namespace
 
 void OptimizeCamerasTask::declare_params(Params& params) const {
-    // Defaults follow Metashape's public Python API: the principal-point and
-    // low-order radial/tangential terms are fit, the affine pair and the highest
-    // radial term are not.
+    // Defaults fit the principal point and the low-order radial/tangential
+    // terms; the affine pair and the highest radial term stay fixed.
     params.declare({"fit_f", ParamType::Bool, true, "Adjust the focal length."});
     params.declare({"fit_cx", ParamType::Bool, true, "Adjust the principal point X offset."});
     params.declare({"fit_cy", ParamType::Bool, true, "Adjust the principal point Y offset."});
@@ -239,12 +260,252 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                                    keypoint_to_pixel(set->keypoints[observation.keypoint_index])});
         }
     }
-    progress.update("prepare", 1.0);
-
-    // -- GNSS centre priors (georeferenced chunks only) ---------------------
     const Transform& transform = chunk->transform();
     const bool georeferenced =
         (transform - Transform::Identity()).cwiseAbs().maxCoeff() > 1e-9;
+    // Local->ECEF scale. Chunk-local units are metres only when this is 1; every
+    // metre-valued sigma and length below is divided by it, and every reported
+    // metre-valued RMS is multiplied by it.
+    const double local_scale =
+        std::cbrt(std::abs(transform.block<3, 3>(0, 0).determinant()));
+    if (!std::isfinite(local_scale) || local_scale <= 0.0) {
+        throw ValueError("OptimizeCameras: chunk transform has no usable scale");
+    }
+    // -- marker points and their image observations -------------------------
+    // A marker with at least two enabled projections in aligned cameras becomes
+    // one BA point. Its projections are stored in the Calibration pixel
+    // convention (top-left pixel centre (0.5, 0.5)), the same convention as
+    // BAObservation, so they are copied without the keypoint +0.5 shift.
+    // BAObservation carries no per-observation sigma, so a
+    // marker_projection_accuracy parameter is deferred until it does.
+    constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
+    std::size_t markers_skipped = 0;
+    std::size_t markers_non_regular = 0;
+    for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+        const Marker& marker = chunk->markers()[m];
+        // Vertex and fiducial markers are image-space target marks, not ground
+        // points: they never become BA points.
+        if (marker.type != MarkerType::Regular) {
+            ++markers_non_regular;
+            ++markers_skipped;
+            continue;
+        }
+        std::vector<std::pair<std::size_t, Eigen::Vector2d>> projections;
+        // One observation per camera: a duplicated projection must not
+        // double-weight the residual. Keep the first enabled entry.
+        std::unordered_map<std::int32_t, bool> seen_camera;
+        for (const MarkerProjection& projection : marker.projections) {
+            if (!projection.enabled || !projection.pixel.allFinite()) {
+                continue;
+            }
+            const auto camera = camera_slot.find(projection.camera_id);
+            if (camera == camera_slot.end()) {
+                continue;  // not aligned: not part of this refinement
+            }
+            if (!seen_camera.emplace(projection.camera_id, true).second) {
+                continue;  // duplicate observation of the same camera
+            }
+            projections.emplace_back(camera->second, projection.pixel);
+        }
+        if (projections.size() < 2) {
+            ++markers_skipped;
+            continue;
+        }
+        Eigen::Vector3d point;
+        // An existing position is only a usable seed when it lies in front of
+        // every camera that observes the marker; a stale position (for example
+        // from a previous alignment) would start the solve behind a camera.
+        bool usable_seed = false;
+        if (marker.position.has_value() && marker.position->allFinite()) {
+            usable_seed = true;
+            for (const std::pair<std::size_t, Eigen::Vector2d>& projection : projections) {
+                const Camera& camera = chunk->cameras()[camera_index[projection.first]];
+                const Eigen::Vector3d camera_point =
+                    camera.pose.block<3, 3>(0, 0) * *marker.position +
+                    camera.pose.block<3, 1>(0, 3);
+                if (!(camera_point.z() > 0.0)) {
+                    usable_seed = false;
+                    break;
+                }
+            }
+        }
+        if (usable_seed) {
+            point = *marker.position;
+        } else {
+            // Linear multi-view triangulation from the current poses. The
+            // 0.5 deg parallax floor matches the marker-refinement task.
+            std::vector<sfm::AbsolutePose> poses;
+            std::vector<Eigen::Vector3d> bearings;
+            poses.reserve(projections.size());
+            bearings.reserve(projections.size());
+            bool usable = true;
+            for (const auto& [slot, pixel] : projections) {
+                const Camera& camera = chunk->cameras()[camera_index[slot]];
+                sfm::AbsolutePose pose;
+                pose.R = camera.pose.block<3, 3>(0, 0);
+                pose.t = camera.pose.block<3, 1>(0, 3);
+                poses.push_back(pose);
+                const Eigen::Vector3d bearing =
+                    chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)]
+                        .calibration.unproject(pixel);
+                if (!bearing.allFinite() || bearing.norm() <= 0.0) {
+                    usable = false;
+                    break;
+                }
+                bearings.push_back(bearing.normalized());
+            }
+            sfm::TriangulationOptions options;
+            options.min_parallax_rad = 0.5 * 3.14159265358979323846 / 180.0;
+            const auto estimate =
+                usable ? sfm::triangulate_multiview(poses, bearings, options)
+                       : std::optional<Eigen::Vector3d>{};
+            if (!estimate || !estimate->allFinite()) {
+                ++markers_skipped;
+                continue;
+            }
+            point = *estimate;
+        }
+        const std::size_t slot = problem.points.size();
+        problem.points.push_back(point);
+        marker_point[m] = slot;
+        for (const auto& [camera, pixel] : projections) {
+            problem.observations.push_back(sfm::BAObservation{camera, slot, pixel});
+        }
+    }
+    // -- control and check points -------------------------------------------
+    // Only a georeferenced chunk can tie a marker reference to the chunk-local
+    // frame. A referenced marker is control unless its meta role is
+    // "check_point"; a point without a reference stays a free point.
+    std::size_t control_markers = 0;
+    std::size_t checkpoint_markers = 0;
+    if (georeferenced) {
+        const Transform inverse = transform.inverse();
+        for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+            const Marker& marker = chunk->markers()[m];
+            if (!marker.reference.has_value() || marker_point[m] == kNoPoint) {
+                continue;
+            }
+            const Eigen::Vector3d& loc = *marker.reference;
+            if (!std::isfinite(loc.x()) || !std::isfinite(loc.y())) {
+                continue;  // no usable horizontal reference
+            }
+            const bool has_alt = std::isfinite(loc.z());
+            const geo::Geodetic geodetic{loc.x(), loc.y(), has_alt ? loc.z() : 0.0};
+            const Eigen::Vector3d ecef = geo::geodetic_to_ecef(geodetic);
+            sfm::BAControlPoint control;
+            control.point = marker_point[m];
+            control.reference =
+                (inverse.block<3, 3>(0, 0) * ecef) + inverse.block<3, 1>(0, 3);
+            // Per-axis accuracy applied along the local axes, exactly as the
+            // camera priors do; metres -> chunk-local units.
+            control.sigma = marker.reference_accuracy / local_scale;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double sigma = control.sigma[axis];
+                if (!std::isfinite(sigma) || sigma <= 0.0) {
+                    control.sigma[axis] = 0.0;  // unconstrained axis
+                }
+            }
+            if (!has_alt) {
+                control.sigma.z() = 0.0;  // no altitude: leave the up axis free
+            }
+            const std::string* role = marker.meta.find("type");
+            control.checkpoint = role != nullptr && *role == "check_point";
+            if (control.checkpoint) {
+                ++checkpoint_markers;
+            } else {
+                ++control_markers;
+            }
+            problem.control_points.push_back(control);
+        }
+    } else {
+        std::size_t ungeoreferenced = 0;
+        for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+            if (chunk->markers()[m].reference.has_value() && marker_point[m] != kNoPoint) {
+                ++ungeoreferenced;
+            }
+        }
+        if (ungeoreferenced > 0) {
+            log(LogLevel::Info)
+                << "OptimizeCameras: markers have references but the chunk is not "
+                   "georeferenced; run georeferencing first";
+        }
+    }
+    // -- scale bars ---------------------------------------------------------
+    // Only marker-to-marker bars with two BA points and a positive measured
+    // length participate. Camera endpoints are a later item. A bar with a
+    // check-point endpoint validates only and contributes no constraint.
+    struct ScalebarEntry {
+        std::size_t index = 0;     ///< index into chunk->scalebars()
+        std::size_t marker_a = 0;  ///< index into chunk->markers()
+        std::size_t marker_b = 0;
+    };
+    std::unordered_map<std::int32_t, std::size_t> marker_by_id;
+    for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+        marker_by_id[chunk->markers()[m].id] = m;
+    }
+    std::vector<ScalebarEntry> scalebar_entry;
+    std::size_t camera_scalebars = 0;
+    std::size_t scalebars_skipped = 0;
+    for (std::size_t s = 0; s < chunk->scalebars().size(); ++s) {
+        const Scalebar& bar = chunk->scalebars()[s];
+        if (bar.from.kind != ScalebarEndpoint::Kind::Marker ||
+            bar.to.kind != ScalebarEndpoint::Kind::Marker) {
+            ++camera_scalebars;  // camera endpoints: not wired yet
+            continue;
+        }
+        const auto from = marker_by_id.find(bar.from.id);
+        const auto to = marker_by_id.find(bar.to.id);
+        if (from == marker_by_id.end() || to == marker_by_id.end() ||
+            marker_point[from->second] == kNoPoint || marker_point[to->second] == kNoPoint) {
+            ++scalebars_skipped;
+            continue;
+        }
+        const std::size_t point_a = marker_point[from->second];
+        const std::size_t point_b = marker_point[to->second];
+        // A bar whose endpoints resolve to the same point carries no direction
+        // and must not fix the scale. A bar without a usable measured length or
+        // accuracy cannot constrain anything either. Each counts once.
+        if (point_a == point_b) {
+            ++scalebars_skipped;
+            continue;
+        }
+        if (!std::isfinite(bar.reference_length_m) || !(bar.reference_length_m > 0.0)) {
+            ++scalebars_skipped;
+            continue;
+        }
+        if (!std::isfinite(bar.reference_accuracy_m) ||
+            !(bar.reference_accuracy_m > 0.0)) {
+            ++scalebars_skipped;
+            continue;
+        }
+        const std::string* role_a = chunk->markers()[from->second].meta.find("type");
+        const std::string* role_b = chunk->markers()[to->second].meta.find("type");
+        sfm::BAScalebar out;
+        out.point_a = point_a;
+        out.point_b = point_b;
+        out.length = bar.reference_length_m / local_scale;  // metres -> local units
+        out.sigma = bar.reference_accuracy_m / local_scale;
+        out.checkpoint = (role_a != nullptr && *role_a == "check_point") ||
+                         (role_b != nullptr && *role_b == "check_point");
+        problem.scalebars.push_back(out);
+        scalebar_entry.push_back({s, from->second, to->second});
+    }
+    if (Log::enabled(LogLevel::Info)) {
+        log(LogLevel::Info) << "OptimizeCameras: "
+                            << (chunk->markers().size() - markers_skipped) << " marker points, "
+                            << markers_skipped
+                            << " markers skipped (non-regular, fewer than 2 projections, or "
+                               "no triangulation; "
+                            << markers_non_regular << " non-regular), "
+                            << control_markers << " control points, " << checkpoint_markers
+                            << " check points, " << problem.scalebars.size() << " scale bars ("
+                            << camera_scalebars << " with a camera endpoint skipped, "
+                            << scalebars_skipped << " skipped)";
+    }
+    progress.update("prepare", 1.0);
+
+    // -- GNSS centre priors (georeferenced chunks only) ---------------------
     if (georeferenced) {
         const Transform inverse = transform.inverse();
         for (std::size_t b = 0; b < camera_index.size(); ++b) {
@@ -259,7 +520,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             sfm::BACentrePrior prior;
             prior.camera = b;
             prior.centre = (inverse.block<3, 3>(0, 0) * ecef) + inverse.block<3, 1>(0, 3);
-            prior.sigma = camera.reference.accuracy;
+            prior.sigma = camera.reference.accuracy / local_scale;
             if (!has_alt) {
                 prior.sigma.z() = 0.0;  // no altitude: leave the up axis unconstrained
             }
@@ -268,15 +529,33 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
 
     // -- gauge --------------------------------------------------------------
-    // Count priors with both horizontal axes constrained and collect their
-    // centres; three non-collinear ones pin the whole similarity, otherwise fall
-    // back to fixing a camera and anchoring the scale.
+    // An anchor can replace the fixed-camera gauge only when it constrains all
+    // three axes: three horizontal-only anchors leave vertical translation a
+    // null direction. Collect the centres of fully constrained priors; three
+    // non-collinear ones pin the whole similarity, otherwise fall back to
+    // fixing a camera and anchoring the scale.
     std::vector<Eigen::Vector3d> prior_centres;
     for (const sfm::BACentrePrior& prior : problem.centre_priors) {
         const bool east = std::isfinite(prior.sigma.x()) && prior.sigma.x() > 0.0;
         const bool north = std::isfinite(prior.sigma.y()) && prior.sigma.y() > 0.0;
-        if (east && north) {
+        const bool up = std::isfinite(prior.sigma.z()) && prior.sigma.z() > 0.0;
+        if (east && north && up) {
             prior_centres.push_back(prior.centre);
+        }
+    }
+
+    // Non-check control points with all three axes constrained count as gauge
+    // anchors alongside the camera priors. Their references are already in
+    // the same chunk-local frame.
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        const bool east = std::isfinite(control.sigma.x()) && control.sigma.x() > 0.0;
+        const bool north = std::isfinite(control.sigma.y()) && control.sigma.y() > 0.0;
+        const bool up = std::isfinite(control.sigma.z()) && control.sigma.z() > 0.0;
+        if (east && north && up) {
+            prior_centres.push_back(control.reference);
         }
     }
 
@@ -286,25 +565,40 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         problem.scale_anchor_camera = -1;
     } else {
         problem.fixed_pose[0] = 1;
-        // Anchor the scale on the aligned camera with the largest baseline to
-        // camera 0 (its centre is farthest).
-        const Eigen::Vector3d centre0 = -problem.poses[0].R.transpose() * problem.poses[0].t;
-        std::size_t anchor = 0;
-        double best = -1.0;
-        for (std::size_t b = 1; b < problem.poses.size(); ++b) {
-            const Eigen::Vector3d centre = -problem.poses[b].R.transpose() * problem.poses[b].t;
-            const double d = (centre - centre0).norm();
-            if (d > best) {
-                best = d;
-                anchor = b;
+        // A real (non-check) scale bar fixes the scale itself, so pinning a
+        // translation component as well would over-constrain the gauge. Every
+        // bar still in problem.scalebars has already passed the degenerate,
+        // length and accuracy filters.
+        bool scalebar_fixes_scale = false;
+        for (const sfm::BAScalebar& bar : problem.scalebars) {
+            if (!bar.checkpoint) {
+                scalebar_fixes_scale = true;
+                break;
             }
         }
-        if (anchor != 0) {
-            problem.scale_anchor_camera = static_cast<int>(anchor);
-            problem.scale_anchor_axis =
-                sfm::choose_scale_anchor_axis(problem.poses[0], problem.poses[anchor]);
+        if (scalebar_fixes_scale) {
+            problem.scale_anchor_camera = -1;
         } else {
-            problem.scale_anchor_camera = -1;  // degenerate: no usable anchor
+            // Anchor the scale on the aligned camera with the largest baseline
+            // to camera 0 (its centre is farthest).
+            const Eigen::Vector3d centre0 = -problem.poses[0].R.transpose() * problem.poses[0].t;
+            std::size_t anchor = 0;
+            double best = -1.0;
+            for (std::size_t b = 1; b < problem.poses.size(); ++b) {
+                const Eigen::Vector3d centre = -problem.poses[b].R.transpose() * problem.poses[b].t;
+                const double d = (centre - centre0).norm();
+                if (d > best) {
+                    best = d;
+                    anchor = b;
+                }
+            }
+            if (anchor != 0) {
+                problem.scale_anchor_camera = static_cast<int>(anchor);
+                problem.scale_anchor_axis =
+                    sfm::choose_scale_anchor_axis(problem.poses[0], problem.poses[anchor]);
+            } else {
+                problem.scale_anchor_camera = -1;  // degenerate: no usable anchor
+            }
         }
     }
 
@@ -332,6 +626,68 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
     }
 
+    // -- markers and scale bars ---------------------------------------------
+    // A check point is re-triangulated after the solve; checkpoint_residuals is
+    // X - reference, so its position is reference + residual. Every other
+    // marker takes its solved point.
+    std::unordered_map<std::size_t, Eigen::Vector3d> rechecked_position;
+    std::size_t check_index = 0;
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (!control.checkpoint) {
+            continue;
+        }
+        if (check_index < report.checkpoint_residuals.size()) {
+            const Eigen::Vector3d& residual = report.checkpoint_residuals[check_index];
+            if (residual.allFinite()) {
+                rechecked_position[control.point] = control.reference + residual;
+            }
+        }
+        ++check_index;
+    }
+    std::size_t marker_points = 0;
+    for (std::size_t m = 0; m < marker_point.size(); ++m) {
+        if (marker_point[m] == kNoPoint) {
+            continue;
+        }
+        ++marker_points;
+        const auto checked = rechecked_position.find(marker_point[m]);
+        staged.markers()[m].position = checked != rechecked_position.end()
+                                           ? checked->second
+                                           : problem.points[marker_point[m]];
+    }
+    for (const ScalebarEntry& entry : scalebar_entry) {
+        const auto& a = staged.markers()[entry.marker_a].position;
+        const auto& b = staged.markers()[entry.marker_b].position;
+        if (a.has_value() && b.has_value()) {
+            staged.scalebars()[entry.index].estimated_length_m =
+                (*a - *b).norm() * local_scale;
+        }
+    }
+
+    // -- report statistics (metres) -----------------------------------------
+    // The solver reports in chunk-local units; multiply by the local->ECEF
+    // scale so the stored and logged values are metres.
+    const double control_rms_m = report.control_rms_m * local_scale;
+    const double checkpoint_rms_m = report.checkpoint_rms_m * local_scale;
+    const double scalebar_rms_m = report.scalebar_rms_m * local_scale;
+    const double checkbar_rms_m = report.checkbar_rms_m * local_scale;
+    staged.meta().set("optimize_cameras.control_rms_m", meta_number(control_rms_m));
+    staged.meta().set("optimize_cameras.checkpoint_rms_m", meta_number(checkpoint_rms_m));
+    staged.meta().set("optimize_cameras.scalebar_rms_m", meta_number(scalebar_rms_m));
+    staged.meta().set("optimize_cameras.checkbar_rms_m", meta_number(checkbar_rms_m));
+    staged.meta().set("optimize_cameras.control_points",
+                      std::to_string(report.control_points));
+    staged.meta().set("optimize_cameras.checkpoints", std::to_string(report.checkpoints));
+    staged.meta().set("optimize_cameras.scalebars", std::to_string(report.scalebars));
+    staged.meta().set("optimize_cameras.checkbars", std::to_string(report.checkbars));
+    staged.meta().set("optimize_cameras.markers", std::to_string(marker_points));
+    staged.meta().set("optimize_cameras.markers_skipped",
+                      std::to_string(chunk->markers().size() - marker_points));
+    staged.meta().set("optimize_cameras.markers_non_regular",
+                      std::to_string(markers_non_regular));
+    staged.meta().set("optimize_cameras.scalebars_skipped",
+                      std::to_string(scalebars_skipped));
+
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
 
@@ -340,7 +696,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                             << report.final_rms_px << " px (" << report.observations
                             << " observations, " << report.iterations << " iterations, prior RMS "
                             << report.prior_rms_sigma << " sigma, " << report.priors
-                            << " prior axes)";
+                            << " prior axes; control RMS " << control_rms_m << " m over "
+                            << report.control_points << ", check-point RMS " << checkpoint_rms_m
+                            << " m over " << report.checkpoints << ", scale-bar RMS "
+                            << scalebar_rms_m << " m over " << report.scalebars << ", check-bar RMS "
+                            << checkbar_rms_m << " m over " << report.checkbars << ")";
     }
 }
 

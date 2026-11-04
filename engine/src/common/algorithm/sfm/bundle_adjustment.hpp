@@ -158,17 +158,18 @@ struct BAReport {
     /// A bar is a check bar when it is flagged `checkpoint` or either endpoint
     /// is a check point; it is scored after re-triangulation, like a check point.
     std::size_t control_points = 0, checkpoints = 0, scalebars = 0, checkbars = 0;
-    /// 3-D RMS of X - reference over non-check control points (metres).
+    /// 3-D RMS of X - reference over non-check control points, in problem
+    /// units (metres when the problem frame is metric).
     double control_rms_m = 0;
     /// 3-D RMS of the re-triangulated X - reference over check control points,
-    /// finite ones only (metres). 0 when there are none.
+    /// finite ones only, in problem units. 0 when there are none.
     double checkpoint_rms_m = 0;
     /// RMS of the length error (|Xa - Xb| - length) over non-check scale bars
-    /// with valid length/sigma (metres). 0 when there are none.
+    /// with valid length/sigma, in problem units. 0 when there are none.
     double scalebar_rms_m = 0;
     /// RMS of the length error over check scale bars, using the re-triangulated
-    /// position of any check endpoint (metres). 0 when there are none, or none
-    /// could be re-triangulated.
+    /// position of any check endpoint, in problem units. 0 when there are none,
+    /// or none could be re-triangulated.
     double checkbar_rms_m = 0;
     /// One residual per check control point, in input order; NaN when that
     /// point has fewer than two usable observations.

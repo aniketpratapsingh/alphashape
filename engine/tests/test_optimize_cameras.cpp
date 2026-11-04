@@ -20,6 +20,9 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
+#include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -32,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include "base/utils/error.hpp"
+#include "base/utils/portable_rng.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/core/document.hpp"
@@ -937,6 +941,594 @@ TEST(Optimize, DistortionTermsFitP3P4) {
                 cal.p3, cal.p4);
     EXPECT_NEAR(cal.p3, 2e-4, 2e-5) << "p3 = " << cal.p3;
     EXPECT_NEAR(cal.p4, -1e-4, 1e-5) << "p4 = " << cal.p4;
+}
+
+// ---------------------------------------------------------------------------
+// Markers and scale bars in OptimizeCameras (WP-13.11b)
+// ---------------------------------------------------------------------------
+
+double meta_value(const Chunk& chunk, const std::string& key) {
+    const std::string* value = chunk.meta().find(key);
+    if (value == nullptr) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::stod(*value);
+}
+
+/// Project a chunk-local point into every aligned camera that sees it, with
+/// optional noise drawn uniformly from [-noise, noise] in both pixel axes. One
+/// rng() call per statement keeps the draw order portable.
+std::vector<MarkerProjection> project_marker(const Chunk& chunk,
+                                             const Eigen::Vector3d& point, double noise,
+                                             std::mt19937& rng) {
+    std::vector<MarkerProjection> projections;
+    for (const Camera& camera : chunk.cameras()) {
+        if (!camera.enabled) {
+            continue;
+        }
+        const Calibration& calibration =
+            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+        const Eigen::Vector3d camera_point =
+            camera.pose.block<3, 3>(0, 0) * point + camera.pose.block<3, 1>(0, 3);
+        Eigen::Vector2d pixel;
+        try {
+            pixel = calibration.project(camera_point);
+        } catch (const ValueError&) {
+            continue;
+        }
+        if (!pixel.allFinite() || pixel.x() < 0.0 ||
+            pixel.x() > static_cast<double>(calibration.width) || pixel.y() < 0.0 ||
+            pixel.y() > static_cast<double>(calibration.height)) {
+            continue;
+        }
+        if (noise > 0.0) {
+            const double dx = rng::uniform_real(rng, -noise, noise);
+            const double dy = rng::uniform_real(rng, -noise, noise);
+            pixel += Eigen::Vector2d(dx, dy);
+        }
+        projections.push_back(MarkerProjection{camera.id, pixel, true});
+    }
+    return projections;
+}
+
+std::int32_t add_marker(Chunk& chunk, const std::vector<MarkerProjection>& projections,
+                        std::optional<Eigen::Vector3d> reference = std::nullopt,
+                        double accuracy_m = 0.02) {
+    Marker marker;
+    marker.id = chunk.allocate_id();
+    marker.valid = true;
+    marker.projections = projections;
+    marker.reference = reference;
+    marker.reference_accuracy = Eigen::Vector3d::Constant(accuracy_m);
+    chunk.markers().push_back(std::move(marker));
+    return chunk.markers().back().id;
+}
+
+struct GeoMarkerScene {
+    Document document;
+    std::vector<Eigen::Vector3d> local_truth;
+    std::vector<Eigen::Vector3d> enu_truth;
+    Transform enu_to_ecef = Transform::Identity();
+};
+
+/// The geo sequence with every camera reference perturbed by up to 3 m per axis
+/// and weighted at 3 m, plus five markers whose references encode the physical
+/// ENU truth. Projections carry 0.3 px uniform noise.
+GeoMarkerScene make_geo_marker_scene(std::uint32_t seed) {
+    GeoMarkerScene scene;
+    scene.document = aligned_document(geo_seq_files());
+    Chunk& chunk = *scene.document.active_chunk();
+    std::mt19937 rng(seed);
+
+    for (Camera& camera : chunk.cameras()) {
+        if (!camera.reference.location.has_value()) {
+            continue;
+        }
+        const Eigen::Vector3d& loc = *camera.reference.location;
+        Eigen::Vector3d ecef =
+            geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
+        const double dx = rng::uniform_real(rng, -3.0, 3.0);
+        const double dy = rng::uniform_real(rng, -3.0, 3.0);
+        const double dz = rng::uniform_real(rng, -3.0, 3.0);
+        ecef += Eigen::Vector3d(dx, dy, dz);
+        const geo::Geodetic noisy = geo::ecef_to_geodetic(ecef);
+        camera.reference.location =
+            Eigen::Vector3d(noisy.longitude_deg, noisy.latitude_deg, noisy.height_m);
+        camera.reference.accuracy = Eigen::Vector3d::Constant(3.0);
+        camera.reference.enabled = true;
+    }
+
+    const TruthOrigin origin = parse_geo_origin("geo_seq_truth.json");
+    const geo::Geodetic true_origin{origin.lon, origin.lat, origin.height};
+    scene.enu_to_ecef = geo::enu_to_ecef(true_origin);
+    const std::vector<GeoTruthImage> truth = parse_geo_images("geo_seq_truth.json");
+    const Transform to_local = chunk.transform().inverse();
+
+    const std::array<std::size_t, 5> images = {0, 2, 4, 6, 7};
+    const std::array<Eigen::Vector3d, 5> offsets = {
+        Eigen::Vector3d(-1.5, 0.5, 9.0), Eigen::Vector3d(1.2, -0.6, 10.0),
+        Eigen::Vector3d(-0.8, 0.8, 11.0), Eigen::Vector3d(1.5, 0.2, 8.5),
+        Eigen::Vector3d(0.3, -0.9, 12.0)};
+    for (std::size_t k = 0; k < images.size(); ++k) {
+        const GeoTruthImage& image = truth[images[k]];
+        const Eigen::Vector3d enu = image.enu_true + image.R.transpose() * offsets[k];
+        const Eigen::Vector3d ecef = apply4(scene.enu_to_ecef, enu);
+        const Eigen::Vector3d local = apply4(to_local, ecef);
+        const geo::Geodetic geodetic = geo::ecef_to_geodetic(ecef);
+        const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
+                                        geodetic.height_m};
+        add_marker(chunk, project_marker(chunk, local, 0.3, rng), reference, 0.02);
+        scene.local_truth.push_back(local);
+        scene.enu_truth.push_back(enu);
+    }
+    return scene;
+}
+
+double mean_camera_error_m(const Chunk& chunk, const std::vector<GeoTruthImage>& truth,
+                           const Transform& enu_to_ecef) {
+    const Transform ecef_to_enu = enu_to_ecef.inverse();
+    double sum = 0.0;
+    for (std::size_t k = 0; k < truth.size(); ++k) {
+        const Eigen::Vector3d ecef =
+            apply4(chunk.transform(), camera_centre(chunk.cameras()[k].pose));
+        const Eigen::Vector3d enu = apply4(ecef_to_enu, ecef);
+        sum += (enu - truth[k].enu_true).norm();
+    }
+    return sum / static_cast<double>(truth.size());
+}
+
+TEST(OptimizeMarkers, GcpsImproveAccuracy) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261104u);
+    Chunk& chunk = *scene.document.active_chunk();
+    ASSERT_EQ(chunk.markers().size(), 5U);
+    for (const Marker& marker : chunk.markers()) {
+        ASSERT_GE(marker.projections.size(), 2U);
+    }
+    const std::vector<GeoTruthImage> truth = parse_geo_images("geo_seq_truth.json");
+    const Chunk baseline = chunk;
+
+    run_optimize_cameras(scene.document);
+    Chunk& solved = *scene.document.active_chunk();
+    double worst_marker = 0.0;
+    for (std::size_t m = 0; m < solved.markers().size(); ++m) {
+        ASSERT_TRUE(solved.markers()[m].position.has_value());
+        worst_marker = std::max(
+            worst_marker, (*solved.markers()[m].position - scene.local_truth[m]).norm());
+    }
+    const double with_error = mean_camera_error_m(solved, truth, scene.enu_to_ecef);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
+
+    chunk = baseline;
+    chunk.markers().clear();
+    run_optimize_cameras(scene.document);
+    const double without_error =
+        mean_camera_error_m(*scene.document.active_chunk(), truth, scene.enu_to_ecef);
+
+    std::printf(
+        "[optimize_markers] gcps: worst marker %.4f m, mean camera centre %.4f m "
+        "(without markers %.4f m)\n",
+        worst_marker, with_error, without_error);
+    EXPECT_LT(worst_marker, 0.1);
+    EXPECT_LT(with_error, without_error);
+}
+
+TEST(OptimizeMarkers, CheckPointNotUsed) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261105u);
+    Chunk& chunk = *scene.document.active_chunk();
+    chunk.markers()[0].meta.set("type", "check_point");
+    const Chunk baseline = chunk;
+
+    run_optimize_cameras(scene.document);
+    std::vector<Transform> poses;
+    for (const Camera& camera : chunk.cameras()) {
+        poses.push_back(camera.pose);
+    }
+    const double rms_first = meta_value(chunk, "optimize_cameras.checkpoint_rms_m");
+
+    chunk = baseline;
+    chunk.markers()[0].reference->z() += 10.0;
+    run_optimize_cameras(scene.document);
+    double worst_pose_change = 0.0;
+    for (std::size_t k = 0; k < chunk.cameras().size(); ++k) {
+        worst_pose_change = std::max(
+            worst_pose_change, (chunk.cameras()[k].pose - poses[k]).cwiseAbs().maxCoeff());
+    }
+    const double rms_moved = meta_value(chunk, "optimize_cameras.checkpoint_rms_m");
+
+    // The held-out marker is written back from its re-triangulated position, so
+    // it must follow the projections (the true point), not the moved reference.
+    ASSERT_TRUE(chunk.markers()[0].position.has_value());
+    const double truth_error =
+        (*chunk.markers()[0].position - scene.local_truth[0]).norm();
+
+    std::printf(
+        "[optimize_markers] check point: worst pose change %.3e, checkpoint RMS %.4f -> "
+        "%.4f m, position error %.4f m\n",
+        worst_pose_change, rms_first, rms_moved, truth_error);
+    EXPECT_LE(worst_pose_change, 1e-9);
+    EXPECT_GT(rms_moved, 5.0);
+    EXPECT_LT(truth_error, 0.05) << "check marker followed the moved reference";
+}
+
+TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_LT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+
+    // Two well-observed tie points; normalise the reconstruction so the pair is
+    // exactly 10 units apart, then start the solve at half that scale. A global
+    // similarity leaves every projection unchanged, so the marker observations
+    // stay valid across both rescalings.
+    std::vector<Eigen::Vector3d> candidates;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            candidates.push_back(*track.point);
+        }
+        if (candidates.size() == 64) {
+            break;
+        }
+    }
+    ASSERT_GE(candidates.size(), 2U);
+    std::size_t far = 1;
+    double best = -1.0;
+    for (std::size_t i = 1; i < candidates.size(); ++i) {
+        const double d = (candidates[i] - candidates[0]).squaredNorm();
+        if (d > best) {
+            best = d;
+            far = i;
+        }
+    }
+    ASSERT_GT(best, 0.0);
+    const double to_ten = 10.0 / std::sqrt(best);
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= to_ten;
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= to_ten;
+        }
+    }
+    const Eigen::Vector3d truth_a = candidates[0] * to_ten;
+    const Eigen::Vector3d truth_b = candidates[far] * to_ten;
+
+    std::mt19937 rng(20261106u);
+    const std::int32_t id_a = add_marker(chunk, project_marker(chunk, truth_a, 0.0, rng));
+    const std::int32_t id_b = add_marker(chunk, project_marker(chunk, truth_b, 0.0, rng));
+    ASSERT_GE(chunk.markers()[0].projections.size(), 2U);
+    ASSERT_GE(chunk.markers()[1].projections.size(), 2U);
+
+    Scalebar bar;
+    bar.id = chunk.allocate_id();
+    bar.from = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_a};
+    bar.to = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_b};
+    bar.reference_length_m = 10.0;
+    bar.reference_accuracy_m = 0.001;
+    chunk.scalebars().push_back(bar);
+
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5;  // start at half the true scale
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5;
+        }
+    }
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    ASSERT_TRUE(solved.markers()[0].position.has_value());
+    ASSERT_TRUE(solved.markers()[1].position.has_value());
+    const double scale =
+        std::cbrt(std::abs(solved.transform().block<3, 3>(0, 0).determinant()));
+    const double distance =
+        (*solved.markers()[0].position - *solved.markers()[1].position).norm() * scale;
+    const double estimated = solved.scalebars()[0].estimated_length_m;
+
+    std::printf("[optimize_markers] scale bar: %.6f m (estimated %.6f m)\n", distance,
+                estimated);
+    EXPECT_LT(std::abs(distance - 10.0), 1e-3 * 10.0);
+    EXPECT_NEAR(estimated, distance, 1e-9);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
+}
+
+TEST(OptimizeMarkers, SelfReferencingScalebarIsSkipped) {
+    // A bar whose two endpoints are the same marker has no length signal. It
+    // must be counted as skipped and must NOT free the scale gauge, so the
+    // solve has to match the same scene without the bar.
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_LT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+
+    std::mt19937 rng(20261110u);
+    std::int32_t marker_id = -1;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        std::vector<MarkerProjection> projections =
+            project_marker(chunk, *track.point, 0.0, rng);
+        if (projections.size() < 2U) {
+            continue;
+        }
+        marker_id = add_marker(chunk, projections);
+        break;
+    }
+    ASSERT_GE(marker_id, 0);
+    const Chunk no_bar = chunk;
+
+    Scalebar bar;
+    bar.id = chunk.allocate_id();
+    bar.from = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, marker_id};
+    bar.to = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, marker_id};
+    bar.reference_length_m = 10.0;
+    bar.reference_accuracy_m = 0.001;
+    chunk.scalebars().push_back(bar);
+
+    run_optimize_cameras(document);
+    std::vector<Transform> with_bar;
+    for (const Camera& camera : chunk.cameras()) {
+        with_bar.push_back(camera.pose);
+    }
+    const double skipped = meta_value(chunk, "optimize_cameras.scalebars_skipped");
+    const double used = meta_value(chunk, "optimize_cameras.scalebars");
+
+    chunk = no_bar;
+    run_optimize_cameras(document);
+    double worst = 0.0;
+    for (std::size_t k = 0; k < chunk.cameras().size(); ++k) {
+        worst = std::max(worst,
+                         (chunk.cameras()[k].pose - with_bar[k]).cwiseAbs().maxCoeff());
+    }
+    std::printf("[optimize_markers] self-referencing bar: skipped %g, used %g, "
+                "worst solve difference %.3e\n",
+                skipped, used, worst);
+    EXPECT_EQ(skipped, 1.0);
+    EXPECT_EQ(used, 0.0);
+    EXPECT_LE(worst, 1e-9) << "the degenerate bar changed the solve (scale anchor lost)";
+}
+
+TEST(OptimizeMarkers, ScalebarReportsMetresAtLocalScaleTwo) {
+    // The same bar-and-markers scene as ScalebarSetsScaleWithoutGeoref, but the
+    // chunk frame's local unit is half a metre (linear part x2). The computed
+    // length is a metric quantity, so it must come back as 10 m, not 5.
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_LT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+
+    std::vector<Eigen::Vector3d> candidates;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            candidates.push_back(*track.point);
+        }
+        if (candidates.size() == 64) {
+            break;
+        }
+    }
+    ASSERT_GE(candidates.size(), 2U);
+    std::size_t far = 1;
+    double best = -1.0;
+    for (std::size_t i = 1; i < candidates.size(); ++i) {
+        const double d = (candidates[i] - candidates[0]).squaredNorm();
+        if (d > best) {
+            best = d;
+            far = i;
+        }
+    }
+    ASSERT_GT(best, 0.0);
+    const double to_ten = 10.0 / std::sqrt(best);
+
+    // Local unit = 0.5 m: transform x2, every local position x0.5.
+    chunk.transform().block<3, 3>(0, 0) *= 2.0;
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5 * to_ten;
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5 * to_ten;
+        }
+    }
+    const Eigen::Vector3d truth_a = candidates[0] * 0.5 * to_ten;
+    const Eigen::Vector3d truth_b = candidates[far] * 0.5 * to_ten;
+
+    std::mt19937 rng(20261112u);
+    const std::int32_t id_a = add_marker(chunk, project_marker(chunk, truth_a, 0.0, rng));
+    const std::int32_t id_b = add_marker(chunk, project_marker(chunk, truth_b, 0.0, rng));
+    ASSERT_GE(chunk.markers()[0].projections.size(), 2U);
+    ASSERT_GE(chunk.markers()[1].projections.size(), 2U);
+
+    Scalebar bar;
+    bar.id = chunk.allocate_id();
+    bar.from = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_a};
+    bar.to = ScalebarEndpoint{ScalebarEndpoint::Kind::Marker, id_b};
+    bar.reference_length_m = 10.0;
+    bar.reference_accuracy_m = 0.001;
+    chunk.scalebars().push_back(bar);
+
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5;  // start at half the true scale
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5;
+        }
+    }
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    ASSERT_TRUE(solved.markers()[0].position.has_value());
+    ASSERT_TRUE(solved.markers()[1].position.has_value());
+    const double local_scale =
+        std::cbrt(std::abs(solved.transform().block<3, 3>(0, 0).determinant()));
+    const double distance =
+        (*solved.markers()[0].position - *solved.markers()[1].position).norm() * local_scale;
+    const double estimated = solved.scalebars()[0].estimated_length_m;
+
+    std::printf("[optimize_markers] scale bar at s=2: %.6f m (estimated %.6f m)\n",
+                distance, estimated);
+    EXPECT_NEAR(local_scale, 2.0, 1e-12);
+    EXPECT_LT(std::abs(distance - 10.0), 1e-3 * 10.0);
+    EXPECT_LT(std::abs(estimated - 10.0), 1e-3 * 10.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
+}
+
+TEST(OptimizeMarkers, NotGeoreferencedSkipsControl) {
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    const geo::Geodetic origin{7.0, 45.0, 300.0};  // arbitrary: the chunk is local
+    std::mt19937 rng(20261107u);
+    std::size_t added = 0;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value() || added == 3) {
+            continue;
+        }
+        const Eigen::Vector3d local = *track.point;
+        const geo::Geodetic geodetic = geo::enu_to_geodetic(local, origin);
+        const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
+                                        geodetic.height_m};
+        add_marker(chunk, project_marker(chunk, local, 0.0, rng), reference, 0.05);
+        ++added;
+    }
+    ASSERT_EQ(added, 3U);
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    std::printf(
+        "[optimize_markers] non-georeferenced: %g control points, %g marker points\n",
+        meta_value(solved, "optimize_cameras.control_points"),
+        meta_value(solved, "optimize_cameras.markers"));
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 0.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.checkpoints"), 0.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers"), 3.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
+    for (const Marker& marker : solved.markers()) {
+        ASSERT_TRUE(marker.position.has_value());
+        EXPECT_TRUE(marker.position->allFinite());
+    }
+}
+
+TEST(OptimizeMarkers, NonRegularMarkersSkippedAndDuplicatesDeduped) {
+    Document document = aligned_document(cal_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    std::mt19937 rng(20261111u);
+
+    std::vector<MarkerProjection> projections;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        projections = project_marker(chunk, *track.point, 0.0, rng);
+        if (projections.size() >= 2U) {
+            break;
+        }
+    }
+    ASSERT_GE(projections.size(), 2U);
+
+    add_marker(chunk, projections);
+    // A repeated projection of the same camera must not double-weight a residual.
+    chunk.markers()[0].projections.push_back(chunk.markers()[0].projections.front());
+    add_marker(chunk, projections);
+    chunk.markers()[1].type = MarkerType::Vertex;
+    add_marker(chunk, projections);
+    chunk.markers()[2].type = MarkerType::Fiducial;
+
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+    std::printf("[optimize_markers] marker types: %g points, %g non-regular, "
+                "%g skipped, %g bars skipped\n",
+                meta_value(solved, "optimize_cameras.markers"),
+                meta_value(solved, "optimize_cameras.markers_non_regular"),
+                meta_value(solved, "optimize_cameras.markers_skipped"),
+                meta_value(solved, "optimize_cameras.scalebars_skipped"));
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers"), 1.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_non_regular"), 2.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 2.0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.scalebars_skipped"), 0.0);
+    ASSERT_TRUE(solved.markers()[0].position.has_value());
+    EXPECT_TRUE(solved.markers()[0].position->allFinite());
+    EXPECT_FALSE(solved.markers()[1].position.has_value());
+    EXPECT_FALSE(solved.markers()[2].position.has_value());
+}
+
+TEST(OptimizeMarkers, UnitScaleRespected) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261108u);
+    Chunk& chunk = *scene.document.active_chunk();
+    const Chunk baseline = chunk;
+
+    run_optimize_cameras(scene.document);
+    const double rms_one = meta_value(chunk, "optimize_cameras.control_rms_m");
+    ASSERT_GT(rms_one, 0.0);
+
+    // Same scene expressed in a chunk frame whose local unit is half a metre:
+    // the transform's linear part doubles and every local position halves, so
+    // every pixel and every normalised residual is unchanged. The reported
+    // RMS must therefore be in metres in both runs.
+    chunk = baseline;
+    chunk.transform().block<3, 3>(0, 0) *= 2.0;
+    for (Camera& camera : chunk.cameras()) {
+        camera.pose.block<3, 1>(0, 3) *= 0.5;
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point *= 0.5;
+        }
+    }
+    run_optimize_cameras(scene.document);
+    const double rms_two = meta_value(chunk, "optimize_cameras.control_rms_m");
+
+    std::printf("[optimize_markers] unit scale: control RMS %.9f m (s=1) vs %.9f m (s=2)\n",
+                rms_one, rms_two);
+    EXPECT_TRUE(std::isfinite(rms_two));
+    EXPECT_LT(std::abs(rms_two - rms_one), 1e-6 * rms_one);
+}
+
+TEST(OptimizeMarkers, HorizontalOnlyControlKeepsGauge) {
+    // Horizontal-only anchors (no altitude) cannot replace the fixed-camera
+    // gauge: three of them would leave vertical translation free. With no GNSS
+    // priors at all the task must keep camera 0 fully fixed and stay finite.
+    Document document = aligned_document(geo_seq_files());
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_GT((chunk.transform() - Transform::Identity()).cwiseAbs().maxCoeff(), 1e-9);
+    for (Camera& camera : chunk.cameras()) {
+        camera.reference.enabled = false;  // no centre priors
+    }
+
+    const TruthOrigin origin = parse_geo_origin("geo_seq_truth.json");
+    const geo::Geodetic enu_origin{origin.lon, origin.lat, origin.height};
+    std::mt19937 rng(20261109u);
+    std::size_t added = 0;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value() || added == 4) {
+            continue;
+        }
+        const Eigen::Vector3d local = *track.point;
+        const geo::Geodetic geodetic = geo::enu_to_geodetic(local, enu_origin);
+        const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
+                                        std::numeric_limits<double>::quiet_NaN()};
+        add_marker(chunk, project_marker(chunk, local, 0.0, rng), reference, 0.05);
+        ++added;
+    }
+    ASSERT_EQ(added, 4U);
+
+    const Transform pose0_before = chunk.cameras()[0].pose;
+    run_optimize_cameras(document);
+    Chunk& solved = *document.active_chunk();
+
+    const double pose0_move =
+        (solved.cameras()[0].pose - pose0_before).cwiseAbs().maxCoeff();
+    std::printf("[optimize_markers] horizontal-only control: camera 0 move %.3e, "
+                "markers %g skipped %g\n",
+                pose0_move, meta_value(solved, "optimize_cameras.markers"),
+                meta_value(solved, "optimize_cameras.markers_skipped"));
+    EXPECT_LE(pose0_move, 1e-12) << "camera 0 was not held as the gauge";
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.markers_skipped"), 0.0);
+    for (const Camera& camera : solved.cameras()) {
+        EXPECT_TRUE(camera.pose.allFinite());
+    }
+    for (const Marker& marker : solved.markers()) {
+        ASSERT_TRUE(marker.position.has_value());
+        EXPECT_TRUE(marker.position->allFinite());
+    }
 }
 
 }  // namespace alphashape
