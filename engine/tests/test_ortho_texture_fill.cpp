@@ -159,7 +159,7 @@ TEST(TextureFill, ReproducesTexture) {
             << "the mean-colour initialisation should be almost flat";
     }
     EXPECT_LT(texture_mae, mean_mae);
-    std::printf("[TextureFill.ReproducesTexture] std in %.2f %.2f %.2f vs out %.2f %.2f %.2f; "
+    std::printf("[texture fill] std in %.2f %.2f %.2f vs out %.2f %.2f %.2f; "
                 "MAE texture %.2f vs mean %.2f; %.3f s\n",
                 inside.stddev[0], inside.stddev[1], inside.stddev[2], texture.stddev[0],
                 texture.stddev[1], texture.stddev[2], texture_mae, mean_mae, seconds);
