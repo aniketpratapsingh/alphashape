@@ -456,5 +456,44 @@ TEST(Georeference, ProjectedMarkerCrsRefused) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 9. Coincident references are degenerate and leave the chunk untouched
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, IdenticalReferencesRefused) {
+    Scene scene;
+    scene.marker_count = 5;
+    Chunk chunk = make_scene(scene);
+    const Eigen::Vector3d location = *chunk.markers()[0].reference;
+    for (Marker& marker : chunk.markers()) {
+        marker.reference = location;
+    }
+
+    const Transform transform_before = chunk.transform();
+    std::vector<Eigen::Vector3d> positions_before;
+    for (const Marker& marker : chunk.markers()) {
+        positions_before.push_back(*marker.position);
+    }
+    std::vector<Transform> poses_before;
+    for (const Camera& camera : chunk.cameras()) {
+        poses_before.push_back(camera.pose);
+    }
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+
+    EXPECT_FALSE(report.applied);
+    EXPECT_NE(report.reason.find("degenerate"), std::string::npos) << report.reason;
+    EXPECT_LT((chunk.transform() - transform_before).cwiseAbs().maxCoeff(), 1e-12);
+    for (std::size_t i = 0; i < chunk.markers().size(); ++i) {
+        ASSERT_TRUE(chunk.markers()[i].position.has_value());
+        EXPECT_LT((*chunk.markers()[i].position - positions_before[i]).norm(), 1e-12)
+            << "marker " << i;
+    }
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        EXPECT_LT((chunk.cameras()[i].pose - poses_before[i]).cwiseAbs().maxCoeff(), 1e-12)
+            << "camera " << i;
+    }
+}
+
 }  // namespace
 }  // namespace alphashape

@@ -305,8 +305,11 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         if (!all_finite(loc)) {
             continue;
         }
-        samples.push_back(
-            {camera_centre(camera.pose), loc, sigma_of(camera.reference.accuracy), -1});
+        const Eigen::Vector3d centre = camera_centre(camera.pose);
+        if (!all_finite(centre)) {
+            continue;  // a garbage pose contributes no usable source point
+        }
+        samples.push_back({centre, loc, sigma_of(camera.reference.accuracy), -1});
     }
     // (b) Regular control markers with a position and a full reference. Check
     // points are held out of the fit and measured only after it.
@@ -316,8 +319,8 @@ GeoreferenceReport update_transform(Chunk& chunk) {
             continue;
         }
         const Eigen::Vector3d& loc = *marker.reference;
-        if (!all_finite(loc)) {
-            continue;
+        if (!all_finite(loc) || !all_finite(*marker.position)) {
+            continue;  // non-finite source/derived positions poison every fit
         }
         const std::string* role = marker.meta.find("type");
         if (role != nullptr && *role == "check_point") {
@@ -389,8 +392,12 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         c.reference_enu = (ecef_to_local * ecef.homogeneous()).head<3>();
     }
 
-    if (!points_not_collinear(source)) {
-        report.reason = "reference points are collinear";
+    // Both sides must hold a non-degenerate configuration: the sources are the
+    // chunk-local points the similarity acts on, the destinations the ENU
+    // positions it must reproduce. Either being collinear (or coincident)
+    // leaves the rotation/scale under-determined.
+    if (!points_not_collinear(source) || !points_not_collinear(reference_enu)) {
+        report.reason = "reference positions are degenerate (collinear or coincident)";
         return report;
     }
 
@@ -440,16 +447,24 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         in_weight.push_back(weights[i]);
     }
     if (in_source.size() < 3) {
-        report.reason = "reference points are collinear";
+        report.reason = "fewer than 3 reference inliers after the robust fit";
         return report;
     }
     const std::optional<Similarity> refit =
         estimate_similarity_weighted(in_source, in_reference, in_weight);
     if (!refit.has_value()) {
-        report.reason = "reference points are collinear";
+        report.reason = "similarity fit failed";
         return report;
     }
     const Similarity& s = *refit;
+
+    // A weighted refit can still produce a degenerate similarity (zero/NaN
+    // scale, non-finite rotation or translation). Never let it reach the chunk.
+    if (!(s.scale > 0.0) || !std::isfinite(s.scale) || !s.R.allFinite() ||
+        !s.t.allFinite()) {
+        report.reason = "similarity fit failed";
+        return report;
+    }
 
     // Composite similarity applied to the STORED local coordinates: T = S o map.
     const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
