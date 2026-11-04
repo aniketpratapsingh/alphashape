@@ -61,7 +61,7 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
     const double ax = rng::uniform_real(engine, -0.90, 0.90);
     const double ay = rng::uniform_real(engine, -0.70, 0.70);
     const double az = rng::uniform_real(engine, -0.80, 0.80);
-    const double depth = rng::uniform_real(engine, 0.50, 0.70);
+    const double depth = rng::uniform_real(engine, 0.30, 0.42);
     const Eigen::Matrix3d rotation =
         (Eigen::AngleAxisd(az, Eigen::Vector3d::UnitZ()) *
          Eigen::AngleAxisd(ay, Eigen::Vector3d::UnitY()) *
@@ -72,8 +72,8 @@ CalibrationView make_view(std::mt19937& engine, int camera_id, bool partial) {
         0.5 * static_cast<double>(kRows) * kSquare, 0.0);
     Eigen::Vector3d translation =
         -rotation * centre + Eigen::Vector3d(0.0, 0.0, depth);
-    translation.x() += rng::uniform_real(engine, -0.18, 0.18);
-    translation.y() += rng::uniform_real(engine, -0.10, 0.10);
+    translation.x() += rng::uniform_real(engine, -0.07, 0.07);
+    translation.y() += rng::uniform_real(engine, -0.045, 0.045);
     const int quarter_turns = partial ? static_cast<int>(rng::uniform_below(engine, 3U))
                                       : 0;
     CalibrationView view;
