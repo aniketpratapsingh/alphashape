@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <string>
 #include <unordered_map>
@@ -279,6 +280,17 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         const std::vector<int>& row_begin = jacobian.rows;
         const std::vector<int>& entry_cols = jacobian.cols;
         const std::vector<double>& entry_values = jacobian.values;
+        std::fprintf(stderr,
+                     "[cov] cols=%d layout_total=%d reduced=%d blocks=%zu points=%zu "
+                     "registered=%zu rows=%d\n",
+                     jacobian.num_cols, layout.total, layout.reduced,
+                     layout.blocks.size(), point_count, eval_blocks.size(), row_count);
+        if (jacobian.num_cols != layout.total) {
+            out.reason = "covariance computation failed: Jacobian has " +
+                         std::to_string(jacobian.num_cols) +
+                         " columns, expected " + std::to_string(layout.total);
+            return out;
+        }
 
         // Hpp for every point, from its own three Jacobian columns.
         std::vector<Eigen::Matrix3d> point_normal(point_count,
@@ -317,6 +329,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
         // Drop rank-deficient point blocks (for example a point seen by one
         // camera) together with their contribution to the normal equations.
         std::vector<std::uint8_t> point_included(point_count, 0);
+        std::size_t included_count = 0;
         for (std::size_t p = 0; p < point_count; ++p) {
             if (layout.point_start[p] < 0) {
                 continue;
@@ -327,6 +340,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             const double smallest = eigen.eigenvalues().minCoeff();
             if (largest > 0.0 && smallest > kPointRankTolerance * largest) {
                 point_included[p] = 1;
+                ++included_count;
             } else {
                 ++out.points_dropped;
             }
@@ -409,6 +423,13 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             block_sizes[b] = layout.blocks[b].size;
         }
         BlockMap accumulator;
+        const auto accumulator_norm = [&accumulator]() {
+            double sum = 0.0;
+            for (const auto& entry : accumulator) {
+                sum += entry.second.cwiseAbs().sum();
+            }
+            return sum;
+        };
         for (int r = 0; r < row_count; ++r) {
             if (row_included[static_cast<std::size_t>(r)] == 0) {
                 continue;
@@ -443,6 +464,7 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 }
             }
         }
+        const double hcc_norm = accumulator_norm();
         struct PointWork {
             std::size_t point = 0;
             Eigen::Matrix3d inverse = Eigen::Matrix3d::Zero();
@@ -545,6 +567,11 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
                 point_work.push_back(std::move(work));
             }
         }
+        std::fprintf(stderr,
+                     "[cov] included=%zu work=%zu accum_blocks=%zu dropped=%zu "
+                     "hcc_norm=%g schur_norm=%g\n",
+                     included_count, point_work.size(), accumulator.size(),
+                     out.points_dropped, hcc_norm, accumulator_norm());
         Eigen::SparseMatrix<double> normal;
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
         if (layout.reduced > 0) {
@@ -583,6 +610,8 @@ CovarianceOutput compute_covariance(ceres::Problem& problem,
             }
             const auto& diagonal = ldlt.vectorD();
             const double largest = diagonal.cwiseAbs().maxCoeff();
+            std::fprintf(stderr, "[cov] pivot_ratio=%g\n",
+                         largest > 0.0 ? diagonal.minCoeff() / largest : 0.0);
             if (!(largest > 0.0) ||
                 diagonal.minCoeff() <= kPointRankTolerance * largest) {
                 out.reason =
