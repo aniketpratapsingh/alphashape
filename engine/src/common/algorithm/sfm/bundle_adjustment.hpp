@@ -141,8 +141,9 @@ struct BAOptions {
 
     /// Posterior covariance (Triggs et al. 2000, "Bundle Adjustment -- A Modern
     /// Synthesis", sec. 4): sigma0^2 * (J^T J)^-1 at the solution, computed for
-    /// selected blocks only with ceres::Covariance. Off by default: a solve with
-    /// every flag false does no covariance work and is bit-identical.
+    /// selected blocks only by Schur-complement elimination of the point
+    /// columns. Off by default: a solve with every flag false does no
+    /// covariance work and is bit-identical.
     bool compute_camera_covariance = false;
     bool compute_point_covariance = false;
     bool compute_calibration_covariance = false;
