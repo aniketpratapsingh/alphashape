@@ -162,14 +162,20 @@ void upsample_holes(const Level& coarse, Level& fine) {
 /// Flood-fill one 4-connected component of `mask` from `seed_cell`, marking
 /// `visited`. Returns the cells in discovery order (irrelevant to the result;
 /// the component's raster-first cell is the caller's seed) and its inclusive
-/// bounding box.
+/// bounding box. The flood fill ALWAYS finishes, marking every cell visited so
+/// the caller never rescans it, but it stops storing cells once the component
+/// exceeds `max_cells`: `exceeded` is then set and the returned vector is
+/// emptied. The stored vector therefore never grows past the cap, which is what
+/// keeps a huge component's memory bounded.
 std::vector<std::size_t> collect_component(int width, int height,
                                            const std::vector<std::uint8_t>& mask,
                                            std::vector<std::uint8_t>& visited,
-                                           std::size_t seed_cell, int& min_x, int& max_x,
+                                           std::size_t seed_cell, std::size_t max_cells,
+                                           bool& exceeded, int& min_x, int& max_x,
                                            int& min_y, int& max_y) {
     std::vector<std::size_t> component;
     std::vector<std::size_t> stack;
+    exceeded = false;
     stack.push_back(seed_cell);
     visited[seed_cell] = 1;
     const int seed_x = static_cast<int>(seed_cell % static_cast<std::size_t>(width));
@@ -179,13 +185,21 @@ std::vector<std::size_t> collect_component(int width, int height,
     while (!stack.empty()) {
         const std::size_t cell = stack.back();
         stack.pop_back();
-        component.push_back(cell);
         const int x = static_cast<int>(cell % static_cast<std::size_t>(width));
         const int y = static_cast<int>(cell / static_cast<std::size_t>(width));
         min_x = std::min(min_x, x);
         max_x = std::max(max_x, x);
         min_y = std::min(min_y, y);
         max_y = std::max(max_y, y);
+        if (!exceeded) {
+            if (component.size() == max_cells) {
+                exceeded = true;
+                component.clear();
+                component.shrink_to_fit();
+            } else {
+                component.push_back(cell);
+            }
+        }
         const int nx[4] = {x - 1, x + 1, x, x};
         const int ny[4] = {y, y, y - 1, y + 1};
         for (int k = 0; k < 4; ++k) {
@@ -536,11 +550,13 @@ TextureFillReport texture_fill(int width, int height, std::vector<std::uint8_t>&
         int max_x = 0;
         int min_y = 0;
         int max_y = 0;
+        bool exceeded = false;
         const std::vector<std::size_t> component = collect_component(
-            width, height, fill_mask, visited, first, min_x, max_x, min_y, max_y);
+            width, height, fill_mask, visited, first,
+            static_cast<std::size_t>(options.max_component_cells), exceeded, min_x, max_x,
+            min_y, max_y);
         ++report.components;
-        if (component.size() >
-            static_cast<std::size_t>(options.max_component_cells)) {
+        if (exceeded) {
             ++report.skipped_large;
             continue;
         }
