@@ -423,6 +423,10 @@ TEST(Optimize, CheckPointTriangulationInvertsDistortion) {
                                                     Eigen::Vector3d(3.0, 0.0, 0.0),
                                                     Eigen::Vector3d(0.0, 0.0, -3.0)};
     const Eigen::Vector3d x = Eigen::Vector3d(0.4, -0.3, 0.15);
+    // A second, free point keeps every camera block and the intrinsics block in
+    // the problem (Ceres refuses to mark an unregistered block constant); the
+    // check point itself still contributes no solve residual.
+    const Eigen::Vector3d x2 = Eigen::Vector3d(-0.25, 0.2, -0.1);
 
     BAProblem problem;
     problem.calibrations.assign(centres.size(), cal);
@@ -441,9 +445,13 @@ TEST(Optimize, CheckPointTriangulationInvertsDistortion) {
         problem.fixed_pose.push_back(1);
     }
     problem.points.push_back(x);
+    problem.points.push_back(x2);
     for (std::size_t cam = 0; cam < centres.size(); ++cam) {
-        const Eigen::Vector3d p_cam = problem.poses[cam].R * x + problem.poses[cam].t;
+        const BAPose& pose = problem.poses[cam];
+        const Eigen::Vector3d p_cam = pose.R * x + pose.t;
+        const Eigen::Vector3d p2_cam = pose.R * x2 + pose.t;
         problem.observations.push_back(BAObservation{cam, 0, cal.project(p_cam)});
+        problem.observations.push_back(BAObservation{cam, 1, cal.project(p2_cam)});
     }
     BAControlPoint cp;
     cp.point = 0;
