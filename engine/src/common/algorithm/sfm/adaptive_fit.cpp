@@ -98,7 +98,8 @@ double cost_of(const BAReport& report) {
 void set_free_mask(BAProblem& problem,
                    const std::vector<std::array<bool, kCalibrationParamCount>>& sensor_allowed,
                    const std::array<bool, kCalibrationParamCount>& active) {
-    problem.fit_intrinsics.assign(sensor_allowed.size(), {});
+    problem.fit_intrinsics.assign(
+        sensor_allowed.size(), std::array<bool, kCalibrationParamCount>{});
     for (std::size_t s = 0; s < sensor_allowed.size(); ++s) {
         for (int k = 0; k < kCalibrationParamCount; ++k) {
             const std::size_t kk = static_cast<std::size_t>(k);
@@ -129,7 +130,7 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     // Per-sensor allowed set: the problem's own masks (fit_X and fixed_params
     // already applied by the caller) intersected with the task-level mask.
     std::vector<std::array<bool, kCalibrationParamCount>> sensor_allowed(
-        problem.calibrations.size(), {});
+        problem.calibrations.size(), std::array<bool, kCalibrationParamCount>{});
     for (std::size_t s = 0; s < sensor_allowed.size(); ++s) {
         for (int k = 0; k < kCalibrationParamCount; ++k) {
             const std::size_t kk = static_cast<std::size_t>(k);
