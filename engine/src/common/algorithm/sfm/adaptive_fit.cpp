@@ -67,8 +67,20 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     std::array<bool, kCalibrationParamCount> base = {};
     base[0] = base[1] = base[2] = base[5] = true;  // f, cx, cy, k1
 
+    // Selection solves never compute posterior covariance: it would be paid on
+    // every candidate and thrown away. The caller's request is remembered and
+    // served once on the final accepted state (see the end of this function).
+    BAOptions solve_options = options.solve_options;
+    const bool want_covariance =
+        solve_options.compute_camera_covariance ||
+        solve_options.compute_point_covariance ||
+        solve_options.compute_calibration_covariance;
+    solve_options.compute_camera_covariance = false;
+    solve_options.compute_point_covariance = false;
+    solve_options.compute_calibration_covariance = false;
+
     set_free_mask(problem, sensor_allowed, base);
-    BAReport report = bundle_adjust(problem, BAOptions{});
+    BAReport report = bundle_adjust(problem, solve_options);
     result.solves = 1;
     if (!report.usable || !report.cost_valid) {
         throw Error(
@@ -108,7 +120,7 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
 
         const BAProblem saved = problem;
         set_free_mask(problem, sensor_allowed, next);
-        const BAReport candidate = bundle_adjust(problem, BAOptions{});
+        const BAReport candidate = bundle_adjust(problem, solve_options);
         ++result.solves;
         bool accept = false;
         if (candidate.usable && candidate.cost_valid &&
@@ -146,6 +158,27 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
                 result.selected[kk] = true;
             }
         }
+    }
+    // Posterior covariance is computed once, on the accepted state only. Reusing
+    // bundle_adjust keeps the problem construction (free masks, manifolds and
+    // robust losses) identical to the selection solves. It is a covariance
+    // pass rather than a new selection solve, so it is not counted in solves.
+    // The pass is evaluation-only (max_iterations = 0): a real re-solve would
+    // round-trip the accepted poses through angle-axis and move them by ~1e-16,
+    // so the geometry is restored exactly and only the covariance fields are
+    // taken from that pass.
+    if (want_covariance) {
+        const BAProblem accepted_state = problem;
+        BAOptions covariance_options = options.solve_options;
+        covariance_options.max_iterations = 0;
+        const BAReport covariance_report = bundle_adjust(problem, covariance_options);
+        problem = accepted_state;
+        report.covariance_valid = covariance_report.covariance_valid;
+        report.covariance_reason = covariance_report.covariance_reason;
+        report.sigma0_squared = covariance_report.sigma0_squared;
+        report.camera_covariance = covariance_report.camera_covariance;
+        report.point_covariance = covariance_report.point_covariance;
+        report.calibration_covariance = covariance_report.calibration_covariance;
     }
     result.report = report;
     return result;

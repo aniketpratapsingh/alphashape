@@ -39,6 +39,10 @@ struct AdaptiveFitOptions {
     /// variance. It keeps a near-zero cost (noise-free or degenerate data) from
     /// making every group look overwhelmingly significant. Our starting value.
     double min_residual_px = 0.05;
+    /// Options forwarded to every bundle_adjust solve. Callers that want the
+    /// final report's posterior covariance set the covariance flags here; the
+    /// default (all off) changes nothing.
+    BAOptions solve_options;
 };
 
 struct AdaptiveFitResult {
