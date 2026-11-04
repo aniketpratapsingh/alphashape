@@ -3,6 +3,7 @@
 
 #include "common/algorithm/sfm/adaptive_fit.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <vector>
@@ -76,6 +77,13 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     double accepted_cost = cost_of(report);
     std::array<bool, kCalibrationParamCount> accepted = base;
 
+    // The cost is 0.5 * sum rho(r^2) with r in pixels, so a residual variance
+    // floor of min_residual_px^2 contributes 0.5 * min_residual_px^2 per
+    // degree of freedom. Without the floor a noise-free cost of zero makes
+    // every candidate look infinitely significant.
+    const double min_variance =
+        0.5 * options.min_residual_px * options.min_residual_px;
+
     for (const std::array<int, 2>& group : kCandidateGroups) {
         std::array<bool, kCalibrationParamCount> next = accepted;
         std::size_t new_parameters = 0;
@@ -109,8 +117,9 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
             if (candidate_cost < accepted_cost) {
                 const std::size_t dof =
                     candidate.residual_count - candidate.free_parameter_count;
-                const double statistic = (accepted_cost - candidate_cost) /
-                                         (candidate_cost / static_cast<double>(dof));
+                const double variance = std::max(
+                    candidate_cost / static_cast<double>(dof), min_variance);
+                const double statistic = (accepted_cost - candidate_cost) / variance;
                 const bool significant =
                     statistic >= options.lr_threshold_per_param *
                                      static_cast<double>(new_parameters);

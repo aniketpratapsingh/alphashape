@@ -21,11 +21,24 @@ namespace alphashape::sfm {
 /// Gates for accepting a candidate group. These are our starting values, chosen
 /// from the self-calibration literature and the likelihood-ratio test at about
 /// 3 sigma; they are expected to be tuned on the benchmark.
+///
+/// The gate is an approximate likelihood-ratio test: (C0 - C1) / sigma2 is
+/// compared with a chi-square threshold scaled by the group size. It is only
+/// approximate because the objective uses robust losses (Cauchy on image
+/// residuals, Huber on priors), so the statistic is not exactly chi-square.
+/// The reweighting is deliberately not undone: the same robust objective is
+/// minimised and compared for every candidate (cf. Förstner & Wrobel,
+/// Photogrammetric Computer Vision, 2016, ch. 4).
 struct AdaptiveFitOptions {
-    /// Accept only if (C0 - C1) / (C1 / dof) >= lr_threshold_per_param * group_size.
+    /// Accept only if (C0 - C1) / sigma2 >= lr_threshold_per_param * group_size,
+    /// where sigma2 is the residual variance estimate of the candidate solve.
     double lr_threshold_per_param = 9.0;
     /// Accept only if (C0 - C1) / C0 >= min_relative_gain.
     double min_relative_gain = 0.005;
+    /// Smallest residual RMS, in pixels, used when estimating the candidate's
+    /// variance. It keeps a near-zero cost (noise-free or degenerate data) from
+    /// making every group look overwhelmingly significant. Our starting value.
+    double min_residual_px = 0.05;
 };
 
 struct AdaptiveFitResult {
