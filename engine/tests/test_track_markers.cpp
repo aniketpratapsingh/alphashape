@@ -14,11 +14,13 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
+#include "common/algorithm/markers/detect_markers_task.hpp"
 #include "common/algorithm/markers/track_markers_task.hpp"
 #include "common/commands/command.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/marker.hpp"
+#include "image/io/image_io.hpp"
 #include "make_marker_sequence.hpp"
 
 namespace alphashape {
@@ -249,6 +251,22 @@ TEST(Markers, TrackRedetectRecovers) {
     spec.occluded_target = 0;
     MarkerSequence scene = make_marker_sequence(spec);
     const std::vector<std::int32_t> ids = seed_all(scene, 0);
+    // The redetection path depends on the decoder, so first prove that the
+    // rendered target is decodable at all: same style, same code.
+    const FloatImage probe = read_image(scene.frames[1].path).to_luminance();
+    const std::vector<ImageDetection> probe_detections =
+        detect_targets_in_image(probe, "Circular12");
+    bool code_found = false;
+    for (const ImageDetection& detection : probe_detections) {
+        code_found = code_found ||
+                     (detection.coded &&
+                      detection.code == scene.targets[0].code);
+    }
+    std::printf("[track redetect] frame 1 detections %zu, expected code %d, "
+                "found %d\n",
+                probe_detections.size(), scene.targets[0].code,
+                code_found ? 1 : 0);
+    ASSERT_TRUE(code_found);
     TrackMarkersOptions options = base_options();
     options.redetect = true;
     // LK cannot meet a 0.001 px forward-backward bound under this noise, so

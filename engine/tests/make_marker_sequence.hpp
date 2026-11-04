@@ -210,9 +210,9 @@ inline void write_gray_png_with_time(
 
 /// Deterministic, continuous ground texture in world coordinates.
 inline float sequence_ground_shade(double x, double z) {
-    const double wave = 0.11 * std::sin(41.0 * x + 0.6) +
-                        0.09 * std::cos(33.0 * z - 0.3) +
-                        0.06 * std::sin(57.0 * (x + z));
+    const double wave = 0.04 * std::sin(41.0 * x + 0.6) +
+                        0.03 * std::cos(33.0 * z - 0.3) +
+                        0.02 * std::sin(57.0 * (x + z));
     const auto hash = [](int ix, int iz) {
         std::uint32_t value = static_cast<std::uint32_t>(ix) * 73856093U ^
                               static_cast<std::uint32_t>(iz) * 19349663U;
@@ -221,9 +221,12 @@ inline float sequence_ground_shade(double x, double z) {
         value ^= value >> 15;
         return static_cast<double>(value & 0xffffU) / 65535.0 - 0.5;
     };
-    const double grain = 0.10 * hash(static_cast<int>(std::floor(x * 55.0)),
+    const double grain = 0.04 * hash(static_cast<int>(std::floor(x * 55.0)),
                                      static_cast<int>(std::floor(z * 55.0)));
-    return static_cast<float>(std::clamp(0.5 + wave + grain, 0.08, 0.92));
+    // Light, paper-like ground keeps the coded target's dark outer border
+    // separated from its quiet zone, which is what the decoder assumes.
+    return static_cast<float>(
+        std::clamp(0.78 + wave + grain, 0.66, 0.90));
 }
 
 /// Target intensity at a world point, or nullopt when the point is ground.
@@ -421,7 +424,7 @@ inline MarkerSequence make_marker_sequence(const MarkerSequenceSpec& spec) {
         MarkerSequenceTarget target;
         target.cross = i == 3;
         target.centre = positions[i];
-        target.radius = 0.042;
+        target.radius = 0.060;
         target.rotation = 0.21 * static_cast<double>(i);
         if (!target.cross) {
             const int index =
