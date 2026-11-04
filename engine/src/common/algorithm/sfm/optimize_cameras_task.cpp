@@ -632,7 +632,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
     } else {
         report = sfm::bundle_adjust(problem, sfm::BAOptions{});
-    }    if (!report.usable) {
+    }
+    if (!report.usable) {
         throw Error("OptimizeCameras: bundle adjustment did not produce a usable solution");
     }
     progress.update("optimize", 1.0);
@@ -714,10 +715,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                       std::to_string(markers_non_regular));
     staged.meta().set("optimize_cameras.scalebars_skipped",
                       std::to_string(scalebars_skipped));
-    if (adaptive_fitting) {
-        staged.meta().set("optimize.adaptive_selected", adaptive_selected);
-        staged.meta().set("optimize.adaptive_solves", std::to_string(adaptive_solves));
-    }
+    // Always written, even when adaptive fitting is off, so a previous run's
+    // selection cannot survive on the chunk.
+    staged.meta().set("optimize_cameras.adaptive_selected", adaptive_selected);
+    staged.meta().set("optimize_cameras.adaptive_solves",
+                      std::to_string(adaptive_solves));
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);
