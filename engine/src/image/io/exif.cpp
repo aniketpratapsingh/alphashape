@@ -672,8 +672,8 @@ std::optional<std::vector<std::uint8_t>> stream_jpeg_exif(std::ifstream& in) {
         if (marker == 0xDA || marker == 0xD9) {  // SOS / EOI
             return std::nullopt;
         }
-        if (marker >= 0xD0 && marker <= 0xD7) {  // RSTn
-            continue;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;  // TEM and RSTn carry no length
         }
         std::uint8_t length_bytes[2];
         if (!in.read(reinterpret_cast<char*>(length_bytes), 2)) {
