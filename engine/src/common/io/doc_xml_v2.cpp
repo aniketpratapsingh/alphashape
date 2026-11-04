@@ -299,11 +299,21 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
         set_attr(e, "orientation", std::to_string(c.orientation));
         set_attr(e, "transform", matrix4(c.pose));
         // Posterior covariances (WP-13.13b). Written only when non-zero, so a
-        // project without covariance is byte-identical to an older build's.
+        // project without covariance is byte-identical to an older build's. A
+        // non-finite matrix is refused here rather than written and then
+        // rejected by our own reader.
         if (!covariance_is_zero(c.location_covariance)) {
+            if (!covariance_is_finite(c.location_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": location_covariance is not finite");
+            }
             set_attr(e, "location_covariance", covariance9(c.location_covariance));
         }
         if (!covariance_is_zero(c.rotation_covariance)) {
+            if (!covariance_is_finite(c.rotation_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": rotation_covariance is not finite");
+            }
             set_attr(e, "rotation_covariance", covariance9(c.rotation_covariance));
         }
         // A reference is written only when a location was set. z may be nan

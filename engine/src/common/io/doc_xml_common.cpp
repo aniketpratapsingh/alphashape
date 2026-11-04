@@ -665,6 +665,9 @@ void write_calibration(const Calibration& c, XmlNode& parent) {
     values.reserve(static_cast<std::size_t>(c.covariance.size()));
     for (Eigen::Index r = 0; r < c.covariance.rows(); ++r) {
         for (Eigen::Index col = 0; col < c.covariance.cols(); ++col) {
+            if (!std::isfinite(c.covariance(r, col))) {
+                throw ProjectIOError("calibration covariance: value is not finite");
+            }
             values.push_back(c.covariance(r, col));
         }
     }
