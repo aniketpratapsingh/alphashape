@@ -58,10 +58,12 @@ const std::vector<Eigen::Vector3d>& truth_enu() {
     return points;
 }
 
-/// Four non-collinear true ENU camera centres.
+/// Six non-collinear true ENU camera centres (the first four cover the older
+/// scenes; the last two let a coarse-camera case use distinct positions).
 const std::vector<Eigen::Vector3d>& camera_truth_enu() {
     static const std::vector<Eigen::Vector3d> points = {
-        {-15.0, -15.0, 3.0}, {15.0, -14.0, 2.0}, {14.0, 15.0, 3.5}, {-14.0, 16.0, 1.0}};
+        {-15.0, -15.0, 3.0}, {15.0, -14.0, 2.0}, {14.0, 15.0, 3.5},
+        {-14.0, 16.0, 1.0},  {0.0, -17.0, 2.5},  {0.0, 17.0, 1.5}};
     return points;
 }
 
@@ -116,6 +118,7 @@ struct Scene {
     std::size_t camera_count = 4;
     bool camera_references = false;
     double camera_accuracy = 5.0;
+    double marker_accuracy = 0.01;
     std::vector<Eigen::Vector3d> camera_noise;  ///< per camera, ENU metres
     std::size_t check_index = kNoIndex;
     std::vector<std::pair<std::size_t, Eigen::Vector3d>> marker_offsets;
@@ -155,7 +158,7 @@ Chunk make_scene(const Scene& scene) {
             }
         }
         marker.reference = geodetic_of(reference);
-        marker.reference_accuracy = Eigen::Vector3d::Constant(0.01);
+        marker.reference_accuracy = Eigen::Vector3d::Constant(scene.marker_accuracy);
         marker.meta.set("type", i == scene.check_index ? "check_point" : "gcp");
         chunk.markers().push_back(marker);
     }
@@ -492,6 +495,38 @@ TEST(Georeference, IdenticalReferencesRefused) {
     for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
         EXPECT_LT((chunk.cameras()[i].pose - poses_before[i]).cwiseAbs().maxCoeff(), 1e-12)
             << "camera " << i;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Per-point gate: coarse cameras stay in, a marker blunder goes out
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, PerPointGateRejectsBlunderWithCoarseCameras) {
+    Scene scene;
+    scene.marker_count = 5;
+    scene.camera_count = 6;
+    scene.camera_references = true;
+    scene.camera_accuracy = 10.0;   // coarse, but their centres are noise-free
+    scene.marker_accuracy = 0.02;
+    scene.marker_offsets = {{4, Eigen::Vector3d(20.0, 0.0, 0.0)}};
+    Chunk chunk = make_scene(scene);
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+
+    // A global max() threshold would have dropped every 10 m camera or admitted
+    // the 20 m blunder; the per-point gate keeps the cameras and drops marker 4.
+    ASSERT_EQ(report.rejected_markers.size(), 1U);
+    EXPECT_EQ(report.rejected_markers[0], 4);
+    EXPECT_EQ(report.control_points_used, 4U);
+    EXPECT_EQ(report.cameras_used, 6U);
+
+    const std::vector<Eigen::Vector3d> references = reference_points(scene);
+    for (std::size_t i = 0; i < 4; ++i) {
+        ASSERT_TRUE(chunk.markers()[i].position.has_value());
+        const Eigen::Vector3d expected = expected_new_frame(truth_enu()[i], references);
+        EXPECT_LT((*chunk.markers()[i].position - expected).norm(), 0.05) << "marker " << i;
     }
 }
 

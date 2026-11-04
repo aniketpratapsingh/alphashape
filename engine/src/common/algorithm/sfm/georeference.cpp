@@ -401,70 +401,92 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         return report;
     }
 
-    // -- threshold: max(camera rule, 5 x median marker sigma, 0.05 m) --------
-    std::vector<double> horizontal;
-    for (const Camera& camera : chunk.cameras()) {
-        if (!camera.enabled || !camera.reference.enabled ||
-            !camera.reference.location.has_value() ||
-            !all_finite(*camera.reference.location)) {
-            continue;
-        }
-        const Eigen::Vector3d& a = camera.reference.accuracy;
-        const double h = std::hypot(a.x(), a.y());
-        horizontal.push_back(std::isfinite(h) && h > 0.0 ? h : kFallbackHorizontalAccuracy);
-    }
-    std::vector<double> marker_sigmas;
+    // -- initial model: RANSAC with one global band --------------------------
+    // The band only seeds the initial inlier set. A single global threshold
+    // cannot serve both tight markers and coarse camera references, so the
+    // final mask comes from the per-point gate below.
+    std::vector<double> sigmas;
+    sigmas.reserve(samples.size());
     for (const Sample& s : samples) {
-        if (s.marker_id >= 0) {
-            marker_sigmas.push_back(s.sigma);
-        }
+        sigmas.push_back(s.sigma);
     }
-    double threshold = 0.05;
-    if (!horizontal.empty()) {
-        threshold = std::max(threshold, std::max(0.5, 5.0 * median(horizontal)));
-    }
-    if (!marker_sigmas.empty()) {
-        threshold = std::max(threshold, 5.0 * median(marker_sigmas));
-    }
+    const double threshold = std::max(0.05, 5.0 * median(sigmas));
 
     constexpr std::uint64_t kSeed = 0x5eed;
     const SimilarityRansacResult ransac =
         estimate_similarity_ransac(source, reference_enu, threshold, kSeed);
+    if (!ransac.similarity.has_value()) {
+        report.reason = "similarity fit failed";
+        return report;
+    }
 
-    // -- refit on the inliers with the per-point weights ---------------------
-    std::vector<Eigen::Vector3d> in_source;
-    std::vector<Eigen::Vector3d> in_reference;
-    std::vector<double> in_weight;
-    for (std::size_t i = 0; i < source.size(); ++i) {
-        if (ransac.inliers[i] == 0) {
-            if (samples[i].marker_id >= 0) {
-                report.rejected_markers.push_back(samples[i].marker_id);
+    // Weighted refit on `mask`, rejecting a degenerate result. `reason` lets
+    // the caller tell "too few points" from a numerical failure.
+    const auto refit_on = [&](const std::vector<std::uint8_t>& mask,
+                              std::string& reason) -> std::optional<Similarity> {
+        std::vector<Eigen::Vector3d> in_source;
+        std::vector<Eigen::Vector3d> in_reference;
+        std::vector<double> in_weight;
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            if (mask[i] == 0) {
+                continue;
             }
-            continue;
+            in_source.push_back(source[i]);
+            in_reference.push_back(reference_enu[i]);
+            in_weight.push_back(weights[i]);
         }
-        in_source.push_back(source[i]);
-        in_reference.push_back(reference_enu[i]);
-        in_weight.push_back(weights[i]);
-    }
-    if (in_source.size() < 3) {
-        report.reason = "fewer than 3 reference inliers after the robust fit";
-        return report;
-    }
-    const std::optional<Similarity> refit =
-        estimate_similarity_weighted(in_source, in_reference, in_weight);
-    if (!refit.has_value()) {
-        report.reason = "similarity fit failed";
-        return report;
-    }
-    const Similarity& s = *refit;
+        if (in_source.size() < 3) {
+            reason = "fewer than 3 reference inliers after the robust fit";
+            return std::nullopt;
+        }
+        const std::optional<Similarity> fit =
+            estimate_similarity_weighted(in_source, in_reference, in_weight);
+        if (!fit.has_value() || !(fit->scale > 0.0) || !std::isfinite(fit->scale) ||
+            !fit->R.allFinite() || !fit->t.allFinite()) {
+            reason = "similarity fit failed";
+            return std::nullopt;
+        }
+        return fit;
+    };
 
-    // A weighted refit can still produce a degenerate similarity (zero/NaN
-    // scale, non-finite rotation or translation). Never let it reach the chunk.
-    if (!(s.scale > 0.0) || !std::isfinite(s.scale) || !s.R.allFinite() ||
-        !s.t.allFinite()) {
-        report.reason = "similarity fit failed";
+    // -- per-point gate: refit, reclassify, stop when the mask settles -------
+    // Each sample's own sigma decides whether it is an inlier; the 0.05 m floor
+    // keeps exact references from being rejected by round-off.
+    std::vector<std::uint8_t> mask(source.size(), 0);
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        mask[i] = ransac.inliers[i] != 0 ? 1 : 0;
+    }
+    std::string fail_reason;
+    std::optional<Similarity> fitted = refit_on(mask, fail_reason);
+    if (!fitted.has_value()) {
+        report.reason = fail_reason;
         return report;
     }
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        std::vector<std::uint8_t> next(source.size(), 0);
+        std::size_t inliers = 0;
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            const double gate = std::max(5.0 * samples[i].sigma, 0.05);
+            if ((fitted->apply(source[i]) - reference_enu[i]).norm() <= gate) {
+                next[i] = 1;
+                ++inliers;
+            }
+        }
+        if (inliers < 3) {
+            report.reason = "fewer than 3 reference inliers after the robust fit";
+            return report;
+        }
+        if (next == mask) {
+            break;  // `fitted` was computed on exactly this mask
+        }
+        mask = next;
+        fitted = refit_on(mask, fail_reason);
+        if (!fitted.has_value()) {
+            report.reason = fail_reason;
+            return report;
+        }
+    }
+    const Similarity& s = *fitted;
 
     // Composite similarity applied to the STORED local coordinates: T = S o map.
     const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
@@ -474,9 +496,14 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     t_sim.R = s.R * map_r;
     t_sim.t = s.scale * (s.R * map_t) + s.t;
 
+    // -- report from the FINAL mask ------------------------------------------
     double sum_sq = 0.0;
+    std::size_t inlier_count = 0;
     for (std::size_t i = 0; i < source.size(); ++i) {
-        if (ransac.inliers[i] == 0) {
+        if (mask[i] == 0) {
+            if (samples[i].marker_id >= 0) {
+                report.rejected_markers.push_back(samples[i].marker_id);
+            }
             continue;
         }
         sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
@@ -485,10 +512,11 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         } else {
             ++report.cameras_used;
         }
+        ++inlier_count;
     }
-    report.rms_control_m = std::sqrt(sum_sq / static_cast<double>(in_source.size()));
+    report.rms_control_m = std::sqrt(sum_sq / static_cast<double>(inlier_count));
     report.references_total = samples.size();
-    report.references_used = in_source.size();
+    report.references_used = inlier_count;
     report.rms_error_m = report.rms_control_m;
 
     // -- apply uniformly, including every marker position -------------------
