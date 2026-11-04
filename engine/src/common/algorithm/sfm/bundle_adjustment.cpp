@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 // Ceres (and its Eigen/glog/suite-sparse headers) is pulled in here only — never
@@ -151,10 +152,155 @@ private:
 /// solution.
 constexpr double kPriorLossScaleSigma = 3.0;
 
+/// An axis with sigma <= 0 or non-finite is unconstrained.
+bool valid_sigma(double s) { return std::isfinite(s) && s > 0.0; }
+
+/// True when `point` is flagged in checkpoint_point (and the map is present).
+bool is_check_point(const BAProblem& problem, std::size_t point) {
+    return point < problem.checkpoint_point.size() && problem.checkpoint_point[point] != 0;
+}
+
+/// A scale bar takes part in the solve only when it is not itself a check bar,
+/// neither endpoint is a check point, and its length/sigma are usable.
+bool scalebar_active(const BAProblem& problem, const BAScalebar& bar) {
+    return !bar.checkpoint && !is_check_point(problem, bar.point_a) &&
+           !is_check_point(problem, bar.point_b) && std::isfinite(bar.length) &&
+           bar.length > 0.0 && valid_sigma(bar.sigma);
+}
+
+/// Residual for a known 3-D position. Acts on the point block only; an axis
+/// whose sigma is <= 0 or non-finite is left 0 and contributes nothing.
+struct ControlPointCost {
+    ControlPointCost(const Eigen::Vector3d& reference, const Eigen::Vector3d& sigma)
+        : reference_(reference), sigma_(sigma) {}
+
+    template <typename T>
+    bool operator()(const T* const point, T* residual) const {
+        for (int k = 0; k < 3; ++k) {
+            const double s = sigma_[k];
+            residual[k] = valid_sigma(s) ? (point[k] - T(reference_[k])) / T(s) : T(0);
+        }
+        return true;
+    }
+
+private:
+    Eigen::Vector3d reference_;
+    Eigen::Vector3d sigma_;
+};
+
+/// Residual for a measured distance between two points, with an analytic
+/// Jacobian (the residual itself lives in detail::scalebar_residual_and_jacobian
+/// so tests can compare it with autodiff).
+class ScalebarCost : public ceres::SizedCostFunction<1, 3, 3> {
+public:
+    ScalebarCost(double length, double sigma) : length_(length), sigma_(sigma) {}
+
+    bool Evaluate(const double* const* parameters, double* residuals,
+                  double** jacobians) const override {
+        detail::scalebar_residual_and_jacobian(
+            parameters[0], parameters[1], length_, sigma_, residuals,
+            jacobians == nullptr ? nullptr : jacobians[0],
+            jacobians == nullptr ? nullptr : jacobians[1]);
+        return true;
+    }
+
+private:
+    double length_ = 0.0;
+    double sigma_ = 0.001;
+};
+
 /// Calibration index for a camera: the sensor map when present, else the camera
 /// index itself (the pre-existing one-calibration-per-camera layout).
 std::size_t sensor_index(const BAProblem& problem, std::size_t camera) {
     return problem.camera_sensor.empty() ? camera : problem.camera_sensor[camera];
+}
+
+/// Triangulate one point from its observations with the final poses, using the
+/// linear pinhole DLT (2x3 normal equations per observation). Distortion terms
+/// are ignored: check points are only scored, never allowed to move the solve.
+/// Returns false for fewer than two usable observations or a degenerate system.
+bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vector3d* out) {
+    Eigen::Matrix3d ata = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d atb = Eigen::Vector3d::Zero();
+    std::size_t used = 0;
+    for (const BAObservation& obs : problem.observations) {
+        if (obs.point != point) {
+            continue;
+        }
+        const Calibration& cal = problem.calibrations[sensor_index(problem, obs.camera)];
+        if (!std::isfinite(cal.f) || cal.f == 0.0) {
+            continue;
+        }
+        const double xn = (obs.pixel.x() - cal.cx) / cal.f;
+        const double yn = (obs.pixel.y() - cal.cy) / cal.f;
+        const BAPose& pose = problem.poses[obs.camera];
+        const Eigen::Vector3d r0 = pose.R.row(0).transpose();
+        const Eigen::Vector3d r1 = pose.R.row(1).transpose();
+        const Eigen::Vector3d r2 = pose.R.row(2).transpose();
+        const Eigen::Vector3d row_a = xn * r2 - r0;
+        const Eigen::Vector3d row_b = yn * r2 - r1;
+        const double rhs_a = pose.t.x() - xn * pose.t.z();
+        const double rhs_b = pose.t.y() - yn * pose.t.z();
+        ata += row_a * row_a.transpose() + row_b * row_b.transpose();
+        atb += row_a * rhs_a + row_b * rhs_b;
+        ++used;
+    }
+    if (used < 2) {
+        return false;
+    }
+    const Eigen::Vector3d x = ata.ldlt().solve(atb);
+    if (!x.allFinite()) {
+        return false;
+    }
+    *out = x;
+    return true;
+}
+
+/// Fill the control/check/scale-bar part of the report from the final state.
+/// Check points are re-triangulated from their observations; one with fewer
+/// than two observations gets a NaN residual and is left out of the RMS.
+void fill_constraint_report(const BAProblem& problem, BAReport* report) {
+    double control_sq = 0.0;
+    double check_sq = 0.0;
+    std::size_t control_n = 0;
+    std::size_t check_n = 0;
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (!cp.checkpoint) {
+            ++report->control_points;
+            control_sq += (problem.points[cp.point] - cp.reference).squaredNorm();
+            ++control_n;
+            continue;
+        }
+        ++report->checkpoints;
+        Eigen::Vector3d x;
+        if (!triangulate_point(problem, cp.point, &x)) {
+            report->checkpoint_residuals.push_back(
+                Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
+            continue;
+        }
+        const Eigen::Vector3d r = x - cp.reference;
+        report->checkpoint_residuals.push_back(r);
+        check_sq += r.squaredNorm();
+        ++check_n;
+    }
+    double bar_sq = 0.0;
+    std::size_t bar_n = 0;
+    for (const BAScalebar& bar : problem.scalebars) {
+        if (!scalebar_active(problem, bar)) {
+            continue;
+        }
+        ++report->scalebars;
+        const double e =
+            (problem.points[bar.point_a] - problem.points[bar.point_b]).norm() - bar.length;
+        bar_sq += e * e;
+        ++bar_n;
+    }
+    const auto rms = [](double sum_sq, std::size_t n) {
+        return n == 0 ? 0.0 : std::sqrt(sum_sq / static_cast<double>(n));
+    };
+    report->control_rms_m = rms(control_sq, control_n);
+    report->checkpoint_rms_m = rms(check_sq, check_n);
+    report->scalebar_rms_m = rms(bar_sq, bar_n);
 }
 
 /// Number of constrained prior axes (finite sigma > 0) over every prior.
@@ -192,6 +338,48 @@ double prior_rms_sigma(const BAProblem& problem) {
 }
 
 }  // namespace
+
+namespace detail {
+
+void scalebar_residual_and_jacobian(const double* a, const double* b, double length,
+                                    double sigma, double* residual, double* jac_a,
+                                    double* jac_b) {
+    const double d0 = a[0] - b[0];
+    const double d1 = a[1] - b[1];
+    const double d2 = a[2] - b[2];
+    const double dist = std::sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const bool usable = dist > 1e-12 && std::isfinite(dist) && valid_sigma(sigma) &&
+                        std::isfinite(length) && length > 0.0;
+    if (!usable) {
+        residual[0] = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            if (jac_a != nullptr) {
+                jac_a[k] = 0.0;
+            }
+            if (jac_b != nullptr) {
+                jac_b[k] = 0.0;
+            }
+        }
+        return;
+    }
+    residual[0] = (dist - length) / sigma;
+    const double factor = 1.0 / (dist * sigma);
+    const double g0 = d0 * factor;
+    const double g1 = d1 * factor;
+    const double g2 = d2 * factor;
+    if (jac_a != nullptr) {
+        jac_a[0] = g0;
+        jac_a[1] = g1;
+        jac_a[2] = g2;
+    }
+    if (jac_b != nullptr) {
+        jac_b[0] = -g0;
+        jac_b[1] = -g1;
+        jac_b[2] = -g2;
+    }
+}
+
+}  // namespace detail
 
 double reprojection_rms_px(const BAProblem& problem) {
     if (problem.observations.empty()) {
@@ -289,17 +477,37 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
             throw ValueError("bundle_adjust: scale_anchor_axis out of range");
         }
     }
+    if (!problem.checkpoint_point.empty() &&
+        problem.checkpoint_point.size() != problem.points.size()) {
+        throw ValueError("bundle_adjust: checkpoint_point.size() != points.size()");
+    }
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (cp.point >= problem.points.size()) {
+            throw ValueError("bundle_adjust: control point index out of range");
+        }
+        if (!cp.checkpoint && is_check_point(problem, cp.point)) {
+            throw ValueError("bundle_adjust: control point refers to a check point");
+        }
+    }
+    for (const BAScalebar& bar : problem.scalebars) {
+        if (bar.point_a >= problem.points.size() || bar.point_b >= problem.points.size()) {
+            throw ValueError("bundle_adjust: scale bar point index out of range");
+        }
+    }
 
     BAReport report;
     report.observations = problem.observations.size();
     report.priors = count_prior_axes(problem);
     const bool has_priors = !problem.centre_priors.empty();
-    if ((problem.observations.empty() && !has_priors) ||
-        (problem.points.empty() && !has_priors) || num_cameras == 0) {
+    const bool has_constraints =
+        has_priors || !problem.control_points.empty() || !problem.scalebars.empty();
+    if ((problem.observations.empty() && !has_constraints) ||
+        (problem.points.empty() && !has_constraints) || num_cameras == 0) {
         report.usable = true;
         report.initial_rms_px = reprojection_rms_px(problem);
         report.final_rms_px = report.initial_rms_px;
         report.prior_rms_sigma = prior_rms_sigma(problem);
+        fill_constraint_report(problem, &report);
         return report;
     }
 
@@ -343,6 +551,10 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     ceres::Problem ceres_problem;
 
     for (const BAObservation& obs : problem.observations) {
+        // Check points must have zero influence on the estimate.
+        if (is_check_point(problem, obs.point)) {
+            continue;
+        }
         const std::size_t sensor = sensor_index(problem, obs.camera);
         const Calibration& cal = problem.calibrations[sensor];
         auto* cost = new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 3, kCalibrationParamCount>(
@@ -356,6 +568,34 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
             new CentrePriorCost(prior.centre, prior.sigma));
         ceres_problem.AddResidualBlock(cost, prior_loss, cam_blocks[prior.camera].data(),
                                        cam_blocks[prior.camera].data() + 3);
+    }
+
+    // Control points and scale bars share the priors' robust loss (Huber, 3
+    // sigma in sigma units). The Problem owns the loss; allocate lazily so no
+    // block-free run leaks one.
+    ceres::LossFunction* constraint_loss = nullptr;
+    const auto constraint_loss_ptr = [&constraint_loss]() -> ceres::LossFunction* {
+        if (constraint_loss == nullptr) {
+            constraint_loss = new ceres::HuberLoss(kPriorLossScaleSigma);
+        }
+        return constraint_loss;
+    };
+    for (const BAControlPoint& cp : problem.control_points) {
+        if (cp.checkpoint) {
+            continue;
+        }
+        auto* cost = new ceres::AutoDiffCostFunction<ControlPointCost, 3, 3>(
+            new ControlPointCost(cp.reference, cp.sigma));
+        ceres_problem.AddResidualBlock(cost, constraint_loss_ptr(), point_blocks[cp.point].data());
+    }
+    for (const BAScalebar& bar : problem.scalebars) {
+        if (!scalebar_active(problem, bar)) {
+            continue;
+        }
+        auto* cost = new ScalebarCost(bar.length, bar.sigma);
+        ceres_problem.AddResidualBlock(cost, constraint_loss_ptr(),
+                                       point_blocks[bar.point_a].data(),
+                                       point_blocks[bar.point_b].data());
     }
 
     // ---- Gauge fixes -----------------------------------------------------
@@ -468,6 +708,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     report.iterations = static_cast<int>(summary.iterations.size());
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
+    fill_constraint_report(problem, &report);
     return report;
 }
 
