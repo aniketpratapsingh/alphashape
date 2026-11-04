@@ -20,6 +20,12 @@
 //     camera is held fully constant and the scale is anchored on the aligned
 //     camera with the largest baseline to it (choose_scale_anchor_axis).
 //
+//   * Markers: every marker with >= 2 enabled projections in aligned cameras
+//     becomes a BA point whose observations are its projections. A referenced
+//     marker becomes a control point (or a check point, held out of the solve)
+//     when the chunk is georeferenced. Scale bars between marker points enter as
+//     BAScalebar constraints and fix scale even in a non-georeferenced chunk.
+//
 // Everything is computed into a staged copy and committed with one move, so an
 // exception anywhere leaves the chunk untouched.
 
@@ -30,6 +36,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -42,6 +50,7 @@
 #include "base/utils/log.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
+#include "common/algorithm/sfm/triangulation.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 
@@ -238,6 +247,82 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                 sfm::BAObservation{camera->second, point->second,
                                    keypoint_to_pixel(set->keypoints[observation.keypoint_index])});
         }
+    }
+    // -- marker points and their image observations -------------------------
+    // A marker with at least two enabled projections in aligned cameras becomes
+    // one BA point. Its projections are stored in the Calibration pixel
+    // convention (top-left pixel centre (0.5, 0.5)), the same convention as
+    // BAObservation, so they are copied without the keypoint +0.5 shift.
+    constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
+    std::size_t markers_skipped = 0;
+    for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
+        const Marker& marker = chunk->markers()[m];
+        std::vector<std::pair<std::size_t, Eigen::Vector2d>> projections;
+        for (const MarkerProjection& projection : marker.projections) {
+            if (!projection.enabled || !projection.pixel.allFinite()) {
+                continue;
+            }
+            const auto camera = camera_slot.find(projection.camera_id);
+            if (camera == camera_slot.end()) {
+                continue;  // not aligned: not part of this refinement
+            }
+            projections.emplace_back(camera->second, projection.pixel);
+        }
+        if (projections.size() < 2) {
+            ++markers_skipped;
+            continue;
+        }
+        Eigen::Vector3d point;
+        if (marker.position.has_value() && marker.position->allFinite()) {
+            point = *marker.position;
+        } else {
+            // Linear multi-view triangulation from the current poses. The
+            // 0.5 deg parallax floor matches the marker-refinement task.
+            std::vector<sfm::AbsolutePose> poses;
+            std::vector<Eigen::Vector3d> bearings;
+            poses.reserve(projections.size());
+            bearings.reserve(projections.size());
+            bool usable = true;
+            for (const auto& [slot, pixel] : projections) {
+                const Camera& camera = chunk->cameras()[camera_index[slot]];
+                sfm::AbsolutePose pose;
+                pose.R = camera.pose.block<3, 3>(0, 0);
+                pose.t = camera.pose.block<3, 1>(0, 3);
+                poses.push_back(pose);
+                const Eigen::Vector3d bearing =
+                    chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)]
+                        .calibration.unproject(pixel);
+                if (!bearing.allFinite() || bearing.norm() <= 0.0) {
+                    usable = false;
+                    break;
+                }
+                bearings.push_back(bearing.normalized());
+            }
+            sfm::TriangulationOptions options;
+            options.min_parallax_rad = 0.5 * 3.14159265358979323846 / 180.0;
+            const auto estimate =
+                usable ? sfm::triangulate_multiview(poses, bearings, options)
+                       : std::nullopt;
+            if (!estimate || !estimate->allFinite()) {
+                ++markers_skipped;
+                continue;
+            }
+            point = *estimate;
+        }
+        const std::size_t slot = problem.points.size();
+        problem.points.push_back(point);
+        marker_point[m] = slot;
+        for (const auto& [camera, pixel] : projections) {
+            problem.observations.push_back(sfm::BAObservation{camera, slot, pixel});
+        }
+    }
+    (void)marker_point;  // consumed by the control-point and write-back stages
+    if (Log::enabled(LogLevel::Info)) {
+        log(LogLevel::Info) << "OptimizeCameras: "
+                            << (chunk->markers().size() - markers_skipped) << " marker points, "
+                            << markers_skipped
+                            << " markers skipped (fewer than 2 projections or no triangulation)";
     }
     progress.update("prepare", 1.0);
 
