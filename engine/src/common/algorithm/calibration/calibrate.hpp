@@ -35,7 +35,13 @@ struct CalibrationView {
 struct CalibrateOptions {
     int max_iterations = 100;
     /// Zero a free distortion coefficient whose |value| < ratio * sigma.
-    /// Purely ours; tuned empirically.
+    ///
+    /// The default 1.0 is our lenient starting value: a term is dropped only
+    /// when it sits within one standard error of zero, which is the weakest
+    /// conventional signal-to-noise cut-off. It is deliberately conservative
+    /// because a wrongly pruned term cannot be recovered afterwards; raise it
+    /// towards 2 (or 3) once real captures give us a false-positive rate.
+    /// Purely ours; to be tuned on measured data, not a fixed rule.
     double prune_t_ratio = 1.0;
     int min_views = 3;
 };
@@ -73,7 +79,10 @@ CalibrationFitFlags default_calibration_fit_flags();
 /// Solve. `initial` supplies the sensor type and image geometry; every
 /// intrinsic is re-estimated subject to `fit`. Throws ValueError for invalid
 /// arguments and Error when fewer than `options.min_views` views are usable or
-/// the closed-form initialisation fails.
+/// the closed-form initialisation fails. Two of those failures name their
+/// cause: views too close to fronto-parallel to separate focal length from
+/// distance, and a closed-form focal length outside [0.1, 100] * max(width,
+/// height) of the image.
 CalibrationResult calibrate_camera(int image_width, int image_height,
                                    const std::vector<CalibrationView>& views,
                                    const Calibration& initial,

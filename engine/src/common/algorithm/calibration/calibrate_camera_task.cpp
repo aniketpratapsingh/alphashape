@@ -274,13 +274,20 @@ void CalibrateCameraTask::apply(Document& document, Params& params,
         staged.meta().set(prefix + "views_used",
                           std::to_string(result.views_used));
         staged.meta().set(prefix + "pruned", joined(result.pruned));
+        // Only a term that was free in the final solve has a meaningful
+        // sigma. A pruned term was zeroed and held for the re-solve, so its
+        // sigma is 0 by construction; publishing that as a measurement would
+        // read as extreme confidence. The pruned list above already names it.
         for (int k = 0; k < kCalibrationParamCount; ++k) {
             const std::size_t kk = static_cast<std::size_t>(k);
-            if (options.fit[kk]) {
-                staged.meta().set(
-                    prefix + "sigma." + kCalibrationParamNames[kk],
-                    meta_number(result.sigma[kk]));
+            const std::string name = kCalibrationParamNames[kk];
+            if (!options.fit[kk] ||
+                std::find(result.pruned.begin(), result.pruned.end(), name) !=
+                    result.pruned.end()) {
+                continue;
             }
+            staged.meta().set(prefix + "sigma." + name,
+                              meta_number(result.sigma[kk]));
         }
         if (options.apply && entry.sensor_id >= 0 &&
             entry.sensor_id < static_cast<std::int32_t>(staged.sensors().size())) {
