@@ -274,8 +274,11 @@ TEST(Markers, TrackRedetectRecovers) {
     TrackMarkersOptions options = base_options();
     options.redetect = true;
     // LK cannot meet a 0.001 px forward-backward bound under this noise, so
-    // every non-seeded projection in this test comes from redetection.
+    // every non-seeded projection in this test comes from redetection. One
+    // level keeps that deliberate failure cheap.
     options.max_error_px = 0.001;
+    options.pyramid_levels = 1;
+    options.window = 15;
     options.max_gap = 3;
     const TrackMarkersStats stats = run_track(scene, options);
     const Marker* marker = find_marker(*scene.chunk, ids[0]);
