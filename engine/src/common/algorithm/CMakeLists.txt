@@ -37,6 +37,7 @@ add_library(alphashape_algorithms STATIC
     sfm/structure_builder.cpp
     sfm/align_cameras_task.cpp
     sfm/optimize_cameras_task.cpp
+    sfm/update_transform_task.cpp
     sfm/georeference.cpp
     sfm/similarity.cpp
     stereo/view_selection.cpp
