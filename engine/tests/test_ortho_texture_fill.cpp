@@ -218,6 +218,34 @@ TEST(TextureFill, Deterministic) {
     EXPECT_EQ(first, second);
 }
 
+TEST(TextureFill, WindowCapSkipsThinDiagonalComponent) {
+    // A diagonal is the bounding-box trap the old estimate missed: 64 cells, but
+    // its margin-dilated window is the whole raster. The window cap, not the
+    // cell count, decides, so this component must be skipped.
+    constexpr int width = 64;
+    constexpr int height = 64;
+    std::vector<std::uint8_t> rgba(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U, 120);
+    std::vector<std::uint8_t> mask(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
+    for (std::size_t i = 0; i < mask.size(); ++i) {
+        rgba[i * 4U + 3U] = 255;
+    }
+    for (int k = 0; k < width; ++k) {
+        mask[static_cast<std::size_t>(k) * static_cast<std::size_t>(width) +
+             static_cast<std::size_t>(k)] = 1;
+    }
+    const std::vector<std::uint8_t> before = rgba;
+    ortho::TextureFillOptions options;
+    options.max_window_cells = 1000;  // below the clamped 64x64 = 4096 window
+    const ortho::TextureFillReport report =
+        ortho::texture_fill(width, height, rgba, mask, options);
+    EXPECT_EQ(report.components, 1U);
+    EXPECT_EQ(report.skipped_large, 1U);
+    EXPECT_EQ(report.filled_cells, 0U);
+    EXPECT_EQ(rgba, before);
+}
+
 TEST(TextureFill, LargeComponentSkipped) {
     constexpr int width = 40;
     constexpr int height = 40;

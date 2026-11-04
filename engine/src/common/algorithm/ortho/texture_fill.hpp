@@ -33,6 +33,11 @@ struct TextureFillOptions {
     /// cost grows with the hole area times the source search, so a big hole is
     /// both slow and prone to inventing structure that is not there.
     int max_component_cells = 20000;
+    /// Components whose margin-dilated, raster-clamped window holds more cells
+    /// than this are skipped. The window, not the cell count, bounds the memory:
+    /// a thin diagonal component of N cells can span the whole raster, so a
+    /// sqrt(N) bbox bound is wrong and the window is capped directly.
+    int max_window_cells = 4'000'000;
     /// The source search is restricted to the component's bounding box dilated
     /// by this many cells. Capping the window keeps the per-component memory
     /// and work local; valid cells outside the window are ignored.

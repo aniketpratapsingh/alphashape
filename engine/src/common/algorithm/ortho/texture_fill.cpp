@@ -554,6 +554,14 @@ TextureFillReport texture_fill(int width, int height, std::vector<std::uint8_t>&
             ++report.skipped_large;
             continue;
         }
+        // The window, not the component size, bounds the memory this component's
+        // completion needs. A thin diagonal component can own few cells but span
+        // the raster, so cap the window itself (see TextureFillOptions).
+        if (static_cast<std::int64_t>(ww) * static_cast<std::int64_t>(wh) >
+            static_cast<std::int64_t>(options.max_window_cells)) {
+            ++report.skipped_large;
+            continue;
+        }
         std::vector<std::uint8_t> window_hole(
             static_cast<std::size_t>(ww) * static_cast<std::size_t>(wh), 0);
         for (const std::size_t cell : component) {

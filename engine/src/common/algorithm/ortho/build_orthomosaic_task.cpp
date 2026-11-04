@@ -1465,21 +1465,24 @@ int block_margin_cells(int block_cells, int pyramid_levels) {
 double estimate_fill_holes_peak_bytes(std::uint64_t output_cells) {
     const double cells = static_cast<double>(output_cells);
     // Texture completion is per component and only one component window is
-    // resident at a time. Derivation of the window bound: a component holds at
-    // most max_component_cells cells, so its bounding box is at most
-    // sqrt(max_component_cells) wide; source_margin is added on each side, so
-    // the window is (sqrt(N) + 2*margin)^2 cells. Per window cell the finest
-    // pyramid level holds RGB (3 B), hole and valid masks (2 B), the int32
-    // nearest-neighbour field and its source mask (5 B), and the vote's three
-    // double sums plus a count (28 B); ~40 B covers that and the coarser levels
-    // (which add at most a third again) rounded up. The values come from the
-    // option defaults so the estimate cannot drift from the implementation.
+    // resident at a time. The window is capped directly by max_window_cells --
+    // a sqrt(N) bounding box is NOT a bound, because a thin diagonal component
+    // of few cells can span the whole raster. Per window cell, straight from
+    // the implementation:
+    //   Level rgb + hole + valid                3 + 1 + 1 = 5 B
+    //   source_mask                                        1 B
+    //   int32 nearest-neighbour field                      4 B
+    //   sources + targets (std::size_t each)         8 + 8 = 16 B
+    //   vote sums (3 double) + counts (uint32)      24 + 4 = 28 B
+    //                                                    = 54 B
+    // The coarser pyramid levels add at most a third of the finest again, so
+    // the peak is 54 * 4/3 = 72 B per window cell. No run can use more windows
+    // than the output has cells, hence min(cap, output_cells) of them.
     const ortho::TextureFillOptions texture_defaults;
-    const double side = std::sqrt(static_cast<double>(texture_defaults.max_component_cells));
-    const double window_side =
-        side + 2.0 * static_cast<double>(texture_defaults.source_margin);
+    const double window_cells =
+        std::min(static_cast<double>(texture_defaults.max_window_cells), cells);
     const double texture_window_bytes =
-        window_side * window_side * 40.0 /* bytes per window cell, see above */;
+        window_cells * 72.0 /* bytes per window cell, see above */;
     return cells * (kBytesPerCellGridLabels + 4.0 /* result RGBA */ +
                     kBytesPerCellFillHoles) +
            kFillHolesFixedBytes + texture_window_bytes;
