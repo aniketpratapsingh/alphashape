@@ -627,6 +627,17 @@ constexpr CalibrationField kCalibrationFields[] = {
     {"p3", &Calibration::p3, true}, {"p4", &Calibration::p4, true},
 };
 
+/// True when `name` is one of the packed calibration coefficients, so a
+/// covariance `params` list can only name real parameters.
+bool is_calibration_param_name(const std::string& name) {
+    for (const CalibrationField& field : kCalibrationFields) {
+        if (name == field.name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void write_calibration(const Calibration& c, XmlNode& parent) {
     XmlNode& node = add_child(parent, "calibration");
     set_attr(node, "type", camera_type_name(c.type));
@@ -638,6 +649,26 @@ void write_calibration(const Calibration& c, XmlNode& parent) {
         }
         set_attr(node, field.name, fmt(c.*(field.member)));
     }
+    // Posterior covariance (WP-13.13b). Written only when known, so a sensor
+    // without covariance stays byte-identical to an older build's output.
+    if (c.covariance.size() == 0) {
+        return;
+    }
+    if (c.covariance.rows() != c.covariance.cols() ||
+        static_cast<std::size_t>(c.covariance.rows()) != c.covariance_params.size()) {
+        throw ProjectIOError(
+            "calibration covariance: matrix and parameter names disagree");
+    }
+    XmlNode& cov = add_child(node, "covariance");
+    set_attr(cov, "params", join_strings(c.covariance_params));
+    std::vector<double> values;
+    values.reserve(static_cast<std::size_t>(c.covariance.size()));
+    for (Eigen::Index r = 0; r < c.covariance.rows(); ++r) {
+        for (Eigen::Index col = 0; col < c.covariance.cols(); ++col) {
+            values.push_back(c.covariance(r, col));
+        }
+    }
+    cov.text = join(values.data(), values.size());
 }
 
 Calibration read_calibration(const XmlNode* node) {
@@ -656,6 +687,38 @@ Calibration read_calibration(const XmlNode* node) {
             continue;
         }
         c.*(field.member) = parse_double(require_attr(*node, field.name));
+    }
+    if (const XmlNode* cov = find_child(*node, "covariance")) {
+        const std::vector<std::string> params = split_strings(require_attr(*cov, "params"));
+        if (params.empty()) {
+            throw ProjectIOError("doc.xml: <covariance> has no parameter names");
+        }
+        for (const std::string& name : params) {
+            if (!is_calibration_param_name(name)) {
+                throw ProjectIOError("doc.xml: <covariance> unknown parameter '" +
+                                     name + "'");
+            }
+        }
+        const std::size_t n = params.size();
+        const std::vector<double> values = parse_doubles(cov->text);
+        if (values.size() != n * n) {
+            throw ProjectIOError("doc.xml: <covariance> expected " +
+                                 std::to_string(n * n) + " values, got " +
+                                 std::to_string(values.size()));
+        }
+        for (const double v : values) {
+            if (!std::isfinite(v)) {
+                throw ProjectIOError("doc.xml: <covariance> value is not finite");
+            }
+        }
+        c.covariance.resize(static_cast<Eigen::Index>(n), static_cast<Eigen::Index>(n));
+        for (std::size_t r = 0; r < n; ++r) {
+            for (std::size_t col = 0; col < n; ++col) {
+                c.covariance(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(col)) =
+                    values[r * n + col];
+            }
+        }
+        c.covariance_params = params;
     }
     return c;
 }
