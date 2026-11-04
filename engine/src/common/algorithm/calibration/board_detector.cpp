@@ -118,7 +118,11 @@ FloatImage hessian_response(const FloatImage& smooth) {
     return out;
 }
 
-/// Strict 3x3 local maxima of the response.
+/// Local maxima of the response. A discrete peak can sit exactly between two
+/// pixel centres (a half-pixel symmetry), where the two samples have equal
+/// response. Requiring a strictly greater value than every neighbour would
+/// then reject both, so equal-valued neighbours are accepted as a plateau as
+/// long as at least one neighbour is lower (which excludes flat regions).
 std::vector<Candidate> local_maxima(const FloatImage& response) {
     const int w = response.width();
     const int h = response.height();
@@ -130,18 +134,23 @@ std::vector<Candidate> local_maxima(const FloatImage& response) {
                 continue;
             }
             bool peak = true;
+            bool has_lower = false;
             for (int dy = -1; dy <= 1 && peak; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
                     if (dx == 0 && dy == 0) {
                         continue;
                     }
-                    if (response.at(x + dx, y + dy) >= v) {
+                    const float neighbour = response.at(x + dx, y + dy);
+                    if (neighbour > v) {
                         peak = false;
                         break;
                     }
+                    if (neighbour < v) {
+                        has_lower = true;
+                    }
                 }
             }
-            if (peak) {
+            if (peak && has_lower) {
                 Candidate candidate;
                 candidate.x = static_cast<double>(x);
                 candidate.y = static_cast<double>(y);
