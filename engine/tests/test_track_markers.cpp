@@ -402,6 +402,40 @@ TEST(Markers, TrackBoth) {
     EXPECT_EQ(stats.markers_extended, 4U);
 }
 
+TEST(Markers, TrackFillsInteriorGap) {
+    MarkerSequenceSpec spec;
+    spec.frames = kFrames;
+    MarkerSequence scene = make_marker_sequence(spec);
+    const std::int32_t id = seed_marker(scene, 0, 0);
+    ASSERT_GE(id, 0);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::optional<Vec2> last = scene.truth(0, 19);
+    ASSERT_TRUE(last.has_value());
+    marker->projections.push_back({scene.frames[19].camera_id, *last, true});
+    TrackMarkersOptions options = base_options();
+    options.redetect = false;
+    options.max_gap = 100;
+    run_track(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    EXPECT_EQ(marker->projections.size(), static_cast<std::size_t>(kFrames));
+    for (std::size_t temporal = 1; temporal <= 18; ++temporal) {
+        EXPECT_NE(projection_for(*marker, scene.frames[temporal].camera_id),
+                  nullptr)
+            << "interior frame " << temporal;
+    }
+    // Both anchors keep exactly the pixel they had.
+    const MarkerProjection* first =
+        projection_for(*marker, scene.frames[0].camera_id);
+    ASSERT_NE(first, nullptr);
+    EXPECT_LT((first->pixel - *scene.truth(0, 0)).norm(), 1e-12);
+    const MarkerProjection* end =
+        projection_for(*marker, scene.frames[19].camera_id);
+    ASSERT_NE(end, nullptr);
+    EXPECT_LT((end->pixel - *last).norm(), 1e-12);
+}
+
 TEST(Markers, TrackDoesNotOverwriteExisting) {
     MarkerSequenceSpec spec;
     spec.frames = kFrames;

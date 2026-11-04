@@ -925,10 +925,11 @@ TrackStep track_step(const Chunk& chunk, const Marker& marker,
 }
 
 /// One direction over one marker. `order` indexes `sequence` in tracking
-/// order. The pass starts at the last position in that order that already has
-/// an enabled projection and only ever appends to `state`. Existing enabled
-/// projections are re-anchors; an existing disabled projection is never
-/// overwritten and never becomes an anchor.
+/// order. The pass starts at the FIRST position in that order that already has
+/// an enabled projection and re-anchors at every later existing projection, so
+/// gaps between multiple anchors are filled. It only ever appends to `state`.
+/// An existing disabled projection is never overwritten and never becomes an
+/// anchor.
 void track_marker_pass(const Chunk& chunk, const Marker& marker,
                        const std::vector<SequenceCamera>& sequence,
                        const std::vector<std::size_t>& order,
@@ -941,6 +942,7 @@ void track_marker_pass(const Chunk& chunk, const Marker& marker,
             state, sequence[order[pos]].camera->id);
         if (projection && projection->enabled) {
             start = static_cast<int>(pos);
+            break;
         }
     }
     if (start < 0) {
