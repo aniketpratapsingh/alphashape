@@ -1066,15 +1066,15 @@ CameraReference read_camera_reference(const XmlNode* ref) {
             parse_double(*yaw), parse_double(*pitch), parse_double(*roll));
     }
     if (const std::string* rot_acc = find_attr(*ref, "rotation_accuracy")) {
-        const Eigen::Vector3d acc = parse_vec3(*rot_acc);
-        if (!std::isfinite(acc.x()) || !std::isfinite(acc.y()) ||
-            !std::isfinite(acc.z()) || !(acc.x() > 0.0) || !(acc.y() > 0.0) ||
-            !(acc.z() > 0.0)) {
+        const Eigen::Vector3d value = parse_vec3(*rot_acc);
+        if (!std::isfinite(value.x()) || !std::isfinite(value.y()) ||
+            !std::isfinite(value.z()) || !(value.x() > 0.0) || !(value.y() > 0.0) ||
+            !(value.z() > 0.0)) {
             throw ProjectIOError(
                 "doc.xml: <reference> rotation_accuracy must be finite and positive, got '" +
                 *rot_acc + "'");
         }
-        reference.rotation_accuracy_deg = acc;
+        reference.rotation_accuracy_deg = value;
     }
     reference.enabled = parse_int(require_attr(*ref, "enabled")) != 0;
     return reference;
