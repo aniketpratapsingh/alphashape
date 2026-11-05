@@ -144,6 +144,7 @@ bool CameraReference::operator==(const CameraReference& other) const {
     return reference_location_equal(location, other.location) &&
            accuracy == other.accuracy &&
            optional_vector_equal(orientation_deg, other.orientation_deg) &&
+           optional_vector_equal(rotation_accuracy_deg, other.rotation_accuracy_deg) &&
            enabled == other.enabled;
 }
 
