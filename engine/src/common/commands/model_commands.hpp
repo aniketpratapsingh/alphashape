@@ -202,7 +202,10 @@ std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
 // --- Sensors (WP-13.16) ----------------------------------------------------
 
 /// Replace one sensor's calibration; undo restores the previous calibration,
-/// including its covariance. Throws ValueError for an unknown sensor.
+/// including its covariance. The sensor's type, width and height follow the
+/// calibration, so the two never disagree. Throws ValueError for an unknown
+/// sensor, a non-finite/non-positive calibration, or one that breaks the
+/// sensor's master link (a slave must match its master's type and size).
 std::unique_ptr<AbstractCommand> make_set_sensor_calibration_command(
     std::int32_t chunk_id, std::int32_t sensor_index, Calibration calibration);
 

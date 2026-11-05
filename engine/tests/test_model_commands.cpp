@@ -1277,6 +1277,46 @@ TEST(Commands, SetSensorCalibrationUndoes) {
                  ValueError);
 }
 
+// A calibration carries the image geometry, so assigning one to a slave must
+// keep the slave's size compatible with its master.
+TEST(Commands, SetSensorCalibrationRejectsBreakingSlaveSize) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    for (const char* label : {"master", "slave"}) {
+        Sensor sensor;
+        sensor.label = label;
+        sensor.width = 640;
+        sensor.height = 480;
+        sensor.calibration = Calibration::initial(CameraType::Frame, 640, 480, 500.0);
+        chunk.sensors().push_back(sensor);
+    }
+    chunk.sensors()[1].master_sensor_id = 0;
+    UndoStack stack(&document);
+
+    const Calibration smaller = Calibration::initial(CameraType::Frame, 320, 240, 250.0);
+    EXPECT_THROW(make_set_sensor_calibration_command(chunk_id, 1, smaller)->apply(document),
+                 ValueError);
+    EXPECT_EQ(chunk.sensors()[1].width, 640);
+    EXPECT_THROW(
+        make_set_sensor_calibration_command(chunk_id, 1,
+                                            Calibration::initial(CameraType::Fisheye, 640, 480,
+                                                                 250.0))
+            ->apply(document),
+        ValueError);
+    EXPECT_EQ(chunk.sensors()[1].type, CameraType::Frame);
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, 0);
+
+    // A same-size calibration for the slave is accepted and undoes cleanly.
+    const Calibration valid = Calibration::initial(CameraType::Frame, 640, 480, 510.0);
+    auto command = make_set_sensor_calibration_command(chunk_id, 1, valid);
+    check_and_reset(*command, document);
+    stack.execute(std::move(command));
+    EXPECT_TRUE(chunk.sensors()[1].calibration == valid);
+    stack.undo();
+    EXPECT_EQ(chunk.sensors()[1].calibration.f, 500.0);
+}
+
 TEST(Commands, SetSensorMasterUndoes) {
     Document document;
     const std::int32_t chunk_id = add_chunk(document, "chunk");
