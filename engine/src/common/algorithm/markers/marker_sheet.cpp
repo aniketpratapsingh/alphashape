@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstdint>
 #include <initializer_list>
 #include <numbers>
@@ -378,9 +378,7 @@ void add_corner_marks(std::vector<Shape>& shapes, double x, double y, double w,
 }
 
 std::string millimetres(double value) {
-    char buffer[32];
-    std::snprintf(buffer, sizeof buffer, "%.1f", value);
-    return std::string(buffer);
+    return fixed_decimal(value, 10U, 1U);
 }
 
 TextItem footer_item(const PageSetup& setup) {
@@ -421,6 +419,44 @@ void add_chessboard(const PageSetup& setup, PageContent& content) {
                          setup.grid_x_mm + board_h - y - square,
                          setup.grid_y_mm + x, square, square);
             } else {
+/// Locale-independent fixed-point number for PDF text. The token must use
+/// '.', never the LC_NUMERIC separator, so the conversion stays in integer
+/// arithmetic instead of the C library's floating-point formatting.
+std::string fixed_decimal(double value, std::uint64_t scale,
+                          std::size_t digits) {
+    const double scaled = value * static_cast<double>(scale);
+    if (!std::isfinite(scaled) || std::abs(scaled) > 9.0e15) {
+        throw ValueError("marker sheet: value is out of range");
+    }
+    const bool negative = std::signbit(value);
+    std::int64_t units = static_cast<std::int64_t>(std::llround(scaled));
+    if (units < 0) {
+        units = -units;
+    }
+    const std::uint64_t magnitude = static_cast<std::uint64_t>(units);
+    const std::uint64_t whole = magnitude / scale;
+    const std::uint64_t fraction = magnitude % scale;
+    char whole_text[24];
+    char* whole_end =
+        std::to_chars(whole_text, whole_text + sizeof whole_text, whole).ptr;
+    char fraction_text[24];
+    char* fraction_end =
+        std::to_chars(fraction_text, fraction_text + sizeof fraction_text,
+                      fraction)
+            .ptr;
+    std::string out;
+    if (negative) {
+        out.push_back('-');
+    }
+    out.append(whole_text, whole_end);
+    out.push_back('.');
+    const std::size_t length =
+        static_cast<std::size_t>(fraction_end - fraction_text);
+    out.append(digits - length, '0');
+    out.append(fraction_text, fraction_end);
+    return out;
+}
+
                 add_rect(content.shapes, setup.grid_x_mm + x,
                          setup.grid_y_mm + y, square, square);
             }

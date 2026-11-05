@@ -1,8 +1,9 @@
 #include "base/io/pdf.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
-#include <cstdio>
+#include <cstdint>
 #include <fstream>
 #include <numbers>
 #include <string>
@@ -15,21 +16,47 @@
 namespace alphashape {
 namespace {
 
-/// snprintf follows LC_NUMERIC, so the PDF uses the process decimal
-/// separator. The applications keep LC_NUMERIC at "C", which makes it '.';
-/// this is not locale-independent.
-std::string number(double value) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof buffer, "%.6g", value);
-    return std::string(buffer);
+/// Locale-independent fixed four-decimal token. A PDF real requires '.', never
+/// the LC_NUMERIC separator, so the conversion stays in integer arithmetic
+/// rather than the C library's floating-point formatting.
+std::string fixed(double value) {
+    const double scaled = value * 10000.0;
+    if (!std::isfinite(scaled) || std::abs(scaled) > 9.0e15) {
+        throw ValueError("PdfDocument: number is out of range");
+    }
+    const bool negative = std::signbit(value);
+    std::int64_t units = static_cast<std::int64_t>(std::llround(scaled));
+    if (units < 0) {
+        units = -units;
+    }
+    const std::uint64_t magnitude = static_cast<std::uint64_t>(units);
+    const std::uint64_t whole = magnitude / 10000U;
+    const std::uint64_t fraction = magnitude % 10000U;
+    char whole_text[24];
+    char* whole_end =
+        std::to_chars(whole_text, whole_text + sizeof whole_text, whole).ptr;
+    char fraction_text[8];
+    char* fraction_end =
+        std::to_chars(fraction_text, fraction_text + sizeof fraction_text,
+                      fraction)
+            .ptr;
+    std::string out;
+    if (negative) {
+        out.push_back('-');
+    }
+    out.append(whole_text, whole_end);
+    out.push_back('.');
+    const std::size_t length =
+        static_cast<std::size_t>(fraction_end - fraction_text);
+    out.append(4U - length, '0');
+    out.append(fraction_text, fraction_end);
+    return out;
 }
 
-/// Fixed-point coordinate for vector operators. Like `number`, this follows
-/// the process LC_NUMERIC; the applications keep it at "C".
-std::string fixed(double value) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof buffer, "%.4f", value);
-    return std::string(buffer);
+/// Text sizes, stroke widths, and image matrices also accept the same
+/// fixed-point token; a four-decimal PDF real is valid in every context.
+std::string number(double value) {
+    return fixed(value);
 }
 
 /// A grey level outside [0, 1] is a programming error, not a printable value.

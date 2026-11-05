@@ -35,9 +35,8 @@ public:
     /// Filled vector primitives, all in points with the PDF native origin at
     /// the bottom-left. `gray` is a non-stroking grey level in [0, 1] (0 is
     /// black, 1 is white); values outside throw ValueError. Coordinates are
-    /// written with four decimal places, relying on LC_NUMERIC being "C" --
-    /// the same caveat as `text()` and `line()`. Every primitive throws Error
-    /// when no page exists yet.
+    /// written with four decimal places in locale-independent integer
+    /// arithmetic. Every primitive throws Error when no page exists yet.
     void fill_rect(double x, double y, double w, double h, double gray);
 
     /// Fill a simple convex or concave polygon. Fewer than three points throw
