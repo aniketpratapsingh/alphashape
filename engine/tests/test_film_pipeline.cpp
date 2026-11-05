@@ -46,10 +46,12 @@ Transform look_at(const Eigen::Vector3d& centre, const Eigen::Vector3d& target) 
     const Eigen::Vector3d up(0.0, 0.0, 1.0);
     const Eigen::Vector3d x = up.cross(z).normalized();
     const Eigen::Vector3d y = z.cross(x);
+    // The Transform's rotation is world -> camera, so its ROWS are the camera
+    // axes expressed in world coordinates (X_cam = R (X_world - C)).
     Transform pose = Transform::Identity();
-    pose.block<3, 1>(0, 0) = x;
-    pose.block<3, 1>(0, 1) = y;
-    pose.block<3, 1>(0, 2) = z;
+    pose.block<1, 3>(0, 0) = x.transpose();
+    pose.block<1, 3>(1, 0) = y.transpose();
+    pose.block<1, 3>(2, 0) = z.transpose();
     pose.block<3, 1>(0, 3) = -pose.block<3, 3>(0, 0) * centre;
     return pose;
 }
