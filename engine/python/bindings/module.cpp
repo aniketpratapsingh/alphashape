@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,6 +41,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/calibration/calibration_io.hpp"
+#include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/reference/reference_table.hpp"
 #include "common/commands/command.hpp"
@@ -50,6 +52,7 @@
 #include "common/io/project_io.hpp"
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
+#include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/crs/coordinate_system.hpp"
 #if defined(ALPHASHAPE_USE_PROJ)
@@ -2011,6 +2014,85 @@ PYBIND11_MODULE(alphashape, m) {
         alphashape::TaskRegistry& registry = alphashape::builtin_registry();
         return registry.names();
     });
+
+    m.def("make_marker_sheet",
+          [](const std::string& path, const std::string& target,
+             const std::string& paper, double size_mm, int first_code,
+             int count, double dpi) {
+              const std::optional<alphashape::SheetTarget> parsed =
+                  alphashape::parse_sheet_target(target);
+              if (!parsed.has_value()) {
+                  throw alphashape::ValueError(
+                      "make_marker_sheet: unknown target '" + target + "'");
+              }
+              alphashape::SheetOptions options;
+              options.target = *parsed;
+              options.paper = paper;
+              options.target_size_mm = size_mm;
+              options.first_code = first_code;
+              options.count = count;
+              const bool png = path.size() >= 4U &&
+                               path.compare(path.size() - 4U, 4U, ".png") == 0;
+              if (png) {
+                  alphashape::write_png(
+                      path, alphashape::marker_sheet_raster(options, dpi, 0));
+                  return;
+              }
+              const std::vector<std::uint8_t> data =
+                  alphashape::marker_sheet_pdf(options);
+              std::ofstream file(path,
+                                 std::ios::binary | std::ios::trunc);
+              if (!file) {
+                  throw alphashape::Error("make_marker_sheet: cannot open '" +
+                                          path + "'");
+              }
+              file.write(reinterpret_cast<const char*>(data.data()),
+                         static_cast<std::streamsize>(data.size()));
+              file.close();
+              if (!file) {
+                  throw alphashape::Error("make_marker_sheet: writing '" +
+                                          path + "' failed");
+              }
+          },
+          py::arg("path"), py::arg("target"), py::arg("paper") = "A4",
+          py::arg("size_mm") = 25.0, py::arg("first_code") = 1,
+          py::arg("count") = 0, py::arg("dpi") = 300.0);
+
+    m.def("make_chessboard_sheet",
+          [](const std::string& path, int cols, int rows, double square_mm,
+             const std::string& paper, double dpi) {
+              alphashape::SheetOptions options;
+              options.target = alphashape::SheetTarget::Chessboard;
+              options.paper = paper;
+              options.board_cols = cols;
+              options.board_rows = rows;
+              options.square_mm = square_mm;
+              const bool png = path.size() >= 4U &&
+                               path.compare(path.size() - 4U, 4U, ".png") == 0;
+              if (png) {
+                  alphashape::write_png(
+                      path, alphashape::marker_sheet_raster(options, dpi, 0));
+                  return;
+              }
+              const std::vector<std::uint8_t> data =
+                  alphashape::marker_sheet_pdf(options);
+              std::ofstream file(path,
+                                 std::ios::binary | std::ios::trunc);
+              if (!file) {
+                  throw alphashape::Error(
+                      "make_chessboard_sheet: cannot open '" + path + "'");
+              }
+              file.write(reinterpret_cast<const char*>(data.data()),
+                         static_cast<std::streamsize>(data.size()));
+              file.close();
+              if (!file) {
+                  throw alphashape::Error(
+                      "make_chessboard_sheet: writing '" + path + "' failed");
+              }
+          },
+          py::arg("path"), py::arg("cols") = 9, py::arg("rows") = 6,
+          py::arg("square_mm") = 25.0, py::arg("paper") = "A4",
+          py::arg("dpi") = 300.0);
 
     m.def("task_params",
           [](const std::string& name) {
