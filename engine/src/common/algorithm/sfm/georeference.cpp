@@ -307,10 +307,11 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
 
     // -- similarity fit ------------------------------------------------------
     // A GNSS reference measures the antenna phase centre, not the projection
-    // centre. When a sensor records a mount, the first fit predicts where the
-    // antenna lies for the current pose; the second fit then targets the
-    // centre that puts the antenna on the measured reference. Without antenna
-    // data only the first fit runs, exactly as before WP-13.19.
+    // centre. When a sensor records a mount, the fit predicts where the antenna
+    // lies for the current pose and targets the centre that puts the antenna on
+    // the measured reference. The prediction needs the fit's own rotation, so
+    // it is iterated to convergence. Without antenna data only the plain fit
+    // runs, exactly as before WP-13.19.
     const auto antenna_of = [&chunk](const Camera& camera) -> const Antenna* {
         if (camera.sensor_id < 0 ||
             camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
@@ -334,30 +335,46 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
         return report;
     }
     if (any_antenna) {
-        // A GNSS reference measures the antenna phase centre, not the
-        // projection centre. The camera-frame lever arm is already in metres,
-        // so only rotations act on it: the chunk transform and the stored pose
-        // may each carry a uniform scale (local units -> metres, and the
-        // AlignChunks pose rule), and both scales are divided out explicitly.
-        // `map_R` carries the stored local frame into the frame the similarity
-        // was fitted in.
+        // The camera-frame lever arm is already in metres, so only rotations
+        // act on it: the chunk transform and the stored pose may each carry a
+        // uniform scale (local units -> metres, and the AlignChunks pose rule),
+        // and both scales are divided out explicitly. `map_r` carries the
+        // stored local frame into the frame the similarity was fitted in.
+        //
+        // The correction itself needs the rotation it is fitting for, so it is
+        // iterated: each pass rebuilds the targets from the ORIGINAL references
+        // using the current fit's rotation, then refits. The first fit's
+        // rotation is biased by the uncorrected lever arm, so a single
+        // correction leaves centimetres of error for a tangential lever arm.
+        constexpr int kMaxPasses = 10;
+        constexpr double kRotationTolerance = 1e-12;
         const Eigen::Matrix3d map_r = pure_rotation(map.block<3, 3>(0, 0));
-        const Eigen::Matrix3d enu_from_source = ransac.similarity->R * map_r;
-        for (std::size_t i = 0; i < candidates.size(); ++i) {
-            const Antenna* antenna = antenna_of(*candidates[i]);
-            if (antenna == nullptr) {
-                continue;
+        Eigen::Matrix3d enu_from_source = ransac.similarity->R * map_r;
+        for (int pass = 0; pass < kMaxPasses; ++pass) {
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                const Antenna* antenna = antenna_of(*candidates[i]);
+                if (antenna == nullptr) {
+                    fit_targets[i] = reference_enu[i];
+                    continue;
+                }
+                const Eigen::Matrix3d r_c =
+                    pure_rotation(candidates[i]->pose.block<3, 3>(0, 0));
+                const Eigen::Vector3d shift =
+                    enu_from_source * r_c.transpose() * antenna->camera_offset();
+                fit_targets[i] = reference_enu[i] - shift;
             }
-            const Eigen::Matrix3d r_c =
-                pure_rotation(candidates[i]->pose.block<3, 3>(0, 0));
-            const Eigen::Vector3d shift =
-                enu_from_source * r_c.transpose() * antenna->camera_offset();
-            fit_targets[i] -= shift;
-        }
-        ransac = estimate_similarity_ransac(source, fit_targets, threshold);
-        if (!ransac.similarity.has_value()) {
-            report.reason = "GNSS references are collinear or the antenna-aware fit failed";
-            return report;
+            ransac = estimate_similarity_ransac(source, fit_targets, threshold);
+            if (!ransac.similarity.has_value()) {
+                report.reason =
+                    "GNSS references are collinear or the antenna-aware fit failed";
+                return report;
+            }
+            const Eigen::Matrix3d next = ransac.similarity->R * map_r;
+            const double change = (next - enu_from_source).norm();
+            enu_from_source = next;
+            if (change < kRotationTolerance) {
+                break;
+            }
         }
     }
 
