@@ -290,6 +290,15 @@ void write_sensors(const Chunk& chunk, XmlNode& node) {
         if (s.master_sensor_id >= 0) {
             set_attr(e, "master", std::to_string(s.master_sensor_id));
         }
+        // Optional antenna mount (WP-13.19). Written only when one is recorded,
+        // so a project without antenna data serialises byte-identically.
+        if (s.antenna.is_set() || s.antenna.boresight_deg.has_value()) {
+            XmlNode& antenna = add_child(e, "antenna");
+            set_attr(antenna, "offset", vec3(s.antenna.offset_m));
+            if (s.antenna.boresight_deg.has_value()) {
+                set_attr(antenna, "boresight", vec3(*s.antenna.boresight_deg));
+            }
+        }
     }
 }
 
@@ -986,6 +995,20 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         s.calibration = read_calibration(find_child(e, "calibration"));
         s.fixed_params = split_strings(require_attr(e, "fixed_params"));
         s.master_sensor_id = parse_i32(attr_or(e, "master", "-1"));
+        if (const XmlNode* antenna = find_child(e, "antenna")) {
+            warn_unknown_attrs(*antenna, {"offset", "boresight"}, report);
+            s.antenna.offset_m = parse_vec3(require_attr(*antenna, "offset"));
+            if (!s.antenna.offset_m.allFinite()) {
+                throw ProjectIOError("doc.xml: antenna offset is not finite");
+            }
+            if (const std::string* boresight = find_attr(*antenna, "boresight")) {
+                const Eigen::Vector3d angles = parse_vec3(*boresight);
+                if (!angles.allFinite()) {
+                    throw ProjectIOError("doc.xml: antenna boresight is not finite");
+                }
+                s.antenna.boresight_deg = angles;
+            }
+        }
         validate_fixed_params(s.label, s.fixed_params);
         chunk.sensors().push_back(std::move(s));
         ++sensor_index;
