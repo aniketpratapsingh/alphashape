@@ -90,6 +90,7 @@ add_executable(alphashape_tests
     test_board_detector.cpp
     test_fiducials.cpp
     test_film_geometry.cpp
+    test_film_pipeline.cpp
     make_film_frame.cpp
     test_calibrate_camera.cpp
     test_stmap.cpp

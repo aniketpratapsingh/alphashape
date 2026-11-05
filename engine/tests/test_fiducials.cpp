@@ -26,6 +26,7 @@
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/doc_xml.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
 #include "image/image.hpp"
@@ -600,12 +601,16 @@ TEST(ProjectIO, FilmRoundTrips) {
     document.set_active_chunk_id(chunk.id());
     Sensor sensor;
     sensor.label = "film-camera";
-    sensor.width = 1600;
-    sensor.height = 1600;
     sensor.film = film_preset("corners4");
-    // The normalised frame (WP-13.18b) must survive the round trip too.
+    // The normalised frame (WP-13.18b) must survive the round trip too. A
+    // complete film geometry means the sizes ARE the normalised ones.
     sensor.film.resolution_mm_per_px = 0.02;
     sensor.film.film_size_mm = Eigen::Vector2d(120.0, 130.0);
+    sensor.film.calibration_normalised = true;
+    sensor.width = 6000;
+    sensor.height = 6500;
+    sensor.calibration =
+        Calibration::initial(CameraType::Frame, 6000, 6500, 4000.0);
     chunk.sensors().push_back(sensor);
     Camera camera;
     camera.id = 0;
@@ -657,6 +662,53 @@ TEST(ProjectIO, FilmWithoutNormalisedGeometryStaysCompact) {
     EXPECT_NE(text.find("<film transform="), std::string::npos);
     EXPECT_EQ(text.find(" resolution=\""), std::string::npos);
     EXPECT_EQ(text.find(" size_x=\""), std::string::npos);
+}
+
+/// A project written before the film-normalised invariant (or by an earlier
+/// commit of this branch) stores raw scan sizes next to a complete film
+/// layout. Loading must normalise it and say so, not leave a mixed chunk.
+TEST(ProjectIO, LegacyRawFilmNormalisesOnLoad) {
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("film");
+    document.set_active_chunk_id(chunk.id());
+    Sensor sensor;
+    sensor.label = "film-camera";
+    sensor.width = 4000;
+    sensor.height = 3000;
+    sensor.calibration =
+        Calibration::initial(CameraType::Frame, 4000, 3000, 4000.0);
+    sensor.film.enabled = true;
+    sensor.film.resolution_mm_per_px = 0.02;
+    sensor.film.film_size_mm = Eigen::Vector2d(40.0, 40.0);
+    chunk.sensors().push_back(sensor);
+    Camera camera;
+    camera.id = 0;
+    camera.sensor_id = 0;
+    Eigen::Matrix3d transform = Eigen::Matrix3d::Identity();
+    transform(0, 0) = 200.0;
+    transform(1, 1) = -200.0;
+    transform(0, 2) = 2000.0;
+    transform(1, 2) = 1500.0;
+    camera.film_transform = transform;
+    chunk.cameras().push_back(camera);
+
+    ZipArchive archive;
+    write_document(document, archive);
+    ReadReport report;
+    const std::shared_ptr<Document> loaded = read_document(archive, &report);
+    ASSERT_TRUE(loaded != nullptr);
+    const Sensor& after = loaded->workspace().chunks().front()->sensors().front();
+    EXPECT_EQ(after.width, 2000);
+    EXPECT_EQ(after.height, 2000);
+    EXPECT_EQ(after.calibration.width, 2000);
+    EXPECT_EQ(after.calibration.height, 2000);
+    EXPECT_NEAR(after.calibration.f, 1000.0, 1e-9);  // 4000 * (1/4)
+    EXPECT_TRUE(after.film.calibration_normalised);
+    bool warned = false;
+    for (const std::string& warning : report.warnings) {
+        warned = warned || warning.find("raw scan pixels") != std::string::npos;
+    }
+    EXPECT_TRUE(warned);
 }
 
 TEST(ProjectIO, NoFilmKeepsLayout) {

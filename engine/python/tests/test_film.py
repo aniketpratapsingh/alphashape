@@ -39,6 +39,12 @@ class FilmGeometryPropertiesTest(unittest.TestCase):
         self.assertAlmostEqual(sensor.film_resolution_mm_per_px, 0.05)
         self.assertEqual(tuple(sensor.film_size_mm), (0.0, 0.0))
         self.assertEqual(len(sensor.fiducials), 3)
+        # WP-13.18b invariant: once the film geometry is complete, the sensor's
+        # own pixel frame IS the normalised one (20 mm / 0.05 mm per pixel).
+        self.assertEqual(sensor.width, 400)
+        self.assertEqual(sensor.height, 400)
+        self.assertEqual(sensor.calibration.width, 400)
+        self.assertEqual(sensor.calibration.height, 400)
 
     def test_extent_is_stored(self):
         doc = alphashape.Document()

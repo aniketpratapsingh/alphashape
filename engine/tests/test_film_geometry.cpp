@@ -399,5 +399,63 @@ TEST(FilmFeatures, FiducialsAndBorderExcluded) {
     std::filesystem::remove(path, error);
 }
 
+/// A film camera whose sensor link is missing must fail loudly: without the
+/// film geometry the raw scan would be in the wrong pixel space.
+TEST(FilmPipeline, LoaderRejectsFilmCameraWithoutSensor) {
+    const FilmSettings film = square_layout(20.0, 0.05);
+    Image scan(100, 100, 1);
+    const std::string path = write_temp_png(scan, "no_sensor");
+    {
+        Document document;
+        Chunk& chunk = add_camera(document, film, 1000, 1000, path,
+                                  canonical_transform(1000, 1000, 20.0, 0.0));
+        chunk.cameras()[0].sensor_id = -1;
+        try {
+            (void)load_camera_image(document, chunk, chunk.cameras()[0]);
+            FAIL() << "expected a film camera without a sensor to throw";
+        } catch (const Error& error) {
+            EXPECT_NE(std::string(error.what()).find("sensor"), std::string::npos);
+        }
+    }
+    std::error_code error;
+    std::filesystem::remove(path, error);
+}
+
+/// The prefilter path (more than 1.5 scan pixels per normalised pixel) must
+/// keep every channel, apply the projective map, and leave samples that fall
+/// outside the scan at 0 instead of clamping to the border.
+TEST(FilmGeometry, ResamplePrefilterProjectiveThreeChannels) {
+    const FilmSettings film = square_layout(20.0, 0.05);  // 800 x 800
+    const int scan_size = 1200;
+    Image scan(scan_size, scan_size, 3);
+    for (int y = 0; y < scan_size; ++y) {
+        for (int x = 0; x < scan_size; ++x) {
+            scan.at(x, y, 0) = 60;
+            scan.at(x, y, 1) = 120;
+            scan.at(x, y, 2) = 180;
+        }
+    }
+    Eigen::Matrix3d transform = Eigen::Matrix3d::Identity();
+    transform(0, 0) = 40.0;  // factor = 0.05 * 40 = 2.0 -> prefiltered
+    transform(1, 1) = -40.0;
+    transform(0, 2) = 600.0;
+    transform(1, 2) = 600.0;
+    transform(2, 0) = 5.0e-4;  // projective terms
+    transform(2, 1) = 3.0e-4;
+    const Image out = resample_film_image(scan, transform, film);
+    ASSERT_EQ(out.width(), 800);
+    ASSERT_EQ(out.height(), 800);
+    ASSERT_EQ(out.channels(), 3);
+    // The centre is well inside the scan: the constant colour survives.
+    EXPECT_EQ(static_cast<int>(out.at(400, 400, 0)), 60);
+    EXPECT_EQ(static_cast<int>(out.at(400, 400, 1)), 120);
+    EXPECT_EQ(static_cast<int>(out.at(400, 400, 2)), 180);
+    // The far corner projects well outside the scan: every channel is 0.
+    for (int ch = 0; ch < 3; ++ch) {
+        EXPECT_EQ(static_cast<int>(out.at(0, 0, ch)), 0);
+        EXPECT_EQ(static_cast<int>(out.at(799, 799, ch)), 0);
+    }
+}
+
 }  // namespace
 }  // namespace alphashape
