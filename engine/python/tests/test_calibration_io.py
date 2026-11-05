@@ -47,7 +47,9 @@ class CalibrationIOTest(unittest.TestCase):
             warnings = loaded.save(target, alphashape.CalibrationFormat.Json)
             self.assertEqual(warnings, [])
 
-            again = alphashape.Calibration.load(target)
+            again = alphashape.Calibration.load(
+                target, alphashape.CalibrationFormat.Json
+            )
             self.assertEqual(again.f, 512.5)
             self.assertEqual(again.k1, -0.02)
 
