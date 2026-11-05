@@ -897,6 +897,48 @@ private:
     FilmSettings previous_;
 };
 
+class SetSensorAntennaCommand : public StagedMutation {
+public:
+    SetSensorAntennaCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                            Antenna antenna)
+        : chunk_id_(chunk_id), sensor_index_(sensor_index), antenna_(std::move(antenna)) {}
+
+    std::string name() const override { return "Set Sensor Antenna"; }
+
+protected:
+    void validate(Document& document) override {
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor antenna");
+        if (!antenna_.offset_m.allFinite()) {
+            throw ValueError("set sensor antenna: offset is not finite");
+        }
+        if (antenna_.boresight_deg.has_value() &&
+            !antenna_.boresight_deg->allFinite()) {
+            throw ValueError("set sensor antenna: boresight is not finite");
+        }
+    }
+
+    void stage(Document& document) override {
+        previous_ =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor antenna").antenna;
+    }
+
+    void commit(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor antenna").antenna =
+            antenna_;
+    }
+
+    void restore(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor antenna").antenna =
+            previous_;
+    }
+
+private:
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    Antenna antenna_;
+    Antenna previous_;
+};
+
 // --- Marker commands -------------------------------------------------------
 
 /// Allocate a marker id from the chunk counter when the caller left it at -1.
@@ -3120,6 +3162,12 @@ std::unique_ptr<AbstractCommand> make_set_sensor_film_command(
     std::int32_t chunk_id, std::int32_t sensor_index, FilmSettings film) {
     return std::make_unique<SetSensorFilmCommand>(chunk_id, sensor_index,
                                                   std::move(film));
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_antenna_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, Antenna antenna) {
+    return std::make_unique<SetSensorAntennaCommand>(chunk_id, sensor_index,
+                                                      std::move(antenna));
 }
 
 // --- asset factories -------------------------------------------------------

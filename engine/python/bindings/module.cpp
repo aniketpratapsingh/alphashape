@@ -981,6 +981,25 @@ PYBIND11_MODULE(alphashape, m) {
                                           fiducial.film_mm.y()));
             }
             return out;
+        })
+        // GNSS antenna mount: camera-frame (or body-frame with a boresight)
+        // offset in metres, and the optional body->camera boresight in degrees.
+        .def_property_readonly("antenna_offset", [](const alphashape::Sensor& s) {
+            py::list out;
+            out.append(s.antenna.offset_m.x());
+            out.append(s.antenna.offset_m.y());
+            out.append(s.antenna.offset_m.z());
+            return out;
+        })
+        .def_property_readonly("antenna_boresight", [](const alphashape::Sensor& s) {
+            if (!s.antenna.boresight_deg.has_value()) {
+                return py::object(py::none());
+            }
+            py::list out;
+            out.append(s.antenna.boresight_deg->x());
+            out.append(s.antenna.boresight_deg->y());
+            out.append(s.antenna.boresight_deg->z());
+            return py::object(out);
         });
 
     py::class_<alphashape::Camera>(m, "Camera")
@@ -1587,6 +1606,24 @@ PYBIND11_MODULE(alphashape, m) {
             py::arg("transform") = "affine", py::arg("detector") = "circle",
             py::arg("corners") = true, py::arg("sides") = false,
             "Replace a sensor's film fiducial layout (undoable in the GUI).")
+        // Set the GNSS antenna mount (undoable in the GUI).
+        .def(
+            "set_sensor_antenna",
+            [](py::object self, std::int32_t sensor_index,
+               const Eigen::Vector3d& offset,
+               std::optional<Eigen::Vector3d> boresight) {
+                alphashape::Document& document = owning_document(self);
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::Antenna antenna;
+                antenna.offset_m = offset;
+                antenna.boresight_deg = boresight;
+                alphashape::make_set_sensor_antenna_command(chunk.id(), sensor_index,
+                                                            antenna)
+                    ->apply(document);
+            },
+            py::arg("sensor_index"), py::arg("offset"), py::arg("boresight") = py::none(),
+            "Set a sensor's antenna offset in metres (camera frame) and optional "
+            "body-frame boresight angles in degrees.")
         // -- dense products (milestone 6) --------------------------------------
         // BuildDepthMaps fills `depth_maps`; BuildPointCloud fuses them into
         // `point_cloud`. Both are read-only views onto the chunk's containers.
@@ -1823,6 +1860,10 @@ PYBIND11_MODULE(alphashape, m) {
         // Derive a sensor's fiducial film coordinates from one reference scan.
         .def("calibrateFiducials", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "CalibrateFiducials", std::move(kwargs));
+        })
+        // Backward STMap export for a calibrated sensor (WP-13.15b).
+        .def("exportStmap", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ExportSTMap", std::move(kwargs));
         })
         // Multi-view consensus refinement (WP-13.9), the same run_task call.
         .def("refineMarkers", [](py::object self, py::kwargs kwargs) {

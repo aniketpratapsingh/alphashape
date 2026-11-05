@@ -8,6 +8,7 @@
 #include "common/algorithm/calibration/calibrate_camera_task.hpp"
 #include "common/algorithm/calibration/calibrate_fiducials_task.hpp"
 #include "common/algorithm/calibration/detect_fiducials_task.hpp"
+#include "common/algorithm/calibration/export_stmap_task.hpp"
 #include "common/algorithm/chunk/append_project_task.hpp"
 #include "common/algorithm/chunk/duplicate_chunk_task.hpp"
 #include "common/algorithm/chunk/merge_chunks_task.hpp"
@@ -52,6 +53,7 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<CalibrateCameraTask>());
     registry.register_task(std::make_shared<DetectFiducialsTask>());
     registry.register_task(std::make_shared<CalibrateFiducialsTask>());
+    registry.register_task(std::make_shared<ExportSTMapTask>());
     registry.register_task(std::make_shared<UpdateTransformTask>());
     registry.register_task(std::make_shared<BuildDepthMapsTask>());
     registry.register_task(std::make_shared<BuildPointCloudTask>());

@@ -29,6 +29,7 @@ add_executable(alphashape_tests
     test_structure_builder.cpp
     test_align_cameras.cpp
     test_optimize_cameras.cpp
+    test_antenna.cpp
     test_optimize_gcp.cpp
     test_geodesy.cpp
     test_similarity.cpp
@@ -89,6 +90,8 @@ add_executable(alphashape_tests
     test_fiducials.cpp
     make_film_frame.cpp
     test_calibrate_camera.cpp
+    test_stmap.cpp
+    test_calibration_report.cpp
     test_calibration_io.cpp
     test_gpu.cpp
 )
@@ -114,11 +117,12 @@ if(ALPHASHAPE_USE_PROJ)
     # directly for the raw-API assertions; linking the interface target keeps
     # the include directories available without a second package lookup.
     target_link_libraries(alphashape_tests PRIVATE alphashape_proj)
-    # test_geotiff_crs.cpp writes GDAL-convention files with libtiff directly,
-    # so the headers TIFF is a PRIVATE dependency of alphashape_model must be
-    # reachable from this suite as well.
-    target_link_libraries(alphashape_tests PRIVATE TIFF::TIFF)
 endif()
+
+# test_geotiff_crs.cpp and test_stmap.cpp include <tiffio.h> directly, so the
+# headers TIFF is a PRIVATE dependency of alphashape_model must be reachable
+# from this suite as well.
+target_link_libraries(alphashape_tests PRIVATE TIFF::TIFF)
 
 target_link_libraries(alphashape_tests PRIVATE
     alphashape_algorithms

@@ -106,7 +106,8 @@ bool Sensor::operator==(const Sensor& other) const {
            model == other.model && serial == other.serial &&
            calibration == other.calibration &&
            fixed_params == other.fixed_params &&
-           master_sensor_id == other.master_sensor_id && film == other.film;
+           master_sensor_id == other.master_sensor_id && film == other.film &&
+           antenna == other.antenna;
 }
 
 void validate_sensor_masters(const std::vector<Sensor>& sensors) {

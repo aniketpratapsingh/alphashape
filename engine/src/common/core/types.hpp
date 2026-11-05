@@ -24,6 +24,7 @@
 #include <Eigen/Core>
 
 #include "base/utils/error.hpp"
+#include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/camera/film.hpp"
 #include "model/crs/coordinate_system.hpp"
@@ -123,6 +124,10 @@ struct Sensor {
     /// Fiducial-mark layout of a scanned analogue film camera (WP-13.18a).
     /// Persisted as an optional `<film>` child, written only when enabled.
     FilmSettings film;
+
+    /// GNSS antenna mounting (WP-13.19). Its offset moves a measured
+    /// reference from the antenna phase centre to the projection centre.
+    Antenna antenna;
 
     bool operator==(const Sensor& other) const;
 };

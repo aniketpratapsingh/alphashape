@@ -224,6 +224,12 @@ std::unique_ptr<AbstractCommand> make_set_sensor_master_command(
 std::unique_ptr<AbstractCommand> make_set_sensor_film_command(
     std::int32_t chunk_id, std::int32_t sensor_index, FilmSettings film);
 
+/// Replace one sensor's GNSS antenna mount (WP-13.19). Undo restores the
+/// previous offset and boresight. Throws ValueError for an unknown sensor or a
+/// non-finite offset; a boresight, when present, must be finite too.
+std::unique_ptr<AbstractCommand> make_set_sensor_antenna_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, Antenna antenna);
+
 // --- Cross-document (WP-11.5b) ---------------------------------------------
 
 std::unique_ptr<AbstractCommand> make_append_document_command(
