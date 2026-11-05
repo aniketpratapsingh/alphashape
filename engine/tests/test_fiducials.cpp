@@ -309,7 +309,7 @@ TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
     report("Fiducials.CalibrateFiducialsDerivesLayout max error", maximum, "mm");
 }
 
-TEST_F(ProjectIO, FilmRoundTrips) {
+TEST(ProjectIO, FilmRoundTrips) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("film");
     document.set_active_chunk_id(chunk.id());
@@ -346,7 +346,7 @@ TEST_F(ProjectIO, FilmRoundTrips) {
     EXPECT_NE(text.find("<film_transform values="), std::string::npos);
 }
 
-TEST_F(ProjectIO, NoFilmKeepsLayout) {
+TEST(ProjectIO, NoFilmKeepsLayout) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("plain");
     document.set_active_chunk_id(chunk.id());
