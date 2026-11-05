@@ -272,14 +272,16 @@ TEST(FilmSensorInvariant, CalibrateFiducialsStoresResolution) {
 
     const Sensor& after = chunk.sensors()[0];
     EXPECT_DOUBLE_EQ(after.film.resolution_mm_per_px, 0.01);
-    // The pixels are 200 per millimetre and the marks are measured 20 mm
-    // either side of centre, so the derived extent is 40 mm:
-    // 40 mm / 0.01 = 4000 normalised pixels and s = 1 / (0.01 * 200) = 0.5.
+    // The marks are measured 2000 pixels either side of centre and the derived
+    // layout puts them 20 mm out, so the frame is 40 mm -> 4000 normalised
+    // pixels. CalibrateFiducials defines the resolution IN REFERENCE-SCAN
+    // PIXELS, so the reference scan's transform scale is exactly 1/res and the
+    // conversion factor s is 1: the focal length must not move.
     EXPECT_EQ(after.width, 4000);
     EXPECT_EQ(after.height, 4000);
     EXPECT_EQ(after.calibration.width, 4000);
     EXPECT_EQ(after.calibration.height, 4000);
-    EXPECT_NEAR(after.calibration.f, 2000.0, 1e-9);
+    EXPECT_NEAR(after.calibration.f, 4000.0, 1e-9);
     EXPECT_TRUE(after.film.calibration_normalised);
 }
 
