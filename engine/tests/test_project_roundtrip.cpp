@@ -1875,15 +1875,22 @@ public:
     ~MasterScratch() {
         std::error_code ec;
         std::filesystem::remove_all(base_, ec);
-        std::filesystem::remove_all(base_ + ".files", ec);
+        std::filesystem::remove_all(sidecar(), ec);
     }
     MasterScratch(const MasterScratch&) = delete;
     MasterScratch& operator=(const MasterScratch&) = delete;
 
     const std::string& path() const { return base_; }
-    std::string zip() const { return base_ + ".files/project.zip"; }
+    std::string zip() const { return (sidecar() / "project.zip").string(); }
 
 private:
+    /// ProjectIO replaces the manifest extension with ".files".
+    std::filesystem::path sidecar() const {
+        std::filesystem::path directory = base_;
+        directory.replace_extension(".files");
+        return directory;
+    }
+
     std::string base_;
 };
 
