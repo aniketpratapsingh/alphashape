@@ -27,7 +27,8 @@ std::string number(double value) {
 std::string escape_text(const std::string& text) {
     std::string out;
     out.reserve(text.size());
-    for (unsigned char ch : text) {
+    for (char raw : text) {
+        const unsigned char ch = static_cast<unsigned char>(raw);
         if (ch >= 0x20U && ch < 0x7FU) {
             if (ch == '(' || ch == ')' || ch == '\\') {
                 out.push_back('\\');
@@ -59,7 +60,10 @@ std::vector<std::uint8_t> deflate(const std::vector<std::uint8_t>& input) {
 std::vector<std::uint8_t> serialise(const std::vector<std::string>& objects) {
     std::vector<std::uint8_t> out;
     auto append = [&out](const std::string& text) {
-        out.insert(out.end(), text.begin(), text.end());
+        out.reserve(out.size() + text.size());
+        for (char raw : text) {
+            out.push_back(static_cast<std::uint8_t>(raw));
+        }
     };
     append("%PDF-1.4\n");
     append("%\xE2\xE3\xCF\xD3\n");

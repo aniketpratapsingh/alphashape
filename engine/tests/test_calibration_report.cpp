@@ -57,7 +57,8 @@ std::vector<std::uint8_t> sample_pdf() {
 
 TEST(Pdf, WritesValidHeader) {
     const std::vector<std::uint8_t> bytes = sample_pdf();
-    const std::string text(bytes.begin(), bytes.end());
+    const std::string text(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size());
     ASSERT_GE(text.size(), 8U);
     EXPECT_EQ(text.compare(0, 8, "%PDF-1.4"), 0);
     EXPECT_EQ(text.compare(text.size() - 6U, 6U, "%%EOF\n"), 0);
@@ -110,7 +111,7 @@ TEST(CalibrationReport, PdfIsWellFormed) {
     const std::vector<std::uint8_t> bytes =
         calibration_report_pdf({sample_input()});
     ASSERT_GE(bytes.size(), 8U);
-    const std::string head(bytes.begin(), bytes.begin() + 8);
+    const std::string head(reinterpret_cast<const char*>(bytes.data()), 8U);
     EXPECT_EQ(head, "%PDF-1.4");
     std::printf("[calibration report pdf] %zu bytes\n", bytes.size());
 }

@@ -99,9 +99,9 @@ void draw_line(Image& image, int x0, int y0, int x1, int y1) {
     int error = dx + dy;
     while (true) {
         if (x0 >= 0 && x0 < image.width() && y0 >= 0 && y0 < image.height()) {
-            image.at(x0, y0, 0) = 40;
-            image.at(x0, y0, 1) = 40;
-            image.at(x0, y0, 2) = 40;
+            image.at(x0, y0, 0) = static_cast<std::uint8_t>(40);
+            image.at(x0, y0, 1) = static_cast<std::uint8_t>(40);
+            image.at(x0, y0, 2) = static_cast<std::uint8_t>(40);
         }
         if (x0 == x1 && y0 == y1) {
             break;
@@ -240,9 +240,9 @@ Image render_distortion_plot(const Calibration& calibration, int width_px,
     Image image(width_px, height_px, 3);
     for (int y = 0; y < height_px; ++y) {
         for (int x = 0; x < width_px; ++x) {
-            image.at(x, y, 0) = 255;
-            image.at(x, y, 1) = 255;
-            image.at(x, y, 2) = 255;
+            image.at(x, y, 0) = static_cast<std::uint8_t>(255);
+            image.at(x, y, 1) = static_cast<std::uint8_t>(255);
+            image.at(x, y, 2) = static_cast<std::uint8_t>(255);
         }
     }
     const double sensor_w = static_cast<double>(calibration.width);
