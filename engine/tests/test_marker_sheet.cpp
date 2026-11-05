@@ -209,7 +209,7 @@ TEST(MarkerSheet, TargetSizeIs25mm) {
         int first = -1;
         int last = -1;
         for (int x = 0; x < sheet.width(); ++x) {
-            if (sheet.at(x, y, 0) < 128U) {
+            if (sheet.at(x, y, 0) < 128) {
                 if (first < 0) {
                     first = x;
                 }

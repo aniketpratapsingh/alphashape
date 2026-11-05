@@ -640,7 +640,7 @@ Image raster_page(const PageContent& content, const PaperSize& paper,
                                             static_cast<std::size_t>(x)];
             int count = 0;
             for (int bit = 0; bit < kSupersample * kSupersample; ++bit) {
-                if ((bits & (static_cast<std::uint16_t>(1U) << bit)) != 0U) {
+                if ((bits & (static_cast<std::uint16_t>(1U) << bit)) != 0) {
                     ++count;
                 }
             }
