@@ -60,6 +60,7 @@
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/sfm/adaptive_fit.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
+#include "common/algorithm/sfm/bundle_adjustment_detail.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
 #include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
@@ -959,7 +960,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
     const double attitude_rms_deg =
         attitude_n == 0 ? 0.0 : std::sqrt(attitude_sq / static_cast<double>(attitude_n));
-    staged.meta().set("optimize_cameras.attitude_rms_deg", meta_number(attitude_rms_deg));
+    // Written only when there is a rotation prior, so a project without
+    // measured attitudes keeps exactly the metadata it had before WP-13.21.
+    if (!problem.rotation_priors.empty()) {
+        staged.meta().set("optimize_cameras.attitude_rms_deg", meta_number(attitude_rms_deg));
+    }
 
     // -- report statistics (metres) -----------------------------------------
     // The solver reports in chunk-local units; multiply by the local->ECEF
@@ -999,17 +1004,24 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     *chunk = std::move(staged);
 
     if (Log::enabled(LogLevel::Info)) {
-        log(LogLevel::Info) << "OptimizeCameras: RMS " << report.initial_rms_px << " -> "
-                            << report.final_rms_px << " px (" << report.observations
-                            << " observations, " << report.iterations << " iterations, prior RMS "
-                            << report.prior_rms_sigma << " sigma, " << report.priors
-                            << " prior axes; control RMS " << control_rms_m << " m over "
-                            << report.control_points << ", check-point RMS " << checkpoint_rms_m
-                            << " m over " << report.checkpoints << ", scale-bar RMS "
-                            << scalebar_rms_m << " m over " << report.scalebars << ", check-bar RMS "
-                            << checkbar_rms_m << " m over " << report.checkbars
-                            << ", attitude RMS " << attitude_rms_deg << " deg over "
-                            << problem.rotation_priors.size() << " cameras)";
+        // The attitude clause appears only when there is a rotation prior, so
+        // orientation-free projects log the same line as before WP-13.21.
+        std::ostringstream message;
+        message << "OptimizeCameras: RMS " << report.initial_rms_px << " -> "
+                << report.final_rms_px << " px (" << report.observations
+                << " observations, " << report.iterations << " iterations, prior RMS "
+                << report.prior_rms_sigma << " sigma, " << report.priors
+                << " prior axes; control RMS " << control_rms_m << " m over "
+                << report.control_points << ", check-point RMS " << checkpoint_rms_m
+                << " m over " << report.checkpoints << ", scale-bar RMS " << scalebar_rms_m
+                << " m over " << report.scalebars << ", check-bar RMS " << checkbar_rms_m
+                << " m over " << report.checkbars;
+        if (!problem.rotation_priors.empty()) {
+            message << ", attitude RMS " << attitude_rms_deg << " deg over "
+                    << problem.rotation_priors.size() << " cameras";
+        }
+        message << ")";
+        log(LogLevel::Info) << message.str();
     }
 }
 
