@@ -61,7 +61,10 @@ enum class SheetTarget {
 struct SheetOptions {
     SheetTarget target = SheetTarget::Circular12;
     std::string paper = "A4";  ///< "A4" (210x297 mm) or "Letter" (8.5x11 in).
-    double target_size_mm = 25.0;   ///< Coded-target outer diameter / cross side.
+    /// Circular outer diameter / cross side. For an AprilTag this is the
+    /// outer extent of the black border; the white margin cell lies outside it
+    /// inside the quiet zone.
+    double target_size_mm = 25.0;
     double quiet_zone_mm = 5.0;     ///< White border around each target.
     int first_code = 1;             ///< First printed code id.
     int count = 0;                  ///< 0 = fill the first page.

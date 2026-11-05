@@ -188,9 +188,13 @@ void add_april_target(std::vector<Shape>& shapes, double cx, double cy,
                       double size_mm, int code) {
     const TagFamily& family = tag_family(AprilTagFamily::Tag36h11);
     const int total = family.total_width;
-    const double cell = size_mm / static_cast<double>(total);
-    const double x0 = cx - 0.5 * size_mm;
-    const double y0 = cy - 0.5 * size_mm;
+    const int border = family.width_at_border;
+    // `size_mm` is the black border's outer extent, the standard tag-size
+    // convention; the white margin cell lies outside it in the quiet zone.
+    const double cell = size_mm / static_cast<double>(border);
+    const double visual = cell * static_cast<double>(total);
+    const double x0 = cx - 0.5 * visual;
+    const double y0 = cy - 0.5 * visual;
     const std::uint64_t word = family.codes[static_cast<std::size_t>(code)];
     for (int gy = 0; gy < total; ++gy) {
         for (int gx = 0; gx < total; ++gx) {
