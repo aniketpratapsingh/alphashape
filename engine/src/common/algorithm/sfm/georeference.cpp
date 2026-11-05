@@ -291,11 +291,55 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     const double threshold = std::max(0.5, 5.0 * median(horizontal));
 
     // -- similarity fit ------------------------------------------------------
-    const SimilarityRansacResult ransac =
-        estimate_similarity_ransac(source, reference_enu, threshold);
+    // A GNSS reference measures the antenna phase centre, not the projection
+    // centre. When a sensor records a mount, the first fit predicts where the
+    // antenna lies for the current pose; the second fit then targets the
+    // centre that puts the antenna on the measured reference. Without antenna
+    // data only the first fit runs, exactly as before WP-13.19.
+    const auto antenna_of = [&chunk](const Camera& camera) -> const Antenna* {
+        if (camera.sensor_id < 0 ||
+            camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
+            return nullptr;
+        }
+        const Antenna& antenna =
+            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].antenna;
+        return (antenna.is_set() || antenna.boresight_deg.has_value()) ? &antenna
+                                                                       : nullptr;
+    };
+    bool any_antenna = false;
+    for (const Camera* camera : candidates) {
+        any_antenna = any_antenna || antenna_of(*camera) != nullptr;
+    }
+
+    std::vector<Eigen::Vector3d> fit_targets = reference_enu;
+    SimilarityRansacResult ransac =
+        estimate_similarity_ransac(source, fit_targets, threshold);
     if (!ransac.similarity.has_value()) {
         report.reason = "GNSS references are collinear or the similarity fit failed";
         return report;
+    }
+    if (any_antenna) {
+        // A source local unit is `s.scale` metres, so the camera-frame lever
+        // arm in metres enters the ENU target space as R_sim * map_R * R_c^T
+        // times the offset -- the scale cancels. `map_R` carries the stored
+        // local frame into the frame the similarity was fitted in.
+        const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
+        const Eigen::Matrix3d enu_from_source = ransac.similarity->R * map_r;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            const Antenna* antenna = antenna_of(*candidates[i]);
+            if (antenna == nullptr) {
+                continue;
+            }
+            const Eigen::Matrix3d r_c = candidates[i]->pose.block<3, 3>(0, 0);
+            const Eigen::Vector3d shift =
+                enu_from_source * r_c.transpose() * antenna->camera_offset();
+            fit_targets[i] -= shift;
+        }
+        ransac = estimate_similarity_ransac(source, fit_targets, threshold);
+        if (!ransac.similarity.has_value()) {
+            report.reason = "GNSS references are collinear or the antenna-aware fit failed";
+            return report;
+        }
     }
 
     // Composite similarity applied to the STORED local coordinates: T = S o map.
@@ -307,12 +351,13 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     t_sim.R = s.R * map_r;
     t_sim.t = s.scale * (s.R * map_t) + s.t;
 
-    // RMS residual of the camera-centre fit over the inliers.
+    // RMS residual of the camera-centre fit over the inliers (against the
+    // antenna-corrected targets when one was applied).
     double sum_sq = 0.0;
     std::size_t inliers = 0;
     for (std::size_t i = 0; i < source.size(); ++i) {
         if (ransac.inliers[i] != 0) {
-            sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
+            sum_sq += (s.apply(source[i]) - fit_targets[i]).squaredNorm();
             ++inliers;
         }
     }
