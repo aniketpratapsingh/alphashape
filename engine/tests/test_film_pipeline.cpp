@@ -242,8 +242,8 @@ TEST(FilmSensorInvariant, CalibrateFiducialsStoresResolution) {
     document.set_active_chunk_id(chunk.id());
     Sensor sensor;
     sensor.label = "film-camera";
-    sensor.width = 4000;
-    sensor.height = 3000;
+    sensor.width = 8000;   // raw scan pixels
+    sensor.height = 6000;
     sensor.calibration =
         Calibration::initial(CameraType::Frame, sensor.width, sensor.height, 4000.0);
     sensor.film.enabled = true;
@@ -272,11 +272,13 @@ TEST(FilmSensorInvariant, CalibrateFiducialsStoresResolution) {
 
     const Sensor& after = chunk.sensors()[0];
     EXPECT_DOUBLE_EQ(after.film.resolution_mm_per_px, 0.01);
-    // 20 mm / 0.01 = 2000 normalised pixels; s = 1 / (0.01 * 200) = 0.5.
-    EXPECT_EQ(after.width, 2000);
-    EXPECT_EQ(after.height, 2000);
-    EXPECT_EQ(after.calibration.width, 2000);
-    EXPECT_EQ(after.calibration.height, 2000);
+    // The pixels are 200 per millimetre and the marks are measured 20 mm
+    // either side of centre, so the derived extent is 40 mm:
+    // 40 mm / 0.01 = 4000 normalised pixels and s = 1 / (0.01 * 200) = 0.5.
+    EXPECT_EQ(after.width, 4000);
+    EXPECT_EQ(after.height, 4000);
+    EXPECT_EQ(after.calibration.width, 4000);
+    EXPECT_EQ(after.calibration.height, 4000);
     EXPECT_NEAR(after.calibration.f, 2000.0, 1e-9);
     EXPECT_TRUE(after.film.calibration_normalised);
 }
