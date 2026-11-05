@@ -85,6 +85,18 @@ Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
 /// <= 0 or non-finite is unconstrained (residual 0). Like the centre priors,
 /// the residual carries a Huber loss of scale 3 in sigma units.
 ///
+/// The engine's stored `orientation_deg` is a BODY attitude, not a camera
+/// attitude: `R_wb` is the body-to-world rotation in the slot CRS's local ENU
+/// basis (see `reference/convert_reference.hpp`). The caller forms `measured`
+/// from it with the fixed nadir camera mount B =
+/// `reference::body_to_camera_nadir()`, i.e. `R_wc = R_wb * B^T`; an antenna
+/// boresight, when the effective master sensor has one, replaces B. The
+/// heading frame is built from `R_wb`, not from the stored angles, so it is
+/// well defined in any rotation order and at body pitch +/-90 degrees (see
+/// `detail::heading_frame_from_body`). In that degenerate pitch case yaw and
+/// roll about the frame are not separable, so the caller gives them the same
+/// sigma.
+///
 /// Rotation priors never enter the gauge decision: they constrain attitude, not
 /// the similarity the caller has already fixed with `fixed_pose` /
 /// `scale_anchor_camera` and the centre/control-point priors.

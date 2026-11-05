@@ -23,7 +23,9 @@
 
 #include "base/io/zip.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
+#include "common/algorithm/reference/xmp_reference.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
+#include "common/algorithm/sfm/bundle_adjustment_detail.hpp"
 #include "common/algorithm/sfm/georeference.hpp"
 #include "common/core/document.hpp"
 #include "common/io/doc_xml.hpp"
@@ -62,23 +64,37 @@ Eigen::Vector3d stored_from_world_body(const Eigen::Matrix3d& r_wb,
     return Eigen::Vector3d(a.yaw, -a.pitch, a.roll);
 }
 
-/// A level ring of cameras over a point grid, in a metric ENU local frame
-/// (the chunk transform is ENU->ECEF at `origin`). `r_bc` is the body->camera
-/// mount used to synthesise the stored orientation triple: for the truth
-/// world->camera rotation `R_wc`, `R_wc = R_bc * R_wb^T`, hence
-/// `R_wb = R_wc^T * R_bc`.
+/// A ring of nadir cameras over a ground point grid, in a metric ENU local
+/// frame (the chunk transform is ENU->ECEF at `origin`). The airframe is level
+/// (body forward horizontal, pitch and roll zero), so the stored body attitude
+/// is well conditioned in every rotation order. `mount` is the body->camera
+/// mount used to synthesise the truth: R_wc = R_wb * mount^T, so the stored
+/// body attitude is R_wb = R_wc * mount.
 struct Scene {
     Document document;
     geo::Geodetic origin;
+    Eigen::Matrix3d mount = reference::body_to_camera_nadir();
     /// True world->camera rotation per camera.
     std::vector<Eigen::Matrix3d> rotations;
+    /// True body->world rotation per camera.
+    std::vector<Eigen::Matrix3d> bodies;
     /// True stored orientation triple per camera.
     std::vector<Eigen::Vector3d> orientations;
 };
 
-Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& r_bc,
+/// Rz(angle) about ENU up, i.e. a body yaw.
+Eigen::Matrix3d yaw_about_up(double radians) {
+    Eigen::Matrix3d m;
+    m << std::cos(radians), -std::sin(radians), 0.0,  //
+        std::sin(radians), std::cos(radians), 0.0,     //
+        0.0, 0.0, 1.0;
+    return m;
+}
+
+Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& mount,
                  bool with_orientation) {
     Scene scene;
+    scene.mount = mount;
     Chunk& chunk = scene.document.workspace().add_chunk("attitude");
     scene.document.set_active_chunk_id(chunk.id());
     scene.origin = geo::Geodetic{7.0, 45.0, 100.0};
@@ -102,18 +118,13 @@ Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& r_bc,
     for (int i = 0; i < kCameras; ++i) {
         const double azimuth =
             2.0 * kPi * static_cast<double>(i) / static_cast<double>(kCameras);
-        // Level ring: every optical axis is horizontal, so the body attitude
-        // has pitch and roll near zero and the yaw/pitch/roll split is
-        // well conditioned (a nadir mount would sit at ZYX gimbal lock).
-        const Eigen::Vector3d centre(6.0 * std::cos(azimuth), 6.0 * std::sin(azimuth), 0.0);
-        const Eigen::Vector3d z = -centre.normalized();
-        const Eigen::Vector3d down(0.0, 0.0, -1.0);
-        const Eigen::Vector3d y = (down - down.dot(z) * z).normalized();
-        const Eigen::Vector3d x = y.cross(z).normalized();
-        Eigen::Matrix3d rotation;
-        rotation.row(0) = x.transpose();
-        rotation.row(1) = y.transpose();
-        rotation.row(2) = z.transpose();
+        // Level airframe at a compass heading, positioned above the grid. The
+        // camera looks straight down because the mount is the nadir one:
+        // R_wc = R_wb * mount^T.
+        const Eigen::Vector3d centre(2.0 * std::cos(azimuth), 2.0 * std::sin(azimuth),
+                                     10.0);
+        const Eigen::Matrix3d body = yaw_about_up(azimuth);
+        const Eigen::Matrix3d rotation = body * mount.transpose();
 
         Camera camera;
         camera.id = i;
@@ -125,17 +136,17 @@ Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& r_bc,
             Eigen::Vector3d(g.longitude_deg, g.latitude_deg, g.height_m);
         camera.reference.accuracy = Eigen::Vector3d::Constant(0.02);
         camera.reference.enabled = true;
-        // R_wb in the camera's own ENU: E_c^T E_o * R_wc^T * R_bc, where E is
-        // ECEF-from-ENU. The chunk-local R_wc is in E_o's ENU.
+        // R_wb in the camera's own ENU: E_c^T E_o * R_wb, where E is
+        // ECEF-from-ENU. The chunk-local body rotation is in E_o's ENU.
         const Eigen::Matrix3d enu_cam = geo::enu_to_ecef(g).block<3, 3>(0, 0);
-        const Eigen::Matrix3d r_wb =
-            enu_cam.transpose() * enu_origin * rotation.transpose() * r_bc;
+        const Eigen::Matrix3d r_wb = enu_cam.transpose() * enu_origin * body;
         const Eigen::Vector3d stored = stored_from_world_body(r_wb, order);
         if (with_orientation) {
             camera.reference.orientation_deg = stored;
         }
         chunk.cameras().push_back(camera);
         scene.rotations.push_back(rotation);
+        scene.bodies.push_back(body);
         scene.orientations.push_back(stored);
         sets[static_cast<std::size_t>(i)].camera_id = i;
     }
@@ -144,8 +155,8 @@ Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& r_bc,
         for (int gy = -2; gy <= 2; ++gy) {
             for (int gz = -1; gz <= 1; ++gz) {
                 const Eigen::Vector3d point(
-                    1.1 * static_cast<double>(gx), 1.1 * static_cast<double>(gy),
-                    1.2 * static_cast<double>(gz));
+                    0.6 * static_cast<double>(gx), 0.6 * static_cast<double>(gy),
+                    0.6 * static_cast<double>(gz));
                 Track track;
                 for (int i = 0; i < kCameras; ++i) {
                     const Transform& pose =
@@ -207,15 +218,6 @@ Eigen::Vector3d heading_error_deg(const Eigen::Matrix3d& solved,
     return Eigen::Vector3d(dh.z(), dh.y(), dh.x()) / kDeg;
 }
 
-/// The level heading frame at `yaw_deg`: columns (forward, left, up), the same
-/// basis OptimizeCameras builds (Rz(yaw + 90 deg) in a metric ENU chunk).
-Eigen::Matrix3d heading_frame(double yaw_deg) {
-    const double a = (yaw_deg + 90.0) * kDeg;
-    Eigen::Matrix3d m;
-    m << std::cos(a), -std::sin(a), 0.0, std::sin(a), std::cos(a), 0.0, 0.0, 0.0, 1.0;
-    return m;
-}
-
 /// ENU(camera) from chunk-local for camera `i`, i.e. E_c^T E_o.
 Eigen::Matrix3d enu_cam_from_internal(const Scene& scene, std::size_t i) {
     const Camera& camera = scene.document.active_chunk()->cameras()[i];
@@ -224,6 +226,15 @@ Eigen::Matrix3d enu_cam_from_internal(const Scene& scene, std::size_t i) {
     const Eigen::Matrix3d e_c =
         geo::enu_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()}).block<3, 3>(0, 0);
     return e_c.transpose() * e_o;
+}
+
+/// The heading frame of camera `i`'s true body attitude, in the chunk-local
+/// frame. Built from R_wb (not the stored angles), so it is valid in every
+/// rotation order.
+Eigen::Matrix3d heading_frame(const Scene& scene, std::size_t i) {
+    // scene.bodies holds the true body attitude in chunk-local axes, which is
+    // the frame the heading frame is expressed in.
+    return sfm::detail::heading_frame_from_body(scene.bodies[i]);
 }
 
 /// The forward map of the stored-orientation contract.
@@ -235,11 +246,11 @@ Eigen::Matrix3d r_wb_from_stored(const Eigen::Vector3d& stored,
 
 TEST(AttitudePrior, ZeroResidualAtTruth) {
     for (crs::RotationOrder order : {crs::RotationOrder::ZYX, crs::RotationOrder::XYZ}) {
-        Scene scene = make_scene(order, reference::body_to_camera(), true);
+        Scene scene = make_scene(order, reference::body_to_camera_nadir(), true);
         // The BA residual itself at truth: Log(R^T R) = 0.
         sfm::BARotationPrior prior;
         prior.measured = scene.rotations[0];
-        prior.heading_frame = heading_frame(scene.orientations[0].x());
+        prior.heading_frame = heading_frame(scene, 0);
         prior.sigma_rad = Eigen::Vector3d::Ones();
         sfm::BAPose pose;
         pose.R = scene.rotations[0];
@@ -258,7 +269,7 @@ TEST(AttitudePrior, ZeroResidualAtTruth) {
 }
 
 TEST(AttitudePrior, YawSigmaSplit) {
-    const Eigen::Matrix3d r_bc = reference::body_to_camera();
+    const Eigen::Matrix3d r_bc = reference::body_to_camera_nadir();
     // Yaw: a 2 degree measurement error with a huge yaw sigma must be ignored
     // by the image-driven solution.
     {
@@ -269,7 +280,7 @@ TEST(AttitudePrior, YawSigmaSplit) {
         chunk.cameras()[0].reference.orientation_deg = stored;
         chunk.cameras()[0].reference.rotation_accuracy_deg =
             Eigen::Vector3d(1e6, 0.01, 0.01);
-        const Eigen::Matrix3d hf = heading_frame(scene.orientations[0].x());
+        const Eigen::Matrix3d hf = heading_frame(scene, 0);
         // World->camera of the measurement: R_bc * R_wb^T.
         const Eigen::Matrix3d measured =
             r_bc * r_wb_from_stored(stored, crs::RotationOrder::ZYX).transpose() *
@@ -294,7 +305,7 @@ TEST(AttitudePrior, YawSigmaSplit) {
         chunk.cameras()[0].reference.orientation_deg = stored;
         chunk.cameras()[0].reference.rotation_accuracy_deg =
             Eigen::Vector3d(1e6, 0.005, 0.005);
-        const Eigen::Matrix3d hf = heading_frame(scene.orientations[0].x());
+        const Eigen::Matrix3d hf = heading_frame(scene, 0);
         const Eigen::Matrix3d measured =
             r_bc * r_wb_from_stored(stored, crs::RotationOrder::ZYX).transpose() *
             enu_cam_from_internal(scene, std::size_t{0});
@@ -385,8 +396,8 @@ TEST(AttitudePrior, WeakCameraStabilised) {
 }
 
 TEST(AttitudePrior, NoPriorWithoutOrientation) {
-    Scene on = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera(), false);
-    Scene off = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera(), false);
+    Scene on = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera_nadir(), false);
+    Scene off = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera_nadir(), false);
     run_optimize(on, true);
     run_optimize(off, false);
     const Chunk& a = *on.document.active_chunk();
@@ -398,7 +409,28 @@ TEST(AttitudePrior, NoPriorWithoutOrientation) {
     EXPECT_TRUE(a.sensors() == b.sensors());
     EXPECT_EQ((a.transform() - b.transform()).cwiseAbs().maxCoeff(), 0.0);
     EXPECT_EQ(a.meta().find("optimize_cameras.0.attitude_error_deg"), nullptr);
-    EXPECT_EQ(meta_double(a, "optimize_cameras.attitude_rms_deg"), 0.0);
+    // Orientation-free projects keep their pre-WP-13.21 metadata exactly.
+    EXPECT_EQ(a.meta().find("optimize_cameras.attitude_rms_deg"), nullptr);
+}
+
+TEST(AttitudePrior, OrientationIgnoredWhenDisabled) {
+    // A chunk that carries orientations but solves with use_orientation=false
+    // must produce the same answer as one with no orientations at all, and
+    // must not record any attitude output.
+    Scene carried = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera_nadir(),
+                               true);
+    Scene absent = make_scene(crs::RotationOrder::ZYX, reference::body_to_camera_nadir(),
+                              false);
+    run_optimize(carried, false);
+    run_optimize(absent, true);
+    const Chunk& a = *carried.document.active_chunk();
+    const Chunk& b = *absent.document.active_chunk();
+    EXPECT_TRUE(a.cameras() == b.cameras());
+    EXPECT_TRUE(a.tie_points() == b.tie_points());
+    EXPECT_TRUE(a.sensors() == b.sensors());
+    EXPECT_EQ((a.transform() - b.transform()).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ(a.meta().find("optimize_cameras.0.attitude_error_deg"), nullptr);
+    EXPECT_EQ(a.meta().find("optimize_cameras.attitude_rms_deg"), nullptr);
 }
 
 TEST(AttitudePrior, BoresightMount) {
@@ -410,9 +442,109 @@ TEST(AttitudePrior, BoresightMount) {
     const double rms =
         meta_double(*scene.document.active_chunk(), "optimize_cameras.attitude_rms_deg");
     std::printf("[attitude] boresight mount RMS %.3e deg\n", rms);
-    // Synthesised with the boresight mount, so the prior is at truth. A level
-    // mount here would leave a large non-zero residual.
+    // Synthesised with the boresight mount, so the prior is at truth. The
+    // default nadir mount here would leave a large non-zero residual.
     EXPECT_LT(rms, 1e-4);
+}
+
+TEST(AttitudePrior, XmpNadirPriorIsZeroAtTruth) {
+    // A gimbal log describing a straight-down camera with heading 30 degrees.
+    // AddPhotos stores orientation_zyx() unchanged in a ZYX chunk.
+    XmpReference xmp;
+    xmp.gimbal_yaw_deg = 30.0;
+    xmp.gimbal_pitch_deg = -90.0;
+    const std::optional<XmpOrientation> angles = xmp.orientation_zyx();
+    ASSERT_TRUE(angles.has_value());
+    const Eigen::Vector3d stored(angles->yaw_deg, angles->pitch_deg, angles->roll_deg);
+
+    const Eigen::Matrix3d r_wb = r_wb_from_stored(stored, crs::RotationOrder::ZYX);
+    const Eigen::Matrix3d mount = reference::body_to_camera_nadir();
+    // The documented rule: the stored triple is a BODY attitude, and the
+    // default mount is nadir, so R_wc = R_wb * B^T.
+    const Eigen::Matrix3d r_wc = r_wb * mount.transpose();
+    // A nadir camera has its optical axis straight down.
+    EXPECT_NEAR(r_wc(2, 2), -1.0, 1e-9);
+
+    sfm::BARotationPrior prior;
+    prior.measured = mount * r_wb.transpose();
+    prior.heading_frame = sfm::detail::heading_frame_from_body(r_wb);
+    prior.sigma_rad = Eigen::Vector3d::Ones();
+    sfm::BAPose pose;
+    pose.R = r_wc;
+    std::printf("[attitude] XMP nadir truth: residual %.3e rad\n",
+                sfm::predicted_rotation_residual(pose, prior).norm());
+    EXPECT_LT(sfm::predicted_rotation_residual(pose, prior).norm(), 1e-9);
+}
+
+TEST(AttitudePrior, RotationLogMatchesAngleAxis) {
+    const Eigen::Vector3d axis = Eigen::Vector3d(1.0, 2.0, 3.0).normalized();
+    // The near-pi branch is entered at cos(theta) < -0.999999, i.e. theta >
+    // pi - 1.4e-3; pi - 1e-4 pins it, while pi - 0.01 exercises the generic
+    // skew branch a step away from the limit.
+    struct Case {
+        double theta;
+        double tolerance;
+    };
+    for (const Case& c : {Case{kPi - 0.01, 1e-6}, Case{kPi - 1e-4, 1e-6},
+                          Case{1e-8, 1e-12}, Case{1.0, 1e-9}}) {
+        const Eigen::Matrix3d rotation =
+            Eigen::AngleAxisd(c.theta, axis).toRotationMatrix();
+        const Eigen::Vector3d log = sfm::detail::rotation_log_matrix(rotation);
+        EXPECT_LT((log - c.theta * axis).norm(), c.tolerance)
+            << "theta " << c.theta << " log " << log.transpose();
+    }
+}
+
+TEST(AttitudePrior, HeadingFrameFromBodyNotStoredAngles) {
+    // The same body attitude written as a ZYX and an XYZ triple. The frame is
+    // built from R_wb, so the order the angles were stored in cannot matter
+    // (the old first-angle heading was only a yaw in ZYX).
+    const Eigen::Matrix3d r_wb = rz90() * crs::to_matrix(
+        crs::EulerAngles{25.0, -10.0, 5.0, crs::RotationOrder::ZYX});
+    const Eigen::Matrix3d r_wb_xyz =
+        crs::to_matrix(crs::from_matrix(r_wb, crs::RotationOrder::XYZ));
+    EXPECT_TRUE(r_wb.isApprox(r_wb_xyz, 1e-12));
+    bool degenerate_zyx = true;
+    bool degenerate_xyz = true;
+    const Eigen::Matrix3d frame_zyx =
+        sfm::detail::heading_frame_from_body(r_wb, &degenerate_zyx);
+    const Eigen::Matrix3d frame_xyz =
+        sfm::detail::heading_frame_from_body(r_wb_xyz, &degenerate_xyz);
+    EXPECT_FALSE(degenerate_zyx);
+    EXPECT_FALSE(degenerate_xyz);
+    EXPECT_TRUE(frame_zyx.isApprox(frame_xyz, 1e-12));
+    // Columns are (forward-level, left-level, up).
+    EXPECT_NEAR(frame_zyx.col(0).z(), 0.0, 1e-12);
+    EXPECT_NEAR(frame_zyx.col(0).norm(), 1.0, 1e-12);
+    EXPECT_TRUE(frame_zyx.col(2).isApprox(Eigen::Vector3d(0.0, 0.0, 1.0), 1e-15));
+    EXPECT_TRUE(frame_zyx.col(1).isApprox(Eigen::Vector3d(0.0, 0.0, 1.0).cross(
+                                              frame_zyx.col(0)),
+                                          1e-12));
+    // Forward is body x projected onto the horizon.
+    Eigen::Vector3d flat = r_wb.col(0);
+    flat.z() = 0.0;
+    EXPECT_TRUE(frame_zyx.col(0).isApprox(flat.normalized(), 1e-12));
+}
+
+TEST(AttitudePrior, HeadingFrameFiniteAtVerticalBodyForward) {
+    // Nose straight up (body pitch 90 degrees): the forward axis has no
+    // horizontal component, so the frame must fall back to another body axis.
+    const Eigen::Matrix3d r_wb = rz90() * crs::to_matrix(
+        crs::EulerAngles{30.0, -90.0, 10.0, crs::RotationOrder::ZYX});
+    bool degenerate = false;
+    const Eigen::Matrix3d frame =
+        sfm::detail::heading_frame_from_body(r_wb, &degenerate);
+    EXPECT_TRUE(degenerate);
+    EXPECT_TRUE(frame.allFinite());
+    EXPECT_NEAR(frame.determinant(), 1.0, 1e-12);
+    EXPECT_NEAR(frame.col(0).norm(), 1.0, 1e-12);
+    EXPECT_NEAR(frame.col(0).z(), 0.0, 1e-12);
+    sfm::BARotationPrior prior;
+    prior.measured = Eigen::AngleAxisd(0.01, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    prior.heading_frame = frame;
+    prior.sigma_rad = Eigen::Vector3d::Ones();
+    sfm::BAPose pose;
+    EXPECT_TRUE(sfm::predicted_rotation_residual(pose, prior).allFinite());
 }
 
 /// One chunk, one camera with a reference position and orientation. The

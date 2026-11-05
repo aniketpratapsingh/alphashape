@@ -50,10 +50,14 @@
 ///   crs::to_matrix({yaw, -pitch, roll})`, since `to_matrix` composes
 ///   `Rz(yaw) * Ry(pitch) * Rx(roll)` and takes the angles in the ENU basis.
 ///
+///   The stored triple is a BODY attitude, not a camera attitude.
 ///   `body_to_camera()` and `body_to_camera_nadir()` convert that FLU body
 ///   frame into the engine camera frame (x right, y down, z forward; see
 ///   `model/camera/calibration.hpp`) for a level and a straight-down camera.
-///   A camera-to-world rotation is `R_wb * body_to_camera().transpose()`.
+///   The engine's default camera mount is the nadir one, B =
+///   `body_to_camera_nadir()`, so a camera-to-world rotation is
+///   `R_wc = R_wb * B.transpose()`. An antenna boresight, when the sensor has
+///   one, replaces B (see WP-13.19); the rule is the same with that mount.
 ///
 ///   `convert_orientation` re-expresses an orientation in the target's axes;
 ///   see its own comment for the exact rule. `convert_reference` applies it to

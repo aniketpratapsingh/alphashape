@@ -653,21 +653,34 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                     geo::enu_to_ecef(geodetic).block<3, 3>(0, 0);
                 const Eigen::Matrix3d r_wb =
                     world_from_body(*camera.reference.orientation_deg, order);
-                // A boresight describes the camera mount in the body frame
-                // (WP-13.19); without one the level FLU camera mount applies.
+                // The stored triple is a BODY attitude (an aircraft or a gimbal
+                // log composed through the fixed mount). The camera is mounted
+                // by the nadir body-to-camera rotation unless the effective
+                // master sensor's antenna carries a boresight, which replaces
+                // that mount (WP-13.19). Either way R_wc = R_wb * B^T.
                 const Eigen::Matrix3d r_bc =
                     antenna.boresight_deg.has_value() ? antenna.body_to_camera()
-                                                      : reference::body_to_camera();
+                                                      : reference::body_to_camera_nadir();
+                bool degenerate_heading = false;
+                const Eigen::Matrix3d frame_enu =
+                    sfm::detail::heading_frame_from_body(r_wb, &degenerate_heading);
+                Eigen::Vector3d sigma_deg =
+                    camera.reference.rotation_accuracy_deg.value_or(
+                        Eigen::Vector3d::Constant(default_rotation_accuracy));
+                if (degenerate_heading) {
+                    // Body forward is vertical, so yaw and roll about the
+                    // heading frame are not separable: give both the looser
+                    // of their two sigmas.
+                    const double shared = std::max(sigma_deg.x(), sigma_deg.z());
+                    sigma_deg.x() = shared;
+                    sigma_deg.z() = shared;
+                }
                 sfm::BARotationPrior prior;
                 prior.camera = b;
                 prior.measured = r_bc * r_wb.transpose() * ecef_from_enu.transpose() *
                                  ecef_from_internal;
                 prior.heading_frame =
-                    ecef_from_internal.transpose() * ecef_from_enu *
-                    rotation_about_z(camera.reference.orientation_deg->x() + 90.0);
-                const Eigen::Vector3d sigma_deg =
-                    camera.reference.rotation_accuracy_deg.value_or(
-                        Eigen::Vector3d::Constant(default_rotation_accuracy));
+                    ecef_from_internal.transpose() * ecef_from_enu * frame_enu;
                 prior.sigma_rad = sigma_deg * kDegToRad;
                 problem.rotation_priors.push_back(prior);
                 ++rotation_prior_count;

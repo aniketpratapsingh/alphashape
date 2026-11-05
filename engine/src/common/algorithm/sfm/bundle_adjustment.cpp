@@ -2,6 +2,8 @@
 
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 
+#include "common/algorithm/sfm/bundle_adjustment_detail.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
