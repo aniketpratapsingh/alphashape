@@ -10,7 +10,9 @@
 /// without any rescaling.
 ///
 /// Paper sizes are the ISO A4 and US Letter rectangles. Layout is centred
-/// inside a printable margin of at least 10 mm. Coordinates in the PDF are
+/// inside a printable margin of at least 10 mm; the footer baseline also sits
+/// inside that bottom margin, at least 5 mm from the paper edge, so ordinary
+/// printers do not clip it. Coordinates in the PDF are
 /// PDF user-space points (origin bottom-left, y up); the raster is a top-down
 /// grayscale image. The geometry is shared: the raster evaluates the same
 /// millimetre-space shapes analytically with 4x4 supersampling per pixel.
@@ -49,11 +51,13 @@ enum class SheetTarget {
     Chessboard,
 };
 
-/// Sheet layout. `board_cols`/`board_rows` count SQUARES, not inner corners;
-/// `BoardSpec` counts inner corners, so the sheet passes `cols - 1` and
-/// `rows - 1` to the detector. A board is rotated 90 degrees when that is the
-/// only orientation that fits the paper. `count == 0` fills the first page; a
-/// positive count spans as many pages as needed.
+/// Sheet layout. `board_cols`/`board_rows` count chessboard SQUARES, not inner
+/// corners; a board detector configured for this sheet takes
+/// `board_cols - 1` by `board_rows - 1` inner corners. A board is rotated 90
+/// degrees when that is the only orientation that fits the paper. For the
+/// coded and cross families `count == 0` fills the first page, trimmed to the
+/// codes the family still has from `first_code`; a positive count spans as
+/// many pages as needed. A chessboard is always a single page.
 struct SheetOptions {
     SheetTarget target = SheetTarget::Circular12;
     std::string paper = "A4";  ///< "A4" (210x297 mm) or "Letter" (8.5x11 in).

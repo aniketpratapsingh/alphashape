@@ -43,7 +43,7 @@ PaperSize paper_size(const std::string& name) {
 /// One black region in millimetre coordinates with the origin at the sheet's
 /// top-left and y growing downwards (the raster orientation). The PDF writer
 /// mirrors y when it emits the same shape, so PDF and raster cannot drift.
-enum class ShapeKind { Rect, Polygon, Circle, Ring, Sector };
+enum class ShapeKind { Rect, Circle, Ring, Sector };
 
 struct Shape {
     ShapeKind kind = ShapeKind::Rect;
@@ -55,8 +55,6 @@ struct Shape {
     double r_outer = 0.0;
     double a0 = 0.0;  ///< Sector start angle, radians, atan2 orientation.
     double a1 = 0.0;  ///< Sector end angle, a1 >= a0.
-    std::array<std::array<double, 2>, 8> points{};
-    int point_count = 0;
     double gray = 0.0;
 };
 
@@ -131,21 +129,8 @@ bool shape_contains(const Shape& shape, double x, double y) {
             }
             return relative <= span;
         }
-        default:
-            break;
     }
-    bool inside = false;
-    for (int i = 0, j = shape.point_count - 1; i < shape.point_count; j = i++) {
-        const double xi = shape.points[static_cast<std::size_t>(i)][0];
-        const double yi = shape.points[static_cast<std::size_t>(i)][1];
-        const double xj = shape.points[static_cast<std::size_t>(j)][0];
-        const double yj = shape.points[static_cast<std::size_t>(j)][1];
-        if (((yi > y) != (yj > y)) &&
-            (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
-            inside = !inside;
-        }
-    }
-    return inside;
+    return false;
 }
 
 /// The printed circular pattern of target_patterns.hpp. Sector 0 starts at
@@ -406,7 +391,9 @@ TextItem footer_item(const PageSetup& setup) {
     text += " - print at 100% / actual size";
     TextItem item;
     item.x_mm = kPrintableMarginMm;
-    item.baseline_y_mm = setup.paper.height_mm - 4.0;
+    // Baseline 7 mm above the paper edge: inside the 10 mm bottom margin and
+    // at least 5 mm clear of the edge including descenders.
+    item.baseline_y_mm = setup.paper.height_mm - 7.0;
     item.size_pt = 7.0;
     item.text = text;
     return item;
@@ -525,16 +512,6 @@ void emit_shapes(PdfDocument& pdf, const PageContent& content,
                                         px(shape.r_inner), px(shape.r_outer),
                                         -shape.a1, -shape.a0, shape.gray);
                 break;
-            case ShapeKind::Polygon: {
-                std::vector<std::array<double, 2>> points;
-                points.reserve(static_cast<std::size_t>(shape.point_count));
-                for (int i = 0; i < shape.point_count; ++i) {
-                    points.push_back({px(shape.points[static_cast<std::size_t>(i)][0]),
-                                      py(shape.points[static_cast<std::size_t>(i)][1])});
-                }
-                pdf.fill_polygon(points, shape.gray);
-                break;
-            }
         }
     }
     for (const TextItem& item : content.texts) {
@@ -560,18 +537,6 @@ void shape_bounds(const Shape& shape, double& min_x, double& min_y,
             max_x = shape.x + shape.r_outer;
             max_y = shape.y + shape.r_outer;
             return;
-        case ShapeKind::Polygon:
-            break;
-    }
-    min_x = shape.points[0][0];
-    min_y = shape.points[0][1];
-    max_x = min_x;
-    max_y = min_y;
-    for (int i = 1; i < shape.point_count; ++i) {
-        min_x = std::min(min_x, shape.points[static_cast<std::size_t>(i)][0]);
-        min_y = std::min(min_y, shape.points[static_cast<std::size_t>(i)][1]);
-        max_x = std::max(max_x, shape.points[static_cast<std::size_t>(i)][0]);
-        max_y = std::max(max_y, shape.points[static_cast<std::size_t>(i)][1]);
     }
 }
 
