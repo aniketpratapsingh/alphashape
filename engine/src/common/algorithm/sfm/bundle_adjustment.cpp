@@ -187,9 +187,13 @@ private:
 /// scale `theta / (2 sin theta)` then tends to 1/2 and `delta` differentiates
 /// like `vee(E - E^T) / 2`, which is the correct first-order log map. Near pi
 /// the skew part vanishes, so the axis is rebuilt from the symmetric part
-/// (`E = 2 u u^T - I`) using the largest diagonal; that branch is entered only
-/// where the chosen component is at least 1/sqrt(3), so it never divides by a
-/// vanishing value.
+/// (`E = 2 u u^T - I`) using the largest diagonal. With `E = cos(t) I +
+/// (1 - cos t) u u^T + sin(t) [u]x`, the diagonal difference is
+/// `E_ii - E_jj - E_kk + 1 = 4 u_i^2 sin^2(t/2)`, so the square root carries a
+/// factor of 1/2, not 1/sqrt(2): dividing by 0.25, then multiplying the
+/// off-diagonal pairs by `1 / (4 u_i)`, recovers `u` exactly when the branch
+/// is entered. That branch is entered only where the chosen component is at
+/// least 1/sqrt(3), so it never divides by a vanishing value.
 template <typename T>
 void rotation_log(const T* r, T* delta) {
     using std::atan2;
@@ -206,21 +210,21 @@ void rotation_log(const T* r, T* delta) {
         const T e22 = r[8];
         T u[3] = {T(0), T(0), T(0)};
         if (e00 >= e11 && e00 >= e22) {
-            const T ux = sqrt(max((e00 - e11 - e22 + T(1.0)) * T(0.5), T(0.0)));
+            const T ux = sqrt(max((e00 - e11 - e22 + T(1.0)) * T(0.25), T(0.0)));
             u[0] = ux;
             if (ux > T(0)) {
                 u[1] = (r[1] + r[3]) / (T(4.0) * ux);
                 u[2] = (r[2] + r[6]) / (T(4.0) * ux);
             }
         } else if (e11 >= e22) {
-            const T uy = sqrt(max((e11 - e00 - e22 + T(1.0)) * T(0.5), T(0.0)));
+            const T uy = sqrt(max((e11 - e00 - e22 + T(1.0)) * T(0.25), T(0.0)));
             u[1] = uy;
             if (uy > T(0)) {
                 u[0] = (r[1] + r[3]) / (T(4.0) * uy);
                 u[2] = (r[5] + r[7]) / (T(4.0) * uy);
             }
         } else {
-            const T uz = sqrt(max((e22 - e00 - e11 + T(1.0)) * T(0.5), T(0.0)));
+            const T uz = sqrt(max((e22 - e00 - e11 + T(1.0)) * T(0.25), T(0.0)));
             u[2] = uz;
             if (uz > T(0)) {
                 u[0] = (r[2] + r[6]) / (T(4.0) * uz);
