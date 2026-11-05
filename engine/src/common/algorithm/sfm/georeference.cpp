@@ -131,6 +131,9 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
             const Camera& camera = chunk.cameras()[i];
             if (!camera.enabled) {
                 geometry.camera_poses[i] = camera.pose;
+                // The helper moved every covariance; an unregistered camera
+                // keeps its own, matching its untouched pose.
+                geometry.camera_location_covariances[i] = camera.location_covariance;
                 continue;
             }
             const Eigen::Matrix3d r_c = camera.pose.block<3, 3>(0, 0);
@@ -143,41 +146,12 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         // The helper already replaced the region with the axis-aligned bound of
         // the eight mapped corners, which is what a rotating similarity needs.
         geometry.transform = geo::enu_to_ecef(origin);
-        apply_geometry(chunk, geometry);
-        chunk.crs().epsg = 4326;
-        // Camera-centre covariances follow the same similarity. The rotation
+        // Camera-centre, tie-point and marker covariances were already moved by
+        // apply_similarity_to_geometry above (C' = s^2 R C R^T). The rotation
         // covariance is in each camera's own angle-axis parametrisation and is
         // left unchanged (see the note in the non-geometry path below).
-        const double camera_scale_sq = t_sim.scale * t_sim.scale;
-        for (Camera& camera : chunk.cameras()) {
-            if (!camera.enabled) {
-                continue;
-            }
-            camera.location_covariance = camera_scale_sq * t_sim.R *
-                                         camera.location_covariance *
-                                         t_sim.R.transpose();
-        }
-        // Track covariances follow the same s^2 R C R^T rule; the stored matrix
-        // is float, so the transform runs in float (WP-13.13b).
-        const Eigen::Matrix3f track_rotation = t_sim.R.cast<float>();
-        const float track_scale_sq = static_cast<float>(camera_scale_sq);
-        for (Track& track : chunk.tie_points().tracks) {
-            if (!track.covariance.has_value()) {
-                continue;
-            }
-            track.covariance = Eigen::Matrix3f(track_scale_sq * track_rotation *
-                                               (*track.covariance) *
-                                               track_rotation.transpose());
-        }
-        if (transform_markers) {
-            // A covariance transforms as C' = s^2 R C R^T.
-            const double scale_sq = t_sim.scale * t_sim.scale;
-            for (Marker& marker : chunk.markers()) {
-                marker.position_covariance = scale_sq * t_sim.R *
-                                             marker.position_covariance *
-                                             t_sim.R.transpose();
-            }
-        }
+        apply_geometry(chunk, geometry);
+        chunk.crs().epsg = 4326;
         chunk.set_camera_crs(chunk.crs());
         chunk.set_world_crs(chunk.crs());
         return;
@@ -200,17 +174,17 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         camera.location_covariance = t_sim.scale * t_sim.scale * t_sim.R *
                                      camera.location_covariance * t_sim.R.transpose();
     }
-    const Eigen::Matrix3f track_rotation = t_sim.R.cast<float>();
-    const float track_scale_sq =
-        static_cast<float>(t_sim.scale) * static_cast<float>(t_sim.scale);
+    const double track_scale_sq = t_sim.scale * t_sim.scale;
     for (Track& track : chunk.tie_points().tracks) {
         if (track.point.has_value()) {
             *track.point = t_sim.apply(*track.point);
             if (track.covariance.has_value()) {
-                // C' = s^2 R C R^T, in float like the stored matrix.
-                track.covariance =
-                    Eigen::Matrix3f(track_scale_sq * track_rotation *
-                                    (*track.covariance) * track_rotation.transpose());
+                // C' = s^2 R C R^T. The stored matrix is float, so the
+                // transform runs in double and casts once.
+                const Eigen::Matrix3d transformed =
+                    track_scale_sq * t_sim.R *
+                    (*track.covariance).cast<double>() * t_sim.R.transpose();
+                track.covariance = transformed.cast<float>();
             }
         }
     }

@@ -36,10 +36,19 @@ struct ChunkGeometry {
 
     /// One entry per `chunk.cameras()`, in order.
     std::vector<Transform> camera_poses;
+    /// Posterior covariance of each camera centre, in the chunk-local frame.
+    /// Same size and order as `camera_poses`; transforms as C' = s^2 R C R^T.
+    std::vector<Eigen::Matrix3d> camera_location_covariances;
     /// One entry per `chunk.tie_points().tracks`, in order (nullopt = untriangulated).
     std::vector<std::optional<Eigen::Vector3d>> track_points;
+    /// Posterior covariance of each tie point, in the chunk-local frame. Same
+    /// size and order as `track_points`; nullopt when the track has none.
+    std::vector<std::optional<Eigen::Matrix3f>> track_covariances;
     /// One entry per `chunk.markers()`, in order.
     std::vector<std::optional<Eigen::Vector3d>> marker_positions;
+    /// Position covariance of each marker, same size and order as
+    /// `marker_positions`.
+    std::vector<Eigen::Matrix3d> marker_position_covariances;
     /// Vertices of `chunk.shapes().features`, in feature order.
     std::vector<std::vector<Eigen::Vector3d>> shape_vertices;
     /// Positions of `chunk.trajectories()`, in trajectory order.

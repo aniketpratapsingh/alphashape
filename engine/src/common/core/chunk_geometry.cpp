@@ -21,18 +21,24 @@ ChunkGeometry capture_geometry(const Chunk& chunk) {
     geometry.meta = chunk.meta().items;
 
     geometry.camera_poses.reserve(chunk.cameras().size());
+    geometry.camera_location_covariances.reserve(chunk.cameras().size());
     for (const Camera& camera : chunk.cameras()) {
         geometry.camera_poses.push_back(camera.pose);
+        geometry.camera_location_covariances.push_back(camera.location_covariance);
     }
 
     geometry.track_points.reserve(chunk.tie_points().tracks.size());
+    geometry.track_covariances.reserve(chunk.tie_points().tracks.size());
     for (const Track& track : chunk.tie_points().tracks) {
         geometry.track_points.push_back(track.point);
+        geometry.track_covariances.push_back(track.covariance);
     }
 
     geometry.marker_positions.reserve(chunk.markers().size());
+    geometry.marker_position_covariances.reserve(chunk.markers().size());
     for (const Marker& marker : chunk.markers()) {
         geometry.marker_positions.push_back(marker.position);
+        geometry.marker_position_covariances.push_back(marker.position_covariance);
     }
 
     geometry.shape_vertices.reserve(chunk.shapes().features.size());
@@ -84,8 +90,14 @@ void apply_geometry(Chunk& chunk, const ChunkGeometry& geometry) {
     // Validate every dimension before touching the chunk, so a mismatched
     // snapshot can never leave it half rewritten.
     check_size(geometry.camera_poses.size(), chunk.cameras().size(), "camera");
+    check_size(geometry.camera_location_covariances.size(), chunk.cameras().size(),
+               "camera covariance");
     check_size(geometry.track_points.size(), chunk.tie_points().tracks.size(), "track");
+    check_size(geometry.track_covariances.size(), chunk.tie_points().tracks.size(),
+               "track covariance");
     check_size(geometry.marker_positions.size(), chunk.markers().size(), "marker");
+    check_size(geometry.marker_position_covariances.size(), chunk.markers().size(),
+               "marker covariance");
     check_size(geometry.point_clouds.size(), chunk.point_clouds().size(), "point cloud");
     check_size(geometry.models.size(), chunk.models().size(), "model");
     check_size(geometry.shape_vertices.size(), chunk.shapes().features.size(), "shape");
@@ -103,12 +115,17 @@ void apply_geometry(Chunk& chunk, const ChunkGeometry& geometry) {
 
     for (std::size_t i = 0; i < geometry.camera_poses.size(); ++i) {
         chunk.cameras()[i].pose = geometry.camera_poses[i];
+        chunk.cameras()[i].location_covariance =
+            geometry.camera_location_covariances[i];
     }
     for (std::size_t i = 0; i < geometry.track_points.size(); ++i) {
         chunk.tie_points().tracks[i].point = geometry.track_points[i];
+        chunk.tie_points().tracks[i].covariance = geometry.track_covariances[i];
     }
     for (std::size_t i = 0; i < geometry.marker_positions.size(); ++i) {
         chunk.markers()[i].position = geometry.marker_positions[i];
+        chunk.markers()[i].position_covariance =
+            geometry.marker_position_covariances[i];
     }
     for (std::size_t i = 0; i < geometry.shape_vertices.size(); ++i) {
         chunk.shapes().features[i].vertices = geometry.shape_vertices[i];
