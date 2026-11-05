@@ -279,7 +279,9 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     // Both passes can find the same target: even ids only through the light
     // interior, odd ids through the dark dot and (once the small dot is
     // blurred away at a coarse scale) through the same light interior. Decode
-    // every seed and keep one detection per target.
+    // every seed, group the decodes that describe the same printed target, and
+    // keep one detection per target.
+    std::vector<std::vector<Detection>> groups;
     const auto emit = [&](const CodedTarget& decoded, bool from_light) {
         Detection detection;
         detection.code = params.noparity ? (decoded.code / 2) * 2 : decoded.code;
@@ -289,20 +291,15 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         detection.coded = true;
         detection.centre_dot = (decoded.code % 2) != 0;
         detection.light_seed = from_light;
-        bool merged = false;
-        for (Detection& kept : out) {
-            const double gate = 0.5 * std::min(kept.radius, detection.radius);
-            if ((kept.center - detection.center).norm() < gate) {
-                if (better(detection, kept)) {
-                    kept = detection;
-                }
-                merged = true;
-                break;
+        for (std::vector<Detection>& group : groups) {
+            const double gate =
+                0.5 * std::min(group.front().radius, detection.radius);
+            if ((group.front().center - detection.center).norm() < gate) {
+                group.push_back(detection);
+                return;
             }
         }
-        if (!merged) {
-            out.push_back(detection);
-        }
+        groups.push_back(std::vector<Detection>{detection});
     };
     const auto decode_seed = [&](const MarkerCandidate& candidate)
         -> std::optional<CodedTarget> {
@@ -336,6 +333,41 @@ std::vector<Detection> detect_circular(const FloatImage& image,
                 break;
             }
         }
+    }
+    // Pick one decode per target. The ring word and the seed class are fixed
+    // once a candidate decodes, so the remaining choice is between border fits
+    // of the same target. A correct fit lands on the complete outer outline and
+    // agrees with the target's other fits to a few hundredths of a pixel of
+    // radius; a fit that mixed in the 0.85 R sector edge or a background edge
+    // is a lone outlier. Rank by that agreement before the radius tie-break.
+    const auto prefer = [&](const Detection& a, int support_a, const Detection& b,
+                            int support_b) {
+        if (a.hamming != b.hamming) return a.hamming < b.hamming;
+        const bool a_match = a.light_seed == !a.centre_dot;
+        const bool b_match = b.light_seed == !b.centre_dot;
+        if (a_match != b_match) return a_match;
+        if (support_a != support_b) return support_a > support_b;
+        return better(a, b);
+    };
+    out.reserve(groups.size());
+    for (const std::vector<Detection>& group : groups) {
+        std::size_t chosen = 0;
+        int chosen_support = 0;
+        for (std::size_t i = 0; i < group.size(); ++i) {
+            int support = 0;
+            for (const Detection& other : group) {
+                if (std::abs(other.radius - group[i].radius) <=
+                    0.003 * group[i].radius) {
+                    ++support;
+                }
+            }
+            if (i == 0 || prefer(group[i], support, group[chosen],
+                                 chosen_support)) {
+                chosen = i;
+                chosen_support = support;
+            }
+        }
+        out.push_back(group[chosen]);
     }
     return out;
 }
