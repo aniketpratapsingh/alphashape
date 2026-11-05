@@ -85,6 +85,10 @@ std::optional<SheetTarget> parse_sheet_target(std::string_view name);
 /// (uncoded). Throws ValueError for Chessboard, which has no code space.
 int sheet_target_code_count(SheetTarget target);
 
+/// Number of pages the options produce. Throws ValueError for the same
+/// invalid layouts as marker_sheet_pdf.
+int marker_sheet_page_count(const SheetOptions& options);
+
 /// Serialise a complete PDF. Throws ValueError for an invalid layout (paper
 /// name, size, or a code range outside the family) and Error for I/O shapes.
 std::vector<std::uint8_t> marker_sheet_pdf(const SheetOptions& options);

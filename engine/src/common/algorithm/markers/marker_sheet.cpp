@@ -733,3 +733,7 @@ Image marker_sheet_raster(const SheetOptions& options, double dpi, int page) {
 }
 
 }  // namespace alphashape
+int marker_sheet_page_count(const SheetOptions& options) {
+    return make_setup(options).pages;
+}
+

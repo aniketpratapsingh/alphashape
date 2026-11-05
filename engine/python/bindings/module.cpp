@@ -2031,9 +2031,24 @@ PYBIND11_MODULE(alphashape, m) {
               options.target_size_mm = size_mm;
               options.first_code = first_code;
               options.count = count;
-              const bool png = path.size() >= 4U &&
-                               path.compare(path.size() - 4U, 4U, ".png") == 0;
+              const bool png =
+                  path.size() >= 4U && path[path.size() - 4U] == '.' &&
+                  (path[path.size() - 3U] == 'p' ||
+                   path[path.size() - 3U] == 'P') &&
+                  (path[path.size() - 2U] == 'n' ||
+                   path[path.size() - 2U] == 'N') &&
+                  (path[path.size() - 1U] == 'g' ||
+                   path[path.size() - 1U] == 'G');
               if (png) {
+                  const int pages =
+                      alphashape::marker_sheet_page_count(options);
+                  if (pages > 1) {
+                      throw alphashape::ValueError(
+                          "PNG output holds a single page, but this sheet "
+                          "needs " +
+                          std::to_string(pages) +
+                          " pages; write a PDF or reduce the count");
+                  }
                   alphashape::write_png(
                       path, alphashape::marker_sheet_raster(options, dpi, 0));
                   return;
@@ -2067,9 +2082,24 @@ PYBIND11_MODULE(alphashape, m) {
               options.board_cols = cols;
               options.board_rows = rows;
               options.square_mm = square_mm;
-              const bool png = path.size() >= 4U &&
-                               path.compare(path.size() - 4U, 4U, ".png") == 0;
+              const bool png =
+                  path.size() >= 4U && path[path.size() - 4U] == '.' &&
+                  (path[path.size() - 3U] == 'p' ||
+                   path[path.size() - 3U] == 'P') &&
+                  (path[path.size() - 2U] == 'n' ||
+                   path[path.size() - 2U] == 'N') &&
+                  (path[path.size() - 1U] == 'g' ||
+                   path[path.size() - 1U] == 'G');
               if (png) {
+                  const int pages =
+                      alphashape::marker_sheet_page_count(options);
+                  if (pages > 1) {
+                      throw alphashape::ValueError(
+                          "PNG output holds a single page, but this sheet "
+                          "needs " +
+                          std::to_string(pages) +
+                          " pages; write a PDF or reduce the count");
+                  }
                   alphashape::write_png(
                       path, alphashape::marker_sheet_raster(options, dpi, 0));
                   return;

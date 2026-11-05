@@ -372,9 +372,19 @@ int run_make_sheet(const Options& opts) {
     sheet.board_rows = opts.rows;
     sheet.square_mm = opts.square_mm;
     const std::string& path = opts.out;
-    const bool png = path.size() >= 4U &&
-                     path.compare(path.size() - 4U, 4U, ".png") == 0;
+    const bool png =
+        path.size() >= 4U && path[path.size() - 4U] == '.' &&
+        (path[path.size() - 3U] == 'p' || path[path.size() - 3U] == 'P') &&
+        (path[path.size() - 2U] == 'n' || path[path.size() - 2U] == 'N') &&
+        (path[path.size() - 1U] == 'g' || path[path.size() - 1U] == 'G');
     if (png) {
+        const int pages = alphashape::marker_sheet_page_count(sheet);
+        if (pages > 1) {
+            throw alphashape::ValueError(
+                "PNG output holds a single page, but this sheet needs " +
+                std::to_string(pages) +
+                " pages; write a PDF or reduce the count");
+        }
         const alphashape::Image image =
             alphashape::marker_sheet_raster(sheet, opts.dpi, 0);
         alphashape::write_png(path, image);
