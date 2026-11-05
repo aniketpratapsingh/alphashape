@@ -1249,6 +1249,117 @@ TEST(Undo, EveryFactoryRejectsAMissingChunk) {
     EXPECT_TRUE(document.workspace().chunks()[0]->validate().empty());
 }
 
+// --- sensor commands (WP-13.16) -------------------------------------------
+
+TEST(Commands, SetSensorCalibrationUndoes) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    Sensor sensor;
+    sensor.label = "s0";
+    sensor.width = 640;
+    sensor.height = 480;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 640, 480, 500.0);
+    chunk.sensors().push_back(sensor);
+    UndoStack stack(&document);
+
+    Calibration replaced = sensor.calibration;
+    replaced.f = 520.0;
+    replaced.k1 = 0.02;
+    auto command = make_set_sensor_calibration_command(chunk_id, 0, replaced);
+    check_and_reset(*command, document);
+    stack.execute(std::move(command));
+    EXPECT_TRUE(chunk.sensors()[0].calibration == replaced);
+    stack.undo();
+    EXPECT_TRUE(chunk.sensors()[0].calibration == sensor.calibration);
+
+    EXPECT_THROW(make_set_sensor_calibration_command(chunk_id, 3, replaced)->apply(document),
+                 ValueError);
+}
+
+// A calibration carries the image geometry, so assigning one to a slave must
+// keep the slave's size compatible with its master.
+TEST(Commands, SetSensorCalibrationRejectsBreakingSlaveSize) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    for (const char* label : {"master", "slave"}) {
+        Sensor sensor;
+        sensor.label = label;
+        sensor.width = 640;
+        sensor.height = 480;
+        sensor.calibration = Calibration::initial(CameraType::Frame, 640, 480, 500.0);
+        chunk.sensors().push_back(sensor);
+    }
+    chunk.sensors()[1].master_sensor_id = 0;
+    UndoStack stack(&document);
+
+    const Calibration smaller = Calibration::initial(CameraType::Frame, 320, 240, 250.0);
+    EXPECT_THROW(make_set_sensor_calibration_command(chunk_id, 1, smaller)->apply(document),
+                 ValueError);
+    EXPECT_EQ(chunk.sensors()[1].width, 640);
+    EXPECT_THROW(
+        make_set_sensor_calibration_command(chunk_id, 1,
+                                            Calibration::initial(CameraType::Fisheye, 640, 480,
+                                                                 250.0))
+            ->apply(document),
+        ValueError);
+    EXPECT_EQ(chunk.sensors()[1].type, CameraType::Frame);
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, 0);
+
+    // A same-size calibration for the slave is accepted and undoes cleanly.
+    const Calibration valid = Calibration::initial(CameraType::Frame, 640, 480, 510.0);
+    auto command = make_set_sensor_calibration_command(chunk_id, 1, valid);
+    check_and_reset(*command, document);
+    stack.execute(std::move(command));
+    EXPECT_TRUE(chunk.sensors()[1].calibration == valid);
+    stack.undo();
+    EXPECT_EQ(chunk.sensors()[1].calibration.f, 500.0);
+}
+
+TEST(Commands, SetSensorMasterUndoes) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    for (const char* label : {"master", "slave"}) {
+        Sensor sensor;
+        sensor.label = label;
+        sensor.width = 640;
+        sensor.height = 480;
+        sensor.calibration = Calibration::initial(CameraType::Frame, 640, 480, 500.0);
+        chunk.sensors().push_back(sensor);
+    }
+    UndoStack stack(&document);
+
+    auto link = make_set_sensor_master_command(chunk_id, 1, 0);
+    check_and_reset(*link, document);
+    stack.execute(std::move(link));
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, 0);
+    stack.undo();
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, -1);
+
+    // Detaching an attached slave is undoable too.
+    stack.execute(make_set_sensor_master_command(chunk_id, 1, 0));
+    auto detach = make_set_sensor_master_command(chunk_id, 1, -1);
+    check_and_reset(*detach, document);
+    stack.execute(std::move(detach));
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, -1);
+    stack.undo();
+    EXPECT_EQ(chunk.sensors()[1].master_sensor_id, 0);
+
+    // Self-reference and an out-of-range master are refused.
+    EXPECT_THROW(make_set_sensor_master_command(chunk_id, 1, 1)->apply(document),
+                 ValueError);
+    EXPECT_THROW(make_set_sensor_master_command(chunk_id, 1, 7)->apply(document),
+                 ValueError);
+
+    // A slave must share its master's camera type: same size is not enough.
+    chunk.sensors()[1].type = CameraType::Fisheye;
+    EXPECT_THROW(make_set_sensor_master_command(chunk_id, 1, 0)->apply(document),
+                 ValueError);
+    chunk.sensors()[1].type = CameraType::Frame;
+}
+
 }  // namespace
 }  // namespace alphashape
 

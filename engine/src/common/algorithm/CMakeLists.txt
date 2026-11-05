@@ -35,6 +35,7 @@ add_library(alphashape_algorithms STATIC
     calibration/calibration_report.cpp
     calibration/export_stmap_task.cpp
     calibration/stmap.cpp
+    calibration/calibration_io.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp

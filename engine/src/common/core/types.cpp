@@ -105,7 +105,36 @@ bool Sensor::operator==(const Sensor& other) const {
            focal_length_mm == other.focal_length_mm && make == other.make &&
            model == other.model && serial == other.serial &&
            calibration == other.calibration &&
-           fixed_params == other.fixed_params;
+           fixed_params == other.fixed_params &&
+           master_sensor_id == other.master_sensor_id;
+}
+
+void validate_sensor_masters(const std::vector<Sensor>& sensors) {
+    const auto count = static_cast<std::int32_t>(sensors.size());
+    for (std::int32_t i = 0; i < count; ++i) {
+        const Sensor& sensor = sensors[static_cast<std::size_t>(i)];
+        const std::int32_t master = sensor.master_sensor_id;
+        if (master < 0) {
+            continue;
+        }
+        const std::string label = "sensor " + std::to_string(i) + " ('" + sensor.label + "')";
+        if (master >= count) {
+            throw ValueError(label + " names out-of-range master " + std::to_string(master));
+        }
+        if (master == i) {
+            throw ValueError(label + " cannot be its own master");
+        }
+        const Sensor& parent = sensors[static_cast<std::size_t>(master)];
+        if (parent.master_sensor_id != -1) {
+            throw ValueError(label + " names sensor " + std::to_string(master) +
+                             ", which is itself a slave");
+        }
+        if (parent.type != sensor.type || parent.width != sensor.width ||
+            parent.height != sensor.height) {
+            throw ValueError(label + " and its master sensor " + std::to_string(master) +
+                             " have different types or image sizes");
+        }
+    }
 }
 
 bool CameraReference::operator==(const CameraReference& other) const {

@@ -39,6 +39,7 @@
 #include <pybind11/stl.h>
 
 #include "base/utils/error.hpp"
+#include "common/algorithm/calibration/calibration_io.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/reference/reference_table.hpp"
 #include "common/commands/command.hpp"
@@ -394,6 +395,19 @@ py::object attach_document(py::object document, const std::shared_ptr<alphashape
     py::object object = py::cast(chunk);
     object.attr("_document") = std::move(document);
     return object;
+}
+
+/// Surface non-fatal calibration-file warnings through the standard Python
+/// warnings mechanism, the way a library is expected to report them.
+void emit_warnings(const std::vector<std::string>& warnings) {
+    if (warnings.empty()) {
+        return;
+    }
+    py::module_ warnings_module = py::module_::import("warnings");
+    for (const std::string& message : warnings) {
+        // stacklevel=2 reports the caller's line, not this binding's.
+        warnings_module.attr("warn")(py::str(message), py::arg("stacklevel") = 2);
+    }
 }
 
 /// Apply the Set Chunk CRS command to the Document that owns `chunk_self`
@@ -850,6 +864,13 @@ PYBIND11_MODULE(alphashape, m) {
     // into chunk.cameras() would dangle the moment another photo is imported.
     // A copy costs a few dozen bytes and removes the whole class of bug; the
     // type names still match what a user would expect to see.
+    py::enum_<alphashape::CalibrationFormat>(m, "CalibrationFormat")
+        .value("Xml", alphashape::CalibrationFormat::Xml)
+        .value("Json", alphashape::CalibrationFormat::Json)
+        .value("OpenCvXml", alphashape::CalibrationFormat::OpenCvXml)
+        .value("OpenCvYaml", alphashape::CalibrationFormat::OpenCvYaml)
+        .export_values();
+
     py::class_<alphashape::Calibration>(m, "Calibration")
         .def_property_readonly("type",
                                [](const alphashape::Calibration& c) { return camera_type_name(c.type); })
@@ -888,6 +909,42 @@ PYBIND11_MODULE(alphashape, m) {
                                    }
                                    return names;
                                })
+        // Write this calibration to a file. Warnings (terms the chosen format
+        // cannot express) are raised through the standard `warnings` module and
+        // also returned as a list of strings.
+        .def(
+            "save",
+            [](const alphashape::Calibration& c, const std::string& path,
+               alphashape::CalibrationFormat format) {
+                const std::vector<std::string> warnings =
+                    alphashape::save_calibration(path, c, format);
+                emit_warnings(warnings);
+                py::list out;
+                for (const std::string& message : warnings) {
+                    out.append(py::str(message));
+                }
+                return out;
+            },
+            py::arg("path"),
+            py::arg("format") = alphashape::CalibrationFormat::Xml,
+            "Save the calibration. `width`/`height` in the OpenCV formats come "
+            "from the calibration; returns the warning list.")
+        // Read a calibration. Warnings are raised through `warnings`; the loaded
+        // Calibration is returned.
+        .def_static(
+            "load",
+            [](const std::string& path, alphashape::CalibrationFormat format, int width,
+               int height) {
+                alphashape::CalibrationFileResult result =
+                    alphashape::load_calibration(path, format, width, height);
+                emit_warnings(result.warnings);
+                return result.calibration;
+            },
+            py::arg("path"),
+            py::arg("format") = alphashape::CalibrationFormat::Xml, py::arg("width") = 0,
+            py::arg("height") = 0,
+            "Load a calibration. `width`/`height` are the fallback image size "
+            "for the OpenCV formats.")
         .def("__repr__", [](const alphashape::Calibration& c) {
             return "<alphashape.Calibration " + std::string(camera_type_name(c.type)) + " " +
                    std::to_string(c.width) + "x" + std::to_string(c.height) + " f=" +
@@ -909,7 +966,9 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly("calibration",
                                [](const alphashape::Sensor& s) { return s.calibration; })
         .def_property_readonly("fixed_params",
-                               [](const alphashape::Sensor& s) { return s.fixed_params; });
+                               [](const alphashape::Sensor& s) { return s.fixed_params; })
+        // Index of the master sensor whose calibration this one shares, or -1.
+        .def_readonly("master", &alphashape::Sensor::master_sensor_id);
 
     py::class_<alphashape::Camera>(m, "Camera")
         .def_readonly("id", &alphashape::Camera::id)
@@ -1421,6 +1480,32 @@ PYBIND11_MODULE(alphashape, m) {
                 c.meta().set(key, value);
             },
             py::arg("key"), py::arg("value"))
+        // Replace one sensor's calibration through the undoable "Set Sensor
+        // Calibration" command, then discard it (the GUI owns undo).
+        .def(
+            "set_sensor_calibration",
+            [](py::object self, std::int32_t sensor_index,
+               const alphashape::Calibration& calibration) {
+                alphashape::Document& document = owning_document(self);
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::make_set_sensor_calibration_command(chunk.id(), sensor_index,
+                                                                calibration)
+                    ->apply(document);
+            },
+            py::arg("sensor_index"), py::arg("calibration"),
+            "Replace a sensor's calibration (undoable in the GUI).")
+        // Link a sensor to a master (master_index >= 0) or detach it (-1).
+        .def(
+            "set_sensor_master",
+            [](py::object self, std::int32_t sensor_index, std::int32_t master_index) {
+                alphashape::Document& document = owning_document(self);
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::make_set_sensor_master_command(chunk.id(), sensor_index,
+                                                           master_index)
+                    ->apply(document);
+            },
+            py::arg("sensor_index"), py::arg("master_index"),
+            "Share a sensor's calibration with a master sensor, or detach with -1.")
         // -- dense products (milestone 6) --------------------------------------
         // BuildDepthMaps fills `depth_maps`; BuildPointCloud fuses them into
         // `point_cloud`. Both are read-only views onto the chunk's containers.

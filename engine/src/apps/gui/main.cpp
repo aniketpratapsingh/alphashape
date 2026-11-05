@@ -3,6 +3,7 @@
 // Exit codes: 0 success, 1 runtime error (for example --open on an unreadable project),
 // 64 bad usage (EX_USAGE, as alphashape-cli).
 
+#include <clocale>
 #include <cstdio>
 #include <cstddef>
 #include <exception>
@@ -60,6 +61,13 @@ int main(int argc, char** argv) {
     // The QApplication goes first: it strips Qt's own options (-platform, -style, ...) from
     // the argument list, and QCoreApplication::arguments() is Unicode-correct on Windows.
     QApplication qapp(argc, argv);
+    // Qt adopts the user's locale from the environment on Unix, and our
+    // doc.xml/calibration number I/O uses snprintf/strtod, which follow
+    // LC_NUMERIC. A comma-decimal locale would then write "1,5" and read back
+    // garbage, so force the C numeric locale for the whole GUI process. This
+    // must come after the QApplication constructor, which applies Qt's own
+    // locale selection.
+    std::setlocale(LC_NUMERIC, "C");
     QApplication::setOrganizationName(QStringLiteral("alphashape"));
     QApplication::setApplicationName(QStringLiteral("alphashape"));
     QApplication::setApplicationVersion(QStringLiteral(ALPHASHAPE_GUI_VERSION));

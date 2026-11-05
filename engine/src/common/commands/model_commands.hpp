@@ -199,6 +199,23 @@ std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool selected);
 
+// --- Sensors (WP-13.16) ----------------------------------------------------
+
+/// Replace one sensor's calibration; undo restores the previous calibration,
+/// including its covariance. The sensor's type, width and height follow the
+/// calibration, so the two never disagree. Throws ValueError for an unknown
+/// sensor, a non-finite/non-positive calibration, or one that breaks the
+/// sensor's master link (a slave must match its master's type and size).
+std::unique_ptr<AbstractCommand> make_set_sensor_calibration_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, Calibration calibration);
+
+/// Point one sensor at a master (`master_index >= 0`) or detach it (-1).
+/// Throws ValueError when the link is invalid under the same rules as doc.xml
+/// loading: in range, not itself, the master is not a slave, and the image
+/// sizes match.
+std::unique_ptr<AbstractCommand> make_set_sensor_master_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, std::int32_t master_index);
+
 // --- Cross-document (WP-11.5b) ---------------------------------------------
 
 std::unique_ptr<AbstractCommand> make_append_document_command(

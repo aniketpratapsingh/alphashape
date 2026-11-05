@@ -89,6 +89,7 @@ add_executable(alphashape_tests
     test_calibrate_camera.cpp
     test_stmap.cpp
     test_calibration_report.cpp
+    test_calibration_io.cpp
     test_gpu.cpp
 )
 
