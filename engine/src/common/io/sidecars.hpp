@@ -16,6 +16,9 @@
 //   "ASH1"  shapes (features + groups), M11 §4.6
 //   "ATJ1"  one trajectory (timed poses)
 //   "AFR1"  chunk frames
+//   "ATC1"  per-track posterior covariance, optional companion to "ATR2"
+//           (WP-13.13b): u32 track count, then per track a u8 flag and, when 1,
+//           six f32 (xx xy xz yy yz zz).
 //
 // The validators at the bottom are the single source of truth for the container
 // invariants: the writers call them before emitting a byte and the readers call
@@ -23,6 +26,7 @@
 // anything we read is something we could have written.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -86,6 +90,9 @@ private:
 constexpr char kKptMagic[4] = {'A', 'K', 'P', '1'};
 constexpr char kMatchesMagic[4] = {'A', 'M', 'T', '1'};
 constexpr char kTracksMagic[4] = {'A', 'T', 'R', '2'};
+/// Per-track posterior covariance (WP-13.13b), written only when at least one
+/// track carries one. Absent, every track reads as "covariance unknown".
+constexpr char kTrackCovarianceMagic[4] = {'A', 'T', 'C', '1'};
 constexpr char kDepthMapsMagic[4] = {'A', 'D', 'M', '1'};   // legacy, read-only
 /// Depth maps with the per-map alignment fingerprint. Doc.xml v1 and v2 both
 /// point at the same encoding; "ADM1" is still read, with every fingerprint
@@ -117,6 +124,13 @@ std::vector<PairMatches> decode_matches(const std::vector<std::uint8_t>& in);
 
 std::vector<std::uint8_t> encode_tracks(const std::vector<Track>& tracks);
 std::vector<Track> decode_tracks(const std::vector<std::uint8_t>& in);
+
+/// Optional covariance companion to the tracks sidecar: one flag plus the
+/// upper triangle per track, in the same order as `tracks`. The decoder returns
+/// one entry per stored track; the caller checks the count against its tracks.
+std::vector<std::uint8_t> encode_track_covariance(const std::vector<Track>& tracks);
+std::vector<std::optional<Eigen::Matrix3f>> decode_track_covariance(
+    const std::vector<std::uint8_t>& in);
 
 // -- dense products ---------------------------------------------------------
 

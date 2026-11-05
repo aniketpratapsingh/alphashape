@@ -121,7 +121,9 @@ bool Camera::operator==(const Camera& other) const {
     return id == other.id && sensor_id == other.sensor_id &&
            label == other.label && pose == other.pose &&
            enabled == other.enabled && selected == other.selected &&
-           reference == other.reference && orientation == other.orientation;
+           reference == other.reference && orientation == other.orientation &&
+           location_covariance == other.location_covariance &&
+           rotation_covariance == other.rotation_covariance;
 }
 
 bool KeypointSet::operator==(const KeypointSet& other) const {

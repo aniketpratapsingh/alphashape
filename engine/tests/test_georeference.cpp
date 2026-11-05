@@ -299,5 +299,43 @@ TEST(Georeference, RepeatedCallIsStable) {
     EXPECT_EQ(chunk.crs().epsg, 4326);
 }
 
+// WP-13.13b: a track covariance follows the same similarity as its point, so
+// the stored float matrix becomes s^2 R C R^T in the georeferenced frame.
+TEST(Georeference, TrackCovarianceFollowsSimilarity) {
+    Chunk chunk = make_synthetic_chunk();
+    Eigen::Matrix3f covariance;
+    covariance << 0.25F, 0.05F, 0.01F,
+                  0.05F, 0.16F, -0.03F,
+                  0.01F, -0.03F, 0.09F;
+
+    Track track;
+    track.observations.push_back(Observation{0, 0});
+    track.observations.push_back(Observation{1, 0});
+    track.point = camera_centre(chunk.cameras()[0].pose);
+    track.covariance = covariance;
+    chunk.tie_points().tracks.push_back(track);
+
+    ASSERT_TRUE(sfm::georeference_chunk(chunk).applied);
+
+    // The local frame is bad(true ENU), so the recovered local->ENU similarity
+    // is bad^-1: scale 1/bad.scale and rotation bad.R^T.
+    const sfm::Similarity bad = bad_similarity();
+    const double scale = 1.0 / bad.scale;
+    const Eigen::Matrix3f expected =
+        ((scale * scale) * bad.R.transpose() * covariance.cast<double>() * bad.R)
+            .cast<float>();
+
+    ASSERT_TRUE(chunk.tie_points().tracks[0].covariance.has_value());
+    const Eigen::Matrix3f& got = *chunk.tie_points().tracks[0].covariance;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            const double value = static_cast<double>(expected(r, c));
+            const double tolerance = 1e-5 * std::max(1.0, std::abs(value));
+            EXPECT_NEAR(static_cast<double>(got(r, c)), value, tolerance)
+                << "at (" << r << ", " << c << ")";
+        }
+    }
+}
+
 }  // namespace
 }  // namespace alphashape

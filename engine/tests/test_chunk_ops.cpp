@@ -722,5 +722,28 @@ TEST(ChunkOps, AppendOffsetsIds) {
     std::filesystem::remove_all(dir);
 }
 
+// Sensor identity is the camera model, not its derived posterior covariance:
+// two sensors that differ only in calibration covariance still deduplicate.
+TEST(ChunkOps, SensorDedupIgnoresCalibrationCovariance) {
+    Chunk a("a");
+    a.set_id(0);
+    build_rich_chunk(a, 2, 0.0);
+    Chunk b("b");
+    b.set_id(1);
+    build_rich_chunk(b, 2, 100.0);
+    a.sensors()[0].calibration.covariance = Eigen::MatrixXd::Identity(2, 2);
+    a.sensors()[0].calibration.covariance_params = {"f", "cx"};
+    b.sensors()[0].calibration.covariance = Eigen::MatrixXd::Identity(3, 3);
+    b.sensors()[0].calibration.covariance_params = {"f", "cx", "cy"};
+    ASSERT_FALSE(a.sensors()[0].calibration == b.sensors()[0].calibration);
+    ASSERT_TRUE(a.sensors()[0].calibration.same_model(b.sensors()[0].calibration));
+
+    Chunk merged = merge_chunks({&a, &b}, 7, "Merged");
+    EXPECT_EQ(merged.sensors().size(), 1U);
+    for (const Camera& camera : merged.cameras()) {
+        EXPECT_EQ(camera.sensor_id, 0);
+    }
+}
+
 }  // namespace alphashape
 

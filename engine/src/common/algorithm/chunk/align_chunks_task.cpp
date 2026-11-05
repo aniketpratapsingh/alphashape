@@ -260,15 +260,38 @@ void apply_similarity_impl(ChunkGeometry& geometry,
     for (Transform& pose : geometry.camera_poses) {
         pose = pose * inverse;
     }
+    // A centre covariance maps as C' = s^2 R C R^T under the same similarity.
+    // Every camera pose above moved, so every covariance moves too.
+    const double scale_sq = similarity.scale * similarity.scale;
+    for (Eigen::Matrix3d& covariance : geometry.camera_location_covariances) {
+        covariance = scale_sq * similarity.R * covariance * similarity.R.transpose();
+    }
     for (std::optional<Eigen::Vector3d>& point : geometry.track_points) {
         if (point.has_value()) {
             *point = similarity.apply(*point);
         }
     }
-    for (std::optional<Eigen::Vector3d>& position : geometry.marker_positions) {
-        if (position.has_value()) {
-            *position = similarity.apply(*position);
+    // A tie-point covariance follows the point: an untriangulated track keeps
+    // whatever covariance it had without being rotated. The stored matrix is
+    // float, so the transform runs in double and casts once.
+    for (std::size_t i = 0; i < geometry.track_points.size(); ++i) {
+        if (!geometry.track_points[i].has_value() ||
+            !geometry.track_covariances[i].has_value()) {
+            continue;
         }
+        const Eigen::Matrix3d transformed =
+            scale_sq * similarity.R * geometry.track_covariances[i]->cast<double>() *
+            similarity.R.transpose();
+        geometry.track_covariances[i] = transformed.cast<float>();
+    }
+    for (std::size_t i = 0; i < geometry.marker_positions.size(); ++i) {
+        if (!geometry.marker_positions[i].has_value()) {
+            continue;
+        }
+        geometry.marker_positions[i] = similarity.apply(*geometry.marker_positions[i]);
+        geometry.marker_position_covariances[i] =
+            scale_sq * similarity.R * geometry.marker_position_covariances[i] *
+            similarity.R.transpose();
     }
     for (std::vector<Eigen::Vector3d>& vertices : geometry.shape_vertices) {
         for (Eigen::Vector3d& vertex : vertices) {

@@ -77,8 +77,9 @@ struct Calibration {
 
     /// Posterior covariance of the packed coefficients in kCalibrationParamNames
     /// order (kCalibrationParamCount square), sigma0^2-scaled. Empty when
-    /// unknown. Held coefficients have zero rows/columns. Derived data: not
-    /// persisted yet, so it is deliberately excluded from operator==.
+    /// unknown. Held coefficients have zero rows/columns. Persisted as the
+    /// optional <covariance> child of <calibration> (WP-13.13b) and compared by
+    /// operator==.
     Eigen::MatrixXd covariance;
     /// Row/column names of `covariance`; the packed order when non-empty.
     std::vector<std::string> covariance_params;
@@ -88,6 +89,13 @@ struct Calibration {
 
     /// Exact (bitwise) comparison of every persisted field.
     bool operator==(const Calibration& other) const;
+
+    /// Exact (bitwise) comparison of the camera model alone: type, width,
+    /// height and every intrinsic/distortion coefficient. The posterior
+    /// covariance is derived state, so two calibrations that describe the same
+    /// sensor compare equal here even when their covariances differ. Use this
+    /// for sensor identity and change detection; use operator== for full state.
+    bool same_model(const Calibration& other) const;
 
     /// Project a camera-frame point to pixels. Throws ValueError for a Frame
     /// sensor when z <= 0. Fisheye accepts z <= 0 (up to the antipode).

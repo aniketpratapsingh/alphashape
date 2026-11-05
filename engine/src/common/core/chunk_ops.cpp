@@ -108,7 +108,7 @@ bool same_sensor_identity(const Sensor& a, const Sensor& b) {
            a.pixel_size_um == b.pixel_size_um &&
            a.focal_length_mm == b.focal_length_mm && a.make == b.make &&
            a.model == b.model && a.serial == b.serial &&
-           a.calibration == b.calibration;
+           a.calibration.same_model(b.calibration);
 }
 
 using AllocateId = std::function<std::int32_t(std::int32_t)>;
