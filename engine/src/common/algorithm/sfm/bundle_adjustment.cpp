@@ -611,6 +611,61 @@ double prior_rms_sigma(const BAProblem& problem) {
 
 namespace detail {
 
+Eigen::Vector3d rotation_log_matrix(const Eigen::Matrix3d& rotation) {
+    // rotation_log expects ceres' column-major 9-element layout.
+    double r[9];
+    for (int col = 0; col < 3; ++col) {
+        for (int row = 0; row < 3; ++row) {
+            r[col * 3 + row] = rotation(row, col);
+        }
+    }
+    double delta[3] = {0.0, 0.0, 0.0};
+    rotation_log(r, delta);
+    return Eigen::Vector3d(delta[0], delta[1], delta[2]);
+}
+
+Eigen::Matrix3d heading_frame_from_body(const Eigen::Matrix3d& world_from_body,
+                                        bool* degenerate) {
+    const Eigen::Vector3d up(0.0, 0.0, 1.0);
+    // Body x is forward. Its world image is the heading direction when the
+    // airframe is level; a pitched body leaves only its horizontal projection.
+    Eigen::Vector3d flat = world_from_body.col(0);
+    flat.z() = 0.0;
+    bool fallback = flat.norm() < 1e-3;
+    if (fallback) {
+        // Body forward is ~vertical, so it carries no heading. Use whichever
+        // body axis is most horizontal; body down (-e_z) is the natural first
+        // choice for an airframe whose nose is up or down, then the side and
+        // nose axes and their opposites.
+        const std::array<Eigen::Vector3d, 6> candidates{
+            -world_from_body.col(2), world_from_body.col(1),
+            -world_from_body.col(1), world_from_body.col(0),
+            -world_from_body.col(0), world_from_body.col(2)};
+        double best = -1.0;
+        for (const Eigen::Vector3d& candidate : candidates) {
+            Eigen::Vector3d horizontal = candidate;
+            horizontal.z() = 0.0;
+            const double norm = horizontal.norm();
+            if (norm > best) {
+                best = norm;
+                flat = horizontal;
+            }
+        }
+    }
+    const double length = flat.norm();
+    const Eigen::Vector3d forward =
+        length > 0.0 ? (flat / length).eval() : Eigen::Vector3d(1.0, 0.0, 0.0);
+    const Eigen::Vector3d left = up.cross(forward);
+    Eigen::Matrix3d frame;
+    frame.col(0) = forward;
+    frame.col(1) = left;
+    frame.col(2) = up;
+    if (degenerate != nullptr) {
+        *degenerate = fallback;
+    }
+    return frame;
+}
+
 void scalebar_residual_and_jacobian(const double* a, const double* b, double length,
                                     double sigma, double* residual, double* jac_a,
                                     double* jac_b) {
