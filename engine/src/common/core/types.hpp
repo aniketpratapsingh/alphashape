@@ -26,6 +26,7 @@
 #include "base/utils/error.hpp"
 #include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
+#include "model/camera/film.hpp"
 #include "model/crs/coordinate_system.hpp"
 
 namespace alphashape {
@@ -120,6 +121,10 @@ struct Sensor {
     /// slot from the master. Persisted as the optional `master` attribute.
     std::int32_t master_sensor_id = -1;
 
+    /// Fiducial-mark layout of a scanned analogue film camera (WP-13.18a).
+    /// Persisted as an optional `<film>` child, written only when enabled.
+    FilmSettings film;
+
     /// GNSS antenna mounting (WP-13.19). Its offset moves a measured
     /// reference from the antenna phase centre to the projection centre.
     Antenna antenna;
@@ -191,6 +196,17 @@ struct Camera {
     /// (angle-axis) in the camera frame. Zero when unknown. Persisted as the
     /// optional `rotation_covariance` attribute and compared by operator==.
     Eigen::Matrix3d rotation_covariance = Eigen::Matrix3d::Zero();
+
+    /// Measured fiducial-mark pixels, parallel to the sensor's
+    /// `film.fiducials`; nullopt means "not found on this scan". Persisted as
+    /// `<fiducial index=... u=... v=.../>` children (WP-13.18a).
+    std::vector<std::optional<Eigen::Vector2d>> fiducial_pixels;
+
+    /// Film millimetres -> scan pixels, homogeneous, when the sensor has
+    /// calibrated fiducial coordinates and the marks could be ordered. An
+    /// affine map has last row (0, 0, 1). Persisted as an optional
+    /// `<film_transform values="9 numbers"/>` child.
+    std::optional<Eigen::Matrix3d> film_transform;
 
     bool operator==(const Camera& other) const;
 };

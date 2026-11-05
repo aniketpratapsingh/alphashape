@@ -31,8 +31,11 @@ add_library(alphashape_algorithms STATIC
     markers/track_markers_task.cpp
     markers/marker_sheet.cpp
     calibration/board_detector.cpp
+    calibration/fiducials.cpp
     calibration/calibrate.cpp
     calibration/calibrate_camera_task.cpp
+    calibration/detect_fiducials_task.cpp
+    calibration/calibrate_fiducials_task.cpp
     calibration/calibration_report.cpp
     calibration/export_stmap_task.cpp
     calibration/stmap.cpp

@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -972,6 +973,18 @@ PYBIND11_MODULE(alphashape, m) {
                                [](const alphashape::Sensor& s) { return s.fixed_params; })
         // Index of the master sensor whose calibration this one shares, or -1.
         .def_readonly("master", &alphashape::Sensor::master_sensor_id)
+        // Film fiducial layout (WP-13.18a).
+        .def_property_readonly("film_enabled",
+                               [](const alphashape::Sensor& s) { return s.film.enabled; })
+        // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
+        .def_property_readonly("fiducials", [](const alphashape::Sensor& s) {
+            py::list out;
+            for (const alphashape::Fiducial& fiducial : s.film.fiducials) {
+                out.append(py::make_tuple(fiducial.label, fiducial.film_mm.x(),
+                                          fiducial.film_mm.y()));
+            }
+            return out;
+        })
         // GNSS antenna mount: camera-frame (or body-frame with a boresight)
         // offset in metres, and the optional body->camera boresight in degrees.
         .def_property_readonly("antenna_offset", [](const alphashape::Sensor& s) {
@@ -1049,6 +1062,27 @@ PYBIND11_MODULE(alphashape, m) {
         // Posterior covariance of the angle-axis rotation, 3x3 nested lists.
         .def_property_readonly("rotation_covariance", [](const alphashape::Camera& c) {
             return nested_matrix(c.rotation_covariance);
+        })
+        // Film millimetres -> scan pixels, 3x3 nested lists, or None when the
+        // marks were not ordered (WP-13.18a).
+        .def_property_readonly("film_transform", [](const alphashape::Camera& c) -> py::object {
+            if (!c.film_transform.has_value()) {
+                return py::none();
+            }
+            return nested_matrix(*c.film_transform);
+        })
+        // Measured fiducial pixels, parallel to Sensor.fiducials; None marks a
+        // fiducial that was not found on this scan.
+        .def_property_readonly("fiducial_pixels", [](const alphashape::Camera& c) {
+            py::list out;
+            for (const std::optional<Eigen::Vector2d>& pixel : c.fiducial_pixels) {
+                if (pixel.has_value()) {
+                    out.append(py::make_tuple((*pixel).x(), (*pixel).y()));
+                } else {
+                    out.append(py::none());
+                }
+            }
+            return out;
         });
 
     // -- Chunk ---------------------------------------------------------------
@@ -1528,6 +1562,53 @@ PYBIND11_MODULE(alphashape, m) {
             },
             py::arg("sensor_index"), py::arg("master_index"),
             "Share a sensor's calibration with a master sensor, or detach with -1.")
+        // Replace a sensor's film/fiducial layout (WP-13.18a) through the
+        // undoable "Set Sensor Film" command, then discard it (the GUI owns undo).
+        .def(
+            "set_sensor_film",
+            [](py::object self, std::int32_t sensor_index, bool enabled,
+               const std::vector<std::tuple<std::string, double, double>>& fiducials,
+               const std::string& transform, const std::string& detector,
+               bool corners, bool sides) {
+                alphashape::FilmSettings film;
+                film.enabled = enabled;
+                if (transform == "affine") {
+                    film.transform = alphashape::FilmTransformType::Affine;
+                } else if (transform == "projective") {
+                    film.transform = alphashape::FilmTransformType::Projective;
+                } else {
+                    throw alphashape::ValueError(
+                        "set_sensor_film: transform must be affine or projective");
+                }
+                if (detector == "circle") {
+                    film.detector = alphashape::FiducialDetector::Circle;
+                } else if (detector == "corner") {
+                    film.detector = alphashape::FiducialDetector::Corner;
+                } else if (detector == "frame_corner") {
+                    film.detector = alphashape::FiducialDetector::FrameCorner;
+                } else {
+                    throw alphashape::ValueError(
+                        "set_sensor_film: detector must be circle, corner or "
+                        "frame_corner");
+                }
+                film.search_corners = corners;
+                film.search_sides = sides;
+                for (const auto& entry : fiducials) {
+                    alphashape::Fiducial fiducial;
+                    fiducial.label = std::get<0>(entry);
+                    fiducial.film_mm = Eigen::Vector2d(std::get<1>(entry),
+                                                       std::get<2>(entry));
+                    film.fiducials.push_back(std::move(fiducial));
+                }
+                alphashape::Document& document = owning_document(self);
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::make_set_sensor_film_command(chunk.id(), sensor_index, film)
+                    ->apply(document);
+            },
+            py::arg("sensor_index"), py::arg("enabled"), py::arg("fiducials"),
+            py::arg("transform") = "affine", py::arg("detector") = "circle",
+            py::arg("corners") = true, py::arg("sides") = false,
+            "Replace a sensor's film fiducial layout (undoable in the GUI).")
         // Set the GNSS antenna mount (undoable in the GUI).
         .def(
             "set_sensor_antenna",
@@ -1773,6 +1854,15 @@ PYBIND11_MODULE(alphashape, m) {
         // Chessboard calibration per sensor (WP-13.15a), the same run_task call.
         .def("calibrateCamera", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "CalibrateCamera", std::move(kwargs));
+        })
+        // Film fiducial detection (WP-13.18a): detect marks on every film
+        // camera and fit each scan's film-mm -> pixel transform.
+        .def("detectFiducials", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "DetectFiducials", std::move(kwargs));
+        })
+        // Derive a sensor's fiducial film coordinates from one reference scan.
+        .def("calibrateFiducials", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "CalibrateFiducials", std::move(kwargs));
         })
         // Backward STMap export for a calibrated sensor (WP-13.15b).
         .def("exportStmap", [](py::object self, py::kwargs kwargs) {

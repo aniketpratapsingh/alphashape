@@ -216,6 +216,14 @@ std::unique_ptr<AbstractCommand> make_set_sensor_calibration_command(
 std::unique_ptr<AbstractCommand> make_set_sensor_master_command(
     std::int32_t chunk_id, std::int32_t sensor_index, std::int32_t master_index);
 
+/// Replace one sensor's film/fiducial configuration (WP-13.18a). Undo restores
+/// the previous settings verbatim. Throws ValueError for an unknown sensor, an
+/// empty or duplicate fiducial label, or a non-finite film coordinate. Camera
+/// fiducial measurements are not edited; the caller re-detects after a layout
+/// change.
+std::unique_ptr<AbstractCommand> make_set_sensor_film_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, FilmSettings film);
+
 /// Replace one sensor's GNSS antenna mount (WP-13.19). Undo restores the
 /// previous offset and boresight. Throws ValueError for an unknown sensor or a
 /// non-finite offset; a boresight, when present, must be finite too.
