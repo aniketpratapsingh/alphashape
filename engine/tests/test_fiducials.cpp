@@ -47,6 +47,13 @@ std::vector<Eigen::Vector2d> centred_marks() {
             Eigen::Vector2d(45.0, -44.0), Eigen::Vector2d(-41.0, -47.0)};
 }
 
+/// A smaller, bbox-centred asymmetric layout for the derivation test, where
+/// the fixture runs at 50 px/mm so 0.02 mm/px is the matching resolution.
+std::vector<Eigen::Vector2d> small_marks() {
+    return {Eigen::Vector2d(-13.5, 11.0), Eigen::Vector2d(12.0, 13.0),
+            Eigen::Vector2d(13.5, -12.0), Eigen::Vector2d(-11.0, -13.0)};
+}
+
 FilmSettings layout_for(const std::vector<Eigen::Vector2d>& marks) {
     FilmSettings settings;
     settings.enabled = true;
@@ -161,8 +168,14 @@ TEST(Fiducials, CircleCentres) {
     double maximum = 0.0;
     for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
         ASSERT_TRUE(detection.by_fiducial[i].has_value()) << "mark " << i;
-        const double error =
-            (*detection.by_fiducial[i] - frame.mark_pixels[i]).norm();
+        const Eigen::Vector2d delta =
+            *detection.by_fiducial[i] - frame.mark_pixels[i];
+        const double error = delta.norm();
+        std::printf("  mark %zu detected (%.2f, %.2f) true (%.2f, %.2f) "
+                    "delta (%.2f, %.2f)\n",
+                    i, detection.by_fiducial[i]->x(),
+                    detection.by_fiducial[i]->y(), frame.mark_pixels[i].x(),
+                    frame.mark_pixels[i].y(), delta.x(), delta.y());
         maximum = std::max(maximum, error);
         EXPECT_LT(error, 0.3) << "mark " << i;
     }
@@ -282,7 +295,9 @@ TEST(Fiducials, OrderingFailureIsReported) {
 TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
     test::FilmFrameSpec spec = base_spec();
     spec.rotation_deg = 0.0;
-    spec.marks_mm = centred_marks();
+    spec.scale_px_per_mm = 50.0;
+    spec.frame_half_mm = 15.0;
+    spec.marks_mm = small_marks();
     const test::FilmFrame frame = test::render_film_frame(spec);
     FilmSettings settings = layout_for(spec.marks_mm);
     settings.detector = FiducialDetector::Circle;

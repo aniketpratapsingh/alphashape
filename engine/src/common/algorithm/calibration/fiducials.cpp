@@ -593,20 +593,46 @@ double corner_response(const Gradients& gradients, int x, int y) {
 std::optional<Eigen::Vector2d> detect_corner(const Gradients& gradients,
                                              const WindowBox& box,
                                              double radius) {
+    // The window is pulled towards where the mark is expected, so the frame
+    // corner itself (at the window's outer edge) must not win. Search the
+    // central 80% of the window, which is the "nearest expected direction"
+    // region, and reject responses only from grain.
+    const int margin_x = std::max(2, box.width() / 10);
+    const int margin_y = std::max(2, box.height() / 10);
+    double strongest = 0.0;
+    for (int y = box.y0 + margin_y; y <= box.y1 - margin_y; ++y) {
+        for (int x = box.x0 + margin_x; x <= box.x1 - margin_x; ++x) {
+            strongest = std::max(strongest, corner_response(gradients, x, y));
+        }
+    }
+    if (!(strongest > 1e-12)) {
+        return std::nullopt;
+    }
+    // Among the strong responses, take the one nearest the expected point (the
+    // window centre); an L mark's arm end can otherwise outscore the vertex.
     double best = 0.0;
+    double best_distance = std::numeric_limits<double>::infinity();
     int best_x = -1;
     int best_y = -1;
-    for (int y = box.y0 + 2; y <= box.y1 - 2; ++y) {
-        for (int x = box.x0 + 2; x <= box.x1 - 2; ++x) {
+    for (int y = box.y0 + margin_y; y <= box.y1 - margin_y; ++y) {
+        for (int x = box.x0 + margin_x; x <= box.x1 - margin_x; ++x) {
             const double response = corner_response(gradients, x, y);
-            if (response > best) {
+            if (response < 0.5 * strongest) {
+                continue;
+            }
+            const double dx = static_cast<double>(x) - box.centre.x();
+            const double dy = static_cast<double>(y) - box.centre.y();
+            const double distance = dx * dx + dy * dy;
+            if (best_x < 0 || distance < best_distance ||
+                (distance == best_distance && response > best)) {
                 best = response;
+                best_distance = distance;
                 best_x = x;
                 best_y = y;
             }
         }
     }
-    if (best_x < 0 || !(best > 1e-12)) {
+    if (best_x < 0) {
         return std::nullopt;
     }
     const std::optional<Eigen::Vector2d> refined = refine_point(
@@ -660,15 +686,17 @@ void add_vote(std::vector<float>& accumulator, int r, double x, double y, int wi
     }
 }
 
+/// Cut at a fraction of the strongest gradient in a window. A mark edge is a
+/// tiny fraction of a window's pixels, so a high percentile would sit in film
+/// grain; the peak magnitude is the reliable reference at this scale.
 double window_threshold(const Gradients& gradients, const WindowBox& box) {
-    std::vector<float> values;
-    values.reserve(static_cast<std::size_t>(box.width() * box.height()));
+    float maximum = 0.0F;
     for (int y = box.y0; y <= box.y1; ++y) {
         for (int x = box.x0; x <= box.x1; ++x) {
-            values.push_back(gradients.magnitude(x, y));
+            maximum = std::max(maximum, gradients.magnitude(x, y));
         }
     }
-    return kWindowEdgeFraction * percentile99(std::move(values));
+    return kWindowEdgeFraction * static_cast<double>(maximum);
 }
 
 /// Gradient-direction Hough vote for a circle (Hough 1962; Ballard 1981).
