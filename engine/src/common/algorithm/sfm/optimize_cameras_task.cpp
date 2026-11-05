@@ -50,6 +50,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <Eigen/LU>
 
 #include "base/utils/error.hpp"
@@ -64,10 +65,8 @@
 namespace alphashape {
 namespace {
 
-/// Calibration coefficient names, in the packed order (calibration.hpp):
-/// f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2, p3, p4. Matches Sensor::fixed_params.
-constexpr std::array<const char*, kCalibrationParamCount> kParamNames = {
-    "f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"};
+/// Calibration coefficient names are shared with the covariance row labels;
+/// the packed order is f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2, p3, p4.
 
 /// The 4x4 [R t; 0 1] form of a bundle-adjustment pose (X_cam = R X_world + t).
 Transform transform_from_pose(const sfm::BAPose& pose) {
@@ -123,6 +122,40 @@ std::string meta_number(double value) {
     return out.str();
 }
 
+/// Rotation matrix of a rotation vector (angle-axis), matching the
+/// parametrisation bundle_adjust uses for the 3-double rotation block.
+Eigen::Matrix3d rotation_from_rotation_vector(const Eigen::Vector3d& vector) {
+    const double angle = vector.norm();
+    if (!(angle > 0.0)) {
+        return Eigen::Matrix3d::Identity();
+    }
+    return Eigen::AngleAxisd(angle, vector / angle).toRotationMatrix();
+}
+
+/// Location covariance of the camera centre C = -R^T t given the 6x6 covariance
+/// of (rotation vector, translation): J Sigma J^T with dC/dt = -R^T and dC/dw
+/// by central differences on the rotation vector. Chunk-local, like the pose.
+Eigen::Matrix3d camera_location_covariance(const sfm::BAPose& pose,
+                                           const Eigen::Matrix<double, 6, 6>& covariance) {
+    Eigen::Matrix<double, 3, 6> jacobian = Eigen::Matrix<double, 3, 6>::Zero();
+    jacobian.block<3, 3>(0, 3) = -pose.R.transpose();
+    const Eigen::AngleAxisd angle_axis(pose.R);
+    const Eigen::Vector3d omega = angle_axis.angle() * angle_axis.axis();
+    constexpr double kStep = 1e-7;
+    for (int k = 0; k < 3; ++k) {
+        Eigen::Vector3d plus = omega;
+        Eigen::Vector3d minus = omega;
+        plus[k] += kStep;
+        minus[k] -= kStep;
+        const Eigen::Vector3d centre_plus =
+            -rotation_from_rotation_vector(plus).transpose() * pose.t;
+        const Eigen::Vector3d centre_minus =
+            -rotation_from_rotation_vector(minus).transpose() * pose.t;
+        jacobian.col(k) = (centre_plus - centre_minus) / (2.0 * kStep);
+    }
+    return jacobian * covariance * jacobian.transpose();
+}
+
 }  // namespace
 
 void OptimizeCamerasTask::declare_params(Params& params) const {
@@ -148,6 +181,13 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
     // groups whose likelihood-ratio gain pays for their degrees of freedom.
     params.declare({"adaptive_fitting", ParamType::Bool, false,
                     "Select the distortion terms automatically (ordered forward selection)."});
+    // Posterior covariance of the cameras and calibration is on by default
+    // (subject to the BA caps); tie-point covariance is opt-in because it is
+    // O(points) dense output a caller rarely needs.
+    params.declare({"camera_covariance", ParamType::Bool, true,
+                    "Store the posterior covariance of the cameras and calibration."});
+    params.declare({"tiepoint_covariance", ParamType::Bool, false,
+                    "Store the posterior covariance of every tie point."});
 }
 
 std::vector<Stage> OptimizeCamerasTask::stages() const {
@@ -166,7 +206,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     std::array<bool, kCalibrationParamCount> fit = {};
     for (int k = 0; k < kCalibrationParamCount; ++k) {
         fit[static_cast<std::size_t>(k)] =
-            params.get_bool("fit_" + std::string(kParamNames[static_cast<std::size_t>(k)]));
+            params.get_bool("fit_" + std::string(kCalibrationParamNames[static_cast<std::size_t>(k)]));
     }
 
     std::vector<std::size_t> camera_index;  // chunk camera -> BA camera
@@ -227,7 +267,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         for (int k = 0; k < kCalibrationParamCount; ++k) {
             const std::size_t kk = static_cast<std::size_t>(k);
             const bool fixed = std::find(sensor.fixed_params.begin(), sensor.fixed_params.end(),
-                                         std::string(kParamNames[kk])) != sensor.fixed_params.end();
+                                         std::string(kCalibrationParamNames[kk])) != sensor.fixed_params.end();
             mask[kk] = fit[kk] && !fixed;
         }
         problem.fit_intrinsics[s] = mask;
@@ -611,13 +651,20 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // -- solve --------------------------------------------------------------
     progress.update("optimize", 0.0);
     const bool adaptive_fitting = params.get_bool("adaptive_fitting");
+    const bool camera_covariance = params.get_bool("camera_covariance");
+    sfm::BAOptions ba_options;
+    ba_options.compute_camera_covariance = camera_covariance;
+    ba_options.compute_calibration_covariance = camera_covariance;
+    ba_options.compute_point_covariance = params.get_bool("tiepoint_covariance");
     sfm::BAReport report;
     std::string adaptive_selected;
     int adaptive_solves = 0;
     if (adaptive_fitting) {
         // The fit flags are the allowed set; adaptive_fit narrows them further.
+        sfm::AdaptiveFitOptions adaptive_options;
+        adaptive_options.solve_options = ba_options;
         const sfm::AdaptiveFitResult adaptive =
-            sfm::adaptive_fit(problem, fit, sfm::AdaptiveFitOptions{});
+            sfm::adaptive_fit(problem, fit, adaptive_options);
         report = adaptive.report;
         adaptive_solves = adaptive.solves;
         for (int k = 0; k < kCalibrationParamCount; ++k) {
@@ -628,10 +675,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             if (!adaptive_selected.empty()) {
                 adaptive_selected += ",";
             }
-            adaptive_selected += kParamNames[kk];
+            adaptive_selected += kCalibrationParamNames[kk];
         }
     } else {
-        report = sfm::bundle_adjust(problem, sfm::BAOptions{});
+        report = sfm::bundle_adjust(problem, ba_options);
     }
     if (!report.usable) {
         throw Error("OptimizeCameras: bundle adjustment did not produce a usable solution");
@@ -641,16 +688,39 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // -- stage the result on a copy -----------------------------------------
     Chunk staged = *chunk;
     for (std::size_t s = 0; s < problem.calibrations.size(); ++s) {
-        staged.sensors()[static_cast<std::size_t>(slot_sensor[s])].calibration =
-            problem.calibrations[s];
+        Calibration& calibration = staged.sensors()[static_cast<std::size_t>(slot_sensor[s])].calibration;
+        calibration = problem.calibrations[s];
+        calibration.covariance.resize(0, 0);
+        calibration.covariance_params.clear();
+        if (s < report.calibration_covariance.size() &&
+            report.calibration_covariance[s].rows() == kCalibrationParamCount) {
+            calibration.covariance = report.calibration_covariance[s];
+            for (const char* name : kCalibrationParamNames) {
+                calibration.covariance_params.emplace_back(name);
+            }
+        }
     }
     for (std::size_t b = 0; b < camera_index.size(); ++b) {
-        staged.cameras()[camera_index[b]].pose = transform_from_pose(problem.poses[b]);
+        Camera& camera = staged.cameras()[camera_index[b]];
+        camera.pose = transform_from_pose(problem.poses[b]);
+        camera.location_covariance.setZero();
+        camera.rotation_covariance.setZero();
+        if (b < report.camera_covariance.size()) {
+            camera.location_covariance =
+                camera_location_covariance(problem.poses[b], report.camera_covariance[b]);
+            camera.rotation_covariance = report.camera_covariance[b].block<3, 3>(0, 0);
+        }
     }
     for (std::size_t t = 0; t < tie_points.tracks.size(); ++t) {
         const auto point = point_slot.find(t);
-        if (point != point_slot.end()) {
-            staged.tie_points().tracks[t].point = problem.points[point->second];
+        if (point == point_slot.end()) {
+            continue;
+        }
+        Track& track = staged.tie_points().tracks[t];
+        track.point = problem.points[point->second];
+        track.covariance.reset();
+        if (point->second < report.point_covariance.size()) {
+            track.covariance = report.point_covariance[point->second].cast<float>();
         }
     }
 
@@ -682,6 +752,15 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         staged.markers()[m].position = checked != rechecked_position.end()
                                            ? checked->second
                                            : problem.points[marker_point[m]];
+        // Only replace a stored covariance when this run actually produced a
+        // valid block for the point. A dropped point (or a run with tie-point
+        // covariance off) leaves the previously stored value untouched.
+        if (report.covariance_valid &&
+            marker_point[m] < report.point_covariance.size() &&
+            !report.point_covariance[marker_point[m]].isZero(0.0)) {
+            staged.markers()[m].position_covariance =
+                report.point_covariance[marker_point[m]];
+        }
     }
     for (const ScalebarEntry& entry : scalebar_entry) {
         const auto& a = staged.markers()[entry.marker_a].position;
@@ -720,6 +799,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("optimize_cameras.adaptive_selected", adaptive_selected);
     staged.meta().set("optimize_cameras.adaptive_solves",
                       std::to_string(adaptive_solves));
+    staged.meta().set("optimize_cameras.sigma0", meta_number(std::sqrt(report.sigma0_squared)));
+    staged.meta().set("optimize_cameras.covariance",
+                      report.covariance_reason.empty()
+                          ? "covariance skipped: not requested"
+                          : report.covariance_reason);
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);

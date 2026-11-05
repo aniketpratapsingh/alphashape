@@ -145,6 +145,18 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         geometry.transform = geo::enu_to_ecef(origin);
         apply_geometry(chunk, geometry);
         chunk.crs().epsg = 4326;
+        // Camera-centre covariances follow the same similarity. The rotation
+        // covariance is in each camera's own angle-axis parametrisation and is
+        // left unchanged (see the note in the non-geometry path below).
+        const double camera_scale_sq = t_sim.scale * t_sim.scale;
+        for (Camera& camera : chunk.cameras()) {
+            if (!camera.enabled) {
+                continue;
+            }
+            camera.location_covariance = camera_scale_sq * t_sim.R *
+                                         camera.location_covariance *
+                                         t_sim.R.transpose();
+        }
         if (transform_markers) {
             // A covariance transforms as C' = s^2 R C R^T.
             const double scale_sq = t_sim.scale * t_sim.scale;
@@ -169,6 +181,12 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         const Eigen::Vector3d t_c_new = t_sim.scale * t_c - r_c_new * t_sim.t;
         camera.pose.block<3, 3>(0, 0) = r_c_new;
         camera.pose.block<3, 1>(0, 3) = t_c_new;
+        // The centre C = -R^T t maps as C' = s R C + t, so its covariance maps
+        // by s^2 R C R^T. rotation_covariance is expressed in the camera's own
+        // angle-axis parametrisation, which this world-frame change leaves
+        // untouched, so it is deliberately not transformed.
+        camera.location_covariance = t_sim.scale * t_sim.scale * t_sim.R *
+                                     camera.location_covariance * t_sim.R.transpose();
     }
     for (Track& track : chunk.tie_points().tracks) {
         if (track.point.has_value()) {

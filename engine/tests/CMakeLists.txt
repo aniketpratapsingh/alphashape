@@ -25,6 +25,7 @@ add_executable(alphashape_tests
     test_absolute_pose.cpp
     test_triangulation.cpp
     test_bundle_adjustment.cpp
+    test_covariance.cpp
     test_structure_builder.cpp
     test_align_cameras.cpp
     test_optimize_cameras.cpp
@@ -118,6 +119,7 @@ endif()
 
 target_link_libraries(alphashape_tests PRIVATE
     alphashape_algorithms
+    Ceres::ceres
     GTest::gtest
     GTest::gtest_main)
 

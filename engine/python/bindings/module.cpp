@@ -502,6 +502,21 @@ std::int32_t camera_id_from_python(const alphashape::Chunk& chunk, py::handle va
     throw alphashape::ValueError("no camera with id " + std::to_string(id));
 }
 
+/// Dense Eigen matrix as nested Python lists, the convention the other dense
+/// views use (no numpy dependency). An empty matrix yields an empty list.
+template <typename Derived>
+py::list nested_matrix(const Eigen::MatrixBase<Derived>& matrix) {
+    py::list rows;
+    for (Eigen::Index r = 0; r < matrix.rows(); ++r) {
+        py::list row;
+        for (Eigen::Index c = 0; c < matrix.cols(); ++c) {
+            row.append(py::float_(matrix(r, c)));
+        }
+        rows.append(row);
+    }
+    return rows;
+}
+
 #if defined(ALPHASHAPE_USE_PROJ)
 /// (x, y, z) tuple or None, the shape every optional vector in the reference
 /// table uses. The table itself needs the CRS engine, so this lives with it.
@@ -853,6 +868,26 @@ PYBIND11_MODULE(alphashape, m) {
         .def_readonly("p2", &alphashape::Calibration::p2)
         .def_readonly("p3", &alphashape::Calibration::p3)
         .def_readonly("p4", &alphashape::Calibration::p4)
+        // Posterior covariance from OptimizeCameras, as nested lists; None when
+        // no covariance was computed. Rows follow covariance_params.
+        .def_property_readonly("covariance_matrix",
+                               [](const alphashape::Calibration& c) -> py::object {
+                                   if (c.covariance.size() == 0) {
+                                       return py::none();
+                                   }
+                                   return nested_matrix(c.covariance);
+                               })
+        .def_property_readonly("covariance_params",
+                               [](const alphashape::Calibration& c) -> py::object {
+                                   if (c.covariance_params.empty()) {
+                                       return py::none();
+                                   }
+                                   py::list names;
+                                   for (const std::string& name : c.covariance_params) {
+                                       names.append(py::str(name));
+                                   }
+                                   return names;
+                               })
         .def("__repr__", [](const alphashape::Calibration& c) {
             return "<alphashape.Calibration " + std::string(camera_type_name(c.type)) + " " +
                    std::to_string(c.width) + "x" + std::to_string(c.height) + " f=" +
@@ -924,6 +959,15 @@ PYBIND11_MODULE(alphashape, m) {
             }
             const Eigen::Vector3d& a = c.reference.accuracy;
             return py::make_tuple(a.x(), a.y(), a.z());
+        })
+        // Posterior covariance of the centre, chunk-local, 3x3 nested lists.
+        // All zeros on a camera whose covariance was not computed.
+        .def_property_readonly("location_covariance", [](const alphashape::Camera& c) {
+            return nested_matrix(c.location_covariance);
+        })
+        // Posterior covariance of the angle-axis rotation, 3x3 nested lists.
+        .def_property_readonly("rotation_covariance", [](const alphashape::Camera& c) {
+            return nested_matrix(c.rotation_covariance);
         });
 
     // -- Chunk ---------------------------------------------------------------

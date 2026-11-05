@@ -165,6 +165,15 @@ struct Camera {
     /// already expressed in the sensor's own orientation.
     int orientation = 1;
 
+    /// Posterior covariance of the camera centre, in the same chunk-local frame
+    /// as `pose` (not converted to world). Zero when unknown. Derived data: not
+    /// persisted yet, so deliberately excluded from operator==.
+    Eigen::Matrix3d location_covariance = Eigen::Matrix3d::Zero();
+    /// Posterior covariance of the rotation, parametrised as a rotation vector
+    /// (angle-axis) in the camera frame. Zero when unknown; excluded from
+    /// operator== for the same reason as location_covariance.
+    Eigen::Matrix3d rotation_covariance = Eigen::Matrix3d::Zero();
+
     bool operator==(const Camera& other) const;
 };
 
@@ -247,6 +256,11 @@ struct Track {
     /// poses are expressed in), set by AlignCameras. nullopt = not
     /// triangulated. When set, every component is finite.
     std::optional<Eigen::Vector3d> point;
+
+    /// Posterior covariance of `point`, when computed by a solve that asked for
+    /// tie-point covariance. float to keep the track compact. Derived data and
+    /// not persisted yet, so it is excluded from operator==.
+    std::optional<Eigen::Matrix3f> covariance;
 
     bool operator==(const Track& other) const {
         return observations == other.observations && point == other.point;

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 // Ceres (and its Eigen/glog/suite-sparse headers) is pulled in here only — never
@@ -41,6 +42,7 @@
 #endif
 #include "ceres/ceres.h"
 #include "ceres/rotation.h"
+#include "common/algorithm/sfm/covariance.hpp"
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
@@ -848,19 +850,30 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     // they cannot move and need no explicit constant marking.
 
     // ---- Solve -----------------------------------------------------------
-    ceres::Solver::Options solver_options;
-    solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
-    solver_options.minimizer_type = ceres::TRUST_REGION;
-    solver_options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    solver_options.max_num_iterations = options.max_iterations;
-    solver_options.function_tolerance = options.function_tolerance;
-    if (options.num_threads > 0) {
-        solver_options.num_threads = options.num_threads;
-    }
-    solver_options.logging_type = ceres::SILENT;
-
+    // A non-positive iteration limit is an evaluation-only pass: the objective
+    // is evaluated at the given state and no optimiser step is taken. It is
+    // used to obtain the posterior covariance at an already accepted solution
+    // without moving it (Ceres rejects max_num_iterations == 0 itself).
+    const bool stepped = options.max_iterations > 0;
     ceres::Solver::Summary summary;
-    ceres::Solve(solver_options, &ceres_problem, &summary);
+    double evaluated_cost = 0.0;
+    bool evaluated_ok = false;
+    if (stepped) {
+        ceres::Solver::Options solver_options;
+        solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
+        solver_options.minimizer_type = ceres::TRUST_REGION;
+        solver_options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        solver_options.max_num_iterations = options.max_iterations;
+        solver_options.function_tolerance = options.function_tolerance;
+        if (options.num_threads > 0) {
+            solver_options.num_threads = options.num_threads;
+        }
+        solver_options.logging_type = ceres::SILENT;
+        ceres::Solve(solver_options, &ceres_problem, &summary);
+    } else {
+        evaluated_ok = ceres_problem.Evaluate(ceres::Problem::EvaluateOptions(),
+                                              &evaluated_cost, nullptr, nullptr, nullptr);
+    }
 
     // Exact dimensions of the solve. Ceres knows which blocks are constant and
     // removes manifold-held components from each block's tangent space, so this
@@ -880,54 +893,120 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     }
 
     // ---- Write back ------------------------------------------------------
-    // Fixed cameras are restored bitwise, not round-tripped through Ceres:
-    // R -> angle-axis -> R is only accurate to ~1e-16, and a fixed pose must
-    // come back exactly as given.
-    for (std::size_t i = 0; i < num_cameras; ++i) {
-        const bool fixed = !problem.fixed_pose.empty() && problem.fixed_pose[i] != 0;
-        if (fixed) {
-            problem.poses[i] = original_poses[i];
-            continue;
+    // An evaluation-only pass leaves every parameter block as it was, so the
+    // state must not be round-tripped through the angle-axis representation.
+    if (stepped) {
+        // Fixed cameras are restored bitwise, not round-tripped through Ceres:
+        // R -> angle-axis -> R is only accurate to ~1e-16, and a fixed pose must
+        // come back exactly as given.
+        for (std::size_t i = 0; i < num_cameras; ++i) {
+            const bool fixed = !problem.fixed_pose.empty() && problem.fixed_pose[i] != 0;
+            if (fixed) {
+                problem.poses[i] = original_poses[i];
+                continue;
+            }
+            double R[9] = {};
+            ceres::AngleAxisToRotationMatrix(cam_blocks[i].data(), R);
+            problem.poses[i].R << R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8];
+            problem.poses[i].t =
+                Eigen::Vector3d(cam_blocks[i][3], cam_blocks[i][4], cam_blocks[i][5]);
         }
-        double R[9] = {};
-        ceres::AngleAxisToRotationMatrix(cam_blocks[i].data(), R);
-        problem.poses[i].R << R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8];
-        problem.poses[i].t = Eigen::Vector3d(cam_blocks[i][3], cam_blocks[i][4], cam_blocks[i][5]);
-    }
-    for (std::size_t i = 0; i < problem.points.size(); ++i) {
-        problem.points[i] = Eigen::Vector3d(point_blocks[i][0], point_blocks[i][1], point_blocks[i][2]);
-    }
-    // Intrinsics: write back only the coefficients marked free, so entries held
-    // fixed come back bitwise as given (the block holds them unchanged anyway,
-    // but this makes that guarantee explicit).
-    if (!problem.fit_intrinsics.empty()) {
-        for (std::size_t s = 0; s < num_calibrations; ++s) {
-            Calibration& c = problem.calibrations[s];
-            const std::array<double, kCalibrationParamCount>& b = intr_blocks[s];
-            const std::array<bool, kCalibrationParamCount>& fit = problem.fit_intrinsics[s];
-            if (fit[0]) c.f = b[0];
-            if (fit[1]) c.cx = b[1];
-            if (fit[2]) c.cy = b[2];
-            if (fit[3]) c.b1 = b[3];
-            if (fit[4]) c.b2 = b[4];
-            if (fit[5]) c.k1 = b[5];
-            if (fit[6]) c.k2 = b[6];
-            if (fit[7]) c.k3 = b[7];
-            if (fit[8]) c.k4 = b[8];
-            if (fit[9]) c.p1 = b[9];
-            if (fit[10]) c.p2 = b[10];
-            if (fit[11]) c.p3 = b[11];
-            if (fit[12]) c.p4 = b[12];
+        for (std::size_t i = 0; i < problem.points.size(); ++i) {
+            problem.points[i] = Eigen::Vector3d(
+                point_blocks[i][0], point_blocks[i][1], point_blocks[i][2]);
+        }
+        // Intrinsics: write back only the coefficients marked free, so entries
+        // held fixed come back bitwise as given (the block holds them unchanged
+        // anyway, but this makes that guarantee explicit).
+        if (!problem.fit_intrinsics.empty()) {
+            for (std::size_t s = 0; s < num_calibrations; ++s) {
+                Calibration& c = problem.calibrations[s];
+                const std::array<double, kCalibrationParamCount>& b = intr_blocks[s];
+                const std::array<bool, kCalibrationParamCount>& fit =
+                    problem.fit_intrinsics[s];
+                if (fit[0]) c.f = b[0];
+                if (fit[1]) c.cx = b[1];
+                if (fit[2]) c.cy = b[2];
+                if (fit[3]) c.b1 = b[3];
+                if (fit[4]) c.b2 = b[4];
+                if (fit[5]) c.k1 = b[5];
+                if (fit[6]) c.k2 = b[6];
+                if (fit[7]) c.k3 = b[7];
+                if (fit[8]) c.k4 = b[8];
+                if (fit[9]) c.p1 = b[9];
+                if (fit[10]) c.p2 = b[10];
+                if (fit[11]) c.p3 = b[11];
+                if (fit[12]) c.p4 = b[12];
+            }
         }
     }
 
-    report.usable = summary.IsSolutionUsable();
-    report.iterations = static_cast<int>(summary.iterations.size());
-    report.robust_cost = summary.final_cost;
-    report.cost_valid =
-        std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;
+    if (stepped) {
+        report.usable = summary.IsSolutionUsable();
+        report.iterations = static_cast<int>(summary.iterations.size());
+        report.robust_cost = summary.final_cost;
+        report.cost_valid =
+            std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;
+    } else {
+        // A finite evaluation of the given state is a usable cost, even though
+        // no trust-region step was taken.
+        report.usable = evaluated_ok && std::isfinite(evaluated_cost);
+        report.iterations = 0;
+        report.robust_cost = evaluated_cost;
+        report.cost_valid =
+            evaluated_ok && std::isfinite(evaluated_cost) && evaluated_cost >= 0.0;
+    }
     report.residual_count = static_cast<std::size_t>(ceres_problem.NumResiduals());
     report.free_parameter_count = free_parameter_count;
+    const std::size_t redundancy =
+        report.residual_count > report.free_parameter_count
+            ? report.residual_count - report.free_parameter_count
+            : 0;
+    report.sigma0_squared =
+        (report.cost_valid && redundancy > 0)
+            ? 2.0 * report.robust_cost / static_cast<double>(redundancy)
+            : 0.0;
+
+    if (options.compute_camera_covariance || options.compute_point_covariance ||
+        options.compute_calibration_covariance) {
+        if (!report.usable || !report.cost_valid ||
+            report.residual_count <= report.free_parameter_count) {
+            // sigma0^2 is only defined when the solve produced a usable cost
+            // and the residual count exceeds the free parameters; without it a
+            // posterior covariance would be meaningless (or negative).
+            report.covariance_valid = false;
+            report.covariance_reason =
+                "covariance skipped: the solve has no usable redundancy";
+        } else {
+            CovarianceRequest request;
+            request.cameras = options.compute_camera_covariance;
+            request.points = options.compute_point_covariance;
+            request.calibrations = options.compute_calibration_covariance;
+            request.max_cameras = options.covariance_max_cameras;
+            request.max_points = options.covariance_max_points;
+            CovarianceBlocks blocks;
+            blocks.cameras.reserve(num_cameras);
+            for (std::array<double, 6>& block : cam_blocks) {
+                blocks.cameras.push_back(block.data());
+            }
+            blocks.points.reserve(point_blocks.size());
+            for (std::array<double, 3>& block : point_blocks) {
+                blocks.points.push_back(block.data());
+            }
+            blocks.calibrations.reserve(num_calibrations);
+            for (std::array<double, kCalibrationParamCount>& block : intr_blocks) {
+                blocks.calibrations.push_back(block.data());
+            }
+            CovarianceOutput covariance =
+                compute_covariance(ceres_problem, blocks, request, report.sigma0_squared);
+            report.covariance_valid = covariance.valid;
+            report.covariance_reason = std::move(covariance.reason);
+            report.camera_covariance = std::move(covariance.camera_covariance);
+            report.point_covariance = std::move(covariance.point_covariance);
+            report.calibration_covariance = std::move(covariance.calibration_covariance);
+        }
+    }
+
     report.final_rms_px = reprojection_rms_px(problem);
     report.prior_rms_sigma = prior_rms_sigma(problem);
     fill_constraint_report(problem, check_mask, &report);
