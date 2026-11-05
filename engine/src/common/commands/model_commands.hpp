@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -78,6 +79,29 @@ std::unique_ptr<AbstractCommand> make_set_reference_settings_command(
 /// reproduces exactly the first apply.
 std::unique_ptr<AbstractCommand> make_align_chunks_command(std::int32_t chunk_id,
                                                            ChunkGeometry after);
+
+/// The pose/tie-point part of a chunk that AlignFromReference and
+/// TriangulateTiePoints rewrite. Unlike ChunkGeometry, the track list itself
+/// may change (observations are dropped), and camera enabled flags are part of
+/// the state, so the tasks use this narrower snapshot.
+struct ChunkPoseState {
+    std::vector<Camera> cameras;
+    std::vector<Track> tracks;
+    Transform transform = Transform::Identity();
+    Region region;
+    std::vector<std::pair<std::string, std::string>> meta;
+    CRS crs;
+    std::optional<CRS> camera_crs;
+    std::optional<CRS> world_crs;
+};
+
+ChunkPoseState capture_chunk_pose_state(const Chunk& chunk);
+
+/// Install a computed pose/tie-point state in one undoable step. The command
+/// captures its own pre-state, so apply -> revert restores the chunk exactly
+/// and apply -> revert -> apply reproduces the first apply.
+std::unique_ptr<AbstractCommand> make_set_chunk_pose_state_command(
+    std::int32_t chunk_id, ChunkPoseState after, std::string label);
 
 /// Set one chunk-meta property, restoring the previous value (or removing the
 /// key when it was absent) on revert. Used for records that live beside a

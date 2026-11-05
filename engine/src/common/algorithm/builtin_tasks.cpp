@@ -24,6 +24,7 @@
 #include "common/algorithm/ortho/build_orthomosaic_task.hpp"
 #include "common/algorithm/ortho/export_orthomosaic_task.hpp"
 #include "common/algorithm/photos/add_photos_task.hpp"
+#include "common/algorithm/reference/align_from_reference_task.hpp"
 #if defined(ALPHASHAPE_USE_PROJ)
 #include "common/algorithm/reference/export_markers_task.hpp"
 #include "common/algorithm/reference/export_reference_task.hpp"
@@ -32,6 +33,7 @@
 #endif
 #include "common/algorithm/sfm/align_cameras_task.hpp"
 #include "common/algorithm/sfm/optimize_cameras_task.hpp"
+#include "common/algorithm/sfm/triangulate_tie_points_task.hpp"
 #include "common/algorithm/sfm/update_transform_task.hpp"
 #include "common/algorithm/stereo/build_depth_maps_task.hpp"
 #include "common/algorithm/stereo/build_point_cloud_task.hpp"
@@ -50,6 +52,8 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MatchPhotosTask>());
     registry.register_task(std::make_shared<AlignCamerasTask>());
     registry.register_task(std::make_shared<OptimizeCamerasTask>());
+    registry.register_task(std::make_shared<AlignFromReferenceTask>());
+    registry.register_task(std::make_shared<TriangulateTiePointsTask>());
     registry.register_task(std::make_shared<CalibrateCameraTask>());
     registry.register_task(std::make_shared<DetectFiducialsTask>());
     registry.register_task(std::make_shared<CalibrateFiducialsTask>());
