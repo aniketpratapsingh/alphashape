@@ -29,6 +29,7 @@ add_library(alphashape_algorithms STATIC
     markers/detect_markers_task.cpp
     markers/refine_markers_task.cpp
     markers/track_markers_task.cpp
+    markers/marker_sheet.cpp
     calibration/board_detector.cpp
     calibration/calibrate.cpp
     calibration/calibrate_camera_task.cpp
