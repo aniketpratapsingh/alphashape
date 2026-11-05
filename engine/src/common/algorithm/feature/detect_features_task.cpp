@@ -14,8 +14,11 @@
 #include "common/algorithm/feature/dog_detector.hpp"
 #include "common/algorithm/feature/mldb_descriptor.hpp"
 #include "common/algorithm/match/tracks.hpp"
+#include "common/core/chunk.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "image/io/image_io.hpp"
+#include "model/camera/film_geometry.hpp"
 
 namespace alphashape {
 
@@ -28,6 +31,9 @@ void DetectFeaturesTask::declare_params(Params& params) const {
                     "Maximum keypoints per megapixel. 0 = no limit."});
     params.declare({"descriptor_type", ParamType::String, std::string{"mldb"},
                     "Descriptor to compute. Only 'mldb' in this version."});
+    params.declare({"fiducial_exclusion_mm", ParamType::Float, 5.0,
+                    "Drop keypoints this close to a fiducial mark or to the "
+                    "normalised image border on scanned-film cameras."});
 }
 
 std::vector<Stage> DetectFeaturesTask::stages() const {
@@ -53,33 +59,74 @@ std::size_t keypoint_cap_from_limits(std::int64_t limit, std::int64_t per_mpx, i
     return cap;
 }
 
-/// Resolve a frame's recorded path against the document's directory. Frames
-/// store paths relative to the project so a moved project still loads; a
-/// document with no path (unsaved, in memory) has no anchor, so the path is
-/// taken as given.
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 }  // namespace
 
-KeypointSet detect_keypoints_for_frame(const Document& document, const Frame& frame,
+KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& chunk,
+                                       const Frame& frame,
                                        std::int64_t keypoint_limit,
-                                       std::int64_t keypoint_limit_per_mpx) {
+                                       std::int64_t keypoint_limit_per_mpx,
+                                       double fiducial_exclusion_mm) {
     if (frame.camera_id() < 0) {
         throw Error("frame '" + frame.path() + "' is not linked to a camera");
     }
-    // read_image handles every container the engine understands (JPEG, PNG,
-    // TIFF, PNM), so a frame imported by AddPhotos from any of them detects
-    // the same way.
-    const Image image = read_image(resolve_frame_path(document, frame.path()).string());
+    const Camera* camera = nullptr;
+    for (const Camera& candidate : chunk.cameras()) {
+        if (candidate.id == frame.camera_id()) {
+            camera = &candidate;
+            break;
+        }
+    }
+    if (camera == nullptr) {
+        throw Error("frame '" + frame.path() + "' names a camera that is not in "
+                    "the chunk");
+    }
+    // Reads the raw scan for a digital camera and the film-normalised image for
+    // a scanned film (WP-13.18b), so detection always sees pipeline pixels.
+    const Image image = load_camera_image(document, chunk, *camera);
     const DogDetector detector;
     const ScaleSpace space = detector.build_scale_space(image.to_luminance());
     std::vector<Detection> detections = detector.detect(space);
+
+    // Fiducial marks are at the same film position in every frame and would
+    // form zero-parallax matches. A general border/mask belongs to the masks
+    // milestone; this only covers the film frame's own geometry.
+    if (fiducial_exclusion_mm > 0.0) {
+        const Sensor& sensor = effective_sensor(chunk, *camera);
+        const FilmSettings& film = sensor.film;
+        if (film.enabled && film_geometry_complete(film)) {
+            const FilmSize size = film_normalised_size(film);
+            const double radius =
+                fiducial_exclusion_mm / film.resolution_mm_per_px;
+            const double max_x = static_cast<double>(size.first) - radius;
+            const double max_y = static_cast<double>(size.second) - radius;
+            std::vector<Eigen::Vector2d> marks;
+            marks.reserve(film.fiducials.size());
+            for (const Fiducial& fiducial : film.fiducials) {
+                marks.push_back(
+                    normalised_from_film_mm(film, fiducial.film_mm));
+            }
+            const auto excluded = [&](const Detection& detection) {
+                // Detector coordinates put the top-left pixel centre at (0, 0);
+                // the normalised frame follows the Calibration convention.
+                const Eigen::Vector2d point(
+                    static_cast<double>(detection.keypoint.x) + 0.5,
+                    static_cast<double>(detection.keypoint.y) + 0.5);
+                if (point.x() < radius || point.y() < radius ||
+                    point.x() > max_x || point.y() > max_y) {
+                    return true;
+                }
+                for (const Eigen::Vector2d& mark : marks) {
+                    if ((point - mark).norm() < radius) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            detections.erase(
+                std::remove_if(detections.begin(), detections.end(), excluded),
+                detections.end());
+        }
+    }
 
     // Strongest first; ties broken by position so output is deterministic
     // regardless of thread scheduling.
@@ -109,6 +156,9 @@ void DetectFeaturesTask::apply(Document& document, Params& params, const Progres
     // Validate limits before spending time on images.
     keypoint_cap_from_limits(params.get_int("keypoint_limit"),
                              params.get_int("keypoint_limit_per_mpx"), 1, 1);
+    if (!(params.get_float("fiducial_exclusion_mm") >= 0.0)) {
+        throw ValueError("fiducial_exclusion_mm must be non-negative");
+    }
 
     Chunk* chunk = document.active_chunk();
     if (chunk == nullptr) {
@@ -147,9 +197,11 @@ void DetectFeaturesTask::apply(Document& document, Params& params, const Progres
         for (std::ptrdiff_t i = processed; i < batch_end; ++i) {
             const auto idx = static_cast<std::size_t>(i);
             try {
-                results[idx] = detect_keypoints_for_frame(document, *frames[idx],
-                                                          params.get_int("keypoint_limit"),
-                                                          params.get_int("keypoint_limit_per_mpx"));
+                results[idx] = detect_keypoints_for_frame(
+                    document, *chunk, *frames[idx],
+                    params.get_int("keypoint_limit"),
+                    params.get_int("keypoint_limit_per_mpx"),
+                    params.get_float("fiducial_exclusion_mm"));
             } catch (const std::exception& e) {
                 errors[idx] = "frame '" + frames[idx]->path() + "': " + e.what();
             }

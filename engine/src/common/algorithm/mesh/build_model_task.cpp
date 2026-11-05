@@ -33,6 +33,7 @@
 #include "common/algorithm/mesh/volume.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
@@ -88,16 +89,6 @@ constexpr double kFaceCountLow = 1.0 / 20.0;
 constexpr double kFaceCountMedium = 1.0 / 5.0;
 constexpr double kFaceCountHigh = 1.0 / 2.0;
 constexpr std::int64_t kFaceCountCustomDefault = 200000;
-
-/// Resolve a frame's recorded path against the document's directory (the same
-/// rule AddPhotos / BuildPointCloud use).
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
 
 Eigen::Matrix3d pose_R(const Transform& pose) { return pose.block<3, 3>(0, 0); }
 Eigen::Vector3d pose_t(const Transform& pose) { return pose.block<3, 1>(0, 3); }
@@ -250,7 +241,8 @@ FusionViewSet collect_fusion_views(const Chunk& chunk) {
                              " has no sensor");
         }
         const Calibration calibration = scaled_calibration(
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration, map.downscale);
+            sensor_pipeline_calibration(effective_sensor(chunk, camera)),
+            map.downscale);
 
         meshing::FusionView view;
         view.map = &map;
@@ -390,20 +382,21 @@ void colour_vertices(const Document& document, const Chunk& chunk, const FusionV
     }
 
     // Decode each view's full-resolution image once, in view order.
-    std::unordered_map<std::int32_t, const Frame*> frame_of;
-    for (const auto& frame : chunk.frames()) {
-        if (frame->camera_id() >= 0) {
-            frame_of.emplace(frame->camera_id(), frame.get());
-        }
-    }
     std::vector<Image> images(set.views.size());
     for (std::size_t v = 0; v < set.views.size(); ++v) {
-        const auto it = frame_of.find(set.maps[v]->camera_id);
-        if (it == frame_of.end()) {
-            throw ValueError("BuildModel: camera " + std::to_string(set.maps[v]->camera_id) +
+        const std::int32_t camera_id = set.maps[v]->camera_id;
+        const Camera* camera = nullptr;
+        for (const Camera& candidate : chunk.cameras()) {
+            if (candidate.id == camera_id) {
+                camera = &candidate;
+                break;
+            }
+        }
+        if (camera == nullptr) {
+            throw ValueError("BuildModel: camera " + std::to_string(camera_id) +
                              " has no linked frame to colour from");
         }
-        images[v] = read_image(resolve_frame_path(document, it->second->path()).string());
+        images[v] = load_camera_image(document, chunk, *camera);
     }
 
     // Pre-pack each view's calibration parameters for the inner loop.

@@ -18,6 +18,7 @@
 
 namespace alphashape {
 
+class Chunk;
 class Frame;
 
 class DetectFeaturesTask : public AbstractTask {
@@ -36,9 +37,17 @@ public:
 ///
 /// keypoint_limit and keypoint_limit_per_mpx carry the DetectFeatures semantics:
 /// a value <= 0 means "no limit". The caller resolves them from its own params.
-KeypointSet detect_keypoints_for_frame(const Document& document, const Frame& frame,
+///
+/// A film camera is detected on its film-normalised image (WP-13.18b). When
+/// `fiducial_exclusion_mm` is positive, keypoints within that distance of a
+/// layout fiducial or of the normalised image border are dropped: fiducial
+/// marks sit at identical positions in every frame and would otherwise match
+/// with zero parallax and poison the adjustment.
+KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& chunk,
+                                       const Frame& frame,
                                        std::int64_t keypoint_limit,
-                                       std::int64_t keypoint_limit_per_mpx);
+                                       std::int64_t keypoint_limit_per_mpx,
+                                       double fiducial_exclusion_mm = 0.0);
 
 /// Convert a detector keypoint to the Calibration pixel convention.
 ///

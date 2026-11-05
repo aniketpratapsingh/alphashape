@@ -35,6 +35,7 @@
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
 #include "common/core/marker.hpp"
+#include "common/io/camera_image.hpp"
 #include "common/core/types.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
@@ -82,19 +83,10 @@ const Frame* frame_of_camera(const Chunk& chunk, std::int32_t camera_id) {
     return nullptr;
 }
 
-std::filesystem::path resolve_frame_path(const Document& document,
-                                         const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 /// One selected camera with its pose, calibration and reduced-resolution image.
 struct CameraView {
     const Camera* camera = nullptr;
-    const Calibration* calibration = nullptr;
+    Calibration calibration;
     FloatImage image;
     /// Gradient magnitude of `image`, computed once when the view is decoded
     /// and reused by every marker that refines against this view.
@@ -175,7 +167,7 @@ Eigen::Vector3d camera_centre(const Camera& camera) {
 
 std::optional<Eigen::Vector2d> project_view(const CameraView& view,
                                             const Eigen::Vector3d& point) {
-    return project_marker(point, *view.camera, *view.calibration, false);
+    return project_marker(point, *view.camera, view.calibration, false);
 }
 
 struct Observation {
@@ -229,7 +221,7 @@ std::optional<Eigen::Vector3d> triangulate_observations(
         pose.t = observation.view->camera->pose.block<3, 1>(0, 3);
         poses.push_back(pose);
         Eigen::Vector3d bearing =
-            observation.view->calibration->unproject(observation.pixel);
+            observation.view->calibration.unproject(observation.pixel);
         if (!bearing.allFinite() || bearing.norm() <= 0.0) {
             return std::nullopt;
         }
@@ -1058,7 +1050,7 @@ std::optional<Eigen::Vector3d> intersect_plane(const CameraView& view,
     }
     const Eigen::Matrix3d rotation = view.camera->pose.block<3, 3>(0, 0);
     const Eigen::Vector3d ray = rotation.transpose() *
-                                view.calibration->unproject(pixel);
+                                view.calibration.unproject(pixel);
     if (!ray.allFinite()) {
         return std::nullopt;
     }
@@ -1304,7 +1296,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 if (!blend.has_scale) {
                     continue;
                 }
-                const double focal = std::max(blend.view->calibration->f, 1e-6);
+                const double focal = std::max(blend.view->calibration.f, 1e-6);
                 const double sample = blend.apparent * blend.depth / focal;
                 if (std::isfinite(sample) && sample > 0.0) {
                     physical_samples.push_back(sample);
@@ -1329,7 +1321,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 if (blend.has_scale) {
                     continue;
                 }
-                const double focal = std::max(blend.view->calibration->f, 1e-6);
+                const double focal = std::max(blend.view->calibration.f, 1e-6);
                 const double projected_radius =
                     physical * focal / std::max(blend.depth, 1e-9);
                 blend.apparent = std::max(1.0, projected_radius);
@@ -1401,8 +1393,8 @@ std::vector<CameraView> build_selected_views(
             }
             continue;
         }
-        const Calibration& calibration =
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+        const Calibration calibration =
+            sensor_pipeline_calibration(effective_sensor(chunk, camera));
         if (calibration.width <= 0 || calibration.height <= 0) {
             continue;
         }
@@ -1411,7 +1403,7 @@ std::vector<CameraView> build_selected_views(
         }
         CameraView view;
         view.camera = &camera;
-        view.calibration = &calibration;
+        view.calibration = calibration;
         view.downscale = downscale;
         views.push_back(std::move(view));
     }
@@ -1431,8 +1423,7 @@ std::shared_ptr<CameraView> decode_view(
     }
     try {
         FloatImage image =
-            read_image(resolve_frame_path(document, frame->path()).string())
-                .to_luminance();
+            load_camera_image(document, chunk, camera).to_luminance();
         if (geometry.downscale > 1) {
             image = downsample_box(image, geometry.downscale);
         }
@@ -1470,15 +1461,15 @@ public:
     /// Bytes a resident view occupies: luminance plus gradient magnitude.
     std::size_t bytes_of(std::int32_t camera_id) const {
         const CameraView* view = geometry_of(camera_id);
-        if (view == nullptr || view->calibration == nullptr) {
+        if (view == nullptr) {
             return 0;
         }
         const std::size_t ds =
             static_cast<std::size_t>(std::max(1, view->downscale));
         const std::size_t width = static_cast<std::size_t>(std::max(
-            1, view->calibration->width / static_cast<int>(ds)));
+            1, view->calibration.width / static_cast<int>(ds)));
         const std::size_t height = static_cast<std::size_t>(std::max(
-            1, view->calibration->height / static_cast<int>(ds)));
+            1, view->calibration.height / static_cast<int>(ds)));
         return width * height * sizeof(float) * 2;
     }
 

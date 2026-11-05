@@ -31,6 +31,7 @@
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
 #include "common/core/marker.hpp"
+#include "common/io/camera_image.hpp"
 #include "common/core/types.hpp"
 #include "image/image.hpp"
 #include "image/io/exif.hpp"
@@ -184,7 +185,7 @@ std::optional<CaptureTime> capture_time_of(const Document& document,
 /// One selected camera in the tracking sequence.
 struct SequenceCamera {
     const Camera* camera = nullptr;
-    const Calibration* calibration = nullptr;
+    Calibration calibration;
     const Frame* frame = nullptr;
     /// Sortable capture instant (seconds since epoch scaled by 1e6 plus
     /// SubSecTimeOriginal microseconds); nullopt when missing or malformed.
@@ -239,9 +240,8 @@ std::vector<SequenceCamera> selected_sequence(
             }
             continue;
         }
-        const Calibration& calibration =
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)]
-                .calibration;
+        const Calibration calibration =
+            sensor_pipeline_calibration(effective_sensor(chunk, camera));
         if (calibration.width <= 0 || calibration.height <= 0) {
             if (!filters.empty()) {
                 throw ValueError("TrackMarkers: camera '" + camera.label +
@@ -251,7 +251,7 @@ std::vector<SequenceCamera> selected_sequence(
         }
         SequenceCamera entry;
         entry.camera = &camera;
-        entry.calibration = &calibration;
+        entry.calibration = calibration;
         entry.frame = frame;
         entry.import_index = index;
         sequence.push_back(std::move(entry));
@@ -327,11 +327,12 @@ struct SequenceView {
 /// unreadable image; the implicit list logs it and counts it.
 class FrameCache {
 public:
-    FrameCache(const Document& document, const std::vector<SequenceCamera>& sequence,
+    FrameCache(const Document& document, const Chunk& chunk,
+               const std::vector<SequenceCamera>& sequence,
                const std::vector<std::string>& filters, TrackMarkersStats& stats,
                int pyramid_levels)
-        : document_(document), sequence_(sequence), filters_(filters),
-          stats_(stats), pyramid_levels_(pyramid_levels) {
+        : document_(document), chunk_(chunk), sequence_(sequence),
+          filters_(filters), stats_(stats), pyramid_levels_(pyramid_levels) {
         for (const SequenceCamera& entry : sequence_) {
             by_camera_.emplace(entry.camera->id, &entry);
         }
@@ -411,6 +412,7 @@ private:
     void insert_locked(const std::shared_ptr<SequenceView>& view);
 
     const Document& document_;
+    const Chunk& chunk_;
     const std::vector<SequenceCamera>& sequence_;
     const std::vector<std::string>& filters_;
     TrackMarkersStats& stats_;
@@ -431,9 +433,7 @@ std::shared_ptr<SequenceView> FrameCache::decode(const SequenceCamera& entry) {
     const Camera& camera = *entry.camera;
     try {
         FloatImage full =
-            read_image(resolve_frame_path(document_, entry.frame->path())
-                           .string())
-                .to_luminance();
+            load_camera_image(document_, chunk_, *camera).to_luminance();
         auto view = std::make_shared<SequenceView>();
         view->entry = &entry;
         view->levels.push_back(std::move(full));
@@ -1053,7 +1053,7 @@ MarkerTrackResult track_marker(const Chunk& chunk, const Marker& marker,
 void run_tracking(const Document& document, const Chunk& chunk,
                   const std::vector<SequenceCamera>& sequence,
                   const TrackMarkersOptions& options, TrackMarkersPlan& plan) {
-    FrameCache cache(document, sequence, options.cameras, plan.stats,
+    FrameCache cache(document, chunk, sequence, options.cameras, plan.stats,
                      options.pyramid_levels);
     const int count = static_cast<int>(chunk.markers().size());
     std::vector<MarkerTrackResult> results(chunk.markers().size());

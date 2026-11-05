@@ -19,6 +19,7 @@
 #include "common/algorithm/elevation/cell_fusion.hpp"
 #include "common/algorithm/elevation/step_edges.hpp"
 #include "common/algorithm/elevation/surface_frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape::elevation {
@@ -194,7 +195,7 @@ DepthSamples collect_depth_map_samples(const Chunk& chunk, const SurfaceFrame& f
                              " has a mismatched provenance buffer");
         }
         const Calibration calibration = scaled_calibration(
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration,
+            sensor_pipeline_calibration(effective_sensor(chunk, camera)),
             map.downscale);
 
         const Eigen::Matrix3d rt = pose_rotation(camera.pose).transpose();
@@ -612,7 +613,7 @@ std::vector<Eigen::Vector2d> camera_ground_ring(const Camera& camera, const Sens
                                                 double ground_local_z,
                                                 const SurfaceHeightFn& surface_height) {
     std::vector<Eigen::Vector2d> ring;
-    const Calibration& calibration = sensor.calibration;
+    const Calibration calibration = sensor_pipeline_calibration(sensor);
     if (calibration.width <= 0 || calibration.height <= 0 || calibration.f <= 0.0) {
         return ring;
     }

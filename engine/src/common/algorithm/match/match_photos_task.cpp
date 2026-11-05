@@ -214,7 +214,8 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
                 const std::int32_t id = detect_ids[static_cast<std::size_t>(i)];
                 try {
                     results[static_cast<std::size_t>(i)] = detect_keypoints_for_frame(
-                        document, *frame_of.at(id), keypoint_limit, keypoint_limit_per_mpx);
+                        document, *chunk, *frame_of.at(id), keypoint_limit,
+                        keypoint_limit_per_mpx);
                 } catch (const std::exception& e) {
                     errors[static_cast<std::size_t>(i)] =
                         "camera " + std::to_string(id) + ": " + e.what();

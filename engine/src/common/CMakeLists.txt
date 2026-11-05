@@ -27,6 +27,7 @@ add_library(alphashape_core STATIC
     io/doc_xml_v1.cpp
     io/doc_xml_v2.cpp
     io/sidecars.cpp
+    io/camera_image.cpp
 )
 
 # Core carries texture pages on Chunk (common/core/chunk.hpp includes

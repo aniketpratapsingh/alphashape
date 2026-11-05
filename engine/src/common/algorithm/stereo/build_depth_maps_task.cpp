@@ -68,6 +68,7 @@
 #include "common/algorithm/stereo/view_selection.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "gpu/gpu.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
@@ -546,9 +547,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                 sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
                 return 1;
             }
-            const Sensor& sensor = chunk->sensors()[static_cast<std::size_t>(sensor_id)];
-            const int width = sensor.width / downscale;
-            const int height = sensor.height / downscale;
+            const Sensor& sensor = effective_sensor(*chunk, camera);
+            const std::pair<int, int> size = sensor_pipeline_size(sensor);
+            const int width = size.first / downscale;
+            const int height = size.second / downscale;
             if (width <= 0 || height <= 0) {
                 return 1;
             }
@@ -585,7 +587,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                 context.neighbour_calibrations.push_back(
                     sensor_id >= 0 &&
                             sensor_id < static_cast<std::int32_t>(chunk->sensors().size())
-                        ? chunk->sensors()[static_cast<std::size_t>(sensor_id)].calibration
+                        ? sensor_pipeline_calibration(
+                              effective_sensor(*chunk, *nb->second))
                         : Calibration{});
             }
         }
@@ -697,10 +700,11 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                              " has no linked frame");
         }
         auto loaded = std::make_shared<LoadedImage>();
-        const Image image = read_image(resolve_frame_path(document, frame_it->second->path()).string());
+        const Image image = load_camera_image(document, *chunk, camera);
         loaded->image = downsample_box(image.to_luminance(), downscale);
         loaded->calibration = scaled_calibration(
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration, downscale);
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera)),
+            downscale);
         cache.emplace(camera_id, loaded);
         return *loaded;
     };
@@ -1005,7 +1009,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         stereo::DepthView reference;
         reference.map = &map;
         reference.calibration = scaled_calibration(
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration, downscale);
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera)), downscale);
         reference.R = pose_R(camera.pose);
         reference.t = pose_t(camera.pose);
 
@@ -1019,7 +1023,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             stereo::DepthView view;
             view.map = nb->second;
             view.calibration = scaled_calibration(
-                chunk->sensors()[static_cast<std::size_t>(nb_camera.sensor_id)].calibration,
+                sensor_pipeline_calibration(effective_sensor(*chunk, nb_camera)),
                 downscale);
             view.R = pose_R(nb_camera.pose);
             view.t = pose_t(nb_camera.pose);

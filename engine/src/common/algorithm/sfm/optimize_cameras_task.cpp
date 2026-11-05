@@ -60,6 +60,7 @@
 #include "common/algorithm/sfm/adaptive_fit.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
+#include "common/io/camera_image.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 
@@ -264,8 +265,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             const std::size_t slot = problem.calibrations.size();
             sensor_slot[effective] = slot;
             slot_sensor.push_back(effective);
-            problem.calibrations.push_back(
-                chunk->sensors()[static_cast<std::size_t>(effective)].calibration);
+            problem.calibrations.push_back(sensor_pipeline_calibration(
+                chunk->sensors()[static_cast<std::size_t>(effective)]));
         }
         problem.camera_sensor.push_back(sensor_slot.at(effective));
         problem.poses.push_back(pose_from_transform(camera.pose));
