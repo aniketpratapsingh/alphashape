@@ -365,6 +365,10 @@ struct BlobSeed {
     /// True when the light branch's outer-border fit succeeded, as opposed to
     /// falling back to the interior blob centre.
     bool border_fitted = false;
+    /// True when the seed came from a printed centre dot (parity 1). A seed
+    /// that is neither a dot nor a light interior is only a dark-blob guess,
+    /// which a coded circular target retries in a wider window.
+    bool centre_dot = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
@@ -526,6 +530,7 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         // patch scale, unchanged from the dark-only path.
         centre = dot->center;
         radius = dot->radius_px;
+        out.centre_dot = true;
         if (const auto fitted = refine_ellipse_center(crop, *dot)) {
             centre = *fitted;
         }
@@ -552,15 +557,14 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 // is not a plausible multiple of the interior scale; that is
                 // what a neighbouring target's outline looks like.
                 const double moved = (*fitted - seed).norm();
-                // The true border is at least 1.1x the interior blob radius by
-                // design (the interior stops at 0.9 R), while a fit that
-                // re-locked onto the interior's own boundary sits at 1.0x and
-                // carries that boundary's bias. The upper bound is the
-                // geometric maximum R / (0.5 R) plus a small measurement
-                // margin; beyond it the fit belongs to something outside the
-                // target.
-                if (fitted_radius >= 1.05 * light->radius_px &&
-                    fitted_radius <= 2.1 * light->radius_px &&
+                // The border is at most 2.0x the interior radius by design
+                // (the interior reaches down to 0.5 R) and at least about
+                // 1.1x it, but the blob's own fit lands anywhere between the
+                // 0.5 R sector edge and the border's inner edge at 0.9 R, so
+                // the lower bound stays loose: rejecting those fits drops the
+                // centre back onto the biased interior blob.
+                if (fitted_radius >= 0.8 * light->radius_px &&
+                    fitted_radius <= 2.2 * light->radius_px &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
                     radius = fitted_radius;
@@ -648,17 +652,21 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     half = std::min(half, max_half);
     auto seed = circular_seed_window(view, pixel, half, coded_circular);
     // A light seed without a border fit means the outline was clipped (or the
-    // fit was rejected) by the window; a known coded target that seeded
-    // nothing at all may simply have had its interior clipped. One doubled
-    // window covers both cases.
+    // fit was rejected) by the window. A coded circular target whose seed came
+    // from neither the light interior nor a centre dot is only a dark-blob
+    // guess: for a large target the whole interior, and with it the light
+    // blob, can fall outside the window. Both cases need the doubled window.
     const bool unfitted =
         seed && seed->light_centre && !seed->border_fitted;
+    const bool guessed =
+        coded_circular && seed && !seed->light_centre && !seed->centre_dot;
     const bool missing = retry_when_missing && !seed;
-    if (coded_circular && (unfitted || missing) && half < max_half) {
+    if (coded_circular && (unfitted || guessed || missing) &&
+        half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried =
                 circular_seed_window(view, pixel, wider, coded_circular)) {
-            if (!seed || retried->border_fitted) {
+            if (!seed || retried->light_centre || retried->border_fitted) {
                 return retried;
             }
         }
