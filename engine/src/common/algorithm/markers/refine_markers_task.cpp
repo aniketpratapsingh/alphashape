@@ -10,6 +10,7 @@
 #include <limits>
 #include <list>
 #include <memory>
+#include <numbers>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -411,12 +412,50 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
                                index.y() - static_cast<double>(y0) + 0.5);
     const double anchor_gate = std::max(4.0, 0.15 * static_cast<double>(half));
+    // A printed centre dot is dark with the white gap just outside it. A
+    // coarse dark blob formed by the whole target of a parity-0 id also sits
+    // on the expected pixel, but its centre is the white inner gap. Sample the
+    // centre against an annulus at 1.5x the blob radius to tell them apart.
+    const auto looks_like_dot = [&](const MarkerCandidate& blob) {
+        if (!(blob.radius_px > 1.0)) {
+            return false;
+        }
+        const int centre_x =
+            static_cast<int>(std::lround(blob.center.x() - 0.5));
+        const int centre_y =
+            static_cast<int>(std::lround(blob.center.y() - 0.5));
+        if (centre_x < 0 || centre_y < 0 || centre_x >= crop.width() ||
+            centre_y >= crop.height()) {
+            return false;
+        }
+        const double centre_value =
+            static_cast<double>(crop.at(centre_x, centre_y));
+        const double ring_radius = 1.5 * blob.radius_px;
+        double sum = 0.0;
+        int count = 0;
+        for (int step = 0; step < 16; ++step) {
+            const double angle = 2.0 * std::numbers::pi_v<double> *
+                                 static_cast<double>(step) / 16.0;
+            const int x = static_cast<int>(std::lround(
+                blob.center.x() - 0.5 + ring_radius * std::cos(angle)));
+            const int y = static_cast<int>(std::lround(
+                blob.center.y() - 0.5 + ring_radius * std::sin(angle)));
+            if (x < 0 || y < 0 || x >= crop.width() || y >= crop.height()) {
+                continue;
+            }
+            sum += static_cast<double>(crop.at(x, y));
+            ++count;
+        }
+        return count >= 8 &&
+               centre_value + 0.08 < sum / static_cast<double>(count);
+    };
     const MarkerCandidate* dot = nullptr;
-    double dot_distance = anchor_gate;
     for (const MarkerCandidate& blob : dark_blobs) {
-        const double distance = (blob.center - seed).norm();
-        if (distance <= dot_distance) {
-            dot_distance = distance;
+        if ((blob.center - seed).norm() > anchor_gate ||
+            !looks_like_dot(blob)) {
+            continue;
+        }
+        if (dot == nullptr || blob.radius_px < dot->radius_px) {
             dot = &blob;
         }
     }
