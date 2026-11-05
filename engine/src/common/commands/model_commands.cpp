@@ -745,7 +745,7 @@ protected:
         // validate the sensor list exactly as it will look after commit, so a
         // slave cannot be given a size that breaks its master link.
         std::vector<Sensor> sensors = chunk.sensors();
-        apply(sensors[static_cast<std::size_t>(sensor_index_)], calibration_);
+        apply_to(sensors[static_cast<std::size_t>(sensor_index_)], calibration_);
         try {
             validate_sensor_masters(sensors);
         } catch (const Error& error) {
@@ -763,8 +763,8 @@ protected:
     }
 
     void commit(Document& document) override {
-        apply(require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration"),
-              calibration_);
+        apply_to(require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration"),
+                 calibration_);
     }
 
     void restore(Document& document) override {
@@ -780,7 +780,7 @@ private:
     /// Write the calibration and the geometry it describes into a sensor, so
     /// the two never disagree (validate_sensor_masters reads the Sensor
     /// fields, not the calibration).
-    static void apply(Sensor& sensor, const Calibration& calibration) {
+    static void apply_to(Sensor& sensor, const Calibration& calibration) {
         sensor.calibration = calibration;
         sensor.type = calibration.type;
         sensor.width = calibration.width;
