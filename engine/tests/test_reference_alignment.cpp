@@ -738,7 +738,10 @@ TEST(ReferenceAlignment, ReusedFrameAppliesSimilarityScale) {
         const Eigen::Vector3d centre = -(r.transpose() * pose.block<3, 1>(0, 3));
         max_error = std::max(max_error, (centre - scene.centres[i] / kScale).norm());
     }
-    EXPECT_LE(max_error, 1e-9) << "lever arm must be divided by the similarity scale";
+    // The measured rotation goes through cbrt(det), so ~1 nm of rounding is
+    // expected; anything above the placement tolerance would mean the lever
+    // arm kept its metric length.
+    EXPECT_LE(max_error, 1e-6) << "lever arm must be divided by the similarity scale";
 }
 
 TEST(ReferenceAlignment, RefusesProjectedCameraCrs) {
