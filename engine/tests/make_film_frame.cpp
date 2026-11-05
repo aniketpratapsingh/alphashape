@@ -5,6 +5,8 @@
 #include <numbers>
 #include <random>
 
+#include <Eigen/Dense>
+
 #include "base/utils/portable_rng.hpp"
 
 namespace alphashape::test {

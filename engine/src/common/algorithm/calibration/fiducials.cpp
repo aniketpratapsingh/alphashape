@@ -949,6 +949,7 @@ struct OrderedLayout {
     std::vector<std::size_t> fiducial_index;
     std::vector<double> residuals;
     double rms_px = 0.0;
+    std::size_t pairs = 0;
 };
 
 bool order_marks(const std::vector<FiducialMark>& marks,
@@ -999,13 +1000,20 @@ bool order_marks(const std::vector<FiducialMark>& marks,
             if (!fit_film_transform(film, pixels, type, candidate, rms, &residuals)) {
                 continue;
             }
-            if (!best.found || rms < best.rms_px) {
+            // Prefer an assignment that explains more marks before comparing
+            // RMS: three correspondences fit an affine exactly, so a lower-RMS
+            // subset must not beat a more complete assignment.
+            const bool better =
+                !best.found || film.size() > best.pairs ||
+                (film.size() == best.pairs && rms < best.rms_px);
+            if (better) {
                 best.found = true;
                 best.transform = candidate;
                 best.mark_index = std::move(mark_index);
                 best.fiducial_index = std::move(fiducial_index);
                 best.residuals = std::move(residuals);
                 best.rms_px = rms;
+                best.pairs = film.size();
             }
         }
     }
