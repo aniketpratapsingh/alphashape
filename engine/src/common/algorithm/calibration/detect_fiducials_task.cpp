@@ -160,8 +160,8 @@ void DetectFiducialsTask::apply(Document& document, Params& params,
     Chunk staged = *chunk;
     int candidates = 0;
     int succeeded = 0;
-    const double total =
-        static_cast<double>(std::max<std::size_t>(1, chunk->cameras().size()));
+    const double total = static_cast<double>(
+        std::max<std::size_t>(std::size_t{1}, chunk->cameras().size()));
     for (std::size_t i = 0; i < chunk->cameras().size(); ++i) {
         const Camera& camera = chunk->cameras()[i];
         if (!options.cameras.empty() &&

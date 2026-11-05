@@ -39,6 +39,27 @@ std::vector<Eigen::Vector2d> marks4(double d) {
             Eigen::Vector2d(d, -d), Eigen::Vector2d(-d, -d)};
 }
 
+/// Four corner marks whose bounding box is centred on the film origin but whose
+/// layout has no dihedral symmetry. A symmetric square would make a 90-degree
+/// rotation fundamentally ambiguous, so the ordering tests use these.
+std::vector<Eigen::Vector2d> centred_marks() {
+    return {Eigen::Vector2d(-45.0, 42.0), Eigen::Vector2d(40.0, 47.0),
+            Eigen::Vector2d(45.0, -44.0), Eigen::Vector2d(-41.0, -47.0)};
+}
+
+FilmSettings layout_for(const std::vector<Eigen::Vector2d>& marks) {
+    FilmSettings settings;
+    settings.enabled = true;
+    settings.detector = FiducialDetector::Corner;
+    settings.search_corners = true;
+    settings.search_sides = false;
+    for (std::size_t i = 0; i < marks.size(); ++i) {
+        settings.fiducials.push_back(
+            Fiducial{"m" + std::to_string(i), marks[i]});
+    }
+    return settings;
+}
+
 FilmSettings corner_layout(double d) {
     FilmSettings settings;
     settings.enabled = true;
@@ -128,9 +149,10 @@ TEST(Fiducials, FrameQuadCorners) {
 }
 
 TEST(Fiducials, CircleCentres) {
-    const test::FilmFrameSpec spec = base_spec();
+    test::FilmFrameSpec spec = base_spec();
+    spec.marks_mm = centred_marks();
     const test::FilmFrame frame = test::render_film_frame(spec);
-    FilmSettings settings = corner_layout(40.0);
+    FilmSettings settings = layout_for(spec.marks_mm);
     settings.detector = FiducialDetector::Circle;
     const FiducialDetection detection =
         detect_fiducials(frame.image, settings, options_for(settings));
@@ -150,8 +172,9 @@ TEST(Fiducials, CircleCentres) {
 TEST(Fiducials, CornerMarks) {
     test::FilmFrameSpec spec = base_spec();
     spec.mark_type = FiducialDetector::Corner;
+    spec.marks_mm = centred_marks();
     const test::FilmFrame frame = test::render_film_frame(spec);
-    const FilmSettings settings = corner_layout(40.0);
+    const FilmSettings settings = layout_for(spec.marks_mm);
     const FiducialDetection detection =
         detect_fiducials(frame.image, settings, options_for(settings));
     ASSERT_TRUE(detection.failure.empty()) << detection.failure;
@@ -168,9 +191,11 @@ TEST(Fiducials, CornerMarks) {
 }
 
 TEST(Fiducials, OrdersRotatedScan) {
-    const FilmSettings settings = corner_layout(40.0);
+    const std::vector<Eigen::Vector2d> marks = centred_marks();
+    const FilmSettings settings = layout_for(marks);
     for (int variant = 0; variant < 4; ++variant) {
         test::FilmFrameSpec spec = base_spec();
+        spec.marks_mm = marks;
         spec.rotation_deg = (variant % 2 == 0) ? 90.0 : 180.0;
         spec.mirror = variant >= 2;
         const test::FilmFrame frame = test::render_film_frame(spec);
@@ -194,8 +219,9 @@ TEST(Fiducials, OrdersRotatedScan) {
 TEST(Fiducials, AffineTransformRecovered) {
     test::FilmFrameSpec spec = base_spec();
     spec.rotation_deg = 0.0;
+    spec.marks_mm = centred_marks();
     const test::FilmFrame frame = test::render_film_frame(spec);
-    FilmSettings settings = corner_layout(40.0);
+    FilmSettings settings = layout_for(spec.marks_mm);
     settings.detector = FiducialDetector::Circle;
     const FiducialDetection detection =
         detect_fiducials(frame.image, settings, options_for(settings));
@@ -256,8 +282,9 @@ TEST(Fiducials, OrderingFailureIsReported) {
 TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
     test::FilmFrameSpec spec = base_spec();
     spec.rotation_deg = 0.0;
+    spec.marks_mm = centred_marks();
     const test::FilmFrame frame = test::render_film_frame(spec);
-    FilmSettings settings = corner_layout(40.0);
+    FilmSettings settings = layout_for(spec.marks_mm);
     settings.detector = FiducialDetector::Circle;
     const FiducialDetection detection =
         detect_fiducials(frame.image, settings, options_for(settings));
