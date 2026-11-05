@@ -98,6 +98,9 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
     if (chunk == nullptr) {
         throw Error("AlignFromReference needs an active chunk");
     }
+    // The antenna mount resolves through a sensor's master, so an invalid link
+    // is a hard error before any camera is placed.
+    validate_sensor_masters(chunk->sensors());
     const std::vector<std::string> id_texts = params.get_string_list("cameras");
     const bool reset_unreferenced = params.get_bool("reset_unreferenced");
     const std::optional<std::unordered_set<std::int32_t>> requested =

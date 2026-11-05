@@ -24,6 +24,7 @@
 #include <Eigen/Geometry>
 #include <gtest/gtest.h>
 
+#include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/reference/reference_orientation.hpp"
 #include "common/algorithm/sfm/absolute_pose.hpp"
@@ -394,6 +395,144 @@ TriScene make_tri_scene() {
     return scene;
 }
 
+struct RealisticScene {
+    Document document;
+    Chunk* chunk = nullptr;
+    std::vector<Eigen::Vector3d> truth_centres;  ///< chunk-internal (ENU)
+};
+
+/// A 6x6 nadir block at 80 m. Each camera's reference carries a deterministic
+/// ~2 m GNSS offset and ~1 degree attitude error; matches are synthesised from
+/// the truth poses with sub-pixel noise and no outliers.
+RealisticScene make_realistic_scene() {
+    RealisticScene scene;
+    Chunk& chunk = scene.document.workspace().add_chunk("realistic");
+    scene.document.set_active_chunk_id(chunk.id());
+    scene.chunk = &chunk;
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.width = 1200;
+    sensor.height = 900;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 1200, 900, 1000.0);
+    chunk.sensors().push_back(sensor);
+    const Eigen::Vector3d lever(0.20, -0.10, 0.15);
+    chunk.sensors()[0].antenna.offset_m = lever;
+    const Calibration& truth = chunk.sensors()[0].calibration;
+    const Eigen::Matrix3d mount = reference::body_to_camera_nadir();
+    const Eigen::Matrix3d body = Eigen::Matrix3d::Identity();
+    const geo::Geodetic origin{7.0, 45.0, 80.0};
+    const Eigen::Matrix4d reference_frame = geo::enu_to_ecef(origin);
+    const Eigen::Matrix3d e_reference = reference_frame.block<3, 3>(0, 0);
+    chunk.transform() = reference_frame;
+    chunk.meta().set(reference::kRotationOrderKey, crs::rotation_order_name(kOrder));
+
+    constexpr int kGrid = 6;  // 6x6 cameras
+    constexpr double kSpacing = 12.0;
+    constexpr double kAltitude = 80.0;
+    for (int gy = 0; gy < kGrid; ++gy) {
+        for (int gx = 0; gx < kGrid; ++gx) {
+            const int i = gy * kGrid + gx;
+            const Eigen::Vector3d centre(kSpacing * (static_cast<double>(gx) - 2.5),
+                                         kSpacing * (static_cast<double>(gy) - 2.5),
+                                         kAltitude);
+            const Eigen::Matrix3d rotation = mount * body.transpose();
+            const Eigen::Vector3d centre_ecef =
+                (reference_frame * centre.homogeneous()).head<3>();
+            const Eigen::Vector3d antenna =
+                centre_ecef + e_reference * rotation.transpose() * lever;
+            const double phase = static_cast<double>(i);
+            Eigen::Vector3d gnss(1.7 * std::cos(1.3 * phase),
+                                 1.7 * std::sin(2.1 * phase),
+                                 0.6 * std::cos(0.9 * phase + 1.0));
+            gnss *= 2.0 / gnss.norm();  // 2 m 3D per camera
+            const geo::Geodetic g = geo::ecef_to_geodetic(antenna + e_reference * gnss);
+            const Eigen::Matrix3d enu_antenna = geo::enu_to_ecef(g).block<3, 3>(0, 0);
+            const Eigen::Matrix3d r_wb =
+                enu_antenna.transpose() * e_reference * body;
+            Eigen::Vector3d stored = stored_from_world_body(r_wb);
+            stored += Eigen::Vector3d(std::cos(0.7 * phase), std::sin(1.1 * phase),
+                                      0.8 * std::cos(0.5 * phase + 0.4));
+
+            Camera camera;
+            camera.id = i;
+            camera.sensor_id = 0;
+            camera.enabled = true;
+            camera.pose = pose_with_centre(rotation, centre);
+            camera.reference.location =
+                Eigen::Vector3d(g.longitude_deg, g.latitude_deg, g.height_m);
+            camera.reference.accuracy = Eigen::Vector3d::Constant(2.0);
+            camera.reference.enabled = true;
+            camera.reference.orientation_deg = stored;
+            camera.reference.rotation_accuracy_deg = Eigen::Vector3d::Constant(1.0);
+            chunk.cameras().push_back(camera);
+            scene.truth_centres.push_back(centre);
+        }
+    }
+
+    constexpr int kPointGrid = 9;
+    constexpr double kPointSpacing = 7.5;
+    std::vector<Eigen::Vector3d> points;
+    for (int gy = 0; gy < kPointGrid; ++gy) {
+        for (int gx = 0; gx < kPointGrid; ++gx) {
+            points.emplace_back(kPointSpacing * (static_cast<double>(gx) - 4.0),
+                                kPointSpacing * (static_cast<double>(gy) - 4.0), 0.0);
+        }
+    }
+    const std::size_t camera_count = chunk.cameras().size();
+    std::vector<std::vector<int>> index(points.size(),
+                                        std::vector<int>(camera_count, -1));
+    std::vector<KeypointSet> sets(camera_count);
+    std::mt19937 rng(20261105u);
+    for (std::size_t c = 0; c < camera_count; ++c) {
+        KeypointSet& set = sets[c];
+        set.camera_id = static_cast<std::int32_t>(c);
+        const Transform& pose = chunk.cameras()[c].pose;
+        for (std::size_t p = 0; p < points.size(); ++p) {
+            const Eigen::Vector3d p_cam =
+                pose.block<3, 3>(0, 0) * points[p] + pose.block<3, 1>(0, 3);
+            if (!(p_cam.z() > 1.0)) {
+                continue;
+            }
+            Eigen::Vector2d pixel = truth.project(p_cam);
+            if (pixel.x() < 4.0 || pixel.x() > 1196.0 || pixel.y() < 4.0 ||
+                pixel.y() > 896.0) {
+                continue;
+            }
+            const double noise_x =
+                0.8 * (static_cast<double>(rng() % 1000U) / 999.0 - 0.5);
+            const double noise_y =
+                0.8 * (static_cast<double>(rng() % 1000U) / 999.0 - 0.5);
+            pixel += Eigen::Vector2d(noise_x, noise_y);
+            Keypoint keypoint;
+            keypoint.x = static_cast<float>(pixel.x() - 0.5);
+            keypoint.y = static_cast<float>(pixel.y() - 0.5);
+            index[p][c] = static_cast<int>(set.keypoints.size());
+            set.keypoints.push_back(keypoint);
+        }
+        chunk.tie_points().keypoint_sets.push_back(std::move(set));
+    }
+    for (std::size_t a = 0; a < camera_count; ++a) {
+        for (std::size_t b = a + 1; b < camera_count; ++b) {
+            PairMatches pair;
+            pair.camera_a = static_cast<std::int32_t>(a);
+            pair.camera_b = static_cast<std::int32_t>(b);
+            for (std::size_t p = 0; p < points.size(); ++p) {
+                const int ia = index[p][a];
+                const int ib = index[p][b];
+                if (ia < 0 || ib < 0) {
+                    continue;
+                }
+                pair.matches.push_back(KeypointMatch{static_cast<std::uint32_t>(ia),
+                                                     static_cast<std::uint32_t>(ib)});
+            }
+            if (pair.matches.size() >= 2U) {
+                chunk.tie_points().matches.push_back(std::move(pair));
+            }
+        }
+    }
+    return scene;
+}
+
 TEST(ReferenceAlignment, TriangulatesWithKnownPoses) {
     TriScene scene = make_tri_scene();
     run_task_named(scene.document, "TriangulateTiePoints");
@@ -571,6 +710,235 @@ TEST(ReferenceAlignment, TriangulateTiePointsIsUndoable) {
                                                      "Triangulate Tie Points");
     command->apply(scene.document);
     expect_pose_state_equal(capture_chunk_pose_state(*scene.chunk), before);
+}
+
+TEST(ReferenceAlignment, ReusedFrameAppliesSimilarityScale) {
+    const Eigen::Vector3d lever(0.30, -0.12, 0.20);
+    Scene scene = make_scene(6, lever, true, {});
+    Chunk& chunk = *scene.chunk;
+    constexpr double kScale = 2.5;
+    Transform scaled = scene.frame;
+    scaled.block<3, 3>(0, 0) *= kScale;
+    chunk.transform() = scaled;
+    // The truth poses live in internal units, so their centres are the ENU
+    // centres divided by the transform's scale.
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        Camera& camera = chunk.cameras()[i];
+        const Eigen::Matrix3d r = camera.pose.block<3, 3>(0, 0);
+        camera.pose.block<3, 1>(0, 3) = -r * (scene.centres[i] / kScale);
+    }
+    const CRS crs_before = chunk.crs();
+    run_task_named(scene.document, "AlignFromReference");
+    EXPECT_EQ(chunk.transform(), scaled);
+    EXPECT_EQ(chunk.crs(), crs_before);
+    double max_error = 0.0;
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        const Transform& pose = chunk.cameras()[i].pose;
+        const Eigen::Matrix3d r = pose.block<3, 3>(0, 0);
+        const Eigen::Vector3d centre = -(r.transpose() * pose.block<3, 1>(0, 3));
+        max_error = std::max(max_error, (centre - scene.centres[i] / kScale).norm());
+    }
+    EXPECT_LE(max_error, 1e-9) << "lever arm must be divided by the similarity scale";
+}
+
+TEST(ReferenceAlignment, RefusesProjectedCameraCrs) {
+    Scene scene = make_scene(4, Eigen::Vector3d(0.2, 0.0, 0.1), true, {});
+    CRS projected;
+    projected.epsg = 32632;  // a projected UTM slot
+    scene.chunk->set_camera_crs(projected);
+    const ChunkPoseState before = capture_chunk_pose_state(*scene.chunk);
+    EXPECT_THROW(run_task_named(scene.document, "AlignFromReference"), ValueError);
+    const ChunkPoseState after = capture_chunk_pose_state(*scene.chunk);
+    EXPECT_EQ(after.transform, before.transform);
+    EXPECT_EQ(after.meta, before.meta);
+}
+
+TEST(ReferenceAlignment, BuiltFrameDisablesUnplacedCameras) {
+    Scene scene = make_scene(6, Eigen::Vector3d(0.2, -0.1, 0.1), false,
+                             {true, false, true, true, true, true});
+    Chunk& chunk = *scene.chunk;
+    Marker marker;
+    marker.id = 100;
+    marker.position = Eigen::Vector3d(1.0, 2.0, 3.0);
+    marker.position_covariance = Eigen::Matrix3d::Identity();
+    chunk.markers().push_back(marker);
+    const Region initial_region = chunk.region();
+
+    // The built frame's origin is the centroid of every measured antenna.
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const Eigen::Vector3d& antenna : scene.antennas) {
+        mean += antenna;
+    }
+    mean /= static_cast<double>(scene.antennas.size());
+    const Eigen::Matrix4d expected = geo::enu_to_ecef(geo::ecef_to_geodetic(mean));
+    std::vector<Eigen::Vector3d> placed_centres;
+    for (std::size_t i = 0; i < scene.centres.size(); ++i) {
+        if (i == 1U) {
+            continue;
+        }
+        placed_centres.push_back(
+            (expected.inverse() *
+             (scene.reference_frame * scene.centres[i].homogeneous()))
+                .head<3>());
+    }
+    const Region expected_region = region_from_points(placed_centres, initial_region);
+    run_task_named(scene.document, "AlignFromReference");
+
+    EXPECT_FALSE(chunk.cameras()[1].enabled);
+    EXPECT_EQ(chunk.cameras()[1].pose, Transform::Identity());
+    EXPECT_LT((chunk.transform() - expected).cwiseAbs().maxCoeff(), 1e-6);
+    // The placed centres are exact to placement precision, so the refitted
+    // region matches the same helper applied to the truth centres.
+    EXPECT_LE((chunk.region().centre - expected_region.centre).norm(), 1e-5);
+    EXPECT_LE((chunk.region().size - expected_region.size).norm(), 1e-5);
+    ASSERT_FALSE(chunk.markers()[0].position.has_value());
+    EXPECT_TRUE(chunk.markers()[0].position_covariance.isZero());
+    ASSERT_NE(chunk.meta().find("align_from_reference.disabled"), nullptr);
+    EXPECT_EQ(*chunk.meta().find("align_from_reference.disabled"), "1");
+}
+
+TEST(ReferenceAlignment, CountsMissingAltitudeSeparately) {
+    Scene scene = make_scene(4, Eigen::Vector3d(0.1, 0.0, 0.1), true, {});
+    scene.chunk->cameras()[2].reference.location->z() =
+        std::numeric_limits<double>::quiet_NaN();
+    run_task_named(scene.document, "AlignFromReference");
+    EXPECT_EQ(*scene.chunk->meta().find("align_from_reference.placed"), "3");
+    EXPECT_EQ(*scene.chunk->meta().find("align_from_reference.skipped"), "0");
+    EXPECT_EQ(*scene.chunk->meta().find("align_from_reference.skipped_no_altitude"), "1");
+}
+
+TEST(ReferenceAlignment, ExplicitListNeedsEligibleReference) {
+    Scene scene = make_scene(3, Eigen::Vector3d(0.1, 0.0, 0.1), true, {});
+    for (Camera& camera : scene.chunk->cameras()) {
+        camera.reference.enabled = false;
+    }
+    EXPECT_THROW(run_task_named(scene.document, "AlignFromReference",
+                                [](Params& p) {
+                                    p.set("cameras",
+                                          std::vector<std::string>{"0"});
+                                }),
+                 ValueError);
+    // An empty list with nothing referenced stays the parity no-op.
+    EXPECT_NO_THROW(run_task_named(scene.document, "AlignFromReference"));
+}
+
+TEST(ReferenceAlignment, ResetsRequestedCameraWithDisabledReference) {
+    Scene scene = make_scene(3, Eigen::Vector3d(0.1, 0.0, 0.1), true, {});
+    Chunk& chunk = *scene.chunk;
+    chunk.cameras()[1].reference.enabled = false;
+    run_task_named(scene.document, "AlignFromReference", [](Params& p) {
+        p.set("cameras", std::vector<std::string>{"0", "1"});
+        p.set("reset_unreferenced", true);
+    });
+    EXPECT_EQ(*chunk.meta().find("align_from_reference.placed"), "1");
+    EXPECT_FALSE(chunk.cameras()[1].enabled);
+    EXPECT_EQ(chunk.cameras()[1].pose, Transform::Identity());
+    EXPECT_TRUE(chunk.cameras()[2].enabled);  // not in the requested list
+}
+
+TEST(ReferenceAlignment, TriangulatesWithMasterCalibration) {
+    TriScene scene = make_tri_scene();
+    Chunk& chunk = *scene.chunk;
+    Sensor slave = chunk.sensors()[0];
+    slave.label = "slave";
+    slave.master_sensor_id = 0;
+    // Deliberately different: using the slave's own values would bias every
+    // ray and fail to recover the points.
+    slave.calibration = Calibration::initial(CameraType::Frame, 1200, 900, 800.0);
+    chunk.sensors().push_back(slave);
+    for (std::size_t i = 1; i < chunk.cameras().size(); ++i) {
+        chunk.cameras()[i].sensor_id = 1;
+    }
+    run_task_named(scene.document, "TriangulateTiePoints");
+    double max_error = 0.0;
+    std::size_t matched = 0;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        double best = std::numeric_limits<double>::infinity();
+        for (const Eigen::Vector3d& point : scene.points) {
+            best = std::min(best, (*track.point - point).norm());
+        }
+        max_error = std::max(max_error, best);
+        matched += best <= 0.10 ? 1U : 0U;
+    }
+    const double fraction =
+        static_cast<double>(matched) / static_cast<double>(scene.points.size());
+    EXPECT_GE(fraction, 0.95);
+    EXPECT_LE(max_error, 0.10);
+}
+
+TEST(ReferenceAlignment, RejectsInvalidSensorMaster) {
+    TriScene tri = make_tri_scene();
+    Sensor slave = tri.chunk->sensors()[0];
+    slave.master_sensor_id = 42;
+    tri.chunk->sensors().push_back(slave);
+    EXPECT_THROW(run_task_named(tri.document, "TriangulateTiePoints"), ValueError);
+
+    Scene scene = make_scene(4, Eigen::Vector3d(0.1, 0.0, 0.1), true, {});
+    Sensor bad = scene.chunk->sensors()[0];
+    bad.master_sensor_id = 42;
+    scene.chunk->sensors().push_back(bad);
+    EXPECT_THROW(run_task_named(scene.document, "AlignFromReference"), ValueError);
+}
+
+TEST(ReferenceAlignment, RealisticErrorsConverge) {
+    RealisticScene scene = make_realistic_scene();
+    Chunk& chunk = *scene.chunk;
+    run_task_named(scene.document, "AlignFromReference");
+    // Reprojection gate: a 2 m position error at 80 m with f = 1000 px is
+    // 2/80 * 1000 = 25 px; a 1 degree attitude error is 0.01745 * 1000 = 17.5
+    // px. Their root-sum-square is 30.5 px, so 60 px (2x) admits every good
+    // observation while still rejecting gross mismatches.
+    run_task_named(scene.document, "TriangulateTiePoints",
+                   [](Params& p) { p.set("max_reprojection_error_px", 60.0); });
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    for (const char* name :
+         {"f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"}) {
+        params.set(std::string("fit_") + name, false);
+    }
+    params.set("camera_covariance", false);
+    params.set("use_orientation", true);
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    const Calibration& calibration = chunk.sensors()[0].calibration;
+    double error_sum = 0.0;
+    std::size_t observations = 0;
+    for (const Track& track : chunk.tie_points().tracks) {
+        if (!track.point.has_value()) {
+            continue;
+        }
+        for (const Observation& observation : track.observations) {
+            const Camera& camera =
+                chunk.cameras()[static_cast<std::size_t>(observation.camera_id)];
+            const KeypointSet* set = chunk.tie_points().find_by_camera(camera.id);
+            ASSERT_NE(set, nullptr);
+            const Eigen::Vector2d pixel =
+                keypoint_to_pixel(set->keypoints[static_cast<std::size_t>(
+                    observation.keypoint_index)]);
+            const Eigen::Vector3d x_cam =
+                camera.pose.block<3, 3>(0, 0) * (*track.point) +
+                camera.pose.block<3, 1>(0, 3);
+            const double error = (calibration.project(x_cam) - pixel).norm();
+            error_sum += error * error;
+            ++observations;
+        }
+    }
+    const double rms = std::sqrt(error_sum / static_cast<double>(observations));
+    EXPECT_LT(rms, 1.0) << "final reprojection RMS (px)";
+    double max_centre_error = 0.0;
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        const Transform& pose = chunk.cameras()[i].pose;
+        const Eigen::Matrix3d r = pose.block<3, 3>(0, 0);
+        const Eigen::Vector3d centre = -(r.transpose() * pose.block<3, 1>(0, 3));
+        max_centre_error =
+            std::max(max_centre_error, (centre - scene.truth_centres[i]).norm());
+    }
+    EXPECT_LT(max_centre_error, 0.5) << "max camera centre error (m)";
+    std::printf("[RefAlign] realistic block: %zu observations, RMS %.3f px, "
+                "max centre error %.3f m\n",
+                observations, rms, max_centre_error);
 }
 
 }  // namespace
