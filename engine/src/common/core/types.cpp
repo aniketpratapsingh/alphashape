@@ -129,9 +129,10 @@ void validate_sensor_masters(const std::vector<Sensor>& sensors) {
             throw ValueError(label + " names sensor " + std::to_string(master) +
                              ", which is itself a slave");
         }
-        if (parent.width != sensor.width || parent.height != sensor.height) {
+        if (parent.type != sensor.type || parent.width != sensor.width ||
+            parent.height != sensor.height) {
             throw ValueError(label + " and its master sensor " + std::to_string(master) +
-                             " have different image sizes");
+                             " have different types or image sizes");
         }
     }
 }

@@ -1312,6 +1312,12 @@ TEST(Commands, SetSensorMasterUndoes) {
                  ValueError);
     EXPECT_THROW(make_set_sensor_master_command(chunk_id, 1, 7)->apply(document),
                  ValueError);
+
+    // A slave must share its master's camera type: same size is not enough.
+    chunk.sensors()[1].type = CameraType::Fisheye;
+    EXPECT_THROW(make_set_sensor_master_command(chunk_id, 1, 0)->apply(document),
+                 ValueError);
+    chunk.sensors()[1].type = CameraType::Frame;
 }
 
 }  // namespace
