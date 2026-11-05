@@ -215,6 +215,15 @@ class TestDriftInvariant(unittest.TestCase):
                         doc.run_task(task, path=os.path.join(tmp, "export.tif"))
             _PREPARED_CACHE[task] = (doc, chunk)
             return doc, chunk
+        if task == "ExportSTMap":
+            # Needs a sensor calibration and a real destination path.
+            doc, chunk = make_document_with_images(*CALBOARD)
+            doc.run_task("CalibrateCamera", board_cols=9, board_rows=6,
+                         square_size=0.025)
+            with tempfile.TemporaryDirectory() as tmp:
+                doc.run_task(task, path=os.path.join(tmp, "stmap.tif"))
+            _PREPARED_CACHE[task] = (doc, chunk)
+            return doc, chunk
         if task == "CalibrateCamera":
             # Needs a detectable board in at least three views; the generic
             # fixtures are unrelated photographs. The task records the same

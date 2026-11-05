@@ -29,6 +29,10 @@ struct CalibrateCameraOptions {
     double square_size = 0.025;
     CalibrationFitFlags fit = default_calibration_fit_flags();
     bool apply = true;
+    /// Empty disables the report. `report_format` is "html" or "pdf"; any
+    /// other value is rejected before solving.
+    std::string report_path;
+    std::string report_format = "html";
 };
 
 struct SensorCalibration {

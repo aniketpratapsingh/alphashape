@@ -5,16 +5,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/calibration/board_detector.hpp"
+#include "common/algorithm/calibration/calibration_report.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/frame.hpp"
 #include "common/core/types.hpp"
@@ -133,6 +136,79 @@ std::string collect_sensor_views(const Document& document, const Chunk& chunk,
     return {};
 }
 
+std::string camera_label(const Chunk& chunk, std::int32_t camera_id) {
+    for (const Camera& camera : chunk.cameras()) {
+        if (camera.id == camera_id) {
+            return camera.label;
+        }
+    }
+    return std::to_string(camera_id);
+}
+
+/// Render every sensor's section and write it in one go: a report is either
+/// complete on disk or absent, never half written.
+void write_report_file(const std::string& path, const std::string& format,
+                       const std::vector<CalibrationReportInput>& reports) {
+    std::vector<std::uint8_t> bytes;
+    if (format == "html") {
+        const std::string html = calibration_report_html(reports);
+        bytes.reserve(html.size());
+        for (char ch : html) {
+            bytes.push_back(static_cast<std::uint8_t>(ch));
+        }
+    } else {
+        bytes = calibration_report_pdf(reports);
+    }
+    const std::filesystem::path destination(path);
+    std::filesystem::path temporary = destination;
+    temporary += ".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            throw Error("CalibrateCamera: cannot open report '" + path + "'");
+        }
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        file.close();
+        if (!file) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            throw Error("CalibrateCamera: writing report '" + path + "' failed");
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, destination, rename_error);
+    if (rename_error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw Error("CalibrateCamera: writing report '" + path +
+                    "' failed: " + rename_error.message());
+    }
+}
+
+/// Build the per-sensor report inputs from the plan and write the file.
+void write_calibration_report(const CalibrateCameraOptions& options,
+                              const CalibrateCameraPlan& plan,
+                              const Chunk& chunk) {
+    std::vector<CalibrationReportInput> reports;
+    reports.reserve(plan.sensors.size());
+    for (const SensorCalibration& entry : plan.sensors) {
+        CalibrationReportInput input;
+        input.sensor_label = entry.label;
+        if (!entry.solved) {
+            input.skipped = entry.skipped;
+        } else {
+            input.result = entry.result;
+            input.view_labels.reserve(entry.result.views.size());
+            for (const ViewError& view : entry.result.views) {
+                input.view_labels.push_back(camera_label(chunk, view.camera_id));
+            }
+        }
+        reports.push_back(std::move(input));
+    }
+    write_report_file(options.report_path, options.report_format, reports);
+}
+
 }  // namespace
 
 CalibrateCameraPlan plan_calibrate_camera(const Document& document,
@@ -223,6 +299,13 @@ void CalibrateCameraTask::declare_params(Params& params) const {
     params.declare({"apply", ParamType::Bool, true,
                     "Write the solved calibration to the sensor. When false only "
                     "the report metadata is written."});
+    params.declare({"report_path", ParamType::String, std::string{},
+                    "Write a calibration report to this path; empty disables it."});
+    ParamSpec report_format{"report_format", ParamType::String,
+                            std::string{"html"},
+                            "Report format: \"html\" or \"pdf\"."};
+    report_format.choices = {"html", "pdf"};
+    params.declare(report_format);
 }
 
 std::vector<Stage> CalibrateCameraTask::stages() const {
@@ -241,11 +324,43 @@ void CalibrateCameraTask::apply(Document& document, Params& params,
             "fit_" + std::string(kCalibrationParamNames[kk]));
     }
     options.apply = params.get_bool("apply");
+    options.report_path = params.get_string("report_path");
+    options.report_format = params.get_string("report_format");
+    if (options.report_format != "html" && options.report_format != "pdf") {
+        throw ValueError("CalibrateCamera: unknown report_format '" +
+                         options.report_format + "'");
+    }
+    // A report path whose parent is missing cannot be written. Reject it
+    // before solving so a doomed run does no work, and never create the
+    // directory: the caller owns the destination.
+    if (!options.report_path.empty()) {
+        std::filesystem::path parent =
+            std::filesystem::path(options.report_path).parent_path();
+        if (parent.empty()) {
+            parent = std::filesystem::path(".");
+        }
+        std::error_code status_error;
+        if (!std::filesystem::is_directory(parent, status_error)) {
+            throw ValueError(
+                "CalibrateCamera: report directory does not exist: " +
+                parent.string());
+        }
+    }
     progress.update("prepare", 0.0);
     progress.update("calibrate", 0.0);
     const CalibrateCameraPlan plan =
         plan_calibrate_camera(document, document.active_chunk_id(), options);
     progress.update("calibrate", 1.0);
+    Chunk* chunk = document.active_chunk();
+    if (chunk == nullptr) {
+        throw Error("CalibrateCamera needs an active chunk");
+    }
+    // The report is written even when every sensor was skipped, so the file
+    // explains why, and before the staged copy replaces the chunk, so a write
+    // failure leaves the document untouched.
+    if (!options.report_path.empty()) {
+        write_calibration_report(options, plan, *chunk);
+    }
     if (plan.solved == 0) {
         if (Log::enabled(LogLevel::Info)) {
             for (const SensorCalibration& entry : plan.sensors) {
@@ -257,10 +372,6 @@ void CalibrateCameraTask::apply(Document& document, Params& params,
         throw Error("calibrate_camera: need at least 3 views with a detected board");
     }
     progress.update("apply", 0.0);
-    Chunk* chunk = document.active_chunk();
-    if (chunk == nullptr) {
-        throw Error("CalibrateCamera needs an active chunk");
-    }
     Chunk staged = *chunk;
     for (const SensorCalibration& entry : plan.sensors) {
         const std::string prefix = "calibrate_camera." + entry.label + ".";

@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -652,6 +654,123 @@ TEST(CalibrateCamera, MixedSizesSkipOnlyThatSensor) {
     ASSERT_NE(skipped, nullptr);
     EXPECT_TRUE(skipped->find("differing image sizes") != std::string::npos)
         << *skipped;
+}
+
+TEST(CalibrateCamera, WritesReport) {
+    CalibrateScene scene = make_calibrate_scene(101U, 5);
+    const std::string path =
+        platform::unique_temp_path("alphashape_calreport_", ".html");
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_path", ParamValue{path});
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    std::ifstream file(path, std::ios::binary);
+    ASSERT_TRUE(file.good()) << path;
+    const std::string report((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+    file.close();
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::printf("[calibrate camera report] %zu bytes\n", report.size());
+    EXPECT_NE(report.find("RMS"), std::string::npos);
+    EXPECT_NE(report.find("sensor"), std::string::npos);
+}
+
+TEST(CalibrateCamera, MissingReportDirectoryFailsBeforeSolve) {
+    CalibrateScene scene = make_calibrate_scene(111U, 5);
+    const Calibration before = scene.chunk->sensors()[0].calibration;
+    // unique_temp_path merely names a path; using one as a directory gives a
+    // parent that certainly does not exist.
+    const std::filesystem::path missing_dir =
+        platform::unique_temp_path("alphashape_calrep_missing_", "");
+    const std::string path = (missing_dir / "report.html").string();
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_path", ParamValue{path});
+    try {
+        run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+        FAIL() << "a missing report directory must be rejected";
+    } catch (const ValueError& error) {
+        const std::string message(error.what());
+        EXPECT_NE(message.find("report directory does not exist"),
+                  std::string::npos)
+            << message;
+        EXPECT_NE(message.find(missing_dir.string()), std::string::npos)
+            << message;
+    }
+    // The check runs before the solve, so nothing was written to the document.
+    EXPECT_TRUE(scene.chunk->sensors()[0].calibration == before);
+    EXPECT_EQ(scene.chunk->meta().find("calibrate_camera.sensor.rms_px"),
+              nullptr);
+}
+
+TEST(CalibrateCamera, ReportListsSkippedSensors) {
+    CalibrateScene scene;
+    Chunk& chunk = scene.document.workspace().add_chunk("Chunk 1");
+    scene.document.set_active_chunk_id(chunk.id());
+    scene.chunk = &chunk;
+    Sensor sensor;
+    sensor.label = "blank";
+    sensor.type = CameraType::Frame;
+    sensor.width = 64;
+    sensor.height = 48;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 64, 48, 50.0);
+    chunk.sensors().push_back(sensor);
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.sensor_id = 0;
+    camera.label = "blank0";
+    camera.enabled = true;
+    chunk.cameras().push_back(camera);
+    // A uniform white image carries no chessboard, so the sole sensor is
+    // skipped rather than calibrated.
+    const std::string image_path =
+        platform::unique_temp_path("alphashape_calib_blank_", ".png");
+    Image blank(64, 48, 1);
+    for (int y = 0; y < blank.height(); ++y) {
+        for (int x = 0; x < blank.width(); ++x) {
+            blank.at(x, y, 0) = static_cast<std::uint8_t>(255);
+        }
+    }
+    write_png(image_path, blank);
+    scene.paths.push_back(image_path);
+    auto frame = std::make_shared<Frame>(image_path, 64, 48);
+    frame->set_id(chunk.allocate_id());
+    frame->set_camera_id(camera.id);
+    chunk.frames().push_back(frame);
+
+    const std::string report_path =
+        platform::unique_temp_path("alphashape_calreport_skip_", ".html");
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_path", ParamValue{report_path});
+    try {
+        run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+        FAIL() << "a sensor with no detected board must not calibrate";
+    } catch (const Error& error) {
+        EXPECT_NE(std::string(error.what()).find("at least 3 views"),
+                  std::string::npos)
+            << error.what();
+    }
+    std::ifstream file(report_path, std::ios::binary);
+    ASSERT_TRUE(file.good()) << report_path;
+    const std::string report((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+    file.close();
+    std::error_code remove_error;
+    std::filesystem::remove(report_path, remove_error);
+    EXPECT_NE(report.find("Skipped"), std::string::npos);
+    EXPECT_NE(report.find("at least 3 views"), std::string::npos);
+}
+
+TEST(CalibrateCamera, RejectsUnknownReportFormat) {
+    CalibrateScene scene = make_calibrate_scene(102U, 5);
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_format", ParamValue{std::string{"json"}});
+    try {
+        run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+        FAIL() << "an unknown report format must be rejected";
+    } catch (const ValueError& error) {
+        EXPECT_NE(std::string(error.what()).find("json"), std::string::npos)
+            << error.what();
+    }
 }
 
 }  // namespace alphashape
