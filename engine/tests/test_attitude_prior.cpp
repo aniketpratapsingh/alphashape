@@ -514,7 +514,7 @@ TEST(AttitudePrior, HeadingFrameFromBodyNotStoredAngles) {
     EXPECT_FALSE(degenerate_xyz);
     EXPECT_TRUE(frame_zyx.isApprox(frame_xyz, 1e-12));
     // Columns are (forward-level, left-level, up).
-    EXPECT_NEAR(frame_zyx.col(0).z(), 0.0, 1e-12);
+    EXPECT_NEAR(frame_zyx(2, 0), 0.0, 1e-12);
     EXPECT_NEAR(frame_zyx.col(0).norm(), 1.0, 1e-12);
     EXPECT_TRUE(frame_zyx.col(2).isApprox(Eigen::Vector3d(0.0, 0.0, 1.0), 1e-15));
     EXPECT_TRUE(frame_zyx.col(1).isApprox(Eigen::Vector3d(0.0, 0.0, 1.0).cross(
@@ -538,7 +538,7 @@ TEST(AttitudePrior, HeadingFrameFiniteAtVerticalBodyForward) {
     EXPECT_TRUE(frame.allFinite());
     EXPECT_NEAR(frame.determinant(), 1.0, 1e-12);
     EXPECT_NEAR(frame.col(0).norm(), 1.0, 1e-12);
-    EXPECT_NEAR(frame.col(0).z(), 0.0, 1e-12);
+    EXPECT_NEAR(frame(2, 0), 0.0, 1e-12);
     sfm::BARotationPrior prior;
     prior.measured = Eigen::AngleAxisd(0.01, Eigen::Vector3d::UnitX()).toRotationMatrix();
     prior.heading_frame = frame;
