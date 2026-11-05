@@ -66,6 +66,41 @@ struct BACentrePrior {
 Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
                                            const Eigen::Vector3d& lever_arm);
 
+/// A stochastic prior on one camera's attitude, in the problem frame (WP-13.21).
+///
+/// With `R` the pose's world->camera rotation and `R_meas` the measured
+/// world->camera rotation, camera-to-world is the transpose, so the rotation
+/// that takes the measurement onto the estimate is
+///
+///     E = R_est_cw * R_meas_cw^T = R^T * R_meas,
+///     delta_w = Log(E),                     (a small rotation in the problem frame)
+///     delta_h = heading_frame^T * delta_w,  (components in heading axes)
+///     residual = (delta_h.z / sigma_yaw,
+///                 delta_h.y / sigma_pitch,
+///                 delta_h.x / sigma_roll).
+///
+/// `heading_frame`'s columns are (forward-level, left-level, up) at the
+/// measured heading, so delta_h.z is rotation about up (yaw), delta_h.y about
+/// left (pitch) and delta_h.x about forward (roll). An axis whose sigma is
+/// <= 0 or non-finite is unconstrained (residual 0). Like the centre priors,
+/// the residual carries a Huber loss of scale 3 in sigma units.
+///
+/// Rotation priors never enter the gauge decision: they constrain attitude, not
+/// the similarity the caller has already fixed with `fixed_pose` /
+/// `scale_anchor_camera` and the centre/control-point priors.
+struct BARotationPrior {
+    std::size_t camera = 0;          ///< index into BAProblem::poses
+    Eigen::Matrix3d measured = Eigen::Matrix3d::Identity();  ///< world->camera
+    Eigen::Matrix3d heading_frame = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d sigma_rad = Eigen::Vector3d::Zero();  ///< (yaw, pitch, roll)
+};
+
+/// The unnormalised attitude residual of `pose` under `prior`, ordered
+/// (yaw, pitch, roll) in radians: `delta_h = heading_frame^T * Log(R^T R_meas)`.
+/// Reporting evaluates this; RotationPriorCost evaluates the same expression.
+Eigen::Vector3d predicted_rotation_residual(const BAPose& pose,
+                                            const BARotationPrior& prior);
+
 /// The bundle-adjustment problem, in place. Intrinsics are held fixed in this
 /// milestone, so `calibrations` is read-only during the solve.
 ///
@@ -123,6 +158,10 @@ struct BAProblem {
     /// GPS-like camera-centre priors. Empty => no priors (pre-existing
     /// behaviour). See BACentrePrior and the gauge note above.
     std::vector<BACentrePrior> centre_priors;
+
+    /// Attitude priors. Empty => no rotation priors (pre-existing behaviour).
+    /// See BARotationPrior. These do not affect the gauge.
+    std::vector<BARotationPrior> rotation_priors;
 
     /// Known 3-D positions. Marker observations are ordinary BAObservations of
     /// the marker's point; no separate observation type is needed.
@@ -193,10 +232,12 @@ struct BAReport {
     /// solution).
     bool cost_valid = false;
 
-    /// Number of constrained prior axes (sigma finite and > 0) over all priors.
+    /// Number of constrained prior axes (sigma finite and > 0) over all priors,
+    /// centre and rotation alike.
     std::size_t priors = 0;
-    /// RMS of the normalised prior residuals (C[k] - centre[k]) / sigma[k] after
-    /// the solve, over every constrained axis. 0 when there are none.
+    /// RMS of the normalised prior residuals after the solve, over every
+    /// constrained axis of both centre priors ((A[k] - centre[k]) / sigma[k])
+    /// and rotation priors (delta_h[axis] / sigma[axis]). 0 when there are none.
     double prior_rms_sigma = 0;
 
     /// Number of non-check control points, check control points, non-check

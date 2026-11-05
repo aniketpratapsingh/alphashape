@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Geometry>
+
 // Ceres (and its Eigen/glog/suite-sparse headers) is pulled in here only — never
 // in the public header — and its headers are not written to the engine's strict
 // warning set. Wrap them so imported-target system-ness is not relied upon.
@@ -56,6 +58,16 @@ namespace alphashape::sfm {
 Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
                                            const Eigen::Vector3d& lever_arm) {
     return pose.R.transpose() * (lever_arm - pose.t);
+}
+
+Eigen::Vector3d predicted_rotation_residual(const BAPose& pose,
+                                            const BARotationPrior& prior) {
+    // Eigen's AngleAxis from a rotation matrix is the log map (angle in
+    // [0, pi]); its vector part matches RotationPriorCost's rotation_log.
+    const Eigen::AngleAxisd angle_axis(pose.R.transpose() * prior.measured);
+    const Eigen::Vector3d delta_w = angle_axis.angle() * angle_axis.axis();
+    const Eigen::Vector3d delta_h = prior.heading_frame.transpose() * delta_w;
+    return Eigen::Vector3d(delta_h.z(), delta_h.y(), delta_h.x());
 }
 
 namespace {
@@ -162,6 +174,121 @@ private:
     Eigen::Vector3d centre_;
     Eigen::Vector3d sigma_;
     Eigen::Vector3d lever_arm_;
+};
+
+/// Log map of a rotation matrix: `delta = theta * axis`. `r` is the
+/// column-major 9-element layout ceres::AngleAxisToRotationMatrix writes, so
+/// element (row, col) is `r[col * 3 + row]`.
+///
+/// Near the identity the axis is undefined but `vee(E - E^T)` is smooth and
+/// vanishes there, so `sin(theta)` is floored at a tiny positive value: the
+/// scale `theta / (2 sin theta)` then tends to 1/2 and `delta` differentiates
+/// like `vee(E - E^T) / 2`, which is the correct first-order log map. Near pi
+/// the skew part vanishes, so the axis is rebuilt from the symmetric part
+/// (`E = 2 u u^T - I`) using the largest diagonal; that branch is entered only
+/// where the chosen component is at least 1/sqrt(3), so it never divides by a
+/// vanishing value.
+template <typename T>
+void rotation_log(const T* r, T* delta) {
+    using std::atan2;
+    using std::max;
+    using std::sqrt;
+
+    const T cos_theta = (r[0] + r[4] + r[8] - T(1.0)) * T(0.5);
+    T sin_sq = T(1.0) - cos_theta * cos_theta;
+    sin_sq = max(sin_sq, T(0.0));
+    const T theta = atan2(max(sqrt(sin_sq), T(1e-12)), cos_theta);
+    if (cos_theta < T(-0.999999)) {
+        const T e00 = r[0];
+        const T e11 = r[4];
+        const T e22 = r[8];
+        T u[3] = {T(0), T(0), T(0)};
+        if (e00 >= e11 && e00 >= e22) {
+            const T ux = sqrt(max((e00 - e11 - e22 + T(1.0)) * T(0.5), T(0.0)));
+            u[0] = ux;
+            if (ux > T(0)) {
+                u[1] = (r[1] + r[3]) / (T(4.0) * ux);
+                u[2] = (r[2] + r[6]) / (T(4.0) * ux);
+            }
+        } else if (e11 >= e22) {
+            const T uy = sqrt(max((e11 - e00 - e22 + T(1.0)) * T(0.5), T(0.0)));
+            u[1] = uy;
+            if (uy > T(0)) {
+                u[0] = (r[1] + r[3]) / (T(4.0) * uy);
+                u[2] = (r[5] + r[7]) / (T(4.0) * uy);
+            }
+        } else {
+            const T uz = sqrt(max((e22 - e00 - e11 + T(1.0)) * T(0.5), T(0.0)));
+            u[2] = uz;
+            if (uz > T(0)) {
+                u[0] = (r[2] + r[6]) / (T(4.0) * uz);
+                u[1] = (r[5] + r[7]) / (T(4.0) * uz);
+            }
+        }
+        for (int k = 0; k < 3; ++k) {
+            delta[k] = theta * u[k];
+        }
+        return;
+    }
+    const T sin_theta = max(sqrt(sin_sq), T(1e-12));
+    const T scale = theta / (T(2.0) * sin_theta);
+    delta[0] = scale * (r[5] - r[7]);
+    delta[1] = scale * (r[6] - r[2]);
+    delta[2] = scale * (r[1] - r[3]);
+}
+
+/// Residual for an attitude prior (see BARotationPrior for the exact formula).
+/// The pose block is (angle-axis rotation, translation); this cost constrains
+/// only the rotation block. An axis whose sigma is <= 0 or non-finite is left
+/// 0 and so contributes nothing.
+struct RotationPriorCost {
+    RotationPriorCost(const Eigen::Matrix3d& measured, const Eigen::Matrix3d& heading_frame,
+                      const Eigen::Vector3d& sigma_rad)
+        : measured_(measured), heading_frame_(heading_frame), sigma_rad_(sigma_rad) {}
+
+    template <typename T>
+    bool operator()(const T* const rotation, T* residual) const {
+        T r[9];
+        ceres::AngleAxisToRotationMatrix(rotation, r);
+        // E = R^T * R_meas, column-major. E(row, col) = sum_k R(k,row) M(k,col).
+        T e[9];
+        for (int col = 0; col < 3; ++col) {
+            for (int row = 0; row < 3; ++row) {
+                T sum = T(0);
+                for (int k = 0; k < 3; ++k) {
+                    sum += r[row * 3 + k] * T(measured_(k, col));
+                }
+                e[col * 3 + row] = sum;
+            }
+        }
+        T delta_w[3];
+        rotation_log(e, delta_w);
+        // delta_h[i] = column i of heading_frame dotted with delta_w.
+        T delta_h[3];
+        for (int i = 0; i < 3; ++i) {
+            T sum = T(0);
+            for (int j = 0; j < 3; ++j) {
+                sum += T(heading_frame_(j, i)) * delta_w[j];
+            }
+            delta_h[i] = sum;
+        }
+        // (yaw, pitch, roll) select up, left, forward.
+        constexpr int kAxis[3] = {2, 1, 0};
+        for (int k = 0; k < 3; ++k) {
+            const double s = sigma_rad_[k];
+            if (std::isfinite(s) && s > 0.0) {
+                residual[k] = delta_h[kAxis[k]] / T(s);
+            } else {
+                residual[k] = T(0);
+            }
+        }
+        return true;
+    }
+
+private:
+    Eigen::Matrix3d measured_;
+    Eigen::Matrix3d heading_frame_;
+    Eigen::Vector3d sigma_rad_;
 };
 
 /// Huber loss scale for centre priors, in sigma units (ours): residuals beyond
@@ -416,7 +543,8 @@ void fill_constraint_report(const BAProblem& problem,
     report->checkbar_rms_m = rms(checkbar_sq, checkbar_n);
 }
 
-/// Number of constrained prior axes (finite sigma > 0) over every prior.
+/// Number of constrained prior axes (finite sigma > 0) over every prior,
+/// centre and rotation alike.
 std::size_t count_prior_axes(const BAProblem& problem) {
     std::size_t n = 0;
     for (const BACentrePrior& prior : problem.centre_priors) {
@@ -427,12 +555,21 @@ std::size_t count_prior_axes(const BAProblem& problem) {
             }
         }
     }
+    for (const BARotationPrior& prior : problem.rotation_priors) {
+        for (int k = 0; k < 3; ++k) {
+            const double s = prior.sigma_rad[k];
+            if (std::isfinite(s) && s > 0.0) {
+                ++n;
+            }
+        }
+    }
     return n;
 }
 
-/// RMS of the normalised prior residuals (A - centre)/sigma over all
-/// constrained axes, with A the modelled antenna position, from the current
-/// poses. 0 when there are none.
+/// RMS of the normalised prior residuals over all constrained axes: the
+/// centre-prior (A - centre)/sigma with A the modelled antenna position, and
+/// the rotation-prior delta_h/sigma, both from the current poses. 0 when there
+/// are none.
 double prior_rms_sigma(const BAProblem& problem) {
     double sum_sq = 0.0;
     std::size_t n = 0;
@@ -444,6 +581,18 @@ double prior_rms_sigma(const BAProblem& problem) {
             const double s = prior.sigma[k];
             if (std::isfinite(s) && s > 0.0) {
                 const double r = (centre[k] - prior.centre[k]) / s;
+                sum_sq += r * r;
+                ++n;
+            }
+        }
+    }
+    for (const BARotationPrior& prior : problem.rotation_priors) {
+        const Eigen::Vector3d residual =
+            predicted_rotation_residual(problem.poses[prior.camera], prior);
+        for (int k = 0; k < 3; ++k) {
+            const double s = prior.sigma_rad[k];
+            if (std::isfinite(s) && s > 0.0) {
+                const double r = residual[k] / s;
                 sum_sq += r * r;
                 ++n;
             }
@@ -602,6 +751,11 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
             throw ValueError("bundle_adjust: centre_prior camera index out of range");
         }
     }
+    for (const BARotationPrior& prior : problem.rotation_priors) {
+        if (prior.camera >= num_cameras) {
+            throw ValueError("bundle_adjust: rotation_prior camera index out of range");
+        }
+    }
     if (problem.scale_anchor_camera >= 0) {
         if (static_cast<std::size_t>(problem.scale_anchor_camera) >= num_cameras) {
             throw ValueError("bundle_adjust: scale_anchor_camera out of range");
@@ -665,7 +819,8 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     BAReport report;
     report.observations = problem.observations.size();
     report.priors = count_prior_axes(problem);
-    const bool has_priors = !problem.centre_priors.empty();
+    const bool has_priors =
+        !problem.centre_priors.empty() || !problem.rotation_priors.empty();
     const bool has_constraints =
         has_priors || !problem.control_points.empty() || !problem.scalebars.empty();
     if ((problem.observations.empty() && !has_constraints) ||
@@ -720,7 +875,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     };
     // Priors use their own robust loss (Huber, 3 sigma), owned by the Problem.
     ceres::LossFunction* prior_loss = nullptr;
-    if (!problem.centre_priors.empty()) {
+    if (!problem.centre_priors.empty() || !problem.rotation_priors.empty()) {
         prior_loss = new ceres::HuberLoss(kPriorLossScaleSigma);
     }
     ceres::Problem ceres_problem;
@@ -778,6 +933,11 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
             new CentrePriorCost(prior.centre, prior.sigma, prior.lever_arm));
         ceres_problem.AddResidualBlock(cost, prior_loss, cam_blocks[prior.camera].data(),
                                        cam_blocks[prior.camera].data() + 3);
+    }
+    for (const BARotationPrior& prior : problem.rotation_priors) {
+        auto* cost = new ceres::AutoDiffCostFunction<RotationPriorCost, 3, 3>(
+            new RotationPriorCost(prior.measured, prior.heading_frame, prior.sigma_rad));
+        ceres_problem.AddResidualBlock(cost, prior_loss, cam_blocks[prior.camera].data());
     }
 
     // Control points and scale bars share the priors' robust loss (Huber, 3
