@@ -219,8 +219,12 @@ Image resample_film_image(const Image& scan,
     // One normalised pixel covers this many scan pixels; past 1.5 the bilinear
     // tap undersamples the scan, so prefilter to the output's Nyquist limit.
     const Eigen::Matrix2d linear = film_transform.topLeftCorner<2, 2>();
+    // The 2x2 determinant is written out: Eigen's determinant() lives in the
+    // LU module, and this translation unit only needs Eigen/Core.
+    const double determinant = linear(0, 0) * linear(1, 1) -
+                               linear(0, 1) * linear(1, 0);
     const double factor =
-        film.resolution_mm_per_px * std::sqrt(std::abs(linear.determinant()));
+        film.resolution_mm_per_px * std::sqrt(std::abs(determinant));
     if (std::isfinite(factor) && factor > 1.5) {
         source = gaussian_blur(source, width, height, channels, 0.5 * factor);
     }

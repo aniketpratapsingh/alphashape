@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/LU>
 #include <gtest/gtest.h>
 
 #include "base/platform/temp.hpp"
