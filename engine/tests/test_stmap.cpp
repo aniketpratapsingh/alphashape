@@ -138,7 +138,9 @@ TEST(Stmap, WritesTwoChannelFloatTiff) {
 
     std::printf("[stmap tiff] %ux%u samples %u bits %u format %u "
                 "s0 %.6f t0 %.6f\n",
-                width, height, samples, bits, format,
+                width, height, static_cast<unsigned int>(samples),
+                static_cast<unsigned int>(bits),
+                static_cast<unsigned int>(format),
                 static_cast<double>(row[0]), static_cast<double>(row[1]));
     EXPECT_EQ(width, 4U);
     EXPECT_EQ(height, 3U);
