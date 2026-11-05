@@ -4,6 +4,7 @@
 // the source pixel, normalised with a bottom-left origin. The tests invert that
 // round trip through the camera model and read the writer's tags back.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -89,6 +90,48 @@ TEST(Stmap, IdentityForZeroDistortion) {
                 << "pixel " << col << "," << row;
         }
     }
+}
+
+TEST(Stmap, IgnoresAffinityAndSkewInIdealPinhole) {
+    // Powers of two keep every map value exactly representable in float, so
+    // the 1e-9 bound checks the model rather than storage rounding.
+    Calibration calibration =
+        Calibration::initial(CameraType::Frame, 512, 512, 512.0);
+    calibration.b1 = 256.0;
+    calibration.b2 = 192.0;
+    const STMap map = compute_stmap(calibration);
+    ASSERT_EQ(map.width, 512);
+    ASSERT_EQ(map.height, 512);
+    double largest_shift = 0.0;
+    for (int row = 0; row < 512; row += 7) {
+        for (int col = 0; col < 512; col += 5) {
+            const double u_out = static_cast<double>(col) + 0.5;
+            const double v_out = static_cast<double>(row) + 0.5;
+            // The ray uses the focal length alone; affinity and skew must
+            // enter only through the projection, i.e. the source coordinate.
+            const double x = (u_out - 256.0) / 512.0;
+            const double y = (v_out - 256.0) / 512.0;
+            const Eigen::Vector2d expected =
+                calibration.project(Eigen::Vector3d(x, y, 1.0));
+            const std::size_t index =
+                static_cast<std::size_t>(row) *
+                    static_cast<std::size_t>(map.width) +
+                static_cast<std::size_t>(col);
+            const double source_u = static_cast<double>(map.s[index]) * 512.0;
+            const double source_v =
+                (1.0 - static_cast<double>(map.t[index])) * 512.0;
+            EXPECT_NEAR(source_u, expected.x(), 1e-9)
+                << "pixel " << col << "," << row;
+            EXPECT_NEAR(source_v, expected.y(), 1e-9)
+                << "pixel " << col << "," << row;
+            largest_shift = std::max(
+                largest_shift,
+                std::hypot(expected.x() - u_out, expected.y() - v_out));
+        }
+    }
+    // Non-zero b1/b2 must actually move a source coordinate; without this the
+    // test would also pass for a model that silently dropped them.
+    EXPECT_GT(largest_shift, 1.0);
 }
 
 TEST(Stmap, ResampledSizeKeepsNormalisedCoordinates) {

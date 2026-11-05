@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@
 #include "base/io/pdf.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/calibration/calibration_report.hpp"
+#include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape {
@@ -94,9 +96,116 @@ TEST(Pdf, WritesValidHeader) {
     }
 }
 
+TEST(Pdf, StreamLengthsMatch) {
+    const std::vector<std::uint8_t> bytes = sample_pdf();
+    const std::string text(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size());
+    std::size_t position = 0;
+    int streams = 0;
+    while ((position = text.find("stream\n", position)) != std::string::npos) {
+        const std::size_t data_start = position + 7U;
+        const std::size_t dictionary = text.rfind("<<", position);
+        ASSERT_NE(dictionary, std::string::npos);
+        // An image stream is filtered and the writer separates its data from
+        // the keyword with a newline; unfiltered content streams end with
+        // their own newline and are followed by "endstream" directly.
+        const bool filtered = text.find("/Filter", dictionary) < position;
+        const std::size_t end =
+            filtered ? text.find("\nendstream", data_start)
+                     : text.find("endstream", data_start);
+        ASSERT_NE(end, std::string::npos) << "stream " << streams;
+        const std::size_t payload = end - data_start;
+
+        const std::size_t length_key = text.rfind("/Length ", position);
+        ASSERT_NE(length_key, std::string::npos);
+        ASSERT_GT(length_key, dictionary) << "stream " << streams;
+        const std::size_t digits = length_key + 8U;
+        const std::size_t digits_end =
+            text.find_first_not_of("0123456789", digits);
+        ASSERT_LT(digits_end, position);
+        const std::size_t declared = static_cast<std::size_t>(
+            std::stoull(text.substr(digits, digits_end - digits)));
+        EXPECT_EQ(declared, payload) << "stream " << streams;
+        ++streams;
+        position = filtered ? end + 10U : end + 9U;
+    }
+    EXPECT_GT(streams, 0);
+}
+
 TEST(Pdf, TextBeforePageThrows) {
     PdfDocument pdf;
     EXPECT_THROW(pdf.text(10.0, 10.0, 10.0, "x"), Error);
+}
+
+namespace {
+
+const char* const kBase64Alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// The base64 payload of the first PNG data URI in the HTML, or empty.
+std::string data_uri_payload(const std::string& html) {
+    const std::string marker = "data:image/png;base64,";
+    const std::size_t start = html.find(marker);
+    if (start == std::string::npos) {
+        return {};
+    }
+    const std::size_t begin = start + marker.size();
+    const std::size_t end = html.find('"', begin);
+    if (end == std::string::npos) {
+        return {};
+    }
+    return html.substr(begin, end - begin);
+}
+
+/// Reference decoder: enough to prove the payload is valid base64 of the PNG.
+std::vector<std::uint8_t> decode_base64(const std::string& text) {
+    std::vector<std::uint8_t> out;
+    std::uint32_t accumulator = 0;
+    int bits = 0;
+    for (char ch : text) {
+        if (ch == '=') {
+            break;
+        }
+        const char* found = std::strchr(kBase64Alphabet, ch);
+        if (found == nullptr) {
+            return {};
+        }
+        accumulator =
+            (accumulator << 6U) |
+            static_cast<std::uint32_t>(found - kBase64Alphabet);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(
+                static_cast<std::uint8_t>((accumulator >> bits) & 0xFFU));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(CalibrationReport, Base64Padding) {
+    // The encoder is file-local, so exercise it through the report's data URI.
+    // The report's plot size is fixed at 640x480, so a 1x1 / 2x1 image cannot
+    // be fed through it; the equivalent check is made on the payload the
+    // report does emit: it must be a multiple of four, carry exactly the '='
+    // padding its input length requires, and decode back to that same PNG.
+    const CalibrationReportInput input = sample_input();
+    const std::string html = calibration_report_html({input});
+    const std::string payload = data_uri_payload(html);
+    ASSERT_FALSE(payload.empty());
+    ASSERT_EQ(payload.size() % 4U, 0U);
+
+    const std::vector<std::uint8_t> png = encode_png(
+        render_distortion_plot(input.result.calibration, 640, 480));
+    const std::size_t padding = (3U - png.size() % 3U) % 3U;
+    ASSERT_GE(payload.size(), padding);
+    EXPECT_EQ(payload.compare(payload.size() - padding, padding,
+                              std::string(padding, '=')),
+              0)
+        << "padding " << padding;
+    EXPECT_EQ(decode_base64(payload), png);
 }
 
 TEST(CalibrationReport, HtmlContainsCoefficientsAndEscapesLabels) {
