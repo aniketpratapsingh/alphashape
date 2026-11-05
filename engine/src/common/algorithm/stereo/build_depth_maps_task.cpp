@@ -605,9 +605,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // map from an unrepaired one. Folded ONLY when repair_holes is on: a map
         // built before the feature existed hashed neither value, so it keeps
         // matching a repair-off run exactly and existing maps stay reusable.
+        // The EFFECTIVE sensor owns the calibration the search actually uses,
+        // so fold that one (a slave's stored copy may be stale).
         std::uint64_t fingerprint = depth_map_fingerprint(
-            camera, chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)], downscale,
-            &context);
+            camera, effective_sensor(*chunk, camera), downscale, &context);
         // The fold follows what the pass actually DOES: with the filter disabled
         // it never runs, so the map is the unrepaired one and must keep the
         // historic fingerprint (and stay reusable).
@@ -641,8 +642,22 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // which never matches, so an old project's maps are rebuilt once and carry a
     // fingerprint from then on.
     const int requested_mode = static_cast<int>(filter_mode);
+    // The pixel grid the map must have. A film sensor whose normalised geometry
+    // was re-derived can produce a differently-sized working image, and a map
+    // at the old size must not be reused even if its fingerprint matched.
+    const auto map_size_of = [&](std::int32_t camera_id) -> std::pair<int, int> {
+        const auto it = camera_by_id.find(camera_id);
+        if (it == camera_by_id.end()) {
+            return {0, 0};
+        }
+        const std::pair<int, int> size =
+            sensor_pipeline_size(effective_sensor(*chunk, *it->second));
+        return {size.first / downscale, size.second / downscale};
+    };
     const auto reusable = [&](const DepthMap& map) {
+        const std::pair<int, int> size = map_size_of(map.camera_id);
         return reuse_depth && map.downscale == downscale &&
+               map.width == size.first && map.height == size.second &&
                map.alignment_fingerprint != 0 &&
                map.alignment_fingerprint == fingerprint_of(map.camera_id) &&
                (map.filter_mode < 0 || map.filter_mode == requested_mode);

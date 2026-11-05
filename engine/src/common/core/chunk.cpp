@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/core/frame.hpp"
+#include "model/camera/film_geometry.hpp"
 
 namespace alphashape {
 
@@ -307,6 +308,26 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
     // a different map.
     fold_calibration(h, sensor.calibration);
     h = fold_int(h, downscale);
+    // Scanned film (WP-13.18b): the map is built from the resampled NORMALISED
+    // image, so the per-scan film transform and the frame geometry decide which
+    // pixels enter the search. Re-fitting fiducials changes them without moving
+    // the pose or the intrinsics, and must invalidate the map. Only folded when
+    // present, so a digital project keeps its historic fingerprint.
+    if (camera.film_transform.has_value()) {
+        h = fold_string(h, "film_transform");
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                h = fold_double(h, (*camera.film_transform)(r, c));
+            }
+        }
+    }
+    if (sensor.film.enabled) {
+        h = fold_string(h, "film_settings");
+        h = fold_double(h, sensor.film.resolution_mm_per_px);
+        const Eigen::Vector2d extent = film_extent_mm(sensor.film);
+        h = fold_double(h, extent.x());
+        h = fold_double(h, extent.y());
+    }
 
     if (context != nullptr) {
         // The NEIGHBOURHOOD: a depth map is estimated against the neighbours, so
