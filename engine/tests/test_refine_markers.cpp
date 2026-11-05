@@ -27,7 +27,6 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
-#include "base/platform/env.hpp"
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
@@ -596,9 +595,7 @@ TEST(Markers, RefineEvenCodeMarker) {
     std::mt19937 engine(83U);
     const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
     RefineMarkersOptions options;
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "1");
     const RefineMarkersStats stats = run_refine(scene, options);
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "");
     EXPECT_EQ(stats.failed, 0U);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);
@@ -635,9 +632,7 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
                          std::vector<std::size_t>{0})};
     ASSERT_FALSE(ids.empty());
     RefineMarkersOptions options;
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "1");
     const RefineMarkersStats stats = run_refine(scene, options);
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "");
     EXPECT_EQ(stats.failed, 0U);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);

@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <list>
@@ -24,7 +23,6 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
-#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -358,12 +356,6 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
-bool seed_diag() {
-    static const bool enabled =
-        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
-    return enabled;
-}
-
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -373,10 +365,6 @@ struct BlobSeed {
     /// True when the light branch's outer-border fit succeeded, as opposed to
     /// falling back to the interior blob centre.
     bool border_fitted = false;
-    /// True when the seed came from a printed centre dot (parity 1). A seed
-    /// that is neither a dot nor a light interior is only a dark-blob guess,
-    /// which a coded circular target retries in a wider window.
-    bool centre_dot = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
@@ -538,7 +526,6 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         // patch scale, unchanged from the dark-only path.
         centre = dot->center;
         radius = dot->radius_px;
-        out.centre_dot = true;
         if (const auto fitted = refine_ellipse_center(crop, *dot)) {
             centre = *fitted;
         }
@@ -570,9 +557,16 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 // 1.1x it, but the blob's own fit lands anywhere between the
                 // 0.5 R sector edge and the border's inner edge at 0.9 R, so
                 // the lower bound stays loose: rejecting those fits drops the
-                // centre back onto the biased interior blob.
+                // centre back onto the biased interior blob. A fit whose
+                // radius does not fit inside the window is extrapolated from a
+                // clipped arc (the border lies outside the crop), which is how
+                // a large target's interior edge gets mistaken for the border;
+                // reject it so the caller retries in a wider window.
+                const double window_limit =
+                    static_cast<double>(half) - 2.0;
                 if (fitted_radius >= 0.8 * light->radius_px &&
                     fitted_radius <= 2.2 * light->radius_px &&
+                    fitted_radius <= window_limit &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
                     radius = fitted_radius;
@@ -582,14 +576,6 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 }
             } else {
                 centre = light->center;
-            }
-            if (seed_diag()) {
-                std::printf(
-                    "[diag light] blob_r=%.2f blob_c=(%.2f,%.2f) fitted_r=%.2f "
-                    "accepted=%d centre=(%.2f,%.2f)\n",
-                    light->radius_px, light->center.x(), light->center.y(),
-                    fitted_radius, static_cast<int>(out.border_fitted),
-                    centre.x(), centre.y());
             }
             out.light_centre = true;
         } else {
@@ -637,16 +623,6 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
-    if (seed_diag()) {
-        std::printf(
-            "[diag win] half=%d seed=(%.2f,%.2f) dark=%zu light=%zu out_px="
-            "(%.2f,%.2f) out_r=%.2f light_c=%d fitted=%d dot=%d\n",
-            half, seed.x(), seed.y(), dark_blobs.size(), light_blobs.size(),
-            out.pixel.x(), out.pixel.y(), out.radius,
-            static_cast<int>(out.light_centre),
-            static_cast<int>(out.border_fitted),
-            static_cast<int>(out.centre_dot));
-    }
     return out;
 }
 
@@ -668,45 +644,35 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const int extent = std::min(view.image.width(), view.image.height());
     const int max_half = std::max(1, extent / 2);
     int half = std::max(48, patch_size);
-    if (expected_px > 0.0) {
-        // The expected radius may be the outer border or a light interior as
-        // small as 0.5 R; either way R + margin fits inside 1.3x it plus the
-        // eight-pixel blur allowance. Anything wider is wasted context.
-        half = std::max(
-            half, static_cast<int>(std::ceil(1.3 * expected_px)) + 8);
+    if (expected_px > static_cast<double>(half) - 8.0) {
+        // Grow only when the expected radius is close enough to the default
+        // half width that the crop could clip the printed outline. The
+        // expected radius may be the outer border or a light interior as small
+        // as 0.5 R; either way R plus a blur allowance fits inside 1.3x it
+        // plus eight pixels. Growing a window that already holds the target
+        // only admits background blobs and edges that the normal window never
+        // sees.
+        half = std::min(max_half,
+                        std::max(half, static_cast<int>(
+                                           std::ceil(1.3 * expected_px)) + 8));
     }
     half = std::min(half, max_half);
     auto seed = circular_seed_window(view, pixel, half, coded_circular);
     // A light seed without a border fit means the outline was clipped (or the
-    // fit was rejected) by the window. A coded circular target whose seed came
-    // from neither the light interior nor a centre dot is only a dark-blob
-    // guess: for a large target the whole interior, and with it the light
-    // blob, can fall outside the window. Both cases need the doubled window.
+    // fit was rejected as extrapolated) by the window; a coded target that
+    // seeded nothing at all may simply have had its interior clipped. One
+    // doubled window covers both cases.
     const bool unfitted =
         seed && seed->light_centre && !seed->border_fitted;
-    const bool guessed =
-        coded_circular && seed && !seed->light_centre && !seed->centre_dot;
     const bool missing = retry_when_missing && !seed;
-    if (coded_circular && (unfitted || guessed || missing) &&
-        half < max_half) {
+    if (coded_circular && (unfitted || missing) && half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried =
                 circular_seed_window(view, pixel, wider, coded_circular)) {
-            if (!seed || retried->light_centre || retried->border_fitted) {
-                if (seed_diag()) {
-                    std::printf("[diag retry] half=%d wider=%d -> returned\n",
-                                half, wider);
-                }
+            if (!seed || retried->border_fitted) {
                 return retried;
             }
         }
-    }
-    if (seed_diag()) {
-        std::printf("[diag seed] half=%d unfitted=%d guessed=%d missing=%d "
-                    "seed=%d\n",
-                    half, static_cast<int>(unfitted),
-                    static_cast<int>(guessed), static_cast<int>(missing),
-                    static_cast<int>(seed.has_value()));
     }
     return seed;
 }
@@ -1085,17 +1051,6 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     std::optional<Eigen::Vector2d> cross;
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         cross = accept(*refined * ds);
-    }
-    if (seed_diag()) {
-        std::printf(
-            "[diag 2d] px=(%.2f,%.2f) limit=%.2f seed=%d light=%d ellipse=%d "
-            "(%.2f,%.2f) cross=%d (%.2f,%.2f)\n",
-            pixel.x(), pixel.y(), limit, static_cast<int>(seed.has_value()),
-            static_cast<int>(seed && seed->light_centre),
-            static_cast<int>(ellipse.has_value()),
-            ellipse ? ellipse->x() : 0.0, ellipse ? ellipse->y() : 0.0,
-            static_cast<int>(cross.has_value()),
-            cross ? cross->x() : 0.0, cross ? cross->y() : 0.0);
     }
     if (ellipse &&
         (!cross ||
