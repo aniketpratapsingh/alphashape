@@ -260,5 +260,30 @@ TEST_F(CalibrationIO, OpenCvUsesFallbackSize) {
     EXPECT_THROW(load_calibration(file, CalibrationFormat::OpenCvYaml), ValueError);
 }
 
+// A non-finite coefficient cannot describe a lens; every writer refuses it
+// before touching the file.
+TEST_F(CalibrationIO, RefusesToSaveNonFinite) {
+    Calibration c = opencv_calibration();
+    c.k1 = std::nan("");
+    for (const CalibrationFormat format :
+         {CalibrationFormat::Xml, CalibrationFormat::Json, CalibrationFormat::OpenCvXml,
+          CalibrationFormat::OpenCvYaml}) {
+        const std::string file = path(".out");
+        EXPECT_THROW(save_calibration(file, c, format), ValueError) << file;
+        EXPECT_FALSE(std::filesystem::exists(file)) << file;
+    }
+}
+
+// The doc.xml reader shared with the project format must reject NaN rather
+// than let it into an optimisation.
+TEST_F(CalibrationIO, XmlRejectsNan) {
+    const std::string xml =
+        "<?xml version=\"1.0\"?>\n<calibration type=\"frame\" width=\"640\" height=\"480\" "
+        "f=\"500\" cx=\"0\" cy=\"0\" b1=\"0\" b2=\"0\" k1=\"nan\" k2=\"0\" k3=\"0\" "
+        "k4=\"0\" p1=\"0\" p2=\"0\"/>\n";
+    const std::string file = write(".xml", xml);
+    EXPECT_THROW(load_calibration(file, CalibrationFormat::Xml), ValueError);
+}
+
 }  // namespace
 }  // namespace alphashape

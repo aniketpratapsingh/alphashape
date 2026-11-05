@@ -710,6 +710,18 @@ Calibration read_calibration(const XmlNode* node) {
         }
         c.*(field.member) = parse_double(require_attr(*node, field.name));
     }
+    // A written calibration describes a real image: a zero or negative size,
+    // or a non-finite coefficient, is corruption rather than "unknown" (the
+    // writer always records the sensor's actual geometry).
+    if (c.width <= 0 || c.height <= 0) {
+        throw ProjectIOError("doc.xml: <calibration> width and height must be positive");
+    }
+    for (const CalibrationField& field : kCalibrationFields) {
+        if (!std::isfinite(c.*(field.member))) {
+            throw ProjectIOError(std::string("doc.xml: <calibration> ") + field.name +
+                                 " is not finite");
+        }
+    }
     if (const XmlNode* cov = find_child(*node, "covariance")) {
         const std::vector<std::string> params = split_strings(require_attr(*cov, "params"));
         if (params.empty()) {

@@ -106,6 +106,12 @@ struct Calibration {
     Eigen::Vector3d unproject(const Eigen::Vector2d& pixel) const;
 };
 
+/// Reject a calibration that cannot describe a real image: a non-finite
+/// coefficient, a non-positive focal length, or a non-positive image size.
+/// `context` names the caller ("saving calibration to x.xml") and prefixes the
+/// ValueError message.
+void check_calibration_values(const Calibration& calibration, const std::string& context);
+
 /// The calibration of an image produced by box-averaging `downscale` x
 /// `downscale` blocks of a `full`-resolution image (the operator in
 /// image/operators/downsample.hpp). Only the floor(W/ds) * floor(H/ds) top-left

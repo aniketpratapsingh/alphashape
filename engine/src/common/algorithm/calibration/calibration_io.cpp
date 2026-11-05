@@ -516,6 +516,15 @@ std::vector<double> parse_matrix_data(const XmlNode& root, const char* element, 
     const XmlNode& matrix = require_child(root, element);
     rows = xml_int(matrix, "rows");
     cols = xml_int(matrix, "cols");
+    // OpenCV writes <dt>d</dt> for double and <dt>f</dt> for float; both parse
+    // as doubles. An absent tag is accepted (the data itself is unambiguous).
+    if (const XmlNode* dt = docxml::find_child(matrix, "dt")) {
+        const std::string text = trim(dt->text);
+        if (text != "d" && text != "f") {
+            throw ValueError(std::string(kPrefix) + "opencv xml: <" + element +
+                             "> has unsupported dt '" + text + "'");
+        }
+    }
     const XmlNode& data = require_child(matrix, "data");
     std::vector<double> values;
     for (const std::string& token : whitespace_tokens(data.text)) {
@@ -749,9 +758,10 @@ YamlMatrix parse_yaml_matrix_block(const std::vector<std::string>& lines, std::s
     YamlMatrix matrix;
     matrix.rows = yaml_int_field(fields, "rows", header_line);
     matrix.cols = yaml_int_field(fields, "cols", header_line);
+    // OpenCV writes 'd' for double and 'f' for float; both parse as doubles.
     const auto dt = fields.find("dt");
-    if (dt == fields.end() || dt->second != "d") {
-        yaml_fail(header_line, "matrix dt must be 'd'");
+    if (dt == fields.end() || (dt->second != "d" && dt->second != "f")) {
+        yaml_fail(header_line, "matrix dt must be 'd' or 'f'");
     }
     if (!have_data) {
         yaml_fail(header_line, "matrix is missing 'data'");
@@ -863,6 +873,7 @@ Calibration parse_opencv_yaml(const std::string& text, int fallback_width,
 
 std::vector<std::string> save_calibration(const std::string& path, const Calibration& c,
                                           CalibrationFormat format) {
+    check_calibration_values(c, "saving calibration '" + path + "'");
     std::vector<std::string> warnings;
     std::string text;
     switch (format) {
@@ -909,6 +920,7 @@ CalibrationFileResult load_calibration(const std::string& path, CalibrationForma
                 parse_opencv_yaml(text, fallback_width, fallback_height, result.warnings);
             break;
     }
+    check_calibration_values(result.calibration, "loading calibration '" + path + "'");
     return result;
 }
 
