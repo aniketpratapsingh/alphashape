@@ -373,8 +373,7 @@ struct BlobSeed {
 /// the caller falls back to patch_size / 4.
 std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                              const Eigen::Vector2d& pixel,
-                                             int half, double expected_px,
-                                             bool coded_circular) {
+                                             int half, bool coded_circular) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
@@ -407,14 +406,11 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
     BlobParams params;
     params.dark_on_light = true;
     params.min_radius = 2;
-    // A large apparent target needs a larger blob scale, or its disc is
-    // silently clipped and the border fit falls back to the biased interior.
-    // `expected_px` can be the interior radius, which is as small as 0.5 R,
-    // so allow the full interior and the outer border on top of it.
-    params.max_radius =
-        std::max(4, expected_px > 0.0
-                        ? static_cast<int>(std::ceil(2.0 * expected_px))
-                        : half);
+    // The window already contains the whole printed target, so its half width
+    // is the largest blob scale worth searching. A fixed cap would either clip
+    // a large target's disc or, when it outgrows a normal target's window,
+    // admit a coarse background blob that was never a candidate before.
+    params.max_radius = std::max(4, half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
     const std::vector<MarkerCandidate> dark_blobs = detect_blobs(crop, params);
@@ -493,20 +489,34 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         return count >= 8 &&
                centre_value + 0.08 < sum / static_cast<double>(count);
     };
-    const MarkerCandidate* dot = nullptr;
-    double dot_distance = anchor_gate;
+    // A printed centre dot sits on the expected pixel and is the smallest dark
+    // blob centred there; the sector ring is centred on it too but has a much
+    // larger scale, and a sensor speck can pass the dot test a few pixels
+    // away. Find the nearest dot-like blob first, then keep the smallest
+    // radius within a proximity band of it. A hard minimum radius cannot be
+    // used: at a reduced working resolution a genuine dot is only a few pixels
+    // across and would fall into the light branch.
+    double nearest = std::numeric_limits<double>::infinity();
     for (const MarkerCandidate& blob : dark_blobs) {
-        // A printed centre dot is several pixels across; a smaller dark speck
-        // is sensor noise, not the fiducial.
-        if (blob.radius_px < 3.0) {
-            continue;
-        }
         const double distance = (blob.center - seed).norm();
-        if (distance > dot_distance || !looks_like_dot(blob)) {
+        if (distance > anchor_gate || !looks_like_dot(blob)) {
             continue;
         }
-        dot = &blob;
-        dot_distance = distance;
+        nearest = std::min(nearest, distance);
+    }
+    const MarkerCandidate* dot = nullptr;
+    if (std::isfinite(nearest)) {
+        const double band = nearest + 3.0;
+        for (const MarkerCandidate& blob : dark_blobs) {
+            const double distance = (blob.center - seed).norm();
+            if (distance > anchor_gate || distance > band ||
+                !looks_like_dot(blob)) {
+                continue;
+            }
+            if (dot == nullptr || blob.radius_px < dot->radius_px) {
+                dot = &blob;
+            }
+        }
     }
     BlobSeed out;
     Eigen::Vector2d centre = seed;
@@ -542,11 +552,15 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 // is not a plausible multiple of the interior scale; that is
                 // what a neighbouring target's outline looks like.
                 const double moved = (*fitted - seed).norm();
-                // The border is at most 2.0x the interior radius by design;
-                // a small margin absorbs the blob radius measured inside the
-                // 0.5 R sector edge.
-                if (fitted_radius >= 0.8 * light->radius_px &&
-                    fitted_radius <= 2.2 * light->radius_px &&
+                // The true border is at least 1.1x the interior blob radius by
+                // design (the interior stops at 0.9 R), while a fit that
+                // re-locked onto the interior's own boundary sits at 1.0x and
+                // carries that boundary's bias. The upper bound is the
+                // geometric maximum R / (0.5 R) plus a small measurement
+                // margin; beyond it the fit belongs to something outside the
+                // target.
+                if (fitted_radius >= 1.05 * light->radius_px &&
+                    fitted_radius <= 2.1 * light->radius_px &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
                     radius = fitted_radius;
@@ -607,10 +621,12 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
 }
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
-/// The crop and blob scale follow the expected apparent radius when the caller
-/// knows it. Without one, a failed outer-border fit is retried once in a
-/// window twice as wide, because a border larger than the initial 48 px half
-/// would otherwise be clipped.
+/// The crop grows with the expected apparent radius when the caller knows it,
+/// but only far enough to hold the printed outline and a little context: an
+/// unnecessarily wide crop admits background blobs and edges that a normal
+/// target's window never sees. Without an expected radius the 48 px minimum
+/// applies, and a failed outer-border fit is retried once in a window twice as
+/// wide, because a border larger than that minimum would otherwise be clipped.
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel,
                                       int patch_size, double expected_radius,
@@ -623,24 +639,25 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const int max_half = std::max(1, extent / 2);
     int half = std::max(48, patch_size);
     if (expected_px > 0.0) {
-        // An expected radius may be a light interior as small as 0.5 R, so
-        // the crop has to reach past the 2.0 R outer border.
-        half = std::max(half,
-                        static_cast<int>(std::ceil(2.2 * expected_px)));
+        // The expected radius may be the outer border or a light interior as
+        // small as 0.5 R; either way R + margin fits inside 1.3x it plus the
+        // eight-pixel blur allowance. Anything wider is wasted context.
+        half = std::max(
+            half, static_cast<int>(std::ceil(1.3 * expected_px)) + 8);
     }
     half = std::min(half, max_half);
-    auto seed =
-        circular_seed_window(view, pixel, half, expected_px, coded_circular);
-    // A light seed without a border fit means the outline was clipped by the
-    // window; a known coded target that seeded nothing at all may simply have
-    // had its interior clipped. One doubled window covers both cases.
+    auto seed = circular_seed_window(view, pixel, half, coded_circular);
+    // A light seed without a border fit means the outline was clipped (or the
+    // fit was rejected) by the window; a known coded target that seeded
+    // nothing at all may simply have had its interior clipped. One doubled
+    // window covers both cases.
     const bool unfitted =
         seed && seed->light_centre && !seed->border_fitted;
     const bool missing = retry_when_missing && !seed;
     if (coded_circular && (unfitted || missing) && half < max_half) {
         const int wider = std::min(2 * half, max_half);
-        if (auto retried = circular_seed_window(view, pixel, wider, expected_px,
-                                                coded_circular)) {
+        if (auto retried =
+                circular_seed_window(view, pixel, wider, coded_circular)) {
             if (!seed || retried->border_fitted) {
                 return retried;
             }
