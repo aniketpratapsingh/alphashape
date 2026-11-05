@@ -365,5 +365,56 @@ TEST(AlignChunks, PayloadsMoveAndRestoreWithoutAliasing) {
     }
 }
 
+// A similarity moves the posterior covariances with the geometry: a camera
+// centre covariance and a triangulated track's covariance both become
+// C' = s^2 R C R^T, and undo restores the exact original matrices.
+TEST(AlignChunks, TransformsCovariance) {
+    const sfm::Similarity similarity = known_similarity();
+    AlignmentScene scene = make_scene(similarity, marker_points());
+    Chunk& chunk = *scene.active;
+
+    Eigen::Matrix3d camera_covariance;
+    camera_covariance << 0.4, 0.02, -0.01,
+                         0.02, 0.3, 0.03,
+                         -0.01, 0.03, 0.2;
+    chunk.cameras()[0].location_covariance = camera_covariance;
+
+    Eigen::Matrix3f track_covariance;
+    track_covariance << 0.05F, 0.002F, 0.0F,
+                        0.002F, 0.04F, -0.001F,
+                        0.0F, -0.001F, 0.06F;
+    Track track;
+    track.point = Eigen::Vector3d(3.0, -2.0, 5.0);
+    track.covariance = track_covariance;
+    chunk.tie_points().tracks.push_back(track);
+
+    const ChunkGeometry before = capture_geometry(chunk);
+    ChunkGeometry after = capture_geometry(chunk);
+    apply_similarity_to_geometry(after, similarity);
+
+    const double scale_sq = similarity.scale * similarity.scale;
+    const Eigen::Matrix3d expected_camera =
+        scale_sq * similarity.R * camera_covariance * similarity.R.transpose();
+    const Eigen::Matrix3f expected_track =
+        (scale_sq * similarity.R * track_covariance.cast<double>() *
+         similarity.R.transpose())
+            .cast<float>();
+
+    auto command = make_align_chunks_command(chunk.id(), std::move(after));
+    command->apply(scene.document);
+
+    EXPECT_LE((chunk.cameras()[0].location_covariance - expected_camera).norm(),
+              1e-9 * expected_camera.norm());
+    ASSERT_TRUE(chunk.tie_points().tracks[0].covariance.has_value());
+    EXPECT_LE((*chunk.tie_points().tracks[0].covariance - expected_track).norm(),
+              1e-5F * expected_track.norm());
+
+    command->revert(scene.document);
+    EXPECT_EQ(chunk.cameras()[0].location_covariance, camera_covariance);
+    ASSERT_TRUE(chunk.tie_points().tracks[0].covariance.has_value());
+    EXPECT_EQ(*chunk.tie_points().tracks[0].covariance, track_covariance);
+    EXPECT_EQ(before.camera_location_covariances[0], camera_covariance);
+}
+
 }  // namespace
 }  // namespace alphashape

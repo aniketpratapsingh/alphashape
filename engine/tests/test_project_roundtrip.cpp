@@ -23,6 +23,7 @@
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
 #include "common/io/project_io.hpp"
+#include "common/io/sidecars.hpp"
 #include "image/image.hpp"
 
 namespace alphashape {
@@ -1802,6 +1803,67 @@ TEST_F(TempDir, RejectsMalformedCalibrationCovariance) {
     rewrite_zip_entry(path("x.files/project.zip"), "doc.xml", xml);
 
     EXPECT_THROW(ProjectIO::load(path("x.psx")), ProjectIOError);
+}
+
+/// WP-13.13b: the track-covariance sidecar is strictly validated. These cases
+/// hand-build the bytes so each check is exercised in isolation.
+TEST(ProjectIO, RejectsMalformedTrackCovariance) {
+    const auto header = [](std::uint32_t count) {
+        std::vector<std::uint8_t> bytes(docxml::sidecar::kTrackCovarianceMagic,
+                                        docxml::sidecar::kTrackCovarianceMagic + 4);
+        docxml::sidecar::put_u32(bytes, count);
+        return bytes;
+    };
+
+    // A flag byte other than 0/1.
+    std::vector<std::uint8_t> bad_flag = header(1);
+    bad_flag.push_back(2);
+    EXPECT_THROW(docxml::sidecar::decode_track_covariance(bad_flag), ProjectIOError);
+
+    // The declared count runs past the bytes that remain.
+    std::vector<std::uint8_t> short_count = header(2);
+    short_count.push_back(0);
+    EXPECT_THROW(docxml::sidecar::decode_track_covariance(short_count), ProjectIOError);
+
+    // Bytes after the declared tracks.
+    std::vector<std::uint8_t> trailing = header(1);
+    trailing.push_back(0);
+    trailing.push_back(0);
+    EXPECT_THROW(docxml::sidecar::decode_track_covariance(trailing), ProjectIOError);
+}
+
+TEST_F(TempDir, RejectsDuplicateCalibrationCovarianceParams) {
+    Document document = build_rich_document();
+    Calibration& cal = document.workspace().chunks().front()->sensors()[0].calibration;
+    cal.covariance = Eigen::MatrixXd::Identity(4, 4);
+    cal.covariance_params = {"f", "cx", "cy", "k1"};
+    ProjectIO::save(document, path("x.psx"));
+
+    // A repeated name makes the packed order ambiguous; the reader refuses it.
+    std::ifstream in(path("x.files/project.zip"), std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+    std::string xml = ZipArchive::parse(bytes).get_text("doc.xml");
+    const std::string good = "params=\"f cx cy k1\"";
+    const std::size_t at = xml.find(good);
+    ASSERT_NE(at, std::string::npos);
+    xml.replace(at, good.size(), "params=\"f f cy k1\"");
+    rewrite_zip_entry(path("x.files/project.zip"), "doc.xml", xml);
+    EXPECT_THROW(ProjectIO::load(path("x.psx")), ProjectIOError);
+
+    // The writer refuses the same thing rather than emitting an ambiguous file.
+    cal.covariance_params = {"f", "f", "cy", "k1"};
+    EXPECT_THROW(ProjectIO::save(document, path("y.psx")), ProjectIOError);
+}
+
+TEST_F(TempDir, RefusesToWriteNonFiniteTrackCovariance) {
+    Document document = build_rich_document();
+    Track& track = document.workspace().chunks().front()->tie_points().tracks[0];
+    Eigen::Matrix3f covariance = Eigen::Matrix3f::Identity();
+    covariance(1, 2) = std::numeric_limits<float>::quiet_NaN();
+    track.covariance = covariance;
+    EXPECT_THROW(ProjectIO::save(document, path("x.psx")), ProjectIOError);
 }
 
 }  // namespace
