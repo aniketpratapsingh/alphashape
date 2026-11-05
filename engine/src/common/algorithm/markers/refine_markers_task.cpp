@@ -496,17 +496,17 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
     // radius within a proximity band of it. A hard minimum radius cannot be
     // used: at a reduced working resolution a genuine dot is only a few pixels
     // across and would fall into the light branch.
-    double nearest = std::numeric_limits<double>::infinity();
+    double nearest_dot = std::numeric_limits<double>::infinity();
     for (const MarkerCandidate& blob : dark_blobs) {
         const double distance = (blob.center - seed).norm();
         if (distance > anchor_gate || !looks_like_dot(blob)) {
             continue;
         }
-        nearest = std::min(nearest, distance);
+        nearest_dot = std::min(nearest_dot, distance);
     }
     const MarkerCandidate* dot = nullptr;
-    if (std::isfinite(nearest)) {
-        const double band = nearest + 3.0;
+    if (std::isfinite(nearest_dot)) {
+        const double band = nearest_dot + 3.0;
         for (const MarkerCandidate& blob : dark_blobs) {
             const double distance = (blob.center - seed).norm();
             if (distance > anchor_gate || distance > band ||
