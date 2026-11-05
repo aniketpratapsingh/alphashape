@@ -91,9 +91,10 @@ KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& ch
     // form zero-parallax matches. A general border/mask belongs to the masks
     // milestone; this only covers the film frame's own geometry.
     if (fiducial_exclusion_mm > 0.0) {
-        const Sensor& sensor = effective_sensor(chunk, *camera);
-        const FilmSettings& film = sensor.film;
-        if (film.enabled && film_geometry_complete(film)) {
+        const Sensor* sensor = find_effective_sensor(chunk, *camera);
+        if (sensor != nullptr && sensor->film.enabled &&
+            film_geometry_complete(sensor->film)) {
+            const FilmSettings& film = sensor->film;
             const FilmSize size = film_normalised_size(film);
             const double radius =
                 fiducial_exclusion_mm / film.resolution_mm_per_px;

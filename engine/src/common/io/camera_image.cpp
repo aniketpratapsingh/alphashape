@@ -31,22 +31,30 @@ std::filesystem::path resolve_frame_path(const Document& document,
     return std::filesystem::path(document.path()).parent_path() / recorded;
 }
 
-const Sensor& effective_sensor(const Chunk& chunk, const Camera& camera) {
+const Sensor* find_effective_sensor(const Chunk& chunk, const Camera& camera) {
     if (camera.sensor_id < 0 ||
         static_cast<std::size_t>(camera.sensor_id) >= chunk.sensors().size()) {
-        throw ValueError(camera_name(camera) + " has no valid sensor");
+        return nullptr;
     }
     const Sensor& sensor =
         chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)];
     if (sensor.master_sensor_id < 0) {
-        return sensor;
+        return &sensor;
     }
     if (static_cast<std::size_t>(sensor.master_sensor_id) >=
         chunk.sensors().size()) {
         throw ValueError(camera_name(camera) +
                          " names an out-of-range master sensor");
     }
-    return chunk.sensors()[static_cast<std::size_t>(sensor.master_sensor_id)];
+    return &chunk.sensors()[static_cast<std::size_t>(sensor.master_sensor_id)];
+}
+
+const Sensor& effective_sensor(const Chunk& chunk, const Camera& camera) {
+    const Sensor* sensor = find_effective_sensor(chunk, camera);
+    if (sensor == nullptr) {
+        throw ValueError(camera_name(camera) + " has no valid sensor");
+    }
+    return *sensor;
 }
 
 std::pair<int, int> sensor_pipeline_size(const Sensor& sensor) {
@@ -81,8 +89,10 @@ Image load_camera_image(const Document& document, const Chunk& chunk,
     }
     const Image scan =
         read_image(resolve_frame_path(document, (*linked)->path()).string());
-    const Sensor& sensor = effective_sensor(chunk, camera);
-    if (!sensor.film.enabled) {
+    // A camera with no sensor (or a chunk built without sensors, as some
+    // digital-only tests do) has no film geometry, so the raw frame stands.
+    const Sensor* sensor = find_effective_sensor(chunk, camera);
+    if (sensor == nullptr || !sensor->film.enabled) {
         return scan;
     }
     if (!camera.film_transform.has_value()) {
@@ -90,12 +100,12 @@ Image load_camera_image(const Document& document, const Chunk& chunk,
                     " is a film camera without a film transform; run "
                     "DetectFiducials first");
     }
-    if (!film_geometry_complete(sensor.film)) {
+    if (!film_geometry_complete(sensor->film)) {
         throw Error(camera_name(camera) +
                     " has no film-normalised geometry; run CalibrateFiducials "
                     "with a resolution first");
     }
-    return resample_film_image(scan, *camera.film_transform, sensor.film);
+    return resample_film_image(scan, *camera.film_transform, sensor->film);
 }
 
 }  // namespace alphashape

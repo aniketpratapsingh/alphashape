@@ -29,7 +29,12 @@ std::filesystem::path resolve_frame_path(const Document& document,
 
 /// The sensor whose film settings and calibration govern this camera: the
 /// camera's sensor, or that sensor's master when it is a slave (WP-13.16).
-/// Throws ValueError when the camera's sensor index is invalid.
+/// Returns null when the camera has no usable sensor, which a digital-only
+/// pipeline may legitimately allow; throws ValueError when the index exists
+/// but the master link is broken.
+const Sensor* find_effective_sensor(const Chunk& chunk, const Camera& camera);
+
+/// As above, but a missing sensor is an error (callers that need a lens).
 const Sensor& effective_sensor(const Chunk& chunk, const Camera& camera);
 
 /// Pixel size the pipeline uses for a sensor. A film sensor with complete film
