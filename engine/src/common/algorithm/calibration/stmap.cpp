@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <vector>
 
 #include <tiffio.h>
@@ -145,14 +146,15 @@ void write_stmap_tiff(const std::string& path, const STMap& map) {
     if (options.get() == nullptr) {
         throw Error("write_stmap_tiff: cannot allocate TIFF open options");
     }
-    TIFF* tif = TIFFOpenExt(path.c_str(), "w", options.get());
-    if (tif == nullptr) {
+    TIFF* raw = TIFFOpenExt(path.c_str(), "w", options.get());
+    if (raw == nullptr) {
         throw Error("write_stmap_tiff: cannot open '" + path + "'");
     }
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> tif(raw, &TIFFClose);
 
     bool ok = true;
-    auto set = [&ok, tif](uint32_t tag, auto value) {
-        if (TIFFSetField(tif, tag, value) != 1) {
+    auto set = [&ok, &tif](uint32_t tag, auto value) {
+        if (TIFFSetField(tif.get(), tag, value) != 1) {
             ok = false;
         }
     };
@@ -165,14 +167,13 @@ void write_stmap_tiff(const std::string& path, const STMap& map) {
     set(TIFFTAG_PLANARCONFIG, static_cast<uint16_t>(PLANARCONFIG_CONTIG));
     set(TIFFTAG_ORIENTATION, static_cast<uint16_t>(ORIENTATION_TOPLEFT));
     uint16_t extra = EXTRASAMPLE_UNSPECIFIED;
-    if (TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extra) != 1) {
+    if (TIFFSetField(tif.get(), TIFFTAG_EXTRASAMPLES, 1, &extra) != 1) {
         ok = false;
     }
     set(TIFFTAG_COMPRESSION, static_cast<uint16_t>(COMPRESSION_ADOBE_DEFLATE));
     const uint32_t rows =
-        static_cast<uint32_t>(TIFFDefaultStripSize(tif, 0));
-    if (!ok || TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rows) != 1) {
-        TIFFClose(tif);
+        static_cast<uint32_t>(TIFFDefaultStripSize(tif.get(), 0));
+    if (!ok || TIFFSetField(tif.get(), TIFFTAG_ROWSPERSTRIP, rows) != 1) {
         throw Error("write_stmap_tiff: cannot configure '" + path + "'");
     }
 
@@ -186,11 +187,11 @@ void write_stmap_tiff(const std::string& path, const STMap& map) {
             row[out] = map.s[index];
             row[out + 1U] = map.t[index];
         }
-        if (TIFFWriteScanline(tif, row.data(), static_cast<uint32_t>(y), 0) < 0) {
+        if (TIFFWriteScanline(tif.get(), row.data(), static_cast<uint32_t>(y),
+                              0) < 0) {
             ok = false;
         }
     }
-    TIFFClose(tif);
     if (!ok) {
         throw Error("write_stmap_tiff: writing '" + path + "' failed");
     }
