@@ -210,11 +210,14 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
             double worst_error = 0.0;
             for (std::size_t i = 0; i < remaining.size(); ++i) {
                 const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
-                const double error =
-                    (calibrations[i]->project(x_cam) - pixels[i]).norm();
-                const double value = std::isfinite(error)
-                                         ? error
-                                         : std::numeric_limits<double>::infinity();
+                double value = std::numeric_limits<double>::infinity();
+                if (x_cam.z() > 0.0) {
+                    const double error =
+                        (calibrations[i]->project(x_cam) - pixels[i]).norm();
+                    if (std::isfinite(error)) {
+                        value = error;
+                    }
+                }
                 if (value > worst_error) {
                     worst_error = value;
                     worst = i;

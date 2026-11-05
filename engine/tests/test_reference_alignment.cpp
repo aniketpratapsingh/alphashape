@@ -449,15 +449,20 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
 
     // Perturb every reference: 2 m east in ECEF and 2 degrees of yaw.
     std::size_t perturbed = 0;
-    for (Camera& camera : chunk.cameras()) {
+    for (std::size_t index = 0; index < chunk.cameras().size(); ++index) {
+        Camera& camera = chunk.cameras()[index];
+        const double sign = index % 2U == 0U ? 1.0 : -1.0;
         const Eigen::Vector3d& loc = *camera.reference.location;
         Eigen::Vector3d ecef = geo::geodetic_to_ecef(
             geo::Geodetic{loc.x(), loc.y(), loc.z()});
-        ecef += Eigen::Vector3d(2.0, 0.0, 0.0);
+        // A per-camera error, not a common translation: reprojection alone
+        // cannot see a translation shared by every camera and point.
+        ecef += Eigen::Vector3d(2.0 * sign, 1.5 * (index % 3U == 0U ? 1.0 : -1.0),
+                                0.5);
         const geo::Geodetic g = geo::ecef_to_geodetic(ecef);
         camera.reference.location =
             Eigen::Vector3d(g.longitude_deg, g.latitude_deg, g.height_m);
-        camera.reference.orientation_deg->x() += 2.0;
+        camera.reference.orientation_deg->x() += 2.0 * sign;
         // Realistic sigma: the priors must not pin the cameras at the error.
         camera.reference.accuracy = Eigen::Vector3d::Constant(1.0);
         camera.reference.rotation_accuracy_deg = Eigen::Vector3d::Constant(3.0);
