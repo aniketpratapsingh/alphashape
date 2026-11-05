@@ -710,12 +710,11 @@ Calibration read_calibration(const XmlNode* node) {
         }
         c.*(field.member) = parse_double(require_attr(*node, field.name));
     }
-    // A written calibration describes a real image: a zero or negative size,
-    // or a non-finite coefficient, is corruption rather than "unknown" (the
-    // writer always records the sensor's actual geometry).
-    if (c.width <= 0 || c.height <= 0) {
-        throw ProjectIOError("doc.xml: <calibration> width and height must be positive");
-    }
+    // A non-finite coefficient can only be corruption. Width/height are NOT
+    // required to be positive here: a project may legitimately carry an
+    // uncalibrated sensor (a bare Sensor{} saved before any photo resolves its
+    // geometry), and the calibration-file formats enforce real geometry
+    // separately.
     for (const CalibrationField& field : kCalibrationFields) {
         if (!std::isfinite(c.*(field.member))) {
             throw ProjectIOError(std::string("doc.xml: <calibration> ") + field.name +
