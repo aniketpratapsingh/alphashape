@@ -1899,6 +1899,11 @@ TEST(ProjectIO, SensorMasterRoundTrips) {
     Document document = build_rich_document();
     Chunk& chunk = *document.workspace().chunks().front();
     ASSERT_EQ(chunk.sensors().size(), 2U);
+    // The rich fixture's second sensor is a fisheye of the same size; a master
+    // link requires the same camera type as well, so make it a frame sensor
+    // before sharing the calibration.
+    chunk.sensors()[1].type = CameraType::Frame;
+    chunk.sensors()[1].calibration.type = CameraType::Frame;
     chunk.sensors()[1].master_sensor_id = 0;
     ProjectIO::save(document, scratch.path());
 

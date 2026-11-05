@@ -9,6 +9,7 @@ through the standard warnings module; a clean calibration produces none.
 Run with plain unittest, no pytest.
 """
 
+import inspect
 import json
 import os
 import tempfile
@@ -19,7 +20,7 @@ import alphashape
 
 
 def load_with_warning(path):
-    """The line the warning must be attributed to (stacklevel=2)."""
+    """One hop above the binding, where stacklevel=2 reports the warning."""
     return alphashape.Calibration.load(path, alphashape.CalibrationFormat.OpenCvYaml)
 
 
@@ -75,14 +76,17 @@ class CalibrationIOTest(unittest.TestCase):
             path = os.path.join(directory, "in.yml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(yaml)
+            frame = inspect.currentframe()
+            self.assertIsNotNone(frame)
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
+                line = frame.f_lineno + 1
                 load_with_warning(path)
         self.assertTrue(caught)
-        # stacklevel=2 makes the warning look like it came from this test
-        # module, at the line that called into the binding.
-        self.assertEqual(caught[0].filename, load_with_warning.__code__.co_filename)
-        self.assertEqual(caught[0].lineno, load_with_warning.__code__.co_firstlineno + 1)
+        # stacklevel=2 steps over the Python wrapper, so the warning points at
+        # the line in this module that called it, not at the bindings.
+        self.assertEqual(caught[0].filename, __file__)
+        self.assertEqual(caught[0].lineno, line)
 
 
 if __name__ == "__main__":
