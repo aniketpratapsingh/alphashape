@@ -39,11 +39,11 @@ void store_source(double u_src, double v_src, double width, double height,
 /// not. Both handlers swallow the message and report success to the caller,
 /// which learns about the failure from a return code instead.
 int swallow_error(TIFF*, void*, const char*, const char*, va_list) {
-    return 0;
+    return 1;  // handled: libtiff prints nothing
 }
 
 int swallow_warning(TIFF*, void*, const char*, const char*, va_list) {
-    return 0;
+    return 1;  // handled: libtiff prints nothing
 }
 
 /// Owns a TIFFOpenOptions block and installs the silent handlers.
@@ -151,24 +151,24 @@ void write_stmap_tiff(const std::string& path, const STMap& map) {
     }
 
     bool ok = true;
-    auto set = [&ok, tif](uint32_t tag, int value) {
+    auto set = [&ok, tif](uint32_t tag, auto value) {
         if (TIFFSetField(tif, tag, value) != 1) {
             ok = false;
         }
     };
     set(TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(map.width));
     set(TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(map.height));
-    set(TIFFTAG_SAMPLESPERPIXEL, 2);
-    set(TIFFTAG_BITSPERSAMPLE, 32);
-    set(TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
-    set(TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    set(TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-    set(TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    set(TIFFTAG_SAMPLESPERPIXEL, static_cast<uint16_t>(2));
+    set(TIFFTAG_BITSPERSAMPLE, static_cast<uint16_t>(32));
+    set(TIFFTAG_SAMPLEFORMAT, static_cast<uint16_t>(SAMPLEFORMAT_IEEEFP));
+    set(TIFFTAG_PHOTOMETRIC, static_cast<uint16_t>(PHOTOMETRIC_MINISBLACK));
+    set(TIFFTAG_PLANARCONFIG, static_cast<uint16_t>(PLANARCONFIG_CONTIG));
+    set(TIFFTAG_ORIENTATION, static_cast<uint16_t>(ORIENTATION_TOPLEFT));
     uint16_t extra = EXTRASAMPLE_UNSPECIFIED;
     if (TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extra) != 1) {
         ok = false;
     }
-    set(TIFFTAG_COMPRESSION, COMPRESSION_ADOBE_DEFLATE);
+    set(TIFFTAG_COMPRESSION, static_cast<uint16_t>(COMPRESSION_ADOBE_DEFLATE));
     const uint32_t rows =
         static_cast<uint32_t>(TIFFDefaultStripSize(tif, 0));
     if (!ok || TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rows) != 1) {
