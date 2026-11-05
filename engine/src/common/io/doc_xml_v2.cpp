@@ -395,6 +395,11 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
         set_attr(e, "sensor_id", std::to_string(c.sensor_id));
         set_attr(e, "label", c.label);
         set_attr(e, "enabled", fmt_bool(c.enabled));
+        // Written only when true, so an unselected project keeps the older
+        // byte layout and an older reader simply ignores the attribute.
+        if (c.selected) {
+            set_attr(e, "selected", "true");
+        }
         set_attr(e, "orientation", std::to_string(c.orientation));
         set_attr(e, "transform", matrix4(c.pose));
         // Posterior covariances (WP-13.13b). Written only when non-zero, so a
@@ -1253,8 +1258,8 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         return;
     }
     for (const XmlNode& e : cameras->children) {
-        warn_unknown_attrs(e, {"id", "sensor_id", "label", "enabled", "orientation",
-                               "transform", "location_covariance",
+        warn_unknown_attrs(e, {"id", "sensor_id", "label", "enabled", "selected",
+                               "orientation", "transform", "location_covariance",
                                "rotation_covariance"},
                            report);
         Camera c;
@@ -1262,6 +1267,8 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         c.sensor_id = parse_i32(require_attr(e, "sensor_id"));
         c.label = require_attr(e, "label");
         c.enabled = parse_bool(require_attr(e, "enabled"));
+        // Absent in files written before WP-11.8: those cameras were unselected.
+        c.selected = parse_bool(attr_or(e, "selected", "false"));
         c.orientation = parse_int(require_attr(e, "orientation"));
         c.pose = parse_matrix4(require_attr(e, "transform"));
         if (const std::string* s = find_attr(e, "location_covariance")) {

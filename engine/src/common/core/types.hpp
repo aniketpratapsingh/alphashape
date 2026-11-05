@@ -207,8 +207,10 @@ struct Camera {
     /// True once SfM/alignment has produced a pose for this camera.
     bool enabled = false;
 
-    /// UI selection state (§4.10). The command layer edits it (WP-11.5b);
-    /// persistence of the `selected` attribute is WP-11.8.
+    /// UI selection state (§4.10). The command layer edits it (WP-11.5b) and
+    /// doc.xml persists it as the optional `selected` attribute (WP-11.8);
+    /// files written before that attribute existed load every camera as
+    /// unselected.
     bool selected = false;
 
     /// Measured position from GPS, the reference for adjustment.
