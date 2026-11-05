@@ -1770,7 +1770,7 @@ TEST(OptimizeCameras, AdaptiveFittingMetaClearedWhenOff) {
 // Master sensors share one calibration slot (WP-13.16)
 // ---------------------------------------------------------------------------
 
-TEST(OptimizeCameras, MasterSharesDuringOptimize) {
+TEST(CalibrationIO, MasterSharesDuringOptimize) {
     Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
     truth.k1 = -0.05;
     truth.k2 = 0.04;
