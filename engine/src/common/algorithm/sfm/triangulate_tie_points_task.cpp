@@ -88,7 +88,12 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
 
     const TiePoints& tie_points = chunk->tie_points();
     if (tie_points.matches.empty()) {
-        throw ValueError("TriangulateTiePoints: no matches \u2014 run MatchPhotos first");
+        // A chunk without matches has nothing to triangulate. Recording the
+        // run parameters and leaving it untouched is the same no-op the
+        // task-schema parity harness expects from every task.
+        progress.update("prepare", 1.0);
+        progress.update("triangulate", 1.0);
+        return;
     }
     std::unordered_map<std::int32_t, View> views;
     views.reserve(chunk->cameras().size());

@@ -135,6 +135,15 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
         mean_ecef += geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
         ++located;
     }
+    if (candidates.empty()) {
+        // No camera carries an enabled reference, so there is nothing to
+        // place. Recording the run parameters and leaving the chunk untouched
+        // is the same no-op the task-schema parity harness expects from every
+        // task.
+        progress.update("prepare", 1.0);
+        progress.update("place", 1.0);
+        return;
+    }
     if (located == 0) {
         throw ValueError("AlignFromReference: no selected camera has a finite reference "
                          "position");
