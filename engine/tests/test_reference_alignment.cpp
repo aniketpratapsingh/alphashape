@@ -458,6 +458,9 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
         camera.reference.location =
             Eigen::Vector3d(g.longitude_deg, g.latitude_deg, g.height_m);
         camera.reference.orientation_deg->x() += 2.0;
+        // Realistic sigma: the priors must not pin the cameras at the error.
+        camera.reference.accuracy = Eigen::Vector3d::Constant(1.0);
+        camera.reference.rotation_accuracy_deg = Eigen::Vector3d::Constant(3.0);
         camera.pose = Transform::Identity();
         ++perturbed;
     }
