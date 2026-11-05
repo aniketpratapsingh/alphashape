@@ -968,7 +968,26 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly("fixed_params",
                                [](const alphashape::Sensor& s) { return s.fixed_params; })
         // Index of the master sensor whose calibration this one shares, or -1.
-        .def_readonly("master", &alphashape::Sensor::master_sensor_id);
+        .def_readonly("master", &alphashape::Sensor::master_sensor_id)
+        // GNSS antenna mount: camera-frame (or body-frame with a boresight)
+        // offset in metres, and the optional body->camera boresight in degrees.
+        .def_property_readonly("antenna_offset", [](const alphashape::Sensor& s) {
+            py::list out;
+            out.append(s.antenna.offset_m.x());
+            out.append(s.antenna.offset_m.y());
+            out.append(s.antenna.offset_m.z());
+            return out;
+        })
+        .def_property_readonly("antenna_boresight", [](const alphashape::Sensor& s) {
+            if (!s.antenna.boresight_deg.has_value()) {
+                return py::object(py::none());
+            }
+            py::list out;
+            out.append(s.antenna.boresight_deg->x());
+            out.append(s.antenna.boresight_deg->y());
+            out.append(s.antenna.boresight_deg->z());
+            return py::object(out);
+        });
 
     py::class_<alphashape::Camera>(m, "Camera")
         .def_readonly("id", &alphashape::Camera::id)
@@ -1506,6 +1525,24 @@ PYBIND11_MODULE(alphashape, m) {
             },
             py::arg("sensor_index"), py::arg("master_index"),
             "Share a sensor's calibration with a master sensor, or detach with -1.")
+        // Set the GNSS antenna mount (undoable in the GUI).
+        .def(
+            "set_sensor_antenna",
+            [](py::object self, std::int32_t sensor_index,
+               const Eigen::Vector3d& offset,
+               std::optional<Eigen::Vector3d> boresight) {
+                alphashape::Document& document = owning_document(self);
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::Antenna antenna;
+                antenna.offset_m = offset;
+                antenna.boresight_deg = boresight;
+                alphashape::make_set_sensor_antenna_command(chunk.id(), sensor_index,
+                                                            antenna)
+                    ->apply(document);
+            },
+            py::arg("sensor_index"), py::arg("offset"), py::arg("boresight") = py::none(),
+            "Set a sensor's antenna offset in metres (camera frame) and optional "
+            "body-frame boresight angles in degrees.")
         // -- dense products (milestone 6) --------------------------------------
         // BuildDepthMaps fills `depth_maps`; BuildPointCloud fuses them into
         // `point_cloud`. Both are read-only views onto the chunk's containers.
