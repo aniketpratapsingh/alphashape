@@ -285,6 +285,11 @@ void write_sensors(const Chunk& chunk, XmlNode& node) {
         set_attr(e, "serial", s.serial);
         write_calibration(s.calibration, e);
         set_attr(e, "fixed_params", join_strings(s.fixed_params));
+        // Written only when the sensor is a slave, so a project without master
+        // links serialises byte-identically to an older build (WP-13.16).
+        if (s.master_sensor_id >= 0) {
+            set_attr(e, "master", std::to_string(s.master_sensor_id));
+        }
     }
 }
 
@@ -957,7 +962,8 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
     for (const XmlNode& e : sensors->children) {
         warn_unknown_attrs(e,
                            {"id", "label", "type", "width", "height", "pixel_size",
-                            "focal_length", "make", "model", "serial", "fixed_params"},
+                            "focal_length", "make", "model", "serial", "fixed_params",
+                            "master"},
                            report);
         if (const XmlNode* calibration = find_child(e, "calibration")) {
             warn_unknown_calibration_attrs(*calibration, report);
@@ -979,9 +985,17 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         s.serial = require_attr(e, "serial");
         s.calibration = read_calibration(find_child(e, "calibration"));
         s.fixed_params = split_strings(require_attr(e, "fixed_params"));
+        s.master_sensor_id = parse_i32(attr_or(e, "master", "-1"));
         validate_fixed_params(s.label, s.fixed_params);
         chunk.sensors().push_back(std::move(s));
         ++sensor_index;
+    }
+    // Master links are validated after the whole list is present: a slave may
+    // name a sensor that appears later in the file.
+    try {
+        validate_sensor_masters(chunk.sensors());
+    } catch (const ValueError& e) {
+        throw ProjectIOError(std::string("doc.xml: ") + e.what());
     }
 }
 

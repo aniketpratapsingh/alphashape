@@ -113,8 +113,20 @@ struct Sensor {
     /// {"f","cx","cy","b1","b2","k1","k2","k3","k4","p1","p2","p3","p4"}.
     std::vector<std::string> fixed_params;
 
+    /// Index of the master sensor this one shares a calibration with (WP-13.16),
+    /// or -1 when independent. A slave has the same width, height and type as
+    /// its master, does not itself name a master, and takes its BA calibration
+    /// slot from the master. Persisted as the optional `master` attribute.
+    std::int32_t master_sensor_id = -1;
+
     bool operator==(const Sensor& other) const;
 };
+
+/// Validate every sensor's master link (WP-13.16): the index is in range and
+/// is not itself, the master does not itself have a master, and the two share
+/// the same image width and height. Independent sensors (master = -1) are not
+/// inspected. Throws ValueError naming the offending sensor.
+void validate_sensor_masters(const std::vector<Sensor>& sensors);
 
 /// The photogrammetric "camera reference": a measured (not adjusted) position
 /// from the camera's GNSS log, used as an observation in adjustment.
