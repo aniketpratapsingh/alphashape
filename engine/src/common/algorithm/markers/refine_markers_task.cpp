@@ -23,6 +23,7 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -356,6 +357,12 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
+bool seed_diag() {
+    static const bool enabled =
+        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
+    return enabled;
+}
+
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -571,6 +578,16 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 if (fitted_radius > window_limit) {
                     out.border_clipped = true;
                 }
+                if (seed_diag()) {
+                    std::fprintf(stderr,
+                                 "[diag retrywin] half=%d blob_r=%.2f "
+                                 "blob_c=(%.2f,%.2f) fit_r=%.2f moved=%.2f "
+                                 "ratio=%.2f limit=%.2f\n",
+                                 half, light->radius_px, light->center.x(),
+                                 light->center.y(), fitted_radius, moved,
+                                 fitted_radius / light->radius_px,
+                                 window_limit);
+                }
                 if (fitted_radius >= 0.8 * light->radius_px &&
                     fitted_radius <= border_multiple * light->radius_px &&
                     fitted_radius <= window_limit &&
@@ -674,11 +691,31 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     // window also accepts a larger border multiple.
     const bool clipped = seed && seed->border_clipped;
     const bool missing = retry_when_missing && !seed;
+    if (seed_diag()) {
+        std::fprintf(stderr,
+                     "[diag seedc] half=%d clipped=%d unfit=%d missing=%d "
+                     "seed=%d r=%.2f\n",
+                     half, static_cast<int>(clipped),
+                     static_cast<int>(seed && seed->light_centre &&
+                                      !seed->border_fitted),
+                     static_cast<int>(missing),
+                     static_cast<int>(seed.has_value()),
+                     seed ? seed->radius : 0.0);
+    }
     if (coded_circular && (clipped || missing) && half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried =
                 circular_seed_window(view, pixel, wider, coded_circular, 2.4)) {
             if (!seed || retried->light_centre || retried->border_fitted) {
+                if (seed_diag()) {
+                    std::fprintf(stderr,
+                                 "[diag retryout] wider=%d r=%.2f px="
+                                 "(%.2f,%.2f) light=%d fit=%d\n",
+                                 wider, retried->radius, retried->pixel.x(),
+                                 retried->pixel.y(),
+                                 static_cast<int>(retried->light_centre),
+                                 static_cast<int>(retried->border_fitted));
+                }
                 return retried;
             }
         }
