@@ -57,10 +57,13 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
+#include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/sfm/adaptive_fit.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
+#include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
+#include "model/crs/euler.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -114,6 +117,42 @@ bool centres_not_collinear(const std::vector<Eigen::Vector3d>& centres) {
         max_perp = std::max(max_perp, (v - v.dot(u) * u).norm());
     }
     return max_perp > 1e-3 * len;
+}
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDegToRad = kPi / 180.0;
+constexpr double kRadToDeg = 180.0 / kPi;
+
+/// Rz(angle) in the ENU / body axes.
+Eigen::Matrix3d rotation_about_z(double degrees) {
+    const double angle = degrees * kDegToRad;
+    Eigen::Matrix3d m;
+    m << std::cos(angle), -std::sin(angle), 0.0,  //
+        std::sin(angle), std::cos(angle), 0.0,     //
+        0.0, 0.0, 1.0;
+    return m;
+}
+
+/// Rotation carried by a 3x3 block, with a uniform similarity scale divided
+/// out (the geometric counterpart of georeference's `pure_rotation`). The
+/// chunk transform and an AlignChunks pose may both carry a scale.
+Eigen::Matrix3d rotation_of_similarity(const Eigen::Matrix3d& m) {
+    const double determinant = m.determinant();
+    if (!std::isfinite(determinant) || !(determinant > 0.0)) {
+        throw ValueError("OptimizeCameras: chunk transform carries no valid rotation");
+    }
+    return m / std::cbrt(determinant);
+}
+
+/// Body-to-ENU rotation for a stored orientation triple, in `order`:
+/// `R_wb = Rz(90 deg) * to_matrix({x, -y, z})`. The Rz(90) turns the
+/// north-pointing zero-heading body frame into the ENU basis; the second
+/// component is negated because a positive stored pitch is nose up while
+/// `to_matrix` applies a positive rotation about its second axis (see the
+/// `convert_reference.hpp` contract).
+Eigen::Matrix3d world_from_body(const Eigen::Vector3d& angles, crs::RotationOrder order) {
+    const crs::EulerAngles internal{angles.x(), -angles.y(), angles.z(), order};
+    return rotation_about_z(90.0) * crs::to_matrix(internal);
 }
 
 /// Full-precision text for a metadata value.
@@ -189,6 +228,11 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
                     "Store the posterior covariance of the cameras and calibration."});
     params.declare({"tiepoint_covariance", ParamType::Bool, false,
                     "Store the posterior covariance of every tie point."});
+    // Measured attitudes (a gimbal log or an INS) enter as soft rotation
+    // priors when the chunk is georeferenced. The heading axis is weighted by
+    // its own sigma, which is typically much looser than pitch and roll.
+    params.declare({"use_orientation", ParamType::Bool, true,
+                    "Use measured camera attitudes as rotation priors."});
 }
 
 std::vector<Stage> OptimizeCamerasTask::stages() const {
@@ -202,6 +246,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     if (chunk == nullptr) {
         throw Error("OptimizeCameras needs an active chunk");
     }
+
+    const bool use_orientation = params.get_bool("use_orientation");
 
     // The fit flags, in the packed coefficient order.
     std::array<bool, kCalibrationParamCount> fit = {};
@@ -565,13 +611,68 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
     progress.update("prepare", 1.0);
 
-    // -- GNSS centre priors (georeferenced chunks only) ---------------------
+    // -- GNSS centre and attitude priors (georeferenced chunks only) ---------
+    std::size_t rotation_prior_count = 0;
     if (georeferenced) {
         const Transform inverse = transform.inverse();
+        const Eigen::Matrix3d ecef_from_internal =
+            rotation_of_similarity(transform.block<3, 3>(0, 0));
+        const crs::RotationOrder order = reference::rotation_order_of(*chunk);
+        const double default_rotation_accuracy =
+            chunk->reference_settings().camera_rotation_accuracy_deg;
         std::unordered_set<std::int32_t> logged_antenna_sensors;
         for (std::size_t b = 0; b < camera_index.size(); ++b) {
             const Camera& camera = chunk->cameras()[camera_index[b]];
-            if (!camera.reference.enabled || !camera.reference.location.has_value()) {
+            if (!camera.reference.enabled) {
+                continue;
+            }
+            // -- attitude prior ---------------------------------------------
+            if (use_orientation && camera.reference.orientation_deg.has_value()) {
+                // The ENU frame is taken at the reference position; without
+                // one, at the camera's current estimated centre converted to
+                // geodetic. The difference only changes the local meridian
+                // convergence over the block.
+                geo::Geodetic geodetic;
+                if (camera.reference.location.has_value()) {
+                    const Eigen::Vector3d& loc = *camera.reference.location;
+                    geodetic = geo::Geodetic{loc.x(), loc.y(),
+                                             std::isfinite(loc.z()) ? loc.z() : 0.0};
+                } else {
+                    const sfm::BAPose& pose = problem.poses[b];
+                    const Eigen::Vector3d centre = -(pose.R.inverse() * pose.t);
+                    geodetic = geo::ecef_to_geodetic(
+                        transform.block<3, 3>(0, 0) * centre + transform.block<3, 1>(0, 3));
+                }
+                const Sensor& sensor =
+                    chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
+                const std::int32_t effective =
+                    sensor.master_sensor_id >= 0 ? sensor.master_sensor_id : camera.sensor_id;
+                const Antenna& antenna =
+                    chunk->sensors()[static_cast<std::size_t>(effective)].antenna;
+                const Eigen::Matrix3d ecef_from_enu =
+                    geo::enu_to_ecef(geodetic).block<3, 3>(0, 0);
+                const Eigen::Matrix3d r_wb =
+                    world_from_body(*camera.reference.orientation_deg, order);
+                // A boresight describes the camera mount in the body frame
+                // (WP-13.19); without one the level FLU camera mount applies.
+                const Eigen::Matrix3d r_bc =
+                    antenna.boresight_deg.has_value() ? antenna.body_to_camera()
+                                                      : reference::body_to_camera();
+                sfm::BARotationPrior prior;
+                prior.camera = b;
+                prior.measured = r_bc * r_wb.transpose() * ecef_from_enu.transpose() *
+                                 ecef_from_internal;
+                prior.heading_frame =
+                    ecef_from_internal.transpose() * ecef_from_enu *
+                    rotation_about_z(camera.reference.orientation_deg->x() + 90.0);
+                const Eigen::Vector3d sigma_deg =
+                    camera.reference.rotation_accuracy_deg.value_or(
+                        Eigen::Vector3d::Constant(default_rotation_accuracy));
+                prior.sigma_rad = sigma_deg * kDegToRad;
+                problem.rotation_priors.push_back(prior);
+                ++rotation_prior_count;
+            }
+            if (!camera.reference.location.has_value()) {
                 continue;
             }
             const Eigen::Vector3d& loc = *camera.reference.location;
@@ -610,6 +711,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                 }
             }
             problem.centre_priors.push_back(prior);
+        }
+        if (rotation_prior_count > 0 && Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "OptimizeCameras: " << rotation_prior_count
+                                << " rotation priors from measured attitudes";
         }
     }
 
@@ -820,6 +925,29 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         }
     }
 
+    // -- attitude residuals -------------------------------------------------
+    // Unweighted (yaw, pitch, roll) delta_h of every rotation prior, in
+    // degrees, plus their aggregate RMS over all components. Any axis held
+    // unconstrained still reports its measured error.
+    double attitude_sq = 0.0;
+    std::size_t attitude_n = 0;
+    for (const sfm::BARotationPrior& prior : problem.rotation_priors) {
+        const Eigen::Vector3d error =
+            sfm::predicted_rotation_residual(problem.poses[prior.camera], prior) *
+            kRadToDeg;
+        const Camera& camera = staged.cameras()[camera_index[prior.camera]];
+        const std::string label =
+            camera.label.empty() ? std::to_string(camera.id) : camera.label;
+        staged.meta().set("optimize_cameras." + label + ".attitude_error_deg",
+                          meta_number(error.x()) + "," + meta_number(error.y()) + "," +
+                              meta_number(error.z()));
+        attitude_sq += error.squaredNorm();
+        attitude_n += 3U;
+    }
+    const double attitude_rms_deg =
+        attitude_n == 0 ? 0.0 : std::sqrt(attitude_sq / static_cast<double>(attitude_n));
+    staged.meta().set("optimize_cameras.attitude_rms_deg", meta_number(attitude_rms_deg));
+
     // -- report statistics (metres) -----------------------------------------
     // The solver reports in chunk-local units; multiply by the local->ECEF
     // scale so the stored and logged values are metres.
@@ -866,7 +994,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                             << report.control_points << ", check-point RMS " << checkpoint_rms_m
                             << " m over " << report.checkpoints << ", scale-bar RMS "
                             << scalebar_rms_m << " m over " << report.scalebars << ", check-bar RMS "
-                            << checkbar_rms_m << " m over " << report.checkbars << ")";
+                            << checkbar_rms_m << " m over " << report.checkbars
+                            << ", attitude RMS " << attitude_rms_deg << " deg over "
+                            << problem.rotation_priors.size() << " cameras)";
     }
 }
 
