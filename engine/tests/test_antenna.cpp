@@ -360,6 +360,53 @@ TEST(Antenna, GeoreferenceWithScaledChunkTransform) {
     EXPECT_LT(worst, 0.01);
 }
 
+TEST(Antenna, GeoreferenceSidewaysLeverArm) {
+    // A 0.5 m lever along camera x is tangential to this ring of nadir cameras:
+    // the first similarity fit's rotation is biased by the uncorrected lever
+    // arm, so a single correction leaves centimetres of error. The iterated fit
+    // must converge to the truth well inside a millimetre.
+    const Eigen::Vector3d lever(0.5, 0.0, 0.0);
+    const auto measure = [&lever](bool scaled) {
+        AntennaScene scene = make_antenna_scene(true, lever);
+        Chunk& chunk = *scene.document.active_chunk();
+        std::vector<Eigen::Vector3d> truth;
+        for (const Camera& camera : chunk.cameras()) {
+            truth.push_back(centre_of(camera.pose));
+        }
+        if (scaled) {
+            const Eigen::Matrix3d r_s =
+                Eigen::AngleAxisd(0.7, Eigen::Vector3d(0.2, -0.3, 0.9).normalized())
+                    .toRotationMatrix();
+            reframe_in_scaled_local_frame(scene, 2.5, r_s);
+        }
+        Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
+        for (const Camera& camera : chunk.cameras()) {
+            const Eigen::Vector3d& loc = *camera.reference.location;
+            mean_ecef +=
+                geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
+        }
+        mean_ecef /= static_cast<double>(chunk.cameras().size());
+        const Transform to_new = geo::ecef_to_enu(geo::ecef_to_geodetic(mean_ecef)) *
+                                 geo::enu_to_ecef(scene.origin);
+        const sfm::GeoreferenceReport report = sfm::georeference_chunk(chunk);
+        EXPECT_TRUE(report.applied) << report.reason;
+        double worst = 0.0;
+        for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+            const Eigen::Vector3d expected =
+                (to_new * truth[i].homogeneous()).head<3>();
+            worst = std::max(worst,
+                             (centre_of(chunk.cameras()[i].pose) - expected).norm());
+        }
+        return worst;
+    };
+    const double metric = measure(false);
+    std::printf("[antenna] sideways-lever centre error: %.6f m\n", metric);
+    EXPECT_LT(metric, 0.001);
+    const double scaled = measure(true);
+    std::printf("[antenna] sideways-lever scaled-chunk centre error: %.6f m\n", scaled);
+    EXPECT_LT(scaled, 0.001);
+}
+
 TEST(Commands, SetSensorAntennaUndoes) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("chunk");
