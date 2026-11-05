@@ -41,6 +41,22 @@ class MarkerSheetTest(unittest.TestCase):
             with open(path, "rb") as handle:
                 self.assertTrue(handle.read(8) == b"%PDF-1.4")
 
+    def test_png_extension_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "sheet.PNG")
+            alphashape.make_marker_sheet(path, "apriltag36h11", count=1)
+            with open(path, "rb") as handle:
+                signature = handle.read(8)
+            self.assertEqual(signature, b"\x89PNG\r\n\x1a\n")
+
+    def test_rejects_multi_page_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "many.png")
+            with self.assertRaises(alphashape.ValueError):
+                alphashape.make_marker_sheet(
+                    path, "apriltag36h11", count=100
+                )
+
     def test_rejects_code_range(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "bad.pdf")

@@ -12,11 +12,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "base/io/pdf.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/calibration/board_detector.hpp"
 #include "common/algorithm/markers/apriltag_decoder.hpp"
@@ -36,13 +38,14 @@ std::string pdf_text(const std::vector<std::uint8_t>& bytes) {
 }
 
 double mediabox_number(const std::string& pdf, int index) {
-    const std::string key = "/MediaBox [0 0 ";
+    const std::string key = "/MediaBox [";
     const std::size_t start = pdf.find(key);
     if (start == std::string::npos) {
         return -1.0;
     }
     std::size_t position = start + key.size();
-    for (int i = 0; i < index; ++i) {
+    // Skip the two lower-left coordinates, then `index` more fields.
+    for (int i = 0; i < 2 + index; ++i) {
         position = pdf.find(' ', position) + 1U;
     }
     return std::stod(pdf.substr(position));
@@ -338,6 +341,170 @@ TEST(MarkerSheet, ChessboardTooLargeForPaperThrows) {
     options.board_rows = 6;
     options.square_mm = 100.0;
     EXPECT_THROW(marker_sheet_pdf(options), ValueError);
+}
+
+TEST(MarkerSheet, AprilTagBlackExtentIsSizeMm) {
+    SheetOptions options = coded(SheetTarget::AprilTag36h11, 1);
+    options.labels = false;
+    const double dpi = 300.0;
+    const Image sheet = raster(options, dpi);
+    // The single tag sits in the first grid cell, so locate its dark bounding
+    // box first and scan through the middle of that box.
+    int min_x = sheet.width();
+    int max_x = -1;
+    int min_y = sheet.height();
+    int max_y = -1;
+    for (int y = 0; y < sheet.height(); ++y) {
+        for (int x = 0; x < sheet.width(); ++x) {
+            if (sheet.at(x, y, 0) < 128) {
+                min_x = std::min(min_x, x);
+                max_x = std::max(max_x, x);
+                min_y = std::min(min_y, y);
+                max_y = std::max(max_y, y);
+            }
+        }
+    }
+    ASSERT_GE(max_x, 0);
+    const int mid_x = (min_x + max_x) / 2;
+    const int mid_y = (min_y + max_y) / 2;
+    const double threshold = 127.5;
+    auto horizontal = [&](bool left) -> double {
+        const int step = left ? 1 : -1;
+        int x = left ? 1 : sheet.width() - 2;
+        const int stop = left ? sheet.width() : -1;
+        while (x != stop) {
+            const double current =
+                static_cast<double>(sheet.at(x, mid_y, 0));
+            const double previous =
+                static_cast<double>(sheet.at(x - step, mid_y, 0));
+            if (current <= threshold && previous > threshold) {
+                const double fraction =
+                    (previous - threshold) / (previous - current);
+                return static_cast<double>(x - step) +
+                       static_cast<double>(step) * fraction;
+            }
+            x += step;
+        }
+        return left ? 0.0 : static_cast<double>(sheet.width());
+    };
+    auto vertical = [&](bool top) -> double {
+        const int step = top ? 1 : -1;
+        int y = top ? 1 : sheet.height() - 2;
+        const int stop = top ? sheet.height() : -1;
+        while (y != stop) {
+            const double current =
+                static_cast<double>(sheet.at(mid_x, y, 0));
+            const double previous =
+                static_cast<double>(sheet.at(mid_x, y - step, 0));
+            if (current <= threshold && previous > threshold) {
+                const double fraction =
+                    (previous - threshold) / (previous - current);
+                return static_cast<double>(y - step) +
+                       static_cast<double>(step) * fraction;
+            }
+            y += step;
+        }
+        return top ? 0.0 : static_cast<double>(sheet.height());
+    };
+    const double width_mm =
+        (horizontal(false) - horizontal(true)) * 25.4 / dpi;
+    const double height_mm =
+        (vertical(false) - vertical(true)) * 25.4 / dpi;
+    EXPECT_NEAR(width_mm, 25.0, 0.1);
+    EXPECT_NEAR(height_mm, 25.0, 0.1);
+}
+
+TEST(MarkerSheet, RejectsOverflowingFirstCode) {
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.first_code = std::numeric_limits<int>::max();
+    options.count = 1;
+    EXPECT_THROW(marker_sheet_pdf(options), ValueError);
+}
+
+TEST(MarkerSheet, RejectsExcessiveDpi) {
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.count = 1;
+    EXPECT_THROW(marker_sheet_raster(options, 1.0e6), ValueError);
+    EXPECT_THROW(marker_sheet_raster(options, 2401.0), ValueError);
+}
+
+TEST(MarkerSheet, CountZeroFillsAvailableCodes) {
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.first_code = 1;
+    options.count = 0;
+    EXPECT_EQ(marker_sheet_page_count(options), 1);
+    const std::string text = pdf_text(marker_sheet_pdf(options));
+    EXPECT_NE(text.find("(25) Tj"), std::string::npos);
+    EXPECT_EQ(text.find("(26) Tj"), std::string::npos);
+}
+
+TEST(MarkerSheet, CountBeyondCapacityPaginates) {
+    SheetOptions options;
+    options.target = SheetTarget::AprilTag36h11;
+    options.first_code = 1;
+    options.corner_marks = false;
+    options.labels = false;
+    const int available = sheet_target_code_count(options.target);
+    int capacity = 0;
+    for (int count = 1; count < available; ++count) {
+        options.count = count;
+        if (marker_sheet_page_count(options) == 2) {
+            capacity = count - 1;
+            break;
+        }
+    }
+    ASSERT_GT(capacity, 0);
+    options.count = capacity + 1;
+    EXPECT_EQ(marker_sheet_page_count(options), 2);
+    const std::string text = pdf_text(marker_sheet_pdf(options));
+    const auto occurrences = [&](const std::string& needle) {
+        std::size_t total = 0;
+        std::size_t at = 0;
+        while ((at = text.find(needle, at)) != std::string::npos) {
+            ++total;
+            at += needle.size();
+        }
+        return total;
+    };
+    const std::size_t pages =
+        occurrences("/Type /Page") - occurrences("/Type /Pages");
+    EXPECT_EQ(pages, 2U);
+}
+
+TEST(MarkerSheet, ChessboardRotatedToFit) {
+    SheetOptions options;
+    options.target = SheetTarget::Chessboard;
+    options.board_cols = 12;
+    options.board_rows = 8;
+    options.square_mm = 20.0;
+    options.corner_marks = false;
+    const double dpi = 200.0;
+    const Image sheet = raster(options, dpi);
+    const FloatImage gray = to_float_image(sheet);
+    BoardSpec spec;
+    spec.cols = options.board_cols - 1;
+    spec.rows = options.board_rows - 1;
+    spec.square_size_m = options.square_mm / 1000.0;
+    const std::optional<BoardView> view = detect_board(gray, spec);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_TRUE(view->complete);
+    EXPECT_EQ(view->corners.size(),
+              static_cast<std::size_t>(spec.cols * spec.rows));
+}
+
+TEST(MarkerSheet, PdfNumbersAreLocaleIndependent) {
+    PdfDocument pdf;
+    pdf.add_page(100.0, 100.0);
+    pdf.text(-0.00004, 12.5, 6.0, "a");
+    pdf.text(-3.25, 1000000.0, 6.0, "b");
+    const std::string text = pdf_text(pdf.bytes());
+    EXPECT_NE(text.find("-0.0000"), std::string::npos);
+    EXPECT_NE(text.find("12.5000"), std::string::npos);
+    EXPECT_NE(text.find("-3.2500"), std::string::npos);
+    EXPECT_NE(text.find("1000000.0000"), std::string::npos);
 }
 
 }  // namespace
