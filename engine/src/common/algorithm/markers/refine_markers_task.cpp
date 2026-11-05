@@ -60,6 +60,15 @@ bool contains(const std::vector<std::string>& list, const std::string& value) {
     return std::find(list.begin(), list.end(), value) != list.end();
 }
 
+/// True for the coded circular target families. Their even ids print a white
+/// centre, so their bright enclosed interior is the only parity-0 seed.
+bool is_circular_coded_target_type(const std::string& type) {
+    return type == "Circular12" || type == "Circular14" ||
+           type == "Circular16" || type == "Circular20" ||
+           type == "CircularTarget12bit" || type == "CircularTarget14bit" ||
+           type == "CircularTarget16bit" || type == "CircularTarget20bit";
+}
+
 const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
     for (const auto& workspace : document.workspaces()) {
         if (!workspace) {
@@ -353,22 +362,23 @@ struct BlobSeed {
     /// True when the seed came from the light-on-dark pass, i.e. the target
     /// has no centre dot and its centre must be taken from the outer border.
     bool light_centre = false;
+    /// True when the light branch's outer-border fit succeeded, as opposed to
+    /// falling back to the interior blob centre.
+    bool border_fitted = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
 /// The blob's scale supplies the physical radius; the ellipse refit supplies a
 /// seed for the 2-D fallback. A cross has no blob, so this returns nullopt and
 /// the caller falls back to patch_size / 4.
-std::optional<BlobSeed> circular_seed(const CameraView& view,
-                                      const Eigen::Vector2d& pixel, int patch_size) {
+std::optional<BlobSeed> circular_seed_window(const CameraView& view,
+                                             const Eigen::Vector2d& pixel,
+                                             int half, double expected_px,
+                                             bool coded_circular) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
     }
-    // Wide enough to hold the whole printed target, so the outer-border fit
-    // below sees the full outline. The blob nearest the expected centre is
-    // unaffected by the larger search area: a farther blob is never preferred.
-    const int half = std::max(48, patch_size);
     const double max_x =
         static_cast<double>(std::max(0, view.image.width() - 1));
     const double max_y =
@@ -397,7 +407,12 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     BlobParams params;
     params.dark_on_light = true;
     params.min_radius = 2;
-    params.max_radius = std::max(4, half);
+    // A large apparent target needs a larger blob scale, or its disc is
+    // silently clipped and the border fit falls back to the biased interior.
+    params.max_radius =
+        std::max(4, expected_px > 0.0
+                        ? static_cast<int>(std::ceil(1.2 * expected_px))
+                        : half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
     const std::vector<MarkerCandidate> dark_blobs = detect_blobs(crop, params);
@@ -408,7 +423,11 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     // it, a parity-0 interior is centred on it, while sector wedges (dark or
     // light) are half a radius away and must not be seeded.
     params.dark_on_light = false;
-    const std::vector<MarkerCandidate> light_blobs = detect_blobs(crop, params);
+    // Only a coded circular target has the bright enclosed interior this
+    // pass responds to. Crosses and other kinds keep the dark-blob path.
+    const std::vector<MarkerCandidate> light_blobs =
+        coded_circular ? detect_blobs(crop, params)
+                       : std::vector<MarkerCandidate>{};
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
                                index.y() - static_cast<double>(y0) + 0.5);
     const double anchor_gate = std::max(4.0, 0.15 * static_cast<double>(half));
@@ -428,8 +447,31 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
             dot_y >= crop.height()) {
             return false;
         }
+        // Average a small disc rather than one pixel: a 2 px speck or noise
+        // spike at the nominal centre must not masquerade as the dot.
+        const int sample_radius =
+            std::max(1, static_cast<int>(std::lround(0.3 * blob.radius_px)));
+        double centre_sum = 0.0;
+        int centre_count = 0;
+        for (int dy = -sample_radius; dy <= sample_radius; ++dy) {
+            for (int dx = -sample_radius; dx <= sample_radius; ++dx) {
+                if (dx * dx + dy * dy > sample_radius * sample_radius) {
+                    continue;
+                }
+                const int x = dot_x + dx;
+                const int y = dot_y + dy;
+                if (x < 0 || y < 0 || x >= crop.width() || y >= crop.height()) {
+                    continue;
+                }
+                centre_sum += static_cast<double>(crop.at(x, y));
+                ++centre_count;
+            }
+        }
+        if (centre_count == 0) {
+            return false;
+        }
         const double centre_value =
-            static_cast<double>(crop.at(dot_x, dot_y));
+            centre_sum / static_cast<double>(centre_count);
         const double ring_radius = 1.5 * blob.radius_px;
         double sum = 0.0;
         int count = 0;
@@ -450,14 +492,19 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                centre_value + 0.08 < sum / static_cast<double>(count);
     };
     const MarkerCandidate* dot = nullptr;
+    double dot_distance = anchor_gate;
     for (const MarkerCandidate& blob : dark_blobs) {
-        if ((blob.center - seed).norm() > anchor_gate ||
-            !looks_like_dot(blob)) {
+        // A printed centre dot is several pixels across; a smaller dark speck
+        // is sensor noise, not the fiducial.
+        if (blob.radius_px < 3.0) {
             continue;
         }
-        if (dot == nullptr || blob.radius_px < dot->radius_px) {
-            dot = &blob;
+        const double distance = (blob.center - seed).norm();
+        if (distance > dot_distance || !looks_like_dot(blob)) {
+            continue;
         }
+        dot = &blob;
+        dot_distance = distance;
     }
     BlobSeed out;
     Eigen::Vector2d centre = seed;
@@ -470,7 +517,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
         if (const auto fitted = refine_ellipse_center(crop, *dot)) {
             centre = *fitted;
         }
-    } else {
+    } else if (coded_circular) {
         // Parity 0: take the largest light blob anchored on the expected
         // pixel (the interior disc) and fit the target's outer border from
         // that pixel. The border is a complete concentric outline, while a
@@ -498,6 +545,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
                     radius = fitted_radius;
+                    out.border_fitted = true;
                 } else {
                     centre = light->center;
                 }
@@ -526,12 +574,71 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                 centre = *fitted;
             }
         }
+    } else {
+        // Non-circular target: keep the original dark-blob path.
+        const MarkerCandidate* nearest = nullptr;
+        double best_distance = static_cast<double>(half) * 0.75;
+        for (const MarkerCandidate& blob : dark_blobs) {
+            const double distance = (blob.center - seed).norm();
+            if (distance <= best_distance) {
+                best_distance = distance;
+                nearest = &blob;
+            }
+        }
+        if (nearest == nullptr) {
+            return std::nullopt;
+        }
+        centre = nearest->center;
+        radius = nearest->radius_px;
+        if (const auto fitted = refine_ellipse_center(crop, *nearest)) {
+            centre = *fitted;
+        }
     }
     out.pixel = (centre + Eigen::Vector2d(static_cast<double>(x0),
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
     return out;
+}
+
+/// Locate the circular target around `pixel` in the (possibly reduced) image.
+/// The crop and blob scale follow the expected apparent radius when the caller
+/// knows it. Without one, a failed outer-border fit is retried once in a
+/// window twice as wide, because a border larger than the initial 48 px half
+/// would otherwise be clipped.
+std::optional<BlobSeed> circular_seed(const CameraView& view,
+                                      const Eigen::Vector2d& pixel,
+                                      int patch_size, double expected_radius,
+                                      bool coded_circular) {
+    const double ds = static_cast<double>(std::max(1, view.downscale));
+    const double expected_px =
+        expected_radius > 0.0 ? expected_radius / ds : 0.0;
+    const int extent = std::min(view.image.width(), view.image.height());
+    const int max_half = std::max(1, extent / 2);
+    int half = std::max(48, patch_size);
+    if (expected_px > 0.0) {
+        half = std::max(half,
+                        static_cast<int>(std::ceil(1.5 * expected_px)));
+    }
+    half = std::min(half, max_half);
+    auto seed =
+        circular_seed_window(view, pixel, half, expected_px, coded_circular);
+    // A missing seed can mean the interior blob was clipped by the scale cap,
+    // and a light seed without a border fit can mean the outline was clipped.
+    // One doubled window covers both without unbounded cost.
+    const bool needs_retry =
+        coded_circular &&
+        (!seed || (seed->light_centre && !seed->border_fitted));
+    if (needs_retry && half < max_half) {
+        const int wider = std::min(2 * half, max_half);
+        if (auto retried = circular_seed_window(view, pixel, wider, expected_px,
+                                                coded_circular)) {
+            if (!seed || retried->border_fitted) {
+                return retried;
+            }
+        }
+    }
+    return seed;
 }
 
 /// Radius of a detected cross near `pixel`, in full-resolution pixels. A cross
@@ -986,6 +1093,9 @@ struct BlendView {
     /// True when the scale is a blob radius. A cross-extent scale is real but
     /// carries no blob, so the refiners keep the tighter movement guard.
     bool blob_scale = false;
+    /// True when the marker is a coded circular target, the only kind whose
+    /// even parity has an enclosed bright interior to seed from.
+    bool coded_circular = true;
     double depth = 1.0;
 };
 
@@ -1243,8 +1353,9 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
         projected_centres[index] = *projected;
         const double limit = refinement_limit(blend);
-        const auto seed =
-            circular_seed(*blend.view, *projected, options.patch_size);
+        const auto seed = circular_seed(*blend.view, *projected,
+                                        options.patch_size, blend.apparent,
+                                        blend.coded_circular);
         const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
                                               options.patch_size, limit);
         anchored[index] = refined ? *refined : *projected;
@@ -1340,7 +1451,8 @@ double median(std::vector<double> values) {
 /// a sample count, never a pixel scale.
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
-        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size);
+        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
+                                   blend.coded_circular);
         if (blend.seed && std::isfinite(blend.seed->radius) &&
             blend.seed->radius > 0.0) {
             blend.apparent = std::max(1.0, blend.seed->radius);
@@ -1915,6 +2027,13 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     for (const std::size_t slot : order) {
         cache.make_room(marker_bytes[slot]);
         const Marker& marker = chunk->markers()[selected[slot]];
+        // A recorded target kind decides whether the even-parity light path
+        // is applicable. Without one (user-placed markers) keep the previous
+        // behaviour, which infers the seed from whatever blobs are present.
+        const std::string* target_kind = marker.meta.find("target_type");
+        const bool coded_circular =
+            target_kind == nullptr ||
+            is_circular_coded_target_type(*target_kind);
         std::vector<std::shared_ptr<CameraView>> held;
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
@@ -1935,6 +2054,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             BlendView blend;
             blend.view = held.back().get();
             blend.pixel = projection.pixel;
+            blend.coded_circular = coded_circular;
             blends.push_back(blend);
         }
         try {

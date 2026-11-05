@@ -1178,10 +1178,14 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
     if (!commands.empty()) {
         auto transaction =
             std::make_unique<CommandTransaction>("Detect Markers");
+        // Record the target kind on newly created markers: refinement uses it
+        // to decide whether the even-parity light-seed path applies.
+        Meta marker_meta;
+        marker_meta.set("target_type", options.target_type);
         for (const Assignment& assignment : commands) {
             transaction->add(make_add_marker_with_projection_command(
                 chunk->id(), assignment.label, assignment.camera_id,
-                assignment.pixel, false));
+                assignment.pixel, false, marker_meta));
         }
         plan.command = std::move(transaction);
     }

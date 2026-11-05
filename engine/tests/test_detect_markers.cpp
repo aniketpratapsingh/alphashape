@@ -618,6 +618,65 @@ TEST(Markers, DetectsEvenCodes) {
     }
 }
 
+TEST(Markers, DetectsEvenCodeAt300Dpi) {
+    // A non-default print scale: 300 dpi puts the 25 mm target at roughly
+    // 148 px radius, well beyond the 200 dpi path every other sheet test uses.
+    const double dpi = 300.0;
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.first_code = 4;  // even id, so the white interior seeds it
+    options.count = 1;
+    options.corner_marks = false;
+    const Image sheet = marker_sheet_raster(options, dpi, 0);
+    const std::vector<Marker> markers =
+        detect_markers(sheet_to_gray(sheet), "Circular12");
+    ASSERT_EQ(markers.size(), 1U);
+    EXPECT_EQ(code_from_label(markers[0].label), 4);
+    ASSERT_EQ(markers[0].projections.size(), 1U);
+    const Eigen::Vector2d expected = sheet_cell_centre(4, 4, dpi);
+    const double error = (markers[0].projections[0].pixel - expected).norm();
+    std::printf("[300dpi even] code 4 error %.4f px\n", error);
+    EXPECT_LT(error, 0.5);
+}
+
+TEST(Markers, NoFalseIdsOnStructuredBrightSpots) {
+    // A dark field with bright discs and small specular spots: the
+    // light-on-dark pass sees all of them, but none carries a code ring, so
+    // the detector must report nothing.
+    const int width = 480;
+    const int height = 360;
+    FloatImage image(width, height, 0.06F);
+    struct Spot {
+        double x;
+        double y;
+        double radius;
+    };
+    const Spot spots[] = {{70.0, 80.0, 22.0},  {200.0, 120.0, 40.0},
+                          {360.0, 90.0, 6.0},  {120.0, 260.0, 55.0},
+                          {380.0, 280.0, 12.0}};
+    for (const Spot& spot : spots) {
+        const int x0 = std::max(
+            0, static_cast<int>(std::floor(spot.x - spot.radius)));
+        const int x1 = std::min(
+            width - 1, static_cast<int>(std::ceil(spot.x + spot.radius)));
+        const int y0 = std::max(
+            0, static_cast<int>(std::floor(spot.y - spot.radius)));
+        const int y1 = std::min(
+            height - 1, static_cast<int>(std::ceil(spot.y + spot.radius)));
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const double dx = static_cast<double>(x) - spot.x;
+                const double dy = static_cast<double>(y) - spot.y;
+                if (dx * dx + dy * dy <= spot.radius * spot.radius) {
+                    image.at(x, y) = 0.97F;
+                }
+            }
+        }
+    }
+    const std::vector<Marker> markers = detect_markers(image, "Circular12");
+    EXPECT_TRUE(markers.empty()) << markers.size();
+}
+
 TEST(Markers, NoDuplicateDetections) {
     // Odd ids are seeded twice now: once from the dark centre dot and once
     // from the light interior at a coarse scale. Each id must still be
