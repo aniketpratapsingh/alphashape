@@ -42,6 +42,22 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **WP-11.8: frames, camera groups and stations, camera selection and frame
+  statistics.** `AddPhotos` gains `group_by_folder` (one folder-typed camera
+  group per source directory, labelled with the directory name), `recursive`
+  (a directory entry imports the images below it, sorted, image extensions
+  only) and `substitute` (ordered `old=new` pairs applied to imported camera
+  labels); every existing default is unchanged. `group_cameras(chunk, type)`
+  rebuilds the grouping by sensor station (serial when present, otherwise
+  make + model), by the frame's parent directory, or clears it with `none`;
+  the bulk edit is an undoable command and `Chunk.group_cameras(group_type)`
+  exposes it in Python. `Camera::selected` now persists as the optional
+  `selected` attribute, so files without it load every camera as unselected.
+  `Chunk.frame_stats()` / `compute_frame_stats()` reports the enabled camera
+  centre bounding box (local and, on a georeferenced chunk, world), the median
+  nearest-neighbour distance times two as the mean capture distance, and the
+  camera, enabled, aligned, frame and group counts.
+
 - **WP-13.9: `RefineMarkers`, multi-view consensus refinement.**
   The decision unit is the marker, not an individual patch: the task
   triangulates the marker from its projections (DLT + Gauss-Newton), fits the
