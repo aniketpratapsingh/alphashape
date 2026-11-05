@@ -859,6 +859,20 @@ void check_film_settings(const FilmSettings& film) {
         }
         labels.push_back(fiducial.label);
     }
+    // The normalised-image geometry (WP-13.18b) is either unset or usable.
+    if (!std::isfinite(film.resolution_mm_per_px) ||
+        film.resolution_mm_per_px < 0.0) {
+        throw ValueError(
+            "set sensor film: resolution must be finite and non-negative");
+    }
+    const Eigen::Vector2d& size = film.film_size_mm;
+    if (!size.allFinite() || size.x() < 0.0 || size.y() < 0.0) {
+        throw ValueError(
+            "set sensor film: film size must be finite and non-negative");
+    }
+    if ((size.x() > 0.0) != (size.y() > 0.0)) {
+        throw ValueError("set sensor film: film size needs both axes");
+    }
 }
 
 class SetSensorFilmCommand : public StagedMutation {

@@ -145,6 +145,9 @@ bool calibrate_one_sensor(const Chunk& chunk, Chunk& staged, std::size_t sensor_
     FilmSettings film = sensor.film;
     film.fiducials = derive_film_layout(sensor.film.fiducials, pixels,
                                         options.resolution_mm_per_px);
+    // The canonical film frame every pipeline stage runs in (WP-13.18b). The
+    // chunk meta below keeps its historical copy for compatibility.
+    film.resolution_mm_per_px = options.resolution_mm_per_px;
     staged.sensors()[sensor_index].film = film;
     refit_camera_transforms(staged, static_cast<std::int32_t>(sensor_index), film);
     const std::string prefix =

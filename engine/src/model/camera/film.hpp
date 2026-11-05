@@ -52,11 +52,25 @@ struct FilmSettings {
     bool search_sides = false;
     std::vector<Fiducial> fiducials;
 
+    /// Millimetres per pixel of the film-normalised image, the canonical frame
+    /// every pipeline stage runs in (WP-13.18b). Zero means "not yet known":
+    /// CalibrateFiducials fills it from the reference scan. No resolution means
+    /// no resampling is possible.
+    double resolution_mm_per_px = 0.0;
+
+    /// Extent of the film-normalised image in millimetres (x right, y up),
+    /// centred on the film origin. Zero means "derive it from the fiducial
+    /// layout's bounding box"; a stored value lets a scan expose more film than
+    /// the marks enclose.
+    Eigen::Vector2d film_size_mm = Eigen::Vector2d::Zero();
+
     bool operator==(const FilmSettings& other) const {
         return enabled == other.enabled && transform == other.transform &&
                detector == other.detector &&
                search_corners == other.search_corners &&
-               search_sides == other.search_sides && fiducials == other.fiducials;
+               search_sides == other.search_sides &&
+               resolution_mm_per_px == other.resolution_mm_per_px &&
+               film_size_mm == other.film_size_mm && fiducials == other.fiducials;
     }
 };
 

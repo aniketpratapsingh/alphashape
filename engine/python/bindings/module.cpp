@@ -976,6 +976,19 @@ PYBIND11_MODULE(alphashape, m) {
         // Film fiducial layout (WP-13.18a).
         .def_property_readonly("film_enabled",
                                [](const alphashape::Sensor& s) { return s.film.enabled; })
+        // Normalised film frame (WP-13.18b): millimetres per pixel, 0 when
+        // CalibrateFiducials has not run yet.
+        .def_property_readonly("film_resolution_mm_per_px",
+                               [](const alphashape::Sensor& s) {
+                                   return s.film.resolution_mm_per_px;
+                               })
+        // (size_x_mm, size_y_mm); (0, 0) means "derive from the fiducials".
+        .def_property_readonly("film_size_mm", [](const alphashape::Sensor& s) {
+            py::list out;
+            out.append(s.film.film_size_mm.x());
+            out.append(s.film.film_size_mm.y());
+            return out;
+        })
         // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
         .def_property_readonly("fiducials", [](const alphashape::Sensor& s) {
             py::list out;
@@ -1569,9 +1582,24 @@ PYBIND11_MODULE(alphashape, m) {
             [](py::object self, std::int32_t sensor_index, bool enabled,
                const std::vector<std::tuple<std::string, double, double>>& fiducials,
                const std::string& transform, const std::string& detector,
-               bool corners, bool sides) {
+               bool corners, bool sides, double resolution_mm_per_px,
+               std::optional<std::pair<double, double>> film_size_mm) {
                 alphashape::FilmSettings film;
                 film.enabled = enabled;
+                if (!(resolution_mm_per_px >= 0.0)) {
+                    throw alphashape::ValueError(
+                        "set_sensor_film: resolution must be non-negative");
+                }
+                film.resolution_mm_per_px = resolution_mm_per_px;
+                if (film_size_mm.has_value()) {
+                    film.film_size_mm =
+                        Eigen::Vector2d(film_size_mm->first, film_size_mm->second);
+                    if (!(film.film_size_mm.x() >= 0.0) ||
+                        !(film.film_size_mm.y() >= 0.0)) {
+                        throw alphashape::ValueError(
+                            "set_sensor_film: film size must be non-negative");
+                    }
+                }
                 if (transform == "affine") {
                     film.transform = alphashape::FilmTransformType::Affine;
                 } else if (transform == "projective") {
@@ -1608,6 +1636,8 @@ PYBIND11_MODULE(alphashape, m) {
             py::arg("sensor_index"), py::arg("enabled"), py::arg("fiducials"),
             py::arg("transform") = "affine", py::arg("detector") = "circle",
             py::arg("corners") = true, py::arg("sides") = false,
+            py::arg("resolution_mm_per_px") = 0.0,
+            py::arg("film_size_mm") = py::none(),
             "Replace a sensor's film fiducial layout (undoable in the GUI).")
         // Set the GNSS antenna mount (undoable in the GUI).
         .def(
