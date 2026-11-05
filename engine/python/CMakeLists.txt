@@ -133,6 +133,10 @@ alphashape_add_python_test(python_update_transform
 alphashape_add_python_test(python_crs ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_crs.py
     TIMEOUT 600)
 
+# WP-13.16: Calibration JSON save/load through the Python surface.
+alphashape_add_python_test(python_calibration_io
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_calibration_io.py)
+
 # The CLI end-to-end check needs the built CLI; guard on the option so a
 # Python-only configure still works.
 if(ALPHASHAPE_BUILD_CLI)
