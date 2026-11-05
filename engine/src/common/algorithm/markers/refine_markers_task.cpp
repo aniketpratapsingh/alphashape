@@ -409,9 +409,11 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
     params.min_radius = 2;
     // A large apparent target needs a larger blob scale, or its disc is
     // silently clipped and the border fit falls back to the biased interior.
+    // `expected_px` can be the interior radius, which is as small as 0.5 R,
+    // so allow the full interior and the outer border on top of it.
     params.max_radius =
         std::max(4, expected_px > 0.0
-                        ? static_cast<int>(std::ceil(1.2 * expected_px))
+                        ? static_cast<int>(std::ceil(2.0 * expected_px))
                         : half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
@@ -540,8 +542,11 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 // is not a plausible multiple of the interior scale; that is
                 // what a neighbouring target's outline looks like.
                 const double moved = (*fitted - seed).norm();
+                // The border is at most 2.0x the interior radius by design;
+                // a small margin absorbs the blob radius measured inside the
+                // 0.5 R sector edge.
                 if (fitted_radius >= 0.8 * light->radius_px &&
-                    fitted_radius <= 2.0 * light->radius_px &&
+                    fitted_radius <= 2.2 * light->radius_px &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
                     radius = fitted_radius;
@@ -618,8 +623,10 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     const int max_half = std::max(1, extent / 2);
     int half = std::max(48, patch_size);
     if (expected_px > 0.0) {
+        // An expected radius may be a light interior as small as 0.5 R, so
+        // the crop has to reach past the 2.0 R outer border.
         half = std::max(half,
-                        static_cast<int>(std::ceil(1.5 * expected_px)));
+                        static_cast<int>(std::ceil(2.2 * expected_px)));
     }
     half = std::min(half, max_half);
     auto seed =
