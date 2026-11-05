@@ -485,7 +485,12 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
         std::sqrt(raw_sum / static_cast<double>(chunk.cameras().size()));
 
     run_task_named(scene.document, "AlignFromReference");
-    run_task_named(scene.document, "TriangulateTiePoints");
+    // The deliberately coarse references leave poses tens of pixels off the
+    // keypoints, so the initial triangulation needs a wide gate; the refinement
+    // is what tightens it.
+    run_task_named(scene.document, "TriangulateTiePoints", [](Params& p) {
+        p.set("max_reprojection_error_px", 60.0);
+    });
     Params params = make_params(builtin_registry().require("OptimizeCameras"));
     for (const char* name :
          {"f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4"}) {
