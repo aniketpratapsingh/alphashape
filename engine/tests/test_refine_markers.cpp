@@ -553,8 +553,10 @@ TEST(Markers, RefineEvenCodeMarker) {
     // Parity-0 circular targets print a white centre, so the dark-dot blob
     // seed has nothing to find. The light-interior seed from the second pass
     // must carry the circular refiner instead.
+    // A single printed target keeps every camera's crop around it free of a
+    // neighbouring outline, so the parity-0 outer-border fit is unambiguous.
     SceneSpec spec;
-    spec.marker_count = 3;
+    spec.marker_count = 1;
     spec.even_code_target = 0;
     RefineScene scene = make_scene(spec, 171U);
     ASSERT_EQ(scene.targets[0].parity, 0);

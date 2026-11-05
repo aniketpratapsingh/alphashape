@@ -450,8 +450,18 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
             double fitted_radius = radius;
             if (const auto fitted =
                     refine_border_center(crop, seed, radius, &fitted_radius)) {
-                centre = *fitted;
-                radius = fitted_radius;
+                // Reject a fit that left the expected target or whose radius
+                // is not a plausible multiple of the interior scale; that is
+                // what a neighbouring target's outline looks like.
+                const double moved = (*fitted - seed).norm();
+                if (fitted_radius >= 0.8 * light->radius_px &&
+                    fitted_radius <= 2.0 * light->radius_px &&
+                    moved <= std::max(4.0, 0.3 * fitted_radius)) {
+                    centre = *fitted;
+                    radius = fitted_radius;
+                } else {
+                    centre = light->center;
+                }
             } else {
                 centre = light->center;
             }
