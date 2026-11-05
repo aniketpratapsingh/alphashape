@@ -95,7 +95,8 @@ std::vector<std::uint8_t> marker_sheet_pdf(const SheetOptions& options);
 
 /// Render one page as an 8-bit single-channel image. `dpi` is the print
 /// resolution; the page raster is `round(page_mm / 25.4 * dpi)` pixels.
-/// Throws ValueError for a non-positive dpi or an out-of-range page index.
+/// Throws ValueError for a non-positive dpi, a dpi above 2400, a raster page
+/// above 2^28 pixels, or an out-of-range page index.
 Image marker_sheet_raster(const SheetOptions& options, double dpi,
                           int page = 0);
 

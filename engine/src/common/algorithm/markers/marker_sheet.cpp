@@ -140,7 +140,12 @@ void add_circular_target(std::vector<Shape>& shapes, double cx, double cy,
                          double size_mm, int code, int bits) {
     const double outer = 0.5 * size_mm;
     const std::vector<std::uint32_t>& table = circular_codes(bits);
-    const std::uint32_t word = table[static_cast<std::size_t>(code / 2)];
+    if (code < 0 ||
+        static_cast<std::size_t>(code / 2) >= table.size()) {
+        throw ValueError("marker sheet: circular code is outside the family");
+    }
+    const std::uint32_t word =
+        table[static_cast<std::size_t>(code / 2)];
     if ((code % 2) != 0) {
         add_circle(shapes, cx, cy, 0.25 * outer);
     }
@@ -187,6 +192,10 @@ bool tag_cell_is_white(const TagFamily& family, std::uint64_t code, int gx,
 void add_april_target(std::vector<Shape>& shapes, double cx, double cy,
                       double size_mm, int code) {
     const TagFamily& family = tag_family(AprilTagFamily::Tag36h11);
+    if (code < 0 ||
+        static_cast<std::size_t>(code) >= family.codes.size()) {
+        throw ValueError("marker sheet: tag code is outside the family");
+    }
     const int total = family.total_width;
     const int border = family.width_at_border;
     // `size_mm` is the black border's outer extent, the standard tag-size
@@ -270,11 +279,18 @@ int circular_bits(SheetTarget target) {
 PageSetup make_setup(const SheetOptions& options) {
     PageSetup setup;
     setup.options = options;
-    if (!(options.target_size_mm > 0.0)) {
-        throw ValueError("marker sheet: target size must be positive");
+    if (!(options.target_size_mm > 0.0) ||
+        !std::isfinite(options.target_size_mm)) {
+        throw ValueError(
+            "marker sheet: target size must be positive and finite");
     }
-    if (!(options.quiet_zone_mm >= 0.0)) {
-        throw ValueError("marker sheet: quiet zone must not be negative");
+    if (!(options.quiet_zone_mm >= 0.0) ||
+        !std::isfinite(options.quiet_zone_mm)) {
+        throw ValueError(
+            "marker sheet: quiet zone must be non-negative and finite");
+    }
+    if (options.count < 0) {
+        throw ValueError("marker sheet: count must not be negative");
     }
     setup.paper = paper_size(options.paper);
     const double printable_w = setup.paper.width_mm - 2.0 * kPrintableMarginMm;
@@ -286,8 +302,10 @@ PageSetup make_setup(const SheetOptions& options) {
                 "marker sheet: a chessboard needs at least 3x3 squares "
                 "(2x2 inner corners)");
         }
-        if (!(options.square_mm > 0.0)) {
-            throw ValueError("marker sheet: square size must be positive");
+        if (!(options.square_mm > 0.0) ||
+            !std::isfinite(options.square_mm)) {
+            throw ValueError(
+                "marker sheet: square size must be positive and finite");
         }
         const double board_w =
             static_cast<double>(options.board_cols) * options.square_mm;
@@ -319,42 +337,68 @@ PageSetup make_setup(const SheetOptions& options) {
         setup.pages = 1;
         return setup;
     }
-    if (options.count < 0) {
-        throw ValueError("marker sheet: count must not be negative");
-    }
     setup.bits = circular_bits(options.target);
     setup.cell_width_mm =
         options.target_size_mm + 2.0 * options.quiet_zone_mm;
     setup.cell_height_mm = setup.cell_width_mm;
-    setup.cols = std::max(
-        0, static_cast<int>(std::floor(printable_w / setup.cell_width_mm)));
-    setup.rows = std::max(
-        0, static_cast<int>(std::floor(printable_h / setup.cell_height_mm)));
-    if (setup.cols < 1 || setup.rows < 1) {
+    const double columns = std::floor(printable_w / setup.cell_width_mm);
+    const double rows = std::floor(printable_h / setup.cell_height_mm);
+    if (!(columns >= 1.0) || !(rows >= 1.0)) {
         throw ValueError(
             "marker sheet: target and quiet zone do not fit the selected "
             "paper");
     }
+    // Bound the cell count before the double-to-int casts: a pathological
+    // target size would otherwise overflow the int conversion or allocate an
+    // enormous shape list.
+    constexpr double kMaxCellsPerSide = 1000.0;
+    if (columns > kMaxCellsPerSide || rows > kMaxCellsPerSide ||
+        columns * rows > 10000.0) {
+        throw ValueError("marker sheet: target size yields too many cells");
+    }
+    setup.cols = static_cast<int>(columns);
+    setup.rows = static_cast<int>(rows);
     setup.capacity = setup.cols * setup.rows;
     const double grid_w = static_cast<double>(setup.cols) * setup.cell_width_mm;
     const double grid_h = static_cast<double>(setup.rows) * setup.cell_height_mm;
     setup.grid_x_mm = kPrintableMarginMm + 0.5 * (printable_w - grid_w);
     setup.grid_y_mm = kPrintableMarginMm + 0.5 * (printable_h - grid_h);
-    const int requested =
-        options.count == 0 ? setup.capacity : options.count;
-    if (options.count == 0 && requested < 1) {
-        throw ValueError("marker sheet: no cell fits the selected paper");
-    }
+    // Range and pagination arithmetic is done in 64 bits: `first_code` is an
+    // int supplied by the caller, so `first_code + requested` and the page
+    // count can overflow int for extreme inputs.
+    const std::int64_t capacity =
+        static_cast<std::int64_t>(setup.capacity);
+    std::int64_t requested = 0;
     if (setup.coded()) {
-        const int available = sheet_target_code_count(options.target);
-        if (options.first_code < 0 ||
-            options.first_code + requested > available) {
+        const std::int64_t available = static_cast<std::int64_t>(
+            sheet_target_code_count(options.target));
+        const std::int64_t first =
+            static_cast<std::int64_t>(options.first_code);
+        if (first < 0 || first >= available) {
             throw ValueError(
                 "marker sheet: code range lies outside the target family");
         }
+        requested = options.count == 0
+                        ? std::min(capacity, available - first)
+                        : static_cast<std::int64_t>(options.count);
+        if (requested < 1 || requested > available - first) {
+            throw ValueError(
+                "marker sheet: code range lies outside the target family");
+        }
+    } else {
+        requested = options.count == 0
+                        ? capacity
+                        : static_cast<std::int64_t>(options.count);
+        if (requested < 1) {
+            throw ValueError("marker sheet: no cell fits the selected paper");
+        }
     }
-    setup.total_codes = requested;
-    setup.pages = (requested + setup.capacity - 1) / setup.capacity;
+    const std::int64_t pages = (requested + capacity - 1) / capacity;
+    if (pages > 1000) {
+        throw ValueError("marker sheet: sheet needs more than 1000 pages");
+    }
+    setup.total_codes = static_cast<int>(requested);
+    setup.pages = static_cast<int>(pages);
     return setup;
 }
 
@@ -375,6 +419,44 @@ void add_corner_marks(std::vector<Shape>& shapes, double x, double y, double w,
     // Bottom-right.
     add_rect(shapes, x + w - length, y + h - thickness, length, thickness);
     add_rect(shapes, x + w - thickness, y + h - length, thickness, length);
+}
+
+/// Locale-independent fixed-point number for PDF text. The token must use
+/// '.', never the LC_NUMERIC separator, so the conversion stays in integer
+/// arithmetic instead of the C library's floating-point formatting.
+std::string fixed_decimal(double value, std::uint64_t scale,
+                          std::size_t digits) {
+    const double scaled = value * static_cast<double>(scale);
+    if (!std::isfinite(scaled) || std::abs(scaled) > 9.0e15) {
+        throw ValueError("marker sheet: value is out of range");
+    }
+    const bool negative = std::signbit(value);
+    std::int64_t units = static_cast<std::int64_t>(std::llround(scaled));
+    if (units < 0) {
+        units = -units;
+    }
+    const std::uint64_t magnitude = static_cast<std::uint64_t>(units);
+    const std::uint64_t whole = magnitude / scale;
+    const std::uint64_t fraction = magnitude % scale;
+    char whole_text[24];
+    char* whole_end =
+        std::to_chars(whole_text, whole_text + sizeof whole_text, whole).ptr;
+    char fraction_text[24];
+    char* fraction_end =
+        std::to_chars(fraction_text, fraction_text + sizeof fraction_text,
+                      fraction)
+            .ptr;
+    std::string out;
+    if (negative) {
+        out.push_back('-');
+    }
+    out.append(whole_text, whole_end);
+    out.push_back('.');
+    const std::size_t length =
+        static_cast<std::size_t>(fraction_end - fraction_text);
+    out.append(digits - length, '0');
+    out.append(fraction_text, fraction_end);
+    return out;
 }
 
 std::string millimetres(double value) {
@@ -419,44 +501,6 @@ void add_chessboard(const PageSetup& setup, PageContent& content) {
                          setup.grid_x_mm + board_h - y - square,
                          setup.grid_y_mm + x, square, square);
             } else {
-/// Locale-independent fixed-point number for PDF text. The token must use
-/// '.', never the LC_NUMERIC separator, so the conversion stays in integer
-/// arithmetic instead of the C library's floating-point formatting.
-std::string fixed_decimal(double value, std::uint64_t scale,
-                          std::size_t digits) {
-    const double scaled = value * static_cast<double>(scale);
-    if (!std::isfinite(scaled) || std::abs(scaled) > 9.0e15) {
-        throw ValueError("marker sheet: value is out of range");
-    }
-    const bool negative = std::signbit(value);
-    std::int64_t units = static_cast<std::int64_t>(std::llround(scaled));
-    if (units < 0) {
-        units = -units;
-    }
-    const std::uint64_t magnitude = static_cast<std::uint64_t>(units);
-    const std::uint64_t whole = magnitude / scale;
-    const std::uint64_t fraction = magnitude % scale;
-    char whole_text[24];
-    char* whole_end =
-        std::to_chars(whole_text, whole_text + sizeof whole_text, whole).ptr;
-    char fraction_text[24];
-    char* fraction_end =
-        std::to_chars(fraction_text, fraction_text + sizeof fraction_text,
-                      fraction)
-            .ptr;
-    std::string out;
-    if (negative) {
-        out.push_back('-');
-    }
-    out.append(whole_text, whole_end);
-    out.push_back('.');
-    const std::size_t length =
-        static_cast<std::size_t>(fraction_end - fraction_text);
-    out.append(digits - length, '0');
-    out.append(fraction_text, fraction_end);
-    return out;
-}
-
                 add_rect(content.shapes, setup.grid_x_mm + x,
                          setup.grid_y_mm + y, square, square);
             }
@@ -586,10 +630,17 @@ void shape_bounds(const Shape& shape, double& min_x, double& min_y,
 Image raster_page(const PageContent& content, const PaperSize& paper,
                   double dpi) {
     const double mm_per_px = 25.4 / dpi;
-    const int width = std::max(
-        1, static_cast<int>(std::lround(paper.width_mm / mm_per_px)));
-    const int height = std::max(
-        1, static_cast<int>(std::lround(paper.height_mm / mm_per_px)));
+    const double width_px = paper.width_mm / mm_per_px;
+    const double height_px = paper.height_mm / mm_per_px;
+    constexpr double kMaxRasterPixels = 268435456.0;  // 2^28
+    if (!std::isfinite(width_px) || !std::isfinite(height_px) ||
+        width_px > 1.0e6 || height_px > 1.0e6 ||
+        width_px * height_px > kMaxRasterPixels) {
+        throw ValueError(
+            "marker sheet: raster page would exceed the pixel limit");
+    }
+    const int width = std::max(1, static_cast<int>(std::lround(width_px)));
+    const int height = std::max(1, static_cast<int>(std::lround(height_px)));
     std::vector<std::uint16_t> mask(
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0U);
     const double step = 1.0 / static_cast<double>(kSupersample);
@@ -707,6 +758,10 @@ int sheet_target_code_count(SheetTarget target) {
     return 0;
 }
 
+int marker_sheet_page_count(const SheetOptions& options) {
+    return make_setup(options).pages;
+}
+
 std::vector<std::uint8_t> marker_sheet_pdf(const SheetOptions& options) {
     const PageSetup setup = make_setup(options);
     PdfDocument pdf;
@@ -719,8 +774,9 @@ std::vector<std::uint8_t> marker_sheet_pdf(const SheetOptions& options) {
 }
 
 Image marker_sheet_raster(const SheetOptions& options, double dpi, int page) {
-    if (!(dpi > 0.0) || !std::isfinite(dpi)) {
-        throw ValueError("marker sheet: dpi must be positive and finite");
+    if (!(dpi > 0.0) || !std::isfinite(dpi) || dpi > 2400.0) {
+        throw ValueError(
+            "marker sheet: dpi must be positive, finite, and at most 2400");
     }
     if (page < 0) {
         throw ValueError("marker sheet: page index must not be negative");
@@ -733,7 +789,3 @@ Image marker_sheet_raster(const SheetOptions& options, double dpi, int page) {
 }
 
 }  // namespace alphashape
-int marker_sheet_page_count(const SheetOptions& options) {
-    return make_setup(options).pages;
-}
-
