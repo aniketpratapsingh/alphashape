@@ -710,6 +710,17 @@ Calibration read_calibration(const XmlNode* node) {
         }
         c.*(field.member) = parse_double(require_attr(*node, field.name));
     }
+    // A non-finite coefficient can only be corruption. Width/height are NOT
+    // required to be positive here: a project may legitimately carry an
+    // uncalibrated sensor (a bare Sensor{} saved before any photo resolves its
+    // geometry), and the calibration-file formats enforce real geometry
+    // separately.
+    for (const CalibrationField& field : kCalibrationFields) {
+        if (!std::isfinite(c.*(field.member))) {
+            throw ProjectIOError(std::string("doc.xml: <calibration> ") + field.name +
+                                 " is not finite");
+        }
+    }
     if (const XmlNode* cov = find_child(*node, "covariance")) {
         const std::vector<std::string> params = split_strings(require_attr(*cov, "params"));
         if (params.empty()) {

@@ -285,4 +285,28 @@ Eigen::Vector3d Calibration::unproject(const Eigen::Vector2d& pixel) const {
     return ray.normalized();
 }
 
+void check_calibration_values(const Calibration& calibration, const std::string& context) {
+    const auto reject = [&context](const char* what) {
+        throw ValueError(context + ": " + what);
+    };
+    if (calibration.width <= 0) {
+        reject("image width must be positive");
+    }
+    if (calibration.height <= 0) {
+        reject("image height must be positive");
+    }
+    if (!std::isfinite(calibration.f) || calibration.f <= 0.0) {
+        reject("focal length must be finite and positive");
+    }
+    const double coefficients[] = {calibration.cx, calibration.cy, calibration.b1,
+                                   calibration.b2, calibration.k1, calibration.k2,
+                                   calibration.k3, calibration.k4, calibration.p1,
+                                   calibration.p2, calibration.p3, calibration.p4};
+    for (const double coefficient : coefficients) {
+        if (!std::isfinite(coefficient)) {
+            reject("distortion coefficients must be finite");
+        }
+    }
+}
+
 }  // namespace alphashape

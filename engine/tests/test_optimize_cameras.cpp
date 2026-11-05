@@ -36,6 +36,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
+#include "calibration_io_fixture.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/core/document.hpp"
@@ -1764,6 +1765,56 @@ TEST(OptimizeCameras, AdaptiveFittingMetaClearedWhenOff) {
     ASSERT_NE(cleared, nullptr);
     EXPECT_TRUE(cleared->empty());
     EXPECT_EQ(adaptive_solves(chunk), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Master sensors share one calibration slot (WP-13.16)
+// ---------------------------------------------------------------------------
+
+TEST_F(CalibrationIO, MasterSharesDuringOptimize) {
+    Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
+    truth.k1 = -0.05;
+    truth.k2 = 0.04;
+    Document document = make_adaptive_scene(truth, 0.0, 20261120u);
+    Chunk& chunk = *document.active_chunk();
+
+    // Both sensors start 2% off in f with zero distortion; the solve has to
+    // recover truth. The slave starts wrong as well and must end identical to
+    // its master.
+    for (Sensor& sensor : chunk.sensors()) {
+        sensor.calibration.f = truth.f * 1.02;
+    }
+    Sensor slave;
+    slave.label = "slave";
+    slave.type = CameraType::Frame;
+    slave.width = truth.width;
+    slave.height = truth.height;
+    slave.calibration = chunk.sensors()[0].calibration;
+    slave.master_sensor_id = 0;
+    chunk.sensors().push_back(slave);
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        if (i % 2 == 1) {
+            chunk.cameras()[i].sensor_id = 1;
+        }
+    }
+
+    // Fit only the terms truth actually uses, so the comparison is not
+    // confounded by an over-parameterised noise-free solve.
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    for (const char* name : {"b1", "b2", "k3", "k4", "p1", "p2", "p3", "p4"}) {
+        params.set(std::string("fit_") + name, false);
+    }
+    run_task(builtin_registry(), document, "OptimizeCameras", params);
+
+    // Re-fetch: the task applies its result through the command layer.
+    const Chunk& solved = *document.active_chunk();
+    const Calibration& master = solved.sensors()[0].calibration;
+    const Calibration& copy = solved.sensors()[1].calibration;
+    EXPECT_TRUE(copy == master) << "slave did not receive the master calibration";
+    // The same tolerance the single-sensor real-data tests use (cal_seq).
+    EXPECT_NEAR(master.f, truth.f, 5.0) << "f = " << master.f;
+    EXPECT_NEAR(master.k1, truth.k1, 0.01) << "k1 = " << master.k1;
+    EXPECT_NEAR(master.k2, truth.k2, 0.01) << "k2 = " << master.k2;
 }
 
 }  // namespace alphashape

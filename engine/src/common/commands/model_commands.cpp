@@ -712,6 +712,135 @@ private:
     std::vector<std::pair<std::string, std::string>> previous_items_;
 };
 
+// --- Sensor commands (WP-13.16) --------------------------------------------
+
+/// Resolve a sensor index, throwing ValueError when it is out of range.
+Sensor& require_sensor(Document& document, std::int32_t chunk_id,
+                       std::int32_t sensor_index, const char* verb) {
+    Chunk& chunk = require_chunk(document, chunk_id);
+    if (sensor_index < 0 ||
+        sensor_index >= static_cast<std::int32_t>(chunk.sensors().size())) {
+        throw ValueError(std::string(verb) + ": no sensor with index " +
+                         std::to_string(sensor_index));
+    }
+    return chunk.sensors()[static_cast<std::size_t>(sensor_index)];
+}
+
+class SetSensorCalibrationCommand : public StagedMutation {
+public:
+    SetSensorCalibrationCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                                Calibration calibration)
+        : chunk_id_(chunk_id),
+          sensor_index_(sensor_index),
+          calibration_(std::move(calibration)) {}
+
+    std::string name() const override { return "Set Sensor Calibration"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = require_chunk(document, chunk_id_);
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration");
+        check_calibration_values(calibration_, "set sensor calibration");
+        // The proposed geometry lives on both the calibration and the sensor;
+        // validate the sensor list exactly as it will look after commit, so a
+        // slave cannot be given a size that breaks its master link.
+        std::vector<Sensor> sensors = chunk.sensors();
+        apply_to(sensors[static_cast<std::size_t>(sensor_index_)], calibration_);
+        try {
+            validate_sensor_masters(sensors);
+        } catch (const Error& error) {
+            throw ValueError(std::string("set sensor calibration: ") + error.what());
+        }
+    }
+
+    void stage(Document& document) override {
+        const Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration");
+        previous_ = sensor.calibration;
+        previous_type_ = sensor.type;
+        previous_width_ = sensor.width;
+        previous_height_ = sensor.height;
+    }
+
+    void commit(Document& document) override {
+        apply_to(require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration"),
+                 calibration_);
+    }
+
+    void restore(Document& document) override {
+        Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor calibration");
+        sensor.calibration = previous_;
+        sensor.type = previous_type_;
+        sensor.width = previous_width_;
+        sensor.height = previous_height_;
+    }
+
+private:
+    /// Write the calibration and the geometry it describes into a sensor, so
+    /// the two never disagree (validate_sensor_masters reads the Sensor
+    /// fields, not the calibration).
+    static void apply_to(Sensor& sensor, const Calibration& calibration) {
+        sensor.calibration = calibration;
+        sensor.type = calibration.type;
+        sensor.width = calibration.width;
+        sensor.height = calibration.height;
+    }
+
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    Calibration calibration_;
+    Calibration previous_;
+    CameraType previous_type_ = CameraType::Frame;
+    int previous_width_ = 0;
+    int previous_height_ = 0;
+};
+
+class SetSensorMasterCommand : public StagedMutation {
+public:
+    SetSensorMasterCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                           std::int32_t master_index)
+        : chunk_id_(chunk_id), sensor_index_(sensor_index), master_index_(master_index) {}
+
+    std::string name() const override { return "Set Sensor Master"; }
+
+protected:
+    void validate(Document& document) override {
+        if (master_index_ < -1) {
+            throw ValueError("set sensor master: master index must be -1 or a sensor index");
+        }
+        Chunk& chunk = require_chunk(document, chunk_id_);
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor master");
+        // Reuse the model-level rule set: range, self-reference, master-is-not-
+        // a-slave, matching image size.
+        std::vector<Sensor> proposed = chunk.sensors();
+        proposed[static_cast<std::size_t>(sensor_index_)].master_sensor_id = master_index_;
+        validate_sensor_masters(proposed);
+    }
+
+    void stage(Document& document) override {
+        previous_ =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor master")
+                .master_sensor_id;
+    }
+
+    void commit(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor master")
+            .master_sensor_id = master_index_;
+    }
+
+    void restore(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor master")
+            .master_sensor_id = previous_;
+    }
+
+private:
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    std::int32_t master_index_;
+    std::int32_t previous_ = -1;
+};
+
 // --- Marker commands -------------------------------------------------------
 
 /// Allocate a marker id from the chunk counter when the caller left it at -1.
@@ -2918,6 +3047,17 @@ std::unique_ptr<AbstractCommand> make_set_chunk_meta_command(std::int32_t chunk_
                                                              std::string value) {
     return std::make_unique<SetChunkMetaCommand>(chunk_id, std::move(key),
                                                  std::move(value));
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_calibration_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, Calibration calibration) {
+    return std::make_unique<SetSensorCalibrationCommand>(chunk_id, sensor_index,
+                                                         std::move(calibration));
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_master_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, std::int32_t master_index) {
+    return std::make_unique<SetSensorMasterCommand>(chunk_id, sensor_index, master_index);
 }
 
 // --- asset factories -------------------------------------------------------

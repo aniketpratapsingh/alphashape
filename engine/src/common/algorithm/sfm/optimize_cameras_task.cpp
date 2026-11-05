@@ -237,9 +237,15 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     sfm::BAProblem problem;
     problem.poses.reserve(camera_index.size());
 
-    // One calibration per sensor used by an aligned camera.
+    // Master links (WP-13.16). A slave resolves to its master, so both share
+    // one BA calibration slot and the free mask comes from the master's
+    // fixed_params. An invalid link is a hard error before any work is done.
+    validate_sensor_masters(chunk->sensors());
+
+    // One calibration per EFFECTIVE sensor used by an aligned camera.
     std::unordered_map<std::int32_t, std::size_t> sensor_slot;
     std::vector<std::int32_t> slot_sensor;  // BA calibration -> chunk sensor id
+    std::vector<std::int32_t> used_sensor;  // sensors named by an aligned camera
     for (const std::size_t ci : camera_index) {
         const Camera& camera = chunk->cameras()[ci];
         if (camera.sensor_id < 0 ||
@@ -247,18 +253,25 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             throw ValueError("OptimizeCameras: camera " + std::to_string(camera.id) +
                              " has no sensor");
         }
-        if (sensor_slot.find(camera.sensor_id) == sensor_slot.end()) {
+        const Sensor& sensor =
+            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
+        const std::int32_t effective = sensor.master_sensor_id >= 0
+                                           ? sensor.master_sensor_id
+                                           : camera.sensor_id;
+        used_sensor.push_back(camera.sensor_id);
+        if (sensor_slot.find(effective) == sensor_slot.end()) {
             const std::size_t slot = problem.calibrations.size();
-            sensor_slot[camera.sensor_id] = slot;
-            slot_sensor.push_back(camera.sensor_id);
+            sensor_slot[effective] = slot;
+            slot_sensor.push_back(effective);
             problem.calibrations.push_back(
-                chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration);
+                chunk->sensors()[static_cast<std::size_t>(effective)].calibration);
         }
-        problem.camera_sensor.push_back(sensor_slot.at(camera.sensor_id));
+        problem.camera_sensor.push_back(sensor_slot.at(effective));
         problem.poses.push_back(pose_from_transform(camera.pose));
     }
 
-    // Free mask per sensor: fit_X && X not in sensor.fixed_params.
+    // Free mask per sensor: fit_X && X not in the effective sensor's
+    // fixed_params (the master's, for a slave).
     problem.fit_intrinsics.resize(problem.calibrations.size());
     for (std::size_t s = 0; s < problem.calibrations.size(); ++s) {
         const Sensor& sensor =
@@ -698,6 +711,16 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             for (const char* name : kCalibrationParamNames) {
                 calibration.covariance_params.emplace_back(name);
             }
+        }
+    }
+    // Every slave used by an aligned camera receives a copy of its master's
+    // solved calibration (and covariance).
+    for (const std::int32_t sensor_id : used_sensor) {
+        const std::int32_t master =
+            chunk->sensors()[static_cast<std::size_t>(sensor_id)].master_sensor_id;
+        if (master >= 0) {
+            staged.sensors()[static_cast<std::size_t>(sensor_id)].calibration =
+                staged.sensors()[static_cast<std::size_t>(master)].calibration;
         }
     }
     for (std::size_t b = 0; b < camera_index.size(); ++b) {

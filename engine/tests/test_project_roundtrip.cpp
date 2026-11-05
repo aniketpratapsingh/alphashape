@@ -1866,5 +1866,75 @@ TEST_F(TempDir, RefusesToWriteNonFiniteTrackCovariance) {
     EXPECT_THROW(ProjectIO::save(document, path("x.psx")), ProjectIOError);
 }
 
+// WP-13.16: sensor master links. The ProjectIO suite is TEST-based (see
+// RejectsMalformedTrackCovariance), so these two use a scope guard rather than
+// the TempDir fixture.
+class MasterScratch {
+public:
+    MasterScratch() : base_(platform::unique_temp_path("alphashape_master_", ".psx")) {}
+    ~MasterScratch() {
+        std::error_code ec;
+        std::filesystem::remove_all(base_, ec);
+        std::filesystem::remove_all(sidecar(), ec);
+    }
+    MasterScratch(const MasterScratch&) = delete;
+    MasterScratch& operator=(const MasterScratch&) = delete;
+
+    const std::string& path() const { return base_; }
+    std::string zip() const { return (sidecar() / "project.zip").string(); }
+
+private:
+    /// ProjectIO replaces the manifest extension with ".files".
+    std::filesystem::path sidecar() const {
+        std::filesystem::path directory = base_;
+        directory.replace_extension(".files");
+        return directory;
+    }
+
+    std::string base_;
+};
+
+TEST(ProjectIO, SensorMasterRoundTrips) {
+    MasterScratch scratch;
+    Document document = build_rich_document();
+    Chunk& chunk = *document.workspace().chunks().front();
+    ASSERT_EQ(chunk.sensors().size(), 2U);
+    // The rich fixture's second sensor is a fisheye of the same size; a master
+    // link requires the same camera type as well, so make it a frame sensor
+    // before sharing the calibration.
+    chunk.sensors()[1].type = CameraType::Frame;
+    chunk.sensors()[1].calibration.type = CameraType::Frame;
+    chunk.sensors()[1].master_sensor_id = 0;
+    ProjectIO::save(document, scratch.path());
+
+    std::shared_ptr<Document> loaded = ProjectIO::load(scratch.path());
+    ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
+    const Chunk& back = *loaded->workspace().chunks().front();
+    ASSERT_EQ(back.sensors().size(), 2U);
+    EXPECT_EQ(back.sensors()[1].master_sensor_id, 0);
+    EXPECT_EQ(back.sensors()[0].master_sensor_id, -1);
+    EXPECT_TRUE(back == chunk);
+}
+
+TEST(ProjectIO, RejectsSelfMaster) {
+    MasterScratch scratch;
+    Document document = build_rich_document();
+    Chunk& chunk = *document.workspace().chunks().front();
+    chunk.sensors()[1].master_sensor_id = 0;
+    ProjectIO::save(document, scratch.path());
+
+    std::ifstream in(scratch.zip(), std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+    std::string xml = ZipArchive::parse(bytes).get_text("doc.xml");
+    const std::string good = "master=\"0\"";
+    const std::size_t at = xml.find(good);
+    ASSERT_NE(at, std::string::npos);
+    xml.replace(at, good.size(), "master=\"1\"");
+    rewrite_zip_entry(scratch.zip(), "doc.xml", xml);
+    EXPECT_THROW(ProjectIO::load(scratch.path()), ProjectIOError);
+}
+
 }  // namespace
 }  // namespace alphashape
