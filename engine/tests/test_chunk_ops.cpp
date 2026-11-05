@@ -745,5 +745,85 @@ TEST(ChunkOps, SensorDedupIgnoresCalibrationCovariance) {
     }
 }
 
+// A slave sensor appended into a chunk that already has sensors keeps its link
+// to the master after the master is placed at a new index.
+TEST(ChunkOps, AppendRemapsSensorMaster) {
+    Chunk target("target");
+    target.set_id(0);
+    for (int i = 0; i < 2; ++i) {
+        Sensor sensor;
+        sensor.label = "target-" + std::to_string(i);
+        sensor.width = 100;
+        sensor.height = 80;
+        sensor.make = "ACME";
+        sensor.model = "X1";
+        sensor.serial = "target-" + std::to_string(i);
+        sensor.calibration =
+            Calibration::initial(CameraType::Frame, 100, 80, 120.0 + i);
+        target.sensors().push_back(sensor);
+    }
+
+    Chunk incoming("incoming");
+    incoming.set_id(1);
+    Sensor master;
+    master.label = "incoming-master";
+    master.width = 100;
+    master.height = 80;
+    master.make = "ACME";
+    master.model = "X1";
+    master.serial = "incoming-master";
+    master.calibration = Calibration::initial(CameraType::Frame, 100, 80, 130.0);
+    Sensor slave = master;
+    slave.label = "incoming-slave";
+    slave.serial = "incoming-slave";
+    slave.master_sensor_id = 0;
+    incoming.sensors().push_back(master);
+    incoming.sensors().push_back(slave);
+
+    append_chunk(target, incoming);
+
+    ASSERT_EQ(target.sensors().size(), 4U);
+    EXPECT_EQ(target.sensors()[2].label, "incoming-master");
+    EXPECT_EQ(target.sensors()[2].master_sensor_id, -1);
+    EXPECT_EQ(target.sensors()[3].label, "incoming-slave");
+    EXPECT_EQ(target.sensors()[3].master_sensor_id, 2);
+    EXPECT_NO_THROW(validate_sensor_masters(target.sensors()));
+}
+
+// Merging chunks that each carry a master/slave pair keeps every link inside
+// the merged sensor list, across different sensor sizes.
+TEST(ChunkOps, MergeKeepsMasterLinksAcrossChunks) {
+    Chunk a("a");
+    a.set_id(0);
+    Chunk b("b");
+    b.set_id(1);
+    const std::pair<int, int> sizes[] = {{100, 80}, {200, 160}};
+    for (Chunk* chunk : {&a, &b}) {
+        const auto& size = sizes[chunk == &a ? 0 : 1];
+        Sensor master;
+        master.label = chunk->label() + "-master";
+        master.width = size.first;
+        master.height = size.second;
+        master.make = "ACME";
+        master.model = "X1";
+        master.serial = chunk->label() + "-master";
+        master.calibration =
+            Calibration::initial(CameraType::Frame, size.first, size.second, 120.0);
+        Sensor slave = master;
+        slave.label = chunk->label() + "-slave";
+        slave.serial = chunk->label() + "-slave";
+        slave.master_sensor_id = 0;
+        chunk->sensors().push_back(master);
+        chunk->sensors().push_back(slave);
+    }
+
+    Chunk merged = merge_chunks({&a, &b}, 7, "Merged");
+    ASSERT_EQ(merged.sensors().size(), 4U);
+    EXPECT_EQ(merged.sensors()[1].master_sensor_id, 0);
+    EXPECT_EQ(merged.sensors()[2].label, "b-master");
+    EXPECT_EQ(merged.sensors()[3].master_sensor_id, 2);
+    EXPECT_NO_THROW(validate_sensor_masters(merged.sensors()));
+}
+
 }  // namespace alphashape
 

@@ -123,12 +123,18 @@ void append_containers(Chunk& target, const Chunk& source, const ChunkCopyOption
     }
 
     // -- sensors (deduplicated on exact identity) --------------------------
+    // Two passes: masters (and unparented sensors) first, so their target
+    // indices exist before any slave needs its master translated.
     std::vector<std::int32_t> sensor_map(source.sensors().size(), -1);
     for (std::size_t i = 0; i < source.sensors().size(); ++i) {
         const Sensor& sensor = source.sensors()[i];
+        if (sensor.master_sensor_id != -1) {
+            continue;  // handled in the slave pass
+        }
         bool found = false;
         for (std::size_t j = 0; j < target.sensors().size(); ++j) {
-            if (same_sensor_identity(target.sensors()[j], sensor)) {
+            if (target.sensors()[j].master_sensor_id == -1 &&
+                same_sensor_identity(target.sensors()[j], sensor)) {
                 sensor_map[i] = static_cast<std::int32_t>(j);
                 found = true;
                 break;
@@ -138,6 +144,51 @@ void append_containers(Chunk& target, const Chunk& source, const ChunkCopyOption
             target.sensors().push_back(sensor);
             sensor_map[i] = static_cast<std::int32_t>(target.sensors().size() - 1);
         }
+    }
+    // Slaves are deduplicated only against a target sensor with the same
+    // identity *and* the same translated master; the link is rewritten into
+    // target-index space on push.
+    for (std::size_t i = 0; i < source.sensors().size(); ++i) {
+        const Sensor& sensor = source.sensors()[i];
+        if (sensor.master_sensor_id == -1) {
+            continue;
+        }
+        if (sensor.master_sensor_id < 0 ||
+            static_cast<std::size_t>(sensor.master_sensor_id) >= source.sensors().size()) {
+            throw ValueError("chunk operations: sensor " + std::to_string(i) +
+                             " names out-of-range master " +
+                             std::to_string(sensor.master_sensor_id));
+        }
+        const std::int32_t master =
+            sensor_map[static_cast<std::size_t>(sensor.master_sensor_id)];
+        if (master < 0) {
+            throw ValueError("chunk operations: sensor " + std::to_string(i) +
+                             " names a master that is itself a slave");
+        }
+        bool found = false;
+        for (std::size_t j = 0; j < target.sensors().size(); ++j) {
+            if (target.sensors()[j].master_sensor_id == master &&
+                same_sensor_identity(target.sensors()[j], sensor)) {
+                sensor_map[i] = static_cast<std::int32_t>(j);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            Sensor copy = sensor;
+            copy.master_sensor_id = master;
+            target.sensors().push_back(std::move(copy));
+            sensor_map[i] = static_cast<std::int32_t>(target.sensors().size() - 1);
+        }
+    }
+    // The remap above is master-first by construction, so any failure here is
+    // an engine logic error rather than bad input.
+    try {
+        validate_sensor_masters(target.sensors());
+    } catch (const Error& error) {
+        throw Error(std::string("chunk operations: internal error after remapping sensor "
+                                "masters: ") +
+                    error.what());
     }
 
     // -- cameras and frames ------------------------------------------------
