@@ -464,7 +464,10 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
     }
     const Eigen::Matrix4d inverse = chunk.transform().inverse();
 
-    // Perturb every reference: 2 m east in ECEF and 2 degrees of yaw.
+    // Perturb every reference: about 0.25 m in ECEF and 2 degrees of yaw.
+    // At this 8 m range that is roughly 30 px, so it defeats the default 4 px
+    // gate without putting the rays beyond what a wide-gate initial
+    // triangulation can still meet.
     std::size_t perturbed = 0;
     for (std::size_t index = 0; index < chunk.cameras().size(); ++index) {
         Camera& camera = chunk.cameras()[index];
@@ -474,8 +477,8 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
             geo::Geodetic{loc.x(), loc.y(), loc.z()});
         // A per-camera error, not a common translation: reprojection alone
         // cannot see a translation shared by every camera and point.
-        ecef += Eigen::Vector3d(2.0 * sign, 1.5 * (index % 3U == 0U ? 1.0 : -1.0),
-                                0.5);
+        ecef += Eigen::Vector3d(0.20 * sign, 0.15 * (index % 3U == 0U ? 1.0 : -1.0),
+                                0.05);
         const geo::Geodetic g = geo::ecef_to_geodetic(ecef);
         camera.reference.location =
             Eigen::Vector3d(g.longitude_deg, g.latitude_deg, g.height_m);

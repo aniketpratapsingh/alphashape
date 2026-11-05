@@ -180,7 +180,7 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
         std::optional<Eigen::Vector3d> point;
         std::size_t removed = 0;
         Outcome outcome = Outcome::Ok;
-        // Remove the single worst observation and re-triangulate until every
+        // Remove the single most likely outlier and re-triangulate until every
         // surviving view is within the threshold. Dropping them all at once
         // would discard good views biased by one gross outlier.
         while (true) {
@@ -206,15 +206,42 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
                 outcome = removed == 0 ? Outcome::Parallax : Outcome::Reprojection;
                 break;
             }
-            // Identify the worst observation by leave-one-out: the outlier is
-            // the view whose keypoint disagrees with the point triangulated
-            // from all the others. Its joint reprojection error can look
-            // moderate because it biased the point itself.
+            // Reprojection errors against the point fitted from every
+            // surviving view. This joint error, not a leave-one-out error, is
+            // the accept gate: a track is consistent when all of its views
+            // agree with one point. Leave-one-out only ranks which
+            // observation to try removing when the gate fails.
             std::size_t worst = remaining.size();
             double worst_error = 0.0;
-            const bool leave_one_out = remaining.size() <= 12U;
             for (std::size_t i = 0; i < remaining.size(); ++i) {
-                if (leave_one_out) {
+                const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
+                double value = std::numeric_limits<double>::infinity();
+                if (x_cam.z() > 0.0) {
+                    const double error =
+                        (calibrations[i]->project(x_cam) - pixels[i]).norm();
+                    if (std::isfinite(error)) {
+                        value = error;
+                    }
+                }
+                if (value > worst_error) {
+                    worst_error = value;
+                    worst = i;
+                }
+            }
+            if (worst_error <= max_error_px) {
+                break;
+            }
+            // Choose the observation to drop by consensus: removing the
+            // outlier leaves the rest consistent, while removing a good view
+            // leaves the outlier to bias the fit. The joint worst can be a
+            // good view when the outlier pulled the point behind its camera,
+            // so score each leave-one-out candidate by how well it explains
+            // the views that remain. With three views a leave-one-out fit
+            // uses two, which is noisy but still ranks the candidates.
+            if (remaining.size() >= 3U && remaining.size() <= 12U) {
+                double best_score = std::numeric_limits<double>::infinity();
+                std::size_t best = remaining.size();
+                for (std::size_t i = 0; i < remaining.size(); ++i) {
                     std::vector<sfm::AbsolutePose> others = poses;
                     std::vector<Eigen::Vector3d> other_bearings = bearings;
                     others.erase(others.begin() + static_cast<std::ptrdiff_t>(i));
@@ -222,40 +249,37 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
                                          static_cast<std::ptrdiff_t>(i));
                     const std::optional<Eigen::Vector3d> candidate =
                         sfm::triangulate_multiview(others, other_bearings, open_options);
-                    double value = std::numeric_limits<double>::infinity();
-                    if (candidate.has_value() && candidate->allFinite()) {
+                    if (!candidate.has_value() || !candidate->allFinite()) {
+                        continue;
+                    }
+                    double score = 0.0;
+                    bool usable = true;
+                    for (std::size_t j = 0; j < remaining.size(); ++j) {
+                        if (j == i) {
+                            continue;
+                        }
                         const Eigen::Vector3d x_cam =
-                            poses[i].R * (*candidate) + poses[i].t;
-                        if (x_cam.z() > 0.0) {
-                            const double error =
-                                (calibrations[i]->project(x_cam) - pixels[i]).norm();
-                            if (std::isfinite(error)) {
-                                value = error;
-                            }
+                            poses[j].R * (*candidate) + poses[j].t;
+                        if (!(x_cam.z() > 0.0)) {
+                            usable = false;
+                            break;
                         }
-                    }
-                    if (value > worst_error) {
-                        worst_error = value;
-                        worst = i;
-                    }
-                } else {
-                    const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
-                    double value = std::numeric_limits<double>::infinity();
-                    if (x_cam.z() > 0.0) {
                         const double error =
-                            (calibrations[i]->project(x_cam) - pixels[i]).norm();
-                        if (std::isfinite(error)) {
-                            value = error;
+                            (calibrations[j]->project(x_cam) - pixels[j]).norm();
+                        if (!std::isfinite(error)) {
+                            usable = false;
+                            break;
                         }
+                        score += error * error;
                     }
-                    if (value > worst_error) {
-                        worst_error = value;
-                        worst = i;
+                    if (usable && score < best_score) {
+                        best_score = score;
+                        best = i;
                     }
                 }
-            }
-            if (worst_error <= max_error_px) {
-                break;
+                if (best != remaining.size()) {
+                    worst = best;
+                }
             }
             remaining.erase(remaining.begin() +
                             static_cast<std::ptrdiff_t>(worst));
