@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -169,69 +170,89 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
         return true;
     };
 
+    enum class Outcome { Ok, Views, Parallax, Degenerate, Reprojection };
     for (const Track& track : tracks) {
-        std::vector<Observation> kept = track.observations;
-        if (kept.size() < min_view_count) {
+        std::vector<Observation> remaining = track.observations;
+        if (remaining.size() < min_view_count) {
             ++rejected_views;
             continue;
         }
-        std::vector<sfm::AbsolutePose> poses;
-        std::vector<Eigen::Vector3d> bearings;
-        std::vector<const Calibration*> calibrations;
-        std::vector<Eigen::Vector2d> pixels;
-        if (!gather(kept, poses, bearings, calibrations, pixels)) {
-            ++rejected_degenerate;
-            continue;
-        }
-        // First pass without the parallax floor: a nullopt now means the rays
-        // do not meet in front of every camera (or are numerically degenerate).
-        sfm::TriangulationOptions open_options;
-        open_options.min_parallax_rad = 0.0;
-        open_options.max_angle_error_rad = 0.0;
-        std::optional<Eigen::Vector3d> point =
-            sfm::triangulate_multiview(poses, bearings, open_options);
-        if (!point.has_value() || !point->allFinite()) {
-            ++rejected_degenerate;
-            continue;
-        }
-        if (sfm::max_parallax(poses, *point) < min_parallax_rad) {
-            ++rejected_parallax;
-            continue;
-        }
-        // Drop every observation that disagrees with the triangulated point,
-        // then re-triangulate from the survivors.
-        std::vector<Observation> remaining;
-        remaining.reserve(kept.size());
-        for (std::size_t i = 0; i < kept.size(); ++i) {
-            const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
-            const double error = (calibrations[i]->project(x_cam) - pixels[i]).norm();
-            if (std::isfinite(error) && error <= max_error_px) {
-                remaining.push_back(kept[i]);
-            } else {
-                ++observations_dropped;
-            }
-        }
-        if (remaining.size() != kept.size()) {
-            if (remaining.size() < min_view_count) {
-                ++rejected_reprojection;
-                continue;
-            }
+        std::optional<Eigen::Vector3d> point;
+        std::size_t removed = 0;
+        Outcome outcome = Outcome::Ok;
+        // Remove the single worst observation and re-triangulate until every
+        // surviving view is within the threshold. Dropping them all at once
+        // would discard good views biased by one gross outlier.
+        while (true) {
+            std::vector<sfm::AbsolutePose> poses;
+            std::vector<Eigen::Vector3d> bearings;
+            std::vector<const Calibration*> calibrations;
+            std::vector<Eigen::Vector2d> pixels;
             if (!gather(remaining, poses, bearings, calibrations, pixels)) {
-                ++rejected_reprojection;
-                continue;
+                outcome = removed == 0 ? Outcome::Degenerate : Outcome::Reprojection;
+                break;
             }
-            sfm::TriangulationOptions closed_options;
-            closed_options.min_parallax_rad = min_parallax_rad;
-            closed_options.max_angle_error_rad = 0.0;
-            point = sfm::triangulate_multiview(poses, bearings, closed_options);
+            // No parallax floor yet: a nullopt here means the rays do not meet
+            // in front of every camera (or are numerically degenerate).
+            sfm::TriangulationOptions open_options;
+            open_options.min_parallax_rad = 0.0;
+            open_options.max_angle_error_rad = 0.0;
+            point = sfm::triangulate_multiview(poses, bearings, open_options);
             if (!point.has_value() || !point->allFinite()) {
-                ++rejected_reprojection;
-                continue;
+                outcome = removed == 0 ? Outcome::Degenerate : Outcome::Reprojection;
+                break;
             }
-            kept = std::move(remaining);
+            if (sfm::max_parallax(poses, *point) < min_parallax_rad) {
+                outcome = removed == 0 ? Outcome::Parallax : Outcome::Reprojection;
+                break;
+            }
+            std::size_t worst = remaining.size();
+            double worst_error = 0.0;
+            for (std::size_t i = 0; i < remaining.size(); ++i) {
+                const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
+                const double error =
+                    (calibrations[i]->project(x_cam) - pixels[i]).norm();
+                const double value = std::isfinite(error)
+                                         ? error
+                                         : std::numeric_limits<double>::infinity();
+                if (value > worst_error) {
+                    worst_error = value;
+                    worst = i;
+                }
+            }
+            if (worst_error <= max_error_px) {
+                break;
+            }
+            remaining.erase(remaining.begin() +
+                            static_cast<std::ptrdiff_t>(worst));
+            ++observations_dropped;
+            ++removed;
+            if (remaining.size() < min_view_count) {
+                outcome = Outcome::Reprojection;
+                break;
+            }
+        }
+        if (outcome != Outcome::Ok) {
+            switch (outcome) {
+                case Outcome::Views:
+                    ++rejected_views;
+                    break;
+                case Outcome::Parallax:
+                    ++rejected_parallax;
+                    break;
+                case Outcome::Degenerate:
+                    ++rejected_degenerate;
+                    break;
+                case Outcome::Reprojection:
+                    ++rejected_reprojection;
+                    break;
+                case Outcome::Ok:
+                    break;
+            }
+            continue;
         }
         Track out;
-        out.observations = std::move(kept);
+        out.observations = std::move(remaining);
         out.point = *point;
         out.covariance.reset();
         accepted.push_back(std::move(out));

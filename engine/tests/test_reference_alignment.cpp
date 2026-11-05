@@ -102,6 +102,7 @@ Scene make_scene(std::size_t count, const Eigen::Vector3d& lever, bool georefere
     sensor.width = 1200;
     sensor.height = 900;
     sensor.calibration = Calibration::initial(CameraType::Frame, 1200, 900, 1000.0);
+    sensor.antenna.offset_m = lever;
     chunk.sensors().push_back(sensor);
 
     const Eigen::Matrix3d e_reference = scene.reference_frame.block<3, 3>(0, 0);
@@ -270,12 +271,13 @@ TriScene make_tri_scene() {
     sensor.height = 900;
     sensor.calibration = Calibration::initial(CameraType::Frame, 1200, 900, 1000.0);
     chunk.sensors().push_back(sensor);
+    const Eigen::Vector3d lever(0.25, -0.10, 0.15);
+    chunk.sensors()[0].antenna.offset_m = lever;
     const Calibration& truth = chunk.sensors()[0].calibration;
     const Eigen::Matrix3d mount = reference::body_to_camera_nadir();
     const geo::Geodetic origin{7.0, 45.0, 100.0};
     const Eigen::Matrix4d reference_frame = geo::enu_to_ecef(origin);
     const Eigen::Matrix3d e_reference = reference_frame.block<3, 3>(0, 0);
-    const Eigen::Vector3d lever(0.25, -0.10, 0.15);
     chunk.transform() = reference_frame;
     chunk.meta().set(reference::kRotationOrderKey, crs::rotation_order_name(kOrder));
 
@@ -473,10 +475,10 @@ TEST(ReferenceAlignment, ReferenceThenOptimize) {
             geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
         const Eigen::Vector3d lever =
             reference::effective_antenna(chunk, camera).camera_offset();
-        const Eigen::Vector3d centre_ecef =
-            antenna - measured->world_to_camera.transpose() * lever;
+        const Eigen::Vector3d antenna_internal =
+            (inverse * antenna.homogeneous()).head<3>();
         const Eigen::Vector3d centre =
-            (inverse * centre_ecef.homogeneous()).head<3>();
+            antenna_internal - measured->world_to_camera.transpose() * lever;
         raw_sum += (centre - truth[i]).squaredNorm();
     }
     const double raw_rms =

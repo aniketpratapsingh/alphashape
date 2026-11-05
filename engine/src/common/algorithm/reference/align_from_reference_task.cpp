@@ -194,10 +194,15 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
         const Eigen::Matrix3d r_wc = measured->world_to_camera;
         const Eigen::Vector3d lever =
             reference::effective_antenna(*chunk, camera).camera_offset();
-        // A = C + R_wc^T * lever, so C = A - R_wc^T * lever.
-        const Eigen::Vector3d centre_ecef = antenna - r_wc.transpose() * lever;
+        // The measured rotation maps chunk-internal coordinates to the camera,
+        // so the lever arm is rotated into the internal frame; a similarity
+        // scale converts its metric length. A = C + R_wc^T * lever, so
+        // C = A - R_wc^T * lever, both in internal units.
+        const double scale = std::cbrt(transform.block<3, 3>(0, 0).determinant());
+        const Eigen::Vector3d antenna_internal =
+            (inverse * antenna.homogeneous()).head<3>();
         const Eigen::Vector3d centre =
-            (inverse * centre_ecef.homogeneous()).head<3>();
+            antenna_internal - r_wc.transpose() * lever / scale;
         camera.pose = Transform::Identity();
         camera.pose.block<3, 3>(0, 0) = r_wc;
         camera.pose.block<3, 1>(0, 3) = -r_wc * centre;
