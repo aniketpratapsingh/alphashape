@@ -37,7 +37,6 @@ namespace alphashape {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kDeg = kPi / 180.0;
 constexpr crs::RotationOrder kOrder = crs::RotationOrder::ZYX;
 
 Transform pose_with_centre(const Eigen::Matrix3d& r, const Eigen::Vector3d& centre) {
