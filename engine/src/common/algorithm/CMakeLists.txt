@@ -32,6 +32,7 @@ add_library(alphashape_algorithms STATIC
     calibration/board_detector.cpp
     calibration/calibrate.cpp
     calibration/calibrate_camera_task.cpp
+    calibration/calibration_io.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
     sfm/absolute_pose.cpp
