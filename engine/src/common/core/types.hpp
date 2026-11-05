@@ -24,6 +24,7 @@
 #include <Eigen/Core>
 
 #include "base/utils/error.hpp"
+#include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/crs/coordinate_system.hpp"
 
@@ -118,6 +119,10 @@ struct Sensor {
     /// its master, does not itself name a master, and takes its BA calibration
     /// slot from the master. Persisted as the optional `master` attribute.
     std::int32_t master_sensor_id = -1;
+
+    /// GNSS antenna mounting (WP-13.19). Its offset moves a measured
+    /// reference from the antenna phase centre to the projection centre.
+    Antenna antenna;
 
     bool operator==(const Sensor& other) const;
 };

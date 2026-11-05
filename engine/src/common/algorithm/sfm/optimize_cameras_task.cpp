@@ -46,6 +46,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -567,6 +568,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // -- GNSS centre priors (georeferenced chunks only) ---------------------
     if (georeferenced) {
         const Transform inverse = transform.inverse();
+        std::unordered_set<std::int32_t> logged_antenna_sensors;
         for (std::size_t b = 0; b < camera_index.size(); ++b) {
             const Camera& camera = chunk->cameras()[camera_index[b]];
             if (!camera.reference.enabled || !camera.reference.location.has_value()) {
@@ -582,6 +584,30 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             prior.sigma = camera.reference.accuracy / local_scale;
             if (!has_alt) {
                 prior.sigma.z() = 0.0;  // no altitude: leave the up axis unconstrained
+            }
+            // The GNSS reference is the antenna phase centre, so the prior
+            // constrains the mounted antenna rather than the projection centre.
+            // Sensors resolve their master's calibration, and the mount is part
+            // of the physical body, so use the effective master's antenna.
+            const Sensor& sensor =
+                chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
+            const std::int32_t effective =
+                sensor.master_sensor_id >= 0 ? sensor.master_sensor_id : camera.sensor_id;
+            const Antenna& antenna =
+                chunk->sensors()[static_cast<std::size_t>(effective)].antenna;
+            if (antenna.is_set() || antenna.boresight_deg.has_value()) {
+                prior.lever_arm = antenna.camera_offset() / local_scale;
+                if (logged_antenna_sensors.insert(effective).second &&
+                    Log::enabled(LogLevel::Info)) {
+                    log(LogLevel::Info) << "OptimizeCameras: sensor " << effective
+                                        << " antenna offset [" << prior.lever_arm.x()
+                                        << ", " << prior.lever_arm.y() << ", "
+                                        << prior.lever_arm.z()
+                                        << "] local units (camera frame) "
+                                        << "= " << antenna.camera_offset().x() << ", "
+                                        << antenna.camera_offset().y() << ", "
+                                        << antenna.camera_offset().z() << " m";
+                }
             }
             problem.centre_priors.push_back(prior);
         }

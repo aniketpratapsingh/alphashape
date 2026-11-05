@@ -93,6 +93,20 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         s.serial = require_attr(e, "serial");
         s.calibration = read_calibration(find_child(e, "calibration"));
         s.fixed_params = split_strings(require_attr(e, "fixed_params"));
+        if (const XmlNode* antenna = find_child(e, "antenna")) {
+            warn_unknown_attrs(*antenna, {"offset", "boresight"}, report);
+            s.antenna.offset_m = parse_vec3(require_attr(*antenna, "offset"));
+            if (!s.antenna.offset_m.allFinite()) {
+                throw ProjectIOError("doc.xml: antenna offset is not finite");
+            }
+            if (const std::string* boresight = find_attr(*antenna, "boresight")) {
+                const Eigen::Vector3d angles = parse_vec3(*boresight);
+                if (!angles.allFinite()) {
+                    throw ProjectIOError("doc.xml: antenna boresight is not finite");
+                }
+                s.antenna.boresight_deg = angles;
+            }
+        }
         validate_fixed_params(s.label, s.fixed_params);
         if (const XmlNode* calibration = find_child(e, "calibration")) {
             warn_unknown_calibration_attrs(*calibration, report);

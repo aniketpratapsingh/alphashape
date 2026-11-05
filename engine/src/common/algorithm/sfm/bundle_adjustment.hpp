@@ -49,7 +49,22 @@ struct BACentrePrior {
     std::size_t camera = 0;   ///< index into BAProblem::poses
     Eigen::Vector3d centre;   ///< measured camera centre, in the problem's coordinate frame
     Eigen::Vector3d sigma;    ///< per-axis standard deviation; sigma <= 0 or non-finite => axis unconstrained
+
+    /// GNSS antenna lever arm in the CAMERA frame (x right, y down, z
+    /// forward), in the problem's local units, already rotated by the sensor's
+    /// body->camera boresight. The prior constrains the antenna position
+    /// `C + R^T * lever_arm`, not the projection centre `C`; zero means the
+    /// reference measures the projection centre (the pre-WP-13.19 behaviour).
+    Eigen::Vector3d lever_arm = Eigen::Vector3d::Zero();
 };
+
+/// The position a centre prior measures for `pose`: the camera centre, or the
+/// mounted antenna when a lever arm is supplied. With C = -R^T t (the camera
+/// centre) the modelled antenna is A = C + R^T * lever_arm, in the same frame
+/// as the pose. Zero lever reproduces the centre exactly; CentrePriorCost
+/// evaluates the same expression.
+Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
+                                           const Eigen::Vector3d& lever_arm);
 
 /// The bundle-adjustment problem, in place. Intrinsics are held fixed in this
 /// milestone, so `calibrations` is read-only during the solve.
