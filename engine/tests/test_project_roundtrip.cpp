@@ -1866,5 +1866,41 @@ TEST_F(TempDir, RefusesToWriteNonFiniteTrackCovariance) {
     EXPECT_THROW(ProjectIO::save(document, path("x.psx")), ProjectIOError);
 }
 
+// WP-13.16: sensor master links.
+TEST_F(TempDir, SensorMasterRoundTrips) {
+    Document document = build_rich_document();
+    Chunk& chunk = *document.workspace().chunks().front();
+    ASSERT_EQ(chunk.sensors().size(), 2U);
+    chunk.sensors()[1].master_sensor_id = 0;
+    ProjectIO::save(document, path("master.psx"));
+
+    std::shared_ptr<Document> loaded = ProjectIO::load(path("master.psx"));
+    ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
+    const Chunk& back = *loaded->workspace().chunks().front();
+    ASSERT_EQ(back.sensors().size(), 2U);
+    EXPECT_EQ(back.sensors()[1].master_sensor_id, 0);
+    EXPECT_EQ(back.sensors()[0].master_sensor_id, -1);
+    EXPECT_TRUE(back == chunk);
+}
+
+TEST_F(TempDir, RejectsSelfMaster) {
+    Document document = build_rich_document();
+    Chunk& chunk = *document.workspace().chunks().front();
+    chunk.sensors()[1].master_sensor_id = 0;
+    ProjectIO::save(document, path("self.psx"));
+
+    std::ifstream in(path("self.files/project.zip"), std::ios::binary);
+    ASSERT_TRUE(in);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+    std::string xml = ZipArchive::parse(bytes).get_text("doc.xml");
+    const std::string good = "master=\"0\"";
+    const std::size_t at = xml.find(good);
+    ASSERT_NE(at, std::string::npos);
+    xml.replace(at, good.size(), "master=\"1\"");
+    rewrite_zip_entry(path("self.files/project.zip"), "doc.xml", xml);
+    EXPECT_THROW(ProjectIO::load(path("self.psx")), ProjectIOError);
+}
+
 }  // namespace
 }  // namespace alphashape
