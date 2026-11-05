@@ -454,9 +454,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                 pose.R = camera.pose.block<3, 3>(0, 0);
                 pose.t = camera.pose.block<3, 1>(0, 3);
                 poses.push_back(pose);
+                // The effective (master) sensor carries the calibration the
+                // pipeline projects with, including the film-normalised one.
                 const Eigen::Vector3d bearing =
-                    chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)]
-                        .calibration.unproject(pixel);
+                    effective_sensor(*chunk, camera).calibration.unproject(pixel);
                 if (!bearing.allFinite() || bearing.norm() <= 0.0) {
                     usable = false;
                     break;

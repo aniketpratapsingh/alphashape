@@ -768,12 +768,10 @@ FootprintRegion build_footprint_region(const Chunk& chunk, const SurfaceFrame& f
     const double py = grid.pixel_size_y;
     const double west = grid.origin_x;
     const double north = grid.origin_y;
+    // The footprint is the ground a camera's pixels see, so it follows the
+    // EFFECTIVE (master) sensor's normalised calibration, not the slave's.
     const auto sensor_of = [&chunk](const Camera& camera) -> const Sensor* {
-        if (camera.sensor_id < 0 ||
-            camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
-            return nullptr;
-        }
-        return &chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)];
+        return find_effective_sensor(chunk, camera);
     };
     for (const Camera& camera : chunk.cameras()) {
         if (!camera.enabled) {
