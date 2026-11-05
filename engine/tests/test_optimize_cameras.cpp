@@ -1805,8 +1805,10 @@ TEST(CalibrationIO, MasterSharesDuringOptimize) {
     }
     run_task(builtin_registry(), document, "OptimizeCameras", params);
 
-    const Calibration& master = chunk.sensors()[0].calibration;
-    const Calibration& copy = chunk.sensors()[1].calibration;
+    // Re-fetch: the task applies its result through the command layer.
+    const Chunk& solved = *document.active_chunk();
+    const Calibration& master = solved.sensors()[0].calibration;
+    const Calibration& copy = solved.sensors()[1].calibration;
     EXPECT_TRUE(copy == master) << "slave did not receive the master calibration";
     // The same tolerance the single-sensor real-data tests use (cal_seq).
     EXPECT_NEAR(master.f, truth.f, 5.0) << "f = " << master.f;
