@@ -271,7 +271,7 @@ TEST(AttitudePrior, YawSigmaSplit) {
         // World->camera of the measurement: R_bc * R_wb^T.
         const Eigen::Matrix3d measured =
             r_bc * r_wb_from_stored(stored, crs::RotationOrder::ZYX).transpose() *
-            enu_cam_from_internal(scene, 0);
+            enu_cam_from_internal(scene, std::size_t{0});
         const Eigen::Vector3d injected =
             heading_error_deg(scene.rotations[0], measured, hf);
         run_optimize(scene);
@@ -295,7 +295,7 @@ TEST(AttitudePrior, YawSigmaSplit) {
         const Eigen::Matrix3d hf = heading_frame(scene.orientations[0].x());
         const Eigen::Matrix3d measured =
             r_bc * r_wb_from_stored(stored, crs::RotationOrder::ZYX).transpose() *
-            enu_cam_from_internal(scene, 0);
+            enu_cam_from_internal(scene, std::size_t{0});
         const Eigen::Vector3d injected =
             heading_error_deg(scene.rotations[0], measured, hf);
         run_optimize(scene);
