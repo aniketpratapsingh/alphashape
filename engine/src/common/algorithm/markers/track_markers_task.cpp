@@ -78,15 +78,6 @@ std::unordered_map<std::int32_t, const Frame*> frames_by_camera(
     return frames;
 }
 
-std::filesystem::path resolve_frame_path(const Document& document,
-                                         const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// civil-from-days inverse). Only the ordering matters, so no timezone is
 /// applied: EXIF date-times are local wall-clock.
@@ -433,7 +424,7 @@ std::shared_ptr<SequenceView> FrameCache::decode(const SequenceCamera& entry) {
     const Camera& camera = *entry.camera;
     try {
         FloatImage full =
-            load_camera_image(document_, chunk_, *camera).to_luminance();
+            load_camera_image(document_, chunk_, camera).to_luminance();
         auto view = std::make_shared<SequenceView>();
         view->entry = &entry;
         view->levels.push_back(std::move(full));

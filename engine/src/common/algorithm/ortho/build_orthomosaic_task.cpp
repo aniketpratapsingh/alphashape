@@ -497,16 +497,6 @@ ResolvedOptions resolve_options(const Params& params) {
     return options;
 }
 
-/// Resolve a frame's recorded path against the document directory, the same
-/// rule AddPhotos / BuildPointCloud / BuildModel / BuildTexture use.
-fs::path resolve_frame_path(const Document& document, const std::string& path) {
-    const fs::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return fs::path(document.path()).parent_path() / recorded;
-}
-
 /// One enabled camera with a pose and a linked photograph. The photograph
 /// itself is NOT held here: decoding every frame up front costs
 /// cameras x image bytes (36 photos of 60 MP are ~6 GB), so the task decodes one
@@ -2692,7 +2682,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     throw Error("BuildOrthomosaic cancelled");
                 }
                 const CameraEntry& entry = cameras[block_cameras[k]];
-                const Image& image = photos.get(block_cameras[k], entry.image_path);
+                const Image& image = photos.get(block_cameras[k], entry);
                 if (image.empty()) {
                     throw ValueError("BuildOrthomosaic: camera " +
                                      std::to_string(entry.camera_id) +

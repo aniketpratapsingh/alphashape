@@ -93,17 +93,6 @@ constexpr std::int64_t kMaxRepairArea = 1000000;
 constexpr const char* kPartialStatusKey = "status";
 constexpr const char* kPartialStatusValue = "partial";
 
-/// Resolve a frame's recorded path against the document's directory (the same
-/// rule AddPhotos/DetectFeatures use). A document with no path (unsaved, in
-/// memory) has no anchor, so the path is taken as given.
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 Eigen::Matrix3d pose_R(const Transform& pose) { return pose.block<3, 3>(0, 0); }
 Eigen::Vector3d pose_t(const Transform& pose) { return pose.block<3, 1>(0, 3); }
 
