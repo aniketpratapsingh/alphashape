@@ -341,7 +341,7 @@ TriScene make_tri_scene() {
             const double noise_y = static_cast<double>(rng() % 3U) - 1.0;
             pixel += Eigen::Vector2d(noise_x, noise_y);
             if (observations % 20U == 19U) {
-                pixel.x() += 30.0;
+                pixel.x() += 250.0;  // gross, so any reasonable gate drops it
                 ++scene.outliers;
             }
             ++observations;
