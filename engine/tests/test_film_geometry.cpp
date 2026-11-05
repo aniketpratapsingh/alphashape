@@ -98,7 +98,7 @@ Image render_canonical(const FilmSettings& film, Eigen::Vector2d& feature_uv) {
     }
     const int fx = (size.first * 3) / 4;
     const int fy = (size.second * 3) / 10;
-    paint_square(image, fx, fy, 4, 250);
+    paint_square(image, fx, fy, 4, static_cast<std::uint8_t>(250));
     feature_uv = Eigen::Vector2d(static_cast<double>(fx) + 0.5,
                                  static_cast<double>(fy) + 0.5);
     return image;
@@ -359,10 +359,12 @@ TEST(FilmFeatures, FiducialsAndBorderExcluded) {
         const Eigen::Vector2d uv = normalised_from_film_mm(film, fiducial.film_mm);
         marks.push_back(uv);
         paint_square(image, static_cast<int>(std::floor(uv.x() - 0.5)),
-                     static_cast<int>(std::floor(uv.y() - 0.5)), 4, 250);
+                     static_cast<int>(std::floor(uv.y() - 0.5)), 4,
+                     static_cast<std::uint8_t>(250));
     }
     // A strong feature away from every mark and from the border must survive.
-    paint_square(image, size.first / 2, size.second / 2, 6, 250);
+    paint_square(image, size.first / 2, size.second / 2, 6,
+                 static_cast<std::uint8_t>(250));
     const std::string path = write_temp_png(image, "features");
     Document document;
     Chunk& chunk = add_camera(document, film, size.first, size.second, path,
