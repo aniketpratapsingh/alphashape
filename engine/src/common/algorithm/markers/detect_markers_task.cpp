@@ -219,9 +219,10 @@ std::vector<Detection> detect_circular(const FloatImage& image,
                                  : 0.0;
     const BlobParams blob =
         blob_params(image.width(), image.height(), seed_size);
-    const std::vector<MarkerCandidate> candidates = detect_blobs(image, blob);
+    const std::vector<MarkerCandidate> dark_candidates =
+        detect_blobs(image, blob);
     if (spec.kind == MarkerKind::CircularNonCoded) {
-        for (const MarkerCandidate& candidate : candidates) {
+        for (const MarkerCandidate& candidate : dark_candidates) {
             if (candidate.radius_px < params.minimum_size) {
                 continue;
             }
@@ -232,12 +233,35 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         }
         return out;
     }
+    // A coded target's centre dot carries the parity bit: parity 1 prints a
+    // black dot, parity 0 a white one. The dark-on-light pass above therefore
+    // only seeds odd ids. For an even id the white centre is not an isolated
+    // blob -- it merges with the 0.25..0.5 R white gap -- but the bright
+    // interior enclosed by the dark border ring is: the light-on-dark pass at
+    // the same scales responds to that interior. A separate coarse dark pass
+    // is unnecessary: the rather scale-selective Hessian response never makes
+    // the white centre a local intensity minimum, so the dark border alone
+    // does not form a blob centred on the target.
+    BlobParams light = blob;
+    light.dark_on_light = false;
+    const std::vector<MarkerCandidate> light_candidates =
+        detect_blobs(image, light);
     const GradientField gradient = compute_gradient_field(image);
-    for (const MarkerCandidate& candidate : candidates) {
+    const auto better = [](const Detection& a, const Detection& b) {
+        if (a.hamming != b.hamming) return a.hamming < b.hamming;
+        if (a.radius != b.radius) return a.radius > b.radius;
+        if (a.center.y() != b.center.y()) return a.center.y() < b.center.y();
+        return a.center.x() < b.center.x();
+    };
+    // Both passes can find the same target: even ids only through the light
+    // interior, odd ids through the dark dot and (once the small dot is
+    // blurred away at a coarse scale) through the same light interior. Decode
+    // every seed and keep one detection per target.
+    const auto consider = [&](const MarkerCandidate& candidate) {
         const auto decoded = decode_circular(image, gradient, candidate, spec.bits,
                                              params.max_hamming);
         if (!decoded || decoded->radius_px < params.minimum_size) {
-            continue;
+            return;
         }
         Detection detection;
         detection.code = params.noparity ? (decoded->code / 2) * 2 : decoded->code;
@@ -245,7 +269,35 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         detection.radius = decoded->radius_px;
         detection.hamming = decoded->hamming;
         detection.coded = true;
-        out.push_back(detection);
+        bool merged = false;
+        for (Detection& kept : out) {
+            const double gate = 0.5 * std::min(kept.radius, detection.radius);
+            if ((kept.center - detection.center).norm() < gate) {
+                if (better(detection, kept)) {
+                    kept = detection;
+                }
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            out.push_back(detection);
+        }
+    };
+    for (const MarkerCandidate& candidate : dark_candidates) {
+        consider(candidate);
+    }
+    for (const MarkerCandidate& candidate : light_candidates) {
+        consider(candidate);
+        // The light interior is bounded by the dark sector edge at 0.5 R on
+        // rays through a dark sector and by the border at 0.9 R elsewhere, so
+        // its fitted radius is a mix between those and the true outer radius.
+        // One extra hypothesis at 1.5x covers the whole plausible range
+        // without a third image pass; decode_circular already probes 4x for
+        // the dark centre dot.
+        MarkerCandidate scaled = candidate;
+        scaled.radius_px *= 1.5;
+        consider(scaled);
     }
     return out;
 }

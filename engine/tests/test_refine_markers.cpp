@@ -58,6 +58,7 @@ struct SceneTarget {
     double radius = 0.07;        ///< physical outer radius, metres
     double rotation = 0.0;
     std::uint32_t word = 0b101101001011U;
+    int parity = 1;  ///< 1 prints a dark centre dot, 0 a white one.
 };
 
 struct BlankBox {
@@ -77,6 +78,8 @@ struct SceneSpec {
     double start_angle = 0.0;
     bool include_blank_target = false;
     std::vector<BlankBox> blank_boxes;
+    /// Target index printed with parity bit 0 (white centre), or -1 for none.
+    int even_code_target = -1;
 };
 
 /// Deterministic, continuous ground texture. The value depends only on the
@@ -132,7 +135,7 @@ std::optional<float> target_shade(const SceneTarget& target, double x, double z)
     test::CircularTruth truth;
     truth.bits = 12;
     truth.word = target.word;
-    truth.parity = 1;
+    truth.parity = target.parity;
     const Eigen::Vector2d local(u / target.radius, v / target.radius);
     const double sector_width =
         2.0 * std::numbers::pi_v<double> / static_cast<double>(truth.bits);
@@ -287,6 +290,7 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.radius = 0.075;
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
+        target.parity = i == spec.even_code_target ? 0 : 1;
         scene.targets.push_back(target);
     }
     if (spec.include_blank_target) {
@@ -543,6 +547,34 @@ TEST(Markers, RefineStableOnExactProjection) {
     EXPECT_EQ(stats.skipped, 0U);
     EXPECT_EQ(stats.refined + stats.unchanged, scene.chunk->markers().size());
     EXPECT_GT(stats.refined + stats.unchanged, 0U);
+}
+
+TEST(Markers, RefineEvenCodeMarker) {
+    // Parity-0 circular targets print a white centre, so the dark-dot blob
+    // seed has nothing to find. The light-interior seed from the second pass
+    // must carry the circular refiner instead.
+    SceneSpec spec;
+    spec.marker_count = 3;
+    spec.even_code_target = 0;
+    RefineScene scene = make_scene(spec, 171U);
+    ASSERT_EQ(scene.targets[0].parity, 0);
+    std::mt19937 engine(83U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine even] marker %zu parity %d RMS %.4f px\n", i,
+                    scene.targets[i].parity, rms);
+        // Parity-0 keeps the border-ellipse centre: the decoder documents a
+        // 0.38 px first-edge bias without the fiducial dot, and the multi-view
+        // consensus reduces it further.
+        EXPECT_LE(rms, 0.2) << "marker " << i;
+    }
+    EXPECT_GE(stats.refined, 1U);
 }
 
 RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,

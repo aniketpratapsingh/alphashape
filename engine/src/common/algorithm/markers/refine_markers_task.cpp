@@ -393,7 +393,16 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     params.max_radius = std::max(4, half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
-    const std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
+    std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
+    // For a parity-0 circular target the white centre merges with the
+    // 0.25..0.5 R white gap, so the dark-on-light pass has no dot to seed
+    // from. The light-on-dark pass finds the bright interior enclosed by the
+    // dark border ring instead. Both passes are searched and the blob nearest
+    // the expected centre wins; for an odd id the dark dot supplies the
+    // fiducial and is normally the nearer of the two.
+    params.dark_on_light = false;
+    const std::vector<MarkerCandidate> light_blobs = detect_blobs(crop, params);
+    blobs.insert(blobs.end(), light_blobs.begin(), light_blobs.end());
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
                                index.y() - static_cast<double>(y0) + 0.5);
     const MarkerCandidate* best = nullptr;
