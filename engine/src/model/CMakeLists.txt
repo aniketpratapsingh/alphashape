@@ -5,6 +5,7 @@
 add_library(alphashape_model STATIC
     camera/calibration.cpp
     camera/film.cpp
+    camera/film_geometry.cpp
     geo/geodesy.cpp
     mesh/marching_tetrahedra.cpp
     mesh/mesh_ops.cpp
@@ -23,6 +24,7 @@ target_include_directories(alphashape_model PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_model
     PUBLIC
         alphashape_base
+        alphashape_image
         Eigen3::Eigen
     PRIVATE
         alphashape_warnings

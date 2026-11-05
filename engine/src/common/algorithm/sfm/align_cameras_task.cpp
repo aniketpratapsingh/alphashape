@@ -43,6 +43,7 @@
 #include "common/algorithm/sfm/absolute_pose.hpp"
 #include "common/algorithm/sfm/georeference.hpp"
 #include "common/algorithm/sfm/structure_builder.hpp"
+#include "common/io/camera_image.hpp"
 
 namespace alphashape {
 namespace {
@@ -156,7 +157,7 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
         sfm::BuilderCamera builder_camera;
         builder_camera.id = id;
         builder_camera.calibration =
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera));
         builder_camera.pixels.reserve(set.keypoints.size());
         for (const Keypoint& keypoint : set.keypoints) {
             builder_camera.pixels.push_back(keypoint_to_pixel(keypoint));

@@ -27,22 +27,13 @@
 #include "common/algorithm/stereo/fusion.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape {
 namespace {
-
-/// Resolve a frame's recorded path against the document's directory (the same
-/// rule AddPhotos/DetectFeatures use).
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
 
 Eigen::Matrix3d pose_R(const Transform& pose) { return pose.block<3, 3>(0, 0); }
 Eigen::Vector3d pose_t(const Transform& pose) { return pose.block<3, 1>(0, 3); }
@@ -124,7 +115,7 @@ void BuildPointCloudTask::apply(Document& document, Params& params, const Progre
         stereo::FusionInput input;
         input.map = &map;
         input.calibration = scaled_calibration(
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration,
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera)),
             map.downscale);
         input.R = pose_R(camera.pose);
         input.t = pose_t(camera.pose);
@@ -141,7 +132,7 @@ void BuildPointCloudTask::apply(Document& document, Params& params, const Progre
             auto inserted = images.emplace(map.camera_id, Image{});
             if (inserted.second) {
                 inserted.first->second =
-                    read_image(resolve_frame_path(document, frame_it->second->path()).string());
+                    load_camera_image(document, *chunk, camera);
             }
             input.image = &inserted.first->second;
         }

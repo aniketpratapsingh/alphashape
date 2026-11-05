@@ -99,6 +99,12 @@ struct CRS {
 
 /// Camera sensor: the physical imaging device. Several cameras may share one
 /// sensor (same body, different shots). Carries the calibration.
+///
+/// Film invariant (WP-13.18b): when `film_geometry_complete(film)` holds, the
+/// pipeline works in film-NORMALISED pixels, so `width`, `height`,
+/// `calibration.width` and `calibration.height` all equal the normalised size
+/// and the pixel-unit coefficients (f, cx, cy, b1, b2) are in those pixels.
+/// The raw scan size lives on each Frame, never here.
 struct Sensor {
     std::string label;
     CameraType type = CameraType::Frame;  ///< doc.xml spells this "frame"/"fisheye"

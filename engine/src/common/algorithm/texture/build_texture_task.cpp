@@ -31,6 +31,7 @@
 #include "common/algorithm/texture/face_views.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "image/io/image_io.hpp"
 #include "model/camera/calibration.hpp"
 #include "model/mesh/mesh.hpp"
@@ -78,16 +79,6 @@ ResolvedOptions resolve_options(const Params& params) {
     return resolved;
 }
 
-/// Resolve a frame's recorded path against the document's directory, the same
-/// rule AddPhotos / BuildPointCloud / BuildModel use.
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 Eigen::Matrix3d pose_R(const Transform& pose) { return pose.block<3, 3>(0, 0); }
 Eigen::Vector3d pose_t(const Transform& pose) { return pose.block<3, 1>(0, 3); }
 
@@ -122,14 +113,13 @@ ViewSet collect_views(const Document& document, const Chunk& chunk) {
             throw ValueError("BuildTexture: camera " + std::to_string(camera.id) +
                              " has no linked frame to sample from");
         }
-        set.images.push_back(read_image(resolve_frame_path(document, frame_it->second->path())
-                                            .string()));
+        set.images.push_back(load_camera_image(document, chunk, camera));
 
         texturing::TexView view;
         view.camera_id = camera.id;
         view.image = nullptr;  // set below, once the vector has stopped growing
         view.calibration =
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+            sensor_pipeline_calibration(effective_sensor(chunk, camera));
         view.R = pose_R(camera.pose);
         view.t = pose_t(camera.pose);
         set.views.push_back(std::move(view));

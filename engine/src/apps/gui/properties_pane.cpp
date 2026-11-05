@@ -15,6 +15,7 @@
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "model/camera/film_geometry.hpp"
 
 namespace alphashape::gui {
 
@@ -117,6 +118,17 @@ void describe_sensor(const Sensor& sensor, std::size_t index, PropertySheet& she
     add(r, QObject::tr("Label"), qs(sensor.label));
     add(r, QObject::tr("Type"), camera_type_text(sensor.type));
     add(r, QObject::tr("Resolution"), size_text(sensor.width, sensor.height));
+    if (sensor.film.enabled) {
+        add(r, QObject::tr("Film resolution (mm/px)"),
+            sensor.film.resolution_mm_per_px > 0.0
+                ? num(sensor.film.resolution_mm_per_px)
+                : QObject::tr("not calibrated"));
+        if (film_geometry_complete(sensor.film)) {
+            const FilmSize size = film_normalised_size(sensor.film);
+            add(r, QObject::tr("Film normalised size"),
+                size_text(size.first, size.second));
+        }
+    }
     add(r, QObject::tr("Focal length (mm)"), sensor.focal_length_mm > 0 ? num(sensor.focal_length_mm) : QObject::tr("unknown"));
     add(r, QObject::tr("Pixel size (um)"), sensor.pixel_size_um > 0 ? num(sensor.pixel_size_um) : QObject::tr("unknown"));
     if (!sensor.make.empty() || !sensor.model.empty()) {

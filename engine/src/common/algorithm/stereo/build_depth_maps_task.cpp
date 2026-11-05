@@ -68,6 +68,7 @@
 #include "common/algorithm/stereo/view_selection.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/camera_image.hpp"
 #include "gpu/gpu.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
@@ -91,17 +92,6 @@ constexpr std::int64_t kMaxRepairArea = 1000000;
 /// the asset's <meta>, so it survives a save/load.
 constexpr const char* kPartialStatusKey = "status";
 constexpr const char* kPartialStatusValue = "partial";
-
-/// Resolve a frame's recorded path against the document's directory (the same
-/// rule AddPhotos/DetectFeatures use). A document with no path (unsaved, in
-/// memory) has no anchor, so the path is taken as given.
-std::filesystem::path resolve_frame_path(const Document& document, const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
 
 Eigen::Matrix3d pose_R(const Transform& pose) { return pose.block<3, 3>(0, 0); }
 Eigen::Vector3d pose_t(const Transform& pose) { return pose.block<3, 1>(0, 3); }
@@ -546,9 +536,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                 sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
                 return 1;
             }
-            const Sensor& sensor = chunk->sensors()[static_cast<std::size_t>(sensor_id)];
-            const int width = sensor.width / downscale;
-            const int height = sensor.height / downscale;
+            const Sensor& sensor = effective_sensor(*chunk, camera);
+            const std::pair<int, int> size = sensor_pipeline_size(sensor);
+            const int width = size.first / downscale;
+            const int height = size.second / downscale;
             if (width <= 0 || height <= 0) {
                 return 1;
             }
@@ -585,7 +576,8 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                 context.neighbour_calibrations.push_back(
                     sensor_id >= 0 &&
                             sensor_id < static_cast<std::int32_t>(chunk->sensors().size())
-                        ? chunk->sensors()[static_cast<std::size_t>(sensor_id)].calibration
+                        ? sensor_pipeline_calibration(
+                              effective_sensor(*chunk, *nb->second))
                         : Calibration{});
             }
         }
@@ -613,9 +605,10 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         // map from an unrepaired one. Folded ONLY when repair_holes is on: a map
         // built before the feature existed hashed neither value, so it keeps
         // matching a repair-off run exactly and existing maps stay reusable.
+        // The EFFECTIVE sensor owns the calibration the search actually uses,
+        // so fold that one (a slave's stored copy may be stale).
         std::uint64_t fingerprint = depth_map_fingerprint(
-            camera, chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)], downscale,
-            &context);
+            camera, effective_sensor(*chunk, camera), downscale, &context);
         // The fold follows what the pass actually DOES: with the filter disabled
         // it never runs, so the map is the unrepaired one and must keep the
         // historic fingerprint (and stay reusable).
@@ -649,8 +642,22 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
     // which never matches, so an old project's maps are rebuilt once and carry a
     // fingerprint from then on.
     const int requested_mode = static_cast<int>(filter_mode);
+    // The pixel grid the map must have. A film sensor whose normalised geometry
+    // was re-derived can produce a differently-sized working image, and a map
+    // at the old size must not be reused even if its fingerprint matched.
+    const auto map_size_of = [&](std::int32_t camera_id) -> std::pair<int, int> {
+        const auto it = camera_by_id.find(camera_id);
+        if (it == camera_by_id.end()) {
+            return {0, 0};
+        }
+        const std::pair<int, int> size =
+            sensor_pipeline_size(effective_sensor(*chunk, *it->second));
+        return {size.first / downscale, size.second / downscale};
+    };
     const auto reusable = [&](const DepthMap& map) {
+        const std::pair<int, int> size = map_size_of(map.camera_id);
         return reuse_depth && map.downscale == downscale &&
+               map.width == size.first && map.height == size.second &&
                map.alignment_fingerprint != 0 &&
                map.alignment_fingerprint == fingerprint_of(map.camera_id) &&
                (map.filter_mode < 0 || map.filter_mode == requested_mode);
@@ -697,10 +704,11 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
                              " has no linked frame");
         }
         auto loaded = std::make_shared<LoadedImage>();
-        const Image image = read_image(resolve_frame_path(document, frame_it->second->path()).string());
+        const Image image = load_camera_image(document, *chunk, camera);
         loaded->image = downsample_box(image.to_luminance(), downscale);
         loaded->calibration = scaled_calibration(
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration, downscale);
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera)),
+            downscale);
         cache.emplace(camera_id, loaded);
         return *loaded;
     };
@@ -1005,7 +1013,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
         stereo::DepthView reference;
         reference.map = &map;
         reference.calibration = scaled_calibration(
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration, downscale);
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera)), downscale);
         reference.R = pose_R(camera.pose);
         reference.t = pose_t(camera.pose);
 
@@ -1019,7 +1027,7 @@ void BuildDepthMapsTask::apply(Document& document, Params& params, const Progres
             stereo::DepthView view;
             view.map = nb->second;
             view.calibration = scaled_calibration(
-                chunk->sensors()[static_cast<std::size_t>(nb_camera.sensor_id)].calibration,
+                sensor_pipeline_calibration(effective_sensor(*chunk, nb_camera)),
                 downscale);
             view.R = pose_R(nb_camera.pose);
             view.t = pose_t(nb_camera.pose);

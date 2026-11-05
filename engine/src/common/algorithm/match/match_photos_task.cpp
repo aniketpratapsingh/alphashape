@@ -23,6 +23,7 @@
 #include "common/algorithm/match/preselection.hpp"
 #include "common/algorithm/match/tracks.hpp"
 #include "common/algorithm/sfm/essential.hpp"
+#include "common/io/camera_image.hpp"
 #include "common/core/frame.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -171,7 +172,9 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
             camera.sensor_id >= static_cast<std::int32_t>(chunk->sensors().size())) {
             throw ValueError("camera " + std::to_string(camera.id) + " has no sensor");
         }
-        const Sensor& sensor = chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
+        // The effective (master) sensor owns the calibration the pipeline
+        // uses, so the film-normalised intrinsics come from there (WP-13.16).
+        const Sensor& sensor = effective_sensor(*chunk, camera);
         // A non-positive focal length makes the epipolar threshold undefined.
         if (!(sensor.calibration.f > 0.0)) {
             throw ValueError("camera " + std::to_string(camera.id) +
@@ -214,7 +217,8 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
                 const std::int32_t id = detect_ids[static_cast<std::size_t>(i)];
                 try {
                     results[static_cast<std::size_t>(i)] = detect_keypoints_for_frame(
-                        document, *frame_of.at(id), keypoint_limit, keypoint_limit_per_mpx);
+                        document, *chunk, *frame_of.at(id), keypoint_limit,
+                        keypoint_limit_per_mpx);
                 } catch (const std::exception& e) {
                     errors[static_cast<std::size_t>(i)] =
                         "camera " + std::to_string(id) + ": " + e.what();

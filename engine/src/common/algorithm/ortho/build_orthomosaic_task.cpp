@@ -31,6 +31,8 @@
 #include "common/algorithm/ortho/ghosting.hpp"
 #include "common/algorithm/ortho/orthorectify.hpp"
 #include "common/algorithm/ortho/seamlines.hpp"
+#include "common/io/camera_image.hpp"
+#include "model/camera/film_geometry.hpp"
 #include "common/algorithm/ortho/texture_fill.hpp"
 #include "common/core/assets.hpp"
 #include "common/core/document.hpp"
@@ -495,16 +497,6 @@ ResolvedOptions resolve_options(const Params& params) {
     return options;
 }
 
-/// Resolve a frame's recorded path against the document directory, the same
-/// rule AddPhotos / BuildPointCloud / BuildModel / BuildTexture use.
-fs::path resolve_frame_path(const Document& document, const std::string& path) {
-    const fs::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return fs::path(document.path()).parent_path() / recorded;
-}
-
 /// One enabled camera with a pose and a linked photograph. The photograph
 /// itself is NOT held here: decoding every frame up front costs
 /// cameras x image bytes (36 photos of 60 MP are ~6 GB), so the task decodes one
@@ -516,6 +508,9 @@ struct CameraEntry {
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
     Eigen::Vector3d centre_local = Eigen::Vector3d::Zero();
     std::string image_path;  ///< resolved absolute path to the photograph
+    /// Film geometry (WP-13.18b), so the decode can resample a scanned film.
+    FilmSettings film;
+    std::optional<Eigen::Matrix3d> film_transform;
 };
 
 /// Collect every enabled camera that has a pose and a linked image (the paths
@@ -544,10 +539,22 @@ std::vector<CameraEntry> collect_cameras(const Document& document, const Chunk& 
             throw ValueError("BuildOrthomosaic: camera " + std::to_string(camera.id) +
                              " has no sensor");
         }
+        const Sensor& sensor = effective_sensor(chunk, camera);
+        if (sensor.film.enabled && !camera.film_transform.has_value()) {
+            throw Error("BuildOrthomosaic: camera " + std::to_string(camera.id) +
+                        " is a film camera without a film transform; run "
+                        "DetectFiducials first");
+        }
+        if (sensor.film.enabled && !film_geometry_complete(sensor.film)) {
+            throw Error("BuildOrthomosaic: camera " + std::to_string(camera.id) +
+                        " has no film-normalised geometry; run "
+                        "CalibrateFiducials with a resolution first");
+        }
         CameraEntry entry;
         entry.camera_id = camera.id;
-        entry.calibration =
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+        entry.calibration = sensor_pipeline_calibration(sensor);
+        entry.film = sensor.film;
+        entry.film_transform = camera.film_transform;
         entry.R = camera.pose.block<3, 3>(0, 0);
         entry.t = camera.pose.block<3, 1>(0, 3);
         entry.centre_local = -entry.R.transpose() * entry.t;
@@ -882,8 +889,9 @@ public:
 
     /// The decoded photograph for `slot`, decoding (and caching) it on a miss.
     /// Returns an empty image when the file cannot be read; the caller turns
-    /// that into the same ValueError the uncached path raises.
-    const Image& get(std::size_t slot, const std::string& path) {
+    /// that into the same ValueError the uncached path raises. A film camera's
+    /// scan is resampled into the film-normalised frame after decoding.
+    const Image& get(std::size_t slot, const CameraEntry& entry) {
         const auto found = index_.find(slot);
         if (found != index_.end()) {
             ++hits_;
@@ -891,10 +899,18 @@ public:
             return entries_[found->second].image;
         }
         ++misses_;
-        Image image = read_image(path);
+        Image image = read_image(entry.image_path);
         if (image.empty()) {
             static const Image kEmpty;
             return kEmpty;
+        }
+        if (entry.film.enabled) {
+            if (!entry.film_transform.has_value()) {
+                throw Error("BuildOrthomosaic: camera " +
+                            std::to_string(entry.camera_id) +
+                            " is a film camera without a film transform");
+            }
+            image = resample_film_image(image, *entry.film_transform, entry.film);
         }
         const std::uint64_t bytes = static_cast<std::uint64_t>(image.size_bytes());
         evict_for(bytes);
@@ -1010,7 +1026,7 @@ std::vector<std::array<double, 3>> estimate_camera_gains(
             throw Error("BuildOrthomosaic cancelled");
         }
         const CameraEntry& entry = cameras[k];
-        const Image& image = photos.get(k, entry.image_path);
+        const Image& image = photos.get(k, entry);
         if (image.empty()) {
             throw ValueError("BuildOrthomosaic: camera " + std::to_string(entry.camera_id) +
                              " has an unreadable image");
@@ -1333,7 +1349,7 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
             continue;
         }
         const CameraEntry& entry = cameras[k];
-        const Image& image = photos.get(k, entry.image_path);
+        const Image& image = photos.get(k, entry);
         if (image.empty()) {
             throw ValueError("BuildOrthomosaic: camera " + std::to_string(entry.camera_id) +
                              " has an unreadable image");
@@ -2666,7 +2682,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     throw Error("BuildOrthomosaic cancelled");
                 }
                 const CameraEntry& entry = cameras[block_cameras[k]];
-                const Image& image = photos.get(block_cameras[k], entry.image_path);
+                const Image& image = photos.get(block_cameras[k], entry);
                 if (image.empty()) {
                     throw ValueError("BuildOrthomosaic: camera " +
                                      std::to_string(entry.camera_id) +

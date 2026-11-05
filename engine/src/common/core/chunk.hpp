@@ -145,7 +145,9 @@ constexpr std::uint8_t kDepthRepairedFlag = 1U;
 /// camera changes every map that used it as a neighbour, not only its own. Two
 /// runs that would produce the same map have the same fingerprint; a
 /// re-aligned camera, a re-calibrated sensor, a different neighbour set or a
-/// different search configuration does not. Never returns 0, which is reserved
+/// different search configuration does not. A film camera's per-scan
+/// film_transform and its sensor's normalised frame are folded in too, so
+/// re-fitting fiducials invalidates the map. Never returns 0, which is reserved
 /// for "no fingerprint recorded".
 ///
 /// `context` is null for a bare "camera identity" hash (the older, narrower

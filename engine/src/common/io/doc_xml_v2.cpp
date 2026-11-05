@@ -26,6 +26,7 @@
 #include "base/io/zip.hpp"
 #include "base/utils/error.hpp"
 #include "common/core/chunk.hpp"
+#include "common/core/sensor_film.hpp"
 #include "common/io/doc_xml.hpp"
 #include "common/core/frame.hpp"
 #include "common/io/doc_xml_common.hpp"
@@ -316,6 +317,20 @@ void write_film(const FilmSettings& film, XmlNode& sensor) {
     set_attr(e, "detector", fiducial_detector_name(film.detector));
     set_attr(e, "corners", film.search_corners ? "1" : "0");
     set_attr(e, "sides", film.search_sides ? "1" : "0");
+    // The normalised-image geometry (WP-13.18b) stays out of the file until it
+    // is known, so a detector-only project serialises byte-identically.
+    if (film.resolution_mm_per_px > 0.0) {
+        set_attr(e, "resolution", fmt(film.resolution_mm_per_px));
+    }
+    if (film.film_size_mm.x() > 0.0 && film.film_size_mm.y() > 0.0) {
+        set_attr(e, "size_x", fmt(film.film_size_mm.x()));
+        set_attr(e, "size_y", fmt(film.film_size_mm.y()));
+    }
+    // Marks a calibration already expressed in normalised pixels. Written only
+    // when true, so a pre-normalisation project keeps its compact form.
+    if (film.calibration_normalised) {
+        set_attr(e, "normalised", "1");
+    }
     std::vector<std::string> labels;
     for (const Fiducial& fiducial : film.fiducials) {
         if (fiducial.label.empty()) {
@@ -1111,7 +1126,33 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
                 parse_fiducial_detector(attr_or(*film, "detector", "circle"));
             s.film.search_corners = parse_int(attr_or(*film, "corners", "1")) != 0;
             s.film.search_sides = parse_int(attr_or(*film, "sides", "0")) != 0;
-            warn_unknown_attrs(*film, {"transform", "detector", "corners", "sides"},
+            s.film.calibration_normalised =
+                parse_int(attr_or(*film, "normalised", "0")) != 0;
+            if (const std::string res = attr_or(*film, "resolution", "");
+                !res.empty()) {
+                s.film.resolution_mm_per_px = parse_film_value(*film, "resolution");
+                if (!(s.film.resolution_mm_per_px > 0.0)) {
+                    throw ProjectIOError(
+                        "doc.xml: <film> resolution must be positive");
+                }
+            }
+            const std::string size_x = attr_or(*film, "size_x", "");
+            const std::string size_y = attr_or(*film, "size_y", "");
+            if (!size_x.empty() || !size_y.empty()) {
+                if (size_x.empty() || size_y.empty()) {
+                    throw ProjectIOError(
+                        "doc.xml: <film> size_x and size_y must be written together");
+                }
+                s.film.film_size_mm = Eigen::Vector2d(parse_film_value(*film, "size_x"),
+                                                      parse_film_value(*film, "size_y"));
+                if (!(s.film.film_size_mm.x() > 0.0) ||
+                    !(s.film.film_size_mm.y() > 0.0)) {
+                    throw ProjectIOError("doc.xml: <film> size must be positive");
+                }
+            }
+            warn_unknown_attrs(*film,
+                               {"transform", "detector", "corners", "sides",
+                                "resolution", "size_x", "size_y", "normalised"},
                                report);
             for (const XmlNode& mark : film->children) {
                 if (mark.name != "fiducial") {
@@ -1891,6 +1932,22 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
                                            require_attr(node, "label"));
     docxml_detail::read_sensors(node, chunk, report);
     docxml_detail::read_cameras(node, chunk, report);
+    // Older film projects (and any written before the WP-13.18b invariant)
+    // carry raw scan sizes next to a normalised-frame film layout. Normalise on
+    // load rather than leaving a chunk that mixes pixel spaces, and report it.
+    for (std::size_t s = 0; s < chunk.sensors().size(); ++s) {
+        Sensor& sensor = chunk.sensors()[s];
+        if (!sensor.film.enabled) {
+            continue;
+        }
+        const SensorFilmNormalisation done = normalise_sensor_film(
+            sensor, chunk.cameras(), static_cast<std::int32_t>(s));
+        if (report != nullptr && (done.sizes_changed || done.coefficients_rescaled)) {
+            report->warnings.push_back(
+                "doc.xml: sensor " + std::to_string(s) +
+                " was stored in raw scan pixels; normalised it to the film frame");
+        }
+    }
     docxml_detail::read_camera_groups(node, chunk, report);
     docxml_detail::read_frames(node, chunk, archive, report);
     warn_missing_frame_files(chunk.frames(), report);

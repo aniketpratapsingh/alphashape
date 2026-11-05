@@ -32,6 +32,7 @@
 #include "common/core/frame.hpp"
 #include "common/core/marker.hpp"
 #include "common/core/mask.hpp"
+#include "common/io/camera_image.hpp"
 #include "common/core/types.hpp"
 #include "image/image.hpp"
 #include "image/io/image_io.hpp"
@@ -456,15 +457,6 @@ void refine_from_windows(std::vector<Detection>& detections,
         }
     }
 }
-std::filesystem::path resolve_frame_path(const Document& document,
-                                         const std::string& path) {
-    const std::filesystem::path recorded(path);
-    if (recorded.is_absolute() || document.path().empty()) {
-        return recorded;
-    }
-    return std::filesystem::path(document.path()).parent_path() / recorded;
-}
-
 const Chunk* find_chunk_by_id(const Document& document, std::int32_t chunk_id) {
     for (const auto& workspace : document.workspaces()) {
         if (!workspace) {
@@ -719,7 +711,7 @@ namespace {
 struct CameraJob {
     const Camera* camera = nullptr;
     const Frame* frame = nullptr;
-    const Calibration* calibration = nullptr;
+    Calibration calibration;
     int scale = 1;
 };
 
@@ -758,14 +750,14 @@ std::size_t estimate_peak_working_set(int width, int height, int scale,
     return full + reduced + copies * luminance_bytes(detect_width, detect_height);
 }
 
-CameraResult process_camera(const Document& document, const CameraJob& job,
-                            const TargetSpec& spec, const DetectorParams& params,
-                            bool inverted, bool filter_mask, const Mask* mask) {
+CameraResult process_camera(const Document& document, const Chunk& chunk,
+                            const CameraJob& job, const TargetSpec& spec,
+                            const DetectorParams& params, bool inverted,
+                            bool filter_mask, const Mask* mask) {
     CameraResult result;
     try {
         FloatImage luminance =
-            read_image(resolve_frame_path(document, job.frame->path()).string())
-                .to_luminance();
+            load_camera_image(document, chunk, *job.camera).to_luminance();
         const int width = luminance.width();
         const int height = luminance.height();
         int scale = job.scale > 0 ? job.scale : auto_scale(width, height);
@@ -978,7 +970,7 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
         job.camera = &camera;
         job.frame = frame;
         job.calibration =
-            &chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)].calibration;
+            sensor_pipeline_calibration(effective_sensor(*chunk, camera));
         job.scale = options.marker_downscale;
         jobs.push_back(job);
     }
@@ -1013,8 +1005,8 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
         const Mask* mask =
             options.filter_mask ? mask_of_camera(*chunk, camera.id) : nullptr;
         results[static_cast<std::size_t>(i)] = process_camera(
-            document, jobs[static_cast<std::size_t>(i)], parsed.spec, detector,
-            options.inverted, options.filter_mask, mask);
+            document, *chunk, jobs[static_cast<std::size_t>(i)], parsed.spec,
+            detector, options.inverted, options.filter_mask, mask);
     }
     (void)parallel_cameras;  // used only by the OpenMP `if` clause
     for (const CameraResult& result : results) {
@@ -1043,7 +1035,7 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
                 continue;
             }
             const auto pixel =
-                project_marker(*marker.position, *job.camera, *job.calibration);
+                project_marker(*marker.position, *job.camera, job.calibration);
             if (pixel) {
                 predictions.emplace_back(marker.label, *pixel);
             }
