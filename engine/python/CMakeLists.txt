@@ -137,6 +137,10 @@ alphashape_add_python_test(python_crs ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_crs
 alphashape_add_python_test(python_calibration_io
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_calibration_io.py)
 
+# WP-13.21: the camera reference attitude properties through Python.
+alphashape_add_python_test(python_attitude_prior
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)
+
 # WP-13.17: printable marker and chessboard sheets (PDF/PNG by extension).
 alphashape_add_python_test(python_marker_sheet
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_marker_sheet.py)

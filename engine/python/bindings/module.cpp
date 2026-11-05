@@ -1054,6 +1054,28 @@ PYBIND11_MODULE(alphashape, m) {
             const Eigen::Vector3d& a = c.reference.accuracy;
             return py::make_tuple(a.x(), a.y(), a.z());
         })
+        // Measured attitude as a (yaw, pitch, roll) tuple in degrees, in the
+        // chunk's rotation order; None when the reference carries none.
+        .def_property_readonly("reference_orientation",
+                               [](const alphashape::Camera& c) -> py::object {
+                                   if (!c.reference.orientation_deg.has_value()) {
+                                       return py::none();
+                                   }
+                                   const Eigen::Vector3d& a = *c.reference.orientation_deg;
+                                   return py::make_tuple(a.x(), a.y(), a.z());
+                               })
+        // Per-axis 1-sigma attitude accuracy in degrees, positional like
+        // reference_orientation; None when the reference does not set its own
+        // (the chunk's reference setting then applies).
+        .def_property_readonly("reference_rotation_accuracy",
+                               [](const alphashape::Camera& c) -> py::object {
+                                   if (!c.reference.rotation_accuracy_deg.has_value()) {
+                                       return py::none();
+                                   }
+                                   const Eigen::Vector3d& a =
+                                       *c.reference.rotation_accuracy_deg;
+                                   return py::make_tuple(a.x(), a.y(), a.z());
+                               })
         // Posterior covariance of the centre, chunk-local, 3x3 nested lists.
         // All zeros on a camera whose covariance was not computed.
         .def_property_readonly("location_covariance", [](const alphashape::Camera& c) {
@@ -1526,6 +1548,45 @@ PYBIND11_MODULE(alphashape, m) {
             py::arg("label"), py::arg("x"), py::arg("y"), py::arg("z"),
             "Create or move the marker with this exact label to (x, y, z) in "
             "chunk-local coordinates. Returns its id.")
+        // Set or clear one camera's per-axis attitude accuracy in degrees, the
+        // sigma trio OptimizeCameras uses to weight that camera's rotation
+        // prior. Cameras are exposed as copies, so the edit goes through the
+        // chunk by id rather than through the Camera object.
+        .def(
+            "set_camera_reference_rotation_accuracy",
+            [](Chunk& c, std::int32_t camera_id, py::object accuracy) {
+                alphashape::Camera* camera = nullptr;
+                for (alphashape::Camera& candidate : c.cameras()) {
+                    if (candidate.id == camera_id) {
+                        camera = &candidate;
+                        break;
+                    }
+                }
+                if (camera == nullptr) {
+                    throw alphashape::ValueError(
+                        "set_camera_reference_rotation_accuracy: no camera with that id");
+                }
+                if (accuracy.is_none()) {
+                    camera->reference.rotation_accuracy_deg.reset();
+                    return;
+                }
+                const auto values = py::cast<std::vector<double>>(accuracy);
+                if (values.size() != 3) {
+                    throw alphashape::ValueError(
+                        "set_camera_reference_rotation_accuracy: accuracy must be a "
+                        "(first, second, third) triple");
+                }
+                const Eigen::Vector3d sigma(values[0], values[1], values[2]);
+                if (!sigma.allFinite() || (sigma.array() < 0.0).any()) {
+                    throw alphashape::ValueError(
+                        "set_camera_reference_rotation_accuracy: accuracy must be "
+                        "finite and non-negative");
+                }
+                camera->reference.rotation_accuracy_deg = sigma;
+            },
+            py::arg("camera_id"), py::arg("accuracy"),
+            "Set one camera's per-axis attitude accuracy in degrees, positional "
+            "like reference_orientation; None restores the chunk setting.")
         // Set (or replace) one chunk-meta property.
         .def(
             "set_meta",
