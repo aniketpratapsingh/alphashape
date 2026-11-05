@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <list>
@@ -23,6 +24,7 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -356,6 +358,12 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
+bool seed_diag() {
+    static const bool enabled =
+        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
+    return enabled;
+}
+
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -565,7 +573,7 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 const double window_limit =
                     static_cast<double>(half) - 2.0;
                 if (fitted_radius >= 0.8 * light->radius_px &&
-                    fitted_radius <= 2.2 * light->radius_px &&
+                    fitted_radius <= 2.4 * light->radius_px &&
                     fitted_radius <= window_limit &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
@@ -623,6 +631,14 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
+    if (seed_diag()) {
+        std::fprintf(stderr,
+                     "[diag win] half=%d seed=(%.2f,%.2f) out=(%.2f,%.2f) "
+                     "r=%.2f light=%d fit=%d\n",
+                     half, seed.x(), seed.y(), out.pixel.x(), out.pixel.y(),
+                     out.radius, static_cast<int>(out.light_centre),
+                     static_cast<int>(out.border_fitted));
+    }
     return out;
 }
 
@@ -1397,6 +1413,20 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             blend.coded_circular, blend.target_kind_known);
         const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
                                               options.patch_size, limit);
+        if (seed_diag()) {
+            std::fprintf(stderr,
+                         "[diag aw] cam=%d px=(%.2f,%.2f) seed=(%.2f,%.2f) "
+                         "r=%.2f light=%d fit=%d refined=(%.2f,%.2f) d=%.2f\n",
+                         blend.view->camera->id, projected->x(), projected->y(),
+                         seed ? seed->pixel.x() : 0.0,
+                         seed ? seed->pixel.y() : 0.0,
+                         seed ? seed->radius : 0.0,
+                         static_cast<int>(seed && seed->light_centre),
+                         static_cast<int>(seed && seed->border_fitted),
+                         refined ? refined->x() : 0.0,
+                         refined ? refined->y() : 0.0,
+                         refined ? (*refined - *projected).norm() : -1.0);
+        }
         anchored[index] = refined ? *refined : *projected;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
@@ -1505,6 +1535,15 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         } else {
             blend.apparent = 1.0;
             blend.has_scale = false;
+        }
+        if (seed_diag()) {
+            std::fprintf(stderr,
+                         "[diag fill] cam=%d px=(%.2f,%.2f) apparent=%.2f "
+                         "light=%d fit=%d\n",
+                         blend.view->camera->id, blend.pixel.x(),
+                         blend.pixel.y(), blend.apparent,
+                         static_cast<int>(blend.seed && blend.seed->light_centre),
+                         static_cast<int>(blend.seed && blend.seed->border_fitted));
         }
     }
 }
