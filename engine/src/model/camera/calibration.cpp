@@ -194,6 +194,10 @@ Calibration scaled_calibration(const Calibration& full, int downscale) {
     out.cy = (static_cast<double>(full.height) * 0.5 + full.cy) / ds -
              static_cast<double>(out.height) * 0.5;
     // Distortion coefficients and the camera type are resolution independent.
+    // The covariance is expressed in pixel units of the full-resolution model,
+    // so it does not survive the rescale; the caller must refit if it wants one.
+    out.covariance = Eigen::MatrixXd();
+    out.covariance_params.clear();
     return out;
 }
 
