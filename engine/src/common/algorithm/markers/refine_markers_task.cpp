@@ -400,9 +400,10 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     // For a parity-0 circular target the white centre merges with the
     // 0.25..0.5 R white gap, so the dark-on-light pass has no dot to seed
     // from. The light-on-dark pass finds the bright interior enclosed by the
-    // dark border ring instead. A dark blob near the expected centre is the
-    // parity-1 centre dot, the precise printed fiducial, so it is preferred
-    // when present; the light blob is the fallback for targets without one.
+    // dark border ring instead. The two parities are then told apart by the
+    // centre dot: only a small dark blob at the fitted border centre is the
+    // printed fiducial. Dark sector wedges form dark blobs too, but they sit
+    // at about 0.5 R and must not be taken for the centre.
     params.dark_on_light = false;
     const std::vector<MarkerCandidate> light_blobs = detect_blobs(crop, params);
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
@@ -419,35 +420,61 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
         }
         return best;
     };
-    const MarkerCandidate* best = nearest(dark_blobs);
-    const bool light_centre = best == nullptr;
-    if (light_centre) {
-        best = nearest(light_blobs);
-    }
-    if (best == nullptr) {
-        return std::nullopt;
-    }
-    Eigen::Vector2d centre = best->center;
-    double radius = best->radius_px;
-    if (light_centre) {
+    BlobSeed out;
+    Eigen::Vector2d centre = seed;
+    double radius = 0.0;
+    const MarkerCandidate* light = nearest(light_blobs);
+    if (light != nullptr) {
         // The light interior's first edge differs between dark and light
         // sectors, so fit the outer border; it also supplies the true target
         // radius instead of the smaller interior scale.
+        centre = light->center;
+        radius = light->radius_px;
+        // The centre dot sits on the target centre; dark sector wedges are
+        // half a radius away, so proximity alone separates the fiducial.
+        double dot_distance = std::max(2.0, 0.5 * radius);
         double fitted_radius = radius;
         if (const auto fitted =
                 refine_border_center(crop, centre, radius, &fitted_radius)) {
             centre = *fitted;
             radius = fitted_radius;
         }
-    } else if (const auto fitted = refine_ellipse_center(crop, *best)) {
-        centre = *fitted;
+        const MarkerCandidate* dot = nullptr;
+        for (const MarkerCandidate& blob : dark_blobs) {
+            if (!(blob.radius_px <= radius)) {
+                continue;
+            }
+            const double distance = (blob.center - centre).norm();
+            if (distance <= dot_distance) {
+                dot_distance = distance;
+                dot = &blob;
+            }
+        }
+        if (dot != nullptr) {
+            centre = dot->center;
+            if (const auto fitted = refine_ellipse_center(crop, *dot)) {
+                centre = *fitted;
+            }
+            out.light_centre = false;
+        } else {
+            out.light_centre = true;
+        }
+    } else {
+        const MarkerCandidate* dark = nearest(dark_blobs);
+        if (dark == nullptr) {
+            return std::nullopt;
+        }
+        centre = dark->center;
+        radius = dark->radius_px;
+        if (const auto fitted = refine_ellipse_center(crop, *dark)) {
+            centre = *fitted;
+        }
+        out.light_centre = false;
     }
-    BlobSeed out;
     out.pixel = (centre + Eigen::Vector2d(static_cast<double>(x0),
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
-    out.light_centre = light_centre;
     return out;
 }
 
