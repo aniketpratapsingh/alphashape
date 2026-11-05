@@ -63,19 +63,6 @@ sfm::AbsolutePose transform_to_pose(const Transform& transform) {
     return pose;
 }
 
-/// Linear-interpolated percentile of an already-sorted vector (ours: a plain
-/// order-statistic interpolation; q is in [0, 1]).
-double percentile(const std::vector<double>& sorted, double q) {
-    if (sorted.empty()) {
-        return 0.0;
-    }
-    const double pos = q * (static_cast<double>(sorted.size()) - 1.0);
-    const std::size_t lo = static_cast<std::size_t>(std::floor(pos));
-    const std::size_t hi = std::min(lo + 1, sorted.size() - 1);
-    const double frac = pos - static_cast<double>(lo);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
 }  // namespace
 
 void AlignCamerasTask::declare_params(Params& params) const {
@@ -216,12 +203,8 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
         new_tracks[t].covariance.reset();
     }
 
-    // The chunk region: ours. The centre is the per-axis median of the
-    // triangulated points and the size is the per-axis 5th-95th percentile span
-    // scaled by 1.1 (a little margin so the region contains the bulk of the
-    // cloud). Fewer than four points is not enough to define a region, so the
-    // existing one is left alone.
-    Region new_region = chunk->region();
+    // The chunk region: ours. Fitted to the triangulated points; fewer than
+    // four is not enough to define one, so the existing region is left alone.
     std::vector<Eigen::Vector3d> points;
     points.reserve(new_tracks.size());
     for (const Track& track : new_tracks) {
@@ -229,19 +212,7 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
             points.push_back(*track.point);
         }
     }
-    if (points.size() >= 4) {
-        for (int axis = 0; axis < 3; ++axis) {
-            std::vector<double> values;
-            values.reserve(points.size());
-            for (const Eigen::Vector3d& p : points) {
-                values.push_back(p[axis]);
-            }
-            std::sort(values.begin(), values.end());
-            new_region.centre[axis] = percentile(values, 0.5);
-            const double span = percentile(values, 0.95) - percentile(values, 0.05);
-            new_region.size[axis] = span * 1.1;
-        }
-    }
+    const Region new_region = region_from_points(points, chunk->region());
 
     // -- stage the result on a copy and georeference it ----------------------
     // Everything below is pure computation on a copy of the chunk; the real

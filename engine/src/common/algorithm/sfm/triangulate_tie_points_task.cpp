@@ -95,6 +95,9 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
         progress.update("triangulate", 1.0);
         return;
     }
+    // A slave uses its master's calibration, so an invalid link is a hard error
+    // before any pose or observation is read.
+    validate_sensor_masters(chunk->sensors());
     std::unordered_map<std::int32_t, View> views;
     views.reserve(chunk->cameras().size());
     for (const Camera& camera : chunk->cameras()) {
@@ -109,8 +112,10 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
         View view;
         view.camera_id = camera.id;
         view.keypoints = set;
-        view.calibration = &chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)]
-                                .calibration;
+        view.calibration =
+            &chunk->sensors()[static_cast<std::size_t>(
+                                  effective_sensor_id(chunk->sensors(), camera.sensor_id))]
+                 .calibration;
         view.pose.R = camera.pose.block<3, 3>(0, 0);
         view.pose.t = camera.pose.block<3, 1>(0, 3);
         views.emplace(camera.id, view);
@@ -207,10 +212,6 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
                 outcome = removed == 0 ? Outcome::Degenerate : Outcome::Reprojection;
                 break;
             }
-            if (sfm::max_parallax(poses, *point) < min_parallax_rad) {
-                outcome = removed == 0 ? Outcome::Parallax : Outcome::Reprojection;
-                break;
-            }
             // Reprojection errors against the point fitted from every
             // surviving view. This joint error, not a leave-one-out error, is
             // the accept gate: a track is consistent when all of its views
@@ -234,6 +235,12 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
                 }
             }
             if (worst_error <= max_error_px) {
+                // Parallax is measured once, on the accepted point. Checking it
+                // on every removal pass would make removal quadratic in the
+                // view count for no extra information.
+                if (sfm::max_parallax(poses, *point) < min_parallax_rad) {
+                    outcome = removed == 0 ? Outcome::Parallax : Outcome::Reprojection;
+                }
                 break;
             }
             // Choose the observation to drop by consensus: removing the

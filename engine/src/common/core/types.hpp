@@ -138,6 +138,23 @@ struct Sensor {
 /// inspected. Throws ValueError naming the offending sensor.
 void validate_sensor_masters(const std::vector<Sensor>& sensors);
 
+/// The sensor whose calibration a camera actually uses: its master when one is
+/// linked, otherwise the sensor itself. Throws ValueError when either index is
+/// out of range.
+std::int32_t effective_sensor_id(const std::vector<Sensor>& sensors,
+                                 std::int32_t sensor_id);
+
+/// Bounding region fitted to a point cloud: per-axis median centre and
+/// 5th-95th percentile span scaled by 1.1. Fewer than four points cannot define
+/// a region, so `fallback` is returned unchanged.
+Region region_from_points(const std::vector<Eigen::Vector3d>& points,
+                          const Region& fallback);
+
+/// True when a CRS descriptor is unset or names a geographic (lon/lat) datum.
+/// Reference values are read as lon/lat/ellipsoidal height, so a projected CRS
+/// cannot be consumed by geodetic conversion.
+bool crs_is_geographic(const CRS& crs);
+
 /// The photogrammetric "camera reference": a measured (not adjusted) position
 /// from the camera's GNSS log, used as an observation in adjustment.
 /// Stored as (longitude_deg, latitude_deg, altitude_m) — longitude first, in

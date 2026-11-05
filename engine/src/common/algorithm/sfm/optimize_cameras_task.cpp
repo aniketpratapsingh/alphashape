@@ -270,11 +270,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             throw ValueError("OptimizeCameras: camera " + std::to_string(camera.id) +
                              " has no sensor");
         }
-        const Sensor& sensor =
-            chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
-        const std::int32_t effective = sensor.master_sensor_id >= 0
-                                           ? sensor.master_sensor_id
-                                           : camera.sensor_id;
+        const std::int32_t effective =
+            effective_sensor_id(chunk->sensors(), camera.sensor_id);
         used_sensor.push_back(camera.sensor_id);
         if (sensor_slot.find(effective) == sensor_slot.end()) {
             const std::size_t slot = problem.calibrations.size();
@@ -637,10 +634,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             // constrains the mounted antenna rather than the projection centre.
             // Sensors resolve their master's calibration, and the mount is part
             // of the physical body, so use the effective master's antenna.
-            const Sensor& sensor =
-                chunk->sensors()[static_cast<std::size_t>(camera.sensor_id)];
             const std::int32_t effective =
-                sensor.master_sensor_id >= 0 ? sensor.master_sensor_id : camera.sensor_id;
+                effective_sensor_id(chunk->sensors(), camera.sensor_id);
             const Antenna& antenna =
                 chunk->sensors()[static_cast<std::size_t>(effective)].antenna;
             if (antenna.is_set() || antenna.boresight_deg.has_value()) {

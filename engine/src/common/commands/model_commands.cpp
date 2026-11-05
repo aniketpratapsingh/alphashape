@@ -1538,6 +1538,11 @@ protected:
             throw ValueError("no marker with id " + std::to_string(marker_id_));
         }
         marker->position = position_;
+        if (!position_.has_value()) {
+            // A cleared estimate has no covariance: the old one described a
+            // position that no longer exists.
+            marker->position_covariance.setZero();
+        }
     }
 
 private:

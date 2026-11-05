@@ -65,26 +65,6 @@ bool all_finite(const Eigen::Vector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
 }
 
-/// True when a slot's CRS is unset or declares a geographic (lon/lat) datum.
-/// update_transform reads references as lon/lat/ellipsoidal height, so a slot
-/// naming a projected CRS cannot be consumed. epsg 0 means "unset": nothing
-/// contradicts the numbers. 4326 is the canonical geographic code and the
-/// 4000-4999 block is the geographic EPSG range that contains it.
-bool crs_is_geographic(const auto& crs) {
-    const int code = static_cast<int>(crs.epsg);
-    if (code != 0) {
-        return code == 4326 || (code >= 4000 && code <= 4999);
-    }
-    // No EPSG code: a WKT that names a projected CRS is still a refusal, and an
-    // empty slot declares nothing.
-    const std::string& wkt = crs.wkt;
-    if (!wkt.empty()) {
-        return wkt.find("PROJCRS") == std::string::npos &&
-               wkt.find("PROJECTEDCRS") == std::string::npos;
-    }
-    return true;
-}
-
 /// True when the points are not collinear: the farthest pair defines a line and
 /// at least one other point deviates from it by more than a relative tolerance.
 /// Mirrors the gauge test used by OptimizeCameras.

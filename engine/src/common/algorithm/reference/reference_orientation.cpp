@@ -50,9 +50,8 @@ Eigen::Matrix3d rotation_of_similarity(const Eigen::Matrix3d& matrix) {
 }
 
 const Antenna& effective_antenna(const Chunk& chunk, const Camera& camera) {
-    const Sensor& sensor = chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)];
     const std::int32_t effective =
-        sensor.master_sensor_id >= 0 ? sensor.master_sensor_id : camera.sensor_id;
+        effective_sensor_id(chunk.sensors(), camera.sensor_id);
     return chunk.sensors()[static_cast<std::size_t>(effective)].antenna;
 }
 

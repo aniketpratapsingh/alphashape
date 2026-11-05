@@ -11,13 +11,20 @@
 //     C    = A - R_wc^T * lever          (lever in the camera frame)
 //     pose = [R_wc | -R_wc * C_internal]
 //
+// A rotation cannot be derived without an attitude, so a camera whose reference
+// carries none is always skipped (as is one with no position, or with a GNSS
+// fix that has no altitude). There is no parameter to relax this.
+//
 // The metadata is never trusted enough to skip refinement; the task only gives
 // OptimizeCameras a good starting point. Existing tie points belong to the old
 // poses and are cleared.
 //
 // A non-georeferenced chunk gets a local ENU frame: internal = metres in the
 // local ENU at the centroid of the reference positions, transform =
-// enu_to_ecef(centroid), CRS 4326.
+// enu_to_ecef(centroid), CRS 4326. Because that replaces the arbitrary frame,
+// cameras the task does not place are disabled (not left in the old frame),
+// estimated marker positions are cleared, and the region is refitted to the
+// placed camera centres.
 
 #include "common/tasks/task.hpp"
 
