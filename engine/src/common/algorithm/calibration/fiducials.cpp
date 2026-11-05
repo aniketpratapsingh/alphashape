@@ -428,13 +428,6 @@ Eigen::Vector2d window_direction(FiducialWindow window) {
     return Eigen::Vector2d(0.0, 1.0);
 }
 
-bool is_corner_window(FiducialWindow window) {
-    return window == FiducialWindow::TopLeft ||
-           window == FiducialWindow::TopRight ||
-           window == FiducialWindow::BottomRight ||
-           window == FiducialWindow::BottomLeft;
-}
-
 /// Eight-sector classification of a film direction (y up). Used to map a
 /// fiducial coordinate to the window that should hold it.
 FiducialWindow classify_direction(const Eigen::Vector2d& direction) {
@@ -1097,7 +1090,7 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
         std::optional<Eigen::Vector2d> pixel;
         if (options.detector == FiducialDetector::FrameCorner) {
             pixel = quad_corner(*quad, request.window);
-        } else if (is_corner_window(request.window)) {
+        } else if (options.detector == FiducialDetector::Corner) {
             pixel = detect_corner(gradients, request.box, 8.0);
         } else {
             const std::optional<CircleHit> hit = detect_circle(

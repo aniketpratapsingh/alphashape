@@ -44,13 +44,16 @@ bool inside_mark(const Eigen::Vector2d& film, const Eigen::Vector2d& centre,
     }
     const double ex = centre.x() > 0.0 ? -1.0 : 1.0;
     const double ey = centre.y() > 0.0 ? -1.0 : 1.0;
+    // A thin L: both edges of each arm stay inside the sub-pixel refinement
+    // window, so the two edge-line families intersect at the vertex rather
+    // than at the inner (concave) corner of a thick bar.
+    const double half_width = 0.5 * spec.mark_line_mm;
     const bool horizontal =
         near_segment(film.x(), film.y(), centre.x(), centre.y(),
-                     centre.x() + ex * spec.mark_arm_mm, centre.y(),
-                     spec.mark_radius_mm);
+                     centre.x() + ex * spec.mark_arm_mm, centre.y(), half_width);
     const bool vertical =
         near_segment(film.x(), film.y(), centre.x(), centre.y(), centre.x(),
-                     centre.y() + ey * spec.mark_arm_mm, spec.mark_radius_mm);
+                     centre.y() + ey * spec.mark_arm_mm, half_width);
     return horizontal || vertical;
 }
 

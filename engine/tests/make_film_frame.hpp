@@ -29,8 +29,9 @@ struct FilmFrameSpec {
     bool mirror = false;
     std::vector<Eigen::Vector2d> marks_mm;
     FiducialDetector mark_type = FiducialDetector::Circle;
-    double mark_radius_mm = 0.4;
-    double mark_arm_mm = 1.2;
+    double mark_radius_mm = 0.4;   ///< circle radius
+    double mark_line_mm = 0.2;     ///< L mark line width (both arms)
+    double mark_arm_mm = 1.2;      ///< L mark arm length
     double background = 0.12;
     double frame = 0.85;
     double mark = 0.12;
