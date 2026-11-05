@@ -159,6 +159,14 @@ struct CameraReference {
     /// `crs::EulerAngles`. nullopt means "no orientation reference".
     std::optional<Eigen::Vector3d> orientation_deg;
 
+    /// Per-axis 1-sigma accuracy of `orientation_deg` in degrees, positional
+    /// like it: (first angle, second angle, third angle), i.e. (yaw, pitch,
+    /// roll) in the default `ZYX` order. nullopt means "use the chunk's
+    /// `ReferenceSettings::camera_rotation_accuracy_deg`" for every axis. Used
+    /// to weight an attitude prior in adjustment; ignored when
+    /// `orientation_deg` is absent.
+    std::optional<Eigen::Vector3d> rotation_accuracy_deg;
+
     bool enabled = true;  ///< used as a constraint in adjustment
 
     bool operator==(const CameraReference& other) const;

@@ -436,6 +436,20 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
                 set_attr(ref, "pitch", fmt(angles.y()));
                 set_attr(ref, "roll", fmt(angles.z()));
             }
+            // Optional per-axis attitude accuracy (WP-13.21). Omitted when
+            // unset so an older project round-trips byte-identically, like the
+            // orientation triple above.
+            if (c.reference.rotation_accuracy_deg.has_value()) {
+                const Eigen::Vector3d& rot_acc = *c.reference.rotation_accuracy_deg;
+                if (!std::isfinite(rot_acc.x()) || !std::isfinite(rot_acc.y()) ||
+                    !std::isfinite(rot_acc.z()) || !(rot_acc.x() > 0.0) ||
+                    !(rot_acc.y() > 0.0) || !(rot_acc.z() > 0.0)) {
+                    throw ProjectIOError(
+                        "camera " + std::to_string(c.id) +
+                        ": reference rotation accuracy must be finite and positive");
+                }
+                set_attr(ref, "rotation_accuracy", vec3(rot_acc));
+            }
             set_attr(ref, "enabled", c.reference.enabled ? "1" : "0");
         }
         // Per-scan film geometry (WP-13.18a). Both children are optional, so a
@@ -1209,6 +1223,17 @@ CameraReference read_camera_reference(const XmlNode* ref) {
         }
         reference.orientation_deg = Eigen::Vector3d(
             parse_double(*yaw), parse_double(*pitch), parse_double(*roll));
+    }
+    if (const std::string* rot_acc = find_attr(*ref, "rotation_accuracy")) {
+        const Eigen::Vector3d value = parse_vec3(*rot_acc);
+        if (!std::isfinite(value.x()) || !std::isfinite(value.y()) ||
+            !std::isfinite(value.z()) || !(value.x() > 0.0) || !(value.y() > 0.0) ||
+            !(value.z() > 0.0)) {
+            throw ProjectIOError(
+                "doc.xml: <reference> rotation_accuracy must be finite and positive, got '" +
+                *rot_acc + "'");
+        }
+        reference.rotation_accuracy_deg = value;
     }
     reference.enabled = parse_int(require_attr(*ref, "enabled")) != 0;
     return reference;
