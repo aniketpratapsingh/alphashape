@@ -68,8 +68,8 @@ Eigen::Vector3d stored_from_world_body(const Eigen::Matrix3d& r_wb,
 /// frame (the chunk transform is ENU->ECEF at `origin`). The airframe is level
 /// (body forward horizontal, pitch and roll zero), so the stored body attitude
 /// is well conditioned in every rotation order. `mount` is the body->camera
-/// mount used to synthesise the truth: R_wc = R_wb * mount^T, so the stored
-/// body attitude is R_wb = R_wc * mount.
+/// mount used to synthesise the truth: the pose's world->camera rotation is
+/// R = mount * R_wb^T, so the stored body attitude is R_wb = R^T * mount.
 struct Scene {
     Document document;
     geo::Geodetic origin;
@@ -119,12 +119,12 @@ Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& mount,
         const double azimuth =
             2.0 * kPi * static_cast<double>(i) / static_cast<double>(kCameras);
         // Level airframe at a compass heading, positioned above the grid. The
-        // camera looks straight down because the mount is the nadir one:
-        // R_wc = R_wb * mount^T.
+        // camera looks straight down because the mount is the nadir one. The
+        // pose rotation is world->camera: R = mount * R_wb^T.
         const Eigen::Vector3d centre(2.0 * std::cos(azimuth), 2.0 * std::sin(azimuth),
                                      10.0);
         const Eigen::Matrix3d body = yaw_about_up(azimuth);
-        const Eigen::Matrix3d rotation = body * mount.transpose();
+        const Eigen::Matrix3d rotation = mount * body.transpose();
 
         Camera camera;
         camera.id = i;
@@ -425,7 +425,12 @@ TEST(AttitudePrior, OrientationIgnoredWhenDisabled) {
     run_optimize(absent, true);
     const Chunk& a = *carried.document.active_chunk();
     const Chunk& b = *absent.document.active_chunk();
-    EXPECT_TRUE(a.cameras() == b.cameras());
+    // The references differ (one carries orientations and the other does not),
+    // so compare the solved poses rather than the whole Camera records.
+    ASSERT_EQ(a.cameras().size(), b.cameras().size());
+    for (std::size_t i = 0; i < a.cameras().size(); ++i) {
+        EXPECT_EQ((a.cameras()[i].pose - b.cameras()[i].pose).cwiseAbs().maxCoeff(), 0.0);
+    }
     EXPECT_TRUE(a.tie_points() == b.tie_points());
     EXPECT_TRUE(a.sensors() == b.sensors());
     EXPECT_EQ((a.transform() - b.transform()).cwiseAbs().maxCoeff(), 0.0);
@@ -467,8 +472,9 @@ TEST(AttitudePrior, XmpNadirPriorIsZeroAtTruth) {
     const Eigen::Matrix3d r_wb = r_wb_from_stored(stored, crs::RotationOrder::ZYX);
     const Eigen::Matrix3d mount = reference::body_to_camera_nadir();
     // The documented rule: the stored triple is a BODY attitude, and the
-    // default mount is nadir, so R_wc = R_wb * B^T.
-    const Eigen::Matrix3d r_wc = r_wb * mount.transpose();
+    // default mount is nadir, so the world->camera rotation is
+    // R_wc = B * R_wb^T.
+    const Eigen::Matrix3d r_wc = mount * r_wb.transpose();
     // A nadir camera has its optical axis straight down.
     EXPECT_NEAR(r_wc(2, 2), -1.0, 1e-9);
 

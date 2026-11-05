@@ -89,8 +89,9 @@ Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
 /// attitude: `R_wb` is the body-to-world rotation in the slot CRS's local ENU
 /// basis (see `reference/convert_reference.hpp`). The caller forms `measured`
 /// from it with the fixed nadir camera mount B =
-/// `reference::body_to_camera_nadir()`, i.e. `R_wc = R_wb * B^T`; an antenna
-/// boresight, when the effective master sensor has one, replaces B. The
+/// `reference::body_to_camera_nadir()`: camera-to-world is `R_wb * B^T`, so
+/// the world->camera measurement is `B * R_wb^T`; an antenna boresight, when
+/// the effective master sensor has one, replaces B. The
 /// heading frame is built from `R_wb`, not from the stored angles, so it is
 /// well defined in any rotation order and at body pitch +/-90 degrees (see
 /// `detail::heading_frame_from_body`). In that degenerate pitch case yaw and

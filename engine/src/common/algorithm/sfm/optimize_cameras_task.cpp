@@ -658,7 +658,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                 // log composed through the fixed mount). The camera is mounted
                 // by the nadir body-to-camera rotation unless the effective
                 // master sensor's antenna carries a boresight, which replaces
-                // that mount (WP-13.19). Either way R_wc = R_wb * B^T.
+                // that mount (WP-13.19). Camera-to-world is R_wb * B^T, so the
+                // world->camera measurement below is B * R_wb^T.
                 const Eigen::Matrix3d r_bc =
                     antenna.boresight_deg.has_value() ? antenna.body_to_camera()
                                                       : reference::body_to_camera_nadir();
