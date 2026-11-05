@@ -1645,6 +1645,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def("detectMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "DetectMarkers", std::move(kwargs));
         })
+        // Chessboard calibration per sensor (WP-13.15a), the same run_task call.
+        .def("calibrateCamera", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "CalibrateCamera", std::move(kwargs));
+        })
         // Multi-view consensus refinement (WP-13.9), the same run_task call.
         .def("refineMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "RefineMarkers", std::move(kwargs));

@@ -34,6 +34,10 @@ CAM_A2 = os.path.join(DATA_DIR, "cam_a2.jpg")
 CAM_B1 = os.path.join(DATA_DIR, "cam_b1.jpg")
 # The rendered three-view scene used by the C++ matching tests.
 SCENE = [os.path.join(DATA_DIR, name) for name in ("scene_0.jpg", "scene_1.jpg", "scene_2.jpg")]
+# Five renders of a 9x6 chessboard for CalibrateCamera: the generic two-image
+# fixtures contain no calibration board, and the task refuses a sensor without
+# three usable views.
+CALBOARD = [os.path.join(DATA_DIR, "calboard_{}.png".format(i)) for i in range(5)]
 
 
 def make_document_with_images(*paths):
@@ -209,6 +213,14 @@ class TestDriftInvariant(unittest.TestCase):
                 if task in ("ExportDem", "ExportOrthomosaic"):
                     with tempfile.TemporaryDirectory() as tmp:
                         doc.run_task(task, path=os.path.join(tmp, "export.tif"))
+            _PREPARED_CACHE[task] = (doc, chunk)
+            return doc, chunk
+        if task == "CalibrateCamera":
+            # Needs a detectable board in at least three views; the generic
+            # fixtures are unrelated photographs. The task records the same
+            # parameter keys as every other task through run_task.
+            doc, chunk = make_document_with_images(*CALBOARD)
+            doc.run_task(task, board_cols=9, board_rows=6, square_size=0.025)
             _PREPARED_CACHE[task] = (doc, chunk)
             return doc, chunk
         doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
