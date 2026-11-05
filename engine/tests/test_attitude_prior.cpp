@@ -62,7 +62,7 @@ Eigen::Vector3d stored_from_world_body(const Eigen::Matrix3d& r_wb,
     return Eigen::Vector3d(a.yaw, -a.pitch, a.roll);
 }
 
-/// A ring of nadir-ish cameras over a point grid, in a metric ENU local frame
+/// A level ring of cameras over a point grid, in a metric ENU local frame
 /// (the chunk transform is ENU->ECEF at `origin`). `r_bc` is the body->camera
 /// mount used to synthesise the stored orientation triple: the truth
 /// camera-to-world rotation is `R_wc`, so `R_wb = R_wc * R_bc` and
@@ -102,8 +102,10 @@ Scene make_scene(crs::RotationOrder order, const Eigen::Matrix3d& r_bc,
     for (int i = 0; i < kCameras; ++i) {
         const double azimuth =
             2.0 * kPi * static_cast<double>(i) / static_cast<double>(kCameras);
-        const Eigen::Vector3d centre(6.0 * std::cos(azimuth), 6.0 * std::sin(azimuth),
-                                     (i % 2 == 0) ? 1.5 : -1.5);
+        // Level ring: every optical axis is horizontal, so the body attitude
+        // has pitch and roll near zero and the yaw/pitch/roll split is
+        // well conditioned (a nadir mount would sit at ZYX gimbal lock).
+        const Eigen::Vector3d centre(6.0 * std::cos(azimuth), 6.0 * std::sin(azimuth), 0.0);
         const Eigen::Vector3d z = -centre.normalized();
         const Eigen::Vector3d down(0.0, 0.0, -1.0);
         const Eigen::Vector3d y = (down - down.dot(z) * z).normalized();
@@ -346,8 +348,10 @@ WeakScene make_weak_scene() {
         out.problem.points.push_back(point);
         const Eigen::Vector2d uv0 = cal.project(point);
         out.problem.observations.push_back({std::size_t{0}, index, uv0});
-        const double noise = (i % 2 == 0) ? 1.0 : -1.0;
-        const Eigen::Vector2d uv1 = cal.project(point - c1) + Eigen::Vector2d(noise, noise);
+        // A tangential 1 px shift is what a small roll looks like: it makes
+        // the roll genuinely (if weakly) observable from noisy data.
+        const Eigen::Vector2d tangential(-std::sin(angle), std::cos(angle));
+        const Eigen::Vector2d uv1 = cal.project(point - c1) + tangential;
         out.problem.observations.push_back({std::size_t{1}, index, uv1});
     }
     out.prior.camera = 1;
@@ -387,8 +391,12 @@ TEST(AttitudePrior, NoPriorWithoutOrientation) {
     run_optimize(off, false);
     const Chunk& a = *on.document.active_chunk();
     const Chunk& b = *off.document.active_chunk();
-    // No rotation priors exist either way, so the solves are identical.
-    EXPECT_TRUE(a == b);
+    // No rotation priors exist either way, so the geometry is bit-identical.
+    // (The whole Chunk differs only in the recorded use_orientation flag.)
+    EXPECT_TRUE(a.cameras() == b.cameras());
+    EXPECT_TRUE(a.tie_points() == b.tie_points());
+    EXPECT_TRUE(a.sensors() == b.sensors());
+    EXPECT_EQ((a.transform() - b.transform()).cwiseAbs().maxCoeff(), 0.0);
     EXPECT_EQ(a.meta().find("optimize_cameras.0.attitude_error_deg"), nullptr);
     EXPECT_EQ(meta_double(a, "optimize_cameras.attitude_rms_deg"), 0.0);
 }
