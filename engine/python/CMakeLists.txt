@@ -114,6 +114,9 @@ alphashape_add_python_test(python_chunk_ops ${CMAKE_CURRENT_SOURCE_DIR}/tests/te
 # WP-13.18b: the film-normalised geometry properties on Sensor.
 alphashape_add_python_test(python_film ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_film.py)
 
+# WP-11.8: Chunk.group_cameras and Chunk.frame_stats.
+alphashape_add_python_test(python_frames ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_frames.py)
+
 # Marker-based chunk alignment (WP-11.7): Document.align_chunks, the marker
 # surface, and the recorded similarity.
 alphashape_add_python_test(python_align_chunks ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_align_chunks.py
