@@ -33,6 +33,7 @@
 /// centre of the top-left pixel, y grows downwards. Film millimetres use
 /// x right and y up, origin at the film centre.
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -107,6 +108,23 @@ struct FiducialDetection {
     bool ambiguous = false;
     std::string failure;
 };
+
+/// Longest image side, pixels, that mark detection processes at once. A larger
+/// scan is box-downsampled for detection and each mark is then refined at full
+/// resolution inside a small window, so memory stays bounded on big scans.
+constexpr int kFiducialDetectSideCap = 4096;
+
+/// Upper bound on the circle-Hough accumulator, in cells. Beyond it the radius
+/// list is stepped coarser instead of allocating an unbounded plane.
+constexpr std::size_t kFiducialHoughCellCap = 64U * 1024U * 1024U;
+
+/// Box-downscale factor for detection: 1 when the longest side fits the cap,
+/// otherwise ceil(longest side / cap).
+int fiducial_work_scale(int width, int height);
+
+/// Radius stride so radius_count * width * height stays within the Hough cell
+/// cap. Returns 1 when the accumulator already fits.
+int fiducial_radius_step(int radius_count, int width, int height);
 
 /// Detect the exposed-frame quad. Returns nullopt when a side has too few
 /// inliers or the four corners are not convex.

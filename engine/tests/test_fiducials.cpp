@@ -221,6 +221,22 @@ TEST(Fiducials, FrameQuadCorners) {
     report("Fiducials.FrameQuadCorners max error", maximum, "px");
 }
 
+/// Large scans must not allocate full-resolution gradient planes or an
+/// unbounded Hough accumulator.
+TEST(Fiducials, DetectionWorkIsBounded) {
+    EXPECT_EQ(fiducial_work_scale(1600, 1200), 1);
+    EXPECT_EQ(fiducial_work_scale(4096, 3000), 1);
+    EXPECT_EQ(fiducial_work_scale(4097, 100), 2);
+    EXPECT_EQ(fiducial_work_scale(12000, 9000), 3);
+    EXPECT_EQ(fiducial_radius_step(38, 640, 640), 1);
+    const int step = fiducial_radius_step(2000, 4096, 4096);
+    EXPECT_GE(step, 2);
+    const std::uint64_t radii =
+        static_cast<std::uint64_t>((2000 + step - 1) / step);
+    const std::uint64_t cells = radii * 4096ULL * 4096ULL;
+    EXPECT_LE(cells, static_cast<std::uint64_t>(kFiducialHoughCellCap));
+}
+
 TEST(Fiducials, CircleCentres) {
     test::FilmFrameSpec spec = base_spec();
     spec.marks_mm = centred_marks();

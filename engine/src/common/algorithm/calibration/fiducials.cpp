@@ -775,8 +775,10 @@ std::optional<CircleHit> detect_circle(const Gradients& gradients,
         return std::nullopt;
     }
     const int radius_count = last_radius - first_radius + 1;
+    const int radius_step = fiducial_radius_step(radius_count, width, height);
+    const int radii = (radius_count + radius_step - 1) / radius_step;
     std::vector<float> accumulator(
-        static_cast<std::size_t>(radius_count) * static_cast<std::size_t>(width) *
+        static_cast<std::size_t>(radii) * static_cast<std::size_t>(width) *
             static_cast<std::size_t>(height),
         0.0F);
     const double threshold = window_threshold(gradients, box);
@@ -796,8 +798,9 @@ std::optional<CircleHit> detect_circle(const Gradients& gradients,
             }
             const double nx = gx / length;
             const double ny = gy / length;
-            for (int k = 0; k < radius_count; ++k) {
-                const double radius = static_cast<double>(first_radius + k);
+            for (int k = 0; k < radii; ++k) {
+                const double radius =
+                    static_cast<double>(first_radius + k * radius_step);
                 for (int sign = -1; sign <= 1; sign += 2) {
                     const double vx = static_cast<double>(x) +
                                       static_cast<double>(sign) * radius * nx -
@@ -830,7 +833,8 @@ std::optional<CircleHit> detect_circle(const Gradients& gradients,
         peak / (static_cast<std::size_t>(width) *
                 static_cast<std::size_t>(height)));
     CircleHit hit;
-    hit.radius = static_cast<double>(first_radius + radius_index);
+    hit.radius =
+        static_cast<double>(first_radius + radius_index * radius_step);
     const Eigen::Vector2d coarse(static_cast<double>(box.x0 + local_x),
                                  static_cast<double>(box.y0 + local_y));
     const std::optional<Eigen::Vector2d> refined =
@@ -941,6 +945,31 @@ const char* fiducial_window_name(FiducialWindow window) {
         case FiducialWindow::Left: return "L";
     }
     return "?";
+}
+
+int fiducial_work_scale(int width, int height) {
+    const int longest = std::max(width, height);
+    if (longest <= kFiducialDetectSideCap) {
+        return 1;
+    }
+    return (longest + kFiducialDetectSideCap - 1) / kFiducialDetectSideCap;
+}
+
+int fiducial_radius_step(int radius_count, int width, int height) {
+    if (radius_count <= 0 || width <= 0 || height <= 0) {
+        return 1;
+    }
+    const std::uint64_t cells =
+        static_cast<std::uint64_t>(radius_count) *
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    if (cells <= static_cast<std::uint64_t>(kFiducialHoughCellCap)) {
+        return 1;
+    }
+    const std::uint64_t step =
+        (cells + static_cast<std::uint64_t>(kFiducialHoughCellCap) - 1) /
+        static_cast<std::uint64_t>(kFiducialHoughCellCap);
+    return static_cast<int>(std::min<std::uint64_t>(
+        step, static_cast<std::uint64_t>(radius_count)));
 }
 
 bool fit_film_transform(const std::vector<Eigen::Vector2d>& film_mm,
@@ -1272,6 +1301,90 @@ Eigen::Vector2d quad_corner(const FrameQuad& quad, FiducialWindow window) {
 
 }  // namespace
 
+namespace {
+
+/// A full-resolution patch around one coarse mark, with its gradients.
+struct CropView {
+    FloatImage image;
+    Gradients gradients;
+    int x0 = 0;
+    int y0 = 0;
+};
+
+std::optional<CropView> crop_around(const FloatImage& gray,
+                                    const Eigen::Vector2d& centre, double half) {
+    CropView view;
+    view.x0 = std::max(1, static_cast<int>(std::floor(centre.x() - half)));
+    view.y0 = std::max(1, static_cast<int>(std::floor(centre.y() - half)));
+    const int x1 =
+        std::min(gray.width() - 2, static_cast<int>(std::ceil(centre.x() + half)));
+    const int y1 =
+        std::min(gray.height() - 2, static_cast<int>(std::ceil(centre.y() + half)));
+    if (x1 - view.x0 < 4 || y1 - view.y0 < 4) {
+        return std::nullopt;
+    }
+    view.image = FloatImage(x1 - view.x0 + 1, y1 - view.y0 + 1, 0.0F);
+    for (int y = view.y0; y <= y1; ++y) {
+        for (int x = view.x0; x <= x1; ++x) {
+            view.image.at(x - view.x0, y - view.y0) = gray.at(x, y);
+        }
+    }
+    view.gradients = sobel_gradients(view.image);
+    return view;
+}
+
+/// Refine one coarse mark at full resolution inside a small crop. Returns the
+/// mapped coarse position when the crop or the refinement is unusable.
+Eigen::Vector2d refine_mark(const FloatImage& gray, const Eigen::Vector2d& coarse,
+                            int scale, FiducialDetector detector,
+                            FiducialWindow window, double min_radius,
+                            double max_radius, double coarse_radius) {
+    const double step = static_cast<double>(scale);
+    const Eigen::Vector2d mapped =
+        coarse * step + Eigen::Vector2d::Constant(0.5 * (step - 1.0));
+    const double mark_radius =
+        coarse_radius > 0.0 ? coarse_radius * step : max_radius;
+    const double half = detector == FiducialDetector::Circle
+                            ? std::max(2.0 * mark_radius + 6.0, 3.0 * step + 6.0)
+                            : std::max(16.0 * step, 24.0);
+    const std::optional<CropView> view = crop_around(gray, mapped, half);
+    if (!view) {
+        return mapped;
+    }
+    const Eigen::Vector2d local = mapped - Eigen::Vector2d(view->x0, view->y0);
+    WindowBox box;
+    box.x0 = 1;
+    box.y0 = 1;
+    box.x1 = view->image.width() - 2;
+    box.y1 = view->image.height() - 2;
+    box.centre = local;
+    std::optional<Eigen::Vector2d> found;
+    if (detector == FiducialDetector::FrameCorner) {
+        found = refine_point(view->gradients, local, 4.0 * step + 2.0, false);
+    } else if (detector == FiducialDetector::Corner) {
+        found = detect_corner(view->image, view->gradients, box, window,
+                              std::max(8.0, 3.0 * step));
+    } else {
+        double rmin = std::max(min_radius, mark_radius - (2.0 * step + 2.0));
+        double rmax = std::min(max_radius, mark_radius + (2.0 * step + 2.0));
+        if (rmax < rmin) {
+            rmin = min_radius;
+            rmax = max_radius;
+        }
+        const std::optional<CircleHit> hit =
+            detect_circle(view->gradients, box, rmin, rmax);
+        if (hit) {
+            found = hit->centre;
+        }
+    }
+    if (!found) {
+        return mapped;
+    }
+    return *found + Eigen::Vector2d(view->x0, view->y0);
+}
+
+}  // namespace
+
 FiducialDetection detect_fiducials(const FloatImage& gray,
                                    const FilmSettings& settings,
                                    const FiducialDetectOptions& options) {
@@ -1300,31 +1413,50 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
         result.failure = "image is too small for fiducial detection";
         return result;
     }
-    const std::optional<FrameQuad> quad = detect_frame_quad(gray);
+    // Bounded-memory path: detect on a downsampled copy, then refine each mark
+    // at full resolution inside its small window.
+    const int work_scale = fiducial_work_scale(gray.width(), gray.height());
+    FloatImage reduced;
+    const FloatImage* work = &gray;
+    if (work_scale > 1) {
+        reduced = box_downsample(gray, work_scale);
+        work = &reduced;
+    }
+    const std::optional<FrameQuad> quad = detect_frame_quad(*work);
     if (!quad) {
         result.failure = "frame quad detection failed";
         return result;
     }
     const std::vector<WindowRequest> windows =
-        build_windows(*quad, options, gray.width(), gray.height());
+        build_windows(*quad, options, work->width(), work->height());
     if (windows.empty()) {
         result.failure = "no valid search window fits inside the image";
         return result;
     }
-    const Gradients gradients = sobel_gradients(gray);
+    const double ratio = static_cast<double>(work_scale);
+    const double coarse_min = std::max(1.5, options.min_radius_px / ratio);
+    const double coarse_max =
+        std::max(coarse_min + 0.5, options.max_radius_px / ratio);
+    const Gradients gradients = sobel_gradients(*work);
     for (const WindowRequest& request : windows) {
         std::optional<Eigen::Vector2d> pixel;
+        double coarse_radius = 0.0;
         if (options.detector == FiducialDetector::FrameCorner) {
             pixel = quad_corner(*quad, request.window);
         } else if (options.detector == FiducialDetector::Corner) {
-            pixel = detect_corner(gray, gradients, request.box, request.window, 8.0);
+            pixel = detect_corner(*work, gradients, request.box, request.window, 8.0);
         } else {
-            const std::optional<CircleHit> hit = detect_circle(
-                gradients, request.box, options.min_radius_px,
-                options.max_radius_px);
+            const std::optional<CircleHit> hit =
+                detect_circle(gradients, request.box, coarse_min, coarse_max);
             if (hit) {
                 pixel = hit->centre;
+                coarse_radius = hit->radius;
             }
+        }
+        if (pixel && work_scale > 1 && pixel->allFinite()) {
+            pixel = refine_mark(gray, *pixel, work_scale, options.detector,
+                                request.window, options.min_radius_px,
+                                options.max_radius_px, coarse_radius);
         }
         if (pixel && pixel->allFinite()) {
             FiducialMark mark;
