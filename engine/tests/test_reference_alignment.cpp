@@ -540,3 +540,5 @@ TEST(ReferenceAlignment, TriangulateTiePointsIsUndoable) {
 }
 
 }  // namespace
+
+}  // namespace alphashape
