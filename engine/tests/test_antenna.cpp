@@ -5,6 +5,7 @@
 // evaluation that consumes the lever arm, persistence, georeferencing, the
 // OptimizeCameras wiring and the undoable command.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -265,6 +266,29 @@ AntennaScene make_antenna_scene(bool with_antenna, const Eigen::Vector3d& lever)
     return scene;
 }
 
+/// Re-express a metric-ENU scene in a local frame whose unit is `1 / scale`
+/// metres and whose axes are `r_s`-rotated. The chunk transform then carries a
+/// similarity (scale `scale`), while the world geometry -- camera poses, tie
+/// points and GNSS references -- is unchanged.
+void reframe_in_scaled_local_frame(AntennaScene& scene, double scale,
+                                   const Eigen::Matrix3d& r_s) {
+    Chunk& chunk = *scene.document.active_chunk();
+    Transform local_to_enu = Transform::Identity();
+    local_to_enu.block<3, 3>(0, 0) = scale * r_s;
+    chunk.transform() = geo::enu_to_ecef(scene.origin) * local_to_enu;
+
+    for (Camera& camera : chunk.cameras()) {
+        const Eigen::Vector3d centre = centre_of(camera.pose);
+        const Eigen::Matrix3d rotation = camera.pose.block<3, 3>(0, 0) * r_s;
+        camera.pose = pose_with_centre(rotation, r_s.transpose() * centre / scale);
+    }
+    for (Track& track : chunk.tie_points().tracks) {
+        if (track.point.has_value()) {
+            *track.point = r_s.transpose() * *track.point / scale;
+        }
+    }
+}
+
 double optimize_and_measure(AntennaScene scene) {
     Params params = make_params(builtin_registry().require("OptimizeCameras"));
     for (const char* name :
@@ -289,6 +313,51 @@ TEST(Antenna, OptimizeUsesAntennaPosition) {
                 with, control);
     EXPECT_LT(with, 0.01);
     EXPECT_GT(control, 0.10);
+}
+
+TEST(Antenna, GeoreferenceWithScaledChunkTransform) {
+    // A 0.5 m lever along camera y: in this nadir scene it is an almost
+    // constant world offset, so the first similarity fit is unbiased and the
+    // truth comparison measures the lever-arm shift itself rather than the
+    // rotation that a tangential lever would mimic.
+    const Eigen::Vector3d lever(0.0, 0.5, 0.0);
+    AntennaScene scene = make_antenna_scene(true, lever);
+    Chunk& chunk = *scene.document.active_chunk();
+
+    // True ENU projection centres, captured before the frame is rescaled.
+    std::vector<Eigen::Vector3d> truth;
+    for (const Camera& camera : chunk.cameras()) {
+        truth.push_back(centre_of(camera.pose));
+    }
+
+    // Local units are 2.5 m and the local axes are rotated, so the chunk
+    // transform is a similarity rather than a rigid transform.
+    const Eigen::Matrix3d r_s =
+        Eigen::AngleAxisd(0.7, Eigen::Vector3d(0.2, -0.3, 0.9).normalized())
+            .toRotationMatrix();
+    reframe_in_scaled_local_frame(scene, 2.5, r_s);
+
+    // The georeferenced origin is the mean ECEF of the antenna references.
+    Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
+    for (const Camera& camera : chunk.cameras()) {
+        const Eigen::Vector3d& loc = *camera.reference.location;
+        mean_ecef += geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
+    }
+    mean_ecef /= static_cast<double>(chunk.cameras().size());
+    const Transform to_new =
+        geo::ecef_to_enu(geo::ecef_to_geodetic(mean_ecef)) * geo::enu_to_ecef(scene.origin);
+
+    const sfm::GeoreferenceReport report = sfm::georeference_chunk(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+
+    double worst = 0.0;
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        const Eigen::Vector3d expected = (to_new * truth[i].homogeneous()).head<3>();
+        const Eigen::Vector3d actual = centre_of(chunk.cameras()[i].pose);
+        worst = std::max(worst, (actual - expected).norm());
+    }
+    std::printf("[antenna] scaled-chunk centre error: %.6f m\n", worst);
+    EXPECT_LT(worst, 0.01);
 }
 
 TEST(Commands, SetSensorAntennaUndoes) {
