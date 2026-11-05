@@ -15,6 +15,7 @@
 
 #include <Eigen/Core>
 
+#include "base/utils/error.hpp"
 #include "common/algorithm/chunk/align_chunks_task.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/core/chunk_geometry.hpp"
@@ -34,6 +35,20 @@ Eigen::Vector3d camera_centre(const Transform& pose) {
     const Eigen::Matrix3d r = pose.block<3, 3>(0, 0);
     const Eigen::Vector3d t = pose.block<3, 1>(0, 3);
     return -r.transpose() * t;
+}
+
+/// Rotation carried by a 3x3 block, with a uniform scale divided out.
+///
+/// The chunk transform may map local units to metres (a similarity rather than
+/// a rigid transform) and the AlignChunks pose rule may store a scaled rotation
+/// in a camera pose. A lever arm expressed in metres must only be rotated, so
+/// both scales are removed explicitly instead of being assumed to cancel.
+Eigen::Matrix3d pure_rotation(const Eigen::Matrix3d& m) {
+    const double determinant = m.determinant();
+    if (!std::isfinite(determinant) || determinant <= 0.0) {
+        throw ValueError("georeference: camera-shift block carries no valid rotation");
+    }
+    return m / std::cbrt(determinant);
 }
 
 /// Median of a non-empty vector (interpolated for an even count).
@@ -319,18 +334,22 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
         return report;
     }
     if (any_antenna) {
-        // A source local unit is `s.scale` metres, so the camera-frame lever
-        // arm in metres enters the ENU target space as R_sim * map_R * R_c^T
-        // times the offset -- the scale cancels. `map_R` carries the stored
-        // local frame into the frame the similarity was fitted in.
-        const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
+        // A GNSS reference measures the antenna phase centre, not the
+        // projection centre. The camera-frame lever arm is already in metres,
+        // so only rotations act on it: the chunk transform and the stored pose
+        // may each carry a uniform scale (local units -> metres, and the
+        // AlignChunks pose rule), and both scales are divided out explicitly.
+        // `map_R` carries the stored local frame into the frame the similarity
+        // was fitted in.
+        const Eigen::Matrix3d map_r = pure_rotation(map.block<3, 3>(0, 0));
         const Eigen::Matrix3d enu_from_source = ransac.similarity->R * map_r;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             const Antenna* antenna = antenna_of(*candidates[i]);
             if (antenna == nullptr) {
                 continue;
             }
-            const Eigen::Matrix3d r_c = candidates[i]->pose.block<3, 3>(0, 0);
+            const Eigen::Matrix3d r_c =
+                pure_rotation(candidates[i]->pose.block<3, 3>(0, 0));
             const Eigen::Vector3d shift =
                 enu_from_source * r_c.transpose() * antenna->camera_offset();
             fit_targets[i] -= shift;
@@ -343,11 +362,14 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     }
 
     // Composite similarity applied to the STORED local coordinates: T = S o map.
+    // `map` carries a uniform scale when a local unit is not a metre, so the
+    // two scales multiply and the composite keeps a pure rotation.
     const Similarity& s = *ransac.similarity;
-    const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
+    const Eigen::Matrix3d map_block = map.block<3, 3>(0, 0);
+    const Eigen::Matrix3d map_r = pure_rotation(map_block);
     const Eigen::Vector3d map_t = map.block<3, 1>(0, 3);
     Similarity t_sim;
-    t_sim.scale = s.scale;
+    t_sim.scale = s.scale * std::cbrt(map_block.determinant());
     t_sim.R = s.R * map_r;
     t_sim.t = s.scale * (s.R * map_t) + s.t;
 
@@ -596,10 +618,13 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     const Similarity& s = *fitted;
 
     // Composite similarity applied to the STORED local coordinates: T = S o map.
-    const Eigen::Matrix3d map_r = map.block<3, 3>(0, 0);
+    // `map` carries a uniform scale when a local unit is not a metre, so the
+    // two scales multiply and the composite keeps a pure rotation.
+    const Eigen::Matrix3d map_block = map.block<3, 3>(0, 0);
+    const Eigen::Matrix3d map_r = pure_rotation(map_block);
     const Eigen::Vector3d map_t = map.block<3, 1>(0, 3);
     Similarity t_sim;
-    t_sim.scale = s.scale;
+    t_sim.scale = s.scale * std::cbrt(map_block.determinant());
     t_sim.R = s.R * map_r;
     t_sim.t = s.scale * (s.R * map_t) + s.t;
 
