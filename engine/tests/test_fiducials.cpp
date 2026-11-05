@@ -603,6 +603,9 @@ TEST(ProjectIO, FilmRoundTrips) {
     sensor.width = 1600;
     sensor.height = 1600;
     sensor.film = film_preset("corners4");
+    // The normalised frame (WP-13.18b) must survive the round trip too.
+    sensor.film.resolution_mm_per_px = 0.02;
+    sensor.film.film_size_mm = Eigen::Vector2d(120.0, 130.0);
     chunk.sensors().push_back(sensor);
     Camera camera;
     camera.id = 0;
@@ -629,6 +632,31 @@ TEST(ProjectIO, FilmRoundTrips) {
     EXPECT_NE(text.find("<film transform=\"affine\" detector=\"corner\""),
               std::string::npos);
     EXPECT_NE(text.find("<film_transform values="), std::string::npos);
+    EXPECT_NE(text.find(" resolution=\""), std::string::npos);
+    EXPECT_NE(text.find(" size_x=\""), std::string::npos);
+    EXPECT_NE(text.find(" size_y=\""), std::string::npos);
+}
+
+/// A detector-only film layout has no normalised geometry yet, so the new
+/// attributes must not appear: a project written by this build stays readable
+/// by an earlier one.
+TEST(ProjectIO, FilmWithoutNormalisedGeometryStaysCompact) {
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("film");
+    document.set_active_chunk_id(chunk.id());
+    Sensor sensor;
+    sensor.label = "film-camera";
+    sensor.width = 1600;
+    sensor.height = 1600;
+    sensor.film = film_preset("corners4");
+    chunk.sensors().push_back(sensor);
+    const std::string psx = temp_project("filmcompact");
+    ProjectIO::save(document, psx);
+    const std::string text = project_doc_text(psx);
+    remove_project(psx);
+    EXPECT_NE(text.find("<film transform="), std::string::npos);
+    EXPECT_EQ(text.find(" resolution=\""), std::string::npos);
+    EXPECT_EQ(text.find(" size_x=\""), std::string::npos);
 }
 
 TEST(ProjectIO, NoFilmKeepsLayout) {
