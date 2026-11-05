@@ -137,6 +137,10 @@ alphashape_add_python_test(python_crs ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_crs
 alphashape_add_python_test(python_calibration_io
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_calibration_io.py)
 
+# WP-13.21: the camera reference attitude properties through Python.
+alphashape_add_python_test(python_attitude_prior
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)
+
 # The CLI end-to-end check needs the built CLI; guard on the option so a
 # Python-only configure still works.
 if(ALPHASHAPE_BUILD_CLI)
