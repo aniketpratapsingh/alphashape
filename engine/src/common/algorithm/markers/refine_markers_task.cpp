@@ -23,7 +23,6 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
-#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -357,12 +356,6 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
-bool seed_diag() {
-    static const bool enabled =
-        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
-    return enabled;
-}
-
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -377,6 +370,10 @@ struct BlobSeed {
     /// lies outside the crop), which is how a large target's interior edge is
     /// mistaken for its border; the caller retries in a wider window.
     bool border_clipped = false;
+    /// True when the seed came from a printed centre dot (parity 1). A seed
+    /// that is neither a dot nor a light interior is only a dark-blob guess,
+    /// which a coded circular target retries in a wider window.
+    bool centre_dot = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
@@ -539,6 +536,7 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         // patch scale, unchanged from the dark-only path.
         centre = dot->center;
         radius = dot->radius_px;
+        out.centre_dot = true;
         if (const auto fitted = refine_ellipse_center(crop, *dot)) {
             centre = *fitted;
         }
@@ -577,16 +575,6 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                     static_cast<double>(half) - 2.0;
                 if (fitted_radius > window_limit) {
                     out.border_clipped = true;
-                }
-                if (seed_diag()) {
-                    std::fprintf(stderr,
-                                 "[diag retrywin] half=%d blob_r=%.2f "
-                                 "blob_c=(%.2f,%.2f) fit_r=%.2f moved=%.2f "
-                                 "ratio=%.2f limit=%.2f\n",
-                                 half, light->radius_px, light->center.x(),
-                                 light->center.y(), fitted_radius, moved,
-                                 fitted_radius / light->radius_px,
-                                 window_limit);
                 }
                 if (fitted_radius >= 0.8 * light->radius_px &&
                     fitted_radius <= border_multiple * light->radius_px &&
@@ -685,37 +673,26 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     auto seed = circular_seed_window(view, pixel, half, coded_circular, 2.0);
     // A border fit that needed more room than the window offered means the
     // outline was clipped, so the accepted radius and centre are unreliable; a
-    // coded target that seeded nothing at all may likewise have had its
-    // interior clipped. One doubled window covers both cases. A blob radius
-    // measured from a clipped first edge is only a lower bound, so the wider
-    // window also accepts a larger border multiple.
+    // coded target whose interior also fell outside the window has no light
+    // seed at all and only a dark-blob guess. One doubled window covers both
+    // cases. A blob radius measured from a clipped first edge is only a lower
+    // bound, so the wider window accepts a larger border multiple. Its fit is
+    // only used when the outline really was larger than the first window;
+    // otherwise the first window already held the target and its own seed is
+    // the better one.
     const bool clipped = seed && seed->border_clipped;
+    const bool guessed =
+        coded_circular && seed && !seed->light_centre && !seed->centre_dot;
     const bool missing = retry_when_missing && !seed;
-    if (seed_diag()) {
-        std::fprintf(stderr,
-                     "[diag seedc] half=%d clipped=%d unfit=%d missing=%d "
-                     "seed=%d r=%.2f\n",
-                     half, static_cast<int>(clipped),
-                     static_cast<int>(seed && seed->light_centre &&
-                                      !seed->border_fitted),
-                     static_cast<int>(missing),
-                     static_cast<int>(seed.has_value()),
-                     seed ? seed->radius : 0.0);
-    }
-    if (coded_circular && (clipped || missing) && half < max_half) {
+    if (coded_circular && (clipped || guessed || missing) &&
+        half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried =
                 circular_seed_window(view, pixel, wider, coded_circular, 2.4)) {
-            if (!seed || retried->light_centre || retried->border_fitted) {
-                if (seed_diag()) {
-                    std::fprintf(stderr,
-                                 "[diag retryout] wider=%d r=%.2f px="
-                                 "(%.2f,%.2f) light=%d fit=%d\n",
-                                 wider, retried->radius, retried->pixel.x(),
-                                 retried->pixel.y(),
-                                 static_cast<int>(retried->light_centre),
-                                 static_cast<int>(retried->border_fitted));
-                }
+            const bool larger =
+                retried->border_fitted &&
+                retried->radius > static_cast<double>(half) - 2.0;
+            if (!seed || larger) {
                 return retried;
             }
         }
