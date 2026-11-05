@@ -477,6 +477,83 @@ TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
     report("Fiducials.CalibrateFiducialsDerivesLayout max error", maximum, "mm");
 }
 
+/// CalibrateFiducials derives only the film layout; the camera's focal length
+/// and principal point come from the camera calibration and must not move.
+TEST(Fiducials, CalibrateFiducialsLeavesIntrinsics) {
+    const std::vector<Eigen::Vector2d> marks = small_marks();
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("film");
+    document.set_active_chunk_id(chunk.id());
+    Sensor sensor;
+    sensor.label = "sensor";
+    sensor.width = 1600;
+    sensor.height = 1600;
+    sensor.calibration =
+        Calibration::initial(CameraType::Frame, sensor.width, sensor.height, 1000.0);
+    sensor.calibration.cx = 12.5;
+    sensor.calibration.cy = -7.5;
+    sensor.film = layout_for(marks);
+    chunk.sensors().push_back(sensor);
+    const Calibration before = chunk.sensors()[0].calibration;
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.sensor_id = 0;
+    camera.label = "scan";
+    for (const Eigen::Vector2d& mm : marks) {
+        camera.fiducial_pixels.emplace_back(
+            Eigen::Vector2d(800.0 + mm.x() / 0.02, 800.0 - mm.y() / 0.02));
+    }
+    chunk.cameras().push_back(camera);
+
+    Params params = make_params(builtin_registry().require("CalibrateFiducials"));
+    params.set("resolution", 0.02);
+    run_task(builtin_registry(), document, "CalibrateFiducials", params);
+    const Calibration& after = chunk.sensors()[0].calibration;
+    EXPECT_DOUBLE_EQ(after.f, before.f);
+    EXPECT_DOUBLE_EQ(after.cx, before.cx);
+    EXPECT_DOUBLE_EQ(after.cy, before.cy);
+    ASSERT_EQ(chunk.sensors()[0].film.fiducials.size(), marks.size());
+    for (std::size_t i = 0; i < marks.size(); ++i) {
+        EXPECT_LT((chunk.sensors()[0].film.fiducials[i].film_mm - marks[i]).norm(),
+                  1e-9);
+    }
+}
+
+/// End-to-end task run on the synthetic film fixture: ordered marks and the
+/// per-scan transform land on the camera, and the asymmetric layout is not
+/// reported as ambiguous.
+TEST(Fiducials, DetectFiducialsTaskWritesLayout) {
+    test::FilmFrameSpec spec = base_spec();
+    spec.marks_mm = centred_marks();
+    const test::FilmFrame frame = test::render_film_frame(spec);
+    ScopedPng png{write_frame_png(frame, "tasklayout")};
+    FilmSettings film = layout_for(spec.marks_mm);
+    film.detector = FiducialDetector::Circle;
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("film");
+    add_film_camera(document, chunk, film, frame, png.path);
+    Params params = make_params(builtin_registry().require("DetectFiducials"));
+    run_task(builtin_registry(), document, "DetectFiducials", params);
+
+    const Camera& camera = chunk.cameras()[0];
+    ASSERT_EQ(camera.fiducial_pixels.size(), frame.mark_pixels.size());
+    double maximum = 0.0;
+    for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
+        ASSERT_TRUE(camera.fiducial_pixels[i].has_value()) << "mark " << i;
+        maximum = std::max(
+            maximum, (*camera.fiducial_pixels[i] - frame.mark_pixels[i]).norm());
+    }
+    EXPECT_LT(maximum, 1.0);
+    EXPECT_TRUE(camera.film_transform.has_value());
+    const std::string prefix = "fiducials/" + std::to_string(camera.id) + "/";
+    const std::string* status = chunk.meta().find(prefix + "status");
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(*status, "ok");
+    const std::string* ambiguous = chunk.meta().find(prefix + "ambiguous");
+    ASSERT_NE(ambiguous, nullptr);
+    EXPECT_EQ(*ambiguous, "0");
+}
+
 /// Without a calibrated layout detection still reports the raw marks, but they
 /// must not be stored in `Camera::fiducial_pixels` (parallel to the layout):
 /// saving such a project must reload cleanly.
