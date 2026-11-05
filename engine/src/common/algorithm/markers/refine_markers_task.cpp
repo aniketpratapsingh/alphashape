@@ -364,7 +364,10 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     if (!index.allFinite()) {
         return std::nullopt;
     }
-    const int half = std::max(32, patch_size);
+    // Wide enough to hold the whole printed target, so the outer-border fit
+    // below sees the full outline. The blob nearest the expected centre is
+    // unaffected by the larger search area: a farther blob is never preferred.
+    const int half = std::max(48, patch_size);
     const double max_x =
         static_cast<double>(std::max(0, view.image.width() - 1));
     const double max_y =
@@ -831,15 +834,10 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     // the radial search converges to the real boundary from there.
     std::optional<Eigen::Vector2d> ellipse;
     if (seed && seed->light_centre) {
-        // The target has no centre dot. Its first radial edge alternates
-        // between the 0.5 R sector ring and the 0.85..0.9 R border, which
-        // biases a first-edge fit; the outer border is the complete
-        // concentric outline.
-        double radius = seed->radius / ds;
-        if (const auto fitted = refine_border_center(
-                view.gradient_field, pixel / ds, radius, &radius)) {
-            ellipse = accept(*fitted * ds);
-        }
+        // The crop re-seed already fitted the outer border from a window that
+        // holds only this target, so reuse that centre. A border fit on the
+        // whole image can lock onto a neighbouring target's outline instead.
+        ellipse = accept(seed->pixel);
     } else if (seed) {
         MarkerCandidate ellipse_seed;
         ellipse_seed.center = pixel / ds;
