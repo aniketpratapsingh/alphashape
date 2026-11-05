@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <list>
@@ -24,7 +23,6 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
-#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -358,12 +356,6 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
-bool seed_diag() {
-    static const bool enabled =
-        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
-    return enabled;
-}
-
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -373,6 +365,11 @@ struct BlobSeed {
     /// True when the light branch's outer-border fit succeeded, as opposed to
     /// falling back to the interior blob centre.
     bool border_fitted = false;
+    /// True when a border fit was found but its radius does not fit inside the
+    /// window. The fit is then extrapolated from a clipped arc (the outline
+    /// lies outside the crop), which is how a large target's interior edge is
+    /// mistaken for its border; the caller retries in a wider window.
+    bool border_clipped = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
@@ -381,7 +378,8 @@ struct BlobSeed {
 /// the caller falls back to patch_size / 4.
 std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                              const Eigen::Vector2d& pixel,
-                                             int half, bool coded_circular) {
+                                             int half, bool coded_circular,
+                                             double border_multiple) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
@@ -560,20 +558,21 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                 // is not a plausible multiple of the interior scale; that is
                 // what a neighbouring target's outline looks like.
                 const double moved = (*fitted - seed).norm();
-                // The border is at most 2.0x the interior radius by design
-                // (the interior reaches down to 0.5 R) and at least about
-                // 1.1x it, but the blob's own fit lands anywhere between the
-                // 0.5 R sector edge and the border's inner edge at 0.9 R, so
-                // the lower bound stays loose: rejecting those fits drops the
-                // centre back onto the biased interior blob. A fit whose
-                // radius does not fit inside the window is extrapolated from a
-                // clipped arc (the border lies outside the crop), which is how
-                // a large target's interior edge gets mistaken for the border;
-                // reject it so the caller retries in a wider window.
+                // The border is at most about 2.0x the interior radius by
+                // design (the interior reaches down to 0.5 R) and at least
+                // about 1.1x it, but the blob's own fit lands anywhere between
+                // the 0.5 R sector edge and the border's inner edge at 0.9 R,
+                // so the lower bound stays loose: rejecting those fits drops
+                // the centre back onto the biased interior blob. The upper
+                // bound is looser still in a widened window, where the blob's
+                // radius comes from a clipped first-edge measurement.
                 const double window_limit =
                     static_cast<double>(half) - 2.0;
+                if (fitted_radius > window_limit) {
+                    out.border_clipped = true;
+                }
                 if (fitted_radius >= 0.8 * light->radius_px &&
-                    fitted_radius <= 2.4 * light->radius_px &&
+                    fitted_radius <= border_multiple * light->radius_px &&
                     fitted_radius <= window_limit &&
                     moved <= std::max(4.0, 0.3 * fitted_radius)) {
                     centre = *fitted;
@@ -631,14 +630,6 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
-    if (seed_diag()) {
-        std::fprintf(stderr,
-                     "[diag win] half=%d seed=(%.2f,%.2f) out=(%.2f,%.2f) "
-                     "r=%.2f light=%d fit=%d\n",
-                     half, seed.x(), seed.y(), out.pixel.x(), out.pixel.y(),
-                     out.radius, static_cast<int>(out.light_centre),
-                     static_cast<int>(out.border_fitted));
-    }
     return out;
 }
 
@@ -647,8 +638,9 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
 /// but only far enough to hold the printed outline and a little context: an
 /// unnecessarily wide crop admits background blobs and edges that a normal
 /// target's window never sees. Without an expected radius the 48 px minimum
-/// applies, and a failed outer-border fit is retried once in a window twice as
-/// wide, because a border larger than that minimum would otherwise be clipped.
+/// applies, and an outer-border fit that did not fit inside that window is
+/// retried once in a window twice as wide, because a border larger than the
+/// minimum would otherwise be clipped and read as an inner edge.
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel,
                                       int patch_size, double expected_radius,
@@ -673,19 +665,20 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                                            std::ceil(1.3 * expected_px)) + 8));
     }
     half = std::min(half, max_half);
-    auto seed = circular_seed_window(view, pixel, half, coded_circular);
-    // A light seed without a border fit means the outline was clipped (or the
-    // fit was rejected as extrapolated) by the window; a coded target that
-    // seeded nothing at all may simply have had its interior clipped. One
-    // doubled window covers both cases.
-    const bool unfitted =
-        seed && seed->light_centre && !seed->border_fitted;
+    auto seed = circular_seed_window(view, pixel, half, coded_circular, 2.0);
+    // A border fit that needed more room than the window offered means the
+    // outline was clipped, so the accepted radius and centre are unreliable; a
+    // coded target that seeded nothing at all may likewise have had its
+    // interior clipped. One doubled window covers both cases. A blob radius
+    // measured from a clipped first edge is only a lower bound, so the wider
+    // window also accepts a larger border multiple.
+    const bool clipped = seed && seed->border_clipped;
     const bool missing = retry_when_missing && !seed;
-    if (coded_circular && (unfitted || missing) && half < max_half) {
+    if (coded_circular && (clipped || missing) && half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried =
-                circular_seed_window(view, pixel, wider, coded_circular)) {
-            if (!seed || retried->border_fitted) {
+                circular_seed_window(view, pixel, wider, coded_circular, 2.4)) {
+            if (!seed || retried->light_centre || retried->border_fitted) {
                 return retried;
             }
         }
@@ -1413,20 +1406,6 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             blend.coded_circular, blend.target_kind_known);
         const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
                                               options.patch_size, limit);
-        if (seed_diag()) {
-            std::fprintf(stderr,
-                         "[diag aw] cam=%d px=(%.2f,%.2f) seed=(%.2f,%.2f) "
-                         "r=%.2f light=%d fit=%d refined=(%.2f,%.2f) d=%.2f\n",
-                         blend.view->camera->id, projected->x(), projected->y(),
-                         seed ? seed->pixel.x() : 0.0,
-                         seed ? seed->pixel.y() : 0.0,
-                         seed ? seed->radius : 0.0,
-                         static_cast<int>(seed && seed->light_centre),
-                         static_cast<int>(seed && seed->border_fitted),
-                         refined ? refined->x() : 0.0,
-                         refined ? refined->y() : 0.0,
-                         refined ? (*refined - *projected).norm() : -1.0);
-        }
         anchored[index] = refined ? *refined : *projected;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
@@ -1535,15 +1514,6 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         } else {
             blend.apparent = 1.0;
             blend.has_scale = false;
-        }
-        if (seed_diag()) {
-            std::fprintf(stderr,
-                         "[diag fill] cam=%d px=(%.2f,%.2f) apparent=%.2f "
-                         "light=%d fit=%d\n",
-                         blend.view->camera->id, blend.pixel.x(),
-                         blend.pixel.y(), blend.apparent,
-                         static_cast<int>(blend.seed && blend.seed->light_centre),
-                         static_cast<int>(blend.seed && blend.seed->border_fitted));
         }
     }
 }

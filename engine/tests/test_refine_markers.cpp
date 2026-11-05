@@ -27,7 +27,6 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
-#include "base/platform/env.hpp"
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
@@ -596,24 +595,11 @@ TEST(Markers, RefineEvenCodeMarker) {
     std::mt19937 engine(83U);
     const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
     RefineMarkersOptions options;
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "1");
     const RefineMarkersStats stats = run_refine(scene, options);
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "");
     EXPECT_EQ(stats.failed, 0U);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);
         ASSERT_NE(marker, nullptr);
-        for (const MarkerProjection& projection : marker->projections) {
-            const std::size_t camera = camera_index(scene, projection.camera_id);
-            const auto truth = scene.truth(i, camera);
-            if (!truth) {
-                continue;
-            }
-            std::printf("[refine even cam] cam=%d got=(%.3f,%.3f) "
-                        "truth=(%.3f,%.3f)\n",
-                        projection.camera_id, projection.pixel.x(),
-                        projection.pixel.y(), truth->x(), truth->y());
-        }
         const double rms = rms_to_truth(scene, *marker, i);
         std::printf("[refine even] marker %zu parity %d RMS %.4f px\n", i,
                     scene.targets[i].parity, rms);
@@ -646,24 +632,11 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
                          std::vector<std::size_t>{0})};
     ASSERT_FALSE(ids.empty());
     RefineMarkersOptions options;
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "1");
     const RefineMarkersStats stats = run_refine(scene, options);
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "");
     EXPECT_EQ(stats.failed, 0U);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);
         ASSERT_NE(marker, nullptr);
-        for (const MarkerProjection& projection : marker->projections) {
-            const std::size_t camera = camera_index(scene, projection.camera_id);
-            const auto truth = scene.truth(0, camera);
-            if (!truth) {
-                continue;
-            }
-            std::printf("[refine large cam] cam=%d got=(%.3f,%.3f) "
-                        "truth=(%.3f,%.3f)\n",
-                        projection.camera_id, projection.pixel.x(),
-                        projection.pixel.y(), truth->x(), truth->y());
-        }
         const double rms = rms_to_truth(scene, *marker, 0);
         std::printf("[refine large] apparent %.2f px RMS %.4f px\n", apparent,
                     rms);
