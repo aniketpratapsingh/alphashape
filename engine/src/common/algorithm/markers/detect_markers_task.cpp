@@ -179,6 +179,9 @@ struct Detection {
     /// Coded circular target whose printed centre is a dark dot (parity 1).
     /// Parity 0 has no fiducial dot and keeps the border-ellipse centre.
     bool centre_dot = true;
+    /// Seed came from the light-on-dark pass; parity-0 targets are seeded
+    /// there, and a coarse dark whole-target blob can land off-centre.
+    bool light_seed = false;
     CrossStyle cross_style = CrossStyle::Saddle;
     // Eigen's default constructor leaves its scalars uninitialised, and a
     // plain `corners{}` therefore still holds indeterminate doubles; GCC's
@@ -252,6 +255,13 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     const GradientField gradient = compute_gradient_field(image);
     const auto better = [](const Detection& a, const Detection& b) {
         if (a.hamming != b.hamming) return a.hamming < b.hamming;
+        // Each parity has one seed that carries its true symmetric centre: the
+        // dark dot for parity 1, the light interior for parity 0. A coarse
+        // whole-target dark blob also decodes an even id but sits off-centre
+        // wherever the dark sectors are unbalanced.
+        const bool a_matches = a.light_seed == !a.centre_dot;
+        const bool b_matches = b.light_seed == !b.centre_dot;
+        if (a_matches != b_matches) return a_matches;
         if (a.radius != b.radius) return a.radius > b.radius;
         if (a.center.y() != b.center.y()) return a.center.y() < b.center.y();
         return a.center.x() < b.center.x();
@@ -260,7 +270,7 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     // interior, odd ids through the dark dot and (once the small dot is
     // blurred away at a coarse scale) through the same light interior. Decode
     // every seed and keep one detection per target.
-    const auto consider = [&](const MarkerCandidate& candidate) {
+    const auto consider = [&](const MarkerCandidate& candidate, bool from_light) {
         const auto decoded = decode_circular(image, gradient, candidate, spec.bits,
                                              params.max_hamming);
         if (!decoded || decoded->radius_px < params.minimum_size) {
@@ -273,6 +283,7 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         detection.hamming = decoded->hamming;
         detection.coded = true;
         detection.centre_dot = (decoded->code % 2) != 0;
+        detection.light_seed = from_light;
         bool merged = false;
         for (Detection& kept : out) {
             const double gate = 0.5 * std::min(kept.radius, detection.radius);
@@ -289,10 +300,10 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         }
     };
     for (const MarkerCandidate& candidate : dark_candidates) {
-        consider(candidate);
+        consider(candidate, false);
     }
     for (const MarkerCandidate& candidate : light_candidates) {
-        consider(candidate);
+        consider(candidate, true);
         // The light interior is bounded by the dark sector edge at 0.5 R on
         // rays through a dark sector and by the border at 0.9 R elsewhere, so
         // its fitted radius is a mix between those and the true outer radius.
@@ -301,7 +312,7 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         // the dark centre dot.
         MarkerCandidate scaled = candidate;
         scaled.radius_px *= 1.5;
-        consider(scaled);
+        consider(scaled, true);
     }
     return out;
 }
