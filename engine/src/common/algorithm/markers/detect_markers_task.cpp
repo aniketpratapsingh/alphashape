@@ -24,6 +24,7 @@
 #include "common/algorithm/markers/apriltag_decoder.hpp"
 #include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/cross_decoder.hpp"
+#include "common/algorithm/markers/light_seed_hints.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
 #include "common/commands/model_commands.hpp"
@@ -250,6 +251,15 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     // does not form a blob centred on the target.
     BlobParams light = blob;
     light.dark_on_light = false;
+    // The bright interior fills most of the target (up to 0.9 R), unlike the
+    // small parity-1 dot the dark pass is tuned for, so the dark pass's 128 px
+    // cap would hide a large even target. Allow four times that, bounded by
+    // the reduced image so a blob can never span the whole frame.
+    const int light_extent =
+        std::max(3, std::min(image.width(), image.height()));
+    light.max_radius =
+        std::max(light.min_radius,
+                 std::min(light_extent / 2, 4 * blob.max_radius));
     const std::vector<MarkerCandidate> light_candidates =
         detect_blobs(image, light);
     const GradientField gradient = compute_gradient_field(image);
@@ -270,11 +280,12 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     // interior, odd ids through the dark dot and (once the small dot is
     // blurred away at a coarse scale) through the same light interior. Decode
     // every seed and keep one detection per target.
-    const auto consider = [&](const MarkerCandidate& candidate, bool from_light) {
+    const auto consider = [&](const MarkerCandidate& candidate,
+                              bool from_light) -> bool {
         const auto decoded = decode_circular(image, gradient, candidate, spec.bits,
                                              params.max_hamming);
         if (!decoded || decoded->radius_px < params.minimum_size) {
-            return;
+            return false;
         }
         Detection detection;
         detection.code = params.noparity ? (decoded->code / 2) * 2 : decoded->code;
@@ -298,6 +309,7 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         if (!merged) {
             out.push_back(detection);
         }
+        return true;
     };
     for (const MarkerCandidate& candidate : dark_candidates) {
         consider(candidate, false);
@@ -305,14 +317,18 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     for (const MarkerCandidate& candidate : light_candidates) {
         // The light interior is bounded by the dark sector edge at 0.5 R on
         // rays through a dark sector and by the 0.85..0.9 R sector edge
-        // elsewhere, so its fitted radius is between about 0.5 R and 0.84 R.
-        // decode_circular treats its hint as the border radius, so scale the
-        // interior by 1.3; the resulting border search (1.6x that hint) still
-        // stops short of the next target cell's outline on a printed sheet
-        // (whose near edge is 1.8 R from the cell centre).
-        MarkerCandidate scaled = candidate;
-        scaled.radius_px *= 1.3;
-        consider(scaled, true);
+        // elsewhere, so its fitted radius is between about 0.5 R and 0.9 R.
+        // decode_circular treats its hint as the border radius and gates a
+        // located border to [hint/1.5, hint*1.5]; a single 1.3x scale misses
+        // the small-interior end of that range, so try each hint scale and
+        // keep the first that decodes.
+        for (const double scale : kLightSeedHintScales) {
+            MarkerCandidate scaled = candidate;
+            scaled.radius_px *= scale;
+            if (consider(scaled, true)) {
+                break;
+            }
+        }
     }
     return out;
 }
@@ -472,7 +488,7 @@ void map_and_crop_refinement(std::vector<Detection>& detections, double scale,
 void refine_from_windows(std::vector<Detection>& detections,
                          const TargetSpec& spec,
                          const std::vector<RefinementWindow>& windows,
-                         int max_hamming) {
+                         int max_hamming, bool noparity) {
     for (std::size_t i = 0; i < detections.size(); ++i) {
         Detection& detection = detections[i];
         const RefinementWindow& window = windows[i];
@@ -525,10 +541,24 @@ void refine_from_windows(std::vector<Detection>& detections,
                 // which is this target's accurate measurement.
                 const auto decoded =
                     decode_circular(window.image, seed, spec.bits, max_hamming);
-                if (decoded) {
+                // The local re-decode is only trustworthy when it reads back
+                // the same id; otherwise it locked onto a neighbouring edge
+                // and its border centre is meaningless. With parities merged
+                // the stored code is even, so compare in that space.
+                const bool same_code =
+                    decoded &&
+                    (noparity ? (decoded->code / 2) * 2 == detection.code
+                              : decoded->code == detection.code);
+                if (same_code) {
                     detection.center = decoded->center + offset;
                     detection.radius = decoded->radius_px;
                     detection.hamming = decoded->hamming;
+                } else {
+                    const GradientField gradient =
+                        compute_gradient_field(window.image);
+                    if (auto refined = refine_ellipse_center(gradient, seed)) {
+                        detection.center = *refined + offset;
+                    }
                 }
             } else {
                 const GradientField gradient =
@@ -889,7 +919,8 @@ CameraResult process_camera(const Document& document, const CameraJob& job,
                                     windows);
             luminance = FloatImage();  // release the full-resolution buffer
             reduced = FloatImage();
-            refine_from_windows(detections, spec, windows, params.max_hamming);
+            refine_from_windows(detections, spec, windows, params.max_hamming,
+                                params.noparity);
         }
         if (filter_mask && mask != nullptr) {
             detections.erase(

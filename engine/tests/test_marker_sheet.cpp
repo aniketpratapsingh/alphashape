@@ -23,6 +23,7 @@
 #include "common/algorithm/calibration/board_detector.hpp"
 #include "common/algorithm/markers/apriltag_decoder.hpp"
 #include "common/algorithm/markers/circular_decoder.hpp"
+#include "common/algorithm/markers/light_seed_hints.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/algorithm/markers/tag_families.hpp"
@@ -176,10 +177,12 @@ TEST(MarkerSheet, RenderDecodesBack) {
                 blobs.push_back(candidate);
                 // The light interior's radius lies between the 0.5 R sector
                 // edge and the 0.9 R border; decode treats the hint as the
-                // border radius, so scale it onto the outer outline.
-                MarkerCandidate scaled = candidate;
-                scaled.radius_px *= 1.3;
-                blobs.push_back(scaled);
+                // border radius, so try the same scales detection uses.
+                for (const double scale : kLightSeedHintScales) {
+                    MarkerCandidate scaled = candidate;
+                    scaled.radius_px *= scale;
+                    blobs.push_back(scaled);
+                }
             }
             std::set<int> decoded;
             int foreign = 0;
