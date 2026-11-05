@@ -303,15 +303,14 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         consider(candidate, false);
     }
     for (const MarkerCandidate& candidate : light_candidates) {
-        consider(candidate, true);
         // The light interior is bounded by the dark sector edge at 0.5 R on
-        // rays through a dark sector and by the border at 0.9 R elsewhere, so
-        // its fitted radius is a mix between those and the true outer radius.
-        // One extra hypothesis at 1.5x covers the whole plausible range
-        // without a third image pass; decode_circular already probes 4x for
-        // the dark centre dot.
+        // rays through a dark sector and by the 0.85..0.9 R sector edge
+        // elsewhere, so its fitted radius is between about 0.5 R and 0.8 R.
+        // decode_circular treats its hint as the border radius, so scale the
+        // interior by 1.4; the resulting border search (1.6x that hint) still
+        // stops short of the next target cell on a printed sheet.
         MarkerCandidate scaled = candidate;
-        scaled.radius_px *= 1.5;
+        scaled.radius_px *= 1.4;
         consider(scaled, true);
     }
     return out;

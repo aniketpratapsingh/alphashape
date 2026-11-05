@@ -175,9 +175,10 @@ TEST(MarkerSheet, RenderDecodesBack) {
             for (const MarkerCandidate& candidate : light_blobs) {
                 blobs.push_back(candidate);
                 // The light interior's radius lies between the 0.5 R sector
-                // edge and the 0.9 R border, so decode a second hypothesis.
+                // edge and the 0.9 R border; decode treats the hint as the
+                // border radius, so scale it onto the outer outline.
                 MarkerCandidate scaled = candidate;
-                scaled.radius_px *= 1.5;
+                scaled.radius_px *= 1.4;
                 blobs.push_back(scaled);
             }
             std::set<int> decoded;
