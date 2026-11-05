@@ -349,6 +349,9 @@ std::optional<Eigen::Vector3d> triangulate_robust(
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
+    /// True when the seed came from the light-on-dark pass, i.e. the target
+    /// has no centre dot and its centre must be taken from the outer border.
+    bool light_centre = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
@@ -393,40 +396,58 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     params.max_radius = std::max(4, half);
     params.threshold = 0.02F;
     params.min_axis_ratio = 0.3;
-    std::vector<MarkerCandidate> blobs = detect_blobs(crop, params);
+    const std::vector<MarkerCandidate> dark_blobs = detect_blobs(crop, params);
     // For a parity-0 circular target the white centre merges with the
     // 0.25..0.5 R white gap, so the dark-on-light pass has no dot to seed
     // from. The light-on-dark pass finds the bright interior enclosed by the
-    // dark border ring instead. Both passes are searched and the blob nearest
-    // the expected centre wins; for an odd id the dark dot supplies the
-    // fiducial and is normally the nearer of the two.
+    // dark border ring instead. A dark blob near the expected centre is the
+    // parity-1 centre dot, the precise printed fiducial, so it is preferred
+    // when present; the light blob is the fallback for targets without one.
     params.dark_on_light = false;
     const std::vector<MarkerCandidate> light_blobs = detect_blobs(crop, params);
-    blobs.insert(blobs.end(), light_blobs.begin(), light_blobs.end());
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
                                index.y() - static_cast<double>(y0) + 0.5);
-    const MarkerCandidate* best = nullptr;
-    double best_distance = static_cast<double>(half) * 0.75;
-    for (const MarkerCandidate& blob : blobs) {
-        const double distance = (blob.center - seed).norm();
-        if (distance <= best_distance) {
-            best_distance = distance;
-            best = &blob;
+    const auto nearest = [&](const std::vector<MarkerCandidate>& candidates) {
+        const MarkerCandidate* best = nullptr;
+        double best_distance = static_cast<double>(half) * 0.75;
+        for (const MarkerCandidate& blob : candidates) {
+            const double distance = (blob.center - seed).norm();
+            if (distance <= best_distance) {
+                best_distance = distance;
+                best = &blob;
+            }
         }
+        return best;
+    };
+    const MarkerCandidate* best = nearest(dark_blobs);
+    const bool light_centre = best == nullptr;
+    if (light_centre) {
+        best = nearest(light_blobs);
     }
     if (best == nullptr) {
         return std::nullopt;
     }
-    MarkerCandidate refined = *best;
     Eigen::Vector2d centre = best->center;
-    if (const auto fitted = refine_ellipse_center(crop, refined)) {
+    double radius = best->radius_px;
+    if (light_centre) {
+        // The light interior's first edge differs between dark and light
+        // sectors, so fit the outer border; it also supplies the true target
+        // radius instead of the smaller interior scale.
+        double fitted_radius = radius;
+        if (const auto fitted =
+                refine_border_center(crop, centre, radius, &fitted_radius)) {
+            centre = *fitted;
+            radius = fitted_radius;
+        }
+    } else if (const auto fitted = refine_ellipse_center(crop, *best)) {
         centre = *fitted;
     }
     BlobSeed out;
     out.pixel = (centre + Eigen::Vector2d(static_cast<double>(x0),
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
-    out.radius = best->radius_px * static_cast<double>(view.downscale);
+    out.radius = radius * static_cast<double>(view.downscale);
+    out.light_centre = light_centre;
     return out;
 }
 
@@ -782,7 +803,17 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     // printed target is centred at the candidate to within a few pixels, so
     // the radial search converges to the real boundary from there.
     std::optional<Eigen::Vector2d> ellipse;
-    if (seed) {
+    if (seed && seed->light_centre) {
+        // The target has no centre dot. Its first radial edge alternates
+        // between the 0.5 R sector ring and the 0.85..0.9 R border, which
+        // biases a first-edge fit; the outer border is the complete
+        // concentric outline.
+        double radius = seed->radius / ds;
+        if (const auto fitted = refine_border_center(
+                view.gradient_field, pixel / ds, radius, &radius)) {
+            ellipse = accept(*fitted * ds);
+        }
+    } else if (seed) {
         MarkerCandidate ellipse_seed;
         ellipse_seed.center = pixel / ds;
         ellipse_seed.radius_px = seed->radius / ds;

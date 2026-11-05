@@ -176,6 +176,9 @@ struct Detection {
     double radius = 0.0;
     int hamming = 0;
     bool coded = false;
+    /// Coded circular target whose printed centre is a dark dot (parity 1).
+    /// Parity 0 has no fiducial dot and keeps the border-ellipse centre.
+    bool centre_dot = true;
     CrossStyle cross_style = CrossStyle::Saddle;
     // Eigen's default constructor leaves its scalars uninitialised, and a
     // plain `corners{}` therefore still holds indeterminate doubles; GCC's
@@ -269,6 +272,7 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         detection.radius = decoded->radius_px;
         detection.hamming = decoded->hamming;
         detection.coded = true;
+        detection.centre_dot = (decoded->code % 2) != 0;
         bool merged = false;
         for (Detection& kept : out) {
             const double gate = 0.5 * std::min(kept.radius, detection.radius);
@@ -501,9 +505,26 @@ void refine_from_windows(std::vector<Detection>& detections,
             seed.center = local;
             seed.radius_px = detection.radius;
             seed.axis_ratio = 1.0;
-            const GradientField gradient = compute_gradient_field(window.image);
-            if (auto refined = refine_ellipse_center(gradient, seed)) {
-                detection.center = *refined + offset;
+            if (detection.coded && !detection.centre_dot) {
+                // Parity-0 targets have no centre dot: a first-edge fit takes
+                // the 0.5 R sector ring on some rays and the border on others,
+                // and an asymmetric sector word biases the centre (measured up
+                // to 1.6 px on a rendered sheet). Re-decode at full resolution
+                // instead; decode_circular keeps the border-ellipse centre,
+                // which is this target's accurate measurement.
+                const auto decoded =
+                    decode_circular(window.image, seed, spec.bits, max_hamming);
+                if (decoded) {
+                    detection.center = decoded->center + offset;
+                    detection.radius = decoded->radius_px;
+                    detection.hamming = decoded->hamming;
+                }
+            } else {
+                const GradientField gradient =
+                    compute_gradient_field(window.image);
+                if (auto refined = refine_ellipse_center(gradient, seed)) {
+                    detection.center = *refined + offset;
+                }
             }
         }
     }
