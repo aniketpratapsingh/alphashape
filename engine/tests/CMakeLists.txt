@@ -31,6 +31,7 @@ add_executable(alphashape_tests
     test_optimize_cameras.cpp
     test_antenna.cpp
     test_attitude_prior.cpp
+    test_reference_alignment.cpp
     test_optimize_gcp.cpp
     test_geodesy.cpp
     test_similarity.cpp

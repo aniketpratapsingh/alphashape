@@ -676,6 +676,72 @@ private:
     ChunkGeometry previous_;
 };
 
+namespace {
+
+void install_chunk_pose_state(Chunk& chunk, const ChunkPoseState& state) {
+    chunk.cameras() = state.cameras;
+    chunk.tie_points().tracks = state.tracks;
+    chunk.transform() = state.transform;
+    chunk.region() = state.region;
+    chunk.meta().items = state.meta;
+    chunk.crs() = state.crs;
+    chunk.clear_camera_crs();
+    if (state.camera_crs.has_value()) {
+        chunk.set_camera_crs(*state.camera_crs);
+    }
+    chunk.clear_world_crs();
+    if (state.world_crs.has_value()) {
+        chunk.set_world_crs(*state.world_crs);
+    }
+}
+
+}  // namespace
+
+/// Install a computed pose/tie-point state in one undoable step. Used by the
+/// reference-placement and tie-point triangulation tasks: both replace camera
+/// poses and tracks together, and the track list may shrink, so the snapshot
+/// owns the whole vector.
+class SetChunkPoseStateCommand : public StagedMutation {
+public:
+    SetChunkPoseStateCommand(std::int32_t chunk_id, ChunkPoseState after,
+                             std::string label)
+        : chunk_id_(chunk_id), after_(std::move(after)), label_(std::move(label)) {}
+
+    std::string name() const override { return label_; }
+
+protected:
+    void validate(Document& document) override {
+        require_chunk(document, chunk_id_);
+        if (!after_.transform.allFinite() || !after_.region.centre.allFinite() ||
+            !after_.region.size.allFinite()) {
+            throw ValueError("set chunk pose state: non-finite transform or region");
+        }
+        for (const Camera& camera : after_.cameras) {
+            if (!camera.pose.allFinite()) {
+                throw ValueError("set chunk pose state: non-finite camera pose");
+            }
+        }
+    }
+
+    void stage(Document& document) override {
+        previous_ = capture_chunk_pose_state(require_chunk(document, chunk_id_));
+    }
+
+    void commit(Document& document) override {
+        install_chunk_pose_state(require_chunk(document, chunk_id_), after_);
+    }
+
+    void restore(Document& document) override {
+        install_chunk_pose_state(require_chunk(document, chunk_id_), previous_);
+    }
+
+private:
+    std::int32_t chunk_id_;
+    ChunkPoseState after_;
+    std::string label_;
+    ChunkPoseState previous_;
+};
+
 /// Set one meta property, restoring the previous value (or absence) on revert.
 class SetChunkMetaCommand : public StagedMutation {
 public:
@@ -1495,6 +1561,11 @@ protected:
             throw ValueError("no marker with id " + std::to_string(marker_id_));
         }
         marker->position = position_;
+        if (!position_.has_value()) {
+            // A cleared estimate has no covariance: the old one described a
+            // position that no longer exists.
+            marker->position_covariance.setZero();
+        }
     }
 
 private:
@@ -3009,6 +3080,19 @@ private:
 
 }  // namespace
 
+ChunkPoseState capture_chunk_pose_state(const Chunk& chunk) {
+    ChunkPoseState state;
+    state.cameras = chunk.cameras();
+    state.tracks = chunk.tie_points().tracks;
+    state.transform = chunk.transform();
+    state.region = chunk.region();
+    state.meta = chunk.meta().items;
+    state.crs = chunk.crs();
+    state.camera_crs = chunk.explicit_camera_crs();
+    state.world_crs = chunk.explicit_world_crs();
+    return state;
+}
+
 std::unique_ptr<AbstractCommand> make_add_marker_command(std::int32_t chunk_id,
                                                         Marker marker) {
     return std::make_unique<AddMarkerCommand>(chunk_id, std::move(marker));
@@ -3161,6 +3245,12 @@ std::unique_ptr<AbstractCommand> make_set_reference_settings_command(
 std::unique_ptr<AbstractCommand> make_align_chunks_command(std::int32_t chunk_id,
                                                            ChunkGeometry after) {
     return std::make_unique<AlignChunksCommand>(chunk_id, std::move(after));
+}
+
+std::unique_ptr<AbstractCommand> make_set_chunk_pose_state_command(
+    std::int32_t chunk_id, ChunkPoseState after, std::string label) {
+    return std::make_unique<SetChunkPoseStateCommand>(chunk_id, std::move(after),
+                                                      std::move(label));
 }
 
 std::unique_ptr<AbstractCommand> make_set_chunk_meta_command(std::int32_t chunk_id,

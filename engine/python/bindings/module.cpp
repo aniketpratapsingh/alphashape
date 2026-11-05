@@ -1972,6 +1972,16 @@ PYBIND11_MODULE(alphashape, m) {
         .def("updateTransform", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "UpdateTransform", std::move(kwargs));
         })
+        // Exterior orientation from navigation metadata (WP-13.21): place the
+        // selected cameras from their reference position and attitude.
+        .def("alignFromReference", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "AlignFromReference", std::move(kwargs));
+        })
+        // Tie points from the stored matches with the current poses held
+        // (WP-13.21): the same run_task call as the task.
+        .def("triangulateTiePoints", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "TriangulateTiePoints", std::move(kwargs));
+        })
 #if defined(ALPHASHAPE_USE_PROJ)
         // Convert the camera/marker reference positions into another CRS
         // (WP-12.7). `target` is an EPSG code; `kind` is "cameras", "markers"

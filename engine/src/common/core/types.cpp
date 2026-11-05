@@ -1,5 +1,6 @@
 #include "common/core/types.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "base/utils/error.hpp"
@@ -78,6 +79,19 @@ bool reference_location_equal(const std::optional<Eigen::Vector3d>& a,
     return optional_vector_equal(a, b);
 }
 
+/// Linear-interpolated percentile of an already-sorted vector, matching the
+/// region fit AlignCameras has always used.
+double percentile_value(const std::vector<double>& sorted, double q) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    const double pos = q * (static_cast<double>(sorted.size()) - 1.0);
+    const std::size_t lo = static_cast<std::size_t>(std::floor(pos));
+    const std::size_t hi = std::min(lo + 1, sorted.size() - 1);
+    const double frac = pos - static_cast<double>(lo);
+    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
 }  // namespace
 
 void Meta::set(std::string key, std::string value) {
@@ -136,6 +150,60 @@ void validate_sensor_masters(const std::vector<Sensor>& sensors) {
                              " have different types or image sizes");
         }
     }
+}
+
+std::int32_t effective_sensor_id(const std::vector<Sensor>& sensors,
+                                 std::int32_t sensor_id) {
+    const auto count = static_cast<std::int32_t>(sensors.size());
+    if (sensor_id < 0 || sensor_id >= count) {
+        throw ValueError("sensor index " + std::to_string(sensor_id) + " is out of range");
+    }
+    const std::int32_t master =
+        sensors[static_cast<std::size_t>(sensor_id)].master_sensor_id;
+    if (master < 0) {
+        return sensor_id;
+    }
+    if (master >= count) {
+        throw ValueError("sensor " + std::to_string(sensor_id) +
+                         " names out-of-range master " + std::to_string(master));
+    }
+    return master;
+}
+
+Region region_from_points(const std::vector<Eigen::Vector3d>& points,
+                          const Region& fallback) {
+    if (points.size() < 4) {
+        return fallback;
+    }
+    Region region = fallback;
+    std::vector<double> values;
+    values.reserve(points.size());
+    for (int axis = 0; axis < 3; ++axis) {
+        values.clear();
+        for (const Eigen::Vector3d& point : points) {
+            values.push_back(point[axis]);
+        }
+        std::sort(values.begin(), values.end());
+        region.centre[axis] = percentile_value(values, 0.5);
+        const double span = percentile_value(values, 0.95) - percentile_value(values, 0.05);
+        region.size[axis] = span * 1.1;
+    }
+    return region;
+}
+
+bool crs_is_geographic(const CRS& crs) {
+    const int code = crs.epsg;
+    if (code != 0) {
+        return code == 4326 || (code >= 4000 && code <= 4999);
+    }
+    // No EPSG code: a WKT that names a projected CRS is still a refusal, and an
+    // empty slot declares nothing.
+    const std::string& wkt = crs.wkt;
+    if (!wkt.empty()) {
+        return wkt.find("PROJCRS") == std::string::npos &&
+               wkt.find("PROJECTEDCRS") == std::string::npos;
+    }
+    return true;
 }
 
 bool CameraReference::operator==(const CameraReference& other) const {
