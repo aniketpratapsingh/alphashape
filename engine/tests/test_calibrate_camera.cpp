@@ -656,6 +656,99 @@ TEST(CalibrateCamera, MixedSizesSkipOnlyThatSensor) {
         << *skipped;
 }
 
+TEST(CalibrateCamera, FixedParamsHoldSensorTerms) {
+    CalibrateScene scene = make_calibrate_scene(83U, 5);
+    Sensor& sensor = scene.chunk->sensors()[0];
+    sensor.calibration.k1 = -0.02;
+    sensor.calibration.p1 = 2e-4;
+    sensor.fixed_params = {"k1", "p1"};
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    const Calibration& after = scene.chunk->sensors()[0].calibration;
+    std::printf("[calibrate camera fixed params] k1 %.6f p1 %.6f f %.3f\n",
+                after.k1, after.p1, after.f);
+    EXPECT_DOUBLE_EQ(after.k1, -0.02);
+    EXPECT_DOUBLE_EQ(after.p1, 2e-4);
+    const std::string* fixed =
+        scene.chunk->meta().find("calibrate_camera.sensor.fixed");
+    ASSERT_NE(fixed, nullptr);
+    EXPECT_EQ(*fixed, "k1,p1");
+    EXPECT_EQ(scene.chunk->meta().find("calibrate_camera.sensor.sigma.k1"),
+              nullptr);
+    EXPECT_EQ(scene.chunk->meta().find("calibrate_camera.sensor.sigma.p1"),
+              nullptr);
+    // A term the sensor did not lock is still solved and publishes a sigma.
+    const std::string* sigma_f =
+        scene.chunk->meta().find("calibrate_camera.sensor.sigma.f");
+    ASSERT_NE(sigma_f, nullptr);
+    EXPECT_GT(std::stod(*sigma_f), 0.0);
+    EXPECT_NEAR(after.f, kTaskFocal, 0.01 * kTaskFocal);
+    const std::string* rms =
+        scene.chunk->meta().find("calibrate_camera.sensor.rms_px");
+    ASSERT_NE(rms, nullptr);
+    EXPECT_GT(std::stod(*rms), 0.0);
+}
+
+TEST(CalibrateCamera, FixedFocalWithoutValueSkipsSensor) {
+    CalibrateScene scene;
+    Chunk& chunk = scene.document.workspace().add_chunk("Chunk 1");
+    scene.document.set_active_chunk_id(chunk.id());
+    scene.chunk = &chunk;
+    Sensor no_focal;
+    no_focal.label = "nofocal";
+    no_focal.type = CameraType::Frame;
+    no_focal.width = kTaskWidth;
+    no_focal.height = kTaskHeight;
+    no_focal.calibration =
+        Calibration::initial(CameraType::Frame, kTaskWidth, kTaskHeight, 500.0);
+    no_focal.calibration.f = 0.0;
+    no_focal.fixed_params = {"f"};
+    chunk.sensors().push_back(no_focal);
+    Sensor good;
+    good.label = "good";
+    good.type = CameraType::Frame;
+    good.width = kTaskWidth;
+    good.height = kTaskHeight;
+    good.calibration =
+        Calibration::initial(CameraType::Frame, kTaskWidth, kTaskHeight, 500.0);
+    chunk.sensors().push_back(good);
+    std::mt19937 engine(92U);
+    for (int i = 0; i < 5; ++i) {
+        add_board_camera(scene, engine, 1, "good" + std::to_string(i),
+                         kTaskWidth, kTaskHeight);
+    }
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    const std::string* skipped =
+        chunk.meta().find("calibrate_camera.nofocal.skipped");
+    std::printf("[calibrate camera fixed focal] skipped \"%s\"\n",
+                skipped != nullptr ? skipped->c_str() : "(none)");
+    ASSERT_NE(skipped, nullptr);
+    EXPECT_TRUE(skipped->find("focal length") != std::string::npos) << *skipped;
+    // The other sensor still calibrates.
+    EXPECT_EQ(chunk.meta().find("calibrate_camera.good.skipped"), nullptr);
+    EXPECT_NEAR(chunk.sensors()[1].calibration.f, kTaskFocal,
+                0.01 * kTaskFocal);
+}
+
+TEST(CalibrateCamera, FixedFocalIsHeld) {
+    CalibrateScene scene = make_calibrate_scene(84U, 5);
+    Sensor& sensor = scene.chunk->sensors()[0];
+    sensor.calibration.f = kTaskFocal;
+    sensor.fixed_params = {"f"};
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    const Calibration& after = scene.chunk->sensors()[0].calibration;
+    std::printf("[calibrate camera fixed focal held] f %.6f\n", after.f);
+    EXPECT_EQ(after.f, kTaskFocal);
+    EXPECT_EQ(scene.chunk->meta().find("calibrate_camera.sensor.sigma.f"),
+              nullptr);
+    const std::string* fixed =
+        scene.chunk->meta().find("calibrate_camera.sensor.fixed");
+    ASSERT_NE(fixed, nullptr);
+    EXPECT_EQ(*fixed, "f");
+}
+
 TEST(CalibrateCamera, WritesReport) {
     CalibrateScene scene = make_calibrate_scene(101U, 5);
     const std::string path =
