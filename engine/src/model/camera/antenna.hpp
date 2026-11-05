@@ -54,7 +54,7 @@ struct Antenna {
 
     /// True when a non-zero offset is recorded. A boresight alone does not
     /// move the antenna, but it is still persisted (see operator==).
-    bool is_set() const { return offset_m != Eigen::Vector3d::Zero; }
+    bool is_set() const { return offset_m != Eigen::Vector3d::Zero(); }
 
     /// Body -> camera rotation: `R_b` from `boresight_deg`, or identity when
     /// the offset is already expressed in the camera frame.
