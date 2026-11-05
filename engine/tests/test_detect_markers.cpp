@@ -639,6 +639,56 @@ TEST(Markers, DetectsEvenCodeAt300Dpi) {
     EXPECT_LT(error, 0.5);
 }
 
+TEST(Markers, DiagLightDecodes) {
+    for (const double dpi : {200.0, 300.0}) {
+        SheetOptions options;
+        options.target = SheetTarget::Circular12;
+        options.first_code = 1;
+        options.count = 8;
+        options.corner_marks = false;
+        const FloatImage gray =
+            sheet_to_gray(marker_sheet_raster(options, dpi, 0));
+        BlobParams params;
+        params.dark_on_light = false;
+        params.min_radius = 3;
+        const int extent = std::min(gray.width(), gray.height());
+        const int cap = std::max(params.min_radius,
+                                 std::min(128, std::max(3, extent / 3)));
+        params.max_radius =
+            std::max(params.min_radius, std::min(std::max(3, extent / 2),
+                                                 4 * cap));
+        params.threshold = 0.02F;
+        params.min_axis_ratio = 0.3;
+        const std::vector<MarkerCandidate> light = detect_blobs(gray, params);
+        const GradientField gradient = compute_gradient_field(gray);
+        const double reach = 98.0 * dpi / 200.0;
+        for (int code = 1; code <= 8; ++code) {
+            const Eigen::Vector2d truth = sheet_cell_centre(code, 1, dpi);
+            for (const MarkerCandidate& candidate : light) {
+                const double off = (candidate.center - truth).norm();
+                if (off > reach) {
+                    continue;
+                }
+                for (const double scale : {1.3, 1.6, 2.0}) {
+                    MarkerCandidate scaled = candidate;
+                    scaled.radius_px *= scale;
+                    const auto decoded =
+                        decode_circular(gray, gradient, scaled, 12, 0);
+                    if (!decoded || decoded->code != code) {
+                        continue;
+                    }
+                    std::printf(
+                        "[diag light] dpi=%.0f code=%d cand_r=%.2f off=%.2f "
+                        "s=%.1f dec_r=%.2f err=%.2f\n",
+                        dpi, code, candidate.radius_px, off, scale,
+                        decoded->radius_px,
+                        (decoded->center - truth).norm());
+                }
+            }
+        }
+    }
+}
+
 TEST(Markers, NoFalseIdsOnStructuredBrightSpots) {
     // A dark field with bright discs and small specular spots: the
     // light-on-dark pass sees all of them, but none carries a code ring, so

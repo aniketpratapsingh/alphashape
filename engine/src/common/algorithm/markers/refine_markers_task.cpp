@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <list>
@@ -23,6 +24,7 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "base/utils/omp.hpp"
@@ -356,6 +358,12 @@ std::optional<Eigen::Vector3d> triangulate_robust(
     return triangulate_observations(observations);
 }
 
+bool seed_diag() {
+    static const bool enabled =
+        platform::get_env("ALPHASHAPE_DIAG_SEED") == "1";
+    return enabled;
+}
+
 struct BlobSeed {
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     double radius = 0.0;
@@ -575,6 +583,14 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
             } else {
                 centre = light->center;
             }
+            if (seed_diag()) {
+                std::printf(
+                    "[diag light] blob_r=%.2f blob_c=(%.2f,%.2f) fitted_r=%.2f "
+                    "accepted=%d centre=(%.2f,%.2f)\n",
+                    light->radius_px, light->center.x(), light->center.y(),
+                    fitted_radius, static_cast<int>(out.border_fitted),
+                    centre.x(), centre.y());
+            }
             out.light_centre = true;
         } else {
             // No target found: fall back to the original nearest dark blob,
@@ -621,6 +637,16 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                           static_cast<double>(y0))) *
                 static_cast<double>(view.downscale);
     out.radius = radius * static_cast<double>(view.downscale);
+    if (seed_diag()) {
+        std::printf(
+            "[diag win] half=%d seed=(%.2f,%.2f) dark=%zu light=%zu out_px="
+            "(%.2f,%.2f) out_r=%.2f light_c=%d fitted=%d dot=%d\n",
+            half, seed.x(), seed.y(), dark_blobs.size(), light_blobs.size(),
+            out.pixel.x(), out.pixel.y(), out.radius,
+            static_cast<int>(out.light_centre),
+            static_cast<int>(out.border_fitted),
+            static_cast<int>(out.centre_dot));
+    }
     return out;
 }
 
@@ -667,9 +693,20 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
         if (auto retried =
                 circular_seed_window(view, pixel, wider, coded_circular)) {
             if (!seed || retried->light_centre || retried->border_fitted) {
+                if (seed_diag()) {
+                    std::printf("[diag retry] half=%d wider=%d -> returned\n",
+                                half, wider);
+                }
                 return retried;
             }
         }
+    }
+    if (seed_diag()) {
+        std::printf("[diag seed] half=%d unfitted=%d guessed=%d missing=%d "
+                    "seed=%d\n",
+                    half, static_cast<int>(unfitted),
+                    static_cast<int>(guessed), static_cast<int>(missing),
+                    static_cast<int>(seed.has_value()));
     }
     return seed;
 }
@@ -1048,6 +1085,17 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     std::optional<Eigen::Vector2d> cross;
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         cross = accept(*refined * ds);
+    }
+    if (seed_diag()) {
+        std::printf(
+            "[diag 2d] px=(%.2f,%.2f) limit=%.2f seed=%d light=%d ellipse=%d "
+            "(%.2f,%.2f) cross=%d (%.2f,%.2f)\n",
+            pixel.x(), pixel.y(), limit, static_cast<int>(seed.has_value()),
+            static_cast<int>(seed && seed->light_centre),
+            static_cast<int>(ellipse.has_value()),
+            ellipse ? ellipse->x() : 0.0, ellipse ? ellipse->y() : 0.0,
+            static_cast<int>(cross.has_value()),
+            cross ? cross->x() : 0.0, cross ? cross->y() : 0.0);
     }
     if (ellipse &&
         (!cross ||
