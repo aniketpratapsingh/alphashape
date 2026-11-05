@@ -8,8 +8,10 @@
 /// decoder takes the seed radius as a border-radius hint and accepts a located
 /// border only within [hint/1.5, hint*1.5]. Scaling the interior radius by the
 /// values below places the hint so that every interior fraction in that range
-/// falls inside the gate of at least one scale; detection tries them in order
-/// and keeps the first that decodes.
+/// falls inside the gate of at least one scale. Detection decodes every scale
+/// and keeps the outermost border that is still a plausible multiple of the
+/// interior radius, because a short search window can make the first decoding
+/// scale lock onto the 0.85 R sector edge instead of the true border.
 
 #include <array>
 

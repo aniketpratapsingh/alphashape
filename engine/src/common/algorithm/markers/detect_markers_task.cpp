@@ -280,20 +280,14 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     // interior, odd ids through the dark dot and (once the small dot is
     // blurred away at a coarse scale) through the same light interior. Decode
     // every seed and keep one detection per target.
-    const auto consider = [&](const MarkerCandidate& candidate,
-                              bool from_light) -> bool {
-        const auto decoded = decode_circular(image, gradient, candidate, spec.bits,
-                                             params.max_hamming);
-        if (!decoded || decoded->radius_px < params.minimum_size) {
-            return false;
-        }
+    const auto emit = [&](const CodedTarget& decoded, bool from_light) {
         Detection detection;
-        detection.code = params.noparity ? (decoded->code / 2) * 2 : decoded->code;
-        detection.center = decoded->center;
-        detection.radius = decoded->radius_px;
-        detection.hamming = decoded->hamming;
+        detection.code = params.noparity ? (decoded.code / 2) * 2 : decoded.code;
+        detection.center = decoded.center;
+        detection.radius = decoded.radius_px;
+        detection.hamming = decoded.hamming;
         detection.coded = true;
-        detection.centre_dot = (decoded->code % 2) != 0;
+        detection.centre_dot = (decoded.code % 2) != 0;
         detection.light_seed = from_light;
         bool merged = false;
         for (Detection& kept : out) {
@@ -309,10 +303,20 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         if (!merged) {
             out.push_back(detection);
         }
-        return true;
+    };
+    const auto decode_seed = [&](const MarkerCandidate& candidate)
+        -> std::optional<CodedTarget> {
+        const auto decoded = decode_circular(image, gradient, candidate,
+                                             spec.bits, params.max_hamming);
+        if (!decoded || decoded->radius_px < params.minimum_size) {
+            return std::nullopt;
+        }
+        return decoded;
     };
     for (const MarkerCandidate& candidate : dark_candidates) {
-        consider(candidate, false);
+        if (const auto decoded = decode_seed(candidate)) {
+            emit(*decoded, false);
+        }
     }
     for (const MarkerCandidate& candidate : light_candidates) {
         // The light interior is bounded by the dark sector edge at 0.5 R on
@@ -320,14 +324,31 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         // elsewhere, so its fitted radius is between about 0.5 R and 0.9 R.
         // decode_circular treats its hint as the border radius and gates a
         // located border to [hint/1.5, hint*1.5]; a single 1.3x scale misses
-        // the small-interior end of that range, so try each hint scale and
-        // keep the first that decodes.
+        // the small-interior end of that range, so try each hint scale.
+        // The scale that decodes first can still lock onto the 0.85 R sector
+        // edge when its search window stops short of the true border, which
+        // biases the centre, so decode all of them and keep the outermost
+        // plausible border. A target's border is at most about twice the
+        // interior blob radius (the interior reaches down to 0.5 R), and a
+        // candidate below the interior radius is a sector edge, not a border.
+        std::optional<CodedTarget> best;
         for (const double scale : kLightSeedHintScales) {
             MarkerCandidate scaled = candidate;
             scaled.radius_px *= scale;
-            if (consider(scaled, true)) {
-                break;
+            const auto decoded = decode_seed(scaled);
+            if (!decoded) {
+                continue;
             }
+            if (!(decoded->radius_px >= candidate.radius_px) ||
+                !(decoded->radius_px <= 2.2 * candidate.radius_px)) {
+                continue;
+            }
+            if (!best || decoded->radius_px > best->radius_px) {
+                best = decoded;
+            }
+        }
+        if (best) {
+            emit(*best, true);
         }
     }
     return out;
