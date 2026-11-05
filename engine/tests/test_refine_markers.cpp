@@ -27,7 +27,6 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
-#include "base/platform/env.hpp"
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
@@ -617,10 +616,18 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
     // A target whose projected radius is well over the 48 px minimum window:
     // the crop and blob scale must follow the apparent size, or the interior
     // is clipped and the border fit silently falls back to a biased centre.
+    // The camera looks straight down because, for a strongly tilted target,
+    // the image of the printed circle is an ellipse whose centre is a few
+    // percent of R away from the projected circle centre (a documented
+    // limitation of the border-ellipse centre); a single-view measurement
+    // against the projected centre is only well posed at (near) normal
+    // incidence, where the two coincide.
     SceneSpec spec;
     spec.marker_count = 1;
     spec.even_code_target = 0;
     spec.target_radius = 0.18;
+    spec.ring_radius = 0.0;
+    spec.height = 2.0;
     RefineScene scene = make_scene(spec, 191U);
     ASSERT_EQ(scene.targets[0].parity, 0);
     const double apparent = apparent_radius(scene, 0, 0);
@@ -633,24 +640,11 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
                          std::vector<std::size_t>{0})};
     ASSERT_FALSE(ids.empty());
     RefineMarkersOptions options;
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "1");
     const RefineMarkersStats stats = run_refine(scene, options);
-    platform::set_env("ALPHASHAPE_DIAG_SEED", "");
     EXPECT_EQ(stats.failed, 0U);
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const Marker* marker = find_marker(*scene.chunk, ids[i]);
         ASSERT_NE(marker, nullptr);
-        for (const MarkerProjection& projection : marker->projections) {
-            const std::size_t camera = camera_index(scene, projection.camera_id);
-            const auto truth = scene.truth(0, camera);
-            if (!truth) {
-                continue;
-            }
-            std::printf("[refine large cam] got=(%.3f,%.3f) "
-                        "truth=(%.3f,%.3f)\n",
-                        projection.pixel.x(), projection.pixel.y(), truth->x(),
-                        truth->y());
-        }
         const double rms = rms_to_truth(scene, *marker, 0);
         std::printf("[refine large] apparent %.2f px RMS %.4f px\n", apparent,
                     rms);
