@@ -31,6 +31,7 @@
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
 #include "model/camera/calibration.hpp"
+#include "model/camera/film.hpp"
 
 namespace alphashape {
 namespace {
@@ -485,6 +486,35 @@ TEST(ChunkOps, AppendIntoPopulatedChunkGrowsIdsAndDedupsSensors) {
                                     return (camera_centre(camera) - want).norm() <= 1e-12;
                                 }));
     }
+}
+
+/// `fiducial_pixels` indexes the sensor's layout, so two otherwise identical
+/// sensors with different film layouts must stay distinct through an append.
+TEST(ChunkOps, AppendKeepsFilmSensorsDistinct) {
+    Chunk target("target");
+    target.set_id(0);
+    build_rich_chunk(target, 1, 0.0);
+    Chunk incoming("incoming");
+    incoming.set_id(1);
+    build_rich_chunk(incoming, 1, 10.0);
+    FilmSettings film;
+    film.enabled = true;
+    film.fiducials = {Fiducial{"a", Eigen::Vector2d(1.0, 2.0)}};
+    incoming.sensors()[0].film = film;
+    incoming.cameras()[0].fiducial_pixels = {Eigen::Vector2d(10.0, 20.0)};
+
+    append_chunk(target, incoming);
+    expect_valid(target, "appended");
+    ASSERT_EQ(target.sensors().size(), 2U);
+    ASSERT_EQ(target.cameras().size(), 2U);
+    EXPECT_EQ(target.cameras()[0].sensor_id, 0);
+    EXPECT_FALSE(target.sensors()[0].film.enabled);
+    EXPECT_EQ(target.cameras()[1].sensor_id, 1);
+    EXPECT_TRUE(target.sensors()[1].film == film);
+    ASSERT_EQ(target.cameras()[1].fiducial_pixels.size(), 1U);
+    ASSERT_TRUE(target.cameras()[1].fiducial_pixels[0].has_value());
+    EXPECT_TRUE(target.cameras()[1].fiducial_pixels[0]->isApprox(
+        Eigen::Vector2d(10.0, 20.0)));
 }
 
 TEST(ChunkOps, MergeRejectsMixedCrs) {
