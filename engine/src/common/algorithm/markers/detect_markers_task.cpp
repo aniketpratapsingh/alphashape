@@ -323,32 +323,18 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         // rays through a dark sector and by the 0.85..0.9 R sector edge
         // elsewhere, so its fitted radius is between about 0.5 R and 0.9 R.
         // decode_circular treats its hint as the border radius and gates a
-        // located border to [hint/1.5, hint*1.5]; a single 1.3x scale misses
-        // the small-interior end of that range, so try each hint scale.
-        // The scale that decodes first can still lock onto the 0.85 R sector
-        // edge when its search window stops short of the true border, which
-        // biases the centre, so decode all of them and keep the outermost
-        // plausible border. A target's border is at most about twice the
-        // interior blob radius (the interior reaches down to 0.5 R), and a
-        // candidate below the interior radius is a sector edge, not a border.
-        std::optional<CodedTarget> best;
+        // located border to [hint/1.5, hint*1.5]; one scale cannot cover the
+        // whole range, so try each hint scale and keep the first that decodes.
+        // The scales all start high enough that the border search window
+        // reaches R, so a decode is the true outer border and not the 0.85 R
+        // sector edge (which shares the ring word but biases the centre).
         for (const double scale : kLightSeedHintScales) {
             MarkerCandidate scaled = candidate;
             scaled.radius_px *= scale;
-            const auto decoded = decode_seed(scaled);
-            if (!decoded) {
-                continue;
+            if (const auto decoded = decode_seed(scaled)) {
+                emit(*decoded, true);
+                break;
             }
-            if (!(decoded->radius_px >= candidate.radius_px) ||
-                !(decoded->radius_px <= 2.2 * candidate.radius_px)) {
-                continue;
-            }
-            if (!best || decoded->radius_px > best->radius_px) {
-                best = decoded;
-            }
-        }
-        if (best) {
-            emit(*best, true);
         }
     }
     return out;
