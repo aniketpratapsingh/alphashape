@@ -10,6 +10,7 @@
 // Coordinates are PDF user space: points, origin bottom-left, y upwards.
 // `text` takes the baseline position, not the top of the glyphs.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,6 +31,37 @@ public:
 
     /// Draw a straight line of `width_pt` points. Throws Error without a page.
     void line(double x0, double y0, double x1, double y1, double width_pt);
+
+    /// Filled vector primitives, all in points with the PDF native origin at
+    /// the bottom-left. `gray` is a non-stroking grey level in [0, 1] (0 is
+    /// black, 1 is white); values outside throw ValueError. Coordinates are
+    /// written with four decimal places in locale-independent integer
+    /// arithmetic. Every primitive throws Error when no page exists yet.
+    void fill_rect(double x, double y, double w, double h, double gray);
+
+    /// Fill a simple convex or concave polygon. Fewer than three points throw
+    /// ValueError. The path closes implicitly with the `f` operator.
+    void fill_polygon(const std::vector<std::array<double, 2>>& points,
+                      double gray);
+
+    /// Fill a circle with four cubic Bezier quadrants.
+    void fill_circle(double cx, double cy, double r, double gray);
+
+    /// Fill an annulus (outer radius `r_outer`, inner radius `r_inner`) using
+    /// the even-odd rule, so the hole is real and not a white overpaint.
+    /// Throws ValueError when 0 <= r_inner < r_outer does not hold.
+    void fill_ring(double cx, double cy, double r_outer, double r_inner,
+                   double gray);
+
+    /// Fill the sector of an annulus between radii `r_inner` and `r_outer` and
+    /// angles `a0`..`a1` radians (counter-clockwise in PDF coordinates; the
+    /// caller mirrors the y axis for image-oriented patterns). Arc spans are
+    /// split into pieces of at most 90 degrees, each a cubic Bezier. Throws
+    /// ValueError for a negative inner radius, a non-positive outer radius, a
+    /// negative angular span, or radii out of order.
+    void fill_annular_sector(double cx, double cy, double r_inner,
+                             double r_outer, double a0, double a1,
+                             double gray);
 
     /// Draw an 8-bit RGB image into the rectangle (x, y, w, h), with `px_w` x
     /// `px_h` samples. `rgb` must hold px_w * px_h * 3 bytes. Throws Error when

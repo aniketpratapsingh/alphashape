@@ -141,6 +141,10 @@ alphashape_add_python_test(python_calibration_io
 alphashape_add_python_test(python_attitude_prior
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)
 
+# WP-13.17: printable marker and chessboard sheets (PDF/PNG by extension).
+alphashape_add_python_test(python_marker_sheet
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_marker_sheet.py)
+
 # The CLI end-to-end check needs the built CLI; guard on the option so a
 # Python-only configure still works.
 if(ALPHASHAPE_BUILD_CLI)

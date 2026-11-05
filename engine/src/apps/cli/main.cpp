@@ -13,8 +13,12 @@
 //   2   the requested task is not in the registry (UnsupportedTaskError)
 //   64  bad usage (EX_USAGE from sysexits.h)
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <fstream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,11 +26,13 @@
 #include "base/platform/console.hpp"
 #include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
+#include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
 #include "gpu/gpu.hpp"
+#include "image/io/image_io.hpp"
 #include "model/crs/proj_context.hpp"
 
 namespace {
@@ -39,7 +45,13 @@ constexpr const char* kUsage =
     "  alphashape-cli --list-params <Task>\n"
     "  alphashape-cli --project <file.psx> --task <Task> [--set key=value ...]\n"
     "  alphashape-cli --new <file.psx> --add-images <img> [<img> ...]\n"
-    "  alphashape-cli --help\n";
+    "  alphashape-cli --make-sheet <type> --out <file.pdf|file.png>\n"
+    "      [--paper A4|Letter] [--size-mm 25] [--first-code N] [--count N]\n"
+    "      [--dpi 300] [--cols 9 --rows 6 --square-mm 25]\n"
+    "  alphashape-cli --help\n"
+    "\n"
+    "Sheet types: circular12 circular14 circular16 circular20 cross\n"
+    "             apriltag36h11 chessboard\n";
 
 /// Thrown for malformed command lines; distinct from engine errors so main can
 /// map it to exit 64 rather than 1.
@@ -102,7 +114,43 @@ struct Options {
     std::string new_project;
     std::vector<std::string> set_values;
     std::vector<std::string> images;
+    bool has_make_sheet = false;
+    std::string make_sheet;
+    bool has_out = false;
+    std::string out;
+    std::string paper = "A4";
+    double size_mm = 25.0;
+    int first_code = 1;
+    int count = 0;
+    double dpi = 300.0;
+    int cols = 9;
+    int rows = 6;
+    double square_mm = 25.0;
 };
+
+int parse_int(const std::string& text) {
+    try {
+        std::size_t used = 0;
+        const int value = std::stoi(text, &used);
+        if (used == text.size()) {
+            return value;
+        }
+    } catch (const std::exception&) {
+    }
+    throw UsageError{};
+}
+
+double parse_double(const std::string& text) {
+    try {
+        std::size_t used = 0;
+        const double value = std::stod(text, &used);
+        if (used == text.size()) {
+            return value;
+        }
+    } catch (const std::exception&) {
+    }
+    throw UsageError{};
+}
 
 Options parse_args(int argc, char** argv) {
     Options opts;
@@ -136,6 +184,28 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--new") {
             opts.has_new = true;
             opts.new_project = take_value();
+        } else if (arg == "--make-sheet") {
+            opts.has_make_sheet = true;
+            opts.make_sheet = take_value();
+        } else if (arg == "--out") {
+            opts.has_out = true;
+            opts.out = take_value();
+        } else if (arg == "--paper") {
+            opts.paper = take_value();
+        } else if (arg == "--size-mm") {
+            opts.size_mm = parse_double(take_value());
+        } else if (arg == "--first-code") {
+            opts.first_code = parse_int(take_value());
+        } else if (arg == "--count") {
+            opts.count = parse_int(take_value());
+        } else if (arg == "--dpi") {
+            opts.dpi = parse_double(take_value());
+        } else if (arg == "--cols") {
+            opts.cols = parse_int(take_value());
+        } else if (arg == "--rows") {
+            opts.rows = parse_int(take_value());
+        } else if (arg == "--square-mm") {
+            opts.square_mm = parse_double(take_value());
         } else if (arg == "--add-images") {
             // Greedy: every following token that is not itself an option is an
             // image path, so the natural spelling "--add-images a b c" works.
@@ -270,6 +340,60 @@ int run_new(const std::string& project, const std::vector<std::string>& images) 
     return 0;
 }
 
+void save_bytes(const std::string& path, const std::vector<std::uint8_t>& data) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        throw alphashape::Error("cannot open '" + path + "' for writing");
+    }
+    file.write(reinterpret_cast<const char*>(data.data()),
+               static_cast<std::streamsize>(data.size()));
+    file.close();
+    if (!file) {
+        throw alphashape::Error("writing '" + path + "' failed");
+    }
+}
+
+int run_make_sheet(const Options& opts) {
+    if (!opts.has_out) {
+        throw UsageError{};
+    }
+    const std::optional<alphashape::SheetTarget> target =
+        alphashape::parse_sheet_target(opts.make_sheet);
+    if (!target.has_value()) {
+        throw alphashape::ValueError("unknown sheet type: " + opts.make_sheet);
+    }
+    alphashape::SheetOptions sheet;
+    sheet.target = *target;
+    sheet.paper = opts.paper;
+    sheet.target_size_mm = opts.size_mm;
+    sheet.first_code = opts.first_code;
+    sheet.count = opts.count;
+    sheet.board_cols = opts.cols;
+    sheet.board_rows = opts.rows;
+    sheet.square_mm = opts.square_mm;
+    const std::string& path = opts.out;
+    const bool png =
+        path.size() >= 4U && path[path.size() - 4U] == '.' &&
+        (path[path.size() - 3U] == 'p' || path[path.size() - 3U] == 'P') &&
+        (path[path.size() - 2U] == 'n' || path[path.size() - 2U] == 'N') &&
+        (path[path.size() - 1U] == 'g' || path[path.size() - 1U] == 'G');
+    if (png) {
+        const int pages = alphashape::marker_sheet_page_count(sheet);
+        if (pages > 1) {
+            throw alphashape::ValueError(
+                "PNG output holds a single page, but this sheet needs " +
+                std::to_string(pages) +
+                " pages; write a PDF or reduce the count");
+        }
+        const alphashape::Image image =
+            alphashape::marker_sheet_raster(sheet, opts.dpi, 0);
+        alphashape::write_png(path, image);
+    } else {
+        save_bytes(path, alphashape::marker_sheet_pdf(sheet));
+    }
+    return 0;
+}
+
 int dispatch(const Options& opts) {
     if (opts.help) {
         std::fputs(kUsage, stdout);
@@ -278,7 +402,8 @@ int dispatch(const Options& opts) {
 
     // Exactly one primary mode may be selected; mixing them is a usage error.
     const int modes = (opts.list_tasks ? 1 : 0) + (opts.gpu_info ? 1 : 0) + (opts.proj_info ? 1 : 0) + (opts.has_list_params ? 1 : 0) +
-                      (opts.has_new ? 1 : 0) + (opts.has_project ? 1 : 0);
+                      (opts.has_new ? 1 : 0) + (opts.has_project ? 1 : 0) +
+                      (opts.has_make_sheet ? 1 : 0);
     if (modes > 1) {
         throw UsageError{};
     }
@@ -294,6 +419,7 @@ int dispatch(const Options& opts) {
     if (opts.proj_info) return run_proj_info();
     if (opts.has_list_params) return run_list_params(opts.list_params);
     if (opts.has_new) return run_new(opts.new_project, opts.images);
+    if (opts.has_make_sheet) return run_make_sheet(opts);
     if (opts.has_project) return run_project(opts.project, opts.task, opts.set_values);
     throw UsageError{};  // no mode selected
 }

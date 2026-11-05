@@ -1,8 +1,11 @@
 #include "base/io/pdf.hpp"
 
+#include <algorithm>
+#include <charconv>
 #include <cmath>
-#include <cstdio>
+#include <cstdint>
 #include <fstream>
+#include <numbers>
 #include <string>
 #include <utility>
 
@@ -13,13 +16,97 @@
 namespace alphashape {
 namespace {
 
-/// snprintf follows LC_NUMERIC, so the PDF uses the process decimal
-/// separator. The applications keep LC_NUMERIC at "C", which makes it '.';
-/// this is not locale-independent.
+/// Locale-independent fixed four-decimal token. A PDF real requires '.', never
+/// the LC_NUMERIC separator, so the conversion stays in integer arithmetic
+/// rather than the C library's floating-point formatting.
+std::string fixed(double value) {
+    const double scaled = value * 10000.0;
+    if (!std::isfinite(scaled) || std::abs(scaled) > 9.0e15) {
+        throw ValueError("PdfDocument: number is out of range");
+    }
+    const bool negative = std::signbit(value);
+    std::int64_t units = static_cast<std::int64_t>(std::llround(scaled));
+    if (units < 0) {
+        units = -units;
+    }
+    const std::uint64_t magnitude = static_cast<std::uint64_t>(units);
+    const std::uint64_t whole = magnitude / 10000U;
+    const std::uint64_t fraction = magnitude % 10000U;
+    char whole_text[24];
+    char* whole_end =
+        std::to_chars(whole_text, whole_text + sizeof whole_text, whole).ptr;
+    char fraction_text[8];
+    char* fraction_end =
+        std::to_chars(fraction_text, fraction_text + sizeof fraction_text,
+                      fraction)
+            .ptr;
+    std::string out;
+    if (negative) {
+        out.push_back('-');
+    }
+    out.append(whole_text, whole_end);
+    out.push_back('.');
+    const std::size_t length =
+        static_cast<std::size_t>(fraction_end - fraction_text);
+    out.append(4U - length, '0');
+    out.append(fraction_text, fraction_end);
+    return out;
+}
+
+/// Text sizes, stroke widths, and image matrices also accept the same
+/// fixed-point token; a four-decimal PDF real is valid in every context.
 std::string number(double value) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof buffer, "%.6g", value);
-    return std::string(buffer);
+    return fixed(value);
+}
+
+/// A grey level outside [0, 1] is a programming error, not a printable value.
+void require_gray(double gray) {
+    if (!(gray >= 0.0) || !(gray <= 1.0)) {
+        throw ValueError("PdfDocument: grey level must be in [0, 1]");
+    }
+}
+
+/// Append one cubic Bezier for the circular arc t0..t1 of radius `r`. The
+/// caller guarantees |t1 - t0| <= pi/2, where the standard tangent control
+/// point construction is accurate to a fraction of a thousandth.
+void append_arc(std::string& out, double cx, double cy, double r, double t0,
+                double t1) {
+    const double k = (4.0 / 3.0) * std::tan(0.25 * (t1 - t0));
+    const double x0 = cx + r * std::cos(t0);
+    const double y0 = cy + r * std::sin(t0);
+    const double x1 = cx + r * std::cos(t1);
+    const double y1 = cy + r * std::sin(t1);
+    const double c0x = x0 - k * r * std::sin(t0);
+    const double c0y = y0 + k * r * std::cos(t0);
+    const double c1x = x1 + k * r * std::sin(t1);
+    const double c1y = y1 - k * r * std::cos(t1);
+    out += fixed(c0x) + " " + fixed(c0y) + " " + fixed(c1x) + " " +
+           fixed(c1y) + " " + fixed(x1) + " " + fixed(y1) + " c\n";
+}
+
+/// Append a closed circular subpath, four quadrants of at most 90 degrees.
+void append_circle(std::string& out, double cx, double cy, double r) {
+    out += fixed(cx + r) + " " + fixed(cy) + " m\n";
+    const double quarter = 0.5 * std::numbers::pi_v<double>;
+    for (int i = 0; i < 4; ++i) {
+        const double t0 = static_cast<double>(i) * quarter;
+        append_arc(out, cx, cy, r, t0, t0 + quarter);
+    }
+}
+
+/// Append an arc of arbitrary span, split so no Bezier exceeds 90 degrees.
+void append_arc_split(std::string& out, double cx, double cy, double r,
+                      double a0, double a1) {
+    const double quarter = 0.5 * std::numbers::pi_v<double>;
+    const double span = a1 - a0;
+    const int pieces =
+        std::max(1, static_cast<int>(std::ceil(std::abs(span) / quarter)));
+    const double step = span / static_cast<double>(pieces);
+    double t = a0;
+    for (int i = 0; i < pieces; ++i) {
+        append_arc(out, cx, cy, r, t, t + step);
+        t += step;
+    }
 }
 
 /// PDF literal-string escaping: delimiters and the backslash are escaped;
@@ -124,6 +211,94 @@ void PdfDocument::line(double x0, double y0, double x1, double y1,
     content += number(width_pt) + " w\n";
     content += number(x0) + " " + number(y0) + " m\n";
     content += number(x1) + " " + number(y1) + " l\nS\n";
+}
+
+void PdfDocument::fill_rect(double x, double y, double w, double h,
+                            double gray) {
+    if (pages_.empty()) {
+        throw Error("PdfDocument: fill_rect() needs a page first");
+    }
+    require_gray(gray);
+    std::string& content = pages_.back().content;
+    content += fixed(gray) + " g\n";
+    content += fixed(x) + " " + fixed(y) + " " + fixed(w) + " " +
+               fixed(h) + " re\nf\n";
+}
+
+void PdfDocument::fill_polygon(
+    const std::vector<std::array<double, 2>>& points, double gray) {
+    if (pages_.empty()) {
+        throw Error("PdfDocument: fill_polygon() needs a page first");
+    }
+    if (points.size() < 3U) {
+        throw ValueError("PdfDocument: a polygon needs three points");
+    }
+    require_gray(gray);
+    std::string& content = pages_.back().content;
+    content += fixed(gray) + " g\n";
+    content += fixed(points[0][0]) + " " + fixed(points[0][1]) + " m\n";
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        content += fixed(points[i][0]) + " " + fixed(points[i][1]) + " l\n";
+    }
+    content += "f\n";
+}
+
+void PdfDocument::fill_circle(double cx, double cy, double r, double gray) {
+    if (pages_.empty()) {
+        throw Error("PdfDocument: fill_circle() needs a page first");
+    }
+    if (!(r > 0.0)) {
+        throw ValueError("PdfDocument: circle radius must be positive");
+    }
+    require_gray(gray);
+    std::string& content = pages_.back().content;
+    content += fixed(gray) + " g\n";
+    append_circle(content, cx, cy, r);
+    content += "f\n";
+}
+
+void PdfDocument::fill_ring(double cx, double cy, double r_outer,
+                            double r_inner, double gray) {
+    if (pages_.empty()) {
+        throw Error("PdfDocument: fill_ring() needs a page first");
+    }
+    if (!(r_outer > 0.0) || !(r_inner >= 0.0) || !(r_inner < r_outer)) {
+        throw ValueError("PdfDocument: ring radii must satisfy 0 <= inner < outer");
+    }
+    require_gray(gray);
+    std::string& content = pages_.back().content;
+    content += fixed(gray) + " g\n";
+    append_circle(content, cx, cy, r_outer);
+    append_circle(content, cx, cy, r_inner);
+    content += "f*\n";  // even-odd: the inner circle is a hole
+}
+
+void PdfDocument::fill_annular_sector(double cx, double cy, double r_inner,
+                                      double r_outer, double a0, double a1,
+                                      double gray) {
+    if (pages_.empty()) {
+        throw Error("PdfDocument: fill_annular_sector() needs a page first");
+    }
+    if (!(r_outer > 0.0) || !(r_inner >= 0.0) || !(r_inner < r_outer)) {
+        throw ValueError(
+            "PdfDocument: sector radii must satisfy 0 <= inner < outer");
+    }
+    if (!(a1 >= a0)) {
+        throw ValueError("PdfDocument: sector angle span must be non-negative");
+    }
+    require_gray(gray);
+    std::string& content = pages_.back().content;
+    content += fixed(gray) + " g\n";
+    const double sx = cx + r_inner * std::cos(a0);
+    const double sy = cy + r_inner * std::sin(a0);
+    content += fixed(sx) + " " + fixed(sy) + " m\n";
+    content += fixed(cx + r_outer * std::cos(a0)) + " " +
+               fixed(cy + r_outer * std::sin(a0)) + " l\n";
+    append_arc_split(content, cx, cy, r_outer, a0, a1);
+    content += fixed(cx + r_inner * std::cos(a1)) + " " +
+               fixed(cy + r_inner * std::sin(a1)) + " l\n";
+    append_arc_split(content, cx, cy, r_inner, a1, a0);
+    content += "f\n";
 }
 
 void PdfDocument::image_rgb(double x, double y, double w, double h, int px_w,
