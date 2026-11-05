@@ -57,22 +57,14 @@ const Sensor& effective_sensor(const Chunk& chunk, const Camera& camera) {
     return *sensor;
 }
 
+// With the film-normalised invariant enforced on the sensor itself
+// (normalise_sensor_film), the pipeline frame IS the stored sensor frame.
 std::pair<int, int> sensor_pipeline_size(const Sensor& sensor) {
-    if (film_geometry_complete(sensor.film)) {
-        const FilmSize size = film_normalised_size(sensor.film);
-        return {size.first, size.second};
-    }
     return {sensor.width, sensor.height};
 }
 
 Calibration sensor_pipeline_calibration(const Sensor& sensor) {
-    Calibration calibration = sensor.calibration;
-    if (film_geometry_complete(sensor.film)) {
-        const FilmSize size = film_normalised_size(sensor.film);
-        calibration.width = size.first;
-        calibration.height = size.second;
-    }
-    return calibration;
+    return sensor.calibration;
 }
 
 Image load_camera_image(const Document& document, const Chunk& chunk,
@@ -89,10 +81,19 @@ Image load_camera_image(const Document& document, const Chunk& chunk,
     }
     const Image scan =
         read_image(resolve_frame_path(document, (*linked)->path()).string());
-    // A camera with no sensor (or a chunk built without sensors, as some
-    // digital-only tests do) has no film geometry, so the raw frame stands.
+    // A digital camera with no sensor (or a chunk built without sensors, as
+    // some digital-only tests do) has no film geometry, so the raw frame
+    // stands. A FILM camera without a usable sensor link must never fall back
+    // to the raw scan: its keypoints would be in the wrong pixel space.
     const Sensor* sensor = find_effective_sensor(chunk, camera);
-    if (sensor == nullptr || !sensor->film.enabled) {
+    if (sensor == nullptr) {
+        if (camera.film_transform.has_value()) {
+            throw Error(camera_name(camera) +
+                        " is a film camera but its sensor link is missing");
+        }
+        return scan;
+    }
+    if (!sensor->film.enabled) {
         return scan;
     }
     if (!camera.film_transform.has_value()) {
