@@ -609,7 +609,8 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel,
                                       int patch_size, double expected_radius,
-                                      bool coded_circular) {
+                                      bool coded_circular,
+                                      bool retry_when_missing) {
     const double ds = static_cast<double>(std::max(1, view.downscale));
     const double expected_px =
         expected_radius > 0.0 ? expected_radius / ds : 0.0;
@@ -623,13 +624,13 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     half = std::min(half, max_half);
     auto seed =
         circular_seed_window(view, pixel, half, expected_px, coded_circular);
-    // A missing seed can mean the interior blob was clipped by the scale cap,
-    // and a light seed without a border fit can mean the outline was clipped.
-    // One doubled window covers both without unbounded cost.
-    const bool needs_retry =
-        coded_circular &&
-        (!seed || (seed->light_centre && !seed->border_fitted));
-    if (needs_retry && half < max_half) {
+    // A light seed without a border fit means the outline was clipped by the
+    // window; a known coded target that seeded nothing at all may simply have
+    // had its interior clipped. One doubled window covers both cases.
+    const bool unfitted =
+        seed && seed->light_centre && !seed->border_fitted;
+    const bool missing = retry_when_missing && !seed;
+    if (coded_circular && (unfitted || missing) && half < max_half) {
         const int wider = std::min(2 * half, max_half);
         if (auto retried = circular_seed_window(view, pixel, wider, expected_px,
                                                 coded_circular)) {
@@ -1096,6 +1097,9 @@ struct BlendView {
     /// True when the marker is a coded circular target, the only kind whose
     /// even parity has an enclosed bright interior to seed from.
     bool coded_circular = true;
+    /// True when a target kind was recorded for this marker. Without one the
+    /// seed search keeps its previous window and only coded kinds widen it.
+    bool target_kind_known = false;
     double depth = 1.0;
 };
 
@@ -1353,9 +1357,9 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
         projected_centres[index] = *projected;
         const double limit = refinement_limit(blend);
-        const auto seed = circular_seed(*blend.view, *projected,
-                                        options.patch_size, blend.apparent,
-                                        blend.coded_circular);
+        const auto seed = circular_seed(
+            *blend.view, *projected, options.patch_size, blend.apparent,
+            blend.coded_circular, blend.target_kind_known);
         const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
                                               options.patch_size, limit);
         anchored[index] = refined ? *refined : *projected;
@@ -1452,7 +1456,8 @@ double median(std::vector<double> values) {
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
         blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
-                                   blend.coded_circular);
+                                   blend.coded_circular,
+                                   blend.target_kind_known);
         if (blend.seed && std::isfinite(blend.seed->radius) &&
             blend.seed->radius > 0.0) {
             blend.apparent = std::max(1.0, blend.seed->radius);
@@ -2031,9 +2036,9 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         // is applicable. Without one (user-placed markers) keep the previous
         // behaviour, which infers the seed from whatever blobs are present.
         const std::string* target_kind = marker.meta.find("target_type");
+        const bool target_kind_known = target_kind != nullptr;
         const bool coded_circular =
-            target_kind == nullptr ||
-            is_circular_coded_target_type(*target_kind);
+            !target_kind_known || is_circular_coded_target_type(*target_kind);
         std::vector<std::shared_ptr<CameraView>> held;
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
@@ -2055,6 +2060,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             blend.view = held.back().get();
             blend.pixel = projection.pixel;
             blend.coded_circular = coded_circular;
+            blend.target_kind_known = target_kind_known;
             blends.push_back(blend);
         }
         try {

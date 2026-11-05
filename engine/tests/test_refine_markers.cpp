@@ -391,6 +391,11 @@ std::int32_t add_scene_marker(RefineScene& scene, std::size_t target_index,
     marker.label = label;
     marker.type = MarkerType::Fiducial;
     marker.valid = true;
+    // Record the printed kind, exactly as DetectMarkers does, so refinement
+    // can tell a coded circular target from a cross.
+    marker.meta.set("target_type", scene.targets[target_index].cross
+                                       ? "Cross"
+                                       : "Circular12");
     for (std::size_t ci = 0; ci < scene.chunk->cameras().size(); ++ci) {
         if (!only.empty() &&
             std::find(only.begin(), only.end(), ci) == only.end()) {
