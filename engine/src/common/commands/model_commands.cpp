@@ -696,19 +696,6 @@ void install_chunk_pose_state(Chunk& chunk, const ChunkPoseState& state) {
 
 }  // namespace
 
-ChunkPoseState capture_chunk_pose_state(const Chunk& chunk) {
-    ChunkPoseState state;
-    state.cameras = chunk.cameras();
-    state.tracks = chunk.tie_points().tracks;
-    state.transform = chunk.transform();
-    state.region = chunk.region();
-    state.meta = chunk.meta().items;
-    state.crs = chunk.crs();
-    state.camera_crs = chunk.explicit_camera_crs();
-    state.world_crs = chunk.explicit_world_crs();
-    return state;
-}
-
 /// Install a computed pose/tie-point state in one undoable step. Used by the
 /// reference-placement and tie-point triangulation tasks: both replace camera
 /// poses and tracks together, and the track list may shrink, so the snapshot
@@ -3064,6 +3051,19 @@ private:
 // --- chunk factories -------------------------------------------------------
 
 }  // namespace
+
+ChunkPoseState capture_chunk_pose_state(const Chunk& chunk) {
+    ChunkPoseState state;
+    state.cameras = chunk.cameras();
+    state.tracks = chunk.tie_points().tracks;
+    state.transform = chunk.transform();
+    state.region = chunk.region();
+    state.meta = chunk.meta().items;
+    state.crs = chunk.crs();
+    state.camera_crs = chunk.explicit_camera_crs();
+    state.world_crs = chunk.explicit_world_crs();
+    return state;
+}
 
 std::unique_ptr<AbstractCommand> make_add_marker_command(std::int32_t chunk_id,
                                                         Marker marker) {
