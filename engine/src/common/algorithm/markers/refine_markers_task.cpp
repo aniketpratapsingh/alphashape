@@ -454,10 +454,13 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
             }
         }
         if (dot != nullptr) {
+            // Parity 1: the dot is the printed fiducial and also supplies the
+            // patch scale, exactly as the dark-only seed did before.
             centre = dot->center;
             if (const auto fitted = refine_ellipse_center(crop, *dot)) {
                 centre = *fitted;
             }
+            radius = dot->radius_px;
             out.light_centre = false;
         } else {
             out.light_centre = true;
