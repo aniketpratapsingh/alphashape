@@ -64,9 +64,9 @@ Eigen::Vector3d stored_from_world_body(const Eigen::Matrix3d& r_wb,
 
 /// A level ring of cameras over a point grid, in a metric ENU local frame
 /// (the chunk transform is ENU->ECEF at `origin`). `r_bc` is the body->camera
-/// mount used to synthesise the stored orientation triple: the truth
-/// camera-to-world rotation is `R_wc`, so `R_wb = R_wc * R_bc` and
-/// `R_wc = R_wb * R_bc^T`.
+/// mount used to synthesise the stored orientation triple: for the truth
+/// world->camera rotation `R_wc`, `R_wc = R_bc * R_wb^T`, hence
+/// `R_wb = R_wc^T * R_bc`.
 struct Scene {
     Document document;
     geo::Geodetic origin;
