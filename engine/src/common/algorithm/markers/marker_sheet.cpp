@@ -134,7 +134,7 @@ bool shape_contains(const Shape& shape, double x, double y) {
         default:
             break;
     }
-    double inside = false;
+    bool inside = false;
     for (int i = 0, j = shape.point_count - 1; i < shape.point_count; j = i++) {
         const double xi = shape.points[static_cast<std::size_t>(i)][0];
         const double yi = shape.points[static_cast<std::size_t>(i)][1];
