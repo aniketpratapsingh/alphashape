@@ -52,6 +52,12 @@
 #include "base/utils/error.hpp"
 
 namespace alphashape::sfm {
+
+Eigen::Vector3d predicted_antenna_position(const BAPose& pose,
+                                           const Eigen::Vector3d& lever_arm) {
+    return pose.R.transpose() * (lever_arm - pose.t);
+}
+
 namespace {
 
 /// Error charged to an observation whose point falls behind a Frame camera.
@@ -117,28 +123,34 @@ private:
     int height_ = 0;
 };
 
-/// Residual for a GPS-like prior on a camera centre. The pose block is
-/// (angle-axis rotation, translation); the camera centre is C = -R^T t, which
-/// with angle-axis `aa` is C = -AngleAxisRotatePoint(-aa, t) (rotating t by the
-/// inverse rotation). A fixed-size 3-residual is written; an axis whose sigma is
-/// <= 0 or non-finite is left 0 and so contributes nothing. Measure is held as a
+/// Residual for a GPS-like prior on a camera centre or, when a lever arm is
+/// set, on the antenna mounted on the camera. The pose block is (angle-axis
+/// rotation, translation). The modelled antenna position is
+///     A = C + R^T * lever_arm,   C = -R^T t,
+/// which with angle-axis `aa` is A = AngleAxisRotatePoint(-aa, lever_arm - t).
+/// A fixed-size 3-residual is written; an axis whose sigma is <= 0 or
+/// non-finite is left 0 and so contributes nothing. Measure is held as a
 /// member (a parameter block cannot carry it).
 struct CentrePriorCost {
-    CentrePriorCost(const Eigen::Vector3d& centre, const Eigen::Vector3d& sigma)
-        : centre_(centre), sigma_(sigma) {}
+    CentrePriorCost(const Eigen::Vector3d& centre, const Eigen::Vector3d& sigma,
+                    const Eigen::Vector3d& lever_arm = Eigen::Vector3d::Zero())
+        : centre_(centre), sigma_(sigma), lever_arm_(lever_arm) {}
 
     template <typename T>
     bool operator()(const T* const rotation, const T* const translation, T* residual) const {
-        // R^T t: rotate t by the inverse of `rotation`, i.e. by -rotation.
+        // R^T (lever - t): rotate that vector by the inverse of `rotation`,
+        // i.e. by -rotation.
         T neg_aa[3] = {-rotation[0], -rotation[1], -rotation[2]};
-        T r_t[3];
-        ceres::AngleAxisRotatePoint(neg_aa, translation, r_t);
-        const T centre[3] = {-r_t[0], -r_t[1], -r_t[2]};
+        const T lever[3] = {T(lever_arm_.x()), T(lever_arm_.y()), T(lever_arm_.z())};
+        T shifted[3] = {lever[0] - translation[0], lever[1] - translation[1],
+                        lever[2] - translation[2]};
+        T antenna[3];
+        ceres::AngleAxisRotatePoint(neg_aa, shifted, antenna);
 
         for (int k = 0; k < 3; ++k) {
             const double s = sigma_[k];
             if (std::isfinite(s) && s > 0.0) {
-                residual[k] = (centre[k] - T(centre_[k])) / T(s);
+                residual[k] = (antenna[k] - T(centre_[k])) / T(s);
             } else {
                 residual[k] = T(0);
             }
@@ -149,6 +161,7 @@ struct CentrePriorCost {
 private:
     Eigen::Vector3d centre_;
     Eigen::Vector3d sigma_;
+    Eigen::Vector3d lever_arm_;
 };
 
 /// Huber loss scale for centre priors, in sigma units (ours): residuals beyond
@@ -417,14 +430,16 @@ std::size_t count_prior_axes(const BAProblem& problem) {
     return n;
 }
 
-/// RMS of the normalised prior residuals (C - centre)/sigma over all constrained
-/// axes, from the current poses. 0 when there are none.
+/// RMS of the normalised prior residuals (A - centre)/sigma over all
+/// constrained axes, with A the modelled antenna position, from the current
+/// poses. 0 when there are none.
 double prior_rms_sigma(const BAProblem& problem) {
     double sum_sq = 0.0;
     std::size_t n = 0;
     for (const BACentrePrior& prior : problem.centre_priors) {
         const BAPose& pose = problem.poses[prior.camera];
-        const Eigen::Vector3d centre = -pose.R.transpose() * pose.t;
+        const Eigen::Vector3d centre =
+            predicted_antenna_position(pose, prior.lever_arm);
         for (int k = 0; k < 3; ++k) {
             const double s = prior.sigma[k];
             if (std::isfinite(s) && s > 0.0) {
@@ -760,7 +775,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
     }
     for (const BACentrePrior& prior : problem.centre_priors) {
         auto* cost = new ceres::AutoDiffCostFunction<CentrePriorCost, 3, 3, 3>(
-            new CentrePriorCost(prior.centre, prior.sigma));
+            new CentrePriorCost(prior.centre, prior.sigma, prior.lever_arm));
         ceres_problem.AddResidualBlock(cost, prior_loss, cam_blocks[prior.camera].data(),
                                        cam_blocks[prior.camera].data() + 3);
     }
