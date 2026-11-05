@@ -355,6 +355,23 @@ TriScene make_tri_scene() {
         chunk.tie_points().keypoint_sets.push_back(std::move(set));
     }
 
+    // Keep only points seen in four or more cameras: with that redundancy a
+    // single bad observation can be identified and dropped without losing the
+    // point, which is what the outlier test measures.
+    std::vector<Eigen::Vector3d> kept_points;
+    std::vector<std::vector<int>> kept_index;
+    for (std::size_t p = 0; p < scene.points.size(); ++p) {
+        const std::size_t visible =
+            static_cast<std::size_t>(std::count_if(
+                index[p].begin(), index[p].end(), [](int value) { return value >= 0; }));
+        if (visible >= 4U) {
+            kept_points.push_back(scene.points[p]);
+            kept_index.push_back(index[p]);
+        }
+    }
+    scene.points = std::move(kept_points);
+    index = std::move(kept_index);
+
     for (int a = 0; a < kCameras; ++a) {
         for (int b = a + 1; b < kCameras; ++b) {
             PairMatches pair;
