@@ -420,16 +420,16 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
         if (!(blob.radius_px > 1.0)) {
             return false;
         }
-        const int centre_x =
+        const int dot_x =
             static_cast<int>(std::lround(blob.center.x() - 0.5));
-        const int centre_y =
+        const int dot_y =
             static_cast<int>(std::lround(blob.center.y() - 0.5));
-        if (centre_x < 0 || centre_y < 0 || centre_x >= crop.width() ||
-            centre_y >= crop.height()) {
+        if (dot_x < 0 || dot_y < 0 || dot_x >= crop.width() ||
+            dot_y >= crop.height()) {
             return false;
         }
         const double centre_value =
-            static_cast<double>(crop.at(centre_x, centre_y));
+            static_cast<double>(crop.at(dot_x, dot_y));
         const double ring_radius = 1.5 * blob.radius_px;
         double sum = 0.0;
         int count = 0;
