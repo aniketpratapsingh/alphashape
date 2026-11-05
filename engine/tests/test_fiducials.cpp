@@ -205,7 +205,8 @@ TEST(Fiducials, CornerMarks) {
 
 TEST(Fiducials, OrdersRotatedScan) {
     const std::vector<Eigen::Vector2d> marks = centred_marks();
-    const FilmSettings settings = layout_for(marks);
+    FilmSettings settings = layout_for(marks);
+    settings.detector = FiducialDetector::Circle;
     for (int variant = 0; variant < 4; ++variant) {
         test::FilmFrameSpec spec = base_spec();
         spec.marks_mm = marks;

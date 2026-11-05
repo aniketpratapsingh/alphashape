@@ -583,8 +583,37 @@ double corner_response(const Gradients& gradients, int x, int y) {
     return (sxx * syy - sxy * sxy) / trace;
 }
 
-std::optional<Eigen::Vector2d> detect_corner(const Gradients& gradients,
+/// True when both expected L arms (the inward image axes sx, sy) carry a dark
+/// stroke a few pixels from (x, y). This rejects an arm end, where only one
+/// direction leaves the mark, and keeps the vertex.
+bool corner_arms_dark(const FloatImage& gray, int x, int y, double sx, double sy,
+                      double threshold) {
+    const auto dark = [&](double px, double py, double nx, double ny) {
+        double value = static_cast<double>(gray.sample(static_cast<float>(px),
+                                                       static_cast<float>(py)));
+        value = std::min(value, static_cast<double>(gray.sample(
+                                    static_cast<float>(px - ny),
+                                    static_cast<float>(py + nx))));
+        value = std::min(value, static_cast<double>(gray.sample(
+                                    static_cast<float>(px + ny),
+                                    static_cast<float>(py - nx))));
+        return value < threshold;
+    };
+    const bool arm_x = dark(static_cast<double>(x) + sx * 5.0, static_cast<double>(y),
+                            1.0, 0.0) ||
+                       dark(static_cast<double>(x) + sx * 10.0,
+                            static_cast<double>(y), 1.0, 0.0);
+    const bool arm_y = dark(static_cast<double>(x),
+                            static_cast<double>(y) + sy * 5.0, 0.0, 1.0) ||
+                       dark(static_cast<double>(x),
+                            static_cast<double>(y) + sy * 10.0, 0.0, 1.0);
+    return arm_x && arm_y;
+}
+
+std::optional<Eigen::Vector2d> detect_corner(const FloatImage& gray,
+                                             const Gradients& gradients,
                                              const WindowBox& box,
+                                             FiducialWindow window,
                                              double radius) {
     // The window is pulled towards where the mark is expected, so the frame
     // corner itself (at the window's outer edge) must not win. Search the
@@ -601,12 +630,38 @@ std::optional<Eigen::Vector2d> detect_corner(const Gradients& gradients,
     if (!(strongest > 1e-12)) {
         return std::nullopt;
     }
-    // Among the strong responses, take the one nearest the expected point (the
-    // window centre); an L mark's arm end can otherwise outscore the vertex.
+    // Expected L opening: the inward image axes of the corner window. Among
+    // responses that see both arms, keep the strongest; the nearest-to-centre
+    // candidate is only a fallback for an unexpected mark.
+    const bool corner_window =
+        window == FiducialWindow::TopLeft || window == FiducialWindow::TopRight ||
+        window == FiducialWindow::BottomRight ||
+        window == FiducialWindow::BottomLeft;
+    const double sx =
+        (window == FiducialWindow::TopLeft || window == FiducialWindow::BottomLeft)
+            ? 1.0
+            : -1.0;
+    const double sy =
+        (window == FiducialWindow::TopLeft || window == FiducialWindow::TopRight)
+            ? 1.0
+            : -1.0;
+    double low = std::numeric_limits<double>::infinity();
+    double high = -low;
+    for (int y = box.y0; y <= box.y1; ++y) {
+        for (int x = box.x0; x <= box.x1; ++x) {
+            const double value = static_cast<double>(gray.at(x, y));
+            low = std::min(low, value);
+            high = std::max(high, value);
+        }
+    }
+    const double threshold = low + 0.4 * (high - low);
     double best = 0.0;
     double best_distance = std::numeric_limits<double>::infinity();
     int best_x = -1;
     int best_y = -1;
+    double fallback_distance = std::numeric_limits<double>::infinity();
+    int fallback_x = -1;
+    int fallback_y = -1;
     for (int y = box.y0 + margin_y; y <= box.y1 - margin_y; ++y) {
         for (int x = box.x0 + margin_x; x <= box.x1 - margin_x; ++x) {
             const double response = corner_response(gradients, x, y);
@@ -616,14 +671,27 @@ std::optional<Eigen::Vector2d> detect_corner(const Gradients& gradients,
             const double dx = static_cast<double>(x) - box.centre.x();
             const double dy = static_cast<double>(y) - box.centre.y();
             const double distance = dx * dx + dy * dy;
-            if (best_x < 0 || distance < best_distance ||
-                (distance == best_distance && response > best)) {
+            if (fallback_x < 0 || distance < fallback_distance) {
+                fallback_distance = distance;
+                fallback_x = x;
+                fallback_y = y;
+            }
+            if (corner_window &&
+                !corner_arms_dark(gray, x, y, sx, sy, threshold)) {
+                continue;
+            }
+            if (best_x < 0 || response > best ||
+                (response == best && distance < best_distance)) {
                 best = response;
                 best_distance = distance;
                 best_x = x;
                 best_y = y;
             }
         }
+    }
+    if (best_x < 0) {
+        best_x = fallback_x;
+        best_y = fallback_y;
     }
     if (best_x < 0) {
         return std::nullopt;
@@ -1091,7 +1159,7 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
         if (options.detector == FiducialDetector::FrameCorner) {
             pixel = quad_corner(*quad, request.window);
         } else if (options.detector == FiducialDetector::Corner) {
-            pixel = detect_corner(gradients, request.box, 8.0);
+            pixel = detect_corner(gray, gradients, request.box, request.window, 8.0);
         } else {
             const std::optional<CircleHit> hit = detect_circle(
                 gradients, request.box, options.min_radius_px,
