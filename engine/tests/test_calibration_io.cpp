@@ -6,11 +6,13 @@
 // shift in the mapping.
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <system_error>
@@ -24,6 +26,7 @@
 #include "base/utils/portable_rng.hpp"
 #include "calibration_io_fixture.hpp"
 #include "common/algorithm/calibration/calibration_io.hpp"
+#include "common/io/doc_xml_common.hpp"
 #include "model/camera/calibration.hpp"
 
 namespace alphashape {
@@ -69,39 +72,124 @@ void expect_relative(double actual, double expected, const char* what) {
     EXPECT_NEAR(actual, expected, 1e-9 * scale) << what;
 }
 
-/// The published OpenCV pinhole model, written out independently of the
-/// engine: this is the reference the mapping must agree with.
-Eigen::Vector2d opencv_projection(const Calibration& c, const Eigen::Vector3d& p) {
+std::string read_file_text(const std::string& path) {
+    std::ifstream input(path);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
+
+/// Every number in `text`, skipping the whitespace, commas and brackets of an
+/// OpenCV matrix payload.
+std::vector<double> numbers_in(const std::string& text) {
+    std::vector<double> values;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const auto space = [](char ch) {
+            return std::isspace(static_cast<unsigned char>(ch)) != 0 || ch == '[' ||
+                   ch == ']' || ch == ',';
+        };
+        while (i < text.size() && space(text[i])) {
+            ++i;
+        }
+        const std::size_t start = i;
+        while (i < text.size() && !space(text[i])) {
+            ++i;
+        }
+        if (i > start) {
+            values.push_back(docxml::parse_double(text.substr(start, i - start)));
+        }
+    }
+    return values;
+}
+
+/// The published OpenCV pinhole model, evaluated from the raw numbers as they
+/// were written. `k` is the row-major 3x3 camera matrix and `d` the
+/// distortion vector (k1, k2, P1, P2, k3), so a symmetric writer/reader error
+/// cannot cancel itself the way deriving the parameters from our Calibration
+/// would allow. The returned point is in our pixel convention (centres at
+/// (0.5, 0.5)); OpenCV's is shifted by half a pixel.
+Eigen::Vector2d project_raw(const std::vector<double>& k, const std::vector<double>& d,
+                            const Eigen::Vector3d& p) {
     const double x = p.x() / p.z();
     const double y = p.y() / p.z();
     const double r2 = x * x + y * y;
-    const double radial = 1.0 + c.k1 * r2 + c.k2 * r2 * r2 + c.k3 * r2 * r2 * r2;
-    // OpenCV's distortion vector is (k1, k2, P1, P2, k3). Its P1 multiplies
-    // 2xy and its P2 multiplies (r^2 + 2x^2), the opposite of our names.
-    const double p1_ocv = c.p2;
-    const double p2_ocv = c.p1;
-    const double xd = x * radial + 2.0 * p1_ocv * x * y + p2_ocv * (r2 + 2.0 * x * x);
-    const double yd = y * radial + p1_ocv * (r2 + 2.0 * y * y) + 2.0 * p2_ocv * x * y;
-    const double fx = c.f + c.b1;
-    const double cx = 0.5 * static_cast<double>(c.width) + c.cx - 0.5;
-    const double cy = 0.5 * static_cast<double>(c.height) + c.cy - 0.5;
-    // OpenCV's top-left pixel centre is (0, 0); ours is (0.5, 0.5).
-    return {fx * xd + c.b2 * yd + cx + 0.5, c.f * yd + cy + 0.5};
+    const double radial = 1.0 + d[0] * r2 + d[1] * r2 * r2 + d[4] * r2 * r2 * r2;
+    const double p1 = d[2];
+    const double p2 = d[3];
+    const double xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+    const double yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+    return {k[0] * xd + k[1] * yd + k[2] + 0.5, k[4] * yd + k[5] + 0.5};
 }
 
 TEST_F(CalibrationIO, OpenCvProjectionAgrees) {
     const Calibration truth = opencv_calibration();
     const std::string file = path(".xml");
     (void)save_calibration(file, truth, CalibrationFormat::OpenCvXml);
-    const Calibration c = load_calibration(file, CalibrationFormat::OpenCvXml).calibration;
+
+    const docxml::XmlNode root = docxml::parse_xml(read_file_text(file));
+    const docxml::XmlNode* matrix = docxml::find_child(root, "camera_matrix");
+    ASSERT_NE(matrix, nullptr);
+    const docxml::XmlNode* matrix_data = docxml::find_child(*matrix, "data");
+    ASSERT_NE(matrix_data, nullptr);
+    const std::vector<double> k = numbers_in(matrix_data->text);
+    const docxml::XmlNode* distortion = docxml::find_child(root, "distortion_coefficients");
+    ASSERT_NE(distortion, nullptr);
+    const docxml::XmlNode* distortion_data = docxml::find_child(*distortion, "data");
+    ASSERT_NE(distortion_data, nullptr);
+    const std::vector<double> d = numbers_in(distortion_data->text);
+    ASSERT_EQ(k.size(), 9U);
+    ASSERT_GE(d.size(), 5U);
+
     std::mt19937_64 engine(20261105);
     for (int i = 0; i < 20; ++i) {
         const double x = rng::uniform_real(engine, -1.5, 1.5);
         const double y = rng::uniform_real(engine, -1.5, 1.5);
         const double z = rng::uniform_real(engine, 1.0, 4.0);
         const Eigen::Vector3d point(x, y, z);
-        const Eigen::Vector2d ours = c.project(point);
-        const Eigen::Vector2d theirs = opencv_projection(c, point);
+        const Eigen::Vector2d ours = truth.project(point);
+        const Eigen::Vector2d theirs = project_raw(k, d, point);
+        EXPECT_NEAR(ours.x(), theirs.x(), 1e-9) << "sample " << i;
+        EXPECT_NEAR(ours.y(), theirs.y(), 1e-9) << "sample " << i;
+    }
+}
+
+TEST_F(CalibrationIO, OpenCvYamlProjectionAgrees) {
+    const Calibration truth = opencv_calibration();
+    const std::string file = path(".yml");
+    (void)save_calibration(file, truth, CalibrationFormat::OpenCvYaml);
+    const std::string text = read_file_text(file);
+
+    const std::size_t camera_key = text.find("camera_matrix:");
+    ASSERT_NE(camera_key, std::string::npos);
+    const std::size_t camera_open = text.find("data: [", camera_key);
+    ASSERT_NE(camera_open, std::string::npos);
+    const std::size_t camera_close = text.find(']', camera_open);
+    ASSERT_NE(camera_close, std::string::npos);
+    const std::size_t camera_data = camera_open + std::string("data: [").size();
+    const std::vector<double> k =
+        numbers_in(text.substr(camera_data, camera_close - camera_data));
+    const std::size_t distortion_key =
+        text.find("distortion_coefficients:", camera_close);
+    ASSERT_NE(distortion_key, std::string::npos);
+    const std::size_t distortion_open = text.find("data: [", distortion_key);
+    ASSERT_NE(distortion_open, std::string::npos);
+    const std::size_t distortion_close = text.find(']', distortion_open);
+    ASSERT_NE(distortion_close, std::string::npos);
+    const std::size_t distortion_data =
+        distortion_open + std::string("data: [").size();
+    const std::vector<double> d =
+        numbers_in(text.substr(distortion_data, distortion_close - distortion_data));
+    ASSERT_EQ(k.size(), 9U);
+    ASSERT_GE(d.size(), 5U);
+
+    std::mt19937_64 engine(20261105);
+    for (int i = 0; i < 20; ++i) {
+        const double x = rng::uniform_real(engine, -1.5, 1.5);
+        const double y = rng::uniform_real(engine, -1.5, 1.5);
+        const double z = rng::uniform_real(engine, 1.0, 4.0);
+        const Eigen::Vector3d point(x, y, z);
+        const Eigen::Vector2d ours = truth.project(point);
+        const Eigen::Vector2d theirs = project_raw(k, d, point);
         EXPECT_NEAR(ours.x(), theirs.x(), 1e-9) << "sample " << i;
         EXPECT_NEAR(ours.y(), theirs.y(), 1e-9) << "sample " << i;
     }
