@@ -405,7 +405,8 @@ void emit_warnings(const std::vector<std::string>& warnings) {
     }
     py::module_ warnings_module = py::module_::import("warnings");
     for (const std::string& message : warnings) {
-        warnings_module.attr("warn")(py::str(message));
+        // stacklevel=2 reports the caller's line, not this binding's.
+        warnings_module.attr("warn")(py::str(message), py::arg("stacklevel") = 2);
     }
 }
 
