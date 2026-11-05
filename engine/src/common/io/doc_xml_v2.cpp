@@ -153,6 +153,43 @@ CameraGroupType parse_camera_group_type(const std::string& s) {
     throw ProjectIOError("doc.xml: unknown camera group type '" + s + "'");
 }
 
+std::string film_transform_name(FilmTransformType type) {
+    return type == FilmTransformType::Projective ? "projective" : "affine";
+}
+
+FilmTransformType parse_film_transform(const std::string& s) {
+    if (s == "affine") return FilmTransformType::Affine;
+    if (s == "projective") return FilmTransformType::Projective;
+    throw ProjectIOError("doc.xml: unknown film transform type '" + s + "'");
+}
+
+std::string fiducial_detector_name(FiducialDetector detector) {
+    switch (detector) {
+        case FiducialDetector::FrameCorner: return "frame_corner";
+        case FiducialDetector::Circle: return "circle";
+        case FiducialDetector::Corner: return "corner";
+    }
+    return "circle";
+}
+
+FiducialDetector parse_fiducial_detector(const std::string& s) {
+    if (s == "frame_corner") return FiducialDetector::FrameCorner;
+    if (s == "circle") return FiducialDetector::Circle;
+    if (s == "corner") return FiducialDetector::Corner;
+    throw ProjectIOError("doc.xml: unknown fiducial detector '" + s + "'");
+}
+
+/// A finite film coordinate. Stored values are millimetres; a non-finite value
+/// would poison every later transform fit.
+double parse_film_value(const XmlNode& e, const char* name) {
+    const double value = parse_double(require_attr(e, name));
+    if (!std::isfinite(value)) {
+        throw ProjectIOError(std::string("doc.xml: non-finite <") + e.name + "> " +
+                             name + " value");
+    }
+    return value;
+}
+
 std::string shape_type_name(ShapeType type) {
     switch (type) {
         case ShapeType::Point: return "point";
@@ -268,6 +305,38 @@ void read_slot_identity(const XmlNode& e, Slot& slot) {
 
 // -- writer: the chunk ------------------------------------------------------
 
+/// Film settings, written only when enabled so a project without fiducial
+/// data serialises byte-identically to an older build (WP-13.18a).
+void write_film(const FilmSettings& film, XmlNode& sensor) {
+    if (!film.enabled) {
+        return;
+    }
+    XmlNode& e = add_child(sensor, "film");
+    set_attr(e, "transform", film_transform_name(film.transform));
+    set_attr(e, "detector", fiducial_detector_name(film.detector));
+    set_attr(e, "corners", film.search_corners ? "1" : "0");
+    set_attr(e, "sides", film.search_sides ? "1" : "0");
+    std::vector<std::string> labels;
+    for (const Fiducial& fiducial : film.fiducials) {
+        if (fiducial.label.empty()) {
+            throw ProjectIOError("doc.xml: a <fiducial> has an empty label");
+        }
+        if (!fiducial.film_mm.allFinite()) {
+            throw ProjectIOError("doc.xml: fiducial '" + fiducial.label +
+                                 "' has a non-finite film position");
+        }
+        if (std::find(labels.begin(), labels.end(), fiducial.label) != labels.end()) {
+            throw ProjectIOError("doc.xml: duplicate fiducial label '" +
+                                 fiducial.label + "'");
+        }
+        labels.push_back(fiducial.label);
+        XmlNode& mark = add_child(e, "fiducial");
+        set_attr(mark, "label", fiducial.label);
+        set_attr(mark, "x", fmt(fiducial.film_mm.x()));
+        set_attr(mark, "y", fmt(fiducial.film_mm.y()));
+    }
+}
+
 void write_sensors(const Chunk& chunk, XmlNode& node) {
     XmlNode& sensors = add_child(node, "sensors");
     for (std::size_t i = 0; i < chunk.sensors().size(); ++i) {
@@ -290,6 +359,7 @@ void write_sensors(const Chunk& chunk, XmlNode& node) {
         if (s.master_sensor_id >= 0) {
             set_attr(e, "master", std::to_string(s.master_sensor_id));
         }
+        write_film(s.film, e);
     }
 }
 
@@ -349,6 +419,31 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
                 set_attr(ref, "roll", fmt(angles.z()));
             }
             set_attr(ref, "enabled", c.reference.enabled ? "1" : "0");
+        }
+        // Per-scan film geometry (WP-13.18a). Both children are optional, so a
+        // camera without fiducial data keeps the exact older byte layout.
+        if (c.film_transform.has_value()) {
+            if (!c.film_transform->allFinite()) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": film_transform is not finite");
+            }
+            XmlNode& ft = add_child(e, "film_transform");
+            set_attr(ft, "values", covariance9(*c.film_transform));
+        }
+        for (std::size_t i = 0; i < c.fiducial_pixels.size(); ++i) {
+            if (!c.fiducial_pixels[i].has_value()) {
+                continue;
+            }
+            const Eigen::Vector2d& pixel = *c.fiducial_pixels[i];
+            if (!pixel.allFinite()) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": fiducial " + std::to_string(i) +
+                                     " is not finite");
+            }
+            XmlNode& mark = add_child(e, "fiducial");
+            set_attr(mark, "index", std::to_string(i));
+            set_attr(mark, "u", fmt(pixel.x()));
+            set_attr(mark, "v", fmt(pixel.y()));
         }
     }
 }
@@ -986,6 +1081,37 @@ void read_sensors(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         s.calibration = read_calibration(find_child(e, "calibration"));
         s.fixed_params = split_strings(require_attr(e, "fixed_params"));
         s.master_sensor_id = parse_i32(attr_or(e, "master", "-1"));
+        if (const XmlNode* film = find_child(e, "film")) {
+            s.film.enabled = true;
+            s.film.transform = parse_film_transform(attr_or(*film, "transform", "affine"));
+            s.film.detector =
+                parse_fiducial_detector(attr_or(*film, "detector", "circle"));
+            s.film.search_corners = parse_int(attr_or(*film, "corners", "1")) != 0;
+            s.film.search_sides = parse_int(attr_or(*film, "sides", "0")) != 0;
+            warn_unknown_attrs(*film, {"transform", "detector", "corners", "sides"},
+                               report);
+            for (const XmlNode& mark : film->children) {
+                if (mark.name != "fiducial") {
+                    throw ProjectIOError("doc.xml: unexpected <" + mark.name +
+                                         "> inside <film>");
+                }
+                warn_unknown_attrs(mark, {"label", "x", "y"}, report);
+                Fiducial fiducial;
+                fiducial.label = require_attr(mark, "label");
+                if (fiducial.label.empty()) {
+                    throw ProjectIOError("doc.xml: a <fiducial> has an empty label");
+                }
+                for (const Fiducial& existing : s.film.fiducials) {
+                    if (existing.label == fiducial.label) {
+                        throw ProjectIOError("doc.xml: duplicate fiducial label '" +
+                                             fiducial.label + "'");
+                    }
+                }
+                fiducial.film_mm = Eigen::Vector2d(parse_film_value(mark, "x"),
+                                                   parse_film_value(mark, "y"));
+                s.film.fiducials.push_back(std::move(fiducial));
+            }
+        }
         validate_fixed_params(s.label, s.fixed_params);
         chunk.sensors().push_back(std::move(s));
         ++sensor_index;
@@ -1064,6 +1190,47 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
             }
         }
         c.reference = read_camera_reference(find_child(e, "reference"));
+        std::size_t film_count = 0;
+        if (c.sensor_id >= 0 &&
+            static_cast<std::size_t>(c.sensor_id) < chunk.sensors().size()) {
+            film_count = chunk.sensors()[static_cast<std::size_t>(c.sensor_id)]
+                             .film.fiducials.size();
+        }
+        if (const XmlNode* ft = find_child(e, "film_transform")) {
+            warn_unknown_attrs(*ft, {"values"}, report);
+            const Eigen::Matrix3d matrix =
+                parse_covariance9(require_attr(*ft, "values"));
+            if (!matrix.allFinite()) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": film_transform is not finite");
+            }
+            c.film_transform = matrix;
+        }
+        for (const XmlNode& mark : e.children) {
+            if (mark.name != "fiducial") {
+                continue;
+            }
+            warn_unknown_attrs(mark, {"index", "u", "v"}, report);
+            const int index = parse_int(require_attr(mark, "index"));
+            if (index < 0 || static_cast<std::size_t>(index) >= film_count) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": fiducial index " + std::to_string(index) +
+                                     " is out of range for sensor " +
+                                     std::to_string(c.sensor_id));
+            }
+            if (c.fiducial_pixels.empty()) {
+                c.fiducial_pixels.assign(film_count, std::nullopt);
+            }
+            const std::size_t slot = static_cast<std::size_t>(index);
+            if (c.fiducial_pixels[slot].has_value()) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": duplicate fiducial index " +
+                                     std::to_string(index));
+            }
+            c.fiducial_pixels[slot] =
+                Eigen::Vector2d(parse_film_value(mark, "u"),
+                                parse_film_value(mark, "v"));
+        }
         chunk.cameras().push_back(std::move(c));
     }
 }

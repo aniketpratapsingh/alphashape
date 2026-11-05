@@ -106,7 +106,7 @@ bool Sensor::operator==(const Sensor& other) const {
            model == other.model && serial == other.serial &&
            calibration == other.calibration &&
            fixed_params == other.fixed_params &&
-           master_sensor_id == other.master_sensor_id;
+           master_sensor_id == other.master_sensor_id && film == other.film;
 }
 
 void validate_sensor_masters(const std::vector<Sensor>& sensors) {
@@ -152,7 +152,9 @@ bool Camera::operator==(const Camera& other) const {
            enabled == other.enabled && selected == other.selected &&
            reference == other.reference && orientation == other.orientation &&
            location_covariance == other.location_covariance &&
-           rotation_covariance == other.rotation_covariance;
+           rotation_covariance == other.rotation_covariance &&
+           fiducial_pixels == other.fiducial_pixels &&
+           film_transform == other.film_transform;
 }
 
 bool KeypointSet::operator==(const KeypointSet& other) const {

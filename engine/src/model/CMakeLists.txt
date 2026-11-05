@@ -4,6 +4,7 @@
 
 add_library(alphashape_model STATIC
     camera/calibration.cpp
+    camera/film.cpp
     geo/geodesy.cpp
     mesh/marching_tetrahedra.cpp
     mesh/mesh_ops.cpp

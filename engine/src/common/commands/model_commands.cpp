@@ -841,6 +841,62 @@ private:
     std::int32_t previous_ = -1;
 };
 
+/// Reject a film layout that could not be persisted or fitted: empty or
+/// duplicate labels and non-finite millimetre coordinates.
+void check_film_settings(const FilmSettings& film) {
+    std::vector<std::string> labels;
+    for (const Fiducial& fiducial : film.fiducials) {
+        if (fiducial.label.empty()) {
+            throw ValueError("set sensor film: every fiducial needs a label");
+        }
+        if (!fiducial.film_mm.allFinite()) {
+            throw ValueError("set sensor film: fiducial '" + fiducial.label +
+                             "' has a non-finite position");
+        }
+        if (std::find(labels.begin(), labels.end(), fiducial.label) != labels.end()) {
+            throw ValueError("set sensor film: duplicate fiducial label '" +
+                             fiducial.label + "'");
+        }
+        labels.push_back(fiducial.label);
+    }
+}
+
+class SetSensorFilmCommand : public StagedMutation {
+public:
+    SetSensorFilmCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                         FilmSettings film)
+        : chunk_id_(chunk_id), sensor_index_(sensor_index), film_(std::move(film)) {}
+
+    std::string name() const override { return "Set Sensor Film"; }
+
+protected:
+    void validate(Document& document) override {
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor film");
+        check_film_settings(film_);
+    }
+
+    void stage(Document& document) override {
+        previous_ = require_sensor(document, chunk_id_, sensor_index_, "set sensor film")
+                        .film;
+    }
+
+    void commit(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor film").film =
+            film_;
+    }
+
+    void restore(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor film").film =
+            previous_;
+    }
+
+private:
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    FilmSettings film_;
+    FilmSettings previous_;
+};
+
 // --- Marker commands -------------------------------------------------------
 
 /// Allocate a marker id from the chunk counter when the caller left it at -1.
@@ -3058,6 +3114,12 @@ std::unique_ptr<AbstractCommand> make_set_sensor_calibration_command(
 std::unique_ptr<AbstractCommand> make_set_sensor_master_command(
     std::int32_t chunk_id, std::int32_t sensor_index, std::int32_t master_index) {
     return std::make_unique<SetSensorMasterCommand>(chunk_id, sensor_index, master_index);
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_film_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, FilmSettings film) {
+    return std::make_unique<SetSensorFilmCommand>(chunk_id, sensor_index,
+                                                  std::move(film));
 }
 
 // --- asset factories -------------------------------------------------------
