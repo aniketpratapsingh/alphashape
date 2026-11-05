@@ -64,12 +64,6 @@ struct CalibrationResult {
     int views_used = 0;
 };
 
-/// Packed coefficient names in `kCalibrationParamCount` order, matching
-/// Sensor::fixed_params and the doc.xml spelling.
-inline constexpr std::array<const char*, kCalibrationParamCount>
-    kCalibrationParamNames = {"f",  "cx", "cy", "b1", "b2", "k1", "k2",
-                              "k3", "k4", "p1", "p2", "p3", "p4"};
-
 using CalibrationFitFlags = std::array<bool, kCalibrationParamCount>;
 
 /// Normalised DLT homography from board-plane XY to pixels (Hartley &
