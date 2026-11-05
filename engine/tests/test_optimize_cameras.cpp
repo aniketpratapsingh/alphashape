@@ -672,6 +672,18 @@ TEST(OptimizeCamerasFixedParams, HonoursSensorFixedParams) {
                 k1_before, cal.k1);
 }
 
+/// Compare the intrinsic model only. OptimizeCameras recomputes the posterior
+/// covariance of the coefficients on every run, so full Calibration equality
+/// (which includes it since WP-13.13b) is not the right test for "the
+/// intrinsics did not move".
+bool same_intrinsics(const Calibration& a, const Calibration& b) {
+    return a.type == b.type && a.width == b.width && a.height == b.height &&
+           a.f == b.f && a.cx == b.cx && a.cy == b.cy && a.b1 == b.b1 &&
+           a.b2 == b.b2 && a.k1 == b.k1 && a.k2 == b.k2 && a.k3 == b.k3 &&
+           a.k4 == b.k4 && a.p1 == b.p1 && a.p2 == b.p2 && a.p3 == b.p3 &&
+           a.p4 == b.p4;
+}
+
 // ---------------------------------------------------------------------------
 // 4. Every fit flag false leaves intrinsics alone but still refines poses
 // ---------------------------------------------------------------------------
@@ -706,8 +718,9 @@ TEST(OptimizeCamerasFitFlags, FitFlagsFalseKeepsIntrinsics) {
     run_task(builtin_registry(), document, "OptimizeCameras", params);
 
     const Chunk& chunk = *document.active_chunk();
-    // Intrinsics bitwise unchanged.
-    EXPECT_TRUE(chunk.sensors()[0].calibration == cal_before);
+    // Intrinsics bitwise unchanged (the derived covariance is not part of that
+    // statement; OptimizeCameras recomputes it either way).
+    EXPECT_TRUE(same_intrinsics(chunk.sensors()[0].calibration, cal_before));
 
     // Poses refined: the perturbation was reduced (a nonzero move away from the
     // shifted state, in the direction that lowers the residual).
@@ -1726,7 +1739,11 @@ TEST(OptimizeCameras, AdaptiveFittingRejectedGroupRestoresState) {
     Chunk& a = *adaptive_document.active_chunk();
     Chunk& b = *plain_document.active_chunk();
     EXPECT_FALSE(selected_term(a, "b2"));
-    EXPECT_TRUE(a.sensors()[0].calibration == b.sensors()[0].calibration);
+    // Rejecting the unsupported group must leave the fitted intrinsics exactly
+    // as the non-adaptive solve does. The derived covariance may differ in its
+    // last bits between the two solve paths, so it is not compared here.
+    EXPECT_TRUE(same_intrinsics(a.sensors()[0].calibration,
+                                b.sensors()[0].calibration));
     ASSERT_EQ(a.cameras().size(), b.cameras().size());
     for (std::size_t i = 0; i < a.cameras().size(); ++i) {
         EXPECT_EQ((a.cameras()[i].pose - b.cameras()[i].pose).cwiseAbs().maxCoeff(), 0.0);
