@@ -194,6 +194,10 @@ Calibration scaled_calibration(const Calibration& full, int downscale) {
     out.cy = (static_cast<double>(full.height) * 0.5 + full.cy) / ds -
              static_cast<double>(out.height) * 0.5;
     // Distortion coefficients and the camera type are resolution independent.
+    // The covariance is expressed in pixel units of the full-resolution model,
+    // so it does not survive the rescale; the caller must refit if it wants one.
+    out.covariance = Eigen::MatrixXd();
+    out.covariance_params.clear();
     return out;
 }
 
@@ -208,12 +212,19 @@ Calibration Calibration::initial(CameraType type, int width, int height,
     return c;
 }
 
-bool Calibration::operator==(const Calibration& other) const {
+bool Calibration::same_model(const Calibration& other) const {
     return type == other.type && width == other.width && height == other.height &&
            f == other.f && cx == other.cx && cy == other.cy && b1 == other.b1 &&
            b2 == other.b2 && k1 == other.k1 && k2 == other.k2 && k3 == other.k3 &&
            k4 == other.k4 && p1 == other.p1 && p2 == other.p2 && p3 == other.p3 &&
            p4 == other.p4;
+}
+
+bool Calibration::operator==(const Calibration& other) const {
+    return same_model(other) && covariance_params == other.covariance_params &&
+           covariance.rows() == other.covariance.rows() &&
+           covariance.cols() == other.covariance.cols() &&
+           (covariance.array() == other.covariance.array()).all();
 }
 
 Eigen::Vector2d Calibration::project(const Eigen::Vector3d& p_cam) const {

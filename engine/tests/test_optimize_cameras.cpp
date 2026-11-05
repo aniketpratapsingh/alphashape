@@ -706,8 +706,9 @@ TEST(OptimizeCamerasFitFlags, FitFlagsFalseKeepsIntrinsics) {
     run_task(builtin_registry(), document, "OptimizeCameras", params);
 
     const Chunk& chunk = *document.active_chunk();
-    // Intrinsics bitwise unchanged.
-    EXPECT_TRUE(chunk.sensors()[0].calibration == cal_before);
+    // Intrinsics bitwise unchanged (the derived covariance is not part of that
+    // statement; OptimizeCameras recomputes it either way).
+    EXPECT_TRUE(chunk.sensors()[0].calibration.same_model(cal_before));
 
     // Poses refined: the perturbation was reduced (a nonzero move away from the
     // shifted state, in the direction that lowers the residual).
@@ -1726,7 +1727,10 @@ TEST(OptimizeCameras, AdaptiveFittingRejectedGroupRestoresState) {
     Chunk& a = *adaptive_document.active_chunk();
     Chunk& b = *plain_document.active_chunk();
     EXPECT_FALSE(selected_term(a, "b2"));
-    EXPECT_TRUE(a.sensors()[0].calibration == b.sensors()[0].calibration);
+    // Rejecting the unsupported group must leave the fitted intrinsics exactly
+    // as the non-adaptive solve does. The derived covariance may differ in its
+    // last bits between the two solve paths, so it is not compared here.
+    EXPECT_TRUE(a.sensors()[0].calibration.same_model(b.sensors()[0].calibration));
     ASSERT_EQ(a.cameras().size(), b.cameras().size());
     for (std::size_t i = 0; i < a.cameras().size(); ++i) {
         EXPECT_EQ((a.cameras()[i].pose - b.cameras()[i].pose).cwiseAbs().maxCoeff(), 0.0);

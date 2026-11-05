@@ -203,11 +203,17 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
             camera.pose = Transform::Identity();
             camera.enabled = false;
         }
+        // Alignment rewrites every input pose; any posterior covariance from an
+        // earlier solve describes the old pose and is dropped (WP-13.13b).
+        camera.location_covariance.setZero();
+        camera.rotation_covariance.setZero();
     }
 
     std::vector<Track> new_tracks = tie_points.tracks;
     for (std::size_t t = 0; t < new_tracks.size(); ++t) {
         new_tracks[t].point = result.points[t];
+        // A re-triangulated point invalidates the covariance of the old one.
+        new_tracks[t].covariance.reset();
     }
 
     // The chunk region: ours. The centre is the per-axis median of the

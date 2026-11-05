@@ -13,6 +13,7 @@
 // empty asset of that kind, which is how an in-memory empty asset slot keeps
 // its identity across a round-trip.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -56,6 +57,10 @@ std::string matches_entry(const Chunk& chunk) {
 
 std::string tracks_entry(const Chunk& chunk) {
     return chunk_prefix(chunk) + "/tie_points/tracks.bin";
+}
+
+std::string track_covariance_entry(const Chunk& chunk) {
+    return chunk_prefix(chunk) + "/tie_points/track_covariance.bin";
 }
 
 std::string depth_maps_entry(const Chunk& chunk, std::int32_t asset_id) {
@@ -212,6 +217,23 @@ Eigen::Matrix3d parse_covariance9(const std::string& s) {
     return m;
 }
 
+/// Exact-zero test used to decide whether an optional covariance is written.
+/// A component that is merely tiny still counts as data.
+bool covariance_is_zero(const Eigen::Matrix3d& m) {
+    return m.cwiseAbs().maxCoeff() == 0.0;
+}
+
+bool covariance_is_finite(const Eigen::Matrix3d& m) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(m(r, c))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // -- writer: identity attributes shared by every asset element ---------------
 
 /// Write the slot's identity (id, label, group, enabled, meta) on its element.
@@ -276,6 +298,24 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
         set_attr(e, "enabled", fmt_bool(c.enabled));
         set_attr(e, "orientation", std::to_string(c.orientation));
         set_attr(e, "transform", matrix4(c.pose));
+        // Posterior covariances (WP-13.13b). Written only when non-zero, so a
+        // project without covariance is byte-identical to an older build's. A
+        // non-finite matrix is refused here rather than written and then
+        // rejected by our own reader.
+        if (!covariance_is_zero(c.location_covariance)) {
+            if (!covariance_is_finite(c.location_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": location_covariance is not finite");
+            }
+            set_attr(e, "location_covariance", covariance9(c.location_covariance));
+        }
+        if (!covariance_is_zero(c.rotation_covariance)) {
+            if (!covariance_is_finite(c.rotation_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": rotation_covariance is not finite");
+            }
+            set_attr(e, "rotation_covariance", covariance9(c.rotation_covariance));
+        }
         // A reference is written only when a location was set. z may be nan
         // (no GNSS altitude); fmt() emits "nan", which parse_double accepts.
         // Every accuracy component must be finite and strictly positive: a
@@ -451,6 +491,16 @@ void write_tie_points(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
         XmlNode& e = add_child(container, "tracks");
         set_attr(e, "count", std::to_string(tie_points.tracks.size()));
         set_attr(e, "path", tracks_entry(chunk));
+        // The covariance companion exists only when at least one track has
+        // one, so a project without covariance gains no entry and no attribute.
+        const bool any_covariance = std::any_of(
+            tie_points.tracks.begin(), tie_points.tracks.end(),
+            [](const Track& track) { return track.covariance.has_value(); });
+        if (any_covariance) {
+            const std::string entry = track_covariance_entry(chunk);
+            archive.add(entry, sidecar::encode_track_covariance(tie_points.tracks));
+            set_attr(e, "covariance_path", entry);
+        }
     }
 }
 
@@ -975,7 +1025,8 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
     }
     for (const XmlNode& e : cameras->children) {
         warn_unknown_attrs(e, {"id", "sensor_id", "label", "enabled", "orientation",
-                               "transform"},
+                               "transform", "location_covariance",
+                               "rotation_covariance"},
                            report);
         Camera c;
         c.id = parse_i32(require_attr(e, "id"));
@@ -984,6 +1035,20 @@ void read_cameras(const XmlNode& node, Chunk& chunk, ReadReport* report) {
         c.enabled = parse_bool(require_attr(e, "enabled"));
         c.orientation = parse_int(require_attr(e, "orientation"));
         c.pose = parse_matrix4(require_attr(e, "transform"));
+        if (const std::string* s = find_attr(e, "location_covariance")) {
+            c.location_covariance = parse_covariance9(*s);
+            if (!covariance_is_finite(c.location_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": location_covariance is not finite");
+            }
+        }
+        if (const std::string* s = find_attr(e, "rotation_covariance")) {
+            c.rotation_covariance = parse_covariance9(*s);
+            if (!covariance_is_finite(c.rotation_covariance)) {
+                throw ProjectIOError("camera " + std::to_string(c.id) +
+                                     ": rotation_covariance is not finite");
+            }
+        }
         c.reference = read_camera_reference(find_child(e, "reference"));
         chunk.cameras().push_back(std::move(c));
     }
@@ -1177,12 +1242,22 @@ void read_tie_points(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
                 throw ProjectIOError("matches count mismatch in doc.xml");
             }
         } else {
-            warn_unknown_attrs(e, {"count", "path"}, report);
+            warn_unknown_attrs(e, {"count", "path", "covariance_path"}, report);
             chunk.tie_points().tracks =
                 sidecar::decode_tracks(require_entry(archive, path));
             if (chunk.tie_points().tracks.size() !=
                 static_cast<std::size_t>(parse_ll(require_attr(e, "count")))) {
                 throw ProjectIOError("tracks count mismatch in doc.xml");
+            }
+            if (const std::string* cov_path = find_attr(e, "covariance_path")) {
+                const std::vector<std::optional<Eigen::Matrix3f>> covariance =
+                    sidecar::decode_track_covariance(require_entry(archive, *cov_path));
+                if (covariance.size() != chunk.tie_points().tracks.size()) {
+                    throw ProjectIOError("track covariance count mismatch in doc.xml");
+                }
+                for (std::size_t i = 0; i < covariance.size(); ++i) {
+                    chunk.tie_points().tracks[i].covariance = covariance[i];
+                }
             }
         }
     }
