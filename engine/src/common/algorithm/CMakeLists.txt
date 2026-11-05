@@ -92,7 +92,7 @@ target_link_libraries(alphashape_algorithms PUBLIC
     alphashape_core
     alphashape_image
     alphashape_gpu)
-target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres)
+target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres TIFF::TIFF)
 
 # M12 §4.1: the algorithms layer links the CRS engine explicitly (it already
 # reaches it through alphashape_model, but WP-12.8 makes DEM/ortho tasks call

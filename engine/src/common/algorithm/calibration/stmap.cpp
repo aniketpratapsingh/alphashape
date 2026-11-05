@@ -1,8 +1,13 @@
 #include "common/algorithm/calibration/stmap.hpp"
 
 #include <cmath>
+#include <cstdarg>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <vector>
+
+#include <tiffio.h>
 
 #include "base/utils/error.hpp"
 
@@ -29,6 +34,42 @@ void store_source(double u_src, double v_src, double width, double height,
     s = static_cast<float>(s_value);
     t = static_cast<float>(t_value);
 }
+
+/// libtiff prints warnings and errors to stderr by default; the library must
+/// not. Both handlers swallow the message and report success to the caller,
+/// which learns about the failure from a return code instead.
+int swallow_error(TIFF*, void*, const char*, const char*, va_list) {
+    return 0;
+}
+
+int swallow_warning(TIFF*, void*, const char*, const char*, va_list) {
+    return 0;
+}
+
+/// Owns a TIFFOpenOptions block and installs the silent handlers.
+class SilentOpenOptions {
+public:
+    SilentOpenOptions() : options_(TIFFOpenOptionsAlloc()) {
+        if (options_ != nullptr) {
+            TIFFOpenOptionsSetErrorHandlerExtR(options_, swallow_error,
+                                               nullptr);
+            TIFFOpenOptionsSetWarningHandlerExtR(options_, swallow_warning,
+                                                 nullptr);
+        }
+    }
+    ~SilentOpenOptions() {
+        if (options_ != nullptr) {
+            TIFFOpenOptionsFree(options_);
+        }
+    }
+    SilentOpenOptions(const SilentOpenOptions&) = delete;
+    SilentOpenOptions& operator=(const SilentOpenOptions&) = delete;
+
+    TIFFOpenOptions* get() const { return options_; }
+
+private:
+    TIFFOpenOptions* options_ = nullptr;
+};
 
 }  // namespace
 
@@ -88,6 +129,71 @@ STMap compute_stmap(const Calibration& calibration, int width, int height) {
         }
     }
     return map;
+}
+
+void write_stmap_tiff(const std::string& path, const STMap& map) {
+    if (map.width <= 0 || map.height <= 0) {
+        throw ValueError("write_stmap_tiff: map size must be positive");
+    }
+    const std::size_t count =
+        static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.height);
+    if (map.s.size() != count || map.t.size() != count) {
+        throw ValueError("write_stmap_tiff: channel size does not match the map");
+    }
+
+    SilentOpenOptions options;
+    if (options.get() == nullptr) {
+        throw Error("write_stmap_tiff: cannot allocate TIFF open options");
+    }
+    TIFF* tif = TIFFOpenExt(path.c_str(), "w", options.get());
+    if (tif == nullptr) {
+        throw Error("write_stmap_tiff: cannot open '" + path + "'");
+    }
+
+    bool ok = true;
+    auto set = [&ok, tif](uint32_t tag, int value) {
+        if (TIFFSetField(tif, tag, value) != 1) {
+            ok = false;
+        }
+    };
+    set(TIFFTAG_IMAGEWIDTH, static_cast<uint32_t>(map.width));
+    set(TIFFTAG_IMAGELENGTH, static_cast<uint32_t>(map.height));
+    set(TIFFTAG_SAMPLESPERPIXEL, 2);
+    set(TIFFTAG_BITSPERSAMPLE, 32);
+    set(TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    set(TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    set(TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    set(TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    uint16_t extra = EXTRASAMPLE_UNSPECIFIED;
+    if (TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extra) != 1) {
+        ok = false;
+    }
+    set(TIFFTAG_COMPRESSION, COMPRESSION_ADOBE_DEFLATE);
+    const uint32_t rows =
+        static_cast<uint32_t>(TIFFDefaultStripSize(tif, 0));
+    if (!ok || TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rows) != 1) {
+        TIFFClose(tif);
+        throw Error("write_stmap_tiff: cannot configure '" + path + "'");
+    }
+
+    std::vector<float> row(static_cast<std::size_t>(map.width) * 2U);
+    for (int y = 0; y < map.height && ok; ++y) {
+        const std::size_t base =
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(map.width);
+        for (int x = 0; x < map.width; ++x) {
+            const std::size_t index = base + static_cast<std::size_t>(x);
+            const std::size_t out = static_cast<std::size_t>(x) * 2U;
+            row[out] = map.s[index];
+            row[out + 1U] = map.t[index];
+        }
+        if (TIFFWriteScanline(tif, row.data(), static_cast<uint32_t>(y), 0) < 0) {
+            ok = false;
+        }
+    }
+    TIFFClose(tif);
+    if (!ok) {
+        throw Error("write_stmap_tiff: writing '" + path + "' failed");
+    }
 }
 
 }  // namespace alphashape
