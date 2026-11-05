@@ -164,7 +164,7 @@ protected:
 
 private:
     Chunk& target(Document& document) {
-        Chunk* chunk = document.find_chunk(chunk_id_);
+        Chunk* chunk = document.workspace().find_chunk(chunk_id_);
         if (chunk == nullptr) {
             throw ValueError("no chunk with id " + std::to_string(chunk_id_));
         }
