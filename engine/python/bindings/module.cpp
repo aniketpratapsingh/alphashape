@@ -1649,6 +1649,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def("calibrateCamera", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "CalibrateCamera", std::move(kwargs));
         })
+        // Backward STMap export for a calibrated sensor (WP-13.15b).
+        .def("exportStmap", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ExportSTMap", std::move(kwargs));
+        })
         // Multi-view consensus refinement (WP-13.9), the same run_task call.
         .def("refineMarkers", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "RefineMarkers", std::move(kwargs));
