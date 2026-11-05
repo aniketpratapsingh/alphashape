@@ -1,11 +1,13 @@
 #include "common/algorithm/photos/add_photos_task.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <Eigen/Core>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -236,6 +238,88 @@ bool same_path(const std::string& a, const std::string& b) {
     return fs::path(a).lexically_normal() == fs::path(b).lexically_normal();
 }
 
+/// The extensions the importer recognises. Compared case-insensitively so a
+/// camera's ".JPG" is not silently skipped. The list matches the decoders in
+/// image/io (JPEG, PNG, TIFF and the Netpbm family).
+bool has_image_extension(const fs::path& path) {
+    std::string ext = path.extension().string();
+    if (!ext.empty()) {
+        ext.erase(ext.begin());  // drop the leading '.'
+    }
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    static const char* const kExtensions[] = {"jpg",  "jpeg", "png", "tif", "tiff",
+                                              "pnm",  "pgm",  "ppm", "pbm"};
+    for (const char* known : kExtensions) {
+        if (ext == known) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Every image file under `root`, recursively, sorted by path. Sorting is what
+/// makes the import deterministic regardless of directory iteration order.
+std::vector<std::string> images_under(const fs::path& root) {
+    std::vector<std::string> files;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, ec), end; it != end;
+         it.increment(ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code status_ec;
+        if (!it->is_regular_file(status_ec) || status_ec) {
+            continue;
+        }
+        if (has_image_extension(it->path())) {
+            files.push_back(it->path().lexically_normal().string());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+/// One "old=new" substitution pair.
+struct Substitution {
+    std::string from, to;
+};
+
+/// Parse the `substitute` parameter. A pair with an empty `old` is rejected
+/// because replacing the empty string has no sensible meaning.
+std::vector<Substitution> parse_substitutions(const std::vector<std::string>& pairs) {
+    std::vector<Substitution> out;
+    out.reserve(pairs.size());
+    for (const std::string& pair : pairs) {
+        const std::size_t equals = pair.find('=');
+        if (equals == std::string::npos) {
+            throw ValueError("AddPhotos: substitute entry '" + pair +
+                             "' must be of the form old=new");
+        }
+        Substitution sub{pair.substr(0, equals), pair.substr(equals + 1)};
+        if (sub.from.empty()) {
+            throw ValueError("AddPhotos: substitute entry '" + pair +
+                             "' has an empty old value");
+        }
+        out.push_back(std::move(sub));
+    }
+    return out;
+}
+
+/// Apply every substitution in order to a label.
+std::string apply_substitutions(std::string label,
+                                const std::vector<Substitution>& substitutions) {
+    for (const Substitution& sub : substitutions) {
+        std::size_t pos = 0;
+        while ((pos = label.find(sub.from, pos)) != std::string::npos) {
+            label.replace(pos, sub.from.size(), sub.to);
+            pos += sub.to.size();
+        }
+    }
+    return label;
+}
+
 }  // namespace
 
 void AddPhotosTask::declare_params(Params& params) const {
@@ -255,6 +339,14 @@ void AddPhotosTask::declare_params(Params& params) const {
     params.declare({"load_xmp_calibration", ParamType::Bool, false,
                     "Reserved for XMP lens calibration (DewarpData). Accepted but not yet "
                     "applied."});
+    params.declare({"group_by_folder", ParamType::Bool, false,
+                    "Create one camera group per source directory, labelled with the "
+                    "directory name and typed as a folder group."});
+    params.declare({"recursive", ParamType::Bool, false,
+                    "When an entry of 'filenames' is a directory, import the image files "
+                    "under it, including subdirectories, in sorted order."});
+    params.declare({"substitute", ParamType::StringList, std::vector<std::string>{},
+                    "Ordered \"old=new\" pairs applied to every imported camera label."});
 }
 
 std::vector<Stage> AddPhotosTask::stages() const {
@@ -278,6 +370,10 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     // Declared so the schema and Python front end accept it; DewarpData is not
     // applied yet (see the parameter description and the PR notes).
     const bool load_xmp_calibration = params.get_bool("load_xmp_calibration");
+    const bool group_by_folder = params.get_bool("group_by_folder");
+    const bool recursive = params.get_bool("recursive");
+    const std::vector<Substitution> substitutions =
+        parse_substitutions(params.get_string_list("substitute"));
     // Any of these reads XMP; with all of them off the packet scan is skipped.
     const bool want_xmp =
         load_reference || load_xmp_accuracy || load_xmp_orientation || load_xmp_calibration;
@@ -297,7 +393,23 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
         if (ec) {
             resolved = fs::path(name);
         }
-        absolute.push_back(resolved.lexically_normal().string());
+        resolved = resolved.lexically_normal();
+        std::error_code dir_ec;
+        if (fs::is_directory(resolved, dir_ec) && !dir_ec) {
+            if (!recursive) {
+                throw ValueError("AddPhotos: '" + resolved.string() +
+                                 "' is a directory; enable 'recursive' to import its "
+                                 "images");
+            }
+            const std::vector<std::string> found = images_under(resolved);
+            if (found.empty()) {
+                throw ValueError("AddPhotos: no images found under '" +
+                                 resolved.string() + "'");
+            }
+            absolute.insert(absolute.end(), found.begin(), found.end());
+            continue;
+        }
+        absolute.push_back(resolved.string());
     }
     for (std::size_t i = 0; i < absolute.size(); ++i) {
         for (std::size_t j = i + 1; j < absolute.size(); ++j) {
@@ -389,9 +501,10 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             }
 
             item.camera.id = camera_id++;
-            item.camera.label = strip_extensions
-                                    ? fs::path(path).stem().string()
-                                    : fs::path(path).filename().string();
+            const std::string stem_or_name =
+                strip_extensions ? fs::path(path).stem().string()
+                                 : fs::path(path).filename().string();
+            item.camera.label = apply_substitutions(stem_or_name, substitutions);
             item.camera.orientation = exif.orientation.value_or(1);
             item.camera.enabled = false;  // not aligned yet
 
@@ -476,6 +589,14 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     // appended in discovery order, which is exactly the order new sensors are
     // pushed below; so each item's sensor_index is already its final sensor_id
     // and nothing here can fail part-way.
+    std::map<std::string, std::vector<std::int32_t>> folder_members;
+    if (group_by_folder) {
+        for (const PendingCamera& item : pending) {
+            const fs::path parent = fs::path(item.frame->path()).parent_path();
+            folder_members[parent.lexically_normal().string()].push_back(item.camera.id);
+        }
+    }
+
     for (PendingCamera& item : pending) {
         if (item.needs_sensor) {
             chunk->sensors().push_back(std::move(item.sensor));
@@ -485,6 +606,35 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
         item.camera.sensor_id = static_cast<std::int32_t>(item.sensor_index);
         chunk->cameras().push_back(std::move(item.camera));
         chunk->frames().push_back(std::move(item.frame));
+    }
+
+    if (group_by_folder) {
+        for (const auto& [dir, ids] : folder_members) {
+            CameraGroup* group = nullptr;
+            for (CameraGroup& existing : chunk->camera_groups()) {
+                if (existing.type == CameraGroupType::Folder && existing.folder == dir) {
+                    group = &existing;
+                    break;
+                }
+            }
+            if (group == nullptr) {
+                CameraGroup created;
+                created.id = chunk->allocate_id();
+                const std::string name = fs::path(dir).filename().string();
+                created.label = name.empty() ? dir : name;
+                created.type = CameraGroupType::Folder;
+                created.folder = dir;
+                chunk->camera_groups().push_back(std::move(created));
+                group = &chunk->camera_groups().back();
+            }
+            for (const std::int32_t id : ids) {
+                auto slot =
+                    std::lower_bound(group->members.begin(), group->members.end(), id);
+                if (slot == group->members.end() || *slot != id) {
+                    group->members.insert(slot, id);
+                }
+            }
+        }
     }
     progress.update("import", 1.0);
 }
