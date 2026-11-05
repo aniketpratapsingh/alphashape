@@ -178,7 +178,7 @@ TEST(MarkerSheet, RenderDecodesBack) {
                 // edge and the 0.9 R border; decode treats the hint as the
                 // border radius, so scale it onto the outer outline.
                 MarkerCandidate scaled = candidate;
-                scaled.radius_px *= 1.4;
+                scaled.radius_px *= 1.3;
                 blobs.push_back(scaled);
             }
             std::set<int> decoded;
