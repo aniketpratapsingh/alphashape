@@ -101,43 +101,35 @@ void report(const char* name, double value, const char* unit) {
     std::printf("%s %.4f %s\n", name, value, unit);
 }
 
-class FilmProject : public ::testing::Test {
-protected:
-    void SetUp() override {
-        const auto base = fs::temp_directory_path() /
-                          ("alphashape_film_" + std::to_string(platform::process_id()) +
-                           "_" +
-                           std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
-        dir_ = base.string() + "_" + std::to_string(counter_++);
-        std::error_code error;
-        fs::remove_all(dir_, error);
-        fs::create_directories(dir_, error);
-        ASSERT_FALSE(error) << error.message();
-    }
-    void TearDown() override {
-        std::error_code error;
-        fs::remove_all(dir_, error);
-    }
-    std::string path(const std::string& name) const {
-        return (fs::path(dir_) / name).string();
-    }
-    static std::string doc_text(const std::string& psx) {
-        fs::path archive = psx;
-        archive.replace_extension();
-        const fs::path zip = archive.string() + ".files/project.zip";
-        std::ifstream in(zip, std::ios::binary);
-        EXPECT_TRUE(in);
-        const std::vector<std::uint8_t> bytes(
-            (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        return ZipArchive::parse(bytes).get_text("doc.xml");
-    }
+/// A fresh project path under the system temp directory. The suite is a plain
+/// TEST (the ProjectIO suite already has non-fixture cases), so temp handling
+/// is a pair of helpers rather than a fixture.
+std::string temp_project(const std::string& name) {
+    const auto parent = fs::temp_directory_path() /
+                        ("alphashape_film_" +
+                         std::to_string(platform::process_id()) + "_" +
+                         std::to_string(::testing::UnitTest::GetInstance()->random_seed()) +
+                         "_" + name);
+    std::error_code error;
+    fs::create_directories(parent, error);
+    return (parent / (name + ".psx")).string();
+}
 
-private:
-    std::string dir_;
-    static int counter_;
-};
+void remove_project(const std::string& psx) {
+    std::error_code error;
+    fs::remove_all(fs::path(psx).parent_path(), error);
+}
 
-int FilmProject::counter_ = 0;
+std::string project_doc_text(const std::string& psx) {
+    fs::path archive = psx;
+    archive.replace_extension();
+    const fs::path zip = archive.string() + ".files/project.zip";
+    std::ifstream in(zip, std::ios::binary);
+    EXPECT_TRUE(in);
+    const std::vector<std::uint8_t> bytes(
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return ZipArchive::parse(bytes).get_text("doc.xml");
+}
 
 TEST(Fiducials, FrameQuadCorners) {
     const test::FilmFrameSpec spec = base_spec();
@@ -168,14 +160,8 @@ TEST(Fiducials, CircleCentres) {
     double maximum = 0.0;
     for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
         ASSERT_TRUE(detection.by_fiducial[i].has_value()) << "mark " << i;
-        const Eigen::Vector2d delta =
-            *detection.by_fiducial[i] - frame.mark_pixels[i];
-        const double error = delta.norm();
-        std::printf("  mark %zu detected (%.2f, %.2f) true (%.2f, %.2f) "
-                    "delta (%.2f, %.2f)\n",
-                    i, detection.by_fiducial[i]->x(),
-                    detection.by_fiducial[i]->y(), frame.mark_pixels[i].x(),
-                    frame.mark_pixels[i].y(), delta.x(), delta.y());
+        const double error =
+            (*detection.by_fiducial[i] - frame.mark_pixels[i]).norm();
         maximum = std::max(maximum, error);
         EXPECT_LT(error, 0.3) << "mark " << i;
     }
@@ -323,7 +309,7 @@ TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
     report("Fiducials.CalibrateFiducialsDerivesLayout max error", maximum, "mm");
 }
 
-TEST_F(FilmProject, ProjectIOFilmRoundTrips) {
+TEST_F(ProjectIO, FilmRoundTrips) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("film");
     document.set_active_chunk_id(chunk.id());
@@ -347,19 +333,20 @@ TEST_F(FilmProject, ProjectIOFilmRoundTrips) {
     (*camera.film_transform)(1, 2) = 790.0;
     chunk.cameras().push_back(camera);
     const Chunk original = chunk;
-    const std::string psx = path("film.psx");
+    const std::string psx = temp_project("filmtrip");
     ProjectIO::save(document, psx);
     const std::shared_ptr<Document> loaded = ProjectIO::load(psx);
     ASSERT_TRUE(loaded != nullptr);
     ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
     EXPECT_TRUE(*loaded->workspace().chunks().front() == original);
-    const std::string text = doc_text(psx);
+    const std::string text = project_doc_text(psx);
+    remove_project(psx);
     EXPECT_NE(text.find("<film transform=\"affine\" detector=\"corner\""),
               std::string::npos);
     EXPECT_NE(text.find("<film_transform values="), std::string::npos);
 }
 
-TEST_F(FilmProject, ProjectIONoFilmKeepsLayout) {
+TEST_F(ProjectIO, NoFilmKeepsLayout) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("plain");
     document.set_active_chunk_id(chunk.id());
@@ -374,16 +361,17 @@ TEST_F(FilmProject, ProjectIONoFilmKeepsLayout) {
     camera.label = "photo";
     chunk.cameras().push_back(camera);
     const Chunk original = chunk;
-    const std::string psx = path("plain.psx");
+    const std::string psx = temp_project("plain");
     ProjectIO::save(document, psx);
-    const std::string text = doc_text(psx);
+    const std::string text = project_doc_text(psx);
     EXPECT_EQ(text.find("<film"), std::string::npos);
     const std::shared_ptr<Document> loaded = ProjectIO::load(psx);
     ASSERT_TRUE(loaded != nullptr);
     EXPECT_TRUE(*loaded->workspace().chunks().front() == original);
+    remove_project(psx);
 }
 
-TEST_F(FilmProject, CommandsSetSensorFilmUndoes) {
+TEST(Commands, SetSensorFilmUndoes) {
     Document document;
     Chunk& chunk = document.workspace().add_chunk("film");
     document.set_active_chunk_id(chunk.id());
