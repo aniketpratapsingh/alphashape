@@ -87,7 +87,12 @@ Image load_camera_image(const Document& document, const Chunk& chunk,
     // to the raw scan: its keypoints would be in the wrong pixel space.
     const Sensor* sensor = find_effective_sensor(chunk, camera);
     if (sensor == nullptr) {
-        if (camera.film_transform.has_value()) {
+        bool film_camera = camera.film_transform.has_value() ||
+                           !camera.fiducial_pixels.empty();
+        for (const Sensor& candidate : chunk.sensors()) {
+            film_camera = film_camera || candidate.film.enabled;
+        }
+        if (film_camera) {
             throw Error(camera_name(camera) +
                         " is a film camera but its sensor link is missing");
         }

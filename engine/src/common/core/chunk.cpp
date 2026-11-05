@@ -314,7 +314,7 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
     // the pose or the intrinsics, and must invalidate the map. Only folded when
     // present, so a digital project keeps its historic fingerprint.
     if (camera.film_transform.has_value()) {
-        h = fold_string(h, "film_transform");
+        h = depth_map_fingerprint_fold_string(h, "film_transform");
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
                 h = fold_double(h, (*camera.film_transform)(r, c));
@@ -322,7 +322,7 @@ std::uint64_t depth_map_fingerprint(const Camera& camera, const Sensor& sensor, 
         }
     }
     if (sensor.film.enabled) {
-        h = fold_string(h, "film_settings");
+        h = depth_map_fingerprint_fold_string(h, "film_settings");
         h = fold_double(h, sensor.film.resolution_mm_per_px);
         const Eigen::Vector2d extent = film_extent_mm(sensor.film);
         h = fold_double(h, extent.x());

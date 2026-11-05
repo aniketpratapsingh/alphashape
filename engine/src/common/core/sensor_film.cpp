@@ -13,7 +13,7 @@ SensorFilmNormalisation normalise_sensor_film(Sensor& sensor,
                                               const std::vector<Camera>& cameras,
                                               std::int32_t sensor_index) {
     SensorFilmNormalisation result;
-    if (!film_geometry_complete(sensor.film)) {
+    if (!sensor.film.enabled || !film_geometry_complete(sensor.film)) {
         return result;  // no canonical frame yet: the raw image still stands
     }
     const FilmSize size = film_normalised_size(sensor.film);
