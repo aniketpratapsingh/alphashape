@@ -90,6 +90,7 @@ add_executable(alphashape_tests
     test_stmap.cpp
     test_calibration_report.cpp
     test_calibration_io.cpp
+    test_marker_sheet.cpp
     test_gpu.cpp
 )
 
