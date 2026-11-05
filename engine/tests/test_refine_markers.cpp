@@ -625,7 +625,11 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
     const double apparent = apparent_radius(scene, 0, 0);
     ASSERT_GT(apparent, 48.0);
     std::mt19937 engine(29U);
-    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    // One projection keeps the 2-D path, so the reported pixel is the window's
+    // own border-fit centre rather than a consensus of several views.
+    const std::vector<std::int32_t> ids = {
+        add_scene_marker(scene, 0, "M0", 0.0, engine,
+                         std::vector<std::size_t>{0})};
     ASSERT_FALSE(ids.empty());
     RefineMarkersOptions options;
     const RefineMarkersStats stats = run_refine(scene, options);
@@ -636,7 +640,7 @@ TEST(Markers, RefineLargeTargetUsesBorderFit) {
         const double rms = rms_to_truth(scene, *marker, 0);
         std::printf("[refine large] apparent %.2f px RMS %.4f px\n", apparent,
                     rms);
-        EXPECT_LE(rms, 0.6) << "marker " << i;
+        EXPECT_LE(rms, 0.5) << "marker " << i;
     }
 }
 
