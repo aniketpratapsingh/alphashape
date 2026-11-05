@@ -90,6 +90,13 @@ struct Calibration {
     /// Exact (bitwise) comparison of every persisted field.
     bool operator==(const Calibration& other) const;
 
+    /// Exact (bitwise) comparison of the camera model alone: type, width,
+    /// height and every intrinsic/distortion coefficient. The posterior
+    /// covariance is derived state, so two calibrations that describe the same
+    /// sensor compare equal here even when their covariances differ. Use this
+    /// for sensor identity and change detection; use operator== for full state.
+    bool same_model(const Calibration& other) const;
+
     /// Project a camera-frame point to pixels. Throws ValueError for a Frame
     /// sensor when z <= 0. Fisheye accepts z <= 0 (up to the antipode).
     Eigen::Vector2d project(const Eigen::Vector3d& p_cam) const;

@@ -208,12 +208,16 @@ Calibration Calibration::initial(CameraType type, int width, int height,
     return c;
 }
 
-bool Calibration::operator==(const Calibration& other) const {
+bool Calibration::same_model(const Calibration& other) const {
     return type == other.type && width == other.width && height == other.height &&
            f == other.f && cx == other.cx && cy == other.cy && b1 == other.b1 &&
            b2 == other.b2 && k1 == other.k1 && k2 == other.k2 && k3 == other.k3 &&
            k4 == other.k4 && p1 == other.p1 && p2 == other.p2 && p3 == other.p3 &&
-           p4 == other.p4 && covariance_params == other.covariance_params &&
+           p4 == other.p4;
+}
+
+bool Calibration::operator==(const Calibration& other) const {
+    return same_model(other) && covariance_params == other.covariance_params &&
            covariance.rows() == other.covariance.rows() &&
            covariance.cols() == other.covariance.cols() &&
            (covariance.array() == other.covariance.array()).all();
