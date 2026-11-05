@@ -13,9 +13,9 @@
 namespace alphashape {
 namespace {
 
-/// Locale-sensitive by the standard, but every caller here runs under the
-/// process locale the project file path already depends on, and the task
-/// contract names snprintf as the accepted formatter.
+/// snprintf follows LC_NUMERIC, so the PDF uses the process decimal
+/// separator. The applications keep LC_NUMERIC at "C", which makes it '.';
+/// this is not locale-independent.
 std::string number(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof buffer, "%.6g", value);

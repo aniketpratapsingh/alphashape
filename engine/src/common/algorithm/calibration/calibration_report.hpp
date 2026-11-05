@@ -4,9 +4,10 @@
 /// @brief Human-readable calibration reports: distortion plot, HTML and PDF.
 ///
 /// A report renders one solved sensor, or explains why a sensor was skipped.
-/// Every renderer formats numbers with snprintf-family helpers, never a
-/// locale-dependent stream, so a report is identical regardless of the process
-/// locale's decimal separator.
+/// Numbers are formatted with snprintf-family helpers, which follow the
+/// LC_NUMERIC category and so emit the locale's decimal separator; the
+/// applications keep LC_NUMERIC at "C", which fixes it at '.'. A report is
+/// therefore only decimal-separator independent while that holds.
 
 #include <cstdint>
 #include <string>

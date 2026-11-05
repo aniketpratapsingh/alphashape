@@ -17,6 +17,9 @@ constexpr int kPlotColumns = 17;
 constexpr int kPlotRows = 13;
 constexpr double kArrowFraction = 0.08;
 
+/// snprintf follows LC_NUMERIC, so these values use the process decimal
+/// separator. The applications keep LC_NUMERIC at "C", which makes it '.';
+/// they are not locale-independent.
 std::string format_number(double value) {
     char buffer[64];
     std::snprintf(buffer, sizeof buffer, "%.6g", value);
