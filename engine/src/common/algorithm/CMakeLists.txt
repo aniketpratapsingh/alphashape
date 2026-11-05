@@ -33,6 +33,8 @@ add_library(alphashape_algorithms STATIC
     calibration/fiducials.cpp
     calibration/calibrate.cpp
     calibration/calibrate_camera_task.cpp
+    calibration/detect_fiducials_task.cpp
+    calibration/calibrate_fiducials_task.cpp
     calibration/calibration_io.cpp
     sfm/five_point.cpp
     sfm/essential.cpp
