@@ -7,6 +7,7 @@
 /// reads the document and writes one file, never mutating the chunk.
 
 #include <string>
+#include <vector>
 
 #include "common/tasks/task.hpp"
 
