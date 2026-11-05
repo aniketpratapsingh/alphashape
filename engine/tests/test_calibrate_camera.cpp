@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -652,6 +654,38 @@ TEST(CalibrateCamera, MixedSizesSkipOnlyThatSensor) {
     ASSERT_NE(skipped, nullptr);
     EXPECT_TRUE(skipped->find("differing image sizes") != std::string::npos)
         << *skipped;
+}
+
+TEST(CalibrateCamera, WritesReport) {
+    CalibrateScene scene = make_calibrate_scene(101U, 5);
+    const std::string path =
+        platform::unique_temp_path("alphashape_calreport_", ".html");
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_path", ParamValue{path});
+    run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+    std::ifstream file(path, std::ios::binary);
+    ASSERT_TRUE(file.good()) << path;
+    const std::string report((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+    file.close();
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::printf("[calibrate camera report] %zu bytes\n", report.size());
+    EXPECT_NE(report.find("RMS"), std::string::npos);
+    EXPECT_NE(report.find("sensor"), std::string::npos);
+}
+
+TEST(CalibrateCamera, RejectsUnknownReportFormat) {
+    CalibrateScene scene = make_calibrate_scene(102U, 5);
+    Params params = make_params(builtin_registry().require("CalibrateCamera"));
+    params.set("report_format", ParamValue{std::string{"json"}});
+    try {
+        run_task(builtin_registry(), scene.document, "CalibrateCamera", params);
+        FAIL() << "an unknown report format must be rejected";
+    } catch (const ValueError& error) {
+        EXPECT_NE(std::string(error.what()).find("json"), std::string::npos)
+            << error.what();
+    }
 }
 
 }  // namespace alphashape
