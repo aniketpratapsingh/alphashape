@@ -16,6 +16,7 @@ add_executable(alphashape_tests
     test_camera_model.cpp
     test_downsample.cpp
     test_add_photos.cpp
+    test_camera_groups.cpp
     test_two_view.cpp
     test_five_point.cpp
     test_matcher.cpp
