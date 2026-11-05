@@ -481,6 +481,7 @@ TEST(MarkerSheet, ChessboardRotatedToFit) {
     options.board_rows = 8;
     options.square_mm = 20.0;
     options.corner_marks = false;
+    options.labels = false;  // keep the footer text out of the detector's view
     const double dpi = 200.0;
     const Image sheet = raster(options, dpi);
     const FloatImage gray = to_float_image(sheet);
