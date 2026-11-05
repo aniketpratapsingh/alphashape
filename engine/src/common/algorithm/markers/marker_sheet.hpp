@@ -18,6 +18,12 @@
 /// Text (code labels and the footer) is vector text in the PDF only; a raster
 /// has no font rasteriser, so it omits the labels while keeping every target,
 /// quiet zone and corner mark.
+///
+/// Circular codes print the documented centre dot for parity 1 and a white
+/// centre for parity 0. The WP-13.5 blob detector seeds a circular candidate
+/// from that dark centre dot, so a decode-back test uses parity-1 ids; the
+/// printed geometry of every id is complete and a caller that already has a
+/// candidate decodes both parities.
 
 #include <cstdint>
 #include <optional>

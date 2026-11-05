@@ -44,7 +44,7 @@ class MarkerSheetTest(unittest.TestCase):
     def test_rejects_code_range(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "bad.pdf")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(alphashape.ValueError):
                 alphashape.make_marker_sheet(
                     path, "circular12", first_code=1000000, count=1
                 )
@@ -52,13 +52,13 @@ class MarkerSheetTest(unittest.TestCase):
     def test_rejects_unknown_target(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "bad.pdf")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(alphashape.ValueError):
                 alphashape.make_marker_sheet(path, "nonsense")
 
     def test_rejects_oversized_board(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "bad.pdf")
-            with self.assertRaises(ValueError):
+            with self.assertRaises(alphashape.ValueError):
                 alphashape.make_chessboard_sheet(
                     path, cols=9, rows=6, square_mm=100.0
                 )
