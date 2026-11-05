@@ -88,6 +88,24 @@ FiducialDetectOptions options_for(const FilmSettings& settings) {
     return options;
 }
 
+/// 2x2 linear part of a film -> pixel map, normalised by its Frobenius norm.
+/// The canonical map diag(1, -1) and its dihedral variants all have norm
+/// sqrt(2), so this exposes orientation alone.
+Eigen::Matrix2d normalised_linear(const Eigen::Matrix3d& transform) {
+    const Eigen::Matrix2d linear = transform.block<2, 2>(0, 0);
+    return linear * (std::sqrt(2.0) / linear.norm());
+}
+
+void expect_linear_near(const Eigen::Matrix2d& got, const Eigen::Matrix2d& want,
+                        double tolerance) {
+    for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 2; ++col) {
+            EXPECT_NEAR(got(row, col), want(row, col), tolerance)
+                << "entry (" << row << "," << col << ")";
+        }
+    }
+}
+
 test::FilmFrameSpec base_spec() {
     test::FilmFrameSpec spec;
     spec.frame_half_mm = 50.0;
@@ -193,16 +211,17 @@ TEST(Fiducials, OrdersRotatedScan) {
     const std::vector<Eigen::Vector2d> marks = centred_marks();
     FilmSettings settings = layout_for(marks);
     settings.detector = FiducialDetector::Circle;
-    for (int variant = 0; variant < 4; ++variant) {
+    for (int variant = 0; variant < 8; ++variant) {
         test::FilmFrameSpec spec = base_spec();
         spec.marks_mm = marks;
-        spec.rotation_deg = (variant % 2 == 0) ? 90.0 : 180.0;
-        spec.mirror = variant >= 2;
+        spec.rotation_deg = 90.0 * static_cast<double>(variant % 4);
+        spec.mirror = variant >= 4;
         const test::FilmFrame frame = test::render_film_frame(spec);
         const FiducialDetection detection =
             detect_fiducials(frame.image, settings, options_for(settings));
         ASSERT_TRUE(detection.failure.empty())
             << "variant " << variant << ": " << detection.failure;
+        EXPECT_FALSE(detection.ambiguous) << "variant " << variant;
         ASSERT_EQ(detection.by_fiducial.size(), frame.mark_pixels.size());
         double maximum = 0.0;
         for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
@@ -214,6 +233,83 @@ TEST(Fiducials, OrdersRotatedScan) {
         EXPECT_LT(maximum, 1.0) << "variant " << variant;
         report("Fiducials.OrdersRotatedScan max error", maximum, "px");
     }
+}
+
+/// A square layout is dihedrally symmetric, so a 90-degree scan leaves eight
+/// equally good assignments. With the matching prior the correct one wins; the
+/// default prior (rotation 0) deliberately selects the canonical, unrotated
+/// labelling instead. Both report `ambiguous`.
+TEST(Fiducials, SymmetricRotatedScanUsesOrientationPrior) {
+    test::FilmFrameSpec spec = base_spec();
+    spec.marks_mm = marks4(40.0);
+    spec.rotation_deg = 90.0;
+    const test::FilmFrame frame = test::render_film_frame(spec);
+    FilmSettings settings = corner_layout(40.0);
+    settings.detector = FiducialDetector::Circle;
+
+    FiducialDetectOptions options = options_for(settings);
+    options.scan_orientation = "90";
+    const FiducialDetection rotated =
+        detect_fiducials(frame.image, settings, options);
+    ASSERT_TRUE(rotated.failure.empty()) << rotated.failure;
+    EXPECT_TRUE(rotated.ambiguous);
+    ASSERT_TRUE(rotated.transform.has_value());
+    Eigen::Matrix2d want;
+    want << 0.0, 1.0, 1.0, 0.0;  // rotation 90 composed with the y flip
+    expect_linear_near(normalised_linear(*rotated.transform), want, 1e-2);
+    ASSERT_EQ(rotated.by_fiducial.size(), frame.mark_pixels.size());
+    for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
+        ASSERT_TRUE(rotated.by_fiducial[i].has_value()) << "mark " << i;
+        EXPECT_LT((*rotated.by_fiducial[i] - frame.mark_pixels[i]).norm(), 1.0)
+            << "mark " << i;
+    }
+
+    options.scan_orientation = "0";
+    const FiducialDetection canonical =
+        detect_fiducials(frame.image, settings, options);
+    ASSERT_TRUE(canonical.failure.empty()) << canonical.failure;
+    EXPECT_TRUE(canonical.ambiguous);
+    ASSERT_TRUE(canonical.transform.has_value());
+    Eigen::Matrix2d canonical_want;
+    canonical_want << 1.0, 0.0, 0.0, -1.0;
+    expect_linear_near(normalised_linear(*canonical.transform), canonical_want,
+                       1e-2);
+    // The canonical prior must not claim the rotated marks are the truth.
+    bool differs = false;
+    for (std::size_t i = 0; i < frame.mark_pixels.size(); ++i) {
+        if (!canonical.by_fiducial[i].has_value()) {
+            continue;
+        }
+        if ((*canonical.by_fiducial[i] - frame.mark_pixels[i]).norm() > 1.0) {
+            differs = true;
+        }
+    }
+    EXPECT_TRUE(differs);
+}
+
+/// Three marks fit an affine exactly, so every relabeling has zero RMS. A
+/// sheared expected layout produces an anisotropic affine; the near-similarity
+/// gate must reject it rather than silently returning the shear.
+TEST(Fiducials, ThreeMarkShearedRelabelingRejected) {
+    const std::vector<Eigen::Vector2d> film = {
+        Eigen::Vector2d(-45.0, 42.0), Eigen::Vector2d(40.0, 47.0),
+        Eigen::Vector2d(45.0, -44.0)};
+    test::FilmFrameSpec spec = base_spec();
+    spec.marks_mm = film;
+    spec.rotation_deg = 0.0;
+    const test::FilmFrame frame = test::render_film_frame(spec);
+    FilmSettings settings = layout_for(film);
+    settings.detector = FiducialDetector::Circle;
+    const Eigen::Matrix2d shear = (Eigen::Matrix2d() << 1.0, 0.3, 0.0, 1.0).finished();
+    for (Fiducial& fiducial : settings.fiducials) {
+        fiducial.film_mm = shear * fiducial.film_mm;
+    }
+    const FiducialDetection detection =
+        detect_fiducials(frame.image, settings, options_for(settings));
+    EXPECT_NE(detection.failure.find("fiducial ordering failed"), std::string::npos)
+        << detection.failure;
+    EXPECT_FALSE(detection.transform.has_value());
+    EXPECT_TRUE(detection.by_fiducial.empty());
 }
 
 TEST(Fiducials, AffineTransformRecovered) {

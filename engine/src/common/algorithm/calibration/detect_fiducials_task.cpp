@@ -59,6 +59,7 @@ struct CameraOutcome {
     std::vector<std::optional<Eigen::Vector2d>> pixels;
     std::optional<Eigen::Matrix3d> transform;
     double rms_px = 0.0;
+    bool ambiguous = false;
 };
 
 CameraOutcome run_camera(const Document& document, const Chunk& chunk,
@@ -89,6 +90,8 @@ CameraOutcome run_camera(const Document& document, const Chunk& chunk,
     detect.min_radius_px = options.min_radius_px;
     detect.max_radius_px = options.max_radius_px;
     detect.max_residual_px = options.max_residual_px;
+    detect.max_anisotropy = options.max_anisotropy;
+    detect.scan_orientation = options.scan_orientation;
     const FiducialDetection result = detect_fiducials(gray, sensor.film, detect);
     if (!result.failure.empty()) {
         out.status = result.failure;
@@ -98,6 +101,7 @@ CameraOutcome run_camera(const Document& document, const Chunk& chunk,
     out.status = result.transform.has_value() ? "ok" : "ok_pixels_only";
     out.transform = result.transform;
     out.rms_px = result.rms_px;
+    out.ambiguous = result.ambiguous;
     if (!result.by_fiducial.empty()) {
         out.pixels = result.by_fiducial;
     } else {
@@ -128,6 +132,19 @@ void DetectFiducialsTask::declare_params(Params& params) const {
                        "Largest acceptable ordering RMS, pixels."};
     residual.minimum = 0.0;
     params.declare(residual);
+    ParamSpec orientation{
+        "scan_orientation", ParamType::String, std::string("0"),
+        "Assumed film-to-scan orientation: 0, 90, 180 or 270, with an 'm' "
+        "suffix when the scan is mirrored. Used only when the layout is "
+        "dihedrally symmetric."};
+    orientation.choices = {"0", "90", "180", "270",
+                           "0m", "90m", "180m", "270m"};
+    params.declare(orientation);
+    ParamSpec anisotropy{
+        "max_anisotropy", ParamType::Float, 0.02,
+        "Largest allowed |sigma1/sigma2 - 1| of the film-to-scan map."};
+    anisotropy.minimum = 0.0;
+    params.declare(anisotropy);
     params.declare({"cameras", ParamType::StringList, std::vector<std::string>{},
                     "Camera ids to process; empty means every film camera."});
 }
@@ -143,6 +160,8 @@ void DetectFiducialsTask::apply(Document& document, Params& params,
     options.min_radius_px = params.get_float("min_radius");
     options.max_radius_px = params.get_float("max_radius");
     options.max_residual_px = params.get_float("max_residual_px");
+    options.max_anisotropy = params.get_float("max_anisotropy");
+    options.scan_orientation = params.get_string("scan_orientation");
     for (const std::string& text : params.get_string_list("cameras")) {
         std::int32_t id = 0;
         const char* begin = text.data();
@@ -184,6 +203,7 @@ void DetectFiducialsTask::apply(Document& document, Params& params,
         const std::string prefix = "fiducials/" + std::to_string(camera.id) + "/";
         staged.meta().set(prefix + "status", outcome.status);
         staged.meta().set(prefix + "rms_px", std::to_string(outcome.rms_px));
+        staged.meta().set(prefix + "ambiguous", outcome.ambiguous ? "1" : "0");
         if (outcome.ok) {
             Camera& target = staged.cameras()[i];
             target.fiducial_pixels = outcome.pixels;

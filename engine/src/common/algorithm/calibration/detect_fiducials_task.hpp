@@ -28,6 +28,11 @@ struct DetectFiducialsOptions {
     double min_radius_px = 3.0;
     double max_radius_px = 40.0;
     double max_residual_px = 3.0;
+    /// Largest allowed |sigma1/sigma2 - 1| of the fitted film -> scan map.
+    double max_anisotropy = 0.02;
+    /// Orientation prior used when a dihedrally symmetric layout leaves more
+    /// than one plausible relabeling (see FiducialDetectOptions).
+    std::string scan_orientation = "0";
     /// Camera ids to process. Empty means every camera on a film sensor.
     std::vector<std::int32_t> cameras;
 };

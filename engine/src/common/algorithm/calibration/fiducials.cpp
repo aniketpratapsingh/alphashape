@@ -97,7 +97,7 @@ Gradients sobel_gradients(const FloatImage& image) {
 /// 99.9th percentile instead (documented deviation), which still tracks the
 /// strongest gradients and sits above the noise floor on our synthetic scans.
 /// Returns 0 for an empty sample.
-double percentile99(std::vector<float> values) {
+double percentile999(std::vector<float> values) {
     if (values.empty()) {
         return 0.0;
     }
@@ -367,7 +367,7 @@ std::optional<FrameQuad> detect_frame_quad(const FloatImage& gray) {
     for (std::size_t i = 0; i < gradients.gx.size(); ++i) {
         magnitudes.push_back(std::hypot(gradients.gx[i], gradients.gy[i]));
     }
-    const double p99 = percentile99(magnitudes);
+    const double p99 = percentile999(magnitudes);
     if (!(p99 > 0.0)) {
         return std::nullopt;
     }
@@ -1033,18 +1033,106 @@ Eigen::Vector2d apply_dihedral(const Eigen::Vector2d& direction, int rotation,
 
 struct OrderedLayout {
     bool found = false;
+    bool ambiguous = false;
     Eigen::Matrix3d transform = Eigen::Matrix3d::Identity();
     std::vector<std::size_t> mark_index;
     std::vector<std::size_t> fiducial_index;
     std::vector<double> residuals;
     double rms_px = 0.0;
     std::size_t pairs = 0;
+    std::string failure;
 };
+
+/// Orientation matrix of the scan relative to the film for one prior. The
+/// canonical map (rotation 0, not mirrored) sends film +x to scan +x and film
+/// +y to scan -y; a rotation is applied before, a mirror flips film +x.
+Eigen::Matrix2d orientation_prior(int rotation, bool mirror) {
+    const double angle = 0.5 * kPi * static_cast<double>(rotation);
+    Eigen::Matrix2d matrix;
+    matrix << std::cos(angle), -std::sin(angle), std::sin(angle), std::cos(angle);
+    if (mirror) {
+        matrix.col(0) *= -1.0;
+    }
+    matrix.col(1) *= -1.0;
+    return matrix;
+}
+
+bool parse_scan_orientation(const std::string& text, int& rotation, bool& mirror) {
+    std::string digits = text;
+    mirror = !digits.empty() && digits.back() == 'm';
+    if (mirror) {
+        digits.pop_back();
+    }
+    if (digits == "0") {
+        rotation = 0;
+    } else if (digits == "90") {
+        rotation = 1;
+    } else if (digits == "180") {
+        rotation = 2;
+    } else if (digits == "270") {
+        rotation = 3;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// Local linear part (Jacobian at `film_centroid`) of a film-mm -> pixel map.
+Eigen::Matrix2d linear_part(const Eigen::Matrix3d& transform,
+                            const Eigen::Vector2d& film_centroid) {
+    const Eigen::Vector3d h = transform * Eigen::Vector3d(
+                                               film_centroid.x(),
+                                               film_centroid.y(), 1.0);
+    const double w = std::abs(h.z()) > 1e-12 ? h.z() : 1.0;
+    Eigen::Matrix2d matrix;
+    matrix << transform(0, 0) - h.x() / w * transform(2, 0),
+        transform(0, 1) - h.x() / w * transform(2, 1),
+        transform(1, 0) - h.y() / w * transform(2, 0),
+        transform(1, 1) - h.y() / w * transform(2, 1);
+    return matrix / w;
+}
+
+/// A plausible relabeling kept for the equivalence-class comparison. The
+/// linear part is stored normalised by its mean singular value so that only
+/// orientation (rotation/mirror) is compared with the prior, never scale.
+struct OrderedCandidate {
+    OrderedLayout layout;
+    Eigen::Matrix2d normalised = Eigen::Matrix2d::Identity();
+};
+
+/// Reject a candidate whose map is not a near-similarity. Returns the linear
+/// part normalised by its mean singular value.
+bool plausible_scan(const Eigen::Matrix2d& linear, double max_anisotropy,
+                    Eigen::Matrix2d& normalised) {
+    const double e = linear.col(0).squaredNorm();
+    const double f = linear.col(1).squaredNorm();
+    const double g = linear.col(0).dot(linear.col(1));
+    if (!(e > 1e-18) || !(f > 1e-18)) {
+        return false;
+    }
+    const double mean = 0.5 * (e + f);
+    const double disc = std::sqrt(std::max(0.0, 0.25 * (e - f) * (e - f) + g * g));
+    const double s1 = std::sqrt(std::max(0.0, mean + disc));
+    const double s2 = std::sqrt(std::max(0.0, mean - disc));
+    if (!(s2 > 1e-18)) {
+        return false;
+    }
+    if (std::abs(s1 / s2 - 1.0) > max_anisotropy) {
+        return false;
+    }
+    if (std::abs(g / std::sqrt(e * f)) > 0.02) {
+        return false;
+    }
+    normalised = linear / (0.5 * (s1 + s2));
+    return true;
+}
 
 bool order_marks(const std::vector<FiducialMark>& marks,
                  const std::vector<ExpectedMark>& expected, FilmTransformType type,
+                 double max_anisotropy, int prior_rotation, bool prior_mirror,
                  OrderedLayout& best) {
     const std::size_t minimum = type == FilmTransformType::Affine ? 3U : 4U;
+    std::vector<OrderedCandidate> candidates;
     for (int mirror = 0; mirror < 2; ++mirror) {
         for (int rotation = 0; rotation < 4; ++rotation) {
             std::vector<Eigen::Vector2d> film;
@@ -1089,24 +1177,83 @@ bool order_marks(const std::vector<FiducialMark>& marks,
             if (!fit_film_transform(film, pixels, type, candidate, rms, &residuals)) {
                 continue;
             }
-            // Prefer an assignment that explains more marks before comparing
-            // RMS: three correspondences fit an affine exactly, so a lower-RMS
-            // subset must not beat a more complete assignment.
-            const bool better =
-                !best.found || film.size() > best.pairs ||
-                (film.size() == best.pairs && rms < best.rms_px);
-            if (better) {
-                best.found = true;
-                best.transform = candidate;
-                best.mark_index = std::move(mark_index);
-                best.fiducial_index = std::move(fiducial_index);
-                best.residuals = std::move(residuals);
-                best.rms_px = rms;
-                best.pairs = film.size();
+            Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
+            for (const Eigen::Vector2d& point : film) {
+                centroid += point;
+            }
+            centroid /= static_cast<double>(film.size());
+            Eigen::Matrix2d normalised;
+            if (!plausible_scan(linear_part(candidate, centroid), max_anisotropy,
+                                normalised)) {
+                continue;
+            }
+            OrderedCandidate kept;
+            kept.layout.found = true;
+            kept.layout.transform = candidate;
+            kept.layout.mark_index = std::move(mark_index);
+            kept.layout.fiducial_index = std::move(fiducial_index);
+            kept.layout.residuals = std::move(residuals);
+            kept.layout.rms_px = rms;
+            kept.layout.pairs = film.size();
+            kept.normalised = normalised;
+            const bool duplicate = std::any_of(
+                candidates.begin(), candidates.end(),
+                [&kept](const OrderedCandidate& other) {
+                    return other.layout.fiducial_index == kept.layout.fiducial_index;
+                });
+            if (!duplicate) {
+                candidates.push_back(std::move(kept));
             }
         }
     }
-    return best.found;
+    if (candidates.empty()) {
+        best.failure = "fiducial ordering failed: no plausible assignment";
+        return false;
+    }
+    std::size_t max_pairs = 0;
+    double best_rms = std::numeric_limits<double>::infinity();
+    for (const OrderedCandidate& candidate : candidates) {
+        max_pairs = std::max(max_pairs, candidate.layout.pairs);
+    }
+    for (const OrderedCandidate& candidate : candidates) {
+        if (candidate.layout.pairs == max_pairs) {
+            best_rms = std::min(best_rms, candidate.layout.rms_px);
+        }
+    }
+    const double tolerance = std::max(0.25, 0.5 * best_rms);
+    std::vector<const OrderedCandidate*> chosen;
+    for (const OrderedCandidate& candidate : candidates) {
+        if (candidate.layout.pairs == max_pairs &&
+            candidate.layout.rms_px <= best_rms + tolerance) {
+            chosen.push_back(&candidate);
+        }
+    }
+    const Eigen::Matrix2d prior = orientation_prior(prior_rotation, prior_mirror);
+    const OrderedCandidate* pick = nullptr;
+    double best_distance = std::numeric_limits<double>::infinity();
+    double second_distance = best_distance;
+    for (const OrderedCandidate* candidate : chosen) {
+        const double distance = (candidate->normalised - prior).norm();
+        if (distance < best_distance) {
+            second_distance = best_distance;
+            best_distance = distance;
+            pick = candidate;
+        } else if (distance < second_distance) {
+            second_distance = distance;
+        }
+    }
+    if (pick == nullptr) {
+        best.failure = "fiducial ordering failed: no consistent assignment";
+        return false;
+    }
+    if (chosen.size() > 1 && second_distance - best_distance <= 1e-6) {
+        best.failure =
+            "fiducial ordering failed: ordering ambiguous under dihedral symmetry";
+        return false;
+    }
+    best = pick->layout;
+    best.ambiguous = chosen.size() > 1;
+    return true;
 }
 
 }  // namespace
@@ -1133,6 +1280,17 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
         !(options.max_radius_px > options.min_radius_px) ||
         !(options.max_residual_px > 0.0)) {
         throw ValueError("detect_fiducials: radii and max_residual_px must be positive");
+    }
+    if (!std::isfinite(options.max_anisotropy) ||
+        !(options.max_anisotropy >= 0.0)) {
+        throw ValueError("detect_fiducials: max_anisotropy must be non-negative");
+    }
+    int prior_rotation = 0;
+    bool prior_mirror = false;
+    if (!parse_scan_orientation(options.scan_orientation, prior_rotation,
+                                prior_mirror)) {
+        throw ValueError("detect_fiducials: unknown scan_orientation '" +
+                         options.scan_orientation + "'");
     }
     if (!settings.enabled) {
         result.failure = "film is not enabled on this sensor";
@@ -1193,8 +1351,11 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
         return result;
     }
     OrderedLayout best;
-    if (!order_marks(result.marks, expected, settings.transform, best)) {
-        result.failure = "fiducial ordering failed: no consistent assignment";
+    if (!order_marks(result.marks, expected, settings.transform,
+                     options.max_anisotropy, prior_rotation, prior_mirror, best)) {
+        result.failure = best.failure.empty()
+                             ? "fiducial ordering failed: no consistent assignment"
+                             : best.failure;
         return result;
     }
     if (best.rms_px > options.max_residual_px) {
@@ -1211,6 +1372,7 @@ FiducialDetection detect_fiducials(const FloatImage& gray,
     result.transform = best.transform;
     result.rms_px = best.rms_px;
     result.residuals_px = best.residuals;
+    result.ambiguous = best.ambiguous;
     return result;
 }
 
