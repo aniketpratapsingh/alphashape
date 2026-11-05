@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -39,9 +40,26 @@ void ExportSTMapTask::apply(Document& document, Params& params,
     if (path.empty()) {
         throw ValueError("ExportSTMap: path is required");
     }
-    const int sensor_index = static_cast<int>(params.get_int("sensor"));
-    const int width = static_cast<int>(params.get_int("width"));
-    const int height = static_cast<int>(params.get_int("height"));
+    // A map is written as a TIFF, whose dimensions are 32-bit, but the map
+    // allocation is quadratic in them; 65535 is the useful ceiling. Reject an
+    // out-of-range value instead of letting the narrowing cast wrap it.
+    constexpr std::int64_t kMaximumMapSide = 65535;
+    auto map_side = [](std::int64_t value, const char* name) -> int {
+        if (value < 0 || value > kMaximumMapSide) {
+            throw ValueError("ExportSTMap: " + std::string(name) +
+                             " must be between 0 and 65535");
+        }
+        return static_cast<int>(value);
+    };
+    const std::int64_t sensor_value = params.get_int("sensor");
+    if (sensor_value < 0 ||
+        sensor_value > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+        throw ValueError("ExportSTMap: sensor index " +
+                         std::to_string(sensor_value) + " is out of range");
+    }
+    const int sensor_index = static_cast<int>(sensor_value);
+    const int width = map_side(params.get_int("width"), "width");
+    const int height = map_side(params.get_int("height"), "height");
 
     const Chunk* chunk = document.active_chunk();
     if (chunk == nullptr) {
