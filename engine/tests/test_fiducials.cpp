@@ -25,9 +25,13 @@
 #include "common/algorithm/calibration/fiducials.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
+#include "common/core/frame.hpp"
 #include "common/io/project_io.hpp"
+#include "common/tasks/registry.hpp"
 #include "image/image.hpp"
+#include "image/io/image_io.hpp"
 #include "make_film_frame.hpp"
+#include "model/camera/calibration.hpp"
 
 namespace alphashape {
 namespace {
@@ -147,6 +151,58 @@ std::string project_doc_text(const std::string& psx) {
     const std::vector<std::uint8_t> bytes(
         (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     return ZipArchive::parse(bytes).get_text("doc.xml");
+}
+
+/// Removes one PNG when the test scope ends.
+struct ScopedPng {
+    std::string path;
+    ~ScopedPng() {
+        if (!path.empty()) {
+            std::error_code error;
+            fs::remove(path, error);
+        }
+    }
+};
+
+std::string write_frame_png(const test::FilmFrame& frame, const std::string& name) {
+    Image image(frame.image.width(), frame.image.height(), 1);
+    for (int y = 0; y < frame.image.height(); ++y) {
+        for (int x = 0; x < frame.image.width(); ++x) {
+            const double value = std::clamp(
+                static_cast<double>(frame.image.at(x, y)), 0.0, 1.0);
+            image.at(x, y) = static_cast<std::uint8_t>(std::lround(value * 255.0));
+        }
+    }
+    const std::string path =
+        platform::unique_temp_path("alphashape_film_" + name + "_", ".png");
+    write_png(path, image);
+    return path;
+}
+
+/// A chunk with one film sensor, one camera and its frame on disk.
+void add_film_camera(Document& document, Chunk& chunk, const FilmSettings& film,
+                     const test::FilmFrame& frame, const std::string& path) {
+    document.set_active_chunk_id(chunk.id());
+    Sensor sensor;
+    sensor.label = "film-camera";
+    sensor.type = CameraType::Frame;
+    sensor.width = frame.image.width();
+    sensor.height = frame.image.height();
+    sensor.calibration =
+        Calibration::initial(CameraType::Frame, sensor.width, sensor.height, 1234.0);
+    sensor.film = film;
+    chunk.sensors().push_back(sensor);
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.sensor_id = 0;
+    camera.label = "scan";
+    camera.enabled = true;
+    chunk.cameras().push_back(camera);
+    auto frame_record =
+        std::make_shared<Frame>(path, sensor.width, sensor.height);
+    frame_record->set_id(chunk.allocate_id());
+    frame_record->set_camera_id(camera.id);
+    chunk.frames().push_back(frame_record);
 }
 
 TEST(Fiducials, FrameQuadCorners) {
@@ -403,6 +459,46 @@ TEST(Fiducials, CalibrateFiducialsDerivesLayout) {
         EXPECT_LT(error, 0.01) << "fiducial " << i;
     }
     report("Fiducials.CalibrateFiducialsDerivesLayout max error", maximum, "mm");
+}
+
+/// Without a calibrated layout detection still reports the raw marks, but they
+/// must not be stored in `Camera::fiducial_pixels` (parallel to the layout):
+/// saving such a project must reload cleanly.
+TEST(Fiducials, PixelsOnlyDetectionRoundTrips) {
+    test::FilmFrameSpec spec = base_spec();
+    spec.marks_mm = centred_marks();
+    const test::FilmFrame frame = test::render_film_frame(spec);
+    ScopedPng png{write_frame_png(frame, "pixelsonly")};
+    FilmSettings film;
+    film.enabled = true;
+    film.detector = FiducialDetector::Circle;
+    film.search_corners = true;
+    Document document;
+    Chunk& chunk = document.workspace().add_chunk("film");
+    add_film_camera(document, chunk, film, frame, png.path);
+    Params params = make_params(builtin_registry().require("DetectFiducials"));
+    run_task(builtin_registry(), document, "DetectFiducials", params);
+
+    const std::int32_t camera_id = chunk.cameras()[0].id;
+    EXPECT_TRUE(chunk.cameras()[0].fiducial_pixels.empty());
+    EXPECT_FALSE(chunk.cameras()[0].film_transform.has_value());
+    const std::string prefix = "fiducials/" + std::to_string(camera_id) + "/";
+    const std::string* status = chunk.meta().find(prefix + "status");
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(*status, "ok_pixels_only");
+    const std::string* marks = chunk.meta().find(prefix + "marks");
+    ASSERT_NE(marks, nullptr);
+    EXPECT_EQ(std::count(marks->begin(), marks->end(), ';'),
+              static_cast<std::ptrdiff_t>(3));
+
+    const std::string psx = temp_project("pixelsonly");
+    ProjectIO::save(document, psx);
+    const std::shared_ptr<Document> loaded = ProjectIO::load(psx);
+    ASSERT_TRUE(loaded != nullptr);
+    ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
+    EXPECT_TRUE(
+        loaded->workspace().chunks().front()->cameras()[0].fiducial_pixels.empty());
+    remove_project(psx);
 }
 
 TEST(ProjectIO, FilmRoundTrips) {

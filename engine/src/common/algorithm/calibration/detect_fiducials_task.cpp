@@ -57,6 +57,8 @@ struct CameraOutcome {
     bool ok = false;
     std::string status;
     std::vector<std::optional<Eigen::Vector2d>> pixels;
+    /// Raw marks when the sensor has no layout yet (pixels only).
+    std::vector<FiducialMark> marks;
     std::optional<Eigen::Matrix3d> transform;
     double rms_px = 0.0;
     bool ambiguous = false;
@@ -102,13 +104,12 @@ CameraOutcome run_camera(const Document& document, const Chunk& chunk,
     out.transform = result.transform;
     out.rms_px = result.rms_px;
     out.ambiguous = result.ambiguous;
+    // `Camera::fiducial_pixels` is parallel to the sensor's layout, so without
+    // a layout it must stay empty; the raw marks go into metadata instead.
     if (!result.by_fiducial.empty()) {
         out.pixels = result.by_fiducial;
     } else {
-        out.pixels.reserve(result.marks.size());
-        for (const FiducialMark& mark : result.marks) {
-            out.pixels.emplace_back(mark.pixel);
-        }
+        out.marks = result.marks;
     }
     return out;
 }
@@ -204,6 +205,19 @@ void DetectFiducialsTask::apply(Document& document, Params& params,
         staged.meta().set(prefix + "status", outcome.status);
         staged.meta().set(prefix + "rms_px", std::to_string(outcome.rms_px));
         staged.meta().set(prefix + "ambiguous", outcome.ambiguous ? "1" : "0");
+        if (!outcome.marks.empty()) {
+            // No layout: report the raw marks as "u,v;u,v;..." so they survive
+            // a save/load without violating the parallel-to-layout contract.
+            std::string joined;
+            for (const FiducialMark& mark : outcome.marks) {
+                if (!joined.empty()) {
+                    joined += ';';
+                }
+                joined += std::to_string(mark.pixel.x()) + "," +
+                          std::to_string(mark.pixel.y());
+            }
+            staged.meta().set(prefix + "marks", joined);
+        }
         if (outcome.ok) {
             Camera& target = staged.cameras()[i];
             target.fiducial_pixels = outcome.pixels;
