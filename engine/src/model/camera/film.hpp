@@ -10,6 +10,14 @@
 /// ASPRS Manual of Photogrammetry). This work package detects, orders, fits
 /// and stores that transform. Applying it inside projection is WP-13.18b.
 ///
+/// Invariant (WP-13.18b): once a sensor's film geometry is complete
+/// (`film_geometry_complete`), the pipeline runs in the film-NORMALISED pixel
+/// frame, so `Sensor::width`/`Sensor::height` AND
+/// `Sensor::calibration.width`/`height` ARE the normalised size, and the
+/// pixel-unit calibration terms (f, cx, cy, b1, b2) are in normalised pixels.
+/// The raw scan size is NOT a sensor property: every frame records its own
+/// image size and the fiducial detector reads the actual scan.
+///
 /// Film coordinates are millimetres with x to the right and y up, origin at
 /// the centre of the fiducial layout (the film centre). Pixel coordinates are
 /// in the engine's continuous image convention, where (0, 0) is the centre of
@@ -64,13 +72,21 @@ struct FilmSettings {
     /// the marks enclose.
     Eigen::Vector2d film_size_mm = Eigen::Vector2d::Zero();
 
+    /// True once the sensor's pixel-unit calibration terms (f, cx, cy, b1, b2)
+    /// are expressed in film-NORMALISED pixels. Persisted as `normalised="1"`
+    /// on `<film>`. False means the coefficients are still in raw scan pixels
+    /// and must be rescaled once the geometry and a film transform are known.
+    bool calibration_normalised = false;
+
     bool operator==(const FilmSettings& other) const {
         return enabled == other.enabled && transform == other.transform &&
                detector == other.detector &&
                search_corners == other.search_corners &&
                search_sides == other.search_sides &&
                resolution_mm_per_px == other.resolution_mm_per_px &&
-               film_size_mm == other.film_size_mm && fiducials == other.fiducials;
+               film_size_mm == other.film_size_mm &&
+               calibration_normalised == other.calibration_normalised &&
+               fiducials == other.fiducials;
     }
 };
 

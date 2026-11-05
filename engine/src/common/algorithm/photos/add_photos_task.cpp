@@ -63,6 +63,18 @@ SensorKey key_of(const Sensor& sensor) {
                      sensor.height};
 }
 
+/// True when a photo belongs to `sensor`. A film sensor's stored width/height
+/// are the NORMALISED frame (WP-13.18b), not any scan's size, so matching it on
+/// dimensions would split every newly imported scan into a new sensor. The
+/// physical identity (make/model/focal) is what groups a film camera's scans.
+bool matches_sensor(const Sensor& sensor, const SensorKey& key) {
+    if (key_of(sensor) == key) {
+        return true;
+    }
+    return sensor.film.enabled && sensor.make == key.make &&
+           sensor.model == key.model && sensor.focal_length_mm == key.focal_length_mm;
+}
+
 std::string or_default(const std::optional<std::string>& value) {
     return value.has_value() ? *value : std::string{};
 }
@@ -343,9 +355,22 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
                                  exif.focal_length_mm.value_or(0.0), info.width, info.height};
 
             item.serial = or_default(exif.body_serial);
-            auto existing = std::find(known_keys.begin(), known_keys.end(), item.key);
-            if (existing != known_keys.end()) {
-                item.sensor_index = static_cast<std::size_t>(existing - known_keys.begin());
+            // The chunk's own sensors come first in known_keys, so match those
+            // with the film-aware rule; sensors discovered earlier in THIS call
+            // are still raw-image sensors and match on the plain key.
+            const std::size_t fixed_count = chunk->sensors().size();
+            std::size_t existing = known_keys.size();
+            for (std::size_t k = 0; k < known_keys.size(); ++k) {
+                const bool same = k < fixed_count
+                                      ? matches_sensor(chunk->sensors()[k], item.key)
+                                      : known_keys[k] == item.key;
+                if (same) {
+                    existing = k;
+                    break;
+                }
+            }
+            if (existing != known_keys.size()) {
+                item.sensor_index = existing;
             } else {
                 item.sensor_index = known_keys.size();
                 known_keys.push_back(item.key);

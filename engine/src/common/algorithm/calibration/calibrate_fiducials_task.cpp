@@ -14,6 +14,7 @@
 #include "base/utils/log.hpp"
 #include "common/algorithm/calibration/fiducials.hpp"
 #include "common/core/chunk.hpp"
+#include "common/core/sensor_film.hpp"
 #include "common/core/types.hpp"
 
 namespace alphashape {
@@ -150,6 +151,10 @@ bool calibrate_one_sensor(const Chunk& chunk, Chunk& staged, std::size_t sensor_
     film.resolution_mm_per_px = options.resolution_mm_per_px;
     staged.sensors()[sensor_index].film = film;
     refit_camera_transforms(staged, static_cast<std::int32_t>(sensor_index), film);
+    // The transforms now exist, so this is the moment a calibration still in
+    // raw scan pixels is converted into the normalised frame (WP-13.18b).
+    (void)normalise_sensor_film(staged.sensors()[sensor_index], staged.cameras(),
+                                static_cast<std::int32_t>(sensor_index));
     const std::string prefix =
         "calibrate_fiducials/" + std::to_string(sensor_index) + "/";
     staged.meta().set(prefix + "reference_camera",

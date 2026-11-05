@@ -29,6 +29,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/core/chunk_ops.hpp"
+#include "common/core/sensor_film.hpp"
 #include "common/io/sidecars.hpp"
 
 #if defined(_WIN32)
@@ -890,17 +891,25 @@ protected:
     }
 
     void stage(Document& document) override {
-        previous_ = require_sensor(document, chunk_id_, sensor_index_, "set sensor film")
-                        .film;
+        previous_ =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor film");
     }
 
     void commit(Document& document) override {
-        require_sensor(document, chunk_id_, sensor_index_, "set sensor film").film =
-            film_;
+        Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor film");
+        // The normalisation flag describes the CALIBRATION, not the layout: a
+        // new layout must not make an already-converted sensor look raw (or
+        // vice versa) just because the caller built a fresh FilmSettings.
+        film_.calibration_normalised = previous_.film.calibration_normalised;
+        sensor.film = film_;
+        // Establish the film-normalised sensor invariant (WP-13.18b).
+        (void)normalise_sensor_film(sensor, require_chunk(document, chunk_id_).cameras(),
+                                    sensor_index_);
     }
 
     void restore(Document& document) override {
-        require_sensor(document, chunk_id_, sensor_index_, "set sensor film").film =
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor film") =
             previous_;
     }
 
@@ -908,7 +917,7 @@ private:
     std::int32_t chunk_id_;
     std::int32_t sensor_index_;
     FilmSettings film_;
-    FilmSettings previous_;
+    Sensor previous_;
 };
 
 class SetSensorAntennaCommand : public StagedMutation {
