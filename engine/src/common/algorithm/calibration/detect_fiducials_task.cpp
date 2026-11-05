@@ -196,7 +196,11 @@ void DetectFiducialsTask::apply(Document& document, Params& params,
         progress.update("detect", (static_cast<double>(i) + 1.0) / total);
     }
     if (candidates == 0) {
-        throw Error("DetectFiducials: no camera on a film-enabled sensor");
+        // A project without film sensors has nothing to detect. Recording the
+        // run parameters and leaving the chunk untouched is the same no-op the
+        // task-schema parity harness expects from every task.
+        progress.update("apply", 1.0);
+        return;
     }
     if (succeeded == 0) {
         throw Error("DetectFiducials: every camera failed to detect fiducials");

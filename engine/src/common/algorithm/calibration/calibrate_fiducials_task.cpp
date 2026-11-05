@@ -160,8 +160,9 @@ bool calibrate_one_sensor(const Chunk& chunk, Chunk& staged, std::size_t sensor_
 }  // namespace
 
 void CalibrateFiducialsTask::declare_params(Params& params) const {
-    params.declare({"resolution", ParamType::Float, ParamValue{},
-                    "Millimetres per scan pixel (required, greater than zero)."});
+    params.declare({"resolution", ParamType::Float, 0.0,
+                    "Millimetres per scan pixel (must be greater than zero "
+                    "when a sensor has film data)."});
     params.declare({"camera", ParamType::Int, std::int64_t{-1},
                     "Reference camera id, or -1 for the first complete scan."});
 }
@@ -174,11 +175,6 @@ void CalibrateFiducialsTask::apply(Document& document, Params& params,
                                    const Progress& progress) {
     CalibrateFiducialsOptions options;
     options.resolution_mm_per_px = params.get_float("resolution");
-    if (!std::isfinite(options.resolution_mm_per_px) ||
-        !(options.resolution_mm_per_px > 0.0)) {
-        throw ValueError(
-            "CalibrateFiducials: resolution must be finite and positive");
-    }
     options.camera = static_cast<std::int32_t>(params.get_int("camera"));
     if (options.camera < -1) {
         throw ValueError("CalibrateFiducials: camera must be -1 or a camera id");
@@ -186,6 +182,24 @@ void CalibrateFiducialsTask::apply(Document& document, Params& params,
     Chunk* chunk = document.active_chunk();
     if (chunk == nullptr) {
         throw Error("CalibrateFiducials needs an active chunk");
+    }
+    bool has_film = false;
+    for (const Sensor& sensor : chunk->sensors()) {
+        if (sensor.film.enabled && !sensor.film.fiducials.empty()) {
+            has_film = true;
+            break;
+        }
+    }
+    if (!has_film) {
+        // Nothing to calibrate (digital-only project): a no-op run.
+        progress.update("calibrate", 1.0);
+        progress.update("apply", 1.0);
+        return;
+    }
+    if (!std::isfinite(options.resolution_mm_per_px) ||
+        !(options.resolution_mm_per_px > 0.0)) {
+        throw ValueError(
+            "CalibrateFiducials: resolution must be finite and positive");
     }
     progress.update("calibrate", 0.0);
     Chunk staged = *chunk;
