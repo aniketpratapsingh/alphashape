@@ -434,8 +434,15 @@ TEST(AttitudePrior, OrientationIgnoredWhenDisabled) {
 }
 
 TEST(AttitudePrior, BoresightMount) {
+    // A boresight replaces the default nadir mount, so start from the nadir
+    // mount's Euler angles and perturb them. The scene's ground grid then stays
+    // in front of the camera while the mount differs from the default by a few
+    // degrees.
+    const crs::EulerAngles nadir =
+        crs::from_matrix(reference::body_to_camera_nadir(), crs::RotationOrder::ZYX);
     Antenna antenna;
-    antenna.boresight_deg = Eigen::Vector3d(5.0, -10.0, 30.0);
+    antenna.boresight_deg =
+        Eigen::Vector3d(nadir.yaw + 2.0, nadir.pitch - 3.0, nadir.roll + 2.0);
     Scene scene = make_scene(crs::RotationOrder::ZYX, antenna.body_to_camera(), true);
     scene.document.active_chunk()->sensors()[0].antenna = antenna;
     run_optimize(scene);

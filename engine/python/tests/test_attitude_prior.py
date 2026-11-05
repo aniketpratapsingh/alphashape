@@ -78,7 +78,7 @@ class TestCameraAttitude(unittest.TestCase):
             cleared = [c for c in stored.cameras if c.label == "fixture_a"][0]
             self.assertIsNone(cleared.reference_rotation_accuracy)
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(alphashape.ValueError):
             chunk.set_camera_reference_rotation_accuracy(9999, (1.0, 1.0, 1.0))
 
     def test_absent_orientation_is_none(self):
