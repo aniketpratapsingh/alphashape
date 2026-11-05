@@ -11,6 +11,8 @@ add_library(alphashape_algorithms STATIC
     chunk/merge_chunks_task.cpp
     photos/add_photos_task.cpp
     reference/xmp_reference.cpp
+    reference/reference_orientation.cpp
+    reference/align_from_reference_task.cpp
     feature/dog_detector.cpp
     feature/mldb_descriptor.cpp
     feature/detect_features_task.cpp
@@ -50,6 +52,7 @@ add_library(alphashape_algorithms STATIC
     sfm/structure_builder.cpp
     sfm/align_cameras_task.cpp
     sfm/optimize_cameras_task.cpp
+    sfm/triangulate_tie_points_task.cpp
     sfm/update_transform_task.cpp
     sfm/georeference.cpp
     sfm/similarity.cpp
