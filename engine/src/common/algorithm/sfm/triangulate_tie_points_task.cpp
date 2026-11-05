@@ -206,21 +206,52 @@ void TriangulateTiePointsTask::apply(Document& document, Params& params,
                 outcome = removed == 0 ? Outcome::Parallax : Outcome::Reprojection;
                 break;
             }
+            // Identify the worst observation by leave-one-out: the outlier is
+            // the view whose keypoint disagrees with the point triangulated
+            // from all the others. Its joint reprojection error can look
+            // moderate because it biased the point itself.
             std::size_t worst = remaining.size();
             double worst_error = 0.0;
+            const bool leave_one_out = remaining.size() <= 12U;
             for (std::size_t i = 0; i < remaining.size(); ++i) {
-                const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
-                double value = std::numeric_limits<double>::infinity();
-                if (x_cam.z() > 0.0) {
-                    const double error =
-                        (calibrations[i]->project(x_cam) - pixels[i]).norm();
-                    if (std::isfinite(error)) {
-                        value = error;
+                if (leave_one_out) {
+                    std::vector<sfm::AbsolutePose> others = poses;
+                    std::vector<Eigen::Vector3d> other_bearings = bearings;
+                    others.erase(others.begin() + static_cast<std::ptrdiff_t>(i));
+                    other_bearings.erase(other_bearings.begin() +
+                                         static_cast<std::ptrdiff_t>(i));
+                    const std::optional<Eigen::Vector3d> candidate =
+                        sfm::triangulate_multiview(others, other_bearings, open_options);
+                    double value = std::numeric_limits<double>::infinity();
+                    if (candidate.has_value() && candidate->allFinite()) {
+                        const Eigen::Vector3d x_cam =
+                            poses[i].R * (*candidate) + poses[i].t;
+                        if (x_cam.z() > 0.0) {
+                            const double error =
+                                (calibrations[i]->project(x_cam) - pixels[i]).norm();
+                            if (std::isfinite(error)) {
+                                value = error;
+                            }
+                        }
                     }
-                }
-                if (value > worst_error) {
-                    worst_error = value;
-                    worst = i;
+                    if (value > worst_error) {
+                        worst_error = value;
+                        worst = i;
+                    }
+                } else {
+                    const Eigen::Vector3d x_cam = poses[i].R * (*point) + poses[i].t;
+                    double value = std::numeric_limits<double>::infinity();
+                    if (x_cam.z() > 0.0) {
+                        const double error =
+                            (calibrations[i]->project(x_cam) - pixels[i]).norm();
+                        if (std::isfinite(error)) {
+                            value = error;
+                        }
+                    }
+                    if (value > worst_error) {
+                        worst_error = value;
+                        worst = i;
+                    }
                 }
             }
             if (worst_error <= max_error_px) {
