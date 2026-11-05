@@ -36,6 +36,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
+#include "calibration_io_fixture.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/core/document.hpp"
@@ -1770,7 +1771,7 @@ TEST(OptimizeCameras, AdaptiveFittingMetaClearedWhenOff) {
 // Master sensors share one calibration slot (WP-13.16)
 // ---------------------------------------------------------------------------
 
-TEST(CalibrationIO, MasterSharesDuringOptimize) {
+TEST_F(CalibrationIO, MasterSharesDuringOptimize) {
     Calibration truth = Calibration::initial(CameraType::Frame, 4000, 4000, 1600.0);
     truth.k1 = -0.05;
     truth.k2 = 0.04;

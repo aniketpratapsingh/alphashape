@@ -22,6 +22,7 @@
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/portable_rng.hpp"
+#include "calibration_io_fixture.hpp"
 #include "common/algorithm/calibration/calibration_io.hpp"
 #include "model/camera/calibration.hpp"
 
@@ -62,32 +63,6 @@ Calibration opencv_calibration() {
     c.p4 = 0.0;
     return c;
 }
-
-class CalibrationIO : public ::testing::Test {
-protected:
-    void TearDown() override {
-        for (const std::string& path : files_) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-        }
-    }
-
-    std::string path(const std::string& suffix) {
-        std::string value = platform::unique_temp_path("alphashape_calio_", suffix);
-        files_.push_back(value);
-        return value;
-    }
-
-    std::string write(const std::string& suffix, const std::string& text) {
-        const std::string file = path(suffix);
-        std::ofstream out(file, std::ios::binary | std::ios::trunc);
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        EXPECT_TRUE(out.good());
-        return file;
-    }
-
-    std::vector<std::string> files_;
-};
 
 void expect_relative(double actual, double expected, const char* what) {
     const double scale = std::max(1.0, std::max(std::abs(actual), std::abs(expected)));
