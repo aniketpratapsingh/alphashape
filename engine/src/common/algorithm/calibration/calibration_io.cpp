@@ -437,11 +437,11 @@ Calibration from_opencv(const OpenCvModel& m, std::vector<std::string>& warnings
     c.cx = m.cx - 0.5 * static_cast<double>(m.width) + 0.5;
     c.cy = m.cy - 0.5 * static_cast<double>(m.height) + 0.5;
     const std::vector<double>& d = m.distortion;
-    c.k1 = d.size() > 0 ? d[0] : 0.0;
-    c.k2 = d.size() > 1 ? d[1] : 0.0;
-    c.p2 = d.size() > 2 ? d[2] : 0.0;  // OpenCV P1
-    c.p1 = d.size() > 3 ? d[3] : 0.0;  // OpenCV P2
-    c.k3 = d.size() > 4 ? d[4] : 0.0;
+    c.k1 = !d.empty() ? d[0] : 0.0;
+    c.k2 = d.size() > 1U ? d[1] : 0.0;
+    c.p2 = d.size() > 2U ? d[2] : 0.0;  // OpenCV P1
+    c.p1 = d.size() > 3U ? d[3] : 0.0;  // OpenCV P2
+    c.k3 = d.size() > 4U ? d[4] : 0.0;
     for (std::size_t i = 5; i < d.size(); ++i) {
         if (d[i] != 0.0) {
             warnings.emplace_back(std::string(kPrefix) + "distortion coefficient " +
@@ -657,7 +657,7 @@ struct YamlMatrix {
 
 std::vector<double> parse_yaml_data(const std::string& text, std::size_t line_index) {
     const std::string value = trim(text);
-    if (value.size() < 2 || value.front() != '[' || value.back() != ']') {
+    if (value.size() < 2U || value.front() != '[' || value.back() != ']') {
         yaml_fail(line_index, "matrix data must be enclosed in '[' and ']'");
     }
     std::vector<double> numbers;
