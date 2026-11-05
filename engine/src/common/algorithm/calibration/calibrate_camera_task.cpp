@@ -233,17 +233,39 @@ CalibrateCameraPlan plan_calibrate_camera(const Document& document,
         SensorCalibration entry;
         entry.sensor_id = static_cast<std::int32_t>(s);
         entry.label = sensor.label;
+        // Every sensor is solved on its own here, so its own fixed_params
+        // holds terms on top of the task's fit flags.
+        entry.fit = options.fit;
+        for (int k = 0; k < kCalibrationParamCount; ++k) {
+            const std::size_t kk = static_cast<std::size_t>(k);
+            const std::string name(kCalibrationParamNames[kk]);
+            if (std::find(sensor.fixed_params.begin(),
+                          sensor.fixed_params.end(), name) !=
+                sensor.fixed_params.end()) {
+                entry.fit[kk] = false;
+            }
+        }
+        // A held focal length is never re-estimated, so the sensor must
+        // already carry a usable one. Disqualify only this sensor.
+        if (!entry.fit[0] &&
+            (!std::isfinite(sensor.calibration.f) ||
+             !(sensor.calibration.f > 0.0))) {
+            entry.skipped =
+                "focal length is fixed but the sensor has no valid focal length";
+        }
         std::vector<CalibrationView> views;
         int width = 0;
         int height = 0;
         // A frame that cannot be read, or a sensor whose frames disagree on
         // size, disqualifies this sensor only; the remaining sensors still get
         // their chance to calibrate.
-        try {
-            entry.skipped = collect_sensor_views(document, *chunk, sensor, s,
-                                                 spec, width, height, views);
-        } catch (const std::exception& error) {
-            entry.skipped = error.what();
+        if (entry.skipped.empty()) {
+            try {
+                entry.skipped = collect_sensor_views(document, *chunk, sensor, s,
+                                                     spec, width, height, views);
+            } catch (const std::exception& error) {
+                entry.skipped = error.what();
+            }
         }
         if (entry.skipped.empty() &&
             views.size() < static_cast<std::size_t>(kMinimumViews)) {
@@ -253,7 +275,7 @@ CalibrateCameraPlan plan_calibrate_camera(const Document& document,
             try {
                 entry.result =
                     calibrate_camera(width, height, views, sensor.calibration,
-                                     options.fit, CalibrateOptions{});
+                                     entry.fit, CalibrateOptions{});
                 entry.solved = true;
                 ++plan.solved;
             } catch (const std::exception& error) {
@@ -281,6 +303,8 @@ void CalibrateCameraTask::declare_params(Params& params) const {
     // Same fit defaults as OptimizeCameras: the principal point, focal length
     // and low-order radial/tangential terms are free; the affine pair, the
     // highest radial term and the higher-order tangential pair are held.
+    // A sensor's own fixed_params also holds the terms it names, regardless
+    // of these flags.
     params.declare({"fit_f", ParamType::Bool, true, "Adjust the focal length."});
     params.declare({"fit_cx", ParamType::Bool, true, "Adjust the principal point X offset."});
     params.declare({"fit_cy", ParamType::Bool, true, "Adjust the principal point Y offset."});
@@ -385,14 +409,26 @@ void CalibrateCameraTask::apply(Document& document, Params& params,
         staged.meta().set(prefix + "views_used",
                           std::to_string(result.views_used));
         staged.meta().set(prefix + "pruned", joined(result.pruned));
+        // Names held by this sensor's fixed_params that the task would
+        // otherwise have fitted, so a reader can tell a user lock from a
+        // task-level fit flag.
+        std::vector<std::string> held;
+        for (int k = 0; k < kCalibrationParamCount; ++k) {
+            const std::size_t kk = static_cast<std::size_t>(k);
+            if (options.fit[kk] && !entry.fit[kk]) {
+                held.emplace_back(kCalibrationParamNames[kk]);
+            }
+        }
+        staged.meta().set(prefix + "fixed", joined(held));
         // Only a term that was free in the final solve has a meaningful
-        // sigma. A pruned term was zeroed and held for the re-solve, so its
-        // sigma is 0 by construction; publishing that as a measurement would
-        // read as extreme confidence. The pruned list above already names it.
+        // sigma. A pruned term was zeroed and held for the re-solve, and a
+        // term in fixed_params was held from the start, so its sigma is 0 by
+        // construction; publishing that as a measurement would read as
+        // extreme confidence. The lists above already name those terms.
         for (int k = 0; k < kCalibrationParamCount; ++k) {
             const std::size_t kk = static_cast<std::size_t>(k);
             const std::string name = kCalibrationParamNames[kk];
-            if (!options.fit[kk] ||
+            if (!entry.fit[kk] ||
                 std::find(result.pruned.begin(), result.pruned.end(), name) !=
                     result.pruned.end()) {
                 continue;

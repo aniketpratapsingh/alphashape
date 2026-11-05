@@ -40,6 +40,10 @@ struct SensorCalibration {
     std::string label;
     bool solved = false;
     std::string skipped;  ///< Reason when `solved` is false.
+    /// Effective free flags for this sensor: the task's fit_X AND every name
+    /// not in the sensor's own fixed_params. Held terms keep the sensor's
+    /// current values and publish no sigma.
+    CalibrationFitFlags fit{};
     CalibrationResult result;
 };
 
