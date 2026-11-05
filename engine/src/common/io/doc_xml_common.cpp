@@ -638,6 +638,24 @@ bool is_calibration_param_name(const std::string& name) {
     return false;
 }
 
+/// Reject covariance parameter names that are not real calibration
+/// coefficients, and repeats (a repeated name makes the packed order
+/// ambiguous, so the stored matrix cannot be interpreted).
+void check_covariance_param_names(const std::vector<std::string>& params,
+                                  const std::string& prefix) {
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (!is_calibration_param_name(params[i])) {
+            throw ProjectIOError(prefix + "unknown parameter '" + params[i] + "'");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (params[i] == params[j]) {
+                throw ProjectIOError(prefix + "duplicate parameter '" + params[i] +
+                                     "'");
+            }
+        }
+    }
+}
+
 void write_calibration(const Calibration& c, XmlNode& parent) {
     XmlNode& node = add_child(parent, "calibration");
     set_attr(node, "type", camera_type_name(c.type));
@@ -651,7 +669,7 @@ void write_calibration(const Calibration& c, XmlNode& parent) {
     }
     // Posterior covariance (WP-13.13b). Written only when known, so a sensor
     // without covariance stays byte-identical to an older build's output.
-    if (c.covariance.size() == 0) {
+    if (c.covariance.size() == 0 && c.covariance_params.empty()) {
         return;
     }
     if (c.covariance.rows() != c.covariance.cols() ||
@@ -659,6 +677,7 @@ void write_calibration(const Calibration& c, XmlNode& parent) {
         throw ProjectIOError(
             "calibration covariance: matrix and parameter names disagree");
     }
+    check_covariance_param_names(c.covariance_params, "calibration covariance: ");
     XmlNode& cov = add_child(node, "covariance");
     set_attr(cov, "params", join_strings(c.covariance_params));
     std::vector<double> values;
@@ -696,12 +715,7 @@ Calibration read_calibration(const XmlNode* node) {
         if (params.empty()) {
             throw ProjectIOError("doc.xml: <covariance> has no parameter names");
         }
-        for (const std::string& name : params) {
-            if (!is_calibration_param_name(name)) {
-                throw ProjectIOError("doc.xml: <covariance> unknown parameter '" +
-                                     name + "'");
-            }
-        }
+        check_covariance_param_names(params, "doc.xml: <covariance> ");
         const std::size_t n = params.size();
         const std::vector<double> values = parse_doubles(cov->text);
         if (values.size() != n * n) {

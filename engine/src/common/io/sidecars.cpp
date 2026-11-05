@@ -372,8 +372,11 @@ std::vector<std::uint8_t> encode_track_covariance(const std::vector<Track>& trac
             out.push_back(0);
             continue;
         }
-        out.push_back(1);
         const Eigen::Matrix3f& c = *track.covariance;
+        if (!c.allFinite()) {
+            throw ProjectIOError("track covariance file: value is not finite");
+        }
+        out.push_back(1);
         put_f32(out, c(0, 0));
         put_f32(out, c(0, 1));
         put_f32(out, c(0, 2));
