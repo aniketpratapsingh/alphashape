@@ -125,6 +125,10 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(
     std::int32_t chunk_id, Marker marker);
 std::unique_ptr<AbstractCommand> make_remove_marker_command(
     std::int32_t chunk_id, std::int32_t marker_id);
+/// Rename one marker. Undo restores the previous label verbatim. An empty
+/// label is rejected, and so is one another marker in the same chunk carries.
+std::unique_ptr<AbstractCommand> make_set_marker_label_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::string label);
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
     std::int32_t chunk_id, std::int32_t marker_id,
     std::optional<Eigen::Vector3d> reference, Eigen::Vector3d accuracy);

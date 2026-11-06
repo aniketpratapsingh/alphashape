@@ -1298,6 +1298,47 @@ private:
     std::int32_t marker_id_;
 };
 
+/// Rename one marker. The container snapshot restores the previous label on
+/// revert, so apply -> revert -> apply is exact.
+class SetMarkerLabelCommand : public ChunkContainersCommand {
+public:
+    SetMarkerLabelCommand(std::int32_t chunk_id, std::int32_t marker_id,
+                          std::string label)
+        : ChunkContainersCommand(chunk_id), marker_id_(marker_id),
+          label_(std::move(label)) {}
+
+    std::string name() const override { return "Set Marker Label"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        if (label_.empty()) {
+            throw ValueError("set marker label: the label must not be empty");
+        }
+        for (const Marker& marker : chunk.markers()) {
+            if (marker.id != marker_id_ && marker.label == label_) {
+                throw ValueError("set marker label: another marker already has "
+                                 "label '" + label_ + "'");
+            }
+        }
+    }
+
+    void commit(Document& document) override {
+        Marker* marker = find_by_id(target_chunk(document).markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        marker->label = label_;
+    }
+
+private:
+    std::int32_t marker_id_;
+    std::string label_;
+};
+
 class SetMarkerReferenceCommand : public ChunkContainersCommand {
 public:
     SetMarkerReferenceCommand(std::int32_t chunk_id, std::int32_t marker_id,
@@ -3399,6 +3440,12 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(std::int32_t chunk_id,
 std::unique_ptr<AbstractCommand> make_remove_marker_command(std::int32_t chunk_id,
                                                            std::int32_t marker_id) {
     return std::make_unique<RemoveMarkerCommand>(chunk_id, marker_id);
+}
+
+std::unique_ptr<AbstractCommand> make_set_marker_label_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::string label) {
+    return std::make_unique<SetMarkerLabelCommand>(chunk_id, marker_id,
+                                                   std::move(label));
 }
 
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(

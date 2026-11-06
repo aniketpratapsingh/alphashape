@@ -111,6 +111,13 @@ alphashape_add_python_test(python_assets ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_
 alphashape_add_python_test(python_chunk_ops ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_chunk_ops.py
     TIMEOUT 600)
 
+# WP-11.11: the completed data model. Every container, the Marker / MarkerGroup
+# / Scalebar / Asset views, command-backed setters with Document.undo/redo,
+# chunk add/remove/copy/merge/append and the project round trips.
+alphashape_add_python_test(python_data_model
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_data_model.py
+    TIMEOUT 600)
+
 # WP-13.18b: the film-normalised geometry properties on Sensor.
 alphashape_add_python_test(python_film ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_film.py)
 
