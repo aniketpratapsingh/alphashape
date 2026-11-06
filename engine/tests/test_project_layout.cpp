@@ -87,8 +87,7 @@ TEST_F(LayoutTempDir, ProjectLayout_PszRoundTrip) {
     fs::create_directories(path("images"), ec);
     write_text(path("images/a.jpg"), "a");
     write_text(path("images/b.jpg"), "b");
-    Document document =
-        make_document({slashed(path("images/a.jpg")), slashed(path("images/b.jpg"))});
+    Document document = make_document({path("images/a.jpg"), path("images/b.jpg")});
 
     const std::string psz = path("project.psz");
     ProjectIO::save(document, psz);
@@ -110,7 +109,7 @@ TEST_F(LayoutTempDir, ProjectLayout_DirectoryRoundTrip) {
     std::error_code ec;
     fs::create_directories(path("images"), ec);
     write_text(path("images/a.jpg"), "a");
-    Document document = make_document({slashed(path("images/a.jpg"))});
+    Document document = make_document({path("images/a.jpg")});
 
     const std::string psx = path("project.psx");
     ProjectIO::save(document, psx);
@@ -151,7 +150,7 @@ TEST_F(LayoutTempDir, ProjectLayout_RelativePhotosSurviveMove) {
     ASSERT_FALSE(ec) << ec.message();
     write_text(path("src/images/a.jpg"), "a");
 
-    Document document = make_document({slashed(path("src/images/a.jpg"))});
+    Document document = make_document({path("src/images/a.jpg")});
     ProjectIO::save(document, path("src/project.psx"));
 
     // The image tree and the project move together.
@@ -161,7 +160,7 @@ TEST_F(LayoutTempDir, ProjectLayout_RelativePhotosSurviveMove) {
     const std::shared_ptr<Document> loaded = ProjectIO::load(path("dst/project.psx"));
     ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
     const auto& frame = loaded->workspace().chunks().front()->frames().front();
-    EXPECT_EQ(frame->path(), slashed(path("dst/images/a.jpg")));
+    EXPECT_EQ(frame->path(), path("dst/images/a.jpg"));
     EXPECT_TRUE(fs::exists(frame->path()));
 }
 
@@ -185,7 +184,7 @@ TEST_F(LayoutTempDir, ProjectLayout_MissingPhotosWarnNotFail) {
 
 TEST_F(LayoutTempDir, ProjectLayout_AbsolutePathsFlagWritten) {
     write_text(path("a.jpg"), "a");
-    Document document = make_document({slashed(path("a.jpg"))});
+    Document document = make_document({path("a.jpg")});
     ProjectIO::save(document, path("project.psx"), true);
 
     const ZipArchive archive =
@@ -197,7 +196,7 @@ TEST_F(LayoutTempDir, ProjectLayout_AbsolutePathsFlagWritten) {
 
     const std::shared_ptr<Document> loaded = ProjectIO::load(path("project.psx"));
     EXPECT_EQ(loaded->workspace().chunks().front()->frames().front()->path(),
-              slashed(path("a.jpg")));
+              path("a.jpg"));
 }
 
 TEST_F(LayoutTempDir, ProjectLayout_CacheClearedOnClose) {

@@ -42,11 +42,13 @@ bool path_is_absolute(const std::string& path) {
 
 std::string path_for_storage(const std::string& path, const std::string& project_dir,
                              bool absolute_paths) {
-    if (path.empty()) {
-        return std::string();
+    if (path.empty() || project_dir.empty()) {
+        // An in-memory archive has no project location to normalise against,
+        // and its bytes must not change: keep the model's path verbatim.
+        return path;
     }
     const std::string normalised = with_forward_slashes(platform::path_from_utf8(path));
-    if (absolute_paths || project_dir.empty()) {
+    if (absolute_paths) {
         return normalised;
     }
     if (!path_is_absolute(normalised)) {
@@ -68,13 +70,16 @@ std::string path_from_storage(const std::string& stored, const std::string& proj
     if (stored.empty()) {
         return std::string();
     }
-    const std::string normalised = with_forward_slashes(platform::path_from_utf8(stored));
-    if (path_is_absolute(normalised) || project_dir.empty()) {
-        return normalised;
+    const fs::path parsed = platform::path_from_utf8(stored);
+    // The in-memory model uses the platform's native separators (Windows code
+    // that built a path with backslashes must compare equal after a round
+    // trip); only the stored form is forced to '/'.
+    if (path_is_absolute(stored) || project_dir.empty()) {
+        return platform::path_to_utf8(parsed);
     }
-    return with_forward_slashes((platform::path_from_utf8(project_dir) /
-                                 platform::path_from_utf8(normalised))
-                                    .lexically_normal());
+    const fs::path joined =
+        (platform::path_from_utf8(project_dir) / parsed).lexically_normal();
+    return platform::path_to_utf8(joined);
 }
 
 }  // namespace alphashape

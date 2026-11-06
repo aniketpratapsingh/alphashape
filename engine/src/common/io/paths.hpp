@@ -22,9 +22,10 @@ namespace alphashape {
 std::string path_for_storage(const std::string& path, const std::string& project_dir,
                              bool absolute_paths);
 
-/// Resolve a stored path against `project_dir`. An absolute stored path is
-/// returned unchanged (and still uses '/' separators); a relative one is joined
-/// with the project directory. An empty stored path returns empty.
+/// Resolve a stored path against `project_dir`, returning the platform's native
+/// separator form (that is what the model holds in memory). An absolute stored
+/// path is returned as it names that location; a relative one is joined with
+/// the project directory. An empty stored path returns empty.
 std::string path_from_storage(const std::string& stored, const std::string& project_dir);
 
 /// True when `path` names an absolute location: a POSIX root, a Windows drive
