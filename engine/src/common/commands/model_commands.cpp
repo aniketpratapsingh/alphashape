@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/LU>
+
 #include "base/utils/error.hpp"
 #include "common/core/chunk_ops.hpp"
 #include "common/core/sensor_film.hpp"
@@ -585,11 +587,23 @@ protected:
     void validate(Document& document) override {
         require_chunk(document, chunk_id_);
         if (!transform_.allFinite() || !region_.centre.allFinite() ||
-            !region_.size.allFinite()) {
+            !region_.size.allFinite() || !region_.rotation.allFinite()) {
             throw ValueError("set chunk transform: non-finite transform or region");
+        }
+        const Eigen::Matrix3d linear = transform_.block<3, 3>(0, 0);
+        const double determinant = linear.determinant();
+        if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12) {
+            throw ValueError("set chunk transform: transform must be non-singular");
         }
         if ((region_.size.array() <= 0.0).any()) {
             throw ValueError("set chunk transform: region size must be positive");
+        }
+        const Eigen::Matrix3d orthonormal =
+            (region_.rotation.transpose() * region_.rotation -
+             Eigen::Matrix3d::Identity()).norm();
+        if (orthonormal >= 1e-9 || region_.rotation.determinant() <= 0.0) {
+            throw ValueError(
+                "set chunk transform: region rotation must be orthonormal");
         }
     }
 

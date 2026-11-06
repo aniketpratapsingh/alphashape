@@ -615,27 +615,79 @@ TEST(Georeference, RegionAndMarkerCovarianceFollowTheTransform) {
     const auto local_to_true = [&](const Eigen::Vector3d& local) {
         return truth.R.transpose() * (local - truth.t) / truth.scale;
     };
-    const Eigen::Vector3d half = 0.5 * corner_size;
-    Eigen::Vector3d low = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
-    Eigen::Vector3d high = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
-    for (int corner = 0; corner < 8; ++corner) {
-        Eigen::Vector3d offset;
-        offset.x() = (corner & 1) != 0 ? half.x() : -half.x();
-        offset.y() = (corner & 2) != 0 ? half.y() : -half.y();
-        offset.z() = (corner & 4) != 0 ? half.z() : -half.z();
-        const Eigen::Vector3d enu = local_to_true(corner_centre + offset);
-        const Eigen::Vector3d mapped = expected_new_frame(enu, references);
-        low = low.cwiseMin(mapped);
-        high = high.cwiseMax(mapped);
+    // An unrotated source box stays unrotated (the similarity rotation is
+    // carried as the region's orientation); the centre maps like a point and
+    // every extent scales by the similarity's scale.
+    const auto mapped_point = [&](const Eigen::Vector3d& local) {
+        return expected_new_frame(local_to_true(local), references);
+    };
+    const Eigen::Vector3d expected_centre = mapped_point(corner_centre);
+    EXPECT_LT((chunk.region().centre - expected_centre).norm(), 1e-6);
+    for (int axis = 0; axis < 3; ++axis) {
+        Eigen::Vector3d unit = Eigen::Vector3d::Zero();
+        unit[axis] = 1.0;
+        const Eigen::Vector3d image = mapped_point(corner_centre + unit) - expected_centre;
+        const double scale = image.norm();
+        EXPECT_NEAR(chunk.region().size[axis], corner_size[axis] * scale,
+                    corner_size[axis] * 1e-6);
+        EXPECT_LT((chunk.region().rotation.col(axis) - image / scale).norm(), 1e-6);
     }
-    EXPECT_LT((chunk.region().centre - 0.5 * (low + high)).norm(), 1e-6);
-    EXPECT_LT((chunk.region().size - (high - low)).norm(), 1e-6);
 
     // Isotropic covariance: C' = s^2 R C R^T collapses to s^2 C.
     const double expected_var = report.scale * report.scale * 0.04;
     EXPECT_NEAR(chunk.markers()[0].position_covariance(0, 0), expected_var, 1e-12);
     EXPECT_NEAR(chunk.markers()[0].position_covariance(1, 1), expected_var, 1e-12);
     EXPECT_NEAR(chunk.markers()[0].position_covariance(2, 2), expected_var, 1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// 12b. A similarity rotates the region's own rotation
+// ---------------------------------------------------------------------------
+
+TEST(Georeference, SimilarityRotatesRegionRotation) {
+    Scene scene;
+    Chunk chunk = make_scene(scene);
+    const sfm::Similarity truth = truth_similarity();
+    const Eigen::Vector3d region_centre = truth.apply(Eigen::Vector3d(2.0, -1.0, 4.0));
+    const Eigen::Vector3d region_size(12.0, 8.0, 5.0);
+    const Eigen::Matrix3d start =
+        rotation(23.0, Eigen::Vector3d::UnitZ()) * rotation(-11.0, Eigen::Vector3d::UnitX());
+    chunk.region().centre = region_centre;
+    chunk.region().size = region_size;
+    chunk.region().rotation = start;
+
+    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    ASSERT_TRUE(report.applied) << report.reason;
+
+    const std::vector<Eigen::Vector3d> references = reference_points(scene);
+    const auto local_to_true = [&](const Eigen::Vector3d& local) {
+        return truth.R.transpose() * (local - truth.t) / truth.scale;
+    };
+    const auto mapped_point = [&](const Eigen::Vector3d& local) {
+        return expected_new_frame(local_to_true(local), references);
+    };
+    const Eigen::Vector3d mapped_centre = mapped_point(region_centre);
+    EXPECT_LT((chunk.region().centre - mapped_centre).norm(), 1e-6);
+
+    // Recover the similarity's rotation from the image of the three local
+    // axes, then expect the region's orientation to be R_sim * R_old.
+    Eigen::Matrix3d r_sim;
+    double scale = 1.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        Eigen::Vector3d unit = Eigen::Vector3d::Zero();
+        unit[axis] = 1.0;
+        const Eigen::Vector3d image = mapped_point(region_centre + unit) - mapped_centre;
+        scale = image.norm();
+        r_sim.col(axis) = image / scale;
+    }
+    const Eigen::Matrix3d expected_rotation = r_sim * start;
+    for (int axis = 0; axis < 3; ++axis) {
+        EXPECT_LT((chunk.region().rotation.col(axis) -
+                   expected_rotation.col(axis)).norm(), 1e-6);
+        EXPECT_NEAR(chunk.region().size[axis], region_size[axis] * scale,
+                    region_size[axis] * 1e-6);
+    }
+    EXPECT_FALSE(chunk.region().rotation.isIdentity());
 }
 
 // ---------------------------------------------------------------------------
