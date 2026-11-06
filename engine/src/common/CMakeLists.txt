@@ -24,6 +24,7 @@ add_library(alphashape_core STATIC
     commands/undo_stack.cpp
     commands/model_commands.cpp
     io/project_io.cpp
+    io/paths.cpp
     io/doc_xml.cpp
     io/doc_xml_common.cpp
     io/doc_xml_v1.cpp
