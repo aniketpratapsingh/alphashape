@@ -11,6 +11,7 @@
 
 #include "base/platform/env.hpp"
 #include "base/platform/process.hpp"
+#include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 
 namespace alphashape {
