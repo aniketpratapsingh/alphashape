@@ -26,6 +26,7 @@
 #include <QtTest/QTest>
 
 #include "apps/gui/export_controller.hpp"
+#include "apps/gui/modal_hooks.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "common/commands/model_commands.hpp"
@@ -815,4 +816,40 @@ TEST_F(MainWindowTest, ViewportSelectionHighlightsOnlyTheActiveChunksCamera) {
     EXPECT_EQ(selected_camera(selection, first), std::nullopt);
     selection->clear();
     EXPECT_EQ(selected_camera(selection, first), std::nullopt);
+}
+
+TEST_F(MainWindowTest, ResetTransformAsksBeforeDroppingGeoreferencing) {
+    show_window();
+    add_chunk(app(), "Geo");
+    Chunk& chunk = *app().document().workspace().chunks().front();
+    app().document().set_active_chunk_id(chunk.id());
+    chunk.crs().epsg = 4326;
+    chunk.transform() = Transform::Identity();
+    chunk.transform()(0, 3) = 12.0;
+    const Transform before = chunk.transform();
+
+    int asked = 0;
+    modal_hooks().confirm = [&asked](QWidget*, const QString&, const QString&) {
+        ++asked;
+        return false;
+    };
+    EXPECT_TRUE(trigger(QStringLiteral("action.tools.reset_transform")));
+    EXPECT_EQ(asked, 1);
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            EXPECT_DOUBLE_EQ(chunk.transform()(row, col), before(row, col));
+        }
+    }
+
+    modal_hooks().confirm = [&asked](QWidget*, const QString&, const QString&) {
+        ++asked;
+        return true;
+    };
+    EXPECT_TRUE(trigger(QStringLiteral("action.tools.reset_transform")));
+    EXPECT_EQ(asked, 2);
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            EXPECT_DOUBLE_EQ(chunk.transform()(row, col), Transform::Identity()(row, col));
+        }
+    }
 }

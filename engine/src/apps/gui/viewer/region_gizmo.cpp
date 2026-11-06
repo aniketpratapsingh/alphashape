@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <numbers>
+#include <optional>
 #include <utility>
 
 #include <Eigen/LU>
@@ -36,13 +38,27 @@ std::array<Eigen::Vector3d, 8> box_corners(const Region& region) {
     std::array<Eigen::Vector3d, 8> corners{};
     const Eigen::Vector3d half = region.size * 0.5;
     for (int i = 0; i < 8; ++i) {
-        corners[static_cast<std::size_t>(i)] =
-            region.centre +
-            Eigen::Vector3d((i & 1) != 0 ? half.x() : -half.x(),
-                            (i & 2) != 0 ? half.y() : -half.y(),
-                            (i & 4) != 0 ? half.z() : -half.z());
+        const Eigen::Vector3d offset((i & 1) != 0 ? half.x() : -half.x(),
+                                     (i & 2) != 0 ? half.y() : -half.y(),
+                                     (i & 4) != 0 ? half.z() : -half.z());
+        corners[static_cast<std::size_t>(i)] = region.centre + region.rotation * offset;
     }
     return corners;
+}
+
+/// Express a chunk-local ray in the box's own frame: a point p maps to
+/// R^T (p - centre), so the oriented box becomes an axis-aligned box centred
+/// on the origin and the existing hit test applies unchanged.
+GizmoRay to_region_local(const Region& region, const GizmoRay& ray) {
+    GizmoRay local;
+    local.origin = region.rotation.transpose() * (ray.origin - region.centre);
+    local.direction = region.rotation.transpose() * ray.direction;
+    return local;
+}
+
+Eigen::Vector3d from_region_local(const Region& region,
+                                  const Eigen::Vector3d& local) {
+    return region.centre + region.rotation * local;
 }
 
 /// Parameter `t` on P + t*d of the point closest to the ray O + s*r. Falls back to the
@@ -209,11 +225,11 @@ std::optional<GizmoHandle> pick_handle(const GizmoState& state, RegionGizmoMode 
         double best = kPickRadiusPixels;
         std::optional<GizmoHandle> found;
         for (int i = 0; i < kRingSegments; ++i) {
-            const double angle = 2.0 * M_PI * static_cast<double>(i) /
+            const double angle = 2.0 * std::numbers::pi * static_cast<double>(i) /
                                  static_cast<double>(kRingSegments);
-            const Eigen::Vector3d point =
-                region.centre + Eigen::Vector3d(std::cos(angle) * radius,
-                                                std::sin(angle) * radius, 0.0);
+            const Eigen::Vector3d point = from_region_local(
+                region, Eigen::Vector3d(std::cos(angle) * radius,
+                                        std::sin(angle) * radius, 0.0));
             const std::optional<Eigen::Vector2d> screen = projected(point);
             if (!screen) {
                 continue;
@@ -233,7 +249,12 @@ std::optional<GizmoHandle> pick_handle(const GizmoState& state, RegionGizmoMode 
     }
     if (mode == RegionGizmoMode::Move) {
         const GizmoRay ray = ray_from_screen(view_projection, width, height, pixel);
-        const std::optional<BoxHit> hit = ray_box(state.region, ray);
+        const GizmoRay local_ray = to_region_local(state.region, ray);
+        // The local test box is axis-aligned on the origin with the region's
+        // extents; `axis`/`sign` therefore already name region-local axes.
+        Region local_box;
+        local_box.size = state.region.size;
+        const std::optional<BoxHit> hit = ray_box(local_box, local_ray);
         if (!hit) {
             return std::nullopt;
         }
@@ -243,7 +264,10 @@ std::optional<GizmoHandle> pick_handle(const GizmoState& state, RegionGizmoMode 
         handle.kind = GizmoHandleKind::Face;
         handle.axis = inside ? hit->exit_axis : hit->entry_axis;
         handle.sign = inside ? hit->exit_sign : hit->entry_sign;
-        handle.point = ray.origin + normalised(ray.direction) * (inside ? hit->exit : hit->entry);
+        const Eigen::Vector3d local_point =
+            local_ray.origin + normalised(local_ray.direction) *
+                                   (inside ? hit->exit : hit->entry);
+        handle.point = from_region_local(state.region, local_point);
         return handle;
     }
     // Resize: the nearest corner or edge midpoint in screen space.
@@ -333,24 +357,32 @@ std::optional<GizmoDrag> begin_drag_with_handle(const GizmoState& state,
     drag.start = state;
     drag.handle = handle;
     if (handle.kind == GizmoHandleKind::Ring) {
-        const std::optional<Eigen::Vector3d> hit = plane_hit(state.region.centre.z(), ray);
+        // The ring lies in the box's local XY plane, so the hit test runs in
+        // the box frame and the angle is measured about its local Z.
+        const GizmoRay local_ray = to_region_local(state.region, ray);
+        const std::optional<Eigen::Vector3d> hit = plane_hit(0.0, local_ray);
         if (!hit) {
             return std::nullopt;
         }
-        drag.start_angle =
-            std::atan2(hit->y() - state.region.centre.y(), hit->x() - state.region.centre.x());
-        drag.line_origin = state.region.centre;
+        drag.start_angle = std::atan2(hit->y(), hit->x());
+        drag.line_origin = Eigen::Vector3d::Zero();
         drag.line_direction = Eigen::Vector3d::UnitZ();
         return drag;
     }
     if (handle.kind == GizmoHandleKind::Face) {
         Eigen::Vector3d axis = Eigen::Vector3d::Zero();
         if (handle.axis >= 0 && handle.axis < 3) {
-            axis[handle.axis] = 1.0;
+            // Move always follows +axis (the face normal), so the centre
+            // tracks the cursor on a negative face too. Resize measures along
+            // the signed outward normal, so its delta is the growth itself.
+            axis[handle.axis] =
+                handle.mode == RegionGizmoMode::Move
+                    ? 1.0
+                    : (handle.sign < 0 ? -1.0 : 1.0);
         }
         drag.line_origin = state.region.centre;
-        drag.line_direction = axis;
-        drag.start_parameter = line_parameter(drag.line_origin, axis, ray);
+        drag.line_direction = state.region.rotation * axis;
+        drag.start_parameter = line_parameter(drag.line_origin, drag.line_direction, ray);
         return drag;
     }
     Eigen::Vector3d direction = Eigen::Vector3d::Zero();
@@ -358,11 +390,14 @@ std::optional<GizmoDrag> begin_drag_with_handle(const GizmoState& state,
     for (std::size_t i = 0; i < count; ++i) {
         const int axis = handle.axes[i];
         if (axis >= 0 && axis < 3) {
-            direction[axis] += static_cast<double>(handle.signs[i]);
+            // The signed outward diagonal: dragging that corner away from the
+            // box advances this line, and its delta is already the per-axis
+            // growth amount (divided by sqrt(count) below).
+            direction[axis] += handle.signs[i] < 0 ? -1.0 : 1.0;
         }
     }
     drag.line_origin = handle.point;
-    drag.line_direction = normalised(direction);
+    drag.line_direction = state.region.rotation * normalised(direction);
     drag.start_parameter = line_parameter(drag.line_origin, drag.line_direction, ray);
     return drag;
 }
@@ -386,13 +421,17 @@ void resize_axis(GizmoState& state, int axis, int sign, double movement) {
         return;
     }
     const double old_size = state.region.size[axis];
-    const double opposite_face = state.region.centre[axis] - static_cast<double>(sign) *
-                                                              old_size * 0.5;
-    const double new_size = std::max(
-        kMinRegionSize, old_size + static_cast<double>(sign) * movement);
+    // `movement` is measured along the signed outward normal, so it is the
+    // growth itself: applying the sign again would flip a negative face's
+    // resize and move it the wrong way.
+    const double new_size = std::max(kMinRegionSize, old_size + movement);
+    // Keep the opposite face fixed. The box centre moves half the size change
+    // along the box's own axis, which is `region.rotation` column `axis`, not
+    // a chunk axis: on an oriented box those differ.
+    Eigen::Vector3d local_shift = Eigen::Vector3d::Zero();
+    local_shift[axis] = static_cast<double>(sign) * (new_size - old_size) * 0.5;
+    state.region.centre += state.region.rotation * local_shift;
     state.region.size[axis] = new_size;
-    state.region.centre[axis] =
-        opposite_face + static_cast<double>(sign) * new_size * 0.5;
 }
 
 }  // namespace
@@ -400,31 +439,29 @@ void resize_axis(GizmoState& state, int axis, int sign, double movement) {
 GizmoState update_drag(const GizmoDrag& drag, const GizmoRay& ray) {
     GizmoState state = drag.start;
     if (drag.handle.kind == GizmoHandleKind::Ring) {
-        const std::optional<Eigen::Vector3d> hit = plane_hit(state.region.centre.z(), ray);
+        const GizmoRay local_ray = to_region_local(state.region, ray);
+        const std::optional<Eigen::Vector3d> hit = plane_hit(0.0, local_ray);
         if (!hit) {
             return state;
         }
-        const double angle =
-            std::atan2(hit->y() - state.region.centre.y(), hit->x() - state.region.centre.x());
+        const double angle = std::atan2(hit->y(), hit->x());
         double delta = angle - drag.start_angle;
-        constexpr double kPi = 3.14159265358979323846;
-        while (delta > kPi) {
-            delta -= 2.0 * kPi;
+        while (delta > std::numbers::pi) {
+            delta -= 2.0 * std::numbers::pi;
         }
-        while (delta < -kPi) {
-            delta += 2.0 * kPi;
+        while (delta < -std::numbers::pi) {
+            delta += 2.0 * std::numbers::pi;
         }
         const double c = std::cos(delta);
         const double s = std::sin(delta);
-        const Eigen::Vector3d& centre = state.region.centre;
-        Eigen::Matrix4d about = Eigen::Matrix4d::Identity();
-        about(0, 0) = c;
-        about(0, 1) = -s;
-        about(1, 0) = s;
-        about(1, 1) = c;
-        about(0, 3) = centre.x() - c * centre.x() + s * centre.y();
-        about(1, 3) = centre.y() - s * centre.x() - c * centre.y();
-        state.transform = drag.start.transform * about;
+        // Turn the box about its own local Z: the axes rotate with it
+        // (R' = R * Rz). The chunk transform is deliberately untouched.
+        Eigen::Matrix3d turn = Eigen::Matrix3d::Identity();
+        turn(0, 0) = c;
+        turn(0, 1) = -s;
+        turn(1, 0) = s;
+        turn(1, 1) = c;
+        state.region.rotation = drag.start.region.rotation * turn;
         return state;
     }
     const double parameter =
@@ -433,8 +470,12 @@ GizmoState update_drag(const GizmoDrag& drag, const GizmoRay& ray) {
     if (drag.handle.kind == GizmoHandleKind::Face) {
         if (drag.handle.mode == RegionGizmoMode::Move) {
             if (drag.handle.axis >= 0 && drag.handle.axis < 3) {
-                state.region.centre[drag.handle.axis] +=
-                    static_cast<double>(drag.handle.sign) * delta;
+                // The line direction is +axis for both faces, so the centre
+                // follows the cursor on a negative face too; re-signing here
+                // would move it the wrong way. The +axis is the box's own
+                // axis, so a rotated box moves along its face normal.
+                state.region.centre +=
+                    state.region.rotation.col(drag.handle.axis) * delta;
             }
         } else {
             resize_axis(state, drag.handle.axis, drag.handle.sign, delta);
@@ -486,8 +527,9 @@ std::vector<SceneLineVertex> preview_lines(const GizmoState& state, RegionGizmoM
     if (mode == RegionGizmoMode::Resize) {
         for (const Eigen::Vector3d& corner : corners) {
             for (int axis = 0; axis < 3; ++axis) {
-                Eigen::Vector3d direction = Eigen::Vector3d::Zero();
-                direction[axis] = tick;
+                Eigen::Vector3d axis_direction = Eigen::Vector3d::Zero();
+                axis_direction[axis] = tick;
+                const Eigen::Vector3d direction = state.region.rotation * axis_direction;
                 add(corner - direction, corner + direction);
             }
         }
@@ -495,20 +537,23 @@ std::vector<SceneLineVertex> preview_lines(const GizmoState& state, RegionGizmoM
         const double radius = std::max(state.region.size.x(), state.region.size.y()) * 0.7;
         constexpr int kSegments = 32;
         for (int i = 0; i < kSegments; ++i) {
-            const double a = 2.0 * 3.14159265358979323846 * static_cast<double>(i) /
+            const double a = 2.0 * std::numbers::pi * static_cast<double>(i) /
                              static_cast<double>(kSegments);
-            const double b = 2.0 * 3.14159265358979323846 * static_cast<double>(i + 1) /
+            const double b = 2.0 * std::numbers::pi * static_cast<double>(i + 1) /
                              static_cast<double>(kSegments);
-            add(state.region.centre + Eigen::Vector3d(std::cos(a) * radius, std::sin(a) * radius,
-                                                      0.0),
-                state.region.centre + Eigen::Vector3d(std::cos(b) * radius, std::sin(b) * radius,
-                                                      0.0));
+            add(from_region_local(state.region,
+                                  Eigen::Vector3d(std::cos(a) * radius,
+                                                  std::sin(a) * radius, 0.0)),
+                from_region_local(state.region,
+                                  Eigen::Vector3d(std::cos(b) * radius,
+                                                  std::sin(b) * radius, 0.0)));
         }
     } else if (mode == RegionGizmoMode::Move) {
         const double reach = span * 0.18;
         for (int axis = 0; axis < 3; ++axis) {
-            Eigen::Vector3d direction = Eigen::Vector3d::Zero();
-            direction[axis] = reach;
+            Eigen::Vector3d axis_direction = Eigen::Vector3d::Zero();
+            axis_direction[axis] = reach;
+            const Eigen::Vector3d direction = state.region.rotation * axis_direction;
             add(state.region.centre + direction * 0.5,
                 state.region.centre + direction * 0.5 + direction);
             add(state.region.centre - direction * 0.5,

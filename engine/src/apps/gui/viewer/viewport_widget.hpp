@@ -148,6 +148,10 @@ private:
     int canvas_height() const;
     /// The active chunk's region and transform, or nullopt when there is no chunk.
     std::optional<GizmoState> read_region_state() const;
+    /// True while the drag's chunk is still the active chunk of the current
+    /// document. A drag whose chunk disappeared or is no longer active is
+    /// dropped without pushing a command.
+    bool region_drag_is_current() const;
     double canvas_aspect() const;
     /// Rebuild so the preview box (or the committed box) is in the scene.
     void refresh_gizmo_preview();

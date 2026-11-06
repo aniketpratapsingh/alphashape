@@ -65,6 +65,11 @@ const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
 }  // namespace
 
 Transform transform_from_values(const TransformValues& values) {
+    // A zero or negative scale collapses the model and inverts it; both are
+    // meaningless placements, so refuse them at the boundary.
+    if (!std::isfinite(values.scale) || !(values.scale > 0.0)) {
+        throw ValueError("transform scale must be a positive finite number");
+    }
     Transform transform = Transform::Identity();
     const Eigen::Matrix3d rotation =
         rotation_from_degrees(values.yaw_degrees, values.pitch_degrees, values.roll_degrees);
@@ -211,12 +216,15 @@ void TransformDialog::set_values(const TransformValues& values) {
 bool TransformDialog::read_field(const QLineEdit* edit, double& value) const {
     bool ok = false;
     const QString text = edit->text().trimmed();
-    value = QLocale::c().toDouble(text, &ok);
-    if (!ok || !std::isfinite(value)) {
+    const double parsed = QLocale::c().toDouble(text, &ok);
+    if (!ok || !std::isfinite(parsed)) {
+        // Leave `value` at its incoming (last valid) value: a typo must not
+        // silently become zero.
         const_cast<QLineEdit*>(edit)->setStyleSheet(
             QStringLiteral("border: 1px solid #d9534f;"));
         return false;
     }
+    value = parsed;
     const_cast<QLineEdit*>(edit)->setStyleSheet(QString());
     return true;
 }
@@ -234,7 +242,15 @@ bool TransformDialog::read_values(TransformValues& values) const {
 }
 
 TransformValues TransformDialog::values_from_fields() const {
+    // Seed with the chunk's current transform so a field that fails to parse
+    // keeps its last valid value instead of falling back to zero.
     TransformValues values;
+    static_cast<void>(app_.read_document([&](const Document& document) {
+        const Chunk* chunk = find_chunk(document, chunk_id_);
+        if (chunk != nullptr) {
+            values = transform_values(chunk->transform());
+        }
+    }));
     static_cast<void>(read_values(values));
     return values;
 }
@@ -265,10 +281,24 @@ bool TransformDialog::push_transform(const Transform& transform) {
 }
 
 bool TransformDialog::apply() {
+    // Seed as values_from_fields() does, then validate every field: a typo
+    // keeps the previous value but still blocks the push, and a non-positive
+    // scale is refused rather than applied.
     TransformValues values;
+    static_cast<void>(app_.read_document([&](const Document& document) {
+        const Chunk* chunk = find_chunk(document, chunk_id_);
+        if (chunk != nullptr) {
+            values = transform_values(chunk->transform());
+        }
+    }));
     if (!read_values(values)) {
         return false;
     }
+    if (!std::isfinite(values.scale) || !(values.scale > 0.0)) {
+        scale_->setStyleSheet(QStringLiteral("border: 1px solid #d9534f;"));
+        return false;
+    }
+    scale_->setStyleSheet(QString());
     return push_transform(transform_from_values(values));
 }
 

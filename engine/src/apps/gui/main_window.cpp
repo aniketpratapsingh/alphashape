@@ -33,6 +33,7 @@
 #include "apps/gui/export_controller.hpp"
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/marker_tools_dialogs.hpp"
+#include "apps/gui/modal_hooks.hpp"
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/start_screen.hpp"
@@ -789,13 +790,36 @@ void MainWindow::reset_transform() {
         return;
     }
     Region region;
+    bool georeferenced = false;
     static_cast<void>(app_.read_document([&](const Document& document) {
         for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
             if (chunk != nullptr && chunk->id() == chunk_id) {
                 region = chunk->region();
+                georeferenced = chunk->crs().is_set();
+                for (const Camera& camera : chunk->cameras()) {
+                    if (camera.reference.location.has_value()) {
+                        georeferenced = true;
+                        break;
+                    }
+                }
+                for (const Marker& marker : chunk->markers()) {
+                    if (marker.reference.has_value()) {
+                        georeferenced = true;
+                        break;
+                    }
+                }
             }
         }
     }));
+    // Resetting the transform drops the placement that georeferencing produced,
+    // so make the loss explicit instead of applying it silently.
+    if (georeferenced &&
+        !modal_hooks().confirm(
+            this, tr("Reset Transform"),
+            tr("This chunk is georeferenced. Resetting its transform removes the "
+               "placement and georeferencing derived from it.\n\nContinue?"))) {
+        return;
+    }
     try {
         app_.execute(
             make_set_chunk_transform_command(chunk_id, Transform::Identity(), region));

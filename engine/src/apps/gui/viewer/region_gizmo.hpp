@@ -9,12 +9,13 @@
 // MODES
 //   * Move: drag a face; the whole box translates along that face's normal.
 //   * Resize: drag a face, edge or corner; the opposite face stays fixed.
-//   * Rotate: drag the ring about the region's local Z axis; the chunk transform absorbs the
-//     rotation (Region has no orientation field of its own).
+//   * Rotate: drag the ring about the region's own local Z axis; the box orientation changes
+//     and the chunk transform is left untouched.
 //
-// The region is axis-aligned in chunk-local coordinates, the same frame the scene is drawn in
-// (scene.hpp). The chunk Transform maps that local frame to world; Rotate bakes a local-space
-// yaw about the region centre into it.
+// The region lives in chunk-local coordinates, the same frame the scene is drawn in (scene.hpp);
+// the chunk Transform maps it to world. Its box may be oriented, so every mode first expresses
+// the ray in the box's own frame, runs the axis-aligned hit test and drag math there, and maps
+// the result back. Region rotations never enter the chunk Transform.
 
 #include <optional>
 #include <vector>
@@ -34,7 +35,7 @@ struct GizmoRay {
     Eigen::Vector3d direction = -Eigen::Vector3d::UnitZ();
 };
 
-/// The editable state: the box and the chunk transform that rotates it about its centre.
+/// The editable state: the oriented box plus the chunk transform, which the gizmo never edits.
 struct GizmoState {
     Region region;
     Transform transform = Transform::Identity();

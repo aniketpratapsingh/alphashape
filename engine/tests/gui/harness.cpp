@@ -118,6 +118,9 @@ void GuiTest::SetUp() {
     // A save prompt would block the test; cancel it unless the test says where.
     modal_hooks().save_file =
         [](QWidget*, const QString&, const QString&, const QString&) { return QString(); };
+    // Confirmations (e.g. Reset Transform on a georeferenced chunk) answer yes
+    // so tests never block; a test that needs another answer installs its own.
+    modal_hooks().confirm = [](QWidget*, const QString&, const QString&) { return true; };
     rebuild(/*reset_settings=*/true);
 }
 

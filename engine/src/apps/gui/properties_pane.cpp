@@ -1,7 +1,9 @@
 #include "apps/gui/properties_pane.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <numbers>
 #include <string>
 
 #include <QAbstractItemView>
@@ -26,6 +28,23 @@ using Rows = QList<QPair<QString, QString>>;
 QString qs(const std::string& text) { return QString::fromStdString(text); }
 QString num(std::size_t n) { return QString::number(static_cast<qulonglong>(n)); }
 QString num(double v) { return QString::number(v, 'g', 8); }
+
+/// The region's orientation as yaw/pitch/roll (ZYX), or an explicit "none" so
+/// an unrotated box is distinguishable from a rounded zero.
+QString rotation_text(const Region& region) {
+    if (region.rotation.isIdentity()) {
+        return QObject::tr("none (axis-aligned)");
+    }
+    const Eigen::Matrix3d& r = region.rotation;
+    const double pitch = std::asin(std::clamp(-r(2, 0), -1.0, 1.0));
+    const double yaw = std::atan2(r(1, 0), r(0, 0));
+    const double roll = std::atan2(r(2, 1), r(2, 2));
+    constexpr double kDegreesPerRadian = 180.0 / std::numbers::pi;
+    return QObject::tr("yaw %1\u00b0, pitch %2\u00b0, roll %3\u00b0")
+        .arg(num(yaw * kDegreesPerRadian))
+        .arg(num(pitch * kDegreesPerRadian))
+        .arg(num(roll * kDegreesPerRadian));
+}
 QString yes_no(bool v) { return v ? QObject::tr("yes") : QObject::tr("no"); }
 
 QString vec3(const Eigen::Vector3d& v) {
@@ -89,6 +108,7 @@ void describe_chunk(const Document& document, const Chunk& chunk, PropertySheet&
     add(r, QObject::tr("Coordinate system"), crs_text(chunk.crs()));
     add(r, QObject::tr("Region centre"), vec3(chunk.region().centre));
     add(r, QObject::tr("Region size"), vec3(chunk.region().size));
+    add(r, QObject::tr("Region rotation"), rotation_text(chunk.region()));
 }
 
 void describe_camera(const Chunk& chunk, const Camera& camera, PropertySheet& sheet) {

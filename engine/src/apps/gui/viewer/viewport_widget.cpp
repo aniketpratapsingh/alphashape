@@ -130,7 +130,15 @@ ViewportWidget::ViewportWidget(GuiApp& app, Theme& theme, QWidget* parent)
     message_->hide();
 
     QObject::connect(&theme_, &Theme::viewport_changed, this, &ViewportWidget::on_theme_changed);
-    QObject::connect(&app_, &GuiApp::document_replaced, this, [this]() { rebuild_scene(); });
+    QObject::connect(&app_, &GuiApp::document_replaced, this, [this]() {
+        // The drag's chunk belongs to the old document; drop it before the
+        // scene is rebuilt, so no command is pushed against the new one.
+        cancel_region_drag();
+        rebuild_scene();
+    });
+    QObject::connect(&app_, &GuiApp::active_chunk_changed, this, [this](qint32) {
+        cancel_region_drag();
+    });
     QObject::connect(&app_, &GuiApp::undo_changed, this, [this]() { rebuild_scene(); });
     // A task changes the document without commands: after every job, whatever its outcome, the
     // scene is rebuilt. Only the job that leaves the manager idle does it (a queued follow-up
@@ -404,13 +412,40 @@ std::optional<GizmoState> ViewportWidget::read_region_state() const {
     return state;
 }
 
+bool ViewportWidget::region_drag_is_current() const {
+    if (!region_drag_ || region_chunk_id_ < 0) {
+        return false;
+    }
+    return app_.read_document([this](const Document& document) {
+        if (document.active_chunk_id() != region_chunk_id_) {
+            return false;
+        }
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == region_chunk_id_) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
 double ViewportWidget::canvas_aspect() const {
     const int height = canvas_height();
     const int width = std::max(canvas_ != nullptr ? canvas_->width() : this->width(), 1);
     return static_cast<double>(width) / static_cast<double>(height);
 }
 
-void ViewportWidget::refresh_gizmo_preview() { rebuild_scene(); }
+void ViewportWidget::refresh_gizmo_preview() {
+    if (region_drag_ && region_preview_) {
+        // The document does not change between mouse moves, so only the region
+        // overlay lines are replaced; the rest of the scene stays as built.
+        renderer_.set_region_lines(
+            preview_lines(*region_preview_, region_mode_, scene_style_for(mode_)));
+        request_frame();
+        return;
+    }
+    rebuild_scene();
+}
 
 bool ViewportWidget::begin_region_drag(const Eigen::Vector2d& pixel) {
     if (region_mode_ == RegionGizmoMode::None) {
@@ -446,6 +481,10 @@ void ViewportWidget::update_region_drag(const Eigen::Vector2d& pixel) {
     if (!region_drag_) {
         return;
     }
+    if (!region_drag_is_current()) {
+        cancel_region_drag();
+        return;
+    }
     const GizmoRay ray =
         ray_from_screen(drag_view_projection_, drag_width_, drag_height_, pixel);
     region_preview_ = update_drag(*region_drag_, ray);
@@ -454,6 +493,10 @@ void ViewportWidget::update_region_drag(const Eigen::Vector2d& pixel) {
 
 bool ViewportWidget::end_region_drag() {
     if (!region_drag_) {
+        return false;
+    }
+    if (!region_drag_is_current()) {
+        cancel_region_drag();
         return false;
     }
     const GizmoDrag drag = *region_drag_;
@@ -544,6 +587,14 @@ void ViewportWidget::handle_wheel(int angle_delta) {
 }
 
 void ViewportWidget::handle_key(int key) {
+    if (region_drag_) {
+        // The projection is frozen for the whole drag, so no view shortcut may
+        // disturb it. Escape is the only key that still acts: it cancels.
+        if (key == Qt::Key_Escape) {
+            cancel_region_drag();
+        }
+        return;
+    }
     switch (key) {
         case Qt::Key_Escape:
             cancel_region_drag();
