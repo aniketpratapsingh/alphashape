@@ -11,6 +11,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QPlainTextEdit>
+#include <QSignalBlocker>
 #include <QTabWidget>
 #include <QVBoxLayout>
 
@@ -51,6 +52,13 @@ void CrsPicker::build_search_tab() {
     filter_->setPlaceholderText(tr("Search by EPSG code or name"));
     filter_->setClearButtonEnabled(true);
     layout->addWidget(filter_);
+    auto* epsg_row = new QHBoxLayout();
+    epsg_row->addWidget(new QLabel(tr("EPSG code:"), page));
+    epsg_ = new QLineEdit(page);
+    epsg_->setObjectName(QStringLiteral("crs.epsg"));
+    epsg_->setPlaceholderText(tr("Any EPSG code the engine knows"));
+    epsg_row->addWidget(epsg_, 1);
+    layout->addLayout(epsg_row);
     list_ = new QListWidget(page);
     list_->setObjectName(QStringLiteral("crs.list"));
     for (const crs::BuiltinCrs& entry : crs::builtin_crs_list()) {
@@ -71,6 +79,10 @@ void CrsPicker::build_search_tab() {
     tabs_->addTab(page, tr("Search"));
 
     connect(filter_, &QLineEdit::textChanged, this, &CrsPicker::apply_filter);
+    connect(epsg_, &QLineEdit::textChanged, this, [this](const QString&) {
+        refresh_validity();
+        Q_EMIT selection_changed();
+    });
     connect(list_, &QListWidget::currentRowChanged, this, [this](int) {
         refresh_validity();
         Q_EMIT selection_changed();
@@ -131,6 +143,16 @@ int CrsPicker::selected_epsg() const {
     return item->data(Qt::UserRole).toInt();
 }
 
+int CrsPicker::typed_epsg() const {
+    const QString text = epsg_->text().trimmed();
+    if (text.isEmpty()) {
+        return -1;
+    }
+    bool ok = false;
+    const int code = text.toInt(&ok);
+    return ok && code > 0 ? code : -1;
+}
+
 void CrsPicker::refresh_validity() {
     if (error_ == nullptr) {
         return;  // construction: the tabs emit before the error label exists
@@ -138,14 +160,22 @@ void CrsPicker::refresh_validity() {
     error_text_.clear();
     valid_ = false;
     if (tabs_->currentIndex() == 0) {
-        if (selected_epsg() < 0) {
-            error_text_ = tr("Select a coordinate system.");
-        } else if (vertical_->isChecked() &&
-                   vertical_name_->text().trimmed().isEmpty()) {
-            error_text_ = tr("Name the vertical datum or clear the vertical option.");
-        } else {
-            valid_ = true;
+        const int typed = typed_epsg();
+        const int code = typed >= 0 ? typed : selected_epsg();
+        if (code < 0) {
+            error_text_ = tr("Select a coordinate system or type an EPSG code.");
+        } else if (typed >= 0) {
+            try {
+                (void)crs::CoordinateSystem::from_epsg(code);
+            } catch (const std::exception& failure) {
+                error_text_ = QString::fromUtf8(failure.what());
+            }
         }
+        if (error_text_.isEmpty() && vertical_->isChecked() &&
+            vertical_name_->text().trimmed().isEmpty()) {
+            error_text_ = tr("Name the vertical datum or clear the vertical option.");
+        }
+        valid_ = error_text_.isEmpty();
     } else {
         const QString text = wkt_->toPlainText().trimmed();
         if (text.isEmpty()) {
@@ -164,15 +194,33 @@ void CrsPicker::refresh_validity() {
 }
 
 void CrsPicker::set_coordinate_system(const crs::CoordinateSystem& cs) {
-    vertical_->setChecked(false);
-    vertical_name_->clear();
+    vertical_state_ = cs.vertical();
+    {
+        const QSignalBlocker blocker(vertical_);
+        vertical_->setChecked(vertical_state_.has_value());
+    }
+    {
+        const QSignalBlocker blocker(vertical_name_);
+        vertical_name_->setText(vertical_state_.has_value()
+                                    ? QString::fromStdString(vertical_state_->name)
+                                    : QString());
+    }
+    vertical_name_->setEnabled(vertical_state_.has_value());
+    epsg_->clear();
     if (cs.is_set() && !cs.is_local() && cs.epsg() > 0) {
         tabs_->setCurrentIndex(0);
+        bool listed = false;
         for (int row = 0; row < list_->count(); ++row) {
             if (list_->item(row)->data(Qt::UserRole).toInt() == cs.epsg()) {
                 list_->setCurrentRow(row);
+                listed = true;
                 break;
             }
+        }
+        if (!listed) {
+            // A code outside the curated list: keep it in the free-form field.
+            list_->setCurrentRow(-1);
+            epsg_->setText(QString::number(cs.epsg()));
         }
     } else if (cs.is_set() && !cs.is_local()) {
         tabs_->setCurrentIndex(1);
@@ -190,14 +238,17 @@ QString CrsPicker::error() const { return error_text_; }
 
 crs::CoordinateSystem CrsPicker::coordinate_system() const {
     if (tabs_->currentIndex() == 0) {
-        const int epsg = selected_epsg();
+        const int typed = typed_epsg();
+        const int epsg = typed >= 0 ? typed : selected_epsg();
         if (epsg < 0) {
             return crs::CoordinateSystem::local();
         }
         crs::CoordinateSystem chosen = crs::CoordinateSystem::from_epsg(epsg);
         if (vertical_->isChecked()) {
-            crs::VerticalCrs vertical;
-            vertical.kind = crs::VerticalCrs::Kind::GravityRelated;
+            crs::VerticalCrs vertical = vertical_state_.value_or(crs::VerticalCrs{});
+            if (!vertical.is_set()) {
+                vertical.kind = crs::VerticalCrs::Kind::GravityRelated;
+            }
             vertical.name = vertical_name_->text().trimmed().toStdString();
             chosen = chosen.with_vertical(vertical);
         }

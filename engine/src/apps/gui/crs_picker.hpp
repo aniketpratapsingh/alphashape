@@ -5,6 +5,8 @@
 // through is_valid(); a containing dialog disables its OK button when false.
 // Everything is gated on the PROJ-backed engine (alphashape_crs).
 
+#include <optional>
+
 #include <QString>
 #include <QWidget>
 
@@ -33,6 +35,7 @@ public:
     crs::CoordinateSystem coordinate_system() const;
 
     QLineEdit* filter_edit() { return filter_; }
+    QLineEdit* epsg_edit() { return epsg_; }
     QListWidget* list_widget() { return list_; }
     QPlainTextEdit* wkt_edit() { return wkt_; }
     QLabel* error_label() { return error_; }
@@ -47,14 +50,20 @@ private:
     void apply_filter(const QString& text);
     void refresh_validity();
     int selected_epsg() const;
+    /// The code typed into the EPSG field, or -1 when it is empty/not a number.
+    int typed_epsg() const;
 
     QTabWidget* tabs_ = nullptr;
     QLineEdit* filter_ = nullptr;
+    QLineEdit* epsg_ = nullptr;
     QListWidget* list_ = nullptr;
     QPlainTextEdit* wkt_ = nullptr;
     QLabel* error_ = nullptr;
     QCheckBox* vertical_ = nullptr;
     QLineEdit* vertical_name_ = nullptr;
+    /// The vertical component restored by set_coordinate_system, kept verbatim
+    /// (grid, offset, reference frame) so a round trip loses nothing.
+    std::optional<crs::VerticalCrs> vertical_state_;
     QString error_text_;
     bool valid_ = false;
 };
