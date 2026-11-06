@@ -131,8 +131,11 @@ void ReferencePane::create_tables() {
                            static_cast<int>(ReferenceModel::SourceZColumn)}) {
             view->setItemDelegateForColumn(column, coordinates);
         }
-        view->setItemDelegateForColumn(static_cast<int>(ReferenceModel::AccuracyColumn),
-                                      accuracy);
+        for (int column : {static_cast<int>(ReferenceModel::AccuracyXColumn),
+                           static_cast<int>(ReferenceModel::AccuracyYColumn),
+                           static_cast<int>(ReferenceModel::AccuracyZColumn)}) {
+            view->setItemDelegateForColumn(column, accuracy);
+        }
         return view;
     };
     camera_view_ = make_view(camera_model_, QStringLiteral("reference.cameras"));

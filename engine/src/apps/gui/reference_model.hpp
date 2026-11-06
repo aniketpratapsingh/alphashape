@@ -44,7 +44,9 @@ public:
         SourceXColumn,
         SourceYColumn,
         SourceZColumn,
-        AccuracyColumn,
+        AccuracyXColumn,
+        AccuracyYColumn,
+        AccuracyZColumn,
         EstimatedXColumn,
         EstimatedYColumn,
         EstimatedZColumn,
@@ -89,6 +91,8 @@ private:
     bool has_column(int column) const;
     /// Axis 0..2 when `column` is a source component.
     static bool source_axis(int column, int* axis);
+    /// Axis 0..2 when `column` is a per-axis accuracy.
+    static bool accuracy_axis(int column, int* axis);
 
     GuiApp& app_;
     Section section_;

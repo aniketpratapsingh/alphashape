@@ -118,6 +118,15 @@ bool ReferenceModel::source_axis(int column, int* axis) {
     }
 }
 
+bool ReferenceModel::accuracy_axis(int column, int* axis) {
+    switch (column) {
+        case AccuracyXColumn: *axis = 0; return true;
+        case AccuracyYColumn: *axis = 1; return true;
+        case AccuracyZColumn: *axis = 2; return true;
+        default: return false;
+    }
+}
+
 int ReferenceModel::rowCount(const QModelIndex& parent) const {
     if (parent.isValid()) {
         return 0;
@@ -194,7 +203,9 @@ QVariant ReferenceModel::data(const QModelIndex& index, int role) const {
         case SourceXColumn: return component(item.source, 0, source_decimals);
         case SourceYColumn: return component(item.source, 1, source_decimals);
         case SourceZColumn: return component(item.source, 2, source_decimals);
-        case AccuracyColumn: return number(item.sigma, 3);
+        case AccuracyXColumn: return number(item.sigma_xyz.x(), 3);
+        case AccuracyYColumn: return number(item.sigma_xyz.y(), 3);
+        case AccuracyZColumn: return number(item.sigma_xyz.z(), 3);
         case EstimatedXColumn: return component(item.estimated, 0, source_decimals);
         case EstimatedYColumn: return component(item.estimated, 1, source_decimals);
         case EstimatedZColumn: return component(item.estimated, 2, source_decimals);
@@ -218,7 +229,9 @@ QVariant ReferenceModel::headerData(int section, Qt::Orientation orientation,
         case SourceXColumn: return tr("Source X");
         case SourceYColumn: return tr("Source Y");
         case SourceZColumn: return tr("Source Z");
-        case AccuracyColumn: return tr("Accuracy");
+        case AccuracyXColumn: return tr("Accuracy X");
+        case AccuracyYColumn: return tr("Accuracy Y");
+        case AccuracyZColumn: return tr("Accuracy Z");
         case EstimatedXColumn: return tr("Estimated X");
         case EstimatedYColumn: return tr("Estimated Y");
         case EstimatedZColumn: return tr("Estimated Z");
@@ -240,7 +253,7 @@ Qt::ItemFlags ReferenceModel::flags(const QModelIndex& index) const {
         result |= Qt::ItemIsUserCheckable;
     }
     int axis = 0;
-    if (source_axis(column, &axis) || column == static_cast<int>(AccuracyColumn)) {
+    if (source_axis(column, &axis) || accuracy_axis(column, &axis)) {
         result |= Qt::ItemIsEditable;
     }
     return result;
@@ -292,11 +305,14 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
         return false;
     }
     const bool camera = item.kind == reference::ReferenceRowKind::Camera;
-    if (column == static_cast<int>(AccuracyColumn)) {
+    int axis = 0;
+    if (accuracy_axis(column, &axis)) {
         if (!(typed > 0.0)) {
             return false;
         }
-        const Eigen::Vector3d accuracy = Eigen::Vector3d::Constant(typed);
+        // Edit one axis as typed and keep the other two.
+        Eigen::Vector3d accuracy = item.sigma_xyz;
+        accuracy[static_cast<Eigen::Index>(axis)] = typed;
         if (camera) {
             app_.execute(make_set_camera_reference_command(chunk_id_, item.id,
                                                           item.source, accuracy));
@@ -306,7 +322,6 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
         }
         return true;
     }
-    int axis = 0;
     if (!source_axis(column, &axis)) {
         return false;
     }

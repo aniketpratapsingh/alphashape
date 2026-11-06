@@ -91,9 +91,9 @@ TEST_F(ReferencePane, CamerasAndMarkers) {
     ReferenceModel& cameras = pane().cameras();
     ReferenceModel& markers = pane().markers();
     EXPECT_EQ(cameras.rowCount(), 12);
-    EXPECT_EQ(cameras.columnCount(), 10);
+    EXPECT_EQ(cameras.columnCount(), 12);
     EXPECT_EQ(markers.rowCount(), 4);
-    EXPECT_EQ(markers.columnCount(), 11);
+    EXPECT_EQ(markers.columnCount(), 13);
 
     const reference::ReferenceSummary summary = cameras.summary();
     EXPECT_EQ(summary.camera_count, 12U);
@@ -192,6 +192,21 @@ TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
     app().undo();
     ASSERT_TRUE(role_of_103().has_value());
     EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::Gcp);
+}
+
+TEST_F(ReferencePane, AccuracyEditKeepsOtherAxes) {
+    Chunk& chunk = build_chunk(1, 0);
+    ASSERT_EQ(chunk.cameras().size(), 1U);
+    chunk.cameras()[0].reference.accuracy = Eigen::Vector3d(0.1, 0.2, 0.3);
+    pane().refresh();
+    ReferenceModel& model = pane().cameras();
+    ASSERT_EQ(model.rowCount(), 1);
+    ASSERT_TRUE(model.setData(model.index(0, ReferenceModel::AccuracyYColumn), 4.5,
+                              Qt::EditRole));
+    const Eigen::Vector3d accuracy = chunk.cameras()[0].reference.accuracy;
+    EXPECT_NEAR(accuracy.x(), 0.1, 1e-12);
+    EXPECT_NEAR(accuracy.y(), 4.5, 1e-12);
+    EXPECT_NEAR(accuracy.z(), 0.3, 1e-12);
 }
 
 TEST_F(ReferencePane, FormatsDegreesAndMetresByUnit) {
