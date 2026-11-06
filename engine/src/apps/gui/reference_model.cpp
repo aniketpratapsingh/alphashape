@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
+#include "model/crs/transform.hpp"
 
 namespace alphashape::gui {
 namespace {
@@ -296,6 +298,40 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
     }
     Eigen::Vector3d location = item.source.value_or(Eigen::Vector3d::Zero());
     location[static_cast<Eigen::Index>(axis)] = typed;
+    if (!location.allFinite()) {
+        return false;
+    }
+    // The row is displayed in the chunk CRS, but the stored reference lives in
+    // the camera / marker slot CRS. When the two differ, convert the edited
+    // display value back through the inverse of the display transform rather
+    // than writing display units into the slot.
+    CRS slot;
+    crs::CoordinateSystem display;
+    bool found = false;
+    app_.read_document([&](const Document& document) {
+        const Chunk* chunk = document.active_chunk();
+        if (chunk == nullptr || chunk->id() != chunk_id_) {
+            return;
+        }
+        found = true;
+        display = chunk->coordinate_system();
+        slot = camera ? chunk->camera_crs() : chunk->marker_crs();
+    });
+    if (!found) {
+        return false;
+    }
+    const crs::CoordinateSystem slot_cs = slot;
+    if (display.is_set() && !display.is_local() && slot_cs.is_set() &&
+        !slot_cs.is_local() && !(slot_cs == display)) {
+        try {
+            const crs::CrsTransform xform = crs::CrsTransform::create(display, slot_cs);
+            const crs::CrsPoint point =
+                xform.forward(crs::CrsPoint{location.x(), location.y(), location.z()});
+            location = Eigen::Vector3d(point.x, point.y, point.z);
+        } catch (const std::exception&) {
+            return false;  // no conversion: refuse rather than write the wrong units
+        }
+    }
     if (!location.allFinite()) {
         return false;
     }

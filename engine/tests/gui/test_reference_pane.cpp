@@ -25,6 +25,8 @@
 #include "apps/gui/workspace_pane.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/crs/transform.hpp"
 #include "harness.hpp"
 #include "../perf_gate.hpp"
 
@@ -190,6 +192,41 @@ TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
     app().undo();
     ASSERT_TRUE(role_of_103().has_value());
     EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::Gcp);
+}
+
+TEST_F(ReferencePane, SourceEditIsConvertedBackToTheSlotCrs) {
+    Document& document = app().document();
+    Chunk& chunk = document.workspace().add_chunk("CRS");
+    chunk.set_coordinate_system(crs::CoordinateSystem::from_epsg(32633));
+    chunk.set_camera_crs(crs::CoordinateSystem::from_epsg(4979));
+    Camera camera;
+    camera.id = 0;
+    camera.label = "crs";
+    camera.enabled = true;
+    camera.reference.location = Eigen::Vector3d(15.0, 50.0, 100.0);
+    camera.reference.accuracy = Eigen::Vector3d::Constant(0.02);
+    chunk.cameras().push_back(camera);
+    document.set_active_chunk_id(chunk.id());
+    pane().refresh();
+
+    ReferenceModel& model = pane().cameras();
+    ASSERT_EQ(model.rowCount(), 1);
+    ASSERT_TRUE(model.row(0).source.has_value());
+    const Eigen::Vector3d displayed = *model.row(0).source;
+    const double typed = displayed.x() + 10.0;  // metres in the projected display
+    ASSERT_TRUE(model.setData(model.index(0, ReferenceModel::SourceXColumn), typed,
+                              Qt::EditRole));
+
+    const crs::CoordinateSystem display = chunk.coordinate_system();
+    const crs::CoordinateSystem slot = crs::CoordinateSystem::from_epsg(4979);
+    const crs::CrsTransform inverse = crs::CrsTransform::create(display, slot);
+    const crs::CrsPoint expected =
+        inverse.forward(crs::CrsPoint{typed, displayed.y(), displayed.z()});
+    ASSERT_TRUE(chunk.cameras()[0].reference.location.has_value());
+    const Eigen::Vector3d written = *chunk.cameras()[0].reference.location;
+    EXPECT_NEAR(written.x(), expected.x, 1e-9);
+    EXPECT_NEAR(written.y(), expected.y, 1e-9);
+    EXPECT_NEAR(written.z(), expected.z, 1e-6);
 }
 
 TEST_F(ReferencePane, SwitchingChunkRefreshesRows) {
