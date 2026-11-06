@@ -372,8 +372,11 @@ class TestChunksApi(unittest.TestCase):
         self.assertEqual(merged.label, "merged")
         # MergeChunks keeps the sources and appends the merged chunk.
         self.assertEqual(len(doc.chunk_ids), 3)
-        doc.remove(doc.chunks)
-        self.assertEqual(doc.chunk_ids, [])
+        # A dict argument contributes its VALUES, not its keys, and a document
+        # must keep one chunk, so remove two of the three.
+        subset = dict(list(doc.chunks.items())[:2])
+        doc.remove(subset)
+        self.assertEqual(len(doc.chunk_ids), 1)
         doc.undo()
         self.assertEqual(len(doc.chunk_ids), 3)
 
