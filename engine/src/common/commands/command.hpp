@@ -201,7 +201,10 @@ public:
     explicit UndoStack(Document* document = nullptr);
     ~UndoStack();
 
-    void bind(Document* document) { document_ = document; }
+    /// Point the stack at a document. Unless a cache directory was set
+    /// explicitly, it picks up the document's `cache_dir()` so undo spill uses
+    /// the project cache (WP-11.9). Defined in undo_stack.cpp.
+    void bind(Document* document);
 
     /// Directory handed to commands for spilling (see UndoContext).
     void set_cache_dir(std::string cache_dir) { cache_dir_ = std::move(cache_dir); }

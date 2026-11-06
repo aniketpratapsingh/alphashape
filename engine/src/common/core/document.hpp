@@ -50,6 +50,8 @@ private:
     Meta meta_;
 };
 
+class DocumentCacheGuard;
+
 /// The whole project. Owns workspaces and the next-id counters that keep
 /// identities stable across save/load — matching the observed `next_id` /
 /// `active_id` root attributes.
@@ -61,7 +63,14 @@ public:
     /// Path the document was loaded from, or will be saved to. Empty for a
     /// new in-memory document.
     const std::string& path() const { return path_; }
-    void set_path(std::string path) { path_ = std::move(path); }
+    void set_path(std::string path);
+
+    /// Scratch directory for this project, `<base>.files/cache`, or "" when the
+    /// document has no on-disk location yet (WP-11.9). Derived from path(),
+    /// never stored in doc.xml. The directory is not created here; callers that
+    /// write into it create it. It is removed when the last Document sharing
+    /// this project's path is destroyed.
+    std::string cache_dir() const;
 
     std::vector<std::shared_ptr<Workspace>>& workspaces() { return workspaces_; }
     const std::vector<std::shared_ptr<Workspace>>& workspaces() const {
@@ -85,8 +94,11 @@ public:
     /// another project without an id collision (M11 §4.8, PRJ-06). Throws
     /// ValueError for an id the document does not hold. Defined in
     /// common/io/project_io.cpp next to the writer it wraps.
+    /// `absolute_paths` stores frame paths absolutely instead of relative to
+    /// the project file (WP-11.9).
     void save(const std::string& path,
-              const std::vector<std::int32_t>& chunk_ids = {}) const;
+              const std::vector<std::int32_t>& chunk_ids = {},
+              bool absolute_paths = false) const;
 
     /// Document-level CRS used for display and export defaults (M12 §4.6).
     crs::CoordinateSystem global_coordinate_system() const;
@@ -121,7 +133,10 @@ public:
     static constexpr int kFormatVersion = 4;
 
 private:
+    void refresh_cache_guard();
+
     std::string path_;
+    mutable std::shared_ptr<DocumentCacheGuard> cache_guard_;
     std::vector<std::shared_ptr<Workspace>> workspaces_;
     std::int32_t active_chunk_id_ = -1;
     CRS global_crs_;

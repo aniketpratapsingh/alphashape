@@ -219,7 +219,7 @@ void read_tie_points(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
 }
 
 void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
-                 ReadReport* report) {
+                 ReadReport* report, const IoContext& context) {
     if (const XmlNode* depth_maps = find_child(node, "depth_maps")) {
         warn_unknown_attrs(*depth_maps, {"path", "count", "asset_id", "asset_label"},
                            report);
@@ -290,7 +290,8 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
                             "crs_wkt", "nodata", "source", "asset_id", "asset_label"},
                            report);
         const std::string path = require_attr(*elevation, "path");
-        Elevation dem = sidecar::decode_elevation(require_entry(archive, path));
+        Elevation dem =
+            sidecar::decode_elevation(require_entry(archive, path), context.scratch_dir);
         dem.source = require_attr(*elevation, "source");
         const RasterGrid& g = dem.raster.grid;
         if (g.width != parse_int(require_attr(*elevation, "width")) ||
@@ -325,7 +326,8 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
                            report);
         const std::string path = require_attr(*ortho, "path");
         const std::string labels_path = require_attr(*ortho, "labels_path");
-        Orthomosaic mosaic = sidecar::decode_orthomosaic(require_entry(archive, path));
+        Orthomosaic mosaic =
+            sidecar::decode_orthomosaic(require_entry(archive, path), context.scratch_dir);
         mosaic.surface = require_attr(*ortho, "surface");
         const RasterGrid& g = mosaic.raster.grid;
         if (g.width != parse_int(require_attr(*ortho, "width")) ||
@@ -361,7 +363,7 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
 }
 
 void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& archive,
-                ReadReport* report) {
+                ReadReport* report, const IoContext& context) {
     using v1_detail::read_assets;
     using v1_detail::read_cameras;
     using v1_detail::read_frames;
@@ -383,7 +385,7 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
     v1_detail::read_frames(node, chunk, report);
     warn_missing_frame_files(chunk.frames(), report);
     v1_detail::read_tie_points(node, chunk, archive, report);
-    v1_detail::read_assets(node, chunk, archive, report);
+    v1_detail::read_assets(node, chunk, archive, report, context);
 
     if (const XmlNode* region = find_child(node, "region")) {
         chunk.region().centre = parse_vec3(require_attr(*region, "centre"));
@@ -418,7 +420,7 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
 }  // namespace v1_detail
 
 std::shared_ptr<Document> read_v1(const XmlNode& root, const ZipArchive& archive,
-                                  ReadReport* report) {
+                                  ReadReport* report, const IoContext& context) {
     auto document = std::make_shared<Document>();
     Workspace& workspace = document->workspace();
     warn_unknown_children(root, {"global_crs", "meta", "chunks"}, report);
@@ -428,7 +430,7 @@ std::shared_ptr<Document> read_v1(const XmlNode& root, const ZipArchive& archive
     if (const XmlNode* chunks = find_child(root, "chunks")) {
         for (const XmlNode& node : chunks->children) {
             if (node.name == "chunk") {
-                v1_detail::read_chunk(node, workspace, archive, report);
+                v1_detail::read_chunk(node, workspace, archive, report, context);
             }
         }
     }

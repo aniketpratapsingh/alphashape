@@ -5,8 +5,11 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <string>
+#include <utility>
 
 #include "base/io/zip.hpp"
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "common/io/doc_xml.hpp"
 
@@ -18,6 +21,7 @@ namespace {
 
 constexpr const char* kManifestMagic = "alphashape-project";
 constexpr const char* kFilesKey = "files=";
+constexpr const char* kAbsolutePathsKey = "Project/AbsolutePaths";
 
 std::vector<std::uint8_t> read_file(const fs::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -56,16 +60,59 @@ fs::path strip_extension(const fs::path& path) {
     return out;
 }
 
+/// The project's own directory, made absolute so a bare relative project path
+/// still yields a stable base for stored frame paths.
+std::string project_directory(const fs::path& project) {
+    std::error_code ec;
+    const fs::path absolute = fs::absolute(project, ec);
+    const fs::path directory = (ec ? project : absolute).parent_path();
+    return platform::path_to_utf8(directory);
+}
+
+/// `<base>.files/cache`, where `<base>` is the project path without extension.
+std::string cache_directory(const fs::path& project) {
+    const fs::path files(
+        platform::path_from_utf8(platform::path_to_utf8(strip_extension(project)) + ".files"));
+    return platform::path_to_utf8(files / "cache");
+}
+
 }  // namespace
 
-void ProjectIO::save(const Document& document, const std::string& path) {
-    const fs::path project(path);
+void ProjectIO::save(const Document& document, const std::string& path,
+                     bool absolute_paths) {
+    const fs::path project = platform::path_from_utf8(path);
+    const bool single_file = project.extension() == ".psz";
     const fs::path base = strip_extension(project);
-    const fs::path files_dir = fs::path(base.string() + ".files");
+    const fs::path files_dir =
+        platform::path_from_utf8(platform::path_to_utf8(base) + ".files");
     const fs::path zip_path = files_dir / "project.zip";
 
+    // The absolute/relative choice is recorded in doc.xml but is a property of
+    // the container, not application metadata: it is written on this shallow
+    // copy (the chunks are shared) and consumed on load.
+    Document view = document;
+    view.meta().set(kAbsolutePathsKey, absolute_paths ? "true" : "false");
+
+    IoContext context;
+    context.project_dir = project_directory(project);
+    // Use the project cache only when it belongs to this document: a save-as to
+    // a new path must not leave a cache directory behind that no Document will
+    // ever clear. The codec then uses the platform temporary directory.
+    const std::string cache_dir = cache_directory(project);
+    if (cache_dir == document.cache_dir()) {
+        context.scratch_dir = cache_dir;
+    }
+    context.absolute_paths = absolute_paths;
+
     ZipArchive archive;
-    write_document(document, archive);  // validates before touching the disk
+    write_document(view, archive, Document::kFormatVersion, context);
+
+    if (single_file) {
+        // One archive carrying exactly what project.zip carries: doc.xml plus
+        // every chunk payload sidecar.
+        write_file_atomically(project, archive.serialise());
+        return;
+    }
 
     std::error_code ec;
     fs::create_directories(files_dir, ec);
@@ -82,9 +129,10 @@ void ProjectIO::save(const Document& document, const std::string& path) {
 }
 
 void Document::save(const std::string& path,
-                    const std::vector<std::int32_t>& chunk_ids) const {
+                    const std::vector<std::int32_t>& chunk_ids,
+                    bool absolute_paths) const {
     if (chunk_ids.empty()) {
-        ProjectIO::save(*this, path);
+        ProjectIO::save(*this, path, absolute_paths);
         return;
     }
 
@@ -134,15 +182,17 @@ void Document::save(const std::string& path,
                     });
     subset.set_active_chunk_id(active_kept ? active_chunk_id_ : first_kept);
 
-    ProjectIO::save(subset, path);
+    ProjectIO::save(subset, path, absolute_paths);
 }
 
-std::shared_ptr<Document> ProjectIO::load(const std::string& path) {
-    const fs::path project(path);
-    fs::path zip_path;
+std::shared_ptr<Document> ProjectIO::load(const std::string& path, ReadReport* report) {
+    const fs::path project = platform::path_from_utf8(path);
+    ZipArchive archive;
 
-    if (project.extension() == ".zip") {
-        zip_path = project;
+    if (project.extension() == ".psz" || project.extension() == ".zip") {
+        // .psz is the single-file project; a bare .zip is the old direct
+        // project.zip form. Both parse into memory whole.
+        archive = ZipArchive::parse(read_file(project));
     } else {
         const auto bytes = read_file(project);
         std::istringstream manifest(std::string(bytes.begin(), bytes.end()));
@@ -152,6 +202,7 @@ std::shared_ptr<Document> ProjectIO::load(const std::string& path) {
         if (magic != kManifestMagic) {
             throw ProjectIOError("Invalid project file: '" + path + "'");
         }
+        fs::path zip_path;
         std::string line;
         while (std::getline(manifest, line)) {
             if (line.rfind(kFilesKey, 0) == 0) {
@@ -161,10 +212,24 @@ std::shared_ptr<Document> ProjectIO::load(const std::string& path) {
         if (zip_path.empty()) {
             throw ProjectIOError("Invalid project file: no files= entry in '" + path + "'");
         }
+        archive = ZipArchive::parse(read_file(zip_path));
     }
 
-    auto document = read_document(ZipArchive::parse(read_file(zip_path)));
+    IoContext context;
+    context.project_dir = project_directory(project);
+    context.scratch_dir = cache_directory(project);
+    auto document = read_document(archive, report, context);
     document->set_path(path);
+
+    // The storage flag describes how the file was written. Consume it so a
+    // load/save round trip does not accumulate container bookkeeping in the
+    // document's own metadata.
+    auto& items = document->meta().items;
+    items.erase(std::remove_if(items.begin(), items.end(),
+                               [](const std::pair<std::string, std::string>& item) {
+                                   return item.first == kAbsolutePathsKey;
+                               }),
+                items.end());
     return document;
 }
 
