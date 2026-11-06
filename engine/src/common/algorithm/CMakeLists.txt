@@ -10,6 +10,7 @@ add_library(alphashape_algorithms STATIC
     chunk/duplicate_chunk_task.cpp
     chunk/merge_chunks_task.cpp
     photos/add_photos_task.cpp
+    photos/camera_groups.cpp
     reference/xmp_reference.cpp
     reference/reference_orientation.cpp
     reference/align_from_reference_task.cpp

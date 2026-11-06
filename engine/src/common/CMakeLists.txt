@@ -13,6 +13,7 @@ add_library(alphashape_core STATIC
     core/assets.cpp
     core/chunk_ops.cpp
     core/chunk_geometry.cpp
+    core/frame_stats.cpp
     core/sensor_film.cpp
     core/validate.cpp
     tasks/registry.cpp

@@ -1,7 +1,10 @@
 #include "image/io/image_io.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstddef>
+#include <filesystem>
 #include <string>
 #include <limits>
 #include <vector>
@@ -60,6 +63,28 @@ ImageFormat detect_from_bytes(const std::vector<std::uint8_t>& bytes) {
 constexpr std::size_t kSignatureBytes = 8;
 
 }  // namespace
+
+bool has_supported_image_extension(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    if (!ext.empty() && ext.front() == '.') {
+        ext.erase(ext.begin());
+    }
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    // One entry per decoder in this file: JPEG, PNG, TIFF and the binary PNM
+    // family. The PNM decoder reads P5/P6 only, so ".pbm" is deliberately
+    // absent even though it is a Netpbm extension; listing it would make a
+    // recursive import fail later at decode time instead of skipping it here.
+    static const char* const kExtensions[] = {"jpg", "jpeg", "png", "tif", "tiff",
+                                              "pnm", "pgm",  "ppm"};
+    for (const char* known : kExtensions) {
+        if (ext == known) {
+            return true;
+        }
+    }
+    return false;
+}
 
 ImageFormat detect_image_format(const std::string& path) {
     try {

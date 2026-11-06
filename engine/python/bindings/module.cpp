@@ -45,11 +45,13 @@
 #include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/reference/reference_table.hpp"
+#include "common/algorithm/photos/camera_groups.hpp"
 #include "common/commands/command.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/core/frame_stats.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
@@ -1221,6 +1223,79 @@ PYBIND11_MODULE(alphashape, m) {
             }
             return out;
         })
+        // Camera groups (WP-11.8): the same shape the group commands edit.
+        .def_property_readonly("camera_groups", [](const Chunk& c) {
+            py::list out;
+            for (const alphashape::CameraGroup& group : c.camera_groups()) {
+                const char* type = "none";
+                switch (group.type) {
+                    case alphashape::CameraGroupType::Folder: type = "folder"; break;
+                    case alphashape::CameraGroupType::Station: type = "station"; break;
+                    case alphashape::CameraGroupType::Fixed: type = "fixed"; break;
+                    case alphashape::CameraGroupType::None: break;
+                }
+                py::list members;
+                for (const std::int32_t id : group.members) {
+                    members.append(py::int_(id));
+                }
+                py::dict entry;
+                entry[py::str("id")] = py::int_(group.id);
+                entry[py::str("label")] = py::str(group.label);
+                entry[py::str("type")] = py::str(type);
+                entry[py::str("members")] = members;
+                entry[py::str("folder")] = py::str(group.folder);
+                out.append(entry);
+            }
+            return out;
+        })
+        // Rebuild the camera grouping through the undoable command, then
+        // discard it: a scripted call is not a GUI undo entry.
+        .def(
+            "group_cameras",
+            [](py::object self, const std::string& group_type) {
+                alphashape::Document& document = owning_document(self);
+                const std::int32_t id = self.cast<const alphashape::Chunk&>().id();
+                alphashape::make_group_cameras_command(
+                    id, alphashape::parse_group_type(group_type))
+                    ->apply(document);
+            },
+            py::arg("group_type") = "station",
+            "Rebuild camera groups: 'station', 'folder', or 'none' to clear.")
+        .def(
+            "frame_stats",
+            [](const Chunk& c) {
+                const alphashape::FrameStats stats = alphashape::compute_frame_stats(c);
+                py::dict out;
+                if (stats.has_extent) {
+                    out[py::str("extent_min")] = py::make_tuple(
+                        stats.extent_min.x(), stats.extent_min.y(), stats.extent_min.z());
+                    out[py::str("extent_max")] = py::make_tuple(
+                        stats.extent_max.x(), stats.extent_max.y(), stats.extent_max.z());
+                } else {
+                    out[py::str("extent_min")] = py::none();
+                    out[py::str("extent_max")] = py::none();
+                }
+                if (stats.has_world_extent) {
+                    out[py::str("world_extent_min")] = py::make_tuple(
+                        stats.world_extent_min.x(), stats.world_extent_min.y(),
+                        stats.world_extent_min.z());
+                    out[py::str("world_extent_max")] = py::make_tuple(
+                        stats.world_extent_max.x(), stats.world_extent_max.y(),
+                        stats.world_extent_max.z());
+                } else {
+                    out[py::str("world_extent_min")] = py::none();
+                    out[py::str("world_extent_max")] = py::none();
+                }
+                out[py::str("mean_capture_distance")] =
+                    py::float_(stats.mean_capture_distance);
+                out[py::str("camera_count")] = py::int_(stats.camera_count);
+                out[py::str("enabled_count")] = py::int_(stats.enabled_count);
+                out[py::str("aligned_count")] = py::int_(stats.aligned_count);
+                out[py::str("frame_count")] = py::int_(stats.frame_count);
+                out[py::str("group_count")] = py::int_(stats.group_count);
+                return out;
+            },
+            "Summary of the camera block: extents, mean capture distance and counts.")
         .def("keypoints",
              [](const Chunk& c, std::int32_t camera_id) {
                  py::list out;
