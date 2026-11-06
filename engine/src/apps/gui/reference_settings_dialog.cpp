@@ -1,7 +1,11 @@
 #include "apps/gui/reference_settings_dialog.hpp"
 
+#include <algorithm>
 #include <exception>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <QCheckBox>
 #include <QDialogButtonBox>
@@ -11,12 +15,16 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QMessageBox>
+#include <QLocale>
 #include <QPushButton>
 #include <QVBoxLayout>
 
 #include "apps/gui/app.hpp"
 #include "apps/gui/crs_picker.hpp"
+#include "apps/gui/modal_hooks.hpp"
+#include "base/utils/error.hpp"
+#include "common/algorithm/reference/convert_reference.hpp"
+#include "common/commands/command.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
@@ -57,6 +65,47 @@ private:
     CrsPicker* picker_ = nullptr;
     QDialogButtonBox* buttons_ = nullptr;
 };
+
+const Chunk* find_chunk_in(const Document& document, std::int32_t chunk_id) {
+    for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+        if (chunk != nullptr && chunk->id() == chunk_id) {
+            return chunk.get();
+        }
+    }
+    return nullptr;
+}
+
+/// True when the chunk stores at least one reference value of `kind`, i.e.
+/// when relabelling its slot would change what those numbers mean.
+bool has_references_in(const Chunk& chunk, reference::ReferenceKind kind) {
+    if (kind != reference::ReferenceKind::Markers) {
+        for (const Camera& camera : chunk.cameras()) {
+            if (camera.reference.location.has_value()) {
+                return true;
+            }
+        }
+    }
+    if (kind != reference::ReferenceKind::Cameras) {
+        for (const Marker& marker : chunk.markers()) {
+            if (marker.reference.has_value()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+QString slot_label(CrsSlot slot) {
+    switch (slot) {
+        case CrsSlot::Camera:
+            return QObject::tr("camera");
+        case CrsSlot::Marker:
+            return QObject::tr("marker");
+        case CrsSlot::World:
+            return QObject::tr("world");
+    }
+    return QString();
+}
 
 }  // namespace
 
@@ -161,6 +210,11 @@ std::optional<CRS>& ReferenceSettingsDialog::slot_ref(int slot) {
     return slot == 0 ? camera_crs_ : (slot == 1 ? marker_crs_ : world_crs_);
 }
 
+void ReferenceSettingsDialog::set_crs_slot(int slot, std::optional<CRS> value) {
+    slot_ref(slot) = std::move(value);
+    refresh_crs_labels();
+}
+
 void ReferenceSettingsDialog::choose_crs(int slot) {
     std::optional<CRS>& target = slot_ref(slot);
     const CRS& base = target.has_value() ? *target : chunk_crs_;
@@ -182,8 +236,7 @@ void ReferenceSettingsDialog::choose_crs(int slot) {
             target = CRS(chosen);
         }
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Coordinate System"),
-                              QString::fromUtf8(error.what()));
+        report_error(this, tr("Coordinate System"), QString::fromUtf8(error.what()));
         return;
     }
     refresh_crs_labels();
@@ -197,6 +250,7 @@ void ReferenceSettingsDialog::build_accuracy_rows() {
                                    QDoubleSpinBox*& editor) {
         editor = new QDoubleSpinBox(group);
         editor->setObjectName(QStringLiteral("reference.") + key);
+        editor->setLocale(QLocale::c());
         editor->setRange(1e-9, maximum);
         editor->setDecimals(decimals);
         editor->setValue(value);
@@ -264,34 +318,97 @@ void ReferenceSettingsDialog::accept() {
         QDialog::accept();
         return;
     }
-    app_.begin_macro("Reference Settings");
-    bool applied = true;
-    try {
-        if (camera_changed) {
-            app_.execute(make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::Camera,
-                                                         camera_crs_));
+    // Ask first, but never read the document while a task owns it: the answer
+    // would be stale and the read would block the GUI thread.
+    if (app_.jobs().busy()) {
+        report_error(this, tr("Reference Settings"),
+                     tr("Cannot change reference settings while a task is running."));
+        return;
+    }
+    // A slot change only relabels the numbers stored in it (chunk.hpp §CRS
+    // slots), so ask before applying it over existing references.
+    struct Conversion {
+        CrsSlot slot;
+        reference::ReferenceKind kind;
+        std::optional<CRS> target;
+    };
+    std::vector<Conversion> conversions;
+    const auto ask = [this, &conversions](CrsSlot slot, reference::ReferenceKind kind,
+                                          const std::optional<CRS>& target,
+                                          bool changed) {
+        if (!changed) {
+            return true;
         }
-        if (marker_changed) {
-            app_.execute(make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::Marker,
-                                                         marker_crs_));
+        const bool has_references = app_.read_document(
+            [this, kind](const Document& document) {
+                const Chunk* chunk = find_chunk_in(document, chunk_id_);
+                return chunk != nullptr && has_references_in(*chunk, kind);
+            });
+        if (!has_references) {
+            return true;
+        }
+        const ReferenceChangeChoice choice =
+            modal_hooks().choose_reference_change(this, slot_label(slot));
+        if (choice == ReferenceChangeChoice::Cancel) {
+            return false;
+        }
+        if (choice == ReferenceChangeChoice::Convert) {
+            conversions.push_back(Conversion{slot, kind, target});
+        }
+        return true;
+    };
+    if (!ask(CrsSlot::Camera, reference::ReferenceKind::Cameras, camera_crs_,
+             camera_changed) ||
+        !ask(CrsSlot::Marker, reference::ReferenceKind::Markers, marker_crs_,
+             marker_changed)) {
+        return;
+    }
+
+    try {
+        if (app_.jobs().busy()) {
+            throw Error(tr("Cannot change reference settings while a task is running.")
+                            .toStdString());
+        }
+        auto transaction = std::make_unique<CommandTransaction>("Reference Settings");
+        std::vector<CrsSlot> converted;
+        for (const Conversion& conversion : conversions) {
+            const crs::CoordinateSystem target =
+                conversion.target.has_value()
+                    ? crs::CoordinateSystem(*conversion.target)
+                    : crs::CoordinateSystem(chunk_crs_);
+            transaction->add(reference::make_convert_reference_command(
+                chunk_id_, target, conversion.kind));
+            if (conversion.target.has_value()) {
+                converted.push_back(conversion.slot);
+            }
+            // With no target the slot goes back to following the chunk CRS,
+            // which the slot command below does after the values are converted.
+        }
+        const auto converted_already = [&converted](CrsSlot slot) {
+            return std::find(converted.begin(), converted.end(), slot) !=
+                   converted.end();
+        };
+        if (camera_changed && !converted_already(CrsSlot::Camera)) {
+            transaction->add(
+                make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::Camera, camera_crs_));
+        }
+        if (marker_changed && !converted_already(CrsSlot::Marker)) {
+            transaction->add(
+                make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::Marker, marker_crs_));
         }
         if (world_changed) {
-            app_.execute(make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::World,
-                                                         world_crs_));
+            transaction->add(
+                make_set_chunk_crs_slot_command(chunk_id_, CrsSlot::World, world_crs_));
         }
         if (settings != initial_settings_) {
-            app_.execute(
-                make_set_reference_settings_command(chunk_id_, settings));
+            transaction->add(make_set_reference_settings_command(chunk_id_, settings));
         }
+        app_.execute(std::move(transaction));
     } catch (const std::exception& error) {
-        applied = false;
-        QMessageBox::critical(this, tr("Reference Settings"),
-                              QString::fromUtf8(error.what()));
+        report_error(this, tr("Reference Settings"), QString::fromUtf8(error.what()));
+        return;
     }
-    app_.end_macro();
-    if (applied) {
-        QDialog::accept();
-    }
+    QDialog::accept();
 }
 
 }  // namespace alphashape::gui

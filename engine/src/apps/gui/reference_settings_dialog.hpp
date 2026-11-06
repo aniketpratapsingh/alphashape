@@ -33,6 +33,10 @@ public:
     /// marker_location, marker_projection, scalebar or tiepoint.
     QDoubleSpinBox* accuracy_editor(const QString& key) const;
 
+    /// Set one CRS slot (0 camera, 1 marker, 2 world) as if the picker had
+    /// returned it. The change is only applied by accept(), like a UI edit.
+    void set_crs_slot(int slot, std::optional<CRS> value);
+
 public Q_SLOTS:
     void accept() override;
 
