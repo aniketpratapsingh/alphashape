@@ -498,3 +498,16 @@ TEST_F(JobsTest, DestroyingTheAppWithAJobRunningEndsItCleanly) {
     EXPECT_FALSE(app().jobs().busy());
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
+
+TEST_F(JobsTest, EstimateHistoryResetsWhenTheUnsavedDocumentIsReplaced) {
+    add_fixture_photos();
+    use_gate_registry();
+    app().jobs().submit("GateTask", gate_params());
+    wait_finished();
+    // The successful run contributed a row to the unsaved project's history.
+    EXPECT_GE(app().jobs().throughput_history().size(), 1U);
+    // File/New: both documents are unsaved (""), so the path alone cannot tell
+    // them apart; the document identity must clear the old rows.
+    app().new_document({});
+    EXPECT_EQ(app().jobs().throughput_history().size(), 0U);
+}
