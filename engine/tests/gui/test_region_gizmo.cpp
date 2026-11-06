@@ -11,6 +11,8 @@
 #include <Eigen/Core>
 #include <gtest/gtest.h>
 
+#include <QLineEdit>
+
 #include "apps/gui/app.hpp"
 #include "apps/gui/transform_dialog.hpp"
 #include "apps/gui/viewer/region_gizmo.hpp"
@@ -38,7 +40,7 @@ protected:
     }
 
     /// Widget pixel of a world point, using the viewport's current camera and size.
-    Eigen::Vector2d pixel_of(const Eigen::Vector3d& world) const {
+    Eigen::Vector2d pixel_of(const Eigen::Vector3d& world) {
         ViewportWidget* view = window().viewport();
         const double width = static_cast<double>(std::max(view->width(), 1));
         const double height = static_cast<double>(std::max(view->height(), 1));
@@ -64,8 +66,6 @@ protected:
     }
 };
 
-using RegionGizmo = RegionGizmoFixture;
-
 class TransformDialogFixture : public GuiTest {
 protected:
     Chunk& make_chunk_for_dialog() {
@@ -76,9 +76,14 @@ protected:
     }
 };
 
-using TransformDialog = TransformDialogFixture;
-
 }  // namespace
+
+// Global aliases: a declaration in the global namespace outranks the names a
+// `using namespace alphashape::gui` directive brings in, so the gtest fixture
+// IDs are exactly RegionGizmo.* / TransformDialog.* without ambiguity with the
+// gui::TransformDialog class.
+using RegionGizmo = RegionGizmoFixture;
+using TransformDialog = TransformDialogFixture;
 
 TEST_F(RegionGizmo, DragFaceChangesOneAxis) {
     GizmoState state;
@@ -191,7 +196,8 @@ TEST_F(TransformDialog, ApplyAndReset) {
     EXPECT_NEAR(chunk.transform()(0, 3), 1.5, 1e-9);
     EXPECT_NEAR(chunk.transform()(1, 3), -2.25, 1e-9);
     EXPECT_NEAR(chunk.transform()(2, 3), 3.0, 1e-9);
-    EXPECT_NEAR(chunk.transform().topLeftCorner<3, 3>().col(0).norm(), 2.0, 1e-9);
+    const double column_norm = chunk.transform().topLeftCorner<3, 3>().col(0).norm();
+    EXPECT_NEAR(column_norm, 2.0, 1e-9);
 
     ASSERT_TRUE(dialog.reset_transform());
     const Transform identity = Transform::Identity();

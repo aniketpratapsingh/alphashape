@@ -7,6 +7,7 @@
 
 #include <Eigen/Geometry>
 
+#include <QAbstractButton>
 #include <QDialogButtonBox>
 #include <QDoubleValidator>
 #include <QFormLayout>
