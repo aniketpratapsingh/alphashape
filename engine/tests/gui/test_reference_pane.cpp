@@ -105,7 +105,7 @@ TEST_F(ReferencePane, CamerasAndMarkers) {
     EXPECT_EQ(summary.check_count, 0U);
     EXPECT_FALSE(std::isfinite(summary.check_rmse_m));
     EXPECT_NE(pane().action("action.reference.settings"), nullptr);
-    EXPECT_FALSE(pane().action("action.reference.settings")->isEnabled());
+    EXPECT_TRUE(pane().action("action.reference.settings")->isEnabled());
 }
 
 TEST_F(ReferencePane, EditEmitsCommand) {
