@@ -9,6 +9,7 @@ add_executable(alphashape_tests
     test_data_model.cpp
     test_project_roundtrip.cpp
     test_project_v2.cpp
+    test_project_layout.cpp
     test_detector.cpp
     test_image_io.cpp
     test_exif.cpp

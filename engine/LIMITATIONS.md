@@ -1089,6 +1089,28 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 - **No Python-side undo hook yet.** `Document.align_chunks` runs the task
   directly (like every other task); the undo entry exists on the C++ side only.
   Wiring the Python undo stack is WP-11.11.
+## M11 — Project layouts: .psz, relative paths, cache, lock (WP-11.9)
+
+- **A `.psz` is read fully into memory.** It is one zip with the same entries
+  `project.zip` carries; there is no streaming reader, so the peak cost is the
+  archive size plus the decoded document. That is the same bound the in-memory
+  `ZipArchive` already imposes on the directory form, but a very large
+  single-file project is bounded by RAM rather than by the file.
+- **Relative frame paths are resolved only when the file is present.** A
+  relative path whose photo is missing stays exactly as written (a warning
+  names the resolved location) so an unresolved project still round-trips
+  byte-stably; a path that cannot be made relative (another drive/root) stays
+  absolute. `Project/AbsolutePaths` records the writer's choice.
+- **The cache is per project, not shared.** `<base>.files/cache` holds undo
+  spill files and the GeoTIFF codec scratch files and is removed when the last
+  `Document` for that path is destroyed. A second engine process working on the
+  same project cannot reuse it (the writer lock is what prevents that).
+- **The writer lock is advisory.** It is taken by the GUI's project open and
+  by explicit `ProjectLock::acquire`; read-only and library consumers do not
+  take it, exactly as before. A lock from another host is only considered
+  stale once it is older than 24 h (configurable), because its pid cannot be
+  checked locally; a lock on this host whose pid is gone is broken at once.
+
 ## M12 — Coordinate systems (PROJ)
 
 M12 is complete. WP-12.1 added PROJ discovery and the data layout, WP-12.2
