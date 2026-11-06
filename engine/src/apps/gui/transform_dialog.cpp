@@ -277,3 +277,5 @@ bool TransformDialog::reset_transform() {
     return push_transform(Transform::Identity());
 }
 
+
+}  // namespace alphashape::gui
