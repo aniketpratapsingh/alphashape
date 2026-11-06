@@ -2,14 +2,22 @@
 
 // Job database (M11 §4.9, WP-11.10).
 //
-// One table: jobs(id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, state TEXT,
-// created TEXT, updated TEXT). Timestamps are ISO-8601 UTC. Every operation is
-// serialised by a mutex, so one JobDb may be shared across threads.
+// One table: jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, payload
+// TEXT, state TEXT, created TEXT, updated TEXT). Timestamps are ISO-8601 UTC.
+// Every operation is serialised by a mutex, so one JobDb may be shared across
+// threads.
 //
 // SQLite is optional at configure time. Without it JobDb is a JSON-lines
 // append-only log replayed on open; ids stay monotonic across reopen because
-// removed rows remain in the log. JobDbFallback is always compiled so the
-// fallback is tested directly on every lane, whether or not SQLite was found.
+// removed rows remain in the log and only newline-terminated records are
+// applied (a torn final line is ignored and truncated). JobDbFallback is always
+// compiled so the fallback is tested directly on every lane.
+//
+// The JSON-lines fallback is SINGLE-PROCESS: the project lock file guarantees
+// one writer per project, and JobDbFallback's mutex only serialises threads.
+// Each append additionally takes an advisory whole-file lock (flock / CRT
+// _locking) as cheap insurance, but that is not a substitute for the project
+// lock. SQLite, by contrast, is safe across processes.
 
 #include <cstdint>
 #include <memory>

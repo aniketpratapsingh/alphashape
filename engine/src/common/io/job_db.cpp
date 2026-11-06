@@ -7,9 +7,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -18,7 +20,9 @@
 
 #if defined(_WIN32)
 #include <io.h>
+#include <sys/locking.h>
 #else
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -191,21 +195,9 @@ std::map<std::string, std::string> parse_object(const std::string& line) {
     return values;
 }
 
-std::string json_get_string(const std::string& line, const std::string& key) {
-    const std::map<std::string, std::string> values = parse_object(line);
-    const auto found = values.find(key);
-    return found == values.end() ? std::string() : found->second;
-}
-
-std::int64_t json_get_int(const std::string& line, const std::string& key) {
-    const std::map<std::string, std::string> values = parse_object(line);
-    const auto found = values.find(key);
-    if (found == values.end()) {
-        return 0;
-    }
+std::int64_t parse_int_text(const std::string& text) {
     std::int64_t value = 0;
     bool negative = false;
-    const std::string& text = found->second;
     std::size_t i = 0;
     if (i < text.size() && text[i] == '-') {
         negative = true;
@@ -215,6 +207,86 @@ std::int64_t json_get_int(const std::string& line, const std::string& key) {
         value = value * 10 + static_cast<std::int64_t>(text[i] - '0');
     }
     return negative ? -value : value;
+}
+
+/// True when `line` is one whole JSON object: it has an opening brace and its
+/// last non-space byte is the closing brace. A line torn mid-write fails it.
+bool is_complete_record(const std::string& line) {
+    const std::size_t open = line.find('{');
+    if (open == std::string::npos) {
+        return false;
+    }
+    std::size_t end = line.size();
+    while (end > 0 &&
+           (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r')) {
+        --end;
+    }
+    return end > open && line[end - 1] == '}';
+}
+
+/// Applies one replayed log line. Incomplete lines and lines missing the
+/// mandatory `op`/`id` keys are skipped, never partially applied.
+void apply_record(const std::string& line, std::vector<JobRecord>& records,
+                  std::int64_t& next_id) {
+    if (!is_complete_record(line)) {
+        return;
+    }
+    const std::map<std::string, std::string> values = parse_object(line);
+    const auto op = values.find("op");
+    const auto id = values.find("id");
+    if (op == values.end() || id == values.end()) {
+        return;
+    }
+    const std::int64_t record_id = parse_int_text(id->second);
+    if (op->second == "insert") {
+        const auto kind = values.find("kind");
+        const auto state = values.find("state");
+        if (kind == values.end() || state == values.end()) {
+            return;
+        }
+        JobRecord record;
+        record.id = record_id;
+        record.kind = kind->second;
+        const auto payload = values.find("payload");
+        if (payload != values.end()) {
+            record.payload = payload->second;
+        }
+        record.state = state->second;
+        const auto created = values.find("created");
+        if (created != values.end()) {
+            record.created = created->second;
+        }
+        const auto updated = values.find("updated");
+        if (updated != values.end()) {
+            record.updated = updated->second;
+        }
+        records.push_back(std::move(record));
+        if (record_id >= next_id) {
+            next_id = record_id + 1;
+        }
+    } else if (op->second == "update") {
+        const auto state = values.find("state");
+        if (state == values.end()) {
+            return;
+        }
+        for (JobRecord& record : records) {
+            if (record.id == record_id) {
+                record.state = state->second;
+                const auto updated = values.find("updated");
+                if (updated != values.end()) {
+                    record.updated = updated->second;
+                }
+                break;
+            }
+        }
+    } else if (op->second == "remove") {
+        for (std::size_t i = 0; i < records.size(); ++i) {
+            if (records[i].id == record_id) {
+                records.erase(records.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
 }
 
 /// Appends one line and fsyncs it before returning.
@@ -228,6 +300,14 @@ void append_synced(const std::string& path, const std::string& line) {
     if (file == nullptr) {
         throw Error("job.db: cannot open '" + path + "' for append");
     }
+    // Advisory whole-file lock: cheap insurance against a second process (the
+    // project lock normally forbids one) interleaving a record.
+#if defined(_WIN32)
+    (void)::_lseek(::_fileno(file), 0, SEEK_SET);
+    const bool locked = ::_locking(::_fileno(file), _LK_LOCK, 1) == 0;
+#else
+    const bool locked = ::flock(::fileno(file), LOCK_EX) == 0;
+#endif
     const std::string record = line + "\n";
     const std::size_t written =
         std::fwrite(record.data(), std::size_t{1}, record.size(), file);
@@ -237,6 +317,13 @@ void append_synced(const std::string& path, const std::string& line) {
 #else
     const bool synced = ok && ::fsync(::fileno(file)) == 0;
 #endif
+    if (locked) {
+#if defined(_WIN32)
+        (void)::_locking(::_fileno(file), _LK_UNLCK, 1);
+#else
+        (void)::flock(::fileno(file), LOCK_UN);
+#endif
+    }
     std::fclose(file);
     if (!synced) {
         throw Error("job.db: cannot write '" + path + "'");
@@ -254,41 +341,27 @@ void JobDbFallback::replay() {
     if (!in) {
         return;
     }
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) {
-            continue;
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    in.close();
+
+    // Only newline-terminated lines are records. A crash can leave a torn
+    // fragment at the end of the log; it is ignored here and truncated away
+    // below, so a later append can never complete it into a valid record.
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t newline = text.find('\n', start);
+        if (newline == std::string::npos) {
+            break;
         }
-        const std::string op = json_get_string(line, "op");
-        const std::int64_t id = json_get_int(line, "id");
-        if (op == "insert") {
-            JobRecord record;
-            record.id = id;
-            record.kind = json_get_string(line, "kind");
-            record.payload = json_get_string(line, "payload");
-            record.state = json_get_string(line, "state");
-            record.created = json_get_string(line, "created");
-            record.updated = json_get_string(line, "updated");
-            records_.push_back(std::move(record));
-            if (id >= next_id_) {
-                next_id_ = id + 1;
-            }
-        } else if (op == "update") {
-            for (JobRecord& record : records_) {
-                if (record.id == id) {
-                    record.state = json_get_string(line, "state");
-                    record.updated = json_get_string(line, "updated");
-                    break;
-                }
-            }
-        } else if (op == "remove") {
-            for (std::size_t i = 0; i < records_.size(); ++i) {
-                if (records_[i].id == id) {
-                    records_.erase(records_.begin() + static_cast<std::ptrdiff_t>(i));
-                    break;
-                }
-            }
-        }
+        apply_record(text.substr(start, newline - start), records_, next_id_);
+        start = newline + 1;
+    }
+    if (!text.empty() && text.back() != '\n') {
+        const std::size_t last = text.rfind('\n');
+        const std::size_t keep = last == std::string::npos ? 0 : last + 1;
+        std::error_code ec;
+        fs::resize_file(platform::path_from_utf8(path_), keep, ec);
     }
 }
 
@@ -434,15 +507,23 @@ struct JobDb::Impl {
                            &message) != SQLITE_OK) {
             const std::string reason = message != nullptr ? message : "WAL failed";
             ::sqlite3_free(message);
+            // The constructor body throwing means ~Impl never runs, so the
+            // handle must be released here.
+            ::sqlite3_close(db);
+            db = nullptr;
             throw Error("job.db: " + reason);
         }
+        // AUTOINCREMENT keeps ids monotonic after a delete, matching the
+        // JSON-lines fallback (whose removed rows stay in the log).
         if (::sqlite3_exec(db,
                            "CREATE TABLE IF NOT EXISTS jobs("
-                           "id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, "
-                           "state TEXT, created TEXT, updated TEXT)",
+                           "id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, "
+                           "payload TEXT, state TEXT, created TEXT, updated TEXT)",
                            nullptr, nullptr, &message) != SQLITE_OK) {
             const std::string reason = message != nullptr ? message : "schema failed";
             ::sqlite3_free(message);
+            ::sqlite3_close(db);
+            db = nullptr;
             throw Error("job.db: " + reason);
         }
 #else
