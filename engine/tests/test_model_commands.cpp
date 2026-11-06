@@ -1360,6 +1360,89 @@ TEST(Commands, SetSensorMasterUndoes) {
     chunk.sensors()[1].type = CameraType::Frame;
 }
 
+TEST(Commands, SetSensorPhysicalRejectsNonFiniteAndNegative) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    Sensor sensor;
+    sensor.label = "s0";
+    sensor.pixel_size_um = 3.76;
+    sensor.focal_length_mm = 24.0;
+    chunk.sensors().push_back(sensor);
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(make_set_sensor_physical_command(chunk_id, 0, nan, 24.0)->apply(document),
+                 ValueError);
+    EXPECT_THROW(make_set_sensor_physical_command(chunk_id, 0, 3.76, nan)->apply(document),
+                 ValueError);
+    EXPECT_THROW(make_set_sensor_physical_command(chunk_id, 0, -1.0, 24.0)->apply(document),
+                 ValueError);
+    EXPECT_THROW(make_set_sensor_physical_command(chunk_id, 0, 3.76, -1.0)->apply(document),
+                 ValueError);
+    EXPECT_DOUBLE_EQ(chunk.sensors()[0].pixel_size_um, 3.76);
+    EXPECT_DOUBLE_EQ(chunk.sensors()[0].focal_length_mm, 24.0);
+
+    // 0 means "unknown" and is accepted; undo restores the previous pair.
+    UndoStack stack(&document);
+    auto command = make_set_sensor_physical_command(chunk_id, 0, 0.0, 0.0);
+    check_and_reset(*command, document);
+    stack.execute(std::move(command));
+    EXPECT_DOUBLE_EQ(chunk.sensors()[0].pixel_size_um, 0.0);
+    stack.undo();
+    EXPECT_DOUBLE_EQ(chunk.sensors()[0].pixel_size_um, 3.76);
+}
+
+TEST(Commands, SetChunkCrsSlotRestoresAbsence) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    UndoStack stack(&document);
+    ASSERT_FALSE(chunk.explicit_camera_crs().has_value());
+
+    CRS value;
+    value.epsg = 25832;
+    auto set = make_set_chunk_crs_slot_command(chunk_id, CrsSlot::Camera, value);
+    check_and_reset(*set, document);
+    stack.execute(std::move(set));
+    ASSERT_TRUE(chunk.explicit_camera_crs().has_value());
+    EXPECT_EQ(chunk.explicit_camera_crs()->epsg, 25832);
+
+    // Undo restores the absence, not an empty CRS.
+    stack.undo();
+    EXPECT_FALSE(chunk.explicit_camera_crs().has_value());
+    stack.redo();
+    ASSERT_TRUE(chunk.explicit_camera_crs().has_value());
+    EXPECT_EQ(chunk.explicit_camera_crs()->epsg, 25832);
+}
+
+TEST(Commands, SetSensorFixedParamsRejectsUnknownAndDuplicate) {
+    Document document;
+    const std::int32_t chunk_id = add_chunk(document, "chunk");
+    Chunk& chunk = chunk_of(document, chunk_id);
+    Sensor sensor;
+    sensor.label = "s0";
+    sensor.width = 640;
+    sensor.height = 480;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 640, 480, 500.0);
+    chunk.sensors().push_back(sensor);
+    UndoStack stack(&document);
+
+    EXPECT_THROW(make_set_sensor_fixed_params_command(chunk_id, 0, {"f", "nope"})
+                     ->apply(document),
+                 ValueError);
+    EXPECT_THROW(make_set_sensor_fixed_params_command(chunk_id, 0, {"k1", "k1"})
+                     ->apply(document),
+                 ValueError);
+    EXPECT_TRUE(chunk.sensors()[0].fixed_params.empty());
+
+    auto valid = make_set_sensor_fixed_params_command(chunk_id, 0, {"f", "k3"});
+    check_and_reset(*valid, document);
+    stack.execute(std::move(valid));
+    ASSERT_EQ(chunk.sensors()[0].fixed_params.size(), 2U);
+    stack.undo();
+    EXPECT_TRUE(chunk.sensors()[0].fixed_params.empty());
+}
+
 }  // namespace
 }  // namespace alphashape
 
