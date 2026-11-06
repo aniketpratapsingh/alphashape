@@ -121,6 +121,7 @@ void GuiApp::set_theme(ThemeMode mode) {
 
 void GuiApp::new_document(const std::string& path) {
     require_idle("replace the project");
+    project_lock_.release();
     undo_stack_.clear();
     document_ = path.empty() ? std::make_shared<Document>() : std::make_shared<Document>(path);
     undo_stack_.bind(document_.get());
@@ -132,7 +133,12 @@ void GuiApp::new_document(const std::string& path) {
 
 void GuiApp::open_document(const std::string& path) {
     require_idle("open a project");
+    // The GUI edits the project it opens, so take the writer lock. A read-only
+    // CLI/Python open does not, and a failed load releases the lock with the
+    // temporary (WP-11.9).
+    ProjectLock acquired = ProjectLock::acquire(path);
     std::shared_ptr<Document> loaded = ProjectIO::load(path);
+    project_lock_ = std::move(acquired);
     undo_stack_.clear();
     document_ = std::move(loaded);
     undo_stack_.bind(document_.get());

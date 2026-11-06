@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -253,5 +255,52 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv) {
 }
 
 #endif
+
+bool process_is_alive(long long pid) {
+    if (pid <= 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    const DWORD id = static_cast<DWORD>(pid);
+    HANDLE handle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id);
+    if (handle == nullptr) {
+        // Access denied means the process exists but belongs to another user;
+        // ERROR_INVALID_PARAMETER means no such process.
+        return ::GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    DWORD exit_code = 0;
+    const BOOL ok = ::GetExitCodeProcess(handle, &exit_code);
+    ::CloseHandle(handle);
+    return ok != 0 && exit_code == STILL_ACTIVE;
+#else
+    // A pid outside pid_t would wrap (possibly negative, which names a process
+    // group), so it cannot be a live process.
+    if (pid > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
+        return false;
+    }
+    // Signal 0 performs the permission and existence checks without sending
+    // anything. EPERM means the process exists but belongs to another user.
+    const int rc = ::kill(static_cast<pid_t>(pid), 0);
+    return rc == 0 || errno == EPERM;
+#endif
+}
+
+std::string hostname() {
+#if defined(_WIN32)
+    wchar_t buffer[256];
+    DWORD size = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+    if (::GetComputerNameW(buffer, &size) == 0) {
+        return std::string();
+    }
+    return to_utf8(std::wstring(buffer, size));
+#else
+    char buffer[256];
+    if (::gethostname(buffer, sizeof(buffer)) != 0) {
+        return std::string();
+    }
+    buffer[sizeof(buffer) - 1] = '\0';
+    return std::string(buffer);
+#endif
+}
 
 }  // namespace alphashape::platform

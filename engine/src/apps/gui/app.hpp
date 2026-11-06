@@ -24,6 +24,7 @@
 #include "common/commands/command.hpp"
 #include "common/core/document.hpp"
 #include "common/core/document_lock.hpp"
+#include "common/io/lock_file.hpp"
 
 namespace alphashape::gui {
 
@@ -141,6 +142,8 @@ private:
     std::unique_ptr<QSettings> settings_;
     std::shared_ptr<Document> document_;
     UndoStack undo_stack_;
+    /// On-disk writer lock for the open project (WP-11.9); released on replace.
+    ProjectLock project_lock_;
     Theme theme_;
     mutable DocumentLock document_lock_;
     JobManager jobs_;

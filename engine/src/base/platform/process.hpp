@@ -29,4 +29,14 @@ struct ProcessResult {
 /// end is added by the implementation) and waits for it.
 ProcessResult run_process_capture(const std::vector<std::string>& argv);
 
+/// True when a process with `pid` is running (or exists but belongs to another
+/// user). Used by the project lock file to tell "the writer is alive" from "the
+/// writer died and left a stale lock". A pid <= 0 is never alive.
+bool process_is_alive(long long pid);
+
+/// The local host name, or "" when the platform cannot report it. Stored in a
+/// lock file so a lock from another machine is never broken as if its pid were
+/// local.
+std::string hostname();
+
 }  // namespace alphashape::platform
