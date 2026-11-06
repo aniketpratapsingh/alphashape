@@ -742,8 +742,19 @@ TEST(Markers, PlacedMarkerAppearsInReferenceTable) {
     EXPECT_EQ(row->kind, reference::ReferenceRowKind::Marker);
     ASSERT_TRUE(row->estimated.has_value());
     expect_vec3(*row->estimated, position);
-    // Placement alone does not mark a marker as adjusted.
-    EXPECT_FALSE(row->enabled);
+    // The checkbox is the reference role: a marker without a role is a
+    // control point (checked). Placement alone still leaves `valid` unset.
+    EXPECT_TRUE(row->enabled);
+    const Marker* marker = nullptr;
+    for (const Marker& candidate : chunk->markers()) {
+        if (candidate.label == "GCP1") {
+            marker = &candidate;
+            break;
+        }
+    }
+    ASSERT_NE(marker, nullptr);
+    EXPECT_FALSE(marker->valid);
+    EXPECT_EQ(reference::marker_role(*marker), reference::MarkerReferenceRole::Gcp);
 }
 #endif  // ALPHASHAPE_USE_PROJ
 
