@@ -26,6 +26,7 @@ add_library(alphashape_core STATIC
     io/project_io.cpp
     io/paths.cpp
     io/lock_file.cpp
+    io/job_db.cpp
     io/doc_xml.cpp
     io/doc_xml_common.cpp
     io/doc_xml_v1.cpp
@@ -39,6 +40,25 @@ add_library(alphashape_core STATIC
 # base, so this stays acyclic: base <- image <- model/core <- algorithms.
 target_include_directories(alphashape_core PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_core PUBLIC alphashape_base alphashape_model alphashape_image)
+
+# WP-11.10: SQLite when the configure found it, the JSON-lines fallback
+# otherwise. The fallback class is compiled either way so its tests never skip.
+if(SQLite3_FOUND)
+    # Newer CMake names the target SQLite3::SQLite3 and deprecates the old
+    # spelling; accept either so older and newer FindSQLite3 modules both work.
+    if(TARGET SQLite3::SQLite3)
+        set(_alphashape_sqlite_target SQLite3::SQLite3)
+    elseif(TARGET SQLite::SQLite3)
+        set(_alphashape_sqlite_target SQLite::SQLite3)
+    endif()
+endif()
+if(DEFINED _alphashape_sqlite_target)
+    target_compile_definitions(alphashape_core PRIVATE ALPHASHAPE_USE_SQLITE3=1)
+    target_link_libraries(alphashape_core PRIVATE ${_alphashape_sqlite_target})
+    message(STATUS "  job database ...... SQLite3 (WAL)")
+else()
+    message(STATUS "  job database ...... JSON-lines fallback")
+endif()
 
 # The CRS bridge in core/types.cpp is written against alphashape_crs; with
 # -DALPHASHAPE_USE_PROJ=OFF the target does not exist and the bridge compiles

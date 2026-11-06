@@ -98,7 +98,8 @@ jobs:
           packages: >-
             build-essential cmake ninja-build ccache
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev
-            libtiff-dev libgtest-dev pybind11-dev python3-dev libvulkan-dev glslc spirv-tools
+            libtiff-dev libgtest-dev pybind11-dev python3-dev libsqlite3-dev
+            libvulkan-dev glslc spirv-tools
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
             libgl-dev libopengl-dev libegl-dev libxkbcommon-dev libfontconfig1-dev libdbus-1-dev
 
@@ -257,8 +258,8 @@ jobs:
       - name: Install dependencies
         run: |
           brew install ninja ccache eigen ceres-solver proj libtiff libpng jpeg-turbo googletest \
-            pybind11 libomp molten-vk vulkan-loader vulkan-headers vulkan-tools shaderc spirv-tools \
-            vulkan-validationlayers
+            pybind11 sqlite libomp molten-vk vulkan-loader vulkan-headers vulkan-tools shaderc \
+            spirv-tools vulkan-validationlayers
           prefix="$(brew --prefix)"
           mkdir -p "$prefix/include/vma"
           curl -fsSL --retry 3 --max-time 60 -o "$prefix/include/vma/vk_mem_alloc.h" \
@@ -449,7 +450,7 @@ jobs:
       # vulkan-1.dll (it would shadow the driver's own loader and could not find
       # the driver's ICDs), and nothing links against it. The test lanes install
       # it separately, because a Windows runner image has no Vulkan runtime.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib vulkan-headers vulkan-memory-allocator shaderc spirv-tools[tools]
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib sqlite3 vulkan-headers vulkan-memory-allocator shaderc spirv-tools[tools]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -980,8 +981,8 @@ jobs:
 
       - name: Install runtime dependencies
         run: |
-          brew install eigen ceres-solver proj libtiff libpng jpeg-turbo pybind11 libomp molten-vk \
-            vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
+          brew install eigen ceres-solver proj libtiff libpng jpeg-turbo pybind11 sqlite libomp \
+            molten-vk vulkan-loader vulkan-headers vulkan-tools vulkan-validationlayers
 
       # Same pin as the build job: the ctest entries run a Python that must match
       # the interpreter the module was built for, and a Homebrew Python on the
@@ -1071,7 +1072,7 @@ jobs:
       # Note that PATH is not enough to make it load: bare names resolve
       # against System32 only (DLL planting), so the step after the vcpkg
       # install points ALPHASHAPE_VULKAN_LIBRARY at the absolute path.
-      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib vulkan-loader
+      VCPKG_PACKAGES: eigen3 ceres[eigensparse] proj[core,tiff] libjpeg-turbo libpng tiff gtest zlib sqlite3 vulkan-loader
     steps:
       - uses: actions/checkout@v7
         with:

@@ -17,6 +17,7 @@ add_library(alphashape_algorithms STATIC
     feature/dog_detector.cpp
     feature/mldb_descriptor.cpp
     feature/detect_features_task.cpp
+    jobs/run_script_task.cpp
     match/hamming_matcher.cpp
     match/preselection.cpp
     match/tracks.cpp
@@ -104,6 +105,12 @@ target_link_libraries(alphashape_algorithms PUBLIC
     alphashape_image
     alphashape_gpu)
 target_link_libraries(alphashape_algorithms PRIVATE Ceres::ceres TIFF::TIFF)
+
+# WP-11.10: where python/CMakeLists.txt puts the built module. RunScript
+# prepends this to the child's PYTHONPATH; the CLI's --python-path overrides it
+# at runtime through ALPHASHAPE_PYTHON_MODULE_DIR.
+target_compile_definitions(alphashape_algorithms PRIVATE
+    "ALPHASHAPE_PYTHON_MODULE_DIR=\"${CMAKE_BINARY_DIR}/python\"")
 
 # M12 §4.1: the algorithms layer links the CRS engine explicitly (it already
 # reaches it through alphashape_model, but WP-12.8 makes DEM/ortho tasks call

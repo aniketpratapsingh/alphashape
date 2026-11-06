@@ -168,6 +168,19 @@ class TestDriftInvariant(unittest.TestCase):
             doc.active_chunk = chunk
             _PREPARED_CACHE[task] = (doc, chunk)
             return doc, chunk
+        if task == "RunScript":
+            # RunScript refuses an unsaved document and needs a real script.
+            # The temp directory is gone afterwards, but the recorded meta and
+            # the save/load checks below only need the parameter values.
+            doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+            with tempfile.TemporaryDirectory() as tmp:
+                doc.path = os.path.join(tmp, "project.psx")
+                script = os.path.join(tmp, "script.py")
+                with open(script, "w", encoding="utf-8") as handle:
+                    handle.write("print('runscript parity')\n")
+                doc.run_task(task, path=script)
+            _PREPARED_CACHE[task] = (doc, chunk)
+            return doc, chunk
         if task in ("AlignCameras", "OptimizeCameras", "BuildDepthMaps", "BuildPointCloud",
                     "BuildModel", "BuildUV", "BuildTexture", "ExportModel", "ExportPointCloud",
                     "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
