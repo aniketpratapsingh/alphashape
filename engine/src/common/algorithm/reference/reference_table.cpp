@@ -262,7 +262,9 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         row.id = camera.id;
         row.label = camera.label;
         row.kind = ReferenceRowKind::Camera;
-        row.enabled = camera.enabled;
+        // The checkbox means "use this reference", which is exactly the flag
+        // OptimizeCameras filters on -- not the alignment flag.
+        row.enabled = camera.reference.enabled;
         if (camera.reference.location) {
             row.source = source_of(camera.reference.location, camera_cs, camera_src);
         }

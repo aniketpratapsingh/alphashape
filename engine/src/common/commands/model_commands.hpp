@@ -228,6 +228,10 @@ std::unique_ptr<AbstractCommand> make_rename_asset_command(
 
 std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool enabled);
+/// Set one camera's reference flag (`Camera::reference.enabled`), the flag
+/// OptimizeCameras gates its GNSS prior on. Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
+    std::int32_t chunk_id, std::int32_t camera_id, bool enabled);
 /// Set one camera's GNSS reference (location and per-axis accuracy). Undo
 /// restores both. The accuracy must be finite and positive, and a location
 /// must be finite.

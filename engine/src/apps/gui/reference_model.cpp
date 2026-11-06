@@ -248,7 +248,8 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
                 return false;
             }
             if (item.kind == reference::ReferenceRowKind::Camera) {
-                app_.execute(make_set_camera_enabled_command(chunk_id_, {item.id}, on));
+                app_.execute(
+                    make_set_camera_reference_enabled_command(chunk_id_, item.id, on));
             } else {
                 app_.execute(make_set_marker_enabled_command(chunk_id_, item.id, on));
             }

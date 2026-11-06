@@ -1935,7 +1935,7 @@ private:
 /// Set a flag ("enabled" or "selected") on a set of cameras in one step.
 class SetCameraFlagCommand : public ChunkContainersCommand {
 public:
-    enum class Flag { Enabled, Selected };
+    enum class Flag { Enabled, Selected, ReferenceEnabled };
 
     SetCameraFlagCommand(std::int32_t chunk_id, std::vector<std::int32_t> camera_ids,
                          Flag flag, bool value)
@@ -1945,8 +1945,12 @@ public:
           value_(value) {}
 
     std::string name() const override {
-        return flag_ == Flag::Enabled ? "Set Camera Enabled"
-                                      : "Set Camera Selected";
+        switch (flag_) {
+            case Flag::Enabled: return "Set Camera Enabled";
+            case Flag::Selected: return "Set Camera Selected";
+            case Flag::ReferenceEnabled: return "Set Camera Reference Enabled";
+        }
+        return "Set Camera Enabled";
     }
 
 protected:
@@ -1973,6 +1977,8 @@ protected:
             }
             if (flag_ == Flag::Enabled) {
                 camera->enabled = value_;
+            } else if (flag_ == Flag::ReferenceEnabled) {
+                camera->reference.enabled = value_;
             } else {
                 camera->selected = value_;
             }
@@ -3291,6 +3297,13 @@ std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
     return std::make_unique<SetCameraFlagCommand>(
         chunk_id, std::move(camera_ids), SetCameraFlagCommand::Flag::Enabled,
         enabled);
+}
+
+std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
+    std::int32_t chunk_id, std::int32_t camera_id, bool enabled) {
+    return std::make_unique<SetCameraFlagCommand>(
+        chunk_id, std::vector<std::int32_t>{camera_id},
+        SetCameraFlagCommand::Flag::ReferenceEnabled, enabled);
 }
 
 std::unique_ptr<AbstractCommand> make_set_camera_reference_command(

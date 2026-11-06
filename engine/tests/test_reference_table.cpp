@@ -128,6 +128,39 @@ TEST(ReferenceTable, DisabledRowsLeaveTheRmse) {
     EXPECT_FALSE(row_for(table, 2).estimated.has_value());
 }
 
+TEST(ReferenceTable, CameraCheckboxMeansReferenceEnabled) {
+    Chunk chunk("reference flag");
+    chunk.set_id(0);
+    Camera used = make_camera(1, Eigen::Vector3d::Zero());
+    used.reference.location = Eigen::Vector3d(1.0, 0.0, 0.0);
+    used.reference.enabled = true;
+    chunk.cameras().push_back(used);
+    // Aligned but its reference is switched off: the estimate still appears,
+    // the row is unchecked and it leaves the RMSE.
+    Camera ignored = make_camera(2, Eigen::Vector3d::Zero());
+    ignored.reference.location = Eigen::Vector3d(100.0, 0.0, 0.0);
+    ignored.reference.enabled = false;
+    chunk.cameras().push_back(ignored);
+    // Reference on, but not aligned: no estimate, so no error either.
+    Camera unaligned = make_camera(3, Eigen::Vector3d::Zero());
+    unaligned.enabled = false;
+    unaligned.reference.location = Eigen::Vector3d(50.0, 0.0, 0.0);
+    chunk.cameras().push_back(unaligned);
+
+    const ReferenceTable table = build_reference_table(chunk, crs::CoordinateSystem());
+    const ReferenceRow& off = row_for(table, 2);
+    EXPECT_FALSE(off.enabled);
+    ASSERT_TRUE(off.estimated.has_value());
+    EXPECT_TRUE(off.error_m.has_value());
+    const ReferenceRow& aligned_only = row_for(table, 3);
+    EXPECT_TRUE(aligned_only.enabled);
+    EXPECT_FALSE(aligned_only.estimated.has_value());
+
+    const ReferenceSummary summary = table.summary();
+    EXPECT_EQ(summary.camera_count, 3U);
+    EXPECT_NEAR(summary.camera_rmse_m, 1.0, 1e-9);
+}
+
 TEST(ReferenceTable, GeographicErrorIsInMetres) {
     Chunk chunk("geo");
     chunk.set_id(0);
