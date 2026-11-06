@@ -798,7 +798,15 @@ bool MainWindow::open_project(const QString& path) {
     }
     start_page_ = false;
     update_central_page();
-    statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
+    if (app_.opened_read_only()) {
+        // The container could not be locked (permissions or read-only media).
+        // GuiApp already logged the reason through the warning reporter; make
+        // the consequence visible where the path is shown.
+        statusBar()->showMessage(
+            tr("Opened %1 read-only: the project cannot be locked").arg(path), 8000);
+    } else {
+        statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
+    }
     return true;
 }
 

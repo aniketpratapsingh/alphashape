@@ -40,6 +40,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/calibration/calibration_io.hpp"
 #include "common/algorithm/markers/marker_sheet.hpp"
@@ -2094,12 +2095,34 @@ PYBIND11_MODULE(alphashape, m) {
         .def(py::init<>())
         .def_property("path", [](const Document& d) { return d.path(); },
                       [](Document& d, const std::string& path) { d.set_path(path); })
+        .def_property_readonly(
+            "cache_dir", [](const Document& d) { return d.cache_dir(); },
+            "Scratch directory for this project (<base>.files/cache), or '' "
+            "when the document has no on-disk location yet. A project.zip "
+            "opened directly resolves to <base>.files/cache as well. The "
+            "directory is not created until a caller writes into it, and it is "
+            "removed when the last Document that shares it closes.")
         .def(
             "save",
-            [](Document& d, const std::string& path, py::object chunks) {
+            [](Document& d, const std::string& path, py::object chunks,
+               py::object archive) {
+                // archive=None infers the layout from the extension;
+                // archive=True forces the single-file .psz form, False the
+                // directory form.
+                std::string target = path;
+                if (!archive.is_none()) {
+                    std::filesystem::path as_path =
+                        alphashape::platform::path_from_utf8(target);
+                    if (archive.cast<bool>()) {
+                        as_path.replace_extension(".psz");
+                    } else if (as_path.extension() == ".psz") {
+                        as_path.replace_extension(".psx");
+                    }
+                    target = alphashape::platform::path_to_utf8(as_path);
+                }
                 // Record the path so a later run resolves relative frame paths
                 // against the project we just wrote, exactly like load() would.
-                d.set_path(path);
+                d.set_path(target);
                 std::vector<std::int32_t> ids;
                 if (!chunks.is_none()) {
                     // A bare int is REJECTED, not iterated: `chunks=3` would
@@ -2119,12 +2142,17 @@ PYBIND11_MODULE(alphashape, m) {
                         }
                     }
                 }
-                d.save(path, ids);
+                d.save(target, ids);
             },
             py::arg("path"), py::arg("chunks") = py::none(),
+            py::arg("archive") = py::none(),
             "Write the project. `chunks` restricts the file to those chunks "
             "(ids or Chunk objects); None writes every chunk. Chunk ids and the "
-            "next-chunk counter are preserved so the file can be appended.")
+            "next-chunk counter are preserved so the file can be appended. "
+            "`archive` selects the layout: None infers it from `path` (a .psz "
+            "path writes the single-file form, anything else the directory "
+            "form); True forces a single-file .psz and False the directory "
+            "form, rewriting the extension when it does not already match.")
         .def("add_chunk",
              [](py::object self, const std::string& label) -> py::object {
                  Document& d = self.cast<Document&>();

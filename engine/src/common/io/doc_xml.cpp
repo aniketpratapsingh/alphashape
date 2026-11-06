@@ -1,12 +1,61 @@
 #include "common/io/doc_xml.hpp"
 
+#include <filesystem>
+#include <memory>
 #include <new>
 #include <string>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "common/io/doc_xml_common.hpp"
+#include "common/io/paths.hpp"
 
 namespace alphashape {
+
+namespace fs = std::filesystem;
+
+namespace {
+
+/// Turn every stored relative frame path into the absolute path it names. A
+/// resolved path that does not exist stays as it was written and produces a
+/// warning: the project still loads, and a project whose image tree moved away
+/// is readable (the user can relink).
+///
+/// Only resolving an existing file is deliberate. A path that was relative and
+/// is still missing has no better absolute form to hand the caller, and keeping
+/// the stored text makes a save/load round trip of an unresolved project
+/// byte-stable.
+void resolve_frame_paths(Document& document, const std::string& project_dir,
+                         ReadReport* report) {
+    for (auto& workspace : document.workspaces()) {
+        if (workspace == nullptr) {
+            continue;
+        }
+        for (auto& chunk : workspace->chunks()) {
+            if (chunk == nullptr) {
+                continue;
+            }
+            for (auto& frame : chunk->frames()) {
+                if (frame == nullptr || frame->path().empty()) {
+                    continue;
+                }
+                const std::string stored = frame->path();
+                const std::string resolved = path_from_storage(stored, project_dir);
+                if (resolved == stored) {
+                    continue;  // already absolute
+                }
+                std::error_code ec;
+                if (fs::exists(platform::path_from_utf8(resolved), ec)) {
+                    frame->set_path(resolved);
+                } else {
+                    docxml::add_warning(report, "frame file not found: " + resolved);
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
 
 // doc.xml is a versioned container. This file is only the dispatcher:
 //
@@ -24,16 +73,18 @@ namespace alphashape {
 // cpp} and sidecars.{hpp,cpp}; the two readers share it, so a v1 project and a
 // v2 project decode through exactly the same value and sidecar code.
 
-void write_document(const Document& document, ZipArchive& archive, int version) {
+void write_document(const Document& document, ZipArchive& archive, int version,
+                    const IoContext& context) {
     if (version != Document::kFormatVersion) {
         throw ProjectIOError("cannot write project format version " +
                              std::to_string(version) + ": this build writes version " +
                              std::to_string(Document::kFormatVersion) + " only");
     }
-    docxml::write_v2(document, archive);
+    docxml::write_v2(document, archive, context);
 }
 
-std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* report) {
+std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* report,
+                                        const IoContext& context) {
     if (report != nullptr) {
         report->version = 0;
         report->warnings.clear();
@@ -61,15 +112,18 @@ std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* r
     // ValueError) or from the allocator (a sidecar whose declared size survives
     // every per-decoder check but cannot be held). Neither says "your project
     // is unreadable", so normalize them here rather than at every call site.
+    std::shared_ptr<Document> document;
     try {
         if (version == 1) {
-            return docxml::read_v1(root, archive, report);
-        }
-        // v2, v3 and v4 share the reader: v3 and v4 are sidecar-encoding bumps
-        // only (ADM1 -> ADM2 -> ADM3 for depth maps), and the codec keys off
-        // its own magic.
-        if (version >= 2 && version <= Document::kFormatVersion) {
-            return docxml::read_v2(root, archive, report);
+            document = docxml::read_v1(root, archive, report, context);
+        } else if (version >= 2 && version <= Document::kFormatVersion) {
+            // v2, v3 and v4 share the reader: v3 and v4 are sidecar-encoding
+            // bumps only (ADM1 -> ADM2 -> ADM3 for depth maps), and the codec
+            // keys off its own magic.
+            document = docxml::read_v2(root, archive, report, context);
+        } else {
+            throw ProjectIOError("Invalid project file: unsupported format version " +
+                                 std::to_string(version));
         }
     } catch (const ProjectIOError&) {
         throw;
@@ -78,8 +132,10 @@ std::shared_ptr<Document> read_document(const ZipArchive& archive, ReadReport* r
     } catch (const std::bad_alloc&) {
         throw ProjectIOError("Invalid project file: a declared size is too large to load");
     }
-    throw ProjectIOError("Invalid project file: unsupported format version " +
-                         std::to_string(version));
+    if (!context.project_dir.empty()) {
+        resolve_frame_paths(*document, context.project_dir, report);
+    }
+    return document;
 }
 
 }  // namespace alphashape

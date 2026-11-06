@@ -145,11 +145,18 @@ Mesh decode_mesh(const std::vector<std::uint8_t>& in);
 
 // -- georeferenced products -------------------------------------------------
 
-std::vector<std::uint8_t> encode_elevation(const Elevation& elevation);
-Elevation decode_elevation(const std::vector<std::uint8_t>& bytes);
+/// GeoTIFF is a file-based codec, so these four write a scratch file and read
+/// it back. `scratch_dir` names the project cache directory when one is
+/// available; empty means the platform temporary directory (WP-11.9).
+std::vector<std::uint8_t> encode_elevation(const Elevation& elevation,
+                                           const std::string& scratch_dir = std::string());
+Elevation decode_elevation(const std::vector<std::uint8_t>& bytes,
+                           const std::string& scratch_dir = std::string());
 
-std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho);
-Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes);
+std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho,
+                                             const std::string& scratch_dir = std::string());
+Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes,
+                               const std::string& scratch_dir = std::string());
 
 std::vector<std::uint8_t> encode_ortho_labels(const Orthomosaic& ortho);
 std::vector<std::int32_t> decode_ortho_labels(const std::vector<std::uint8_t>& in,

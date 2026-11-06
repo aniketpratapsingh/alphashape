@@ -1,5 +1,6 @@
 #include "common/io/doc_xml_common.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -516,7 +517,14 @@ Transform parse_matrix4(const std::string& s) {
 
 void write_meta(const Meta& meta, XmlNode& parent) {
     XmlNode& node = add_child(parent, "meta");
-    for (const auto& [key, value] : meta.items) {
+    // Stable ordering (§4.9): sorted meta keys, whatever order the model holds.
+    std::vector<std::pair<std::string, std::string>> sorted = meta.items;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const std::pair<std::string, std::string>& a,
+                 const std::pair<std::string, std::string>& b) {
+                  return a.first < b.first;
+              });
+    for (const auto& [key, value] : sorted) {
         XmlNode& prop = add_child(node, "property");
         set_attr(prop, "name", key);
         set_attr(prop, "value", value);

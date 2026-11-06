@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/platform/env.hpp"
 #include "base/platform/temp.hpp"
 #include "base/utils/error.hpp"
 #include "model/raster/geotiff.hpp"
@@ -789,10 +790,23 @@ namespace {
 /// A per-process counter plus the pid names every scratch file.
 class ScopedTempFile {
 public:
-    explicit ScopedTempFile(const char* tag) {
+    ScopedTempFile(const char* tag, const std::string& scratch_dir) {
         static std::atomic<unsigned> counter{0};
         std::error_code ec;
-        const std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+        std::filesystem::path dir;
+        if (!scratch_dir.empty()) {
+            dir = platform::path_from_utf8(scratch_dir);
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                // The project cache is unavailable; the platform temp dir is a
+                // safe fallback and the codec result is identical.
+                ec.clear();
+                dir.clear();
+            }
+        }
+        if (dir.empty()) {
+            dir = std::filesystem::temp_directory_path(ec);
+        }
         if (ec) {
             throw ProjectIOError("no temporary directory for a GeoTIFF scratch file");
         }
@@ -800,7 +814,7 @@ public:
             std::string("alphashape_") + tag + "_" +
             std::to_string(platform::process_id()) + "_" +
             std::to_string(counter.fetch_add(1)) + ".tif";
-        path_ = (dir / name).string();
+        path_ = platform::path_to_utf8(dir / name);
     }
     ~ScopedTempFile() {
         std::error_code ec;
@@ -816,7 +830,7 @@ private:
 };
 
 std::vector<std::uint8_t> read_whole_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(platform::path_from_utf8(path), std::ios::binary);
     if (!in) {
         throw ProjectIOError("cannot read the GeoTIFF scratch file '" + path + "'");
     }
@@ -824,7 +838,7 @@ std::vector<std::uint8_t> read_whole_file(const std::string& path) {
 }
 
 void write_whole_file(const std::string& path, const std::vector<std::uint8_t>& bytes) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    std::ofstream out(platform::path_from_utf8(path), std::ios::binary | std::ios::trunc);
     if (!out) {
         throw ProjectIOError("cannot write the GeoTIFF scratch file '" + path + "'");
     }
@@ -854,8 +868,9 @@ void validate_raster_grid(const RasterGrid& grid, const char* what) {
 
 }  // namespace
 
-std::vector<std::uint8_t> encode_elevation(const Elevation& elevation) {
-    ScopedTempFile scratch("dem");
+std::vector<std::uint8_t> encode_elevation(const Elevation& elevation,
+                                           const std::string& scratch_dir) {
+    ScopedTempFile scratch("dem", scratch_dir);
     GeoTiffOptions options;
     options.epsg = elevation.epsg();
 #if defined(ALPHASHAPE_USE_PROJ)
@@ -874,8 +889,9 @@ std::vector<std::uint8_t> encode_elevation(const Elevation& elevation) {
     return read_whole_file(scratch.path());
 }
 
-Elevation decode_elevation(const std::vector<std::uint8_t>& bytes) {
-    ScopedTempFile scratch("dem_read");
+Elevation decode_elevation(const std::vector<std::uint8_t>& bytes,
+                           const std::string& scratch_dir) {
+    ScopedTempFile scratch("dem_read", scratch_dir);
     write_whole_file(scratch.path(), bytes);
     const GeoTiffInfo info = read_geotiff_info(scratch.path());
     if (!info.is_float || info.channels != 1) {
@@ -898,8 +914,9 @@ Elevation decode_elevation(const std::vector<std::uint8_t>& bytes) {
     return elevation;
 }
 
-std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho) {
-    ScopedTempFile scratch("ortho");
+std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho,
+                                             const std::string& scratch_dir) {
+    ScopedTempFile scratch("ortho", scratch_dir);
     GeoTiffOptions options;
     options.epsg = ortho.epsg();
 #if defined(ALPHASHAPE_USE_PROJ)
@@ -917,8 +934,9 @@ std::vector<std::uint8_t> encode_orthomosaic(const Orthomosaic& ortho) {
     return read_whole_file(scratch.path());
 }
 
-Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes) {
-    ScopedTempFile scratch("ortho_read");
+Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes,
+                               const std::string& scratch_dir) {
+    ScopedTempFile scratch("ortho_read", scratch_dir);
     write_whole_file(scratch.path(), bytes);
     const GeoTiffInfo info = read_geotiff_info(scratch.path());
     if (info.is_float || info.channels != 4) {

@@ -162,16 +162,16 @@ void validate_fixed_params(const std::string& sensor_label,
 // ---- versioned entry points ----------------------------------------------
 
 /// Write the whole document in format v2 (the only version written).
-void write_v2(const Document& document, ZipArchive& archive);
+void write_v2(const Document& document, ZipArchive& archive, const IoContext& context);
 
 /// Rebuild a document from a v1 root element (and its legacy sidecar paths).
 /// Warnings (unknown attributes, missing optional sidecars) go to `report`.
 std::shared_ptr<Document> read_v1(const XmlNode& root, const ZipArchive& archive,
-                                  ReadReport* report);
+                                  ReadReport* report, const IoContext& context);
 
 /// Rebuild a document from a v2 root element (chunks/<id>/ sidecar paths).
 std::shared_ptr<Document> read_v2(const XmlNode& root, const ZipArchive& archive,
-                                  ReadReport* report);
+                                  ReadReport* report, const IoContext& context);
 
 }  // namespace docxml
 }  // namespace alphashape
