@@ -18,6 +18,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -597,26 +598,107 @@ void expect_reader_understands(const Document& document, const ZipArchive& archi
     EXPECT_EQ(loaded->active_chunk_id(), document.active_chunk_id());
     EXPECT_EQ(loaded->workspace().next_chunk_id(),
               document.workspace().next_chunk_id());
+    std::string warnings;
     for (const std::string& warning : report.warnings) {
-        EXPECT_EQ(warning.find("unknown"), std::string::npos) << warning;
+        warnings += "\n  " + warning;
     }
+    EXPECT_TRUE(report.warnings.empty())
+        << "the fixture's own writer output must read back warning-free:"
+        << warnings;
 }
 
-// -- tests ------------------------------------------------------------------
+// -- Markdown table parsing -------------------------------------------------
+
+/// Strip the Markdown code span a documented name is wrapped in.
+std::string strip_code_span(std::string cell) {
+    cell.erase(std::remove(cell.begin(), cell.end(), '`'), cell.end());
+    return cell;
+}
+
+std::string trim_cell(std::string cell) {
+    const auto first = std::find_if(cell.begin(), cell.end(),
+                                    [](char c) { return c != ' ' && c != '\t'; });
+    const auto last = std::find_if(cell.rbegin(), cell.rend(), [](char c) {
+                          return c != ' ' && c != '\t';
+                      }).base();
+    if (first >= last) return {};
+    return std::string(first, last);
+}
+
+std::vector<std::string> table_cells(const std::string& line) {
+    std::vector<std::string> cells;
+    std::string::size_type start = (!line.empty() && line.front() == '|') ? 1U : 0U;
+    while (start < line.size()) {
+        const std::string::size_type bar = line.find('|', start);
+        const std::string::size_type end =
+            bar == std::string::npos ? line.size() : bar;
+        cells.push_back(trim_cell(line.substr(start, end - start)));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return cells;
+}
+
+bool is_separator_row(const std::vector<std::string>& cells) {
+    for (const std::string& cell : cells) {
+        if (!cell.empty() && cell.find_first_not_of("-:") != std::string::npos) {
+            return false;
+        }
+    }
+    return !cells.empty();
+}
+
+struct MarkdownVocabulary {
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+};
+
+/// Read the element and attribute tables out of docs/project-format-v2.md.
+/// The vocabulary tests pin what the writer emits; this parser pins what the
+/// published document claims, and the two sets must be identical.
+MarkdownVocabulary parse_vocabulary_markdown(const std::string& text) {
+    enum class Table { kNone, kElements, kAttributes };
+    MarkdownVocabulary result;
+    Table table = Table::kNone;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::string trimmed = trim_cell(line);
+        if (trimmed.empty()) continue;  // a blank line does not end the group
+        if (trimmed.front() != '|') {
+            table = Table::kNone;
+            continue;
+        }
+        const std::vector<std::string> cells = table_cells(trimmed);
+        if (cells.empty()) continue;
+        if (cells[0] == "element" && cells.size() >= 2U) {
+            if (cells[1] == "parent") {
+                table = Table::kElements;
+                continue;
+            }
+            if (cells[1] == "attribute" && cells.size() == 5U) {
+                table = Table::kAttributes;
+                continue;
+            }
+        }
+        if (is_separator_row(cells)) continue;
+        if (table == Table::kElements && cells.size() == 3U) {
+            result.elements.insert(strip_code_span(cells[0]));
+        } else if (table == Table::kAttributes && cells.size() == 5U) {
+            result.attributes.insert(strip_code_span(cells[0]) + "@" +
+                                     strip_code_span(cells[1]));
+        }
+    }
+    return result;
+}
+
+// -- expected vocabulary ----------------------------------------------------
 
 /// The complete set of element names the v2 writer can emit for one chunk that
 /// populates every container and every optional field. A new element in the
 /// writer must appear here AND in docs/project-format-v2.md (the drift test).
-TEST_F(ProjectV2, ElementVocabulary) {
-    const Document document = build_vocabulary_document();
-    ZipArchive archive;
-    write_document(document, archive);
-    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
-    std::set<std::string> elements;
-    std::set<std::string> attributes;
-    collect_vocabulary(root, elements, attributes);
-
-    const std::set<std::string> expected = {
+const std::set<std::string>& expected_elements() {
+    static const std::set<std::string> expected = {
         "document",     "global_crs",   "vertical",     "meta",
         "property",     "chunks",       "chunk",        "sensors",
         "sensor",       "calibration",  "covariance",   "film",
@@ -634,25 +716,14 @@ TEST_F(ProjectV2, ElementVocabulary) {
         "transform",    "crs",          "camera_crs",   "marker_crs",
         "world_crs",
     };
-    EXPECT_EQ(expected.size(), 61U);
-
-    expect_same_vocabulary(elements, expected, "doc.xml element vocabulary");
-    expect_reader_understands(document, archive);
+    return expected;
 }
 
 /// Every element@attribute pair the writer can emit, with every optional
 /// attribute exercised by the fixture. This is the attribute half of the same
 /// drift contract: a new attribute must be documented and expected here.
-TEST_F(ProjectV2, AttributeVocabulary) {
-    const Document document = build_vocabulary_document();
-    ZipArchive archive;
-    write_document(document, archive);
-    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
-    std::set<std::string> elements;
-    std::set<std::string> attributes;
-    collect_vocabulary(root, elements, attributes);
-
-    const std::set<std::string> expected = {
+const std::set<std::string>& expected_attributes() {
+    static const std::set<std::string> expected = {
         // Root and chunk.
         "document@version", "document@next_id", "document@active_id",
         "global_crs@epsg", "global_crs@wkt",
@@ -741,10 +812,60 @@ TEST_F(ProjectV2, AttributeVocabulary) {
         "marker_crs@epsg", "marker_crs@wkt",
         "world_crs@epsg", "world_crs@wkt",
     };
-    EXPECT_EQ(expected.size(), 231U);
+    return expected;
+}
 
-    expect_same_vocabulary(attributes, expected, "doc.xml attribute vocabulary");
+// -- tests ------------------------------------------------------------------
+
+/// The vocabulary the published document pins; see expected_elements().
+TEST_F(ProjectV2, ElementVocabulary) {
+    const Document document = build_vocabulary_document();
+    ZipArchive archive;
+    write_document(document, archive);
+    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+    collect_vocabulary(root, elements, attributes);
+
+    EXPECT_EQ(expected_elements().size(), 61U);
+    expect_same_vocabulary(elements, expected_elements(),
+                           "doc.xml element vocabulary");
     expect_reader_understands(document, archive);
+}
+
+/// Every element@attribute pair the writer can emit, with every optional
+/// attribute exercised by the fixture. This is the attribute half of the same
+/// drift contract: a new attribute must be documented and expected here.
+TEST_F(ProjectV2, AttributeVocabulary) {
+    const Document document = build_vocabulary_document();
+    ZipArchive archive;
+    write_document(document, archive);
+    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+    collect_vocabulary(root, elements, attributes);
+
+    expect_same_vocabulary(attributes, expected_attributes(),
+                           "doc.xml attribute vocabulary");
+    EXPECT_EQ(expected_attributes().size(), 231U);
+    expect_reader_understands(document, archive);
+}
+
+/// The published format document is the contract the vocabulary tests pin:
+/// changing the writer without updating docs/project-format-v2.md fails here.
+TEST_F(ProjectV2, FormatDocMatchesVocabulary) {
+    const std::string path =
+        std::string(ALPHASHAPE_SOURCE_DIR) + "/docs/project-format-v2.md";
+    std::ifstream in(path);
+    ASSERT_TRUE(in.good()) << "cannot read " << path;
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+
+    const MarkdownVocabulary documented = parse_vocabulary_markdown(text);
+    expect_same_vocabulary(documented.elements, expected_elements(),
+                           "docs/project-format-v2.md element table");
+    expect_same_vocabulary(documented.attributes, expected_attributes(),
+                           "docs/project-format-v2.md attribute table");
 }
 
 /// A project written before M11 has version="1" and the flat entry names. The
@@ -1565,6 +1686,36 @@ TEST_F(ProjectV2, RejectsUnknownV2Element) {
     const std::size_t region = xml.find("<region ");
     ASSERT_NE(region, std::string::npos);
     xml.insert(xml.rfind('\n', region) + 1, "      <warp_grid id=\"0\"/>\n");
+    archive.add("doc.xml", xml);
+    EXPECT_THROW(read_document(archive), ProjectIOError);
+}
+
+TEST_F(ProjectV2, RejectsShapeAltitudeDrift) {
+    ZipArchive archive;
+    write_document(build_full_document(), archive);
+    std::string xml = archive.get_text("doc.xml");
+    // The XML mirror of the shape says no altitude; shapes.shp says otherwise.
+    const std::string from = "has_altitude=\"true\"";
+    const std::size_t at = xml.find(from);
+    ASSERT_NE(at, std::string::npos);
+    xml.replace(at, from.size(), "has_altitude=\"false\"");
+    archive.add("doc.xml", xml);
+    EXPECT_THROW(read_document(archive), ProjectIOError);
+}
+
+TEST_F(ProjectV2, RejectsPanoramaSizeDrift) {
+    ZipArchive archive;
+    write_document(build_full_document(), archive);
+    std::string xml = archive.get_text("doc.xml");
+    const std::size_t at = xml.find("<panorama ");
+    ASSERT_NE(at, std::string::npos);
+    const std::size_t width = xml.find("width=\"", at);
+    ASSERT_NE(width, std::string::npos);
+    const std::size_t value = width + std::string("width=\"").size();
+    const std::size_t end = xml.find('"', value);
+    ASSERT_NE(end, std::string::npos);
+    // A width that cannot describe the decoded PNG.
+    xml.replace(value, end - value, "9999");
     archive.add("doc.xml", xml);
     EXPECT_THROW(read_document(archive), ProjectIOError);
 }
