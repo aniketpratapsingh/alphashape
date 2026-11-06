@@ -288,10 +288,12 @@ TEST(RunScript, OutputTruncatedTo8KB) {
     Project project;
     // 8191 ASCII bytes, then a 3-byte code point (U+20AC) whose bytes straddle
     // the 8192-byte cut, then filler.
+    // Written through the binary buffer so the child's locale cannot encode the
+    // euro sign as one legacy-code-page byte instead of three UTF-8 bytes.
     const std::string script = write_script(
         project.dir, "big.py",
         "import sys\n"
-        "sys.stdout.write('x' * 8191 + '\\u20ac' + 'y' * 100)\n"
+        "sys.stdout.buffer.write(b'x' * 8191 + b'\\xe2\\x82\\xac' + b'y' * 100)\n"
         "sys.stdout.flush()\n");
     run_script(project.document, script, {}, 60);
     const std::string output = script_output(project.document);
