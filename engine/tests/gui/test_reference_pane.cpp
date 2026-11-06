@@ -167,7 +167,7 @@ TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
     const QModelIndex index = markers.index(0, ReferenceModel::LabelColumn);
     ASSERT_TRUE(markers.setData(
         index, QVariant(static_cast<int>(Qt::Unchecked)), Qt::CheckStateRole));
-    const ReferenceSummary& summary = markers.summary();
+    const reference::ReferenceSummary& summary = markers.summary();
     EXPECT_NEAR(summary.control_rmse_m, std::sqrt((1.0 + 4.0 + 9.0) / 3.0), 1e-3);
     EXPECT_NEAR(summary.check_rmse_m, 4.0, 1e-3);
     EXPECT_EQ(summary.control_count, 3U);
