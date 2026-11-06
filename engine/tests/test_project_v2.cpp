@@ -607,7 +607,7 @@ void expect_reader_understands(const Document& document, const ZipArchive& archi
 /// The complete set of element names the v2 writer can emit for one chunk that
 /// populates every container and every optional field. A new element in the
 /// writer must appear here AND in docs/project-format-v2.md (the drift test).
-TEST(ProjectV2, ElementVocabulary) {
+TEST_F(ProjectV2, ElementVocabulary) {
     const Document document = build_vocabulary_document();
     ZipArchive archive;
     write_document(document, archive);
@@ -643,7 +643,7 @@ TEST(ProjectV2, ElementVocabulary) {
 /// Every element@attribute pair the writer can emit, with every optional
 /// attribute exercised by the fixture. This is the attribute half of the same
 /// drift contract: a new attribute must be documented and expected here.
-TEST(ProjectV2, AttributeVocabulary) {
+TEST_F(ProjectV2, AttributeVocabulary) {
     const Document document = build_vocabulary_document();
     ZipArchive archive;
     write_document(document, archive);
