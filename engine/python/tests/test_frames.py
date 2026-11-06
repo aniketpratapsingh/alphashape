@@ -29,12 +29,14 @@ class TestCameraGroups(unittest.TestCase):
         self.assertEqual(chunk.camera_groups, [])
         chunk.group_cameras("station")
         groups = chunk.camera_groups
-        # The fixtures are three bodies with three distinct serials, so the
-        # grouping is exactly one group per body, labelled by that serial.
-        self.assertEqual(len(groups), 3)
+        # cam_a1 and cam_a2 are the same make/model/lens (so one sensor whose
+        # serial is cleared because the two bodies disagree); cam_b1 is a
+        # different model with its own serial. That is exactly two stations:
+        # the make+model fallback and the surviving serial.
+        self.assertEqual(len(groups), 2)
         self.assertEqual(
             sorted(group["label"] for group in groups),
-            ["AO100-0001", "AO100-0002", "BC7-0001"],
+            ["AlphaOptics AO-100", "BC7-0001"],
         )
         for group in groups:
             self.assertEqual(group["type"], "station")
