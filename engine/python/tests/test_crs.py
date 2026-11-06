@@ -7,9 +7,9 @@ What this file pins:
     name; the name / authority / epsg / wkt properties and the repr;
   * `__eq__` is PROJ equivalence, so a WKT round trip compares equal, and the
     type is unhashable (hash / eq contract);
-  * `Chunk.crs` merely relabels the chunk (no Python-side undo stack: the GUI
-    owns undo and Metashape's API has none), and assigning it does NOT
-    transform camera references; `CoordinateSystem()` resets to LOCAL;
+  * `Chunk.crs` merely relabels the chunk (the assignment is one entry on the
+    document's undo stack since WP-11.11), and assigning it does NOT transform
+    camera references; `CoordinateSystem()` resets to LOCAL;
   * the geoid registry lists ids and refuses a missing or non-grid file;
   * BuildDem accepts its `projection` EPSG parameter (and refuses a `crs`
     that disagrees).
@@ -157,10 +157,16 @@ class CoordinateSystemTest(unittest.TestCase):
         self.assertIn("UTM zone 33N", chunk.crs.name)
         # Setting the CRS relabels the chunk; no reference is transformed.
         self.assertEqual(_reference_repr(chunk), before)
-        # The GUI owns the document's undo history; there is no Python-side
-        # stack (Metashape's public API has no undo either).
-        self.assertFalse(hasattr(doc, "undo"))
-        self.assertFalse(hasattr(doc, "undo_stack"))
+        # WP-11.11: every mutating binding is an entry on the document's
+        # undo stack. The CRS assignment above is one, and undo restores the
+        # previous descriptor exactly.
+        self.assertTrue(hasattr(doc, "undo"))
+        self.assertTrue(doc.can_undo)
+        doc.undo()
+        self.assertIsNone(chunk.crs.epsg)
+        self.assertEqual(chunk.crs.name, "LOCAL")
+        doc.redo()
+        self.assertEqual(chunk.crs.epsg, UTM_ZONE_33N)
 
     def test_chunk_crs_reset_to_local(self):
         doc = alphashape.Document()

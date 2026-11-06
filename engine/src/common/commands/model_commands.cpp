@@ -1312,6 +1312,47 @@ private:
     std::int32_t marker_id_;
 };
 
+/// Rename one marker. The container snapshot restores the previous label on
+/// revert, so apply -> revert -> apply is exact.
+class SetMarkerLabelCommand : public ChunkContainersCommand {
+public:
+    SetMarkerLabelCommand(std::int32_t chunk_id, std::int32_t marker_id,
+                          std::string label)
+        : ChunkContainersCommand(chunk_id), marker_id_(marker_id),
+          label_(std::move(label)) {}
+
+    std::string name() const override { return "Set Marker Label"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        if (label_.empty()) {
+            throw ValueError("set marker label: the label must not be empty");
+        }
+        for (const Marker& marker : chunk.markers()) {
+            if (marker.id != marker_id_ && marker.label == label_) {
+                throw ValueError("set marker label: another marker already has "
+                                 "label '" + label_ + "'");
+            }
+        }
+    }
+
+    void commit(Document& document) override {
+        Marker* marker = find_by_id(target_chunk(document).markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        marker->label = label_;
+    }
+
+private:
+    std::int32_t marker_id_;
+    std::string label_;
+};
+
 class SetMarkerReferenceCommand : public ChunkContainersCommand {
 public:
     SetMarkerReferenceCommand(std::int32_t chunk_id, std::int32_t marker_id,
@@ -1822,6 +1863,9 @@ protected:
             throw ValueError("no marker with id " + std::to_string(marker_id_));
         }
         marker->position = position_;
+        // A placed marker is a valid measurement. The container snapshot in
+        // ChunkContainersCommand restores the previous flag on undo.
+        marker->valid = true;
         if (!position_.has_value()) {
             // A cleared estimate has no covariance: the old one described a
             // position that no longer exists.
@@ -2253,6 +2297,47 @@ private:
     Eigen::Vector3d accuracy_;
 };
 
+/// Set (or clear) one camera's per-axis attitude accuracy. The container
+/// snapshot restores the previous optional value on revert.
+class SetCameraRotationAccuracyCommand : public ChunkContainersCommand {
+public:
+    SetCameraRotationAccuracyCommand(std::int32_t chunk_id,
+                                     std::int32_t camera_id,
+                                     std::optional<Eigen::Vector3d> accuracy_deg)
+        : ChunkContainersCommand(chunk_id),
+          camera_id_(camera_id),
+          accuracy_deg_(accuracy_deg) {}
+
+    std::string name() const override { return "Set Camera Rotation Accuracy"; }
+
+protected:
+    void validate(Document& document) override {
+        require_camera(target_chunk(document), camera_id_,
+                       "set camera rotation accuracy");
+        if (accuracy_deg_.has_value() &&
+            (!accuracy_deg_->allFinite() ||
+             (accuracy_deg_->array() < 0.0).any())) {
+            throw ValueError("set camera rotation accuracy: the accuracy must "
+                             "be finite and non-negative");
+        }
+    }
+
+    void commit(Document& document) override {
+        for (Camera& camera : target_chunk(document).cameras()) {
+            if (camera.id == camera_id_) {
+                camera.reference.rotation_accuracy_deg = accuracy_deg_;
+                return;
+            }
+        }
+        throw ValueError("set camera rotation accuracy: no camera with id " +
+                         std::to_string(camera_id_));
+    }
+
+private:
+    std::int32_t camera_id_;
+    std::optional<Eigen::Vector3d> accuracy_deg_;
+};
+
 /// Append every chunk of `source` to the target document.
 ///
 /// Incoming chunk ids are offset by the target's next_chunk_id() (§4.8); every
@@ -2290,8 +2375,19 @@ protected:
     }
 
     void commit(Document& document) override {
+        // Snapshot the source's chunks on the first apply. Appending a
+        // document to itself would otherwise push_back into the very vector
+        // being iterated, and a redo must replay the original chunks even if
+        // the source was edited in between.
+        if (!snapshot_taken_) {
+            snapshot_.reserve(source_->workspace().chunks().size());
+            for (const auto& chunk : source_->workspace().chunks()) {
+                snapshot_.push_back(std::make_shared<Chunk>(*chunk));
+            }
+            snapshot_taken_ = true;
+        }
         Workspace& workspace = document.workspace();
-        for (const auto& chunk : source_->workspace().chunks()) {
+        for (const auto& chunk : snapshot_) {
             auto copy = std::make_shared<Chunk>(*chunk);
             copy->set_id(workspace.next_chunk_id());
             workspace.chunks().push_back(std::move(copy));
@@ -2320,6 +2416,8 @@ private:
 
     std::shared_ptr<Document> source_;
     std::string source_path_;
+    std::vector<std::shared_ptr<Chunk>> snapshot_;
+    bool snapshot_taken_ = false;
     std::size_t previous_chunks_ = 0;
     std::size_t appended_count_ = 0;
     std::int32_t previous_next_id_ = 0;
@@ -3415,6 +3513,12 @@ std::unique_ptr<AbstractCommand> make_remove_marker_command(std::int32_t chunk_i
     return std::make_unique<RemoveMarkerCommand>(chunk_id, marker_id);
 }
 
+std::unique_ptr<AbstractCommand> make_set_marker_label_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::string label) {
+    return std::make_unique<SetMarkerLabelCommand>(chunk_id, marker_id,
+                                                   std::move(label));
+}
+
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
     std::int32_t chunk_id, std::int32_t marker_id,
     std::optional<Eigen::Vector3d> reference, Eigen::Vector3d accuracy) {
@@ -3533,6 +3637,14 @@ std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
     std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy) {
     return std::make_unique<SetCameraReferenceCommand>(
         chunk_id, camera_id, location, accuracy);
+}
+
+std::unique_ptr<AbstractCommand>
+make_set_camera_reference_rotation_accuracy_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> accuracy_deg) {
+    return std::make_unique<SetCameraRotationAccuracyCommand>(
+        chunk_id, camera_id, accuracy_deg);
 }
 
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
