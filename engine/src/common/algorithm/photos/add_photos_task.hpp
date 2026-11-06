@@ -35,6 +35,13 @@
 //
 // The result seeds Calibration::f. Distortion terms stay zero: a bundle
 // adjustment milestone refines all of it later.
+//
+// ---------------------------------------------------------------------------
+// Undo
+// ---------------------------------------------------------------------------
+// Like every other task, AddPhotos edits the chunk in place and its changes are
+// NOT placed on the undo stack. A caller that needs a reversible import wraps
+// the task in a staged command; the GUI does exactly that where it offers one.
 
 #include "common/tasks/task.hpp"
 

@@ -921,11 +921,12 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   does not), so those two kinds throw `ValueError`. They are wired up when the
   containers land (with the Python `addPointCloudGroup`/`addModelGroup`
   bindings in WP-11.11).
-- **`Camera::selected` is in-memory only.** WP-11.5b adds the flag, compares it
-  in `Camera::operator==` and edits it through
-  `make_set_camera_selected_command`, but the v2 writer does not emit a
-  `selected` attribute yet — persisting it is WP-11.8, together with the rest
-  of the camera fields (`group`, `mask_id`).
+- **`Camera::selected` is persisted, but only when true.** WP-11.8 writes the
+  flag as the optional `selected` attribute on a `<camera>` element (absent
+  means false, so an unselected camera adds no bytes) and the reader restores
+  it. The other two WP-11.5b camera fields remain unsaved: `group` is a
+  camera-group membership that no container stores on the camera, and
+  `mask_id` belongs to the mask milestone.
 - **`AppendDocument` copies the chunks and drops the source path.** Chunk ids
   are offset by the target's `next_chunk_id()` and chunk-local ids are
   preserved (§4.8), but the `source_path` argument is currently only used in
