@@ -166,7 +166,9 @@ bool create_exclusive(const std::string& path, const std::string& text, std::str
 std::string ProjectLock::lock_path(const std::string& project_path) {
     const fs::path project = platform::path_from_utf8(project_path);
     const fs::path files_dir(platform::path_from_utf8(strip_extension(project) + ".files"));
-    return platform::path_to_utf8(files_dir / "lock");
+    fs::path lock = files_dir / "lock";
+    lock.make_preferred();
+    return platform::path_to_utf8(lock);
 }
 
 ProjectLock ProjectLock::acquire(const std::string& project_path,

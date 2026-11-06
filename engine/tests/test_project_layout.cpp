@@ -45,7 +45,12 @@ protected:
     }
 
     std::string path(const std::string& name) const {
-        return (fs::path(dir_) / name).string();
+        // A name like "images/a.jpg" appended to a native directory otherwise
+        // keeps the '/' it was typed with; normalise the whole path so
+        // expectations match the engine's preferred-separator output.
+        fs::path full = (fs::path(dir_) / name).lexically_normal();
+        full.make_preferred();
+        return full.string();
     }
 
     static int counter_;

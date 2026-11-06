@@ -23,12 +23,16 @@ std::string cache_dir_for_path(const std::string& path) {
     // A project.zip opened directly lives in `<base>.files`, so the cache is
     // that directory's own cache subdirectory.
     if (base.extension() == ".zip" && base.parent_path().extension() == ".files") {
-        return platform::path_to_utf8(base.parent_path() / "cache");
+        fs::path cache = base.parent_path() / "cache";
+        cache.make_preferred();
+        return platform::path_to_utf8(cache);
     }
     base.replace_extension();
     const fs::path files(
         platform::path_from_utf8(platform::path_to_utf8(base) + ".files"));
-    return platform::path_to_utf8(files / "cache");
+    fs::path cache = files / "cache";
+    cache.make_preferred();
+    return platform::path_to_utf8(cache);
 }
 
 std::mutex& cache_guard_mutex() {

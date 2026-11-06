@@ -64,8 +64,12 @@ fs::path strip_extension(const fs::path& path) {
 /// yields a stable base for stored frame paths.
 std::string absolute_directory(const fs::path& directory) {
     std::error_code ec;
-    const fs::path absolute = fs::absolute(directory, ec);
-    return platform::path_to_utf8(ec ? directory : absolute);
+    fs::path absolute = fs::absolute(directory, ec);
+    if (ec) {
+        absolute = directory;
+    }
+    absolute.make_preferred();
+    return platform::path_to_utf8(absolute);
 }
 
 /// The directory frame paths are stored relative to: the project file's own
@@ -89,7 +93,9 @@ std::string cache_directory(const fs::path& project) {
     }
     const fs::path files(platform::path_from_utf8(
         platform::path_to_utf8(strip_extension(project_path)) + ".files"));
-    return platform::path_to_utf8(files / "cache");
+    fs::path cache = files / "cache";
+    cache.make_preferred();
+    return platform::path_to_utf8(cache);
 }
 
 }  // namespace
