@@ -179,6 +179,9 @@ endif()
 find_package(JPEG REQUIRED)
 find_package(PNG REQUIRED)
 find_package(TIFF REQUIRED)
+# WP-11.10: the job database prefers SQLite and falls back to a JSON-lines log.
+# Optional on purpose: every lane compiles and tests the fallback regardless.
+find_package(SQLite3 QUIET)
 
 # Qt is LGPL-3: it is always linked dynamically (the official binaries are shared).
 # ShaderTools provides qt_add_shaders(), which turns the viewport's GLSL into the .qsb files

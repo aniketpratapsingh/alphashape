@@ -123,6 +123,7 @@ set(ALPHASHAPE_DEB_DEPENDS
     "libjpeg-turbo8"
     "libpng16-16t64"
     "libtiff6"
+    "libsqlite3-0"
     "zlib1g"
     "libvulkan1 (>= 1.3)"
     "python3 (>= 3.12)"

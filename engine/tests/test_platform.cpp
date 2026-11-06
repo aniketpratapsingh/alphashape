@@ -8,11 +8,16 @@
 // from: that behaviour is only observable through the Win32 API itself.
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,6 +25,9 @@
 #include <windows.h>
 
 #include <cwchar>  // _wcsnicmp
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include <gtest/gtest.h>
@@ -30,6 +38,7 @@
 #include "base/platform/paths.hpp"
 #include "base/platform/process.hpp"
 #include "base/platform/temp.hpp"
+#include "perf_gate.hpp"
 
 namespace alphashape {
 namespace {
@@ -440,6 +449,100 @@ TEST(Platform, ProcessCaptureLargeOutputDoesNotDeadlock) {
     EXPECT_EQ(result.exit_code, 0);
     EXPECT_GT(result.output.size(), 100000U);
 }
+
+TEST(Platform, ProcessCaptureConcurrentCallsStaySeparate) {
+    std::string python = plat::find_executable("python3");
+    if (python.empty()) {
+        python = plat::find_executable("python");
+    }
+    if (python.empty()) {
+        GTEST_SKIP() << "no python executable on PATH";
+    }
+    plat::ProcessResult short_result;
+    plat::ProcessResult long_result;
+    std::chrono::steady_clock::time_point short_done;
+    std::chrono::steady_clock::time_point long_done;
+    std::thread short_thread([&]() {
+        short_result = plat::run_process_capture(
+            {python, "-c", "import time; time.sleep(1); print('short-marker')"});
+        short_done = std::chrono::steady_clock::now();
+    });
+    std::thread long_thread([&]() {
+        long_result = plat::run_process_capture(
+            {python, "-c", "import time; time.sleep(3); print('long-marker')"});
+        long_done = std::chrono::steady_clock::now();
+    });
+    short_thread.join();
+    long_thread.join();
+
+    ASSERT_TRUE(short_result.started) << short_result.output;
+    ASSERT_TRUE(long_result.started) << long_result.output;
+    EXPECT_NE(short_result.output.find("short-marker"), std::string::npos)
+        << short_result.output;
+    EXPECT_EQ(short_result.output.find("long-marker"), std::string::npos)
+        << "the short call captured the long call's output: " << short_result.output;
+    EXPECT_NE(long_result.output.find("long-marker"), std::string::npos)
+        << long_result.output;
+    EXPECT_EQ(long_result.output.find("short-marker"), std::string::npos)
+        << "the long call captured the short call's output: " << long_result.output;
+    if (test::perf_asserts_enabled()) {
+        EXPECT_LT(short_done, long_done);
+    }
+}
+
+#if !defined(_WIN32)
+TEST(Platform, ProcessCaptureClosesUnrelatedDescriptors) {
+    // A descriptor the parent opened *without* close-on-exec must still not
+    // reach the child: only 0/1/2 may cross the boundary.
+    std::string python = plat::find_executable("python3");
+    if (python.empty()) {
+        python = plat::find_executable("python");
+    }
+    if (python.empty()) {
+        GTEST_SKIP() << "no python executable on PATH";
+    }
+    const std::string path = plat::unique_temp_path("alphashape_fdleak_", ".txt");
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
+    ASSERT_GE(fd, 0) << std::strerror(errno);
+    const std::string script =
+        "import os, sys\n"
+        "fd = int(sys.argv[1]); path = sys.argv[2]\n"
+        "try:\n"
+        "    seen = os.fstat(fd); target = os.stat(path)\n"
+        "    leaked = (seen.st_dev, seen.st_ino) == (target.st_dev, target.st_ino)\n"
+        "except OSError:\n"
+        "    leaked = False\n"
+        "if os.path.isdir('/proc/self/fd') and os.path.exists('/proc/self/fd/%d' % fd):\n"
+        "    leaked = leaked or os.readlink('/proc/self/fd/%d' % fd) == path\n"
+        "print('LEAK' if leaked else 'CLEAN')\n";
+    const plat::ProcessResult result = plat::run_process_capture(
+        {python, "-c", script, std::to_string(fd), path});
+    (void)::close(fd);
+    (void)::unlink(path.c_str());
+    ASSERT_TRUE(result.started) << result.output;
+    EXPECT_NE(result.output.find("CLEAN"), std::string::npos)
+        << "the parent's descriptor " << fd << " was inherited: " << result.output;
+}
+#endif
+
+#if defined(_WIN32)
+TEST(Platform, ProcessCaptureEmptyArgumentIsQuoted) {
+    std::string python = plat::find_executable("python3");
+    if (python.empty()) {
+        python = plat::find_executable("python");
+    }
+    if (python.empty()) {
+        GTEST_SKIP() << "no python executable on PATH";
+    }
+    const plat::ProcessResult result = plat::run_process_capture(
+        {python, "-c", "import sys; print('ARGV:' + '|'.join(sys.argv[1:]))", "",
+         "tail"});
+    ASSERT_TRUE(result.started) << result.output;
+    EXPECT_EQ(result.exit_code, 0) << result.output;
+    EXPECT_NE(result.output.find("ARGV:|tail"), std::string::npos)
+        << "an empty argument must reach the child as \"\": " << result.output;
+}
+#endif
 
 TEST(Platform, EnvRoundTrip) {
     const char* name = "ALPHASHAPE_PLATFORM_TEST_VAR";
