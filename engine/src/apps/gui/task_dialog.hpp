@@ -27,6 +27,7 @@
 // and validate() also rejects a value that violates a declared constraint — the same range or
 // choice set the editor offers, re-checked because a remembered setting bypasses the editor.
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@
 #include <QDialog>
 #include <QString>
 
+#include "apps/gui/jobs/estimate.hpp"
 #include "common/tasks/registry.hpp"
 
 class QDialogButtonBox;
@@ -42,7 +44,13 @@ class QGroupBox;
 class QLabel;
 class QSettings;
 
+namespace alphashape {
+class Chunk;
+}
+
 namespace alphashape::gui {
+
+class ThroughputHistory;
 
 class TaskDialog : public QDialog {
     Q_OBJECT
@@ -89,6 +97,20 @@ public:
     /// True when the parameter sits in the collapsed "Advanced" group.
     bool advanced(const std::string& param) const;
 
+    /// Supply the plain chunk facts and measured history the estimate row
+    /// reads. The facts are copied (snapshot them under read_document()), so
+    /// the dialog never holds a Chunk* across exec(); a null history hides the
+    /// row. Call after the constructor; the row also refreshes whenever a
+    /// parameter changes.
+    void set_estimate_context(ChunkFacts facts, const ThroughputHistory* history);
+    /// Override the RAM budget the warning compares against (0 = the platform
+    /// budget). Tests use this to pin the 75 % threshold.
+    void set_memory_budget(std::uint64_t bytes);
+    /// The estimate label and the RAM warning label (both always exist; hidden
+    /// when there is no context or no warning).
+    QLabel* estimate_label() const { return estimate_label_; }
+    QLabel* ram_warning_label() const { return ram_warning_label_; }
+
     /// "keypoint_limit" -> "Keypoint limit".
     static QString display_name(const std::string& param);
     /// "BuildDepthMaps" -> "Build Depth Maps".
@@ -126,12 +148,19 @@ private:
     void remember() const;
     void set_error(Field& field, const QString& text);
     QString constraint_problem(const Field& field) const;
+    void refresh_estimate();
 
     std::string task_name_;
     QSettings& settings_;
     std::vector<Field> fields_;
     QGroupBox* advanced_group_ = nullptr;
     QDialogButtonBox* buttons_ = nullptr;
+    QLabel* estimate_label_ = nullptr;
+    QLabel* ram_warning_label_ = nullptr;
+    ChunkFacts estimate_facts_;
+    const ThroughputHistory* estimate_history_ = nullptr;
+    const TaskRegistry* registry_ = nullptr;
+    std::uint64_t memory_budget_ = 0;
 };
 
 }  // namespace alphashape::gui

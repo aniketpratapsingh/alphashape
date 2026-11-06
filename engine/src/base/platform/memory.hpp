@@ -31,4 +31,9 @@ std::uint64_t memory_budget_bytes();
 /// Used in the "this machine has Y GB" diagnostics.
 std::string format_gb(double bytes);
 
+/// Peak resident set size of this process in bytes, or 0 when the platform
+/// cannot report it. This is the process-wide high-water mark, not the peak of
+/// one task: the job history records it as an upper bound on a run's memory.
+std::uint64_t peak_resident_set_bytes();
+
 }  // namespace alphashape::platform

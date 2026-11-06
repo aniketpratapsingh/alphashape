@@ -9,10 +9,13 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #elif defined(__APPLE__)
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #else
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -88,6 +91,29 @@ std::string format_gb(double bytes) {
         text.resize(dot + 2);
     }
     return text + " GB";
+}
+
+std::uint64_t peak_resident_set_bytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(), &counters,
+                               static_cast<DWORD>(sizeof(counters))) == 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(counters.PeakWorkingSetSize);
+#else
+    ::rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    // macOS reports ru_maxrss in bytes.
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    // Linux and the BSDs report ru_maxrss in kilobytes.
+    return static_cast<std::uint64_t>(usage.ru_maxrss) * 1024ULL;
+#endif
+#endif
 }
 
 }  // namespace alphashape::platform
