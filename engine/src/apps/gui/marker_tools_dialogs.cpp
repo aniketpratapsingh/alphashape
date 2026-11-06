@@ -79,7 +79,7 @@ DetectMarkersDialog::DetectMarkersDialog(const TaskRegistry& registry,
     preview_->setAlignment(Qt::AlignCenter);
     preview_->setWordWrap(true);
     preview_->setMinimumWidth(kPreviewWidth + 20);
-    if (auto* root = layout()) {
+    if (auto* root = qobject_cast<QVBoxLayout*>(layout())) {
         // The button box is the last item TaskDialog adds; keep it there.
         root->insertWidget(root->count() - 1, preview_);
     }
@@ -173,7 +173,7 @@ PrintMarkersDialog::PrintMarkersDialog(QWidget* parent) : QDialog(parent) {
     auto* buttons = new QDialogButtonBox(this);
     save_ = buttons->addButton(tr("Save PDF..."), QDialogButtonBox::AcceptRole);
     save_->setObjectName(QStringLiteral("print.save"));
-    buttons->addButton(QDialogButtonBox::RejectRole);
+    buttons->addButton(tr("Close"), QDialogButtonBox::RejectRole);
     connect(buttons, &QDialogButtonBox::accepted, this, &PrintMarkersDialog::save_pdf);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     root->addWidget(buttons);
