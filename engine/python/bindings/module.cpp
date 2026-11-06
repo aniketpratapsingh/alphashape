@@ -2449,40 +2449,27 @@ PYBIND11_MODULE(alphashape, m) {
             "Create or move the marker with this exact label to (x, y, z) in "
             "chunk-local coordinates. Returns its id.")
         // Set or clear one camera's per-axis attitude accuracy in degrees, the
-        // sigma trio OptimizeCameras uses to weight that camera's rotation
-        // prior. Cameras are exposed as copies, so the edit goes through the
-        // chunk by id rather than through the Camera object.
+        // sigma trio the adjustment weights that camera's rotation prior by.
+        // The edit goes through the undoable command by camera id.
         .def(
             "set_camera_reference_rotation_accuracy",
-            [](Chunk& c, std::int32_t camera_id, py::object accuracy) {
-                alphashape::Camera* camera = nullptr;
-                for (alphashape::Camera& candidate : c.cameras()) {
-                    if (candidate.id == camera_id) {
-                        camera = &candidate;
-                        break;
+            [](py::object self, std::int32_t camera_id, py::object accuracy) {
+                std::optional<Eigen::Vector3d> sigma;
+                if (!accuracy.is_none()) {
+                    const auto values = py::cast<std::vector<double>>(accuracy);
+                    if (values.size() != 3) {
+                        throw alphashape::ValueError(
+                            "set_camera_reference_rotation_accuracy: accuracy must "
+                            "be a (first, second, third) triple");
                     }
+                    sigma = Eigen::Vector3d(values[0], values[1], values[2]);
                 }
-                if (camera == nullptr) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: no camera with that id");
-                }
-                if (accuracy.is_none()) {
-                    camera->reference.rotation_accuracy_deg.reset();
-                    return;
-                }
-                const auto values = py::cast<std::vector<double>>(accuracy);
-                if (values.size() != 3) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: accuracy must be a "
-                        "(first, second, third) triple");
-                }
-                const Eigen::Vector3d sigma(values[0], values[1], values[2]);
-                if (!sigma.allFinite() || (sigma.array() < 0.0).any()) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: accuracy must be "
-                        "finite and non-negative");
-                }
-                camera->reference.rotation_accuracy_deg = sigma;
+                const std::int32_t chunk_id =
+                    self.cast<const Chunk&>().id();
+                execute_on_chunk(
+                    self,
+                    alphashape::make_set_camera_reference_rotation_accuracy_command(
+                        chunk_id, camera_id, sigma));
             },
             py::arg("camera_id"), py::arg("accuracy"),
             "Set one camera's per-axis attitude accuracy in degrees, positional "

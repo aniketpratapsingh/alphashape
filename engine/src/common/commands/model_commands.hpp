@@ -254,6 +254,14 @@ std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
 std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
     std::int32_t chunk_id, std::int32_t camera_id,
     std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy);
+/// Set (or clear, with nullopt) one camera's per-axis attitude accuracy in
+/// degrees, the sigma trio the adjustment weights that camera's rotation
+/// prior by. Undo restores the previous value, absence included. Every set
+/// component must be finite and non-negative.
+std::unique_ptr<AbstractCommand>
+make_set_camera_reference_rotation_accuracy_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> accuracy_deg);
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool selected);
 

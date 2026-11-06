@@ -2280,6 +2280,47 @@ private:
     Eigen::Vector3d accuracy_;
 };
 
+/// Set (or clear) one camera's per-axis attitude accuracy. The container
+/// snapshot restores the previous optional value on revert.
+class SetCameraRotationAccuracyCommand : public ChunkContainersCommand {
+public:
+    SetCameraRotationAccuracyCommand(std::int32_t chunk_id,
+                                     std::int32_t camera_id,
+                                     std::optional<Eigen::Vector3d> accuracy_deg)
+        : ChunkContainersCommand(chunk_id),
+          camera_id_(camera_id),
+          accuracy_deg_(accuracy_deg) {}
+
+    std::string name() const override { return "Set Camera Rotation Accuracy"; }
+
+protected:
+    void validate(Document& document) override {
+        require_camera(target_chunk(document), camera_id_,
+                       "set camera rotation accuracy");
+        if (accuracy_deg_.has_value() &&
+            (!accuracy_deg_->allFinite() ||
+             (accuracy_deg_->array() < 0.0).any())) {
+            throw ValueError("set camera rotation accuracy: the accuracy must "
+                             "be finite and non-negative");
+        }
+    }
+
+    void commit(Document& document) override {
+        for (Camera& camera : target_chunk(document).cameras()) {
+            if (camera.id == camera_id_) {
+                camera.reference.rotation_accuracy_deg = accuracy_deg_;
+                return;
+            }
+        }
+        throw ValueError("set camera rotation accuracy: no camera with id " +
+                         std::to_string(camera_id_));
+    }
+
+private:
+    std::int32_t camera_id_;
+    std::optional<Eigen::Vector3d> accuracy_deg_;
+};
+
 /// Append every chunk of `source` to the target document.
 ///
 /// Incoming chunk ids are offset by the target's next_chunk_id() (§4.8); every
@@ -3566,6 +3607,14 @@ std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
     std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy) {
     return std::make_unique<SetCameraReferenceCommand>(
         chunk_id, camera_id, location, accuracy);
+}
+
+std::unique_ptr<AbstractCommand>
+make_set_camera_reference_rotation_accuracy_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> accuracy_deg) {
+    return std::make_unique<SetCameraRotationAccuracyCommand>(
+        chunk_id, camera_id, accuracy_deg);
 }
 
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
