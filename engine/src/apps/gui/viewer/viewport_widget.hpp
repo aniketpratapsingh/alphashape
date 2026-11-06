@@ -30,6 +30,7 @@
 
 #include "apps/gui/theme/theme_mode.hpp"
 #include "apps/gui/viewer/camera_controller.hpp"
+#include "apps/gui/viewer/region_gizmo.hpp"
 #include "apps/gui/viewer/scene.hpp"
 #include "apps/gui/viewer/viewport_renderer.hpp"
 
@@ -97,6 +98,25 @@ public:
     /// Request one frame: the canvas renders on its next paint, the placeholder repaints now.
     void request_frame();
 
+    // --- Region gizmo (WP-14.15) -----------------------------------------------------------
+
+    /// Select Move / Resize / Rotate, or None to return to camera-only input. Switching modes
+    /// cancels an in-progress drag without pushing a command.
+    void set_region_mode(RegionGizmoMode mode);
+    RegionGizmoMode region_mode() const { return region_mode_; }
+
+    /// True while a region drag owns the left button. The camera is frozen for its duration.
+    bool region_drag_active() const { return region_drag_.has_value(); }
+
+    /// Programmatic entry points, in widget pixels. The mouse handlers call these too, so the
+    /// tests drive exactly the production path without synthesising events.
+    bool begin_region_drag(const Eigen::Vector2d& pixel);
+    void update_region_drag(const Eigen::Vector2d& pixel);
+    /// Release: push at most one command. True when one was pushed.
+    bool end_region_drag();
+    /// Escape: drop the in-progress edit and restore the original box; no command.
+    void cancel_region_drag();
+
 Q_SIGNALS:
     /// The projection changed (the View menu keeps its checkable entry in step).
     void projection_changed(bool orthographic);
@@ -126,6 +146,15 @@ private:
     void handle_wheel(int angle_delta);
     void handle_key(int key);
     int canvas_height() const;
+    /// The active chunk's region and transform, or nullopt when there is no chunk.
+    std::optional<GizmoState> read_region_state() const;
+    /// True while the drag's chunk is still the active chunk of the current
+    /// document. A drag whose chunk disappeared or is no longer active is
+    /// dropped without pushing a command.
+    bool region_drag_is_current() const;
+    double canvas_aspect() const;
+    /// Rebuild so the preview box (or the committed box) is in the scene.
+    void refresh_gizmo_preview();
 
     GuiApp& app_;
     Theme& theme_;
@@ -149,6 +178,15 @@ private:
     QPoint last_mouse_;
     bool dragging_ = false;
     Qt::MouseButton drag_button_ = Qt::NoButton;
+
+    RegionGizmoMode region_mode_ = RegionGizmoMode::None;
+    std::optional<GizmoDrag> region_drag_;
+    std::optional<GizmoState> region_preview_;
+    /// Chunk the drag belongs to and the projection frozen at its first press.
+    std::int32_t region_chunk_id_ = -1;
+    Eigen::Matrix4d drag_view_projection_ = Eigen::Matrix4d::Identity();
+    int drag_width_ = 0;
+    int drag_height_ = 0;
 };
 
 /// The camera id (in the active chunk) the Workspace selection names, if it names one.

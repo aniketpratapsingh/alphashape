@@ -138,6 +138,27 @@ void ViewportRenderer::set_scene(Scene&& scene) {
     }
 }
 
+void ViewportRenderer::set_region_lines(std::vector<SceneLineVertex>&& lines) {
+    // Region overlay vertices are appended last by build_scene(), so dropping
+    // the trailing run and appending the new one leaves every other line and
+    // every point/mesh vertex untouched.
+    while (!scene_.lines.empty() && !scene_.line_kinds.empty() &&
+           scene_.line_kinds.back() == LineKind::Region) {
+        scene_.lines.pop_back();
+        scene_.line_kinds.pop_back();
+        if (!scene_.line_cameras.empty()) {
+            scene_.line_cameras.pop_back();
+        }
+    }
+    scene_.lines.insert(scene_.lines.end(), lines.begin(), lines.end());
+    scene_.line_kinds.insert(scene_.line_kinds.end(), lines.size(), LineKind::Region);
+    scene_.line_cameras.insert(scene_.line_cameras.end(), lines.size(), -1);
+    lines_pending_ = true;
+    if (rhi_ != nullptr) {
+        size_scene_buffers();
+    }
+}
+
 void ViewportRenderer::restyle(const SceneStyle& style,
                                std::optional<std::int32_t> highlight_camera,
                                RestyleScope scope) {
@@ -428,6 +449,7 @@ void ViewportRenderer::upload_scene(QRhiResourceUpdateBatch* batch) {
             if (!page_->create()) {
                 error_ = QStringLiteral("could not resize the texture page");
                 upload_pending_ = false;
+                lines_pending_ = false;
                 return;
             }
         }
@@ -448,6 +470,7 @@ void ViewportRenderer::upload_scene(QRhiResourceUpdateBatch* batch) {
         batch->uploadTexture(page_, page_image_);
     }
     upload_pending_ = false;
+    lines_pending_ = false;
     colours_pending_ = RestyleScope::None;
 }
 
@@ -464,6 +487,11 @@ void ViewportRenderer::render(QRhiCommandBuffer* cb, QRhiRenderTarget* target,
     QRhiResourceUpdateBatch* batch = rhi_->nextResourceUpdateBatch();
     if (upload_pending_) {
         upload_scene(batch);
+    } else if (lines_pending_) {
+        if (lines_ != nullptr && !scene_.lines.empty()) {
+            batch->uploadStaticBuffer(lines_, scene_.lines.data());
+        }
+        lines_pending_ = false;
     } else if (colours_pending_ != RestyleScope::None) {
         upload_colours(batch);
     }

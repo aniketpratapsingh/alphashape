@@ -390,6 +390,8 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
     if (const XmlNode* region = find_child(node, "region")) {
         chunk.region().centre = parse_vec3(require_attr(*region, "centre"));
         chunk.region().size = parse_vec3(require_attr(*region, "size"));
+        // v1 predates oriented regions; its boxes are always axis-aligned.
+        chunk.region().rotation = Eigen::Matrix3d::Identity();
     }
     if (const XmlNode* transform = find_child(node, "transform")) {
         chunk.transform() = parse_matrix4(require_attr(*transform, "matrix"));

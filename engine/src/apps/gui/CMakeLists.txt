@@ -17,6 +17,7 @@ add_library(alphashape_gui_lib STATIC
     jobs/estimate_model.cpp
     task_dialog.cpp
     calibration_dialog.cpp
+    transform_dialog.cpp
     marker_tools_dialogs.cpp
     workflow.cpp
     export_controller.cpp
@@ -29,6 +30,7 @@ add_library(alphashape_gui_lib STATIC
     properties_pane.cpp
     log_pane.cpp
     viewer/camera_controller.cpp
+    viewer/region_gizmo.cpp
     viewer/scene.cpp
     viewer/viewport_renderer.cpp
     viewer/viewport_widget.cpp

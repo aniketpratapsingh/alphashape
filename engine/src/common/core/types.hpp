@@ -31,13 +31,18 @@
 
 namespace alphashape {
 
-/// World-space axis-aligned bounding region of a chunk.
+/// Oriented bounding region of a chunk, expressed in the chunk-local frame
+/// (the same frame as cameras and tie points; `chunk.transform()` maps it to
+/// world). `centre` and `size` describe the box in its own local axes, and
+/// `rotation` holds those axes as columns: column 0 is the direction of the
+/// half-extent `size.x()`, and so on. Identity means axis-aligned.
 struct Region {
     Eigen::Vector3d centre = Eigen::Vector3d::Zero();
     Eigen::Vector3d size = Eigen::Vector3d::Ones();
+    Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
 
     bool operator==(const Region& other) const {
-        return centre == other.centre && size == other.size;
+        return centre == other.centre && size == other.size && rotation == other.rotation;
     }
 };
 

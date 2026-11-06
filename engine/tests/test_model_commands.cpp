@@ -6,6 +6,7 @@
 // model), and a second apply reproduces the first. After every apply and every
 // revert the chunk must pass Chunk::validate().
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -762,7 +763,37 @@ TEST(Undo, ChunkTransformAndRegion) {
         make_set_chunk_transform_command(chunk_id, bad_transform, region)
             ->apply(document),
         ValueError);
+    // A singular linear part is not a placement.
+    Transform singular = Transform::Identity();
+    singular(0, 0) = 0.0;
+    EXPECT_THROW(
+        make_set_chunk_transform_command(chunk_id, singular, region)->apply(document),
+        ValueError);
+    // The region rotation must be a proper rotation, not a scaled or NaN one.
+    Region bad_rotation = region;
+    bad_rotation.rotation(0, 0) = 2.0;
+    EXPECT_THROW(
+        make_set_chunk_transform_command(chunk_id, transform, bad_rotation)
+            ->apply(document),
+        ValueError);
+    Region nan_rotation = region;
+    nan_rotation.rotation(1, 1) = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(
+        make_set_chunk_transform_command(chunk_id, transform, nan_rotation)
+            ->apply(document),
+        ValueError);
     EXPECT_EQ(chunk.transform(), Transform::Identity());
+
+    // An oriented region is a legal state and round-trips through apply/revert.
+    Region rotated = region;
+    const double cosine = std::cos(0.3);
+    const double sine = std::sin(0.3);
+    rotated.rotation << cosine, -sine, 0.0, sine, cosine, 0.0, 0.0, 0.0, 1.0;
+    auto rotated_command = make_set_chunk_transform_command(chunk_id, transform, rotated);
+    rotated_command->apply(document);
+    EXPECT_TRUE(chunk.region() == rotated);
+    rotated_command->revert(document);
+    EXPECT_EQ(chunk.region(), Region());
 
     auto missing = make_set_chunk_transform_command(99, transform, region);
     EXPECT_THROW(missing->apply(document), ValueError);

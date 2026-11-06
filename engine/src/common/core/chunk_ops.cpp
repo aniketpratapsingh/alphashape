@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -501,16 +502,30 @@ Chunk merge_chunks(const std::vector<const Chunk*>& sources, std::int32_t chunk_
     merged.meta() = sources[0]->meta();
 
     // Bounding box of every source region, so the merged chunk's region covers
-    // all of its content.
-    Eigen::Vector3d low = sources[0]->region().centre - 0.5 * sources[0]->region().size;
-    Eigen::Vector3d high = sources[0]->region().centre + 0.5 * sources[0]->region().size;
-    for (std::size_t i = 1; i < sources.size(); ++i) {
-        const Region& region = sources[i]->region();
-        low = low.cwiseMin(region.centre - 0.5 * region.size);
-        high = high.cwiseMax(region.centre + 0.5 * region.size);
+    // all of its content. Each source box may be oriented, and the merged box
+    // has no single sensible orientation, so we take the axis-aligned bound of
+    // the eight rotated corners of every source and leave the result
+    // axis-aligned (identity rotation).
+    Eigen::Vector3d low = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector3d high = Eigen::Vector3d::Constant(
+        -std::numeric_limits<double>::infinity());
+    for (const Chunk* source : sources) {
+        const Region& region = source->region();
+        const Eigen::Vector3d half = 0.5 * region.size;
+        for (int corner = 0; corner < 8; ++corner) {
+            const Eigen::Vector3d offset(
+                (corner & 1) != 0 ? half.x() : -half.x(),
+                (corner & 2) != 0 ? half.y() : -half.y(),
+                (corner & 4) != 0 ? half.z() : -half.z());
+            const Eigen::Vector3d mapped = region.centre + region.rotation * offset;
+            low = low.cwiseMin(mapped);
+            high = high.cwiseMax(mapped);
+        }
     }
     merged.region().centre = 0.5 * (low + high);
     merged.region().size = high - low;
+    merged.region().rotation = Eigen::Matrix3d::Identity();
 
     for (const Chunk* source : sources) {
         IdMaps maps;

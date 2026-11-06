@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -25,6 +27,8 @@
 #include "apps/gui/theme/theme.hpp"
 #include "apps/gui/theme/viewport_colors.hpp"
 #include "apps/gui/workspace_model.hpp"
+#include "common/commands/model_commands.hpp"
+#include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 
 namespace alphashape::gui {
@@ -126,7 +130,15 @@ ViewportWidget::ViewportWidget(GuiApp& app, Theme& theme, QWidget* parent)
     message_->hide();
 
     QObject::connect(&theme_, &Theme::viewport_changed, this, &ViewportWidget::on_theme_changed);
-    QObject::connect(&app_, &GuiApp::document_replaced, this, [this]() { rebuild_scene(); });
+    QObject::connect(&app_, &GuiApp::document_replaced, this, [this]() {
+        // The drag's chunk belongs to the old document; drop it before the
+        // scene is rebuilt, so no command is pushed against the new one.
+        cancel_region_drag();
+        rebuild_scene();
+    });
+    QObject::connect(&app_, &GuiApp::active_chunk_changed, this, [this](qint32) {
+        cancel_region_drag();
+    });
     QObject::connect(&app_, &GuiApp::undo_changed, this, [this]() { rebuild_scene(); });
     // A task changes the document without commands: after every job, whatever its outcome, the
     // scene is rebuilt. Only the job that leaves the manager idle does it (a queued follow-up
@@ -206,6 +218,33 @@ void ViewportWidget::rebuild_scene() {
         return build_scene(document, style, options);
     });
     last_highlight_ = options.highlight_camera;
+    // The region box is part of the live view while a gizmo mode is active. During a drag the
+    // preview state is authoritative; otherwise the committed chunk region is read.
+    if (region_mode_ != RegionGizmoMode::None || region_preview_) {
+        std::optional<GizmoState> gizmo = region_preview_;
+        if (!gizmo) {
+            gizmo = read_region_state();
+        }
+        if (gizmo) {
+            std::vector<SceneLineVertex> region_lines =
+                preview_lines(*gizmo, region_mode_, style);
+            for (const SceneLineVertex& vertex : region_lines) {
+                scene.lines.push_back(vertex);
+                scene.line_kinds.push_back(LineKind::Region);
+                scene.line_cameras.push_back(-1);
+                const Eigen::Vector3d point =
+                    vertex.position.cast<double>();
+                if (!scene.has_bounds) {
+                    scene.bounds_min = point;
+                    scene.bounds_max = point;
+                    scene.has_bounds = true;
+                } else {
+                    scene.bounds_min = scene.bounds_min.cwiseMin(point);
+                    scene.bounds_max = scene.bounds_max.cwiseMax(point);
+                }
+            }
+        }
+    }
     const bool had_bounds = scene.has_bounds;
     const Eigen::Vector3d bounds_min = scene.bounds_min;
     const Eigen::Vector3d bounds_max = scene.bounds_max;
@@ -346,17 +385,179 @@ void ViewportWidget::set_show_axes(bool on) {
     rebuild_scene();
 }
 
+void ViewportWidget::set_region_mode(RegionGizmoMode mode) {
+    if (region_mode_ == mode) {
+        return;
+    }
+    region_drag_.reset();
+    region_preview_.reset();
+    region_mode_ = mode;
+    rebuild_scene();
+}
+
+std::optional<GizmoState> ViewportWidget::read_region_state() const {
+    std::optional<GizmoState> state;
+    static_cast<void>(app_.read_document([&](const Document& document) {
+        const std::int32_t active = document.active_chunk_id();
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == active) {
+                GizmoState found;
+                found.region = chunk->region();
+                found.transform = chunk->transform();
+                state = found;
+                return;
+            }
+        }
+    }));
+    return state;
+}
+
+bool ViewportWidget::region_drag_is_current() const {
+    if (!region_drag_ || region_chunk_id_ < 0) {
+        return false;
+    }
+    return app_.read_document([this](const Document& document) {
+        if (document.active_chunk_id() != region_chunk_id_) {
+            return false;
+        }
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == region_chunk_id_) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
+double ViewportWidget::canvas_aspect() const {
+    const int height = canvas_height();
+    const int width = std::max(canvas_ != nullptr ? canvas_->width() : this->width(), 1);
+    return static_cast<double>(width) / static_cast<double>(height);
+}
+
+void ViewportWidget::refresh_gizmo_preview() {
+    if (region_drag_ && region_preview_) {
+        // The document does not change between mouse moves, so only the region
+        // overlay lines are replaced; the rest of the scene stays as built.
+        renderer_.set_region_lines(
+            preview_lines(*region_preview_, region_mode_, scene_style_for(mode_)));
+        request_frame();
+        return;
+    }
+    rebuild_scene();
+}
+
+bool ViewportWidget::begin_region_drag(const Eigen::Vector2d& pixel) {
+    if (region_mode_ == RegionGizmoMode::None) {
+        return false;
+    }
+    std::optional<GizmoState> state = region_preview_;
+    if (!state) {
+        state = read_region_state();
+    }
+    if (!state) {
+        return false;
+    }
+    const int width = std::max(canvas_ != nullptr ? canvas_->width() : this->width(), 1);
+    const int height = canvas_height();
+    const Eigen::Matrix4d view_projection = camera_.view_projection(canvas_aspect());
+    const std::optional<GizmoDrag> drag =
+        begin_drag(*state, region_mode_, view_projection, width, height, pixel);
+    if (!drag) {
+        return false;
+    }
+    region_drag_ = drag;
+    region_preview_ = drag->start;
+    region_chunk_id_ = active_chunk_id();
+    drag_view_projection_ = view_projection;
+    drag_width_ = width;
+    drag_height_ = height;
+    dragging_ = false;
+    refresh_gizmo_preview();
+    return true;
+}
+
+void ViewportWidget::update_region_drag(const Eigen::Vector2d& pixel) {
+    if (!region_drag_) {
+        return;
+    }
+    if (!region_drag_is_current()) {
+        cancel_region_drag();
+        return;
+    }
+    const GizmoRay ray =
+        ray_from_screen(drag_view_projection_, drag_width_, drag_height_, pixel);
+    region_preview_ = update_drag(*region_drag_, ray);
+    refresh_gizmo_preview();
+}
+
+bool ViewportWidget::end_region_drag() {
+    if (!region_drag_) {
+        return false;
+    }
+    if (!region_drag_is_current()) {
+        cancel_region_drag();
+        return false;
+    }
+    const GizmoDrag drag = *region_drag_;
+    const GizmoState final_state = region_preview_.value_or(drag.start);
+    const bool changed = drag_changed(drag, final_state);
+    const std::int32_t chunk_id = region_chunk_id_;
+    region_drag_.reset();
+    region_preview_.reset();
+    region_chunk_id_ = -1;
+    bool pushed = false;
+    if (changed && chunk_id >= 0) {
+        try {
+            app_.execute(
+                make_set_chunk_transform_command(chunk_id, final_state.transform,
+                                                 final_state.region));
+            pushed = true;
+        } catch (const std::exception&) {
+            pushed = false;
+        }
+    }
+    if (!pushed) {
+        refresh_gizmo_preview();
+    }
+    return pushed;
+}
+
+void ViewportWidget::cancel_region_drag() {
+    if (!region_drag_ && !region_preview_) {
+        return;
+    }
+    region_drag_.reset();
+    region_preview_.reset();
+    region_chunk_id_ = -1;
+    refresh_gizmo_preview();
+}
+
 void ViewportWidget::handle_mouse_press(const QPoint& position, Qt::MouseButton button) {
     last_mouse_ = position;
+    setFocus(Qt::MouseFocusReason);
+    if (button == Qt::LeftButton && region_mode_ != RegionGizmoMode::None) {
+        // The gizmo owns the left button while a mode is active: a miss deliberately does
+        // nothing, so a stray drag cannot orbit the frozen view.
+        static_cast<void>(begin_region_drag(
+            Eigen::Vector2d(static_cast<double>(position.x()), static_cast<double>(position.y()))));
+        dragging_ = false;
+        drag_button_ = Qt::NoButton;
+        return;
+    }
     dragging_ = true;
     drag_button_ = button;
     // Keep the keyboard with the view: a click that landed on the canvas forwards here from the
     // event filter, but moving focus explicitly (rather than letting the canvas take it) means
     // the shortcuts keep working whichever child received the press.
-    setFocus(Qt::MouseFocusReason);
 }
 
 void ViewportWidget::handle_mouse_move(const QPoint& position, Qt::MouseButtons buttons) {
+    if (region_drag_) {
+        update_region_drag(
+            Eigen::Vector2d(static_cast<double>(position.x()), static_cast<double>(position.y())));
+        return;
+    }
     if (!dragging_) {
         return;
     }
@@ -377,13 +578,27 @@ void ViewportWidget::handle_mouse_move(const QPoint& position, Qt::MouseButtons 
 }
 
 void ViewportWidget::handle_wheel(int angle_delta) {
+    if (region_drag_) {
+        return;  // the projection stays fixed for the whole drag
+    }
     // One wheel notch (120 units) is one dolly step; a trackpad sends fractions of that.
     camera_.dolly(static_cast<double>(angle_delta) / 120.0);
     request_frame();
 }
 
 void ViewportWidget::handle_key(int key) {
+    if (region_drag_) {
+        // The projection is frozen for the whole drag, so no view shortcut may
+        // disturb it. Escape is the only key that still acts: it cancels.
+        if (key == Qt::Key_Escape) {
+            cancel_region_drag();
+        }
+        return;
+    }
     switch (key) {
+        case Qt::Key_Escape:
+            cancel_region_drag();
+            break;
         case Qt::Key_F:
             fit_scene();
             break;
@@ -401,6 +616,7 @@ void ViewportWidget::keyPressEvent(QKeyEvent* event) {
     // here; the canvas forwards its keys through the event filter to the same handle_key(). One
     // switch, two entry points.
     switch (event->key()) {
+        case Qt::Key_Escape:
         case Qt::Key_F:
         case Qt::Key_5:
         case Qt::Key_P:
@@ -431,10 +647,15 @@ bool ViewportWidget::eventFilter(QObject* watched, QEvent* event) {
             handle_mouse_move(mouse->position().toPoint(), mouse->buttons());
             return false;
         }
-        case QEvent::MouseButtonRelease:
+        case QEvent::MouseButtonRelease: {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() == Qt::LeftButton && region_drag_) {
+                static_cast<void>(end_region_drag());
+            }
             dragging_ = false;
             drag_button_ = Qt::NoButton;
             return false;
+        }
         case QEvent::Wheel: {
             auto* wheel = static_cast<QWheelEvent*>(event);
             handle_wheel(wheel->angleDelta().y());
@@ -443,6 +664,7 @@ bool ViewportWidget::eventFilter(QObject* watched, QEvent* event) {
         case QEvent::KeyPress: {
             auto* key = static_cast<QKeyEvent*>(event);
             switch (key->key()) {
+                case Qt::Key_Escape:
                 case Qt::Key_F:
                 case Qt::Key_5:
                 case Qt::Key_P:

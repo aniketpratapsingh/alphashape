@@ -1059,6 +1059,11 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive,
     XmlNode& region = add_child(node, "region");
     set_attr(region, "centre", vec3(chunk.region().centre));
     set_attr(region, "size", vec3(chunk.region().size));
+    // Absent means identity, so an unrotated region costs no attribute and
+    // existing files stay byte-stable.
+    if (!chunk.region().rotation.isIdentity()) {
+        set_attr(region, "rotation", matrix3(chunk.region().rotation));
+    }
     set_attr(add_child(node, "transform"), "matrix", matrix4(chunk.transform()));
     write_crs("crs", chunk.crs(), node);
     write_crs_slots(chunk, node);
@@ -1992,9 +1997,14 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
     docxml_detail::read_panorama(node, chunk, archive, report);
 
     if (const XmlNode* region = find_child(node, "region")) {
-        warn_unknown_attrs(*region, {"centre", "size"}, report);
+        warn_unknown_attrs(*region, {"centre", "size", "rotation"}, report);
         chunk.region().centre = parse_vec3(require_attr(*region, "centre"));
         chunk.region().size = parse_vec3(require_attr(*region, "size"));
+        // Absent means identity (the pre-rotation format).
+        chunk.region().rotation = Eigen::Matrix3d::Identity();
+        if (const std::string* rotation = find_attr(*region, "rotation")) {
+            chunk.region().rotation = parse_matrix3(*rotation);
+        }
     }
     if (const XmlNode* transform = find_child(node, "transform")) {
         warn_unknown_attrs(*transform, {"matrix"}, report);
