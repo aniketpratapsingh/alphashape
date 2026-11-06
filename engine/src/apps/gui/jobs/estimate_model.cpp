@@ -153,7 +153,8 @@ ColdEstimate cold_estimate(ColdTask task, const WorkItem& raw) {
                 co.a + co.b * input_mpx * (neighbours / kReferenceNeighbours);
             // 96 MB per working megapixel: depth, normals, confidence and the
             // PatchMatch scratch buffers held for the active neighbourhood.
-            out.peak_ram_bytes = saturating_bytes(static_cast<double>(kDepthMegapixelRamBytes) * input_mpx);
+            out.peak_ram_bytes = saturating_bytes(
+                static_cast<double>(kDepthMegapixelRamBytes) * input_mpx);
             // 16 B per working pixel: 4 B depth + 12 B normal.
             out.output_bytes = saturating_bytes(input_mpx * 1.0e6 * 16.0);
             break;
@@ -162,7 +163,8 @@ ColdEstimate cold_estimate(ColdTask task, const WorkItem& raw) {
             const double scale =
                 work.volume_voxels > 0.0 ? work.volume_voxels / kModelReferenceVoxels : 1.0;
             out.seconds = co.a * scale + co.b * input_mpx;
-            out.peak_ram_bytes = saturating_bytes(work.volume_voxels * static_cast<double>(kMeshBytesPerVoxel));
+            out.peak_ram_bytes = saturating_bytes(
+                work.volume_voxels * static_cast<double>(kMeshBytesPerVoxel));
             // Rough mesh product: half a point per input pixel, 12 B per vertex.
             out.output_bytes = saturating_bytes(input_mpx * 1.0e6 * 6.0);
             break;

@@ -11,7 +11,11 @@
 // camera-megapixel replaces the cold constants and the estimate is marked
 // confident; sigma comes from the inter-quartile range of those rates, floored
 // at 10 %. Rows survive a restart through ThroughputStore, whose file
-// implementation writes `<project>.files/job_history.tsv` atomically.
+// implementation writes `<project>.files/job_history.tsv` atomically (and
+// `<x>.psz.history.tsv` beside a .psz project, which has no .files folder).
+//
+// A run's peak RSS is only recorded when it raised the process-wide high-water
+// mark; the median of three such peaks then replaces the cold RAM model.
 //
 // No Qt types in this header.
 
@@ -122,8 +126,9 @@ public:
 };
 
 /// `<base>.files/job_history.tsv` for a project path, where `base` is the path
-/// with its final extension removed (the ProjectIO side-car folder). Empty for
-/// no path.
+/// with its final extension removed (the ProjectIO side-car folder). A `.psz`
+/// project has no such folder, so its history is `<path>.history.tsv` beside
+/// the manifest instead. Empty for no path.
 std::string history_path_for_project(const std::string& project_path);
 
 /// Atomic TSV implementation: load parses skip-malformed lines, append rewrites
