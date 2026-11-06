@@ -21,6 +21,8 @@ constexpr double kMinEtaPercent = 2.0;
 }  // namespace
 
 JobManager::JobManager(GuiApp& app) : QObject(nullptr), app_(app), registry_(&builtin_registry()) {
+    QObject::connect(&app_, &GuiApp::document_replaced, this,
+                     [this]() { ++document_generation_; });
     sync_history();
 }
 
@@ -29,17 +31,14 @@ void JobManager::sync_history() {
     // project (File/New) leaves the path empty, so the path alone would let the
     // previous document's rows leak into the new one. Read under the shared
     // lock: the path belongs to the document, not to this manager.
-    const Document* identity = nullptr;
-    const std::string path = app_.read_document([&identity](const Document& document) {
-        identity = &document;
-        return document.path();
-    });
-    const bool same_document = identity == history_document_;
+    const std::string path = app_.read_document(
+        [](const Document& document) { return document.path(); });
+    const bool same_document = document_generation_ == history_generation_;
     if (same_document && path == history_project_) {
         return;
     }
     const std::string previous_path = history_project_;
-    history_document_ = identity;
+    history_generation_ = document_generation_;
     history_project_ = path;
     ThroughputHistory carried;
     if (same_document && previous_path.empty() && !path.empty()) {

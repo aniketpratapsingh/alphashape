@@ -150,9 +150,11 @@ private:
     bool shutting_down_ = false;
     ThroughputHistory throughput_;
     std::string history_project_;
-    /// Identity of the document the rows belong to. A new document (File/New,
-    /// Open) always starts with empty history even when its path is still "".
-    const void* history_document_ = nullptr;
+    /// Identity of the document the rows belong to. A counter (not the raw
+    /// pointer, which an allocator may reuse) is bumped on document_replaced so
+    /// a new document always starts empty even when its path is still "".
+    std::uint64_t document_generation_ = 0;
+    std::uint64_t history_generation_ = 0;
 
     void sync_history();
     void start_next();
