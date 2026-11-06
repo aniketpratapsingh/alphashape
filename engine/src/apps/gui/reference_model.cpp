@@ -39,6 +39,7 @@ ReferenceModel::ReferenceModel(GuiApp& app, Section section, QObject* parent)
     : QAbstractTableModel(parent), app_(app), section_(section) {
     connect(&app_, &GuiApp::undo_changed, this, &ReferenceModel::refresh);
     connect(&app_, &GuiApp::document_replaced, this, &ReferenceModel::refresh);
+    connect(&app_, &GuiApp::active_chunk_changed, this, &ReferenceModel::refresh);
     connect(&app_.jobs(), &JobManager::job_finished, this,
             [this](quint64, JobManager::State, const QString&) {
                 refresh_after_job();

@@ -22,6 +22,7 @@
 #include "apps/gui/app.hpp"
 #include "apps/gui/reference_model.hpp"
 #include "apps/gui/reference_pane.hpp"
+#include "apps/gui/workspace_pane.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "harness.hpp"
@@ -189,6 +190,39 @@ TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
     app().undo();
     ASSERT_TRUE(role_of_103().has_value());
     EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::Gcp);
+}
+
+TEST_F(ReferencePane, SwitchingChunkRefreshesRows) {
+    Chunk& first = build_chunk(3, 2);
+    Chunk& second = build_chunk(5, 1);
+    // The second build_chunk left it active.
+    EXPECT_EQ(pane().cameras().rowCount(), 5);
+    EXPECT_EQ(pane().cameras().chunk_id(), second.id());
+
+    auto* workspace = widget<WorkspacePane>("pane.workspace");
+    ASSERT_NE(workspace, nullptr);
+    ASSERT_TRUE(workspace->activate_chunk(first.id()));
+    EXPECT_EQ(pane().cameras().chunk_id(), first.id());
+    EXPECT_EQ(pane().cameras().rowCount(), 3);
+    EXPECT_EQ(pane().markers().rowCount(), 2);
+
+    // Edits go to the chunk that is now active.
+    ReferenceModel& cameras = pane().cameras();
+    int row = -1;
+    for (int i = 0; i < cameras.rowCount(); ++i) {
+        if (cameras.row_id(i) == 0) {
+            row = i;
+        }
+    }
+    ASSERT_GE(row, 0);
+    ASSERT_TRUE(cameras.setData(cameras.index(row, ReferenceModel::SourceXColumn), 7.0,
+                                Qt::EditRole));
+    EXPECT_DOUBLE_EQ(first.cameras()[0].reference.location->x(), 7.0);
+    EXPECT_DOUBLE_EQ(second.cameras()[0].reference.location->x(), -5.5);
+
+    ASSERT_TRUE(workspace->activate_chunk(second.id()));
+    EXPECT_EQ(pane().cameras().rowCount(), 5);
+    EXPECT_EQ(pane().cameras().chunk_id(), second.id());
 }
 
 TEST_F(ReferencePane, ThousandRowsWithinBudget) {
