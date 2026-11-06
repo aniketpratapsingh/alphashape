@@ -133,7 +133,7 @@ TEST(CameraGroups, SelectionPersistsRoundTrip) {
     const std::string project = temp.path("selection.psx");
     document.set_path(project);
     ProjectIO::save(document, project);
-    std::unique_ptr<Document> loaded = ProjectIO::load(project);
+    const auto loaded = ProjectIO::load(project);
 
     ASSERT_NE(loaded->active_chunk(), nullptr);
     const Chunk& got = *loaded->active_chunk();
