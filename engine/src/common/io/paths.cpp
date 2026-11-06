@@ -70,15 +70,17 @@ std::string path_from_storage(const std::string& stored, const std::string& proj
     if (stored.empty()) {
         return std::string();
     }
-    const fs::path parsed = platform::path_from_utf8(stored);
-    // The in-memory model uses the platform's native separators (Windows code
-    // that built a path with backslashes must compare equal after a round
-    // trip); only the stored form is forced to '/'.
+    fs::path parsed = platform::path_from_utf8(stored);
+    // The in-memory model uses the platform's preferred separators (Windows
+    // code that built a path with backslashes must compare equal after a round
+    // trip); only the stored form is forced to '/'. u8string() preserves the
+    // separators it was given, so the conversion is explicit.
+    parsed.make_preferred();
     if (path_is_absolute(stored) || project_dir.empty()) {
         return platform::path_to_utf8(parsed);
     }
-    const fs::path joined =
-        (platform::path_from_utf8(project_dir) / parsed).lexically_normal();
+    fs::path joined = (platform::path_from_utf8(project_dir) / parsed).lexically_normal();
+    joined.make_preferred();
     return platform::path_to_utf8(joined);
 }
 
