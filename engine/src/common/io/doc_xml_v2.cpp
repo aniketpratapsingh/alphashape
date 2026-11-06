@@ -1831,11 +1831,16 @@ void read_shapes(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
         for (std::size_t i = 0; i < elements.size(); ++i) {
             const Shape& stored = chunk.shapes().features[i];
             const XmlNode& e = *elements[i];
-            warn_unknown_attrs(e, {"id", "type", "label", "layer", "closed"}, report);
+            warn_unknown_attrs(e,
+                               {"id", "type", "label", "layer", "closed",
+                                "has_altitude"},
+                               report);
             if (parse_i32(require_attr(e, "id")) != stored.id ||
                 parse_shape_type(require_attr(e, "type")) != stored.type ||
                 require_attr(e, "label") != stored.label ||
-                attr_or(e, "layer", "Default") != stored.layer) {
+                attr_or(e, "layer", "Default") != stored.layer ||
+                parse_bool(attr_or(e, "has_altitude", "false")) !=
+                    stored.has_altitude) {
                 throw ProjectIOError("doc.xml: <shape> element does not match shapes.shp");
             }
         }
@@ -1888,13 +1893,20 @@ void read_panorama(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
     if (e == nullptr) {
         return;
     }
-    warn_unknown_attrs(*e, {"id", "label", "group", "enabled", "path"}, report);
+    warn_unknown_attrs(*e,
+                       {"id", "label", "group", "enabled", "path", "width",
+                        "height"},
+                       report);
     PanoramaAsset panorama;
     read_slot_identity(*e, panorama);
     if (const std::string* path = find_attr(*e, "path")) {
         const std::vector<std::uint8_t> bytes = require_entry(archive, *path);
         panorama.data = std::make_shared<Image>(
             image_detail::png_decode(bytes.data(), bytes.size()));
+        if (panorama.data->width() != parse_int(require_attr(*e, "width")) ||
+            panorama.data->height() != parse_int(require_attr(*e, "height"))) {
+            throw ProjectIOError("doc.xml: <panorama> size does not match the image");
+        }
     } else {
         add_warning(report, "doc.xml: <panorama> entry has no image; it loads empty");
     }

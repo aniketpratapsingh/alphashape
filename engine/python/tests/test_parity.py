@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 
 import alphashape
 
@@ -288,6 +289,67 @@ class TestDriftInvariant(unittest.TestCase):
             self.assertEqual(before, after, "task {}: meta changed across save/load".format(task))
             recorded = _parameter_keys(after, task)
             self.assertEqual(recorded, expected)
+
+
+# The format-drift test reuses the fixture recipe above. The recipe is a method
+# of TestDriftInvariant (it is that class's preparation logic); calling it on an
+# instance that never runs a test shares the module-level per-task cache, so the
+# expensive dense pipeline is still built once for both classes.
+_PIPELINE_RECIPE = TestDriftInvariant()
+
+
+def _prepared_document(task):
+    """The shared per-task fixture; see TestDriftInvariant._prepared_document."""
+    return _PIPELINE_RECIPE._prepared_document(task)
+
+
+def _doc_xml(project_path):
+    """doc.xml text of a saved directory-form project (``name.psx``)."""
+    base = os.path.splitext(project_path)[0]
+    archive = os.path.join(base + ".files", "project.zip")
+    with zipfile.ZipFile(archive) as bundle:
+        return bundle.read("doc.xml").decode("utf-8")
+
+
+class TestFormatDrift(unittest.TestCase):
+    """Every registered task's parameters reach doc.xml and survive a reload.
+
+    TestDriftInvariant proves the binder/meta agreement in memory. This test
+    extends it to the file the user actually gets: after saving the prepared
+    project, doc.xml must carry a <property> for every declared
+    "<Task>/<param>", and loading it back must return exactly those keys.
+
+    No task is skipped. The shared preparation recipe above already supplies
+    each task's prerequisites (destination paths, a second project to append,
+    the calibration board, the matched scene), and run_task records parameters
+    only after a successful run -- a task that could not run here would also
+    fail TestDriftInvariant, so an allow-list would hide a real defect.
+    """
+
+    def test_each_parameter_is_in_doc_xml_and_reloads(self):
+        for task in alphashape.list_tasks():
+            params = alphashape.task_params(task)
+            doc, chunk = _prepared_document(task)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "project.psx")
+                doc.save(path)
+                xml = _doc_xml(path)
+                reloaded = alphashape.load_project(path)
+            for name in params:
+                key = "{}/{}".format(task, name)
+                self.assertIn(
+                    '<property name="{}"'.format(key),
+                    xml,
+                    "task {}: parameter {} was not written to doc.xml".format(task, name),
+                )
+            loaded = reloaded.chunk(chunk.id)
+            self.assertIsNotNone(loaded)
+            expected = {"{}/{}".format(task, name) for name in params}
+            self.assertEqual(
+                _parameter_keys(loaded.meta, task),
+                expected,
+                "task {}: parameter keys did not survive save/load".format(task),
+            )
 
 
 class TestKeyboardBinder(unittest.TestCase):
