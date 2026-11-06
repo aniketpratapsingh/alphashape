@@ -230,27 +230,40 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         return Eigen::Vector3d(p.x, p.y, p.z);
     };
     // A geographic display CRS reports degrees, so its difference is taken in
-    // the frame's local ENU metres instead. This is only meaningful once the
-    // chunk geometry is georeferenced (the frame is identity before that).
+    // metres in a proper orthonormal ENU frame at the source. Converting both
+    // points to ECEF and rotating the difference avoids the similarity scale
+    // contaminating the result (the chunk transform's linear part is S*Q, not
+    // a rotation, so subtracting local-frame coordinates scales the error).
+    // Heights are ellipsoidal, exactly as OptimizeCameras reads them: a vertical
+    // datum in the display CRS is not applied.
     const bool geographic_display =
         geo && (display.kind() == crs::CrsKind::Geographic2D ||
                 display.kind() == crs::CrsKind::Geographic3D ||
                 display.kind() == crs::CrsKind::Compound);
-    const auto error_of = [&](const std::optional<Eigen::Vector3d>& estimated,
+    const Eigen::Matrix4d internal_to_ecef = chunk.transform();
+    const auto error_of = [&](const std::optional<Eigen::Vector3d>& estimated_local,
+                              const std::optional<Eigen::Vector3d>& estimated,
                               const std::optional<Eigen::Vector3d>& source)
         -> std::optional<Eigen::Vector3d> {
         if (!estimated || !source) {
             return std::nullopt;
         }
         if (geographic_display) {
-            const Eigen::Vector3d e =
-                frame.to_local(CrsPoint{estimated->x(), estimated->y(), estimated->z()});
-            const Eigen::Vector3d s =
-                frame.to_local(CrsPoint{source->x(), source->y(), source->z()});
-            if (!e.allFinite() || !s.allFinite()) {
+            if (!estimated_local) {
                 return std::nullopt;
             }
-            return Eigen::Vector3d(e - s);
+            const Eigen::Vector3d estimate_ecef =
+                (internal_to_ecef * estimated_local->homogeneous()).head<3>();
+            const geo::Geodetic source_geodetic{source->x(), source->y(), source->z()};
+            const Eigen::Vector3d source_ecef = geo::geodetic_to_ecef(source_geodetic);
+            const Eigen::Matrix3d enu_rotation =
+                geo::ecef_to_enu(source_geodetic).block<3, 3>(0, 0);
+            const Eigen::Vector3d enu =
+                enu_rotation * (estimate_ecef - source_ecef);
+            if (!enu.allFinite()) {
+                return std::nullopt;
+            }
+            return enu;
         }
         return Eigen::Vector3d(*estimated - *source);
     };
@@ -290,11 +303,13 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         if (camera.reference.location) {
             row.source = source_of(camera.reference.location, camera_cs, camera_src);
         }
-        if (camera.enabled) {
-            row.estimated = estimate_of(
-                camera_antenna_position(chunk, camera, centres[ci]));
-        }
-        row.error = error_of(row.estimated, row.source);
+        const std::optional<Eigen::Vector3d> estimated_local =
+            camera.enabled
+                ? std::optional<Eigen::Vector3d>(
+                      camera_antenna_position(chunk, camera, centres[ci]))
+                : std::nullopt;
+        row.estimated = estimate_of(estimated_local);
+        row.error = error_of(estimated_local, row.estimated, row.source);
         if (row.error) {
             row.error_m = row.error->norm();
         }
@@ -334,10 +349,8 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         if (marker.reference) {
             row.source = source_of(marker.reference, marker_cs, marker_src);
         }
-        if (marker.position) {
-            row.estimated = estimate_of(marker.position);
-        }
-        row.error = error_of(row.estimated, row.source);
+        row.estimated = estimate_of(marker.position);
+        row.error = error_of(marker.position, row.estimated, row.source);
         if (row.error) {
             row.error_m = row.error->norm();
         }

@@ -256,5 +256,36 @@ TEST(ReferenceTable, GeographicErrorIsInMetres) {
     EXPECT_NEAR(table.summary().camera_rmse_m, expected, 0.01);
 }
 
+TEST(ReferenceTable, GeographicErrorIgnoresTheSimilarityScale) {
+    Chunk chunk("scaled geo");
+    chunk.set_id(0);
+    chunk.set_coordinate_system(crs::CoordinateSystem::from_epsg(4979));
+    const geo::Geodetic origin{10.0, 50.0, 100.0};
+    const Eigen::Vector3d anchor = geo::geodetic_to_ecef(origin);
+    // A non-unit similarity: the internal linear part is 2.5*I, not a rotation.
+    chunk.transform().setIdentity();
+    chunk.transform().block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 2.5;
+    chunk.transform().block<3, 1>(0, 3) = anchor;
+
+    Camera camera = make_camera(1, Eigen::Vector3d::Zero());
+    const geo::Geodetic measured{origin.longitude_deg + 1e-5, origin.latitude_deg,
+                                 origin.height_m};
+    camera.reference.location =
+        Eigen::Vector3d(measured.longitude_deg, measured.latitude_deg, measured.height_m);
+    chunk.cameras().push_back(camera);
+
+    const ReferenceTable table =
+        build_reference_table(chunk, chunk.coordinate_system());
+    const ReferenceRow& row = row_for(table, 1);
+    ASSERT_TRUE(row.error.has_value());
+    ASSERT_TRUE(row.error_m.has_value());
+    const Eigen::Vector3d expected = geo::geodetic_to_enu(measured, origin);
+    // Orthonormal ENU metres: neither S nor S^2 may leak into the residual.
+    EXPECT_NEAR(row.error->x(), expected.x(), 1e-6);
+    EXPECT_NEAR(row.error->y(), expected.y(), 1e-6);
+    EXPECT_NEAR(row.error->z(), expected.z(), 1e-6);
+    EXPECT_NEAR(*row.error_m, expected.norm(), 1e-6);
+}
+
 }  // namespace
 }  // namespace alphashape::reference
