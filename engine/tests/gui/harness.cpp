@@ -1,5 +1,7 @@
 #include "harness.hpp"
 
+#include "apps/gui/modal_hooks.hpp"
+
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
@@ -103,6 +105,16 @@ void GuiTest::SetUp() {
     capture_ = std::make_unique<QtMessageCapture>();
     scratch_ = std::make_unique<QTemporaryDir>();
     ASSERT_TRUE(scratch_->isValid());
+    // No GUI test may open a modal dialog: report an unexpected error as a
+    // failure and answer a reference-change question with the non-destructive
+    // relabel. A test that needs another answer installs its own hook.
+    modal_hooks().error = [](QWidget*, const QString& title, const QString& text) {
+        ADD_FAILURE() << "unexpected modal error: " << title.toStdString() << ": "
+                      << text.toStdString();
+    };
+    modal_hooks().choose_reference_change = [](QWidget*, const QString&) {
+        return ReferenceChangeChoice::Relabel;
+    };
     rebuild(/*reset_settings=*/true);
 }
 
@@ -112,6 +124,7 @@ void GuiTest::TearDown() {
     app_.reset();
     scratch_.reset();
     capture_.reset();
+    reset_modal_hooks();
 }
 
 void GuiTest::rebuild(bool reset_settings) {

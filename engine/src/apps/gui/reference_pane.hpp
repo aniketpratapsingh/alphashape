@@ -5,9 +5,8 @@
 //
 // Every cell edit is one undoable command (see ReferenceModel). The toolbar
 // opens the existing task dialogs for OptimizeCameras, ImportReference,
-// ExportReference and ConvertReference; the reference-settings dialog is a
-// later work package, so its action is a disabled placeholder, as is picking a
-// reference in the viewport.
+// ExportReference and ConvertReference; the Settings action opens the reference
+// settings dialog. Picking a reference in the viewport is still a placeholder.
 //
 // The pane never reads the document while a job owns it: the models mark
 // themselves stale and rebuild when the job finishes.

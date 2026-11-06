@@ -15,6 +15,7 @@
 #include <QVBoxLayout>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/calibration_dialog.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 
@@ -263,6 +264,23 @@ bool WorkspacePane::activate_chunk(std::int32_t chunk_id) {
     return true;
 }
 
+bool WorkspacePane::open_calibration(std::int32_t chunk_id,
+                                     std::int32_t sensor_index) {
+    if (refuse_while_busy(tr("Camera Calibration"))) {
+        return false;
+    }
+    const Chunk* chunk = app_.document().workspace().find_chunk(chunk_id);
+    if (chunk == nullptr || sensor_index < 0 ||
+        sensor_index >= static_cast<std::int32_t>(chunk->sensors().size())) {
+        return false;
+    }
+    CalibrationDialog dialog(app_, this);
+    dialog.set_chunk(chunk_id);
+    dialog.select_sensor(static_cast<int>(sensor_index));
+    dialog.exec();
+    return true;
+}
+
 void WorkspacePane::on_activated(const QModelIndex& index) {
     const NodeRef ref = model_->ref_at(index);
     if (ref.kind == NodeKind::Chunk) {
@@ -361,6 +379,14 @@ std::unique_ptr<QMenu> WorkspacePane::build_context_menu() {
         // The engine refuses to remove the last chunk; say so up front instead of failing.
         entry(QStringLiteral("remove_chunk"), tr("Remove chunk"), !busy && chunk_count > 1,
               [this, id]() { remove_chunk(id); });
+    }
+
+    if (items.size() == 1 && items.front().kind == NodeKind::Sensor) {
+        menu->addSeparator();
+        const NodeRef ref = items.front();
+        // The dialog edits the document, so it waits for a running job.
+        entry(QStringLiteral("camera_calibration"), tr("Camera Calibration..."),
+              !busy, [this, ref]() { open_calibration(ref.chunk_id, ref.item_id); });
     }
 
     if (busy) {

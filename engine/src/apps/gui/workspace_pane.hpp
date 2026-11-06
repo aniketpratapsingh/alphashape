@@ -55,6 +55,9 @@ public:
                              bool enabled);
     /// Make a chunk the active one. Not undoable (see the file comment).
     bool activate_chunk(std::int32_t chunk_id);
+    /// Open the Camera Calibration dialog for one sensor. False when the chunk
+    /// or sensor does not exist or a job owns the document.
+    bool open_calibration(std::int32_t chunk_id, std::int32_t sensor_index);
 
     /// The context menu for the current selection (or for empty space when it is empty).
     /// Entries are named "action.workspace.<verb>"; disabled ones stay listed.

@@ -14,6 +14,7 @@ add_library(alphashape_gui_lib STATIC
     app.cpp
     job_manager.cpp
     task_dialog.cpp
+    calibration_dialog.cpp
     workflow.cpp
     export_controller.cpp
     start_screen.cpp
@@ -38,7 +39,11 @@ target_link_libraries(alphashape_gui_lib
 # PROJ-backed coordinate engine. A -DALPHASHAPE_USE_PROJ=OFF build leaves the
 # dock out entirely (main_window.cpp and the tests guard on the same macro).
 if(TARGET alphashape_crs)
-    target_sources(alphashape_gui_lib PRIVATE reference_model.cpp reference_pane.cpp)
+    target_sources(alphashape_gui_lib PRIVATE
+        reference_model.cpp
+        reference_pane.cpp
+        crs_picker.cpp
+        reference_settings_dialog.cpp)
 endif()
 
 # The engine uses `slots` and `signals` as ordinary identifiers (core/assets.hpp), which Qt's

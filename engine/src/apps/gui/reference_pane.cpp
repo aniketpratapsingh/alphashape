@@ -22,6 +22,7 @@
 
 #include "apps/gui/app.hpp"
 #include "apps/gui/job_manager.hpp"
+#include "apps/gui/reference_settings_dialog.hpp"
 #include "apps/gui/task_dialog.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
@@ -184,8 +185,15 @@ void ReferencePane::create_toolbar() {
     }
 
     QAction* settings = make(QStringLiteral("action.reference.settings"), tr("Settings"));
-    settings->setEnabled(false);
-    settings->setToolTip(tr("Reference settings arrive with the settings dialog"));
+    settings->setToolTip(tr("Edit the reference settings"));
+    connect(settings, &QAction::triggered, this, [this]() {
+        if (app_.jobs().busy()) {
+            return;
+        }
+        ReferenceSettingsDialog dialog(app_, this);
+        dialog.exec();
+        refresh();
+    });
 
     QAction* pick = make(QStringLiteral("action.reference.pick"),
                          tr("Pick in viewport"));
@@ -256,6 +264,9 @@ void ReferencePane::update_actions() {
         if (entry != nullptr) {
             entry->setEnabled(idle_chunk);
         }
+    }
+    if (QAction* settings = action(QStringLiteral("action.reference.settings"))) {
+        settings->setEnabled(idle_chunk);
     }
     if (convert_ != nullptr && builtin_registry().find("ConvertReference") != nullptr) {
         convert_->setEnabled(idle_chunk);
