@@ -33,6 +33,11 @@ target_link_libraries(alphashape_gui_tests PRIVATE alphashape_gui_lib Qt6::Test 
                                               alphashape_warnings)
 add_dependencies(alphashape_gui_tests alphashape-gui)
 
+# The Reference pane and its table only exist with the PROJ-backed engine.
+if(TARGET alphashape_crs)
+    target_sources(alphashape_gui_tests PRIVATE test_reference_pane.cpp)
+endif()
+
 # The Phase 1 exit check: one window, one project, the whole pipeline through the Workflow menu
 # and the JobManager. Its own binary because it needs a timeout of its own (a per-test property
 # is not available on a gtest_discover_tests() call, and 120 s would turn a slow CI runner into a
