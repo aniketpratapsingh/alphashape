@@ -133,6 +133,12 @@ void GuiApp::new_document(const std::string& path) {
 
 void GuiApp::open_document(const std::string& path) {
     require_idle("open a project");
+    // Re-opening the project already on screen would see our own live lock as a
+    // second writer, so drop it first. Any other path keeps its lock until the
+    // new one is secured.
+    if (document_ != nullptr && document_->path() == path) {
+        project_lock_.release();
+    }
     // The GUI edits the project it opens, so take the writer lock. A read-only
     // CLI/Python open does not, and a failed load releases the lock with the
     // temporary (WP-11.9).
