@@ -52,6 +52,11 @@ private:
 
 class DocumentCacheGuard;
 
+/// The scratch directory for a project container path: `<base>.files/cache`,
+/// or "" for an empty path. Shared by Document and ProjectIO so both agree,
+/// including for a `<base>.files/project.zip` opened directly.
+std::string project_cache_directory(const std::string& project_path);
+
 /// The whole project. Owns workspaces and the next-id counters that keep
 /// identities stable across save/load — matching the observed `next_id` /
 /// `active_id` root attributes.
@@ -71,6 +76,12 @@ public:
     /// write into it create it. It is removed when the last Document sharing
     /// this project's path is destroyed.
     std::string cache_dir() const;
+
+    /// Keep the cache directory current at this moment alive after set_path()
+    /// moves the document elsewhere. Save As uses it so undo spill files in the
+    /// old cache stay readable until the history that references them is gone.
+    /// Drop the returned token to release it.
+    std::shared_ptr<void> pin_cache_directory() const;
 
     std::vector<std::shared_ptr<Workspace>>& workspaces() { return workspaces_; }
     const std::vector<std::shared_ptr<Workspace>>& workspaces() const {

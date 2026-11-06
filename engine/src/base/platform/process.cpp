@@ -285,6 +285,71 @@ bool process_is_alive(long long pid) {
 #endif
 }
 
+bool create_file_exclusive(const std::string& path, const std::string& text,
+                           std::string* error) {
+#if defined(_WIN32)
+    const std::wstring wide = from_utf8(path);
+    if (wide.empty()) {
+        *error = "path is not valid UTF-8";
+        return false;
+    }
+    HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        *error = "CreateFile failed (error " +
+                 std::to_string(static_cast<unsigned long>(code)) + ")";
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const std::size_t left = text.size() - written;
+        const DWORD chunk =
+            static_cast<DWORD>(left > 0x7fffffffU ? 0x7fffffffU : left);
+        DWORD put = 0;
+        const BOOL ok = ::WriteFile(handle, text.data() + written, chunk, &put, nullptr);
+        if (ok == 0 || put == 0) {
+            ::CloseHandle(handle);
+            (void)::DeleteFileW(wide.c_str());
+            *error = "short write";
+            return false;
+        }
+        written += static_cast<std::size_t>(put);
+    }
+    ::CloseHandle(handle);
+    return true;
+#else
+    const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        *error = std::strerror(errno);
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t put =
+            ::write(fd, text.data() + written, text.size() - written);
+        if (put < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            *error = std::strerror(errno);
+            ::close(fd);
+            (void)::unlink(path.c_str());
+            return false;
+        }
+        if (put == 0) {
+            *error = "short write";
+            ::close(fd);
+            (void)::unlink(path.c_str());
+            return false;
+        }
+        written += static_cast<std::size_t>(put);
+    }
+    ::close(fd);
+    return true;
+#endif
+}
+
 std::string hostname() {
 #if defined(_WIN32)
     wchar_t buffer[256];

@@ -13,7 +13,11 @@ namespace {
 
 std::string with_forward_slashes(const fs::path& path) {
     std::string text = platform::path_to_utf8(path);
-    std::replace(text.begin(), text.end(), '\\', '/');
+    // Only Windows uses '\' as a separator; on POSIX a backslash is an
+    // ordinary character in a file name and must survive storage.
+    if constexpr (fs::path::preferred_separator == '\\') {
+        std::replace(text.begin(), text.end(), '\\', '/');
+    }
     return text;
 }
 
@@ -49,7 +53,16 @@ std::string path_for_storage(const std::string& path, const std::string& project
     }
     const std::string normalised = with_forward_slashes(platform::path_from_utf8(path));
     if (absolute_paths) {
-        return normalised;
+        // absolute_paths covers every stored path: a path that is relative in
+        // memory is resolved against the project directory first, so the file
+        // records a location a reader on any working directory can open.
+        if (path_is_absolute(normalised)) {
+            return normalised;
+        }
+        fs::path resolved =
+            (platform::path_from_utf8(project_dir) /
+             platform::path_from_utf8(path)).lexically_normal();
+        return with_forward_slashes(resolved);
     }
     if (!path_is_absolute(normalised)) {
         return normalised;

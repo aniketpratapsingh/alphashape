@@ -33,8 +33,10 @@ struct ProjectIO {
     /// the .psx manifest plus "name.files/project.zip". Both go through a temp
     /// file and rename, so a failed save never truncates the previous project.
     ///
-    /// `absolute_paths` stores frame paths absolutely instead of relative to
-    /// the project file, and records Project/AbsolutePaths accordingly.
+    /// `absolute_paths` stores every path absolutely instead of relative to
+    /// the project file, and records Project/AbsolutePaths="true". The key is
+    /// absent for the default relative layout, so the directory form keeps the
+    /// bytes it had before the key existed.
     static void save(const Document& document, const std::string& path,
                      bool absolute_paths = false);
 

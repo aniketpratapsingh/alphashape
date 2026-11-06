@@ -39,4 +39,10 @@ bool process_is_alive(long long pid);
 /// local.
 std::string hostname();
 
+/// Create `path` and write `text` to it only when the file does not already
+/// exist. POSIX uses open(O_CREAT|O_EXCL); Windows uses CreateFileW(CREATE_NEW).
+/// Returns false with `error` set when the file exists or cannot be written.
+bool create_file_exclusive(const std::string& path, const std::string& text,
+                           std::string* error);
+
 }  // namespace alphashape::platform

@@ -37,17 +37,22 @@ void write_file_atomically(const fs::path& path, const std::vector<std::uint8_t>
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) {
+            std::error_code ignored;
+            fs::remove(tmp, ignored);
             throw ProjectIOError("cannot write '" + tmp.string() + "'");
         }
         out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         if (!out) {
+            std::error_code ignored;
+            fs::remove(tmp, ignored);
             throw ProjectIOError("short write to '" + tmp.string() + "'");
         }
     }
     std::error_code ec;
     fs::rename(tmp, path, ec);
     if (ec) {
-        fs::remove(tmp);
+        std::error_code ignored;
+        fs::remove(tmp, ignored);
         throw ProjectIOError("cannot replace '" + path.string() + "': " + ec.message());
     }
 }
@@ -68,6 +73,7 @@ std::string absolute_directory(const fs::path& directory) {
     if (ec) {
         absolute = directory;
     }
+    absolute = absolute.lexically_normal();
     absolute.make_preferred();
     return platform::path_to_utf8(absolute);
 }
@@ -81,21 +87,6 @@ std::string project_directory(const fs::path& project) {
         directory = directory.parent_path();
     }
     return absolute_directory(directory);
-}
-
-/// `<base>.files/cache`, where `<base>` is the project path without extension.
-/// A project.zip opened directly already lives inside that `.files` directory.
-std::string cache_directory(const fs::path& project) {
-    fs::path project_path = project;
-    if (project.extension() == ".zip" && project.parent_path().extension() == ".files") {
-        project_path = platform::path_from_utf8(
-            platform::path_to_utf8(project.parent_path().parent_path()) + ".files");
-    }
-    const fs::path files(platform::path_from_utf8(
-        platform::path_to_utf8(strip_extension(project_path)) + ".files"));
-    fs::path cache = files / "cache";
-    cache.make_preferred();
-    return platform::path_to_utf8(cache);
 }
 
 }  // namespace
@@ -113,14 +104,19 @@ void ProjectIO::save(const Document& document, const std::string& path,
     // the container, not application metadata: it is written on this shallow
     // copy (the chunks are shared) and consumed on load.
     Document view = document;
-    view.meta().set(kAbsolutePathsKey, absolute_paths ? "true" : "false");
+    // Absence means relative, so the key is written only for the non-default
+    // choice. This keeps the directory form byte-identical with a writer that
+    // predates the key.
+    if (absolute_paths) {
+        view.meta().set(kAbsolutePathsKey, "true");
+    }
 
     IoContext context;
     context.project_dir = project_directory(project);
     // Use the project cache only when it belongs to this document: a save-as to
     // a new path must not leave a cache directory behind that no Document will
     // ever clear. The codec then uses the platform temporary directory.
-    const std::string cache_dir = cache_directory(project);
+    const std::string cache_dir = project_cache_directory(path);
     if (cache_dir == document.cache_dir()) {
         context.scratch_dir = cache_dir;
     }
@@ -239,7 +235,7 @@ std::shared_ptr<Document> ProjectIO::load(const std::string& path, ReadReport* r
 
     IoContext context;
     context.project_dir = project_directory(project);
-    context.scratch_dir = cache_directory(project);
+    context.scratch_dir = project_cache_directory(path);
     auto document = read_document(archive, report, context);
     document->set_path(path);
 

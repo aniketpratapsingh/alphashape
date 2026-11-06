@@ -117,8 +117,9 @@ struct Options {
     std::string new_project;
     std::vector<std::string> set_values;
     std::vector<std::string> images;
-    /// "dir" (default) keeps the .psx + .files layout; "psz" writes one file.
-    std::string save_layout = "dir";
+    /// "dir" keeps the .psx + .files layout; "psz" writes one file; "" leaves
+    /// the choice to the target's extension (.psz means the single-file form).
+    std::string save_layout;
     /// Save only these chunk ids; empty means every chunk.
     std::vector<std::int32_t> chunk_ids;
     bool has_make_sheet = false;
@@ -166,15 +167,18 @@ std::vector<std::int32_t> parse_chunk_ids(const std::string& text) {
     return ids;
 }
 
-/// The path a save writes for the requested layout. ".psz" always produces a
-/// .psz file; a directory save of a .psz input writes the sibling .psx, so the
-/// extension always matches what is on disk.
+/// The path a save writes for the requested layout. An unspecified layout is
+/// inferred from the target: a ".psz" path is the single-file form, anything
+/// else the directory form. An explicit layout must match the extension, and a
+/// mismatch is a usage error rather than a silent write under another name.
 std::string save_path_for(const std::string& project, const std::string& layout) {
-    std::filesystem::path path = alphashape::platform::path_from_utf8(project);
-    if (layout == "psz") {
-        path.replace_extension(".psz");
-    } else if (path.extension() == ".psz") {
-        path.replace_extension(".psx");
+    const std::filesystem::path path = alphashape::platform::path_from_utf8(project);
+    const bool psz_target = path.extension() == ".psz";
+    if (layout == "psz" && !psz_target) {
+        throw UsageError{};
+    }
+    if (layout == "dir" && psz_target) {
+        throw UsageError{};
     }
     return alphashape::platform::path_to_utf8(path);
 }

@@ -15,24 +15,19 @@ namespace fs = std::filesystem;
 
 namespace {
 
-std::string cache_dir_for_path(const std::string& path) {
+/// Same normal form for guards and same-project checks: absolute with "." and
+/// ".." resolved, so two spellings of one project share a guard.
+std::string canonical_key(const std::string& path) {
     if (path.empty()) {
         return std::string();
     }
-    fs::path base = platform::path_from_utf8(path);
-    // A project.zip opened directly lives in `<base>.files`, so the cache is
-    // that directory's own cache subdirectory.
-    if (base.extension() == ".zip" && base.parent_path().extension() == ".files") {
-        fs::path cache = base.parent_path() / "cache";
-        cache.make_preferred();
-        return platform::path_to_utf8(cache);
+    const fs::path given = platform::path_from_utf8(path);
+    std::error_code ec;
+    fs::path canonical = fs::weakly_canonical(given, ec);
+    if (ec) {
+        canonical = given;
     }
-    base.replace_extension();
-    const fs::path files(
-        platform::path_from_utf8(platform::path_to_utf8(base) + ".files"));
-    fs::path cache = files / "cache";
-    cache.make_preferred();
-    return platform::path_to_utf8(cache);
+    return platform::path_to_utf8(canonical.lexically_normal());
 }
 
 std::mutex& cache_guard_mutex() {
@@ -49,6 +44,26 @@ std::map<std::string, std::weak_ptr<DocumentCacheGuard>>& cache_guards() {
 }
 
 }  // namespace
+
+std::string project_cache_directory(const std::string& project_path) {
+    if (project_path.empty()) {
+        return std::string();
+    }
+    fs::path base = platform::path_from_utf8(project_path);
+    // A project.zip opened directly lives in `<base>.files`, so the cache is
+    // that directory's own cache subdirectory, not a sibling of it.
+    if (base.extension() == ".zip" && base.parent_path().extension() == ".files") {
+        fs::path cache = base.parent_path() / "cache";
+        cache.make_preferred();
+        return platform::path_to_utf8(cache);
+    }
+    base.replace_extension();
+    const fs::path files(
+        platform::path_from_utf8(platform::path_to_utf8(base) + ".files"));
+    fs::path cache = files / "cache";
+    cache.make_preferred();
+    return platform::path_to_utf8(cache);
+}
 
 /// Removes the project cache directory when the last Document that used it is
 /// destroyed. Only the cache subdirectory is touched.
@@ -68,20 +83,30 @@ private:
 };
 
 void Document::refresh_cache_guard() {
-    const std::string dir = cache_dir_for_path(path_);
+    const std::string dir = project_cache_directory(path_);
     if (dir.empty()) {
         cache_guard_.reset();
         return;
     }
+    // Key on the cache directory itself: a .psx and the project.zip opened
+    // directly are two spellings of one project and must share one guard.
+    const std::string key = canonical_key(dir);
     const std::lock_guard<std::mutex> lock(cache_guard_mutex());
     auto& guards = cache_guards();
-    const auto found = guards.find(dir);
+    for (auto it = guards.begin(); it != guards.end();) {
+        if (it->second.expired()) {
+            it = guards.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const auto found = guards.find(key);
     if (found != guards.end()) {
         cache_guard_ = found->second.lock();
     }
     if (!cache_guard_) {
         cache_guard_ = std::make_shared<DocumentCacheGuard>(dir);
-        guards[dir] = cache_guard_;
+        guards[key] = cache_guard_;
     }
 }
 
@@ -91,8 +116,10 @@ void Document::set_path(std::string path) {
 }
 
 std::string Document::cache_dir() const {
-    return cache_dir_for_path(path_);
+    return project_cache_directory(path_);
 }
+
+std::shared_ptr<void> Document::pin_cache_directory() const { return cache_guard_; }
 
 Chunk* Workspace::find_chunk(std::int32_t id) {
     for (auto& chunk : chunks_) {

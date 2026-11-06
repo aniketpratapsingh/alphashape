@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <QObject>
 #include <QSettings>
@@ -76,8 +77,10 @@ public:
     /// the undo history.
     void new_document(const std::string& path);
 
-    /// Replace the document with the project at `path`. On failure the current document is
-    /// untouched and alphashape::Error propagates.
+    /// Replace the document with the project at `path`. A container that cannot be locked
+    /// because it is read-only is still opened, without a lock and with a logged warning
+    /// (see opened_read_only()). Any other failure leaves the current document untouched
+    /// and propagates alphashape::Error.
     void open_document(const std::string& path);
 
     /// Write the document to its own path. Throws alphashape::Error on I/O failure, or when
@@ -92,6 +95,11 @@ public:
     /// uses it to tell "the user asked for an empty project" from "no project is open yet" and
     /// so whether the start screen belongs on screen.
     bool project_requested() const { return project_requested_; }
+
+    /// True when the project currently open could not be locked because the
+    /// container is read-only (permissions or a read-only filesystem). The GUI
+    /// then opens it without a writer lock and reports a warning.
+    bool opened_read_only() const { return opened_read_only_; }
 
     /// Window title fragment for the current document ("Untitled" when it has no path).
     /// Takes the shared lock itself: call it from the GUI thread outside read_document(),
@@ -144,6 +152,10 @@ private:
     UndoStack undo_stack_;
     /// On-disk writer lock for the open project (WP-11.9); released on replace.
     ProjectLock project_lock_;
+    /// Cache directories pinned by Save As so undo spill files in the previous
+    /// project cache stay readable until the history that names them is cleared.
+    std::vector<std::shared_ptr<void>> pinned_caches_;
+    bool opened_read_only_ = false;
     Theme theme_;
     mutable DocumentLock document_lock_;
     JobManager jobs_;

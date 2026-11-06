@@ -41,9 +41,12 @@ but its bytes come from a file the caller can still stream externally.
 stored relative to the project file when the photo is on the same drive/root,
 and absolute otherwise. All stored separators are `/`.
 
-`Project/AbsolutePaths` in the document `<meta>` records the writer's choice
-(`true` when paths were forced absolute). It is consumed on load and does not
-become part of the document's own metadata.
+A save with `absolute_paths=true` stores every path absolutely, including one
+that was relative in memory (resolved against the project directory first).
+
+`Project/AbsolutePaths` is written as `true` only for that non-default choice;
+its absence means relative. It is consumed on load and does not become part of
+the document's own metadata.
 
 On load, a relative path is resolved against the directory holding the project
 file. A missing photo is a warning in `ReadReport`, never an error; the frame
@@ -63,13 +66,21 @@ destroyed. Only the `cache` subdirectory is touched.
 
 ## Writer lock
 
-`ProjectLock::acquire(project_path)` writes `<base>.files/lock` with the pid,
-host name, start time and a random token. A second writer raises
-`ProjectIOError` naming the holder.
+`ProjectLock::acquire(project_path)` writes `<base>.files/lock` for the
+directory form and `<path>.lock` for a `.psz` (a single-file project owns no
+`.files` directory, so no directory is created for it), with the pid, host name,
+start time and a random token. A second writer raises `ProjectIOError` naming
+the holder. When the lock cannot be created for permission or
+read-only-filesystem reasons, `acquire` raises `ProjectReadOnlyError` instead:
+that is not a second writer.
 
 A lock is stale when its host is this machine and the pid is no longer running,
 or when it came from another host and is older than `max_age_seconds`
-(default 24 h). A stale lock is replaced. The lock is released on save-close
-(RAII) and read-only opens never take it. `ProjectLock::release()` removes the
-file only when its token still matches, so a stale-break by another process is
-not undone.
+(default 24 h). A stale lock is replaced, but never by deleting the path: it is
+renamed aside (`lock.stale.<token>`), re-read, and compared with the record
+that was judged stale. A different record (a writer that won the race) is put
+back and reported as the holder, so two processes breaking the same stale lock
+cannot remove the fresh lock one of them just created. The lock is released on
+save-close (RAII) and read-only opens never take it. `ProjectLock::release()`
+removes the file only when its token still matches, so a stale-break by another
+process is not undone.

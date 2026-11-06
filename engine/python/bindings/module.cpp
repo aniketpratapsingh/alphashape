@@ -2098,8 +2098,10 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly(
             "cache_dir", [](const Document& d) { return d.cache_dir(); },
             "Scratch directory for this project (<base>.files/cache), or '' "
-            "when the document has no on-disk location yet. Removed when the "
-            "document is closed.")
+            "when the document has no on-disk location yet. A project.zip "
+            "opened directly resolves to <base>.files/cache as well. The "
+            "directory is not created until a caller writes into it, and it is "
+            "removed when the last Document that shares it closes.")
         .def(
             "save",
             [](Document& d, const std::string& path, py::object chunks,
@@ -2147,8 +2149,10 @@ PYBIND11_MODULE(alphashape, m) {
             "Write the project. `chunks` restricts the file to those chunks "
             "(ids or Chunk objects); None writes every chunk. Chunk ids and the "
             "next-chunk counter are preserved so the file can be appended. "
-            "`archive` selects the layout: None infers it from the extension, "
-            "True forces a single-file .psz, False the directory form.")
+            "`archive` selects the layout: None infers it from `path` (a .psz "
+            "path writes the single-file form, anything else the directory "
+            "form); True forces a single-file .psz and False the directory "
+            "form, rewriting the extension when it does not already match.")
         .def("add_chunk",
              [](py::object self, const std::string& label) -> py::object {
                  Document& d = self.cast<Document&>();
