@@ -52,6 +52,13 @@ struct ImageInfo {
     int bit_depth = 0;
 };
 
+/// True when `path`'s extension names a format this module can decode. The
+/// comparison is case-insensitive, so a camera's ".JPG" matches. This is the
+/// list the recursive AddPhotos import uses; the reader itself sniffs the magic
+/// bytes and ignores the extension, so a mis-named file still decodes when it
+/// is named explicitly.
+bool has_supported_image_extension(const std::string& path);
+
 /// Sniffs the file's magic bytes. The extension is ignored — a PNG named
 /// "photo.jpg" is reported as Png. Returns Unknown for a file that cannot be
 /// opened or whose signature is not recognised; detection never throws.

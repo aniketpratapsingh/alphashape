@@ -17,6 +17,7 @@
 
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
+#include "common/algorithm/photos/camera_groups.hpp"
 #include "common/algorithm/reference/xmp_reference.hpp"
 #include "common/core/frame.hpp"
 #include "image/io/exif.hpp"
@@ -238,43 +239,61 @@ bool same_path(const std::string& a, const std::string& b) {
     return fs::path(a).lexically_normal() == fs::path(b).lexically_normal();
 }
 
-/// The extensions the importer recognises. Compared case-insensitively so a
-/// camera's ".JPG" is not silently skipped. The list matches the decoders in
-/// image/io (JPEG, PNG, TIFF and the Netpbm family).
+/// The recursive import accepts exactly what the image loader can decode; the
+/// predicate lives beside the decoders so the two lists cannot drift apart.
 bool has_image_extension(const fs::path& path) {
-    std::string ext = path.extension().string();
-    if (!ext.empty()) {
-        ext.erase(ext.begin());  // drop the leading '.'
-    }
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    static const char* const kExtensions[] = {"jpg",  "jpeg", "png", "tif", "tiff",
-                                              "pnm",  "pgm",  "ppm", "pbm"};
-    for (const char* known : kExtensions) {
-        if (ext == known) {
-            return true;
-        }
-    }
-    return false;
+    return has_supported_image_extension(path.string());
 }
 
 /// Every image file under `root`, recursively, sorted by path. Sorting is what
 /// makes the import deterministic regardless of directory iteration order.
+///
+/// Hidden entries (a name starting with '.') and everything inside a hidden
+/// directory are skipped, which is what users expect from a photo folder and
+/// keeps tool metadata (".DS_Store", VCS directories) out of the import.
+///
+/// A read failure anywhere is a hard error rather than a silent stop: the
+/// recursive iterator reports an error by advancing to the end, so a permission
+/// problem would otherwise look like a short but successful import.
 std::vector<std::string> images_under(const fs::path& root) {
     std::vector<std::string> files;
     std::error_code ec;
-    for (fs::recursive_directory_iterator it(root, ec), end; it != end;
-         it.increment(ec)) {
-        if (ec) {
-            break;
-        }
+    fs::recursive_directory_iterator it(root, ec);
+    if (ec) {
+        throw ValueError("AddPhotos: cannot read '" + root.string() + "': " + ec.message());
+    }
+    const fs::recursive_directory_iterator end;
+    for (; it != end;) {
+        const fs::directory_entry& entry = *it;
+        // Copied because `increment` invalidates the entry this iteration
+        // refers to, and a failed increment lands on the end iterator.
+        const fs::path current = entry.path();
+        const bool hidden = current.filename().string().rfind('.', 0) == 0;
         std::error_code status_ec;
-        if (!it->is_regular_file(status_ec) || status_ec) {
-            continue;
+        const bool is_directory = entry.is_directory(status_ec);
+        if (status_ec) {
+            throw ValueError("AddPhotos: cannot stat '" + current.string() + "': " +
+                             status_ec.message());
         }
-        if (has_image_extension(it->path())) {
-            files.push_back(it->path().lexically_normal().string());
+        if (hidden) {
+            if (is_directory) {
+                it.disable_recursion_pending();
+            }
+        } else if (!is_directory) {
+            std::error_code type_ec;
+            if (entry.is_regular_file(type_ec)) {
+                if (has_image_extension(current)) {
+                    files.push_back(current.lexically_normal().string());
+                }
+            } else if (type_ec) {
+                throw ValueError("AddPhotos: cannot stat '" + current.string() + "': " +
+                                 type_ec.message());
+            }
+        }
+        it.increment(ec);
+        if (ec) {
+            throw ValueError("AddPhotos: cannot read '" + root.string() + "' (at '" +
+                             current.string() + "'): " + ec.message());
         }
     }
     std::sort(files.begin(), files.end());
@@ -635,6 +654,9 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
                 }
             }
         }
+        // Two folders named ".../100MEDIA" from different cards must not share
+        // a label; the same rule the Folder grouping command applies.
+        disambiguate_folder_labels(chunk->camera_groups());
     }
     progress.update("import", 1.0);
 }
