@@ -117,6 +117,7 @@ if(ALPHASHAPE_USE_PROJ)
         test_euler_angles.cpp
         test_reference_convert.cpp
         test_reference_settings.cpp
+        test_reference_table.cpp
         test_import_reference.cpp
         test_surface_frame.cpp
         test_reproject.cpp)

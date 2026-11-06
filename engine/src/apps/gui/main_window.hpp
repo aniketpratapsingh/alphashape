@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <functional>
+#include <string>
 
 #include <QList>
 #include <QMainWindow>
@@ -24,6 +25,7 @@ class GuiApp;
 class LogPane;
 class PhotosPane;
 class PropertiesPane;
+class ReferencePane;
 class StartScreen;
 class ViewportWidget;
 class WorkflowController;
@@ -123,6 +125,13 @@ private:
     void create_actions();
     void create_menus();
     void create_status_strip();
+    /// Enable the Tools actions only when their dialog can run.
+    void update_marker_actions();
+    /// Ask for params through the task's dialog and submit it for the active
+    /// chunk. The dialog is the marker-specific one for DetectMarkers.
+    void run_marker_task(const std::string& task);
+    /// Print Markers is dialog-only: it never touches the document.
+    void show_print_markers();
     void apply_default_layout();
     void update_title();
     void update_undo_actions();
@@ -167,6 +176,9 @@ private:
 
     QDockWidget* workspace_dock_ = nullptr;
     QDockWidget* properties_dock_ = nullptr;
+#if defined(ALPHASHAPE_USE_PROJ)
+    QDockWidget* reference_dock_ = nullptr;
+#endif
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     QStackedWidget* stack_ = nullptr;   ///< central area: viewport / start screen
@@ -175,6 +187,9 @@ private:
     WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties, Photos panes and viewport
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
+#if defined(ALPHASHAPE_USE_PROJ)
+    ReferencePane* reference_pane_ = nullptr;
+#endif
     PhotosPane* photos_pane_ = nullptr;
     LogPane* log_pane_ = nullptr;
     WorkflowController* workflow_ = nullptr;
@@ -200,6 +215,10 @@ private:
     QAction* redo_action_ = nullptr;
     QAction* theme_light_ = nullptr;
     QAction* theme_dark_ = nullptr;
+    /// Tools menu: the two detection tasks and the sheet printer.
+    QAction* detect_markers_action_ = nullptr;
+    QAction* detect_fiducials_action_ = nullptr;
+    QAction* print_markers_action_ = nullptr;
 };
 
 }  // namespace alphashape::gui

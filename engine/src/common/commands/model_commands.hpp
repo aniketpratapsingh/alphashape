@@ -64,6 +64,14 @@ std::unique_ptr<AbstractCommand> make_set_chunk_transform_command(
 std::unique_ptr<AbstractCommand> make_set_chunk_crs_command(std::int32_t chunk_id,
                                                             CRS crs);
 
+/// Which per-object CRS slot a command addresses (M12 §4.4).
+enum class CrsSlot { Camera, Marker, World };
+
+/// Set or clear (nullopt = follow the chunk CRS) one per-object CRS slot.
+/// Undo restores the previous slot exactly, absence included.
+std::unique_ptr<AbstractCommand> make_set_chunk_crs_slot_command(
+    std::int32_t chunk_id, CrsSlot slot, std::optional<CRS> value);
+
 /// Replace a chunk's reference settings (WP-13.1). Undoable: revert restores the
 /// previous settings. Every accuracy must be finite and strictly positive;
 /// `use_gcp` is unconstrained. Throws ValueError on a bad accuracy or an
@@ -120,6 +128,16 @@ std::unique_ptr<AbstractCommand> make_remove_marker_command(
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
     std::int32_t chunk_id, std::int32_t marker_id,
     std::optional<Eigen::Vector3d> reference, Eigen::Vector3d accuracy);
+/// Set a marker's enabled flag (`Marker::valid`). Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_marker_enabled_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool enabled);
+/// Set a marker's pinned flag (interactively placed). Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_marker_pinned_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool pinned);
+/// Set a marker's reference role (control point / check point). Undo restores
+/// the previous role. Check points are excluded from the adjustment.
+std::unique_ptr<AbstractCommand> make_set_marker_role_command(
+    std::int32_t chunk_id, std::int32_t marker_id, MarkerReferenceRole role);
 std::unique_ptr<AbstractCommand> make_move_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
     Eigen::Vector2d pixel);
@@ -222,6 +240,16 @@ std::unique_ptr<AbstractCommand> make_rename_asset_command(
 
 std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool enabled);
+/// Set one camera's reference flag (`Camera::reference.enabled`), the flag
+/// OptimizeCameras gates its GNSS prior on. Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
+    std::int32_t chunk_id, std::int32_t camera_id, bool enabled);
+/// Set one camera's GNSS reference (location and per-axis accuracy). Undo
+/// restores both. The accuracy must be finite and positive, and a location
+/// must be finite.
+std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy);
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool selected);
 
@@ -255,6 +283,20 @@ std::unique_ptr<AbstractCommand> make_set_sensor_film_command(
 /// non-finite offset; a boresight, when present, must be finite too.
 std::unique_ptr<AbstractCommand> make_set_sensor_antenna_command(
     std::int32_t chunk_id, std::int32_t sensor_index, Antenna antenna);
+
+/// Replace one sensor's "held fixed during adjustment" coefficient names.
+/// Every name must be a calibration parameter (kCalibrationParamNames) and no
+/// name may repeat. Undo restores the previous list.
+std::unique_ptr<AbstractCommand> make_set_sensor_fixed_params_command(
+    std::int32_t chunk_id, std::int32_t sensor_index,
+    std::vector<std::string> fixed_params);
+
+/// Replace one sensor's physical geometry (pixel pitch and focal length as
+/// recorded from EXIF/spec). Both must be finite and non-negative; 0 means
+/// unknown. Undo restores the previous values.
+std::unique_ptr<AbstractCommand> make_set_sensor_physical_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, double pixel_size_um,
+    double focal_length_mm);
 
 // --- Cross-document (WP-11.5b) ---------------------------------------------
 

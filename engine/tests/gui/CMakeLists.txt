@@ -21,6 +21,8 @@ add_executable(alphashape_gui_tests
     test_gui_app.cpp
     test_jobs.cpp
     test_task_dialog.cpp
+    test_calibration_dialog.cpp
+    test_marker_tools.cpp
     test_workflow.cpp
     test_start_screen.cpp
     test_export_menu.cpp
@@ -32,6 +34,14 @@ add_executable(alphashape_gui_tests
 target_link_libraries(alphashape_gui_tests PRIVATE alphashape_gui_lib Qt6::Test GTest::gtest
                                               alphashape_warnings)
 add_dependencies(alphashape_gui_tests alphashape-gui)
+
+# The Reference pane and its table only exist with the PROJ-backed engine.
+if(TARGET alphashape_crs)
+    target_sources(alphashape_gui_tests PRIVATE
+        test_reference_pane.cpp
+        test_crs_picker.cpp
+        test_reference_settings.cpp)
+endif()
 
 # The Phase 1 exit check: one window, one project, the whole pipeline through the Workflow menu
 # and the JobManager. Its own binary because it needs a timeout of its own (a per-test property

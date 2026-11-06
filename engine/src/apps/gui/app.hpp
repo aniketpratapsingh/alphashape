@@ -9,6 +9,7 @@
 // A QApplication must exist before a GuiApp is constructed.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -144,6 +145,9 @@ Q_SIGNALS:
     void dirty_changed(bool dirty);
     /// Emitted after execute()/undo()/redo(), and after the document was replaced.
     void undo_changed();
+    /// Emitted when the document's active chunk changes (the workspace tree or a
+    /// job switching its target). Panes that cache the active chunk rebuild.
+    void active_chunk_changed(qint32 chunk_id);
     void recent_files_changed();
 
 private:

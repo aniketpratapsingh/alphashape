@@ -72,7 +72,7 @@ TEST_F(MainWindowTest, ConstructsWithoutQtWarnings) {
 TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
     const QStringList menus = {
         "menu.file", "menu.file.recent", "menu.edit", "menu.view", "menu.view.theme",
-        "menu.workflow", "menu.help",
+        "menu.workflow", "menu.tools", "menu.help",
     };
     for (const QString& name : menus) {
         EXPECT_NE(menu(name), nullptr) << name.toStdString();
@@ -84,8 +84,9 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
         "action.edit.redo", "action.edit.preferences", "action.view.dock.workspace",
         "action.view.dock.properties", "action.view.dock.photos", "action.view.dock.log",
         "action.view.theme.light", "action.view.theme.dark", "action.view.reset_layout",
-        "action.workflow.add_photos", "action.workflow.build_orthomosaic", "action.help.about",
-        "action.help.repository",
+        "action.workflow.add_photos", "action.workflow.build_orthomosaic",
+        "action.tools.detect_markers", "action.tools.detect_fiducials",
+        "action.tools.print_markers", "action.help.about", "action.help.repository",
     };
     for (const QString& name : actions) {
         EXPECT_NE(action(name), nullptr) << name.toStdString();
@@ -96,7 +97,7 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
     for (QAction* entry : window().menuBar()->actions()) {
         titles << entry->text().remove(QLatin1Char('&'));
     }
-    EXPECT_EQ(titles, (QStringList{"File", "Edit", "View", "Workflow", "Help"}));
+    EXPECT_EQ(titles, (QStringList{"File", "Edit", "View", "Workflow", "Tools", "Help"}));
 
     // Preferences is present but disabled for now.
     EXPECT_FALSE(action("action.edit.preferences")->isEnabled());
@@ -328,6 +329,35 @@ TEST_F(BusyWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
     app().jobs().set_registry(&builtin_registry());
     EXPECT_TRUE(window().new_project());
     EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(BusyWindowTest, MarkerActionsAreDisabledWhileAJobRuns) {
+    show_window();
+    add_chunk(app(), "Markers");
+    // With an active chunk and an idle registry every marker action is usable.
+    ASSERT_TRUE(action("action.tools.detect_markers")->isEnabled());
+    ASSERT_TRUE(action("action.tools.detect_fiducials")->isEnabled());
+    ASSERT_TRUE(action("action.tools.print_markers")->isEnabled());
+
+    auto started = std::make_shared<std::atomic<bool>>(false);
+    registry_.register_task(std::make_shared<HoldTask>(gate_, started));
+    app().jobs().set_registry(&registry_);
+    app().jobs().submit("HoldTask", Params{},
+                        app().document().workspace().chunks().front()->id());
+    ASSERT_TRUE(pump_until([&]() { return started->load(); }, 15000));
+
+    // Detect and Print all act on the document the worker owns; the window
+    // refuses them until it is free again.
+    EXPECT_FALSE(action("action.tools.detect_markers")->isEnabled());
+    EXPECT_FALSE(action("action.tools.detect_fiducials")->isEnabled());
+    EXPECT_FALSE(action("action.tools.print_markers")->isEnabled());
+
+    gate_->open();
+    ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, 15000));
+    app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(action("action.tools.detect_markers")->isEnabled());
+    EXPECT_TRUE(action("action.tools.detect_fiducials")->isEnabled());
+    EXPECT_TRUE(action("action.tools.print_markers")->isEnabled());
 }
 
 TEST_F(MainWindowTest, OpensAProjectCreatedByTheEngine) {
