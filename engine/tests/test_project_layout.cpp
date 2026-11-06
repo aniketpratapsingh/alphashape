@@ -382,6 +382,9 @@ TEST_F(ProjectLayout, PszLockSitsBesideTheFile) {
 }
 
 TEST_F(ProjectLayout, AbsolutePathsResolveRelativeInput) {
+    std::error_code ec;
+    fs::create_directories(path("images"), ec);
+    ASSERT_FALSE(ec) << ec.message();
     write_text(path("images/a.jpg"), "a");
     // The model holds a relative path; absolute_paths=true must still store a
     // location a reader can open, resolved against the project directory.
