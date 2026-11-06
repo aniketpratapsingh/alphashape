@@ -38,6 +38,31 @@ std::string truncate_utf8(const std::string& text, std::size_t limit) {
     return text.substr(0, cut);
 }
 
+/// The last <= 2 KB of `output`, starting on a UTF-8 code-point boundary.
+/// Returned whole when it is shorter than the limit.
+std::string failure_tail(const std::string& output) {
+    constexpr std::size_t kTailLimit = 2U * 1024U;
+    if (output.size() <= kTailLimit) {
+        return output;
+    }
+    std::size_t start = output.size() - kTailLimit;
+    while (start < output.size() &&
+           (static_cast<unsigned char>(output[start]) & 0xC0U) == 0x80U) {
+        ++start;
+    }
+    return output.substr(start);
+}
+
+/// Appends the captured output (when any) to a failure message.
+std::string with_output_tail(const std::string& message,
+                             const std::string& output) {
+    const std::string tail = failure_tail(output);
+    if (tail.empty()) {
+        return message;
+    }
+    return message + "\n" + tail;
+}
+
 bool all_digits(const std::string& text) {
     return !text.empty() &&
            std::all_of(text.begin(), text.end(),
@@ -178,10 +203,14 @@ void RunScriptTask::apply(Document& document, Params& params,
         throw Error("RunScript failed: " + result.output);
     }
     if (result.timed_out) {
-        throw Error("RunScript timed out after " + std::to_string(seconds) + " s");
+        throw Error(with_output_tail(
+            "RunScript timed out after " + std::to_string(seconds) + " s",
+            result.output));
     }
     if (result.exit_code != 0) {
-        throw Error("RunScript failed: exit " + std::to_string(result.exit_code));
+        throw Error(with_output_tail(
+            "RunScript failed: exit " + std::to_string(result.exit_code),
+            result.output));
     }
 
     const std::int64_t index = next_output_index(chunk->meta());

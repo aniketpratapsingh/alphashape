@@ -10,7 +10,12 @@
 // through the CLI's --python-path). stdout and stderr are captured, and the
 // output is stored on the active chunk as `RunScript/<n>/output`, truncated to
 // 8 KB on a UTF-8 boundary. A non-zero exit, a missing python3 or a timeout is
-// an Error.
+// an Error carrying the tail of the captured output.
+//
+// The script reads the project FROM DISK, not from the in-memory document: the
+// path handed to the child is the last saved project file, so unsaved edits are
+// invisible to the script. A caller (the GUI) must save the project before
+// starting the task.
 
 #include "common/tasks/task.hpp"
 

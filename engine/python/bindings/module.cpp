@@ -2354,8 +2354,10 @@ PYBIND11_MODULE(alphashape, m) {
             py::arg("path"), py::arg("args") = py::none(),
             py::arg("timeout_s") = 600,
             "Run the Python script at `path` as a child process with "
-            "--project <path> followed by `args`. Output is stored on the "
-            "active chunk under RunScript/<n>/output (8 KB).");
+            "--project <path> followed by `args`. The script reads the project "
+            "FROM DISK: unsaved in-memory changes are invisible to it, so save "
+            "the project first. Output is stored on the active chunk under "
+            "RunScript/<n>/output (8 KB).");
 
     // -- module functions ----------------------------------------------------
     m.def("load_project",
