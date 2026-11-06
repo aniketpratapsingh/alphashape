@@ -241,9 +241,26 @@ ReferenceTable build_reference_table(const Chunk& chunk,
                 display.kind() == crs::CrsKind::Geographic3D ||
                 display.kind() == crs::CrsKind::Compound);
     const Eigen::Matrix4d internal_to_ecef = chunk.transform();
+    // The measured position as geodetic lon/lat/ellipsoidal height. A slot CRS
+    // that is already geographic names those units directly, which is exactly
+    // how OptimizeCameras reads the value; the display conversion is bypassed
+    // so a vertical datum in the display CRS cannot shift the height.
+    const auto geodetic_of = [&](const std::optional<Eigen::Vector3d>& value,
+                                 const std::optional<CoordinateSystem>& source_cs)
+        -> std::optional<geo::Geodetic> {
+        if (!value || !geo || !source_cs) {
+            return std::nullopt;
+        }
+        const crs::CrsKind kind = source_cs->kind();
+        if (kind == crs::CrsKind::Geographic2D || kind == crs::CrsKind::Geographic3D) {
+            return geo::Geodetic{value->x(), value->y(), value->z()};
+        }
+        return std::nullopt;
+    };
     const auto error_of = [&](const std::optional<Eigen::Vector3d>& estimated_local,
                               const std::optional<Eigen::Vector3d>& estimated,
-                              const std::optional<Eigen::Vector3d>& source)
+                              const std::optional<Eigen::Vector3d>& source,
+                              const std::optional<geo::Geodetic>& source_geodetic)
         -> std::optional<Eigen::Vector3d> {
         if (!estimated || !source) {
             return std::nullopt;
@@ -254,10 +271,11 @@ ReferenceTable build_reference_table(const Chunk& chunk,
             }
             const Eigen::Vector3d estimate_ecef =
                 (internal_to_ecef * estimated_local->homogeneous()).head<3>();
-            const geo::Geodetic source_geodetic{source->x(), source->y(), source->z()};
-            const Eigen::Vector3d source_ecef = geo::geodetic_to_ecef(source_geodetic);
+            const geo::Geodetic geodetic =
+                source_geodetic.value_or(geo::Geodetic{source->x(), source->y(), source->z()});
+            const Eigen::Vector3d source_ecef = geo::geodetic_to_ecef(geodetic);
             const Eigen::Matrix3d enu_rotation =
-                geo::ecef_to_enu(source_geodetic).block<3, 3>(0, 0);
+                geo::ecef_to_enu(geodetic).block<3, 3>(0, 0);
             const Eigen::Vector3d enu =
                 enu_rotation * (estimate_ecef - source_ecef);
             if (!enu.allFinite()) {
@@ -309,7 +327,8 @@ ReferenceTable build_reference_table(const Chunk& chunk,
                       camera_antenna_position(chunk, camera, centres[ci]))
                 : std::nullopt;
         row.estimated = estimate_of(estimated_local);
-        row.error = error_of(estimated_local, row.estimated, row.source);
+        row.error = error_of(estimated_local, row.estimated, row.source,
+                             geodetic_of(camera.reference.location, camera_cs));
         if (row.error) {
             row.error_m = row.error->norm();
         }
@@ -350,7 +369,8 @@ ReferenceTable build_reference_table(const Chunk& chunk,
             row.source = source_of(marker.reference, marker_cs, marker_src);
         }
         row.estimated = estimate_of(marker.position);
-        row.error = error_of(marker.position, row.estimated, row.source);
+        row.error = error_of(marker.position, row.estimated, row.source,
+                             geodetic_of(marker.reference, marker_cs));
         if (row.error) {
             row.error_m = row.error->norm();
         }

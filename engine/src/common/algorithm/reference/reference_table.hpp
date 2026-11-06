@@ -28,6 +28,15 @@
 #include "common/core/reference_settings.hpp"
 #include "model/crs/coordinate_system.hpp"
 
+/// Heights in a reference row are ELLIPSOIDAL, in the same sense as
+/// OptimizeCameras reads them: the measured altitude and the estimated height
+/// are converted to ECEF with the WGS84 ellipsoid. A vertical datum carried by
+/// the display CRS (a compound CRS) is NOT applied -- no geoid or orthometric
+/// correction is introduced -- so the error columns stay comparable with the
+/// adjustment's own residual. A geographically referenced row's error is
+/// reported as an (east, north, up) vector of metres; other rows report the
+/// display-CRS difference.
+
 namespace alphashape::reference {
 
 enum class ReferenceRowKind { Camera, Marker, CheckPoint };
