@@ -60,19 +60,35 @@ fs::path strip_extension(const fs::path& path) {
     return out;
 }
 
-/// The project's own directory, made absolute so a bare relative project path
-/// still yields a stable base for stored frame paths.
-std::string project_directory(const fs::path& project) {
+/// An absolute UTF-8 form of `directory`, so a bare relative project path still
+/// yields a stable base for stored frame paths.
+std::string absolute_directory(const fs::path& directory) {
     std::error_code ec;
-    const fs::path absolute = fs::absolute(project, ec);
-    const fs::path directory = (ec ? project : absolute).parent_path();
-    return platform::path_to_utf8(directory);
+    const fs::path absolute = fs::absolute(directory, ec);
+    return platform::path_to_utf8(ec ? directory : absolute);
+}
+
+/// The directory frame paths are stored relative to: the project file's own
+/// directory. A project.zip opened directly lives in `<base>.files`, so its
+/// base is the grandparent.
+std::string project_directory(const fs::path& project) {
+    fs::path directory = project.parent_path();
+    if (project.extension() == ".zip" && directory.extension() == ".files") {
+        directory = directory.parent_path();
+    }
+    return absolute_directory(directory);
 }
 
 /// `<base>.files/cache`, where `<base>` is the project path without extension.
+/// A project.zip opened directly already lives inside that `.files` directory.
 std::string cache_directory(const fs::path& project) {
-    const fs::path files(
-        platform::path_from_utf8(platform::path_to_utf8(strip_extension(project)) + ".files"));
+    fs::path project_path = project;
+    if (project.extension() == ".zip" && project.parent_path().extension() == ".files") {
+        project_path = platform::path_from_utf8(
+            platform::path_to_utf8(project.parent_path().parent_path()) + ".files");
+    }
+    const fs::path files(platform::path_from_utf8(
+        platform::path_to_utf8(strip_extension(project_path)) + ".files"));
     return platform::path_to_utf8(files / "cache");
 }
 
