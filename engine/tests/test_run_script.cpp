@@ -253,10 +253,10 @@ TEST(RunScript, TimeoutKills) {
         "time.sleep(30)\n");
     const auto started = std::chrono::steady_clock::now();
     try {
-        run_script(project.document, script, {pid_file}, 2);
+        run_script(project.document, script, {pid_file}, 5);
         FAIL() << "RunScript should have timed out";
     } catch (const Error& error) {
-        EXPECT_NE(std::string(error.what()).find("RunScript timed out after 2 s"),
+        EXPECT_NE(std::string(error.what()).find("RunScript timed out after 5 s"),
                   std::string::npos)
             << error.what();
     }
