@@ -65,8 +65,6 @@ const ParamSpec& spec_of(const std::string& task, const std::string& name) {
     return empty;
 }
 
-}  // namespace
-
 TEST_F(DetectMarkersDialog, PreviewFollowsTargetType) {
     alphashape::gui::DetectMarkersDialog dialog(builtin_registry(), store());
     auto* target = qobject_cast<QComboBox*>(dialog.editor("target_type"));
@@ -282,3 +280,5 @@ TEST_F(PrintMarkersDialog, ChessboardFieldsToggle) {
     EXPECT_EQ(dialog.first_code_editor()->maximum(),
               sheet_target_code_count(SheetTarget::Circular20) - 1);
 }
+
+}  // namespace
