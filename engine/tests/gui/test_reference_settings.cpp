@@ -59,7 +59,7 @@ TEST_F(ReferenceSettings, FailedCommandRollsBackTheWholeEdit) {
     Document& document = app().document();
     Chunk& chunk = document.workspace().add_chunk("Settings");
     document.set_active_chunk_id(chunk.id());
-    const ReferenceSettings before = chunk.reference_settings();
+    const alphashape::ReferenceSettings before = chunk.reference_settings();
     ASSERT_FALSE(chunk.explicit_camera_crs().has_value());
 
     alphashape::gui::ReferenceSettingsDialog dialog(app());
