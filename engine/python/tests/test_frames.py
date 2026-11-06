@@ -29,10 +29,15 @@ class TestCameraGroups(unittest.TestCase):
         self.assertEqual(chunk.camera_groups, [])
         chunk.group_cameras("station")
         groups = chunk.camera_groups
-        self.assertGreaterEqual(len(groups), 1)
+        # The fixtures are three bodies with three distinct serials, so the
+        # grouping is exactly one group per body, labelled by that serial.
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(
+            sorted(group["label"] for group in groups),
+            ["AO100-0001", "AO100-0002", "BC7-0001"],
+        )
         for group in groups:
             self.assertEqual(group["type"], "station")
-            self.assertNotEqual(group["label"], "")
         covered = sorted(cid for group in groups for cid in group["members"])
         self.assertEqual(covered, sorted(camera.id for camera in chunk.cameras))
         self.assertEqual(chunk.frame_stats()["group_count"], len(groups))

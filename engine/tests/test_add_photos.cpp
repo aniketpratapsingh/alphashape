@@ -480,5 +480,70 @@ TEST(AddPhotos, SubstituteReplacesName) {
     EXPECT_EQ(document.active_chunk()->cameras()[0].label, "frame_a");
 }
 
+TEST(AddPhotos, RecursiveImportIsCaseInsensitiveAndSkipsNonDecodableExtensions) {
+    ScopedTempDir temp;
+    write_test_png(temp.path("UPPER.PNG"));
+    write_test_png(temp.path("photo.JPG"));
+    // A PNG under a Netpbm extension: the decoder reads P5/P6 only, so the
+    // extension filter must not offer ".pbm" to it.
+    write_test_png(temp.path("not_really.pbm"));
+    // Hidden files and directories are never part of a photo import.
+    write_test_png(temp.path(".hidden.png"));
+    write_test_png(temp.path(".git/inside.png"));
+
+    Document document = document_with_chunk();
+    Params params = make_params(builtin_registry().require("AddPhotos"));
+    params.set("filenames", ParamValue{std::vector<std::string>{temp.dir()}});
+    params.set("recursive", ParamValue{true});
+    run_task(builtin_registry(), document, "AddPhotos", params);
+
+    std::vector<std::string> labels;
+    for (const Camera& camera : document.active_chunk()->cameras()) {
+        labels.push_back(camera.label);
+    }
+    std::sort(labels.begin(), labels.end());
+    EXPECT_EQ(labels, (std::vector<std::string>{"UPPER", "photo"}));
+}
+
+TEST(AddPhotos, MalformedSubstituteIsRejectedBeforeAnythingIsImported) {
+    ScopedTempDir temp;
+    write_test_png(temp.path("one.png"));
+
+    Document document = document_with_chunk();
+    Params params = make_params(builtin_registry().require("AddPhotos"));
+    params.set("filenames", ParamValue{std::vector<std::string>{temp.path("one.png")}});
+    params.set("substitute", ParamValue{std::vector<std::string>{"no_equals_sign"}});
+    EXPECT_THROW(run_task(builtin_registry(), document, "AddPhotos", params), ValueError);
+    EXPECT_TRUE(document.active_chunk()->cameras().empty());
+
+    Document other = document_with_chunk();
+    Params empty_old = make_params(builtin_registry().require("AddPhotos"));
+    empty_old.set("filenames", ParamValue{std::vector<std::string>{temp.path("one.png")}});
+    empty_old.set("substitute", ParamValue{std::vector<std::string>{"=replacement"}});
+    EXPECT_THROW(run_task(builtin_registry(), other, "AddPhotos", empty_old), ValueError);
+    EXPECT_TRUE(other.active_chunk()->cameras().empty());
+}
+
+TEST(AddPhotos, GroupByFolderDisambiguatesSameNamedFolders) {
+    ScopedTempDir temp;
+    write_test_png(temp.path("cardA/100MEDIA/one.png"));
+    write_test_png(temp.path("cardB/100MEDIA/two.png"));
+
+    Document document = document_with_chunk();
+    Params params = make_params(builtin_registry().require("AddPhotos"));
+    params.set("filenames", ParamValue{std::vector<std::string>{
+                              temp.path("cardA/100MEDIA/one.png"),
+                              temp.path("cardB/100MEDIA/two.png")}});
+    params.set("group_by_folder", ParamValue{true});
+    run_task(builtin_registry(), document, "AddPhotos", params);
+
+    std::vector<std::string> labels;
+    for (const CameraGroup& group : document.active_chunk()->camera_groups()) {
+        labels.push_back(group.label);
+    }
+    std::sort(labels.begin(), labels.end());
+    EXPECT_EQ(labels, (std::vector<std::string>{"cardA/100MEDIA", "cardB/100MEDIA"}));
+}
+
 }  // namespace
 }  // namespace alphashape
