@@ -84,7 +84,7 @@ TransformValues transform_values(const Transform& transform) {
         values.scale = 1.0;
         return values;
     }
-    Eigen::Matrix3d rotation = linear / values.scale;
+    Eigen::Matrix3d rotation = linear * (1.0 / values.scale);
     const double sin_pitch = std::clamp(-rotation(2, 0), -1.0, 1.0);
     const double pitch = std::asin(sin_pitch);
     double yaw = 0.0;

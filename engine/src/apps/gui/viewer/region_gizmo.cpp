@@ -18,11 +18,18 @@ constexpr double kPickRadiusPixels = 12.0;
 constexpr int kRingSegments = 64;
 
 Eigen::Vector3d normalised(const Eigen::Vector3d& value) {
-    const double length = value.norm();
+    // Scalar arithmetic rather than Eigen's packet paths: GCC 13 otherwise reports a
+    // false-positive -Wmaybe-uninitialized for the tail of the padded vector.
+    const double length =
+        std::sqrt(value.x() * value.x() + value.y() * value.y() + value.z() * value.z());
     if (!(length > 0.0)) {
         return Eigen::Vector3d::UnitZ();
     }
-    return value / length;
+    Eigen::Vector3d result;
+    result.x() = value.x() / length;
+    result.y() = value.y() / length;
+    result.z() = value.z() / length;
+    return result;
 }
 
 std::array<Eigen::Vector3d, 8> box_corners(const Region& region) {
@@ -139,16 +146,19 @@ std::optional<Eigen::Vector2d> project_to_pixels(const Eigen::Matrix4d& view_pro
     if (width <= 0 || height <= 0) {
         return std::nullopt;
     }
-    const Eigen::Vector3d clip =
-        view_projection.block<3, 3>(0, 0) * world + view_projection.block<3, 1>(0, 3);
-    const double w =
-        view_projection.block<1, 3>(3, 0).dot(world) + view_projection(3, 3);
+    const Eigen::Matrix4d& m = view_projection;
+    const double clip_x = m(0, 0) * world.x() + m(0, 1) * world.y() +
+                          m(0, 2) * world.z() + m(0, 3);
+    const double clip_y = m(1, 0) * world.x() + m(1, 1) * world.y() +
+                          m(1, 2) * world.z() + m(1, 3);
+    const double w = m(3, 0) * world.x() + m(3, 1) * world.y() + m(3, 2) * world.z() + m(3, 3);
     if (!(w > 1e-12)) {
         return std::nullopt;
     }
-    const Eigen::Vector3d ndc = clip / w;
-    return Eigen::Vector2d((ndc.x() * 0.5 + 0.5) * static_cast<double>(width),
-                           (0.5 - ndc.y() * 0.5) * static_cast<double>(height));
+    const double ndc_x = clip_x / w;
+    const double ndc_y = clip_y / w;
+    return Eigen::Vector2d((ndc_x * 0.5 + 0.5) * static_cast<double>(width),
+                           (0.5 - ndc_y * 0.5) * static_cast<double>(height));
 }
 
 }  // namespace
@@ -162,14 +172,20 @@ GizmoRay ray_from_screen(const Eigen::Matrix4d& view_projection, int width, int 
     const Eigen::Matrix4d inverse = view_projection.inverse();
     const double ndc_x = pixel.x() / static_cast<double>(width) * 2.0 - 1.0;
     const double ndc_y = 1.0 - pixel.y() / static_cast<double>(height) * 2.0;
-    const Eigen::Vector3d ndc(ndc_x, ndc_y, 0.0);
     const auto unproject = [&](double z) {
-        Eigen::Vector3d point = ndc;
-        point.z() = z;
-        const Eigen::Vector3d numerator =
-            inverse.block<3, 3>(0, 0) * point + inverse.block<3, 1>(0, 3);
-        const double w = inverse.block<1, 3>(3, 0).dot(point) + inverse(3, 3);
-        return numerator / w;
+        const double x = inverse(0, 0) * ndc_x + inverse(0, 1) * ndc_y +
+                         inverse(0, 2) * z + inverse(0, 3);
+        const double y = inverse(1, 0) * ndc_x + inverse(1, 1) * ndc_y +
+                         inverse(1, 2) * z + inverse(1, 3);
+        const double wz = inverse(2, 0) * ndc_x + inverse(2, 1) * ndc_y +
+                          inverse(2, 2) * z + inverse(2, 3);
+        const double w = inverse(3, 0) * ndc_x + inverse(3, 1) * ndc_y +
+                         inverse(3, 2) * z + inverse(3, 3);
+        Eigen::Vector3d point;
+        point.x() = x / w;
+        point.y() = y / w;
+        point.z() = wz / w;
+        return point;
     };
     const Eigen::Vector3d near_point = unproject(-1.0);
     const Eigen::Vector3d far_point = unproject(1.0);
