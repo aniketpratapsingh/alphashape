@@ -6,6 +6,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,17 @@ constexpr std::array<CalibrationField, kCalibrationParamCount> kCalibrationField
 
 bool is_fixed(const std::vector<std::string>& fixed, const char* name) {
     return std::find(fixed.begin(), fixed.end(), name) != fixed.end();
+}
+
+/// Workspace has no const find_chunk(), and the panes read the document under
+/// the shared lock as a const Document.
+const Chunk* find_chunk_in(const Document& document, std::int32_t chunk_id) {
+    for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+        if (chunk != nullptr && chunk->id() == chunk_id) {
+            return chunk.get();
+        }
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -271,7 +283,7 @@ void CalibrationDialog::build_sensor_list() {
     sensor_ = Sensor{};
     std::vector<Sensor> sensors;
     app_.read_document([this, &sensors](const Document& document) {
-        const Chunk* chunk = document.workspace().find_chunk(chunk_id_);
+        const Chunk* chunk = find_chunk_in(document, chunk_id_);
         if (chunk != nullptr) {
             sensors = chunk->sensors();
         }
@@ -299,7 +311,7 @@ Sensor CalibrationDialog::read_sensor(std::int32_t& chunk_id) const {
     Sensor sensor;
     std::int32_t found = -1;
     app_.read_document([this, &sensor, &found](const Document& document) {
-        const Chunk* chunk = document.workspace().find_chunk(chunk_id_);
+        const Chunk* chunk = find_chunk_in(document, chunk_id_);
         if (chunk == nullptr) {
             return;
         }

@@ -43,11 +43,10 @@ TEST_F(ReferenceSettings, AccuracyPersists) {
     app().save_document_as(path.toStdString());
     app().open_document(path.toStdString());
 
-    const Chunk* reloaded =
-        app().read_document([chunk_id](const Document& loaded) {
-            return loaded.workspace().find_chunk(chunk_id);
-        });
+    const Chunk* reloaded = app().read_document(
+        [](const Document& loaded) { return loaded.active_chunk(); });
     ASSERT_NE(reloaded, nullptr);
+    EXPECT_EQ(reloaded->id(), chunk_id);
     EXPECT_DOUBLE_EQ(reloaded->reference_settings().camera_location_accuracy_m,
                      2.5);
 }
