@@ -97,6 +97,8 @@ std::vector<std::string> python_command() {
     return {};
 }
 
+}  // namespace
+
 void RunScriptTask::declare_params(Params& params) const {
     params.declare({"path", ParamType::String, ParamValue{},
                     "Path to the Python script to run."});
