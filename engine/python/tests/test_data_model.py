@@ -67,7 +67,7 @@ class TestMultipleAssets(unittest.TestCase):
         cls.doc.run_task("AddPhotos", filenames=list(AERIAL))
         cls.doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
         cls.doc.run_task("AlignCameras")
-        cls.doc.run_task("BuildDepthMaps", downscale=16)
+        cls.doc.run_task("BuildDepthMaps", downscale=8)
         cls.chunk.buildDem(source_data="depth_maps", interpolation="enabled",
                            smoothing="none", label="dem a")
         cls.chunk.buildDem(source_data="depth_maps", interpolation="enabled",
@@ -201,7 +201,9 @@ class TestPersistence(unittest.TestCase):
 
     def test_append_project(self):
         source, _ = editable_document()
-        dest, _ = empty_document()
+        dest, dest_chunk = empty_document()
+        # The AppendProject task resolves its target through the active chunk.
+        dest.active_chunk = dest_chunk
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "source.psx")
             source.save(path)
