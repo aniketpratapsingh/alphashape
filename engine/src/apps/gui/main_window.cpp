@@ -36,6 +36,7 @@
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/start_screen.hpp"
+#include "apps/gui/transform_dialog.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/workflow.hpp"
@@ -434,6 +435,43 @@ void MainWindow::create_actions() {
     connect(print_markers_action_, &QAction::triggered, this,
             &MainWindow::show_print_markers);
 
+    // Region gizmo: one exclusive toggle per mode (GUI-19).
+    region_mode_group_ = new QActionGroup(this);
+    region_mode_group_->setExclusive(true);
+    region_move_action_ =
+        make_action(QStringLiteral("action.tools.region_move"), tr("&Move Region"));
+    region_resize_action_ =
+        make_action(QStringLiteral("action.tools.region_resize"), tr("&Resize Region"));
+    region_rotate_action_ =
+        make_action(QStringLiteral("action.tools.region_rotate"), tr("&Rotate Region"));
+    for (QAction* action : {region_move_action_, region_resize_action_, region_rotate_action_}) {
+        action->setCheckable(true);
+        region_mode_group_->addAction(action);
+    }
+    region_move_action_->setToolTip(tr("Drag a region face to move the box along its normal"));
+    region_resize_action_->setToolTip(
+        tr("Drag a region corner or edge to resize it; the opposite face stays fixed"));
+    region_rotate_action_->setToolTip(tr("Drag the ring to rotate the region about its Z axis"));
+    connect(region_move_action_, &QAction::triggered, this,
+            [this](bool on) { set_region_mode(on ? RegionGizmoMode::Move : RegionGizmoMode::None); });
+    connect(region_resize_action_, &QAction::triggered, this,
+            [this](bool on) { set_region_mode(on ? RegionGizmoMode::Resize : RegionGizmoMode::None); });
+    connect(region_rotate_action_, &QAction::triggered, this,
+            [this](bool on) { set_region_mode(on ? RegionGizmoMode::Rotate : RegionGizmoMode::None); });
+
+    // Object transform: numeric dialog plus the Update/Reset actions (GUI-20).
+    transform_object_action_ =
+        make_action(QStringLiteral("action.tools.transform_object"), tr("Transform &Object..."));
+    connect(transform_object_action_, &QAction::triggered, this,
+            &MainWindow::show_transform_dialog);
+    update_transform_action_ =
+        make_action(QStringLiteral("action.tools.update_transform"), tr("&Update Transform"));
+    connect(update_transform_action_, &QAction::triggered, this,
+            &MainWindow::run_update_transform);
+    reset_transform_action_ =
+        make_action(QStringLiteral("action.tools.reset_transform"), tr("&Reset Transform"));
+    connect(reset_transform_action_, &QAction::triggered, this, &MainWindow::reset_transform);
+
     // Help.
     QAction* about = make_action(QStringLiteral("action.help.about"), tr("&About alphashape"));
     about->setMenuRole(QAction::AboutRole);
@@ -532,6 +570,14 @@ void MainWindow::create_menus() {
     tools_menu->addAction(detect_fiducials_action_);
     tools_menu->addSeparator();
     tools_menu->addAction(print_markers_action_);
+    tools_menu->addSeparator();
+    tools_menu->addAction(region_move_action_);
+    tools_menu->addAction(region_resize_action_);
+    tools_menu->addAction(region_rotate_action_);
+    tools_menu->addSeparator();
+    tools_menu->addAction(transform_object_action_);
+    tools_menu->addAction(update_transform_action_);
+    tools_menu->addAction(reset_transform_action_);
     // The active chunk can change without a signal, so refresh as the menu opens.
     connect(tools_menu, &QMenu::aboutToShow, this,
             [this]() { update_marker_actions(); });
@@ -656,6 +702,105 @@ void MainWindow::update_marker_actions() {
     }
     if (print_markers_action_ != nullptr) {
         print_markers_action_->setEnabled(!busy);
+    }
+    const bool can_edit = !busy && has_chunk;
+    for (QAction* action : {region_move_action_, region_resize_action_, region_rotate_action_,
+                            transform_object_action_, update_transform_action_,
+                            reset_transform_action_}) {
+        if (action != nullptr) {
+            action->setEnabled(can_edit);
+        }
+    }
+    // A job or an empty workspace ends a gizmo session: the region it edited may be gone.
+    if (!can_edit) {
+        set_region_mode(RegionGizmoMode::None);
+    }
+}
+
+std::int32_t MainWindow::usable_chunk_id() const {
+    std::int32_t chunk_id = -1;
+    static_cast<void>(app_.read_document([&chunk_id](const Document& document) {
+        const std::int32_t active = document.active_chunk_id();
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == active) {
+                chunk_id = chunk->id();
+            }
+        }
+    }));
+    return chunk_id;
+}
+
+void MainWindow::set_region_mode(RegionGizmoMode mode) {
+    if (viewport_ == nullptr) {
+        return;
+    }
+    viewport_->set_region_mode(mode);
+    const auto check = [mode](QAction* action, RegionGizmoMode value) {
+        if (action != nullptr) {
+            action->setChecked(mode == value);
+        }
+    };
+    check(region_move_action_, RegionGizmoMode::Move);
+    check(region_resize_action_, RegionGizmoMode::Resize);
+    check(region_rotate_action_, RegionGizmoMode::Rotate);
+}
+
+void MainWindow::show_transform_dialog() {
+    if (busy_refusal()) {
+        return;
+    }
+    const std::int32_t chunk_id = usable_chunk_id();
+    if (chunk_id < 0) {
+        statusBar()->showMessage(tr("There is no active chunk."), 4000);
+        return;
+    }
+    TransformDialog dialog(app_, chunk_id, this);
+    dialog.exec();
+}
+
+void MainWindow::run_update_transform() {
+    if (busy_refusal()) {
+        return;
+    }
+    const std::int32_t chunk_id = usable_chunk_id();
+    if (chunk_id < 0) {
+        statusBar()->showMessage(tr("There is no active chunk."), 4000);
+        return;
+    }
+    const TaskEntry* entry = builtin_registry().find("UpdateTransform");
+    if (entry == nullptr || !entry->enabled) {
+        statusBar()->showMessage(tr("This task is not available."), 4000);
+        return;
+    }
+    try {
+        static_cast<void>(app_.jobs().submit("UpdateTransform", Params{}, chunk_id));
+    } catch (const std::exception& e) {
+        report_error(tr("Update Transform failed"), e);
+    }
+}
+
+void MainWindow::reset_transform() {
+    if (busy_refusal()) {
+        return;
+    }
+    const std::int32_t chunk_id = usable_chunk_id();
+    if (chunk_id < 0) {
+        statusBar()->showMessage(tr("There is no active chunk."), 4000);
+        return;
+    }
+    Region region;
+    static_cast<void>(app_.read_document([&](const Document& document) {
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == chunk_id) {
+                region = chunk->region();
+            }
+        }
+    }));
+    try {
+        app_.execute(
+            make_set_chunk_transform_command(chunk_id, Transform::Identity(), region));
+    } catch (const std::exception& e) {
+        report_error(tr("Reset Transform failed"), e);
     }
 }
 

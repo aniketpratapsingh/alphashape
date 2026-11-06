@@ -29,6 +29,7 @@ class ReferencePane;
 class StartScreen;
 class ViewportWidget;
 class WorkflowController;
+enum class RegionGizmoMode;
 class WorkspacePane;
 class WorkspaceSelection;
 
@@ -127,6 +128,12 @@ private:
     void create_status_strip();
     /// Enable the Tools actions only when their dialog can run.
     void update_marker_actions();
+    /// The active chunk id, or -1 when there is none (the caller must not be busy).
+    std::int32_t usable_chunk_id() const;
+    void show_transform_dialog();
+    void run_update_transform();
+    void reset_transform();
+    void set_region_mode(RegionGizmoMode mode);
     /// Ask for params through the task's dialog and submit it for the active
     /// chunk. The dialog is the marker-specific one for DetectMarkers.
     void run_marker_task(const std::string& task);
@@ -219,6 +226,14 @@ private:
     QAction* detect_markers_action_ = nullptr;
     QAction* detect_fiducials_action_ = nullptr;
     QAction* print_markers_action_ = nullptr;
+    /// Region gizmo modes (exclusive) and the object transform actions.
+    QActionGroup* region_mode_group_ = nullptr;
+    QAction* region_move_action_ = nullptr;
+    QAction* region_resize_action_ = nullptr;
+    QAction* region_rotate_action_ = nullptr;
+    QAction* transform_object_action_ = nullptr;
+    QAction* update_transform_action_ = nullptr;
+    QAction* reset_transform_action_ = nullptr;
 };
 
 }  // namespace alphashape::gui

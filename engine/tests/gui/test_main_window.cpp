@@ -86,7 +86,10 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
         "action.view.theme.light", "action.view.theme.dark", "action.view.reset_layout",
         "action.workflow.add_photos", "action.workflow.build_orthomosaic",
         "action.tools.detect_markers", "action.tools.detect_fiducials",
-        "action.tools.print_markers", "action.help.about", "action.help.repository",
+        "action.tools.print_markers", "action.tools.region_move",
+        "action.tools.region_resize", "action.tools.region_rotate",
+        "action.tools.transform_object", "action.tools.update_transform",
+        "action.tools.reset_transform", "action.help.about", "action.help.repository",
     };
     for (const QString& name : actions) {
         EXPECT_NE(action(name), nullptr) << name.toStdString();
