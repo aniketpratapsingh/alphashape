@@ -224,6 +224,28 @@ performs network access for the EGM96 source and the NGS service; the test
 suite itself does not. Review the generated diffs before committing them,
 because the fixtures intentionally record a PROJ data version.
 
+## Markers, GCP and calibration tests (M13)
+
+The marker/GCP/calibration surface is covered by these Python suites, all
+registered in `engine/python/CMakeLists.txt` and run by `ctest`:
+
+- `python/tests/test_markers.py` — marker placement, projections, groups,
+  `ground_control`, scale bars, detection, refinement, tracking and the
+  `optimizeCameras` refusal contract.
+- `python/tests/test_reference.py` — `importReference`/`exportReference`, the
+  `columns`/`columns_order` selection and the control/check-point split.
+- `python/tests/test_calibration.py` — `Sensor.calibration`/`fixed_params`,
+  `Calibration.p3`/`p4`/`covariance_matrix`, save/load, `Sensor.makeMaster`,
+  `calibrateCamera`, `exportSTMap` and the `fiducial_type` spelling.
+- `python/tests/test_calibration_io.py`, `test_marker_sheet.py` and
+  `test_reference_settings.py` — the codecs, printable sheets and accuracies.
+
+`python_gcp_validation` runs `engine/tests/run_gcp_validation.py --synthetic`:
+it builds the 12-image synthetic GCP block, fits it from 9 control points and
+requires the 3 held-out check points to stay within 2 cm RMS. The same script
+has a `--real <dir> --gcp <csv>` mode for a real aerial block. It runs in a few
+seconds on the light lanes; no network access and no extra data are needed.
+
 ## Bug-hunting (Debug + ASan + UBSan + Eigen NaN init)
 
 ```

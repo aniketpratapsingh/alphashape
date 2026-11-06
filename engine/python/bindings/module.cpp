@@ -519,6 +519,37 @@ struct ScalebarRef {
     }
 };
 
+/// One projection of one marker, addressed by (marker id, camera id) and
+/// re-resolved on every access like the other proxies above.
+struct MarkerProjectionRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t marker_id = -1;
+    std::int32_t camera_id = -1;
+
+    const alphashape::Marker& marker() const {
+        for (const alphashape::Marker& marker : chunk->markers()) {
+            if (marker.id == marker_id) {
+                return marker;
+            }
+        }
+        throw alphashape::ValueError("marker id " + std::to_string(marker_id) +
+                                     " no longer exists");
+    }
+
+    const alphashape::MarkerProjection& get() const {
+        for (const alphashape::MarkerProjection& projection :
+             marker().projections) {
+            if (projection.camera_id == camera_id) {
+                return projection;
+            }
+        }
+        throw alphashape::ValueError(
+            "marker " + std::to_string(marker_id) + " has no projection in camera " +
+            std::to_string(camera_id));
+    }
+};
+
 /// Shared fields of every AssetSlot instantiation, so an AssetRef can read an
 /// asset through one pointer without knowing its payload type.
 struct AssetSlotBase {
@@ -679,6 +710,22 @@ void set_reference_accuracy(py::object chunk_self,
     alphashape::ReferenceSettings settings =
         chunk_self.cast<const alphashape::Chunk&>().reference_settings();
     settings.*field = value;
+    const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
+    execute_command(
+        owning_document_object(std::move(chunk_self)),
+        alphashape::make_set_reference_settings_command(id, settings));
+}
+
+/// Toggle whether control points constrain the adjustment, through the same
+/// undoable "Set Reference Settings" command as the accuracy properties.
+/// `Chunk.optimizeCameras(use_gcps=...)` is the public caller.
+void set_reference_use_gcp(py::object chunk_self, bool value) {
+    if (!py::hasattr(chunk_self, "_document")) {
+        throw py::type_error("this Chunk is not attached to a Document");
+    }
+    alphashape::ReferenceSettings settings =
+        chunk_self.cast<const alphashape::Chunk&>().reference_settings();
+    settings.use_gcp = value;
     const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
     execute_command(
         owning_document_object(std::move(chunk_self)),
@@ -1377,7 +1424,10 @@ PYBIND11_MODULE(alphashape, m) {
                    std::to_string(c.f) + ">";
         });
 
-    py::class_<alphashape::Sensor>(m, "Sensor")
+    // dynamic_attr: a sensor handed out by Chunk.sensors carries back-pointers
+    // (_chunk, _index) so makeMaster() can reach the owning Document's undo
+    // stack. The sensor itself is still a value copy.
+    py::class_<alphashape::Sensor>(m, "Sensor", py::dynamic_attr())
         .def_property_readonly("label", [](const alphashape::Sensor& s) { return s.label; })
         .def_property_readonly("type", [](const alphashape::Sensor& s) { return camera_type_name(s.type); })
         .def_readonly("width", &alphashape::Sensor::width)
@@ -1412,6 +1462,27 @@ PYBIND11_MODULE(alphashape, m) {
             return out;
         })
         // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
+        // Detach this sensor from any master link, making it a master in its
+        // own right (master_sensor_id = -1). Goes through the undoable "Set
+        // Sensor Master" command; only callable on a sensor obtained from
+        // Chunk.sensors, which carries the owning chunk and its index.
+        .def("makeMaster",
+             [](py::object self) {
+                 if (!py::hasattr(self, "_chunk") || !py::hasattr(self, "_index")) {
+                     throw py::type_error(
+                         "makeMaster: this Sensor is not attached to a Chunk");
+                 }
+                 py::object chunk_object = self.attr("_chunk");
+                 py::object document = owning_document_object(chunk_object);
+                 const auto chunk = chunk_object.cast<std::shared_ptr<Chunk>>();
+                 const auto index = py::cast<std::int32_t>(self.attr("_index"));
+                 execute_command(
+                     document,
+                     alphashape::make_set_sensor_master_command(
+                         chunk->id(), index, -1));
+             },
+             py::is_method(m),
+             "Make this sensor a master by detaching it from any master link.")
         .def_property_readonly("fiducials", [](const alphashape::Sensor& s) {
             py::list out;
             for (const alphashape::Fiducial& fiducial : s.film.fiducials) {
@@ -1652,15 +1723,37 @@ PYBIND11_MODULE(alphashape, m) {
             }
             return "regular";
         })
+        // The marker group this marker belongs to, or None. Assignment moves
+        // it through the undoable "Move to Group" command.
+        .def_property(
+            "group",
+            py::cpp_function([](const MarkerRef& r) -> py::object {
+                for (const alphashape::MarkerGroup& group :
+                     r.chunk->marker_groups()) {
+                    for (const std::int32_t member : group.members) {
+                        if (member == r.id) {
+                            return py::int_(group.id);
+                        }
+                    }
+                }
+                return py::none();
+            }, py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, py::object value) {
+                    const std::int32_t group_id =
+                        value.is_none() ? -1 : py::cast<std::int32_t>(value);
+                    execute_command(
+                        r.document,
+                        alphashape::make_move_to_group_command(
+                            alphashape::GroupKind::Marker, r.chunk->id(),
+                            {r.id}, group_id));
+                },
+                py::is_method(m)))
         .def_property_readonly("projections", [](const MarkerRef& r) {
             py::list out;
             for (const alphashape::MarkerProjection& projection : r.get().projections) {
-                py::dict entry;
-                entry[py::str("camera_id")] = py::int_(projection.camera_id);
-                entry[py::str("pixel")] = py::make_tuple(projection.pixel.x(),
-                                                         projection.pixel.y());
-                entry[py::str("enabled")] = py::bool_(projection.enabled);
-                out.append(std::move(entry));
+                out.append(py::cast(MarkerProjectionRef{
+                    r.chunk, r.document, r.id, projection.camera_id}));
             }
             return out;
         })
@@ -1771,6 +1864,50 @@ PYBIND11_MODULE(alphashape, m) {
              py::arg("default") = py::none())
         .def("items", mapping_items)
         .def("__iter__", mapping_iter);
+
+    // -- MarkerProjection ----------------------------------------------------
+    // One image measurement of a marker. The camera is a Camera proxy; pixel
+    // is (x, y) in pixels and enabled mirrors `MarkerProjection::enabled`.
+    py::class_<MarkerProjectionRef>(m, "MarkerProjection")
+        .def_property_readonly("camera_id",
+                               [](const MarkerProjectionRef& r) {
+                                   return r.camera_id;
+                               })
+        .def_property_readonly("camera", [](const MarkerProjectionRef& r) {
+            return py::cast(
+                CameraRef{r.chunk, r.document, r.camera_id});
+        })
+        .def_property_readonly("pixel", [](const MarkerProjectionRef& r) {
+            const Eigen::Vector2d& pixel = r.get().pixel;
+            return py::make_tuple(pixel.x(), pixel.y());
+        })
+        .def_property_readonly("enabled", [](const MarkerProjectionRef& r) {
+            return r.get().enabled;
+        })
+        // The pre-WP-13.20 dict protocol, so scripts that read
+        // marker.projections[i]["camera_id"] keep working.
+        .def("__getitem__",
+             [](const MarkerProjectionRef& r, const std::string& key)
+                 -> py::object {
+                 if (key == "camera_id") return py::int_(r.camera_id);
+                 if (key == "camera") {
+                     return py::cast(CameraRef{r.chunk, r.document, r.camera_id});
+                 }
+                 if (key == "pixel") {
+                     const Eigen::Vector2d& pixel = r.get().pixel;
+                     return py::make_tuple(pixel.x(), pixel.y());
+                 }
+                 if (key == "enabled") return py::bool_(r.get().enabled);
+                 throw py::key_error(key);
+             },
+             py::arg("key"))
+        .def("keys", [](const MarkerProjectionRef&) {
+            py::list out;
+            for (const char* key : {"camera_id", "camera", "pixel", "enabled"}) {
+                out.append(py::str(key));
+            }
+            return out;
+        });
 
     // -- Asset ---------------------------------------------------------------
     // Every derived product (point cloud, model, DEM, orthomosaic, depth-map
@@ -2015,14 +2152,20 @@ PYBIND11_MODULE(alphashape, m) {
                  }
                  return out;
              })
-        .def_property_readonly("sensors", [](const Chunk& c) {
-            // Copies, so the list cannot dangle when the chunk grows.
+        .def_property_readonly("sensors", py::cpp_function([](py::object self) {
+            // Copies, so the list cannot dangle when the chunk grows. Each copy
+            // records the owning chunk and its index so Sensor.makeMaster()
+            // can issue its undoable command.
+            auto chunk = self.cast<std::shared_ptr<Chunk>>();
             py::list out;
-            for (const alphashape::Sensor& sensor : c.sensors()) {
-                out.append(sensor);
+            for (std::size_t index = 0; index < chunk->sensors().size(); ++index) {
+                py::object item = py::cast(chunk->sensors()[index]);
+                item.attr("_chunk") = self;
+                item.attr("_index") = py::int_(index);
+                out.append(std::move(item));
             }
             return out;
-        })
+        }, py::is_method(m)))
         .def_property_readonly(
             "cameras",
             py::cpp_function(
@@ -2373,6 +2516,38 @@ PYBIND11_MODULE(alphashape, m) {
                 for (const alphashape::Scalebar& bar : chunk->scalebars()) {
                     out.append(py::cast(ScalebarRef{chunk, document, bar.id}));
                 }
+                return out;
+            }, py::is_method(m)))
+        // The ground-control view: every marker that carries a measured
+        // reference, split by role. `markers` holds all referenced markers,
+        // `control_points` the ones the adjustment may use and `check_points`
+        // the held-out ones (Marker meta role "check_point"). This is a view
+        // over the same Marker proxies as Chunk.markers, not a copy.
+        .def_property_readonly("ground_control", py::cpp_function(
+            [](py::object self) {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
+                py::list all;
+                py::list control;
+                py::list checks;
+                for (const alphashape::Marker& marker : chunk->markers()) {
+                    if (!marker.reference.has_value()) {
+                        continue;
+                    }
+                    py::object ref =
+                        py::cast(MarkerRef{chunk, document, marker.id});
+                    all.append(ref);
+                    if (alphashape::marker_role(marker) ==
+                        alphashape::MarkerReferenceRole::CheckPoint) {
+                        checks.append(ref);
+                    } else {
+                        control.append(ref);
+                    }
+                }
+                py::dict out;
+                out[py::str("markers")] = all;
+                out[py::str("control_points")] = control;
+                out[py::str("check_points")] = checks;
                 return out;
             }, py::is_method(m)))
         // Vector annotations (declared and persisted; the editing UI lands
@@ -3050,6 +3225,12 @@ PYBIND11_MODULE(alphashape, m) {
             run_chunk_task(self, "ImportReference", std::move(kwargs));
         })
         .def("exportReference", [](py::object self, py::kwargs kwargs) {
+            // The public spelling `columns` is the task's `columns_order`:
+            // both name the ordered list of written fields.
+            if (kwargs.contains("columns") && !kwargs.contains("columns_order")) {
+                kwargs[py::str("columns_order")] =
+                    kwargs.attr("pop")(py::str("columns"));
+            }
             run_chunk_task(self, "ExportReference", std::move(kwargs));
         })
         // Marker projection import/export (WP-13.4), the same run_task calls.
@@ -3068,15 +3249,26 @@ PYBIND11_MODULE(alphashape, m) {
             run_chunk_task(self, "CalibrateCamera", std::move(kwargs));
         })
         // Film fiducial detection (WP-13.18a): detect marks on every film
-        // camera and fit each scan's film-mm -> pixel transform.
+        // camera and fit each scan's film-mm -> pixel transform. The public
+        // spelling `fiducial_type` is mapped onto the task's `detector`.
         .def("detectFiducials", [](py::object self, py::kwargs kwargs) {
+            if (kwargs.contains("fiducial_type")) {
+                py::object value = kwargs.attr("pop")(py::str("fiducial_type"));
+                if (!kwargs.contains("detector")) {
+                    kwargs[py::str("detector")] = value;
+                }
+            }
             run_chunk_task(self, "DetectFiducials", std::move(kwargs));
         })
         // Derive a sensor's fiducial film coordinates from one reference scan.
         .def("calibrateFiducials", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "CalibrateFiducials", std::move(kwargs));
         })
-        // Backward STMap export for a calibrated sensor (WP-13.15b).
+        // Backward STMap export for a calibrated sensor (WP-13.15b). Both
+        // spellings reach the same task; `exportSTMap` is the documented one.
+        .def("exportSTMap", [](py::object self, py::kwargs kwargs) {
+            run_chunk_task(self, "ExportSTMap", std::move(kwargs));
+        })
         .def("exportStmap", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "ExportSTMap", std::move(kwargs));
         })
@@ -3092,6 +3284,17 @@ PYBIND11_MODULE(alphashape, m) {
         // (WP-13.12): the same run_task call as the UpdateTransform task.
         .def("updateTransform", [](py::object self, py::kwargs kwargs) {
             run_chunk_task(self, "UpdateTransform", std::move(kwargs));
+        })
+        // Self-calibrating bundle adjustment (WP-13.13). `use_gcps` is not a
+        // task parameter: it selects whether control points constrain the
+        // adjustment, so it is written to the chunk's reference settings
+        // first (an undoable edit), then the task runs.
+        .def("optimizeCameras", [](py::object self, py::kwargs kwargs) {
+            if (kwargs.contains("use_gcps")) {
+                py::object value = kwargs.attr("pop")(py::str("use_gcps"));
+                set_reference_use_gcp(self, py::cast<bool>(value));
+            }
+            run_chunk_task(self, "OptimizeCameras", std::move(kwargs));
         })
         // Exterior orientation from navigation metadata (WP-13.21): place the
         // selected cameras from their reference position and attitude.

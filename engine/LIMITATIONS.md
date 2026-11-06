@@ -1569,3 +1569,30 @@ close-out (WP-12.12). The engine guide is
   a new marker; the task does not match non-coded targets across cameras. Run
   it once to seed the markers, place their positions, and run it again to
   attach the remaining views.
+- **Circle-grid calibration is not implemented.** `calibrateCamera` detects
+  chessboard inner corners only; a grid of circular targets has no detector.
+- **Per-observation marker sigma is not supported.** Weighting is one accuracy
+  per marker (`marker_location_accuracy` plus the reference row accuracy); an
+  individual projection cannot carry its own sigma.
+- **Per-sensor adaptive selection is absent.** `adaptive_fitting` selects
+  distortion terms once for the adjustment; a rig with several sensors cannot
+  opt each sensor into its own selection.
+- **Rig lever arms for slave sensors are not estimated.** A sensor linked to a
+  master shares its calibration but has no estimated baseline to the master.
+- **Scale bars between cameras are absent.** `addScalebar` accepts camera
+  endpoints in the model, but the adjustment only consumes marker-to-marker
+  bars.
+- **Circular targets use a conic fit without perspective correction.** The
+  ellipse centre is the measurement; the offset of the projected circle's
+  centre under oblique viewing is not corrected.
+- **Film border masking is absent.** Scanned frames are not automatically
+  cropped to the film gate, so a bright film border can seed false fiducials.
+- **`Calibration.error()` has no engine value to report.** The calibration
+  task records its reprojection RMS in the chunk metadata
+  (`calibrate_camera.<sensor>.rms_px`); the model does not store a per-sensor
+  error, so no `Calibration.error()` is bound rather than inventing one.
+- **`addScalebar` takes numeric defaults, not sentinels.** `reference` and
+  `accuracy` default to `0.0` and `0.001`; there is no `None` "unset" spelling.
+- **`Chunk.ground_control` is a view.** It groups the referenced Marker
+  proxies into `markers`, `control_points` and `check_points`; it is not a
+  separate ground-control object with its own editing commands.
