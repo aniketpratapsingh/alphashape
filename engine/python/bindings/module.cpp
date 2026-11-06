@@ -336,12 +336,13 @@ bool sample_height(const alphashape::GeoRaster<float>& raster, float nodata, dou
 /// The token is deliberately opaque: it exposes no methods a script could
 /// call. Holding the Document through a shared_ptr keeps the raw pointer the
 /// stack was bound to valid even when a script retains the token after
-/// dropping the Document. `cache_pin` keeps a Save As source cache directory
-/// alive while the retained commands may still spill into it.
+/// dropping the Document. `cache_pins` keeps every Save As source cache
+/// directory alive while retained commands may still spill into it; it is
+/// cleared together with the history, exactly like the GUI's pinned_caches_.
 struct DocumentHistory {
     std::shared_ptr<alphashape::Document> document;
     std::shared_ptr<alphashape::UndoStack> stack;
-    std::shared_ptr<void> cache_pin;
+    std::vector<std::shared_ptr<void>> cache_pins;
 };
 
 namespace {
@@ -367,6 +368,8 @@ void clear_document_history(py::object document) {
     DocumentHistory* history = document_history(document);
     if (history != nullptr) {
         history->stack->clear();
+        // No history survives, so no spill file in a pinned cache is needed.
+        history->cache_pins.clear();
     }
 }
 }  // namespace
@@ -719,12 +722,13 @@ std::shared_ptr<alphashape::UndoStack> document_undo_stack(py::object document) 
     return raw->stack;
 }
 
-/// Keep the pre-Save-As cache directory alive for as long as the history that
+/// Keep a pre-Save-As cache directory alive for as long as the history that
 /// may spill into it. Does nothing when no history exists yet: there are then
-/// no commands holding a spill file.
+/// no commands holding a spill file. Pins accumulate so successive Save As
+/// calls keep each old cache until the history is cleared.
 void pin_document_history_cache(py::object document, std::shared_ptr<void> pin) {
     if (DocumentHistory* history = document_history(document); history != nullptr) {
-        history->cache_pin = std::move(pin);
+        history->cache_pins.push_back(std::move(pin));
     }
 }
 
