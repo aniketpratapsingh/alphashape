@@ -1142,16 +1142,20 @@ public:
     std::string name() const override { return "Set Reference CRS"; }
 
 protected:
+    void validate(Document& document) override {
+        (void)require_chunk(document, chunk_id_);
+    }
+
     void stage(Document& document) override {
         previous_ = explicit_slot(require_chunk(document, chunk_id_));
     }
 
     void commit(Document& document) override {
-        apply(require_chunk(document, chunk_id_), value_);
+        write_slot(require_chunk(document, chunk_id_), value_);
     }
 
     void restore(Document& document) override {
-        apply(require_chunk(document, chunk_id_), previous_);
+        write_slot(require_chunk(document, chunk_id_), previous_);
     }
 
 private:
@@ -1167,7 +1171,7 @@ private:
         return std::nullopt;
     }
 
-    void apply(Chunk& chunk, const std::optional<CRS>& value) const {
+    void write_slot(Chunk& chunk, const std::optional<CRS>& value) const {
         if (slot_ == CrsSlot::Camera) {
             if (value.has_value()) {
                 chunk.set_camera_crs(*value);
