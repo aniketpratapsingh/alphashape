@@ -87,11 +87,36 @@ class TestMultipleAssets(unittest.TestCase):
         # The dict protocol of the old asset lists still works.
         self.assertEqual(dems[-1]["label"], "dem b")
         self.assertEqual(dems[-1]["key"], dems[-1].id)
-        # All depth maps across every set are flattened into `depth_maps`.
-        self.assertEqual(len(self.chunk.depth_maps),
-                         len(self.chunk.active_depth_maps))
+        self.assertEqual(dict(dems[-1])["label"], "dem b")
+        # All depth maps across every set are flattened into `depth_maps`;
+        # with a single set the active maps are the identical full entries.
+        all_maps = self.chunk.depth_maps
+        active_maps = self.chunk.active_depth_maps
+        self.assertEqual(len(all_maps), len(active_maps))
+        for all_map, active_map in zip(all_maps, active_maps):
+            self.assertEqual(set(all_map), set(active_map))
+            self.assertEqual(set(all_map),
+                             {"camera_id", "width", "height", "downscale",
+                              "depth", "normals", "confidence"})
+            self.assertEqual(all_map, active_map)
         self.assertIsNotNone(self.chunk.elevation)
         self.assertEqual(self.chunk.elevation.source, "depth_maps")
+
+    def test_camera_rotation_accuracy_validation(self):
+        camera_id = self.chunk.cameras[0].id
+        for bad in ((float("nan"), 1.0, 1.0),
+                    (1.0, float("inf"), 1.0),
+                    (-1.0, 1.0, 1.0),
+                    (1.0, 2.0)):
+            with self.assertRaises(Exception):
+                self.chunk.set_camera_reference_rotation_accuracy(
+                    camera_id, bad)
+        # The command is one undo step and restores the previous absence.
+        self.chunk.set_camera_reference_rotation_accuracy(camera_id, (1.0, 2.0, 3.0))
+        self.assertEqual(
+            self.chunk.cameras[0].reference_rotation_accuracy, (1.0, 2.0, 3.0))
+        self.doc.undo()
+        self.assertIsNone(self.chunk.cameras[0].reference_rotation_accuracy)
 
 
 class TestMarkerCrudAndUndo(unittest.TestCase):
@@ -156,6 +181,58 @@ class TestMarkerCrudAndUndo(unittest.TestCase):
         held.label = "still mine"
         self.assertEqual(chunk.markers[0].label, "still mine")
 
+    def test_marker_mapping_protocol(self):
+        doc, chunk = empty_document()
+        marker = chunk.addMarker(label="mapped", position=(1.0, 2.0, 3.0))
+        self.assertEqual(dict(marker)["label"], "mapped")
+        self.assertEqual(marker.get("missing", "fallback"), "fallback")
+        self.assertEqual(dict(marker.items())["id"], marker.id)
+        self.assertEqual(sorted(marker), sorted(marker.keys()))
+        self.assertIn("valid", marker)
+
+    def test_set_marker_position_is_one_undo(self):
+        doc, chunk = empty_document()
+        marker_id = chunk.set_marker_position("placed", 1.0, 2.0, 3.0)
+        self.assertEqual(len(chunk.markers), 1)
+        self.assertTrue(chunk.markers[0].valid)
+        self.assertEqual(chunk.markers[0].position, (1.0, 2.0, 3.0))
+        self.assertEqual(chunk.markers[0].id, marker_id)
+        # Create and enable are one entry: a single undo removes both.
+        doc.undo()
+        self.assertEqual(chunk.markers, [])
+        doc.redo()
+        self.assertEqual(chunk.markers[0].label, "placed")
+
+        # Moving an existing marker also makes it valid, and undoes in one step.
+        chunk.markers[0].valid = False
+        doc.undo()  # undo the explicit flag flip
+        chunk.set_marker_position("placed", 4.0, 5.0, 6.0)
+        self.assertEqual(chunk.markers[0].position, (4.0, 5.0, 6.0))
+        self.assertTrue(chunk.markers[0].valid)
+
+    def test_set_marker_label_validation(self):
+        doc, chunk = empty_document()
+        first = chunk.addMarker(label="one", position=(0.0, 0.0, 0.0))
+        chunk.addMarker(label="two", position=(0.0, 0.0, 0.0))
+        with self.assertRaises(Exception):
+            first.label = ""
+        with self.assertRaises(Exception):
+            first.label = "two"
+        self.assertEqual(chunk.markers[0].label, "one")
+
+
+class TestTaskHistory(unittest.TestCase):
+    def test_task_discards_undo_history(self):
+        doc, chunk = empty_document()
+        chunk.addMarker(label="before", position=(0.0, 0.0, 0.0))
+        self.assertTrue(doc.can_undo)
+        # A task mutates in place and cannot be undone; the history before it
+        # no longer describes the document, so it is discarded.
+        doc.duplicate_chunk(chunk)
+        self.assertEqual(len(doc.chunk_ids), 2)
+        self.assertFalse(doc.can_undo)
+        self.assertFalse(doc.can_redo)
+
 
 def editable_document():
     doc, chunk = empty_document()
@@ -214,6 +291,32 @@ class TestPersistence(unittest.TestCase):
             dest.append(other)
             self.assertEqual(len(dest.chunk_ids), 3)
 
+    def test_append_self_is_safe_and_replays(self):
+        doc, chunk = editable_document()
+        chunk.set_meta("note", "self")
+        original_labels = [chunk.label for chunk in doc.chunks.values()]
+        doc.append(doc)
+        self.assertEqual(len(doc.chunk_ids), 2)
+        doubled = [chunk.label for chunk in doc.chunks.values()]
+        self.assertEqual(doubled, original_labels + original_labels)
+        doc.undo()
+        self.assertEqual(len(doc.chunk_ids), 1)
+        doc.redo()
+        self.assertEqual([chunk.label for chunk in doc.chunks.values()], doubled)
+
+    def test_chunk_enabled_persists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "enabled.psx")
+            doc, chunk = empty_document()
+            chunk.enabled = False
+            doc.save(path)
+            loaded = alphashape.load_project(path)
+            self.assertFalse(loaded.chunk(loaded.chunk_ids[0]).enabled)
+            loaded.chunk(loaded.chunk_ids[0]).enabled = True
+            loaded.save()
+            again = alphashape.load_project(path)
+            self.assertTrue(again.chunk(again.chunk_ids[0]).enabled)
+
 
 class TestChunksApi(unittest.TestCase):
     def test_chunks_api(self):
@@ -243,6 +346,34 @@ class TestChunksApi(unittest.TestCase):
         self.assertEqual(merged.label, "merged")
         self.assertEqual(len(doc.chunk_ids), 3)
         self.assertEqual(doc.chunks[first.key].label, "Chunk 1")
+
+    def test_add_chunk_default_labels(self):
+        doc = alphashape.Document()
+        self.assertEqual(doc.addChunk().label, "Chunk 1")
+        self.assertEqual(doc.addChunk().label, "Chunk 2")
+        # The next default skips names already in use.
+        self.assertEqual(doc.addChunk().label, "Chunk 3")
+
+    def test_add_chunk_redo_keeps_active(self):
+        doc, first = empty_document()
+        doc.active_chunk = first
+        second = doc.addChunk()
+        self.assertEqual(second.label, "Chunk 2")
+        self.assertEqual(doc.active_chunk.id, first.id)
+        doc.undo()
+        doc.redo()
+        self.assertEqual(doc.active_chunk.id, first.id)
+
+    def test_chunk_arguments_accept_dict(self):
+        doc, _ = empty_document()
+        doc.addChunk("Second")
+        merged = doc.merge_chunks(doc.chunks, label="merged")
+        self.assertEqual(merged.label, "merged")
+        self.assertEqual(len(doc.chunk_ids), 1)
+        doc.remove(doc.chunks)
+        self.assertEqual(doc.chunk_ids, [])
+        doc.undo()
+        self.assertEqual(len(doc.chunk_ids), 1)
 
 
 if __name__ == "__main__":

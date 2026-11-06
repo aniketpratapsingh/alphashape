@@ -274,6 +274,26 @@ py::list reshape_vec3_grid(const std::vector<float>& data, int height, int width
     return rows;
 }
 
+/// One depth map as the full dict both `depth_maps` and `active_depth_maps`
+/// expose. A single builder keeps the two properties identical.
+py::dict depth_map_entry(const alphashape::DepthMap& map) {
+    py::dict entry;
+    entry[py::str("camera_id")] = py::int_(map.camera_id);
+    entry[py::str("width")] = py::int_(map.width);
+    entry[py::str("height")] = py::int_(map.height);
+    entry[py::str("downscale")] = py::int_(map.downscale);
+    entry[py::str("depth")] = reshape_scalar(map.depths, map.height, map.width);
+    entry[py::str("normals")] =
+        map.normals.empty()
+            ? py::object(py::none())
+            : py::object(reshape_vec3_grid(map.normals, map.height, map.width));
+    entry[py::str("confidence")] =
+        map.confidence.empty()
+            ? py::object(py::none())
+            : py::object(reshape_scalar(map.confidence, map.height, map.width));
+    return entry;
+}
+
 /// Bilinear, nodata-aware height sample on a DEM (the orthorectifier's rule).
 /// Returns false when the point is off the grid or no valid cell contributes.
 bool sample_height(const alphashape::GeoRaster<float>& raster, float nodata, double x, double y,
@@ -311,10 +331,52 @@ bool sample_height(const alphashape::GeoRaster<float>& raster, float nodata, dou
     return true;
 }
 
+/// C++-side state attached to a Python Document under `_undo_stack`.
+///
+/// The token is deliberately opaque: it exposes no methods a script could
+/// call. Holding the Document through a shared_ptr keeps the raw pointer the
+/// stack was bound to valid even when a script retains the token after
+/// dropping the Document. `cache_pin` keeps a Save As source cache directory
+/// alive while the retained commands may still spill into it.
+struct DocumentHistory {
+    std::shared_ptr<alphashape::Document> document;
+    std::shared_ptr<alphashape::UndoStack> stack;
+    std::shared_ptr<void> cache_pin;
+};
+
+namespace {
+constexpr const char* kHistoryCapsuleName = "alphashape.document_history";
+
+void delete_history(void* pointer) {
+    delete static_cast<DocumentHistory*>(pointer);
+}
+
+DocumentHistory* document_history(py::object document) {
+    if (!py::hasattr(document, "_undo_stack")) {
+        return nullptr;
+    }
+    return static_cast<DocumentHistory*>(
+        document.attr("_undo_stack").cast<py::capsule>().get_pointer());
+}
+
+/// Drop the recorded history after a whole-document mutation (a task, or an
+/// in-place edit that bypasses the command layer). Tasks mutate in place and
+/// cannot be undone, so keeping earlier entries would let an undo restore
+/// stale snapshots and delete the task's result.
+void clear_document_history(py::object document) {
+    DocumentHistory* history = document_history(document);
+    if (history != nullptr) {
+        history->stack->clear();
+    }
+}
+}  // namespace
+std::shared_ptr<alphashape::UndoStack> document_undo_stack(py::object document);
+
 /// Run a task by name with keyword arguments bound against its declared schema.
 /// Shared by Document.run_task and the Chunk convenience methods (buildDem,
 /// buildOrthomosaic, ...) so the two cannot drift.
-void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwargs kwargs) {
+void run_task_kwargs(py::object document, const std::string& name, py::kwargs kwargs) {
+    alphashape::Document& d = document.cast<alphashape::Document&>();
     alphashape::TaskRegistry& registry = alphashape::builtin_registry();
     // Throws UnsupportedTaskError (mapped) for an unknown task.
     const alphashape::TaskEntry& entry = registry.require(name);
@@ -337,8 +399,14 @@ void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwarg
     // Release the GIL: the task computes in C++ and may parallelise across
     // frames. The empty Progress guarantees no worker thread ever calls back
     // into Python.
-    py::gil_scoped_release release;
-    alphashape::run_task(registry, d, name, params, alphashape::Progress{});
+    {
+        py::gil_scoped_release release;
+        alphashape::run_task(registry, d, name, params, alphashape::Progress{});
+    }
+    // A task cannot be undone; discard the history it just invalidated. Only
+    // touch the token when one already exists: creating it here would make a
+    // document with no edits look like it had a stack.
+    clear_document_history(std::move(document));
 }
 
 /// Convert a C++ chunk to the Python object the Document bindings hand out,
@@ -361,10 +429,10 @@ void run_chunk_task(py::object self, const char* name, py::kwargs kwargs) {
     if (!py::hasattr(self, "_document")) {
         throw py::type_error("this Chunk is not attached to a Document");
     }
-    alphashape::Document& document = self.attr("_document").cast<alphashape::Document&>();
+    py::object document = self.attr("_document");
     const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
-    document.set_active_chunk_id(chunk.id());
-    run_task_kwargs(document, name, std::move(kwargs));
+    document.cast<alphashape::Document&>().set_active_chunk_id(chunk.id());
+    run_task_kwargs(std::move(document), name, std::move(kwargs));
 }
 
 /// The DEM view (milestone 9). Holds the chunk's shared_ptr so the raster it
@@ -635,15 +703,29 @@ py::object owning_document_object(py::object chunk_self) {
 /// with it; `Document.undo()` / `Document.redo()` drive this same stack and a
 /// scripted edit is therefore an ordinary undo entry.
 std::shared_ptr<alphashape::UndoStack> document_undo_stack(py::object document) {
-    if (py::hasattr(document, "_undo_stack")) {
-        return document.attr("_undo_stack")
-            .cast<std::shared_ptr<alphashape::UndoStack>>();
+    if (DocumentHistory* history = document_history(document); history != nullptr) {
+        return history->stack;
     }
-    alphashape::Document& owner = document.cast<alphashape::Document&>();
-    auto stack = std::make_shared<alphashape::UndoStack>(&owner);
-    stack->set_cache_dir(owner.cache_dir());
-    document.attr("_undo_stack") = py::cast(stack);
-    return stack;
+    auto owner = document.cast<std::shared_ptr<alphashape::Document>>();
+    auto history = std::make_unique<DocumentHistory>();
+    history->document = owner;
+    history->stack = std::make_shared<alphashape::UndoStack>(owner.get());
+    history->stack->set_cache_dir(owner->cache_dir());
+    DocumentHistory* raw = history.release();
+    // The token is opaque: no bound class exposes undo/redo on it, so a script
+    // cannot keep calling into a stack whose owner it dropped.
+    document.attr("_undo_stack") =
+        py::capsule(raw, kHistoryCapsuleName, &delete_history);
+    return raw->stack;
+}
+
+/// Keep the pre-Save-As cache directory alive for as long as the history that
+/// may spill into it. Does nothing when no history exists yet: there are then
+/// no commands holding a spill file.
+void pin_document_history_cache(py::object document, std::shared_ptr<void> pin) {
+    if (DocumentHistory* history = document_history(document); history != nullptr) {
+        history->cache_pin = std::move(pin);
+    }
 }
 
 /// Execute one undoable command against the Document that owns `document`.
@@ -661,22 +743,96 @@ void execute_on_chunk(py::object chunk_self,
 py::object attach_document(py::object document,
                            const std::shared_ptr<alphashape::Chunk>& chunk);
 
+namespace {
+
+/// Restore the active chunk as part of the same undo entry as the add, so a
+/// redo leaves the active chunk exactly where the original call did.
+class RestoreActiveChunkCommand : public alphashape::AbstractCommand {
+public:
+    RestoreActiveChunkCommand(std::int32_t before, std::int32_t after)
+        : before_(before), after_(after) {}
+
+    std::string name() const override { return "Add Chunk"; }
+
+    void apply(alphashape::Document& document) override {
+        document.set_active_chunk_id(after_);
+    }
+
+    void revert(alphashape::Document& document) override {
+        document.set_active_chunk_id(before_);
+    }
+
+private:
+    std::int32_t before_;
+    std::int32_t after_;
+};
+
+}  // namespace
+
 /// Add a chunk through the undoable command. The command makes the new chunk
 /// active (the GUI wants that); the scripting contract of add_chunk() predates
-/// it and leaves the active chunk alone, so the previous id is restored.
-py::object document_add_chunk(py::object self, const std::string& label) {
+/// it and leaves the active chunk alone, so the previous id is restored as a
+/// second command in the same transaction (redo therefore behaves the same).
+py::object document_add_chunk(py::object self, py::object label) {
     Document& document = self.cast<Document&>();
     const std::int32_t previous_active = document.active_chunk_id();
     const std::int32_t created = document.workspace().next_chunk_id();
-    execute_command(
-        self, alphashape::make_add_chunk_command(document.workspace(), label, -1));
-    document.set_active_chunk_id(previous_active);
+    std::string resolved;
+    if (!label.is_none()) {
+        resolved = py::cast<std::string>(label);
+    }
+    if (resolved.empty()) {
+        // "Chunk N" for the smallest unused N, so a second add_chunk() is
+        // "Chunk 2" rather than a duplicate "Chunk 1".
+        for (int n = 1;; ++n) {
+            const std::string candidate = "Chunk " + std::to_string(n);
+            bool used = false;
+            for (const auto& chunk : document.workspace().chunks()) {
+                if (chunk->label() == candidate) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) {
+                resolved = candidate;
+                break;
+            }
+        }
+    }
+    auto transaction =
+        std::make_unique<alphashape::CommandTransaction>("Add Chunk");
+    transaction->add(alphashape::make_add_chunk_command(
+        document.workspace(), resolved, -1));
+    transaction->add(
+        std::make_unique<RestoreActiveChunkCommand>(created, previous_active));
+    execute_command(self, std::move(transaction));
     for (const auto& candidate : document.workspace().chunks()) {
         if (candidate->id() == created) {
             return attach_document(self, candidate);
         }
     }
     throw alphashape::Error("addChunk: the chunk was not created");
+}
+
+/// Normalise a chunk-container argument to its elements. A dict — the shape
+/// of Document.chunks — contributes its VALUES; a single Chunk or int is one
+/// element; anything else iterable contributes its items.
+std::vector<py::object> chunk_argument_items(py::object chunks) {
+    std::vector<py::object> items;
+    if (py::isinstance<Chunk>(chunks) || py::isinstance<py::int_>(chunks)) {
+        items.push_back(std::move(chunks));
+        return items;
+    }
+    if (py::isinstance<py::dict>(chunks)) {
+        for (auto item : chunks.cast<py::dict>()) {
+            items.emplace_back(py::reinterpret_borrow<py::object>(item.second));
+        }
+        return items;
+    }
+    for (py::handle item : chunks) {
+        items.emplace_back(py::reinterpret_borrow<py::object>(item));
+    }
+    return items;
 }
 
 /// One mask as a dict. `data` is the raw u8 plane, one byte per pixel.
@@ -1289,6 +1445,31 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly("height", &alphashape::Frame::height)
         .def_property_readonly("camera_id", &alphashape::Frame::camera_id);
 
+    // The mapping protocol the pre-WP-11.11 proxy dicts exposed, shared by the
+    // classes that implement keys() and __getitem__. dict(proxy) works too,
+    // because Python uses keys() + __getitem__ for that.
+    // (Defined as a free function: pybind11 treats a py::object first
+    // parameter as the instance.)
+    auto mapping_get = [](py::object self, py::object key,
+                          py::object fallback) -> py::object {
+        for (py::handle known : self.attr("keys")()) {
+            if (known.equal(key)) {
+                return self.attr("__getitem__")(key);
+            }
+        }
+        return fallback;
+    };
+    auto mapping_items = [](py::object self) {
+        py::list out;
+        for (py::handle key : self.attr("keys")()) {
+            out.append(py::make_tuple(key, self.attr("__getitem__")(key)));
+        }
+        return out;
+    };
+    auto mapping_iter = [](py::object self) {
+        return py::iter(self.attr("keys")());
+    };
+
     // Camera is a proxy: it addresses a camera inside Chunk::cameras() by id
     // and re-resolves on every access, so it stays correct across mutations
     // and never holds a pointer into a vector.
@@ -1573,7 +1754,19 @@ PYBIND11_MODULE(alphashape, m) {
                  if (key == "valid") return py::bool_(marker.valid);
                  throw py::key_error(key);
              },
-             py::arg("key"));
+             py::arg("key"))
+        .def("keys", [](const MarkerRef&) {
+            py::list out;
+            for (const char* key : {"id", "label", "position", "reference",
+                                    "pinned", "valid"}) {
+                out.append(py::str(key));
+            }
+            return out;
+        })
+        .def("get", mapping_get, py::arg("key"),
+             py::arg("default") = py::none())
+        .def("items", mapping_items)
+        .def("__iter__", mapping_iter);
 
     // -- Asset ---------------------------------------------------------------
     // Every derived product (point cloud, model, DEM, orthomosaic, depth-map
@@ -1617,7 +1810,19 @@ PYBIND11_MODULE(alphashape, m) {
                  if (key == "enabled") return py::bool_(fields.enabled);
                  throw py::key_error(key);
              },
-             py::arg("key"));
+             py::arg("key"))
+        .def("keys", [](const AssetRef&) {
+            py::list out;
+            for (const char* key : {"key", "id", "label", "active", "group",
+                                    "enabled"}) {
+                out.append(py::str(key));
+            }
+            return out;
+        })
+        .def("get", mapping_get, py::arg("key"),
+             py::arg("default") = py::none())
+        .def("items", mapping_items)
+        .def("__iter__", mapping_iter);
 
     // -- MarkerGroup ---------------------------------------------------------
     py::class_<MarkerGroupRef>(m, "MarkerGroup")
@@ -2435,14 +2640,14 @@ PYBIND11_MODULE(alphashape, m) {
                     }
                 }
                 const std::int32_t id = chunk->next_id();
-                execute_on_chunk(
-                    self,
-                    alphashape::make_add_marker_command(chunk->id(), label,
-                                                        position));
-                execute_on_chunk(
-                    self,
-                    alphashape::make_set_marker_enabled_command(chunk->id(), id,
-                                                                true));
+                // One call is one undo step: create and enable together.
+                auto transaction = std::make_unique<alphashape::CommandTransaction>(
+                    "Set Marker Position");
+                transaction->add(alphashape::make_add_marker_command(
+                    chunk->id(), label, position));
+                transaction->add(alphashape::make_set_marker_enabled_command(
+                    chunk->id(), id, true));
+                execute_on_chunk(self, std::move(transaction));
                 return id;
             },
             py::arg("label"), py::arg("x"), py::arg("y"), py::arg("z"),
@@ -2612,36 +2817,18 @@ PYBIND11_MODULE(alphashape, m) {
                     continue;
                 }
                 for (const alphashape::DepthMap& map : *set.data) {
-                py::dict entry;
-                entry[py::str("camera_id")] = py::int_(map.camera_id);
-                entry[py::str("width")] = py::int_(map.width);
-                entry[py::str("height")] = py::int_(map.height);
-                entry[py::str("downscale")] = py::int_(map.downscale);
-                entry[py::str("depth")] = reshape_scalar(map.depths, map.height, map.width);
-                entry[py::str("normals")] =
-                    map.normals.empty()
-                        ? py::object(py::none())
-                        : py::object(reshape_vec3_grid(map.normals, map.height, map.width));
-                entry[py::str("confidence")] =
-                    map.confidence.empty()
-                        ? py::object(py::none())
-                        : py::object(reshape_scalar(map.confidence, map.height, map.width));
-                out.append(std::move(entry));
+                    out.append(depth_map_entry(map));
                 }
             }
             return out;
         })
         // The ACTIVE set's maps, the pre-WP-11.11 meaning of `depth_maps`,
-        // kept under its own name for scripts that relied on it.
+        // kept under its own name for scripts that relied on it. The entries
+        // are identical to the corresponding `depth_maps` entries.
         .def_property_readonly("active_depth_maps", [](const Chunk& c) {
             py::list out;
             for (const alphashape::DepthMap& map : c.depth_maps()) {
-                py::dict entry;
-                entry[py::str("camera_id")] = py::int_(map.camera_id);
-                entry[py::str("width")] = py::int_(map.width);
-                entry[py::str("height")] = py::int_(map.height);
-                entry[py::str("downscale")] = py::int_(map.downscale);
-                out.append(std::move(entry));
+                out.append(depth_map_entry(map));
             }
             return out;
         })
@@ -2779,10 +2966,11 @@ PYBIND11_MODULE(alphashape, m) {
                                    return py::cast(std::move(view));
                                })
         // -- multi-instance assets (milestone 11) ------------------------------
-        // One entry per asset of each kind, in id order: {key, label, active}.
-        // The scalar properties above (elevation, orthomosaic, model,
-        // point_cloud, depth_maps, model_texture) are views onto the ACTIVE
-        // asset, which is the one the last producing task added.
+        // One asset view per asset of each kind, in id order. The scalar
+        // properties above (elevation, orthomosaic, model, point_cloud,
+        // model_texture) are views onto the ACTIVE asset, which is the one the
+        // last producing task added. `depth_maps` is the exception: it
+        // flattens every set, while `active_depth_maps` is the active one.
         .def_property_readonly("elevations", py::cpp_function(
             [](py::object self) {
                 auto c = self.cast<std::shared_ptr<Chunk>>();
@@ -2920,7 +3108,8 @@ PYBIND11_MODULE(alphashape, m) {
         // front end exposes never carry one).
         .def(
             "convertReference",
-            [](Chunk& c, int target_epsg, const std::string& kind) {
+            [](py::object self, int target_epsg, const std::string& kind) {
+                Chunk& c = self.cast<Chunk&>();
                 if (target_epsg <= 0) {
                     throw alphashape::ValueError(
                         "convertReference: target_epsg must be a positive EPSG code");
@@ -2938,19 +3127,20 @@ PYBIND11_MODULE(alphashape, m) {
                 }
                 alphashape::reference::convert_reference(
                     c, alphashape::crs::CoordinateSystem::from_epsg(target_epsg), which);
+                // An in-place conversion bypasses the command layer, so the
+                // history before it no longer describes the document.
+                if (py::hasattr(self, "_document")) {
+                    clear_document_history(self.attr("_document"));
+                }
             },
             py::arg("target_epsg"), py::arg("kind") = "both");
 #endif  // ALPHASHAPE_USE_PROJ
 
 
-    // The per-document undo history. It is held on the Document Python object
-    // (see document_undo_stack) and is not otherwise part of the public API.
-    py::class_<alphashape::UndoStack, std::shared_ptr<alphashape::UndoStack>>(
-        m, "_UndoStack")
-        .def_property_readonly("can_undo", &alphashape::UndoStack::can_undo)
-        .def_property_readonly("can_redo", &alphashape::UndoStack::can_redo)
-        .def("undo", &alphashape::UndoStack::undo)
-        .def("redo", &alphashape::UndoStack::redo);
+    // The per-document undo history is an opaque capsule on the Document
+    // object (see document_undo_stack); Document.undo/redo/can_undo/can_redo
+    // are the only public surface, so a script cannot retain a stack whose
+    // owning Document it dropped.
 
     // -- Document ------------------------------------------------------------
     // dynamic_attr: the document's undo stack lives on the object (see
@@ -2991,6 +3181,14 @@ PYBIND11_MODULE(alphashape, m) {
                     }
                     target = alphashape::platform::path_to_utf8(as_path);
                 }
+                // Save As can move the document out of its cache directory.
+                // Pin the old one before set_path() so undo spill files that
+                // retained commands still reference are not deleted; the GUI
+                // does the same (apps/gui/app.cpp save_document_as).
+                std::shared_ptr<void> cache_pin;
+                if (target != d.path()) {
+                    cache_pin = d.pin_cache_directory();
+                }
                 // Record the path so a later run resolves relative frame paths
                 // against the project we just wrote, exactly like load() would.
                 d.set_path(target);
@@ -3017,6 +3215,9 @@ PYBIND11_MODULE(alphashape, m) {
                 if (py::hasattr(self, "_undo_stack")) {
                     document_undo_stack(self)->set_cache_dir(d.cache_dir());
                 }
+                if (cache_pin) {
+                    pin_document_history_cache(self, std::move(cache_pin));
+                }
             },
             py::arg("path") = py::none(), py::arg("chunks") = py::none(),
             py::arg("archive") = py::none(),
@@ -3029,9 +3230,10 @@ PYBIND11_MODULE(alphashape, m) {
             "path writes the single-file form, anything else the directory "
             "form); True forces a single-file .psz and False the directory "
             "form, rewriting the extension when it does not already match.")
-        .def("add_chunk", &document_add_chunk, py::arg("label") = "Chunk 1",
-             "Add a chunk and return it. The active chunk is unchanged.")
-        .def("addChunk", &document_add_chunk, py::arg("label") = "Chunk 1",
+        .def("add_chunk", &document_add_chunk, py::arg("label") = py::none(),
+             "Add a chunk and return it. The active chunk is unchanged. With no "
+             "label the chunk is named 'Chunk N' for the smallest unused N.")
+        .def("addChunk", &document_add_chunk, py::arg("label") = py::none(),
              "Add a chunk and return it (public scripting API spelling).")
         .def("chunk",
              [](py::object self, std::int32_t id) -> py::object {
@@ -3084,13 +3286,9 @@ PYBIND11_MODULE(alphashape, m) {
                             "remove expects chunk ids or Chunk objects");
                     }
                 };
-                if (py::isinstance<Chunk>(chunks) ||
-                    py::isinstance<py::int_>(chunks)) {
-                    collect(chunks);
-                } else {
-                    for (py::handle item : chunks) {
-                        collect(item);
-                    }
+                for (const py::object& item :
+                     chunk_argument_items(std::move(chunks))) {
+                    collect(item);
                 }
                 if (ids.empty()) {
                     return;
@@ -3160,8 +3358,8 @@ PYBIND11_MODULE(alphashape, m) {
                 }
             })
         .def("run_task",
-             [](Document& d, const std::string& name, py::kwargs kwargs) {
-                 run_task_kwargs(d, name, std::move(kwargs));
+             [](py::object self, const std::string& name, py::kwargs kwargs) {
+                 run_task_kwargs(std::move(self), name, std::move(kwargs));
              },
              py::arg("name"))
         .def(
@@ -3169,7 +3367,8 @@ PYBIND11_MODULE(alphashape, m) {
             [](py::object self, py::object chunks, const std::string& label) -> py::object {
                 Document& d = self.cast<Document&>();
                 std::vector<std::string> ids;
-                for (py::handle item : chunks) {
+                for (const py::object& item :
+                     chunk_argument_items(std::move(chunks))) {
                     if (py::isinstance<Chunk>(item)) {
                         ids.push_back(std::to_string(item.cast<Chunk*>()->id()));
                     } else if (py::isinstance<py::int_>(item)) {
@@ -3192,7 +3391,7 @@ PYBIND11_MODULE(alphashape, m) {
                     id_list.append(py::str(id));
                 }
                 kwargs[py::str("chunk_ids")] = id_list;
-                run_task_kwargs(d, "MergeChunks", kwargs);
+                run_task_kwargs(self, "MergeChunks", kwargs);
                 return attach_document(self, d.workspace().chunks().back());
             },
             py::arg("chunks"),
@@ -3201,7 +3400,7 @@ PYBIND11_MODULE(alphashape, m) {
             "chunk and return it. Refuses chunks with different non-local CRSs.")
         .def(
             "append_project",
-            [](Document& d, const std::string& path, py::object chunks,
+            [](py::object self, const std::string& path, py::object chunks,
                bool append_doc) {
                 std::vector<std::string> ids;
                 if (!chunks.is_none()) {
@@ -3222,7 +3421,7 @@ PYBIND11_MODULE(alphashape, m) {
                     id_list.append(py::str(id));
                 }
                 kwargs[py::str("chunk_ids")] = id_list;
-                run_task_kwargs(d, "AppendProject", kwargs);
+                run_task_kwargs(self, "AppendProject", kwargs);
             },
             py::arg("path"), py::arg("chunk_ids") = py::none(),
             py::arg("append_doc") = true,
@@ -3248,7 +3447,7 @@ PYBIND11_MODULE(alphashape, m) {
                 if (!label.empty()) {
                     kwargs[py::str("label")] = py::str(label);
                 }
-                run_task_kwargs(d, "DuplicateChunk", kwargs);
+                run_task_kwargs(self, "DuplicateChunk", kwargs);
                 return attach_document(self, d.workspace().chunks().back());
             },
             py::arg("chunk") = py::none(), py::arg("label") = "",
@@ -3256,7 +3455,7 @@ PYBIND11_MODULE(alphashape, m) {
             "Chunk, an id, or None for the active chunk. Returns the copy.")
         .def(
             "align_chunks",
-            [](Document& d, py::object reference, const std::string& method,
+            [](py::object self, py::object reference, const std::string& method,
                int min_common_markers, double accuracy_m) {
                 std::int32_t id = -1;
                 if (!reference.is_none()) {
@@ -3274,7 +3473,7 @@ PYBIND11_MODULE(alphashape, m) {
                 kwargs[py::str("method")] = py::str(method);
                 kwargs[py::str("min_common_markers")] = py::int_(min_common_markers);
                 kwargs[py::str("accuracy_m")] = py::float_(accuracy_m);
-                run_task_kwargs(d, "AlignChunks", kwargs);
+                run_task_kwargs(self, "AlignChunks", kwargs);
             },
             py::arg("reference") = py::none(),
             py::arg("method") = "markers", py::arg("min_common_markers") = 3,
@@ -3287,7 +3486,7 @@ PYBIND11_MODULE(alphashape, m) {
             "AlignChunks/<other id>/matrix.")
         .def(
             "run_script",
-            [](Document& d, const std::string& path, py::object args,
+            [](py::object self, const std::string& path, py::object args,
                int timeout_s) {
                 py::dict kwargs;
                 kwargs[py::str("path")] = py::str(path);
@@ -3299,7 +3498,7 @@ PYBIND11_MODULE(alphashape, m) {
                     kwargs[py::str("args")] = values;
                 }
                 kwargs[py::str("timeout_s")] = py::int_(timeout_s);
-                run_task_kwargs(d, "RunScript", kwargs);
+                run_task_kwargs(self, "RunScript", kwargs);
             },
             py::arg("path"), py::arg("args") = py::none(),
             py::arg("timeout_s") = 600,

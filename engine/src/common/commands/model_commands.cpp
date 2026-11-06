@@ -1849,6 +1849,9 @@ protected:
             throw ValueError("no marker with id " + std::to_string(marker_id_));
         }
         marker->position = position_;
+        // A placed marker is a valid measurement. The container snapshot in
+        // ChunkContainersCommand restores the previous flag on undo.
+        marker->valid = true;
         if (!position_.has_value()) {
             // A cleared estimate has no covariance: the old one described a
             // position that no longer exists.
@@ -2358,8 +2361,19 @@ protected:
     }
 
     void commit(Document& document) override {
+        // Snapshot the source's chunks on the first apply. Appending a
+        // document to itself would otherwise push_back into the very vector
+        // being iterated, and a redo must replay the original chunks even if
+        // the source was edited in between.
+        if (!snapshot_taken_) {
+            snapshot_.reserve(source_->workspace().chunks().size());
+            for (const auto& chunk : source_->workspace().chunks()) {
+                snapshot_.push_back(std::make_shared<Chunk>(*chunk));
+            }
+            snapshot_taken_ = true;
+        }
         Workspace& workspace = document.workspace();
-        for (const auto& chunk : source_->workspace().chunks()) {
+        for (const auto& chunk : snapshot_) {
             auto copy = std::make_shared<Chunk>(*chunk);
             copy->set_id(workspace.next_chunk_id());
             workspace.chunks().push_back(std::move(copy));
@@ -2388,6 +2402,8 @@ private:
 
     std::shared_ptr<Document> source_;
     std::string source_path_;
+    std::vector<std::shared_ptr<Chunk>> snapshot_;
+    bool snapshot_taken_ = false;
     std::size_t previous_chunks_ = 0;
     std::size_t appended_count_ = 0;
     std::int32_t previous_next_id_ = 0;
