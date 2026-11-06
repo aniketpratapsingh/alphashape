@@ -91,6 +91,17 @@ DetectMarkersDialog::DetectMarkersDialog(const TaskRegistry& registry,
         connect(inverted, &QCheckBox::toggled, this,
                 [this](bool) { refresh_preview(); });
     }
+    // The base Reset action loads values with the editor signals blocked.
+    if (auto* reset = findChild<QPushButton*>(QStringLiteral("task.reset"))) {
+        connect(reset, &QPushButton::clicked, this,
+                [this]() { refresh_preview(); });
+    }
+    refresh_preview();
+}
+
+void DetectMarkersDialog::set_value(const std::string& param,
+                                    const ParamValue& value) {
+    TaskDialog::set_value(param, value);
     refresh_preview();
 }
 

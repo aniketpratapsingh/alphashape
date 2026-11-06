@@ -147,8 +147,12 @@ TEST_F(MarkerToolsTest, PrintMarkersDialogPageCountUpdates) {
     EXPECT_EQ(dialog.page_count(), 1);
     EXPECT_EQ(dialog.page_count_label()->text(), QStringLiteral("1 page"));
 
-    // A hundred Circular12 targets take three A4 pages (35 cells each); the
-    // family has 122 codes, so the range stays legal and this exercises pages.
+    // Circular20 has thousands of codes, so a hundred targets stay legal and
+    // take three A4 pages (35 cells each).
+    const int circular20 =
+        dialog.target_editor()->findData(static_cast<int>(SheetTarget::Circular20));
+    ASSERT_GE(circular20, 0);
+    dialog.target_editor()->setCurrentIndex(circular20);
     dialog.count_editor()->setValue(100);
     EXPECT_EQ(dialog.page_count(), 3);
     EXPECT_EQ(dialog.page_count_label()->text(), QStringLiteral("3 pages"));

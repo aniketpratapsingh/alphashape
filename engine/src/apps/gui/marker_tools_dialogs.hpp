@@ -43,6 +43,9 @@ public:
     /// The image last drawn into the preview; null while a placeholder shows.
     const QImage& preview_image() const { return preview_image_; }
 
+    /// TaskDialog::set_value blocks the editor signals, so redraw explicitly.
+    void set_value(const std::string& param, const ParamValue& value);
+
 private:
     void refresh_preview();
 
