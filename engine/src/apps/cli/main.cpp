@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -44,7 +45,9 @@ constexpr const char* kUsage =
     "  alphashape-cli --proj-info\n"
     "  alphashape-cli --list-params <Task>\n"
     "  alphashape-cli --project <file.psx> --task <Task> [--set key=value ...]\n"
+    "      [--save-layout dir|psz] [--chunks <id,id,...>]\n"
     "  alphashape-cli --new <file.psx> --add-images <img> [<img> ...]\n"
+    "      [--save-layout dir|psz] [--chunks <id,id,...>]\n"
     "  alphashape-cli --make-sheet <type> --out <file.pdf|file.png>\n"
     "      [--paper A4|Letter] [--size-mm 25] [--first-code N] [--count N]\n"
     "      [--dpi 300] [--cols 9 --rows 6 --square-mm 25]\n"
@@ -114,6 +117,10 @@ struct Options {
     std::string new_project;
     std::vector<std::string> set_values;
     std::vector<std::string> images;
+    /// "dir" (default) keeps the .psx + .files layout; "psz" writes one file.
+    std::string save_layout = "dir";
+    /// Save only these chunk ids; empty means every chunk.
+    std::vector<std::int32_t> chunk_ids;
     bool has_make_sheet = false;
     std::string make_sheet;
     bool has_out = false;
@@ -138,6 +145,38 @@ int parse_int(const std::string& text) {
     } catch (const std::exception&) {
     }
     throw UsageError{};
+}
+
+std::vector<std::int32_t> parse_chunk_ids(const std::string& text) {
+    std::vector<std::int32_t> ids;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t comma = text.find(',', start);
+        const std::string part =
+            text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (part.empty()) {
+            throw UsageError{};
+        }
+        ids.push_back(static_cast<std::int32_t>(parse_int(part)));
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return ids;
+}
+
+/// The path a save writes for the requested layout. ".psz" always produces a
+/// .psz file; a directory save of a .psz input writes the sibling .psx, so the
+/// extension always matches what is on disk.
+std::string save_path_for(const std::string& project, const std::string& layout) {
+    std::filesystem::path path = alphashape::platform::path_from_utf8(project);
+    if (layout == "psz") {
+        path.replace_extension(".psz");
+    } else if (path.extension() == ".psz") {
+        path.replace_extension(".psx");
+    }
+    return alphashape::platform::path_to_utf8(path);
 }
 
 double parse_double(const std::string& text) {
@@ -184,6 +223,13 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--new") {
             opts.has_new = true;
             opts.new_project = take_value();
+        } else if (arg == "--save-layout") {
+            opts.save_layout = take_value();
+            if (opts.save_layout != "dir" && opts.save_layout != "psz") {
+                throw UsageError{};
+            }
+        } else if (arg == "--chunks") {
+            opts.chunk_ids = parse_chunk_ids(take_value());
         } else if (arg == "--make-sheet") {
             opts.has_make_sheet = true;
             opts.make_sheet = take_value();
@@ -279,7 +325,9 @@ int run_list_params(const std::string& task_name) {
 }
 
 int run_project(const std::string& project, const std::string& task_name,
-                const std::vector<std::string>& set_values) {
+                const std::vector<std::string>& set_values,
+                const std::string& save_layout,
+                const std::vector<std::int32_t>& chunk_ids) {
     alphashape::TaskRegistry& registry = alphashape::builtin_registry();
     const alphashape::TaskEntry& entry = registry.require(task_name);  // throws if unknown
 
@@ -308,11 +356,13 @@ int run_project(const std::string& project, const std::string& task_name,
         std::fprintf(stderr, "\n");
     }
 
-    alphashape::ProjectIO::save(*document, project);
+    document->save(save_path_for(project, save_layout), chunk_ids);
     return 0;
 }
 
-int run_new(const std::string& project, const std::vector<std::string>& images) {
+int run_new(const std::string& project, const std::vector<std::string>& images,
+            const std::string& save_layout,
+            const std::vector<std::int32_t>& chunk_ids) {
     alphashape::Document document;
     document.set_path(project);
     alphashape::Workspace& workspace = document.workspace();
@@ -336,7 +386,7 @@ int run_new(const std::string& project, const std::vector<std::string>& images) 
         std::fprintf(stderr, "\n");
     }
 
-    alphashape::ProjectIO::save(document, project);
+    document.save(save_path_for(project, save_layout), chunk_ids);
     return 0;
 }
 
@@ -418,9 +468,14 @@ int dispatch(const Options& opts) {
     if (opts.gpu_info) return run_gpu_info();
     if (opts.proj_info) return run_proj_info();
     if (opts.has_list_params) return run_list_params(opts.list_params);
-    if (opts.has_new) return run_new(opts.new_project, opts.images);
+    if (opts.has_new) {
+        return run_new(opts.new_project, opts.images, opts.save_layout, opts.chunk_ids);
+    }
     if (opts.has_make_sheet) return run_make_sheet(opts);
-    if (opts.has_project) return run_project(opts.project, opts.task, opts.set_values);
+    if (opts.has_project) {
+        return run_project(opts.project, opts.task, opts.set_values, opts.save_layout,
+                           opts.chunk_ids);
+    }
     throw UsageError{};  // no mode selected
 }
 
