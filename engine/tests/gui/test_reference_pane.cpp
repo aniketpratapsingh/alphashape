@@ -25,7 +25,7 @@
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "harness.hpp"
-#include "../../perf_gate.hpp"
+#include "../perf_gate.hpp"
 
 using namespace alphashape;
 using namespace alphashape::gui;
