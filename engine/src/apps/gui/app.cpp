@@ -1,5 +1,6 @@
 #include "apps/gui/app.hpp"
 
+#include <filesystem>
 #include <iostream>
 #include <memory>
 
@@ -12,6 +13,7 @@
 #include <QSettings>
 #include <QtGlobal>
 
+#include "base/platform/env.hpp"
 #include "base/utils/error.hpp"
 #include "common/io/project_io.hpp"
 
@@ -36,6 +38,22 @@ std::unique_ptr<QSettings> make_settings() {
     }
     return std::make_unique<QSettings>(QStringLiteral("alphashape"),
                                        QStringLiteral("alphashape"));
+}
+
+/// One normal form for "the same project": absolute, "." and ".." resolved.
+/// Used to recognise our own lock (Save As to the open path, re-opening it)
+/// without depending on how the path was spelled.
+std::string canonical_project_path(const std::string& path) {
+    if (path.empty()) {
+        return path;
+    }
+    std::error_code ec;
+    std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(platform::path_from_utf8(path), ec);
+    if (ec) {
+        canonical = platform::path_from_utf8(path);
+    }
+    return platform::path_to_utf8(canonical.lexically_normal());
 }
 }  // namespace
 
@@ -108,6 +126,8 @@ void GuiApp::require_idle(const char* what) const {
 
 void GuiApp::task_changed_document() {
     undo_stack_.clear();
+    // No history survives, so no spill file in a pinned cache can be needed.
+    pinned_caches_.clear();
     force_dirty_ = true;
     clean_position_ = undo_stack_.position();
     Q_EMIT undo_changed();
@@ -121,9 +141,13 @@ void GuiApp::set_theme(ThemeMode mode) {
 
 void GuiApp::new_document(const std::string& path) {
     require_idle("replace the project");
+    project_lock_.release();
     undo_stack_.clear();
+    pinned_caches_.clear();
+    opened_read_only_ = false;
     document_ = path.empty() ? std::make_shared<Document>() : std::make_shared<Document>(path);
     undo_stack_.bind(document_.get());
+    undo_stack_.set_cache_dir(document_->cache_dir());
     reset_dirty_tracking();
     Q_EMIT document_replaced();
     Q_EMIT undo_changed();
@@ -132,10 +156,35 @@ void GuiApp::new_document(const std::string& path) {
 
 void GuiApp::open_document(const std::string& path) {
     require_idle("open a project");
+    // Re-opening the project already on screen would see our own live lock as a
+    // second writer, so drop it first. Any other path keeps its lock until the
+    // new one is secured. The comparison is canonical so a different spelling
+    // of the same file still counts as a reopen.
+    if (document_ != nullptr && !document_->path().empty() &&
+        canonical_project_path(document_->path()) == canonical_project_path(path)) {
+        project_lock_.release();
+    }
+    // The GUI edits the project it opens, so take the writer lock. A container
+    // that cannot be locked for permission / read-only-filesystem reasons is
+    // still opened, without a lock and with a warning: only a live record is
+    // "locked by another writer".
+    ProjectLock acquired;
+    bool read_only = false;
+    try {
+        acquired = ProjectLock::acquire(path);
+    } catch (const ProjectReadOnlyError& error) {
+        read_only = true;
+        Log::write(LogLevel::Warn, "opening '" + path + "' read-only: " + error.what());
+    }
+    // A failed load releases the lock with the temporary (WP-11.9).
     std::shared_ptr<Document> loaded = ProjectIO::load(path);
+    project_lock_ = std::move(acquired);
+    opened_read_only_ = read_only;
     undo_stack_.clear();
+    pinned_caches_.clear();
     document_ = std::move(loaded);
     undo_stack_.bind(document_.get());
+    undo_stack_.set_cache_dir(document_->cache_dir());
     reset_dirty_tracking();
     add_recent_file(QString::fromStdString(path));
     Q_EMIT document_replaced();
@@ -157,8 +206,25 @@ void GuiApp::save_document() {
 
 void GuiApp::save_document_as(const std::string& path) {
     require_idle("save the project");
+    const std::string current = read_document([](const Document& d) { return d.path(); });
+    if (!current.empty() &&
+        canonical_project_path(current) == canonical_project_path(path)) {
+        save_document();
+        return;
+    }
+    // Secure the destination before writing: a live writer must reject Save As
+    // rather than have its file overwritten. The lock is released again if the
+    // save throws, because `acquired` is a temporary until the swap below.
+    ProjectLock acquired = ProjectLock::acquire(path);
     ProjectIO::save(*document_, path);
+    // Undo entries may hold spill files in the old project cache; keep that
+    // directory alive until the history is cleared, then point new spills at
+    // the new project's cache.
+    pinned_caches_.push_back(document_->pin_cache_directory());
     document_->set_path(path);
+    undo_stack_.set_cache_dir(document_->cache_dir());
+    project_lock_ = std::move(acquired);
+    opened_read_only_ = false;
     reset_dirty_tracking();
     add_recent_file(QString::fromStdString(path));
     Q_EMIT path_changed();

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "common/core/document.hpp"
+
 namespace alphashape {
 
 namespace {
@@ -13,7 +15,17 @@ constexpr const char* kTruncatedSuffix = " (older steps dropped)";
 
 }  // namespace
 
-UndoStack::UndoStack(Document* document) : document_(document) {}
+UndoStack::UndoStack(Document* document) : document_(document) {
+    bind(document);
+}
+
+void UndoStack::bind(Document* document) {
+    document_ = document;
+    // An explicit set_cache_dir() always wins; otherwise follow the document.
+    if (cache_dir_.empty() && document_ != nullptr) {
+        cache_dir_ = document_->cache_dir();
+    }
+}
 
 UndoStack::~UndoStack() { close_all_macros(); }
 

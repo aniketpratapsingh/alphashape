@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "base/utils/error.hpp"
 #include "common/core/frame.hpp"
@@ -95,13 +96,19 @@ double percentile_value(const std::vector<double>& sorted, double q) {
 }  // namespace
 
 void Meta::set(std::string key, std::string value) {
-    for (auto& item : items) {
-        if (item.first == key) {
-            item.second = std::move(value);
-            return;
-        }
+    // Canonical order: sorted by key. doc.xml stores meta keys sorted (§4.9),
+    // so keeping the model in the same order makes a load/save round trip
+    // compare equal and removes any dependence on insertion order.
+    const auto position = std::lower_bound(
+        items.begin(), items.end(), key,
+        [](const std::pair<std::string, std::string>& item, const std::string& wanted) {
+            return item.first < wanted;
+        });
+    if (position != items.end() && position->first == key) {
+        position->second = std::move(value);
+        return;
     }
-    items.emplace_back(std::move(key), std::move(value));
+    items.insert(position, std::make_pair(std::move(key), std::move(value)));
 }
 
 const std::string* Meta::find(const std::string& key) const {

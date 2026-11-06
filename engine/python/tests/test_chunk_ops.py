@@ -111,5 +111,41 @@ class TestAppendProjectAndSubsetSave(unittest.TestCase):
             self.assertEqual(len(dest.chunk_ids), 1)
 
 
+class TestProjectLayout(unittest.TestCase):
+    """WP-11.9: save(archive=...) and Document.cache_dir."""
+
+    def test_archive_true_forces_psz(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = alphashape.Document()
+            doc.add_chunk("Chunk 1")
+            doc.save(os.path.join(tmp, "project.psx"), archive=True)
+            psz = os.path.join(tmp, "project.psz")
+            self.assertTrue(os.path.exists(psz))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "project.psx")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "project.files")))
+            loaded = alphashape.load_project(psz)
+            self.assertEqual(len(loaded.chunk_ids), 1)
+
+    def test_archive_none_infers_from_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = alphashape.Document()
+            doc.add_chunk("Chunk 1")
+            psz = os.path.join(tmp, "project.psz")
+            doc.save(psz)
+            self.assertTrue(os.path.exists(psz))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "project.files")))
+
+    def test_cache_dir(self):
+        doc = alphashape.Document()
+        self.assertEqual(doc.cache_dir, "")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "project.psx")
+            doc.add_chunk("Chunk 1")
+            doc.save(path)
+            self.assertEqual(
+                doc.cache_dir, os.path.join(tmp, "project.files", "cache")
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

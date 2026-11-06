@@ -46,4 +46,12 @@ public:
     explicit ProjectIOError(const std::string& what) : Error(what) {}
 };
 
+/// The project container cannot be made writable: its lock directory or the
+/// lock file could not be created because of permissions or a read-only
+/// filesystem. Distinct from a live writer holding the lock.
+class ProjectReadOnlyError : public ProjectIOError {
+public:
+    explicit ProjectReadOnlyError(const std::string& what) : ProjectIOError(what) {}
+};
+
 }  // namespace alphashape

@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -253,5 +255,117 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv) {
 }
 
 #endif
+
+bool process_is_alive(long long pid) {
+    if (pid <= 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    const DWORD id = static_cast<DWORD>(pid);
+    HANDLE handle = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id);
+    if (handle == nullptr) {
+        // Access denied means the process exists but belongs to another user;
+        // ERROR_INVALID_PARAMETER means no such process.
+        return ::GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    DWORD exit_code = 0;
+    const BOOL ok = ::GetExitCodeProcess(handle, &exit_code);
+    ::CloseHandle(handle);
+    return ok != 0 && exit_code == STILL_ACTIVE;
+#else
+    // A pid outside pid_t would wrap (possibly negative, which names a process
+    // group), so it cannot be a live process.
+    if (pid > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
+        return false;
+    }
+    // Signal 0 performs the permission and existence checks without sending
+    // anything. EPERM means the process exists but belongs to another user.
+    const int rc = ::kill(static_cast<pid_t>(pid), 0);
+    return rc == 0 || errno == EPERM;
+#endif
+}
+
+bool create_file_exclusive(const std::string& path, const std::string& text,
+                           std::string* error) {
+#if defined(_WIN32)
+    const std::wstring wide = from_utf8(path);
+    if (wide.empty()) {
+        *error = "path is not valid UTF-8";
+        return false;
+    }
+    HANDLE handle = ::CreateFileW(wide.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        *error = "CreateFile failed (error " +
+                 std::to_string(static_cast<unsigned long>(code)) + ")";
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const std::size_t left = text.size() - written;
+        const DWORD chunk =
+            static_cast<DWORD>(left > 0x7fffffffU ? 0x7fffffffU : left);
+        DWORD put = 0;
+        const BOOL ok = ::WriteFile(handle, text.data() + written, chunk, &put, nullptr);
+        if (ok == 0 || put == 0) {
+            ::CloseHandle(handle);
+            (void)::DeleteFileW(wide.c_str());
+            *error = "short write";
+            return false;
+        }
+        written += static_cast<std::size_t>(put);
+    }
+    ::CloseHandle(handle);
+    return true;
+#else
+    const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        *error = std::strerror(errno);
+        return false;
+    }
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t put =
+            ::write(fd, text.data() + written, text.size() - written);
+        if (put < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            *error = std::strerror(errno);
+            ::close(fd);
+            (void)::unlink(path.c_str());
+            return false;
+        }
+        if (put == 0) {
+            *error = "short write";
+            ::close(fd);
+            (void)::unlink(path.c_str());
+            return false;
+        }
+        written += static_cast<std::size_t>(put);
+    }
+    ::close(fd);
+    return true;
+#endif
+}
+
+std::string hostname() {
+#if defined(_WIN32)
+    wchar_t buffer[256];
+    DWORD size = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+    if (::GetComputerNameW(buffer, &size) == 0) {
+        return std::string();
+    }
+    return to_utf8(std::wstring(buffer, size));
+#else
+    char buffer[256];
+    if (::gethostname(buffer, sizeof(buffer)) != 0) {
+        return std::string();
+    }
+    buffer[sizeof(buffer) - 1] = '\0';
+    return std::string(buffer);
+#endif
+}
 
 }  // namespace alphashape::platform

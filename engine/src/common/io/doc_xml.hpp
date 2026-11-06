@@ -61,6 +61,22 @@ struct ReadReport {
     std::vector<std::string> warnings;
 };
 
+/// Where a project container lives, for the reader/writer that needs it.
+///
+/// `project_dir` is the directory holding the project file; frame paths are
+/// stored relative to it and resolved against it (see common/io/paths.hpp). An
+/// empty project_dir leaves paths exactly as the model holds them, which is
+/// what an in-memory archive (tests, imports) expects.
+///
+/// `scratch_dir` is used by the file-based codecs (the GeoTIFF sidecars) before
+/// falling back to the platform temporary directory.
+struct IoContext {
+    std::string project_dir;
+    std::string scratch_dir;
+    /// Store frame paths as absolute even when a relative form is possible.
+    bool absolute_paths = false;
+};
+
 /// Write doc.xml and every binary sidecar into `archive`.
 ///
 /// Only the current format (Document::kFormatVersion, v4) can be written; a
@@ -68,14 +84,17 @@ struct ReadReport {
 /// Throws ProjectIOError for content the format cannot represent, rather than
 /// silently dropping it.
 void write_document(const Document& document, ZipArchive& archive,
-                    int version = Document::kFormatVersion);
+                    int version = Document::kFormatVersion,
+                    const IoContext& context = IoContext{});
 
 /// Rebuild a Document from an archive written by write_document.
 ///
 /// When `report` is non-null it receives the format version that was read and
-/// any non-fatal warnings. Throws ProjectIOError on malformed or unsupported
-/// input.
+/// any non-fatal warnings. When `context.project_dir` is set, relative frame
+/// paths are resolved against it and a missing photo is a warning, not an
+/// error. Throws ProjectIOError on malformed or unsupported input.
 std::shared_ptr<Document> read_document(const ZipArchive& archive,
-                                        ReadReport* report = nullptr);
+                                        ReadReport* report = nullptr,
+                                        const IoContext& context = IoContext{});
 
 }  // namespace alphashape

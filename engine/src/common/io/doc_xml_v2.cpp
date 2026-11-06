@@ -30,6 +30,7 @@
 #include "common/io/doc_xml.hpp"
 #include "common/core/frame.hpp"
 #include "common/io/doc_xml_common.hpp"
+#include "common/io/paths.hpp"
 #include "common/io/sidecars.hpp"
 #include "image/io/codec.hpp"
 #include "image/io/image_io.hpp"
@@ -508,14 +509,27 @@ void write_camera_groups(const Chunk& chunk, XmlNode& node) {
     }
 }
 
-void write_frames(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
+void write_frames(const Chunk& chunk, XmlNode& node, ZipArchive& archive,
+                  const IoContext& context) {
     if (chunk.frames().empty()) {
         return;
     }
-    archive.add(frames_entry(chunk), sidecar::encode_frames(chunk.frames()));
+    // The element text and frames.bin must agree, so both take the stored form:
+    // relative to the project when that is possible (WP-11.9).
+    std::vector<std::shared_ptr<Frame>> stored;
+    stored.reserve(chunk.frames().size());
+    for (const auto& f : chunk.frames()) {
+        auto copy = std::make_shared<Frame>(f->path(), f->width(), f->height());
+        copy->set_id(f->id());
+        copy->set_camera_id(f->camera_id());
+        copy->set_path(
+            path_for_storage(f->path(), context.project_dir, context.absolute_paths));
+        stored.push_back(std::move(copy));
+    }
+    archive.add(frames_entry(chunk), sidecar::encode_frames(stored));
     XmlNode& frames = add_child(node, "frames");
     set_attr(frames, "path", frames_entry(chunk));
-    for (const auto& f : chunk.frames()) {
+    for (const auto& f : stored) {
         XmlNode& e = add_child(frames, "frame");
         set_attr(e, "id", std::to_string(f->id()));
         set_attr(e, "path", f->path());
@@ -732,7 +746,8 @@ void write_models(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
     }
 }
 
-void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
+void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive,
+                      const IoContext& context) {
     if (chunk.elevations().empty()) {
         return;
     }
@@ -748,7 +763,7 @@ void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
         }
         const Elevation& elevation = *asset.data;
         const std::string entry = elevation_entry(chunk, asset.id);
-        archive.add(entry, sidecar::encode_elevation(elevation));
+        archive.add(entry, sidecar::encode_elevation(elevation, context.scratch_dir));
         const RasterGrid& g = elevation.raster.grid;
         set_attr(e, "path", entry);
         set_attr(e, "width", std::to_string(g.width));
@@ -768,7 +783,8 @@ void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
     }
 }
 
-void write_orthomosaics(const Chunk& chunk, XmlNode& node, ZipArchive& archive) {
+void write_orthomosaics(const Chunk& chunk, XmlNode& node, ZipArchive& archive,
+                        const IoContext& context) {
     if (chunk.orthomosaics().empty()) {
         return;
     }
@@ -785,7 +801,7 @@ void write_orthomosaics(const Chunk& chunk, XmlNode& node, ZipArchive& archive) 
         const Orthomosaic& ortho = *asset.data;
         const std::string entry = ortho_entry(chunk, asset.id);
         const std::string labels = ortho_labels_entry(chunk, asset.id);
-        archive.add(entry, sidecar::encode_orthomosaic(ortho));
+        archive.add(entry, sidecar::encode_orthomosaic(ortho, context.scratch_dir));
         archive.add(labels, sidecar::encode_ortho_labels(ortho));
         const RasterGrid& g = ortho.raster.grid;
         set_attr(e, "path", entry);
@@ -1004,7 +1020,8 @@ void read_reference_settings(const XmlNode& node, Chunk& chunk, ReadReport* repo
 /// The containers every chunk carries, in the fixed order the writer emits
 /// them. The reader dispatches over the same set; anything else inside <chunk>
 /// is a hard error (v2 is strict about elements, §4.4).
-void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
+void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive,
+                 const IoContext& context) {
     // Enforce every container invariant before a single byte is emitted, so a
     // file the reader would reject can never reach the archive.
     sidecar::validate_tie_points(chunk);
@@ -1024,7 +1041,7 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
     write_sensors(chunk, node);
     write_cameras(chunk, node);
     write_camera_groups(chunk, node);
-    write_frames(chunk, node, archive);
+    write_frames(chunk, node, archive, context);
     write_markers(chunk, node);
     write_scalebars(chunk, node);
     write_tie_points(chunk, node, archive);
@@ -1033,8 +1050,8 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
     write_point_clouds(chunk, node, archive);
     write_models(chunk, node, archive);
     write_tiled_models(chunk, node, archive);
-    write_elevations(chunk, node, archive);
-    write_orthomosaics(chunk, node, archive);
+    write_elevations(chunk, node, archive, context);
+    write_orthomosaics(chunk, node, archive, context);
     write_trajectories(chunk, node, archive);
     write_shapes(chunk, node, archive);
     write_panorama(chunk, node, archive);
@@ -1051,7 +1068,7 @@ void write_chunk(const Chunk& chunk, XmlNode& parent, ZipArchive& archive) {
 
 }  // namespace docxml_detail
 
-void write_v2(const Document& document, ZipArchive& archive) {
+void write_v2(const Document& document, ZipArchive& archive, const IoContext& context) {
     if (document.workspaces().size() != 1) {
         throw ProjectIOError("project format v2 stores exactly one workspace");
     }
@@ -1069,7 +1086,7 @@ void write_v2(const Document& document, ZipArchive& archive) {
 
     XmlNode& chunks = add_child(root, "chunks");
     for (const auto& chunk : workspace.chunks()) {
-        docxml_detail::write_chunk(*chunk, chunks, archive);
+        docxml_detail::write_chunk(*chunk, chunks, archive, context);
     }
 
     std::string xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
@@ -1682,7 +1699,7 @@ void read_models(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
 
 
 void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
-                     ReadReport* report) {
+                     ReadReport* report, const IoContext& context) {
     const XmlNode* container = find_child(node, "elevations");
     if (container == nullptr) {
         return;
@@ -1696,7 +1713,8 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
         ElevationAsset slot;
         read_slot_identity(e, slot);
         if (const std::string* path = find_attr(e, "path")) {
-            Elevation dem = sidecar::decode_elevation(require_entry(archive, *path));
+            Elevation dem =
+                sidecar::decode_elevation(require_entry(archive, *path), context.scratch_dir);
             dem.source = attr_or(e, "source_data", std::string());
             const RasterGrid& g = dem.raster.grid;
             if (g.width != parse_int(require_attr(e, "width")) ||
@@ -1734,7 +1752,7 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
 }
 
 void read_orthomosaics(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
-                       ReadReport* report) {
+                       ReadReport* report, const IoContext& context) {
     const XmlNode* container = find_child(node, "orthomosaics");
     if (container == nullptr) {
         return;
@@ -1748,7 +1766,8 @@ void read_orthomosaics(const XmlNode& node, Chunk& chunk, const ZipArchive& arch
         OrthomosaicAsset slot;
         read_slot_identity(e, slot);
         if (const std::string* path = find_attr(e, "path")) {
-            Orthomosaic mosaic = sidecar::decode_orthomosaic(require_entry(archive, *path));
+            Orthomosaic mosaic = sidecar::decode_orthomosaic(require_entry(archive, *path),
+                                                             context.scratch_dir);
             mosaic.surface = attr_or(e, "blendingMode", std::string());
             const RasterGrid& g = mosaic.raster.grid;
             if (g.width != parse_int(require_attr(e, "width")) ||
@@ -1932,7 +1951,7 @@ void check_chunk_vocabulary(const XmlNode& node) {
 }
 
 void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& archive,
-                ReadReport* report) {
+                ReadReport* report, const IoContext& context) {
     check_chunk_vocabulary(node);
     warn_unknown_attrs(node, {"id", "label", "next_id"}, report);
     Chunk& chunk = workspace.restore_chunk(parse_i32(require_attr(node, "id")),
@@ -1966,8 +1985,8 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
     docxml_detail::read_point_clouds(node, chunk, archive, report);
     docxml_detail::read_models(node, chunk, archive, report);
     docxml_detail::read_tiled_models(node, chunk, archive, report);
-    docxml_detail::read_elevations(node, chunk, archive, report);
-    docxml_detail::read_orthomosaics(node, chunk, archive, report);
+    docxml_detail::read_elevations(node, chunk, archive, report, context);
+    docxml_detail::read_orthomosaics(node, chunk, archive, report, context);
     docxml_detail::read_trajectories(node, chunk, archive, report);
     docxml_detail::read_shapes(node, chunk, archive, report);
     docxml_detail::read_panorama(node, chunk, archive, report);
@@ -2033,7 +2052,7 @@ void read_chunk(const XmlNode& node, Workspace& workspace, const ZipArchive& arc
 }  // namespace docxml_detail
 
 std::shared_ptr<Document> read_v2(const XmlNode& root, const ZipArchive& archive,
-                                  ReadReport* report) {
+                                  ReadReport* report, const IoContext& context) {
     auto document = std::make_shared<Document>();
     Workspace& workspace = document->workspace();
     warn_unknown_children(root, {"global_crs", "meta", "chunks"}, report);
@@ -2043,7 +2062,7 @@ std::shared_ptr<Document> read_v2(const XmlNode& root, const ZipArchive& archive
     if (const XmlNode* chunks = find_child(root, "chunks")) {
         for (const XmlNode& node : chunks->children) {
             if (node.name == "chunk") {
-                docxml_detail::read_chunk(node, workspace, archive, report);
+                docxml_detail::read_chunk(node, workspace, archive, report, context);
             }
         }
     }
