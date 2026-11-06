@@ -165,7 +165,7 @@ TEST(Estimates, HistoryFileRoundTrip) {
     ASSERT_TRUE(directory.isValid());
     const std::string project = directory.filePath("scene.psx").toStdString();
     const std::string path = history_path_for_project(project);
-    ASSERT_EQ(path, project + ".files/job_history.tsv");
+    ASSERT_EQ(path, directory.filePath("scene").toStdString() + ".files/job_history.tsv");
 
     std::filesystem::create_directories(std::filesystem::path(path).parent_path());
     {

@@ -89,7 +89,11 @@ std::string history_path_for_project(const std::string& project_path) {
     if (project_path.empty()) {
         return {};
     }
-    return project_path + ".files/job_history.tsv";
+    // ProjectIO stores the side-car folder beside the manifest with the final
+    // extension removed: dir/name.psx -> dir/name.files.
+    std::filesystem::path base(project_path);
+    base.replace_extension();
+    return base.string() + ".files/job_history.tsv";
 }
 
 FileThroughputStore::FileThroughputStore(std::string path) : path_(std::move(path)) {}
@@ -255,8 +259,9 @@ Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
                        const Params& params, const Chunk& chunk,
                        const ThroughputHistory& history) {
     Estimate out;
+    const bool known = registry.find(task) != nullptr;
     const estimates::ColdTask kind =
-        registry.find(task) != nullptr ? estimates::cold_task(task) : estimates::ColdTask::Generic;
+        known ? estimates::cold_task(task) : estimates::ColdTask::Generic;
     const WorkItem work = work_for(params, chunk);
     const estimates::ColdEstimate cold = estimates::cold_estimate(kind, work);
 
@@ -268,7 +273,7 @@ Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
     out.basis = kind == estimates::ColdTask::Generic ? "cold model (generic)" : "cold model";
 
     const std::vector<ThroughputRow>* rows = history.rows(task);
-    if (rows != nullptr && rows->size() >= 3) {
+    if (known && rows != nullptr && rows->size() >= 3) {
         std::vector<double> rates;
         rates.reserve(rows->size());
         for (const ThroughputRow& row : *rows) {

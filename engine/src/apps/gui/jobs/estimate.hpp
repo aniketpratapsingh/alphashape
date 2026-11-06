@@ -76,7 +76,9 @@ public:
     virtual bool append(const ThroughputRow& row) = 0;
 };
 
-/// `<project>.files/job_history.tsv` for a project path (empty for no path).
+/// `<base>.files/job_history.tsv` for a project path, where `base` is the path
+/// with its final extension removed (the ProjectIO side-car folder). Empty for
+/// no path.
 std::string history_path_for_project(const std::string& project_path);
 
 /// Atomic TSV implementation: load parses skip-malformed lines, append rewrites
