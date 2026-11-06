@@ -4,9 +4,12 @@
 // without a shell. Used by tests (the Platform suite's child that prints and
 // exits 3) and by the video path, which shells out to ffmpeg.
 //
-// POSIX: fork + execvp in the child with a pipe; Windows: CreateProcessW over
-// a redirected pipe. Both read until EOF, so a child that writes more than the
-// pipe buffer does not deadlock.
+// POSIX: posix_spawn with a pipe and file actions that give the child only
+// descriptors 0/1/2 (stdin on /dev/null, stdout and stderr on the pipe) and a
+// process group of its own. Windows: CreateProcessW with an explicit
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST, so no unrelated inheritable handle reaches
+// the child even when two calls overlap. Both read until EOF, so a child that
+// writes more than the pipe buffer does not deadlock.
 
 #include <string>
 #include <utility>

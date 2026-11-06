@@ -1,3 +1,9 @@
+// posix_spawn_file_actions_addclosefrom_np and pipe2 are GNU extensions; the
+// macro must precede every system header.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "base/platform/process.hpp"
 
 #include <algorithm>
@@ -7,6 +13,7 @@
 #include <cstring>
 #include <cwchar>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -18,11 +25,17 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char** environ;
+
+#if defined(__APPLE__) && !defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+// <spawn.h> hides the flag below __DARWIN_C_FULL; the value is stable in Darwin.
+#define POSIX_SPAWN_CLOEXEC_DEFAULT 0x4000
+#endif
 #endif
 
 #include "base/platform/env.hpp"
@@ -117,6 +130,36 @@ std::vector<std::string> build_environment(
     return entries;
 }
 
+/// Serialises pipe creation and spawn on platforms whose pipe() has no
+/// atomic close-on-exec flag: between pipe() and fcntl() another spawn could
+/// otherwise inherit the descriptors.
+std::mutex& spawn_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+/// Creates the capture pipe with close-on-exec on both ends, so neither end
+/// leaks into an unrelated concurrently spawned child.
+bool create_capture_pipe(int fds[2], std::string* error) {
+#if defined(__linux__)
+    if (::pipe2(fds, O_CLOEXEC) != 0) {
+        *error = std::string("pipe failed: ") + std::strerror(errno);
+        return false;
+    }
+#else
+    if (::pipe(fds) != 0) {
+        *error = std::string("pipe failed: ") + std::strerror(errno);
+        return false;
+    }
+    // macOS has no pipe2; the flag is set while spawn_mutex() is held so no
+    // other spawn can observe the window.
+    for (int index = 0; index < 2; ++index) {
+        (void)::fcntl(fds[index], F_SETFD, FD_CLOEXEC);
+    }
+#endif
+    return true;
+}
+
 }  // namespace
 
 ProcessResult run_process_capture(const std::vector<std::string>& argv) {
@@ -131,14 +174,17 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
         return result;
     }
 
+    // Held until posix_spawn returns: macOS sets FD_CLOEXEC after pipe().
+    std::unique_lock<std::mutex> spawn_lock{spawn_mutex()};
     int fds[2] = {-1, -1};
-    if (::pipe(fds) != 0) {
-        result.output = std::string("pipe failed: ") + std::strerror(errno);
+    std::string pipe_error;
+    if (!create_capture_pipe(fds, &pipe_error)) {
+        result.output = pipe_error;
         return result;
     }
 
-    // Build everything the child needs before forking: only async-signal-safe
-    // calls are allowed between fork and exec.
+    // Resolve the executable in the parent: posix_spawn reports an exec failure
+    // as an error code, so the child needs no fallback path of its own.
     const std::string executable = find_executable_posix(argv[0]);
     if (executable.empty()) {
         ::close(fds[0]);
@@ -161,34 +207,51 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
     }
     envp.push_back(nullptr);
 
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        const std::string detail = std::string("fork failed: ") + std::strerror(errno);
+    posix_spawn_file_actions_t actions;
+    (void)::posix_spawn_file_actions_init(&actions);
+    (void)::posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    (void)::posix_spawn_file_actions_adddup2(&actions, fds[1], STDERR_FILENO);
+    (void)::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
+                                             O_RDONLY, 0);
+    // Only 0/1/2 may reach the script: close both pipe ends explicitly, then
+    // close every other descriptor where the platform supports it in one step.
+    if (fds[0] > STDERR_FILENO) {
+        (void)::posix_spawn_file_actions_addclose(&actions, fds[0]);
+    }
+    if (fds[1] > STDERR_FILENO) {
+        (void)::posix_spawn_file_actions_addclose(&actions, fds[1]);
+    }
+    short spawn_flags = POSIX_SPAWN_SETPGROUP;
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
+#elif defined(__linux__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+    (void)::posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#endif
+#endif
+
+    posix_spawnattr_t attributes;
+    (void)::posix_spawnattr_init(&attributes);
+    (void)::posix_spawnattr_setflags(&attributes, spawn_flags);
+    // pgroup 0: the child leads a new group, so a timeout kills descendants.
+    (void)::posix_spawnattr_setpgroup(&attributes, 0);
+
+    pid_t pid = 0;
+    const int spawn_error =
+        ::posix_spawn(&pid, executable.c_str(), &actions, &attributes,
+                      raw.data(), envp.data());
+    (void)::posix_spawnattr_destroy(&attributes);
+    (void)::posix_spawn_file_actions_destroy(&actions);
+    spawn_lock.unlock();
+    if (spawn_error != 0) {
         ::close(fds[0]);
         ::close(fds[1]);
-        result.output = detail;
+        // posix_spawn reports an exec failure as an errno in the parent.
+        result.output = "cannot execute '" + argv[0] + "': " +
+                        std::strerror(spawn_error) + "\n";
+        result.exit_code = 127;
         return result;
     }
-    if (pid == 0) {
-        // Child: its own process group so a timeout can kill descendants too.
-        (void)::setpgid(0, 0);
-        ::dup2(fds[1], STDOUT_FILENO);
-        ::dup2(fds[1], STDERR_FILENO);
-        const int dev_null = ::open("/dev/null", O_RDONLY);
-        if (dev_null >= 0) {
-            ::dup2(dev_null, STDIN_FILENO);
-            ::close(dev_null);
-        }
-        ::close(fds[0]);
-        ::close(fds[1]);
-        ::execve(executable.c_str(), raw.data(), envp.data());
-        const std::string message =
-            std::string("cannot execute '") + argv[0] + "': " + std::strerror(errno) + "\n";
-        (void)!::write(STDERR_FILENO, message.data(), message.size());
-        ::_exit(127);
-    }
-
-    (void)::setpgid(pid, pid);  // close the child's race to install the group
     ::close(fds[1]);
     (void)::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
 
@@ -293,7 +356,9 @@ std::wstring build_command_line(const std::vector<std::string>& argv, std::strin
     std::wstring line;
     for (std::size_t i = 0; i < argv.size(); ++i) {
         const std::wstring wide = from_utf8(argv[i]);
-        if (wide.empty()) {
+        // An empty argument is valid and must reach the child as ""; only a
+        // non-empty string that failed to convert is an error.
+        if (wide.empty() && !argv[i].empty()) {
             *error = "run_process_capture: argument " + std::to_string(i) + " is not valid UTF-8";
             return std::wstring();
         }
@@ -362,20 +427,33 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
         return result;
     }
 
-    // Inheritable write end, non-inheritable read end. The child gets stdout and
-    // stderr on the write end; the parent keeps the read end and closes its copy
-    // of the write end, so EOF means the child exited.
-    SECURITY_ATTRIBUTES attributes{};
-    attributes.nLength = sizeof(attributes);
-    attributes.bInheritHandle = TRUE;
+    // Both pipe ends are created non-inheritable. Only the child's two write
+    // handles (and a NUL stdin) are named in PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    // so no unrelated inheritable handle crosses into the child even when two
+    // run_process_capture calls overlap.
     HANDLE read_end = nullptr;
     HANDLE write_end = nullptr;
-    if (::CreatePipe(&read_end, &write_end, &attributes, 0) == 0) {
+    if (::CreatePipe(&read_end, &write_end, nullptr, 0) == 0) {
         result.output = "CreatePipe failed (error " +
                         std::to_string(static_cast<unsigned long>(::GetLastError())) + ")";
         return result;
     }
     (void)::SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+    (void)::SetHandleInformation(write_end, HANDLE_FLAG_INHERIT,
+                                 HANDLE_FLAG_INHERIT);
+    HANDLE null_input = ::CreateFileW(L"NUL", GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (null_input == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        ::CloseHandle(read_end);
+        ::CloseHandle(write_end);
+        result.output = "CreateFile NUL failed (error " +
+                        std::to_string(static_cast<unsigned long>(code)) + ")";
+        return result;
+    }
+    (void)::SetHandleInformation(null_input, HANDLE_FLAG_INHERIT,
+                                 HANDLE_FLAG_INHERIT);
 
     // A job object kills the whole tree on timeout; TerminateProcess alone
     // leaves python's own children running.
@@ -390,12 +468,46 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
         }
     }
 
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
-    startup.hStdOutput = write_end;
-    startup.hStdError = write_end;
+    // Exactly these handles may cross the boundary: NUL stdin plus the one
+    // write end shared by stdout and stderr.
+    HANDLE inherited[2] = {null_input, write_end};
+    SIZE_T attribute_size = 0;
+    (void)::InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    std::vector<unsigned char> attribute_storage(attribute_size);
+    auto* attribute_list =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+    const bool initialized =
+        attribute_size != 0 &&
+        ::InitializeProcThreadAttributeList(attribute_list, 1, 0,
+                                            &attribute_size) != 0;
+    const bool listed =
+        initialized &&
+        ::UpdateProcThreadAttribute(attribute_list, 0,
+                                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+                                    sizeof(inherited), nullptr, nullptr) != 0;
+    if (!listed) {
+        const DWORD code = ::GetLastError();
+        if (initialized) {
+            ::DeleteProcThreadAttributeList(attribute_list);
+        }
+        ::CloseHandle(read_end);
+        ::CloseHandle(write_end);
+        ::CloseHandle(null_input);
+        if (job != nullptr) {
+            ::CloseHandle(job);
+        }
+        result.output = "InitializeProcThreadAttributeList failed (error " +
+                        std::to_string(static_cast<unsigned long>(code)) + ")";
+        return result;
+    }
+
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = null_input;
+    startup.StartupInfo.hStdOutput = write_end;
+    startup.StartupInfo.hStdError = write_end;
+    startup.lpAttributeList = attribute_list;
     PROCESS_INFORMATION process{};
 
     // CreateProcessW may modify the command line buffer, hence the mutable
@@ -410,10 +522,12 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
     // is supplied; without it CreateProcessW rejects the block (error 87).
     const BOOL created =
         ::CreateProcessW(nullptr, mutable_line.data(), nullptr, nullptr, TRUE,
-                         CREATE_UNICODE_ENVIRONMENT,
+                         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                          environment.empty() ? nullptr : environment.data(), nullptr,
-                         &startup, &process);
+                         &startup.StartupInfo, &process);
+    ::DeleteProcThreadAttributeList(attribute_list);
     ::CloseHandle(write_end);
+    ::CloseHandle(null_input);
 
     if (created == 0) {
         const DWORD code = ::GetLastError();
