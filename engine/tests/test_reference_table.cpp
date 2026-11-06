@@ -279,7 +279,9 @@ TEST(ReferenceTable, GeographicErrorIgnoresTheSimilarityScale) {
     const ReferenceRow& row = row_for(table, 1);
     ASSERT_TRUE(row.error.has_value());
     ASSERT_TRUE(row.error_m.has_value());
-    const Eigen::Vector3d expected = geo::geodetic_to_enu(measured, origin);
+    // estimated - source, in ENU at the source: the estimate sits at the
+    // anchor, west of the measured point.
+    const Eigen::Vector3d expected = -geo::geodetic_to_enu(measured, origin);
     // Orthonormal ENU metres: neither S nor S^2 may leak into the residual.
     EXPECT_NEAR(row.error->x(), expected.x(), 1e-6);
     EXPECT_NEAR(row.error->y(), expected.y(), 1e-6);
