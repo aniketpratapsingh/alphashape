@@ -15,6 +15,7 @@ add_library(alphashape_gui_lib STATIC
     job_manager.cpp
     task_dialog.cpp
     calibration_dialog.cpp
+    marker_tools_dialogs.cpp
     workflow.cpp
     export_controller.cpp
     start_screen.cpp

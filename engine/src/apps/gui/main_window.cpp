@@ -1,6 +1,8 @@
 #include "apps/gui/main_window.hpp"
 
+#include <cstdint>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -30,6 +32,7 @@
 #include "apps/gui/drop_paths.hpp"
 #include "apps/gui/export_controller.hpp"
 #include "apps/gui/log_pane.hpp"
+#include "apps/gui/marker_tools_dialogs.hpp"
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/start_screen.hpp"
@@ -199,7 +202,14 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
                 on_job_finished(static_cast<int>(state), message, export_note,
                                 task.startsWith(QStringLiteral("Export")));
             });
+    connect(&jobs, &JobManager::busy_changed, this,
+            [this](bool) { update_marker_actions(); });
+    connect(&app_, &GuiApp::document_replaced, this,
+            [this]() { update_marker_actions(); });
+    connect(&app_, &GuiApp::undo_changed, this,
+            [this]() { update_marker_actions(); });
     update_job_ui();
+    update_marker_actions();
 }
 
 // --- Hooks -------------------------------------------------------------------------------
@@ -408,6 +418,22 @@ void MainWindow::create_actions() {
     connect(viewport_, &ViewportWidget::projection_changed, orthographic,
             &QAction::setChecked);
 
+    // Tools: marker detection runs as a task on the active chunk, like a Workflow action.
+    // Print Markers is dialog-only and never touches the document.
+    detect_markers_action_ =
+        make_action(QStringLiteral("action.tools.detect_markers"), tr("Detect &Markers..."));
+    connect(detect_markers_action_, &QAction::triggered, this,
+            [this]() { run_marker_task("DetectMarkers"); });
+    detect_fiducials_action_ =
+        make_action(QStringLiteral("action.tools.detect_fiducials"),
+                    tr("Detect &Fiducials..."));
+    connect(detect_fiducials_action_, &QAction::triggered, this,
+            [this]() { run_marker_task("DetectFiducials"); });
+    print_markers_action_ =
+        make_action(QStringLiteral("action.tools.print_markers"), tr("&Print Markers..."));
+    connect(print_markers_action_, &QAction::triggered, this,
+            &MainWindow::show_print_markers);
+
     // Help.
     QAction* about = make_action(QStringLiteral("action.help.about"), tr("&About alphashape"));
     about->setMenuRole(QAction::AboutRole);
@@ -501,6 +527,15 @@ void MainWindow::create_menus() {
     workflow_->set_error_handler(
         [this](const QString& title, const QString& message) { error_handler_(title, message); });
 
+    QMenu* tools_menu = menu(QStringLiteral("menu.tools"), tr("&Tools"));
+    tools_menu->addAction(detect_markers_action_);
+    tools_menu->addAction(detect_fiducials_action_);
+    tools_menu->addSeparator();
+    tools_menu->addAction(print_markers_action_);
+    // The active chunk can change without a signal, so refresh as the menu opens.
+    connect(tools_menu, &QMenu::aboutToShow, this,
+            [this]() { update_marker_actions(); });
+
     QMenu* help = menu(QStringLiteral("menu.help"), tr("&Help"));
     help->addAction(act("action.help.about"));
     help->addAction(act("action.help.repository"));
@@ -593,6 +628,83 @@ void MainWindow::update_job_ui() {
     }
     jobs_label_->setText(text);
     jobs_progress_->setValue(current ? static_cast<int>(current->percent) : 0);
+}
+
+void MainWindow::update_marker_actions() {
+    const bool busy = app_.jobs().busy();
+    bool has_chunk = false;
+    if (!busy) {
+        has_chunk = app_.read_document([](const Document& document) {
+            const std::int32_t active = document.active_chunk_id();
+            for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+                if (chunk != nullptr && chunk->id() == active) {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+    const TaskEntry* markers = builtin_registry().find("DetectMarkers");
+    const TaskEntry* fiducials = builtin_registry().find("DetectFiducials");
+    if (detect_markers_action_ != nullptr) {
+        detect_markers_action_->setEnabled(!busy && has_chunk && markers != nullptr &&
+                                           markers->enabled);
+    }
+    if (detect_fiducials_action_ != nullptr) {
+        detect_fiducials_action_->setEnabled(!busy && has_chunk && fiducials != nullptr &&
+                                             fiducials->enabled);
+    }
+    if (print_markers_action_ != nullptr) {
+        print_markers_action_->setEnabled(!busy);
+    }
+}
+
+void MainWindow::run_marker_task(const std::string& task) {
+    if (busy_refusal()) {
+        return;
+    }
+    const TaskEntry* entry = builtin_registry().find(task);
+    if (entry == nullptr || !entry->enabled) {
+        statusBar()->showMessage(tr("This task is not available."), 4000);
+        return;
+    }
+    std::int32_t chunk_id = -1;
+    app_.read_document([&chunk_id](const Document& document) {
+        const std::int32_t active = document.active_chunk_id();
+        for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+            if (chunk != nullptr && chunk->id() == active) {
+                chunk_id = chunk->id();
+            }
+        }
+    });
+    if (chunk_id < 0) {
+        statusBar()->showMessage(tr("There is no active chunk."), 4000);
+        return;
+    }
+    try {
+        std::optional<Params> params;
+        if (task == "DetectMarkers") {
+            DetectMarkersDialog dialog(builtin_registry(), app_.settings(), this);
+            if (dialog.exec() != QDialog::Accepted) {
+                return;
+            }
+            params = dialog.params();
+        } else {
+            TaskDialog dialog(task, builtin_registry(), app_.settings(), this);
+            if (dialog.exec() != QDialog::Accepted) {
+                return;
+            }
+            params = dialog.params();
+        }
+        app_.jobs().submit(task, std::move(*params), chunk_id);
+    } catch (const std::exception& error) {
+        error_handler_(tr("Could not start task"), QString::fromUtf8(error.what()));
+    }
+}
+
+void MainWindow::show_print_markers() {
+    PrintMarkersDialog dialog(this);
+    dialog.exec();
 }
 
 void MainWindow::on_job_progress(double percent, const QString& stage, qint64 eta_ms) {
