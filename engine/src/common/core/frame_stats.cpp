@@ -8,9 +8,17 @@
 
 #include "common/core/chunk.hpp"
 
+#if defined(ALPHASHAPE_USE_PROJ)
+#include "model/crs/local_frame.hpp"
+#endif
+
 namespace alphashape {
 
 namespace {
+
+#if defined(ALPHASHAPE_USE_PROJ)
+bool is_identity(const Eigen::Matrix4d& m) { return m == Eigen::Matrix4d::Identity(); }
+#endif
 
 /// The camera centre C = -A^-1 b for a pose stored as [A | b], where
 /// X_camera = A X_world + b. The inverse is general because AlignChunks can
@@ -64,12 +72,21 @@ FrameStats compute_frame_stats(const Chunk& chunk) {
             stats.extent_min = stats.extent_min.cwiseMin(centre);
             stats.extent_max = stats.extent_max.cwiseMax(centre);
         }
-        if (chunk.crs().is_set()) {
-            stats.has_world_extent = true;
-            const Eigen::Matrix4d& transform = chunk.transform();
+#if defined(ALPHASHAPE_USE_PROJ)
+        // A georeferenced chunk has a non-identity local->ECEF transform and a
+        // CRS. Go through the same LocalFrame the reference table uses: the
+        // transform alone yields ECEF metres, not the chunk CRS, and a chunk
+        // with a CRS but an identity transform is still chunk-local (the CRS
+        // is only a label until the chunk is georeferenced).
+        const Eigen::Matrix4d& transform = chunk.transform();
+        const crs::CoordinateSystem cs = chunk.coordinate_system();
+        if (!is_identity(transform) && cs.is_set() && !cs.is_local()) {
+            const crs::LocalFrame frame =
+                crs::LocalFrame::with_rotation(cs, transform.block<3, 1>(0, 3),
+                                               transform.block<3, 3>(0, 0));
             for (std::size_t i = 0; i < centres.size(); ++i) {
-                const Eigen::Vector4d world4 = transform * centres[i].homogeneous();
-                const Eigen::Vector3d world = world4.head<3>() / world4.w();
+                const crs::CrsPoint point = frame.to_crs(centres[i]);
+                const Eigen::Vector3d world(point.x, point.y, point.z);
                 if (i == 0) {
                     stats.world_extent_min = world;
                     stats.world_extent_max = world;
@@ -78,7 +95,11 @@ FrameStats compute_frame_stats(const Chunk& chunk) {
                     stats.world_extent_max = stats.world_extent_max.cwiseMax(world);
                 }
             }
+            stats.has_world_extent = true;
         }
+#else
+        (void)chunk;
+#endif
     }
 
     if (centres.size() >= 2) {

@@ -20,7 +20,10 @@ struct FrameStats {
     Eigen::Vector3d extent_min = Eigen::Vector3d::Zero();
     Eigen::Vector3d extent_max = Eigen::Vector3d::Zero();
 
-    /// The same box after the chunk's transform, when a CRS is set.
+    /// The same box in the chunk CRS, when the chunk is georeferenced (a
+    /// non-identity local->ECEF transform and a set, non-local CRS). Units are
+    /// the CRS's: metres for a projected CRS, degrees for a geographic one.
+    /// `extent_min`/`extent_max` stay chunk-local metres in every case.
     bool has_world_extent = false;
     Eigen::Vector3d world_extent_min = Eigen::Vector3d::Zero();
     Eigen::Vector3d world_extent_max = Eigen::Vector3d::Zero();
@@ -40,6 +43,13 @@ struct FrameStats {
 };
 
 /// Compute the summary. Never mutates the chunk.
+///
+/// `mean_capture_distance` is the median nearest-neighbour camera-centre
+/// distance times two. Finding that nearest neighbour is O(n^2) over the
+/// enabled cameras; at ~10k cameras that is 1e8 distance tests, still cheap
+/// (well under a second) and it needs no spatial index. Replace it with a
+/// k-d tree if the statistics are ever needed on much larger blocks.
+
 FrameStats compute_frame_stats(const Chunk& chunk);
 
 }  // namespace alphashape
