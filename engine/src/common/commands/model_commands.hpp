@@ -126,6 +126,10 @@ std::unique_ptr<AbstractCommand> make_set_marker_enabled_command(
 /// Set a marker's pinned flag (interactively placed). Undo restores it.
 std::unique_ptr<AbstractCommand> make_set_marker_pinned_command(
     std::int32_t chunk_id, std::int32_t marker_id, bool pinned);
+/// Set a marker's reference role (control point / check point). Undo restores
+/// the previous role. Check points are excluded from the adjustment.
+std::unique_ptr<AbstractCommand> make_set_marker_role_command(
+    std::int32_t chunk_id, std::int32_t marker_id, MarkerReferenceRole role);
 std::unique_ptr<AbstractCommand> make_move_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
     Eigen::Vector2d pixel);

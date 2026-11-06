@@ -251,7 +251,9 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
                 app_.execute(
                     make_set_camera_reference_enabled_command(chunk_id_, item.id, on));
             } else {
-                app_.execute(make_set_marker_enabled_command(chunk_id_, item.id, on));
+                const auto role = on ? reference::MarkerReferenceRole::Gcp
+                                     : reference::MarkerReferenceRole::CheckPoint;
+                app_.execute(make_set_marker_role_command(chunk_id_, item.id, role));
             }
             return true;
         }

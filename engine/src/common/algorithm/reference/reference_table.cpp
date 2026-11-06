@@ -60,23 +60,6 @@ std::optional<Eigen::Vector3d> as_vector(const std::optional<CrsPoint>& point) {
 
 }  // namespace
 
-MarkerReferenceRole marker_role(const Marker& marker) {
-    if (const std::string* value = marker.meta.find("type")) {
-        if (*value == "check_point") {
-            return MarkerReferenceRole::CheckPoint;
-        }
-    }
-    return MarkerReferenceRole::Gcp;
-}
-
-void set_marker_role(Marker& marker, MarkerReferenceRole role) {
-    marker.meta.set("type", marker_reference_role_name(role));
-}
-
-const char* marker_reference_role_name(MarkerReferenceRole role) {
-    return role == MarkerReferenceRole::CheckPoint ? "check_point" : "gcp";
-}
-
 std::size_t ReferenceTable::control_count() const {
     std::size_t count = 0;
     for (const ReferenceRow& row : rows) {
@@ -91,33 +74,44 @@ std::size_t ReferenceTable::control_count() const {
 ReferenceSummary ReferenceTable::summary() const {
     ReferenceSummary result;
     double camera_sum = 0.0;
-    double marker_sum = 0.0;
+    double control_sum = 0.0;
+    double check_sum = 0.0;
     std::size_t camera_n = 0;
-    std::size_t marker_n = 0;
+    std::size_t control_n = 0;
+    std::size_t check_n = 0;
     for (const ReferenceRow& row : rows) {
-        const bool camera = row.kind == ReferenceRowKind::Camera;
-        if (camera) {
+        if (row.kind == ReferenceRowKind::Camera) {
             ++result.camera_count;
         } else {
             ++result.marker_count;
         }
-        if (!row.enabled || !row.error_m.has_value()) {
+        if (!row.error_m.has_value()) {
             continue;
         }
         const double squared = *row.error_m * *row.error_m;
-        if (camera) {
+        if (row.kind == ReferenceRowKind::Camera) {
+            if (!row.enabled) {
+                continue;
+            }
             camera_sum += squared;
             ++camera_n;
+        } else if (row.kind == ReferenceRowKind::CheckPoint) {
+            check_sum += squared;
+            ++check_n;
         } else {
-            marker_sum += squared;
-            ++marker_n;
+            control_sum += squared;
+            ++control_n;
         }
     }
+    result.control_count = control_n;
+    result.check_count = check_n;
     constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
     result.camera_rmse_m =
         camera_n > 0 ? std::sqrt(camera_sum / static_cast<double>(camera_n)) : kNaN;
-    result.marker_rmse_m =
-        marker_n > 0 ? std::sqrt(marker_sum / static_cast<double>(marker_n)) : kNaN;
+    result.control_rmse_m =
+        control_n > 0 ? std::sqrt(control_sum / static_cast<double>(control_n)) : kNaN;
+    result.check_rmse_m =
+        check_n > 0 ? std::sqrt(check_sum / static_cast<double>(check_n)) : kNaN;
     return result;
 }
 
@@ -301,10 +295,13 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         ReferenceRow row;
         row.id = marker.id;
         row.label = marker.label;
-        row.kind = marker_role(marker) == MarkerReferenceRole::CheckPoint
-                       ? ReferenceRowKind::CheckPoint
-                       : ReferenceRowKind::Marker;
-        row.enabled = marker.valid;
+        const MarkerReferenceRole role = marker_role(marker);
+        row.kind = role == MarkerReferenceRole::CheckPoint ? ReferenceRowKind::CheckPoint
+                                                           : ReferenceRowKind::Marker;
+        // The checkbox means "control point": checked holds the marker in the
+        // adjustment, unchecked marks it as a check point. `valid` is the
+        // projection/filter status and is never edited from here.
+        row.enabled = role == MarkerReferenceRole::Gcp;
         if (marker.reference) {
             row.source = source_of(marker.reference, marker_cs, marker_src);
         }

@@ -55,12 +55,18 @@ struct ReferenceRow {
     bool pinned = false;
 };
 
-/// RMSE over the enabled rows that carry both ends of an error.
+/// RMSE over the rows that carry both ends of an error. Camera rows use the
+/// cameras whose reference is enabled; marker rows are split into control and
+/// check points, exactly as OptimizeCameras treats them.
 struct ReferenceSummary {
     std::size_t camera_count = 0;
+    /// All marker rows (control points plus check points).
     std::size_t marker_count = 0;
+    std::size_t control_count = 0;
+    std::size_t check_count = 0;
     double camera_rmse_m = std::numeric_limits<double>::quiet_NaN();
-    double marker_rmse_m = std::numeric_limits<double>::quiet_NaN();
+    double control_rmse_m = std::numeric_limits<double>::quiet_NaN();
+    double check_rmse_m = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct ReferenceTable {
@@ -72,11 +78,12 @@ struct ReferenceTable {
     ReferenceSummary summary() const;
 };
 
-/// Marker reference role, stored under `Marker::meta` key "type".
-enum class MarkerReferenceRole { Gcp, CheckPoint };
-MarkerReferenceRole marker_role(const Marker& marker);
-void set_marker_role(Marker& marker, MarkerReferenceRole role);
-const char* marker_reference_role_name(MarkerReferenceRole role);
+// The role helpers live in core (common/core/marker.hpp) so the command layer
+// can reach them; re-exported here for the reference API.
+using alphashape::MarkerReferenceRole;
+using alphashape::marker_reference_role_name;
+using alphashape::marker_role;
+using alphashape::set_marker_role;
 
 /// Build the table. An unset/local `display_crs`, or an unreferenced chunk,
 /// keeps coordinates in chunk-local units; otherwise sources are converted from

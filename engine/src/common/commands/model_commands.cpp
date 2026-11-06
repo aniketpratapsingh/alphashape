@@ -1210,6 +1210,38 @@ private:
     bool value_;
 };
 
+/// Set a marker's reference role ("gcp" / "check_point") in one undoable
+/// step. The container snapshot restores the previous meta on revert.
+class SetMarkerRoleCommand : public ChunkContainersCommand {
+public:
+    SetMarkerRoleCommand(std::int32_t chunk_id, std::int32_t marker_id,
+                         MarkerReferenceRole role)
+        : ChunkContainersCommand(chunk_id), marker_id_(marker_id), role_(role) {}
+
+    std::string name() const override { return "Set Marker Role"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker* marker = find_by_id(chunk.markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        set_marker_role(*marker, role_);
+    }
+
+private:
+    std::int32_t marker_id_;
+    MarkerReferenceRole role_;
+};
+
 class MoveMarkerProjectionCommand : public ChunkContainersCommand {
 public:
     MoveMarkerProjectionCommand(std::int32_t chunk_id, std::int32_t marker_id,
@@ -3215,6 +3247,11 @@ std::unique_ptr<AbstractCommand> make_set_marker_pinned_command(
     std::int32_t chunk_id, std::int32_t marker_id, bool pinned) {
     return std::make_unique<SetMarkerFlagCommand>(
         chunk_id, marker_id, SetMarkerFlagCommand::Flag::Pinned, pinned);
+}
+
+std::unique_ptr<AbstractCommand> make_set_marker_role_command(
+    std::int32_t chunk_id, std::int32_t marker_id, MarkerReferenceRole role) {
+    return std::make_unique<SetMarkerRoleCommand>(chunk_id, marker_id, role);
 }
 
 std::unique_ptr<AbstractCommand> make_move_marker_projection_command(

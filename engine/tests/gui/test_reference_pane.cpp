@@ -97,7 +97,10 @@ TEST_F(ReferencePane, CamerasAndMarkers) {
     EXPECT_EQ(summary.marker_count, 4U);
     EXPECT_NEAR(summary.camera_rmse_m, analytic_camera_rmse(12), 1e-3);
     // Marker offsets are 1, 2, 3 and 4 metres: sqrt(30 / 4).
-    EXPECT_NEAR(summary.marker_rmse_m, std::sqrt(30.0 / 4.0), 1e-3);
+    EXPECT_NEAR(summary.control_rmse_m, std::sqrt(30.0 / 4.0), 1e-3);
+    EXPECT_EQ(summary.control_count, 4U);
+    EXPECT_EQ(summary.check_count, 0U);
+    EXPECT_FALSE(std::isfinite(summary.check_rmse_m));
     EXPECT_NE(pane().action("action.reference.settings"), nullptr);
     EXPECT_FALSE(pane().action("action.reference.settings")->isEnabled());
 }
@@ -152,18 +155,40 @@ TEST_F(ReferencePane, SortByErrorDescending) {
     EXPECT_NEAR(*model.error_m(0), 5.5, 1e-9);
 }
 
-TEST_F(ReferencePane, DisableProjectionUpdatesRMSE) {
-    build_chunk(12, 4);
+TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
+    Chunk& chunk = build_chunk(12, 4);
     ReferenceModel& markers = pane().markers();
-    const double before = markers.summary().marker_rmse_m;
+    const double before = markers.summary().control_rmse_m;
     ASSERT_GT(before, 0.0);
     // The first row carries the largest error (marker 103, four metres).
     const QModelIndex index = markers.index(0, ReferenceModel::LabelColumn);
     ASSERT_TRUE(markers.setData(
         index, QVariant(static_cast<int>(Qt::Unchecked)), Qt::CheckStateRole));
-    const double after = markers.summary().marker_rmse_m;
-    EXPECT_LT(after, before);
-    EXPECT_NEAR(after, std::sqrt((1.0 + 4.0 + 9.0) / 3.0), 1e-3);
+    const ReferenceSummary& summary = markers.summary();
+    EXPECT_NEAR(summary.control_rmse_m, std::sqrt((1.0 + 4.0 + 9.0) / 3.0), 1e-3);
+    EXPECT_NEAR(summary.check_rmse_m, 4.0, 1e-3);
+    EXPECT_EQ(summary.control_count, 3U);
+    EXPECT_EQ(summary.check_count, 1U);
+    // The role, not the projection status, changed.
+    const auto role_of_103 = [&chunk]() {
+        for (const Marker& marker : chunk.markers()) {
+            if (marker.id == 103) {
+                return std::optional<reference::MarkerReferenceRole>(
+                    reference::marker_role(marker));
+            }
+        }
+        return std::optional<reference::MarkerReferenceRole>();
+    };
+    ASSERT_TRUE(role_of_103().has_value());
+    EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::CheckPoint);
+    for (const Marker& marker : chunk.markers()) {
+        if (marker.id == 103) {
+            EXPECT_TRUE(marker.valid);
+        }
+    }
+    app().undo();
+    ASSERT_TRUE(role_of_103().has_value());
+    EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::Gcp);
 }
 
 TEST_F(ReferencePane, ThousandRowsWithinBudget) {

@@ -108,7 +108,37 @@ TEST(ReferenceTable, KnownOffsetsAndRmse) {
     const double marker_rmse =
         std::sqrt(marker_squares / static_cast<double>(kMarkers));
     EXPECT_NEAR(summary.camera_rmse_m, camera_rmse, 1e-3);
-    EXPECT_NEAR(summary.marker_rmse_m, marker_rmse, 1e-3);
+    EXPECT_NEAR(summary.control_rmse_m, marker_rmse, 1e-3);
+    EXPECT_EQ(summary.control_count, static_cast<std::size_t>(kMarkers));
+    EXPECT_EQ(summary.check_count, 0U);
+    EXPECT_FALSE(std::isfinite(summary.check_rmse_m));
+}
+
+TEST(ReferenceTable, CheckPointLeavesTheControlRmse) {
+    Chunk chunk("roles");
+    chunk.set_id(0);
+    const Eigen::Vector3d position(1.0, 2.0, 3.0);
+    Marker control = make_marker(10, position, position);
+    control.reference = position + Eigen::Vector3d(0.0, 0.0, 1.0);
+    chunk.markers().push_back(control);
+    Marker check = make_marker(11, position, position);
+    check.reference = position + Eigen::Vector3d(0.0, 0.0, 4.0);
+    set_marker_role(check, MarkerReferenceRole::CheckPoint);
+    chunk.markers().push_back(check);
+
+    const ReferenceTable table = build_reference_table(chunk, crs::CoordinateSystem());
+    EXPECT_EQ(row_for(table, 10).kind, ReferenceRowKind::Marker);
+    EXPECT_TRUE(row_for(table, 10).enabled);
+    EXPECT_EQ(row_for(table, 11).kind, ReferenceRowKind::CheckPoint);
+    EXPECT_FALSE(row_for(table, 11).enabled);
+
+    const ReferenceSummary summary = table.summary();
+    EXPECT_EQ(summary.marker_count, 2U);
+    EXPECT_EQ(summary.control_count, 1U);
+    EXPECT_EQ(summary.check_count, 1U);
+    EXPECT_NEAR(summary.control_rmse_m, 1.0, 1e-9);
+    EXPECT_NEAR(summary.check_rmse_m, 4.0, 1e-9);
+    EXPECT_EQ(table.control_count(), 1U);  // check points are not control
 }
 
 TEST(ReferenceTable, DisabledRowsLeaveTheRmse) {

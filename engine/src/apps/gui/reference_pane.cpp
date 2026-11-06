@@ -237,9 +237,10 @@ void ReferencePane::update_status() {
         }
     });
     status_->setText(
-        tr("%1 markers  |  camera RMSE %2 m  |  marker RMSE %3 m  |  %4")
+        tr("%1 markers  |  camera RMSE %2 m  |  control RMSE %3 m  |  check RMSE %4 m  |  %5")
             .arg(QString::number(static_cast<qulonglong>(summary.marker_count)),
-                 rmse_text(summary.camera_rmse_m), rmse_text(summary.marker_rmse_m), crs));
+                 rmse_text(summary.camera_rmse_m), rmse_text(summary.control_rmse_m),
+                 rmse_text(summary.check_rmse_m), crs));
 }
 
 void ReferencePane::update_actions() {
