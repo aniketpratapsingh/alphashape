@@ -138,8 +138,10 @@ CreateStatus create_exclusive(const std::string& path, const std::string& text,
                               std::string* error, bool* read_only) {
     const fs::path target = platform::path_from_utf8(path);
     fs::path temp = target;
-    temp += ".tmp";
-    temp += std::to_string(platform::process_id());
+    temp += ".tmp.";
+    // Token, not only the pid: two acquisitions in one process must not write
+    // over each other's staging file.
+    temp += make_token();
     {
         errno = 0;
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
@@ -203,7 +205,9 @@ enum class BreakStatus { Broken, Vanished, Changed };
 BreakStatus break_stale_lock(const std::string& lock_path, const LockRecord& judged,
                              std::string* holder) {
     const fs::path path = platform::path_from_utf8(lock_path);
-    const fs::path sideline = path.parent_path() / ("lock.stale." + make_token());
+    fs::path sideline = path;
+    sideline += ".stale.";
+    sideline += make_token();
     std::error_code ec;
     fs::rename(path, sideline, ec);
     if (ec) {
