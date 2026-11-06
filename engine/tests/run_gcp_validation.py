@@ -94,12 +94,16 @@ def enu_to_geodetic(enu, origin):
 
 
 def ecef_to_local(ecef, transform):
-    """Map an ECEF point into the chunk's local frame via chunk.transform."""
+    """Map an ECEF point into the chunk's local frame via chunk.transform.
+
+    chunk.transform is the rigid local-ENU -> ECEF placement, so its inverse
+    is the transpose of its rotation block applied to (ecef - translation).
+    """
     rotation = [[transform[r][c] for c in range(3)] for r in range(3)]
     shift = [transform[row][3] for row in range(3)]
     delta = [ecef[i] - shift[i] for i in range(3)]
     return tuple(
-        sum(rotation[r][c] * delta[c] for c in range(3)) for r in range(3))
+        sum(rotation[c][r] * delta[c] for c in range(3)) for r in range(3))
 
 
 # The synthetic block: the ground points sit at z = 0, the elevated ones on the

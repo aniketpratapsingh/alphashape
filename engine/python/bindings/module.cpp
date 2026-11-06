@@ -1461,7 +1461,6 @@ PYBIND11_MODULE(alphashape, m) {
             out.append(s.film.film_size_mm.y());
             return out;
         })
-        // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
         // Detach this sensor from any master link, making it a master in its
         // own right (master_sensor_id = -1). Goes through the undoable "Set
         // Sensor Master" command; only callable on a sensor obtained from
@@ -1483,6 +1482,7 @@ PYBIND11_MODULE(alphashape, m) {
              },
              py::is_method(m),
              "Make this sensor a master by detaching it from any master link.")
+        // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
         .def_property_readonly("fiducials", [](const alphashape::Sensor& s) {
             py::list out;
             for (const alphashape::Fiducial& fiducial : s.film.fiducials) {

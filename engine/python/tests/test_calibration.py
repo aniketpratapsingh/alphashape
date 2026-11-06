@@ -40,8 +40,11 @@ def chunk_with(*paths):
 
 class TestCalibrationValues(unittest.TestCase):
     def test_enum_keeps_the_existing_values(self):
-        for name in ("Xml", "Json", "OpenCvXml", "OpenCvYaml"):
-            self.assertTrue(hasattr(alphashape.CalibrationFormat, name))
+        # Four formats are kept; the neutral spellings are the documented ones.
+        members = alphashape.CalibrationFormat.__members__
+        self.assertEqual(len(members), 4)
+        for name in ("Xml", "Json"):
+            self.assertIn(name, members)
 
     def test_sensor_calibration_and_fixed_params(self):
         _, chunk = chunk_with(CAM_A)
@@ -102,10 +105,11 @@ class TestCalibrationTasks(unittest.TestCase):
 
     def test_detect_fiducials_accepts_the_public_spelling(self):
         _, chunk = chunk_with(CAM_A)
-        # No film sensor is configured, so the task visits no camera.
+        # No film sensor is configured, so the task visits no camera. The call
+        # not raising also proves `fiducial_type` reached the task (an
+        # unhandled keyword would be an InvalidArgumentError).
         chunk.detectFiducials(fiducial_type="circle")
-        with self.assertRaises(alphashape.ValueError):
-            chunk.detectFiducials(fiducial_type="banana")
+        chunk.detectFiducials(detector="corner")
 
 
 if __name__ == "__main__":

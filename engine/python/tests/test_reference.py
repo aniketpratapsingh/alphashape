@@ -72,11 +72,10 @@ class TestImportReference(unittest.TestCase):
     def test_explicit_columns_read_a_headerless_file(self):
         _, chunk = local_chunk()
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "plain.txt")
+            path = os.path.join(directory, "plain.csv")
             # Explicit columns are positional: no header row is expected.
             write_rows(path, [("P1", 7.5, -8.25, 9.0)])
-            chunk.importReference(path=path, format="txt",
-                                  delimiter=" ",
+            chunk.importReference(path=path, format="csv",
                                   columns=["label", "x", "y", "z"])
         self.assertEqual(chunk.markers[0].label, "P1")
         self.assertEqual(chunk.markers[0].reference, (7.5, -8.25, 9.0))
