@@ -598,7 +598,7 @@ protected:
         if ((region_.size.array() <= 0.0).any()) {
             throw ValueError("set chunk transform: region size must be positive");
         }
-        const Eigen::Matrix3d orthonormal =
+        const double orthonormal =
             (region_.rotation.transpose() * region_.rotation -
              Eigen::Matrix3d::Identity()).norm();
         if (orthonormal >= 1e-9 || region_.rotation.determinant() <= 0.0) {
