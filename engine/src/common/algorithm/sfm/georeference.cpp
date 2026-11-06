@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/chunk/align_chunks_task.hpp"
@@ -99,6 +100,21 @@ bool points_not_collinear(const std::vector<Eigen::Vector3d>& points) {
     return max_perp > 1e-3 * len;
 }
 
+/// Nearest rotation matrix to `m` by Gram-Schmidt on its columns, so the stored
+/// orientation stays orthonormal after composing floating-point rotations.
+Eigen::Matrix3d orthonormalised_rotation(const Eigen::Matrix3d& m) {
+    Eigen::Vector3d x = m.col(0).normalized();
+    Eigen::Vector3d y = m.col(1);
+    y -= x * x.dot(y);
+    y.normalize();
+    Eigen::Vector3d z = x.cross(y);
+    Eigen::Matrix3d r;
+    r.col(0) = x;
+    r.col(1) = y;
+    r.col(2) = z;
+    return r;
+}
+
 /// Rewrite the chunk by one similarity `t_sim` (already composed with any old
 /// transform map) and adopt `origin` as the new ENU origin. Poses, track points
 /// and the region always move; marker positions move only when asked, because
@@ -109,8 +125,8 @@ bool points_not_collinear(const std::vector<Eigen::Vector3d>& points) {
 ///
 /// `transform_geometry` is the update_transform path: derived geometry (shapes,
 /// trajectories, point-cloud and mesh payloads) follows the same similarity,
-/// through the AlignChunks helper, and the region becomes the axis-aligned
-/// bound of the mapped corners. georeference_chunk passes false so its results
+/// through the AlignChunks helper, and the region carries its orientation
+/// through the same similarity. georeference_chunk passes false so its results
 /// stay bit-identical.
 void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
                                const geo::Geodetic& origin, bool transform_markers,
@@ -138,8 +154,8 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
             geometry.camera_poses[i].block<3, 1>(0, 3) =
                 t_sim.scale * t_c - r_c_new * t_sim.t;
         }
-        // The helper already replaced the region with the axis-aligned bound of
-        // the eight mapped corners, which is what a rotating similarity needs.
+        // The helper already moved the region's centre, scaled its extents and
+        // composed its orientation with the similarity rotation.
         geometry.transform = geo::enu_to_ecef(origin);
         // Camera-centre, tie-point and marker covariances were already moved by
         // apply_similarity_to_geometry above (C' = s^2 R C R^T). The rotation
@@ -183,10 +199,14 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
             }
         }
     }
-    // Region: axis-aligned, no rotation -- the centre maps like a point and the
-    // size is scaled by the similarity scale.
+    // Region: the centre maps like a point, the extents scale by |s|, and the
+    // orientation composes with the similarity rotation (R' = R_sim * R,
+    // re-orthonormalised). A rotated region stays rotated rather than being
+    // collapsed to an axis-aligned box.
     chunk.region().centre = t_sim.apply(chunk.region().centre);
-    chunk.region().size *= t_sim.scale;
+    chunk.region().size *= std::abs(t_sim.scale);
+    chunk.region().rotation =
+        orthonormalised_rotation(t_sim.R * chunk.region().rotation);
 
     if (transform_markers) {
         for (Marker& marker : chunk.markers()) {

@@ -45,6 +45,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <Eigen/SVD>
 
 #include "base/utils/error.hpp"
@@ -243,6 +244,23 @@ double ransac_threshold(const std::vector<MarkerPair>& pairs) {
     return std::max(3.0 * median(std::move(sigmas)), kMinThresholdM);
 }
 
+/// Nearest rotation matrix to `m` by Gram-Schmidt on its columns. Composing two
+/// rotations keeps them orthonormal analytically, but re-orthonormalising here
+/// keeps the stored orientation inside the command validator's bound after the
+/// floating-point product.
+Eigen::Matrix3d orthonormalised_rotation(const Eigen::Matrix3d& m) {
+    Eigen::Vector3d x = m.col(0).normalized();
+    Eigen::Vector3d y = m.col(1);
+    y -= x * x.dot(y);
+    y.normalize();
+    Eigen::Vector3d z = x.cross(y);
+    Eigen::Matrix3d r;
+    r.col(0) = x;
+    r.col(1) = y;
+    r.col(2) = z;
+    return r;
+}
+
 /// Apply a similarity (dst = s R p + t) to one chunk-local geometry state.
 /// Camera poses are world->camera, and their world side is what the similarity
 /// rewrites, so each pose is post-multiplied by the INVERSE similarity:
@@ -331,26 +349,15 @@ void apply_similarity_impl(ChunkGeometry& geometry,
         }
     }
 
-    // The region is an axis-aligned box in the old frame; its corners map to a
-    // rotated box, so the region becomes the axis-aligned bound of the mapped
-    // corners (the same rule merge_chunks uses).
-    const Eigen::Vector3d half = 0.5 * geometry.region.size;
-    Eigen::Vector3d low = Eigen::Vector3d::Constant(
-        std::numeric_limits<double>::infinity());
-    Eigen::Vector3d high = Eigen::Vector3d::Constant(
-        -std::numeric_limits<double>::infinity());
-    for (int corner = 0; corner < 8; ++corner) {
-        Eigen::Vector3d offset;
-        offset.x() = (corner & 1) != 0 ? half.x() : -half.x();
-        offset.y() = (corner & 2) != 0 ? half.y() : -half.y();
-        offset.z() = (corner & 4) != 0 ? half.z() : -half.z();
-        const Eigen::Vector3d mapped =
-            similarity.apply(geometry.region.centre + offset);
-        low = low.cwiseMin(mapped);
-        high = high.cwiseMax(mapped);
-    }
-    geometry.region.centre = 0.5 * (low + high);
-    geometry.region.size = high - low;
+    // The region is an oriented box in the old frame. A similarity maps its
+    // axes by R_sim and scales its extents by |s|, so the result stays an
+    // oriented box: carry the rotation (R' = R_sim * R, re-orthonormalised)
+    // instead of collapsing it to an axis-aligned bound. Carrying it keeps the
+    // box tight around rotated content, which the region must cover.
+    geometry.region.centre = similarity.apply(geometry.region.centre);
+    geometry.region.size *= std::abs(similarity.scale);
+    geometry.region.rotation =
+        orthonormalised_rotation(similarity.R * geometry.region.rotation);
 
     // The chunk transform is the local->world placement; the similarity acts on
     // chunk-local coordinates, so it is composed on the RIGHT: T' = T . S.

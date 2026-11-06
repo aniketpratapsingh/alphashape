@@ -183,6 +183,9 @@ Region region_from_points(const std::vector<Eigen::Vector3d>& points,
         return fallback;
     }
     Region region = fallback;
+    // The extents below are measured along the chunk-local axes, so the box is
+    // axis-aligned even when the fallback was rotated.
+    region.rotation = Eigen::Matrix3d::Identity();
     std::vector<double> values;
     values.reserve(points.size());
     for (int axis = 0; axis < 3; ++axis) {

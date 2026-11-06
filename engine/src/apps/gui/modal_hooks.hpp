@@ -37,6 +37,9 @@ struct ModalHooks {
     /// Default: QFileDialog::getSaveFileName. Empty = cancelled.
     std::function<QString(QWidget*, const QString&, const QString&, const QString&)>
         save_file;
+    /// Ask a yes/no question (title, text). Default: QMessageBox::question;
+    /// true only on Yes.
+    std::function<bool(QWidget*, const QString&, const QString&)> confirm;
 };
 
 /// The real Qt dialogs.
@@ -73,6 +76,9 @@ inline ModalHooks default_modal_hooks() {
         [](QWidget* parent, const QString& title, const QString& suggested,
            const QString& filter) {
             return QFileDialog::getSaveFileName(parent, title, suggested, filter);
+        },
+        [](QWidget* parent, const QString& title, const QString& text) {
+            return QMessageBox::question(parent, title, text) == QMessageBox::Yes;
         },
     };
 }

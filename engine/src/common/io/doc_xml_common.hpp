@@ -147,6 +147,8 @@ std::pair<double, double> parse_pair(const std::string& s, const char* what);
 Eigen::Vector3d parse_vec3(const std::string& s);
 std::string matrix4(const Transform& m);
 Transform parse_matrix4(const std::string& s);
+std::string matrix3(const Eigen::Matrix3d& m);
+Eigen::Matrix3d parse_matrix3(const std::string& s);
 
 // ---- small element helpers ------------------------------------------------
 

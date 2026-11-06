@@ -515,6 +515,29 @@ Transform parse_matrix4(const std::string& s) {
     return m;
 }
 
+// Row-major, like matrix4: r00 r01 r02 r10 ... r22.
+std::string matrix3(const Eigen::Matrix3d& m) {
+    double values[9];
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) values[r * 3 + c] = m(r, c);
+    }
+    return join(values, 9);
+}
+
+Eigen::Matrix3d parse_matrix3(const std::string& s) {
+    const auto v = parse_doubles(s);
+    if (v.size() != 9) {
+        throw ProjectIOError("doc.xml: expected 9 numbers for a rotation");
+    }
+    Eigen::Matrix3d m;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            m(r, c) = v[static_cast<std::size_t>(r * 3 + c)];
+        }
+    }
+    return m;
+}
+
 void write_meta(const Meta& meta, XmlNode& parent) {
     XmlNode& node = add_child(parent, "meta");
     // Stable ordering (§4.9): sorted meta keys, whatever order the model holds.

@@ -69,6 +69,10 @@ public:
     /// Takes ownership through a move, so rebuilding from the widget costs no copy: the caller
     /// hands its built Scene straight over.
     void set_scene(Scene&& scene);
+    /// Replace only the trailing region overlay lines. During a gizmo drag the
+    /// document does not change, so this keeps the rest of the scene (points,
+    /// mesh, camera lines) intact instead of rebuilding it per mouse move.
+    void set_region_lines(std::vector<SceneLineVertex>&& lines);
     const Scene& scene() const { return scene_; }
     bool upload_pending() const { return upload_pending_; }
 
@@ -151,6 +155,8 @@ private:
     Eigen::Vector3f background_ = Eigen::Vector3f(0.11F, 0.14F, 0.16F);
     /// Upload the scene into the buffers on the next frame.
     bool upload_pending_ = true;
+    /// Re-upload only the line stream on the next frame (a gizmo preview).
+    bool lines_pending_ = false;
     /// Re-upload only these vertex colours on the next frame (a restyle).
     RestyleScope colours_pending_ = RestyleScope::None;
     /// The static point-sprite quad still has to be uploaded into point_quad_.

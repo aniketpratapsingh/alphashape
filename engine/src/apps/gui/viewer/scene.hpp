@@ -40,6 +40,8 @@ struct SceneStyle {
     Eigen::Vector3f point_cloud = Eigen::Vector3f(0.73F, 0.78F, 0.82F);
     Eigen::Vector3f point_highlight = Eigen::Vector3f(1.0F, 1.0F, 1.0F);
     Eigen::Vector3f selection = Eigen::Vector3f(0.21F, 0.74F, 0.69F);
+    /// The region box and its gizmo handles (WP-14.15).
+    Eigen::Vector3f region = Eigen::Vector3f(0.95F, 0.62F, 0.25F);
     /// The three axis directions (X red, Y green, Z blue).
     Eigen::Vector3f axis_x = Eigen::Vector3f(0.85F, 0.35F, 0.32F);
     Eigen::Vector3f axis_y = Eigen::Vector3f(0.42F, 0.75F, 0.36F);
@@ -94,6 +96,8 @@ enum class LineKind : std::uint8_t {
     Axis,
     BoundingBox,
     Camera,
+    /// The editable region box and its gizmo (WP-14.15).
+    Region,
 };
 
 /// Everything one frame draws. Vectors are empty when the chunk has no such product.

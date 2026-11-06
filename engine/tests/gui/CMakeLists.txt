@@ -23,6 +23,7 @@ add_executable(alphashape_gui_tests
     test_estimates.cpp
     test_task_dialog.cpp
     test_calibration_dialog.cpp
+    test_region_gizmo.cpp
     test_marker_tools.cpp
     test_workflow.cpp
     test_start_screen.cpp

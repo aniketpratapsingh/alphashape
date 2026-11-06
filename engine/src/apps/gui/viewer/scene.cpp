@@ -581,6 +581,9 @@ void Scene::restyle(const SceneStyle& style, std::optional<std::int32_t> highlig
             case LineKind::BoundingBox:
                 lines[i].colour = style.bounding_box;
                 break;
+            case LineKind::Region:
+                lines[i].colour = style.region;
+                break;
             case LineKind::Camera:
                 lines[i].colour = highlight_camera && *highlight_camera == camera_id
                                       ? style.camera_active

@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Geometry>
 #include <gtest/gtest.h>
 
 #include "base/platform/temp.hpp"
@@ -615,6 +616,37 @@ TEST_F(ProjectV2, UntouchedChunkResaveIsByteStable) {
     const std::string third = path("c.psx");
     ProjectIO::save(*again, third);
     EXPECT_EQ(zip_bytes(first), zip_bytes(third));
+}
+
+TEST_F(ProjectV2, OrientedRegionRoundTrip) {
+    // Identity writes no rotation attribute, so a pre-rotation project stays
+    // byte-identical.
+    Document plain = build_full_document();
+    const std::string plain_psx = path("plain_region.psx");
+    ProjectIO::save(plain, plain_psx);
+    EXPECT_EQ(doc_text(plain_psx).find("rotation=\""), std::string::npos);
+
+    // A rotated region survives save/load exactly, all 17 significant digits.
+    Document document = build_full_document();
+    ASSERT_NE(document.active_chunk(), nullptr);
+    const Eigen::Matrix3d rotation =
+        Eigen::AngleAxisd(0.4713, Eigen::Vector3d(0.2, 0.4, 0.9).normalized())
+            .toRotationMatrix();
+    document.active_chunk()->region().rotation = rotation;
+    const Region original = document.active_chunk()->region();
+    const std::string psx = path("rotated_region.psx");
+    ProjectIO::save(document, psx);
+    EXPECT_NE(doc_text(psx).find("rotation=\""), std::string::npos);
+
+    std::shared_ptr<Document> loaded = ProjectIO::load(psx);
+    ASSERT_NE(loaded->active_chunk(), nullptr);
+    EXPECT_TRUE(loaded->active_chunk()->region() == original);
+    EXPECT_TRUE(loaded->active_chunk()->region().rotation == rotation);
+
+    // Re-saving the loaded project is byte-stable too.
+    const std::string resaved = path("rotated_region_resaved.psx");
+    ProjectIO::save(*loaded, resaved);
+    EXPECT_EQ(zip_bytes(psx), zip_bytes(resaved));
 }
 
 TEST_F(ProjectV2, RoundTripsAllContainers) {
