@@ -230,7 +230,7 @@ void append_synced(const std::string& path, const std::string& line) {
     }
     const std::string record = line + "\n";
     const std::size_t written =
-        std::fwrite(record.data(), 1, record.size(), file);
+        std::fwrite(record.data(), std::size_t{1}, record.size(), file);
     const bool ok = written == record.size() && std::fflush(file) == 0;
 #if defined(_WIN32)
     const bool synced = ok && ::_commit(::_fileno(file)) == 0;
@@ -242,6 +242,8 @@ void append_synced(const std::string& path, const std::string& line) {
         throw Error("job.db: cannot write '" + path + "'");
     }
 }
+
+}  // namespace
 
 JobDbFallback::JobDbFallback(std::string path) : path_(std::move(path)) {
     replay();

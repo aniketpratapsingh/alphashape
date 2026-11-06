@@ -384,7 +384,7 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
-                                      sizeof(limits)) == 0) {
+                                      static_cast<DWORD>(sizeof(limits))) == 0) {
             ::CloseHandle(job);
             job = nullptr;
         }
@@ -445,10 +445,11 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
         options.timeout_ms > 0 ? static_cast<DWORD>(options.timeout_ms) : INFINITE;
     if (::WaitForSingleObject(process.hProcess, timeout) == WAIT_TIMEOUT) {
         result.timed_out = true;
+        const UINT kill_code = static_cast<UINT>(1);
         if (job != nullptr) {
-            (void)::TerminateJobObject(job, 1);
+            (void)::TerminateJobObject(job, kill_code);
         } else {
-            (void)::TerminateProcess(process.hProcess, 1);
+            (void)::TerminateProcess(process.hProcess, kill_code);
         }
     }
     (void)::WaitForSingleObject(process.hProcess, INFINITE);
