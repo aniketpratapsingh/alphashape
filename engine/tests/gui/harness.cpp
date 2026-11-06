@@ -115,6 +115,9 @@ void GuiTest::SetUp() {
     modal_hooks().choose_reference_change = [](QWidget*, const QString&) {
         return ReferenceChangeChoice::Relabel;
     };
+    // A save prompt would block the test; cancel it unless the test says where.
+    modal_hooks().save_file =
+        [](QWidget*, const QString&, const QString&, const QString&) { return QString(); };
     rebuild(/*reset_settings=*/true);
 }
 

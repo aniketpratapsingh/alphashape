@@ -10,6 +10,7 @@
 
 #include <functional>
 
+#include <QFileDialog>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QString>
@@ -32,6 +33,10 @@ struct ModalHooks {
     /// three-button message box. The first string is the slot name.
     std::function<ReferenceChangeChoice(QWidget*, const QString&)>
         choose_reference_change;
+    /// Ask where to save a generated file (title, suggested name, filter).
+    /// Default: QFileDialog::getSaveFileName. Empty = cancelled.
+    std::function<QString(QWidget*, const QString&, const QString&, const QString&)>
+        save_file;
 };
 
 /// The real Qt dialogs.
@@ -64,6 +69,10 @@ inline ModalHooks default_modal_hooks() {
                 return ReferenceChangeChoice::Relabel;
             }
             return ReferenceChangeChoice::Cancel;
+        },
+        [](QWidget* parent, const QString& title, const QString& suggested,
+           const QString& filter) {
+            return QFileDialog::getSaveFileName(parent, title, suggested, filter);
         },
     };
 }
