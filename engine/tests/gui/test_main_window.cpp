@@ -331,6 +331,35 @@ TEST_F(BusyWindowTest, EveryDocumentOperationRefusesWhileAJobOwnsTheDocument) {
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 
+TEST_F(BusyWindowTest, MarkerActionsAreDisabledWhileAJobRuns) {
+    show_window();
+    add_chunk(app(), "Markers");
+    // With an active chunk and an idle registry every marker action is usable.
+    ASSERT_TRUE(action("action.tools.detect_markers")->isEnabled());
+    ASSERT_TRUE(action("action.tools.detect_fiducials")->isEnabled());
+    ASSERT_TRUE(action("action.tools.print_markers")->isEnabled());
+
+    auto started = std::make_shared<std::atomic<bool>>(false);
+    registry_.register_task(std::make_shared<HoldTask>(gate_, started));
+    app().jobs().set_registry(&registry_);
+    app().jobs().submit("HoldTask", Params{},
+                        app().document().workspace().chunks().front()->id());
+    ASSERT_TRUE(pump_until([&]() { return started->load(); }, 15000));
+
+    // Detect and Print all act on the document the worker owns; the window
+    // refuses them until it is free again.
+    EXPECT_FALSE(action("action.tools.detect_markers")->isEnabled());
+    EXPECT_FALSE(action("action.tools.detect_fiducials")->isEnabled());
+    EXPECT_FALSE(action("action.tools.print_markers")->isEnabled());
+
+    gate_->open();
+    ASSERT_TRUE(pump_until([&]() { return !app().jobs().busy(); }, 15000));
+    app().jobs().set_registry(&builtin_registry());
+    EXPECT_TRUE(action("action.tools.detect_markers")->isEnabled());
+    EXPECT_TRUE(action("action.tools.detect_fiducials")->isEnabled());
+    EXPECT_TRUE(action("action.tools.print_markers")->isEnabled());
+}
+
 TEST_F(MainWindowTest, OpensAProjectCreatedByTheEngine) {
     const QString path = make_engine_project(scratch("engine.psx"));
     ASSERT_TRUE(window().open_project(path));

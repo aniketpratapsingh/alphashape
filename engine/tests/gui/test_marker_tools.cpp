@@ -1,7 +1,7 @@
-// MarkerTools.*: the Detect Markers dialog (a TaskDialog plus a target
-// preview) and the Print Markers sheet generator. Both are driven through
-// their widgets, and the save path comes from the modal hook so no test opens
-// a file dialog.
+// DetectMarkersDialog.* / PrintMarkersDialog.*: the Detect Markers dialog (a
+// TaskDialog plus a target preview) and the Print Markers sheet generator.
+// Both are driven through their widgets, and the save path comes from the
+// modal hook so no test opens a file dialog.
 
 #include <gtest/gtest.h>
 
@@ -13,8 +13,10 @@
 #include <QCheckBox>
 #include <QColor>
 #include <QComboBox>
+#include <QDir>
 #include <QDoubleSpinBox>
 #include <QFile>
+#include <QFileInfo>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
@@ -32,7 +34,7 @@ using alphashape::gui::testing::GuiTest;
 
 namespace {
 
-class MarkerToolsTest : public GuiTest {
+class DetectMarkersDialogFixture : public GuiTest {
 protected:
     QSettings& store() {
         if (!store_) {
@@ -46,6 +48,13 @@ private:
     std::unique_ptr<QSettings> store_;
 };
 
+class PrintMarkersDialogFixture : public GuiTest {};
+
+// The aliases live in this namespace, so they hide the real dialog classes
+// imported at global scope; the tests spell those out in full.
+using DetectMarkersDialog = DetectMarkersDialogFixture;
+using PrintMarkersDialog = PrintMarkersDialogFixture;
+
 const ParamSpec& spec_of(const std::string& task, const std::string& name) {
     for (const ParamSpec& spec : builtin_registry().require(task).schema.specs()) {
         if (spec.name == name) {
@@ -58,8 +67,8 @@ const ParamSpec& spec_of(const std::string& task, const std::string& name) {
 
 }  // namespace
 
-TEST_F(MarkerToolsTest, DetectMarkersDialogPreviewFollowsTargetType) {
-    DetectMarkersDialog dialog(builtin_registry(), store());
+TEST_F(DetectMarkersDialog, PreviewFollowsTargetType) {
+    alphashape::gui::DetectMarkersDialog dialog(builtin_registry(), store());
     auto* target = qobject_cast<QComboBox*>(dialog.editor("target_type"));
     ASSERT_NE(target, nullptr);
     ASSERT_NE(dialog.preview_label(), nullptr);
@@ -72,6 +81,20 @@ TEST_F(MarkerToolsTest, DetectMarkersDialogPreviewFollowsTargetType) {
     EXPECT_FALSE(dialog.preview_image().isNull());
     EXPECT_TRUE(circular12 != dialog.preview_image())
         << "the two targets must draw different patterns";
+    const QImage circular16 = dialog.preview_image();
+
+    // A script alias selects the same family and preview as its canonical
+    // name, and the combo agrees with the value the task receives.
+    dialog.set_value("target_type", std::string("CircularTarget16bit"));
+    EXPECT_EQ(target->currentText(), QStringLiteral("Circular16"));
+    EXPECT_TRUE(dialog.preview_image() == circular16);
+
+    dialog.set_value("target_type", std::string("Cross"));
+    const QImage cross = dialog.preview_image();
+    ASSERT_FALSE(cross.isNull());
+    dialog.set_value("target_type", std::string("CrossTarget"));
+    EXPECT_EQ(target->currentText(), QStringLiteral("Cross"));
+    EXPECT_TRUE(dialog.preview_image() == cross);
 
     // Circular (uncoded) has no printable sheet: a placeholder, not an exception.
     target->setCurrentText(QStringLiteral("Circular"));
@@ -80,8 +103,8 @@ TEST_F(MarkerToolsTest, DetectMarkersDialogPreviewFollowsTargetType) {
               QStringLiteral("No preview for Circular"));
 }
 
-TEST_F(MarkerToolsTest, DetectMarkersDialogInvertedFlipsPreview) {
-    DetectMarkersDialog dialog(builtin_registry(), store());
+TEST_F(DetectMarkersDialog, InvertedFlipsPreview) {
+    alphashape::gui::DetectMarkersDialog dialog(builtin_registry(), store());
     auto* target = qobject_cast<QComboBox*>(dialog.editor("target_type"));
     auto* inverted = qobject_cast<QCheckBox*>(dialog.editor("inverted"));
     ASSERT_NE(target, nullptr);
@@ -105,8 +128,8 @@ TEST_F(MarkerToolsTest, DetectMarkersDialogInvertedFlipsPreview) {
     }
 }
 
-TEST_F(MarkerToolsTest, DetectMarkersDialogToleranceRangeFromSchema) {
-    DetectMarkersDialog dialog(builtin_registry(), store());
+TEST_F(DetectMarkersDialog, ToleranceRangeFromSchema) {
+    alphashape::gui::DetectMarkersDialog dialog(builtin_registry(), store());
     const ParamSpec& spec = spec_of("DetectMarkers", "tolerance");
     ASSERT_EQ(spec.name, "tolerance");
     ASSERT_TRUE(std::holds_alternative<double>(spec.minimum));
@@ -120,8 +143,8 @@ TEST_F(MarkerToolsTest, DetectMarkersDialogToleranceRangeFromSchema) {
     EXPECT_EQ(spin->maximum(), 100.0);
 }
 
-TEST_F(MarkerToolsTest, DetectMarkersDialogParamsReachTask) {
-    DetectMarkersDialog dialog(builtin_registry(), store());
+TEST_F(DetectMarkersDialog, ParamsReachTask) {
+    alphashape::gui::DetectMarkersDialog dialog(builtin_registry(), store());
     auto* target = qobject_cast<QComboBox*>(dialog.editor("target_type"));
     auto* tolerance = qobject_cast<QDoubleSpinBox*>(dialog.editor("tolerance"));
     auto* inverted = qobject_cast<QCheckBox*>(dialog.editor("inverted"));
@@ -141,8 +164,8 @@ TEST_F(MarkerToolsTest, DetectMarkersDialogParamsReachTask) {
     EXPECT_EQ(std::get<bool>(params.get("inverted")), true);
 }
 
-TEST_F(MarkerToolsTest, PrintMarkersDialogPageCountUpdates) {
-    PrintMarkersDialog dialog;
+TEST_F(PrintMarkersDialog, PageCountUpdates) {
+    alphashape::gui::PrintMarkersDialog dialog;
     ASSERT_NE(dialog.count_editor(), nullptr);
     EXPECT_EQ(dialog.page_count(), 1);
     EXPECT_EQ(dialog.page_count_label()->text(), QStringLiteral("1 page"));
@@ -153,16 +176,17 @@ TEST_F(MarkerToolsTest, PrintMarkersDialogPageCountUpdates) {
         dialog.target_editor()->findData(static_cast<int>(SheetTarget::Circular20));
     ASSERT_GE(circular20, 0);
     dialog.target_editor()->setCurrentIndex(circular20);
+    EXPECT_EQ(dialog.target_editor()->currentText(), QStringLiteral("Circular 20-bit"));
     dialog.count_editor()->setValue(100);
     EXPECT_EQ(dialog.page_count(), 3);
     EXPECT_EQ(dialog.page_count_label()->text(), QStringLiteral("3 pages"));
 }
 
-TEST_F(MarkerToolsTest, PrintMarkersDialogSavesPdf) {
+TEST_F(PrintMarkersDialog, SavesPdf) {
     const QString path = scratch(QStringLiteral("markers.pdf"));
     modal_hooks().save_file = [path](QWidget*, const QString&, const QString&,
                                      const QString&) { return path; };
-    PrintMarkersDialog dialog;
+    alphashape::gui::PrintMarkersDialog dialog;
     ASSERT_TRUE(dialog.layout_valid());
     ASSERT_TRUE(dialog.save_button()->isEnabled());
 
@@ -173,8 +197,30 @@ TEST_F(MarkerToolsTest, PrintMarkersDialogSavesPdf) {
     EXPECT_EQ(file.read(4), QByteArray("%PDF"));
 }
 
-TEST_F(MarkerToolsTest, PrintMarkersDialogInvalidLayoutShowsError) {
-    PrintMarkersDialog dialog;
+TEST_F(PrintMarkersDialog, SaveCancelWritesNothing) {
+    int prompts = 0;
+    modal_hooks().save_file = [&prompts](QWidget*, const QString&, const QString&,
+                                         const QString&) {
+        ++prompts;
+        return QString();
+    };
+    alphashape::gui::PrintMarkersDialog dialog;
+    ASSERT_TRUE(dialog.layout_valid());
+    EXPECT_NO_THROW(dialog.save_pdf());
+
+    // The hook was asked once, answered "cancelled", and the dialog treated
+    // that as a no-op: no file, no error report (the harness hook would have
+    // failed the test), and the inline error label stays empty.
+    EXPECT_EQ(prompts, 1);
+    const QString dir = QFileInfo(scratch(QStringLiteral("unused"))).absolutePath();
+    EXPECT_TRUE(QDir(dir).entryList(QStringList{QStringLiteral("*.pdf")},
+                                    QDir::Files)
+                    .isEmpty());
+    EXPECT_TRUE(dialog.error_label()->text().isEmpty());
+}
+
+TEST_F(PrintMarkersDialog, InvalidLayoutShowsError) {
+    alphashape::gui::PrintMarkersDialog dialog;
     ASSERT_TRUE(dialog.layout_valid());
 
     // 400 mm does not fit any edge of A4, so the layout is invalid while the
@@ -193,8 +239,8 @@ TEST_F(MarkerToolsTest, PrintMarkersDialogInvalidLayoutShowsError) {
     EXPECT_TRUE(dialog.error_label()->text().isEmpty());
 }
 
-TEST_F(MarkerToolsTest, PrintMarkersDialogChessboardFieldsToggle) {
-    PrintMarkersDialog dialog;
+TEST_F(PrintMarkersDialog, ChessboardFieldsToggle) {
+    alphashape::gui::PrintMarkersDialog dialog;
     ASSERT_NE(dialog.target_editor(), nullptr);
     // A coded sheet uses the code fields and not the board geometry.
     EXPECT_TRUE(dialog.target_size_editor()->isEnabled());
@@ -217,4 +263,22 @@ TEST_F(MarkerToolsTest, PrintMarkersDialogChessboardFieldsToggle) {
     EXPECT_TRUE(dialog.square_size_editor()->isEnabled());
     EXPECT_TRUE(dialog.layout_valid());
     EXPECT_EQ(dialog.page_count(), 1);
+
+    // Cross is uncoded (a code count of zero), so the first-code field is off.
+    const int cross =
+        dialog.target_editor()->findData(static_cast<int>(SheetTarget::Cross));
+    ASSERT_GE(cross, 0);
+    dialog.target_editor()->setCurrentIndex(cross);
+    EXPECT_FALSE(dialog.first_code_editor()->isEnabled());
+    EXPECT_TRUE(dialog.count_editor()->isEnabled());
+
+    // A coded family offers ids 0..count-1.
+    const int circular20 =
+        dialog.target_editor()->findData(static_cast<int>(SheetTarget::Circular20));
+    ASSERT_GE(circular20, 0);
+    dialog.target_editor()->setCurrentIndex(circular20);
+    EXPECT_TRUE(dialog.first_code_editor()->isEnabled());
+    EXPECT_EQ(dialog.first_code_editor()->minimum(), 0);
+    EXPECT_EQ(dialog.first_code_editor()->maximum(),
+              sheet_target_code_count(SheetTarget::Circular20) - 1);
 }

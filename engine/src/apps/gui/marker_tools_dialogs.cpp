@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <QCheckBox>
@@ -61,11 +62,56 @@ QImage to_qimage(const Image& source) {
     return {};
 }
 
-/// The sheet family a DetectMarkers target_type selects, when one exists.
-/// parse_sheet_target covers the lower-case script aliases as well as the
-/// schema's capitalised names.
+/// The sheet family a DetectMarkers target selects, when one can be printed.
+/// Both the schema's canonical names and the script aliases the task accepts
+/// map here. The uncoded Circular/CircularTarget family has no printed sheet,
+/// so it is deliberately absent and the dialog shows its placeholder.
 std::optional<SheetTarget> preview_target(const QString& type) {
-    return parse_sheet_target(type.toLower().toStdString());
+    const std::string name = type.toStdString();
+    if (name == "Circular12" || name == "CircularTarget12bit") {
+        return SheetTarget::Circular12;
+    }
+    if (name == "Circular14" || name == "CircularTarget14bit") {
+        return SheetTarget::Circular14;
+    }
+    if (name == "Circular16" || name == "CircularTarget16bit") {
+        return SheetTarget::Circular16;
+    }
+    if (name == "Circular20" || name == "CircularTarget20bit") {
+        return SheetTarget::Circular20;
+    }
+    if (name == "Cross" || name == "CrossTarget") {
+        return SheetTarget::Cross;
+    }
+    if (name == "AprilTag36h11") {
+        return SheetTarget::AprilTag36h11;
+    }
+    return std::nullopt;
+}
+
+/// The canonical schema name for a target alias the task also accepts. The
+/// combo only holds canonical names, so an alias loaded verbatim would show
+/// index 0 while the dialog submitted the alias: resolve it first.
+std::string canonical_target_type(const std::string& name) {
+    if (name == "CircularTarget12bit") {
+        return "Circular12";
+    }
+    if (name == "CircularTarget14bit") {
+        return "Circular14";
+    }
+    if (name == "CircularTarget16bit") {
+        return "Circular16";
+    }
+    if (name == "CircularTarget20bit") {
+        return "Circular20";
+    }
+    if (name == "CircularTarget") {
+        return "Circular";
+    }
+    if (name == "CrossTarget") {
+        return "Cross";
+    }
+    return name;
 }
 
 }  // namespace
@@ -101,6 +147,13 @@ DetectMarkersDialog::DetectMarkersDialog(const TaskRegistry& registry,
 
 void DetectMarkersDialog::set_value(const std::string& param,
                                     const ParamValue& value) {
+    if (param == "target_type") {
+        if (const auto* text = std::get_if<std::string>(&value)) {
+            TaskDialog::set_value(param, canonical_target_type(*text));
+            refresh_preview();
+            return;
+        }
+    }
     TaskDialog::set_value(param, value);
     refresh_preview();
 }
@@ -121,9 +174,11 @@ void DetectMarkersDialog::refresh_preview() {
     SheetOptions options;
     options.target = *sheet;
     // A single target keeps the raster cheap; the preview only has to show the
-    // pattern the decoder will look for, not a complete page.
+    // pattern the decoder will look for, not a complete page. Registration
+    // marks and labels belong to a printed sheet, not a target sample.
     options.count = 1;
     options.first_code = 1;
+    options.corner_marks = false;
     options.labels = false;
     try {
         preview_image_ = to_qimage(
@@ -218,8 +273,31 @@ QWidget* PrintMarkersDialog::build_fields() {
     target_ = new QComboBox(host);
     target_->setObjectName(QStringLiteral("print.target"));
     for (SheetTarget target : all_sheet_targets()) {
-        target_->addItem(QString::fromStdString(sheet_target_name(target)),
-                         static_cast<int>(target));
+        QString label;
+        switch (target) {
+            case SheetTarget::Circular12:
+                label = tr("Circular 12-bit");
+                break;
+            case SheetTarget::Circular14:
+                label = tr("Circular 14-bit");
+                break;
+            case SheetTarget::Circular16:
+                label = tr("Circular 16-bit");
+                break;
+            case SheetTarget::Circular20:
+                label = tr("Circular 20-bit");
+                break;
+            case SheetTarget::Cross:
+                label = tr("Cross");
+                break;
+            case SheetTarget::AprilTag36h11:
+                label = tr("AprilTag 36h11");
+                break;
+            case SheetTarget::Chessboard:
+                label = tr("Chessboard");
+                break;
+        }
+        target_->addItem(label, static_cast<int>(target));
     }
     form->addRow(tr("Target"), target_);
 
@@ -267,17 +345,22 @@ QWidget* PrintMarkersDialog::build_fields() {
     labels_->setChecked(true);
     form->addRow(QString(), labels_);
 
+    // The board is described by SQUARES; a detector configured for this sheet
+    // takes one inner corner fewer in each direction.
+    const QString board_tip = tr("The detector uses squares - 1 inner corners.");
     board_cols_ = new QSpinBox(host);
     board_cols_->setObjectName(QStringLiteral("print.board_cols"));
     board_cols_->setRange(3, 50);
     board_cols_->setValue(9);
-    form->addRow(tr("Board columns"), board_cols_);
+    board_cols_->setToolTip(board_tip);
+    form->addRow(tr("Board squares across"), board_cols_);
 
     board_rows_ = new QSpinBox(host);
     board_rows_->setObjectName(QStringLiteral("print.board_rows"));
     board_rows_->setRange(3, 50);
     board_rows_->setValue(6);
-    form->addRow(tr("Board rows"), board_rows_);
+    board_rows_->setToolTip(board_tip);
+    form->addRow(tr("Board squares down"), board_rows_);
 
     square_size_ = new QDoubleSpinBox(host);
     square_size_->setObjectName(QStringLiteral("print.square_size"));
@@ -294,15 +377,21 @@ SheetTarget PrintMarkersDialog::selected_target() const {
 }
 
 void PrintMarkersDialog::sync_chessboard_fields() {
-    const bool chessboard = selected_target() == SheetTarget::Chessboard;
+    const SheetTarget target = selected_target();
+    const bool chessboard = target == SheetTarget::Chessboard;
     // A chessboard has no codes; the code fields stay visible but inert, and
     // the board geometry takes over.
     for (QWidget* field : {static_cast<QWidget*>(target_size_),
                            static_cast<QWidget*>(quiet_zone_),
-                           static_cast<QWidget*>(first_code_),
                            static_cast<QWidget*>(count_)}) {
         field->setEnabled(!chessboard);
     }
+    // Codes are numbered from zero, so the largest id the family prints is the
+    // count minus one. Cross is uncoded and a chessboard has no code space at
+    // all (asking its count throws), so both leave the field disabled.
+    const int codes = chessboard ? 0 : sheet_target_code_count(target);
+    first_code_->setEnabled(codes > 0);
+    first_code_->setRange(0, codes > 0 ? codes - 1 : 0);
     for (QWidget* field : {static_cast<QWidget*>(board_cols_),
                            static_cast<QWidget*>(board_rows_),
                            static_cast<QWidget*>(square_size_)}) {
@@ -367,24 +456,30 @@ void PrintMarkersDialog::refresh() {
 }
 
 void PrintMarkersDialog::save_pdf() {
-    if (!layout_valid()) {
-        refresh();
-    }
-    if (!layout_valid()) {
-        return;
-    }
-    const SheetOptions layout = options();
-    const QString suggested =
-        QStringLiteral("markers-") +
-        QString::fromStdString(sheet_target_name(layout.target)) +
-        QStringLiteral(".pdf");
-    const QString path =
-        modal_hooks().save_file(this, tr("Save Marker Sheet"), suggested,
-                                tr("PDF files (*.pdf);;All files (*)"));
-    if (path.isEmpty()) {
-        return;
-    }
+    // Everything runs inside the try: this is a Qt slot, so an exception must
+    // never unwind through the event loop, including one from the save hook.
     try {
+        if (!layout_valid()) {
+            refresh();
+        }
+        if (!layout_valid()) {
+            return;
+        }
+        const SheetOptions layout = options();
+        const auto& ask_path = modal_hooks().save_file;
+        if (!ask_path) {
+            return;
+        }
+        const QString suggested =
+            QStringLiteral("markers-") +
+            QString::fromStdString(sheet_target_name(layout.target)) +
+            QStringLiteral(".pdf");
+        const QString path =
+            ask_path(this, tr("Save Marker Sheet"), suggested,
+                     tr("PDF files (*.pdf);;All files (*)"));
+        if (path.isEmpty()) {
+            return;
+        }
         const std::vector<std::uint8_t> pdf = marker_sheet_pdf(layout);
         // QSaveFile writes a temporary file beside the target and renames it
         // on commit; a failed write removes the temporary file on destruction.
