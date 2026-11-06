@@ -165,7 +165,11 @@ TEST(Estimates, HistoryFileRoundTrip) {
     ASSERT_TRUE(directory.isValid());
     const std::string project = directory.filePath("scene.psx").toStdString();
     const std::string path = history_path_for_project(project);
-    ASSERT_EQ(path, directory.filePath("scene").toStdString() + ".files/job_history.tsv");
+    // Compare through std::filesystem: its string() is native, while
+    // QTemporaryDir::filePath() uses forward slashes on every platform.
+    const std::string base =
+        std::filesystem::path(directory.filePath("scene").toStdString()).string();
+    ASSERT_EQ(path, base + ".files/job_history.tsv");
 
     std::filesystem::create_directories(std::filesystem::path(path).parent_path());
     {
