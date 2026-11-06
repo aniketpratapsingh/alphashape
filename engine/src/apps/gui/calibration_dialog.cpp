@@ -23,7 +23,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QListWidget>
-#include <QMessageBox>
+#include <QLocale>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSplitter>
@@ -36,6 +36,7 @@
 
 #include "apps/gui/app.hpp"
 #include "apps/gui/job_manager.hpp"
+#include "apps/gui/modal_hooks.hpp"
 #include "apps/gui/task_dialog.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
@@ -102,6 +103,19 @@ CalibrationDialog::CalibrationDialog(GuiApp& app, QWidget* parent)
     split->addWidget(tabs_);
     split->setStretchFactor(1, 1);
     layout->addWidget(split, 1);
+    auto* slave_row = new QHBoxLayout();
+    slave_note_ = new QLabel(this);
+    slave_note_->setObjectName(QStringLiteral("calibration.slave_note"));
+    slave_note_->setWordWrap(true);
+    slave_note_->setVisible(false);
+    edit_master_ = new QPushButton(tr("Edit master sensor"), this);
+    edit_master_->setObjectName(QStringLiteral("calibration.edit_master"));
+    edit_master_->setVisible(false);
+    slave_row->addWidget(slave_note_, 1);
+    slave_row->addWidget(edit_master_);
+    layout->addLayout(slave_row);
+    connect(edit_master_, &QPushButton::clicked, this,
+            &CalibrationDialog::select_master);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
     optimize_ = buttons->addButton(tr("Optimize..."), QDialogButtonBox::ActionRole);
     optimize_->setObjectName(QStringLiteral("calibration.optimize"));
@@ -115,7 +129,10 @@ CalibrationDialog::CalibrationDialog(GuiApp& app, QWidget* parent)
             refresh();
         }
     });
-    connect(&app_.jobs(), &JobManager::busy_changed, this, [this](bool) { refresh(); });
+    connect(&app_.jobs(), &JobManager::busy_changed, this, [this](bool) {
+        refresh();
+        update_editor_state();
+    });
     optimize_->setEnabled(builtin_registry().find("OptimizeCameras") != nullptr);
     const std::int32_t active = app_.read_document([](const Document& document) {
         const Chunk* chunk = document.active_chunk();
@@ -139,6 +156,7 @@ QWidget* CalibrationDialog::build_initial_tab() {
     const auto spin = [geometry](const QString& name, double maximum, int decimals) {
         auto* editor = new QDoubleSpinBox(geometry);
         editor->setObjectName(name);
+        editor->setLocale(QLocale::c());
         editor->setRange(-maximum, maximum);
         editor->setDecimals(decimals);
         editor->setKeyboardTracking(false);
@@ -159,9 +177,13 @@ QWidget* CalibrationDialog::build_initial_tab() {
         row_layout->setContentsMargins(0, 0, 0, 0);
         auto* editor = new QDoubleSpinBox(row);
         editor->setObjectName(QStringLiteral("calibration.initial.") + name);
+        editor->setLocale(QLocale::c());
         editor->setRange(-1e9, 1e9);
         editor->setDecimals(6);
         editor->setKeyboardTracking(false);
+        editor->setToolTip(
+            tr("Editing a coefficient clears the covariance from the last "
+               "adjustment; run Optimize to recompute it."));
         auto* fit = new QCheckBox(tr("Fit"), row);
         fit->setObjectName(QStringLiteral("calibration.fit.") + name);
         row_layout->addWidget(editor, 1);
@@ -226,6 +248,7 @@ QWidget* CalibrationDialog::build_gnss_tab() {
         auto* editor = new QDoubleSpinBox(group);
         editor->setObjectName(QStringLiteral("calibration.antenna.") +
                              QString::fromLatin1(axes[i]));
+        editor->setLocale(QLocale::c());
         editor->setRange(-1e6, 1e6);
         editor->setDecimals(4);
         editor->setKeyboardTracking(false);
@@ -247,6 +270,7 @@ QWidget* CalibrationDialog::build_gnss_tab() {
         auto* editor = new QDoubleSpinBox(angles);
         editor->setObjectName(QStringLiteral("calibration.boresight.") +
                              QString::fromLatin1(axes[i]));
+        editor->setLocale(QLocale::c());
         editor->setRange(-360.0, 360.0);
         editor->setDecimals(6);
         editor->setKeyboardTracking(false);
@@ -341,7 +365,8 @@ void CalibrationDialog::refresh() {
 void CalibrationDialog::load_sensor(int index) {
     sensor_index_ = index;
     if (index < 0) {
-        update_adjusted(Sensor{});
+        sensor_ = Sensor{};
+        show_sensor();
         return;
     }
     std::int32_t id = -1;
@@ -349,6 +374,25 @@ void CalibrationDialog::load_sensor(int index) {
     if (id >= 0) {
         chunk_id_ = id;
     }
+    master_label_.clear();
+    if (sensor_.master_sensor_id >= 0) {
+        app_.read_document([this](const Document& document) {
+            const Chunk* chunk = find_chunk_in(document, chunk_id_);
+            if (chunk == nullptr) {
+                return;
+            }
+            const std::int32_t master = sensor_.master_sensor_id;
+            if (master >= 0 &&
+                master < static_cast<std::int32_t>(chunk->sensors().size())) {
+                master_label_ = QString::fromStdString(
+                    chunk->sensors()[static_cast<std::size_t>(master)].label);
+            }
+        });
+    }
+    show_sensor();
+}
+
+void CalibrationDialog::show_sensor() {
     const Calibration& calibration = sensor_.calibration;
     for (int i = 0; i < kCalibrationParamCount; ++i) {
         const std::size_t at = static_cast<std::size_t>(i);
@@ -360,7 +404,7 @@ void CalibrationDialog::load_sensor(int index) {
         if (QCheckBox* check = fit_.value(name)) {
             const QSignalBlocker blocker(check);
             check->setChecked(
-                is_fixed(sensor_.fixed_params, kCalibrationParamNames[at]));
+                !is_fixed(sensor_.fixed_params, kCalibrationParamNames[at]));
         }
     }
     {
@@ -393,6 +437,51 @@ void CalibrationDialog::load_sensor(int index) {
                        : 0.0);
     }
     update_adjusted(sensor_);
+    update_editor_state();
+}
+
+void CalibrationDialog::update_editor_state() {
+    const bool editable = !app_.jobs().busy() && !is_slave();
+    const bool has_angles = sensor_.antenna.boresight_deg.has_value();
+    for (QDoubleSpinBox* editor : initial_) {
+        editor->setEnabled(editable);
+    }
+    for (QCheckBox* check : fit_) {
+        check->setEnabled(editable);
+    }
+    type_->setEnabled(editable);
+    pixel_size_->setEnabled(editable);
+    focal_length_->setEnabled(editable);
+    boresight_enabled_->setEnabled(editable);
+    for (int i = 0; i < 3; ++i) {
+        antenna_offset_[i]->setEnabled(editable);
+        boresight_[i]->setEnabled(editable && has_angles);
+    }
+    const bool slave = is_slave();
+    slave_note_->setVisible(slave);
+    edit_master_->setVisible(slave);
+    if (slave) {
+        slave_note_->setText(
+            tr("Calibration is shared with master sensor %1; edit the master.")
+                .arg(master_label_.isEmpty() ? tr("(unnamed)") : master_label_));
+    }
+}
+
+void CalibrationDialog::reload_after_rejection() {
+    if (app_.jobs().busy()) {
+        // The document is exclusively held by a task; the cached copy is the
+        // last state read from it, and the rejected edit left it unchanged.
+        show_sensor();
+        return;
+    }
+    refresh();
+}
+
+void CalibrationDialog::select_master() {
+    if (sensor_.master_sensor_id < 0) {
+        return;
+    }
+    select_sensor(static_cast<int>(sensor_.master_sensor_id));
 }
 
 void CalibrationDialog::update_adjusted(const Sensor& sensor) {
@@ -482,9 +571,14 @@ void CalibrationDialog::commit_calibration() {
     }
     calibration.type =
         type_->currentIndex() == 1 ? CameraType::Fisheye : CameraType::Frame;
-    if (calibration.same_model(sensor_.calibration)) {
+    if (calibration.same_model(sensor_.calibration) &&
+        calibration.type == sensor_.calibration.type) {
         return;
     }
+    // The stored covariance belongs to the model values the adjustment
+    // produced; once those change it no longer describes them.
+    calibration.covariance.resize(0, 0);
+    calibration.covariance_params.clear();
     try {
         app_.execute(make_set_sensor_calibration_command(chunk_id_, sensor_index_,
                                                          calibration));
@@ -493,9 +587,8 @@ void CalibrationDialog::commit_calibration() {
         sensor_.width = calibration.width;
         sensor_.height = calibration.height;
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Camera Calibration"),
-                              QString::fromUtf8(error.what()));
-        refresh();
+        report_error(this, tr("Camera Calibration"), QString::fromUtf8(error.what()));
+        reload_after_rejection();
         return;
     }
     update_adjusted(sensor_);
@@ -509,7 +602,8 @@ void CalibrationDialog::commit_fixed_params() {
     for (int i = 0; i < kCalibrationParamCount; ++i) {
         const std::size_t at = static_cast<std::size_t>(i);
         const QString name = QString::fromLatin1(kCalibrationParamNames[at]);
-        if (QCheckBox* check = fit_.value(name); check != nullptr && check->isChecked()) {
+        if (QCheckBox* check = fit_.value(name);
+            check != nullptr && !check->isChecked()) {
             fixed.emplace_back(kCalibrationParamNames[at]);
         }
     }
@@ -521,9 +615,8 @@ void CalibrationDialog::commit_fixed_params() {
                                                           fixed));
         sensor_.fixed_params = fixed;
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Camera Calibration"),
-                              QString::fromUtf8(error.what()));
-        refresh();
+        report_error(this, tr("Camera Calibration"), QString::fromUtf8(error.what()));
+        reload_after_rejection();
     }
 }
 
@@ -543,9 +636,8 @@ void CalibrationDialog::commit_physical() {
         sensor_.pixel_size_um = pixel_size;
         sensor_.focal_length_mm = focal_length;
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Camera Calibration"),
-                              QString::fromUtf8(error.what()));
-        refresh();
+        report_error(this, tr("Camera Calibration"), QString::fromUtf8(error.what()));
+        reload_after_rejection();
     }
 }
 
@@ -572,9 +664,8 @@ void CalibrationDialog::commit_antenna() {
             make_set_sensor_antenna_command(chunk_id_, sensor_index_, antenna));
         sensor_.antenna = antenna;
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Camera Calibration"),
-                              QString::fromUtf8(error.what()));
-        refresh();
+        report_error(this, tr("Camera Calibration"), QString::fromUtf8(error.what()));
+        reload_after_rejection();
     }
 }
 
@@ -591,8 +682,7 @@ void CalibrationDialog::run_optimize() {
         }
         app_.jobs().submit("OptimizeCameras", dialog.params(), chunk_id_);
     } catch (const std::exception& error) {
-        QMessageBox::critical(this, tr("Camera Calibration"),
-                              QString::fromUtf8(error.what()));
+        report_error(this, tr("Camera Calibration"), QString::fromUtf8(error.what()));
     }
 }
 

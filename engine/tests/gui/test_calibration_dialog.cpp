@@ -9,8 +9,10 @@
 #include <gtest/gtest.h>
 
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QLabel>
 #include <QListWidget>
+#include <QPushButton>
 #include <QTableWidget>
 
 #include "apps/gui/app.hpp"
@@ -82,11 +84,18 @@ TEST_F(CalibrationDialog, FitFlagEditEmitsCommand) {
     dialog.set_chunk(chunk.id());
     QCheckBox* k3 = dialog.fit_check(QStringLiteral("k3"));
     ASSERT_NE(k3, nullptr);
-    ASSERT_FALSE(k3->isChecked());
+    // "Fit" checked means the coefficient is optimised, i.e. it is NOT in
+    // fixed_params. Every coefficient is fitted by default.
+    for (int i = 0; i < kCalibrationParamCount; ++i) {
+        QCheckBox* check = dialog.fit_check(
+            QString::fromLatin1(kCalibrationParamNames[static_cast<std::size_t>(i)]));
+        ASSERT_NE(check, nullptr);
+        EXPECT_TRUE(check->isChecked());
+    }
     ASSERT_TRUE(chunk.sensors()[0].fixed_params.empty());
     const std::size_t before = app().undo_stack().size();
 
-    k3->setChecked(true);
+    k3->setChecked(false);
 
     EXPECT_EQ(app().undo_stack().size(), before + 1);
     ASSERT_EQ(chunk.sensors()[0].fixed_params.size(), 1U);
@@ -96,6 +105,53 @@ TEST_F(CalibrationDialog, FitFlagEditEmitsCommand) {
 
     EXPECT_TRUE(chunk.sensors()[0].fixed_params.empty());
     EXPECT_EQ(app().undo_stack().position(), before);
+}
+
+TEST_F(CalibrationDialog, SlavePointsAtItsMaster) {
+    Chunk& chunk = build_sensor();
+    Sensor slave;
+    slave.label = "Secondary";
+    slave.width = 6000;
+    slave.height = 4000;
+    slave.calibration = chunk.sensors()[0].calibration;
+    slave.master_sensor_id = 0;
+    chunk.sensors().push_back(slave);
+    alphashape::gui::CalibrationDialog dialog(app());
+    dialog.set_chunk(chunk.id());
+    ASSERT_EQ(dialog.sensor_list()->count(), 2);
+
+    dialog.select_sensor(1);
+    ASSERT_EQ(dialog.sensor_index(), 1);
+    // A slave's calibration belongs to its master: the editors are read-only
+    // and the note points at the master.
+    EXPECT_FALSE(dialog.initial_editor(QStringLiteral("f"))->isEnabled());
+    EXPECT_FALSE(dialog.fit_check(QStringLiteral("k3"))->isEnabled());
+    ASSERT_NE(dialog.slave_note(), nullptr);
+    EXPECT_FALSE(dialog.slave_note()->isHidden());
+    EXPECT_NE(dialog.slave_note()->text().indexOf(QStringLiteral("Primary")), -1);
+    ASSERT_NE(dialog.edit_master_button(), nullptr);
+    EXPECT_FALSE(dialog.edit_master_button()->isHidden());
+
+    dialog.edit_master_button()->click();
+    EXPECT_EQ(dialog.sensor_index(), 0);
+    EXPECT_TRUE(dialog.initial_editor(QStringLiteral("f"))->isEnabled());
+    EXPECT_TRUE(dialog.slave_note()->isHidden());
+}
+
+TEST_F(CalibrationDialog, EditingCoefficientClearsCovariance) {
+    Chunk& chunk = build_sensor();
+    alphashape::gui::CalibrationDialog dialog(app());
+    dialog.set_chunk(chunk.id());
+    auto* sigma = dialog.findChild<QLabel*>(QStringLiteral("calibration.sigma.f"));
+    ASSERT_NE(sigma, nullptr);
+    ASSERT_EQ(sigma->text(), QStringLiteral("2.000000"));
+
+    dialog.initial_editor(QStringLiteral("k1"))->setValue(0.02);
+    dialog.commit_calibration();
+
+    EXPECT_DOUBLE_EQ(chunk.sensors()[0].calibration.k1, 0.02);
+    EXPECT_TRUE(chunk.sensors()[0].calibration.covariance_params.empty());
+    EXPECT_EQ(sigma->text(), QStringLiteral("n/a"));
 }
 
 }  // namespace
