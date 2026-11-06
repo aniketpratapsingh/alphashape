@@ -22,7 +22,17 @@
 #include "harness.hpp"
 
 using namespace alphashape;
-using namespace alphashape::gui;
+// Deliberately not `using namespace alphashape::gui`: the gtest fixture must be named
+// TransformDialog, and importing the whole namespace would make that name ambiguous with
+// gui::TransformDialog. The names used unqualified below are imported one by one instead.
+using alphashape::gui::GizmoDrag;
+using alphashape::gui::GizmoHandle;
+using alphashape::gui::GizmoHandleKind;
+using alphashape::gui::GizmoRay;
+using alphashape::gui::GizmoState;
+using alphashape::gui::RegionGizmoMode;
+using alphashape::gui::ViewportWidget;
+using alphashape::gui::transform_from_values;
 using alphashape::gui::testing::GuiTest;
 
 namespace {
