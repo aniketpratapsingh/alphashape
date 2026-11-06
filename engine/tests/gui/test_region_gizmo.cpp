@@ -36,6 +36,7 @@ using alphashape::gui::GizmoHandleKind;
 using alphashape::gui::GizmoRay;
 using alphashape::gui::GizmoState;
 using alphashape::gui::RegionGizmoMode;
+using alphashape::gui::TransformValues;
 using alphashape::gui::ViewportWidget;
 using alphashape::gui::transform_from_values;
 using alphashape::gui::testing::GuiTest;
