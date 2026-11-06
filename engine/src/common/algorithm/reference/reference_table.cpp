@@ -6,8 +6,10 @@
 #include <optional>
 #include <utility>
 
+#include "common/algorithm/reference/reference_orientation.hpp"
 #include "model/crs/local_frame.hpp"
 #include "model/crs/transform.hpp"
+#include "model/geo/geodesy.hpp"
 
 namespace alphashape::reference {
 namespace {
@@ -31,6 +33,32 @@ Eigen::Vector3d camera_centre(const Transform& pose) {
 
 bool positive_finite(double value) {
     return std::isfinite(value) && value > 0.0;
+}
+
+/// The position a camera reference measures: the projection centre plus the
+/// mounted antenna's lever arm, in chunk-local units. This is exactly
+/// OptimizeCameras' `A = C + R^T lever` (bundle_adjustment.hpp): the lever is
+/// in metres in the camera frame, rotated by the pose and divided by the chunk
+/// similarity scale. An unset antenna (or a camera without a sensor) leaves the
+/// centre unchanged.
+Eigen::Vector3d camera_antenna_position(const Chunk& chunk, const Camera& camera,
+                                        const Eigen::Vector3d& centre) {
+    const std::vector<Sensor>& sensors = chunk.sensors();
+    if (camera.sensor_id < 0 ||
+        static_cast<std::size_t>(camera.sensor_id) >= sensors.size()) {
+        return centre;
+    }
+    const Eigen::Vector3d lever = effective_antenna(chunk, camera).camera_offset();
+    if (lever.isZero()) {
+        return centre;
+    }
+    const double scale =
+        std::cbrt(std::abs(chunk.transform().block<3, 3>(0, 0).determinant()));
+    if (!positive_finite(scale)) {
+        return centre;
+    }
+    const Eigen::Matrix3d rotation = camera.pose.block<3, 3>(0, 0);
+    return centre + rotation.transpose() * lever / scale;
 }
 
 /// The per-axis accuracies collapsed to one 1-sigma figure, or -1 when they
@@ -263,7 +291,8 @@ ReferenceTable build_reference_table(const Chunk& chunk,
             row.source = source_of(camera.reference.location, camera_cs, camera_src);
         }
         if (camera.enabled) {
-            row.estimated = estimate_of(centres[ci]);
+            row.estimated = estimate_of(
+                camera_antenna_position(chunk, camera, centres[ci]));
         }
         row.error = error_of(row.estimated, row.source);
         if (row.error) {

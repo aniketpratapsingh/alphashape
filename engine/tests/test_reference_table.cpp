@@ -191,6 +191,37 @@ TEST(ReferenceTable, CameraCheckboxMeansReferenceEnabled) {
     EXPECT_NEAR(summary.camera_rmse_m, 1.0, 1e-9);
 }
 
+TEST(ReferenceTable, AntennaLeverArmMatchesTheEstimate) {
+    Chunk chunk("lever arm");
+    chunk.set_id(0);
+    chunk.set_coordinate_system(crs::CoordinateSystem::from_epsg(4979));
+    const geo::Geodetic origin{10.0, 50.0, 100.0};
+    const Eigen::Vector3d anchor = geo::geodetic_to_ecef(origin);
+    chunk.transform().block<3, 1>(0, 3) = anchor;
+
+    const Eigen::Vector3d lever(1.0, 2.0, 3.0);
+    Sensor sensor;
+    sensor.antenna.offset_m = lever;
+    chunk.sensors().push_back(sensor);
+
+    // Identity pose: R is identity, so the antenna sits at C + lever.
+    Camera camera = make_camera(1, Eigen::Vector3d::Zero());
+    camera.sensor_id = 0;
+    const geo::Geodetic measured = geo::ecef_to_geodetic(anchor + lever);
+    camera.reference.location =
+        Eigen::Vector3d(measured.longitude_deg, measured.latitude_deg, measured.height_m);
+    chunk.cameras().push_back(camera);
+
+    const ReferenceTable table =
+        build_reference_table(chunk, chunk.coordinate_system());
+    const ReferenceRow& row = row_for(table, 1);
+    ASSERT_TRUE(row.estimated.has_value());
+    ASSERT_TRUE(row.error_m.has_value());
+    // The reference measures the antenna, so the residual vanishes when the
+    // lever arm is applied.
+    EXPECT_NEAR(*row.error_m, 0.0, 1e-6);
+}
+
 TEST(ReferenceTable, GeographicErrorIsInMetres) {
     Chunk chunk("geo");
     chunk.set_id(0);
