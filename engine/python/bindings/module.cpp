@@ -274,6 +274,26 @@ py::list reshape_vec3_grid(const std::vector<float>& data, int height, int width
     return rows;
 }
 
+/// One depth map as the full dict both `depth_maps` and `active_depth_maps`
+/// expose. A single builder keeps the two properties identical.
+py::dict depth_map_entry(const alphashape::DepthMap& map) {
+    py::dict entry;
+    entry[py::str("camera_id")] = py::int_(map.camera_id);
+    entry[py::str("width")] = py::int_(map.width);
+    entry[py::str("height")] = py::int_(map.height);
+    entry[py::str("downscale")] = py::int_(map.downscale);
+    entry[py::str("depth")] = reshape_scalar(map.depths, map.height, map.width);
+    entry[py::str("normals")] =
+        map.normals.empty()
+            ? py::object(py::none())
+            : py::object(reshape_vec3_grid(map.normals, map.height, map.width));
+    entry[py::str("confidence")] =
+        map.confidence.empty()
+            ? py::object(py::none())
+            : py::object(reshape_scalar(map.confidence, map.height, map.width));
+    return entry;
+}
+
 /// Bilinear, nodata-aware height sample on a DEM (the orthorectifier's rule).
 /// Returns false when the point is off the grid or no valid cell contributes.
 bool sample_height(const alphashape::GeoRaster<float>& raster, float nodata, double x, double y,
@@ -311,10 +331,55 @@ bool sample_height(const alphashape::GeoRaster<float>& raster, float nodata, dou
     return true;
 }
 
+/// C++-side state attached to a Python Document under `_undo_stack`.
+///
+/// The token is deliberately opaque: it exposes no methods a script could
+/// call. Holding the Document through a shared_ptr keeps the raw pointer the
+/// stack was bound to valid even when a script retains the token after
+/// dropping the Document. `cache_pins` keeps every Save As source cache
+/// directory alive while retained commands may still spill into it; it is
+/// cleared together with the history, exactly like the GUI's pinned_caches_.
+struct DocumentHistory {
+    std::shared_ptr<alphashape::Document> document;
+    std::shared_ptr<alphashape::UndoStack> stack;
+    std::vector<std::shared_ptr<void>> cache_pins;
+};
+
+namespace {
+constexpr const char* kHistoryCapsuleName = "alphashape.document_history";
+
+void delete_history(void* pointer) {
+    delete static_cast<DocumentHistory*>(pointer);
+}
+
+DocumentHistory* document_history(py::object document) {
+    if (!py::hasattr(document, "_undo_stack")) {
+        return nullptr;
+    }
+    return static_cast<DocumentHistory*>(
+        document.attr("_undo_stack").cast<py::capsule>().get_pointer());
+}
+
+/// Drop the recorded history after a whole-document mutation (a task, or an
+/// in-place edit that bypasses the command layer). Tasks mutate in place and
+/// cannot be undone, so keeping earlier entries would let an undo restore
+/// stale snapshots and delete the task's result.
+void clear_document_history(py::object document) {
+    DocumentHistory* history = document_history(document);
+    if (history != nullptr) {
+        history->stack->clear();
+        // No history survives, so no spill file in a pinned cache is needed.
+        history->cache_pins.clear();
+    }
+}
+}  // namespace
+std::shared_ptr<alphashape::UndoStack> document_undo_stack(py::object document);
+
 /// Run a task by name with keyword arguments bound against its declared schema.
 /// Shared by Document.run_task and the Chunk convenience methods (buildDem,
 /// buildOrthomosaic, ...) so the two cannot drift.
-void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwargs kwargs) {
+void run_task_kwargs(py::object document, const std::string& name, py::kwargs kwargs) {
+    alphashape::Document& d = document.cast<alphashape::Document&>();
     alphashape::TaskRegistry& registry = alphashape::builtin_registry();
     // Throws UnsupportedTaskError (mapped) for an unknown task.
     const alphashape::TaskEntry& entry = registry.require(name);
@@ -337,8 +402,14 @@ void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwarg
     // Release the GIL: the task computes in C++ and may parallelise across
     // frames. The empty Progress guarantees no worker thread ever calls back
     // into Python.
-    py::gil_scoped_release release;
-    alphashape::run_task(registry, d, name, params, alphashape::Progress{});
+    {
+        py::gil_scoped_release release;
+        alphashape::run_task(registry, d, name, params, alphashape::Progress{});
+    }
+    // A task cannot be undone; discard the history it just invalidated. Only
+    // touch the token when one already exists: creating it here would make a
+    // document with no edits look like it had a stack.
+    clear_document_history(std::move(document));
 }
 
 /// Convert a C++ chunk to the Python object the Document bindings hand out,
@@ -346,6 +417,9 @@ void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwarg
 /// the attribute lives in the object's __dict__; pybind11's GC traverses it, so
 /// the Document <-> Chunk cycle stays collectable.
 py::object attach_document(py::object document, const std::shared_ptr<alphashape::Chunk>& chunk);
+py::object owning_document_object(py::object chunk_self);
+void execute_command(py::object document,
+                     std::unique_ptr<alphashape::AbstractCommand> command);
 
 /// Run a chunk-scoped task on the document that owns `self`.
 ///
@@ -358,10 +432,10 @@ void run_chunk_task(py::object self, const char* name, py::kwargs kwargs) {
     if (!py::hasattr(self, "_document")) {
         throw py::type_error("this Chunk is not attached to a Document");
     }
-    alphashape::Document& document = self.attr("_document").cast<alphashape::Document&>();
+    py::object document = self.attr("_document");
     const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
-    document.set_active_chunk_id(chunk.id());
-    run_task_kwargs(document, name, std::move(kwargs));
+    document.cast<alphashape::Document&>().set_active_chunk_id(chunk.id());
+    run_task_kwargs(std::move(document), name, std::move(kwargs));
 }
 
 /// The DEM view (milestone 9). Holds the chunk's shared_ptr so the raster it
@@ -378,19 +452,178 @@ struct OrthomosaicView {
     const alphashape::Orthomosaic* orthomosaic = nullptr;
 };
 
-/// One entry per asset of one kind: {key: id, label: str, active: bool}. The
-/// `key` name and the id semantics follow Metashape's asset lists; the
-/// payload itself is reached through the scalar properties, which expose the
-/// active asset, so the lists stay cheap however large the rasters are.
+/// Proxy types below refer to an element INSIDE a chunk vector by (chunk, id)
+/// and re-resolve on every access. Holding the element's address would dangle
+/// as soon as any mutation reallocated or reordered the vector.
+struct MarkerRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Marker& get() const {
+        for (const alphashape::Marker& marker : chunk->markers()) {
+            if (marker.id == id) {
+                return marker;
+            }
+        }
+        throw alphashape::ValueError("marker id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct CameraRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Camera& get() const {
+        for (const alphashape::Camera& camera : chunk->cameras()) {
+            if (camera.id == id) {
+                return camera;
+            }
+        }
+        throw alphashape::ValueError("camera id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct MarkerGroupRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::MarkerGroup& get() const {
+        for (const alphashape::MarkerGroup& group : chunk->marker_groups()) {
+            if (group.id == id) {
+                return group;
+            }
+        }
+        throw alphashape::ValueError("marker group id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct ScalebarRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Scalebar& get() const {
+        for (const alphashape::Scalebar& bar : chunk->scalebars()) {
+            if (bar.id == id) {
+                return bar;
+            }
+        }
+        throw alphashape::ValueError("scalebar id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+/// Shared fields of every AssetSlot instantiation, so an AssetRef can read an
+/// asset through one pointer without knowing its payload type.
+struct AssetSlotBase {
+    std::int32_t id = -1;
+    std::string label;
+    std::int32_t group_id = -1;
+    bool enabled = true;
+};
+
+/// One asset of any kind, addressed by (chunk, kind, id) and resolved on
+/// every access. `label` is editable through the rename command the GUI uses.
+struct AssetRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    alphashape::AssetKind kind = alphashape::AssetKind::Elevation;
+    std::int32_t id = -1;
+
+    /// Copy the common fields out of the addressed slot. Defined after all
+    /// the slot types are visible.
+    AssetSlotBase fields() const;
+    std::int32_t active_id() const;
+};
+
 template <class Slot>
-py::list asset_list(const std::vector<Slot>& slots, std::int32_t active_id) {
+AssetSlotBase slot_fields(const Slot& slot) {
+    AssetSlotBase fields;
+    fields.id = slot.id;
+    fields.label = slot.label;
+    fields.group_id = slot.group_id;
+    fields.enabled = slot.enabled;
+    return fields;
+}
+
+AssetSlotBase AssetRef::fields() const {
+    switch (kind) {
+        case alphashape::AssetKind::PointCloud:
+            for (const auto& slot : chunk->point_clouds()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::Model:
+            for (const auto& slot : chunk->models()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::DepthMaps:
+            for (const auto& slot : chunk->depth_map_sets()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::Elevation:
+            for (const auto& slot : chunk->elevations()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::Orthomosaic:
+            for (const auto& slot : chunk->orthomosaics()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::TiledModel:
+            for (const auto& slot : chunk->tiled_models()) {
+                if (slot.id == id) return slot_fields(slot);
+            }
+            break;
+        case alphashape::AssetKind::Panorama:
+            if (chunk->panorama().has_value() && chunk->panorama()->id == id) {
+                return slot_fields(*chunk->panorama());
+            }
+            break;
+    }
+    throw alphashape::ValueError("asset id " + std::to_string(id) +
+                                 " no longer exists");
+}
+
+std::int32_t AssetRef::active_id() const {
+    switch (kind) {
+        case alphashape::AssetKind::PointCloud:
+            return chunk->active_point_cloud_id();
+        case alphashape::AssetKind::Model:
+            return chunk->active_model_id();
+        case alphashape::AssetKind::DepthMaps:
+            return chunk->active_depth_maps_id();
+        case alphashape::AssetKind::Elevation:
+            return chunk->active_elevation_id();
+        case alphashape::AssetKind::Orthomosaic:
+            return chunk->active_orthomosaic_id();
+        case alphashape::AssetKind::TiledModel:
+            return chunk->active_tiled_model_id();
+        case alphashape::AssetKind::Panorama:
+            break;
+    }
+    return -1;
+}
+
+/// One AssetRef per slot, carrying the owning Python Document so a label edit
+/// goes through the document's undo stack.
+template <class Slot>
+py::list asset_refs(py::object self, alphashape::AssetKind kind,
+                    const std::vector<Slot>& slots) {
+    auto chunk = self.cast<std::shared_ptr<Chunk>>();
+    py::object document = owning_document_object(self);
     py::list out;
     for (const Slot& slot : slots) {
-        py::dict entry;
-        entry[py::str("key")] = py::int_(slot.id);
-        entry[py::str("label")] = py::str(slot.label);
-        entry[py::str("active")] = py::bool_(slot.id == active_id);
-        out.append(std::move(entry));
+        out.append(py::cast(AssetRef{chunk, document, kind, slot.id}));
     }
     return out;
 }
@@ -417,25 +650,23 @@ void emit_warnings(const std::vector<std::string>& warnings) {
     }
 }
 
-/// Apply the Set Chunk CRS command to the Document that owns `chunk_self`
-/// (every chunk the Document bindings hand out carries `_document`) and discard
-/// it. The GUI owns the document's undo history; a scripted assignment is a
-/// one-shot relabel, not a stack entry (Metashape's Python API has no undo).
-/// Setting the CRS only relabels the chunk; no data is transformed.
+/// Apply the Set Chunk CRS command on the Document that owns `chunk_self`
+/// (every chunk the Document bindings hand out carries `_document`), as one
+/// undo entry. Setting the CRS only relabels the chunk; no data is
+/// transformed.
 void apply_crs_command(py::object chunk_self, alphashape::CRS crs) {
     if (!py::hasattr(chunk_self, "_document")) {
         throw py::type_error("this Chunk is not attached to a Document");
     }
-    auto document =
-        chunk_self.attr("_document").cast<std::shared_ptr<alphashape::Document>>();
     const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
-    alphashape::make_set_chunk_crs_command(id, std::move(crs))->apply(*document);
+    execute_command(
+        owning_document_object(std::move(chunk_self)),
+        alphashape::make_set_chunk_crs_command(id, std::move(crs)));
 }
 
 /// Replace one accuracy in the owning Document's chunk through the undoable
-/// "Set Reference Settings" command, then discard the command (a scripted
-/// assignment is not a stack entry; the GUI owns undo). `field` names the
-/// member so the six public properties share one implementation.
+/// "Set Reference Settings" command. `field` names the member so the six
+/// public properties share one implementation.
 void set_reference_accuracy(py::object chunk_self,
                             double alphashape::ReferenceSettings::*field,
                             double value) {
@@ -445,13 +676,13 @@ void set_reference_accuracy(py::object chunk_self,
     if (!py::hasattr(chunk_self, "_document")) {
         throw py::type_error("this Chunk is not attached to a Document");
     }
-    auto document =
-        chunk_self.attr("_document").cast<std::shared_ptr<alphashape::Document>>();
     alphashape::ReferenceSettings settings =
         chunk_self.cast<const alphashape::Chunk&>().reference_settings();
     settings.*field = value;
     const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
-    alphashape::make_set_reference_settings_command(id, settings)->apply(*document);
+    execute_command(
+        owning_document_object(std::move(chunk_self)),
+        alphashape::make_set_reference_settings_command(id, settings));
 }
 
 /// The Document that owns `chunk_self`, for the command-backed marker edits.
@@ -462,24 +693,174 @@ alphashape::Document& owning_document(py::object chunk_self) {
     return chunk_self.attr("_document").cast<alphashape::Document&>();
 }
 
-/// The Python view of one marker: a dict, matching the `markers` property.
-py::dict marker_dict(const alphashape::Marker& marker) {
+/// The Python Document object that owns `chunk_self`.
+py::object owning_document_object(py::object chunk_self) {
+    if (!py::hasattr(chunk_self, "_document")) {
+        throw py::type_error("this Chunk is not attached to a Document");
+    }
+    return chunk_self.attr("_document");
+}
+
+/// The undo stack associated with a Python Document, created on first use.
+/// The stack lives on the Document object (dynamic_attr), so it is destroyed
+/// with it; `Document.undo()` / `Document.redo()` drive this same stack and a
+/// scripted edit is therefore an ordinary undo entry.
+std::shared_ptr<alphashape::UndoStack> document_undo_stack(py::object document) {
+    if (DocumentHistory* history = document_history(document); history != nullptr) {
+        return history->stack;
+    }
+    auto owner = document.cast<std::shared_ptr<alphashape::Document>>();
+    auto history = std::make_unique<DocumentHistory>();
+    history->document = owner;
+    history->stack = std::make_shared<alphashape::UndoStack>(owner.get());
+    history->stack->set_cache_dir(owner->cache_dir());
+    DocumentHistory* raw = history.release();
+    // The token is opaque: no bound class exposes undo/redo on it, so a script
+    // cannot keep calling into a stack whose owner it dropped.
+    document.attr("_undo_stack") =
+        py::capsule(raw, kHistoryCapsuleName, &delete_history);
+    return raw->stack;
+}
+
+/// Keep a pre-Save-As cache directory alive for as long as the history that
+/// may spill into it. Does nothing when no history exists yet: there are then
+/// no commands holding a spill file. Pins accumulate so successive Save As
+/// calls keep each old cache until the history is cleared.
+void pin_document_history_cache(py::object document, std::shared_ptr<void> pin) {
+    if (DocumentHistory* history = document_history(document); history != nullptr) {
+        history->cache_pins.push_back(std::move(pin));
+    }
+}
+
+/// Execute one undoable command against the Document that owns `document`.
+void execute_command(py::object document,
+                     std::unique_ptr<alphashape::AbstractCommand> command) {
+    document_undo_stack(std::move(document))->execute(std::move(command));
+}
+
+/// Execute one undoable command against the Document that owns `chunk_self`.
+void execute_on_chunk(py::object chunk_self,
+                      std::unique_ptr<alphashape::AbstractCommand> command) {
+    execute_command(owning_document_object(std::move(chunk_self)), std::move(command));
+}
+
+py::object attach_document(py::object document,
+                           const std::shared_ptr<alphashape::Chunk>& chunk);
+
+namespace {
+
+/// Restore the active chunk as part of the same undo entry as the add, so a
+/// redo leaves the active chunk exactly where the original call did.
+class RestoreActiveChunkCommand : public alphashape::AbstractCommand {
+public:
+    RestoreActiveChunkCommand(std::int32_t before, std::int32_t after)
+        : before_(before), after_(after) {}
+
+    std::string name() const override { return "Add Chunk"; }
+
+    void apply(alphashape::Document& document) override {
+        document.set_active_chunk_id(after_);
+    }
+
+    void revert(alphashape::Document& document) override {
+        document.set_active_chunk_id(before_);
+    }
+
+private:
+    std::int32_t before_;
+    std::int32_t after_;
+};
+
+}  // namespace
+
+/// Add a chunk through the undoable command. The command makes the new chunk
+/// active (the GUI wants that); the scripting contract of add_chunk() predates
+/// it and leaves the active chunk alone, so the previous id is restored as a
+/// second command in the same transaction (redo therefore behaves the same).
+py::object document_add_chunk(py::object self, py::object label) {
+    Document& document = self.cast<Document&>();
+    const std::int32_t previous_active = document.active_chunk_id();
+    const std::int32_t created = document.workspace().next_chunk_id();
+    std::string resolved;
+    if (!label.is_none()) {
+        resolved = py::cast<std::string>(label);
+    }
+    if (resolved.empty()) {
+        // "Chunk N" for the smallest unused N, so a second add_chunk() is
+        // "Chunk 2" rather than a duplicate "Chunk 1".
+        for (int n = 1;; ++n) {
+            const std::string candidate = "Chunk " + std::to_string(n);
+            bool used = false;
+            for (const auto& chunk : document.workspace().chunks()) {
+                if (chunk->label() == candidate) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) {
+                resolved = candidate;
+                break;
+            }
+        }
+    }
+    auto transaction =
+        std::make_unique<alphashape::CommandTransaction>("Add Chunk");
+    transaction->add(alphashape::make_add_chunk_command(
+        document.workspace(), resolved, -1));
+    transaction->add(
+        std::make_unique<RestoreActiveChunkCommand>(created, previous_active));
+    execute_command(self, std::move(transaction));
+    for (const auto& candidate : document.workspace().chunks()) {
+        if (candidate->id() == created) {
+            return attach_document(self, candidate);
+        }
+    }
+    throw alphashape::Error("addChunk: the chunk was not created");
+}
+
+/// Normalise a chunk-container argument to its elements. A dict — the shape
+/// of Document.chunks — contributes its VALUES; a single Chunk or int is one
+/// element; anything else iterable contributes its items.
+std::vector<py::object> chunk_argument_items(py::object chunks) {
+    std::vector<py::object> items;
+    if (py::isinstance<Chunk>(chunks) || py::isinstance<py::int_>(chunks)) {
+        items.push_back(std::move(chunks));
+        return items;
+    }
+    if (py::isinstance<py::dict>(chunks)) {
+        for (auto item : chunks.cast<py::dict>()) {
+            items.emplace_back(py::reinterpret_borrow<py::object>(item.second));
+        }
+        return items;
+    }
+    for (py::handle item : chunks) {
+        items.emplace_back(py::reinterpret_borrow<py::object>(item));
+    }
+    return items;
+}
+
+/// One mask as a dict. `data` is the raw u8 plane, one byte per pixel.
+py::dict mask_dict(const alphashape::Mask& mask) {
     py::dict entry;
-    entry[py::str("id")] = py::int_(marker.id);
-    entry[py::str("label")] = py::str(marker.label);
-    if (marker.position.has_value()) {
-        const Eigen::Vector3d& p = *marker.position;
-        entry[py::str("position")] = py::make_tuple(p.x(), p.y(), p.z());
-    } else {
-        entry[py::str("position")] = py::none();
-    }
-    if (marker.reference.has_value()) {
-        const Eigen::Vector3d& r = *marker.reference;
-        entry[py::str("reference")] = py::make_tuple(r.x(), r.y(), r.z());
-    } else {
-        entry[py::str("reference")] = py::none();
-    }
+    entry[py::str("camera_id")] = py::int_(mask.camera_id);
+    entry[py::str("width")] = py::int_(mask.width);
+    entry[py::str("height")] = py::int_(mask.height);
+    entry[py::str("invert")] = py::bool_(mask.invert);
+    entry[py::str("data")] = py::bytes(
+        reinterpret_cast<const char*>(mask.data.data()), mask.data.size());
     return entry;
+}
+
+/// The mask of `camera_id`, or None. Linear scan: a chunk has one mask per
+/// camera at most, and the container is sorted by camera id.
+const alphashape::Mask* find_mask(const alphashape::Chunk& chunk,
+                                  std::int32_t camera_id) {
+    for (const alphashape::Mask& mask : chunk.masks()) {
+        if (mask.camera_id == camera_id) {
+            return &mask;
+        }
+    }
+    return nullptr;
 }
 
 /// Resolve a marker argument: an int id or an exact label. Throws ValueError
@@ -501,6 +882,44 @@ std::int32_t marker_id_from_python(const alphashape::Chunk& chunk, py::handle va
         }
     }
     throw alphashape::ValueError("no marker with id " + std::to_string(id));
+}
+
+std::int32_t camera_id_from_python(const alphashape::Chunk& chunk,
+                                   py::handle value);
+
+/// Resolve a scalebar endpoint from Python: an int marker id, an exact marker
+/// label, or ("marker"|"camera", id-or-marker-label). The command validates
+/// that the endpoint exists.
+alphashape::ScalebarEndpoint scalebar_endpoint(const alphashape::Chunk& chunk,
+                                               py::handle value,
+                                               const char* argument) {
+    alphashape::ScalebarEndpoint endpoint;
+    py::object kind = py::none();
+    py::object target = py::reinterpret_borrow<py::object>(value);
+    if (py::isinstance<py::tuple>(value) || py::isinstance<py::list>(value)) {
+        const auto items = py::cast<std::vector<py::object>>(value);
+        if (items.size() != 2) {
+            throw alphashape::ValueError(std::string("addScalebar: ") + argument +
+                                         " must be (kind, id)");
+        }
+        kind = items[0];
+        target = items[1];
+    }
+    const bool camera = !kind.is_none() && py::cast<std::string>(kind) == "camera";
+    if (!kind.is_none() && !camera &&
+        py::cast<std::string>(kind) != "marker") {
+        throw alphashape::ValueError(std::string("addScalebar: ") + argument +
+                                     " kind must be 'marker' or 'camera'");
+    }
+    endpoint.kind = camera ? alphashape::ScalebarEndpoint::Kind::Camera
+                           : alphashape::ScalebarEndpoint::Kind::Marker;
+    if (py::isinstance<py::str>(target)) {
+        endpoint.id = camera ? camera_id_from_python(chunk, target)
+                             : marker_id_from_python(chunk, target);
+        return endpoint;
+    }
+    endpoint.id = py::cast<std::int32_t>(target);
+    return endpoint;
 }
 
 /// Resolve a camera argument: an int id or an exact label.
@@ -1021,20 +1440,98 @@ PYBIND11_MODULE(alphashape, m) {
             return py::object(out);
         });
 
-    py::class_<alphashape::Camera>(m, "Camera")
-        .def_readonly("id", &alphashape::Camera::id)
-        .def_readonly("sensor_id", &alphashape::Camera::sensor_id)
-        .def_property_readonly("label", [](const alphashape::Camera& c) { return c.label; })
-        .def_readonly("orientation", &alphashape::Camera::orientation)
-        .def_readonly("enabled", &alphashape::Camera::enabled)
-        // The 4x4 world->camera transform, as a list of four rows of four
-        // floats. Identity on a camera that has not been aligned.
-        .def_property_readonly("pose", [](const alphashape::Camera& c) {
+    // Frames are held by shared_ptr in Chunk, so the Python object co-owns
+    // one and stays valid across workspace edits. Read-only.
+    py::class_<alphashape::Frame, std::shared_ptr<alphashape::Frame>>(m, "Frame")
+        .def_property_readonly("id", &alphashape::Frame::id)
+        .def_property_readonly("path", &alphashape::Frame::path)
+        .def_property_readonly("width", &alphashape::Frame::width)
+        .def_property_readonly("height", &alphashape::Frame::height)
+        .def_property_readonly("camera_id", &alphashape::Frame::camera_id);
+
+    // The mapping protocol the pre-WP-11.11 proxy dicts exposed, shared by the
+    // classes that implement keys() and __getitem__. dict(proxy) works too,
+    // because Python uses keys() + __getitem__ for that.
+    // (Defined as a free function: pybind11 treats a py::object first
+    // parameter as the instance.)
+    auto mapping_get = [](py::object self, py::object key,
+                          py::object fallback) -> py::object {
+        for (py::handle known : self.attr("keys")()) {
+            if (known.equal(key)) {
+                return self.attr("__getitem__")(key);
+            }
+        }
+        return fallback;
+    };
+    auto mapping_items = [](py::object self) {
+        py::list out;
+        for (py::handle key : self.attr("keys")()) {
+            out.append(py::make_tuple(key, self.attr("__getitem__")(key)));
+        }
+        return out;
+    };
+    auto mapping_iter = [](py::object self) {
+        return py::iter(self.attr("keys")());
+    };
+
+    // Camera is a proxy: it addresses a camera inside Chunk::cameras() by id
+    // and re-resolves on every access, so it stays correct across mutations
+    // and never holds a pointer into a vector.
+    py::class_<CameraRef> camera_class(m, "Camera");
+    camera_class.def_property_readonly("id", [](const CameraRef& r) { return r.id; })
+        .def_property_readonly("sensor_id",
+                               [](const CameraRef& r) { return r.get().sensor_id; })
+        .def_property_readonly("label", [](const CameraRef& r) { return r.get().label; })
+        .def_property_readonly("orientation",
+                               [](const CameraRef& r) { return r.get().orientation; })
+        .def_property(
+            "enabled",
+            py::cpp_function([](const CameraRef& r) { return r.get().enabled; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](CameraRef& r, bool value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_camera_enabled_command(
+                                        r.chunk->id(), {r.id}, value));
+                },
+                py::is_method(m)))
+        .def_property(
+            "selected",
+            py::cpp_function([](const CameraRef& r) { return r.get().selected; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](CameraRef& r, bool value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_camera_selected_command(
+                                        r.chunk->id(), {r.id}, value));
+                },
+                py::is_method(m)))
+        .def_property_readonly("group", [](const CameraRef& r) -> py::object {
+            for (const alphashape::CameraGroup& group : r.chunk->camera_groups()) {
+                for (const std::int32_t member : group.members) {
+                    if (member == r.id) {
+                        return py::int_(group.id);
+                    }
+                }
+            }
+            return py::none();
+        })
+        .def_property_readonly("mask", [](const CameraRef& r) -> py::object {
+            const alphashape::Mask* mask = find_mask(*r.chunk, r.id);
+            if (mask == nullptr) {
+                return py::none();
+            }
+            return mask_dict(*mask);
+        });
+    // The 4x4 world->camera transform, as a list of four rows of four
+    // floats. Identity on a camera that has not been aligned.
+    camera_class.def_property_readonly("pose", [](const CameraRef& ref) {
+            const alphashape::Camera& c = ref.get();
             py::list rows;
-            for (int r = 0; r < 4; ++r) {
+            for (int row_index = 0; row_index < 4; ++row_index) {
                 py::list row;
                 for (int col = 0; col < 4; ++col) {
-                    row.append(py::float_(c.pose(r, col)));
+                    row.append(py::float_(c.pose(row_index, col)));
                 }
                 rows.append(row);
             }
@@ -1045,13 +1542,15 @@ PYBIND11_MODULE(alphashape, m) {
         // AlignChunks similarity scales it (A = R/s), so the general inverse is
         // used rather than the -R^T b shortcut. An unaligned camera has the
         // identity pose, so its centre is (0, 0, 0).
-        .def_property_readonly("center", [](const alphashape::Camera& c) {
+        .def_property_readonly("center", [](const CameraRef& r) {
+            const alphashape::Camera& c = r.get();
             const Eigen::Matrix3d A = c.pose.block<3, 3>(0, 0);
             const Eigen::Vector3d b = c.pose.block<3, 1>(0, 3);
             const Eigen::Vector3d centre = -(A.inverse() * b);
             return py::make_tuple(centre.x(), centre.y(), centre.z());
         })
-        .def_property_readonly("reference", [](const alphashape::Camera& c) -> py::object {
+        .def_property_readonly("reference", [](const CameraRef& r) -> py::object {
+            const alphashape::Camera& c = r.get();
             // None when there is no measured position; otherwise the
             // (longitude, latitude, altitude) triple, with altitude NaN when
             // the GNSS log had none.
@@ -1063,7 +1562,8 @@ PYBIND11_MODULE(alphashape, m) {
         })
         // The per-axis 1-sigma accuracy of the reference position in metres
         // (east, north, up), as a tuple; None when there is no location.
-        .def_property_readonly("reference_accuracy", [](const alphashape::Camera& c) -> py::object {
+        .def_property_readonly("reference_accuracy", [](const CameraRef& r) -> py::object {
+            const alphashape::Camera& c = r.get();
             if (!c.reference.location.has_value()) {
                 return py::none();
             }
@@ -1073,7 +1573,8 @@ PYBIND11_MODULE(alphashape, m) {
         // Measured attitude as a (yaw, pitch, roll) tuple in degrees, in the
         // chunk's rotation order; None when the reference carries none.
         .def_property_readonly("reference_orientation",
-                               [](const alphashape::Camera& c) -> py::object {
+                               [](const CameraRef& r) -> py::object {
+                                   const alphashape::Camera& c = r.get();
                                    if (!c.reference.orientation_deg.has_value()) {
                                        return py::none();
                                    }
@@ -1084,7 +1585,8 @@ PYBIND11_MODULE(alphashape, m) {
         // reference_orientation; None when the reference does not set its own
         // (the chunk's reference setting then applies).
         .def_property_readonly("reference_rotation_accuracy",
-                               [](const alphashape::Camera& c) -> py::object {
+                               [](const CameraRef& r) -> py::object {
+                                   const alphashape::Camera& c = r.get();
                                    if (!c.reference.rotation_accuracy_deg.has_value()) {
                                        return py::none();
                                    }
@@ -1094,16 +1596,17 @@ PYBIND11_MODULE(alphashape, m) {
                                })
         // Posterior covariance of the centre, chunk-local, 3x3 nested lists.
         // All zeros on a camera whose covariance was not computed.
-        .def_property_readonly("location_covariance", [](const alphashape::Camera& c) {
-            return nested_matrix(c.location_covariance);
+        .def_property_readonly("location_covariance", [](const CameraRef& r) {
+            return nested_matrix(r.get().location_covariance);
         })
         // Posterior covariance of the angle-axis rotation, 3x3 nested lists.
-        .def_property_readonly("rotation_covariance", [](const alphashape::Camera& c) {
-            return nested_matrix(c.rotation_covariance);
+        .def_property_readonly("rotation_covariance", [](const CameraRef& r) {
+            return nested_matrix(r.get().rotation_covariance);
         })
         // Film millimetres -> scan pixels, 3x3 nested lists, or None when the
         // marks were not ordered (WP-13.18a).
-        .def_property_readonly("film_transform", [](const alphashape::Camera& c) -> py::object {
+        .def_property_readonly("film_transform", [](const CameraRef& r) -> py::object {
+            const alphashape::Camera& c = r.get();
             if (!c.film_transform.has_value()) {
                 return py::none();
             }
@@ -1111,7 +1614,8 @@ PYBIND11_MODULE(alphashape, m) {
         })
         // Measured fiducial pixels, parallel to Sensor.fiducials; None marks a
         // fiducial that was not found on this scan.
-        .def_property_readonly("fiducial_pixels", [](const alphashape::Camera& c) {
+        .def_property_readonly("fiducial_pixels", [](const CameraRef& r) {
+            const alphashape::Camera& c = r.get();
             py::list out;
             for (const std::optional<Eigen::Vector2d>& pixel : c.fiducial_pixels) {
                 if (pixel.has_value()) {
@@ -1123,6 +1627,275 @@ PYBIND11_MODULE(alphashape, m) {
             return out;
         });
 
+    // -- Marker --------------------------------------------------------------
+    // A proxy: mutations go through the same undoable commands the GUI uses.
+    // The dict protocol is kept alongside the attributes so existing scripts
+    // that read marker["label"] keep working.
+    py::class_<MarkerRef> marker_class(m, "Marker");
+    marker_class.def_property_readonly("id", [](const MarkerRef& r) { return r.id; })
+        .def_property(
+            "label",
+            py::cpp_function([](const MarkerRef& r) { return r.get().label; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, const std::string& value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_marker_label_command(
+                                        r.chunk->id(), r.id, value));
+                },
+                py::is_method(m)))
+        .def_property_readonly("type", [](const MarkerRef& r) {
+            switch (r.get().type) {
+                case alphashape::MarkerType::Vertex: return "vertex";
+                case alphashape::MarkerType::Fiducial: return "fiducial";
+                case alphashape::MarkerType::Regular: break;
+            }
+            return "regular";
+        })
+        .def_property_readonly("projections", [](const MarkerRef& r) {
+            py::list out;
+            for (const alphashape::MarkerProjection& projection : r.get().projections) {
+                py::dict entry;
+                entry[py::str("camera_id")] = py::int_(projection.camera_id);
+                entry[py::str("pixel")] = py::make_tuple(projection.pixel.x(),
+                                                         projection.pixel.y());
+                entry[py::str("enabled")] = py::bool_(projection.enabled);
+                out.append(std::move(entry));
+            }
+            return out;
+        })
+        .def_property(
+            "pinned",
+            py::cpp_function([](const MarkerRef& r) { return r.get().pinned; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, bool value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_marker_pinned_command(
+                                        r.chunk->id(), r.id, value));
+                },
+                py::is_method(m)))
+        .def_property(
+            "valid",
+            py::cpp_function([](const MarkerRef& r) { return r.get().valid; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, bool value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_marker_enabled_command(
+                                        r.chunk->id(), r.id, value));
+                },
+                py::is_method(m)));
+    marker_class
+        .def_property(
+            "position",
+            py::cpp_function([](const MarkerRef& r) -> py::object {
+                const std::optional<Eigen::Vector3d>& p = r.get().position;
+                if (!p.has_value()) {
+                    return py::none();
+                }
+                return py::make_tuple(p->x(), p->y(), p->z());
+            }, py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, py::object value) {
+                    std::optional<Eigen::Vector3d> position;
+                    if (!value.is_none()) {
+                        const auto values = py::cast<std::vector<double>>(value);
+                        if (values.size() != 3) {
+                            throw alphashape::ValueError(
+                                "marker.position expects an (x, y, z) tuple or None");
+                        }
+                        position = Eigen::Vector3d(values[0], values[1], values[2]);
+                    }
+                    execute_command(r.document,
+                                    alphashape::make_set_marker_position_command(
+                                        r.chunk->id(), r.id, position));
+                },
+                py::is_method(m)))
+        .def_property(
+            "reference",
+            py::cpp_function([](const MarkerRef& r) -> py::object {
+                const std::optional<Eigen::Vector3d>& p = r.get().reference;
+                if (!p.has_value()) {
+                    return py::none();
+                }
+                return py::make_tuple(p->x(), p->y(), p->z());
+            }, py::is_method(m)),
+            py::cpp_function(
+                [](MarkerRef& r, py::object value) {
+                    std::optional<Eigen::Vector3d> reference;
+                    if (!value.is_none()) {
+                        const auto values = py::cast<std::vector<double>>(value);
+                        if (values.size() != 3) {
+                            throw alphashape::ValueError(
+                                "marker.reference expects a (lon, lat, alt) tuple "
+                                "or None");
+                        }
+                        reference = Eigen::Vector3d(values[0], values[1], values[2]);
+                    }
+                    execute_command(r.document,
+                                    alphashape::make_set_marker_reference_command(
+                                        r.chunk->id(), r.id, reference,
+                                        r.get().reference_accuracy));
+                },
+                py::is_method(m)))
+        .def("__getitem__",
+             [](const MarkerRef& r, const std::string& key) -> py::object {
+                 const alphashape::Marker& marker = r.get();
+                 if (key == "id") return py::int_(marker.id);
+                 if (key == "label") return py::str(marker.label);
+                 if (key == "position") {
+                     if (!marker.position.has_value()) return py::none();
+                     const Eigen::Vector3d& p = *marker.position;
+                     return py::make_tuple(p.x(), p.y(), p.z());
+                 }
+                 if (key == "reference") {
+                     if (!marker.reference.has_value()) return py::none();
+                     const Eigen::Vector3d& p = *marker.reference;
+                     return py::make_tuple(p.x(), p.y(), p.z());
+                 }
+                 if (key == "pinned") return py::bool_(marker.pinned);
+                 if (key == "valid") return py::bool_(marker.valid);
+                 throw py::key_error(key);
+             },
+             py::arg("key"))
+        .def("keys", [](const MarkerRef&) {
+            py::list out;
+            for (const char* key : {"id", "label", "position", "reference",
+                                    "pinned", "valid"}) {
+                out.append(py::str(key));
+            }
+            return out;
+        })
+        .def("get", mapping_get, py::arg("key"),
+             py::arg("default") = py::none())
+        .def("items", mapping_items)
+        .def("__iter__", mapping_iter);
+
+    // -- Asset ---------------------------------------------------------------
+    // Every derived product (point cloud, model, DEM, orthomosaic, depth-map
+    // set, tiled model, panorama) is addressed by kind and id.
+    py::class_<AssetRef> asset_class(m, "Asset");
+    asset_class
+        .def_property_readonly("id",
+                               [](const AssetRef& r) { return r.fields().id; })
+        .def_property(
+            "label",
+            py::cpp_function([](const AssetRef& r) { return r.fields().label; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](AssetRef& r, const std::string& value) {
+                    execute_command(r.document,
+                                    alphashape::make_rename_asset_command(
+                                        r.kind, r.chunk->id(), r.id, value));
+                },
+                py::is_method(m)))
+        .def_property_readonly("group", [](const AssetRef& r) -> py::object {
+            const std::int32_t group = r.fields().group_id;
+            return group < 0 ? py::object(py::none()) : py::object(py::int_(group));
+        })
+        .def_property_readonly(
+            "enabled", [](const AssetRef& r) { return r.fields().enabled; })
+        .def_property_readonly("active", [](const AssetRef& r) {
+            return r.id == r.active_id();
+        })
+        // The pre-WP-11.11 asset lists were dicts; keep that protocol.
+        .def("__getitem__",
+             [](const AssetRef& r, const std::string& key) -> py::object {
+                 const AssetSlotBase fields = r.fields();
+                 if (key == "key" || key == "id") return py::int_(fields.id);
+                 if (key == "label") return py::str(fields.label);
+                 if (key == "active") return py::bool_(r.id == r.active_id());
+                 if (key == "group") {
+                     return fields.group_id < 0
+                                ? py::object(py::none())
+                                : py::object(py::int_(fields.group_id));
+                 }
+                 if (key == "enabled") return py::bool_(fields.enabled);
+                 throw py::key_error(key);
+             },
+             py::arg("key"))
+        .def("keys", [](const AssetRef&) {
+            py::list out;
+            for (const char* key : {"key", "id", "label", "active", "group",
+                                    "enabled"}) {
+                out.append(py::str(key));
+            }
+            return out;
+        })
+        .def("get", mapping_get, py::arg("key"),
+             py::arg("default") = py::none())
+        .def("items", mapping_items)
+        .def("__iter__", mapping_iter);
+
+    // -- MarkerGroup ---------------------------------------------------------
+    py::class_<MarkerGroupRef>(m, "MarkerGroup")
+        .def_property_readonly("id", [](const MarkerGroupRef& r) { return r.id; })
+        .def_property_readonly("label",
+                               [](const MarkerGroupRef& r) { return r.get().label; })
+        .def_property_readonly("markers", [](const MarkerGroupRef& r) {
+            py::list out;
+            for (const std::int32_t member : r.get().members) {
+                for (const alphashape::Marker& marker : r.chunk->markers()) {
+                    if (marker.id == member) {
+                        out.append(py::cast(
+                            MarkerRef{r.chunk, r.document, marker.id}));
+                        break;
+                    }
+                }
+            }
+            return out;
+        });
+
+    // -- Scalebar ------------------------------------------------------------
+    py::class_<ScalebarRef>(m, "Scalebar")
+        .def_property_readonly("id", [](const ScalebarRef& r) { return r.id; })
+        .def_property_readonly("label",
+                               [](const ScalebarRef& r) { return r.get().label; })
+        .def_property_readonly("from_", [](const ScalebarRef& r) {
+            return py::make_tuple(
+                r.get().from.kind == alphashape::ScalebarEndpoint::Kind::Marker
+                    ? "marker" : "camera",
+                r.get().from.id);
+        })
+        .def_property_readonly("to_", [](const ScalebarRef& r) {
+            return py::make_tuple(
+                r.get().to.kind == alphashape::ScalebarEndpoint::Kind::Marker
+                    ? "marker" : "camera",
+                r.get().to.id);
+        })
+        .def_property(
+            "reference",
+            py::cpp_function(
+                [](const ScalebarRef& r) { return r.get().reference_length_m; },
+                py::is_method(m)),
+            py::cpp_function(
+                [](ScalebarRef& r, double value) {
+                    execute_command(
+                        r.document,
+                        alphashape::make_set_scalebar_reference_command(
+                            r.chunk->id(), r.id, value,
+                            r.get().reference_accuracy_m));
+                },
+                py::is_method(m)))
+        .def_property(
+            "accuracy",
+            py::cpp_function(
+                [](const ScalebarRef& r) { return r.get().reference_accuracy_m; },
+                py::is_method(m)),
+            py::cpp_function(
+                [](ScalebarRef& r, double value) {
+                    execute_command(
+                        r.document,
+                        alphashape::make_set_scalebar_reference_command(
+                            r.chunk->id(), r.id, r.get().reference_length_m,
+                            value));
+                },
+                py::is_method(m)))
+        .def_property_readonly("estimated_length", [](const ScalebarRef& r) {
+            return r.get().estimated_length_m;
+        });
+
     // -- Chunk ---------------------------------------------------------------
     // Held by shared_ptr: values returned from Document methods carry the same
     // shared_ptr the Workspace owns, so Python co-owns the chunk.
@@ -1132,7 +1905,40 @@ PYBIND11_MODULE(alphashape, m) {
     // so the Document <-> Chunk cycle is collectable.
     py::class_<Chunk, std::shared_ptr<Chunk>>(m, "Chunk", py::dynamic_attr())
         .def_property_readonly("id", &Chunk::id)
-        .def_property("label", &Chunk::label, &Chunk::set_label)
+        // Stable string identity, the key Document.chunks uses.
+        .def_property_readonly(
+            "key", [](const Chunk& c) { return std::to_string(c.id()); })
+        .def_property(
+            "label",
+            py::cpp_function([](const Chunk& c) { return c.label(); },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, const std::string& value) {
+                    Chunk& c = self.cast<Chunk&>();
+                    execute_on_chunk(
+                        self, alphashape::make_set_chunk_label_command(
+                                  c.id(), owning_document(self), value));
+                },
+                py::is_method(m)))
+        // `enabled` has no dedicated field on Chunk; it is stored in the
+        // chunk meta ("true"/"false", default true) so it persists in doc.xml
+        // with the rest of the free-form metadata.
+        .def_property(
+            "enabled",
+            py::cpp_function(
+                [](const Chunk& c) {
+                    const std::string* value = c.meta().find("enabled");
+                    return value == nullptr || *value != "false";
+                },
+                py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, bool value) {
+                    Chunk& c = self.cast<Chunk&>();
+                    execute_on_chunk(
+                        self, alphashape::make_set_chunk_meta_command(
+                                  c.id(), "enabled", value ? "true" : "false"));
+                },
+                py::is_method(m)))
         .def_property_readonly(
             "camera_count", [](const Chunk& c) { return static_cast<int>(c.cameras().size()); })
         .def_property_readonly(
@@ -1217,13 +2023,32 @@ PYBIND11_MODULE(alphashape, m) {
             }
             return out;
         })
-        .def_property_readonly("cameras", [](const Chunk& c) {
-            py::list out;
-            for (const alphashape::Camera& camera : c.cameras()) {
-                out.append(camera);
-            }
-            return out;
-        })
+        .def_property_readonly(
+            "cameras",
+            py::cpp_function(
+                [](py::object self) {
+                    auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                    py::object document = owning_document_object(self);
+                    py::list out;
+                    for (const alphashape::Camera& camera : chunk->cameras()) {
+                        out.append(py::cast(
+                            CameraRef{chunk, document, camera.id}));
+                    }
+                    return out;
+                },
+                py::is_method(m)))
+        .def_property_readonly(
+            "frames",
+            py::cpp_function(
+                [](const std::shared_ptr<Chunk>& c) {
+                    py::list out;
+                    for (const std::shared_ptr<alphashape::Frame>& frame :
+                         c->frames()) {
+                        out.append(py::cast(frame));
+                    }
+                    return out;
+                },
+                py::is_method(m)))
         // Camera groups (WP-11.8): the same shape the group commands edit.
         .def_property_readonly("camera_groups", [](const Chunk& c) {
             py::list out;
@@ -1249,16 +2074,15 @@ PYBIND11_MODULE(alphashape, m) {
             }
             return out;
         })
-        // Rebuild the camera grouping through the undoable command, then
-        // discard it: a scripted call is not a GUI undo entry.
+        // Rebuild the camera grouping through the undoable command, as one
+        // entry on the document's stack.
         .def(
             "group_cameras",
             [](py::object self, const std::string& group_type) {
-                alphashape::Document& document = owning_document(self);
                 const std::int32_t id = self.cast<const alphashape::Chunk&>().id();
-                alphashape::make_group_cameras_command(
-                    id, alphashape::parse_group_type(group_type))
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_group_cameras_command(
+                              id, alphashape::parse_group_type(group_type)));
             },
             py::arg("group_type") = "station",
             "Rebuild camera groups: 'station', 'folder', or 'none' to clear.")
@@ -1359,8 +2183,7 @@ PYBIND11_MODULE(alphashape, m) {
                 py::is_method(m)))
 #if defined(ALPHASHAPE_USE_PROJ)
         // The chunk CRS as a value (WP-12.11). Assignment goes through the
-        // "Set Chunk CRS" command, which is then discarded: the GUI owns the
-        // document's undo history (Metashape's Python API has no undo). It only
+        // "Set Chunk CRS" command on the document's undo stack. It only
         // RELABELS the chunk: no reference, pose, tie point or asset is
         // transformed. Assigning CoordinateSystem() clears to LOCAL.
         // The getter and setter are wrapped explicitly with py::is_method:
@@ -1387,8 +2210,8 @@ PYBIND11_MODULE(alphashape, m) {
                                [](const Chunk& c) { return c.marker_crs().epsg; })
         // Reference settings (WP-13.1). The names are the public Python API
         // spellings so scripts that set them keep working. Each assignment goes
-        // through the undoable "Set Reference Settings" command, then the
-        // command is discarded: the GUI owns the history, as with `crs`.
+        // through the undoable "Set Reference Settings" command on the
+        // document's stack, as with `crs`.
         .def_property(
             "camera_location_accuracy",
             py::cpp_function(
@@ -1516,22 +2339,132 @@ PYBIND11_MODULE(alphashape, m) {
         // and `reference` (a (lon, lat, alt) tuple, or None). AlignChunks pairs
         // markers by exact `label`, so two chunks need matching labels, not
         // matching ids.
-        .def_property_readonly("markers", [](const Chunk& c) {
+        .def_property_readonly(
+            "markers",
+            py::cpp_function(
+                [](py::object self) {
+                    auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                    py::object document = owning_document_object(self);
+                    py::list out;
+                    for (const alphashape::Marker& marker : chunk->markers()) {
+                        out.append(py::cast(
+                            MarkerRef{chunk, document, marker.id}));
+                    }
+                    return out;
+                },
+                py::is_method(m)))
+        .def_property_readonly("marker_groups", py::cpp_function(
+            [](py::object self) {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
+                py::list out;
+                for (const alphashape::MarkerGroup& group :
+                     chunk->marker_groups()) {
+                    out.append(py::cast(
+                        MarkerGroupRef{chunk, document, group.id}));
+                }
+                return out;
+            }, py::is_method(m)))
+        .def_property_readonly("scalebars", py::cpp_function(
+            [](py::object self) {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
+                py::list out;
+                for (const alphashape::Scalebar& bar : chunk->scalebars()) {
+                    out.append(py::cast(ScalebarRef{chunk, document, bar.id}));
+                }
+                return out;
+            }, py::is_method(m)))
+        // Vector annotations (declared and persisted; the editing UI lands
+        // later). One dict per feature, in id order.
+        .def_property_readonly("shapes", [](const Chunk& c) {
             py::list out;
-            for (const alphashape::Marker& marker : c.markers()) {
-                out.append(marker_dict(marker));
+            for (const alphashape::Shape& shape : c.shapes().features) {
+                py::dict entry;
+                entry[py::str("id")] = py::int_(shape.id);
+                switch (shape.type) {
+                    case alphashape::ShapeType::Polyline:
+                        entry[py::str("type")] = py::str("polyline");
+                        break;
+                    case alphashape::ShapeType::Polygon:
+                        entry[py::str("type")] = py::str("polygon");
+                        break;
+                    case alphashape::ShapeType::Point:
+                        entry[py::str("type")] = py::str("point");
+                        break;
+                }
+                entry[py::str("label")] = py::str(shape.label);
+                entry[py::str("closed")] = py::bool_(shape.closed);
+                entry[py::str("layer")] = py::str(shape.layer);
+                entry[py::str("has_altitude")] = py::bool_(shape.has_altitude);
+                py::list vertices;
+                for (const Eigen::Vector3d& v : shape.vertices) {
+                    vertices.append(py::make_tuple(v.x(), v.y(), v.z()));
+                }
+                entry[py::str("vertices")] = vertices;
+                py::dict attributes;
+                for (const auto& [key, value] : shape.attributes) {
+                    attributes[py::str(key)] = py::str(value);
+                }
+                entry[py::str("attributes")] = attributes;
+                out.append(std::move(entry));
             }
             return out;
         })
+        // Timed camera tracks (declared and persisted; populated by future
+        // video/import work).
+        .def_property_readonly("trajectories", [](const Chunk& c) {
+            py::list out;
+            for (const alphashape::Trajectory& track : c.trajectories()) {
+                py::dict entry;
+                entry[py::str("id")] = py::int_(track.id);
+                entry[py::str("label")] = py::str(track.label);
+                py::list points;
+                for (const alphashape::TrajectoryPoint& point : track.points) {
+                    py::dict sample;
+                    sample[py::str("position")] =
+                        py::make_tuple(point.position.x(), point.position.y(),
+                                       point.position.z());
+                    sample[py::str("timestamp")] = py::float_(point.timestamp_s);
+                    if (point.has_orientation) {
+                        sample[py::str("orientation")] = py::make_tuple(
+                            point.orientation.w(), point.orientation.x(),
+                            point.orientation.y(), point.orientation.z());
+                    } else {
+                        sample[py::str("orientation")] = py::none();
+                    }
+                    points.append(std::move(sample));
+                }
+                entry[py::str("points")] = points;
+                out.append(std::move(entry));
+            }
+            return out;
+        })
+        // One mask per camera (a u8 plane; see mask_dict).
+        .def_property_readonly("masks", [](const Chunk& c) {
+            py::list out;
+            for (const alphashape::Mask& mask : c.masks()) {
+                out.append(mask_dict(mask));
+            }
+            return out;
+        })
+        .def_property_readonly("region", [](const Chunk& c) {
+            py::dict entry;
+            const Eigen::Vector3d& centre = c.region().centre;
+            const Eigen::Vector3d& size = c.region().size;
+            entry[py::str("center")] =
+                py::make_tuple(centre.x(), centre.y(), centre.z());
+            entry[py::str("size")] = py::make_tuple(size.x(), size.y(), size.z());
+            return entry;
+        })
         // Manual marker placement (WP-13.4). Each edit goes through the same
-        // undoable model command the GUI uses; the command is applied and then
-        // discarded, since the GUI owns the undo history (a scripted edit is
-        // not a stack entry).
+        // undoable model command the GUI uses and is recorded on the
+        // document's undo stack.
         .def(
             "addMarker",
             [](py::object self, py::object label, py::object position) {
-                alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
-                alphashape::Document& document = owning_document(self);
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
                 std::optional<std::string> marker_label;
                 if (!label.is_none()) {
                     marker_label = py::cast<std::string>(label);
@@ -1546,27 +2479,97 @@ PYBIND11_MODULE(alphashape, m) {
                     marker_position =
                         Eigen::Vector3d(values[0], values[1], values[2]);
                 }
-                const std::int32_t new_id = chunk.next_id();
-                alphashape::make_add_marker_command(chunk.id(), std::move(marker_label),
-                                                    marker_position)
-                    ->apply(document);
-                for (const alphashape::Marker& marker : chunk.markers()) {
+                const std::int32_t new_id = chunk->next_id();
+                execute_command(
+                    document,
+                    alphashape::make_add_marker_command(
+                        chunk->id(), std::move(marker_label), marker_position));
+                for (const alphashape::Marker& marker : chunk->markers()) {
                     if (marker.id == new_id) {
-                        return marker_dict(marker);
+                        return py::cast(MarkerRef{chunk, document, new_id});
                     }
                 }
                 throw alphashape::Error("addMarker: the marker was not created");
             },
             py::arg("label") = py::none(), py::arg("position") = py::none(),
-            "Create a marker and return its dict. A missing label generates the "
+            "Create a marker and return it. A missing label generates the "
             "lowest free \"point N\"; a duplicate label raises ValueError. "
             "position is an optional chunk-local (x, y, z) tuple.")
+        .def(
+            "addMarkerGroup",
+            [](py::object self, const std::string& label) -> py::object {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
+                const std::int32_t id = chunk->next_id();
+                execute_command(
+                    document,
+                    alphashape::make_add_group_command(
+                        alphashape::GroupKind::Marker, chunk->id(), label));
+                for (const alphashape::MarkerGroup& group :
+                     chunk->marker_groups()) {
+                    if (group.id == id) {
+                        return py::cast(
+                            MarkerGroupRef{chunk, document, id});
+                    }
+                }
+                throw alphashape::Error(
+                    "addMarkerGroup: the group was not created");
+            },
+            py::arg("label") = "",
+            "Create a marker group. An empty label uses \"Marker Group\".")
+        .def(
+            "addScalebar",
+            [](py::object self, py::object from_, py::object to,
+               double reference, double accuracy, const std::string& label)
+                -> py::object {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                py::object document = owning_document_object(self);
+                alphashape::Scalebar bar;
+                bar.label = label;
+                bar.from = scalebar_endpoint(*chunk, from_, "from_");
+                bar.to = scalebar_endpoint(*chunk, to, "to");
+                bar.reference_length_m = reference;
+                bar.reference_accuracy_m = accuracy;
+                const std::int32_t id = chunk->next_id();
+                execute_command(
+                    document,
+                    alphashape::make_add_scalebar_command(chunk->id(), bar));
+                for (const alphashape::Scalebar& candidate :
+                     chunk->scalebars()) {
+                    if (candidate.id == id) {
+                        return py::cast(ScalebarRef{chunk, document, id});
+                    }
+                }
+                throw alphashape::Error("addScalebar: the scalebar was not created");
+            },
+            py::arg("from_"), py::arg("to"), py::arg("reference") = 0.0,
+            py::arg("accuracy") = 0.001, py::arg("label") = "",
+            "Add a scale bar between two endpoints. Each endpoint is a marker "
+            "id, a marker label, or (\"marker\"|\"camera\", id-or-label).")
+        .def(
+            "copy",
+            [](py::object self, const std::string& label) -> py::object {
+                alphashape::Document& document = owning_document(self);
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                const std::int32_t created = document.workspace().next_chunk_id();
+                execute_on_chunk(
+                    self, alphashape::make_duplicate_chunk_command(
+                              chunk->id(), label));
+                for (const auto& candidate : document.workspace().chunks()) {
+                    if (candidate->id() == created) {
+                        return attach_document(owning_document_object(self),
+                                               candidate);
+                    }
+                }
+                throw alphashape::Error("copy: the chunk was not duplicated");
+            },
+            py::arg("label") = "",
+            "Duplicate this chunk, ids remapped, and return the new chunk.")
         .def(
             "setMarkerProjection",
             [](py::object self, py::object marker, py::object camera, double u,
                double v) {
                 alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
-                alphashape::Document& document = owning_document(self);
                 const std::int32_t camera_id = camera_id_from_python(chunk, camera);
                 // A string names a marker by label (and may name one that does
                 // not exist yet, which the command creates); a Marker object or
@@ -1578,11 +2581,11 @@ PYBIND11_MODULE(alphashape, m) {
                         ? alphashape::MarkerRef(py::cast<std::string>(marker))
                         : alphashape::MarkerRef(
                               marker_id_from_python(chunk, marker));
-                alphashape::make_add_marker_with_projection_command(
-                    chunk.id(), std::move(reference), camera_id,
-                    Eigen::Vector2d(u, v),
-                    /*pinned=*/false)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_add_marker_with_projection_command(
+                              chunk.id(), std::move(reference), camera_id,
+                              Eigen::Vector2d(u, v),
+                              /*pinned=*/false));
             },
             py::arg("marker"), py::arg("camera"), py::arg("u"), py::arg("v"),
             "Set or replace one marker projection. A string `marker` is an exact "
@@ -1593,23 +2596,35 @@ PYBIND11_MODULE(alphashape, m) {
             [](py::object self, py::object marker, py::object camera,
                bool delete_marker) {
                 alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
-                alphashape::Document& document = owning_document(self);
                 const std::int32_t marker_id = marker_id_from_python(chunk, marker);
                 const std::int32_t camera_id = camera_id_from_python(chunk, camera);
-                alphashape::make_remove_marker_projection_command(
-                    chunk.id(), marker_id, camera_id, delete_marker)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_remove_marker_projection_command(
+                              chunk.id(), marker_id, camera_id, delete_marker));
             },
             py::arg("marker"), py::arg("camera"), py::arg("delete_marker") = false,
             "Remove one projection. With delete_marker a marker whose last "
             "projection this was is removed too.")
+        .def(
+            "removeMarker",
+            [](py::object self, py::object marker) {
+                alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
+                const std::int32_t marker_id =
+                    marker_id_from_python(chunk, marker);
+                execute_on_chunk(
+                    self, alphashape::make_remove_marker_command(chunk.id(),
+                                                                 marker_id));
+            },
+            py::arg("marker"),
+            "Remove one marker (by id or exact label) as an undoable step.")
         // Place or move a marker: sets `position` on the marker with `label`,
         // creating the marker (and allocating its id) when the chunk has none
         // with that label. This is the manual placement path WP-11.1 ships
         // (detection is M13); AlignChunks is its first consumer.
         .def(
             "set_marker_position",
-            [](Chunk& c, const std::string& label, double x, double y, double z) {
+            [](py::object self, const std::string& label, double x, double y,
+               double z) {
                 if (label.empty()) {
                     throw alphashape::ValueError("set_marker_position: empty label");
                 }
@@ -1618,60 +2633,52 @@ PYBIND11_MODULE(alphashape, m) {
                     throw alphashape::ValueError(
                         "set_marker_position: position must be finite");
                 }
-                for (alphashape::Marker& marker : c.markers()) {
+                auto chunk = self.cast<std::shared_ptr<Chunk>>();
+                for (const alphashape::Marker& marker : chunk->markers()) {
                     if (marker.label == label) {
-                        marker.position = position;
-                        marker.valid = true;
+                        execute_on_chunk(
+                            self,
+                            alphashape::make_set_marker_position_command(
+                                chunk->id(), marker.id, position));
                         return marker.id;
                     }
                 }
-                alphashape::Marker marker;
-                marker.id = c.allocate_id();
-                marker.label = label;
-                marker.position = position;
-                marker.valid = true;
-                const std::int32_t id = marker.id;
-                c.markers().push_back(std::move(marker));
+                const std::int32_t id = chunk->next_id();
+                // One call is one undo step: create and enable together.
+                auto transaction = std::make_unique<alphashape::CommandTransaction>(
+                    "Set Marker Position");
+                transaction->add(alphashape::make_add_marker_command(
+                    chunk->id(), label, position));
+                transaction->add(alphashape::make_set_marker_enabled_command(
+                    chunk->id(), id, true));
+                execute_on_chunk(self, std::move(transaction));
                 return id;
             },
             py::arg("label"), py::arg("x"), py::arg("y"), py::arg("z"),
             "Create or move the marker with this exact label to (x, y, z) in "
             "chunk-local coordinates. Returns its id.")
         // Set or clear one camera's per-axis attitude accuracy in degrees, the
-        // sigma trio OptimizeCameras uses to weight that camera's rotation
-        // prior. Cameras are exposed as copies, so the edit goes through the
-        // chunk by id rather than through the Camera object.
+        // sigma trio the adjustment weights that camera's rotation prior by.
+        // The edit goes through the undoable command by camera id.
         .def(
             "set_camera_reference_rotation_accuracy",
-            [](Chunk& c, std::int32_t camera_id, py::object accuracy) {
-                alphashape::Camera* camera = nullptr;
-                for (alphashape::Camera& candidate : c.cameras()) {
-                    if (candidate.id == camera_id) {
-                        camera = &candidate;
-                        break;
+            [](py::object self, std::int32_t camera_id, py::object accuracy) {
+                std::optional<Eigen::Vector3d> sigma;
+                if (!accuracy.is_none()) {
+                    const auto values = py::cast<std::vector<double>>(accuracy);
+                    if (values.size() != 3) {
+                        throw alphashape::ValueError(
+                            "set_camera_reference_rotation_accuracy: accuracy must "
+                            "be a (first, second, third) triple");
                     }
+                    sigma = Eigen::Vector3d(values[0], values[1], values[2]);
                 }
-                if (camera == nullptr) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: no camera with that id");
-                }
-                if (accuracy.is_none()) {
-                    camera->reference.rotation_accuracy_deg.reset();
-                    return;
-                }
-                const auto values = py::cast<std::vector<double>>(accuracy);
-                if (values.size() != 3) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: accuracy must be a "
-                        "(first, second, third) triple");
-                }
-                const Eigen::Vector3d sigma(values[0], values[1], values[2]);
-                if (!sigma.allFinite() || (sigma.array() < 0.0).any()) {
-                    throw alphashape::ValueError(
-                        "set_camera_reference_rotation_accuracy: accuracy must be "
-                        "finite and non-negative");
-                }
-                camera->reference.rotation_accuracy_deg = sigma;
+                const std::int32_t chunk_id =
+                    self.cast<const Chunk&>().id();
+                execute_on_chunk(
+                    self,
+                    alphashape::make_set_camera_reference_rotation_accuracy_command(
+                        chunk_id, camera_id, sigma));
             },
             py::arg("camera_id"), py::arg("accuracy"),
             "Set one camera's per-axis attitude accuracy in degrees, positional "
@@ -1679,24 +2686,28 @@ PYBIND11_MODULE(alphashape, m) {
         // Set (or replace) one chunk-meta property.
         .def(
             "set_meta",
-            [](Chunk& c, const std::string& key, const std::string& value) {
+            [](py::object self, const std::string& key,
+               const std::string& value) {
                 if (key.empty()) {
                     throw alphashape::ValueError("set_meta: empty key");
                 }
-                c.meta().set(key, value);
+                const std::int32_t chunk_id =
+                    self.cast<const Chunk&>().id();
+                execute_on_chunk(
+                    self, alphashape::make_set_chunk_meta_command(chunk_id, key,
+                                                                  value));
             },
             py::arg("key"), py::arg("value"))
         // Replace one sensor's calibration through the undoable "Set Sensor
-        // Calibration" command, then discard it (the GUI owns undo).
+        // Calibration" command on the document's stack.
         .def(
             "set_sensor_calibration",
             [](py::object self, std::int32_t sensor_index,
                const alphashape::Calibration& calibration) {
-                alphashape::Document& document = owning_document(self);
                 const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
-                alphashape::make_set_sensor_calibration_command(chunk.id(), sensor_index,
-                                                                calibration)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_calibration_command(
+                              chunk.id(), sensor_index, calibration));
             },
             py::arg("sensor_index"), py::arg("calibration"),
             "Replace a sensor's calibration (undoable in the GUI).")
@@ -1704,16 +2715,15 @@ PYBIND11_MODULE(alphashape, m) {
         .def(
             "set_sensor_master",
             [](py::object self, std::int32_t sensor_index, std::int32_t master_index) {
-                alphashape::Document& document = owning_document(self);
                 const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
-                alphashape::make_set_sensor_master_command(chunk.id(), sensor_index,
-                                                           master_index)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_master_command(
+                              chunk.id(), sensor_index, master_index));
             },
             py::arg("sensor_index"), py::arg("master_index"),
             "Share a sensor's calibration with a master sensor, or detach with -1.")
         // Replace a sensor's film/fiducial layout (WP-13.18a) through the
-        // undoable "Set Sensor Film" command, then discard it (the GUI owns undo).
+        // undoable "Set Sensor Film" command.
         .def(
             "set_sensor_film",
             [](py::object self, std::int32_t sensor_index, bool enabled,
@@ -1765,10 +2775,10 @@ PYBIND11_MODULE(alphashape, m) {
                                                        std::get<2>(entry));
                     film.fiducials.push_back(std::move(fiducial));
                 }
-                alphashape::Document& document = owning_document(self);
                 const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
-                alphashape::make_set_sensor_film_command(chunk.id(), sensor_index, film)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_film_command(
+                              chunk.id(), sensor_index, film));
             },
             py::arg("sensor_index"), py::arg("enabled"), py::arg("fiducials"),
             py::arg("transform") = "affine", py::arg("detector") = "circle",
@@ -1782,14 +2792,13 @@ PYBIND11_MODULE(alphashape, m) {
             [](py::object self, std::int32_t sensor_index,
                const Eigen::Vector3d& offset,
                std::optional<Eigen::Vector3d> boresight) {
-                alphashape::Document& document = owning_document(self);
                 const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
                 alphashape::Antenna antenna;
                 antenna.offset_m = offset;
                 antenna.boresight_deg = boresight;
-                alphashape::make_set_sensor_antenna_command(chunk.id(), sensor_index,
-                                                            antenna)
-                    ->apply(document);
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_antenna_command(
+                              chunk.id(), sensor_index, antenna));
             },
             py::arg("sensor_index"), py::arg("offset"), py::arg("boresight") = py::none(),
             "Set a sensor's antenna offset in metres (camera frame) and optional "
@@ -1802,24 +2811,28 @@ PYBIND11_MODULE(alphashape, m) {
         // unit bearing in chunk-local units, NOT a camera-frame Z. -1 is the
         // sentinel for "no depth"; depths is always present, while normals and
         // confidence are None when the map carries none (their vectors are empty).
+        // ALL depth-map sets flattened, as the public scripting API expects.
+        // The ACTIVE set alone is still reachable through `depth_maps_sets`
+        // and the `active_depth_maps` convenience below.
         .def_property_readonly("depth_maps", [](const Chunk& c) {
             py::list out;
+            for (const alphashape::DepthMapsAsset& set : c.depth_map_sets()) {
+                if (!set.data) {
+                    continue;
+                }
+                for (const alphashape::DepthMap& map : *set.data) {
+                    out.append(depth_map_entry(map));
+                }
+            }
+            return out;
+        })
+        // The ACTIVE set's maps, the pre-WP-11.11 meaning of `depth_maps`,
+        // kept under its own name for scripts that relied on it. The entries
+        // are identical to the corresponding `depth_maps` entries.
+        .def_property_readonly("active_depth_maps", [](const Chunk& c) {
+            py::list out;
             for (const alphashape::DepthMap& map : c.depth_maps()) {
-                py::dict entry;
-                entry[py::str("camera_id")] = py::int_(map.camera_id);
-                entry[py::str("width")] = py::int_(map.width);
-                entry[py::str("height")] = py::int_(map.height);
-                entry[py::str("downscale")] = py::int_(map.downscale);
-                entry[py::str("depth")] = reshape_scalar(map.depths, map.height, map.width);
-                entry[py::str("normals")] =
-                    map.normals.empty()
-                        ? py::object(py::none())
-                        : py::object(reshape_vec3_grid(map.normals, map.height, map.width));
-                entry[py::str("confidence")] =
-                    map.confidence.empty()
-                        ? py::object(py::none())
-                        : py::object(reshape_scalar(map.confidence, map.height, map.width));
-                out.append(std::move(entry));
+                out.append(depth_map_entry(map));
             }
             return out;
         })
@@ -1957,25 +2970,57 @@ PYBIND11_MODULE(alphashape, m) {
                                    return py::cast(std::move(view));
                                })
         // -- multi-instance assets (milestone 11) ------------------------------
-        // One entry per asset of each kind, in id order: {key, label, active}.
-        // The scalar properties above (elevation, orthomosaic, model,
-        // point_cloud, depth_maps, model_texture) are views onto the ACTIVE
-        // asset, which is the one the last producing task added.
-        .def_property_readonly("elevations", [](const Chunk& c) {
-            return asset_list(c.elevations(), c.active_elevation_id());
-        })
-        .def_property_readonly("orthomosaics", [](const Chunk& c) {
-            return asset_list(c.orthomosaics(), c.active_orthomosaic_id());
-        })
-        .def_property_readonly("models", [](const Chunk& c) {
-            return asset_list(c.models(), c.active_model_id());
-        })
-        .def_property_readonly("point_clouds", [](const Chunk& c) {
-            return asset_list(c.point_clouds(), c.active_point_cloud_id());
-        })
-        .def_property_readonly("depth_maps_sets", [](const Chunk& c) {
-            return asset_list(c.depth_map_sets(), c.active_depth_maps_id());
-        })
+        // One asset view per asset of each kind, in id order. The scalar
+        // properties above (elevation, orthomosaic, model, point_cloud,
+        // model_texture) are views onto the ACTIVE asset, which is the one the
+        // last producing task added. `depth_maps` is the exception: it
+        // flattens every set, while `active_depth_maps` is the active one.
+        .def_property_readonly("elevations", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::Elevation,
+                                  c->elevations());
+            }, py::is_method(m)))
+        .def_property_readonly("orthomosaics", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::Orthomosaic,
+                                  c->orthomosaics());
+            }, py::is_method(m)))
+        .def_property_readonly("models", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::Model,
+                                  c->models());
+            }, py::is_method(m)))
+        .def_property_readonly("point_clouds", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::PointCloud,
+                                  c->point_clouds());
+            }, py::is_method(m)))
+        .def_property_readonly("depth_maps_sets", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::DepthMaps,
+                                  c->depth_map_sets());
+            }, py::is_method(m)))
+        .def_property_readonly("tiled_models", py::cpp_function(
+            [](py::object self) {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                return asset_refs(self, alphashape::AssetKind::TiledModel,
+                                  c->tiled_models());
+            }, py::is_method(m)))
+        .def_property_readonly("panorama", py::cpp_function(
+            [](py::object self) -> py::object {
+                auto c = self.cast<std::shared_ptr<Chunk>>();
+                if (!c->panorama().has_value()) {
+                    return py::none();
+                }
+                return py::cast(AssetRef{
+                    c, owning_document_object(self),
+                    alphashape::AssetKind::Panorama, c->panorama()->id});
+            }, py::is_method(m)))
         // -- milestone 9 task shortcuts ----------------------------------------
         // Metashape-style convenience wrappers over run_task, so
         // `chunk.buildDem(interpolation="extrapolated")` and
@@ -2067,7 +3112,8 @@ PYBIND11_MODULE(alphashape, m) {
         // front end exposes never carry one).
         .def(
             "convertReference",
-            [](Chunk& c, int target_epsg, const std::string& kind) {
+            [](py::object self, int target_epsg, const std::string& kind) {
+                Chunk& c = self.cast<Chunk&>();
                 if (target_epsg <= 0) {
                     throw alphashape::ValueError(
                         "convertReference: target_epsg must be a positive EPSG code");
@@ -2085,13 +3131,26 @@ PYBIND11_MODULE(alphashape, m) {
                 }
                 alphashape::reference::convert_reference(
                     c, alphashape::crs::CoordinateSystem::from_epsg(target_epsg), which);
+                // An in-place conversion bypasses the command layer, so the
+                // history before it no longer describes the document.
+                if (py::hasattr(self, "_document")) {
+                    clear_document_history(self.attr("_document"));
+                }
             },
             py::arg("target_epsg"), py::arg("kind") = "both");
 #endif  // ALPHASHAPE_USE_PROJ
 
 
+    // The per-document undo history is an opaque capsule on the Document
+    // object (see document_undo_stack); Document.undo/redo/can_undo/can_redo
+    // are the only public surface, so a script cannot retain a stack whose
+    // owning Document it dropped.
+
     // -- Document ------------------------------------------------------------
-    py::class_<Document, std::shared_ptr<Document>>(m, "Document")
+    // dynamic_attr: the document's undo stack lives on the object (see
+    // document_undo_stack), so it is destroyed with the document.
+    py::class_<Document, std::shared_ptr<Document>>(m, "Document",
+                                                    py::dynamic_attr())
         .def(py::init<>())
         .def_property("path", [](const Document& d) { return d.path(); },
                       [](Document& d, const std::string& path) { d.set_path(path); })
@@ -2104,12 +3163,18 @@ PYBIND11_MODULE(alphashape, m) {
             "removed when the last Document that shares it closes.")
         .def(
             "save",
-            [](Document& d, const std::string& path, py::object chunks,
+            [](py::object self, py::object path, py::object chunks,
                py::object archive) {
+                Document& d = self.cast<Document&>();
                 // archive=None infers the layout from the extension;
                 // archive=True forces the single-file .psz form, False the
                 // directory form.
-                std::string target = path;
+                std::string target = path.is_none() ? d.path()
+                                                    : py::cast<std::string>(path);
+                if (target.empty()) {
+                    throw alphashape::ValueError(
+                        "save: the document has no path yet; pass one");
+                }
                 if (!archive.is_none()) {
                     std::filesystem::path as_path =
                         alphashape::platform::path_from_utf8(target);
@@ -2119,6 +3184,14 @@ PYBIND11_MODULE(alphashape, m) {
                         as_path.replace_extension(".psx");
                     }
                     target = alphashape::platform::path_to_utf8(as_path);
+                }
+                // Save As can move the document out of its cache directory.
+                // Pin the old one before set_path() so undo spill files that
+                // retained commands still reference are not deleted; the GUI
+                // does the same (apps/gui/app.cpp save_document_as).
+                std::shared_ptr<void> cache_pin;
+                if (target != d.path()) {
+                    cache_pin = d.pin_cache_directory();
                 }
                 // Record the path so a later run resolves relative frame paths
                 // against the project we just wrote, exactly like load() would.
@@ -2143,23 +3216,29 @@ PYBIND11_MODULE(alphashape, m) {
                     }
                 }
                 d.save(target, ids);
+                if (py::hasattr(self, "_undo_stack")) {
+                    document_undo_stack(self)->set_cache_dir(d.cache_dir());
+                }
+                if (cache_pin) {
+                    pin_document_history_cache(self, std::move(cache_pin));
+                }
             },
-            py::arg("path"), py::arg("chunks") = py::none(),
+            py::arg("path") = py::none(), py::arg("chunks") = py::none(),
             py::arg("archive") = py::none(),
-            "Write the project. `chunks` restricts the file to those chunks "
+            "Write the project. `path=None` writes to the document's current "
+            "path (set when it was loaded or last saved). `chunks` restricts "
+            "the file to those chunks "
             "(ids or Chunk objects); None writes every chunk. Chunk ids and the "
             "next-chunk counter are preserved so the file can be appended. "
             "`archive` selects the layout: None infers it from `path` (a .psz "
             "path writes the single-file form, anything else the directory "
             "form); True forces a single-file .psz and False the directory "
             "form, rewriting the extension when it does not already match.")
-        .def("add_chunk",
-             [](py::object self, const std::string& label) -> py::object {
-                 Document& d = self.cast<Document&>();
-                 d.workspace().add_chunk(label);
-                 return attach_document(self, d.workspace().chunks().back());
-             },
-             py::arg("label"))
+        .def("add_chunk", &document_add_chunk, py::arg("label") = py::none(),
+             "Add a chunk and return it. The active chunk is unchanged. With no "
+             "label the chunk is named 'Chunk N' for the smallest unused N.")
+        .def("addChunk", &document_add_chunk, py::arg("label") = py::none(),
+             "Add a chunk and return it (public scripting API spelling).")
         .def("chunk",
              [](py::object self, std::int32_t id) -> py::object {
                  Document& d = self.cast<Document&>();
@@ -2182,6 +3261,79 @@ PYBIND11_MODULE(alphashape, m) {
                 return ids;
             },
             "Ids of the workspace's chunks, in workspace order.")
+        // Chunks keyed by Chunk.key, the public scripting API shape. Python
+        // 3.7+ dicts preserve insertion order, so iteration is workspace
+        // order.
+        .def_property_readonly(
+            "chunks",
+            [](py::object self) {
+                Document& d = self.cast<Document&>();
+                py::dict out;
+                for (const auto& chunk : d.workspace().chunks()) {
+                    out[py::str(std::to_string(chunk->id()))] =
+                        attach_document(self, chunk);
+                }
+                return out;
+            },
+            "Chunks keyed by Chunk.key.")
+        .def(
+            "remove",
+            [](py::object self, py::object chunks) {
+                std::vector<std::int32_t> ids;
+                auto collect = [&ids](py::handle item) {
+                    if (py::isinstance<Chunk>(item)) {
+                        ids.push_back(item.cast<Chunk*>()->id());
+                    } else if (py::isinstance<py::int_>(item)) {
+                        ids.push_back(item.cast<std::int32_t>());
+                    } else {
+                        throw py::type_error(
+                            "remove expects chunk ids or Chunk objects");
+                    }
+                };
+                for (const py::object& item :
+                     chunk_argument_items(std::move(chunks))) {
+                    collect(item);
+                }
+                if (ids.empty()) {
+                    return;
+                }
+                auto transaction = std::make_unique<alphashape::CommandTransaction>(
+                    "Remove Chunks");
+                for (const std::int32_t id : ids) {
+                    transaction->add(
+                        alphashape::make_remove_chunk_command(id));
+                }
+                execute_command(self, std::move(transaction));
+            },
+            py::arg("chunks"),
+            "Remove one chunk or a sequence of chunks (ids or Chunk objects) "
+            "as one undoable step.")
+        .def(
+            "append",
+            [](py::object self, py::object other) {
+                if (!py::isinstance<Document>(other)) {
+                    throw py::type_error("append expects a Document");
+                }
+                auto source = other.cast<std::shared_ptr<Document>>();
+                execute_command(
+                    self, alphashape::make_append_document_command(
+                              source, source->path()));
+            },
+            py::arg("doc"),
+            "Append every chunk of another Document, remapping chunk ids past "
+            "this document's next id.")
+        .def("undo",
+             [](py::object self) { document_undo_stack(self)->undo(); },
+             "Undo the last edit recorded on this document's stack.")
+        .def("redo",
+             [](py::object self) { document_undo_stack(self)->redo(); },
+             "Redo the last undone edit.")
+        .def_property_readonly("can_undo", [](py::object self) {
+            return document_undo_stack(self)->can_undo();
+        })
+        .def_property_readonly("can_redo", [](py::object self) {
+            return document_undo_stack(self)->can_redo();
+        })
         .def_property(
             "active_chunk",
             [](py::object self) -> py::object {
@@ -2210,8 +3362,8 @@ PYBIND11_MODULE(alphashape, m) {
                 }
             })
         .def("run_task",
-             [](Document& d, const std::string& name, py::kwargs kwargs) {
-                 run_task_kwargs(d, name, std::move(kwargs));
+             [](py::object self, const std::string& name, py::kwargs kwargs) {
+                 run_task_kwargs(std::move(self), name, std::move(kwargs));
              },
              py::arg("name"))
         .def(
@@ -2219,7 +3371,8 @@ PYBIND11_MODULE(alphashape, m) {
             [](py::object self, py::object chunks, const std::string& label) -> py::object {
                 Document& d = self.cast<Document&>();
                 std::vector<std::string> ids;
-                for (py::handle item : chunks) {
+                for (const py::object& item :
+                     chunk_argument_items(std::move(chunks))) {
                     if (py::isinstance<Chunk>(item)) {
                         ids.push_back(std::to_string(item.cast<Chunk*>()->id()));
                     } else if (py::isinstance<py::int_>(item)) {
@@ -2242,7 +3395,7 @@ PYBIND11_MODULE(alphashape, m) {
                     id_list.append(py::str(id));
                 }
                 kwargs[py::str("chunk_ids")] = id_list;
-                run_task_kwargs(d, "MergeChunks", kwargs);
+                run_task_kwargs(self, "MergeChunks", kwargs);
                 return attach_document(self, d.workspace().chunks().back());
             },
             py::arg("chunks"),
@@ -2251,7 +3404,7 @@ PYBIND11_MODULE(alphashape, m) {
             "chunk and return it. Refuses chunks with different non-local CRSs.")
         .def(
             "append_project",
-            [](Document& d, const std::string& path, py::object chunks,
+            [](py::object self, const std::string& path, py::object chunks,
                bool append_doc) {
                 std::vector<std::string> ids;
                 if (!chunks.is_none()) {
@@ -2272,7 +3425,7 @@ PYBIND11_MODULE(alphashape, m) {
                     id_list.append(py::str(id));
                 }
                 kwargs[py::str("chunk_ids")] = id_list;
-                run_task_kwargs(d, "AppendProject", kwargs);
+                run_task_kwargs(self, "AppendProject", kwargs);
             },
             py::arg("path"), py::arg("chunk_ids") = py::none(),
             py::arg("append_doc") = true,
@@ -2298,7 +3451,7 @@ PYBIND11_MODULE(alphashape, m) {
                 if (!label.empty()) {
                     kwargs[py::str("label")] = py::str(label);
                 }
-                run_task_kwargs(d, "DuplicateChunk", kwargs);
+                run_task_kwargs(self, "DuplicateChunk", kwargs);
                 return attach_document(self, d.workspace().chunks().back());
             },
             py::arg("chunk") = py::none(), py::arg("label") = "",
@@ -2306,7 +3459,7 @@ PYBIND11_MODULE(alphashape, m) {
             "Chunk, an id, or None for the active chunk. Returns the copy.")
         .def(
             "align_chunks",
-            [](Document& d, py::object reference, const std::string& method,
+            [](py::object self, py::object reference, const std::string& method,
                int min_common_markers, double accuracy_m) {
                 std::int32_t id = -1;
                 if (!reference.is_none()) {
@@ -2324,7 +3477,7 @@ PYBIND11_MODULE(alphashape, m) {
                 kwargs[py::str("method")] = py::str(method);
                 kwargs[py::str("min_common_markers")] = py::int_(min_common_markers);
                 kwargs[py::str("accuracy_m")] = py::float_(accuracy_m);
-                run_task_kwargs(d, "AlignChunks", kwargs);
+                run_task_kwargs(self, "AlignChunks", kwargs);
             },
             py::arg("reference") = py::none(),
             py::arg("method") = "markers", py::arg("min_common_markers") = 3,
@@ -2337,7 +3490,7 @@ PYBIND11_MODULE(alphashape, m) {
             "AlignChunks/<other id>/matrix.")
         .def(
             "run_script",
-            [](Document& d, const std::string& path, py::object args,
+            [](py::object self, const std::string& path, py::object args,
                int timeout_s) {
                 py::dict kwargs;
                 kwargs[py::str("path")] = py::str(path);
@@ -2349,7 +3502,7 @@ PYBIND11_MODULE(alphashape, m) {
                     kwargs[py::str("args")] = values;
                 }
                 kwargs[py::str("timeout_s")] = py::int_(timeout_s);
-                run_task_kwargs(d, "RunScript", kwargs);
+                run_task_kwargs(self, "RunScript", kwargs);
             },
             py::arg("path"), py::arg("args") = py::none(),
             py::arg("timeout_s") = 600,

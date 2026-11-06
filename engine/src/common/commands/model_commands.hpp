@@ -125,6 +125,10 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(
     std::int32_t chunk_id, Marker marker);
 std::unique_ptr<AbstractCommand> make_remove_marker_command(
     std::int32_t chunk_id, std::int32_t marker_id);
+/// Rename one marker. Undo restores the previous label verbatim. An empty
+/// label is rejected, and so is one another marker in the same chunk carries.
+std::unique_ptr<AbstractCommand> make_set_marker_label_command(
+    std::int32_t chunk_id, std::int32_t marker_id, std::string label);
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
     std::int32_t chunk_id, std::int32_t marker_id,
     std::optional<Eigen::Vector3d> reference, Eigen::Vector3d accuracy);
@@ -250,6 +254,14 @@ std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
 std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
     std::int32_t chunk_id, std::int32_t camera_id,
     std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy);
+/// Set (or clear, with nullopt) one camera's per-axis attitude accuracy in
+/// degrees, the sigma trio the adjustment weights that camera's rotation
+/// prior by. Undo restores the previous value, absence included. Every set
+/// component must be finite and non-negative.
+std::unique_ptr<AbstractCommand>
+make_set_camera_reference_rotation_accuracy_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> accuracy_deg);
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool selected);
 
