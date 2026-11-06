@@ -13,6 +13,8 @@ add_library(alphashape_gui_lib STATIC
     drop_paths.cpp
     app.cpp
     job_manager.cpp
+    jobs/estimate.cpp
+    jobs/estimate_model.cpp
     task_dialog.cpp
     calibration_dialog.cpp
     marker_tools_dialogs.cpp

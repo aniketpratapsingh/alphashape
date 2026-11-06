@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <exception>
+#include <string>
 #include <utility>
 
 #include <QCheckBox>
@@ -11,6 +13,8 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFont>
+#include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -23,6 +27,10 @@
 #include <QSpinBox>
 #include <QStyle>
 #include <QVBoxLayout>
+
+#include "apps/gui/jobs/estimate.hpp"
+#include "base/platform/memory.hpp"
+#include "common/core/chunk.hpp"
 
 namespace alphashape::gui {
 
@@ -177,6 +185,32 @@ bool is_required(const ParamSpec& spec) {
     return spec.name == "path" && text != nullptr && text->empty();
 }
 
+/// A compact wall-time figure for the estimate row.
+QString format_estimate_duration(double seconds) {
+    if (seconds < 90.0) {
+        return QStringLiteral("%1 s").arg(
+            QString::number(seconds, 'f', seconds < 10.0 ? 1 : 0));
+    }
+    const double minutes = seconds / 60.0;
+    if (minutes < 90.0) {
+        return QStringLiteral("%1 min").arg(
+            QString::number(minutes, 'f', minutes < 10.0 ? 1 : 0));
+    }
+    return QStringLiteral("%1 h").arg(QString::number(minutes / 60.0, 'f', 1));
+}
+
+/// Lining tabular figures where Qt has them, a fixed-pitch fallback otherwise,
+/// so the numbers do not jitter while a parameter is being dragged.
+void apply_tabular_figures(QLabel* label) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+    QFont font = label->font();
+    font.setFeature(QFont::Tag("tnum"), 1U);
+    label->setFont(font);
+#else
+    label->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+#endif
+}
+
 }  // namespace
 
 QString TaskDialog::display_name(const std::string& param) {
@@ -224,7 +258,7 @@ QString TaskDialog::settings_key(const std::string& task_name, const std::string
 
 TaskDialog::TaskDialog(const std::string& task_name, const TaskRegistry& registry,
                        QSettings& settings, QWidget* parent)
-    : QDialog(parent), task_name_(task_name), settings_(settings) {
+    : QDialog(parent), task_name_(task_name), settings_(settings), registry_(&registry) {
     const TaskEntry& entry = registry.require(task_name);
     setObjectName(QStringLiteral("dialog.task"));
     setWindowTitle(task_title(task_name));
@@ -289,6 +323,21 @@ void TaskDialog::build() {
         root->addLayout(general_form);
     }
 
+    estimate_label_ = new QLabel(this);
+    estimate_label_->setObjectName(QStringLiteral("task.estimate"));
+    estimate_label_->setWordWrap(true);
+    estimate_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    apply_tabular_figures(estimate_label_);
+    estimate_label_->hide();
+    root->addWidget(estimate_label_);
+
+    ram_warning_label_ = new QLabel(this);
+    ram_warning_label_->setObjectName(QStringLiteral("task.ram_warning"));
+    ram_warning_label_->setWordWrap(true);
+    apply_tabular_figures(ram_warning_label_);
+    ram_warning_label_->hide();
+    root->addWidget(ram_warning_label_);
+
     buttons_ = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::RestoreDefaults, this);
     buttons_->setObjectName(QStringLiteral("task.buttons"));
@@ -315,7 +364,10 @@ void TaskDialog::add_field(const ParamSpec& spec, bool is_advanced, QFormLayout*
     column->setContentsMargins(0, 0, 0, 0);
     column->setSpacing(2);
 
-    auto mark_dirty = [this, index]() { fields_[index].dirty = true; };
+    auto mark_dirty = [this, index]() {
+        fields_[index].dirty = true;
+        refresh_estimate();
+    };
 
     switch (field->kind) {
         case EditorKind::CheckBox: {
@@ -658,11 +710,69 @@ void TaskDialog::reset_to_defaults() {
         load(field, schema_default(field));
         set_error(field, QString());
     }
+    refresh_estimate();
 }
 
 void TaskDialog::set_value(const std::string& param, const ParamValue& value) {
     if (Field* field = find(param)) {
         load(*field, value);
+        refresh_estimate();
+    }
+}
+
+void TaskDialog::set_estimate_context(const Chunk* chunk, const ThroughputHistory* history) {
+    estimate_chunk_ = chunk;
+    estimate_history_ = history;
+    refresh_estimate();
+}
+
+void TaskDialog::set_memory_budget(std::uint64_t bytes) {
+    memory_budget_ = bytes;
+    refresh_estimate();
+}
+
+void TaskDialog::refresh_estimate() {
+    if (estimate_label_ == nullptr || ram_warning_label_ == nullptr) {
+        return;
+    }
+    if (estimate_chunk_ == nullptr || estimate_history_ == nullptr || registry_ == nullptr) {
+        estimate_label_->hide();
+        ram_warning_label_->hide();
+        return;
+    }
+    const Estimate estimate =
+        estimate_task(*registry_, task_name_, params(), *estimate_chunk_, *estimate_history_);
+    const int sigma_percent =
+        static_cast<int>(std::lround(estimate.seconds_sigma_rel * 100.0));
+    estimate_label_->setText(
+        tr("Estimated: ~%1 ± %2% · RAM ~%3 · disk ~%4 (%5)")
+            .arg(format_estimate_duration(estimate.seconds))
+            .arg(sigma_percent)
+            .arg(QString::fromStdString(
+                platform::format_gb(static_cast<double>(estimate.peak_ram_bytes))))
+            .arg(QString::fromStdString(
+                platform::format_gb(static_cast<double>(estimate.disk_bytes))))
+            .arg(QString::fromStdString(estimate.basis)));
+    estimate_label_->show();
+
+    const std::uint64_t budget =
+        memory_budget_ != 0 ? memory_budget_ : estimate_memory_budget();
+    if (needs_ram_warning(estimate, budget)) {
+        int images = 0;
+        for (const Camera& camera : estimate_chunk_->cameras()) {
+            if (camera.enabled) {
+                ++images;
+            }
+        }
+        ram_warning_label_->setText(
+            tr("Same settings on an %1-image block would need ~%2 RAM")
+                .arg(images)
+                .arg(QString::fromStdString(
+                    platform::format_gb(static_cast<double>(estimate.peak_ram_bytes)))));
+        ram_warning_label_->show();
+    } else {
+        ram_warning_label_->clear();
+        ram_warning_label_->hide();
     }
 }
 

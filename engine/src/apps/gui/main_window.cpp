@@ -691,6 +691,16 @@ void MainWindow::run_marker_task(const std::string& task) {
             params = dialog.params();
         } else {
             TaskDialog dialog(task, builtin_registry(), app_.settings(), this);
+            const Chunk* estimate_chunk =
+                app_.read_document([chunk_id](const Document& document) -> const Chunk* {
+                    for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+                        if (chunk != nullptr && chunk->id() == chunk_id) {
+                            return chunk.get();
+                        }
+                    }
+                    return nullptr;
+                });
+            dialog.set_estimate_context(estimate_chunk, &app_.jobs().throughput_history());
             if (dialog.exec() != QDialog::Accepted) {
                 return;
             }
