@@ -44,8 +44,17 @@ target_link_libraries(alphashape_core PUBLIC alphashape_base alphashape_model al
 # WP-11.10: SQLite when the configure found it, the JSON-lines fallback
 # otherwise. The fallback class is compiled either way so its tests never skip.
 if(SQLite3_FOUND)
+    # Newer CMake names the target SQLite3::SQLite3 and deprecates the old
+    # spelling; accept either so older and newer FindSQLite3 modules both work.
+    if(TARGET SQLite3::SQLite3)
+        set(_alphashape_sqlite_target SQLite3::SQLite3)
+    elseif(TARGET SQLite::SQLite3)
+        set(_alphashape_sqlite_target SQLite::SQLite3)
+    endif()
+endif()
+if(DEFINED _alphashape_sqlite_target)
     target_compile_definitions(alphashape_core PRIVATE ALPHASHAPE_USE_SQLITE3=1)
-    target_link_libraries(alphashape_core PRIVATE SQLite::SQLite3)
+    target_link_libraries(alphashape_core PRIVATE ${_alphashape_sqlite_target})
     message(STATUS "  job database ...... SQLite3 (WAL)")
 else()
     message(STATUS "  job database ...... JSON-lines fallback")

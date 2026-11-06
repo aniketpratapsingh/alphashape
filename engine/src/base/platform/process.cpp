@@ -406,8 +406,11 @@ ProcessResult run_process_capture(const std::vector<std::string>& argv,
     mutable_line.push_back(L'\0');
     std::wstring environment = build_environment_block(options.env);
 
+    // CREATE_UNICODE_ENVIRONMENT is required when a Unicode environment block
+    // is supplied; without it CreateProcessW rejects the block (error 87).
     const BOOL created =
-        ::CreateProcessW(nullptr, mutable_line.data(), nullptr, nullptr, TRUE, 0,
+        ::CreateProcessW(nullptr, mutable_line.data(), nullptr, nullptr, TRUE,
+                         CREATE_UNICODE_ENVIRONMENT,
                          environment.empty() ? nullptr : environment.data(), nullptr,
                          &startup, &process);
     ::CloseHandle(write_end);
