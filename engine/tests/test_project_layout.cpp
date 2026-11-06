@@ -78,6 +78,17 @@ Document make_document(const std::vector<std::string>& photos) {
     return document;
 }
 
+/// A depth map names a chunk camera, and the writer validates that the id
+/// exists, so tests that store depth maps need one.
+Camera& add_camera(Chunk& chunk) {
+    Camera camera;
+    camera.id = chunk.allocate_id();
+    camera.sensor_id = -1;
+    camera.label = "Camera 1";
+    chunk.cameras().push_back(camera);
+    return chunk.cameras().back();
+}
+
 void write_text(const std::string& path, const std::string& text) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << text;
@@ -105,7 +116,7 @@ TEST_F(ProjectLayout, PszRoundTrip) {
     // A non-frame sidecar: a depth-map set travels with the container too.
     Chunk& chunk = *document.workspace().chunks().front();
     DepthMap depth;
-    depth.camera_id = chunk.frames().front()->id();
+    depth.camera_id = add_camera(chunk).id;
     depth.width = 4;
     depth.height = 3;
     depth.downscale = 1;
@@ -432,7 +443,7 @@ TEST_F(ProjectLayout, LargeProjectSaveLoadPerf) {
     Document document = make_document({path("perf.jpg")});
     Chunk& chunk = *document.workspace().chunks().front();
     DepthMap depth;
-    depth.camera_id = chunk.frames().front()->id();
+    depth.camera_id = add_camera(chunk).id;
     depth.width = 10000;
     depth.height = 5000;
     depth.downscale = 1;
