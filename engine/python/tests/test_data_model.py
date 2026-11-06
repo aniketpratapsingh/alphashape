@@ -224,6 +224,7 @@ class TestMarkerCrudAndUndo(unittest.TestCase):
 class TestTaskHistory(unittest.TestCase):
     def test_task_discards_undo_history(self):
         doc, chunk = empty_document()
+        doc.active_chunk = chunk
         chunk.addMarker(label="before", position=(0.0, 0.0, 0.0))
         self.assertTrue(doc.can_undo)
         # A task mutates in place and cannot be undone; the history before it
@@ -369,11 +370,12 @@ class TestChunksApi(unittest.TestCase):
         doc.addChunk("Second")
         merged = doc.merge_chunks(doc.chunks, label="merged")
         self.assertEqual(merged.label, "merged")
-        self.assertEqual(len(doc.chunk_ids), 1)
+        # MergeChunks keeps the sources and appends the merged chunk.
+        self.assertEqual(len(doc.chunk_ids), 3)
         doc.remove(doc.chunks)
         self.assertEqual(doc.chunk_ids, [])
         doc.undo()
-        self.assertEqual(len(doc.chunk_ids), 1)
+        self.assertEqual(len(doc.chunk_ids), 3)
 
 
 if __name__ == "__main__":
