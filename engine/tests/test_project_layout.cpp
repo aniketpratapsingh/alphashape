@@ -393,10 +393,12 @@ TEST_F(ProjectLayout, RelativeProjectPathResolvesOnReload) {
 
     // "sub/../proj.psx" names the same directory; the frame must resolve
     // against the normalised project directory, not against "sub/..".
+    // Build it by concatenation: the fixture's path() helper would normalise.
+    const std::string dotted = (fs::path(dir_) / "sub" / ".." / "proj.psx").string();
     Document document = make_document({path("images/a.jpg")});
-    ProjectIO::save(document, path("sub/../proj.psx"));
+    ProjectIO::save(document, dotted);
 
-    const std::shared_ptr<Document> loaded = ProjectIO::load(path("sub/../proj.psx"));
+    const std::shared_ptr<Document> loaded = ProjectIO::load(dotted);
     EXPECT_EQ(loaded->workspace().chunks().front()->frames().front()->path(),
               path("images/a.jpg"));
 }
