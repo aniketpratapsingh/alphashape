@@ -387,7 +387,12 @@ FrameStats stats_for_enu_chunk(const crs::CoordinateSystem& target,
     Chunk& chunk = chunk_of(document, chunk_id);
     chunk.sensors().push_back(make_sensor("ACME", "X1", "SERIAL-A"));
     chunk.set_coordinate_system(target);
-    chunk.transform() = frame.transform();
+    // The chunk transform is local -> ECEF (origin + local axes in ECEF), not
+    // LocalFrame::transform(), which is the linearised local -> CRS matrix.
+    Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+    transform.block<3, 1>(0, 3) = frame.origin_ecef();
+    transform.block<3, 3>(0, 0) = frame.rotation();
+    chunk.transform() = transform;
     for (int i = 0; i < 2; ++i) {
         Camera camera = make_camera(chunk.allocate_id(), 0, "c" + std::to_string(i));
         camera.pose(0, 3) = -100.0 * static_cast<double>(i);
