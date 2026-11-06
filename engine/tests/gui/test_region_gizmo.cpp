@@ -281,8 +281,12 @@ TEST_F(RegionGizmo, RotateRingTurnsAboutZ) {
     ring.axis = 2;
     ring.point = Eigen::Vector3d(1.0, 0.0, 0.0);
 
-    const GizmoRay first{Eigen::Vector3d(10.0, 0.0, 5.0), Eigen::Vector3d(0.0, 0.0, -1.0)};
-    const GizmoRay quarter{Eigen::Vector3d(0.0, 10.0, 5.0), Eigen::Vector3d(0.0, 0.0, -1.0)};
+    // Rays aimed at the ring around the box centre: the local +X point (angle
+    // 0) and the local +Y point (a quarter turn).
+    const GizmoRay first{Eigen::Vector3d(1.0 + 10.0, 2.0, 3.0 + 5.0),
+                         Eigen::Vector3d(0.0, 0.0, -1.0)};
+    const GizmoRay quarter{Eigen::Vector3d(1.0, 2.0 + 10.0, 3.0 + 5.0),
+                           Eigen::Vector3d(0.0, 0.0, -1.0)};
     const std::optional<GizmoDrag> drag = begin_drag_with_handle(state, ring, first);
     ASSERT_TRUE(drag.has_value());
     const GizmoState after = update_drag(*drag, quarter);
