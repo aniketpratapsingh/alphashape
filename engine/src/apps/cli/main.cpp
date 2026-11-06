@@ -45,7 +45,7 @@ constexpr const char* kUsage =
     "  alphashape-cli --proj-info\n"
     "  alphashape-cli --list-params <Task>\n"
     "  alphashape-cli --project <file.psx> --task <Task> [--set key=value ...]\n"
-    "      [--save-layout dir|psz] [--chunks <id,id,...>]\n"
+    "      [--save-layout dir|psz] [--chunks <id,id,...>] [--python-path <dir>]\n"
     "  alphashape-cli --new <file.psx> --add-images <img> [<img> ...]\n"
     "      [--save-layout dir|psz] [--chunks <id,id,...>]\n"
     "  alphashape-cli --make-sheet <type> --out <file.pdf|file.png>\n"
@@ -122,6 +122,8 @@ struct Options {
     std::string save_layout;
     /// Save only these chunk ids; empty means every chunk.
     std::vector<std::int32_t> chunk_ids;
+    /// Directory prepended to RunScript's PYTHONPATH (the built module).
+    std::string python_path;
     bool has_make_sheet = false;
     std::string make_sheet;
     bool has_out = false;
@@ -234,6 +236,8 @@ Options parse_args(int argc, char** argv) {
             }
         } else if (arg == "--chunks") {
             opts.chunk_ids = parse_chunk_ids(take_value());
+        } else if (arg == "--python-path") {
+            opts.python_path = take_value();
         } else if (arg == "--make-sheet") {
             opts.has_make_sheet = true;
             opts.make_sheet = take_value();
@@ -493,6 +497,11 @@ int main(int argc, char** argv) {
     alphashape::platform::setup_console_utf8();
     try {
         const Options opts = parse_args(argc, argv);
+        if (!opts.python_path.empty()) {
+            // RunScript reads this at run time; the CMake define is the default.
+            (void)alphashape::platform::set_env("ALPHASHAPE_PYTHON_MODULE_DIR",
+                                               opts.python_path);
+        }
         return dispatch(opts);
     } catch (const UsageError&) {
         std::fputs(kUsage, stderr);

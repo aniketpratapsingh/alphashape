@@ -2334,7 +2334,28 @@ PYBIND11_MODULE(alphashape, m) {
             "fits a similarity from markers with matching labels and estimated "
             "positions; method=\"reference\" places both chunks by their shared "
             "CRS. The applied 4x4 is recorded in both chunks' meta under "
-            "AlignChunks/<other id>/matrix.");
+            "AlignChunks/<other id>/matrix.")
+        .def(
+            "run_script",
+            [](Document& d, const std::string& path, py::object args,
+               int timeout_s) {
+                py::dict kwargs;
+                kwargs[py::str("path")] = py::str(path);
+                if (!args.is_none()) {
+                    py::list values;
+                    for (py::handle item : args) {
+                        values.append(py::str(item));
+                    }
+                    kwargs[py::str("args")] = values;
+                }
+                kwargs[py::str("timeout_s")] = py::int_(timeout_s);
+                run_task_kwargs(d, "RunScript", kwargs);
+            },
+            py::arg("path"), py::arg("args") = py::none(),
+            py::arg("timeout_s") = 600,
+            "Run the Python script at `path` as a child process with "
+            "--project <path> followed by `args`. Output is stored on the "
+            "active chunk under RunScript/<n>/output (8 KB).");
 
     // -- module functions ----------------------------------------------------
     m.def("load_project",

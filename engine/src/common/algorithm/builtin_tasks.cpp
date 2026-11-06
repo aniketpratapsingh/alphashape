@@ -15,6 +15,7 @@
 #include "common/algorithm/elevation/build_dem_task.hpp"
 #include "common/algorithm/elevation/export_dem_task.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"
+#include "common/algorithm/jobs/run_script_task.hpp"
 #include "common/algorithm/markers/detect_markers_task.hpp"
 #include "common/algorithm/markers/refine_markers_task.hpp"
 #include "common/algorithm/markers/track_markers_task.hpp"
@@ -74,6 +75,7 @@ void register_builtin_tasks(TaskRegistry& registry) {
     registry.register_task(std::make_shared<MergeChunksTask>());
     registry.register_task(std::make_shared<AppendProjectTask>());
     registry.register_task(std::make_shared<AlignChunksTask>());
+    registry.register_task(std::make_shared<RunScriptTask>());
     // WP-13.4: marker projection import/export needs no CRS, so the tasks are
     // always registered (their sources are compiled unconditionally).
     registry.register_task(std::make_shared<ImportMarkersTask>());
