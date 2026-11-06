@@ -503,6 +503,8 @@ TEST_F(JobsTest, EstimateHistoryResetsWhenTheUnsavedDocumentIsReplaced) {
     add_fixture_photos();
     use_gate_registry();
     app().jobs().submit("GateTask", gate_params());
+    wait_started();
+    gate_->release = true;
     wait_finished();
     // The successful run contributed a row to the unsaved project's history.
     EXPECT_GE(app().jobs().throughput_history().size(), 1U);
