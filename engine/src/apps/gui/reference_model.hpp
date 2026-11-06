@@ -95,6 +95,8 @@ private:
     std::vector<reference::ReferenceRow> rows_;
     reference::ReferenceSummary summary_;
     std::int32_t chunk_id_ = -1;
+    /// The display CRS is geographic, so source / estimated values are degrees.
+    bool geographic_ = false;
     bool stale_ = false;
 };
 

@@ -66,12 +66,19 @@ void ReferenceModel::refresh() {
     std::vector<reference::ReferenceRow> rows;
     reference::ReferenceSummary summary;
     std::int32_t chunk_id = -1;
+    bool geographic = false;
     app_.read_document([&](const Document& document) {
         const Chunk* chunk = document.active_chunk();
         if (chunk == nullptr) {
             return;
         }
         chunk_id = chunk->id();
+        const crs::CoordinateSystem display = chunk->coordinate_system();
+        geographic =
+            display.is_set() && !display.is_local() &&
+            (display.kind() == crs::CrsKind::Geographic2D ||
+             display.kind() == crs::CrsKind::Geographic3D ||
+             display.kind() == crs::CrsKind::Compound);
         const reference::ReferenceTable table =
             reference::build_reference_table(*chunk, chunk->coordinate_system());
         summary = table.summary();
@@ -89,6 +96,7 @@ void ReferenceModel::refresh() {
     rows_ = std::move(rows);
     summary_ = summary;
     chunk_id_ = chunk_id;
+    geographic_ = geographic;
     stale_ = false;
     endResetModel();
     Q_EMIT refreshed();
@@ -143,13 +151,17 @@ std::int32_t ReferenceModel::row_id(int row_index) const {
 
 namespace {
 
-QString number(double value) { return QString::number(value, 'g', 10); }
+/// Fixed decimals by unit: 8 for degrees, 3 for metres.
+QString number(double value, int decimals) {
+    return QString::number(value, 'f', decimals);
+}
 
-QString component(const std::optional<Eigen::Vector3d>& vector, int axis) {
+QString component(const std::optional<Eigen::Vector3d>& vector, int axis,
+                  int decimals) {
     if (!vector.has_value()) {
         return QString();
     }
-    return number((*vector)[axis]);
+    return number((*vector)[axis], decimals);
 }
 
 }  // namespace
@@ -176,17 +188,19 @@ QVariant ReferenceModel::data(const QModelIndex& index, int role) const {
     if (role != Qt::DisplayRole) {
         return QVariant();
     }
+    const int source_decimals = geographic_ ? 8 : 3;
     switch (column) {
         case LabelColumn: return QString::fromStdString(item.label);
-        case SourceXColumn: return component(item.source, 0);
-        case SourceYColumn: return component(item.source, 1);
-        case SourceZColumn: return component(item.source, 2);
-        case AccuracyColumn: return number(item.sigma);
-        case EstimatedXColumn: return component(item.estimated, 0);
-        case EstimatedYColumn: return component(item.estimated, 1);
-        case EstimatedZColumn: return component(item.estimated, 2);
+        case SourceXColumn: return component(item.source, 0, source_decimals);
+        case SourceYColumn: return component(item.source, 1, source_decimals);
+        case SourceZColumn: return component(item.source, 2, source_decimals);
+        case AccuracyColumn: return number(item.sigma, 3);
+        case EstimatedXColumn: return component(item.estimated, 0, source_decimals);
+        case EstimatedYColumn: return component(item.estimated, 1, source_decimals);
+        case EstimatedZColumn: return component(item.estimated, 2, source_decimals);
         case ErrorColumn:
-            return item.error_m.has_value() ? number(*item.error_m) : QString();
+            // ENU metres, or display metres for a projected CRS.
+            return item.error_m.has_value() ? number(*item.error_m, 3) : QString();
         case ProjectionsColumn:
             return QString::number(static_cast<qulonglong>(item.projection_count));
         default: return QVariant();

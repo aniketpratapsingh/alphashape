@@ -194,6 +194,29 @@ TEST_F(ReferencePane, CheckPointMovesOutOfControlRmse) {
     EXPECT_EQ(*role_of_103(), reference::MarkerReferenceRole::Gcp);
 }
 
+TEST_F(ReferencePane, FormatsDegreesAndMetresByUnit) {
+    build_chunk(2, 0);
+    ReferenceModel& local = pane().cameras();
+    // The worst camera (offset -5.5) sorts first; chunk-local units are metres.
+    EXPECT_EQ(local.data(local.index(0, ReferenceModel::SourceXColumn)).toString(),
+              QStringLiteral("-5.500"));
+
+    Document& document = app().document();
+    Chunk& chunk = document.workspace().add_chunk("Degrees");
+    chunk.set_coordinate_system(crs::CoordinateSystem::from_epsg(4979));
+    Camera camera;
+    camera.id = 50;
+    camera.enabled = true;
+    camera.reference.location = Eigen::Vector3d(15.125, 50.25, 100.0);
+    chunk.cameras().push_back(camera);
+    document.set_active_chunk_id(chunk.id());
+    pane().refresh();
+    ReferenceModel& geographic = pane().cameras();
+    ASSERT_EQ(geographic.rowCount(), 1);
+    EXPECT_EQ(geographic.data(geographic.index(0, ReferenceModel::SourceXColumn)).toString(),
+              QStringLiteral("15.12500000"));
+}
+
 TEST_F(ReferencePane, SourceEditIsConvertedBackToTheSlotCrs) {
     Document& document = app().document();
     Chunk& chunk = document.workspace().add_chunk("CRS");
