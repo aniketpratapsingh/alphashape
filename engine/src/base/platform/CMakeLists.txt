@@ -19,3 +19,8 @@ target_include_directories(alphashape_platform PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 # with dladdr on POSIX, which lives in libdl on systems that keep it separate
 # (CMAKE_DL_LIBS is "dl" there and empty on macOS and Windows).
 target_link_libraries(alphashape_platform PUBLIC ALPHASHAPE_COMPILER_FLAGS ${CMAKE_DL_LIBS})
+
+# Peak working-set reporting uses GetProcessMemoryInfo, which lives in psapi.
+if(WIN32)
+    target_link_libraries(alphashape_platform PUBLIC psapi)
+endif()

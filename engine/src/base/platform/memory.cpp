@@ -96,7 +96,8 @@ std::string format_gb(double bytes) {
 std::uint64_t peak_resident_set_bytes() {
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS counters{};
-    if (::K32GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof(counters)) == 0) {
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(), &counters,
+                               static_cast<DWORD>(sizeof(counters))) == 0) {
         return 0;
     }
     return static_cast<std::uint64_t>(counters.PeakWorkingSetSize);
