@@ -1028,6 +1028,173 @@ private:
     Antenna previous_;
 };
 
+/// Replace the coefficient names held fixed during adjustment.
+class SetSensorFixedParamsCommand : public StagedMutation {
+public:
+    SetSensorFixedParamsCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                                std::vector<std::string> fixed)
+        : chunk_id_(chunk_id), sensor_index_(sensor_index), fixed_(std::move(fixed)) {}
+
+    std::string name() const override { return "Set Sensor Fit Flags"; }
+
+protected:
+    void validate(Document& document) override {
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor fit flags");
+        for (const std::string& name : fixed_) {
+            bool known = false;
+            for (const char* candidate : kCalibrationParamNames) {
+                known = known || name == candidate;
+            }
+            if (!known) {
+                throw ValueError("set sensor fit flags: unknown parameter '" + name + "'");
+            }
+            if (std::count(fixed_.begin(), fixed_.end(), name) > 1) {
+                throw ValueError("set sensor fit flags: duplicate parameter '" + name + "'");
+            }
+        }
+    }
+
+    void stage(Document& document) override {
+        previous_ =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor fit flags")
+                .fixed_params;
+    }
+
+    void commit(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor fit flags")
+            .fixed_params = fixed_;
+    }
+
+    void restore(Document& document) override {
+        require_sensor(document, chunk_id_, sensor_index_, "set sensor fit flags")
+            .fixed_params = previous_;
+    }
+
+private:
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    std::vector<std::string> fixed_;
+    std::vector<std::string> previous_;
+};
+
+/// Replace a sensor's physical pixel pitch and focal length.
+class SetSensorPhysicalCommand : public StagedMutation {
+public:
+    SetSensorPhysicalCommand(std::int32_t chunk_id, std::int32_t sensor_index,
+                             double pixel_size_um, double focal_length_mm)
+        : chunk_id_(chunk_id),
+          sensor_index_(sensor_index),
+          pixel_size_um_(pixel_size_um),
+          focal_length_mm_(focal_length_mm) {}
+
+    std::string name() const override { return "Set Sensor Geometry"; }
+
+protected:
+    void validate(Document& document) override {
+        (void)require_sensor(document, chunk_id_, sensor_index_, "set sensor geometry");
+        if (!std::isfinite(pixel_size_um_) || pixel_size_um_ < 0.0) {
+            throw ValueError(
+                "set sensor geometry: pixel size must be finite and non-negative");
+        }
+        if (!std::isfinite(focal_length_mm_) || focal_length_mm_ < 0.0) {
+            throw ValueError(
+                "set sensor geometry: focal length must be finite and non-negative");
+        }
+    }
+
+    void stage(Document& document) override {
+        const Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor geometry");
+        previous_pixel_size_um_ = sensor.pixel_size_um;
+        previous_focal_length_mm_ = sensor.focal_length_mm;
+    }
+
+    void commit(Document& document) override {
+        Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor geometry");
+        sensor.pixel_size_um = pixel_size_um_;
+        sensor.focal_length_mm = focal_length_mm_;
+    }
+
+    void restore(Document& document) override {
+        Sensor& sensor =
+            require_sensor(document, chunk_id_, sensor_index_, "set sensor geometry");
+        sensor.pixel_size_um = previous_pixel_size_um_;
+        sensor.focal_length_mm = previous_focal_length_mm_;
+    }
+
+private:
+    std::int32_t chunk_id_;
+    std::int32_t sensor_index_;
+    double pixel_size_um_;
+    double focal_length_mm_;
+    double previous_pixel_size_um_ = 0.0;
+    double previous_focal_length_mm_ = 0.0;
+};
+
+/// Set or clear one per-object CRS slot.
+class SetChunkCrsSlotCommand : public StagedMutation {
+public:
+    SetChunkCrsSlotCommand(std::int32_t chunk_id, CrsSlot slot,
+                           std::optional<CRS> value)
+        : chunk_id_(chunk_id), slot_(slot), value_(std::move(value)) {}
+
+    std::string name() const override { return "Set Reference CRS"; }
+
+protected:
+    void stage(Document& document) override {
+        previous_ = explicit_slot(require_chunk(document, chunk_id_));
+    }
+
+    void commit(Document& document) override {
+        apply(require_chunk(document, chunk_id_), value_);
+    }
+
+    void restore(Document& document) override {
+        apply(require_chunk(document, chunk_id_), previous_);
+    }
+
+private:
+    std::optional<CRS> explicit_slot(const Chunk& chunk) const {
+        switch (slot_) {
+            case CrsSlot::Camera:
+                return chunk.explicit_camera_crs();
+            case CrsSlot::Marker:
+                return chunk.explicit_marker_crs();
+            case CrsSlot::World:
+                return chunk.explicit_world_crs();
+        }
+        return std::nullopt;
+    }
+
+    void apply(Chunk& chunk, const std::optional<CRS>& value) const {
+        if (slot_ == CrsSlot::Camera) {
+            if (value.has_value()) {
+                chunk.set_camera_crs(*value);
+            } else {
+                chunk.clear_camera_crs();
+            }
+        } else if (slot_ == CrsSlot::Marker) {
+            if (value.has_value()) {
+                chunk.set_marker_crs(*value);
+            } else {
+                chunk.clear_marker_crs();
+            }
+        } else {
+            if (value.has_value()) {
+                chunk.set_world_crs(*value);
+            } else {
+                chunk.clear_world_crs();
+            }
+        }
+    }
+
+    std::int32_t chunk_id_;
+    CrsSlot slot_;
+    std::optional<CRS> value_;
+    std::optional<CRS> previous_;
+};
+
 // --- Marker commands -------------------------------------------------------
 
 /// Allocate a marker id from the chunk counter when the caller left it at -1.
@@ -3439,6 +3606,25 @@ std::unique_ptr<AbstractCommand> make_set_sensor_antenna_command(
     std::int32_t chunk_id, std::int32_t sensor_index, Antenna antenna) {
     return std::make_unique<SetSensorAntennaCommand>(chunk_id, sensor_index,
                                                       std::move(antenna));
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_fixed_params_command(
+    std::int32_t chunk_id, std::int32_t sensor_index,
+    std::vector<std::string> fixed_params) {
+    return std::make_unique<SetSensorFixedParamsCommand>(
+        chunk_id, sensor_index, std::move(fixed_params));
+}
+
+std::unique_ptr<AbstractCommand> make_set_sensor_physical_command(
+    std::int32_t chunk_id, std::int32_t sensor_index, double pixel_size_um,
+    double focal_length_mm) {
+    return std::make_unique<SetSensorPhysicalCommand>(chunk_id, sensor_index,
+                                                      pixel_size_um, focal_length_mm);
+}
+
+std::unique_ptr<AbstractCommand> make_set_chunk_crs_slot_command(
+    std::int32_t chunk_id, CrsSlot slot, std::optional<CRS> value) {
+    return std::make_unique<SetChunkCrsSlotCommand>(chunk_id, slot, std::move(value));
 }
 
 // --- asset factories -------------------------------------------------------
