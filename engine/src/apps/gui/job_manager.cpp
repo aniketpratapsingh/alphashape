@@ -7,6 +7,7 @@
 #include <QMetaObject>
 
 #include "apps/gui/app.hpp"
+#include "base/platform/memory.hpp"
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/core/document.hpp"
@@ -19,7 +20,48 @@ constexpr std::size_t kMaxHistory = 200;
 constexpr double kMinEtaPercent = 2.0;
 }  // namespace
 
-JobManager::JobManager(GuiApp& app) : QObject(nullptr), app_(app), registry_(&builtin_registry()) {}
+JobManager::JobManager(GuiApp& app) : QObject(nullptr), app_(app), registry_(&builtin_registry()) {
+    QObject::connect(&app_, &GuiApp::document_replaced, this,
+                     [this]() { ++document_generation_; });
+    sync_history();
+}
+
+void JobManager::sync_history() {
+    // Both the path and the document identity matter: replacing an unsaved
+    // project (File/New) leaves the path empty, so the path alone would let the
+    // previous document's rows leak into the new one. Read under the shared
+    // lock: the path belongs to the document, not to this manager.
+    const std::string path = app_.read_document(
+        [](const Document& document) { return document.path(); });
+    const bool same_document = document_generation_ == history_generation_;
+    if (same_document && path == history_project_) {
+        return;
+    }
+    const std::string previous_path = history_project_;
+    history_generation_ = document_generation_;
+    history_project_ = path;
+    ThroughputHistory carried;
+    if (same_document && previous_path.empty() && !path.empty()) {
+        // A project that was unsaved when its rows were measured now has a
+        // home: keep them rather than starting over at the new path.
+        carried = throughput_;
+    }
+    if (path.empty()) {
+        throughput_.clear();
+        return;
+    }
+    FileThroughputStore store(history_path_for_project(path));
+    throughput_ = store.load();
+    for (const ThroughputRow& row : carried.all()) {
+        throughput_.add(row);
+        store.append(row);
+    }
+}
+
+const ThroughputHistory& JobManager::throughput_history() {
+    sync_history();
+    return throughput_;
+}
 
 JobManager::~JobManager() {
     shutdown();
@@ -177,6 +219,9 @@ void JobManager::start_next() {
         return;
     }
     Request& front = queue_.front();
+    // The peak-RSS counter is process-wide, so remember its value at the start:
+    // the run may only claim the peak when it ends above this mark.
+    front.peak_rss_before = platform::peak_resident_set_bytes();
     stages_.clear();
     if (const TaskEntry* entry = registry_->find(front.task_name)) {
         for (const Stage& stage : entry->task->stages()) {
@@ -337,6 +382,33 @@ void JobManager::finish_current(State final_state, const QString& message,
     done.state = final_state;
     done.message = message;
     done.elapsed_ms = clock_.elapsed();
+
+    if (final_state == State::Succeeded) {
+        sync_history();
+        const std::uint64_t peak_rss = recorded_peak_rss(
+            request.peak_rss_before, platform::peak_resident_set_bytes());
+        const double seconds =
+            static_cast<double>(done.elapsed_ms) / 1000.0;
+        app_.read_document([this, &request, seconds, peak_rss](const Document& document) {
+            const std::int32_t active = document.active_chunk_id();
+            const Chunk* chunk = nullptr;
+            for (const std::shared_ptr<Chunk>& candidate : document.workspace().chunks()) {
+                if (candidate != nullptr && candidate->id() == active) {
+                    chunk = candidate.get();
+                    break;
+                }
+            }
+            if (chunk == nullptr) {
+                return;
+            }
+            const ThroughputRow row = throughput_row_for(request.task_name, request.params,
+                                                         *chunk, seconds, peak_rss);
+            throughput_.add(row);
+            if (!document.path().empty()) {
+                FileThroughputStore(history_path_for_project(document.path())).append(row);
+            }
+        });
+    }
 
     if (touched_document) {
         // The task changed (or, if it stopped early, may have partly changed) the document in

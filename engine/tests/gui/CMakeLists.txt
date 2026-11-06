@@ -20,6 +20,7 @@ add_executable(alphashape_gui_tests
     test_theme.cpp
     test_gui_app.cpp
     test_jobs.cpp
+    test_estimates.cpp
     test_task_dialog.cpp
     test_calibration_dialog.cpp
     test_marker_tools.cpp

@@ -34,6 +34,7 @@
 #include <QObject>
 #include <QString>
 
+#include "apps/gui/jobs/estimate.hpp"
 #include "common/tasks/params.hpp"
 #include "common/tasks/registry.hpp"
 
@@ -97,6 +98,10 @@ public:
     /// their own tasks this way. Not allowed while busy.
     void set_registry(const TaskRegistry* registry);
 
+    /// Measured throughput of the current project, reloaded when the document's
+    /// path changes. An unsaved project keeps its rows in memory only.
+    const ThroughputHistory& throughput_history();
+
     static QString state_name(State state);
 
 Q_SIGNALS:
@@ -115,6 +120,9 @@ private:
         std::string task_name;
         Params params;
         std::int32_t chunk_id = -1;
+        /// Process-wide peak-RSS mark sampled when the job started; the run
+        /// only gets credit for the peak when it ends above this.
+        std::uint64_t peak_rss_before = 0;
     };
 
     /// State shared with the worker thread.
@@ -140,7 +148,15 @@ private:
     QElapsedTimer clock_;
     JobId next_id_ = 1;
     bool shutting_down_ = false;
+    ThroughputHistory throughput_;
+    std::string history_project_;
+    /// Identity of the document the rows belong to. A counter (not the raw
+    /// pointer, which an allocator may reuse) is bumped on document_replaced so
+    /// a new document always starts empty even when its path is still "".
+    std::uint64_t document_generation_ = 0;
+    std::uint64_t history_generation_ = 0;
 
+    void sync_history();
     void start_next();
     void run_worker(const std::shared_ptr<Worker>& worker, Request request,
                     std::shared_ptr<Document> document);
