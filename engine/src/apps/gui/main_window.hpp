@@ -24,6 +24,7 @@ class GuiApp;
 class LogPane;
 class PhotosPane;
 class PropertiesPane;
+class ReferencePane;
 class StartScreen;
 class ViewportWidget;
 class WorkflowController;
@@ -167,6 +168,9 @@ private:
 
     QDockWidget* workspace_dock_ = nullptr;
     QDockWidget* properties_dock_ = nullptr;
+#if defined(ALPHASHAPE_USE_PROJ)
+    QDockWidget* reference_dock_ = nullptr;
+#endif
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     QStackedWidget* stack_ = nullptr;   ///< central area: viewport / start screen
@@ -175,6 +179,9 @@ private:
     WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties, Photos panes and viewport
     WorkspacePane* workspace_pane_ = nullptr;
     PropertiesPane* properties_pane_ = nullptr;
+#if defined(ALPHASHAPE_USE_PROJ)
+    ReferencePane* reference_pane_ = nullptr;
+#endif
     PhotosPane* photos_pane_ = nullptr;
     LogPane* log_pane_ = nullptr;
     WorkflowController* workflow_ = nullptr;
