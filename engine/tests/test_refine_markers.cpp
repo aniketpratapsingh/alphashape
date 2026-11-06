@@ -58,6 +58,7 @@ struct SceneTarget {
     double radius = 0.07;        ///< physical outer radius, metres
     double rotation = 0.0;
     std::uint32_t word = 0b101101001011U;
+    int parity = 1;  ///< 1 prints a dark centre dot, 0 a white one.
 };
 
 struct BlankBox {
@@ -77,6 +78,14 @@ struct SceneSpec {
     double start_angle = 0.0;
     bool include_blank_target = false;
     std::vector<BlankBox> blank_boxes;
+    /// Target index printed with parity bit 0 (white centre), or -1 for none.
+    int even_code_target = -1;
+    /// Physical outer radius of every printed target, metres.
+    double target_radius = 0.075;
+    /// Target index that receives an extra small dark speck near its centre,
+    /// or -1. Used to prove a speck cannot win over the printed centre dot.
+    int speck_target = -1;
+    double speck_offset_px = 8.0;
 };
 
 /// Deterministic, continuous ground texture. The value depends only on the
@@ -132,7 +141,7 @@ std::optional<float> target_shade(const SceneTarget& target, double x, double z)
     test::CircularTruth truth;
     truth.bits = 12;
     truth.word = target.word;
-    truth.parity = 1;
+    truth.parity = target.parity;
     const Eigen::Vector2d local(u / target.radius, v / target.radius);
     const double sector_width =
         2.0 * std::numbers::pi_v<double> / static_cast<double>(truth.bits);
@@ -284,9 +293,10 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.centre = Vec3((static_cast<double>(column) - 1.0) * spec.spread_x,
                              0.0,
                              (static_cast<double>(row) - 0.5) * spec.spread_z);
-        target.radius = 0.075;
+        target.radius = spec.target_radius;
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
+        target.parity = i == spec.even_code_target ? 0 : 1;
         scene.targets.push_back(target);
     }
     if (spec.include_blank_target) {
@@ -332,6 +342,27 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         scene.paths.push_back(path);
         FloatImage image =
             render_view(scene.poses[i], sensor.calibration, spec, scene.targets);
+        if (spec.speck_target >= 0 &&
+            static_cast<std::size_t>(spec.speck_target) < scene.targets.size()) {
+            const auto centre = project_marker(
+                scene.targets[static_cast<std::size_t>(spec.speck_target)]
+                    .centre,
+                camera_record, sensor.calibration);
+            if (centre) {
+                const int speck_x = static_cast<int>(
+                    std::lround(centre->x() + spec.speck_offset_px));
+                const int speck_y =
+                    static_cast<int>(std::lround(centre->y()));
+                for (int y = speck_y - 1; y <= speck_y + 1; ++y) {
+                    for (int x = speck_x - 1; x <= speck_x + 1; ++x) {
+                        if (x < 0 || y < 0 || x >= width || y >= height) {
+                            continue;
+                        }
+                        image.at(x, y) = 0.02F;
+                    }
+                }
+            }
+        }
         image = gaussian_blur(image, 0.8F);
         test::add_noise(image, 0.008, seed + static_cast<std::uint32_t>(i));
         write_gray_png(path, image);
@@ -360,6 +391,11 @@ std::int32_t add_scene_marker(RefineScene& scene, std::size_t target_index,
     marker.label = label;
     marker.type = MarkerType::Fiducial;
     marker.valid = true;
+    // Record the printed kind, exactly as DetectMarkers does, so refinement
+    // can tell a coded circular target from a cross.
+    marker.meta.set("target_type", scene.targets[target_index].cross
+                                       ? "Cross"
+                                       : "Circular12");
     for (std::size_t ci = 0; ci < scene.chunk->cameras().size(); ++ci) {
         if (!only.empty() &&
             std::find(only.begin(), only.end(), ci) == only.end()) {
@@ -543,6 +579,105 @@ TEST(Markers, RefineStableOnExactProjection) {
     EXPECT_EQ(stats.skipped, 0U);
     EXPECT_EQ(stats.refined + stats.unchanged, scene.chunk->markers().size());
     EXPECT_GT(stats.refined + stats.unchanged, 0U);
+}
+
+TEST(Markers, RefineEvenCodeMarker) {
+    // Parity-0 circular targets print a white centre, so the dark-dot blob
+    // seed has nothing to find. The light-interior seed from the second pass
+    // must carry the circular refiner instead.
+    // A single printed target keeps every camera's crop around it free of a
+    // neighbouring outline, so the parity-0 outer-border fit is unambiguous.
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.even_code_target = 0;
+    RefineScene scene = make_scene(spec, 171U);
+    ASSERT_EQ(scene.targets[0].parity, 0);
+    std::mt19937 engine(83U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, i);
+        std::printf("[refine even] marker %zu parity %d RMS %.4f px\n", i,
+                    scene.targets[i].parity, rms);
+        // Parity-0 has no fiducial dot and keeps the border-ellipse centre;
+        // the decoder documents a 0.38 px first-edge bias for such targets at
+        // 2 px blur, several times smaller than the input perturbation here.
+        // Half a pixel is the meaningful bound for this parity.
+        EXPECT_LE(rms, 0.6) << "marker " << i;
+    }
+    EXPECT_GE(stats.refined, 1U);
+}
+
+TEST(Markers, RefineLargeTargetUsesBorderFit) {
+    // A target whose projected radius is well over the 48 px minimum window:
+    // the crop and blob scale must follow the apparent size, or the interior
+    // is clipped and the border fit silently falls back to a biased centre.
+    // The camera looks straight down because, for a strongly tilted target,
+    // the image of the printed circle is an ellipse whose centre is a few
+    // percent of R away from the projected circle centre (a documented
+    // limitation of the border-ellipse centre); a single-view measurement
+    // against the projected centre is only well posed at (near) normal
+    // incidence, where the two coincide.
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.even_code_target = 0;
+    spec.target_radius = 0.18;
+    spec.ring_radius = 0.0;
+    spec.height = 2.0;
+    RefineScene scene = make_scene(spec, 191U);
+    ASSERT_EQ(scene.targets[0].parity, 0);
+    const double apparent = apparent_radius(scene, 0, 0);
+    ASSERT_GT(apparent, 48.0);
+    std::mt19937 engine(29U);
+    // One projection keeps the 2-D path, so the reported pixel is the window's
+    // own border-fit centre rather than a consensus of several views.
+    const std::vector<std::int32_t> ids = {
+        add_scene_marker(scene, 0, "M0", 0.0, engine,
+                         std::vector<std::size_t>{0})};
+    ASSERT_FALSE(ids.empty());
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, 0);
+        std::printf("[refine large] apparent %.2f px RMS %.4f px\n", apparent,
+                    rms);
+        EXPECT_LE(rms, 0.5) << "marker " << i;
+    }
+}
+
+TEST(Markers, RefineIgnoresSpeckNearCentreDot) {
+    // A 2 px dark speck inside the anchor gate must not beat the printed
+    // centre dot: the dot nearest the seed with a plausible radius wins.
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.target_radius = 0.05;
+    spec.speck_target = 0;
+    spec.speck_offset_px = 8.0;
+    RefineScene scene = make_scene(spec, 233U);
+    ASSERT_EQ(scene.targets[0].parity, 1);
+    std::mt19937 engine(97U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 2.0, engine);
+    ASSERT_FALSE(ids.empty());
+    RefineMarkersOptions options;
+    // A wider patch grows the anchor gate past the speck offset, so the test
+    // exercises the choice between two candidate blobs.
+    options.patch_size = 65;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    EXPECT_EQ(stats.failed, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const Marker* marker = find_marker(*scene.chunk, ids[i]);
+        ASSERT_NE(marker, nullptr);
+        const double rms = rms_to_truth(scene, *marker, 0);
+        std::printf("[refine speck] RMS %.4f px\n", rms);
+        EXPECT_LE(rms, 0.6) << "marker " << i;
+    }
 }
 
 RefineScene make_contradicted_scene(std::vector<std::int32_t>& ids,

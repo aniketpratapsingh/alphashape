@@ -23,6 +23,7 @@
 #include "common/algorithm/calibration/board_detector.hpp"
 #include "common/algorithm/markers/apriltag_decoder.hpp"
 #include "common/algorithm/markers/circular_decoder.hpp"
+#include "common/algorithm/markers/light_seed_hints.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/algorithm/markers/tag_families.hpp"
@@ -155,12 +156,10 @@ TEST(MarkerSheet, RenderDecodesBack) {
                          : target == SheetTarget::Circular14 ? 14
                          : target == SheetTarget::Circular16 ? 16
                                                              : 20;
-        // The blob detector seeds a coded target from its black centre dot
-        // (see detect_markers_task.cpp). Parity-0 targets print without that
-        // dot by design, so the decode-back check uses parity-1 code ids. The
-        // sheet itself prints every code id; this is a detector seeding
-        // limitation, not a sheet geometry one.
-        for (int code : {1, 3}) {
+        // Both parities are printed and both are seeded: the dark pass finds
+        // parity-1 centre dots, the light pass finds the bright interior of
+        // parity-0 targets, which have no dot by design.
+        for (int code : {1, 2, 3}) {
             SheetOptions options = coded(target, 1);
             options.first_code = code;
             const Image sheet = raster(options, dpi);
@@ -170,8 +169,21 @@ TEST(MarkerSheet, RenderDecodesBack) {
             params.min_radius = 2;
             params.max_radius = 120;
             params.threshold = 0.015F;
-            const std::vector<MarkerCandidate> blobs =
+            std::vector<MarkerCandidate> blobs = detect_blobs(gray, params);
+            params.dark_on_light = false;
+            const std::vector<MarkerCandidate> light_blobs =
                 detect_blobs(gray, params);
+            for (const MarkerCandidate& candidate : light_blobs) {
+                blobs.push_back(candidate);
+                // The light interior's radius lies between the 0.5 R sector
+                // edge and the 0.9 R border; decode treats the hint as the
+                // border radius, so try the same scales detection uses.
+                for (const double scale : kLightSeedHintScales) {
+                    MarkerCandidate scaled = candidate;
+                    scaled.radius_px *= scale;
+                    blobs.push_back(scaled);
+                }
+            }
             std::set<int> decoded;
             int foreign = 0;
             for (const MarkerCandidate& blob : blobs) {

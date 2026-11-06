@@ -1381,12 +1381,13 @@ class AddMarkerWithProjectionCommand : public ChunkContainersCommand {
 public:
     AddMarkerWithProjectionCommand(std::int32_t chunk_id, MarkerRef marker,
                                    std::int32_t camera_id, Eigen::Vector2d uv,
-                                   bool pinned)
+                                   bool pinned, const Meta& meta)
         : ChunkContainersCommand(chunk_id),
           marker_(std::move(marker)),
           camera_id_(camera_id),
           uv_(uv),
-          pinned_(pinned) {}
+          pinned_(pinned),
+          meta_(meta) {}
 
     std::string name() const override { return "Add Marker Projection"; }
 
@@ -1426,6 +1427,7 @@ protected:
             created.id = chunk.allocate_id();
             created.label = *label;
             created.pinned = pinned_;
+            created.meta = meta_;
             marker_id = created.id;
             insert_by_id(chunk.markers(), std::move(created));
         }
@@ -1447,6 +1449,7 @@ private:
     std::int32_t camera_id_;
     Eigen::Vector2d uv_;
     bool pinned_;
+    Meta meta_;
 };
 
 /// Remove one projection, optionally deleting the marker with its last one.
@@ -3131,9 +3134,9 @@ std::unique_ptr<AbstractCommand> make_add_marker_command(
 
 std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
     std::int32_t chunk_id, MarkerRef marker, std::int32_t camera_id,
-    Eigen::Vector2d uv, bool pinned) {
+    Eigen::Vector2d uv, bool pinned, const Meta& meta) {
     return std::make_unique<AddMarkerWithProjectionCommand>(
-        chunk_id, std::move(marker), camera_id, uv, pinned);
+        chunk_id, std::move(marker), camera_id, uv, pinned, meta);
 }
 
 std::unique_ptr<AbstractCommand> make_remove_marker_projection_command(

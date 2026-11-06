@@ -144,10 +144,12 @@ using MarkerRef = std::variant<std::int32_t, std::string>;
 /// Set or replace one projection of the referenced marker in `camera_id`.
 ///
 /// With an id the marker must already exist; with a label a missing marker is
-/// created with that label. A newly created marker is pinned when `pinned`.
+/// created with that label. A newly created marker is pinned when `pinned` and
+/// receives `meta` (target provenance), so a later refinement can tell the
+/// target kind.
 std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
     std::int32_t chunk_id, MarkerRef marker, std::int32_t camera_id,
-    Eigen::Vector2d uv, bool pinned = true);
+    Eigen::Vector2d uv, bool pinned = true, const Meta& meta = Meta{});
 
 /// Remove one projection. When this was the marker's last projection and
 /// `delete_marker` is set, the marker itself is removed; otherwise it stays

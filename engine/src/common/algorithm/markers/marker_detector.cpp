@@ -283,7 +283,8 @@ bool sample_inside(const FloatImage& image, double x, double y, double& value) {
 /// systematically biased centre.
 std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
                                                const Eigen::Vector2d& centre,
-                                               double radius) {
+                                               double radius,
+                                               bool outermost = false) {
     std::vector<WeightedPoint> samples;
     if (!(radius > 0.0) || gradient.empty()) {
         return samples;
@@ -321,10 +322,12 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
         if (!(strongest > kMinEdgeGradient)) {
             continue;
         }
-        // Take the FIRST peak that is at least 30% of the strongest one on this
+        // Take the first peak that is at least 30% of the strongest one on this
         // ray. In a marker sheet the strongest peak can belong to a neighbouring
         // target further out; the first significant peak is this target's own
-        // boundary. Noise peaks are far below the fraction of a real edge.
+        // boundary. Noise peaks are far below the fraction of a real edge. An
+        // outermost fit takes the last such peak instead, which is the outer
+        // border of a target printed without a centre dot.
         const double acceptance = 0.3 * strongest;
         int best_index = -1;
         for (int i = 1; i < last; ++i) {
@@ -332,7 +335,9 @@ std::vector<WeightedPoint> radial_edge_samples(const FloatImage& gradient,
             if (value >= values[static_cast<std::size_t>(i - 1)] &&
                 value > values[static_cast<std::size_t>(i + 1)] && value >= acceptance) {
                 best_index = i;
-                break;
+                if (!outermost) {
+                    break;
+                }
             }
         }
         if (best_index <= 0 || best_index >= last) {
@@ -1355,6 +1360,41 @@ std::optional<Eigen::Vector2d> refine_ellipse_center(const GradientField& gradie
 std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
                                                      const MarkerCandidate& seed) {
     return refine_ellipse_center(compute_gradient_field(gray), seed);
+}
+
+std::optional<Eigen::Vector2d> refine_border_center(const GradientField& gradient,
+                                                    const Eigen::Vector2d& centre,
+                                                    double expected_radius,
+                                                    double* fitted_radius) {
+    if (gradient.magnitude.empty() || !centre.allFinite() ||
+        !std::isfinite(expected_radius) || !(expected_radius > 0.5)) {
+        return std::nullopt;
+    }
+    const FloatImage& field = gradient.magnitude;
+    Eigen::Vector2d current = centre - Eigen::Vector2d(0.5, 0.5);
+    double radius = expected_radius;
+    std::optional<Ellipse> last;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        const std::optional<Ellipse> fit =
+            robust_fit(radial_edge_samples(field, current, radius, true));
+        if (!fit) break;
+        last = fit;
+        const double move = (fit->center - current).norm();
+        current = fit->center;
+        radius = std::max(fit->a, 1.0);
+        if (move < 1e-3) break;
+    }
+    if (!last || !current.allFinite()) return std::nullopt;
+    if (fitted_radius != nullptr) *fitted_radius = last->a;
+    return current + Eigen::Vector2d(0.5, 0.5);
+}
+
+std::optional<Eigen::Vector2d> refine_border_center(const FloatImage& gray,
+                                                    const Eigen::Vector2d& centre,
+                                                    double expected_radius,
+                                                    double* fitted_radius) {
+    return refine_border_center(compute_gradient_field(gray), centre,
+                                expected_radius, fitted_radius);
 }
 
 std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params,

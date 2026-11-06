@@ -105,6 +105,26 @@ std::optional<Eigen::Vector2d> refine_ellipse_center(const GradientField& gradie
 std::optional<Eigen::Vector2d> refine_ellipse_center(const FloatImage& gray,
                                                      const MarkerCandidate& seed);
 
+/// Re-estimate a circular target's centre from its OUTER border: the same
+/// radial fit as refine_ellipse_center, but locking onto the last significant
+/// edge on every ray instead of the first. A target printed without a centre
+/// dot (coded circular parity 0) has its first edge at the 0.5 R sector ring on
+/// rays through a dark sector and at the 0.85..0.9 R border on rays through a
+/// light one; that mixture biases a first-edge centre. The outer border is the
+/// complete concentric outline and gives the unbiased centre. `expected_radius`
+/// is only the radial search extent. When `fitted_radius` is not null it
+/// receives the fitted semi-major radius of the outer border.
+std::optional<Eigen::Vector2d> refine_border_center(const GradientField& gradient,
+                                                    const Eigen::Vector2d& centre,
+                                                    double expected_radius,
+                                                    double* fitted_radius = nullptr);
+
+/// Convenience overload that computes the gradient field first.
+std::optional<Eigen::Vector2d> refine_border_center(const FloatImage& gray,
+                                                    const Eigen::Vector2d& centre,
+                                                    double expected_radius,
+                                                    double* fitted_radius = nullptr);
+
 /// Direct least-squares ellipse fit (Fitzgibbon/Pilu/Fisher, numerically
 /// stable split form). Returns nullopt for fewer than 5 points, degenerate or
 /// non-elliptic conics.

@@ -22,10 +22,10 @@
 /// quiet zone and corner mark.
 ///
 /// Circular codes print the documented centre dot for parity 1 and a white
-/// centre for parity 0. The WP-13.5 blob detector seeds a circular candidate
-/// from that dark centre dot, so a decode-back test uses parity-1 ids; the
-/// printed geometry of every id is complete and a caller that already has a
-/// candidate decodes both parities.
+/// centre for parity 0. The detector seeds parity-1 ids from the dark centre
+/// dot and parity-0 ids from the bright interior enclosed by the dark border
+/// ring, so automatic detection finds both parities. A caller that already has
+/// a candidate decodes either parity directly.
 
 #include <cstdint>
 #include <optional>

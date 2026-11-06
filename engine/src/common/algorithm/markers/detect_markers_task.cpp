@@ -24,6 +24,7 @@
 #include "common/algorithm/markers/apriltag_decoder.hpp"
 #include "common/algorithm/markers/circular_decoder.hpp"
 #include "common/algorithm/markers/cross_decoder.hpp"
+#include "common/algorithm/markers/light_seed_hints.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
 #include "common/commands/model_commands.hpp"
@@ -177,6 +178,12 @@ struct Detection {
     double radius = 0.0;
     int hamming = 0;
     bool coded = false;
+    /// Coded circular target whose printed centre is a dark dot (parity 1).
+    /// Parity 0 has no fiducial dot and keeps the border-ellipse centre.
+    bool centre_dot = true;
+    /// Seed came from the light-on-dark pass; parity-0 targets are seeded
+    /// there, and a coarse dark whole-target blob can land off-centre.
+    bool light_seed = false;
     CrossStyle cross_style = CrossStyle::Saddle;
     // Eigen's default constructor leaves its scalars uninitialised, and a
     // plain `corners{}` therefore still holds indeterminate doubles; GCC's
@@ -220,9 +227,10 @@ std::vector<Detection> detect_circular(const FloatImage& image,
                                  : 0.0;
     const BlobParams blob =
         blob_params(image.width(), image.height(), seed_size);
-    const std::vector<MarkerCandidate> candidates = detect_blobs(image, blob);
+    const std::vector<MarkerCandidate> dark_candidates =
+        detect_blobs(image, blob);
     if (spec.kind == MarkerKind::CircularNonCoded) {
-        for (const MarkerCandidate& candidate : candidates) {
+        for (const MarkerCandidate& candidate : dark_candidates) {
             if (candidate.radius_px < params.minimum_size) {
                 continue;
             }
@@ -233,20 +241,134 @@ std::vector<Detection> detect_circular(const FloatImage& image,
         }
         return out;
     }
+    // A coded target's centre dot carries the parity bit: parity 1 prints a
+    // black dot, parity 0 a white one. The dark-on-light pass above therefore
+    // only seeds odd ids. For an even id the white centre is not an isolated
+    // blob -- it merges with the 0.25..0.5 R white gap -- but the bright
+    // interior enclosed by the dark border ring is: the light-on-dark pass at
+    // the same scales responds to that interior. A separate coarse dark pass
+    // is unnecessary: the rather scale-selective Hessian response never makes
+    // the white centre a local intensity minimum, so the dark border alone
+    // does not form a blob centred on the target.
+    BlobParams light = blob;
+    light.dark_on_light = false;
+    // The bright interior fills most of the target (up to 0.9 R), unlike the
+    // small parity-1 dot the dark pass is tuned for, so the dark pass's 128 px
+    // cap would hide a large even target. Allow four times that, bounded by
+    // the reduced image so a blob can never span the whole frame.
+    const int light_extent =
+        std::max(3, std::min(image.width(), image.height()));
+    light.max_radius =
+        std::max(light.min_radius,
+                 std::min(light_extent / 2, 4 * blob.max_radius));
+    const std::vector<MarkerCandidate> light_candidates =
+        detect_blobs(image, light);
     const GradientField gradient = compute_gradient_field(image);
-    for (const MarkerCandidate& candidate : candidates) {
-        const auto decoded = decode_circular(image, gradient, candidate, spec.bits,
-                                             params.max_hamming);
-        if (!decoded || decoded->radius_px < params.minimum_size) {
-            continue;
-        }
+    const auto better = [](const Detection& a, const Detection& b) {
+        if (a.hamming != b.hamming) return a.hamming < b.hamming;
+        // Each parity has one seed that carries its true symmetric centre: the
+        // dark dot for parity 1, the light interior for parity 0. A coarse
+        // whole-target dark blob also decodes an even id but sits off-centre
+        // wherever the dark sectors are unbalanced.
+        const bool a_matches = a.light_seed == !a.centre_dot;
+        const bool b_matches = b.light_seed == !b.centre_dot;
+        if (a_matches != b_matches) return a_matches;
+        if (a.radius != b.radius) return a.radius > b.radius;
+        if (a.center.y() != b.center.y()) return a.center.y() < b.center.y();
+        return a.center.x() < b.center.x();
+    };
+    // Both passes can find the same target: even ids only through the light
+    // interior, odd ids through the dark dot and (once the small dot is
+    // blurred away at a coarse scale) through the same light interior. Decode
+    // every seed, group the decodes that describe the same printed target, and
+    // keep one detection per target.
+    std::vector<std::vector<Detection>> groups;
+    const auto emit = [&](const CodedTarget& decoded, bool from_light) {
         Detection detection;
-        detection.code = params.noparity ? (decoded->code / 2) * 2 : decoded->code;
-        detection.center = decoded->center;
-        detection.radius = decoded->radius_px;
-        detection.hamming = decoded->hamming;
+        detection.code = params.noparity ? (decoded.code / 2) * 2 : decoded.code;
+        detection.center = decoded.center;
+        detection.radius = decoded.radius_px;
+        detection.hamming = decoded.hamming;
         detection.coded = true;
-        out.push_back(detection);
+        detection.centre_dot = (decoded.code % 2) != 0;
+        detection.light_seed = from_light;
+        for (std::vector<Detection>& group : groups) {
+            const double gate =
+                0.5 * std::min(group.front().radius, detection.radius);
+            if ((group.front().center - detection.center).norm() < gate) {
+                group.push_back(detection);
+                return;
+            }
+        }
+        groups.push_back(std::vector<Detection>{detection});
+    };
+    const auto decode_seed = [&](const MarkerCandidate& candidate)
+        -> std::optional<CodedTarget> {
+        const auto decoded = decode_circular(image, gradient, candidate,
+                                             spec.bits, params.max_hamming);
+        if (!decoded || decoded->radius_px < params.minimum_size) {
+            return std::nullopt;
+        }
+        return decoded;
+    };
+    for (const MarkerCandidate& candidate : dark_candidates) {
+        if (const auto decoded = decode_seed(candidate)) {
+            emit(*decoded, false);
+        }
+    }
+    for (const MarkerCandidate& candidate : light_candidates) {
+        // The light interior is bounded by the dark sector edge at 0.5 R on
+        // rays through a dark sector and by the 0.85..0.9 R sector edge
+        // elsewhere, so its fitted radius is between about 0.5 R and 0.9 R.
+        // decode_circular treats its hint as the border radius and gates a
+        // located border to [hint/1.5, hint*1.5]; one scale cannot cover the
+        // whole range, so try each hint scale and keep the first that decodes.
+        // The scales all start high enough that the border search window
+        // reaches R, so a decode is the true outer border and not the 0.85 R
+        // sector edge (which shares the ring word but biases the centre).
+        for (const double scale : kLightSeedHintScales) {
+            MarkerCandidate scaled = candidate;
+            scaled.radius_px *= scale;
+            if (const auto decoded = decode_seed(scaled)) {
+                emit(*decoded, true);
+                break;
+            }
+        }
+    }
+    // Pick one decode per target. The ring word and the seed class are fixed
+    // once a candidate decodes, so the remaining choice is between border fits
+    // of the same target. A correct fit lands on the complete outer outline and
+    // agrees with the target's other fits to a few hundredths of a pixel of
+    // radius; a fit that mixed in the 0.85 R sector edge or a background edge
+    // is a lone outlier. Rank by that agreement before the radius tie-break.
+    const auto prefer = [&](const Detection& a, int support_a, const Detection& b,
+                            int support_b) {
+        if (a.hamming != b.hamming) return a.hamming < b.hamming;
+        const bool a_match = a.light_seed == !a.centre_dot;
+        const bool b_match = b.light_seed == !b.centre_dot;
+        if (a_match != b_match) return a_match;
+        if (support_a != support_b) return support_a > support_b;
+        return better(a, b);
+    };
+    out.reserve(groups.size());
+    for (const std::vector<Detection>& group : groups) {
+        std::size_t chosen = 0;
+        int chosen_support = 0;
+        for (std::size_t i = 0; i < group.size(); ++i) {
+            int support = 0;
+            for (const Detection& other : group) {
+                if (std::abs(other.radius - group[i].radius) <=
+                    0.003 * group[i].radius) {
+                    ++support;
+                }
+            }
+            if (i == 0 || prefer(group[i], support, group[chosen],
+                                 chosen_support)) {
+                chosen = i;
+                chosen_support = support;
+            }
+        }
+        out.push_back(group[chosen]);
     }
     return out;
 }
@@ -406,7 +528,7 @@ void map_and_crop_refinement(std::vector<Detection>& detections, double scale,
 void refine_from_windows(std::vector<Detection>& detections,
                          const TargetSpec& spec,
                          const std::vector<RefinementWindow>& windows,
-                         int max_hamming) {
+                         int max_hamming, bool noparity) {
     for (std::size_t i = 0; i < detections.size(); ++i) {
         Detection& detection = detections[i];
         const RefinementWindow& window = windows[i];
@@ -450,9 +572,40 @@ void refine_from_windows(std::vector<Detection>& detections,
             seed.center = local;
             seed.radius_px = detection.radius;
             seed.axis_ratio = 1.0;
-            const GradientField gradient = compute_gradient_field(window.image);
-            if (auto refined = refine_ellipse_center(gradient, seed)) {
-                detection.center = *refined + offset;
+            if (detection.coded && !detection.centre_dot) {
+                // Parity-0 targets have no centre dot: a first-edge fit takes
+                // the 0.5 R sector ring on some rays and the border on others,
+                // and an asymmetric sector word biases the centre (measured up
+                // to 1.6 px on a rendered sheet). Re-decode at full resolution
+                // instead; decode_circular keeps the border-ellipse centre,
+                // which is this target's accurate measurement.
+                const auto decoded =
+                    decode_circular(window.image, seed, spec.bits, max_hamming);
+                // The local re-decode is only trustworthy when it reads back
+                // the same id; otherwise it locked onto a neighbouring edge
+                // and its border centre is meaningless. With parities merged
+                // the stored code is even, so compare in that space.
+                const bool same_code =
+                    decoded &&
+                    (noparity ? (decoded->code / 2) * 2 == detection.code
+                              : decoded->code == detection.code);
+                if (same_code) {
+                    detection.center = decoded->center + offset;
+                    detection.radius = decoded->radius_px;
+                    detection.hamming = decoded->hamming;
+                } else {
+                    const GradientField gradient =
+                        compute_gradient_field(window.image);
+                    if (auto refined = refine_ellipse_center(gradient, seed)) {
+                        detection.center = *refined + offset;
+                    }
+                }
+            } else {
+                const GradientField gradient =
+                    compute_gradient_field(window.image);
+                if (auto refined = refine_ellipse_center(gradient, seed)) {
+                    detection.center = *refined + offset;
+                }
             }
         }
     }
@@ -797,7 +950,8 @@ CameraResult process_camera(const Document& document, const Chunk& chunk,
                                     windows);
             luminance = FloatImage();  // release the full-resolution buffer
             reduced = FloatImage();
-            refine_from_windows(detections, spec, windows, params.max_hamming);
+            refine_from_windows(detections, spec, windows, params.max_hamming,
+                                params.noparity);
         }
         if (filter_mask && mask != nullptr) {
             detections.erase(
@@ -1055,10 +1209,14 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
     if (!commands.empty()) {
         auto transaction =
             std::make_unique<CommandTransaction>("Detect Markers");
+        // Record the target kind on newly created markers: refinement uses it
+        // to decide whether the even-parity light-seed path applies.
+        Meta marker_meta;
+        marker_meta.set("target_type", options.target_type);
         for (const Assignment& assignment : commands) {
             transaction->add(make_add_marker_with_projection_command(
                 chunk->id(), assignment.label, assignment.camera_id,
-                assignment.pixel, false));
+                assignment.pixel, false, marker_meta));
         }
         plan.command = std::move(transaction);
     }

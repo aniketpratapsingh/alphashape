@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "common/algorithm/markers/cross_decoder.hpp"
 #include "common/algorithm/markers/detect_markers_task.hpp"
 #include "common/algorithm/markers/marker_detector.hpp"
+#include "common/algorithm/markers/marker_sheet.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
 #include "common/commands/command.hpp"
 #include "common/commands/model_commands.hpp"
@@ -344,6 +346,55 @@ std::vector<std::string> detect_labels(const FloatImage& image,
     return labels;
 }
 
+FloatImage sheet_to_gray(const Image& image) {
+    FloatImage out(image.width(), image.height(), 0.0F);
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            out.at(x, y) = static_cast<float>(image.at(x, y, 0)) / 255.0F;
+        }
+    }
+    return out;
+}
+
+/// Run DetectMarkers over one image and return the markers it created.
+std::vector<Marker> detect_markers(const FloatImage& image,
+                                   const std::string& target_type) {
+    DetectScene scene = make_scene(image.width(), image.height(), 1);
+    write_gray_png(scene.paths[0], image);
+    DetectMarkersPlan plan = plan_scene(scene, options_for(target_type));
+    if (plan.command) {
+        plan.command->apply(scene.document);
+    }
+    return scene.chunk->markers();
+}
+
+/// Centre of one cell of the first-page coded grid on an A4 sheet, in the
+/// calibration convention (the top-left pixel centre is (0.5, 0.5)). The grid
+/// arithmetic mirrors marker_sheet.cpp: a 25 mm target plus its 5 mm quiet
+/// zone per cell, centred inside the 10 mm printable margin.
+Eigen::Vector2d sheet_cell_centre(int code, int first_code, double dpi) {
+    constexpr double kPageWidthMm = 210.0;
+    constexpr double kPageHeightMm = 297.0;
+    constexpr double kMarginMm = 10.0;
+    const double cell = 25.0 + 2.0 * 5.0;
+    const int cols = static_cast<int>(
+        std::floor((kPageWidthMm - 2.0 * kMarginMm) / cell));
+    const int rows = static_cast<int>(
+        std::floor((kPageHeightMm - 2.0 * kMarginMm) / cell));
+    const double grid_x = kMarginMm +
+                          0.5 * (kPageWidthMm - 2.0 * kMarginMm -
+                                 static_cast<double>(cols) * cell);
+    const double grid_y = kMarginMm +
+                          0.5 * (kPageHeightMm - 2.0 * kMarginMm -
+                                 static_cast<double>(rows) * cell);
+    const int index = code - first_code;
+    const double cx =
+        grid_x + (static_cast<double>(index % cols) + 0.5) * cell;
+    const double cy =
+        grid_y + (static_cast<double>(index / cols) + 0.5) * cell;
+    return Eigen::Vector2d(cx, cy) * (dpi / 25.4);
+}
+
 struct AccuracyResult {
     std::size_t detections = 0;
     std::size_t markers = 0;
@@ -519,6 +570,155 @@ TEST(Markers, NoParityReportsEvenCode) {
     ASSERT_EQ(no_parity.chunk->markers().size(), 1U);
     EXPECT_EQ(code_from_label(no_parity.chunk->markers()[0].label),
               (code / 2) * 2);
+}
+
+TEST(Markers, DetectsEvenCodes) {
+    // 200 dpi prints each 25 mm target at ~98 px radius, well above the 40 px
+    // the blob detector needs. Ids 1..8 mix five even (white-centre) parities
+    // with three odd ones.
+    const double dpi = 200.0;
+    constexpr int kFirst = 1;
+    constexpr int kCount = 8;
+    for (SheetTarget target :
+         {SheetTarget::Circular12, SheetTarget::Circular16}) {
+        SheetOptions options;
+        options.target = target;
+        options.first_code = kFirst;
+        options.count = kCount;
+        options.corner_marks = false;  // keep the detector looking at targets
+        const std::string type =
+            target == SheetTarget::Circular12 ? "Circular12" : "Circular16";
+        const Image sheet = marker_sheet_raster(options, dpi, 0);
+        const std::vector<Marker> markers =
+            detect_markers(sheet_to_gray(sheet), type);
+
+        std::map<int, std::vector<Eigen::Vector2d>> centres;
+        for (const Marker& marker : markers) {
+            const int code = code_from_label(marker.label);
+            ASSERT_GE(code, 0) << marker.label;
+            for (const MarkerProjection& projection : marker.projections) {
+                centres[code].push_back(projection.pixel);
+            }
+        }
+        EXPECT_EQ(centres.size(), static_cast<std::size_t>(kCount)) << type;
+        for (const auto& [code, pixels] : centres) {
+            EXPECT_GE(code, kFirst) << type;
+            EXPECT_LE(code, kFirst + kCount - 1) << type;
+            ASSERT_EQ(pixels.size(), 1U) << type << " code " << code;
+            const Eigen::Vector2d expected =
+                sheet_cell_centre(code, kFirst, dpi);
+            const double error = (pixels.front() - expected).norm();
+            std::printf("[DetectsEvenCodes] %s code %d error %.4f px\n",
+                        type.c_str(), code, error);
+            EXPECT_LT(error, 0.5) << type << " code " << code;
+        }
+        for (int code = kFirst; code < kFirst + kCount; ++code) {
+            EXPECT_EQ(centres.count(code), 1U) << type << " code " << code;
+        }
+    }
+}
+
+TEST(Markers, DetectsEvenCodeAt300Dpi) {
+    // A non-default print scale: 300 dpi puts the 25 mm target at roughly
+    // 148 px radius, well beyond the 200 dpi path every other sheet test uses.
+    const double dpi = 300.0;
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.first_code = 4;  // even id, so the white interior seeds it
+    options.count = 1;
+    options.corner_marks = false;
+    const Image sheet = marker_sheet_raster(options, dpi, 0);
+    const std::vector<Marker> markers =
+        detect_markers(sheet_to_gray(sheet), "Circular12");
+    ASSERT_EQ(markers.size(), 1U);
+    EXPECT_EQ(code_from_label(markers[0].label), 4);
+    ASSERT_EQ(markers[0].projections.size(), 1U);
+    const Eigen::Vector2d expected = sheet_cell_centre(4, 4, dpi);
+    const double error = (markers[0].projections[0].pixel - expected).norm();
+    std::printf("[300dpi even] code 4 error %.4f px\n", error);
+    EXPECT_LT(error, 0.5);
+}
+
+TEST(Markers, NoFalseIdsOnStructuredBrightSpots) {
+    // A dark field with bright discs and small specular spots: the
+    // light-on-dark pass sees all of them, but none carries a code ring, so
+    // the detector must report nothing.
+    const int width = 480;
+    const int height = 360;
+    FloatImage image(width, height, 0.06F);
+    struct Spot {
+        double x;
+        double y;
+        double radius;
+    };
+    const Spot spots[] = {{70.0, 80.0, 22.0},  {200.0, 120.0, 40.0},
+                          {360.0, 90.0, 6.0},  {120.0, 260.0, 55.0},
+                          {380.0, 280.0, 12.0}};
+    for (const Spot& spot : spots) {
+        const int x0 = std::max(
+            0, static_cast<int>(std::floor(spot.x - spot.radius)));
+        const int x1 = std::min(
+            width - 1, static_cast<int>(std::ceil(spot.x + spot.radius)));
+        const int y0 = std::max(
+            0, static_cast<int>(std::floor(spot.y - spot.radius)));
+        const int y1 = std::min(
+            height - 1, static_cast<int>(std::ceil(spot.y + spot.radius)));
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const double dx = static_cast<double>(x) - spot.x;
+                const double dy = static_cast<double>(y) - spot.y;
+                if (dx * dx + dy * dy <= spot.radius * spot.radius) {
+                    image.at(x, y) = 0.97F;
+                }
+            }
+        }
+    }
+    const std::vector<Marker> markers = detect_markers(image, "Circular12");
+    EXPECT_TRUE(markers.empty()) << markers.size();
+}
+
+TEST(Markers, NoDuplicateDetections) {
+    // Odd ids are seeded twice now: once from the dark centre dot and once
+    // from the light interior at a coarse scale. Each id must still be
+    // reported exactly once.
+    const double dpi = 200.0;
+    constexpr int kFirst = 1;
+    constexpr int kCount = 7;
+    SheetOptions options;
+    options.target = SheetTarget::Circular12;
+    options.first_code = kFirst;
+    options.count = kCount;
+    options.corner_marks = false;
+    const Image sheet = marker_sheet_raster(options, dpi, 0);
+    const std::vector<Marker> markers =
+        detect_markers(sheet_to_gray(sheet), "Circular12");
+    ASSERT_EQ(markers.size(), static_cast<std::size_t>(kCount));
+    std::set<int> codes;
+    for (const Marker& marker : markers) {
+        const int code = code_from_label(marker.label);
+        ASSERT_GE(code, 0) << marker.label;
+        EXPECT_TRUE(codes.insert(code).second) << "duplicate code " << code;
+        EXPECT_EQ(marker.projections.size(), 1U) << "code " << code;
+    }
+    EXPECT_EQ(codes.size(), static_cast<std::size_t>(kCount));
+    for (int code = kFirst; code < kFirst + kCount; ++code) {
+        EXPECT_TRUE(codes.count(code) != 0U) << "missing code " << code;
+    }
+}
+
+TEST(Markers, NoFalseIdsOnBlank) {
+    for (int variant = 0; variant < 2; ++variant) {
+        FloatImage image(480, 360, 0.5F);
+        if (variant == 0) {
+            image = FloatImage(480, 360, 0.95F);  // blank page
+        } else {
+            test::add_noise(image, 0.1, 2024U);  // sensor noise
+        }
+        const std::vector<Marker> markers =
+            detect_markers(image, "Circular12");
+        EXPECT_TRUE(markers.empty())
+            << "variant " << variant << " reported " << markers.size();
+    }
 }
 
 TEST(Markers, FramesAndCamerasFilters) {
