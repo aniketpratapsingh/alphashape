@@ -258,13 +258,14 @@ TEST_F(ReferencePane, SourceEditIsConvertedBackToTheSlotCrs) {
     const crs::CoordinateSystem display = chunk.coordinate_system();
     const crs::CoordinateSystem slot = crs::CoordinateSystem::from_epsg(4979);
     const crs::CrsTransform inverse = crs::CrsTransform::create(display, slot);
-    const crs::CrsPoint expected =
+    const std::optional<crs::CrsPoint> expected =
         inverse.forward(crs::CrsPoint{typed, displayed.y(), displayed.z()});
+    ASSERT_TRUE(expected.has_value());
     ASSERT_TRUE(chunk.cameras()[0].reference.location.has_value());
     const Eigen::Vector3d written = *chunk.cameras()[0].reference.location;
-    EXPECT_NEAR(written.x(), expected.x, 1e-9);
-    EXPECT_NEAR(written.y(), expected.y, 1e-9);
-    EXPECT_NEAR(written.z(), expected.z, 1e-6);
+    EXPECT_NEAR(written.x(), expected->x, 1e-9);
+    EXPECT_NEAR(written.y(), expected->y, 1e-9);
+    EXPECT_NEAR(written.z(), expected->z, 1e-6);
 }
 
 TEST_F(ReferencePane, SwitchingChunkRefreshesRows) {

@@ -281,9 +281,11 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
                 app_.execute(
                     make_set_camera_reference_enabled_command(chunk_id_, item.id, on));
             } else {
-                const auto role = on ? reference::MarkerReferenceRole::Gcp
-                                     : reference::MarkerReferenceRole::CheckPoint;
-                app_.execute(make_set_marker_role_command(chunk_id_, item.id, role));
+                const auto target_role =
+                    on ? reference::MarkerReferenceRole::Gcp
+                       : reference::MarkerReferenceRole::CheckPoint;
+                app_.execute(
+                    make_set_marker_role_command(chunk_id_, item.id, target_role));
             }
             return true;
         }
@@ -354,9 +356,12 @@ bool ReferenceModel::setData(const QModelIndex& index, const QVariant& value,
         !slot_cs.is_local() && !(slot_cs == display)) {
         try {
             const crs::CrsTransform xform = crs::CrsTransform::create(display, slot_cs);
-            const crs::CrsPoint point =
+            const std::optional<crs::CrsPoint> point =
                 xform.forward(crs::CrsPoint{location.x(), location.y(), location.z()});
-            location = Eigen::Vector3d(point.x, point.y, point.z);
+            if (!point.has_value()) {
+                return false;
+            }
+            location = Eigen::Vector3d(point->x, point->y, point->z);
         } catch (const std::exception&) {
             return false;  // no conversion: refuse rather than write the wrong units
         }
