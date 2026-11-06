@@ -691,16 +691,21 @@ void MainWindow::run_marker_task(const std::string& task) {
             params = dialog.params();
         } else {
             TaskDialog dialog(task, builtin_registry(), app_.settings(), this);
-            const Chunk* estimate_chunk =
-                app_.read_document([chunk_id](const Document& document) -> const Chunk* {
-                    for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
-                        if (chunk != nullptr && chunk->id() == chunk_id) {
-                            return chunk.get();
-                        }
+            // Copy the numbers the estimate needs while the shared lock is
+            // held; the dialog must never keep a Chunk* across its exec().
+            ChunkFacts facts;
+            const bool has_facts = app_.read_document([chunk_id, &facts](const Document& document) {
+                for (const std::shared_ptr<Chunk>& chunk : document.workspace().chunks()) {
+                    if (chunk != nullptr && chunk->id() == chunk_id) {
+                        facts = chunk_facts(*chunk);
+                        return true;
                     }
-                    return nullptr;
-                });
-            dialog.set_estimate_context(estimate_chunk, &app_.jobs().throughput_history());
+                }
+                return false;
+            });
+            if (has_facts) {
+                dialog.set_estimate_context(std::move(facts), &app_.jobs().throughput_history());
+            }
             if (dialog.exec() != QDialog::Accepted) {
                 return;
             }

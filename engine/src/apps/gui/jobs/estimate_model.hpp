@@ -53,16 +53,21 @@ ColdTask cold_task(const std::string& task_name);
 // row names refer to our measured CPU profile (M1, 8 threads), not to a file
 // in this repository.
 //
-//   Features        a 0.40  b 2.03  c 0.00
-//       DoG + MLDB row: 0.35 s for 480x360 = 0.1728 Mpx per image, so
-//       0.35 / 0.1728 = 2.03 s per camera-megapixel. a is thread start.
-//   MatchPhotos     a 0.80  b 2.20  c 0.00
-//       the detection row plus the Hamming row: 2.6 s over ten tiny 8-image
-//       tests is 0.26 s per 8 x 0.1728 Mpx = 0.19; 2.03 + 0.19 = 2.22 -> 2.2.
-//   DepthMaps       a 0.05  b 24.80 c 0.00
+//   Features        a 0.40  b 0.51  c 0.00
+//       DoG + MLDB row: 0.35 s is the TOTAL over its four 480x360 = 0.1728 Mpx
+//       tests, so treat it as four single-image runs: 0.35 / 4 = 0.0875 s per
+//       0.1728 Mpx = 0.51 s per camera-megapixel. a is thread start. A project
+//       with three measured DetectFeatures runs replaces this constant.
+//   MatchPhotos     a 0.80  b 0.19  c 0.00
+//       the Hamming row only: 2.6 s over ten tiny 8-image tests is 0.26 s per
+//       8 x 0.1728 = 1.3824 Mpx, i.e. 0.26 / 1.3824 = 0.188 -> 0.19 s per
+//       camera-megapixel. Detection is added separately, and only for cameras
+//       that have no keypoint set yet (kFeatureDetectionSecondsPerCameraMpx).
+//   DepthMaps       a 0.05  b 24.90 c 0.00
 //       PatchMatch row: 1.04 s per map at 0.0432 Mpx with 3-8 neighbours;
-//       1.04 / 0.0432 = 24.07 s per camera-megapixel at 7 neighbours, plus the
-//       11 % filter stage = 24.8. The neighbour count scales b separately.
+//       1.04 / 0.0432 = 24.07 s per camera-megapixel at 7 neighbours. The
+//       profile's filter row keeps ~2-5 % of depth maps, midpoint 3.5 %, so
+//       24.07 x 1.035 = 24.91 -> 24.9. The neighbour count scales b separately.
 //   PointCloud      a 0.20  b 1.90  c 0.00
 //       fusion row: < 1 s for 12 maps at 0.0432 Mpx = 0.518 Mpx total, i.e.
 //       1.9 s per total megapixel.
@@ -102,7 +107,19 @@ struct WorkItem {
     double volume_voxels = 0.0;  ///< meshing volume (resolution^3)
     double product_pixels = 0.0; ///< DEM / ortho output cells
     double texels = 0.0;         ///< texture atlas texels
+    /// MatchPhotos only: cameras with no keypoint set yet, which still have to
+    /// run detection (the rest go straight to matching).
+    double detect_cameras = 0.0;
 };
+
+/// Detector coefficient shared by Features and MatchPhotos' detect term:
+/// 0.35 s for 4 single-image runs of 480x360 = 0.1728 Mpx is
+/// 0.0875 / 0.1728 = 0.506 s per camera-megapixel (0.51 rounded).
+inline constexpr double kFeatureDetectionSecondsPerCameraMpx = 0.51;
+
+/// Absolute non-negative double to bytes, saturating instead of invoking
+/// undefined behaviour: non-finite or <= 0 gives 0, >= 2^64 gives UINT64_MAX.
+std::uint64_t saturating_bytes(double value);
 
 /// Bytes per output cell used for the product-size rules. DEM products are
 /// float elevation (4 B); ortho products are RGB (3 B). Texture pages are RGB

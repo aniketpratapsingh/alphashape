@@ -36,8 +36,53 @@ struct ThroughputRow {
     double cameras = 0.0;
     double megapixels = 0.0;  ///< working-resolution megapixels per camera
     double seconds = 0.0;
+    /// Process-wide peak-RSS high-water mark at the moment the run ended, but
+    /// only when this run raised it (`after > before`). 0 means "unknown": the
+    /// counter is shared by the whole process, so a run that stayed below an
+    /// earlier high-water mark says nothing about its own footprint.
     std::uint64_t peak_rss_bytes = 0;
 };
+
+/// Peak RSS a run may claim: `after` only when it raised the process-wide
+/// high-water mark, otherwise 0 ("unknown"). Pure so the rule is testable.
+std::uint64_t recorded_peak_rss(std::uint64_t before, std::uint64_t after);
+
+/// Median of the nonzero `peak_rss_bytes` in `rows`, scaled by the ratio of
+/// `current_units` (cameras * megapixels) to the median units of the rows that
+/// recorded a peak. Returns `fallback` when fewer than three rows recorded one
+/// (the cold model is more trustworthy than two samples).
+std::uint64_t measured_ram_from_history(const std::vector<ThroughputRow>& rows,
+                                        double current_units, std::uint64_t fallback);
+
+/// The plain numbers the estimator needs from a chunk. Copied under the
+/// document lock so a modal dialog never keeps a `Chunk*` (and the lock) alive
+/// while it waits for the user. Nothing here borrows from the chunk.
+struct ChunkFacts {
+    struct CameraFacts {
+        bool enabled = false;
+        bool has_frame = false;
+        bool has_keypoints = false;
+        /// Sensor width * height, or the linked frame's size when the sensor
+        /// has no dimensions.
+        double pixels = 0.0;
+    };
+    std::vector<CameraFacts> cameras;
+    /// Total width * height over the active depth-map set (0 when none).
+    double depth_map_pixels = 0.0;
+    double depth_map_count = 0.0;
+    /// Active elevation raster cells, 0 when the chunk has no DEM.
+    std::uint64_t dem_cells = 0;
+    /// Active dense point-cloud point count, 0 when the chunk has none.
+    std::uint64_t point_count = 0;
+};
+
+/// Snapshot the estimator inputs from `chunk`. Call this inside read_document().
+ChunkFacts chunk_facts(const Chunk& chunk);
+
+/// The camera count estimate_task uses: every camera when none is enabled yet
+/// (before the first alignment), otherwise the enabled ones. The task dialog's
+/// RAM warning uses the same rule so it never says "0-image block".
+double estimate_camera_count(const std::string& task, const ChunkFacts& facts);
 
 /// Bounded per-task history: at most the newest 20 rows for each task.
 class ThroughputHistory {
@@ -113,6 +158,11 @@ struct Estimate {
 /// Estimate one run. Never throws: an unknown task, an empty chunk or an
 /// unavailable history all fall back to the generic cold model. Takes O(rows)
 /// in the task's history (bounded at 20) and is expected well under 5 ms.
+Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
+                       const Params& params, const ChunkFacts& facts,
+                       const ThroughputHistory& history);
+
+/// Convenience overload for callers that already hold the chunk under the lock.
 Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
                        const Params& params, const Chunk& chunk,
                        const ThroughputHistory& history);

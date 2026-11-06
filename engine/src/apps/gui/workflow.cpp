@@ -240,9 +240,19 @@ WorkflowController::WorkflowController(GuiApp& app, QMenu* menu, QWidget* dialog
     params_handler_ = [this](const std::string& task,
                              const Presets& presets) -> std::optional<Params> {
         TaskDialog dialog(task, builtin_registry(), app_.settings(), dialog_parent_);
-        const Chunk* active_chunk = app_.read_document(
-            [](const Document& document) { return active_chunk_of(document); });
-        dialog.set_estimate_context(active_chunk, &app_.jobs().throughput_history());
+        // Snapshot under the lock: no Chunk* may survive into the modal exec().
+        ChunkFacts facts;
+        const bool has_facts = app_.read_document([&facts](const Document& document) {
+            const Chunk* chunk = active_chunk_of(document);
+            if (chunk == nullptr) {
+                return false;
+            }
+            facts = chunk_facts(*chunk);
+            return true;
+        });
+        if (has_facts) {
+            dialog.set_estimate_context(std::move(facts), &app_.jobs().throughput_history());
+        }
         // The presets override whatever the dialog would otherwise start on (the schema
         // default, or the value the user last accepted): they name data this chunk has, so
         // they are the right starting point for this run.

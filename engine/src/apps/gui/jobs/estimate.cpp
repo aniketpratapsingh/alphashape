@@ -8,6 +8,7 @@
 #include <optional>
 #include <sstream>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #include "apps/gui/jobs/estimate_model.hpp"
@@ -52,6 +53,42 @@ double percentile(const std::vector<double>& sorted, double fraction) {
 
 }  // namespace
 
+std::uint64_t recorded_peak_rss(std::uint64_t before, std::uint64_t after) {
+    // The counter is process-wide: a run only gets credit when it lifted it.
+    return after > before ? after : 0ULL;
+}
+
+std::uint64_t measured_ram_from_history(const std::vector<ThroughputRow>& rows,
+                                        double current_units, std::uint64_t fallback) {
+    std::vector<std::uint64_t> peaks;
+    std::vector<double> units;
+    peaks.reserve(rows.size());
+    units.reserve(rows.size());
+    for (const ThroughputRow& row : rows) {
+        if (row.peak_rss_bytes == 0) {
+            continue;  // unknown: the run did not raise the high-water mark
+        }
+        const double row_units = row.cameras * row.megapixels;
+        if (!(row_units > 0.0)) {
+            continue;
+        }
+        peaks.push_back(row.peak_rss_bytes);
+        units.push_back(row_units);
+    }
+    if (peaks.size() < 3 || !(current_units > 0.0)) {
+        return fallback;
+    }
+    std::sort(peaks.begin(), peaks.end());
+    std::sort(units.begin(), units.end());
+    const double median_peak = percentile(
+        std::vector<double>(peaks.begin(), peaks.end()), 0.5);
+    const double median_units = percentile(units, 0.5);
+    if (!(median_units > 0.0)) {
+        return fallback;
+    }
+    return estimates::saturating_bytes(median_peak * (current_units / median_units));
+}
+
 void ThroughputHistory::add(ThroughputRow row) {
     if (row.task.empty() || !finite_non_negative(row.cameras) ||
         !finite_non_negative(row.megapixels) || !finite_non_negative(row.seconds)) {
@@ -89,9 +126,16 @@ std::string history_path_for_project(const std::string& project_path) {
     if (project_path.empty()) {
         return {};
     }
+    // TODO(WP-11.9): use the shared .files helper once it lands (PR #101).
+    // A .psz project keeps its directory layout to itself, so its history sits
+    // beside the manifest as dir/name.psz.history.tsv rather than creating a
+    // dir/name.files/ folder the format does not have.
+    std::filesystem::path base(project_path);
+    if (base.extension() == ".psz") {
+        return project_path + ".history.tsv";
+    }
     // ProjectIO stores the side-car folder beside the manifest with the final
     // extension removed: dir/name.psx -> dir/name.files.
-    std::filesystem::path base(project_path);
     base.replace_extension();
     return base.string() + ".files/job_history.tsv";
 }
@@ -122,7 +166,8 @@ ThroughputHistory FileThroughputStore::load() {
             !finite_non_negative(row.seconds) || !std::isfinite(peak) || peak < 0.0) {
             continue;
         }
-        row.peak_rss_bytes = static_cast<std::uint64_t>(peak);
+        // A finite but enormous peak (1e300) must saturate, not invoke UB.
+        row.peak_rss_bytes = estimates::saturating_bytes(peak);
         history.add(std::move(row));
     }
     return history;
@@ -180,72 +225,164 @@ namespace {
 
 using estimates::WorkItem;
 
+/// Tasks whose working resolution is the active depth-map set: they never look
+/// at the sensor pixels, so their cost follows whatever downscale produced the
+/// maps (typically 4, not the sensor's full resolution).
+bool consumes_depth_maps(const std::string& task) {
+    return task == "BuildPointCloud" || task == "BuildModel";
+}
+
+bool any_camera_enabled(const ChunkFacts& facts) {
+    for (const ChunkFacts::CameraFacts& camera : facts.cameras) {
+        if (camera.enabled) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Working-resolution pixels of the enabled cameras. The sensor is the
 /// authority; a camera whose sensor is missing falls back to its linked frame.
-WorkItem work_for(const Params& params, const Chunk& chunk) {
+/// Tasks that consume depth maps take their resolution from the active
+/// depth-map set instead (see below).
+WorkItem work_for(const std::string& task, const Params& params, const ChunkFacts& facts) {
     WorkItem work;
     double total_pixels = 0.0;
-    bool any_aligned = false;
-    for (const Camera& camera : chunk.cameras()) {
-        any_aligned = any_aligned || camera.enabled;
-    }
-    for (const Camera& camera : chunk.cameras()) {
+    const bool any_aligned = any_camera_enabled(facts);
+    for (const ChunkFacts::CameraFacts& camera : facts.cameras) {
         // Before the first alignment no camera is enabled yet, but every image
         // still has to be detected/matched: count them all in that case.
         if (any_aligned && !camera.enabled) {
             continue;
         }
-        double pixels = 0.0;
-        const std::vector<Sensor>& sensors = chunk.sensors();
-        for (std::size_t index = 0; index < sensors.size(); ++index) {
-            if (static_cast<std::int32_t>(index) == camera.sensor_id &&
-                sensors[index].width > 0 && sensors[index].height > 0) {
-                pixels = static_cast<double>(sensors[index].width) *
-                         static_cast<double>(sensors[index].height);
-                break;
-            }
-        }
-        if (pixels == 0.0) {
-            for (const std::shared_ptr<Frame>& frame : chunk.frames()) {
-                if (frame != nullptr && frame->camera_id() == camera.id) {
-                    pixels = static_cast<double>(frame->width()) *
-                             static_cast<double>(frame->height());
-                    break;
-                }
-            }
-        }
         work.cameras += 1.0;
-        total_pixels += pixels;
+        total_pixels += camera.pixels;
+        // MatchPhotos reuses existing keypoint sets and detects only what is
+        // missing, so its detection term covers these cameras alone.
+        if (task == "MatchPhotos" && camera.has_frame && !camera.has_keypoints) {
+            work.detect_cameras += 1.0;
+        }
     }
-    double downscale = 1.0;
-    if (const std::optional<std::int64_t> declared = param_int(params, "downscale");
-        declared && *declared > 1) {
-        downscale = static_cast<double>(*declared);
+    if (consumes_depth_maps(task) && facts.depth_map_count > 0.0) {
+        // The depth maps ARE the task's input and already carry the builder's
+        // downscale, so their per-map size is the working resolution.
+        work.cameras = facts.depth_map_count;
+        work.megapixels = facts.depth_map_pixels / work.cameras / 1.0e6;
+    } else {
+        double downscale = 1.0;
+        if (const std::optional<std::int64_t> declared = param_int(params, "downscale");
+            declared && *declared > 1) {
+            downscale = static_cast<double>(*declared);
+        }
+        if (consumes_depth_maps(task)) {
+            // No depth maps yet: assume the default 4x working resolution a
+            // BuildDepthMaps run would produce.
+            downscale = 4.0;
+        }
+        work.megapixels = work.cameras > 0.0
+                              ? total_pixels / work.cameras / (downscale * downscale) / 1.0e6
+                              : 0.0;
     }
-    work.megapixels = work.cameras > 0.0
-                          ? total_pixels / work.cameras / (downscale * downscale) / 1.0e6
-                          : 0.0;
     const std::optional<std::int64_t> neighbours = param_int(params, "max_neighbors");
     work.neighbours = neighbours && *neighbours > 0 ? static_cast<double>(*neighbours)
                                                    : kDefaultNeighbours;
     const std::optional<std::int64_t> resolution = param_int(params, "volume_resolution");
     const double volume = resolution && *resolution > 0 ? static_cast<double>(*resolution) : 128.0;
     work.volume_voxels = volume * volume * volume;
-    // The output grid's cell count depends on the CRS and the footprint, which
-    // are not in the chunk alone. Use the working input pixels as the proxy:
-    // an input pixel is at most one output cell after the usual resampling.
-    work.product_pixels = work.cameras * work.megapixels * 1.0e6;
-    // A texture page carries roughly four texels per input pixel.
+    // Output cells. Duplicated camera coverage must not scale the product
+    // linearly: prefer an existing grid. An ortho drapes on the DEM, and a DEM
+    // rebuild replaces the existing one. Without either, a DEM falls back to
+    // the dense cloud's points, then to the coverage proxy divided by the mean
+    // overlap (cameras / 4 for a typical nadir block). Other tasks use the
+    // coverage proxy.
+    const double coverage_pixels = work.cameras * work.megapixels * 1.0e6;
+    if (task == "BuildOrthomosaic" && facts.dem_cells > 0) {
+        work.product_pixels = static_cast<double>(facts.dem_cells);
+    } else if (task == "BuildDem") {
+        if (facts.dem_cells > 0) {
+            work.product_pixels = static_cast<double>(facts.dem_cells);
+        } else if (facts.point_count > 0) {
+            work.product_pixels = static_cast<double>(facts.point_count);
+        } else if (work.cameras > 0.0) {
+            work.product_pixels = coverage_pixels / (work.cameras / 4.0);
+        }
+    } else {
+        work.product_pixels = coverage_pixels;
+    }
+    // A texture page carries roughly four texels per output cell.
     work.texels = work.product_pixels * 4.0;
     return work;
 }
 
 }  // namespace
 
+ChunkFacts chunk_facts(const Chunk& chunk) {
+    ChunkFacts facts;
+    std::unordered_set<std::int32_t> keypoint_cameras;
+    for (const KeypointSet& set : chunk.tie_points().keypoint_sets) {
+        keypoint_cameras.insert(set.camera_id);
+    }
+    for (const Camera& camera : chunk.cameras()) {
+        ChunkFacts::CameraFacts entry;
+        entry.enabled = camera.enabled;
+        entry.has_keypoints = keypoint_cameras.count(camera.id) != 0;
+        if (camera.sensor_id >= 0 &&
+            camera.sensor_id < static_cast<std::int32_t>(chunk.sensors().size())) {
+            const Sensor& sensor =
+                chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)];
+            if (sensor.width > 0 && sensor.height > 0) {
+                entry.pixels = static_cast<double>(sensor.width) *
+                               static_cast<double>(sensor.height);
+            }
+        }
+        for (const std::shared_ptr<Frame>& frame : chunk.frames()) {
+            if (frame != nullptr && frame->camera_id() == camera.id) {
+                entry.has_frame = true;
+                if (entry.pixels == 0.0) {
+                    entry.pixels = static_cast<double>(frame->width()) *
+                                   static_cast<double>(frame->height());
+                }
+                break;
+            }
+        }
+        facts.cameras.push_back(entry);
+    }
+    for (const DepthMap& map : chunk.depth_maps()) {
+        if (map.width > 0 && map.height > 0) {
+            facts.depth_map_pixels += static_cast<double>(map.width) *
+                                      static_cast<double>(map.height);
+            facts.depth_map_count += 1.0;
+        }
+    }
+    if (const ElevationAsset* active =
+            find_asset(chunk.elevations(), chunk.active_elevation_id());
+        active != nullptr && active->data != nullptr && !active->data->raster.empty()) {
+        facts.dem_cells =
+            static_cast<std::uint64_t>(active->data->raster.grid.width) *
+            static_cast<std::uint64_t>(active->data->raster.grid.height);
+    }
+    facts.point_count = static_cast<std::uint64_t>(chunk.point_cloud().points.size());
+    return facts;
+}
+
+double estimate_camera_count(const std::string& task, const ChunkFacts& facts) {
+    if (consumes_depth_maps(task) && facts.depth_map_count > 0.0) {
+        return facts.depth_map_count;
+    }
+    double count = 0.0;
+    const bool any_aligned = any_camera_enabled(facts);
+    for (const ChunkFacts::CameraFacts& camera : facts.cameras) {
+        if (!any_aligned || camera.enabled) {
+            count += 1.0;
+        }
+    }
+    return count;
+}
+
 ThroughputRow throughput_row_for(const std::string& task, const Params& params,
                                  const Chunk& chunk, double seconds,
                                  std::uint64_t peak_rss_bytes) {
-    const WorkItem work = work_for(params, chunk);
+    const WorkItem work = work_for(task, params, chunk_facts(chunk));
     ThroughputRow row;
     row.task = task;
     row.cameras = work.cameras;
@@ -256,13 +393,13 @@ ThroughputRow throughput_row_for(const std::string& task, const Params& params,
 }
 
 Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
-                       const Params& params, const Chunk& chunk,
+                       const Params& params, const ChunkFacts& facts,
                        const ThroughputHistory& history) {
     Estimate out;
     const bool known = registry.find(task) != nullptr;
     const estimates::ColdTask kind =
         known ? estimates::cold_task(task) : estimates::ColdTask::Generic;
-    const WorkItem work = work_for(params, chunk);
+    const WorkItem work = work_for(task, params, facts);
     const estimates::ColdEstimate cold = estimates::cold_estimate(kind, work);
 
     out.seconds = cold.seconds;
@@ -293,6 +430,10 @@ Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
                     std::max(kSigmaFloor, iqr / median);
                 out.confident = true;
                 out.basis = "measured (last " + std::to_string(rows->size()) + " runs)";
+                // History beats the cold RAM model too, but only when at least
+                // three runs actually recorded a peak (see remembered rule).
+                out.peak_ram_bytes =
+                    measured_ram_from_history(*rows, units, cold.peak_ram_bytes);
             }
         }
     }
@@ -301,6 +442,12 @@ Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
     }
     out.seconds_sigma_rel = std::max(kSigmaFloor, out.seconds_sigma_rel);
     return out;
+}
+
+Estimate estimate_task(const TaskRegistry& registry, const std::string& task,
+                       const Params& params, const Chunk& chunk,
+                       const ThroughputHistory& history) {
+    return estimate_task(registry, task, params, chunk_facts(chunk), history);
 }
 
 std::uint64_t estimate_memory_budget() {

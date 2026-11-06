@@ -35,6 +35,7 @@
 #include <QDialog>
 #include <QString>
 
+#include "apps/gui/jobs/estimate.hpp"
 #include "common/tasks/registry.hpp"
 
 class QDialogButtonBox;
@@ -96,10 +97,12 @@ public:
     /// True when the parameter sits in the collapsed "Advanced" group.
     bool advanced(const std::string& param) const;
 
-    /// Supply the chunk and measured history the estimate row reads. Both are
-    /// borrowed and must outlive the dialog; null hides the row. Call after the
-    /// constructor; the row also refreshes whenever a parameter changes.
-    void set_estimate_context(const Chunk* chunk, const ThroughputHistory* history);
+    /// Supply the plain chunk facts and measured history the estimate row
+    /// reads. The facts are copied (snapshot them under read_document()), so
+    /// the dialog never holds a Chunk* across exec(); a null history hides the
+    /// row. Call after the constructor; the row also refreshes whenever a
+    /// parameter changes.
+    void set_estimate_context(ChunkFacts facts, const ThroughputHistory* history);
     /// Override the RAM budget the warning compares against (0 = the platform
     /// budget). Tests use this to pin the 75 % threshold.
     void set_memory_budget(std::uint64_t bytes);
@@ -154,7 +157,7 @@ private:
     QDialogButtonBox* buttons_ = nullptr;
     QLabel* estimate_label_ = nullptr;
     QLabel* ram_warning_label_ = nullptr;
-    const Chunk* estimate_chunk_ = nullptr;
+    ChunkFacts estimate_facts_;
     const ThroughputHistory* estimate_history_ = nullptr;
     const TaskRegistry* registry_ = nullptr;
     std::uint64_t memory_budget_ = 0;

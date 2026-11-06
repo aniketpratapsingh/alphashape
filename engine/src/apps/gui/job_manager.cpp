@@ -25,14 +25,24 @@ JobManager::JobManager(GuiApp& app) : QObject(nullptr), app_(app), registry_(&bu
 }
 
 void JobManager::sync_history() {
-    const std::string path = app_.document().path();
-    if (path == history_project_) {
+    // Both the path and the document identity matter: replacing an unsaved
+    // project (File/New) leaves the path empty, so the path alone would let the
+    // previous document's rows leak into the new one. Read under the shared
+    // lock: the path belongs to the document, not to this manager.
+    const Document* identity = nullptr;
+    const std::string path = app_.read_document([&identity](const Document& document) {
+        identity = &document;
+        return document.path();
+    });
+    const bool same_document = identity == history_document_;
+    if (same_document && path == history_project_) {
         return;
     }
     const std::string previous_path = history_project_;
+    history_document_ = identity;
     history_project_ = path;
     ThroughputHistory carried;
-    if (previous_path.empty() && !path.empty()) {
+    if (same_document && previous_path.empty() && !path.empty()) {
         // A project that was unsaved when its rows were measured now has a
         // home: keep them rather than starting over at the new path.
         carried = throughput_;
@@ -210,6 +220,9 @@ void JobManager::start_next() {
         return;
     }
     Request& front = queue_.front();
+    // The peak-RSS counter is process-wide, so remember its value at the start:
+    // the run may only claim the peak when it ends above this mark.
+    front.peak_rss_before = platform::peak_resident_set_bytes();
     stages_.clear();
     if (const TaskEntry* entry = registry_->find(front.task_name)) {
         for (const Stage& stage : entry->task->stages()) {
@@ -373,7 +386,8 @@ void JobManager::finish_current(State final_state, const QString& message,
 
     if (final_state == State::Succeeded) {
         sync_history();
-        const std::uint64_t peak_rss = platform::peak_resident_set_bytes();
+        const std::uint64_t peak_rss = recorded_peak_rss(
+            request.peak_rss_before, platform::peak_resident_set_bytes());
         const double seconds =
             static_cast<double>(done.elapsed_ms) / 1000.0;
         app_.read_document([this, &request, seconds, peak_rss](const Document& document) {

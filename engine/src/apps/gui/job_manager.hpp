@@ -120,6 +120,9 @@ private:
         std::string task_name;
         Params params;
         std::int32_t chunk_id = -1;
+        /// Process-wide peak-RSS mark sampled when the job started; the run
+        /// only gets credit for the peak when it ends above this.
+        std::uint64_t peak_rss_before = 0;
     };
 
     /// State shared with the worker thread.
@@ -147,6 +150,9 @@ private:
     bool shutting_down_ = false;
     ThroughputHistory throughput_;
     std::string history_project_;
+    /// Identity of the document the rows belong to. A new document (File/New,
+    /// Open) always starts with empty history even when its path is still "".
+    const void* history_document_ = nullptr;
 
     void sync_history();
     void start_next();

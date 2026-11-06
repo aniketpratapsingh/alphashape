@@ -720,8 +720,8 @@ void TaskDialog::set_value(const std::string& param, const ParamValue& value) {
     }
 }
 
-void TaskDialog::set_estimate_context(const Chunk* chunk, const ThroughputHistory* history) {
-    estimate_chunk_ = chunk;
+void TaskDialog::set_estimate_context(ChunkFacts facts, const ThroughputHistory* history) {
+    estimate_facts_ = std::move(facts);
     estimate_history_ = history;
     refresh_estimate();
 }
@@ -735,13 +735,13 @@ void TaskDialog::refresh_estimate() {
     if (estimate_label_ == nullptr || ram_warning_label_ == nullptr) {
         return;
     }
-    if (estimate_chunk_ == nullptr || estimate_history_ == nullptr || registry_ == nullptr) {
+    if (estimate_history_ == nullptr || registry_ == nullptr) {
         estimate_label_->hide();
         ram_warning_label_->hide();
         return;
     }
     const Estimate estimate =
-        estimate_task(*registry_, task_name_, params(), *estimate_chunk_, *estimate_history_);
+        estimate_task(*registry_, task_name_, params(), estimate_facts_, *estimate_history_);
     const int sigma_percent =
         static_cast<int>(std::lround(estimate.seconds_sigma_rel * 100.0));
     estimate_label_->setText(
@@ -757,13 +757,11 @@ void TaskDialog::refresh_estimate() {
 
     const std::uint64_t budget =
         memory_budget_ != 0 ? memory_budget_ : estimate_memory_budget();
-    if (needs_ram_warning(estimate, budget)) {
-        int images = 0;
-        for (const Camera& camera : estimate_chunk_->cameras()) {
-            if (camera.enabled) {
-                ++images;
-            }
-        }
+    // Same camera rule as work_for, so the message never says "0-image block";
+    // a chunk with no images to scale has no warning to give.
+    const int images = static_cast<int>(std::lround(
+        estimate_camera_count(task_name_, estimate_facts_)));
+    if (images > 0 && needs_ram_warning(estimate, budget)) {
         ram_warning_label_->setText(
             tr("Same settings on an %1-image block would need ~%2 RAM")
                 .arg(images)
