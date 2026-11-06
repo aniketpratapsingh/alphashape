@@ -29,7 +29,7 @@ TEST_F(ReferenceSettings, AccuracyPersists) {
     document.set_active_chunk_id(chunk.id());
     const std::int32_t chunk_id = chunk.id();
     {
-        ReferenceSettings dialog(app());
+        alphashape::gui::ReferenceSettingsDialog dialog(app());
         QDoubleSpinBox* accuracy =
             dialog.accuracy_editor(QStringLiteral("camera_location"));
         ASSERT_NE(accuracy, nullptr);

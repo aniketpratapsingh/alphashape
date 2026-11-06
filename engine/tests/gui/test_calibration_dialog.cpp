@@ -59,7 +59,7 @@ using CalibrationDialog = CalibrationDialogFixture;
 
 TEST_F(CalibrationDialog, ShowsAdjustedValues) {
     Chunk& chunk = build_sensor();
-    CalibrationDialog dialog(app());
+    alphashape::gui::CalibrationDialog dialog(app());
     dialog.set_chunk(chunk.id());
     ASSERT_EQ(dialog.sensor_list()->count(), 1);
     ASSERT_NE(dialog.adjusted_value("f"), nullptr);
@@ -78,7 +78,7 @@ TEST_F(CalibrationDialog, ShowsAdjustedValues) {
 
 TEST_F(CalibrationDialog, FitFlagEditEmitsCommand) {
     Chunk& chunk = build_sensor();
-    CalibrationDialog dialog(app());
+    alphashape::gui::CalibrationDialog dialog(app());
     dialog.set_chunk(chunk.id());
     QCheckBox* k3 = dialog.fit_check(QStringLiteral("k3"));
     ASSERT_NE(k3, nullptr);

@@ -23,7 +23,7 @@ class CrsPickerFixture : public GuiTest {};
 using CrsPicker = CrsPickerFixture;
 
 TEST_F(CrsPicker, SearchAndSelect) {
-    CrsPicker picker;
+    alphashape::gui::CrsPicker picker;
     EXPECT_FALSE(picker.is_valid());
     picker.filter_edit()->setText(QStringLiteral("25832"));
     ASSERT_NE(picker.list_widget()->currentItem(), nullptr);
@@ -33,7 +33,7 @@ TEST_F(CrsPicker, SearchAndSelect) {
 }
 
 TEST_F(CrsPicker, InvalidWktIsRejected) {
-    CrsPicker picker;
+    alphashape::gui::CrsPicker picker;
     picker.tabs()->setCurrentIndex(1);
     picker.wkt_edit()->setPlainText(QStringLiteral("not a coordinate system"));
     EXPECT_FALSE(picker.is_valid());
