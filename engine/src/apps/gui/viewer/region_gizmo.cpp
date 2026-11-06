@@ -139,11 +139,14 @@ std::optional<Eigen::Vector2d> project_to_pixels(const Eigen::Matrix4d& view_pro
     if (width <= 0 || height <= 0) {
         return std::nullopt;
     }
-    const Eigen::Vector4d clip = view_projection * Eigen::Vector4d(world.x(), world.y(), world.z(), 1.0);
-    if (!(clip.w() > 1e-12)) {
+    const Eigen::Vector3d clip =
+        view_projection.block<3, 3>(0, 0) * world + view_projection.block<3, 1>(0, 3);
+    const double w =
+        view_projection.block<1, 3>(3, 0).dot(world) + view_projection(3, 3);
+    if (!(w > 1e-12)) {
         return std::nullopt;
     }
-    const Eigen::Vector3d ndc = clip.head<3>() / clip.w();
+    const Eigen::Vector3d ndc = clip / w;
     return Eigen::Vector2d((ndc.x() * 0.5 + 0.5) * static_cast<double>(width),
                            (0.5 - ndc.y() * 0.5) * static_cast<double>(height));
 }
@@ -159,9 +162,14 @@ GizmoRay ray_from_screen(const Eigen::Matrix4d& view_projection, int width, int 
     const Eigen::Matrix4d inverse = view_projection.inverse();
     const double ndc_x = pixel.x() / static_cast<double>(width) * 2.0 - 1.0;
     const double ndc_y = 1.0 - pixel.y() / static_cast<double>(height) * 2.0;
+    const Eigen::Vector3d ndc(ndc_x, ndc_y, 0.0);
     const auto unproject = [&](double z) {
-        const Eigen::Vector4d p = inverse * Eigen::Vector4d(ndc_x, ndc_y, z, 1.0);
-        return p.head<3>() / p.w();
+        Eigen::Vector3d point = ndc;
+        point.z() = z;
+        const Eigen::Vector3d numerator =
+            inverse.block<3, 3>(0, 0) * point + inverse.block<3, 1>(0, 3);
+        const double w = inverse.block<1, 3>(3, 0).dot(point) + inverse(3, 3);
+        return numerator / w;
     };
     const Eigen::Vector3d near_point = unproject(-1.0);
     const Eigen::Vector3d far_point = unproject(1.0);
