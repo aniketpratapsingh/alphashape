@@ -88,6 +88,39 @@ std::size_t ReferenceTable::control_count() const {
     return count;
 }
 
+ReferenceSummary ReferenceTable::summary() const {
+    ReferenceSummary result;
+    double camera_sum = 0.0;
+    double marker_sum = 0.0;
+    std::size_t camera_n = 0;
+    std::size_t marker_n = 0;
+    for (const ReferenceRow& row : rows) {
+        const bool camera = row.kind == ReferenceRowKind::Camera;
+        if (camera) {
+            ++result.camera_count;
+        } else {
+            ++result.marker_count;
+        }
+        if (!row.enabled || !row.error_m.has_value()) {
+            continue;
+        }
+        const double squared = *row.error_m * *row.error_m;
+        if (camera) {
+            camera_sum += squared;
+            ++camera_n;
+        } else {
+            marker_sum += squared;
+            ++marker_n;
+        }
+    }
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    result.camera_rmse_m =
+        camera_n > 0 ? std::sqrt(camera_sum / static_cast<double>(camera_n)) : kNaN;
+    result.marker_rmse_m =
+        marker_n > 0 ? std::sqrt(marker_sum / static_cast<double>(marker_n)) : kNaN;
+    return result;
+}
+
 ReferenceTable build_reference_table(const Chunk& chunk,
                                      const CoordinateSystem& display_crs) {
     ReferenceTable table;
@@ -174,11 +207,28 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         }
         return Eigen::Vector3d(p.x, p.y, p.z);
     };
-    const auto error_of = [](const std::optional<Eigen::Vector3d>& estimated,
-                             const std::optional<Eigen::Vector3d>& source)
+    // A geographic display CRS reports degrees, so its difference is taken in
+    // the frame's local ENU metres instead. This is only meaningful once the
+    // chunk geometry is georeferenced (the frame is identity before that).
+    const bool geographic_display =
+        geo && (display.kind() == crs::CrsKind::Geographic2D ||
+                display.kind() == crs::CrsKind::Geographic3D ||
+                display.kind() == crs::CrsKind::Compound);
+    const auto error_of = [&](const std::optional<Eigen::Vector3d>& estimated,
+                              const std::optional<Eigen::Vector3d>& source)
         -> std::optional<Eigen::Vector3d> {
         if (!estimated || !source) {
             return std::nullopt;
+        }
+        if (geographic_display) {
+            const Eigen::Vector3d e =
+                frame.to_local(CrsPoint{estimated->x(), estimated->y(), estimated->z()});
+            const Eigen::Vector3d s =
+                frame.to_local(CrsPoint{source->x(), source->y(), source->z()});
+            if (!e.allFinite() || !s.allFinite()) {
+                return std::nullopt;
+            }
+            return Eigen::Vector3d(e - s);
         }
         return Eigen::Vector3d(*estimated - *source);
     };
@@ -220,6 +270,9 @@ ReferenceTable build_reference_table(const Chunk& chunk,
             row.estimated = estimate_of(centres[ci]);
         }
         row.error = error_of(row.estimated, row.source);
+        if (row.error) {
+            row.error_m = row.error->norm();
+        }
         const double sigma = mean_accuracy(camera.reference.accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.camera_location_accuracy_m;
         row.sigma_xyz = per_axis_accuracy(camera.reference.accuracy, row.sigma);
@@ -257,6 +310,11 @@ ReferenceTable build_reference_table(const Chunk& chunk,
             row.estimated = estimate_of(marker.position);
         }
         row.error = error_of(row.estimated, row.source);
+        if (row.error) {
+            row.error_m = row.error->norm();
+        }
+        row.projection_count = marker.projections.size();
+        row.pinned = marker.pinned;
         const double sigma = mean_accuracy(marker.reference_accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.marker_location_accuracy_m;
         row.sigma_xyz = per_axis_accuracy(marker.reference_accuracy, row.sigma);
