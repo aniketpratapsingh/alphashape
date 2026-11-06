@@ -386,6 +386,14 @@ def main(argv):
         raise SystemExit(
             "run_gcp_validation: choose --synthetic or --real DIR --gcp CSV")
     report["passed"] = passed
+    rms = report["check_point_rms_m"]
+    # A bracket-tagged measurement line, the same shape the other
+    # benchmark-style tests use, so CI surfaces the numbers even when the test
+    # passes (ctest hides passing output).
+    print("[gcp validation] horizontal={:.6f} vertical={:.6f} total={:.6f} "
+          "tolerance={:.6f} passed={}".format(
+              rms["horizontal"], rms["vertical"], rms["total"],
+              args.tolerance, passed))
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if passed else 2
 
