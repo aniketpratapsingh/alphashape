@@ -36,6 +36,9 @@
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/workflow.hpp"
+#if defined(ALPHASHAPE_USE_PROJ)
+#include "apps/gui/reference_pane.hpp"
+#endif
 #include "base/utils/error.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
@@ -229,6 +232,10 @@ void MainWindow::create_docks() {
                                 tr("Workspace"));
     properties_dock_ = make_dock(this, QStringLiteral("dock.properties"), tr("Properties"),
                                  tr("Properties"));
+#if defined(ALPHASHAPE_USE_PROJ)
+    reference_dock_ = make_dock(this, QStringLiteral("dock.reference"), tr("Reference"),
+                                tr("Reference"));
+#endif
     photos_dock_ = make_dock(this, QStringLiteral("dock.photos"), tr("Photos"), tr("Photos"));
     log_dock_ = make_dock(this, QStringLiteral("dock.log"), tr("Log"), tr("Log"));
 
@@ -239,6 +246,9 @@ void MainWindow::create_docks() {
     selection_->setObjectName(QStringLiteral("selection.workspace"));
     workspace_pane_ = new WorkspacePane(app_, *selection_, workspace_dock_);
     properties_pane_ = new PropertiesPane(app_, *selection_, properties_dock_);
+#if defined(ALPHASHAPE_USE_PROJ)
+    reference_pane_ = new ReferencePane(app_, reference_dock_);
+#endif
     photos_pane_ = new PhotosPane(app_, *selection_, photos_dock_);
     log_pane_ = new LogPane(app_, log_dock_);
 
@@ -251,6 +261,9 @@ void MainWindow::create_docks() {
     const Pane panes[] = {
         {workspace_dock_, workspace_pane_},
         {properties_dock_, properties_pane_},
+#if defined(ALPHASHAPE_USE_PROJ)
+        {reference_dock_, reference_pane_},
+#endif
         {photos_dock_, photos_pane_},
         {log_dock_, log_pane_},
     };
@@ -267,6 +280,9 @@ void MainWindow::apply_default_layout() {
     } placement[] = {
         {workspace_dock_, Qt::LeftDockWidgetArea},
         {properties_dock_, Qt::RightDockWidgetArea},
+#if defined(ALPHASHAPE_USE_PROJ)
+        {reference_dock_, Qt::RightDockWidgetArea},
+#endif
         {photos_dock_, Qt::BottomDockWidgetArea},
         {log_dock_, Qt::BottomDockWidgetArea},
     };
@@ -275,6 +291,10 @@ void MainWindow::apply_default_layout() {
         addDockWidget(item.area, item.dock);
         item.dock->show();
     }
+#if defined(ALPHASHAPE_USE_PROJ)
+    tabifyDockWidget(properties_dock_, reference_dock_);
+#endif
+    properties_dock_->raise();
     tabifyDockWidget(photos_dock_, log_dock_);
     photos_dock_->raise();
     resizeDocks({workspace_dock_, properties_dock_}, {268, 320}, Qt::Horizontal);
@@ -399,6 +419,9 @@ void MainWindow::create_actions() {
     const QPair<QDockWidget*, QString> toggles[] = {
         {workspace_dock_, QStringLiteral("workspace")},
         {properties_dock_, QStringLiteral("properties")},
+#if defined(ALPHASHAPE_USE_PROJ)
+        {reference_dock_, QStringLiteral("reference")},
+#endif
         {photos_dock_, QStringLiteral("photos")},
         {log_dock_, QStringLiteral("log")},
     };
@@ -452,7 +475,12 @@ void MainWindow::create_menus() {
     edit->addAction(act("action.edit.preferences"));
 
     QMenu* view = menu(QStringLiteral("menu.view"), tr("&View"));
-    for (QDockWidget* pane : {workspace_dock_, properties_dock_, photos_dock_, log_dock_}) {
+    QList<QDockWidget*> docked{workspace_dock_, properties_dock_};
+#if defined(ALPHASHAPE_USE_PROJ)
+    docked.append(reference_dock_);
+#endif
+    docked << photos_dock_ << log_dock_;
+    for (QDockWidget* pane : docked) {
         view->addAction(pane->toggleViewAction());
     }
     view->addSeparator();

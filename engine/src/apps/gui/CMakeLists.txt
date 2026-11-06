@@ -34,6 +34,13 @@ target_link_libraries(alphashape_gui_lib
     PUBLIC Qt6::Widgets alphashape_algorithms alphashape_core
     PRIVATE alphashape_warnings Qt6::GuiPrivate)
 
+# The Reference pane renders the reference table, which is built only with the
+# PROJ-backed coordinate engine. A -DALPHASHAPE_USE_PROJ=OFF build leaves the
+# dock out entirely (main_window.cpp and the tests guard on the same macro).
+if(TARGET alphashape_crs)
+    target_sources(alphashape_gui_lib PRIVATE reference_model.cpp reference_pane.cpp)
+endif()
+
 # The engine uses `slots` and `signals` as ordinary identifiers (core/assets.hpp), which Qt's
 # keyword macros would break, so Qt code here spells them Q_SLOTS / Q_SIGNALS / Q_EMIT.
 target_compile_definitions(alphashape_gui_lib PUBLIC QT_NO_KEYWORDS)

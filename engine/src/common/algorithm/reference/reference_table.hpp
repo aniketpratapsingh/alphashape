@@ -28,6 +28,15 @@
 #include "common/core/reference_settings.hpp"
 #include "model/crs/coordinate_system.hpp"
 
+/// Heights in a reference row are ELLIPSOIDAL, in the same sense as
+/// OptimizeCameras reads them: the measured altitude and the estimated height
+/// are converted to ECEF with the WGS84 ellipsoid. A vertical datum carried by
+/// the display CRS (a compound CRS) is NOT applied -- no geoid or orthometric
+/// correction is introduced -- so the error columns stay comparable with the
+/// adjustment's own residual. A geographically referenced row's error is
+/// reported as an (east, north, up) vector of metres; other rows report the
+/// display-CRS difference.
+
 namespace alphashape::reference {
 
 enum class ReferenceRowKind { Camera, Marker, CheckPoint };
@@ -39,12 +48,34 @@ struct ReferenceRow {
     bool enabled = true;
     std::optional<Eigen::Vector3d> source;
     std::optional<Eigen::Vector3d> estimated;
+    /// estimated - source. When the display CRS is geographic this is the
+    /// difference in local east/north/up metres rather than degrees.
     std::optional<Eigen::Vector3d> error;
+    /// |error| in metres, or nullopt when either end is missing.
+    std::optional<double> error_m;
     double sigma = 0.0;
     /// Per-axis accuracies (east, north, up) for `source`. Falls back to
     /// `sigma` on an axis whose stored accuracy is not usable.
     Eigen::Vector3d sigma_xyz = Eigen::Vector3d::Constant(0.0);
     double capture_distance_m = std::numeric_limits<double>::quiet_NaN();
+    /// Camera projections of a marker row (0 for a camera).
+    std::size_t projection_count = 0;
+    /// Marker placed interactively by the user (markers only).
+    bool pinned = false;
+};
+
+/// RMSE over the rows that carry both ends of an error. Camera rows use the
+/// cameras whose reference is enabled; marker rows are split into control and
+/// check points, exactly as OptimizeCameras treats them.
+struct ReferenceSummary {
+    std::size_t camera_count = 0;
+    /// All marker rows (control points plus check points).
+    std::size_t marker_count = 0;
+    std::size_t control_count = 0;
+    std::size_t check_count = 0;
+    double camera_rmse_m = std::numeric_limits<double>::quiet_NaN();
+    double control_rmse_m = std::numeric_limits<double>::quiet_NaN();
+    double check_rmse_m = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct ReferenceTable {
@@ -53,13 +84,15 @@ struct ReferenceTable {
     /// Markers that are control points (role "gcp" with a reference source);
     /// check points and markers without a source are excluded.
     std::size_t control_count() const;
+    ReferenceSummary summary() const;
 };
 
-/// Marker reference role, stored under `Marker::meta` key "type".
-enum class MarkerReferenceRole { Gcp, CheckPoint };
-MarkerReferenceRole marker_role(const Marker& marker);
-void set_marker_role(Marker& marker, MarkerReferenceRole role);
-const char* marker_reference_role_name(MarkerReferenceRole role);
+// The role helpers live in core (common/core/marker.hpp) so the command layer
+// can reach them; re-exported here for the reference API.
+using alphashape::MarkerReferenceRole;
+using alphashape::marker_reference_role_name;
+using alphashape::marker_role;
+using alphashape::set_marker_role;
 
 /// Build the table. An unset/local `display_crs`, or an unreferenced chunk,
 /// keeps coordinates in chunk-local units; otherwise sources are converted from

@@ -6,8 +6,10 @@
 #include <optional>
 #include <utility>
 
+#include "common/algorithm/reference/reference_orientation.hpp"
 #include "model/crs/local_frame.hpp"
 #include "model/crs/transform.hpp"
+#include "model/geo/geodesy.hpp"
 
 namespace alphashape::reference {
 namespace {
@@ -31,6 +33,32 @@ Eigen::Vector3d camera_centre(const Transform& pose) {
 
 bool positive_finite(double value) {
     return std::isfinite(value) && value > 0.0;
+}
+
+/// The position a camera reference measures: the projection centre plus the
+/// mounted antenna's lever arm, in chunk-local units. This is exactly
+/// OptimizeCameras' `A = C + R^T lever` (bundle_adjustment.hpp): the lever is
+/// in metres in the camera frame, rotated by the pose and divided by the chunk
+/// similarity scale. An unset antenna (or a camera without a sensor) leaves the
+/// centre unchanged.
+Eigen::Vector3d camera_antenna_position(const Chunk& chunk, const Camera& camera,
+                                        const Eigen::Vector3d& centre) {
+    const std::vector<Sensor>& sensors = chunk.sensors();
+    if (camera.sensor_id < 0 ||
+        static_cast<std::size_t>(camera.sensor_id) >= sensors.size()) {
+        return centre;
+    }
+    const Eigen::Vector3d lever = effective_antenna(chunk, camera).camera_offset();
+    if (lever.isZero()) {
+        return centre;
+    }
+    const double scale =
+        std::cbrt(std::abs(chunk.transform().block<3, 3>(0, 0).determinant()));
+    if (!positive_finite(scale)) {
+        return centre;
+    }
+    const Eigen::Matrix3d rotation = camera.pose.block<3, 3>(0, 0);
+    return centre + rotation.transpose() * lever / scale;
 }
 
 /// The per-axis accuracies collapsed to one 1-sigma figure, or -1 when they
@@ -60,23 +88,6 @@ std::optional<Eigen::Vector3d> as_vector(const std::optional<CrsPoint>& point) {
 
 }  // namespace
 
-MarkerReferenceRole marker_role(const Marker& marker) {
-    if (const std::string* value = marker.meta.find("type")) {
-        if (*value == "check_point") {
-            return MarkerReferenceRole::CheckPoint;
-        }
-    }
-    return MarkerReferenceRole::Gcp;
-}
-
-void set_marker_role(Marker& marker, MarkerReferenceRole role) {
-    marker.meta.set("type", marker_reference_role_name(role));
-}
-
-const char* marker_reference_role_name(MarkerReferenceRole role) {
-    return role == MarkerReferenceRole::CheckPoint ? "check_point" : "gcp";
-}
-
 std::size_t ReferenceTable::control_count() const {
     std::size_t count = 0;
     for (const ReferenceRow& row : rows) {
@@ -86,6 +97,50 @@ std::size_t ReferenceTable::control_count() const {
         }
     }
     return count;
+}
+
+ReferenceSummary ReferenceTable::summary() const {
+    ReferenceSummary result;
+    double camera_sum = 0.0;
+    double control_sum = 0.0;
+    double check_sum = 0.0;
+    std::size_t camera_n = 0;
+    std::size_t control_n = 0;
+    std::size_t check_n = 0;
+    for (const ReferenceRow& row : rows) {
+        if (row.kind == ReferenceRowKind::Camera) {
+            ++result.camera_count;
+        } else {
+            ++result.marker_count;
+        }
+        if (!row.error_m.has_value()) {
+            continue;
+        }
+        const double squared = *row.error_m * *row.error_m;
+        if (row.kind == ReferenceRowKind::Camera) {
+            if (!row.enabled) {
+                continue;
+            }
+            camera_sum += squared;
+            ++camera_n;
+        } else if (row.kind == ReferenceRowKind::CheckPoint) {
+            check_sum += squared;
+            ++check_n;
+        } else {
+            control_sum += squared;
+            ++control_n;
+        }
+    }
+    result.control_count = control_n;
+    result.check_count = check_n;
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    result.camera_rmse_m =
+        camera_n > 0 ? std::sqrt(camera_sum / static_cast<double>(camera_n)) : kNaN;
+    result.control_rmse_m =
+        control_n > 0 ? std::sqrt(control_sum / static_cast<double>(control_n)) : kNaN;
+    result.check_rmse_m =
+        check_n > 0 ? std::sqrt(check_sum / static_cast<double>(check_n)) : kNaN;
+    return result;
 }
 
 ReferenceTable build_reference_table(const Chunk& chunk,
@@ -174,11 +229,59 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         }
         return Eigen::Vector3d(p.x, p.y, p.z);
     };
-    const auto error_of = [](const std::optional<Eigen::Vector3d>& estimated,
-                             const std::optional<Eigen::Vector3d>& source)
+    // A geographic display CRS reports degrees, so its difference is taken in
+    // metres in a proper orthonormal ENU frame at the source. Converting both
+    // points to ECEF and rotating the difference avoids the similarity scale
+    // contaminating the result (the chunk transform's linear part is S*Q, not
+    // a rotation, so subtracting local-frame coordinates scales the error).
+    // Heights are ellipsoidal, exactly as OptimizeCameras reads them: a vertical
+    // datum in the display CRS is not applied.
+    const bool geographic_display =
+        geo && (display.kind() == crs::CrsKind::Geographic2D ||
+                display.kind() == crs::CrsKind::Geographic3D ||
+                display.kind() == crs::CrsKind::Compound);
+    const Eigen::Matrix4d internal_to_ecef = chunk.transform();
+    // The measured position as geodetic lon/lat/ellipsoidal height. A slot CRS
+    // that is already geographic names those units directly, which is exactly
+    // how OptimizeCameras reads the value; the display conversion is bypassed
+    // so a vertical datum in the display CRS cannot shift the height.
+    const auto geodetic_of = [&](const std::optional<Eigen::Vector3d>& value,
+                                 const std::optional<CoordinateSystem>& source_cs)
+        -> std::optional<geo::Geodetic> {
+        if (!value || !geo || !source_cs) {
+            return std::nullopt;
+        }
+        const crs::CrsKind kind = source_cs->kind();
+        if (kind == crs::CrsKind::Geographic2D || kind == crs::CrsKind::Geographic3D) {
+            return geo::Geodetic{value->x(), value->y(), value->z()};
+        }
+        return std::nullopt;
+    };
+    const auto error_of = [&](const std::optional<Eigen::Vector3d>& estimated_local,
+                              const std::optional<Eigen::Vector3d>& estimated,
+                              const std::optional<Eigen::Vector3d>& source,
+                              const std::optional<geo::Geodetic>& source_geodetic)
         -> std::optional<Eigen::Vector3d> {
         if (!estimated || !source) {
             return std::nullopt;
+        }
+        if (geographic_display) {
+            if (!estimated_local) {
+                return std::nullopt;
+            }
+            const Eigen::Vector3d estimate_ecef =
+                (internal_to_ecef * estimated_local->homogeneous()).head<3>();
+            const geo::Geodetic geodetic =
+                source_geodetic.value_or(geo::Geodetic{source->x(), source->y(), source->z()});
+            const Eigen::Vector3d source_ecef = geo::geodetic_to_ecef(geodetic);
+            const Eigen::Matrix3d enu_rotation =
+                geo::ecef_to_enu(geodetic).block<3, 3>(0, 0);
+            const Eigen::Vector3d enu =
+                enu_rotation * (estimate_ecef - source_ecef);
+            if (!enu.allFinite()) {
+                return std::nullopt;
+            }
+            return enu;
         }
         return Eigen::Vector3d(*estimated - *source);
     };
@@ -212,14 +315,23 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         row.id = camera.id;
         row.label = camera.label;
         row.kind = ReferenceRowKind::Camera;
-        row.enabled = camera.enabled;
+        // The checkbox means "use this reference", which is exactly the flag
+        // OptimizeCameras filters on -- not the alignment flag.
+        row.enabled = camera.reference.enabled;
         if (camera.reference.location) {
             row.source = source_of(camera.reference.location, camera_cs, camera_src);
         }
-        if (camera.enabled) {
-            row.estimated = estimate_of(centres[ci]);
+        const std::optional<Eigen::Vector3d> estimated_local =
+            camera.enabled
+                ? std::optional<Eigen::Vector3d>(
+                      camera_antenna_position(chunk, camera, centres[ci]))
+                : std::nullopt;
+        row.estimated = estimate_of(estimated_local);
+        row.error = error_of(estimated_local, row.estimated, row.source,
+                             geodetic_of(camera.reference.location, camera_cs));
+        if (row.error) {
+            row.error_m = row.error->norm();
         }
-        row.error = error_of(row.estimated, row.source);
         const double sigma = mean_accuracy(camera.reference.accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.camera_location_accuracy_m;
         row.sigma_xyz = per_axis_accuracy(camera.reference.accuracy, row.sigma);
@@ -246,17 +358,24 @@ ReferenceTable build_reference_table(const Chunk& chunk,
         ReferenceRow row;
         row.id = marker.id;
         row.label = marker.label;
-        row.kind = marker_role(marker) == MarkerReferenceRole::CheckPoint
-                       ? ReferenceRowKind::CheckPoint
-                       : ReferenceRowKind::Marker;
-        row.enabled = marker.valid;
+        const MarkerReferenceRole role = marker_role(marker);
+        row.kind = role == MarkerReferenceRole::CheckPoint ? ReferenceRowKind::CheckPoint
+                                                           : ReferenceRowKind::Marker;
+        // The checkbox means "control point": checked holds the marker in the
+        // adjustment, unchecked marks it as a check point. `valid` is the
+        // projection/filter status and is never edited from here.
+        row.enabled = role == MarkerReferenceRole::Gcp;
         if (marker.reference) {
             row.source = source_of(marker.reference, marker_cs, marker_src);
         }
-        if (marker.position) {
-            row.estimated = estimate_of(marker.position);
+        row.estimated = estimate_of(marker.position);
+        row.error = error_of(marker.position, row.estimated, row.source,
+                             geodetic_of(marker.reference, marker_cs));
+        if (row.error) {
+            row.error_m = row.error->norm();
         }
-        row.error = error_of(row.estimated, row.source);
+        row.projection_count = marker.projections.size();
+        row.pinned = marker.pinned;
         const double sigma = mean_accuracy(marker.reference_accuracy);
         row.sigma = sigma > 0.0 ? sigma : settings.marker_location_accuracy_m;
         row.sigma_xyz = per_axis_accuracy(marker.reference_accuracy, row.sigma);

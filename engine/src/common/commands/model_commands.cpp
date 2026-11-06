@@ -1169,6 +1169,79 @@ private:
     Eigen::Vector3d accuracy_;
 };
 
+/// Toggle one boolean flag of a marker: `valid` (the enabled checkbox) or
+/// `pinned` (placed interactively).
+class SetMarkerFlagCommand : public ChunkContainersCommand {
+public:
+    enum class Flag { Enabled, Pinned };
+
+    SetMarkerFlagCommand(std::int32_t chunk_id, std::int32_t marker_id, Flag flag,
+                         bool value)
+        : ChunkContainersCommand(chunk_id), marker_id_(marker_id), flag_(flag),
+          value_(value) {}
+
+    std::string name() const override {
+        return flag_ == Flag::Enabled ? "Set Marker Enabled" : "Set Marker Pinned";
+    }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+    }
+
+    void commit(Document& document) override {
+        Marker* marker = find_by_id(target_chunk(document).markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        if (flag_ == Flag::Enabled) {
+            marker->valid = value_;
+        } else {
+            marker->pinned = value_;
+        }
+    }
+
+private:
+    std::int32_t marker_id_;
+    Flag flag_;
+    bool value_;
+};
+
+/// Set a marker's reference role ("gcp" / "check_point") in one undoable
+/// step. The container snapshot restores the previous meta on revert.
+class SetMarkerRoleCommand : public ChunkContainersCommand {
+public:
+    SetMarkerRoleCommand(std::int32_t chunk_id, std::int32_t marker_id,
+                         MarkerReferenceRole role)
+        : ChunkContainersCommand(chunk_id), marker_id_(marker_id), role_(role) {}
+
+    std::string name() const override { return "Set Marker Role"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        if (find_by_id(chunk.markers(), marker_id_) == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        Marker* marker = find_by_id(chunk.markers(), marker_id_);
+        if (marker == nullptr) {
+            throw ValueError("no marker with id " + std::to_string(marker_id_));
+        }
+        set_marker_role(*marker, role_);
+    }
+
+private:
+    std::int32_t marker_id_;
+    MarkerReferenceRole role_;
+};
+
 class MoveMarkerProjectionCommand : public ChunkContainersCommand {
 public:
     MoveMarkerProjectionCommand(std::int32_t chunk_id, std::int32_t marker_id,
@@ -1894,7 +1967,7 @@ private:
 /// Set a flag ("enabled" or "selected") on a set of cameras in one step.
 class SetCameraFlagCommand : public ChunkContainersCommand {
 public:
-    enum class Flag { Enabled, Selected };
+    enum class Flag { Enabled, Selected, ReferenceEnabled };
 
     SetCameraFlagCommand(std::int32_t chunk_id, std::vector<std::int32_t> camera_ids,
                          Flag flag, bool value)
@@ -1904,8 +1977,12 @@ public:
           value_(value) {}
 
     std::string name() const override {
-        return flag_ == Flag::Enabled ? "Set Camera Enabled"
-                                      : "Set Camera Selected";
+        switch (flag_) {
+            case Flag::Enabled: return "Set Camera Enabled";
+            case Flag::Selected: return "Set Camera Selected";
+            case Flag::ReferenceEnabled: return "Set Camera Reference Enabled";
+        }
+        return "Set Camera Enabled";
     }
 
 protected:
@@ -1932,6 +2009,8 @@ protected:
             }
             if (flag_ == Flag::Enabled) {
                 camera->enabled = value_;
+            } else if (flag_ == Flag::ReferenceEnabled) {
+                camera->reference.enabled = value_;
             } else {
                 camera->selected = value_;
             }
@@ -1942,6 +2021,51 @@ private:
     std::vector<std::int32_t> camera_ids_;
     Flag flag_;
     bool value_;
+};
+
+/// Replace one camera's GNSS reference: its location and per-axis accuracy.
+/// Undo restores both, so editing a source coordinate and its accuracy is one
+/// reversible operation.
+class SetCameraReferenceCommand : public ChunkContainersCommand {
+public:
+    SetCameraReferenceCommand(std::int32_t chunk_id, std::int32_t camera_id,
+                              std::optional<Eigen::Vector3d> location,
+                              Eigen::Vector3d accuracy)
+        : ChunkContainersCommand(chunk_id), camera_id_(camera_id),
+          location_(location), accuracy_(accuracy) {}
+
+    std::string name() const override { return "Set Camera Reference"; }
+
+protected:
+    void validate(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        require_camera(chunk, camera_id_, "set camera reference");
+        if (!positive_finite(accuracy_)) {
+            throw ValueError(
+                "set camera reference: accuracy must be finite and positive");
+        }
+        if (location_.has_value() && !location_->allFinite()) {
+            throw ValueError("set camera reference: location is not finite");
+        }
+    }
+
+    void commit(Document& document) override {
+        Chunk& chunk = target_chunk(document);
+        for (Camera& camera : chunk.cameras()) {
+            if (camera.id == camera_id_) {
+                camera.reference.location = location_;
+                camera.reference.accuracy = accuracy_;
+                return;
+            }
+        }
+        throw ValueError("set camera reference: no camera with id " +
+                         std::to_string(camera_id_));
+    }
+
+private:
+    std::int32_t camera_id_;
+    std::optional<Eigen::Vector3d> location_;
+    Eigen::Vector3d accuracy_;
 };
 
 /// Append every chunk of `source` to the target document.
@@ -3113,6 +3237,23 @@ std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
         chunk_id, marker_id, reference, accuracy);
 }
 
+std::unique_ptr<AbstractCommand> make_set_marker_enabled_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool enabled) {
+    return std::make_unique<SetMarkerFlagCommand>(
+        chunk_id, marker_id, SetMarkerFlagCommand::Flag::Enabled, enabled);
+}
+
+std::unique_ptr<AbstractCommand> make_set_marker_pinned_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool pinned) {
+    return std::make_unique<SetMarkerFlagCommand>(
+        chunk_id, marker_id, SetMarkerFlagCommand::Flag::Pinned, pinned);
+}
+
+std::unique_ptr<AbstractCommand> make_set_marker_role_command(
+    std::int32_t chunk_id, std::int32_t marker_id, MarkerReferenceRole role) {
+    return std::make_unique<SetMarkerRoleCommand>(chunk_id, marker_id, role);
+}
+
 std::unique_ptr<AbstractCommand> make_move_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
     Eigen::Vector2d pixel) {
@@ -3193,6 +3334,20 @@ std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
     return std::make_unique<SetCameraFlagCommand>(
         chunk_id, std::move(camera_ids), SetCameraFlagCommand::Flag::Enabled,
         enabled);
+}
+
+std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
+    std::int32_t chunk_id, std::int32_t camera_id, bool enabled) {
+    return std::make_unique<SetCameraFlagCommand>(
+        chunk_id, std::vector<std::int32_t>{camera_id},
+        SetCameraFlagCommand::Flag::ReferenceEnabled, enabled);
+}
+
+std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy) {
+    return std::make_unique<SetCameraReferenceCommand>(
+        chunk_id, camera_id, location, accuracy);
 }
 
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(

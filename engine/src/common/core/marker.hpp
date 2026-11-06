@@ -91,4 +91,25 @@ struct Marker {
     }
 };
 
+/// Marker reference role, stored under `Marker::meta` key "type". A control
+/// point (Gcp) constrains the adjustment; a check point is held out of it.
+enum class MarkerReferenceRole { Gcp, CheckPoint };
+
+inline MarkerReferenceRole marker_role(const Marker& marker) {
+    if (const std::string* value = marker.meta.find("type")) {
+        if (*value == "check_point") {
+            return MarkerReferenceRole::CheckPoint;
+        }
+    }
+    return MarkerReferenceRole::Gcp;
+}
+
+inline const char* marker_reference_role_name(MarkerReferenceRole role) {
+    return role == MarkerReferenceRole::CheckPoint ? "check_point" : "gcp";
+}
+
+inline void set_marker_role(Marker& marker, MarkerReferenceRole role) {
+    marker.meta.set("type", marker_reference_role_name(role));
+}
+
 }  // namespace alphashape

@@ -120,6 +120,16 @@ std::unique_ptr<AbstractCommand> make_remove_marker_command(
 std::unique_ptr<AbstractCommand> make_set_marker_reference_command(
     std::int32_t chunk_id, std::int32_t marker_id,
     std::optional<Eigen::Vector3d> reference, Eigen::Vector3d accuracy);
+/// Set a marker's enabled flag (`Marker::valid`). Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_marker_enabled_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool enabled);
+/// Set a marker's pinned flag (interactively placed). Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_marker_pinned_command(
+    std::int32_t chunk_id, std::int32_t marker_id, bool pinned);
+/// Set a marker's reference role (control point / check point). Undo restores
+/// the previous role. Check points are excluded from the adjustment.
+std::unique_ptr<AbstractCommand> make_set_marker_role_command(
+    std::int32_t chunk_id, std::int32_t marker_id, MarkerReferenceRole role);
 std::unique_ptr<AbstractCommand> make_move_marker_projection_command(
     std::int32_t chunk_id, std::int32_t marker_id, std::int32_t camera_id,
     Eigen::Vector2d pixel);
@@ -222,6 +232,16 @@ std::unique_ptr<AbstractCommand> make_rename_asset_command(
 
 std::unique_ptr<AbstractCommand> make_set_camera_enabled_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool enabled);
+/// Set one camera's reference flag (`Camera::reference.enabled`), the flag
+/// OptimizeCameras gates its GNSS prior on. Undo restores it.
+std::unique_ptr<AbstractCommand> make_set_camera_reference_enabled_command(
+    std::int32_t chunk_id, std::int32_t camera_id, bool enabled);
+/// Set one camera's GNSS reference (location and per-axis accuracy). Undo
+/// restores both. The accuracy must be finite and positive, and a location
+/// must be finite.
+std::unique_ptr<AbstractCommand> make_set_camera_reference_command(
+    std::int32_t chunk_id, std::int32_t camera_id,
+    std::optional<Eigen::Vector3d> location, Eigen::Vector3d accuracy);
 std::unique_ptr<AbstractCommand> make_set_camera_selected_command(
     std::int32_t chunk_id, std::vector<std::int32_t> camera_ids, bool selected);
 

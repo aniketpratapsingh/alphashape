@@ -259,6 +259,7 @@ bool WorkspacePane::activate_chunk(std::int32_t chunk_id) {
     document.set_active_chunk_id(chunk_id);
     app_.mark_dirty();
     model_->refresh();
+    Q_EMIT app_.active_chunk_changed(chunk_id);
     return true;
 }
 
