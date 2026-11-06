@@ -347,6 +347,8 @@ void run_task_kwargs(alphashape::Document& d, const std::string& name, py::kwarg
 /// the Document <-> Chunk cycle stays collectable.
 py::object attach_document(py::object document, const std::shared_ptr<alphashape::Chunk>& chunk);
 py::object owning_document_object(py::object chunk_self);
+void execute_command(py::object document,
+                     std::unique_ptr<alphashape::AbstractCommand> command);
 
 /// Run a chunk-scoped task on the document that owns `self`.
 ///
@@ -377,6 +379,96 @@ struct ElevationView {
 struct OrthomosaicView {
     std::shared_ptr<alphashape::Chunk> chunk;
     const alphashape::Orthomosaic* orthomosaic = nullptr;
+};
+
+/// Proxy types below refer to an element INSIDE a chunk vector by (chunk, id)
+/// and re-resolve on every access. Holding the element's address would dangle
+/// as soon as any mutation reallocated or reordered the vector.
+struct MarkerRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Marker& get() const {
+        for (const alphashape::Marker& marker : chunk->markers()) {
+            if (marker.id == id) {
+                return marker;
+            }
+        }
+        throw alphashape::ValueError("marker id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct CameraRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Camera& get() const {
+        for (const alphashape::Camera& camera : chunk->cameras()) {
+            if (camera.id == id) {
+                return camera;
+            }
+        }
+        throw alphashape::ValueError("camera id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct MarkerGroupRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::MarkerGroup& get() const {
+        for (const alphashape::MarkerGroup& group : chunk->marker_groups()) {
+            if (group.id == id) {
+                return group;
+            }
+        }
+        throw alphashape::ValueError("marker group id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+struct ScalebarRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    std::int32_t id = -1;
+
+    const alphashape::Scalebar& get() const {
+        for (const alphashape::Scalebar& bar : chunk->scalebars()) {
+            if (bar.id == id) {
+                return bar;
+            }
+        }
+        throw alphashape::ValueError("scalebar id " + std::to_string(id) +
+                                     " no longer exists");
+    }
+};
+
+/// Shared fields of every AssetSlot instantiation, so an AssetRef can read an
+/// asset through one pointer without knowing its payload type.
+struct AssetSlotBase {
+    std::int32_t id = -1;
+    std::string label;
+    std::int32_t group_id = -1;
+    bool enabled = true;
+};
+
+/// One asset of any kind, addressed by (chunk, kind, id) and resolved on
+/// every access. `label` is editable through the rename command the GUI uses.
+struct AssetRef {
+    std::shared_ptr<alphashape::Chunk> chunk;
+    py::object document;
+    alphashape::AssetKind kind = alphashape::AssetKind::Elevation;
+    std::int32_t id = -1;
+
+    /// Copy the common fields out of the addressed slot. Defined after all
+    /// the slot types are visible.
+    AssetSlotBase fields() const;
+    std::int32_t active_id() const;
 };
 
 template <class Slot>
@@ -689,96 +781,6 @@ std::int32_t camera_id_from_python(const alphashape::Chunk& chunk, py::handle va
     }
     throw alphashape::ValueError("no camera with id " + std::to_string(id));
 }
-
-/// Proxy types below refer to an element INSIDE a chunk vector by (chunk, id)
-/// and re-resolve on every access. Holding the element's address would dangle
-/// as soon as any mutation reallocated or reordered the vector.
-struct MarkerRef {
-    std::shared_ptr<alphashape::Chunk> chunk;
-    py::object document;
-    std::int32_t id = -1;
-
-    const alphashape::Marker& get() const {
-        for (const alphashape::Marker& marker : chunk->markers()) {
-            if (marker.id == id) {
-                return marker;
-            }
-        }
-        throw alphashape::ValueError("marker id " + std::to_string(id) +
-                                     " no longer exists");
-    }
-};
-
-struct CameraRef {
-    std::shared_ptr<alphashape::Chunk> chunk;
-    py::object document;
-    std::int32_t id = -1;
-
-    const alphashape::Camera& get() const {
-        for (const alphashape::Camera& camera : chunk->cameras()) {
-            if (camera.id == id) {
-                return camera;
-            }
-        }
-        throw alphashape::ValueError("camera id " + std::to_string(id) +
-                                     " no longer exists");
-    }
-};
-
-struct MarkerGroupRef {
-    std::shared_ptr<alphashape::Chunk> chunk;
-    py::object document;
-    std::int32_t id = -1;
-
-    const alphashape::MarkerGroup& get() const {
-        for (const alphashape::MarkerGroup& group : chunk->marker_groups()) {
-            if (group.id == id) {
-                return group;
-            }
-        }
-        throw alphashape::ValueError("marker group id " + std::to_string(id) +
-                                     " no longer exists");
-    }
-};
-
-struct ScalebarRef {
-    std::shared_ptr<alphashape::Chunk> chunk;
-    py::object document;
-    std::int32_t id = -1;
-
-    const alphashape::Scalebar& get() const {
-        for (const alphashape::Scalebar& bar : chunk->scalebars()) {
-            if (bar.id == id) {
-                return bar;
-            }
-        }
-        throw alphashape::ValueError("scalebar id " + std::to_string(id) +
-                                     " no longer exists");
-    }
-};
-
-/// Shared fields of every AssetSlot instantiation, so an AssetRef can read an
-/// asset through one pointer without knowing its payload type.
-struct AssetSlotBase {
-    std::int32_t id = -1;
-    std::string label;
-    std::int32_t group_id = -1;
-    bool enabled = true;
-};
-
-/// One asset of any kind, addressed by (chunk, kind, id) and resolved on
-/// every access. `label` is editable through the rename command the GUI uses.
-struct AssetRef {
-    std::shared_ptr<alphashape::Chunk> chunk;
-    py::object document;
-    alphashape::AssetKind kind = alphashape::AssetKind::Elevation;
-    std::int32_t id = -1;
-
-    /// Copy the common fields out of the addressed slot. Defined after all
-    /// the slot types are visible.
-    AssetSlotBase fields() const;
-    std::int32_t active_id() const;
-};
 
 /// Dense Eigen matrix as nested Python lists, the convention the other dense
 /// views use (no numpy dependency). An empty matrix yields an empty list.
