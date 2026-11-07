@@ -31,21 +31,26 @@ confirm an identity.
 
 ### Measured in CI
 
-Filled from the CI log of the run that introduced this document (the test
-`python_gcp_validation` prints the JSON, and also runs the scenario through
-`ctest`). Numbers are metres; the bound is 2 cm.
+The test `python_gcp_validation` prints one JSON object and a bracket-tagged
+measurement line; CI surfaces the line even when the test passes. Numbers are
+metres; the bound is 2 cm.
+
+Measured by `python_gcp_validation` on the PR's CI run (Linux x86-64,
+run 42314821252, test 1966, 1.35 s):
 
 | quantity | value |
 | --- | --- |
-| images | pending CI run |
-| markers after detection + placement | pending CI run |
+| images | 12 |
+| markers after detection + placement | 12 |
+| markers detected automatically | 0 (the fixture has no printed targets; the projections come from the truth poses) |
 | control points | 9 |
 | check points | 3 |
-| georeferenced by `updateTransform` | pending CI run |
-| horizontal check-point RMS | pending CI run |
-| vertical check-point RMS | pending CI run |
-| total check-point RMS | pending CI run |
-| passed the 2 cm bound | pending CI run |
+| georeferenced by `updateTransform` | yes |
+| horizontal check-point RMS | 0.012331 m |
+| vertical check-point RMS | 0.008786 m |
+| total check-point RMS | 0.015141 m |
+| engine `update_transform.rms_check_m` | 0.0151408 m |
+| passed the 2 cm bound | yes |
 
 ## Real block
 
