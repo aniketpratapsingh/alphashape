@@ -22,7 +22,7 @@ whose truth poses, ground grid and building are recorded in
 3. adds each marker's projections by projecting its truth position through the
    fixture's truth camera pose, then offsets every projection by seeded uniform
    noise of 0.5 px peak to peak (±0.25 px per axis);
-4. weights the exact-GPS camera references at 1 mm (not the 10 m consumer
+4. weights the exact-GPS camera references at 1 cm (not the 10 m consumer
    default), so the near-planar network cannot trade camera depth against scene
    depth, and sets the marker reference accuracy to the 1 cm the survey noise
    actually has;

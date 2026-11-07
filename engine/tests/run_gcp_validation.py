@@ -142,8 +142,10 @@ ROOF_HEIGHT = 9.52
 PROJECTION_NOISE_PX = 0.25
 PROJECTION_SEED = 20261107
 # The fixture writes exact GPS EXIF (sub-millimetre); this is the 1-sigma the
-# camera references are weighted at in the synthetic adjustment.
-CAMERA_ACCURACY_M = 0.001
+# camera references are weighted at in the synthetic adjustment. 1 cm is the
+# pose accuracy the alignment itself reaches, so the prior neither overrides
+# the image geometry nor lets the near-planar network drift.
+CAMERA_ACCURACY_M = 0.01
 
 
 def noise(index, axis):
