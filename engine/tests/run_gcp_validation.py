@@ -117,8 +117,10 @@ def ecef_to_enu(ecef, origin):
     """Inverse of `enu_to_geodetic`'s rotation: ECEF -> local ENU."""
     rotation, origin_ecef = enu_to_ecef_matrix(origin)
     delta = [ecef[i] - origin_ecef[i] for i in range(3)]
+    # `rotation` maps ENU -> ECEF (columns are east, north, up), so the inverse
+    # is its transpose: enu[c] = sum_r rotation[r][c] * delta[r].
     return tuple(
-        sum(rotation[c][r] * delta[r] for r in range(3)) for c in range(3))
+        sum(rotation[r][c] * delta[r] for r in range(3)) for c in range(3))
 
 
 def geodetic_to_enu(lon, lat, height, origin):
@@ -240,6 +242,27 @@ def write_camera_reference_csv(path, rows):
                 accuracy[0], accuracy[1], accuracy[2]))
 
 
+def apply_exact_camera_accuracy(chunk, directory):
+    """Re-import the EXIF camera references with their true 1-sigma accuracy.
+
+    AddPhotos stores the position but no accuracy, so the fit would fall back
+    to the 10 m consumer default and leave the near-planar nadir network free
+    to trade camera depth against scene depth. In the exact-camera scenarios
+    the fixture GPS is genuinely sub-millimetre; declare that.
+    """
+    rows = []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if reference is None:
+            continue
+        rows.append((camera.label, reference[0], reference[1], reference[2],
+                     (EXACT_CAMERA_ACCURACY_M, EXACT_CAMERA_ACCURACY_M,
+                      EXACT_CAMERA_ACCURACY_M)))
+    path = os.path.join(directory, "camera_accuracy.csv")
+    write_camera_reference_csv(path, rows)
+    chunk.importReference(path=path, create_markers=False)
+
+
 def apply_camera_gnss(chunk, by_stem, directory):
     """Overwrite every camera reference with seeded consumer-GNSS positions.
 
@@ -344,6 +367,8 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         # The fixture EXIF GPS is exact (sub-millimetre); say so, so the bundle
         # adjustment cannot trade camera depth against scene depth.
         chunk.camera_location_accuracy = EXACT_CAMERA_ACCURACY_M
+        with tempfile.TemporaryDirectory() as directory:
+            apply_exact_camera_accuracy(chunk, directory)
     # A real alignment gives the cameras poses from the (possibly noisy)
     # references above. With the exact references this is the fixture's truth
     # GPS, which is the zero-noise pipeline-exactness ablation.
