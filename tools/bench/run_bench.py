@@ -309,14 +309,6 @@ DOWNLOAD_ATTEMPTS = 4
 DOWNLOAD_BACKOFF_S = 5.0
 DOWNLOAD_TIMEOUT_S = 120
 
-# The manifest pin is computed on the runner, not on the machine that authors the
-# manifest: this marker is a placeholder that tells `download` to fetch the archive
-# once WITHOUT verifying, print its SHA-256 and byte count, and stop. It is 64 zero
-# hex digits (not a plausible digest) because the manifest test asserts every
-# download's hash is a 64-character hex string and its byte count is positive. The
-# placeholder path below is removed as soon as the real values are pinned.
-PENDING_SHA = "0" * 64
-
 
 def _is_transient_download_error(error: BaseException) -> bool:
     """True for a network failure that is worth retrying.
@@ -392,10 +384,6 @@ def download(
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    if remote.sha256 == PENDING_SHA:
-        _collect_pin(remote, destination)
-        return
-
     if destination.exists():
         if destination.stat().st_size == remote.bytes and sha256_file(destination) == remote.sha256:
             print(f"  cached   {destination.name} ({remote.bytes:,} bytes)")
@@ -458,38 +446,6 @@ def download(
     tmp.unlink(missing_ok=True)
     plural = "attempt" if attempts == 1 else "attempts"
     raise SystemExit(f"{remote.url}: download failed after {attempts} {plural} ({reason})")
-
-
-def _collect_pin(remote: RemoteFile, destination: Path) -> None:
-    """One-off: download an archive whose SHA-256 is still a placeholder and print it.
-
-    Exists only while a new dataset's manifest carries ``PENDING_SHA``. It fetches
-    the archive without verifying, computes the digest and byte count, prints both
-    on unmistakable lines for the runner log, and stops the run so the values can be
-    pinned. It is deleted once datasets.json holds the real numbers.
-    """
-    tmp = destination.with_suffix(destination.suffix + ".part")
-    print(f"  download (collect pin) {remote.url}")
-    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-        if attempt > 1:
-            time.sleep(DOWNLOAD_BACKOFF_S * (2 ** (attempt - 2)))
-        tmp.unlink(missing_ok=True)
-        try:
-            _fetch_once(remote, tmp)
-        except Exception as error:  # noqa: BLE001 - retried or surfaced below
-            if not _is_transient_download_error(error):
-                raise SystemExit(f"{remote.url}: {error}") from error
-            continue
-        size = tmp.stat().st_size
-        if size == 0:
-            continue
-        print(f"PIN-SHA256 {sha256_file(tmp)}")
-        print(f"PIN-BYTES {size}")
-        raise SystemExit(
-            "sha256 and byte pin printed above; write them into datasets.json "
-            "and remove the PENDING-PIN placeholder path from run_bench.py"
-        )
-    raise SystemExit(f"{remote.url}: download failed while collecting the pin")
 
 
 # ---------------------------------------------------------------------------
