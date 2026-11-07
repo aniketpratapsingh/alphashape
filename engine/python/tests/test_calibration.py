@@ -111,6 +111,12 @@ class TestCalibrationTasks(unittest.TestCase):
         chunk.detectFiducials(fiducial_type="circle")
         chunk.detectFiducials(detector="corner")
 
+    def test_detect_fiducials_refuses_both_spellings(self):
+        _, chunk = chunk_with(CAM_A)
+        with self.assertRaises(alphashape.ValueError) as context:
+            chunk.detectFiducials(fiducial_type="circle", detector="corner")
+        self.assertIn("not both", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

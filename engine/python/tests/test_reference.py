@@ -118,6 +118,15 @@ class TestExportReference(unittest.TestCase):
             with self.assertRaises(alphashape.ValueError):
                 chunk.exportReference(path=path, columns_order=["label", "banana"])
 
+    def test_both_column_spellings_are_rejected(self):
+        _, chunk = local_chunk()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "out.csv")
+            with self.assertRaises(alphashape.ValueError) as context:
+                chunk.exportReference(path=path, columns=["label"],
+                                      columns_order=["label"])
+        self.assertIn("not both", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

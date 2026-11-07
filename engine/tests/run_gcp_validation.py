@@ -3,22 +3,29 @@
 
 Two modes:
 
-  * ``--synthetic`` builds the aerial synthetic block, adds 12 control points
-    (6 on the ground, 6 on the elevated building) with 1 cm reference noise,
-    holds 3 of them out as check points, detects/refines marker projections and
-    georeferences the block, then reports the check-point RMS.
+  * ``--synthetic`` aligns the 12-image aerial fixture (MatchPhotos +
+    AlignCameras), places 12 markers from the fixture's truth projections with
+    seeded 0.5 px noise, triangulates them with refineMarkers, imports control
+    references (truth + 1 cm noise) and holds 3 labels out as check points,
+    refits the datum with UpdateTransform and the bundle with OptimizeCameras,
+    then reports the check-point RMS measured against the TRUE positions.
   * ``--real <dir> --gcp <csv>`` runs match -> align -> detect markers ->
-    import the CSV -> bundle-adjust and reports the check-point RMS.
+    import the CSV -> UpdateTransform -> OptimizeCameras and reports the
+    check-point RMS. ``--crs`` must name a geographic (lon/lat) CRS; projected
+    coordinates are refused because this script converts references as lon/lat.
 
 The script prints ONE JSON object on stdout and exits 0 when the total
-check-point RMS is within the tolerance (default 2 cm), 2 otherwise. No data is
-downloaded and nothing is written outside a temporary directory.
+check-point RMS is within the tolerance (default 2 cm), 2 otherwise. A check
+label with no marker or no computed position is an error (exit 2), so a missing
+check point cannot silently shrink the sample. No data is downloaded and
+nothing is written outside a temporary directory.
 """
 
 import argparse
 import json
 import math
 import os
+import random
 import sys
 import tempfile
 
@@ -96,14 +103,24 @@ def enu_to_geodetic(enu, origin):
 def ecef_to_local(ecef, transform):
     """Map an ECEF point into the chunk's local frame via chunk.transform.
 
-    chunk.transform is the rigid local-ENU -> ECEF placement, so its inverse
-    is the transpose of its rotation block applied to (ecef - translation).
+    chunk.transform is a similarity local -> ECEF (E = scale * R * L + shift),
+    so its inverse is L = R^T (E - shift) / scale. The rotation block is
+    scaled in a similarity, hence the cube root of its determinant.
     """
     rotation = [[transform[r][c] for c in range(3)] for r in range(3)]
     shift = [transform[row][3] for row in range(3)]
+    determinant = (
+        rotation[0][0] * (rotation[1][1] * rotation[2][2] -
+                          rotation[1][2] * rotation[2][1])
+        - rotation[0][1] * (rotation[1][0] * rotation[2][2] -
+                            rotation[1][2] * rotation[2][0])
+        + rotation[0][2] * (rotation[1][0] * rotation[2][1] -
+                            rotation[1][1] * rotation[2][0]))
+    scale = abs(determinant) ** (1.0 / 3.0)
     delta = [ecef[i] - shift[i] for i in range(3)]
     return tuple(
-        sum(rotation[c][r] * delta[c] for c in range(3)) for r in range(3))
+        sum(rotation[c][r] * delta[c] for c in range(3)) / scale
+        for r in range(3))
 
 
 # The synthetic block: the ground points sit at z = 0, the elevated ones on the
@@ -116,11 +133,10 @@ ELEVATED = [(-19.0, 6.0), (-14.0, 6.5), (-9.0, 7.0),
 CHECK_LABELS = {"G6", "E2", "E5"}
 ROOF_HEIGHT = 9.52
 
-# The arbitrary local frame the block is reconstructed in: a known similarity
-# the georeferencing step has to undo.
-SIM_SCALE = 0.5
-SIM_ANGLE = math.radians(25.0)
-SIM_SHIFT = (12.0, -7.0, 3.0)
+# Marker projections carry a seeded uniform offset in [-0.5, +0.5] px per axis:
+# about the image-space accuracy the adjustment assumes (0.5 px).
+PROJECTION_NOISE_PX = 0.5
+PROJECTION_SEED = 20261107
 
 
 def noise(index, axis):
@@ -128,12 +144,10 @@ def noise(index, axis):
     return (((index * 37 + axis * 11 + 5) % 101) / 100.0 - 0.5) * 0.02
 
 
-def to_local_frame(point):
-    x, y, z = point
-    cos_a, sin_a = math.cos(SIM_ANGLE), math.sin(SIM_ANGLE)
-    return (SIM_SCALE * (cos_a * x - sin_a * y) + SIM_SHIFT[0],
-            SIM_SCALE * (sin_a * x + cos_a * y) + SIM_SHIFT[1],
-            SIM_SCALE * z + SIM_SHIFT[2])
+def truth_local(enu, transform):
+    """The true ENU point in the chunk-local frame after georeferencing."""
+    lon, lat, height = enu_to_geodetic(enu, ORIGIN)
+    return ecef_to_local(geodetic_to_ecef(lon, lat, height), transform)
 
 
 def truth_points():
@@ -168,17 +182,24 @@ def write_reference_csv(path, rows):
             handle.write("{},{!r},{!r},{!r}\n".format(label, x, y, z))
 
 
-def check_point_errors(chunk, labels):
-    """Per-axis error of each held-out marker after georeferencing."""
-    transform = chunk.transform
+def check_point_errors(chunk, labels, targets):
+    """Per-axis error of each held-out marker against `targets`.
+
+    `targets` maps a label to its true chunk-local position. A label with no
+    marker or no computed position raises ValueError: a missing check point has
+    to fail the scenario instead of silently shrinking the sample.
+    """
     markers = {marker.label: marker for marker in chunk.markers}
+    missing = [label for label in labels
+               if label not in markers or markers[label].position is None]
+    if missing:
+        raise ValueError(
+            "missing or unpositioned check point(s): " + ", ".join(missing))
     errors = []
     for label in labels:
-        marker = markers[label]
-        if marker.position is None or marker.reference is None:
-            continue
-        local = ecef_to_local(geodetic_to_ecef(*marker.reference), transform)
-        delta = [marker.position[i] - local[i] for i in range(3)]
+        position = markers[label].position
+        target = targets[label]
+        delta = [position[i] - target[i] for i in range(3)]
         errors.append({"label": label,
                        "horizontal": math.hypot(delta[0], delta[1]),
                        "vertical": delta[2],
@@ -187,13 +208,28 @@ def check_point_errors(chunk, labels):
     return errors
 
 
+def reference_local_targets(chunk, labels):
+    """Chunk-local positions of the labels' stored (lon/lat) references."""
+    markers = {marker.label: marker for marker in chunk.markers}
+    transform = chunk.transform
+    targets = {}
+    for label in labels:
+        marker = markers.get(label)
+        if marker is None or marker.reference is None:
+            raise ValueError("missing check point: " + label)
+        targets[label] = ecef_to_local(
+            geodetic_to_ecef(*marker.reference), transform)
+    return targets
+
+
 def root_mean_square(values):
-    return math.sqrt(sum(value * value for value in values) / len(values)) \
-        if values else 0.0
+    if not values:
+        raise ValueError("root mean square of an empty sample")
+    return math.sqrt(sum(value * value for value in values) / len(values))
 
 
 def run_synthetic(args):
-    """Build the synthetic GCP block and measure the held-out check points."""
+    """Align the fixture, triangulate markers, georeference and optimise."""
     with open(os.path.join(DATA_DIR, "aerial_truth.json"),
               encoding="utf-8") as handle:
         truth = json.load(handle)
@@ -203,39 +239,45 @@ def run_synthetic(args):
     doc.active_chunk = chunk
     doc.run_task("AddPhotos",
                  filenames=[os.path.join(DATA_DIR, name) for name in images])
-    # Geographic CRS: marker references are (longitude, latitude, altitude).
+    # A real alignment gives the cameras poses, and the fixture's exact GPS
+    # EXIF georeferences the chunk. Geographic CRS, so marker references are
+    # (longitude, latitude, altitude).
+    doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
+    doc.run_task("AlignCameras")
     chunk.crs_epsg = 4326
 
-    first_camera = chunk.cameras[0].label
-    before = len(chunk.markers)
-    chunk.detectMarkers(target_type="Circular", cameras=[first_camera])
-    detected = len(chunk.markers) - before
-
     points = truth_points()
-    for label, enu in points:
-        chunk.addMarker(label=label, position=to_local_frame(enu))
+    for label, _ in points:
+        chunk.addMarker(label=label)
 
+    # Marker positions are NOT seeded: they come from image measurements only.
+    # Every projection is the fixture's truth projection plus seeded noise.
     by_stem = {os.path.splitext(item["file"])[0]: item
                for item in truth["images"]}
+    rng = random.Random(PROJECTION_SEED)
     for camera in chunk.cameras:
         image = by_stem.get(camera.label)
         if image is None:
             continue
         for label, enu in points:
             pixel = project_truth(image, enu)
-            if pixel is not None:
-                chunk.setMarkerProjection(label, camera.label, pixel[0], pixel[1])
+            if pixel is None:
+                continue
+            u = pixel[0] + rng.uniform(-PROJECTION_NOISE_PX,
+                                       PROJECTION_NOISE_PX)
+            v = pixel[1] + rng.uniform(-PROJECTION_NOISE_PX,
+                                       PROJECTION_NOISE_PX)
+            chunk.setMarkerProjection(label, camera.label, u, v)
 
     control_rows = []
     check_rows = []
     for index, (label, enu) in enumerate(points):
-        noisy = tuple(enu[axis] + noise(index, axis) for axis in range(3))
-        lon, lat, height = enu_to_geodetic(noisy, ORIGIN)
-        row = (label, lon, lat, height)
         if label in CHECK_LABELS:
-            check_rows.append(row)
+            # Held out of the fit, so its (unused) reference is the truth.
+            check_rows.append((label,) + enu_to_geodetic(enu, ORIGIN))
         else:
-            control_rows.append(row)
+            noisy = tuple(enu[axis] + noise(index, axis) for axis in range(3))
+            control_rows.append((label,) + enu_to_geodetic(noisy, ORIGIN))
 
     with tempfile.TemporaryDirectory() as directory:
         control_path = os.path.join(directory, "control.csv")
@@ -245,21 +287,28 @@ def run_synthetic(args):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
+    # Triangulate every marker from its projections (their only source of a
+    # position), fit the datum from the control markers, then refine the whole
+    # block in the bundle adjustment with the control references constraining.
     chunk.refineMarkers(cameras=[camera.label for camera in chunk.cameras])
-    # The block is not aligned: every camera pose is still the identity, so its
-    # EXIF reference would be an unusable correspondence. Disable the cameras
-    # before the datum fit so the control markers alone drive it (an unaligned
-    # camera's "centre" is the origin for all of them).
-    for camera in chunk.cameras:
-        camera.enabled = False
     chunk.updateTransform()
+    applied = chunk.meta.get("update_transform.applied") == "1"
+    if not applied:
+        raise ValueError("georeferencing failed: " +
+                         str(chunk.meta.get("update_transform.reason",
+                                            "unknown")))
+    chunk.optimizeCameras(use_gcps=True)
 
     labels = [label for label, _ in points if label in CHECK_LABELS]
-    errors = check_point_errors(chunk, labels)
+    targets = {label: truth_local(enu, chunk.transform)
+               for label, enu in points}
+    errors = check_point_errors(chunk, labels, targets)
+    if len(errors) != len(labels):
+        raise ValueError("evaluated {} check points, expected {}".format(
+            len(errors), len(labels)))
     horizontal = root_mean_square([e["horizontal"] for e in errors])
     vertical = root_mean_square([e["vertical"] for e in errors])
     total = root_mean_square([e["total"] for e in errors])
-    applied = chunk.meta.get("update_transform.applied") == "1"
     return {
         "scenario": "synthetic-gcp-block",
         "images": len(images),
@@ -268,7 +317,8 @@ def run_synthetic(args):
         "elevated_points": len(ELEVATED),
         "control_points": len(control_rows),
         "check_points": len(check_rows),
-        "detected_markers": detected,
+        "evaluated_check_points": len(errors),
+        "projection_noise_px": PROJECTION_NOISE_PX,
         "georeferenced": applied,
         "engine_check_rms_m": float(
             chunk.meta.get("update_transform.rms_check_m", "nan")),
@@ -303,8 +353,22 @@ def split_csv(path, check_labels):
     return control, checks
 
 
+def require_geographic_crs(code):
+    """Refuse a projected --crs: references are converted as lon/lat here."""
+    if not code:
+        return
+    if not hasattr(alphashape, "CoordinateSystem"):
+        raise ValueError("--crs needs a build with PROJ")
+    system = alphashape.CoordinateSystem(int(code))
+    if "+proj=longlat" not in system.toProj4():
+        raise ValueError(
+            "--crs must name a geographic (lon/lat) CRS; projected "
+            "coordinates are not supported")
+
+
 def run_real(args):
-    """Match -> align -> detect -> import GCPs -> bundle-adjust a real block."""
+    """Match -> align -> detect -> import GCPs -> georeference -> bundle-adjust."""
+    require_geographic_crs(args.crs)
     images = collect_images(args.real)
     if len(images) < 3:
         raise ValueError("need at least three images in " + args.real)
@@ -338,14 +402,29 @@ def run_real(args):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
+    # OptimizeCameras only consumes marker references in a georeferenced chunk.
+    # A block without usable camera GPS needs this fit to seed the transform
+    # from the control markers before the bundle adjustment runs.
+    chunk.updateTransform()
+    if chunk.meta.get("update_transform.applied") != "1":
+        raise ValueError("georeferencing failed: " +
+                         str(chunk.meta.get("update_transform.reason",
+                                            "unknown")))
     chunk.optimizeCameras(use_gcps=True)
-    errors = check_point_errors(chunk, sorted(check_labels))
+
+    labels = sorted(check_labels)
+    targets = reference_local_targets(chunk, labels)
+    errors = check_point_errors(chunk, labels, targets)
+    if len(errors) != len(labels):
+        raise ValueError("evaluated {} check points, expected {}".format(
+            len(errors), len(labels)))
     return {
         "scenario": "real-block",
         "images": len(images),
         "markers": len(chunk.markers),
         "control_points": len(control_lines) - 1,
         "check_points": len(check_lines) - 1,
+        "evaluated_check_points": len(errors),
         "optimizer": "OptimizeCameras",
         "check_point_rms_m": {
             "horizontal": root_mean_square(
@@ -379,16 +458,24 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    if args.synthetic:
-        report = run_synthetic(args)
-        passed = (report["georeferenced"] and
-                  report["check_point_rms_m"]["total"] <= args.tolerance)
-    elif args.real and args.gcp:
-        report = run_real(args)
-        passed = report["check_point_rms_m"]["total"] <= args.tolerance
-    else:
-        raise SystemExit(
-            "run_gcp_validation: choose --synthetic or --real DIR --gcp CSV")
+    try:
+        if args.synthetic:
+            report = run_synthetic(args)
+            passed = (report["georeferenced"] and
+                      report["evaluated_check_points"] ==
+                      report["check_points"] and
+                      report["check_point_rms_m"]["total"] <= args.tolerance)
+        elif args.real and args.gcp:
+            report = run_real(args)
+            passed = (report["evaluated_check_points"] ==
+                      report["check_points"] and
+                      report["check_point_rms_m"]["total"] <= args.tolerance)
+        else:
+            raise SystemExit(
+                "run_gcp_validation: choose --synthetic or --real DIR --gcp CSV")
+    except ValueError as error:
+        print("run_gcp_validation: {}".format(error), file=sys.stderr)
+        return 2
     report["passed"] = passed
     rms = report["check_point_rms_m"]
     # A bracket-tagged measurement line, the same shape the other

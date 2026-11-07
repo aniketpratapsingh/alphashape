@@ -26,6 +26,11 @@ DATA_DIR = os.path.join(
 )
 FIXTURE_A = os.path.join(DATA_DIR, "fixture_a.pgm")
 FIXTURE_B = os.path.join(DATA_DIR, "fixture_b.pgm")
+AERIAL = [
+    os.path.join(DATA_DIR, "aerial_r{}c{}.jpg".format(row, col))
+    for row in range(3)
+    for col in range(4)
+]
 
 
 def document_with_photos():
@@ -236,6 +241,19 @@ class TestMarkerSurfaceExtensions(unittest.TestCase):
         self.assertTrue(projection.enabled)
         # The earlier dict protocol still works.
         self.assertEqual(projection["camera_id"], camera.id)
+        as_dict = dict(projection)
+        self.assertEqual(set(as_dict),
+                         {"camera_id", "camera", "pixel", "enabled"})
+        self.assertEqual(as_dict["pixel"], (10.0, 20.0))
+        self.assertEqual(len(projection), 4)
+        self.assertEqual(list(projection), projection.keys())
+        self.assertIsNone(projection.get("missing"))
+        self.assertEqual(projection.get("missing", 7), 7)
+        self.assertEqual(projection.get("pixel"), (10.0, 20.0))
+        self.assertEqual([key for key, _ in projection.items()],
+                         projection.keys())
+        self.assertEqual([value for _, value in projection.items()],
+                         projection.values())
 
     def test_marker_group_round_trip(self):
         _, chunk = document_with_photos()
@@ -271,9 +289,41 @@ class TestMarkerSurfaceExtensions(unittest.TestCase):
 class TestOptimizeCameras(unittest.TestCase):
     def test_requires_an_aligned_block(self):
         _, chunk = document_with_photos()
+        self.assertTrue(chunk.use_gcps)
         with self.assertRaises(alphashape.ValueError) as context:
             chunk.optimizeCameras(use_gcps=False, adaptive_fitting=True)
         self.assertIn("align", str(context.exception))
+        # The per-call override is restored even when the task fails.
+        self.assertTrue(chunk.use_gcps)
+
+
+class TestOptimizeCamerasUseGcps(unittest.TestCase):
+    """`use_gcps` overrides the chunk setting for one call only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = alphashape.Document()
+        cls.chunk = cls.doc.add_chunk("Chunk 1")
+        cls.doc.active_chunk = cls.chunk
+        cls.doc.run_task("AddPhotos", filenames=list(AERIAL))
+        cls.doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
+        cls.doc.run_task("AlignCameras")
+
+    def test_per_call_override_leaves_the_chunk_setting_alone(self):
+        self.assertTrue(self.chunk.use_gcps)
+        self.chunk.optimizeCameras(use_gcps=False)
+        self.assertTrue(self.chunk.use_gcps)
+        # Default None uses the chunk's own value.
+        self.chunk.optimizeCameras()
+        self.assertTrue(self.chunk.use_gcps)
+
+    def test_chunk_setting_is_persistent_and_undoable(self):
+        self.chunk.use_gcps = False
+        self.assertFalse(self.chunk.use_gcps)
+        self.chunk.optimizeCameras()
+        self.assertFalse(self.chunk.use_gcps)
+        self.chunk.use_gcps = True
+        self.assertTrue(self.chunk.use_gcps)
 
 
 if __name__ == "__main__":

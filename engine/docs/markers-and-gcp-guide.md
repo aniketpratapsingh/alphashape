@@ -127,9 +127,12 @@ stored under `update_transform.check_error_<id>_m`.
 `fit_p3`, `fit_p4` and the other `fit_*` flags free or hold individual
 coefficients; `adaptive_fitting=True` treats those flags as permission and
 automatically frees the higher-order groups whose likelihood gain pays for
-their degrees of freedom. `use_gcps` turns the control points on or off in the
-adjustment, and `tiepoint_covariance=True` stores the posterior covariance of
-every tie point.
+their degrees of freedom. `use_gcps` overrides whether marker references act
+as control points for this call only: omit it to use the chunk's persistent
+`use_gcps` setting (the same value the reference-settings dialog edits), and
+the chunk's setting is unchanged when the call returns, including after a
+failure. `tiepoint_covariance=True` stores the posterior covariance of every tie
+point.
 
 ```python
 chunk.optimizeCameras(fit_f=True, fit_p3=False, adaptive_fitting=True,

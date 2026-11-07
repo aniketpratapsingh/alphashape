@@ -92,10 +92,13 @@ GeoreferenceReport georeference_chunk(Chunk& chunk);
 /// Correspondences are (local point -> ENU reference) pairs from
 ///   * aligned enabled cameras with a full lon/lat/alt reference (centre), and
 ///   * Regular markers that carry both a local position and a full reference
-///     and whose meta role is not "check_point".
+///     and whose meta role is not "check_point", when the chunk's
+///     ReferenceSettings::use_gcp is true.
 /// Both kinds share one weighted system: weight = 1/sigma^2, sigma = the mean
 /// per-axis accuracy (falling back to 10 m when it is non-finite or non-positive).
 /// Check-point markers are measured after the fit and reported, never used.
+/// With use_gcp=false camera references still drive the fit; only the marker
+/// part of the constraint is dropped.
 ///
 /// The robust fit uses estimate_similarity_ransac with a deterministic seed and
 /// threshold = max(camera rule, 5 x median marker sigma, 0.05 m), then refits the

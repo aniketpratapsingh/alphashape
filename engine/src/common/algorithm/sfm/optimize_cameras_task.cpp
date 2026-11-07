@@ -27,8 +27,10 @@
 //     (one per camera). Vertex and fiducial markers are image-space target
 //     marks, not ground points, and are skipped. A referenced marker becomes a
 //     control point (or a check point, held out of the solve) when the chunk is
-//     georeferenced. Scale bars between marker points enter as BAScalebar
-//     constraints and fix scale even in a non-georeferenced chunk.
+//     georeferenced AND ReferenceSettings::use_gcp is true; with use_gcp=false
+//     its projections stay in the solve as an ordinary point but its reference
+//     contributes no residual. Scale bars between marker points enter as
+//     BAScalebar constraints and fix scale even in a non-georeferenced chunk.
 //
 // Everything is computed into a staged copy and committed with one move, so an
 // exception anywhere leaves the chunk untouched.
@@ -452,6 +454,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // Only a georeferenced chunk can tie a marker reference to the chunk-local
     // frame. A referenced marker is control unless its meta role is
     // "check_point"; a point without a reference stays a free point.
+    // ReferenceSettings::use_gcp=false disables the marker part of that
+    // constraint: such markers keep their image observations (so they are
+    // still triangulated) but contribute no reference residual. Check points
+    // are unaffected because they never constrained the solve.
+    const bool use_gcp = chunk->reference_settings().use_gcp;
     std::size_t control_markers = 0;
     std::size_t checkpoint_markers = 0;
     if (georeferenced) {
@@ -460,6 +467,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             const Marker& marker = chunk->markers()[m];
             if (!marker.reference.has_value() || marker_point[m] == kNoPoint) {
                 continue;
+            }
+            const std::string* role = marker.meta.find("type");
+            const bool checkpoint = role != nullptr && *role == "check_point";
+            if (!checkpoint && !use_gcp) {
+                continue;  // markers disabled as control points
             }
             const Eigen::Vector3d& loc = *marker.reference;
             if (!std::isfinite(loc.x()) || !std::isfinite(loc.y())) {
@@ -484,8 +496,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             if (!has_alt) {
                 control.sigma.z() = 0.0;  // no altitude: leave the up axis free
             }
-            const std::string* role = marker.meta.find("type");
-            control.checkpoint = role != nullptr && *role == "check_point";
+            control.checkpoint = checkpoint;
             if (control.checkpoint) {
                 ++checkpoint_markers;
             } else {

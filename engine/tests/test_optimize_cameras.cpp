@@ -1153,6 +1153,50 @@ TEST(OptimizeMarkers, CheckPointNotUsed) {
     EXPECT_LT(truth_error, 0.05) << "check marker followed the moved reference";
 }
 
+TEST(OptimizeMarkers, UseGcpFalseDropsMarkerReferences) {
+    // ReferenceSettings::use_gcp gates the marker part of the control
+    // constraint. Bias one control reference; the solve must follow it with
+    // use_gcp=true and stay identical to the un-biased run with false.
+    GeoMarkerScene scene = make_geo_marker_scene(20261113u);
+    Document& document = scene.document;
+    Chunk& chunk = *document.active_chunk();
+    const Chunk baseline = chunk;
+
+    const auto solve = [&](bool use_gcp, double bias) {
+        chunk = baseline;
+        chunk.markers()[0].reference->z() += bias;
+        ReferenceSettings settings = chunk.reference_settings();
+        settings.use_gcp = use_gcp;
+        chunk.set_reference_settings(settings);
+        run_optimize_cameras(document);
+        std::vector<Transform> poses;
+        poses.reserve(chunk.cameras().size());
+        for (const Camera& camera : chunk.cameras()) {
+            poses.push_back(camera.pose);
+        }
+        return poses;
+    };
+    const auto max_difference = [](const std::vector<Transform>& a,
+                                   const std::vector<Transform>& b) {
+        double worst = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            worst = std::max(worst, (a[i] - b[i]).cwiseAbs().maxCoeff());
+        }
+        return worst;
+    };
+
+    const std::vector<Transform> control_clean = solve(true, 0.0);
+    const std::vector<Transform> control_biased = solve(true, 2.0);
+    const std::vector<Transform> plain_clean = solve(false, 0.0);
+    const std::vector<Transform> plain_biased = solve(false, 2.0);
+
+    std::printf("[optimize_markers] use_gcp: control shift %.3e, plain shift %.3e\n",
+                max_difference(control_clean, control_biased),
+                max_difference(plain_clean, plain_biased));
+    EXPECT_GT(max_difference(control_clean, control_biased), 1e-6);
+    EXPECT_LT(max_difference(plain_clean, plain_biased), 1e-12);
+}
+
 TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {
     Document document = aligned_document(cal_seq_files());
     Chunk& chunk = *document.active_chunk();

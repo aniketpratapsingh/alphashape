@@ -716,21 +716,27 @@ void set_reference_accuracy(py::object chunk_self,
         alphashape::make_set_reference_settings_command(id, settings));
 }
 
-/// Toggle whether control points constrain the adjustment, through the same
-/// undoable "Set Reference Settings" command as the accuracy properties.
-/// `Chunk.optimizeCameras(use_gcps=...)` is the public caller.
-void set_reference_use_gcp(py::object chunk_self, bool value) {
-    if (!py::hasattr(chunk_self, "_document")) {
-        throw py::type_error("this Chunk is not attached to a Document");
+/// Temporarily set `ReferenceSettings::use_gcp` on a chunk and restore the
+/// previous settings when this goes out of scope, including when the task
+/// throws. This is a per-call override, not an undoable edit: it issues no
+/// command and leaves no history entry. `Chunk.optimizeCameras(use_gcps=...)`
+/// is the public caller.
+class ReferenceUseGcpOverride {
+public:
+    ReferenceUseGcpOverride(alphashape::Chunk& chunk, bool value)
+        : chunk_(chunk), previous_(chunk.reference_settings()) {
+        alphashape::ReferenceSettings settings = previous_;
+        settings.use_gcp = value;
+        chunk_.set_reference_settings(settings);
     }
-    alphashape::ReferenceSettings settings =
-        chunk_self.cast<const alphashape::Chunk&>().reference_settings();
-    settings.use_gcp = value;
-    const std::int32_t id = chunk_self.cast<const alphashape::Chunk&>().id();
-    execute_command(
-        owning_document_object(std::move(chunk_self)),
-        alphashape::make_set_reference_settings_command(id, settings));
-}
+    ~ReferenceUseGcpOverride() { chunk_.set_reference_settings(previous_); }
+    ReferenceUseGcpOverride(const ReferenceUseGcpOverride&) = delete;
+    ReferenceUseGcpOverride& operator=(const ReferenceUseGcpOverride&) = delete;
+
+private:
+    alphashape::Chunk& chunk_;
+    alphashape::ReferenceSettings previous_;
+};
 
 /// The Document that owns `chunk_self`, for the command-backed marker edits.
 alphashape::Document& owning_document(py::object chunk_self) {
@@ -1462,9 +1468,11 @@ PYBIND11_MODULE(alphashape, m) {
             return out;
         })
         // Detach this sensor from any master link, making it a master in its
-        // own right (master_sensor_id = -1). Goes through the undoable "Set
-        // Sensor Master" command; only callable on a sensor obtained from
-        // Chunk.sensors, which carries the owning chunk and its index.
+        // own right (master_sensor_id = kNoMasterSensor). Goes through the
+        // undoable "Set Sensor Master" command; only callable on a sensor
+        // obtained from Chunk.sensors, which carries the owning chunk and its
+        // index. The index is re-validated here because the chunk may have
+        // gained or lost sensors since the value was handed out.
         .def("makeMaster",
              [](py::object self) {
                  if (!py::hasattr(self, "_chunk") || !py::hasattr(self, "_index")) {
@@ -1475,13 +1483,24 @@ PYBIND11_MODULE(alphashape, m) {
                  py::object document = owning_document_object(chunk_object);
                  const auto chunk = chunk_object.cast<std::shared_ptr<Chunk>>();
                  const auto index = py::cast<std::int32_t>(self.attr("_index"));
+                 if (index < 0 ||
+                     static_cast<std::size_t>(index) >= chunk->sensors().size() ||
+                     chunk->sensors()[static_cast<std::size_t>(index)].label !=
+                         self.cast<const alphashape::Sensor&>().label) {
+                     throw alphashape::ValueError(
+                         "makeMaster: the sensor no longer exists in the chunk");
+                 }
+                 // types.hpp documents -1 as the "no master" sentinel.
+                 constexpr std::int32_t kNoMasterSensor = -1;
                  execute_command(
                      document,
                      alphashape::make_set_sensor_master_command(
-                         chunk->id(), index, -1));
+                         chunk->id(), index, kNoMasterSensor));
              },
              py::is_method(m),
-             "Make this sensor a master by detaching it from any master link.")
+             "Detach this sensor from its master, making it an independent "
+             "master sensor (master_sensor_id = -1). Has no effect on a sensor "
+             "that is already a master.")
         // (label, film_x_mm, film_y_mm) per calibrated fiducial; y is up.
         .def_property_readonly("fiducials", [](const alphashape::Sensor& s) {
             py::list out;
@@ -1906,6 +1925,54 @@ PYBIND11_MODULE(alphashape, m) {
             for (const char* key : {"camera_id", "camera", "pixel", "enabled"}) {
                 out.append(py::str(key));
             }
+            return out;
+        })
+        // The rest of the mapping protocol, so dict(projection) and
+        // `for key in projection` behave like the old plain-dict projection.
+        .def("__len__", [](const MarkerProjectionRef&) { return 4; })
+        .def("__iter__",
+             [](const MarkerProjectionRef&) {
+                 py::list out;
+                 for (const char* key : {"camera_id", "camera", "pixel", "enabled"}) {
+                     out.append(py::str(key));
+                 }
+                 return py::iter(out);
+             })
+        .def("get",
+             [](const MarkerProjectionRef& r, const std::string& key,
+                py::object fallback) -> py::object {
+                 if (key == "camera_id") return py::int_(r.camera_id);
+                 if (key == "camera") {
+                     return py::cast(CameraRef{r.chunk, r.document, r.camera_id});
+                 }
+                 if (key == "pixel") {
+                     const Eigen::Vector2d& pixel = r.get().pixel;
+                     return py::make_tuple(pixel.x(), pixel.y());
+                 }
+                 if (key == "enabled") return py::bool_(r.get().enabled);
+                 return fallback;
+             },
+             py::arg("key"), py::arg("default") = py::none())
+        .def("items", [](const MarkerProjectionRef& r) {
+            const Eigen::Vector2d& pixel = r.get().pixel;
+            py::list out;
+            out.append(py::make_tuple(py::str("camera_id"), py::int_(r.camera_id)));
+            out.append(py::make_tuple(
+                py::str("camera"),
+                py::cast(CameraRef{r.chunk, r.document, r.camera_id})));
+            out.append(py::make_tuple(py::str("pixel"),
+                                      py::make_tuple(pixel.x(), pixel.y())));
+            out.append(
+                py::make_tuple(py::str("enabled"), py::bool_(r.get().enabled)));
+            return out;
+        })
+        .def("values", [](const MarkerProjectionRef& r) {
+            const Eigen::Vector2d& pixel = r.get().pixel;
+            py::list out;
+            out.append(py::int_(r.camera_id));
+            out.append(py::cast(CameraRef{r.chunk, r.document, r.camera_id}));
+            out.append(py::make_tuple(pixel.x(), pixel.y()));
+            out.append(py::bool_(r.get().enabled));
             return out;
         });
 
@@ -2432,6 +2499,28 @@ PYBIND11_MODULE(alphashape, m) {
                         self, &alphashape::ReferenceSettings::tiepoint_accuracy_px, value);
                 },
                 py::is_method(m)))
+        // Whether marker references act as control points. This is the
+        // persistent chunk setting; `optimizeCameras(use_gcps=...)` overrides
+        // it for one call without changing it. The assignment is undoable,
+        // like the accuracies above.
+        .def_property(
+            "use_gcps",
+            py::cpp_function([](const Chunk& c) { return c.reference_settings().use_gcp; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](py::object self, bool value) {
+                    if (!py::hasattr(self, "_document")) {
+                        throw py::type_error("this Chunk is not attached to a Document");
+                    }
+                    alphashape::ReferenceSettings settings =
+                        self.cast<const alphashape::Chunk&>().reference_settings();
+                    settings.use_gcp = value;
+                    const std::int32_t id = self.cast<const alphashape::Chunk&>().id();
+                    execute_command(
+                        owning_document_object(std::move(self)),
+                        alphashape::make_set_reference_settings_command(id, settings));
+                },
+                py::is_method(m)))
         // The reference table (WP-13.1): one dict per camera and per marker
         // with its measured and adjusted positions in `display_crs` (the
         // chunk's own CRS when omitted), the signed error, the sigma and the
@@ -2526,7 +2615,12 @@ PYBIND11_MODULE(alphashape, m) {
         .def_property_readonly("ground_control", py::cpp_function(
             [](py::object self) {
                 auto chunk = self.cast<std::shared_ptr<Chunk>>();
-                py::object document = owning_document_object(self);
+                // This view is read-only, so a chunk with no owning Document
+                // still reports its referenced markers: the proxies carry no
+                // owner and only an edit through them would raise.
+                py::object document =
+                    py::hasattr(self, "_document") ? self.attr("_document")
+                                                   : py::object(py::none());
                 py::list all;
                 py::list control;
                 py::list checks;
@@ -3226,8 +3320,14 @@ PYBIND11_MODULE(alphashape, m) {
         })
         .def("exportReference", [](py::object self, py::kwargs kwargs) {
             // The public spelling `columns` is the task's `columns_order`:
-            // both name the ordered list of written fields.
-            if (kwargs.contains("columns") && !kwargs.contains("columns_order")) {
+            // both name the ordered list of written fields. Passing both is
+            // ambiguous, so refuse it rather than silently preferring one.
+            if (kwargs.contains("columns") && kwargs.contains("columns_order")) {
+                throw alphashape::ValueError(
+                    "exportReference: pass either columns or columns_order, not "
+                    "both");
+            }
+            if (kwargs.contains("columns")) {
                 kwargs[py::str("columns_order")] =
                     kwargs.attr("pop")(py::str("columns"));
             }
@@ -3252,11 +3352,17 @@ PYBIND11_MODULE(alphashape, m) {
         // camera and fit each scan's film-mm -> pixel transform. The public
         // spelling `fiducial_type` is mapped onto the task's `detector`.
         .def("detectFiducials", [](py::object self, py::kwargs kwargs) {
+            // `fiducial_type` and `detector` are two spellings of the same
+            // task argument. Refuse both at once instead of silently dropping
+            // the one the caller may have intended.
+            if (kwargs.contains("fiducial_type") && kwargs.contains("detector")) {
+                throw alphashape::ValueError(
+                    "detectFiducials: pass either fiducial_type or detector, not "
+                    "both");
+            }
             if (kwargs.contains("fiducial_type")) {
                 py::object value = kwargs.attr("pop")(py::str("fiducial_type"));
-                if (!kwargs.contains("detector")) {
-                    kwargs[py::str("detector")] = value;
-                }
+                kwargs[py::str("detector")] = value;
             }
             run_chunk_task(self, "DetectFiducials", std::move(kwargs));
         })
@@ -3287,13 +3393,20 @@ PYBIND11_MODULE(alphashape, m) {
         })
         // Self-calibrating bundle adjustment (WP-13.13). `use_gcps` is not a
         // task parameter: it selects whether control points constrain the
-        // adjustment, so it is written to the chunk's reference settings
-        // first (an undoable edit), then the task runs.
+        // adjustment. Passing it overrides the chunk's ReferenceSettings for
+        // this call only (default None uses the chunk's value); the previous
+        // settings are restored on return, also on failure, with no undo entry.
         .def("optimizeCameras", [](py::object self, py::kwargs kwargs) {
+            std::optional<bool> use_gcps;
             if (kwargs.contains("use_gcps")) {
-                py::object value = kwargs.attr("pop")(py::str("use_gcps"));
-                set_reference_use_gcp(self, py::cast<bool>(value));
+                use_gcps = py::cast<bool>(kwargs.attr("pop")(py::str("use_gcps")));
             }
+            if (!use_gcps.has_value()) {
+                run_chunk_task(self, "OptimizeCameras", std::move(kwargs));
+                return;
+            }
+            alphashape::Chunk& chunk = self.cast<alphashape::Chunk&>();
+            const ReferenceUseGcpOverride guard(chunk, *use_gcps);
             run_chunk_task(self, "OptimizeCameras", std::move(kwargs));
         })
         // Exterior orientation from navigation metadata (WP-13.21): place the

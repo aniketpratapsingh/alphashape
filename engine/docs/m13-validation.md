@@ -15,19 +15,25 @@ The scenario loads the 12-image nadir fixture (`engine/data/aerial_r*c*.jpg`)
 whose truth poses, ground grid and building are recorded in
 `engine/data/aerial_truth.json`. It then:
 
-1. imports the images and declares the chunk WGS 84 geographic;
-2. runs `detectMarkers` on the first frame;
-3. places 12 markers: 6 on the ground (z = 0) and 6 on the building roof
-   (z = 9.52 m);
-4. adds their projections by projecting the truth pose through each camera;
-5. perturbs each reference by deterministic 1 cm per-axis noise, imports 9 as
-   control points and 3 as check points;
-6. runs `refineMarkers`, then `updateTransform` (the weighted similarity fit);
-7. reports the horizontal, vertical and total check-point RMS.
+1. imports the images, runs `MatchPhotos` and `AlignCameras` (the fixture EXIF
+   carries exact GPS), and declares the chunk WGS 84 geographic;
+2. creates 12 markers: 6 on the ground (z = 0) and 6 on the building roof
+   (z = 9.52 m), with NO seeded 3-D position;
+3. adds each marker's projections by projecting its truth position through the
+   fixture's truth camera pose, then offsets every projection by seeded uniform
+   noise of 0.5 px per axis;
+4. imports 9 references as control points (truth + deterministic 1 cm per-axis
+   noise) and 3 as check points (held out of the fit);
+5. runs `refineMarkers`, so every marker position comes from its image
+   measurements only, then `updateTransform` (the weighted similarity fit) and
+   a final `optimizeCameras` with the control references constraining;
+6. measures every check point against its TRUE position (not its reference)
+   and reports the horizontal, vertical and total RMS.
 
-The chunk starts in an arbitrary local frame (scale 0.5, 25 degree rotation,
-a translation), so the similarity fit has to recover the datum rather than
-confirm an identity.
+The chunk is reconstructed by a real alignment and georeferenced from the
+fixture GPS, so the similarity fit and the bundle adjustment both have real
+work to do, and the check-point errors are independent of the noisy control
+references.
 
 ### Measured in CI
 
@@ -62,10 +68,18 @@ python3 engine/tests/run_gcp_validation.py \
     --check-points GCP17,GCP23,GCP31
 ```
 
-The procedure is: import every image, declare the reference CRS, run
+The procedure is: import every image, declare the geographic reference CRS, run
 `MatchPhotos` and `AlignCameras`, detect markers, import the CSV as control
-points and the designated labels as check points, run `optimizeCameras`, and
-report the check-point RMS with the same per-axis reconstruction.
+points and the designated labels as check points, run `updateTransform` (which
+seeds the datum from the control markers when the block has no usable camera
+GPS), run `optimizeCameras`, and report the check-point RMS against each
+marker's stored reference with the same per-axis reconstruction.
+
+`--crs` must name a geographic (lon/lat) CRS. The script converts references to
+ECEF as lon/lat, so a projected CRS is refused with an error rather than
+silently misinterpreting the coordinates. A check label with no marker or no
+computed position also exits non-zero, so a missing check point cannot be
+mistaken for a perfect one.
 
 The real-block measurement is **pending a cloud run**: no real aerial block with
 surveyed check points is checked into this repository, so this document does not
