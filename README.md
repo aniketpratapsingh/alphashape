@@ -23,6 +23,15 @@ Qt 6.
 > string, datum transformations with offline grids, geoids and vertical datums,
 > local frames, GeoTIFF GeoKeys, and raster reprojection are implemented. See
 > [`engine/docs/crs-guide.md`](engine/docs/crs-guide.md).
+>
+> **Multi-instance containers and project format v2 (M11): done.** Markers,
+> masks, camera groups, shapes, trajectories and tiled models are persisted;
+> a chunk holds every asset of every kind, with multi-chunk operations, `.psz`
+> and directory project layouts, an undoable command layer, a job database,
+> task scripts and the full Python data model. See
+> [`engine/docs/project-format-v2.md`](engine/docs/project-format-v2.md); the
+> knowingly partial parts are in
+> [`engine/LIMITATIONS.md`](engine/LIMITATIONS.md).
 
 ## What it does
 
