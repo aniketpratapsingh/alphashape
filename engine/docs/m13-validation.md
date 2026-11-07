@@ -247,4 +247,28 @@ accuracy back from the binding, which is the 10 m consumer default once a locati
 exists, so the RTK positions carried no weight and the two variants agreed to
 within a millimetre. The control markers also used the 5 mm chunk default instead
 of the stated 0.015 m. Both are fixed; the table above is kept only as the record
-of that run. Results: pending rerun.
+of that run.
+
+Rerun with the stated accuracies (CI run `42383670611`, same alignment: 146/176,
+0.740 px):
+
+| check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
+| --- | --- | --- |
+| 1 | 0.1028 / -0.1322 / 0.1674 | 0.0711 / 0.0243 / 0.0751 |
+| 2 | 0.0380 / -0.3137 / 0.3160 | 0.0348 / 0.0103 / 0.0363 |
+| 3 | 0.1133 / -0.1296 / 0.1722 | 0.0885 / -0.1129 / 0.1434 |
+| 4 | 0.0399 / 0.0919 / 0.1002 | 0.1127 / 0.1757 / 0.2087 |
+| 5 | 0.0446 / 0.0142 / 0.0469 | 0.0670 / 0.0820 / 0.1059 |
+| RMS | **0.0754 / 0.1681 / 0.1843** | **0.0791 / 0.1010 / 0.1283** |
+
+The 5 cm horizontal target is still **missed** (reported, not gated). The GCPs-only
+folds explain why the camera variant does not help: against the GCP-adjusted
+camera centres, the stored camera positions sit on average 3.45 m too high
+(mean E/N/U -0.61 / 0.20 / 3.45 m, RMS 0.72 / 0.50 / 3.49 m over 146 cameras). The
+near-constant vertical offset is a height-reference mismatch between the camera
+altitudes and the surveyed GCP heights, and the ~0.4 m horizontal scatter is far
+above RTK-fixed precision. Weighted at 5 cm, those positions pull against the GCPs:
+the image residual rises from ~0.95 to ~1.18 px and the camera-variant vertical
+error is worse than GCPs only. Until the camera altitude reference of this block is
+resolved, the GCPs-only variant is the meaningful one: 7.9 cm horizontal and
+10.1 cm vertical from four control points per fold.
