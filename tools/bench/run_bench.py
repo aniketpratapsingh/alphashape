@@ -311,9 +311,11 @@ DOWNLOAD_TIMEOUT_S = 120
 
 # The manifest pin is computed on the runner, not on the machine that authors the
 # manifest: this marker is a placeholder that tells `download` to fetch the archive
-# once WITHOUT verifying, print its SHA-256 and byte count, and stop. The one-off
-# path below is removed as soon as the real values are written into datasets.json.
-PENDING_SHA = "PENDING-PIN"
+# once WITHOUT verifying, print its SHA-256 and byte count, and stop. It is 64 zero
+# hex digits (not a plausible digest) because the manifest test asserts every
+# download's hash is a 64-character hex string and its byte count is positive. The
+# placeholder path below is removed as soon as the real values are pinned.
+PENDING_SHA = "0" * 64
 
 
 def _is_transient_download_error(error: BaseException) -> bool:

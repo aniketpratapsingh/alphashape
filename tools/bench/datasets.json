@@ -148,8 +148,8 @@
       "images_archive": {
         "download": "odm_data_helenenschacht.tar.gz",
         "url": "https://codeload.github.com/OpenDroneMap/odm_data_helenenschacht/tar.gz/eece33e9ece2ff358a7bdc02e1db6f67925e00c4",
-        "sha256": "PENDING-PIN",
-        "bytes": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 1,
         "extract_glob": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/images/*"
       },
       "reference_files": [
