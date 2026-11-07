@@ -1269,7 +1269,7 @@ def import_camera_references_for_block(chunk, accuracy_m, directory):
         accuracy = declared if declared is not None else (
             accuracy_m, accuracy_m, accuracy_m)
         rows.append((camera.label, reference[0], reference[1], reference[2],
-                     accuracy[0], accuracy[1], accuracy[2]))
+                     tuple(accuracy)))
     path = os.path.join(directory, "camera_references.csv")
     write_camera_reference_csv(path, rows)
     chunk.importReference(path=path)
@@ -1364,7 +1364,7 @@ def run_real_odm(args):
                 if measured else None),
         }
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
-    target = args.tolerance
+    target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
     report = {
         "scenario": "real-block-gcp",
@@ -1417,6 +1417,9 @@ def parse_args(argv):
                         help="control-point reference accuracy in metres")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
+    parser.add_argument("--horizontal-target", type=float, default=0.05,
+                        help="maximum acceptable horizontal check-point RMS over "
+                             "the folds, metres (the real-block target)")
     parser.add_argument("--json-out", metavar="PATH",
                         help="write the JSON report to this file as well as stdout")
     parser.add_argument("--crs", default="",

@@ -1219,7 +1219,7 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     command = [
         python, str(script), "--real", str(images_dir),
         "--gcp-list", str(gcp_list), "--gcp-names", str(gcp_names),
-        "--target", str(gcp.get("target_horizontal_m", 0.05)),
+        "--horizontal-target", str(gcp.get("target_horizontal_m", 0.05)),
         "--camera-accuracy", str(gcp.get("camera_accuracy_fallback_m", 0.05)),
         "--marker-accuracy", str(gcp.get("marker_location_accuracy_m", 0.015)),
         "--keypoint-limit", str(match.get("keypoint_limit_per_mpx", 250)),
