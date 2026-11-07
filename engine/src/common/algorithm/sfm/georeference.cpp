@@ -665,8 +665,10 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
         if (samples[i].marker_id >= 0) {
             ++report.control_points_used;
+            report.control_weight += weights[i];
         } else {
             ++report.cameras_used;
+            report.camera_weight += weights[i];
         }
         ++inlier_count;
     }

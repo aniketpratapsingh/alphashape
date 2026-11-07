@@ -59,6 +59,11 @@ struct GeoreferenceReport {
     double rms_check_m = 0.0;             ///< RMS of the held-out check-point errors
     double max_check_m = 0.0;             ///< largest held-out check-point error
     double scale = 1.0;                   ///< recovered similarity scale
+    /// Sum of the 1/sigma^2 weights over the inlier camera references and over
+    /// the inlier control markers. The ratio shows which correspondences carry
+    /// the datum: a 1 cm GCP outweighs a metre-level reference by four orders.
+    double camera_weight = 0.0;
+    double control_weight = 0.0;
     /// Held-out check-point errors, (marker id, 3-D error in metres), measured
     /// on the marker's position AFTER the transform is applied.
     std::vector<std::pair<std::int32_t, double>> check_errors;

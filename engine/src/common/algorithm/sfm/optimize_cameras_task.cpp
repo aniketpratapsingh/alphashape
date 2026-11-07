@@ -916,6 +916,16 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     const double checkbar_rms_m = report.checkbar_rms_m * local_scale;
     staged.meta().set("optimize_cameras.control_rms_m", meta_number(control_rms_m));
     staged.meta().set("optimize_cameras.checkpoint_rms_m", meta_number(checkpoint_rms_m));
+    staged.meta().set(
+        "optimize_cameras.control_rms_xyz_m",
+        meta_number(report.control_rms_xyz.x() * local_scale) + "," +
+            meta_number(report.control_rms_xyz.y() * local_scale) + "," +
+            meta_number(report.control_rms_xyz.z() * local_scale));
+    staged.meta().set(
+        "optimize_cameras.checkpoint_rms_xyz_m",
+        meta_number(report.checkpoint_rms_xyz.x() * local_scale) + "," +
+            meta_number(report.checkpoint_rms_xyz.y() * local_scale) + "," +
+            meta_number(report.checkpoint_rms_xyz.z() * local_scale));
     staged.meta().set("optimize_cameras.scalebar_rms_m", meta_number(scalebar_rms_m));
     staged.meta().set("optimize_cameras.checkbar_rms_m", meta_number(checkbar_rms_m));
     staged.meta().set("optimize_cameras.control_points",
@@ -940,6 +950,72 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                       report.covariance_reason.empty()
                           ? "covariance skipped: not requested"
                           : report.covariance_reason);
+
+    // -- solve diagnostics (metres for the sigmas) ---------------------------
+    // Every residual category this solve forms and the weight it carried, so a
+    // consumer can tell a mis-weighted adjustment from a noise-limited one
+    // without reading source. Image observations are not whitened individually
+    // (BAObservation carries no sigma), hence the explicit 1 px entry.
+    const auto axes_string = [](const Eigen::Vector3d& v) {
+        return meta_number(v.x()) + "," + meta_number(v.y()) + "," + meta_number(v.z());
+    };
+    if (!problem.centre_priors.empty()) {
+        staged.meta().set("optimize_cameras.sigma.camera_centre_m",
+                          axes_string(problem.centre_priors.front().sigma * local_scale));
+    }
+    std::size_t constrained_control_axes = 0;
+    std::size_t fully_constrained_control = 0;
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        std::size_t axes = 0;
+        for (int k = 0; k < 3; ++k) {
+            const double s = control.sigma[k];
+            if (std::isfinite(s) && s > 0.0) {
+                ++axes;
+            }
+        }
+        constrained_control_axes += axes;
+        fully_constrained_control += axes == 3 ? 1U : 0U;
+    }
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        staged.meta().set("optimize_cameras.sigma.marker_control_m",
+                          axes_string(control.sigma * local_scale));
+        break;
+    }
+    staged.meta().set("optimize_cameras.sigma.observation_px", "1");
+    staged.meta().set("optimize_cameras.control_axes",
+                      std::to_string(constrained_control_axes));
+    staged.meta().set("optimize_cameras.control_points_fully_constrained",
+                      std::to_string(fully_constrained_control));
+    staged.meta().set("optimize_cameras.rotation_priors",
+                      std::to_string(problem.rotation_priors.size()));
+    staged.meta().set("optimize_cameras.iterations", std::to_string(report.iterations));
+    staged.meta().set("optimize_cameras.termination", report.termination);
+    staged.meta().set("optimize_cameras.initial_cost", meta_number(report.initial_cost));
+    staged.meta().set("optimize_cameras.final_cost", meta_number(report.robust_cost));
+    staged.meta().set("optimize_cameras.final_gradient_norm",
+                      meta_number(report.final_gradient_norm));
+    staged.meta().set("optimize_cameras.prior_rms_sigma",
+                      meta_number(report.prior_rms_sigma));
+    staged.meta().set("optimize_cameras.prior_axes", std::to_string(report.priors));
+    staged.meta().set("optimize_cameras.free_parameters",
+                      std::to_string(report.free_parameter_count));
+    staged.meta().set("optimize_cameras.residuals",
+                      std::to_string(report.residual_count));
+    std::size_t fixed_poses = 0;
+    for (const std::uint8_t flag : problem.fixed_pose) {
+        fixed_poses += flag != 0 ? 1U : 0U;
+    }
+    staged.meta().set("optimize_cameras.gauge_fixed_poses", std::to_string(fixed_poses));
+    staged.meta().set("optimize_cameras.gauge_scale_anchor_camera",
+                      std::to_string(problem.scale_anchor_camera));
+    staged.meta().set("optimize_cameras.gauge_scale_anchor_axis",
+                      std::to_string(problem.scale_anchor_axis));
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);

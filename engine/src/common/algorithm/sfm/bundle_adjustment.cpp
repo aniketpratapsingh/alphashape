@@ -313,6 +313,24 @@ constexpr double kControlObservationLossScale = 3.0;
 /// An axis with sigma <= 0 or non-finite is unconstrained.
 bool valid_sigma(double s) { return std::isfinite(s) && s > 0.0; }
 
+/// Short, stable name for a solver termination category. The report carries it
+/// so a caller can tell "hit the iteration cap" from "converged".
+const char* termination_name(ceres::TerminationType type) {
+    switch (type) {
+        case ceres::CONVERGENCE:
+            return "convergence";
+        case ceres::NO_CONVERGENCE:
+            return "no_convergence";
+        case ceres::FAILURE:
+            return "numerical_failure";
+        case ceres::USER_SUCCESS:
+            return "user_success";
+        case ceres::USER_FAILURE:
+            return "user_failure";
+    }
+    return "unknown";
+}
+
 /// True when `point` is flagged in a check mask (and the mask covers it).
 bool is_check_point(const std::vector<std::uint8_t>& check, std::size_t point) {
     return point < check.size() && check[point] != 0;
@@ -467,6 +485,8 @@ void fill_constraint_report(const BAProblem& problem,
                             const std::vector<std::uint8_t>& check, BAReport* report) {
     double control_sq = 0.0;
     double check_sq = 0.0;
+    Eigen::Vector3d control_xyz = Eigen::Vector3d::Zero();
+    Eigen::Vector3d check_xyz = Eigen::Vector3d::Zero();
     std::size_t control_n = 0;
     std::size_t check_n = 0;
     std::vector<Eigen::Vector3d> checked_pos(problem.points.size());
@@ -474,7 +494,10 @@ void fill_constraint_report(const BAProblem& problem,
     for (const BAControlPoint& cp : problem.control_points) {
         if (!cp.checkpoint) {
             ++report->control_points;
-            control_sq += (problem.points[cp.point] - cp.reference).squaredNorm();
+            const Eigen::Vector3d control_residual =
+                problem.points[cp.point] - cp.reference;
+            control_sq += control_residual.squaredNorm();
+            control_xyz += control_residual.cwiseProduct(control_residual);
             ++control_n;
             continue;
         }
@@ -490,6 +513,7 @@ void fill_constraint_report(const BAProblem& problem,
         const Eigen::Vector3d r = x - cp.reference;
         report->checkpoint_residuals.push_back(r);
         check_sq += r.squaredNorm();
+        check_xyz += r.cwiseProduct(r);
         ++check_n;
     }
     double bar_sq = 0.0;
@@ -545,6 +569,14 @@ void fill_constraint_report(const BAProblem& problem,
     };
     report->control_rms_m = rms(control_sq, control_n);
     report->checkpoint_rms_m = rms(check_sq, check_n);
+    const auto rms_axis = [](const Eigen::Vector3d& sum_sq, std::size_t n) {
+        if (n == 0) {
+            return Eigen::Vector3d::Zero();
+        }
+        return (sum_sq / static_cast<double>(n)).cwiseSqrt();
+    };
+    report->control_rms_xyz = rms_axis(control_xyz, control_n);
+    report->checkpoint_rms_xyz = rms_axis(check_xyz, check_n);
     report->scalebar_rms_m = rms(bar_sq, bar_n);
     report->checkbar_rms_m = rms(checkbar_sq, checkbar_n);
 }
@@ -1181,6 +1213,9 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         report.usable = summary.IsSolutionUsable();
         report.iterations = static_cast<int>(summary.iterations.size());
         report.robust_cost = summary.final_cost;
+        report.initial_cost = summary.initial_cost;
+        report.final_gradient_norm = summary.final_gradient_norm;
+        report.termination = termination_name(summary.termination_type);
         report.cost_valid =
             std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;
     } else {
@@ -1189,6 +1224,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         report.usable = evaluated_ok && std::isfinite(evaluated_cost);
         report.iterations = 0;
         report.robust_cost = evaluated_cost;
+        report.initial_cost = evaluated_cost;
         report.cost_valid =
             evaluated_ok && std::isfinite(evaluated_cost) && evaluated_cost >= 0.0;
     }

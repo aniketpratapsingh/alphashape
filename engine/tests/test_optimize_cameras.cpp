@@ -1015,8 +1015,11 @@ struct GeoMarkerScene {
 
 /// The geo sequence with every camera reference perturbed by up to 3 m per axis
 /// and weighted at 3 m, plus five markers whose references encode the physical
-/// ENU truth. Projections carry 0.3 px uniform noise.
-GeoMarkerScene make_geo_marker_scene(std::uint32_t seed) {
+/// ENU truth. Projections carry `projection_noise` px of uniform noise and the
+/// marker references are weighted at `marker_accuracy` metres (defaults: the
+/// realistic 0.3 px / 2 cm pair the marker tests use).
+GeoMarkerScene make_geo_marker_scene(std::uint32_t seed, double projection_noise = 0.3,
+                                     double marker_accuracy = 0.02) {
     GeoMarkerScene scene;
     scene.document = aligned_document(geo_seq_files());
     Chunk& chunk = *scene.document.active_chunk();
@@ -1059,7 +1062,8 @@ GeoMarkerScene make_geo_marker_scene(std::uint32_t seed) {
         const geo::Geodetic geodetic = geo::ecef_to_geodetic(ecef);
         const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
                                         geodetic.height_m};
-        add_marker(chunk, project_marker(chunk, local, 0.3, rng), reference, 0.02);
+        add_marker(chunk, project_marker(chunk, local, projection_noise, rng), reference,
+                   marker_accuracy);
         scene.local_truth.push_back(local);
         scene.enu_truth.push_back(enu);
     }
@@ -1113,6 +1117,47 @@ TEST(OptimizeMarkers, GcpsImproveAccuracy) {
         worst_marker, with_error, without_error);
     EXPECT_LT(worst_marker, 0.1);
     EXPECT_LT(with_error, without_error);
+}
+
+// Exact control references with exact projections must pin the model. The
+// camera references here are perturbed by up to 3 m per axis and weighted at
+// 3 m, the control at 1 mm: a correctly weighted adjustment is governed by the
+// control, so every marker has to come back to the physical truth within a
+// millimetre. A larger residual means a camera prior outvotes the control (or
+// the gauge is fighting it), not that the noise limit was reached.
+TEST(OptimizeMarkers, ExactControlPinsModelAgainstNoisyCameraPriors) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261107u, 0.0, 0.001);
+    Chunk& chunk = *scene.document.active_chunk();
+    ASSERT_EQ(chunk.markers().size(), 5U);
+    for (const Marker& marker : chunk.markers()) {
+        ASSERT_GE(marker.projections.size(), 2U);
+    }
+
+    run_optimize_cameras(scene.document);
+    Chunk& solved = *scene.document.active_chunk();
+    double worst = 0.0;
+    double worst_h = 0.0;
+    double worst_v = 0.0;
+    for (std::size_t m = 0; m < solved.markers().size(); ++m) {
+        ASSERT_TRUE(solved.markers()[m].position.has_value());
+        const Eigen::Vector3d delta =
+            *solved.markers()[m].position - scene.local_truth[m];
+        worst = std::max(worst, delta.norm());
+        worst_h = std::max(worst_h, delta.head<2>().norm());
+        worst_v = std::max(worst_v, std::abs(delta.z()));
+    }
+    const std::string* termination =
+        solved.meta().find("optimize_cameras.termination");
+    std::printf("[optimize_markers] exact control: worst marker %.6f m "
+                "(h %.6f, v %.6f), control points %.0f, control RMS %.6f m, "
+                "iterations %.0f, termination %s\n",
+                worst, worst_h, worst_v,
+                meta_value(solved, "optimize_cameras.control_points"),
+                meta_value(solved, "optimize_cameras.control_rms_m"),
+                meta_value(solved, "optimize_cameras.iterations"),
+                termination == nullptr ? "?" : termination->c_str());
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 5.0);
+    EXPECT_LT(worst, 0.001);
 }
 
 TEST(OptimizeMarkers, CheckPointNotUsed) {

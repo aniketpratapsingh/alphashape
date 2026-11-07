@@ -17,14 +17,18 @@ Two modes:
     check-point RMS. ``--crs`` must name a geographic (lon/lat) CRS; projected
     coordinates are refused because this script converts references as lon/lat.
 
-``--ablations`` runs four synthetic scenarios in one process so a pipeline
+``--ablations`` runs five synthetic scenarios in one process so a pipeline
 defect can be told from noise-limited accuracy: (1) no projection noise, no
 reference noise, with the fixture's exact camera position and attitude pinned
 (the check-point 3D total must be <= 2 mm: the pipeline is otherwise exact),
-(2) 1 cm reference noise only, (3) 0.25 px projection noise only, and (4) both
-noises, which is the gated scenario. Scenarios 2-4 keep the realistic
-consumer-GNSS camera references and take their attitude from the alignment, so
-their differences come from the two noise knobs.
+(2) 1 cm reference noise only, (3) 0.25 px projection noise only, (4) noisy
+consumer-GNSS camera references with every other input exact (a correctly
+weighted adjustment is then governed by the control points, so its check-point
+error must stay at centimetre level), and (5) both noises, which is the gated
+scenario. Scenarios 2-5 keep the realistic consumer-GNSS camera references and
+take their attitude from the alignment, so their differences come from the two
+noise knobs. Every report carries the engine's solve diagnostics (per-category
+sigmas, iterations, termination, cost) under ``diagnostics``.
 
 The script prints one JSON object per scenario on stdout and exits 0 when the
 3D total check-point RMS is within the tolerance (2 cm by default), 2
@@ -193,6 +197,35 @@ PIPELINE_TOLERANCE_M = 0.002
 # 0.5 px would under-weight exact or 0.25 px-peak projections against the 1 px
 # tie points). The floor keeps the exact scenarios positive.
 PROJECTION_ACCURACY_FLOOR_PX = 0.001
+
+# Solve diagnostics the engine records on the chunk (chunk.meta), surfaced in
+# every synthetic report so a mis-weighted adjustment can be told from a
+# noise-limited one. The sigmas are metres / pixels as named.
+DIAGNOSTIC_KEYS = (
+    "optimize_cameras.sigma.camera_centre_m",
+    "optimize_cameras.sigma.marker_control_m",
+    "optimize_cameras.sigma.observation_px",
+    "optimize_cameras.control_axes",
+    "optimize_cameras.control_points_fully_constrained",
+    "optimize_cameras.rotation_priors",
+    "optimize_cameras.iterations",
+    "optimize_cameras.termination",
+    "optimize_cameras.initial_cost",
+    "optimize_cameras.final_cost",
+    "optimize_cameras.final_gradient_norm",
+    "optimize_cameras.prior_rms_sigma",
+    "optimize_cameras.prior_axes",
+    "optimize_cameras.free_parameters",
+    "optimize_cameras.residuals",
+    "optimize_cameras.gauge_fixed_poses",
+    "optimize_cameras.gauge_scale_anchor_camera",
+    "optimize_cameras.gauge_scale_anchor_axis",
+    "optimize_cameras.control_rms_m",
+    "optimize_cameras.control_rms_xyz_m",
+    "optimize_cameras.checkpoint_rms_m",
+    "optimize_cameras.checkpoint_rms_xyz_m",
+)
+
 
 
 def reference_noise(index, axis, amplitude_m):
@@ -537,6 +570,14 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
                           fit_k1=False, fit_k2=False, fit_k3=False, fit_k4=False,
                           fit_p1=False, fit_p2=False,
                           fit_p3=False, fit_p4=False)
+    # The check-point error right after the bundle adjustment, in the datum the
+    # adjustment itself worked in. Comparing it with the post-datum error tells
+    # a bundle-adjustment defect from a datum-fit one.
+    labels = [label for label, _ in points if label in CHECK_LABELS]
+    pre_errors = check_point_errors(
+        chunk, labels,
+        {label: truth_local(enu, chunk.transform) for label, enu in points})
+    pre_datum_total = root_mean_square([e["total"] for e in pre_errors])
     # Refit the datum now that the marker positions and control references
     # agree. This is the weighted similarity step: it moves the block without
     # changing its internal shape.
@@ -546,7 +587,6 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
                          str(chunk.meta.get("update_transform.reason",
                                             "unknown")))
 
-    labels = [label for label, _ in points if label in CHECK_LABELS]
     targets = {label: truth_local(enu, chunk.transform)
                for label, enu in points}
     errors = check_point_errors(chunk, labels, targets)
@@ -571,6 +611,7 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "evaluated_check_points": len(errors),
         "projection_noise_px": projection_noise_px,
         "marker_projection_accuracy_px": chunk.marker_projection_accuracy,
+        "marker_location_accuracy_m": chunk.marker_location_accuracy,
         "reference_noise_m": reference_noise_m,
         "camera_gnss": camera_gnss,
         "camera_location_accuracy_m": (
@@ -591,6 +632,19 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "georeferenced": applied,
         "engine_check_rms_m": float(
             chunk.meta.get("update_transform.rms_check_m", "nan")),
+        "check_point_rms_before_datum_m": pre_datum_total,
+        "diagnostics": {key: chunk.meta.get(key) for key in DIAGNOSTIC_KEYS},
+        "update_transform": {
+            "cameras_used": chunk.meta.get("update_transform.cameras"),
+            "control_points_used": chunk.meta.get(
+                "update_transform.control_points"),
+            "check_points_used": chunk.meta.get("update_transform.check_points"),
+            "rms_control_m": chunk.meta.get("update_transform.rms_control_m"),
+            "rms_check_m": chunk.meta.get("update_transform.rms_check_m"),
+            "scale": chunk.meta.get("update_transform.scale"),
+            "camera_weight": chunk.meta.get("update_transform.camera_weight"),
+            "control_weight": chunk.meta.get("update_transform.control_weight"),
+        },
         "check_point_rms_m": {
             "horizontal": horizontal,
             "vertical": vertical,
@@ -730,9 +784,10 @@ def parse_args(argv):
                         help="give every camera a consumer-GNSS reference "
                              "(on) or keep the fixture's exact GPS (off)")
     parser.add_argument("--ablations", action="store_true",
-                        help="run the four synthetic noise/GNSS scenarios: "
+                        help="run the five synthetic noise/GNSS scenarios: "
                              "exact pipeline (<= 2 mm), reference noise only, "
-                             "projection noise only, and both (gated)")
+                             "projection noise only, GNSS-only with exact "
+                             "inputs, and both noises (gated)")
     args = parser.parse_args(argv)
     if args.projection_noise_px < 0.0 or args.reference_noise_m < 0.0:
         parser.error("noise magnitudes must not be negative")
@@ -765,16 +820,20 @@ def emit(report, gate_m, passed):
 
 
 def run_ablations(args):
-    """Run the four synthetic scenarios and gate (1) exactness and (4) accuracy."""
+    """Run the five synthetic scenarios and gate (1) exactness and (5) accuracy."""
     scenarios = (
         # name, projection noise, reference noise, camera GNSS, gate.
         # Scenario 1 is the pipeline-exactness control: every input the GCP
-        # machinery consumes is exact. Scenarios 2-4 keep the realistic
+        # machinery consumes is exact. Scenarios 2-5 keep the realistic
         # consumer-GNSS camera references and vary only the two noise knobs, so
-        # their differences are attributable to those noises.
+        # their differences are attributable to those noises. Scenario 4 keeps
+        # the noisy GNSS but removes both other noises: with 1 cm control points
+        # the answer must be pinned by them, so it isolates the camera-prior /
+        # control interaction from the injected noise.
         ("exact", 0.0, 0.0, False, PIPELINE_TOLERANCE_M),
         ("reference-noise", 0.0, args.reference_noise_m, True, None),
         ("projection-noise", args.projection_noise_px, 0.0, True, None),
+        ("gnss-only", 0.0, 0.0, True, None),
         ("combined", args.projection_noise_px, args.reference_noise_m,
          args.camera_gnss == "on", args.tolerance),
     )

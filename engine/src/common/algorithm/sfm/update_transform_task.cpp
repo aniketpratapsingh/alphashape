@@ -67,6 +67,12 @@ void UpdateTransformTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("update_transform.rms_check_m", meta_number(report.rms_check_m));
     staged.meta().set("update_transform.max_check_m", meta_number(report.max_check_m));
     staged.meta().set("update_transform.scale", meta_number(report.scale));
+    // Total 1/sigma^2 weight carried by each correspondence class in the
+    // similarity fit: the datum must be dominated by the control markers.
+    staged.meta().set("update_transform.camera_weight",
+                      meta_number(report.camera_weight));
+    staged.meta().set("update_transform.control_weight",
+                      meta_number(report.control_weight));
 
     // Rejected control markers, comma-separated, and one key per check point so
     // a front end can show the error next to the marker id.

@@ -230,6 +230,15 @@ struct BAReport {
     /// Robust objective value (the sum of 0.5 * rho(r^2) the solver minimised).
     /// Only meaningful when `cost_valid` is true.
     double robust_cost = 0;
+    /// Robust objective at the starting state, same units as robust_cost, so a
+    /// caller can tell a converged solve from one that barely moved.
+    double initial_cost = 0;
+    /// The solver's termination category as a short name ("convergence",
+    /// "max_iterations", "numerical_failure", ...). Empty for an
+    /// evaluation-only pass.
+    std::string termination;
+    /// Infinity norm of the final gradient. 0 for an evaluation-only pass.
+    double final_gradient_norm = 0;
 
     /// Dimension of the residual vector Ceres actually assembled. Exact: points
     /// with no observations are never added, and check observations are skipped
@@ -261,9 +270,14 @@ struct BAReport {
     /// 3-D RMS of X - reference over non-check control points, in problem
     /// units (metres when the problem frame is metric).
     double control_rms_m = 0;
+    /// The same residual split per axis (x, y, z), so a weak vertical can be
+    /// told from a uniform offset.
+    Eigen::Vector3d control_rms_xyz = Eigen::Vector3d::Zero();
     /// 3-D RMS of the re-triangulated X - reference over check control points,
     /// finite ones only, in problem units. 0 when there are none.
     double checkpoint_rms_m = 0;
+    /// The same check residual split per axis.
+    Eigen::Vector3d checkpoint_rms_xyz = Eigen::Vector3d::Zero();
     /// RMS of the length error (|Xa - Xb| - length) over non-check scale bars
     /// with valid length/sigma, in problem units. 0 when there are none.
     double scalebar_rms_m = 0;
