@@ -252,8 +252,15 @@ class TestMarkerSurfaceExtensions(unittest.TestCase):
         self.assertEqual(projection.get("pixel"), (10.0, 20.0))
         self.assertEqual([key for key, _ in projection.items()],
                          projection.keys())
-        self.assertEqual([value for _, value in projection.items()],
-                         projection.values())
+        # Camera proxies compare by identity, not equality, so compare the
+        # scalar values and the camera's id rather than the proxy objects.
+        values = projection.values()
+        self.assertEqual(len(values), 4)
+        self.assertEqual(values[0], camera.id)
+        self.assertEqual(values[1].id, camera.id)
+        self.assertEqual(values[2], (10.0, 20.0))
+        self.assertEqual(values[3], True)
+        self.assertEqual([value for _, value in projection.items()][0], camera.id)
 
     def test_marker_group_round_trip(self):
         _, chunk = document_with_photos()
