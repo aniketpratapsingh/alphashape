@@ -131,8 +131,9 @@ the similarity fit used and the total 1/sigma^2 weight of each class.
 ### Measured in CI
 
 Measured by `python_gcp_validation` on CI run 42361458754. The Linux x86-64 and
-macOS arm64 lanes produced identical numbers; the five scenarios take about 20 s
-(the prediction included). Numbers are metres.
+macOS arm64 lanes produced identical numbers. The test reported
+`Passed 77.36 sec` on the Linux lane, which covers the five alignments and the
+prediction. Numbers are metres.
 
 | scenario | horizontal | vertical | total | predicted h / v / total | gate | result |
 | --- | --- | --- | --- | --- | --- | --- |
