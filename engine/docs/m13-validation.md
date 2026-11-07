@@ -48,21 +48,24 @@ measurement line; CI surfaces the line even when the test passes. Numbers are
 metres; the bound is 2 cm.
 
 Measured by `python_gcp_validation` on the PR's CI run (Linux x86-64,
-run 42314821252, test 1966, 1.35 s):
+run 42335619894, about 28 s including the alignment):
 
 | quantity | value |
 | --- | --- |
 | images | 12 |
-| markers after detection + placement | 12 |
-| markers detected automatically | 0 (the fixture has no printed targets; the projections come from the truth poses) |
-| control points | 9 |
-| check points | 3 |
-| georeferenced by `updateTransform` | yes |
-| horizontal check-point RMS | 0.012331 m |
-| vertical check-point RMS | 0.008786 m |
-| total check-point RMS | 0.015141 m |
-| engine `update_transform.rms_check_m` | 0.0151408 m |
-| passed the 2 cm bound | yes |
+| markers | 12 (6 ground, 6 roof) |
+| control points | 8 usable (9 imported; one edge target has a single projection) |
+| check points | 3 (`E2`, `E3`, `E5`, all on the roof) |
+| markers detected automatically | 0 (the fixture has no printed targets; the projections are the truth projections plus seeded noise) |
+| projection noise | 0.5 px peak to peak |
+| georeferenced | yes (`AlignCameras` from exact GPS, then `updateTransform`) |
+| horizontal check-point RMS | 0.009053 m |
+| vertical check-point RMS | 0.018104 m |
+| total check-point RMS (quadrature) | 0.020241 m |
+| engine `update_transform.rms_check_m` | 0.020241 m |
+| worst camera centre vs truth | 0.0747 m |
+| truth reprojection through the final poses | 0.193 px RMS, 0.323 px max |
+| passed the 2 cm per-axis bound | yes |
 
 ## Real block
 
