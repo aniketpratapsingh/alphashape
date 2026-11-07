@@ -18,6 +18,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,8 @@
 #include "base/utils/portable_rng.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/io/doc_xml.hpp"
+#include "common/io/doc_xml_common.hpp"
 #include "common/io/project_io.hpp"
 #include "common/io/sidecars.hpp"
 #include "image/image.hpp"
@@ -416,7 +419,454 @@ Document build_full_document() {
     return document;
 }
 
+/// Extend the full fixture with every optional attribute and child the v2
+/// writer can emit, so the vocabulary tests see the whole vocabulary in one
+/// project. Adding these here (rather than to build_full_document) keeps the
+/// compact fixture the byte-stability tests pin unchanged.
+Document build_vocabulary_document() {
+    Document document = build_full_document();
+    Chunk& chunk = *document.workspace().chunks().front();
+
+    // A complete, already-normalised film frame: 30 x 20 mm at 1 mm/px is a
+    // 30 x 20 normalised image, so the reader's post-load normalisation is a
+    // no-op and the round-trip stays exact.
+    Sensor& sensor = chunk.sensors().front();
+    sensor.width = 30;
+    sensor.height = 20;
+    sensor.calibration.width = 30;
+    sensor.calibration.height = 20;
+    sensor.calibration.p3 = 1.0e-6;
+    sensor.calibration.p4 = 2.0e-6;
+    sensor.calibration.covariance = Eigen::MatrixXd::Identity(2, 2) * 0.25;
+    sensor.calibration.covariance_params = {"f", "k1"};
+    sensor.film.enabled = true;
+    sensor.film.transform = FilmTransformType::Projective;
+    sensor.film.detector = FiducialDetector::FrameCorner;
+    sensor.film.search_corners = true;
+    sensor.film.search_sides = false;
+    sensor.film.resolution_mm_per_px = 1.0;
+    sensor.film.film_size_mm = Eigen::Vector2d(30.0, 20.0);
+    sensor.film.calibration_normalised = true;
+    for (int i = 0; i < 2; ++i) {
+        Fiducial fiducial;
+        fiducial.label = i == 0 ? "a" : "b";
+        fiducial.film_mm = Eigen::Vector2d(1.0 + 2.0 * static_cast<double>(i), 2.0);
+        sensor.film.fiducials.push_back(fiducial);
+    }
+    sensor.antenna.offset_m = Eigen::Vector3d(0.1, 0.2, 0.3);
+    sensor.antenna.boresight_deg = Eigen::Vector3d(1.0, 2.0, 3.0);
+
+    // A slave sensor shares its master's geometry. Its optional film and
+    // antenna state is cleared so the copy carries no unsaved state.
+    Sensor slave = sensor;
+    slave.label = "slave";
+    slave.fixed_params.clear();
+    slave.master_sensor_id = 0;
+    slave.film = FilmSettings{};
+    slave.antenna = Antenna{};
+    chunk.sensors().push_back(slave);
+
+    Camera& first = chunk.cameras().front();
+    first.fiducial_pixels = {Eigen::Vector2d(1.0, 2.0), Eigen::Vector2d(3.0, 4.0)};
+    Eigen::Matrix3d scan;
+    scan << 2.0, 0.1, 0.0, 0.0, 2.0, 0.0, 5.0, 6.0, 1.0;
+    first.film_transform = scan;
+    first.location_covariance = Eigen::Matrix3d::Identity() * 0.1;
+    first.rotation_covariance = Eigen::Matrix3d::Identity() * 0.2;
+    Camera& second = chunk.cameras()[1];
+    second.selected = true;
+    second.reference.location = Eigen::Vector3d(11.0, 48.0, 500.0);
+    second.reference.accuracy = Eigen::Vector3d(0.05, 0.06, 0.07);
+    second.reference.orientation_deg = Eigen::Vector3d(1.0, 2.0, 3.0);
+    second.reference.rotation_accuracy_deg = Eigen::Vector3d(0.1, 0.2, 0.3);
+    second.reference.enabled = false;
+
+    // Marker internals, a disabled projection and a track covariance.
+    chunk.markers()[0].projections[1].enabled = false;
+    chunk.markers()[1].internal = true;
+    chunk.markers()[1].meta.set("role", "check");
+    chunk.tie_points().tracks.front().covariance = Eigen::Matrix3f::Identity();
+
+    // One asset group id gives every asset kind the optional group attribute;
+    // the last asset of each kind is disabled.
+    const std::int32_t asset_group = chunk.allocate_id();
+    const auto decorate = [asset_group](auto& assets) {
+        assets.front().group_id = asset_group;
+        assets.front().meta.set("note", "asset");
+        assets.back().enabled = false;
+    };
+    decorate(chunk.depth_map_sets());
+    decorate(chunk.point_clouds());
+    decorate(chunk.models());
+    decorate(chunk.tiled_models());
+    decorate(chunk.elevations());
+    decorate(chunk.orthomosaics());
+    chunk.panorama()->group_id = asset_group;
+    chunk.panorama()->enabled = false;
+    chunk.panorama()->meta.set("note", "pano");
+    chunk.elevations().front().data->crs.wkt = "PROJCRS[\"fixture dem\"]";
+    chunk.orthomosaics().front().data->crs.wkt = "PROJCRS[\"fixture ortho\"]";
+
+    // Every reference-settings field off its default writes <reference>.
+    ReferenceSettings settings;
+    settings.camera_location_accuracy_m = 1.5;
+    settings.camera_rotation_accuracy_deg = 2.5;
+    settings.marker_location_accuracy_m = 0.05;
+    settings.marker_projection_accuracy_px = 0.75;
+    settings.scalebar_accuracy_m = 0.002;
+    settings.tiepoint_accuracy_px = 1.25;
+    settings.use_gcp = false;
+    chunk.set_reference_settings(settings);
+
+    // A non-identity region rotation and a vertical datum on the chunk CRS.
+    chunk.region().rotation =
+        Eigen::AngleAxisd(0.3, Eigen::Vector3d(1.0, 2.0, 3.0).normalized())
+            .toRotationMatrix();
+    crs::VerticalCrs vertical;
+    vertical.kind = crs::VerticalCrs::Kind::GeoidModel;
+    vertical.name = "EGM2008 height";
+    vertical.grid = "us_nga_egm08_25.tif";
+    vertical.offset_m = 0.02;
+    vertical.horizontal_epsg = 4326;
+    chunk.crs().vertical = vertical;
+
+    // The three per-object CRS slots.
+    CRS camera_crs;
+    camera_crs.epsg = 32633;
+    camera_crs.wkt = "PROJCRS[\"camera slot\"]";
+    chunk.set_camera_crs(camera_crs);
+    CRS marker_crs;
+    marker_crs.epsg = 32634;
+    marker_crs.wkt = "PROJCRS[\"marker slot\"]";
+    chunk.set_marker_crs(marker_crs);
+    CRS world_crs;
+    world_crs.epsg = 4978;
+    world_crs.wkt = "GEODCRS[\"world slot\"]";
+    chunk.set_world_crs(world_crs);
+    return document;
+}
+
+// -- vocabulary -------------------------------------------------------------
+
+/// Collect every element name and every "element@attribute" pair in an XML
+/// tree. The reader's own parser is used, so the vocabulary is measured on
+/// exactly the document the loader sees.
+void collect_vocabulary(const docxml::XmlNode& node,
+                        std::set<std::string>& elements,
+                        std::set<std::string>& attributes) {
+    elements.insert(node.name);
+    for (const auto& [name, value] : node.attrs) {
+        (void)value;
+        attributes.insert(node.name + "@" + name);
+    }
+    for (const docxml::XmlNode& child : node.children) {
+        collect_vocabulary(child, elements, attributes);
+    }
+}
+
+/// Fail with both directions of the difference, and the message that names
+/// what to update. A drift test that only says "sets differ" is not actionable.
+void expect_same_vocabulary(const std::set<std::string>& actual,
+                            const std::set<std::string>& expected,
+                            const char* what) {
+    std::string added;
+    std::string missing;
+    for (const std::string& name : actual) {
+        if (expected.count(name) == 0) added += " " + name;
+    }
+    for (const std::string& name : expected) {
+        if (actual.count(name) == 0) missing += " " + name;
+    }
+    if (added.empty() && missing.empty()) return;
+    ADD_FAILURE() << what << " changed (added:" << added << "; missing:" << missing
+                  << "): doc.xml vocabulary changed: update the expected set in "
+                     "tests/test_project_v2.cpp AND docs/project-format-v2.md";
+}
+
+/// Load the archive back and prove the reader understands the whole document:
+/// v2 rejects unknown elements inside <chunk> outright, and an attribute the
+/// reader does not know is reported as an "unknown attribute" warning.
+void expect_reader_understands(const Document& document, const ZipArchive& archive) {
+    ReadReport report;
+    const std::shared_ptr<Document> loaded = read_document(archive, &report);
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->workspace().chunks().size(), 1U);
+    EXPECT_TRUE(*loaded->workspace().chunks().front() ==
+                *document.workspace().chunks().front());
+    EXPECT_TRUE(loaded->meta() == document.meta());
+    EXPECT_TRUE(loaded->global_crs() == document.global_crs());
+    EXPECT_EQ(loaded->active_chunk_id(), document.active_chunk_id());
+    EXPECT_EQ(loaded->workspace().next_chunk_id(),
+              document.workspace().next_chunk_id());
+    std::string warnings;
+    for (const std::string& warning : report.warnings) {
+        warnings += "\n  " + warning;
+    }
+    EXPECT_TRUE(report.warnings.empty())
+        << "the fixture's own writer output must read back warning-free:"
+        << warnings;
+}
+
+// -- Markdown table parsing -------------------------------------------------
+
+/// Strip the Markdown code span a documented name is wrapped in.
+std::string strip_code_span(std::string cell) {
+    cell.erase(std::remove(cell.begin(), cell.end(), '`'), cell.end());
+    return cell;
+}
+
+std::string trim_cell(std::string cell) {
+    const auto first = std::find_if(cell.begin(), cell.end(),
+                                    [](char c) { return c != ' ' && c != '\t'; });
+    const auto last = std::find_if(cell.rbegin(), cell.rend(), [](char c) {
+                          return c != ' ' && c != '\t';
+                      }).base();
+    if (first >= last) return {};
+    return std::string(first, last);
+}
+
+std::vector<std::string> table_cells(const std::string& line) {
+    std::vector<std::string> cells;
+    std::string::size_type start = (!line.empty() && line.front() == '|') ? 1U : 0U;
+    while (start < line.size()) {
+        const std::string::size_type bar = line.find('|', start);
+        const std::string::size_type end =
+            bar == std::string::npos ? line.size() : bar;
+        cells.push_back(trim_cell(line.substr(start, end - start)));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return cells;
+}
+
+bool is_separator_row(const std::vector<std::string>& cells) {
+    for (const std::string& cell : cells) {
+        if (!cell.empty() && cell.find_first_not_of("-:") != std::string::npos) {
+            return false;
+        }
+    }
+    return !cells.empty();
+}
+
+struct MarkdownVocabulary {
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+};
+
+/// Read the element and attribute tables out of docs/project-format-v2.md.
+/// The vocabulary tests pin what the writer emits; this parser pins what the
+/// published document claims, and the two sets must be identical.
+MarkdownVocabulary parse_vocabulary_markdown(const std::string& text) {
+    enum class Table { kNone, kElements, kAttributes };
+    MarkdownVocabulary result;
+    Table table = Table::kNone;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::string trimmed = trim_cell(line);
+        if (trimmed.empty()) continue;  // a blank line does not end the group
+        if (trimmed.front() != '|') {
+            table = Table::kNone;
+            continue;
+        }
+        const std::vector<std::string> cells = table_cells(trimmed);
+        if (cells.empty()) continue;
+        if (cells[0] == "element" && cells.size() >= 2U) {
+            if (cells[1] == "parent") {
+                table = Table::kElements;
+                continue;
+            }
+            if (cells[1] == "attribute" && cells.size() == 5U) {
+                table = Table::kAttributes;
+                continue;
+            }
+        }
+        if (is_separator_row(cells)) continue;
+        if (table == Table::kElements && cells.size() == 3U) {
+            result.elements.insert(strip_code_span(cells[0]));
+        } else if (table == Table::kAttributes && cells.size() == 5U) {
+            result.attributes.insert(strip_code_span(cells[0]) + "@" +
+                                     strip_code_span(cells[1]));
+        }
+    }
+    return result;
+}
+
+// -- expected vocabulary ----------------------------------------------------
+
+/// The complete set of element names the v2 writer can emit for one chunk that
+/// populates every container and every optional field. A new element in the
+/// writer must appear here AND in docs/project-format-v2.md (the drift test).
+const std::set<std::string>& expected_elements() {
+    static const std::set<std::string> expected = {
+        "document",     "global_crs",   "vertical",     "meta",
+        "property",     "chunks",       "chunk",        "sensors",
+        "sensor",       "calibration",  "covariance",   "film",
+        "fiducial",     "antenna",      "cameras",      "camera",
+        "reference",    "film_transform", "camera_groups", "group",
+        "frames",       "frame",        "markers",      "marker",
+        "projection",   "marker_groups", "scalebars",   "scalebar",
+        "tie_points",   "keypoint_set", "matches",      "tracks",
+        "mask_sets",    "masks",        "mask",         "depth_map_sets",
+        "depth_maps",   "dense_clouds", "dense_cloud",  "models",
+        "model",        "texture",      "page",         "tiled_models",
+        "tiled_model",  "elevations",   "elevation",    "orthomosaics",
+        "orthomosaic",  "trajectories", "trajectory",   "shapes",
+        "shape",        "shape_groups", "panorama",     "region",
+        "transform",    "crs",          "camera_crs",   "marker_crs",
+        "world_crs",
+    };
+    return expected;
+}
+
+/// Every element@attribute pair the writer can emit, with every optional
+/// attribute exercised by the fixture. This is the attribute half of the same
+/// drift contract: a new attribute must be documented and expected here.
+const std::set<std::string>& expected_attributes() {
+    static const std::set<std::string> expected = {
+        // Root and chunk.
+        "document@version", "document@next_id", "document@active_id",
+        "global_crs@epsg", "global_crs@wkt",
+        "vertical@kind", "vertical@name", "vertical@grid", "vertical@offset",
+        "vertical@horizontal_epsg",
+        "property@name", "property@value",
+        "chunk@id", "chunk@label", "chunk@next_id",
+        // Sensors.
+        "sensor@id", "sensor@label", "sensor@type", "sensor@width",
+        "sensor@height", "sensor@pixel_size", "sensor@focal_length",
+        "sensor@make", "sensor@model", "sensor@serial", "sensor@fixed_params",
+        "sensor@master",
+        "calibration@type", "calibration@width", "calibration@height",
+        "calibration@f", "calibration@cx", "calibration@cy",
+        "calibration@b1", "calibration@b2", "calibration@k1", "calibration@k2",
+        "calibration@k3", "calibration@k4", "calibration@p1", "calibration@p2",
+        "calibration@p3", "calibration@p4", "covariance@params",
+        "film@transform", "film@detector", "film@corners", "film@sides",
+        "film@resolution", "film@size_x", "film@size_y", "film@normalised",
+        "fiducial@label", "fiducial@x", "fiducial@y",
+        "fiducial@index", "fiducial@u", "fiducial@v",
+        "antenna@offset", "antenna@boresight",
+        // Cameras and camera groups.
+        "camera@id", "camera@sensor_id", "camera@label", "camera@enabled",
+        "camera@selected", "camera@orientation", "camera@transform",
+        "camera@location_covariance", "camera@rotation_covariance",
+        "reference@x", "reference@y", "reference@z", "reference@accuracy",
+        "reference@yaw", "reference@pitch", "reference@roll",
+        "reference@rotation_accuracy", "reference@enabled",
+        "reference@camera_location_accuracy", "reference@camera_rotation_accuracy",
+        "reference@marker_location_accuracy", "reference@marker_projection_accuracy",
+        "reference@scalebar_accuracy", "reference@tiepoint_accuracy",
+        "reference@use_gcp", "film_transform@values",
+        "group@id", "group@label", "group@type", "group@members", "group@folder",
+        "frames@path",
+        "frame@id", "frame@path", "frame@width", "frame@height", "frame@camera_id",
+        // Markers, scale bars and tie points.
+        "marker@id", "marker@label", "marker@group", "marker@type",
+        "marker@projections", "marker@location", "marker@reference_accuracy",
+        "marker@location_estimate", "marker@position_covariance", "marker@pinned",
+        "marker@valid", "marker@internal",
+        "projection@camera_id", "projection@pixel", "projection@enabled",
+        "scalebar@id", "scalebar@label", "scalebar@from_kind", "scalebar@from_id",
+        "scalebar@to_kind", "scalebar@to_id", "scalebar@reference_length",
+        "scalebar@reference_accuracy", "scalebar@estimated_length",
+        "keypoint_set@camera_id", "keypoint_set@count", "keypoint_set@path",
+        "matches@pairs", "matches@path",
+        "tracks@count", "tracks@path", "tracks@covariance_path",
+        "mask@camera_id", "mask@width", "mask@height", "mask@invert", "mask@path",
+        // Assets.
+        "depth_maps@id", "depth_maps@label", "depth_maps@group",
+        "depth_maps@enabled", "depth_maps@active", "depth_maps@count",
+        "depth_maps@path",
+        "dense_cloud@id", "dense_cloud@label", "dense_cloud@group",
+        "dense_cloud@enabled", "dense_cloud@active", "dense_cloud@count",
+        "dense_cloud@hasPointColors", "dense_cloud@hasPointNormals",
+        "dense_cloud@hasPointConfidence", "dense_cloud@path",
+        "model@id", "model@label", "model@group", "model@enabled", "model@active",
+        "model@source_id", "model@faceCount", "model@vertexCount",
+        "model@hasVertexColors", "model@hasVertexConfidence", "model@hasUV",
+        "model@path", "texture@pages", "page@path",
+        "tiled_model@id", "tiled_model@label", "tiled_model@group",
+        "tiled_model@enabled", "tiled_model@active", "tiled_model@path",
+        "tiled_model@size",
+        "elevation@id", "elevation@label", "elevation@group",
+        "elevation@enabled", "elevation@active", "elevation@path",
+        "elevation@width", "elevation@height", "elevation@origin",
+        "elevation@pixel_size", "elevation@epsg", "elevation@crs_wkt",
+        "elevation@nodataValue", "elevation@source_data",
+        "orthomosaic@id", "orthomosaic@label", "orthomosaic@group",
+        "orthomosaic@enabled", "orthomosaic@active", "orthomosaic@path",
+        "orthomosaic@labels_path", "orthomosaic@width", "orthomosaic@height",
+        "orthomosaic@origin", "orthomosaic@pixel_size", "orthomosaic@epsg",
+        "orthomosaic@crs_wkt", "orthomosaic@blendingMode",
+        // Remaining containers.
+        "trajectory@id", "trajectory@label", "trajectory@count", "trajectory@path",
+        "shapes@path", "shapes@count",
+        "shape@id", "shape@type", "shape@label", "shape@layer", "shape@closed",
+        "shape@has_altitude",
+        "panorama@id", "panorama@label", "panorama@group", "panorama@enabled",
+        "panorama@path", "panorama@width", "panorama@height",
+        "region@centre", "region@size", "region@rotation",
+        "transform@matrix",
+        "crs@epsg", "crs@wkt",
+        "camera_crs@epsg", "camera_crs@wkt",
+        "marker_crs@epsg", "marker_crs@wkt",
+        "world_crs@epsg", "world_crs@wkt",
+    };
+    return expected;
+}
+
 // -- tests ------------------------------------------------------------------
+
+/// The vocabulary the published document pins; see expected_elements().
+TEST_F(ProjectV2, ElementVocabulary) {
+    const Document document = build_vocabulary_document();
+    ZipArchive archive;
+    write_document(document, archive);
+    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+    collect_vocabulary(root, elements, attributes);
+
+    EXPECT_EQ(expected_elements().size(), 61U);
+    expect_same_vocabulary(elements, expected_elements(),
+                           "doc.xml element vocabulary");
+    expect_reader_understands(document, archive);
+}
+
+/// Every element@attribute pair the writer can emit, with every optional
+/// attribute exercised by the fixture. This is the attribute half of the same
+/// drift contract: a new attribute must be documented and expected here.
+TEST_F(ProjectV2, AttributeVocabulary) {
+    const Document document = build_vocabulary_document();
+    ZipArchive archive;
+    write_document(document, archive);
+    const docxml::XmlNode root = docxml::parse_xml(archive.get_text(kDocXmlEntry));
+    std::set<std::string> elements;
+    std::set<std::string> attributes;
+    collect_vocabulary(root, elements, attributes);
+
+    expect_same_vocabulary(attributes, expected_attributes(),
+                           "doc.xml attribute vocabulary");
+    EXPECT_EQ(expected_attributes().size(), 231U);
+    expect_reader_understands(document, archive);
+}
+
+/// The published format document is the contract the vocabulary tests pin:
+/// changing the writer without updating docs/project-format-v2.md fails here.
+TEST_F(ProjectV2, FormatDocMatchesVocabulary) {
+    const std::string path =
+        std::string(ALPHASHAPE_SOURCE_DIR) + "/docs/project-format-v2.md";
+    std::ifstream in(path);
+    ASSERT_TRUE(in.good()) << "cannot read " << path;
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+
+    const MarkdownVocabulary documented = parse_vocabulary_markdown(text);
+    expect_same_vocabulary(documented.elements, expected_elements(),
+                           "docs/project-format-v2.md element table");
+    expect_same_vocabulary(documented.attributes, expected_attributes(),
+                           "docs/project-format-v2.md attribute table");
+}
 
 /// A project written before M11 has version="1" and the flat entry names. The
 /// v1 reader must still load it exactly as it did, and a re-save must produce
@@ -1236,6 +1686,36 @@ TEST_F(ProjectV2, RejectsUnknownV2Element) {
     const std::size_t region = xml.find("<region ");
     ASSERT_NE(region, std::string::npos);
     xml.insert(xml.rfind('\n', region) + 1, "      <warp_grid id=\"0\"/>\n");
+    archive.add("doc.xml", xml);
+    EXPECT_THROW(read_document(archive), ProjectIOError);
+}
+
+TEST_F(ProjectV2, RejectsShapeAltitudeDrift) {
+    ZipArchive archive;
+    write_document(build_full_document(), archive);
+    std::string xml = archive.get_text("doc.xml");
+    // The XML mirror of the shape says no altitude; shapes.shp says otherwise.
+    const std::string from = "has_altitude=\"true\"";
+    const std::size_t at = xml.find(from);
+    ASSERT_NE(at, std::string::npos);
+    xml.replace(at, from.size(), "has_altitude=\"false\"");
+    archive.add("doc.xml", xml);
+    EXPECT_THROW(read_document(archive), ProjectIOError);
+}
+
+TEST_F(ProjectV2, RejectsPanoramaSizeDrift) {
+    ZipArchive archive;
+    write_document(build_full_document(), archive);
+    std::string xml = archive.get_text("doc.xml");
+    const std::size_t at = xml.find("<panorama ");
+    ASSERT_NE(at, std::string::npos);
+    const std::size_t width = xml.find("width=\"", at);
+    ASSERT_NE(width, std::string::npos);
+    const std::size_t value = width + std::string("width=\"").size();
+    const std::size_t end = xml.find('"', value);
+    ASSERT_NE(end, std::string::npos);
+    // A width that cannot describe the decoded PNG.
+    xml.replace(value, end - value, "9999");
     archive.add("doc.xml", xml);
     EXPECT_THROW(read_document(archive), ProjectIOError);
 }

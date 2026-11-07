@@ -141,8 +141,11 @@ target_link_libraries(alphashape_tests PRIVATE
     GTest::gtest_main)
 
 # Where the checked-in fixtures live, for tests that compare against them.
+# ALPHASHAPE_SOURCE_DIR is the engine root: the format-drift test reads
+# docs/project-format-v2.md from the source tree, not from an installed copy.
 target_compile_definitions(alphashape_tests PRIVATE
-    ALPHASHAPE_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+    ALPHASHAPE_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+    ALPHASHAPE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 # The GPU suite starts the real CLI once, to prove that a build with the GPU
 # layer compiled in cannot fail to load when no Vulkan runtime is installed (the

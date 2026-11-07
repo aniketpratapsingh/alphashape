@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 
 import alphashape
 
@@ -73,190 +74,195 @@ def _parameter_keys(meta, task):
     }
 
 
-class TestDriftInvariant(unittest.TestCase):
-    """Every parameter a task declares must reach the project meta, and back."""
+# The recipe is shared by TestDriftInvariant and TestFormatDrift and lives at
+# module level: a TestCase instance must never be created at import time. The
+# module-level `_PREPARED_CACHE` above keeps one prepared document per task, so
+# the expensive dense pipeline is built once for both classes.
+def _prepared_document(task):
+    """A document with `task` run once, plus any prerequisites it needs.
 
-    def _prepared_document(self, task):
-        """A document with `task` run once, plus any prerequisites it needs.
+    Most tasks run on the two generic fixtures. AlignCameras, OptimizeCameras
+    and the dense tasks (BuildDepthMaps, BuildPointCloud, BuildModel) need tie
+    points, which those fixtures do not produce, so they run on the matched
+    three-view scene instead. BuildPointCloud additionally needs depth maps,
+    and the milestone-9 tasks need a DEM (and, for the ortho tasks, an
+    orthomosaic) on top of the dense products,
+    and BuildModel needs either depth maps or a point cloud, so BuildDepthMaps
+    (and for BuildModel a point cloud too) is run first. The export tasks need
+    the geometry they write plus a destination path.
 
-        Most tasks run on the two generic fixtures. AlignCameras, OptimizeCameras
-        and the dense tasks (BuildDepthMaps, BuildPointCloud, BuildModel) need tie
-        points, which those fixtures do not produce, so they run on the matched
-        three-view scene instead. BuildPointCloud additionally needs depth maps,
-        and the milestone-9 tasks need a DEM (and, for the ortho tasks, an
-        orthomosaic) on top of the dense products,
-        and BuildModel needs either depth maps or a point cloud, so BuildDepthMaps
-        (and for BuildModel a point cloud too) is run first. The export tasks need
-        the geometry they write plus a destination path.
+    The chunk-planning tasks (WP-11.6) are the exception: DuplicateChunk and
+    MergeChunks only restructure chunks, AppendProject needs a second project
+    on disk, and SaveChunksSubset is a Document method, not a task.
+    """
+    if task in _PREPARED_CACHE:
+        doc, chunk = _PREPARED_CACHE[task]
+        # Return a fresh chunk handle onto the cached document; the tests
+        # only read it (and save/load it), never mutate the geometry.
+        return doc, chunk
+    if task == "AppendProject":
+        # Needs a second project on disk to append from; the incoming
+        # chunks arrive with offset ids, and run_task records the
+        # parameters into the destination chunk that was active first.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = alphashape.Document()
+            source_chunk = source.add_chunk("Source")
+            source.active_chunk = source_chunk
+            source.run_task("AddPhotos", filenames=[CAM_A1, CAM_B1])
+            path = os.path.join(tmp, "source.psx")
+            source.save(path)
 
-        The chunk-planning tasks (WP-11.6) are the exception: DuplicateChunk and
-        MergeChunks only restructure chunks, AppendProject needs a second project
-        on disk, and SaveChunksSubset is a Document method, not a task.
-        """
-        if task in _PREPARED_CACHE:
-            doc, chunk = _PREPARED_CACHE[task]
-            # Return a fresh chunk handle onto the cached document; the tests
-            # only read it (and save/load it), never mutate the geometry.
-            return doc, chunk
-        if task == "AppendProject":
-            # Needs a second project on disk to append from; the incoming
-            # chunks arrive with offset ids, and run_task records the
-            # parameters into the destination chunk that was active first.
-            with tempfile.TemporaryDirectory() as tmp:
-                source = alphashape.Document()
-                source_chunk = source.add_chunk("Source")
-                source.active_chunk = source_chunk
-                source.run_task("AddPhotos", filenames=[CAM_A1, CAM_B1])
-                path = os.path.join(tmp, "source.psx")
-                source.save(path)
-
-                doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-                doc.run_task(task, path=path)
-                # The task makes the appended chunk active; the drift checks
-                # read the chunk run_task recorded its parameters into.
-                doc.active_chunk = chunk
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task in ("ImportReference", "ExportReference", "ImportMarkers",
-                    "ExportMarkers"):
-            # All four need a real path. The exports run on the imported
-            # document (a header-only table is still a valid export), and the
-            # imports read a one-row file that creates a marker, so the drift
-            # checks exercise both the chunk mutation and the save/load path.
             doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-            with tempfile.TemporaryDirectory() as tmp:
-                path = os.path.join(tmp, "reference.csv")
-                if task in ("ExportReference", "ExportMarkers"):
-                    doc.run_task(task, path=path)
-                elif task == "ImportReference":
-                    with open(path, "w", encoding="utf-8") as handle:
-                        handle.write("REF1,1,2,3\n")
-                    doc.run_task(task, path=path)
-                else:
-                    # Camera labels come from the image file stems.
-                    with open(path, "w", encoding="utf-8") as handle:
-                        handle.write("marker,camera,u,v\nMARK1,fixture_a,10,20\n")
-                    doc.run_task(task, path=path)
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task == "AlignChunks":
-            # Marker-based alignment (WP-11.7): two chunks of the same frames,
-            # marker labels matching, both with estimated positions. The
-            # parameters are recorded into the ACTIVE chunk, which must stay
-            # active for the drift checks below.
-            doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-            second = doc.add_chunk("Reference")
-            points = [(0.0, 0.0, 0.0), (10.0, 0.0, 2.0), (0.0, 8.0, 4.0),
-                      (6.0, 6.0, 1.0)]
-            for i, (x, y, z) in enumerate(points):
-                label = "M{}".format(i + 1)
-                chunk.set_marker_position(label, x, y, z)
-                second.set_marker_position(label, x + 1.0, y - 2.0, z + 0.5)
+            doc.run_task(task, path=path)
+            # The task makes the appended chunk active; the drift checks
+            # read the chunk run_task recorded its parameters into.
             doc.active_chunk = chunk
-            doc.run_task(task, reference_chunk_id=second.id)
-            doc.active_chunk = chunk
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task in ("DuplicateChunk", "MergeChunks"):
-            # Chunk-planning tasks: they restructure chunks only, so the plain
-            # imported document is all they need. MergeChunks needs two sources.
-            doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-            if task == "MergeChunks":
-                doc.add_chunk("Second")
-                doc.active_chunk = chunk
-            doc.run_task(task)
-            doc.active_chunk = chunk
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task == "RunScript":
-            # RunScript refuses an unsaved document and needs a real script.
-            # The temp directory is gone afterwards, but the recorded meta and
-            # the save/load checks below only need the parameter values.
-            doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-            with tempfile.TemporaryDirectory() as tmp:
-                doc.path = os.path.join(tmp, "project.psx")
-                script = os.path.join(tmp, "script.py")
-                with open(script, "w", encoding="utf-8") as handle:
-                    handle.write("print('runscript parity')\n")
-                doc.run_task(task, path=script)
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task in ("AlignCameras", "OptimizeCameras", "BuildDepthMaps", "BuildPointCloud",
-                    "BuildModel", "BuildUV", "BuildTexture", "ExportModel", "ExportPointCloud",
-                    "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
-            doc, chunk = make_document_with_images(*SCENE)
-            doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
-            doc.run_task("AlignCameras")
-            if task == "OptimizeCameras":
-                doc.run_task("OptimizeCameras")
-            elif task in ("BuildDepthMaps", "BuildPointCloud", "BuildModel", "BuildUV",
-                          "BuildTexture", "ExportModel", "ExportPointCloud",
-                          "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
-                # filter_mode="mild" is pinned: this file checks the parameter
-                # contract (declared keys reach the meta and survive a save), not
-                # the filter's strength. At the 120x90 working resolution of this
-                # fixture the moderate default keeps well under half the pixels,
-                # which starves the small BuildModel volume used below.
-                doc.run_task("BuildDepthMaps", filter_mode="mild")
-                if task in ("BuildPointCloud", "BuildModel", "BuildUV", "BuildTexture",
-                            "ExportModel", "ExportPointCloud"):
-                    doc.run_task("BuildPointCloud")
-                if task in ("BuildModel", "BuildUV", "BuildTexture", "ExportModel"):
-                    # Small volume + face target keep the parity run quick;
-                    # ExportModel needs a mesh, ExportPointCloud only the cloud.
-                    doc.run_task("BuildModel", volume_resolution=32, face_count="custom",
-                                 face_count_custom=2000)
-                if task in ("BuildUV", "BuildTexture"):
-                    # BuildTexture needs a UV layout, so BuildUV runs first.
-                    doc.run_task("BuildUV", texture_size=256)
-                if task == "BuildTexture":
-                    doc.run_task("BuildTexture", texture_size=256)
-                # Milestone 9: all four product tasks need a DEM (the ortho
-                # tasks use it as their surface too).
-                if task in ("BuildDem", "BuildOrthomosaic", "ExportDem",
-                            "ExportOrthomosaic"):
-                    doc.run_task("BuildDem")
-                if task in ("BuildOrthomosaic", "ExportOrthomosaic"):
-                    doc.run_task("BuildOrthomosaic", refine_seamlines=False,
-                                 color_correction="none")
-                if task in ("ExportModel", "ExportPointCloud"):
-                    # The export tasks need a real destination path.
-                    with tempfile.TemporaryDirectory() as tmp:
-                        doc.run_task(task, path=os.path.join(tmp, "export.ply"))
-                if task in ("ExportDem", "ExportOrthomosaic"):
-                    with tempfile.TemporaryDirectory() as tmp:
-                        doc.run_task(task, path=os.path.join(tmp, "export.tif"))
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task == "ExportSTMap":
-            # Needs a sensor calibration and a real destination path.
-            doc, chunk = make_document_with_images(*CALBOARD)
-            doc.run_task("CalibrateCamera", board_cols=9, board_rows=6,
-                         square_size=0.025)
-            with tempfile.TemporaryDirectory() as tmp:
-                doc.run_task(task, path=os.path.join(tmp, "stmap.tif"))
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        if task == "CalibrateCamera":
-            # Needs a detectable board in at least three views; the generic
-            # fixtures are unrelated photographs. The task records the same
-            # parameter keys as every other task through run_task.
-            doc, chunk = make_document_with_images(*CALBOARD)
-            doc.run_task(task, board_cols=9, board_rows=6, square_size=0.025)
-            _PREPARED_CACHE[task] = (doc, chunk)
-            return doc, chunk
-        doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
-        if task != "AddPhotos":  # already run once by the helper
-            doc.run_task(task)
         _PREPARED_CACHE[task] = (doc, chunk)
         return doc, chunk
+    if task in ("ImportReference", "ExportReference", "ImportMarkers",
+                "ExportMarkers"):
+        # All four need a real path. The exports run on the imported
+        # document (a header-only table is still a valid export), and the
+        # imports read a one-row file that creates a marker, so the drift
+        # checks exercise both the chunk mutation and the save/load path.
+        doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reference.csv")
+            if task in ("ExportReference", "ExportMarkers"):
+                doc.run_task(task, path=path)
+            elif task == "ImportReference":
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("REF1,1,2,3\n")
+                doc.run_task(task, path=path)
+            else:
+                # Camera labels come from the image file stems.
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("marker,camera,u,v\nMARK1,fixture_a,10,20\n")
+                doc.run_task(task, path=path)
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task == "AlignChunks":
+        # Marker-based alignment (WP-11.7): two chunks of the same frames,
+        # marker labels matching, both with estimated positions. The
+        # parameters are recorded into the ACTIVE chunk, which must stay
+        # active for the drift checks below.
+        doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+        second = doc.add_chunk("Reference")
+        points = [(0.0, 0.0, 0.0), (10.0, 0.0, 2.0), (0.0, 8.0, 4.0),
+                  (6.0, 6.0, 1.0)]
+        for i, (x, y, z) in enumerate(points):
+            label = "M{}".format(i + 1)
+            chunk.set_marker_position(label, x, y, z)
+            second.set_marker_position(label, x + 1.0, y - 2.0, z + 0.5)
+        doc.active_chunk = chunk
+        doc.run_task(task, reference_chunk_id=second.id)
+        doc.active_chunk = chunk
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task in ("DuplicateChunk", "MergeChunks"):
+        # Chunk-planning tasks: they restructure chunks only, so the plain
+        # imported document is all they need. MergeChunks needs two sources.
+        doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+        if task == "MergeChunks":
+            doc.add_chunk("Second")
+            doc.active_chunk = chunk
+        doc.run_task(task)
+        doc.active_chunk = chunk
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task == "RunScript":
+        # RunScript refuses an unsaved document and needs a real script.
+        # The temp directory is gone afterwards, but the recorded meta and
+        # the save/load checks below only need the parameter values.
+        doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+        with tempfile.TemporaryDirectory() as tmp:
+            doc.path = os.path.join(tmp, "project.psx")
+            script = os.path.join(tmp, "script.py")
+            with open(script, "w", encoding="utf-8") as handle:
+                handle.write("print('runscript parity')\n")
+            doc.run_task(task, path=script)
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task in ("AlignCameras", "OptimizeCameras", "BuildDepthMaps", "BuildPointCloud",
+                "BuildModel", "BuildUV", "BuildTexture", "ExportModel", "ExportPointCloud",
+                "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
+        doc, chunk = make_document_with_images(*SCENE)
+        doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
+        doc.run_task("AlignCameras")
+        if task == "OptimizeCameras":
+            doc.run_task("OptimizeCameras")
+        elif task in ("BuildDepthMaps", "BuildPointCloud", "BuildModel", "BuildUV",
+                      "BuildTexture", "ExportModel", "ExportPointCloud",
+                      "BuildDem", "BuildOrthomosaic", "ExportDem", "ExportOrthomosaic"):
+            # filter_mode="mild" is pinned: this file checks the parameter
+            # contract (declared keys reach the meta and survive a save), not
+            # the filter's strength. At the 120x90 working resolution of this
+            # fixture the moderate default keeps well under half the pixels,
+            # which starves the small BuildModel volume used below.
+            doc.run_task("BuildDepthMaps", filter_mode="mild")
+            if task in ("BuildPointCloud", "BuildModel", "BuildUV", "BuildTexture",
+                        "ExportModel", "ExportPointCloud"):
+                doc.run_task("BuildPointCloud")
+            if task in ("BuildModel", "BuildUV", "BuildTexture", "ExportModel"):
+                # Small volume + face target keep the parity run quick;
+                # ExportModel needs a mesh, ExportPointCloud only the cloud.
+                doc.run_task("BuildModel", volume_resolution=32, face_count="custom",
+                             face_count_custom=2000)
+            if task in ("BuildUV", "BuildTexture"):
+                # BuildTexture needs a UV layout, so BuildUV runs first.
+                doc.run_task("BuildUV", texture_size=256)
+            if task == "BuildTexture":
+                doc.run_task("BuildTexture", texture_size=256)
+            # Milestone 9: all four product tasks need a DEM (the ortho
+            # tasks use it as their surface too).
+            if task in ("BuildDem", "BuildOrthomosaic", "ExportDem",
+                        "ExportOrthomosaic"):
+                doc.run_task("BuildDem")
+            if task in ("BuildOrthomosaic", "ExportOrthomosaic"):
+                doc.run_task("BuildOrthomosaic", refine_seamlines=False,
+                             color_correction="none")
+            if task in ("ExportModel", "ExportPointCloud"):
+                # The export tasks need a real destination path.
+                with tempfile.TemporaryDirectory() as tmp:
+                    doc.run_task(task, path=os.path.join(tmp, "export.ply"))
+            if task in ("ExportDem", "ExportOrthomosaic"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    doc.run_task(task, path=os.path.join(tmp, "export.tif"))
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task == "ExportSTMap":
+        # Needs a sensor calibration and a real destination path.
+        doc, chunk = make_document_with_images(*CALBOARD)
+        doc.run_task("CalibrateCamera", board_cols=9, board_rows=6,
+                     square_size=0.025)
+        with tempfile.TemporaryDirectory() as tmp:
+            doc.run_task(task, path=os.path.join(tmp, "stmap.tif"))
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    if task == "CalibrateCamera":
+        # Needs a detectable board in at least three views; the generic
+        # fixtures are unrelated photographs. The task records the same
+        # parameter keys as every other task through run_task.
+        doc, chunk = make_document_with_images(*CALBOARD)
+        doc.run_task(task, board_cols=9, board_rows=6, square_size=0.025)
+        _PREPARED_CACHE[task] = (doc, chunk)
+        return doc, chunk
+    doc, chunk = make_document_with_images(FIXTURE_A, FIXTURE_B)
+    if task != "AddPhotos":  # already run once by the helper
+        doc.run_task(task)
+    _PREPARED_CACHE[task] = (doc, chunk)
+    return doc, chunk
+
+
+class TestDriftInvariant(unittest.TestCase):
+    """Every parameter a task declares must reach the project meta, and back."""
 
     def test_declared_params_equal_recorded_meta_keys(self):
         for task in alphashape.list_tasks():
             params = alphashape.task_params(task)
             expected = {"{}/{}".format(task, name) for name in params}
 
-            doc, chunk = self._prepared_document(task)
+            doc, chunk = _prepared_document(task)
             meta = chunk.meta
             recorded = _parameter_keys(meta, task)
 
@@ -272,7 +278,7 @@ class TestDriftInvariant(unittest.TestCase):
         for task in alphashape.list_tasks():
             expected = {"{}/{}".format(task, name) for name in alphashape.task_params(task)}
 
-            doc, chunk = self._prepared_document(task)
+            doc, chunk = _prepared_document(task)
             before = dict(chunk.meta)
 
             with tempfile.TemporaryDirectory() as tmp:
@@ -288,6 +294,58 @@ class TestDriftInvariant(unittest.TestCase):
             self.assertEqual(before, after, "task {}: meta changed across save/load".format(task))
             recorded = _parameter_keys(after, task)
             self.assertEqual(recorded, expected)
+
+
+def _doc_xml(project_path):
+    """doc.xml text of a saved directory-form project (``name.psx``)."""
+    base = os.path.splitext(project_path)[0]
+    archive = os.path.join(base + ".files", "project.zip")
+    with zipfile.ZipFile(archive) as bundle:
+        return bundle.read("doc.xml").decode("utf-8")
+
+
+class TestFormatDrift(unittest.TestCase):
+    """Every registered task's parameters reach the saved doc.xml.
+
+    TestDriftInvariant proves the binder/meta agreement in memory and that the
+    meta survives a save/load. This test extends it to the file the user
+    actually gets: doc.xml must carry a <property> for every declared
+    "<Task>/<param>".
+
+    No task is skipped. The shared preparation recipe above already supplies
+    each task's prerequisites (destination paths, a second project to append,
+    the calibration board, the matched scene), and run_task records parameters
+    only after a successful run -- a task that could not run here would also
+    fail TestDriftInvariant, so an allow-list would hide a real defect.
+    list_tasks() does not expose the enabled flag, so a registered-but-disabled
+    task is reported here with actionable guidance instead of the raw error.
+    """
+
+    def test_each_parameter_is_in_doc_xml(self):
+        for task in alphashape.list_tasks():
+            params = alphashape.task_params(task)
+            try:
+                doc, _ = _prepared_document(task)
+            except alphashape.Error as exc:
+                if "Task is disabled:" in str(exc):
+                    self.fail(
+                        "task {!r} is listed by list_tasks() but registered as "
+                        "disabled; this drift test requires every listed task "
+                        "to be enabled (list_tasks() does not expose the "
+                        "flag)".format(task)
+                    )
+                raise
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "project.psx")
+                doc.save(path)
+                xml = _doc_xml(path)
+            for name in params:
+                key = "{}/{}".format(task, name)
+                self.assertIn(
+                    '<property name="{}"'.format(key),
+                    xml,
+                    "task {}: parameter {} was not written to doc.xml".format(task, name),
+                )
 
 
 class TestKeyboardBinder(unittest.TestCase):
