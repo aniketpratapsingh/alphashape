@@ -471,10 +471,11 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
     for label, _ in points:
         chunk.addMarker(label=label)
 
-    # Declare the image-space accuracy of the marker projections this script
-    # injects: uniform noise of +-a has sigma a/sqrt(3). Without this the fit
-    # would assume its 0.5 px default and let the 1 px tie points dominate the
-    # camera poses even when the projections are exact.
+    # Record the image-space accuracy of the marker projections this script
+    # injects (uniform noise of +-a has sigma a/sqrt(3)). The bundle adjustment
+    # currently gives tie and marker observations one shared reprojection
+    # weight (BAObservation carries no per-observation sigma), so this is
+    # honest metadata about the injection, not a lever on the fit.
     chunk.marker_projection_accuracy = max(
         PROJECTION_ACCURACY_FLOOR_PX, projection_noise_px / math.sqrt(3.0))
 

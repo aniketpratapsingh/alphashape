@@ -30,9 +30,10 @@ whose truth poses, ground grid and building are recorded in
 4. adds each marker's projections by projecting its truth position through the
    fixture's truth camera pose, then offsets every projection by seeded uniform
    noise of 0.5 px peak to peak (±0.25 px per axis). The chunk's
-   marker-projection accuracy is declared from that noise (σ = a/√3), so the
-   fit does not assume its 0.5 px default and under-weight the projections
-   against the 1 px tie points;
+   marker-projection accuracy is recorded from that noise (σ = a/√3). The
+   bundle adjustment currently gives marker and tie observations one shared
+   reprojection weight, so the value documents the injection rather than
+   changing the solve;
 5. sets the marker reference accuracy to the 1 cm the survey noise actually
    has, so the control points are not treated as exact;
 6. imports 8 usable references as control points (truth + deterministic 1 cm
@@ -80,15 +81,32 @@ The test `python_gcp_validation` prints four JSON objects and four
 bracket-tagged measurement lines; CI surfaces them even when the test passes.
 Numbers are metres; the gates are 2 mm (scenario 1) and 2 cm (scenario 4).
 
-Measured by `python_gcp_validation` on the PR's CI run (Linux x86-64,
-run RUN_ID_PLACEHOLDER, about TIME_PLACEHOLDER):
+Measured by `python_gcp_validation` on the PR's CI run (macOS arm64, run
+42349669604, about 15 s for all four scenarios; the same numbers were produced
+by run 42347626176 on Linux and macOS):
 
-| scenario | horizontal RMS | vertical RMS | 3D total RMS |
-| --- | --- | --- | --- |
-| 1 `exact` | H1_PLACEHOLDER | V1_PLACEHOLDER | T1_PLACEHOLDER |
-| 2 `reference-noise` | H2_PLACEHOLDER | V2_PLACEHOLDER | T2_PLACEHOLDER |
-| 3 `projection-noise` | H3_PLACEHOLDER | V3_PLACEHOLDER | T3_PLACEHOLDER |
-| 4 `combined` | H4_PLACEHOLDER | V4_PLACEHOLDER | T4_PLACEHOLDER |
+| scenario | horizontal RMS | vertical RMS | 3D total RMS | gate |
+| --- | --- | --- | --- | --- |
+| 1 `exact` | 0.000146 m | 0.000469 m | 0.000491 m | 2 mm, pass |
+| 2 `reference-noise` | 0.012760 m | 0.049357 m | 0.050980 m | not gated |
+| 3 `projection-noise` | 0.020654 m | 0.046611 m | 0.050982 m | not gated |
+| 4 `combined` | 0.020175 m | 0.044273 m | 0.048653 m | 2 cm, **fail** |
+
+Scenario 1 passes by a wide margin: with every input exact, the marker/GCP
+machinery reproduces the truth to half a millimetre, so there is no pipeline
+defect in the marker, reference or bundle-adjustment path.
+
+Scenarios 2-4 all sit at about 5 cm, and removing either injected noise does
+not reduce that: scenario 2 (no projection noise) and scenario 3 (no reference
+noise) have the same total as scenario 4. The common limit is therefore the
+consumer-GNSS camera references, not the marker noise: with 2 m / 4 m camera
+positions and a near-planar 12-image nadir block, the vertical scale and the
+camera depths are only weakly determined, and the bundle adjustment can trade a
+few centimetres of camera depth against a sub-pixel reprojection residual even
+with the exact control references of scenario 3. The scenario-4 gate is left
+failing as specified; these four numbers are the evidence for the coordinator's
+decision. Raising the fixture's parallax or adding vertical control would be a
+change to the scenario, not a fix to the pipeline, so neither is done here.
 
 Fixed in every scenario: 12 images, 12 markers (6 ground, 6 roof), 8 usable
 control points (9 imported; one edge target has a single projection), 3 check
