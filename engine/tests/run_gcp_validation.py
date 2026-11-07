@@ -298,7 +298,16 @@ def run_synthetic(args):
     if not applied:
         raise ValueError(
             "AlignCameras did not georeference the block (no GPS references)")
-    chunk.optimizeCameras(use_gcps=True)
+    # The aerial fixture is a distortion-free pinhole render, and AlignCameras
+    # already holds its calibration fixed. Letting the bundle adjustment
+    # self-calibrate distortion on this near-planar scene would fit noise into a
+    # radial term (a depth/distortion degeneracy) and bow the model, so this
+    # validation holds every intrinsic at the alignment's value.
+    chunk.optimizeCameras(use_gcps=True,
+                          fit_f=False, fit_cx=False, fit_cy=False,
+                          fit_k1=False, fit_k2=False, fit_k3=False, fit_k4=False,
+                          fit_p1=False, fit_p2=False,
+                          fit_p3=False, fit_p4=False)
     # Refit the datum now that the marker positions and control references
     # agree. This is the weighted similarity step: it moves the block without
     # changing its internal shape.
@@ -328,6 +337,8 @@ def run_synthetic(args):
         "check_points": len(check_rows),
         "evaluated_check_points": len(errors),
         "projection_noise_px": PROJECTION_NOISE_PX,
+        "camera_f": chunk.sensors[0].calibration.f,
+        "camera_k1": chunk.sensors[0].calibration.k1,
         "georeferenced": applied,
         "engine_check_rms_m": float(
             chunk.meta.get("update_transform.rms_check_m", "nan")),
