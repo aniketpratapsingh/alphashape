@@ -51,20 +51,20 @@ georeferencing at all.
 
 ### Ablation scenarios
 
-`--ablations` runs the same block four times with the noise sources switched
-independently, so a pipeline defect can be told from noise-limited accuracy.
-Scenarios 1-3 disable the camera-GNSS references, keep the fixture's exact GPS
-and pin its exact attitude, so only the stated image/reference noise source is
-present; the SfM tie-point network's own noise is not part of those ablations.
-Scenario 4 is the realistic pipeline: the attitude comes from the alignment and
-the camera positions from the noisy GNSS.
+`--ablations` runs the same block four times, so a pipeline defect can be told
+from noise-limited accuracy. Scenario 1 is the pipeline-exactness control: the
+camera-GNSS references are off and the fixture's exact GPS position and
+attitude are pinned, so every input the marker/GCP machinery consumes is exact.
+Scenarios 2-4 keep the realistic consumer-GNSS camera references (attitude from
+the alignment) and vary only the two noise knobs; their differences are
+therefore attributable to those noises.
 
 | # | name | projection noise | reference noise | camera references | gate |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `exact` | 0 px | 0 m | exact position + attitude | 3D total <= 2 mm |
-| 2 | `reference-noise` | 0 px | 1 cm per axis | exact position + attitude | reported, not gated |
-| 3 | `projection-noise` | ±0.25 px per axis | 0 m | exact position + attitude | reported, not gated |
-| 4 | `combined` | ±0.25 px per axis | 1 cm per axis | consumer GNSS (2 m / 4 m sigma), attitude from the alignment | 3D total <= 2 cm |
+| 2 | `reference-noise` | 0 px | 1 cm per axis | consumer GNSS (2 m / 4 m sigma) | reported, not gated |
+| 3 | `projection-noise` | ±0.25 px per axis | 0 m | consumer GNSS (2 m / 4 m sigma) | reported, not gated |
+| 4 | `combined` | ±0.25 px per axis | 1 cm per axis | consumer GNSS (2 m / 4 m sigma) | 3D total <= 2 cm |
 
 Scenario 1 is the pipeline-exactness check: with exact projections, exact
 references and exact camera GPS, a correct pipeline reconstructs the truth to

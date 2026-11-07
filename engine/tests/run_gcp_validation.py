@@ -19,12 +19,12 @@ Two modes:
 
 ``--ablations`` runs four synthetic scenarios in one process so a pipeline
 defect can be told from noise-limited accuracy: (1) no projection noise, no
-reference noise (the check-point 3D total must be <= 2 mm: the pipeline is
-otherwise exact), (2) 1 cm reference noise only, (3) 0.25 px projection noise
-only, and (4) both noises with the camera-GNSS references on, which is the
-gated scenario. Scenarios 1-3 keep and pin the fixture's exact camera position
-and attitude, so they isolate the marker/GCP machinery from the tie-point
-network's own noise; scenario 4 takes the attitude from the alignment.
+reference noise, with the fixture's exact camera position and attitude pinned
+(the check-point 3D total must be <= 2 mm: the pipeline is otherwise exact),
+(2) 1 cm reference noise only, (3) 0.25 px projection noise only, and (4) both
+noises, which is the gated scenario. Scenarios 2-4 keep the realistic
+consumer-GNSS camera references and take their attitude from the alignment, so
+their differences come from the two noise knobs.
 
 The script prints one JSON object per scenario on stdout and exits 0 when the
 3D total check-point RMS is within the tolerance (2 cm by default), 2
@@ -753,10 +753,14 @@ def emit(report, gate_m, passed):
 def run_ablations(args):
     """Run the four synthetic scenarios and gate (1) exactness and (4) accuracy."""
     scenarios = (
-        # name, projection noise, reference noise, camera GNSS, gate
+        # name, projection noise, reference noise, camera GNSS, gate.
+        # Scenario 1 is the pipeline-exactness control: every input the GCP
+        # machinery consumes is exact. Scenarios 2-4 keep the realistic
+        # consumer-GNSS camera references and vary only the two noise knobs, so
+        # their differences are attributable to those noises.
         ("exact", 0.0, 0.0, False, PIPELINE_TOLERANCE_M),
-        ("reference-noise", 0.0, args.reference_noise_m, False, None),
-        ("projection-noise", args.projection_noise_px, 0.0, False, None),
+        ("reference-noise", 0.0, args.reference_noise_m, True, None),
+        ("projection-noise", args.projection_noise_px, 0.0, True, None),
         ("combined", args.projection_noise_px, args.reference_noise_m,
          args.camera_gnss == "on", args.tolerance),
     )
