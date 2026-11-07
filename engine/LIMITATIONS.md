@@ -630,7 +630,8 @@ solvers see the same operator, right-hand side, preconditioner and iso level.
   - Throughput with every block resident: 96^3, 8 bins, 300 iterations — GPU **0.100 s** vs CPU **0.496 s** (**4.96x**); 128^3, 16 bins — GPU **0.306 s** vs CPU **1.555 s** (**5.08x**); the end-to-end 192^3 fusion runs in 0.30 s against the CPU's 0.94 s. The kernels are memory-bound and the culled blocks were a small share of the working set, so removing the culling cost little.
   - A related indexing defect surfaced on the same run: the block list stored flattened `row * x_blocks + block` ids while both kernels read the entry as a row index (`index = row * nx + x`). The two agree only when `x_blocks == 1` (`nx <= 128`), which is why every sphere/unit case passed; the 192^3 end-to-end grid has `x_blocks == 2` and the kernel read/wrote past the buffer, so Metal raised a GPU address fault and the device was lost. With nothing culled any more the list is the identity over rows.
 
-## M11 — Multi-instance containers and project format v2 (WP-11.1 – 11.4)
+## M29 — Windows build and installer
+
 ### Windows build (M29 WP-29.1 first run)
 
 Built natively on the owner's Windows 11 machine (Ryzen 5 5500U, 6C/12T, 8 GB)
@@ -738,16 +739,17 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   first, and the configure says which case it took. `ALPHASHAPE_PROJ_DATA` can be
   pointed at a full `proj-data` directory to supply them.
 
-## M11 — Multi-instance containers (WP-11.1 / WP-11.2)
+## M11 — Multi-instance containers and project format v2 (WP-11.1 – 11.4)
 
 - **Every container is now persisted (WP-11.3).** Markers, marker groups, scale
   bars, camera groups, masks, shapes (features, layers, attributes, groups),
   trajectories, the panorama and tiled models are written to `doc.xml` v2 and
   read back; `ProjectV2.RoundTripsAllContainers` compares the reloaded chunk to
-  the original with `Chunk::operator==`. They are **not yet bound to Python**
-  (WP-11.11), so the Python surface still exposes only the derived-product
-  asset lists (`elevations`, `orthomosaics`, `models`, `point_clouds`,
-  `depth_maps_sets`) as read-only id/label lists.
+  the original with `Chunk::operator==`. WP-11.11 bound them to Python, so the
+  containers and their views are available; the derived-product asset lists
+  (`elevations`, `orthomosaics`, `models`, `point_clouds`, `depth_maps_sets`)
+  keep their id/label view. Point-cloud and model groups remain the exception
+  (see below).
 - **`Document::kFormatVersion == 3`; v1 and v2 files are still read.** The
   writer emits only v3: `<document version="3">` with every chunk container, all
   assets of every kind, and bulk entries under `chunks/<chunk_id>/...`.
@@ -917,10 +919,9 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   and `Chunk::validate()` assume at least one).
 - **Group commands cover marker and camera groups only.** `GroupKind` declares
   `PointCloud` and `Model`, but `Chunk` has no `point_cloud_groups()` /
-  `model_groups()` container yet (the plan's §4.2 aliases exist, the storage
-  does not), so those two kinds throw `ValueError`. They are wired up when the
-  containers land (with the Python `addPointCloudGroup`/`addModelGroup`
-  bindings in WP-11.11).
+  `model_groups()` container (the plan's §4.2 aliases exist, the storage does
+  not), so those two kinds throw `ValueError`. The containers never landed, so
+  there are no `addPointCloudGroup`/`addModelGroup` bindings either.
 - **`Camera::selected` is persisted, but only when true.** WP-11.8 writes the
   flag as the optional `selected` attribute on a `<camera>` element (absent
   means false, so an unselected camera adds no bytes) and the reader restores
@@ -930,8 +931,9 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 - **`AppendDocument` copies the chunks and drops the source path.** Chunk ids
   are offset by the target's `next_chunk_id()` and chunk-local ids are
   preserved (§4.8), but the `source_path` argument is currently only used in
-  error messages; recording it in `Workspace::meta` (as the plan sketches) is
-  left to the `AppendProject` task (WP-11.6), which is the real entry point.
+  error messages and command labels. Recording it in `Workspace::meta` (as the
+  plan sketches) is not implemented; `AppendProject` (WP-11.6) does not record
+  it either.
 - **`DuplicateChunk` now REMAPS ids (WP-11.6 replaced the verbatim copy).**
   The 11.5b command used to keep the source's chunk-local ids and `next_id()`;
   it now routes through `core/chunk_ops.hpp`'s `duplicate_chunk`, so a copy can
@@ -944,19 +946,12 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   `Marker` may arrive with projections out of camera order (a GUI appends the
   one just clicked); `make_add_marker_command` sorts them into place. A
   repeated camera or a non-finite pixel is an error and nothing is staged.
-- **`make_set_chunk_crs_command` is not declared.** Its parameter type,
-  `crs::CoordinateSystem`, arrives with M12 WP-12.11; declaring a factory over
-  a type that does not exist would not compile. The factory is added there,
-  together with the rest of the CRS wiring.
-- **The spill policy is implemented as a reusable buffer, not wired into
-  commands yet.** `SpillBuffer` enforces the §4.7 rule (payloads above
-  `kUndoAssetSpillBytes` = 64 MiB go to the cache directory; without a cache
-  directory the payload is unbounded and `UndoStack::execute` refuses the
-  command with `Error("command too large for the undo history")`). Asset
-  commands in 11.5c are the first callers. `UndoStack::set_cache_dir` is the
-  plumbing the caller must feed (`<base>.files/cache`, §4.9); the project
-  layout WP (11.9) computes it, so until then it is empty and oversized
-  payloads are refused rather than spilled.
+- **The spill policy is `SpillBuffer`, wired into the asset commands.**
+  Payloads above `kUndoAssetSpillBytes` = 64 MiB go to the cache directory;
+  without a cache directory the command reports itself unbounded and
+  `UndoStack::execute` refuses it with `Error("command too large for the undo
+  history")`. `UndoStack::set_cache_dir` is the plumbing the caller feeds
+  (`<base>.files/cache`, §4.9), and the project layout (11.9) computes it.
 - **`SpillBuffer` handles `Image` only.** That is the one payload with a
   self-describing byte layout available today (panorama assets are the `> 64
   MiB` case in practice). Point-cloud, mesh and depth-map payloads are not
@@ -1086,9 +1081,10 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 - **`reference_chunk_id` defaults to the first other chunk.** That is
   convenient for scripts and unambiguous for two chunks; a three-chunk
   workspace should pass the id. Aligning a chunk onto itself is an error.
-- **No Python-side undo hook yet.** `Document.align_chunks` runs the task
-  directly (like every other task); the undo entry exists on the C++ side only.
-  Wiring the Python undo stack is WP-11.11.
+- **`Document.align_chunks` has no Python undo entry.** It runs the task
+  directly, and like every other task it discards the undo history rather than
+  pushing one; `Document.undo`/`redo` cover the command-backed setters
+  (WP-11.11). The undo entry exists on the C++ side only.
 ## M11 — Project layouts: .psz, relative paths, cache, lock (WP-11.9)
 
 - **A `.psz` is read fully into memory.** It is one zip with the same entries
@@ -1110,6 +1106,40 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
   take it, exactly as before. A lock from another host is only considered
   stale once it is older than 24 h (configurable), because its pid cannot be
   checked locally; a lock on this host whose pid is gone is broken at once.
+
+### M11 — close-out
+
+M11 is complete and green; the following are the knowingly partial parts.
+
+- **The project archive is in memory and has no Zip64.** `ZipArchive` keeps the
+  whole archive and its inflated entries in RAM, and the writer refuses a file
+  above 4 GiB or more than 65 535 entries with "Zip64 not supported yet". A
+  project beyond that size cannot be saved, and opening one costs the archive
+  plus the decoded document in memory.
+- **Shapes are stored in our own container, not a GIS file.** Features, layers
+  and groups live in the chunk sidecar with the other containers; there is no
+  GeoPackage export yet, so vector data cannot be handed to GIS tools without
+  an exporter in a later milestone.
+- **Tiled-model payloads are still opaque bytes** (see above): M11 persists
+  them, but the builder and a scene-format writer are later work.
+- **Multiframe camera layouts are absent.** A `Camera` references one sensor and
+  a `Frame` names one camera, so a rig that produces several frames per camera
+  position (or several sensors rigidly attached) has no representation.
+- **Chunk alignment has no point-cloud path.** `AlignChunks` accepts
+  `method="markers"` and `method="reference"` only; ICP or nearest-neighbour
+  cloud alignment is not implemented.
+- **The job database is SQLite when the configure found it, and a JSON-lines
+  file otherwise.** The fallback is single-process (the project lock is what
+  keeps a second writer out); only the SQLite backend is safe across processes.
+- **Python: `Chunk.addPointCloudGroup` / `addModelGroup` are not bound.**
+  `GroupKind` declares those two kinds, but `Chunk` has no point-cloud or model
+  group container to put them in, so the factories throw.
+- **`Chunk.enabled` is chunk metadata, not a field.** It is the meta key
+  `"enabled"` (`"true"`/`"false"`, default true), so it persists with the
+  free-form metadata and a meta edit is what changes it.
+- **Flattening across depth-map sets is untested.** `Chunk.depth_maps` returns
+  every map from every set; the only test that exercises it has a single set,
+  so the two-or-more-set case is not covered.
 
 ## M12 — Coordinate systems (PROJ)
 

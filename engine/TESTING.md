@@ -1,6 +1,8 @@
 # Testing
 
-Normal is the configuration whose 684 tests (C++, Python and CLI e2e) must stay green.
+Normal is the configuration whose tests (C++, Python and CLI e2e) must stay
+green; the current counts and suite times are measured on CI and recorded in
+[Test inventory and current counts](#test-inventory-and-current-counts) below.
 
 ## Normal (Release, day-to-day)
 
@@ -149,6 +151,63 @@ ctest --test-dir build-mac -N | tail -2      # discovery ran during the link
   POST_BUILD step runs `alphashape_tests --gtest_list_tests --gtest_output=json:...`
   with a 5 s timeout; running the same command by hand reproduces exactly what
   the build step saw.
+
+## Test inventory and current counts
+
+Measured on CI run 42309528047 (2026-11-06, `main`, head `3f64f7c`). "Tests"
+are CTest entries: `gtest_discover_tests` registers every C++ case as its own
+test, so the number is not a count of executables.
+
+The `Build / Test shard coverage` job reports **Linux: 2015 tests run across 17
+lanes**, **macOS: 2015 tests across 3 lanes**, and **Windows: 1997 tests across
+17 lanes**. Linux per-lane wall times from `Total Test time (real)`:
+
+| Lane | Tests | Wall time |
+|---|---|---|
+| light-1-of-4 | 492 | 384.60 s |
+| light-2-of-4 | 492 | 296.80 s |
+| light-3-of-4 | 490 | 751.59 s |
+| light-4-of-4 | 491 | 756.09 s |
+| heavy-depth-pyramid | 1 | 35.31 s |
+| heavy-ortho-surface | 5 | 707.44 s |
+| heavy-errors-dense-model | 3 | 302.66 s |
+| heavy-dem-plane | 6 | 372.28 s |
+| heavy-texture-python | 6 | 310.59 s |
+| heavy-ortho-truth | 1 | 145.53 s |
+| heavy-ortho-ghosting | 2 | 356.74 s |
+| heavy-ortho-affine | 4 | 579.63 s |
+| heavy-gui-e2e | 1 | 22.07 s |
+| heavy-ortho-gain | 4 | 601.08 s |
+| heavy-ortho-blocks | 14 | 631.31 s |
+| heavy-apriltag-clutter | 1 | 92.78 s |
+| heavy-marker-detector-12mp | 1 | 2.19 s |
+
+The per-lane test counts sum to 2014; the coverage job counts 2015 tests in the
+generated list, so one entry is not attributed to a lane above. Both numbers
+come from the same run.
+
+### M11 suites
+
+- `tests/test_project_layout.cpp` — `ProjectLayout.*`: `.psz` and directory
+  round trips, relative and absolute frame paths, missing photos, cache cleanup,
+  the advisory writer lock and stale-lock recovery.
+- `tests/test_job_db.cpp` — `JobDb.*` and `JobDbFallback.*`: insert, list,
+  update, remove, concurrent inserts, reopen, id reuse, torn records and the
+  per-project path; both the SQLite backend and the JSON-lines fallback run.
+- `tests/test_run_script.cpp` — `RunScript.*`: output capture, non-zero exit,
+  timeout kill, 8 KB truncation, output index, `PYTHONPATH` prepending and the
+  unsaved-document refusal.
+- `tests/test_project_v2.cpp` — `ProjectV2.*`: container round trips, v1/v2
+  reads, byte-stable resave, the fuzz corpus, plus `ElementVocabulary`,
+  `AttributeVocabulary` and `FormatDocMatchesVocabulary` (61 elements and 231
+  attribute pairs pinned against `docs/project-format-v2.md`) and the tamper
+  case `RejectsImpossibleDeclaredEntrySize`.
+- Python `python_data_model` (`tests/test_data_model.py`): containers, multiple
+  assets, marker CRUD with undo, task history, `.psx`/`.psz` save and load,
+  append, the chunk API and `Chunk.enabled`.
+- Python `TestFormatDrift` (`tests/test_parity.py`): every declared task
+  parameter must appear in `doc.xml` with its recorded meta keys, and unknown
+  tasks, parameters and wrong value types must be refused.
 
 ## Coordinate-system tests (M12)
 
