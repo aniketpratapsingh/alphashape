@@ -53,6 +53,7 @@ on:
         options:
           - aerial-nadir
           - terrestrial-laser
+          - gcp-rtk
           - all
       # Extra BuildDepthMaps keyword arguments, e.g. "cost_type=census". This exists
       # so a change to a depth-map parameter can be MEASURED on the same dataset as a
@@ -209,7 +210,7 @@ jobs:
           packages: >-
             build-essential cmake ninja-build ccache
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
-            libpng-dev libtiff-dev
+            libpng-dev libtiff-dev pybind11-dev python3-dev
           attempt-timeout: "240"
           install-timeout: "420"
 
@@ -225,13 +226,16 @@ jobs:
         run: |
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DALPHASHAPE_BUILD_TESTS=OFF \
-            -DALPHASHAPE_BUILD_PYTHON=OFF \
+            -DALPHASHAPE_BUILD_PYTHON=ON \
             -DALPHASHAPE_BUILD_GUI=OFF \
             -DALPHASHAPE_GPU=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build the CLI
-        run: cmake --build build --target alphashape-cli --parallel 4
+        # The Python bindings are built alongside the CLI: the gcp-rtk dataset's
+        # ground-control protocol drives the engine through the alphashape module,
+        # not through the task-based CLI. Other datasets ignore the module.
+        run: cmake --build build --target alphashape-cli alphashape_python --parallel 4
 
       - name: Smoke the binary
         # A binary that cannot even list its tasks would fail every dataset for the
@@ -244,6 +248,13 @@ jobs:
         with:
           name: bench-cli
           path: build/src/apps/cli/alphashape-cli
+          retention-days: 1
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: bench-python
+          path: build/python/
           retention-days: 1
           if-no-files-found: error
 
@@ -268,6 +279,14 @@ jobs:
         with:
           name: bench-cli
           path: build/bench/bin
+
+      # The alphashape Python module, for the gcp-rtk ground-control protocol. It
+      # is built against the runner's python3 (3.12 on ubuntu-24.04), the same
+      # interpreter the metrics deps below install into.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: bench-python
+          path: build/bench/python
 
       # Runtime libraries for the CLI, p7zip for the ETH3D archives. The metrics Python
       # packages are installed separately below, pinned in versions.txt.
@@ -313,6 +332,10 @@ jobs:
       - name: Run the benchmark
         env:
           ALPHASHAPE_CLI: ${{ github.workspace }}/build/bench/bin/alphashape-cli
+          # The gcp-rtk protocol drives the engine through the built alphashape
+          # module rather than the CLI; these name its directory and interpreter.
+          ALPHASHAPE_PYTHON_DIR: ${{ github.workspace }}/build/bench/python
+          ALPHASHAPE_PYTHON: python3
           # An env var, not an interpolation into the script below. The value is a
           # dispatch input, so it is untrusted text; `run_bench.py --depth-params`
           # validates it before anything reaches the CLI. Empty for every scheduled,

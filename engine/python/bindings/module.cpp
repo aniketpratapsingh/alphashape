@@ -1684,6 +1684,20 @@ PYBIND11_MODULE(alphashape, m) {
                                        *c.reference.rotation_accuracy_deg;
                                    return py::make_tuple(a.x(), a.y(), a.z());
                                })
+        // Whether this camera's measured reference position constrains the fit.
+        // The real-block GCP protocol's "GCPs only" variant clears this on every
+        // camera so the survey GCPs alone carry the georeference.
+        .def_property(
+            "reference_enabled",
+            py::cpp_function([](const CameraRef& r) { return r.get().reference.enabled; },
+                             py::is_method(m)),
+            py::cpp_function(
+                [](CameraRef& r, bool value) {
+                    execute_command(r.document,
+                                    alphashape::make_set_camera_reference_enabled_command(
+                                        r.chunk->id(), r.id, value));
+                },
+                py::is_method(m)))
         // Posterior covariance of the centre, chunk-local, 3x3 nested lists.
         // All zeros on a camera whose covariance was not computed.
         .def_property_readonly("location_covariance", [](const CameraRef& r) {

@@ -1017,6 +1017,117 @@ def require_geographic_crs(code):
             "coordinates are not supported")
 
 
+# Observations of one surveyed point are grouped by identical (x, y, z), so a
+# GCP is keyed on its coordinates rounded to this many decimals of a degree.
+ODM_GCP_GROUP_DECIMALS = 9
+# A CSV point is the same survey point as a gcp_list coordinate within this
+# angular tolerance (~1 m at these latitudes) for the label match.
+GCP_NAME_MATCH_TOLERANCE_DEG = 1e-5
+# A z offset this small between gcp_list z and the CSV elevation means the two
+# are the same datum; a several-tens-of-metres offset is the geoid undulation.
+ORTHOMETRIC_OFFSET_M = 2.0
+
+
+def parse_odm_gcp_list(path):
+    """Parse an ODM gcp_list.txt into one dict per survey point.
+
+    The header is a CRS string (``EPSG:4326``: x=longitude, y=latitude). Each
+    following row is ``x y z px py image [label]`` — one image observation of
+    one point. Rows with the same (x, y, z) are one GCP, collected in first-seen
+    order so the returned list has one entry per distinct surveyed point.
+    """
+    with open(path, encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("gcp_list is empty")
+    header = lines[0]
+    gcps = []
+    order = {}
+    for line in lines[1:]:
+        tokens = line.split()
+        if len(tokens) < 6:
+            continue
+        x, y, z = float(tokens[0]), float(tokens[1]), float(tokens[2])
+        px, py = float(tokens[3]), float(tokens[4])
+        image = tokens[5]
+        label = tokens[6] if len(tokens) > 6 else None
+        key = (round(x, ODM_GCP_GROUP_DECIMALS),
+               round(y, ODM_GCP_GROUP_DECIMALS),
+               round(z, ODM_GCP_GROUP_DECIMALS))
+        if key not in order:
+            order[key] = len(gcps)
+            gcps.append({"lon": x, "lat": y, "height": z, "label": label,
+                         "observations": []})
+        gcps[order[key]]["observations"].append(
+            {"px": px, "py": py, "image": image})
+    return header, gcps
+
+
+def parse_gcp_names_csv(path):
+    """Parse the survey CSV into one dict per point, keyed by its header names."""
+    with open(path, encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError("gcp names CSV has no data rows")
+    columns = [column.strip().lower() for column in lines[0].split(";")]
+    index = {name: position for position, name in enumerate(columns)}
+    rows = []
+    for line in lines[1:]:
+        fields = [field.strip() for field in line.split(";")]
+        rows.append({
+            "name": fields[index["name"]],
+            "easting": float(fields[index["easting"]]),
+            "northing": float(fields[index["northing"]]),
+            "elevation": float(fields[index["elevation"]]),
+            "longitude": float(fields[index["longitude"]]),
+            "latitude": float(fields[index["latitude"]]),
+        })
+    return columns, rows
+
+
+def match_gcp_names(gcps, names):
+    """Give each GCP its CSV survey name, falling back to G1..Gn when no point
+    matches within ``GCP_NAME_MATCH_TOLERANCE_DEG``. Records the matched CSV
+    elevation on the GCP for the z-datum determination."""
+    for position, gcp in enumerate(gcps):
+        best_name, best_distance, best_elevation = None, None, None
+        for row in names:
+            distance = math.hypot(gcp["lon"] - row["longitude"],
+                                  gcp["lat"] - row["latitude"])
+            if best_distance is None or distance < best_distance:
+                best_distance, best_name, best_elevation = (
+                    distance, row["name"], row["elevation"])
+        if best_distance is not None and best_distance < GCP_NAME_MATCH_TOLERANCE_DEG:
+            gcp["label"] = best_name
+            gcp["csv_elevation"] = best_elevation
+        else:
+            gcp["label"] = "G{}".format(position + 1)
+    return gcps
+
+
+def determine_z_datum(gcps):
+    """Whether gcp_list z is ellipsoidal or orthometric, from the CSV elevation.
+
+    A near-zero mean offset means the gcp_list z is the surveyed orthometric
+    elevation; an offset of tens of metres is the geoid undulation, so z is an
+    ellipsoidal height. The per-point offsets and the decision are recorded.
+    """
+    offsets = [gcp["height"] - gcp["csv_elevation"]
+               for gcp in gcps if "csv_elevation" in gcp]
+    if not offsets:
+        return {"decision": "unknown",
+                "reason": "no gcp matched a CSV elevation"}
+    mean = sum(offsets) / len(offsets)
+    if abs(mean) <= ORTHOMETRIC_OFFSET_M:
+        decision = "orthometric"
+    elif abs(mean) > 10.0:
+        decision = "ellipsoidal"
+    else:
+        decision = "ambiguous"
+    return {"decision": decision, "mean_offset_m": mean,
+            "offsets_m": offsets}
+
+
 def run_real(args):
     """Match -> align -> detect -> import GCPs -> georeference -> bundle-adjust."""
     require_geographic_crs(args.crs)
@@ -1087,6 +1198,177 @@ def run_real(args):
     }
 
 
+def project_path_for(args):
+    """The on-disk project the protocol saves once and reloads per fold."""
+    base = os.path.dirname(os.path.abspath(args.json_out or "gcp_report.json"))
+    return os.path.join(base, "gcp_site.psx")
+
+
+def align_block(args, images):
+    """MatchPhotos + AlignCameras once, save the project, return alignment facts.
+
+    The same block is reloaded for every fold, so the expensive matching and
+    alignment happen exactly once. keypoint_limit_per_mpx is the 16 GB-runner
+    budget recorded in the manifest; the dense stage never runs.
+    """
+    doc = alphashape.Document()
+    chunk = doc.add_chunk("Helenenschacht RTK block")
+    doc.active_chunk = chunk
+    doc.run_task("AddPhotos", filenames=images)
+    chunk.crs_epsg = 4326
+    doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit)
+    doc.run_task("AlignCameras")
+    project = project_path_for(args)
+    doc.save(project)
+    total = len(chunk.cameras)
+    aligned = sum(1 for camera in chunk.cameras if camera.enabled)
+    return {"project": project, "cameras_total": total,
+            "cameras_aligned": aligned,
+            "keypoint_limit_per_mpx": args.keypoint_limit}
+
+
+def import_camera_references_for_block(chunk, accuracy_m, directory):
+    """Re-import camera references at their EXIF/XMP accuracy, else ``accuracy_m``.
+
+    AddPhotos stores the position but no accuracy, so the fit would fall back to
+    the loose consumer default. The RTK positions deserve their stated accuracy,
+    which EXIF/XMP may already carry; otherwise the manifest's fallback applies.
+    """
+    rows = []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if reference is None or not all(
+                math.isfinite(float(value)) for value in reference):
+            continue
+        declared = camera.reference_accuracy
+        accuracy = declared if declared is not None else (
+            accuracy_m, accuracy_m, accuracy_m)
+        rows.append((camera.label, reference[0], reference[1], reference[2],
+                     accuracy[0], accuracy[1], accuracy[2]))
+    path = os.path.join(directory, "camera_references.csv")
+    write_camera_reference_csv(path, rows)
+    chunk.importReference(path=path)
+
+
+def run_fold(args, gcps, check_index, camera_refs, align_report):
+    """One leave-one-out fold: reload, project, import, fit, measure the check."""
+    doc = alphashape.load_project(align_report["project"])
+    chunk = doc.active_chunk
+
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    for gcp in gcps:
+        chunk.addMarker(label=gcp["label"])
+    for gcp in gcps:
+        for observation in gcp["observations"]:
+            stem = os.path.splitext(observation["image"])[0]
+            target = stem if stem in cameras else (
+                observation["image"] if observation["image"] in cameras else None)
+            if target is None:
+                continue
+            chunk.setMarkerProjection(gcp["label"], target,
+                                      observation["px"], observation["py"])
+
+    with tempfile.TemporaryDirectory() as directory:
+        if camera_refs:
+            import_camera_references_for_block(chunk, args.camera_accuracy,
+                                               directory)
+        else:
+            for camera in chunk.cameras:
+                camera.reference_enabled = False
+
+        control_rows = [(gcps[index]["label"], gcps[index]["lon"],
+                         gcps[index]["lat"], gcps[index]["height"])
+                        for index in range(len(gcps)) if index != check_index]
+        check_rows = [(gcps[check_index]["label"], gcps[check_index]["lon"],
+                       gcps[check_index]["lat"], gcps[check_index]["height"])]
+        control_path = os.path.join(directory, "control.csv")
+        check_path = os.path.join(directory, "check.csv")
+        write_reference_csv(control_path, control_rows)
+        write_reference_csv(check_path, check_rows)
+        chunk.importReference(path=control_path, marker_type="gcp")
+        chunk.importReference(path=check_path, marker_type="check_point")
+
+    chunk.updateTransform()
+    chunk.optimizeCameras(use_gcps=True)
+
+    labels = [gcps[check_index]["label"]]
+    targets = reference_local_targets(chunk, labels)
+    errors = check_point_errors(chunk, labels, targets)[0]
+    return {"check": labels[0],
+            "control": [gcps[index]["label"]
+                        for index in range(len(gcps)) if index != check_index],
+            "horizontal_m": errors["horizontal"],
+            "vertical_m": errors["vertical"],
+            "total_m": errors["total"]}
+
+
+def run_real_odm(args):
+    """The real-block leave-one-out protocol over the ODM GCPs, two variants."""
+    header, gcps = parse_odm_gcp_list(args.gcp_list)
+    _, names = parse_gcp_names_csv(args.gcp_names)
+    gcps = match_gcp_names(gcps, names)
+    z_datum = determine_z_datum(gcps)
+    images = collect_images(args.real)
+    if len(images) < 3:
+        raise ValueError("need at least three images in " + args.real)
+
+    align_report = align_block(args, images)
+    variants = {}
+    for variant, camera_refs in (("camera_rtk_gcps", True),
+                                 ("gcps_only", False)):
+        folds = []
+        for check_index in range(len(gcps)):
+            try:
+                folds.append(run_fold(args, gcps, check_index, camera_refs,
+                                      align_report))
+            except ValueError as error:
+                folds.append({"check": gcps[check_index]["label"],
+                              "error": str(error)})
+        measured = [fold for fold in folds if "error" not in fold]
+        variants[variant] = {
+            "folds": folds,
+            "evaluated": len(measured),
+            "rms_horizontal_m": (
+                root_mean_square([fold["horizontal_m"] for fold in measured])
+                if measured else None),
+            "rms_vertical_m": (
+                root_mean_square([fold["vertical_m"] for fold in measured])
+                if measured else None),
+            "rms_total_m": (
+                root_mean_square([fold["total_m"] for fold in measured])
+                if measured else None),
+        }
+    best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
+    target = args.tolerance
+    passed = (best_horizontal is not None and best_horizontal <= target)
+    report = {
+        "scenario": "real-block-gcp",
+        "kind": "gcp",
+        "images": len(images),
+        "gcps": len(gcps),
+        "observations": sum(len(gcp["observations"]) for gcp in gcps),
+        "crs_header": header,
+        "z_datum": z_datum,
+        "align": align_report,
+        "variants": variants,
+        "target_horizontal_m": target,
+        "passed": passed,
+    }
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    print("[gcp validation] scenario={} images={} gcps={} "
+          "camera_rtk_gcps_h={:.6f} gcps_only_h={:.6f} target={:.6f} "
+          "passed={}".format(
+              report["scenario"], len(images), len(gcps),
+              variants["camera_rtk_gcps"]["rms_horizontal_m"] or -1.0,
+              variants["gcps_only"]["rms_horizontal_m"] or -1.0,
+              target, passed))
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="GCP / check-point validation scenarios.")
@@ -1096,6 +1378,22 @@ def parse_args(argv):
                         help="directory of a real aerial block")
     parser.add_argument("--gcp", metavar="CSV",
                         help="label,x,y,z control-point CSV for --real")
+    parser.add_argument("--gcp-list", metavar="PATH",
+                        help="ODM gcp_list.txt (header EPSG:4326, rows "
+                             "'x y z px py image [label]') for --real")
+    parser.add_argument("--gcp-names", metavar="CSV",
+                        help="Name;Easting;Northing;Elevation;Longitude;Latitude "
+                             "CSV whose points are matched to --gcp-list by "
+                             "coordinates")
+    parser.add_argument("--camera-accuracy", type=float, default=0.05,
+                        help="fallback camera reference accuracy in metres when "
+                             "EXIF/XMP carries none")
+    parser.add_argument("--marker-accuracy", type=float, default=0.015,
+                        help="control-point reference accuracy in metres")
+    parser.add_argument("--keypoint-limit", type=int, default=250,
+                        help="MatchPhotos keypoint_limit_per_mpx for the block")
+    parser.add_argument("--json-out", metavar="PATH",
+                        help="write the JSON report to this file as well as stdout")
     parser.add_argument("--crs", default="",
                         help="EPSG code of the CSV coordinates")
     parser.add_argument("--check-points", default="",
@@ -1221,6 +1519,8 @@ def main(argv):
             passed = synthetic_passed(report, args.tolerance)
             emit(report, args.tolerance, passed)
             return 0 if passed else 2
+        if args.real and args.gcp_list and args.gcp_names:
+            return run_real_odm(args)
         if args.real and args.gcp:
             report = run_real(args)
             passed = (report["evaluated_check_points"] ==
