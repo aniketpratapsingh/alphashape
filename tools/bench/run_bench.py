@@ -1113,6 +1113,9 @@ def run(
         shutil.copy2(found, target)
     references = reference_paths(dataset, work)
 
+    if dataset.get("validation") == "gcp":
+        return run_gcp_validation(dataset_name, dataset, work, references)
+
     print("-- pipeline")
     available = collect_images(dataset, work)
     images, selection = select_subset(available, dataset.get("max_images"))
@@ -1182,6 +1185,76 @@ def run(
         "image_selection": selection,
     }
     return result
+
+
+def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references: dict) -> dict:
+    """Run the real-block ground-control validation (engine/tests/run_gcp_validation.py).
+
+    The GCP protocol is different from the ortho/DEM pipeline: align the block once,
+    then leave-one-out over the surveyed GCPs. The heavy lifting is in the script,
+    which needs the built ``alphashape`` Python module (the workflow builds it and
+    points ``ALPHASHAPE_PYTHON_DIR`` at it). This function only downloads/verifies
+    the data, resolves the script and its inputs, runs it, and folds the JSON report
+    into the metrics shape the report understands.
+    """
+    available = collect_images(dataset, work)
+    images_dir = available[0].parent
+    gcp_list = references.get("gcp_list")
+    gcp_names = references.get("gcp_names")
+    if not gcp_list or not gcp_names:
+        raise SystemExit(f"{dataset_name}: the gcp-rtk manifest must name gcp_list and gcp_names references")
+
+    script = HERE.parent.parent / "engine" / "tests" / "run_gcp_validation.py"
+    gcp = dataset.get("gcp") or {}
+    match = (dataset.get("param_overrides") or {}).get("MatchPhotos") or {}
+
+    python_dir = os.environ.get("ALPHASHAPE_PYTHON_DIR")
+    if not python_dir:
+        raise SystemExit("ALPHASHAPE_PYTHON_DIR is not set; the GCP validation needs the built alphashape module")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = python_dir + os.pathsep + env.get("PYTHONPATH", "")
+    python = os.environ.get("ALPHASHAPE_PYTHON") or "python3"
+
+    out_json = work / "gcp_report.json"
+    command = [
+        python, str(script), "--real", str(images_dir),
+        "--gcp-list", str(gcp_list), "--gcp-names", str(gcp_names),
+        "--horizontal-target", str(gcp.get("target_horizontal_m", 0.05)),
+        "--camera-accuracy", str(gcp.get("camera_accuracy_fallback_m", 0.05)),
+        "--marker-accuracy", str(gcp.get("marker_location_accuracy_m", 0.015)),
+        "--keypoint-limit", str(match.get("keypoint_limit_per_mpx", 250)),
+        "--json-out", str(out_json),
+    ]
+
+    print("-- gcp validation")
+    print(f"  $ {' '.join(command)}")
+    started = time.monotonic()
+    result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    print(result.stdout)
+    elapsed = time.monotonic() - started
+    if result.returncode != 0:
+        raise SystemExit(f"gcp validation failed (exit {result.returncode}); see the log above")
+    if not out_json.exists():
+        raise SystemExit("gcp validation reported success but wrote no JSON report")
+
+    with open(out_json, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    report["dataset"] = dataset_name
+    report["kind"] = "gcp"
+    report["licence"] = dataset["licence"]
+    report["manifest_hash"] = manifest_hash(load_manifest())
+    report["timing"] = {"total_s": elapsed, "stages_s": {"gcp_validation": elapsed},
+                        "param_overrides": dataset.get("param_overrides") or {}}
+    report["dataset_manifest"] = {
+        "title": dataset["title"],
+        "doi": dataset.get("doi"),
+        "flight": dataset["flight"],
+        "images": len(available),
+        "images_available": len(available),
+        "image_selection": {"mode": "all", "selected": len(available), "images": [p.name for p in available]},
+    }
+    return report
 
 
 def _reprojection(work: Path, project: Path) -> dict:

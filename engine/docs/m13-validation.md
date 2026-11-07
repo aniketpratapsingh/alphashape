@@ -211,7 +211,64 @@ silently misinterpreting the coordinates. A check label with no marker or no
 computed position also exits non-zero, so a missing check point cannot be
 mistaken for a perfect one.
 
-The real-block measurement is **pending a cloud run**: no real aerial block with
-surveyed check points is checked into this repository, so this document does not
-state a number for it. The synthetic figures above are the committed,
-reproducible measurements.
+### Measured: Helenenschacht RTK block (GPL-3.0)
+
+Measured by the `gcp-rtk` dataset of the quality benchmark on CI run
+`42378055451`. Dataset: the OpenDroneMap `odm_data_helenenschacht` sample (pinned
+commit `eece33e9ece2ff358a7bdc02e1db6f67925e00c4`, tarball SHA-256
+`4e71dbfc08efcf1ff854c4b82a01f2ba5b6b42dd7530fd64c890ab2261643bab`, 2 546 560 515
+bytes) — 176 nadir JPEGs from an Autel Evo II Pro RTK drone, 5 surveyed GCPs (35
+image observations) and a 5-point survey CSV (Emlid Reach RS2 via NTRIP). Photos
+by Daniel Dobosi, published by OpenDroneMap (GPL-3.0); the benchmark downloads and
+measures only and does not redistribute.
+
+Protocol: align once (`MatchPhotos keypoint_limit_per_mpx=250` + `AlignCameras`,
+146/176 cameras registered, 0.740 px RMS), save, then leave-one-out over the 5
+GCPs — 4 control + 1 held-out check per fold, `UpdateTransform` +
+`OptimizeCameras(use_gcps=True)`, and the check point's horizontal / vertical / 3D
+error measured against its surveyed reference. Two variants: camera RTK references
+at `--camera-accuracy` (0.05 m) plus the GCPs at `--marker-accuracy` (0.015 m), and
+GCPs only with the camera references disabled. The GCPs-only folds also report how
+far the stored camera references sit from the adjusted camera centres (mean and RMS
+east/north/up), which separates a height-datum mismatch from unfixed positions. Runtime 2702.7 s on a shared CPU runner. The gcp-list
+z is orthometric (mean offset to the CSV elevation 0.0 m).
+
+| check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
+| --- | --- | --- |
+| 1 | 0.0753 / 0.1368 / 0.1562 | 0.0741 / 0.1359 / 0.1548 |
+| 2 | 0.0385 / -0.0581 / 0.0696 | 0.0409 / -0.0399 / 0.0572 |
+| 3 | 0.0926 / -0.0905 / 0.1295 | 0.0921 / -0.0851 / 0.1254 |
+| 4 | 0.1043 / 0.2697 / 0.2891 | 0.1058 / 0.2823 / 0.3015 |
+| 5 | 0.0638 / 0.1841 / 0.1948 | 0.0646 / 0.1845 / 0.1954 |
+| RMS | **0.0783 / 0.1655 / 0.1831** | **0.0788 / 0.1680 / 0.1855** |
+
+**Superseded.** In this first run the camera variant read each camera's stored
+accuracy back from the binding, which is the 10 m consumer default once a location
+exists, so the RTK positions carried no weight and the two variants agreed to
+within a millimetre. The control markers also used the 5 mm chunk default instead
+of the stated 0.015 m. Both are fixed; the table above is kept only as the record
+of that run.
+
+Rerun with the stated accuracies (CI run `42383670611`, same alignment: 146/176,
+0.740 px):
+
+| check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
+| --- | --- | --- |
+| 1 | 0.1028 / -0.1322 / 0.1674 | 0.0711 / 0.0243 / 0.0751 |
+| 2 | 0.0380 / -0.3137 / 0.3160 | 0.0348 / 0.0103 / 0.0363 |
+| 3 | 0.1133 / -0.1296 / 0.1722 | 0.0885 / -0.1129 / 0.1434 |
+| 4 | 0.0399 / 0.0919 / 0.1002 | 0.1127 / 0.1757 / 0.2087 |
+| 5 | 0.0446 / 0.0142 / 0.0469 | 0.0670 / 0.0820 / 0.1059 |
+| RMS | **0.0754 / 0.1681 / 0.1843** | **0.0791 / 0.1010 / 0.1283** |
+
+The 5 cm horizontal target is still **missed** (reported, not gated). The GCPs-only
+folds explain why the camera variant does not help: against the GCP-adjusted
+camera centres, the stored camera positions sit on average 3.45 m too high
+(mean E/N/U -0.61 / 0.20 / 3.45 m, RMS 0.72 / 0.50 / 3.49 m over 146 cameras). The
+near-constant vertical offset is a height-reference mismatch between the camera
+altitudes and the surveyed GCP heights, and the ~0.4 m horizontal scatter is far
+above RTK-fixed precision. Weighted at 5 cm, those positions pull against the GCPs:
+the image residual rises from ~0.95 to ~1.18 px and the camera-variant vertical
+error is worse than GCPs only. Until the camera altitude reference of this block is
+resolved, the GCPs-only variant is the meaningful one: 7.9 cm horizontal and
+10.1 cm vertical from four control points per fold.
