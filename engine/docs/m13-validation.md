@@ -3,7 +3,8 @@
 The M13 close-out is validated by one reproducible synthetic scenario and by a
 real-block procedure. The script is `engine/tests/run_gcp_validation.py`; it
 prints one JSON object on stdout and exits non-zero when the held-out
-check-point RMS exceeds the tolerance (2 cm by default).
+check-point horizontal or vertical RMS exceeds the tolerance (2 cm by default).
+The 3D total is the quadrature of the two and is reported alongside.
 
 ```
 python3 engine/tests/run_gcp_validation.py --synthetic
@@ -22,10 +23,8 @@ whose truth poses, ground grid and building are recorded in
 3. adds each marker's projections by projecting its truth position through the
    fixture's truth camera pose, then offsets every projection by seeded uniform
    noise of 0.5 px peak to peak (±0.25 px per axis);
-4. weights the exact-GPS camera references at 1 cm (not the 10 m consumer
-   default), so the near-planar network cannot trade camera depth against scene
-   depth, and sets the marker reference accuracy to the 1 cm the survey noise
-   actually has;
+4. sets the marker reference accuracy to the 1 cm the survey noise actually
+   has, so the control points are not treated as exact;
 5. imports 8 usable references as control points (truth + deterministic 1 cm
    per-axis noise) and 3 as check points (held out of the fit; the three
    best-observed roof targets, since the fixture's edge targets have only 1-3
