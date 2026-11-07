@@ -162,23 +162,25 @@ alphashape_add_python_test(python_reference
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference.py
     TIMEOUT 600)
 
-# WP-13.20: the synthetic GCP validation scenario. The script aligns the
-# 12-image fixture, triangulates the markers and runs UpdateTransform + a bundle
-# adjustment; it exits non-zero when the held-out check-point RMS exceeds 2 cm,
-# so the test asserts both the pipeline and the accuracy bound. That is the same
-# work the other light Python pipeline tests do, so it stays in the light lanes.
+# WP-13.20: the synthetic GCP validation scenarios. The script aligns the
+# 12-image fixture four times (no noise, reference noise only, projection noise
+# only, both plus consumer-GNSS camera references), triangulates the markers and
+# runs UpdateTransform + a bundle adjustment. It exits non-zero when the
+# zero-noise check-point 3D total exceeds 2 mm (a pipeline defect) or the
+# realistic scenario exceeds 2 cm. That is four alignments of the same fixture
+# the other light Python pipeline tests use, so it stays in the light lanes.
 add_test(
     NAME python_gcp_validation
     COMMAND ${CMAKE_COMMAND}
         "-DTEST_SCRIPT=${PROJECT_SOURCE_DIR}/tests/run_gcp_validation.py"
-        "-DTEST_ARGS=--synthetic"
+        "-DTEST_ARGS=--synthetic;--ablations"
         "-DEXPECTED_VERSION=${ALPHASHAPE_PYTHON_MINOR}"
         "-DCONFIGURED_PYTHON=${Python3_EXECUTABLE}"
         "-DPYTHONPATH=${ALPHASHAPE_PYTHON_DIR}"
         -P "${ALPHASHAPE_RUN_PYTHON}")
 # The heavy/light split is the name list in .github/ci/test-lanes.json (light
 # is the default); LABELS records the same choice for any ctest filter.
-set_tests_properties(python_gcp_validation PROPERTIES TIMEOUT 600
+set_tests_properties(python_gcp_validation PROPERTIES TIMEOUT 900
     LABELS "light")
 
 # WP-13.21: the camera reference attitude properties through Python.

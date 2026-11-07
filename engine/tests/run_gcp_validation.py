@@ -4,22 +4,34 @@
 Two modes:
 
   * ``--synthetic`` aligns the 12-image aerial fixture (MatchPhotos +
-    AlignCameras), places 12 markers from the fixture's truth projections with
-    seeded 0.5 px noise, imports control references (truth + 1 cm noise) and
-    holds 3 labels out as check points, triangulates the markers and optimises
-    with OptimizeCameras, refits the datum with UpdateTransform, then reports
-    the check-point RMS measured against the TRUE positions.
+    AlignCameras), imports a realistic consumer-GNSS reference for every camera
+    (truth + seeded horizontal sigma 2 m / vertical sigma 4 m error and a
+    common block bias), places 12 markers from the fixture's truth projections
+    with seeded +-0.25 px noise, imports control references (truth + 1 cm
+    noise) and holds 3 labels out as check points, triangulates the markers and
+    optimises with OptimizeCameras, refits the datum with UpdateTransform, then
+    reports the check-point RMS measured against the TRUE positions. The GCPs,
+    not the camera references, must therefore carry the georeference.
   * ``--real <dir> --gcp <csv>`` runs match -> align -> detect markers ->
     import the CSV -> UpdateTransform -> OptimizeCameras and reports the
     check-point RMS. ``--crs`` must name a geographic (lon/lat) CRS; projected
     coordinates are refused because this script converts references as lon/lat.
 
-The script prints ONE JSON object on stdout and exits 0 when the horizontal and
-the vertical check-point RMS are each within the tolerance (2 cm by default), 2
-otherwise. The 3D total is reported as the quadrature of the two. A check label
-with no marker or no computed position is an error (exit 2), so a missing check
-point cannot silently shrink the sample. No data is downloaded and nothing is
-written outside a temporary directory.
+``--ablations`` runs four synthetic scenarios in one process so a pipeline
+defect can be told from noise-limited accuracy: (1) no projection noise, no
+reference noise (the check-point 3D total must be <= 2 mm: the pipeline is
+otherwise exact), (2) 1 cm reference noise only, (3) 0.25 px projection noise
+only, and (4) both noises with the camera-GNSS references on, which is the
+gated scenario.
+
+The script prints one JSON object per scenario on stdout and exits 0 when the
+3D total check-point RMS is within the tolerance (2 cm by default), 2
+otherwise. The horizontal and vertical RMS are reported separately; the real
+mode's target is horizontal. The total is the RMS of the per-check-point 3D
+distances, i.e. the quadrature of the two axes. A check label with no marker or
+no computed position is an error (exit 2), so a missing check point cannot
+silently shrink the sample. No data is downloaded and nothing is written
+outside a temporary directory.
 """
 
 import argparse
@@ -101,6 +113,18 @@ def enu_to_geodetic(enu, origin):
     return (lon, lat, height)
 
 
+def ecef_to_enu(ecef, origin):
+    """Inverse of `enu_to_geodetic`'s rotation: ECEF -> local ENU."""
+    rotation, origin_ecef = enu_to_ecef_matrix(origin)
+    delta = [ecef[i] - origin_ecef[i] for i in range(3)]
+    return tuple(
+        sum(rotation[c][r] * delta[r] for r in range(3)) for c in range(3))
+
+
+def geodetic_to_enu(lon, lat, height, origin):
+    return ecef_to_enu(geodetic_to_ecef(lon, lat, height), origin)
+
+
 def ecef_to_local(ecef, transform):
     """Map an ECEF point into the chunk's local frame via chunk.transform.
 
@@ -137,16 +161,26 @@ ELEVATED = [(-19.0, 6.0), (-14.0, 6.5), (-9.0, 7.0),
 CHECK_LABELS = {"E2", "E3", "E5"}
 ROOF_HEIGHT = 9.52
 
-# Marker projections carry a seeded uniform offset of 0.5 px peak to peak
-# ([-0.25, +0.25] px per axis), the image-space accuracy this validation
-# expects from the measured projection.
-PROJECTION_NOISE_PX = 0.25
+# Consumer-GNSS error model for the camera references: per-camera seeded
+# Gaussian horizontal sigma 2 m and vertical sigma 4 m on top of a common block
+# bias. With these references the camera positions no longer carry the datum;
+# the survey-grade GCPs must.
+GNSS_HORIZONTAL_SIGMA_M = 2.0
+GNSS_VERTICAL_SIGMA_M = 4.0
+GNSS_BLOCK_BIAS_ENU_M = (1.5, -1.0, 3.0)
+GNSS_SEED = 20261107
+# The chunk-level fallback sigma for a camera reference (meters). The per-camera
+# rows carry their own (2, 2, 4) accuracy, which the fit uses; this setting
+# documents the order of magnitude and is what an unweighted reference gets.
+CAMERA_LOCATION_ACCURACY_M = 3.0
+
 PROJECTION_SEED = 20261107
+PIPELINE_TOLERANCE_M = 0.002
 
 
-def noise(index, axis):
-    """Deterministic per-axis reference noise in [-1 cm, +1 cm]."""
-    return (((index * 37 + axis * 11 + 5) % 101) / 100.0 - 0.5) * 0.02
+def reference_noise(index, axis, amplitude_m):
+    """Deterministic per-axis reference noise in [-amplitude, +amplitude]."""
+    return (((index * 37 + axis * 11 + 5) % 101) / 100.0 - 0.5) * 2.0 * amplitude_m
 
 
 def truth_local(enu, transform):
@@ -185,6 +219,51 @@ def write_reference_csv(path, rows):
         handle.write("label,x,y,z\n")
         for label, x, y, z in rows:
             handle.write("{},{!r},{!r},{!r}\n".format(label, x, y, z))
+
+
+def write_camera_reference_csv(path, rows):
+    """label,lon,lat,alt,acc_x,acc_y,acc_z rows for ImportReference.
+
+    No `crs` is passed on import: the rows are already lon/lat/ellipsoidal
+    height, the chunk's camera-reference CRS (WGS 84 geographic).
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("label,lon,lat,alt,acc_x,acc_y,acc_z\n")
+        for label, lon, lat, height, accuracy in rows:
+            handle.write("{},{!r},{!r},{!r},{!r},{!r},{!r}\n".format(
+                label, lon, lat, height,
+                accuracy[0], accuracy[1], accuracy[2]))
+
+
+def apply_camera_gnss(chunk, by_stem, directory):
+    """Overwrite every camera reference with seeded consumer-GNSS positions.
+
+    The fixture EXIF GPS is exact; leaving it in place would let the camera
+    references carry the datum and the GCPs would barely matter. Each camera
+    gets a per-camera seeded Gauss offset (horizontal sigma 2 m, vertical sigma
+    4 m) plus a common block bias, with the matching per-axis accuracy so the
+    adjustment weights them as consumer GNSS.
+    """
+    rng = random.Random(GNSS_SEED)
+    rows = []
+    for camera in chunk.cameras():
+        image = by_stem.get(camera.label)
+        if image is None:
+            continue
+        gps = image["gps"]
+        enu = geodetic_to_enu(gps["lon"], gps["lat"], gps["height"], ORIGIN)
+        noisy = (
+            enu[0] + GNSS_BLOCK_BIAS_ENU_M[0] + rng.gauss(0.0, GNSS_HORIZONTAL_SIGMA_M),
+            enu[1] + GNSS_BLOCK_BIAS_ENU_M[1] + rng.gauss(0.0, GNSS_HORIZONTAL_SIGMA_M),
+            enu[2] + GNSS_BLOCK_BIAS_ENU_M[2] + rng.gauss(0.0, GNSS_VERTICAL_SIGMA_M),
+        )
+        lon, lat, height = enu_to_geodetic(noisy, ORIGIN)
+        rows.append((camera.label, lon, lat, height,
+                     (GNSS_HORIZONTAL_SIGMA_M, GNSS_HORIZONTAL_SIGMA_M,
+                      GNSS_VERTICAL_SIGMA_M)))
+    path = os.path.join(directory, "camera_references.csv")
+    write_camera_reference_csv(path, rows)
+    chunk.importReference(path=path)
 
 
 def check_point_errors(chunk, labels, targets):
@@ -233,26 +312,40 @@ def root_mean_square(values):
     return math.sqrt(sum(value * value for value in values) / len(values))
 
 
-def run_synthetic(args):
+def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
     """Align the fixture, triangulate markers, georeference and optimise."""
     with open(os.path.join(DATA_DIR, "aerial_truth.json"),
               encoding="utf-8") as handle:
         truth = json.load(handle)
     images = [item["file"] for item in truth["images"]]
+    by_stem = {os.path.splitext(item["file"])[0]: item
+               for item in truth["images"]}
     doc = alphashape.Document()
     chunk = doc.add_chunk("Synthetic GCP block")
     doc.active_chunk = chunk
     doc.run_task("AddPhotos",
                  filenames=[os.path.join(DATA_DIR, name) for name in images])
-    # A real alignment gives the cameras poses, and the fixture's exact GPS
-    # EXIF georeferences the chunk. Geographic CRS, so marker references are
-    # (longitude, latitude, altitude).
+    # Declare WGS 84 geographic before any reference import, so both camera and
+    # marker references are interpreted as (longitude, latitude, altitude).
+    chunk.crs_epsg = 4326
+    # Replace the fixture's exact EXIF GPS with realistic consumer-GNSS
+    # references. The datum must then come from the GCPs; a block georeferenced
+    # by exact camera centres would not test GCP georeferencing at all.
+    if camera_gnss:
+        chunk.camera_location_accuracy = CAMERA_LOCATION_ACCURACY_M
+        with tempfile.TemporaryDirectory() as directory:
+            apply_camera_gnss(chunk, by_stem, directory)
+    # A real alignment gives the cameras poses from the (possibly noisy)
+    # references above. With the exact references this is the fixture's truth
+    # GPS, which is the zero-noise pipeline-exactness ablation.
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
     doc.run_task("AlignCameras")
-    chunk.crs_epsg = 4326
-    # The survey references carry 1 cm per-axis noise; say so, so the control
-    # points are not treated as exact.
-    chunk.marker_location_accuracy = 0.01
+    # The survey references carry the configured per-axis noise; say so, so the
+    # control points are not treated as exact. Zero is not a valid accuracy
+    # (the setter refuses it): the exact-reference scenarios keep the default,
+    # which does not affect their datum because every reference is exact.
+    if reference_noise_m > 0.0:
+        chunk.marker_location_accuracy = reference_noise_m
 
     points = truth_points()
     for label, _ in points:
@@ -260,8 +353,6 @@ def run_synthetic(args):
 
     # Marker positions are NOT seeded: they come from image measurements only.
     # Every projection is the fixture's truth projection plus seeded noise.
-    by_stem = {os.path.splitext(item["file"])[0]: item
-               for item in truth["images"]}
     rng = random.Random(PROJECTION_SEED)
     for camera in chunk.cameras:
         image = by_stem.get(camera.label)
@@ -271,10 +362,8 @@ def run_synthetic(args):
             pixel = project_truth(image, enu)
             if pixel is None:
                 continue
-            u = pixel[0] + rng.uniform(-PROJECTION_NOISE_PX,
-                                       PROJECTION_NOISE_PX)
-            v = pixel[1] + rng.uniform(-PROJECTION_NOISE_PX,
-                                       PROJECTION_NOISE_PX)
+            u = pixel[0] + rng.uniform(-projection_noise_px, projection_noise_px)
+            v = pixel[1] + rng.uniform(-projection_noise_px, projection_noise_px)
             chunk.setMarkerProjection(label, camera.label, u, v)
 
     control_rows = []
@@ -284,7 +373,9 @@ def run_synthetic(args):
             # Held out of the fit, so its (unused) reference is the truth.
             check_rows.append((label,) + enu_to_geodetic(enu, ORIGIN))
         else:
-            noisy = tuple(enu[axis] + noise(index, axis) for axis in range(3))
+            noisy = tuple(
+                enu[axis] + reference_noise(index, axis, reference_noise_m)
+                for axis in range(3))
             control_rows.append((label,) + enu_to_geodetic(noisy, ORIGIN))
 
     with tempfile.TemporaryDirectory() as directory:
@@ -295,10 +386,12 @@ def run_synthetic(args):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
-    # AlignCameras georeferenced the block from its exact GPS references. The
-    # bundle adjustment then triangulates every marker from its projections
-    # (their only source of a position) with the control references
-    # constraining the solve, and writes the solved positions back.
+    # AlignCameras georeferenced the block from the camera references (exact
+    # EXIF GPS or the seeded consumer GNSS). The bundle adjustment then
+    # triangulates every marker from its projections (their only source of a
+    # position) with the control references constraining the solve, and writes
+    # the solved positions back. UpdateTransform then refits the datum, so the
+    # survey GCPs, not the camera references, carry the georeference.
     transform = chunk.transform
     applied = any(abs(transform[row][col] -
                       (1.0 if row == col else 0.0)) > 1e-9
@@ -325,54 +418,6 @@ def run_synthetic(args):
                          str(chunk.meta.get("update_transform.reason",
                                             "unknown")))
 
-    # -- diagnostics: where does the residual come from? -------------------
-    # Reproject each truth point through the FINAL aligned pose and compare
-    # with the pixel this script actually gave the marker: a large residual
-    # means the camera network, not the triangulation, is off.
-    truth_by_label = dict(points)
-    marker_by_label = {marker.label: marker for marker in chunk.markers}
-    reproj_sq = 0.0
-    reproj_count = 0
-    worst_reproj = 0.0
-    worst_camera = 0.0
-    to_ecef = chunk.transform
-    for camera in chunk.cameras:
-        image = by_stem.get(camera.label)
-        if image is None:
-            continue
-        rotation = [[camera.pose[r][c] for c in range(3)] for r in range(3)]
-        shift = [camera.pose[r][3] for r in range(3)]
-        centre = list(camera.center)
-        centre_ecef = [sum(to_ecef[r][c] * centre[c] for c in range(3)) +
-                       to_ecef[r][3] for r in range(3)]
-        gps = image["gps"]
-        worst_camera = max(
-            worst_camera,
-            math.dist(centre_ecef,
-                      geodetic_to_ecef(gps["lon"], gps["lat"], gps["height"])))
-        calibration = chunk.sensors[camera.sensor_id].calibration
-        for label, projection in ((name, projection)
-                                  for name, marker in marker_by_label.items()
-                                  for projection in marker.projections
-                                  if projection.camera_id == camera.id):
-            enu = truth_by_label.get(label)
-            if enu is None:
-                continue
-            target = truth_local(enu, to_ecef)
-            camera_point = [sum(rotation[r][c] * target[c] for c in range(3)) +
-                            shift[r] for r in range(3)]
-            if camera_point[2] <= 1e-6:
-                continue
-            u = (calibration.width / 2.0 + calibration.cx +
-                 calibration.f * camera_point[0] / camera_point[2])
-            v = (calibration.height / 2.0 + calibration.cy +
-                 calibration.f * camera_point[1] / camera_point[2])
-            difference = math.hypot(u - projection.pixel[0],
-                                    v - projection.pixel[1])
-            worst_reproj = max(worst_reproj, difference)
-            reproj_sq += difference * difference
-            reproj_count += 1
-
     labels = [label for label, _ in points if label in CHECK_LABELS]
     targets = {label: truth_local(enu, chunk.transform)
                for label, enu in points}
@@ -383,6 +428,10 @@ def run_synthetic(args):
     horizontal = root_mean_square([e["horizontal"] for e in errors])
     vertical = root_mean_square([e["vertical"] for e in errors])
     total = root_mean_square([e["total"] for e in errors])
+    altitudes = [item["gps"]["height"] - ORIGIN[2]
+                 for item in truth["images"]]
+    focal = [item["f"] for item in truth["images"]]
+    gsd = (sum(altitudes) / len(altitudes)) / (sum(focal) / len(focal))
     return {
         "scenario": "synthetic-gcp-block",
         "images": len(images),
@@ -392,13 +441,16 @@ def run_synthetic(args):
         "control_points": len(control_rows),
         "check_points": len(check_rows),
         "evaluated_check_points": len(errors),
-        "projection_noise_px": PROJECTION_NOISE_PX,
+        "projection_noise_px": projection_noise_px,
+        "reference_noise_m": reference_noise_m,
+        "camera_gnss": camera_gnss,
+        "camera_gnss_model": None if not camera_gnss else {
+            "horizontal_sigma_m": GNSS_HORIZONTAL_SIGMA_M,
+            "vertical_sigma_m": GNSS_VERTICAL_SIGMA_M,
+            "block_bias_enu_m": list(GNSS_BLOCK_BIAS_ENU_M),
+        },
+        "gsd_m_per_px": gsd,
         "camera_f": chunk.sensors[0].calibration.f,
-        "camera_k1": chunk.sensors[0].calibration.k1,
-        "diagnostic_worst_camera_m": worst_camera,
-        "diagnostic_truth_reprojection_rms_px":
-            math.sqrt(reproj_sq / reproj_count) if reproj_count else float("nan"),
-        "diagnostic_truth_reprojection_max_px": worst_reproj,
         "diagnostic_marker_projections": {
             marker.label: len(marker.projections)
             for marker in chunk.markers},
@@ -410,7 +462,6 @@ def run_synthetic(args):
             "vertical": vertical,
             "total": total,
         },
-        "tolerance_m": args.tolerance,
         "check_point_errors_m": errors,
     }
 
@@ -535,47 +586,99 @@ def parse_args(argv):
     parser.add_argument("--target", default="Circular12",
                         help="marker target style for detection")
     parser.add_argument("--tolerance", type=float, default=0.02,
-                        help="maximum acceptable check-point RMS, metres")
-    return parser.parse_args(argv)
+                        help="maximum acceptable 3D total check-point RMS, "
+                             "metres")
+    parser.add_argument("--projection-noise-px", type=float, default=0.25,
+                        help="seeded marker projection noise, pixels per axis")
+    parser.add_argument("--reference-noise-m", type=float, default=0.01,
+                        help="seeded per-axis control-reference noise, metres")
+    parser.add_argument("--camera-gnss", choices=("on", "off"), default="on",
+                        help="give every camera a consumer-GNSS reference "
+                             "(on) or keep the fixture's exact GPS (off)")
+    parser.add_argument("--ablations", action="store_true",
+                        help="run the four synthetic noise/GNSS scenarios: "
+                             "exact pipeline (<= 2 mm), reference noise only, "
+                             "projection noise only, and both (gated)")
+    args = parser.parse_args(argv)
+    if args.projection_noise_px < 0.0 or args.reference_noise_m < 0.0:
+        parser.error("noise magnitudes must not be negative")
+    if not 0.0 < args.tolerance < 1.0:
+        parser.error("--tolerance must be between 0 and 1 metre")
+    return args
+
+
+def synthetic_passed(report, gate_m):
+    """The synthetic gate: georeferenced, every check point evaluated, 3D total."""
+    return (report["georeferenced"] and
+            report["evaluated_check_points"] == report["check_points"] and
+            report["check_point_rms_m"]["total"] <= gate_m)
+
+
+def emit(report, gate_m, passed):
+    """Print the bracket-tagged measurement line and the JSON report."""
+    rms = report["check_point_rms_m"]
+    report["gate_m"] = gate_m
+    report["passed"] = passed
+    # A bracket-tagged measurement line, the same shape the other
+    # benchmark-style tests use, so CI surfaces the numbers even when the test
+    # passes (ctest hides passing output).
+    print("[gcp validation] scenario={} horizontal={:.6f} vertical={:.6f} "
+          "total={:.6f} gate={} passed={}".format(
+              report.get("ablation", report["scenario"]),
+              rms["horizontal"], rms["vertical"], rms["total"],
+              "none" if gate_m is None else "{:.6f}".format(gate_m), passed))
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def run_ablations(args):
+    """Run the four synthetic scenarios and gate (1) exactness and (4) accuracy."""
+    scenarios = (
+        # name, projection noise, reference noise, camera GNSS, gate
+        ("exact", 0.0, 0.0, False, PIPELINE_TOLERANCE_M),
+        ("reference-noise", 0.0, args.reference_noise_m, False, None),
+        ("projection-noise", args.projection_noise_px, 0.0, False, None),
+        ("combined", args.projection_noise_px, args.reference_noise_m,
+         args.camera_gnss == "on", args.tolerance),
+    )
+    all_passed = True
+    for name, projection, reference, camera_gnss, gate in scenarios:
+        report = run_synthetic(args, projection, reference, camera_gnss)
+        report["ablation"] = name
+        passed = None if gate is None else synthetic_passed(report, gate)
+        emit(report, gate, passed)
+        if passed is False:
+            all_passed = False
+    return 0 if all_passed else 2
 
 
 def main(argv):
     args = parse_args(argv)
     try:
+        if args.ablations:
+            if not args.synthetic:
+                raise SystemExit("--ablations needs --synthetic")
+            return run_ablations(args)
         if args.synthetic:
-            report = run_synthetic(args)
-            rms = report["check_point_rms_m"]
-            # The 2 cm limit applies to each measured axis. The 3D total is
-            # reported for information (it is the quadrature of the two).
-            passed = (report["georeferenced"] and
-                      report["evaluated_check_points"] ==
-                      report["check_points"] and
-                      rms["horizontal"] <= args.tolerance and
-                      rms["vertical"] <= args.tolerance)
-        elif args.real and args.gcp:
+            report = run_synthetic(args, args.projection_noise_px,
+                                   args.reference_noise_m,
+                                   args.camera_gnss == "on")
+            # The spec is the 3D total check-point RMS; the horizontal and
+            # vertical RMS are reported alongside it.
+            passed = synthetic_passed(report, args.tolerance)
+            emit(report, args.tolerance, passed)
+            return 0 if passed else 2
+        if args.real and args.gcp:
             report = run_real(args)
-            rms = report["check_point_rms_m"]
             passed = (report["evaluated_check_points"] ==
                       report["check_points"] and
-                      rms["horizontal"] <= args.tolerance and
-                      rms["vertical"] <= args.tolerance)
-        else:
-            raise SystemExit(
-                "run_gcp_validation: choose --synthetic or --real DIR --gcp CSV")
+                      report["check_point_rms_m"]["total"] <= args.tolerance)
+            emit(report, args.tolerance, passed)
+            return 0 if passed else 2
+        raise SystemExit(
+            "run_gcp_validation: choose --synthetic or --real DIR --gcp CSV")
     except ValueError as error:
         print("run_gcp_validation: {}".format(error), file=sys.stderr)
         return 2
-    report["passed"] = passed
-    rms = report["check_point_rms_m"]
-    # A bracket-tagged measurement line, the same shape the other
-    # benchmark-style tests use, so CI surfaces the numbers even when the test
-    # passes (ctest hides passing output).
-    print("[gcp validation] horizontal={:.6f} vertical={:.6f} total={:.6f} "
-          "tolerance={:.6f} passed={}".format(
-              rms["horizontal"], rms["vertical"], rms["total"],
-              args.tolerance, passed))
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if passed else 2
 
 
 if __name__ == "__main__":
