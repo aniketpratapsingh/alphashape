@@ -17,7 +17,7 @@ whose truth poses, ground grid and building are recorded in
 
 1. imports the images and declares the chunk WGS 84 geographic;
 2. runs `detectMarkers` on the first frame;
-3. places 12 check points: 6 on the ground (z = 0) and 6 on the building roof
+3. places 12 markers: 6 on the ground (z = 0) and 6 on the building roof
    (z = 9.52 m);
 4. adds their projections by projecting the truth pose through each camera;
 5. perturbs each reference by deterministic 1 cm per-axis noise, imports 9 as
