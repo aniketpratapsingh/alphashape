@@ -24,14 +24,14 @@ whose truth poses, ground grid and building are recorded in
    noise of 0.5 px per axis;
 4. imports 9 references as control points (truth + deterministic 1 cm per-axis
    noise) and 3 as check points (held out of the fit);
-5. runs `refineMarkers`, so every marker position comes from its image
-   measurements only, then `updateTransform` (the weighted similarity fit) and
-   a final `optimizeCameras` with the control references constraining;
+5. runs `optimizeCameras` with the control references constraining, so every
+   marker position is triangulated from its image measurements only, then
+   `updateTransform` (the weighted similarity fit) refits the datum;
 6. measures every check point against its TRUE position (not its reference)
    and reports the horizontal, vertical and total RMS.
 
 The chunk is reconstructed by a real alignment and georeferenced from the
-fixture GPS, so the similarity fit and the bundle adjustment both have real
+fixture GPS, so the bundle adjustment and the similarity fit both have real
 work to do, and the check-point errors are independent of the noisy control
 references.
 

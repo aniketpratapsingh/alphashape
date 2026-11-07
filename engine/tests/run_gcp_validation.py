@@ -5,10 +5,10 @@ Two modes:
 
   * ``--synthetic`` aligns the 12-image aerial fixture (MatchPhotos +
     AlignCameras), places 12 markers from the fixture's truth projections with
-    seeded 0.5 px noise, triangulates them with refineMarkers, imports control
-    references (truth + 1 cm noise) and holds 3 labels out as check points,
-    refits the datum with UpdateTransform and the bundle with OptimizeCameras,
-    then reports the check-point RMS measured against the TRUE positions.
+    seeded 0.5 px noise, imports control references (truth + 1 cm noise) and
+    holds 3 labels out as check points, triangulates the markers and optimises
+    with OptimizeCameras, refits the datum with UpdateTransform, then reports
+    the check-point RMS measured against the TRUE positions.
   * ``--real <dir> --gcp <csv>`` runs match -> align -> detect markers ->
     import the CSV -> UpdateTransform -> OptimizeCameras and reports the
     check-point RMS. ``--crs`` must name a geographic (lon/lat) CRS; projected
@@ -287,17 +287,26 @@ def run_synthetic(args):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
-    # Triangulate every marker from its projections (their only source of a
-    # position), fit the datum from the control markers, then refine the whole
-    # block in the bundle adjustment with the control references constraining.
-    chunk.refineMarkers(cameras=[camera.label for camera in chunk.cameras])
-    chunk.updateTransform()
-    applied = chunk.meta.get("update_transform.applied") == "1"
+    # AlignCameras georeferenced the block from its exact GPS references. The
+    # bundle adjustment then triangulates every marker from its projections
+    # (their only source of a position) with the control references
+    # constraining the solve, and writes the solved positions back.
+    transform = chunk.transform
+    applied = any(abs(transform[row][col] -
+                      (1.0 if row == col else 0.0)) > 1e-9
+                  for row in range(4) for col in range(4))
     if not applied:
+        raise ValueError(
+            "AlignCameras did not georeference the block (no GPS references)")
+    chunk.optimizeCameras(use_gcps=True)
+    # Refit the datum now that the marker positions and control references
+    # agree. This is the weighted similarity step: it moves the block without
+    # changing its internal shape.
+    chunk.updateTransform()
+    if chunk.meta.get("update_transform.applied") != "1":
         raise ValueError("georeferencing failed: " +
                          str(chunk.meta.get("update_transform.reason",
                                             "unknown")))
-    chunk.optimizeCameras(use_gcps=True)
 
     labels = [label for label, _ in points if label in CHECK_LABELS]
     targets = {label: truth_local(enu, chunk.transform)
