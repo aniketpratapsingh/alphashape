@@ -309,6 +309,12 @@ DOWNLOAD_ATTEMPTS = 4
 DOWNLOAD_BACKOFF_S = 5.0
 DOWNLOAD_TIMEOUT_S = 120
 
+# The manifest pin is computed on the runner, not on the machine that authors the
+# manifest: this marker is a placeholder that tells `download` to fetch the archive
+# once WITHOUT verifying, print its SHA-256 and byte count, and stop. The one-off
+# path below is removed as soon as the real values are written into datasets.json.
+PENDING_SHA = "PENDING-PIN"
+
 
 def _is_transient_download_error(error: BaseException) -> bool:
     """True for a network failure that is worth retrying.
@@ -384,6 +390,10 @@ def download(
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
+    if remote.sha256 == PENDING_SHA:
+        _collect_pin(remote, destination)
+        return
+
     if destination.exists():
         if destination.stat().st_size == remote.bytes and sha256_file(destination) == remote.sha256:
             print(f"  cached   {destination.name} ({remote.bytes:,} bytes)")
@@ -446,6 +456,38 @@ def download(
     tmp.unlink(missing_ok=True)
     plural = "attempt" if attempts == 1 else "attempts"
     raise SystemExit(f"{remote.url}: download failed after {attempts} {plural} ({reason})")
+
+
+def _collect_pin(remote: RemoteFile, destination: Path) -> None:
+    """One-off: download an archive whose SHA-256 is still a placeholder and print it.
+
+    Exists only while a new dataset's manifest carries ``PENDING_SHA``. It fetches
+    the archive without verifying, computes the digest and byte count, prints both
+    on unmistakable lines for the runner log, and stops the run so the values can be
+    pinned. It is deleted once datasets.json holds the real numbers.
+    """
+    tmp = destination.with_suffix(destination.suffix + ".part")
+    print(f"  download (collect pin) {remote.url}")
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        if attempt > 1:
+            time.sleep(DOWNLOAD_BACKOFF_S * (2 ** (attempt - 2)))
+        tmp.unlink(missing_ok=True)
+        try:
+            _fetch_once(remote, tmp)
+        except Exception as error:  # noqa: BLE001 - retried or surfaced below
+            if not _is_transient_download_error(error):
+                raise SystemExit(f"{remote.url}: {error}") from error
+            continue
+        size = tmp.stat().st_size
+        if size == 0:
+            continue
+        print(f"PIN-SHA256 {sha256_file(tmp)}")
+        print(f"PIN-BYTES {size}")
+        raise SystemExit(
+            "sha256 and byte pin printed above; write them into datasets.json "
+            "and remove the PENDING-PIN placeholder path from run_bench.py"
+        )
+    raise SystemExit(f"{remote.url}: download failed while collecting the pin")
 
 
 # ---------------------------------------------------------------------------
@@ -1113,6 +1155,9 @@ def run(
         shutil.copy2(found, target)
     references = reference_paths(dataset, work)
 
+    if dataset.get("validation") == "gcp":
+        return run_gcp_validation(dataset_name, dataset, work, references)
+
     print("-- pipeline")
     available = collect_images(dataset, work)
     images, selection = select_subset(available, dataset.get("max_images"))
@@ -1182,6 +1227,76 @@ def run(
         "image_selection": selection,
     }
     return result
+
+
+def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references: dict) -> dict:
+    """Run the real-block ground-control validation (engine/tests/run_gcp_validation.py).
+
+    The GCP protocol is different from the ortho/DEM pipeline: align the block once,
+    then leave-one-out over the surveyed GCPs. The heavy lifting is in the script,
+    which needs the built ``alphashape`` Python module (the workflow builds it and
+    points ``ALPHASHAPE_PYTHON_DIR`` at it). This function only downloads/verifies
+    the data, resolves the script and its inputs, runs it, and folds the JSON report
+    into the metrics shape the report understands.
+    """
+    available = collect_images(dataset, work)
+    images_dir = available[0].parent
+    gcp_list = references.get("gcp_list")
+    gcp_names = references.get("gcp_names")
+    if not gcp_list or not gcp_names:
+        raise SystemExit(f"{dataset_name}: the gcp-rtk manifest must name gcp_list and gcp_names references")
+
+    script = HERE.parent.parent / "engine" / "tests" / "run_gcp_validation.py"
+    gcp = dataset.get("gcp") or {}
+    match = (dataset.get("param_overrides") or {}).get("MatchPhotos") or {}
+
+    python_dir = os.environ.get("ALPHASHAPE_PYTHON_DIR")
+    if not python_dir:
+        raise SystemExit("ALPHASHAPE_PYTHON_DIR is not set; the GCP validation needs the built alphashape module")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = python_dir + os.pathsep + env.get("PYTHONPATH", "")
+    python = os.environ.get("ALPHASHAPE_PYTHON") or "python3"
+
+    out_json = work / "gcp_report.json"
+    command = [
+        python, str(script), "--real", str(images_dir),
+        "--gcp-list", str(gcp_list), "--gcp-names", str(gcp_names),
+        "--target", str(gcp.get("target_horizontal_m", 0.05)),
+        "--camera-accuracy", str(gcp.get("camera_accuracy_fallback_m", 0.05)),
+        "--marker-accuracy", str(gcp.get("marker_location_accuracy_m", 0.015)),
+        "--keypoint-limit", str(match.get("keypoint_limit_per_mpx", 250)),
+        "--json-out", str(out_json),
+    ]
+
+    print("-- gcp validation")
+    print(f"  $ {' '.join(command)}")
+    started = time.monotonic()
+    result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    print(result.stdout)
+    elapsed = time.monotonic() - started
+    if result.returncode != 0:
+        raise SystemExit(f"gcp validation failed (exit {result.returncode}); see the log above")
+    if not out_json.exists():
+        raise SystemExit("gcp validation reported success but wrote no JSON report")
+
+    with open(out_json, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    report["dataset"] = dataset_name
+    report["kind"] = "gcp"
+    report["licence"] = dataset["licence"]
+    report["manifest_hash"] = manifest_hash(load_manifest())
+    report["timing"] = {"total_s": elapsed, "stages_s": {"gcp_validation": elapsed},
+                        "param_overrides": dataset.get("param_overrides") or {}}
+    report["dataset_manifest"] = {
+        "title": dataset["title"],
+        "doi": dataset.get("doi"),
+        "flight": dataset["flight"],
+        "images": len(available),
+        "images_available": len(available),
+        "image_selection": {"mode": "all", "selected": len(available), "images": [p.name for p in available]},
+    }
+    return report
 
 
 def _reprojection(work: Path, project: Path) -> dict:
