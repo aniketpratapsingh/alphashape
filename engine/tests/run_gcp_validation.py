@@ -317,6 +317,54 @@ def run_synthetic(args):
                          str(chunk.meta.get("update_transform.reason",
                                             "unknown")))
 
+    # -- diagnostics: where does the residual come from? -------------------
+    # Reproject each truth point through the FINAL aligned pose and compare
+    # with the pixel this script actually gave the marker: a large residual
+    # means the camera network, not the triangulation, is off.
+    truth_by_label = dict(points)
+    marker_by_label = {marker.label: marker for marker in chunk.markers}
+    reproj_sq = 0.0
+    reproj_count = 0
+    worst_reproj = 0.0
+    worst_camera = 0.0
+    to_ecef = chunk.transform
+    for camera in chunk.cameras:
+        image = by_stem.get(camera.label)
+        if image is None:
+            continue
+        rotation = [[camera.pose[r][c] for c in range(3)] for r in range(3)]
+        shift = [camera.pose[r][3] for r in range(3)]
+        centre = list(camera.center)
+        centre_ecef = [sum(to_ecef[r][c] * centre[c] for c in range(3)) +
+                       to_ecef[r][3] for r in range(3)]
+        gps = image["gps"]
+        worst_camera = max(
+            worst_camera,
+            math.dist(centre_ecef,
+                      geodetic_to_ecef(gps["lon"], gps["lat"], gps["height"])))
+        calibration = chunk.sensors[camera.sensor_id].calibration
+        for label, projection in ((name, projection)
+                                  for name, marker in marker_by_label.items()
+                                  for projection in marker.projections
+                                  if projection.camera_id == camera.id):
+            enu = truth_by_label.get(label)
+            if enu is None:
+                continue
+            target = truth_local(enu, to_ecef)
+            camera_point = [sum(rotation[r][c] * target[c] for c in range(3)) +
+                            shift[r] for r in range(3)]
+            if camera_point[2] <= 1e-6:
+                continue
+            u = (calibration.width / 2.0 + calibration.cx +
+                 calibration.f * camera_point[0] / camera_point[2])
+            v = (calibration.height / 2.0 + calibration.cy +
+                 calibration.f * camera_point[1] / camera_point[2])
+            difference = math.hypot(u - projection.pixel[0],
+                                    v - projection.pixel[1])
+            worst_reproj = max(worst_reproj, difference)
+            reproj_sq += difference * difference
+            reproj_count += 1
+
     labels = [label for label, _ in points if label in CHECK_LABELS]
     targets = {label: truth_local(enu, chunk.transform)
                for label, enu in points}
@@ -339,6 +387,13 @@ def run_synthetic(args):
         "projection_noise_px": PROJECTION_NOISE_PX,
         "camera_f": chunk.sensors[0].calibration.f,
         "camera_k1": chunk.sensors[0].calibration.k1,
+        "diagnostic_worst_camera_m": worst_camera,
+        "diagnostic_truth_reprojection_rms_px":
+            math.sqrt(reproj_sq / reproj_count) if reproj_count else float("nan"),
+        "diagnostic_truth_reprojection_max_px": worst_reproj,
+        "diagnostic_marker_projections": {
+            marker.label: len(marker.projections)
+            for marker in chunk.markers},
         "georeferenced": applied,
         "engine_check_rms_m": float(
             chunk.meta.get("update_transform.rms_check_m", "nan")),
