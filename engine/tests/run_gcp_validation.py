@@ -173,6 +173,11 @@ GNSS_SEED = 20261107
 # rows carry their own (2, 2, 4) accuracy, which the fit uses; this setting
 # documents the order of magnitude and is what an unweighted reference gets.
 CAMERA_LOCATION_ACCURACY_M = 3.0
+# Scenarios that keep the fixture's exact EXIF GPS declare how exact it is. At
+# the 10 m consumer default the near-planar nadir network is free to trade
+# camera depth against scene depth (a centimetre-scale warp); the exact
+# reference deserves the sub-millimetre accuracy the fixture actually writes.
+EXACT_CAMERA_ACCURACY_M = 0.001
 
 PROJECTION_SEED = 20261107
 PIPELINE_TOLERANCE_M = 0.002
@@ -246,7 +251,7 @@ def apply_camera_gnss(chunk, by_stem, directory):
     """
     rng = random.Random(GNSS_SEED)
     rows = []
-    for camera in chunk.cameras():
+    for camera in chunk.cameras:
         image = by_stem.get(camera.label)
         if image is None:
             continue
@@ -335,6 +340,10 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         chunk.camera_location_accuracy = CAMERA_LOCATION_ACCURACY_M
         with tempfile.TemporaryDirectory() as directory:
             apply_camera_gnss(chunk, by_stem, directory)
+    else:
+        # The fixture EXIF GPS is exact (sub-millimetre); say so, so the bundle
+        # adjustment cannot trade camera depth against scene depth.
+        chunk.camera_location_accuracy = EXACT_CAMERA_ACCURACY_M
     # A real alignment gives the cameras poses from the (possibly noisy)
     # references above. With the exact references this is the fixture's truth
     # GPS, which is the zero-noise pipeline-exactness ablation.
@@ -444,6 +453,9 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "projection_noise_px": projection_noise_px,
         "reference_noise_m": reference_noise_m,
         "camera_gnss": camera_gnss,
+        "camera_location_accuracy_m": (
+            CAMERA_LOCATION_ACCURACY_M if camera_gnss
+            else EXACT_CAMERA_ACCURACY_M),
         "camera_gnss_model": None if not camera_gnss else {
             "horizontal_sigma_m": GNSS_HORIZONTAL_SIGMA_M,
             "vertical_sigma_m": GNSS_VERTICAL_SIGMA_M,
