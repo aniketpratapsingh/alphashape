@@ -569,7 +569,8 @@ void fill_constraint_report(const BAProblem& problem,
     };
     report->control_rms_m = rms(control_sq, control_n);
     report->checkpoint_rms_m = rms(check_sq, check_n);
-    const auto rms_axis = [](const Eigen::Vector3d& sum_sq, std::size_t n) {
+    const auto rms_axis = [](const Eigen::Vector3d& sum_sq,
+                             std::size_t n) -> Eigen::Vector3d {
         if (n == 0) {
             return Eigen::Vector3d::Zero();
         }
@@ -1214,7 +1215,12 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         report.iterations = static_cast<int>(summary.iterations.size());
         report.robust_cost = summary.final_cost;
         report.initial_cost = summary.initial_cost;
-        report.final_gradient_norm = summary.final_gradient_norm;
+        if (!summary.iterations.empty()) {
+            const double cost = summary.iterations.back().cost;
+            const double change = summary.iterations.back().cost_change;
+            report.final_relative_cost_change =
+                std::isfinite(cost) && cost > 0.0 ? std::abs(change) / cost : 0.0;
+        }
         report.termination = termination_name(summary.termination_type);
         report.cost_valid =
             std::isfinite(summary.final_cost) && summary.final_cost >= 0.0;

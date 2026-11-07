@@ -212,7 +212,7 @@ DIAGNOSTIC_KEYS = (
     "optimize_cameras.termination",
     "optimize_cameras.initial_cost",
     "optimize_cameras.final_cost",
-    "optimize_cameras.final_gradient_norm",
+    "optimize_cameras.final_relative_cost_change",
     "optimize_cameras.prior_rms_sigma",
     "optimize_cameras.prior_axes",
     "optimize_cameras.free_parameters",

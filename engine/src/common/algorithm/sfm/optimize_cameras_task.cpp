@@ -998,8 +998,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     staged.meta().set("optimize_cameras.termination", report.termination);
     staged.meta().set("optimize_cameras.initial_cost", meta_number(report.initial_cost));
     staged.meta().set("optimize_cameras.final_cost", meta_number(report.robust_cost));
-    staged.meta().set("optimize_cameras.final_gradient_norm",
-                      meta_number(report.final_gradient_norm));
+    staged.meta().set("optimize_cameras.final_relative_cost_change",
+                      meta_number(report.final_relative_cost_change));
     staged.meta().set("optimize_cameras.prior_rms_sigma",
                       meta_number(report.prior_rms_sigma));
     staged.meta().set("optimize_cameras.prior_axes", std::to_string(report.priors));

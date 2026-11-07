@@ -237,8 +237,11 @@ struct BAReport {
     /// "max_iterations", "numerical_failure", ...). Empty for an
     /// evaluation-only pass.
     std::string termination;
-    /// Infinity norm of the final gradient. 0 for an evaluation-only pass.
-    double final_gradient_norm = 0;
+    /// Relative cost change of the last accepted iteration,
+    /// |cost_change| / max(cost, eps). Near zero at convergence; the caller can
+    /// tell a solve that stalled from one that hit the iteration cap. 0 for an
+    /// evaluation-only pass.
+    double final_relative_cost_change = 0;
 
     /// Dimension of the residual vector Ceres actually assembled. Exact: points
     /// with no observations are never added, and check observations are skipped
