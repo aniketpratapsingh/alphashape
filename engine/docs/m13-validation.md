@@ -211,7 +211,38 @@ silently misinterpreting the coordinates. A check label with no marker or no
 computed position also exits non-zero, so a missing check point cannot be
 mistaken for a perfect one.
 
-The real-block measurement is **pending a cloud run**: no real aerial block with
-surveyed check points is checked into this repository, so this document does not
-state a number for it. The synthetic figures above are the committed,
-reproducible measurements.
+### Measured: Helenenschacht RTK block (GPL-3.0)
+
+Measured by the `gcp-rtk` dataset of the quality benchmark on CI run
+`42378055451`. Dataset: the OpenDroneMap `odm_data_helenenschacht` sample (pinned
+commit `eece33e9ece2ff358a7bdc02e1db6f67925e00c4`, tarball SHA-256
+`4e71dbfc08efcf1ff854c4b82a01f2ba5b6b42dd7530fd64c890ab2261643bab`, 2 546 560 515
+bytes) — 176 nadir JPEGs from an Autel Evo II Pro RTK drone, 5 surveyed GCPs (35
+image observations) and a 5-point survey CSV (Emlid Reach RS2 via NTRIP). Photos
+by Daniel Dobosi, published by OpenDroneMap (GPL-3.0); the benchmark downloads and
+measures only and does not redistribute.
+
+Protocol: align once (`MatchPhotos keypoint_limit_per_mpx=250` + `AlignCameras`,
+146/176 cameras registered, 0.740 px RMS), save, then leave-one-out over the 5
+GCPs — 4 control + 1 held-out check per fold, `UpdateTransform` +
+`OptimizeCameras(use_gcps=True)`, and the check point's horizontal / vertical / 3D
+error measured against its surveyed reference. Two variants: camera RTK references
+at their EXIF/XMP accuracy (fallback 0.05 m) plus the GCPs, and GCPs only with the
+camera references disabled. Runtime 2702.7 s on a shared CPU runner. The gcp-list
+z is orthometric (mean offset to the CSV elevation 0.0 m).
+
+| check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
+| --- | --- | --- |
+| 1 | 0.0753 / 0.1368 / 0.1562 | 0.0741 / 0.1359 / 0.1548 |
+| 2 | 0.0385 / -0.0581 / 0.0696 | 0.0409 / -0.0399 / 0.0572 |
+| 3 | 0.0926 / -0.0905 / 0.1295 | 0.0921 / -0.0851 / 0.1254 |
+| 4 | 0.1043 / 0.2697 / 0.2891 | 0.1058 / 0.2823 / 0.3015 |
+| 5 | 0.0638 / 0.1841 / 0.1948 | 0.0646 / 0.1845 / 0.1954 |
+| RMS | **0.0783 / 0.1655 / 0.1831** | **0.0788 / 0.1680 / 0.1855** |
+
+The horizontal target was 5 cm; both variants measure ~7.8 cm horizontal RMS, so
+the target is **missed** in this first version (reported, not gated). The two
+variants agree to within a millimetre, so the RTK camera references do not move
+the check-point error; the block's own accuracy at the GCP locations dominates.
+Check point 4 is the outlier in both (10.4-10.6 cm horizontal, 0.27-0.28 m
+vertical), the remaining four sit between 3.8 and 9.3 cm horizontal.
