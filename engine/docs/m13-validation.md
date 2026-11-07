@@ -1,6 +1,6 @@
 # M13 validation — markers, GCP and calibration
 
-The M13 close-out is validated by four reproducible synthetic scenarios and by
+The M13 close-out is validated by five reproducible synthetic scenarios and by
 a real-block procedure. The script is `engine/tests/run_gcp_validation.py`; it
 prints one JSON object per scenario on stdout and exits non-zero when the
 held-out check-point 3D total RMS exceeds the tolerance (2 cm by default). The
@@ -55,58 +55,100 @@ georeferencing at all.
 
 ### Ablation scenarios
 
-`--ablations` runs the same block four times, so a pipeline defect can be told
+`--ablations` runs the same block five times, so a pipeline defect can be told
 from noise-limited accuracy. Scenario 1 is the pipeline-exactness control: the
 camera-GNSS references are off and the fixture's exact GPS position and
 attitude are pinned, so every input the marker/GCP machinery consumes is exact.
-Scenarios 2-4 keep the realistic consumer-GNSS camera references (attitude from
+Scenarios 2-5 keep the realistic consumer-GNSS camera references (attitude from
 the alignment) and vary only the two noise knobs; their differences are
-therefore attributable to those noises.
+therefore attributable to those noises. Scenario 4 keeps the noisy GNSS and
+removes both other noises, so it isolates the camera-prior/control interaction.
 
 | # | name | projection noise | reference noise | camera references | gate |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `exact` | 0 px | 0 m | exact position + attitude | 3D total <= 2 mm |
 | 2 | `reference-noise` | 0 px | 1 cm per axis | consumer GNSS (2 m / 4 m sigma) | reported, not gated |
 | 3 | `projection-noise` | ±0.25 px per axis | 0 m | consumer GNSS (2 m / 4 m sigma) | reported, not gated |
-| 4 | `combined` | ±0.25 px per axis | 1 cm per axis | consumer GNSS (2 m / 4 m sigma) | 3D total <= 2 cm |
+| 4 | `gnss-only` | 0 px | 0 m | consumer GNSS (2 m / 4 m sigma) | reported, not gated |
+| 5 | `combined` | ±0.25 px per axis | 1 cm per axis | consumer GNSS (2 m / 4 m sigma) | 3D total <= 2 cm |
 
 Scenario 1 is the pipeline-exactness check: with exact projections, exact
 references and exact camera GPS, a correct pipeline reconstructs the truth to
 well under a millimetre. A scenario-1 failure is a defect to fix, not a bound
-to loosen. Scenario 4 is the validation gate.
+to loosen. Scenario 4 pins the camera-prior/control interaction: with exact
+control and exact projections a correctly weighted adjustment is governed by
+the control, so its check-point error must be millimetre-level. Scenario 5 is
+the validation gate.
+
+Every report also carries the engine's solve diagnostics under `diagnostics`:
+the per-category sigmas actually used (camera centre, marker control, marker
+projection, tie point), the iteration count and termination category, the
+initial and final robust cost, the last relative cost change, the prior RMS in
+sigma units, the gauge state, and the control/check residuals split per axis.
+`update_transform` additionally reports how many cameras and control markers
+the similarity fit used and the total 1/sigma^2 weight of each class.
 
 ### Measured in CI
 
-The test `python_gcp_validation` prints four JSON objects and four
+The test `python_gcp_validation` prints five JSON objects and five
 bracket-tagged measurement lines; CI surfaces them even when the test passes.
-Numbers are metres; the gates are 2 mm (scenario 1) and 2 cm (scenario 4).
+Numbers are metres; the gates are 2 mm (scenario 1) and 2 cm (scenario 5).
 
 Measured by `python_gcp_validation` on the PR's CI run (macOS arm64, run
-42349669604, about 15 s for all four scenarios; the same numbers were produced
-by run 42347626176 on Linux and macOS):
+42357021231, about 20 s for all five scenarios; Linux x86-64 in the same run
+produced the same numbers):
 
 | scenario | horizontal RMS | vertical RMS | 3D total RMS | gate |
 | --- | --- | --- | --- | --- |
-| 1 `exact` | 0.000146 m | 0.000469 m | 0.000491 m | 2 mm, pass |
-| 2 `reference-noise` | 0.012760 m | 0.049357 m | 0.050980 m | not gated |
-| 3 `projection-noise` | 0.020654 m | 0.046611 m | 0.050982 m | not gated |
-| 4 `combined` | 0.020175 m | 0.044273 m | 0.048653 m | 2 cm, **fail** |
+| 1 `exact` | 0.000135 m | 0.000324 m | 0.000351 m | 2 mm, pass |
+| 2 `reference-noise` | 0.001972 m | 0.007280 m | 0.007542 m | not gated |
+| 3 `projection-noise` | 0.008216 m | 0.018440 m | 0.020187 m | not gated |
+| 4 `gnss-only` | 0.000561 m | 0.000704 m | 0.000900 m | not gated |
+| 5 `combined` | 0.008028 m | 0.025646 m | 0.026873 m | 2 cm, **fail** |
 
-Scenario 1 passes by a wide margin: with every input exact, the marker/GCP
-machinery reproduces the truth to half a millimetre, so there is no pipeline
-defect in the marker, reference or bundle-adjustment path.
+### Defect found and fixed
 
-Scenarios 2-4 all sit at about 5 cm, and removing either injected noise does
-not reduce that: scenario 2 (no projection noise) and scenario 3 (no reference
-noise) have the same total as scenario 4. The common limit is therefore the
-consumer-GNSS camera references, not the marker noise: with 2 m / 4 m camera
-positions and a near-planar 12-image nadir block, the vertical scale and the
-camera depths are only weakly determined, and the bundle adjustment can trade a
-few centimetres of camera depth against a sub-pixel reprojection residual even
-with the exact control references of scenario 3. The scenario-4 gate is left
-failing as specified; these four numbers are the evidence for the coordinator's
-decision. Raising the fixture's parallax or adding vertical control would be a
-change to the scenario, not a fix to the pipeline, so neither is done here.
+Before the fix these five scenarios were 0.49 mm, 5.10 cm, 5.10 cm, 5.33 cm and
+4.87 cm. Scenarios 2 and 3 removed different noise sources yet both sat at
+5.1 cm, so the error tracked the noisy camera GNSS, not the injected marker
+noise. The diagnostics pinned it: scenario 4 converged in 31 iterations with
+the control points satisfied to 0.08 mm, yet its check points re-triangulated
+5.2 cm away, almost all vertical, while the reprojection RMS stayed at
+0.127 px. The control points were pinned in 3-D, but the camera poses were
+being set by the ~7990 tie-point observations — and every observation carried
+one shared 1 px weight, because `BAObservation` had no per-observation sigma
+(the marker-projection accuracy the chunk declares was never consumed). With
+30 marker observations against 7990 tie observations at equal weight, the
+poses followed the tie-point cloud and the held-out points drifted by
+centimetres in depth.
+
+The fix follows the standard weighted least-squares formulation (Triggs et al.
+2000; Foerstner & Wrobel 2016): each observation is whitened by its own 1-sigma
+accuracy, so the problem is one weighted system with weights 1/sigma^2. Marker
+projections use the chunk's marker-projection accuracy, tie-point observations
+its tie-point accuracy, and the robust loss now acts on the whitened residual.
+Check-point triangulation uses the same weights. The camera-centre, marker
+control and datum weights were already correct (2 m / 4 m per axis, 1 cm, and
+the datum fit's 1/sigma^2 weights: 80000 for the control markers against 1.69
+for the twelve camera references).
+
+Scenario 4 now recovers to 0.9 mm, which is the direct confirmation that
+camera priors and control interact correctly. Scenarios 2 and 3 fall to 7.5 mm
+and 20.2 mm.
+
+### Why the gate is still exceeded
+
+Scenario 3 is at its own information limit, not a pipeline limit. Propagating
+the injected 0.25 px uniform noise (sigma 0.144 px) through the truth camera
+geometry of the three check points gives a linearised triangulation sigma of
+1.7-2.5 cm 3D per point (vertical 1.4-2.3 cm), an RMS of about 2.14 cm over the
+three; the measured 2.02 cm is at that bound. Scenario 5 combines that with the
+datum error from the 1 cm control noise (scenario 2: 0.75 cm), so its expected
+RMS is about 2.3 cm, and the three seeded realisations happen to add rather
+than cancel (E2 alone is 3.9 cm). The 2 cm gate therefore sits below the
+check-point noise floor of this fixture and cannot be met without changing the
+noise, the layout or the gate — none of which is done here. The failing gate is
+reported as evidence, not hidden.
 
 Fixed in every scenario: 12 images, 12 markers (6 ground, 6 roof), 8 usable
 control points (9 imported; one edge target has a single projection), 3 check
