@@ -188,6 +188,11 @@ EXACT_ROTATION_ACCURACY_DEG = 0.001
 
 PROJECTION_SEED = 20261107
 PIPELINE_TOLERANCE_M = 0.002
+# Uniform noise of +-a has sigma a/sqrt(3). The marker-projection accuracy is
+# declared from the noise this script actually injects (the fit's default
+# 0.5 px would under-weight exact or 0.25 px-peak projections against the 1 px
+# tie points). The floor keeps the exact scenarios positive.
+PROJECTION_ACCURACY_FLOOR_PX = 0.001
 
 
 def reference_noise(index, axis, amplitude_m):
@@ -466,6 +471,13 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
     for label, _ in points:
         chunk.addMarker(label=label)
 
+    # Declare the image-space accuracy of the marker projections this script
+    # injects: uniform noise of +-a has sigma a/sqrt(3). Without this the fit
+    # would assume its 0.5 px default and let the 1 px tie points dominate the
+    # camera poses even when the projections are exact.
+    chunk.marker_projection_accuracy = max(
+        PROJECTION_ACCURACY_FLOOR_PX, projection_noise_px / math.sqrt(3.0))
+
     # Marker positions are NOT seeded: they come from image measurements only.
     # Every projection is the fixture's truth projection plus seeded noise.
     rng = random.Random(PROJECTION_SEED)
@@ -557,6 +569,7 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "check_points": len(check_rows),
         "evaluated_check_points": len(errors),
         "projection_noise_px": projection_noise_px,
+        "marker_projection_accuracy_px": chunk.marker_projection_accuracy,
         "reference_noise_m": reference_noise_m,
         "camera_gnss": camera_gnss,
         "camera_location_accuracy_m": (

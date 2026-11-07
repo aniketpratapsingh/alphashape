@@ -29,7 +29,10 @@ whose truth poses, ground grid and building are recorded in
    (z = 9.52 m), with NO seeded 3-D position;
 4. adds each marker's projections by projecting its truth position through the
    fixture's truth camera pose, then offsets every projection by seeded uniform
-   noise of 0.5 px peak to peak (±0.25 px per axis);
+   noise of 0.5 px peak to peak (±0.25 px per axis). The chunk's
+   marker-projection accuracy is declared from that noise (σ = a/√3), so the
+   fit does not assume its 0.5 px default and under-weight the projections
+   against the 1 px tie points;
 5. sets the marker reference accuracy to the 1 cm the survey noise actually
    has, so the control points are not treated as exact;
 6. imports 8 usable references as control points (truth + deterministic 1 cm
