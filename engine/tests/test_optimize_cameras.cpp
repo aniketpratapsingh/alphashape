@@ -1160,6 +1160,41 @@ TEST(OptimizeMarkers, ExactControlPinsModelAgainstNoisyCameraPriors) {
     EXPECT_LT(worst, 0.001);
 }
 
+// A held-out marker is positioned only by re-triangulating its exact
+// projections with the solved poses, so it measures the pose accuracy the
+// adjustment actually reached. With exact marker projections declared at their
+// true accuracy and noisy tie points, the marker observations must outvote the
+// tie points (each residual whitened by its own sigma); otherwise the poses
+// follow the tie-point cloud and the check point drifts by centimetres.
+TEST(OptimizeMarkers, CheckPointFollowsProperlyWeightedPoses) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261108u, 0.0, 0.001);
+    Chunk& chunk = *scene.document.active_chunk();
+    ASSERT_EQ(chunk.markers().size(), 5U);
+    // The projections are rendered from the truth: declare them exact.
+    ReferenceSettings settings = chunk.reference_settings();
+    settings.marker_projection_accuracy_px = 0.001;
+    chunk.set_reference_settings(settings);
+    constexpr std::size_t kHeldOut = 2;
+    chunk.markers()[kHeldOut].meta.set("type", "check_point");
+
+    run_optimize_cameras(scene.document);
+    Chunk& solved = *scene.document.active_chunk();
+    ASSERT_TRUE(solved.markers()[kHeldOut].position.has_value());
+    const Eigen::Vector3d delta =
+        *solved.markers()[kHeldOut].position - scene.local_truth[kHeldOut];
+    const std::string* termination =
+        solved.meta().find("optimize_cameras.termination");
+    std::printf("[optimize_markers] weighted check point: error %.6f m "
+                "(h %.6f, v %.6f), checkpoint RMS %.6f m, iterations %.0f, "
+                "termination %s\n",
+                delta.norm(), delta.head<2>().norm(), std::abs(delta.z()),
+                meta_value(solved, "optimize_cameras.checkpoint_rms_m"),
+                meta_value(solved, "optimize_cameras.iterations"),
+                termination == nullptr ? "?" : termination->c_str());
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.checkpoints"), 1.0);
+    EXPECT_LT(delta.norm(), 0.001);
+}
+
 TEST(OptimizeMarkers, CheckPointNotUsed) {
     GeoMarkerScene scene = make_geo_marker_scene(20261105u);
     Chunk& chunk = *scene.document.active_chunk();

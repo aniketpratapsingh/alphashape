@@ -204,7 +204,8 @@ PROJECTION_ACCURACY_FLOOR_PX = 0.001
 DIAGNOSTIC_KEYS = (
     "optimize_cameras.sigma.camera_centre_m",
     "optimize_cameras.sigma.marker_control_m",
-    "optimize_cameras.sigma.observation_px",
+    "optimize_cameras.sigma.marker_projection_px",
+    "optimize_cameras.sigma.tiepoint_px",
     "optimize_cameras.control_axes",
     "optimize_cameras.control_points_fully_constrained",
     "optimize_cameras.rotation_priors",
@@ -506,9 +507,8 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
 
     # Record the image-space accuracy of the marker projections this script
     # injects (uniform noise of +-a has sigma a/sqrt(3)). The bundle adjustment
-    # currently gives tie and marker observations one shared reprojection
-    # weight (BAObservation carries no per-observation sigma), so this is
-    # honest metadata about the injection, not a lever on the fit.
+    # whitens every observation by its own sigma, so marker projections get
+    # this weight and tie points keep the (looser) tie-point accuracy.
     chunk.marker_projection_accuracy = max(
         PROJECTION_ACCURACY_FLOOR_PX, projection_noise_px / math.sqrt(3.0))
 
@@ -612,6 +612,7 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "projection_noise_px": projection_noise_px,
         "marker_projection_accuracy_px": chunk.marker_projection_accuracy,
         "marker_location_accuracy_m": chunk.marker_location_accuracy,
+        "tiepoint_accuracy_px": chunk.tiepoint_accuracy,
         "reference_noise_m": reference_noise_m,
         "camera_gnss": camera_gnss,
         "camera_location_accuracy_m": (

@@ -36,6 +36,12 @@ struct BAObservation {
     std::size_t camera = 0;  ///< index into BAProblem::poses / calibrations
     std::size_t point = 0;   ///< index into BAProblem::points
     Eigen::Vector2d pixel;   ///< Calibration pixel convention (top-left pixel centre = (0.5,0.5))
+    /// 1-sigma image-space accuracy of this measurement, pixels. Each residual
+    /// is divided by it, so every observation carries its own weight 1/sigma^2
+    /// in the one weighted least-squares system (Triggs et al. 2000). A value
+    /// that is not finite and positive means "unweighted": 1 px, the historical
+    /// shared weight.
+    double sigma_px = 0.0;
 };
 
 /// A GPS-like prior on one camera centre, in the problem's coordinate frame.

@@ -104,8 +104,10 @@ void pack_calibration(const Calibration& c, double* params) {
 /// coefficients.
 /// The block is shared by every camera on the same sensor.
 struct ReprojectionCost {
-    ReprojectionCost(CameraType type, int width, int height, const Eigen::Vector2d& pixel)
-        : pixel_(pixel), type_(type), width_(width), height_(height) {}
+    ReprojectionCost(CameraType type, int width, int height, const Eigen::Vector2d& pixel,
+                     double sigma_px = 1.0)
+        : pixel_(pixel), sigma_px_(sigma_px > 0.0 && std::isfinite(sigma_px) ? sigma_px : 1.0),
+          type_(type), width_(width), height_(height) {}
 
     template <typename T>
     bool operator()(const T* const rotation, const T* const translation, const T* const point,
@@ -125,13 +127,18 @@ struct ReprojectionCost {
 
         T uv[2];
         project_point<T>(type_, width_, height_, intr, p, uv);
-        residual[0] = uv[0] - T(pixel_[0]);
-        residual[1] = uv[1] - T(pixel_[1]);
+        // Whitened by this observation's own sigma: the robust loss attached to
+        // the block therefore also acts in sigma units, so a tight marker
+        // measurement is not treated as an outlier by a threshold meant for
+        // tie points.
+        residual[0] = (uv[0] - T(pixel_[0])) / T(sigma_px_);
+        residual[1] = (uv[1] - T(pixel_[1])) / T(sigma_px_);
         return true;
     }
 
 private:
     Eigen::Vector2d pixel_;
+    double sigma_px_ = 1.0;
     CameraType type_ = CameraType::Frame;
     int width_ = 0;
     int height_ = 0;
@@ -423,9 +430,10 @@ Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
 /// distortion, affine terms and fisheye are all inverted. Rays with z > 0 use
 /// the normalised form (x/z, y/z); a ray at or behind the image plane (a
 /// fisheye ray beyond 90 degrees) uses the equivalent cross-product form
-/// [ray]_x (R X + t) = 0. Check points are only scored, never allowed to move
-/// the solve. Returns false for fewer than two usable observations or a
-/// degenerate system.
+/// [ray]_x (R X + t) = 0. Each observation enters with its own 1/sigma^2
+/// weight, the same weighting the bundle adjustment gives it. Check points are
+/// only scored, never allowed to move the solve. Returns false for fewer than
+/// two usable observations or a degenerate system.
 bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vector3d* out) {
     Eigen::Matrix3d ata = Eigen::Matrix3d::Zero();
     Eigen::Vector3d atb = Eigen::Vector3d::Zero();
@@ -442,6 +450,8 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
         if (!ray.allFinite()) {
             continue;
         }
+        const double weight =
+            valid_sigma(obs.sigma_px) ? 1.0 / (obs.sigma_px * obs.sigma_px) : 1.0;
         const BAPose& pose = problem.poses[obs.camera];
         if (ray.z() > 0.0) {
             const double xn = ray.x() / ray.z();
@@ -453,15 +463,15 @@ bool triangulate_point(const BAProblem& problem, std::size_t point, Eigen::Vecto
             const Eigen::Vector3d row_b = yn * r2 - r1;
             const double rhs_a = pose.t.x() - xn * pose.t.z();
             const double rhs_b = pose.t.y() - yn * pose.t.z();
-            ata += row_a * row_a.transpose() + row_b * row_b.transpose();
-            atb += row_a * rhs_a + row_b * rhs_b;
+            ata += weight * (row_a * row_a.transpose() + row_b * row_b.transpose());
+            atb += weight * (row_a * rhs_a + row_b * rhs_b);
         } else {
             // [ray]_x (R X + t) = 0, i.e. (ray_x R) X = -ray_x t. The third
             // row is linearly dependent; the normal equations only add rank 2.
             const Eigen::Matrix3d a = skew(ray) * pose.R;
             const Eigen::Vector3d b = -(skew(ray) * pose.t);
-            ata += a.transpose() * a;
-            atb += a.transpose() * b;
+            ata += weight * (a.transpose() * a);
+            atb += weight * (a.transpose() * b);
         }
         ++used;
     }
@@ -1015,7 +1025,7 @@ BAReport bundle_adjust(BAProblem& problem, const BAOptions& options) {
         const std::size_t sensor = sensor_index(problem, obs.camera);
         const Calibration& cal = problem.calibrations[sensor];
         auto* cost = new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 3, kCalibrationParamCount>(
-            new ReprojectionCost(cal.type, cal.width, cal.height, obs.pixel));
+            new ReprojectionCost(cal.type, cal.width, cal.height, obs.pixel, obs.sigma_px));
         ceres::LossFunction* obs_loss =
             control_observation[obs.point] != 0 ? control_observation_loss_ptr() : loss_ptr();
         ceres_problem.AddResidualBlock(cost, obs_loss, cam_blocks[obs.camera].data(),

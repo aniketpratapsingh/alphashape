@@ -65,6 +65,7 @@
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/bundle_adjustment_detail.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
+#include "common/core/reference_settings.hpp"
 #include "common/io/camera_image.hpp"
 #include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
@@ -313,6 +314,15 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
 
     // Observations: track observations in an aligned camera, at keypoint_to_pixel.
+    // Every observation carries its own 1-sigma image accuracy (the reference
+    // settings), so the solve is one weighted least-squares system: a marker
+    // projection is weighted by the marker-projection accuracy and a tie-point
+    // observation by the tie-point accuracy. Without this the ~thousands of tie
+    // observations would outvote the handful of marker observations and set the
+    // pose from the point cloud's own geometry alone.
+    const ReferenceSettings& reference_settings = chunk->reference_settings();
+    const double tiepoint_sigma_px = reference_settings.tiepoint_accuracy_px;
+    const double marker_sigma_px = reference_settings.marker_projection_accuracy_px;
     std::unordered_map<std::int32_t, std::size_t> camera_slot;
     for (std::size_t b = 0; b < camera_index.size(); ++b) {
         camera_slot[chunk->cameras()[camera_index[b]].id] = b;
@@ -333,7 +343,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             }
             problem.observations.push_back(
                 sfm::BAObservation{camera->second, point->second,
-                                   keypoint_to_pixel(set->keypoints[observation.keypoint_index])});
+                                   keypoint_to_pixel(set->keypoints[observation.keypoint_index]),
+                                   tiepoint_sigma_px});
         }
     }
     const Transform& transform = chunk->transform();
@@ -352,8 +363,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // one BA point. Its projections are stored in the Calibration pixel
     // convention (top-left pixel centre (0.5, 0.5)), the same convention as
     // BAObservation, so they are copied without the keypoint +0.5 shift.
-    // BAObservation carries no per-observation sigma, so a
-    // marker_projection_accuracy parameter is deferred until it does.
+    // Each observation carries its own sigma: the marker-projection accuracy
+    // for these, the tie-point accuracy for the track observations, so the
+    // solve whitens every residual by the right amount.
     constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
     std::size_t markers_skipped = 0;
@@ -447,7 +459,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         problem.points.push_back(point);
         marker_point[m] = slot;
         for (const auto& [camera, pixel] : projections) {
-            problem.observations.push_back(sfm::BAObservation{camera, slot, pixel});
+            problem.observations.push_back(
+                sfm::BAObservation{camera, slot, pixel, marker_sigma_px});
         }
     }
     // -- control and check points -------------------------------------------
@@ -987,7 +1000,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                           axes_string(control.sigma * local_scale));
         break;
     }
-    staged.meta().set("optimize_cameras.sigma.observation_px", "1");
+    staged.meta().set("optimize_cameras.sigma.marker_projection_px",
+                      meta_number(marker_sigma_px));
+    staged.meta().set("optimize_cameras.sigma.tiepoint_px",
+                      meta_number(tiepoint_sigma_px));
     staged.meta().set("optimize_cameras.control_axes",
                       std::to_string(constrained_control_axes));
     staged.meta().set("optimize_cameras.control_points_fully_constrained",
