@@ -300,13 +300,15 @@ registered in `engine/python/CMakeLists.txt` and run by `ctest`:
   `test_reference_settings.py` — the codecs, printable sheets and accuracies.
 
 `python_gcp_validation` runs `engine/tests/run_gcp_validation.py --synthetic
---ablations`: it builds the 12-image synthetic GCP block four times (no noise;
-reference noise only; projection noise only; both plus metre-level
-consumer-GNSS camera references) and fits each from 9 control points. The
-zero-noise scenario must stay within 2 mm 3D total RMS (pipeline exactness) and
-the realistic scenario must keep the 3 held-out check points within 2 cm 3D
-total RMS. The same script has a `--real <dir> --gcp <csv>` mode for a real
-aerial block. It runs four alignments of the light fixture; no network access
+--ablations`: it builds the 12-image synthetic GCP block five times (exact;
+reference noise only; projection noise only; consumer-GNSS only; and both
+noises) and fits each from 9 control points. The exact and GNSS-only scenarios
+must stay within 2 mm 3D total RMS (pipeline exactness), the 1 cm reference
+scenario must keep the 3 held-out check points within 2 cm 3D total RMS (the
+milestone's own scenario), and the two noisy-image scenarios must stay within
+1.5x the first-order covariance prediction propagated through the true
+geometry. The same script has a `--real <dir> --gcp <csv>` mode for a real
+aerial block. It runs five alignments of the light fixture; no network access
 and no extra data are needed.
 
 ## Bug-hunting (Debug + ASan + UBSan + Eigen NaN init)

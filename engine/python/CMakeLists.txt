@@ -163,12 +163,14 @@ alphashape_add_python_test(python_reference
     TIMEOUT 600)
 
 # WP-13.20: the synthetic GCP validation scenarios. The script aligns the
-# 12-image fixture four times (no noise, reference noise only, projection noise
-# only, both plus consumer-GNSS camera references), triangulates the markers and
-# runs UpdateTransform + a bundle adjustment. It exits non-zero when the
-# zero-noise check-point 3D total exceeds 2 mm (a pipeline defect) or the
-# realistic scenario exceeds 2 cm. That is four alignments of the same fixture
-# the other light Python pipeline tests use, so it stays in the light lanes.
+# 12-image fixture five times (no noise, reference noise only, projection noise
+# only, consumer-GNSS only, and both noises), triangulates the markers and runs
+# UpdateTransform + a bundle adjustment. It exits non-zero when the exact and
+# GNSS-only check-point 3D totals exceed 2 mm, the spec scenario (1 cm control
+# noise) exceeds 2 cm, or the noisy-image scenarios exceed 1.5x the first-order
+# prediction propagated through the true geometry. That is five alignments of
+# the same fixture the other light Python pipeline tests use, so it stays in
+# the light lanes.
 add_test(
     NAME python_gcp_validation
     COMMAND ${CMAKE_COMMAND}

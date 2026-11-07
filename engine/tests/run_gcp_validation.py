@@ -24,15 +24,24 @@ reference noise, with the fixture's exact camera position and attitude pinned
 (2) 1 cm reference noise only, (3) 0.25 px projection noise only, (4) noisy
 consumer-GNSS camera references with every other input exact (a correctly
 weighted adjustment is then governed by the control points, so its check-point
-error must stay at centimetre level), and (5) both noises, which is the gated
-scenario. Scenarios 2-5 keep the realistic consumer-GNSS camera references and
-take their attitude from the alignment, so their differences come from the two
-noise knobs. Every report carries the engine's solve diagnostics (per-category
-sigmas, iterations, termination, cost) under ``diagnostics``.
+error must stay at millimetre level), and (5) both noises. Scenarios 2-5 keep
+the realistic consumer-GNSS camera references and take their attitude from the
+alignment, so their differences come from the two noise knobs.
 
-The script prints one JSON object per scenario on stdout and exits 0 when the
-3D total check-point RMS is within the tolerance (2 cm by default), 2
-otherwise. The horizontal and vertical RMS are reported separately; the real
+Three gates are applied. Gate A is the milestone's own scenario: scenario 2
+(noisy camera GNSS, 1 cm control references, exact projections) must stay at
+or below 2 cm 3D total. Gate B is estimator efficiency: for scenarios 3 and 5
+the script propagates the injected image noise through the TRUE geometry (a
+first-order Gauss-Newton normal matrix over the camera poses, every marker and
+a sampled tie-point cloud), takes the marginal covariance of each check point,
+and requires the measured total to stay within 1.5x the predicted total. Gate
+C is pipeline exactness: scenarios 1 and 4 must stay at or below 2 mm. Every
+report carries the engine's solve diagnostics (per-category sigmas, iterations,
+termination, cost) under ``diagnostics`` and, for Gate B, the prediction under
+``predicted``.
+
+The script prints one JSON object per scenario on stdout and exits non-zero
+when a gate fails. The horizontal and vertical RMS are reported separately; the real
 mode's target is horizontal. The total is the RMS of the per-check-point 3D
 distances, i.e. the quadrature of the two axes. A check label with no marker or
 no computed position is an error (exit 2), so a missing check point cannot
@@ -197,6 +206,24 @@ PIPELINE_TOLERANCE_M = 0.002
 # 0.5 px would under-weight exact or 0.25 px-peak projections against the 1 px
 # tie points). The floor keeps the exact scenarios positive.
 PROJECTION_ACCURACY_FLOOR_PX = 0.001
+
+# Gate B (estimator efficiency): the measured check-point total must stay within
+# this factor of the first-order prediction through the true geometry. The
+# factor is not tuned per run.
+GATE_B_FACTOR = 1.5
+# A scenario with no reference noise keeps its control points essentially
+# exact. A zero sigma would make the normal matrix singular, so the prediction
+# uses this floor; it is far below every other sigma in the system.
+CONTROL_REFERENCE_FLOOR_M = 1e-4
+# The tie-point cloud the prediction models: sampled on the truth surface, no
+# 3-D prior, each observation weighted at the chunk's tie-point accuracy.
+TIEPOINT_COUNT = 300
+TIEPOINT_MIN_VIEWS = 3
+TIEPOINT_SEED = 20261107
+# Central-difference steps for the numeric Jacobians of the pinhole projection.
+POSE_STEP_M = 1e-6
+POSE_STEP_RAD = 1e-6
+POINT_STEP_M = 1e-6
 
 # Solve diagnostics the engine records on the chunk (chunk.meta), surfaced in
 # every synthetic report so a mis-weighted adjustment can be told from a
@@ -457,6 +484,307 @@ def root_mean_square(values):
     if not values:
         raise ValueError("root mean square of an empty sample")
     return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def rodrigues(omega):
+    """Rotation matrix of a rotation vector (exact for any angle)."""
+    theta = math.sqrt(omega[0] ** 2 + omega[1] ** 2 + omega[2] ** 2)
+    if theta < 1e-12:
+        return ((1.0, -omega[2], omega[1]),
+                (omega[2], 1.0, -omega[0]),
+                (-omega[1], omega[0], 1.0))
+    kx, ky, kz = (value / theta for value in omega)
+    sin_t, cos_t = math.sin(theta), math.cos(theta)
+    one = 1.0 - cos_t
+    return (
+        (cos_t + kx * kx * one, kx * ky * one - kz * sin_t,
+         kx * kz * one + ky * sin_t),
+        (ky * kx * one + kz * sin_t, cos_t + ky * ky * one,
+         ky * kz * one - kx * sin_t),
+        (kz * kx * one - ky * sin_t, kz * ky * one + kx * sin_t,
+         cos_t + kz * kz * one))
+
+
+def project_world(rotation, centre, focal, width, height, point):
+    """Project a world point through an (R, centre) pinhole camera."""
+    delta = [point[i] - centre[i] for i in range(3)]
+    camera = [sum(rotation[r][c] * delta[c] for c in range(3))
+              for r in range(3)]
+    if camera[2] <= 1e-6:
+        return None
+    return (width / 2.0 + focal * camera[0] / camera[2],
+            height / 2.0 + focal * camera[1] / camera[2])
+
+
+def load_truth():
+    with open(os.path.join(DATA_DIR, "aerial_truth.json"),
+              encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def surface_height(x, y, building):
+    """The truth surface height: the roof inside its footprint, else ground."""
+    if (building["x0"] <= x <= building["x1"] and
+            building["y0"] <= y <= building["y1"]):
+        return building["top"]
+    return 0.0
+
+
+def sample_tie_points(truth, count=TIEPOINT_COUNT):
+    """Deterministic tie-point cloud on the truth surface, >= 3 views each."""
+    images = truth["images"]
+    building = truth["building"]
+    rng = random.Random(TIEPOINT_SEED)
+    points = []
+    for _ in range(200000):
+        if len(points) >= count:
+            break
+        x = rng.uniform(-58.0, 58.0)
+        y = rng.uniform(-43.0, 43.0)
+        point = (x, y, surface_height(x, y, building))
+        views = sum(1 for image in images
+                    if project_truth(image, point) is not None)
+        if views >= TIEPOINT_MIN_VIEWS:
+            points.append(point)
+    if len(points) < count:
+        raise ValueError("could not sample {} tie points".format(count))
+    return points
+
+
+def invert3(matrix):
+    """Inverse of a 3x3 matrix by the adjugate; raises when singular."""
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    det = (a * (e * i - f * h) - b * (d * i - f * g) +
+           c * (d * h - e * g))
+    if abs(det) < 1e-18:
+        raise ValueError("singular 3x3 block")
+    return (
+        ((e * i - f * h) / det, (c * h - b * i) / det,
+         (b * f - c * e) / det),
+        ((f * g - d * i) / det, (a * i - c * g) / det,
+         (c * d - a * f) / det),
+        ((d * h - e * g) / det, (b * g - a * h) / det,
+         (a * e - b * d) / det))
+
+
+def invert_matrix(matrix):
+    """Gauss-Jordan inverse of a square matrix with partial pivoting."""
+    size = len(matrix)
+    if any(len(row) != size for row in matrix):
+        raise ValueError("matrix is not square")
+    work = [list(row) + [1.0 if i == j else 0.0 for j in range(size)]
+            for i, row in enumerate(matrix)]
+    for column in range(size):
+        pivot = max(range(column, size),
+                    key=lambda row: abs(work[row][column]))
+        if abs(work[pivot][column]) < 1e-15:
+            raise ValueError("singular normal matrix")
+        work[column], work[pivot] = work[pivot], work[column]
+        scale = work[column][column]
+        work[column] = [value / scale for value in work[column]]
+        pivot_row = work[column]
+        for row in range(size):
+            if row == column:
+                continue
+            factor = work[row][column]
+            if factor == 0.0:
+                continue
+            current = work[row]
+            for index in range(len(current)):
+                current[index] -= factor * pivot_row[index]
+    return [row[size:] for row in work]
+
+
+def camera_projection_jacobian(image, point):
+    """d(u, v)/d(rotation vector, centre), central differences at truth."""
+    rotation, centre = image["R"], image["centre"]
+    focal, width, height = image["f"], image["width"], image["height"]
+    rows = []
+    for axis in range(6):
+        step = POSE_STEP_RAD if axis < 3 else POSE_STEP_M
+        pixels = []
+        for sign in (1.0, -1.0):
+            omega = [0.0, 0.0, 0.0]
+            shift = [0.0, 0.0, 0.0]
+            if axis < 3:
+                omega[axis] = sign * step
+            else:
+                shift[axis - 3] = sign * step
+            perturbed = multiply(rodrigues(omega), rotation)
+            moved = [centre[i] + shift[i] for i in range(3)]
+            pixel = project_world(perturbed, moved, focal, width, height,
+                                  point)
+            if pixel is None:
+                raise ValueError("projection left the image while differencing")
+            pixels.append(pixel)
+        rows.append(((pixels[0][0] - pixels[1][0]) / (2.0 * step),
+                     (pixels[0][1] - pixels[1][1]) / (2.0 * step)))
+    return rows
+
+
+def point_projection_jacobian(image, point):
+    """d(u, v)/d(point x, y, z), central differences at truth."""
+    rotation, centre = image["R"], image["centre"]
+    focal, width, height = image["f"], image["width"], image["height"]
+    rows = []
+    for axis in range(3):
+        pixels = []
+        for sign in (1.0, -1.0):
+            moved = list(point)
+            moved[axis] += sign * POINT_STEP_M
+            pixel = project_world(rotation, centre, focal, width, height,
+                                  moved)
+            if pixel is None:
+                raise ValueError("projection left the image while differencing")
+            pixels.append(pixel)
+        rows.append(((pixels[0][0] - pixels[1][0]) / (2.0 * POINT_STEP_M),
+                     (pixels[0][1] - pixels[1][1]) / (2.0 * POINT_STEP_M)))
+    return rows
+
+
+def add_outer(normal, indices, row):
+    """Add the outer product of ``row`` at ``indices`` into ``normal``."""
+    for a, i in enumerate(indices):
+        value = row[a]
+        if value == 0.0:
+            continue
+        columns = normal[i]
+        for b, j in enumerate(indices):
+            columns[j] += value * row[b]
+
+
+def add_projection(normal, indices, point_rows, camera_rows, sigma):
+    """Add one weighted 2-D projection observation."""
+    for component in (0, 1):
+        row = [entry[component] / sigma for entry in point_rows]
+        row += [entry[component] / sigma for entry in camera_rows]
+        add_outer(normal, indices, row)
+
+
+def predict_check_point_rms(truth, marker_projection_sigma_px,
+                            control_sigma_m, camera_gnss,
+                            tiepoint_sigma_px):
+    """First-order check-point covariance through the true geometry (Gate B).
+
+    This is the Gauss-Newton normal matrix J^T W J of a bundle adjustment at
+    the fixture's truth parameters: six degrees of freedom per camera
+    (rotation vector and centre; intrinsics fixed), three per marker and three
+    per sampled tie point. Its observations are the truth projections weighted
+    by the image sigma, the control markers' 3-D references weighted by the
+    survey sigma, and the camera centres weighted by the GNSS sigma; tie points
+    carry no prior. The block-diagonal tie-point blocks are eliminated by their
+    Schur complement, so the reduced system is the camera/marker matrix the
+    real adjustment effectively solves. Its inverse gives each check point's
+    marginal 3x3 covariance in ENU; the predicted RMS is the root of the mean
+    per-axis variance over the check points.
+    """
+    images = truth["images"]
+    markers = truth_points()
+    ties = sample_tie_points(truth)
+    camera_parameters = 6 * len(images)
+    marker_base = camera_parameters
+    tie_base = marker_base + 3 * len(markers)
+    size = tie_base + 3 * len(ties)
+    normal = [[0.0] * size for _ in range(size)]
+    marker_views = [
+        [index for index, image in enumerate(images)
+         if project_truth(image, point) is not None]
+        for _, point in markers]
+    tie_views = [
+        [index for index, image in enumerate(images)
+         if project_truth(image, point) is not None]
+        for point in ties]
+    tie_links = [[] for _ in ties]
+    for j, (_, point) in enumerate(markers):
+        base = marker_base + 3 * j
+        for camera_index in marker_views[j]:
+            image = images[camera_index]
+            camera_base = 6 * camera_index
+            indices = ([base, base + 1, base + 2] +
+                       [camera_base + b for b in range(6)])
+            add_projection(normal, indices,
+                           point_projection_jacobian(image, point),
+                           camera_projection_jacobian(image, point),
+                           marker_projection_sigma_px)
+    for k, point in enumerate(ties):
+        base = tie_base + 3 * k
+        for camera_index in tie_views[k]:
+            image = images[camera_index]
+            camera_base = 6 * camera_index
+            indices = ([base, base + 1, base + 2] +
+                       [camera_base + b for b in range(6)])
+            add_projection(normal, indices,
+                           point_projection_jacobian(image, point),
+                           camera_projection_jacobian(image, point),
+                           tiepoint_sigma_px)
+            tie_links[k].extend(range(camera_base, camera_base + 6))
+    for j, (label, _) in enumerate(markers):
+        if label in CHECK_LABELS:
+            continue
+        base = marker_base + 3 * j
+        for axis in range(3):
+            normal[base + axis][base + axis] += 1.0 / (control_sigma_m ** 2)
+    camera_sigma = ((GNSS_HORIZONTAL_SIGMA_M, GNSS_HORIZONTAL_SIGMA_M,
+                     GNSS_VERTICAL_SIGMA_M) if camera_gnss
+                    else (EXACT_CAMERA_ACCURACY_M,) * 3)
+    for camera_index in range(len(images)):
+        base = 6 * camera_index + 3
+        for axis in range(3):
+            normal[base + axis][base + axis] += 1.0 / (camera_sigma[axis] ** 2)
+    reduced = [row[:tie_base] for row in normal[:tie_base]]
+    for k in range(len(ties)):
+        block = tie_base + 3 * k
+        inverse = invert3([[normal[block + a][block + b] for b in range(3)]
+                           for a in range(3)])
+        links = sorted(set(tie_links[k]))
+        transformed = []
+        for index in links:
+            row = [normal[index][block + b] for b in range(3)]
+            transformed.append(
+                [sum(inverse[a][b] * row[b] for b in range(3))
+                 for a in range(3)])
+        for a, row_index in enumerate(links):
+            for b, column_index in enumerate(links):
+                correction = sum(
+                    transformed[a][c] * normal[column_index][block + c]
+                    for c in range(3))
+                reduced[row_index][column_index] -= correction
+    covariance = invert_matrix(reduced)
+    check_indices = [j for j, (label, _) in enumerate(markers)
+                     if label in CHECK_LABELS]
+    if not check_indices:
+        raise ValueError("no check points to predict")
+    horizontal, vertical, total = [], [], []
+    per_point = {}
+    for j in check_indices:
+        base = marker_base + 3 * j
+        trace = sum(covariance[base + axis][base + axis] for axis in range(3))
+        h_sq = covariance[base][base] + covariance[base + 1][base + 1]
+        v_sq = covariance[base + 2][base + 2]
+        if min(h_sq, v_sq) < 0.0:
+            raise ValueError("negative variance in the check-point covariance")
+        horizontal.append(h_sq)
+        vertical.append(v_sq)
+        total.append(trace)
+        per_point[markers[j][0]] = {
+            "horizontal": math.sqrt(h_sq),
+            "vertical": math.sqrt(v_sq),
+            "total": math.sqrt(trace)}
+    return {
+        "tie_points": len(ties),
+        "tie_point_sigma_px": tiepoint_sigma_px,
+        "marker_projection_sigma_px": marker_projection_sigma_px,
+        "control_reference_sigma_m": control_sigma_m,
+        "camera_gnss": camera_gnss,
+        "parameters": size,
+        "reduced_parameters": tie_base,
+        "horizontal": math.sqrt(sum(horizontal) / len(horizontal)),
+        "vertical": math.sqrt(sum(vertical) / len(vertical)),
+        "total": math.sqrt(sum(total) / len(total)),
+        "check_points": per_point,
+    }
 
 
 def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
@@ -786,9 +1114,10 @@ def parse_args(argv):
                              "(on) or keep the fixture's exact GPS (off)")
     parser.add_argument("--ablations", action="store_true",
                         help="run the five synthetic noise/GNSS scenarios: "
-                             "exact pipeline (<= 2 mm), reference noise only, "
-                             "projection noise only, GNSS-only with exact "
-                             "inputs, and both noises (gated)")
+                             "exact pipeline (<= 2 mm), reference noise only "
+                             "(spec gate <= 2 cm), projection noise only and "
+                             "both noises (<= 1.5x the first-order prediction), "
+                             "and GNSS-only with exact inputs (<= 2 mm)")
     args = parser.parse_args(argv)
     if args.projection_noise_px < 0.0 or args.reference_noise_m < 0.0:
         parser.error("noise magnitudes must not be negative")
@@ -809,42 +1138,69 @@ def emit(report, gate_m, passed):
     rms = report["check_point_rms_m"]
     report["gate_m"] = gate_m
     report["passed"] = passed
+    predicted = report.get("predicted")
+    if predicted:
+        prediction_text = (
+            "predicted_horizontal={:.6f} predicted_vertical={:.6f} "
+            "predicted_total={:.6f} ratio={:.3f} ".format(
+                predicted["horizontal"], predicted["vertical"],
+                predicted["total"], report["predicted_ratio"]))
+    else:
+        prediction_text = ""
     # A bracket-tagged measurement line, the same shape the other
     # benchmark-style tests use, so CI surfaces the numbers even when the test
     # passes (ctest hides passing output).
     print("[gcp validation] scenario={} horizontal={:.6f} vertical={:.6f} "
-          "total={:.6f} gate={} passed={}".format(
+          "total={:.6f} {}gate={} passed={}".format(
               report.get("ablation", report["scenario"]),
               rms["horizontal"], rms["vertical"], rms["total"],
+              prediction_text,
               "none" if gate_m is None else "{:.6f}".format(gate_m), passed))
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def run_ablations(args):
-    """Run the five synthetic scenarios and gate (1) exactness and (5) accuracy."""
+    """Run the five synthetic scenarios and apply gates A, B and C."""
+    truth = load_truth()
     scenarios = (
-        # name, projection noise, reference noise, camera GNSS, gate.
+        # name, projection noise, reference noise, camera GNSS, gate kind, gate.
         # Scenario 1 is the pipeline-exactness control: every input the GCP
         # machinery consumes is exact. Scenarios 2-5 keep the realistic
         # consumer-GNSS camera references and vary only the two noise knobs, so
         # their differences are attributable to those noises. Scenario 4 keeps
-        # the noisy GNSS but removes both other noises: with 1 cm control points
-        # the answer must be pinned by them, so it isolates the camera-prior /
-        # control interaction from the injected noise.
-        ("exact", 0.0, 0.0, False, PIPELINE_TOLERANCE_M),
-        ("reference-noise", 0.0, args.reference_noise_m, True, None),
-        ("projection-noise", args.projection_noise_px, 0.0, True, None),
-        ("gnss-only", 0.0, 0.0, True, None),
+        # the noisy GNSS but removes both other noises: with exact control
+        # points the answer must be pinned by them, so it isolates the camera
+        # prior / control interaction from the injected noise.
+        ("exact", 0.0, 0.0, False, "absolute", PIPELINE_TOLERANCE_M),
+        ("reference-noise", 0.0, args.reference_noise_m, True,
+         "absolute", args.tolerance),
+        ("projection-noise", args.projection_noise_px, 0.0, True,
+         "predicted", GATE_B_FACTOR),
+        ("gnss-only", 0.0, 0.0, True, "absolute", PIPELINE_TOLERANCE_M),
         ("combined", args.projection_noise_px, args.reference_noise_m,
-         args.camera_gnss == "on", args.tolerance),
+         args.camera_gnss == "on", "predicted", GATE_B_FACTOR),
     )
     all_passed = True
-    for name, projection, reference, camera_gnss, gate in scenarios:
+    for name, projection, reference, camera_gnss, kind, value in scenarios:
         report = run_synthetic(args, projection, reference, camera_gnss)
         report["ablation"] = name
-        passed = None if gate is None else synthetic_passed(report, gate)
+        report["gate_kind"] = kind
+        if kind == "predicted":
+            control_sigma = (reference / math.sqrt(3.0) if reference > 0.0
+                             else CONTROL_REFERENCE_FLOOR_M)
+            prediction = predict_check_point_rms(
+                truth, report["marker_projection_accuracy_px"],
+                control_sigma, camera_gnss, report["tiepoint_accuracy_px"])
+            report["predicted"] = prediction
+            measured = report["check_point_rms_m"]["total"]
+            report["predicted_ratio"] = measured / prediction["total"]
+            report["gate_factor"] = value
+            gate = value * prediction["total"]
+        else:
+            gate = value
+        passed = synthetic_passed(report, gate)
         emit(report, gate, passed)
-        if passed is False:
+        if not passed:
             all_passed = False
     return 0 if all_passed else 2
 
