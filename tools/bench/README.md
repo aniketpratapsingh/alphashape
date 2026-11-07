@@ -267,6 +267,7 @@ Every schedule-triggered run has no dispatch inputs at all, so its behaviour is 
 |---|---|---|---|---|
 | `aerial-nadir` | nadir drone | 102 | orthomosaic + DSM + dense cloud, from the publisher's own OpenDroneMap run | CC BY 4.0 |
 | `terrestrial-laser` | oblique handheld DSLR | 42 | registered terrestrial laser scan (ETH3D `terrains`) | CC BY-NC-SA 4.0 |
+| `gcp-rtk` | nadir RTK drone | 176 | 5 surveyed GCPs (35 image observations) + a 5-point survey CSV | GPL-3.0 |
 
 `terrestrial-laser` scores accuracy and completeness against the laser scan. ETH3D also
 publishes per-image occlusion masks, in a separate archive this benchmark does **not**

@@ -15,6 +15,7 @@ and a byte budget; a mismatch fails the run rather than producing a silently wro
 |---|---|---|---|---|
 | `aerial-nadir` (Zenodo 8436963, Bandamaji, Comoros) | 102 nadir JPEG | Orthomosaic + DSM GeoTIFF + dense cloud (LAZ), all from the publisher's own ODM run | CC BY 4.0 | primary aerial |
 | `terrestrial-laser` (ETH3D `terrains`, high-res multi-view training) | 42 DSLR JPEG | Laser-scan point cloud, registered into the image frame (the `scan_eval` archive) | CC BY-NC-SA 4.0 | ground-truth geometry |
+| `gcp-rtk` (OpenDroneMap `odm_data_helenenschacht`, RTK sample) | 176 nadir JPEG | 5 surveyed ground-control points (35 image observations) + a 5-point survey CSV | GPL-3.0 | ground-control validation |
 
 The Comoros survey is the primary aerial set. Its publisher ran OpenDroneMap on the
 images it publishes and released the orthomosaic, the DSM and the dense cloud beside
@@ -177,6 +178,42 @@ does not come from a photogrammetry pipeline at all.
   the accuracy tolerances (2/5/10 cm against the laser scan) are what decide whether the
   result is good enough — neither limit costs information those tolerances can measure.
   Each stage also carries a 40-minute budget and every limit is printed in the report.
+
+## Ground control: `gcp-rtk`
+
+**Helenenschacht RTK sample dataset, photos by Daniel Dobosi, published by
+OpenDroneMap (GPL-3.0).**
+
+- Publisher: [github.com/OpenDroneMap/odm_data_helenenschacht](https://github.com/OpenDroneMap/odm_data_helenenschacht),
+  pinned commit `eece33e9ece2ff358a7bdc02e1db6f67925e00c4`. Downloaded at run time as a
+  codeload tarball, verified by SHA-256 and byte count in `datasets.json`.
+- Licence: **GPL-3.0**. The benchmark downloads and measures only, and does **not**
+  redistribute: no image, GCP file, or converted copy of the GCP file is committed to
+  this repository, and no derived imagery (orthomosaic, screenshot) is ever published.
+  Only numbers are published.
+- Images: 176 nadir JPEGs (5472 x 3648, 1" sensor, ~2.5 GB) from an Autel Evo II Pro
+  RTK drone, with EXIF GPS from the RTK receiver.
+- Files used (all inside the pinned tarball, never committed):
+  - `images/` — the photographs (the only input the engine gets).
+  - `GCP/gcp_list.txt` — the ODM GCP list: header `EPSG:4326`, then
+    `x y z px py image [label]` per line, 35 image observations of 5 GCPs. Parsed at
+    run time; nothing is converted or committed.
+  - `GCP/latlon-easting_northing.csv` — 5 points
+    (`Name;Easting;Northing;Elevation;Longitude;Latitude`), surveyed with an Emlid
+    Reach RS2 via NTRIP at a stated 1–2 cm accuracy. Matched to the GCP list by
+    coordinates to recover the survey names.
+- The gcp-list coordinate `z` is compared with the CSV `Elevation` to decide whether it
+  is ellipsoidal or orthometric; the decision and the mean offset are recorded in the
+  report rather than assumed.
+- The run is a **leave-one-out over the 5 GCPs**: the block is aligned once
+  (`MatchPhotos keypoint_limit_per_mpx=250` + `AlignCameras`, no dense stage), saved,
+  then per fold 4 points are control and 1 is a held-out check. Two variants are
+  measured — camera RTK references at their stated accuracy plus the GCPs, and GCPs
+  alone with the camera references disabled. The target is <= 5 cm horizontal RMS over
+  the folds, reported as PASS/MISS and not gated in this first version.
+- Why this one: it is the only ODM sample repository with surveyed ground-control
+  points and RTK camera positions in one place, which is exactly what a ground-control
+  validation needs. `odm_data_*` sample repos publish images only (see "Also surveyed").
 
 ## Also surveyed, not chosen
 

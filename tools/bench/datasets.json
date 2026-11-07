@@ -132,6 +132,53 @@
       "stage_budgets": {
         "BuildOrthomosaic": 3600
       }
+    },
+    "gcp-rtk": {
+      "title": "Helenenschacht RTK sample, Autel Evo II Pro RTK (OpenDroneMap)",
+      "publisher": "OpenDroneMap sample repository odm_data_helenenschacht (GitHub)",
+      "doi": null,
+      "flight": "nadir RTK drone",
+      "validation": "gcp",
+      "licence": {
+        "spdx": "GPL-3.0",
+        "name": "GNU General Public License 3.0",
+        "url": "https://www.gnu.org/licenses/gpl-3.0.html",
+        "redistribution": "download and measure only; never redistributed"
+      },
+      "images_archive": {
+        "download": "odm_data_helenenschacht.tar.gz",
+        "url": "https://codeload.github.com/OpenDroneMap/odm_data_helenenschacht/tar.gz/eece33e9ece2ff358a7bdc02e1db6f67925e00c4",
+        "sha256": "4e71dbfc08efcf1ff854c4b82a01f2ba5b6b42dd7530fd64c890ab2261643bab",
+        "bytes": 2546560515,
+        "extract_glob": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/images/*"
+      },
+      "reference_files": [
+        {
+          "path": "reference/gcp_list.txt",
+          "from_archive": "odm_data_helenenschacht.tar.gz",
+          "archive_member": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/GCP/gcp_list.txt",
+          "kind": "gcp_list"
+        },
+        {
+          "path": "reference/gcp_names.csv",
+          "from_archive": "odm_data_helenenschacht.tar.gz",
+          "archive_member": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/GCP/latlon-easting_northing.csv",
+          "kind": "gcp_names"
+        }
+      ],
+      "expected_images": 176,
+      "gcp": {
+        "target_horizontal_m": 0.05,
+        "camera_accuracy_fallback_m": 0.05,
+        "marker_location_accuracy_m": 0.015
+      },
+      "param_overrides": {
+        "MatchPhotos": {
+          "keypoint_limit_per_mpx": 250
+        }
+      },
+      "param_overrides_reason": "176 frames at 20 MP each do not fit a 16 GB runner at the default keypoint density (the same measured limit as the aerial set). keypoint_limit_per_mpx=250 yields ~5000 keypoints per image, and reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera, keeping MatchPhotos + AlignCameras inside the two-hour budget. The GCP validation never runs the dense stage.",
+      "notes": "35 image observations of 5 surveyed GCPs (ODM gcp_list format, header EPSG:4326) and a 5-point CSV (Name;Easting;Northing;Elevation;Longitude;Latitude) surveyed with an Emlid Reach RS2 via NTRIP at a stated 1-2 cm accuracy. Photographs by Daniel Dobosi, published by OpenDroneMap under GPL-3.0."
     }
   }
 }

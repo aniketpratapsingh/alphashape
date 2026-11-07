@@ -420,6 +420,64 @@ def _crs_rows(provenance: Any) -> list[str]:
     return rows
 
 
+def gcp_markdown(current: dict) -> str:
+    """The report body for the ground-control dataset, which has no ortho/DEM.
+
+    Its numbers are per-fold check-point errors and their RMS, one table per
+    variant. The PASS/MISS verdict is reported but never fails the job in this
+    first version: there is no history to regress against yet.
+    """
+    manifest = current.get("dataset_manifest", {}) or {}
+    licence = current.get("licence", {}) or {}
+    align = current.get("align", {}) or {}
+    z_datum = current.get("z_datum", {}) or {}
+    target = current.get("target_horizontal_m")
+    verdict = "PASS" if current.get("passed") else "MISS"
+    lines = ["# Quality benchmark: " + str(manifest.get("title") or current.get("dataset", "?")), ""]
+    lines.append(f"**Verdict: {verdict}** — check-point horizontal RMS target "
+                 f"{_fmt(target)} m; reported, not gated (first version)")
+    lines.append("")
+    lines.append("## Provenance")
+    lines.append("")
+    lines.append("| | |")
+    lines.append("|---|---|")
+    lines.append(f"| Dataset | {manifest.get('title') or '-'} |")
+    lines.append(f"| Flight | {manifest.get('flight') or '-'} |")
+    lines.append(f"| Images | {manifest.get('images') or '-'} |")
+    lines.append(f"| Licence | {licence.get('spdx', '-')} — [terms]({licence.get('url', '')}) |")
+    lines.append(f"| Manifest hash | `{current.get('manifest_hash', '-')}` |")
+    lines.append("")
+    lines.append("## Alignment (once, then leave-one-out)")
+    lines.append("")
+    lines.append("| | |")
+    lines.append("|---|---:|")
+    lines.append(f"| Cameras aligned | {align.get('cameras_aligned')} / {align.get('cameras_total')} |")
+    lines.append(f"| keypoint_limit_per_mpx | {align.get('keypoint_limit_per_mpx')} |")
+    lines.append(f"| GCPs | {current.get('gcps')} |")
+    lines.append(f"| Observations | {current.get('observations')} |")
+    lines.append(f"| CRS header | {current.get('crs_header')} |")
+    lines.append(f"| z datum | {z_datum.get('decision', '-')} "
+                 f"(mean gcp z - CSV elevation {_fmt(z_datum.get('mean_offset_m'))} m) |")
+    lines.append("")
+    for variant, data in (current.get("variants") or {}).items():
+        lines.append(f"## Variant: {variant}")
+        lines.append("")
+        lines.append("| Check | Horizontal (m) | Vertical (m) | 3D total (m) |")
+        lines.append("|---|---:|---:|---:|")
+        for fold in data.get("folds") or []:
+            if "error" in fold:
+                lines.append(f"| {fold.get('check')} | _error: {fold.get('error')}_ | | |")
+            else:
+                lines.append(
+                    f"| {fold.get('check')} | {_fmt(fold.get('horizontal_m'))} | "
+                    f"{_fmt(fold.get('vertical_m'))} | {_fmt(fold.get('total_m'))} |")
+        lines.append(f"| **RMS** | **{_fmt(data.get('rms_horizontal_m'))}** | "
+                     f"**{_fmt(data.get('rms_vertical_m'))}** | "
+                     f"**{_fmt(data.get('rms_total_m'))}** |")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def markdown(
     current: dict,
     previous: dict | None,
@@ -430,6 +488,9 @@ def markdown(
     png_name: str | None,
 ) -> str:
     """The report body. Pure formatting: every number comes from ``current``."""
+    if current.get("kind") == "gcp":
+        return gcp_markdown(current)
+
     free = current.get("reference_free", {}) or {}
     based = current.get("reference_based", {}) or {}
     timing = current.get("timing", {}) or {}
