@@ -227,8 +227,10 @@ Protocol: align once (`MatchPhotos keypoint_limit_per_mpx=250` + `AlignCameras`,
 GCPs — 4 control + 1 held-out check per fold, `UpdateTransform` +
 `OptimizeCameras(use_gcps=True)`, and the check point's horizontal / vertical / 3D
 error measured against its surveyed reference. Two variants: camera RTK references
-at their EXIF/XMP accuracy (fallback 0.05 m) plus the GCPs, and GCPs only with the
-camera references disabled. Runtime 2702.7 s on a shared CPU runner. The gcp-list
+at `--camera-accuracy` (0.05 m) plus the GCPs at `--marker-accuracy` (0.015 m), and
+GCPs only with the camera references disabled. The GCPs-only folds also report how
+far the stored camera references sit from the adjusted camera centres (mean and RMS
+east/north/up), which separates a height-datum mismatch from unfixed positions. Runtime 2702.7 s on a shared CPU runner. The gcp-list
 z is orthometric (mean offset to the CSV elevation 0.0 m).
 
 | check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
@@ -240,9 +242,9 @@ z is orthometric (mean offset to the CSV elevation 0.0 m).
 | 5 | 0.0638 / 0.1841 / 0.1948 | 0.0646 / 0.1845 / 0.1954 |
 | RMS | **0.0783 / 0.1655 / 0.1831** | **0.0788 / 0.1680 / 0.1855** |
 
-The horizontal target was 5 cm; both variants measure ~7.8 cm horizontal RMS, so
-the target is **missed** in this first version (reported, not gated). The two
-variants agree to within a millimetre, so the RTK camera references do not move
-the check-point error; the block's own accuracy at the GCP locations dominates.
-Check point 4 is the outlier in both (10.4-10.6 cm horizontal, 0.27-0.28 m
-vertical), the remaining four sit between 3.8 and 9.3 cm horizontal.
+**Superseded.** In this first run the camera variant read each camera's stored
+accuracy back from the binding, which is the 10 m consumer default once a location
+exists, so the RTK positions carried no weight and the two variants agreed to
+within a millimetre. The control markers also used the 5 mm chunk default instead
+of the stated 0.015 m. Both are fixed; the table above is kept only as the record
+of that run. Results: pending rerun.

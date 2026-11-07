@@ -1253,11 +1253,11 @@ def align_block(args, images):
 
 
 def import_camera_references_for_block(chunk, accuracy_m, directory):
-    """Re-import camera references at their EXIF/XMP accuracy, else ``accuracy_m``.
+    """Re-import every camera reference at the block's stated ``accuracy_m``.
 
-    AddPhotos stores the position but no accuracy, so the fit would fall back to
-    the loose consumer default. The RTK positions deserve their stated accuracy,
-    which EXIF/XMP may already carry; otherwise the manifest's fallback applies.
+    The binding's ``reference_accuracy`` is never None once a location exists:
+    AddPhotos stores the 10 m consumer default, so reading it back would weight
+    the RTK positions as consumer GNSS and leave them without effect.
     """
     rows = []
     for camera in chunk.cameras:
@@ -1265,14 +1265,48 @@ def import_camera_references_for_block(chunk, accuracy_m, directory):
         if reference is None or not all(
                 math.isfinite(float(value)) for value in reference):
             continue
-        declared = camera.reference_accuracy
-        accuracy = declared if declared is not None else (
-            accuracy_m, accuracy_m, accuracy_m)
         rows.append((camera.label, reference[0], reference[1], reference[2],
-                     tuple(accuracy)))
+                     (accuracy_m, accuracy_m, accuracy_m)))
     path = os.path.join(directory, "camera_references.csv")
     write_camera_reference_csv(path, rows)
     chunk.importReference(path=path)
+
+
+def camera_consistency(chunk):
+    """How far each aligned camera's stored reference is from its adjusted centre.
+
+    Per camera with a finite reference: the adjusted centre (chunk-local, mapped
+    to ECEF by chunk.transform) expressed in the reference's local east/north/up
+    frame. A constant up offset points at a height-datum mismatch between the
+    camera altitudes and the GCP heights; a metre-level spread points at
+    positions that are not RTK-fixed. Measured only, never applied.
+    """
+    transform = chunk.transform
+    east, north, up = [], [], []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if not camera.enabled or reference is None or not all(
+                math.isfinite(float(value)) for value in reference):
+            continue
+        local = camera.center
+        ecef = [sum(transform[r][c] * local[c] for c in range(3)) + transform[r][3]
+                for r in range(3)]
+        enu = ecef_to_enu(ecef, (reference[0], reference[1], reference[2]))
+        east.append(enu[0])
+        north.append(enu[1])
+        up.append(enu[2])
+    if not east:
+        return {"cameras": 0}
+
+    def mean(values):
+        return sum(values) / len(values)
+
+    return {"cameras": len(east),
+            "mean_east_m": mean(east), "mean_north_m": mean(north),
+            "mean_up_m": mean(up),
+            "rms_east_m": root_mean_square(east),
+            "rms_north_m": root_mean_square(north),
+            "rms_up_m": root_mean_square(up)}
 
 
 def run_fold(args, gcps, check_index, camera_refs, align_report):
@@ -1280,6 +1314,9 @@ def run_fold(args, gcps, check_index, camera_refs, align_report):
     doc = alphashape.load_project(align_report["project"])
     chunk = doc.active_chunk
 
+    # Control and check markers take the survey's stated accuracy: the import
+    # rows carry no accuracy column, so the chunk setting is the one applied.
+    chunk.marker_location_accuracy = args.marker_accuracy
     cameras = {camera.label: camera for camera in chunk.cameras}
     for gcp in gcps:
         chunk.addMarker(label=gcp["label"])
@@ -1319,12 +1356,15 @@ def run_fold(args, gcps, check_index, camera_refs, align_report):
     labels = [gcps[check_index]["label"]]
     targets = reference_local_targets(chunk, labels)
     errors = check_point_errors(chunk, labels, targets)[0]
-    return {"check": labels[0],
+    fold = {"check": labels[0],
             "control": [gcps[index]["label"]
                         for index in range(len(gcps)) if index != check_index],
             "horizontal_m": errors["horizontal"],
             "vertical_m": errors["vertical"],
             "total_m": errors["total"]}
+    if not camera_refs:
+        fold["camera_consistency"] = camera_consistency(chunk)
+    return fold
 
 
 def run_real_odm(args):
@@ -1363,6 +1403,26 @@ def run_real_odm(args):
                 root_mean_square([fold["total_m"] for fold in measured])
                 if measured else None),
         }
+        if not camera_refs:
+            # One line per fold would repeat the same block-level picture; the
+            # mean over folds is the summary, the folds keep their own values.
+            per_fold = [fold["camera_consistency"] for fold in measured
+                        if fold.get("camera_consistency", {}).get("cameras")]
+            if per_fold:
+                summary = {"folds": len(per_fold),
+                           "cameras": per_fold[0]["cameras"]}
+                for key in ("mean_east_m", "mean_north_m", "mean_up_m",
+                            "rms_east_m", "rms_north_m", "rms_up_m"):
+                    summary[key] = sum(item[key] for item in per_fold) / len(per_fold)
+                variants[variant]["camera_consistency"] = summary
+                print("[gcp validation] camera reference - adjusted centre "
+                      "(gcps_only, mean over folds): mean E/N/U "
+                      "{:.3f}/{:.3f}/{:.3f} m, RMS E/N/U {:.3f}/{:.3f}/{:.3f} m "
+                      "over {} cameras".format(
+                          summary["mean_east_m"], summary["mean_north_m"],
+                          summary["mean_up_m"], summary["rms_east_m"],
+                          summary["rms_north_m"], summary["rms_up_m"],
+                          summary["cameras"]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -1376,6 +1436,8 @@ def run_real_odm(args):
         "z_datum": z_datum,
         "align": align_report,
         "variants": variants,
+        "camera_accuracy_m": args.camera_accuracy,
+        "marker_accuracy_m": args.marker_accuracy,
         "target_horizontal_m": target,
         "passed": passed,
     }
@@ -1411,10 +1473,10 @@ def parse_args(argv):
                              "CSV whose points are matched to --gcp-list by "
                              "coordinates")
     parser.add_argument("--camera-accuracy", type=float, default=0.05,
-                        help="fallback camera reference accuracy in metres when "
-                             "EXIF/XMP carries none")
+                        help="camera reference accuracy in metres for the "
+                             "camera_rtk_gcps variant (the RTK block's stated value)")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
-                        help="control-point reference accuracy in metres")
+                        help="control- and check-point reference accuracy in metres")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
     parser.add_argument("--horizontal-target", type=float, default=0.05,
