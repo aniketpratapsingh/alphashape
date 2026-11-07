@@ -26,6 +26,11 @@ DATA_DIR = os.path.join(
 )
 FIXTURE_A = os.path.join(DATA_DIR, "fixture_a.pgm")
 FIXTURE_B = os.path.join(DATA_DIR, "fixture_b.pgm")
+AERIAL = [
+    os.path.join(DATA_DIR, "aerial_r{}c{}.jpg".format(row, col))
+    for row in range(3)
+    for col in range(4)
+]
 
 
 def document_with_photos():
@@ -213,6 +218,119 @@ class TestTrackMarkers(unittest.TestCase):
         with self.assertRaises(alphashape.ValueError) as context:
             chunk.trackMarkers(direction="sideways")
         self.assertIn("direction", str(context.exception))
+
+
+class TestMarkerSurfaceExtensions(unittest.TestCase):
+    """The WP-13.20 additions to the marker surface."""
+
+    def test_add_marker_generates_a_label(self):
+        _, chunk = document_with_photos()
+        marker = chunk.addMarker()
+        self.assertEqual(marker.label, "point 1")
+        self.assertEqual(marker.type, "regular")
+
+    def test_projection_is_a_marker_projection_view(self):
+        _, chunk = document_with_photos()
+        chunk.addMarker(label="GCP1")
+        camera = chunk.cameras[0]
+        chunk.setMarkerProjection("GCP1", camera.label, 10.0, 20.0)
+        projection = chunk.markers[0].projections[0]
+        self.assertEqual(projection.camera.label, camera.label)
+        self.assertEqual(projection.camera_id, camera.id)
+        self.assertEqual(projection.pixel, (10.0, 20.0))
+        self.assertTrue(projection.enabled)
+        # The earlier dict protocol still works.
+        self.assertEqual(projection["camera_id"], camera.id)
+        as_dict = dict(projection)
+        self.assertEqual(set(as_dict),
+                         {"camera_id", "camera", "pixel", "enabled"})
+        self.assertEqual(as_dict["pixel"], (10.0, 20.0))
+        self.assertEqual(len(projection), 4)
+        self.assertEqual(list(projection), projection.keys())
+        self.assertIsNone(projection.get("missing"))
+        self.assertEqual(projection.get("missing", 7), 7)
+        self.assertEqual(projection.get("pixel"), (10.0, 20.0))
+        self.assertEqual([key for key, _ in projection.items()],
+                         projection.keys())
+        # Camera proxies compare by identity, not equality, so compare the
+        # scalar values and the camera's id rather than the proxy objects.
+        values = projection.values()
+        self.assertEqual(len(values), 4)
+        self.assertEqual(values[0], camera.id)
+        self.assertEqual(values[1].id, camera.id)
+        self.assertEqual(values[2], (10.0, 20.0))
+        self.assertEqual(values[3], True)
+        self.assertEqual([value for _, value in projection.items()][0], camera.id)
+
+    def test_marker_group_round_trip(self):
+        _, chunk = document_with_photos()
+        group = chunk.addMarkerGroup("Control")
+        marker = chunk.addMarker(label="GCP1")
+        self.assertIsNone(marker.group)
+        marker.group = group.id
+        self.assertEqual(chunk.markers[0].group, group.id)
+        marker.group = None
+        self.assertIsNone(chunk.markers[0].group)
+
+    def test_ground_control_separates_referenced_markers(self):
+        _, chunk = document_with_photos()
+        referenced = chunk.addMarker(label="GCP1")
+        referenced.reference = (1.0, 2.0, 3.0)
+        chunk.addMarker(label="NO_REFERENCE")
+        control = chunk.ground_control
+        self.assertEqual([m.label for m in control["markers"]], ["GCP1"])
+        self.assertEqual([m.label for m in control["control_points"]], ["GCP1"])
+        self.assertEqual(control["check_points"], [])
+
+    def test_scalebar_round_trip(self):
+        _, chunk = document_with_photos()
+        first = chunk.addMarker(label="A")
+        second = chunk.addMarker(label="B")
+        bar = chunk.addScalebar(first.id, second.id, reference=1.5,
+                                accuracy=0.001)
+        self.assertEqual(bar.reference, 1.5)
+        self.assertEqual(bar.accuracy, 0.001)
+        self.assertEqual([b.id for b in chunk.scalebars], [bar.id])
+
+
+class TestOptimizeCameras(unittest.TestCase):
+    def test_requires_an_aligned_block(self):
+        _, chunk = document_with_photos()
+        self.assertTrue(chunk.use_gcps)
+        with self.assertRaises(alphashape.ValueError) as context:
+            chunk.optimizeCameras(use_gcps=False, adaptive_fitting=True)
+        self.assertIn("align", str(context.exception))
+        # The per-call override is restored even when the task fails.
+        self.assertTrue(chunk.use_gcps)
+
+
+class TestOptimizeCamerasUseGcps(unittest.TestCase):
+    """`use_gcps` overrides the chunk setting for one call only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = alphashape.Document()
+        cls.chunk = cls.doc.add_chunk("Chunk 1")
+        cls.doc.active_chunk = cls.chunk
+        cls.doc.run_task("AddPhotos", filenames=list(AERIAL))
+        cls.doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
+        cls.doc.run_task("AlignCameras")
+
+    def test_per_call_override_leaves_the_chunk_setting_alone(self):
+        self.assertTrue(self.chunk.use_gcps)
+        self.chunk.optimizeCameras(use_gcps=False)
+        self.assertTrue(self.chunk.use_gcps)
+        # Default None uses the chunk's own value.
+        self.chunk.optimizeCameras()
+        self.assertTrue(self.chunk.use_gcps)
+
+    def test_chunk_setting_is_persistent_and_undoable(self):
+        self.chunk.use_gcps = False
+        self.assertFalse(self.chunk.use_gcps)
+        self.chunk.optimizeCameras()
+        self.assertFalse(self.chunk.use_gcps)
+        self.chunk.use_gcps = True
+        self.assertTrue(self.chunk.use_gcps)
 
 
 if __name__ == "__main__":

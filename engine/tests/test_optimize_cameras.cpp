@@ -1015,8 +1015,11 @@ struct GeoMarkerScene {
 
 /// The geo sequence with every camera reference perturbed by up to 3 m per axis
 /// and weighted at 3 m, plus five markers whose references encode the physical
-/// ENU truth. Projections carry 0.3 px uniform noise.
-GeoMarkerScene make_geo_marker_scene(std::uint32_t seed) {
+/// ENU truth. Projections carry `projection_noise` px of uniform noise and the
+/// marker references are weighted at `marker_accuracy` metres (defaults: the
+/// realistic 0.3 px / 2 cm pair the marker tests use).
+GeoMarkerScene make_geo_marker_scene(std::uint32_t seed, double projection_noise = 0.3,
+                                     double marker_accuracy = 0.02) {
     GeoMarkerScene scene;
     scene.document = aligned_document(geo_seq_files());
     Chunk& chunk = *scene.document.active_chunk();
@@ -1059,7 +1062,8 @@ GeoMarkerScene make_geo_marker_scene(std::uint32_t seed) {
         const geo::Geodetic geodetic = geo::ecef_to_geodetic(ecef);
         const Eigen::Vector3d reference{geodetic.longitude_deg, geodetic.latitude_deg,
                                         geodetic.height_m};
-        add_marker(chunk, project_marker(chunk, local, 0.3, rng), reference, 0.02);
+        add_marker(chunk, project_marker(chunk, local, projection_noise, rng), reference,
+                   marker_accuracy);
         scene.local_truth.push_back(local);
         scene.enu_truth.push_back(enu);
     }
@@ -1115,6 +1119,82 @@ TEST(OptimizeMarkers, GcpsImproveAccuracy) {
     EXPECT_LT(with_error, without_error);
 }
 
+// Exact control references with exact projections must pin the model. The
+// camera references here are perturbed by up to 3 m per axis and weighted at
+// 3 m, the control at 1 mm: a correctly weighted adjustment is governed by the
+// control, so every marker has to come back to the physical truth within a
+// millimetre. A larger residual means a camera prior outvotes the control (or
+// the gauge is fighting it), not that the noise limit was reached.
+TEST(OptimizeMarkers, ExactControlPinsModelAgainstNoisyCameraPriors) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261107u, 0.0, 0.001);
+    Chunk& chunk = *scene.document.active_chunk();
+    ASSERT_EQ(chunk.markers().size(), 5U);
+    for (const Marker& marker : chunk.markers()) {
+        ASSERT_GE(marker.projections.size(), 2U);
+    }
+
+    run_optimize_cameras(scene.document);
+    Chunk& solved = *scene.document.active_chunk();
+    double worst = 0.0;
+    double worst_h = 0.0;
+    double worst_v = 0.0;
+    for (std::size_t m = 0; m < solved.markers().size(); ++m) {
+        ASSERT_TRUE(solved.markers()[m].position.has_value());
+        const Eigen::Vector3d delta =
+            *solved.markers()[m].position - scene.local_truth[m];
+        worst = std::max(worst, delta.norm());
+        worst_h = std::max(worst_h, delta.head<2>().norm());
+        worst_v = std::max(worst_v, std::abs(delta.z()));
+    }
+    const std::string* termination =
+        solved.meta().find("optimize_cameras.termination");
+    std::printf("[optimize_markers] exact control: worst marker %.6f m "
+                "(h %.6f, v %.6f), control points %.0f, control RMS %.6f m, "
+                "iterations %.0f, termination %s\n",
+                worst, worst_h, worst_v,
+                meta_value(solved, "optimize_cameras.control_points"),
+                meta_value(solved, "optimize_cameras.control_rms_m"),
+                meta_value(solved, "optimize_cameras.iterations"),
+                termination == nullptr ? "?" : termination->c_str());
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 5.0);
+    EXPECT_LT(worst, 0.001);
+}
+
+// A held-out marker is positioned only by re-triangulating its exact
+// projections with the solved poses, so it measures the pose accuracy the
+// adjustment actually reached. With exact marker projections declared at their
+// true accuracy and noisy tie points, the marker observations must outvote the
+// tie points (each residual whitened by its own sigma); otherwise the poses
+// follow the tie-point cloud and the check point drifts by centimetres.
+TEST(OptimizeMarkers, CheckPointFollowsProperlyWeightedPoses) {
+    GeoMarkerScene scene = make_geo_marker_scene(20261108u, 0.0, 0.001);
+    Chunk& chunk = *scene.document.active_chunk();
+    ASSERT_EQ(chunk.markers().size(), 5U);
+    // The projections are rendered from the truth: declare them exact.
+    ReferenceSettings settings = chunk.reference_settings();
+    settings.marker_projection_accuracy_px = 0.001;
+    chunk.set_reference_settings(settings);
+    constexpr std::size_t kHeldOut = 2;
+    chunk.markers()[kHeldOut].meta.set("type", "check_point");
+
+    run_optimize_cameras(scene.document);
+    Chunk& solved = *scene.document.active_chunk();
+    ASSERT_TRUE(solved.markers()[kHeldOut].position.has_value());
+    const Eigen::Vector3d delta =
+        *solved.markers()[kHeldOut].position - scene.local_truth[kHeldOut];
+    const std::string* termination =
+        solved.meta().find("optimize_cameras.termination");
+    std::printf("[optimize_markers] weighted check point: error %.6f m "
+                "(h %.6f, v %.6f), checkpoint RMS %.6f m, iterations %.0f, "
+                "termination %s\n",
+                delta.norm(), delta.head<2>().norm(), std::abs(delta.z()),
+                meta_value(solved, "optimize_cameras.checkpoint_rms_m"),
+                meta_value(solved, "optimize_cameras.iterations"),
+                termination == nullptr ? "?" : termination->c_str());
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.checkpoints"), 1.0);
+    EXPECT_LT(delta.norm(), 0.001);
+}
+
 TEST(OptimizeMarkers, CheckPointNotUsed) {
     GeoMarkerScene scene = make_geo_marker_scene(20261105u);
     Chunk& chunk = *scene.document.active_chunk();
@@ -1151,6 +1231,50 @@ TEST(OptimizeMarkers, CheckPointNotUsed) {
     EXPECT_LE(worst_pose_change, 1e-9);
     EXPECT_GT(rms_moved, 5.0);
     EXPECT_LT(truth_error, 0.05) << "check marker followed the moved reference";
+}
+
+TEST(OptimizeMarkers, UseGcpFalseDropsMarkerReferences) {
+    // ReferenceSettings::use_gcp gates the marker part of the control
+    // constraint. Bias one control reference; the solve must follow it with
+    // use_gcp=true and stay identical to the un-biased run with false.
+    GeoMarkerScene scene = make_geo_marker_scene(20261113u);
+    Document& document = scene.document;
+    Chunk& chunk = *document.active_chunk();
+    const Chunk baseline = chunk;
+
+    const auto solve = [&](bool use_gcp, double bias) {
+        chunk = baseline;
+        chunk.markers()[0].reference->z() += bias;
+        ReferenceSettings settings = chunk.reference_settings();
+        settings.use_gcp = use_gcp;
+        chunk.set_reference_settings(settings);
+        run_optimize_cameras(document);
+        std::vector<Transform> poses;
+        poses.reserve(chunk.cameras().size());
+        for (const Camera& camera : chunk.cameras()) {
+            poses.push_back(camera.pose);
+        }
+        return poses;
+    };
+    const auto max_difference = [](const std::vector<Transform>& a,
+                                   const std::vector<Transform>& b) {
+        double worst = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            worst = std::max(worst, (a[i] - b[i]).cwiseAbs().maxCoeff());
+        }
+        return worst;
+    };
+
+    const std::vector<Transform> control_clean = solve(true, 0.0);
+    const std::vector<Transform> control_biased = solve(true, 2.0);
+    const std::vector<Transform> plain_clean = solve(false, 0.0);
+    const std::vector<Transform> plain_biased = solve(false, 2.0);
+
+    std::printf("[optimize_markers] use_gcp: control shift %.3e, plain shift %.3e\n",
+                max_difference(control_clean, control_biased),
+                max_difference(plain_clean, plain_biased));
+    EXPECT_GT(max_difference(control_clean, control_biased), 1e-6);
+    EXPECT_LT(max_difference(plain_clean, plain_biased), 1e-12);
 }
 
 TEST(OptimizeMarkers, ScalebarSetsScaleWithoutGeoref) {

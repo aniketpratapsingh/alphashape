@@ -459,6 +459,10 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     }
     // (b) Regular control markers with a position and a full reference. Check
     // points are held out of the fit and measured only after it.
+    // ReferenceSettings::use_gcp=false removes the non-check markers from the
+    // fit; they are not converted to check points, so their reference still
+    // has no effect on the transform.
+    const bool use_gcp = chunk.reference_settings().use_gcp;
     for (const Marker& marker : chunk.markers()) {
         if (marker.type != MarkerType::Regular || !marker.position.has_value() ||
             !marker.reference.has_value()) {
@@ -472,6 +476,9 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         if (role != nullptr && *role == "check_point") {
             checks.push_back({marker.id, loc, Eigen::Vector3d::Zero()});
             continue;
+        }
+        if (!use_gcp) {
+            continue;  // markers disabled as control points
         }
         samples.push_back(
             {*marker.position, loc, sigma_of(marker.reference_accuracy), marker.id});
@@ -658,8 +665,10 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
         if (samples[i].marker_id >= 0) {
             ++report.control_points_used;
+            report.control_weight += weights[i];
         } else {
             ++report.cameras_used;
+            report.camera_weight += weights[i];
         }
         ++inlier_count;
     }

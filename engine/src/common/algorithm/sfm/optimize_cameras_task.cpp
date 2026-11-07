@@ -27,8 +27,10 @@
 //     (one per camera). Vertex and fiducial markers are image-space target
 //     marks, not ground points, and are skipped. A referenced marker becomes a
 //     control point (or a check point, held out of the solve) when the chunk is
-//     georeferenced. Scale bars between marker points enter as BAScalebar
-//     constraints and fix scale even in a non-georeferenced chunk.
+//     georeferenced AND ReferenceSettings::use_gcp is true; with use_gcp=false
+//     its projections stay in the solve as an ordinary point but its reference
+//     contributes no residual. Scale bars between marker points enter as
+//     BAScalebar constraints and fix scale even in a non-georeferenced chunk.
 //
 // Everything is computed into a staged copy and committed with one move, so an
 // exception anywhere leaves the chunk untouched.
@@ -63,6 +65,7 @@
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/bundle_adjustment_detail.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
+#include "common/core/reference_settings.hpp"
 #include "common/io/camera_image.hpp"
 #include "model/camera/antenna.hpp"
 #include "model/camera/calibration.hpp"
@@ -311,6 +314,15 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     }
 
     // Observations: track observations in an aligned camera, at keypoint_to_pixel.
+    // Every observation carries its own 1-sigma image accuracy (the reference
+    // settings), so the solve is one weighted least-squares system: a marker
+    // projection is weighted by the marker-projection accuracy and a tie-point
+    // observation by the tie-point accuracy. Without this the ~thousands of tie
+    // observations would outvote the handful of marker observations and set the
+    // pose from the point cloud's own geometry alone.
+    const ReferenceSettings& reference_settings = chunk->reference_settings();
+    const double tiepoint_sigma_px = reference_settings.tiepoint_accuracy_px;
+    const double marker_sigma_px = reference_settings.marker_projection_accuracy_px;
     std::unordered_map<std::int32_t, std::size_t> camera_slot;
     for (std::size_t b = 0; b < camera_index.size(); ++b) {
         camera_slot[chunk->cameras()[camera_index[b]].id] = b;
@@ -331,7 +343,8 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             }
             problem.observations.push_back(
                 sfm::BAObservation{camera->second, point->second,
-                                   keypoint_to_pixel(set->keypoints[observation.keypoint_index])});
+                                   keypoint_to_pixel(set->keypoints[observation.keypoint_index]),
+                                   tiepoint_sigma_px});
         }
     }
     const Transform& transform = chunk->transform();
@@ -350,8 +363,9 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // one BA point. Its projections are stored in the Calibration pixel
     // convention (top-left pixel centre (0.5, 0.5)), the same convention as
     // BAObservation, so they are copied without the keypoint +0.5 shift.
-    // BAObservation carries no per-observation sigma, so a
-    // marker_projection_accuracy parameter is deferred until it does.
+    // Each observation carries its own sigma: the marker-projection accuracy
+    // for these, the tie-point accuracy for the track observations, so the
+    // solve whitens every residual by the right amount.
     constexpr std::size_t kNoPoint = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> marker_point(chunk->markers().size(), kNoPoint);
     std::size_t markers_skipped = 0;
@@ -445,13 +459,19 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         problem.points.push_back(point);
         marker_point[m] = slot;
         for (const auto& [camera, pixel] : projections) {
-            problem.observations.push_back(sfm::BAObservation{camera, slot, pixel});
+            problem.observations.push_back(
+                sfm::BAObservation{camera, slot, pixel, marker_sigma_px});
         }
     }
     // -- control and check points -------------------------------------------
     // Only a georeferenced chunk can tie a marker reference to the chunk-local
     // frame. A referenced marker is control unless its meta role is
     // "check_point"; a point without a reference stays a free point.
+    // ReferenceSettings::use_gcp=false disables the marker part of that
+    // constraint: such markers keep their image observations (so they are
+    // still triangulated) but contribute no reference residual. Check points
+    // are unaffected because they never constrained the solve.
+    const bool use_gcp = chunk->reference_settings().use_gcp;
     std::size_t control_markers = 0;
     std::size_t checkpoint_markers = 0;
     if (georeferenced) {
@@ -460,6 +480,11 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             const Marker& marker = chunk->markers()[m];
             if (!marker.reference.has_value() || marker_point[m] == kNoPoint) {
                 continue;
+            }
+            const std::string* role = marker.meta.find("type");
+            const bool checkpoint = role != nullptr && *role == "check_point";
+            if (!checkpoint && !use_gcp) {
+                continue;  // markers disabled as control points
             }
             const Eigen::Vector3d& loc = *marker.reference;
             if (!std::isfinite(loc.x()) || !std::isfinite(loc.y())) {
@@ -484,8 +509,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             if (!has_alt) {
                 control.sigma.z() = 0.0;  // no altitude: leave the up axis free
             }
-            const std::string* role = marker.meta.find("type");
-            control.checkpoint = role != nullptr && *role == "check_point";
+            control.checkpoint = checkpoint;
             if (control.checkpoint) {
                 ++checkpoint_markers;
             } else {
@@ -905,6 +929,16 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     const double checkbar_rms_m = report.checkbar_rms_m * local_scale;
     staged.meta().set("optimize_cameras.control_rms_m", meta_number(control_rms_m));
     staged.meta().set("optimize_cameras.checkpoint_rms_m", meta_number(checkpoint_rms_m));
+    staged.meta().set(
+        "optimize_cameras.control_rms_xyz_m",
+        meta_number(report.control_rms_xyz.x() * local_scale) + "," +
+            meta_number(report.control_rms_xyz.y() * local_scale) + "," +
+            meta_number(report.control_rms_xyz.z() * local_scale));
+    staged.meta().set(
+        "optimize_cameras.checkpoint_rms_xyz_m",
+        meta_number(report.checkpoint_rms_xyz.x() * local_scale) + "," +
+            meta_number(report.checkpoint_rms_xyz.y() * local_scale) + "," +
+            meta_number(report.checkpoint_rms_xyz.z() * local_scale));
     staged.meta().set("optimize_cameras.scalebar_rms_m", meta_number(scalebar_rms_m));
     staged.meta().set("optimize_cameras.checkbar_rms_m", meta_number(checkbar_rms_m));
     staged.meta().set("optimize_cameras.control_points",
@@ -929,6 +963,75 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                       report.covariance_reason.empty()
                           ? "covariance skipped: not requested"
                           : report.covariance_reason);
+
+    // -- solve diagnostics (metres for the sigmas) ---------------------------
+    // Every residual category this solve forms and the weight it carried, so a
+    // consumer can tell a mis-weighted adjustment from a noise-limited one
+    // without reading source. Image observations are not whitened individually
+    // (BAObservation carries no sigma), hence the explicit 1 px entry.
+    const auto axes_string = [](const Eigen::Vector3d& v) {
+        return meta_number(v.x()) + "," + meta_number(v.y()) + "," + meta_number(v.z());
+    };
+    if (!problem.centre_priors.empty()) {
+        staged.meta().set("optimize_cameras.sigma.camera_centre_m",
+                          axes_string(problem.centre_priors.front().sigma * local_scale));
+    }
+    std::size_t constrained_control_axes = 0;
+    std::size_t fully_constrained_control = 0;
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        std::size_t axes = 0;
+        for (int k = 0; k < 3; ++k) {
+            const double s = control.sigma[k];
+            if (std::isfinite(s) && s > 0.0) {
+                ++axes;
+            }
+        }
+        constrained_control_axes += axes;
+        fully_constrained_control += axes == 3 ? 1U : 0U;
+    }
+    for (const sfm::BAControlPoint& control : problem.control_points) {
+        if (control.checkpoint) {
+            continue;
+        }
+        staged.meta().set("optimize_cameras.sigma.marker_control_m",
+                          axes_string(control.sigma * local_scale));
+        break;
+    }
+    staged.meta().set("optimize_cameras.sigma.marker_projection_px",
+                      meta_number(marker_sigma_px));
+    staged.meta().set("optimize_cameras.sigma.tiepoint_px",
+                      meta_number(tiepoint_sigma_px));
+    staged.meta().set("optimize_cameras.control_axes",
+                      std::to_string(constrained_control_axes));
+    staged.meta().set("optimize_cameras.control_points_fully_constrained",
+                      std::to_string(fully_constrained_control));
+    staged.meta().set("optimize_cameras.rotation_priors",
+                      std::to_string(problem.rotation_priors.size()));
+    staged.meta().set("optimize_cameras.iterations", std::to_string(report.iterations));
+    staged.meta().set("optimize_cameras.termination", report.termination);
+    staged.meta().set("optimize_cameras.initial_cost", meta_number(report.initial_cost));
+    staged.meta().set("optimize_cameras.final_cost", meta_number(report.robust_cost));
+    staged.meta().set("optimize_cameras.final_relative_cost_change",
+                      meta_number(report.final_relative_cost_change));
+    staged.meta().set("optimize_cameras.prior_rms_sigma",
+                      meta_number(report.prior_rms_sigma));
+    staged.meta().set("optimize_cameras.prior_axes", std::to_string(report.priors));
+    staged.meta().set("optimize_cameras.free_parameters",
+                      std::to_string(report.free_parameter_count));
+    staged.meta().set("optimize_cameras.residuals",
+                      std::to_string(report.residual_count));
+    std::size_t fixed_poses = 0;
+    for (const std::uint8_t flag : problem.fixed_pose) {
+        fixed_poses += flag != 0 ? 1U : 0U;
+    }
+    staged.meta().set("optimize_cameras.gauge_fixed_poses", std::to_string(fixed_poses));
+    staged.meta().set("optimize_cameras.gauge_scale_anchor_camera",
+                      std::to_string(problem.scale_anchor_camera));
+    staged.meta().set("optimize_cameras.gauge_scale_anchor_axis",
+                      std::to_string(problem.scale_anchor_axis));
 
     // -- commit atomically --------------------------------------------------
     *chunk = std::move(staged);

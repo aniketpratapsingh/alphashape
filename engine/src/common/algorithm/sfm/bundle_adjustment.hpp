@@ -36,6 +36,12 @@ struct BAObservation {
     std::size_t camera = 0;  ///< index into BAProblem::poses / calibrations
     std::size_t point = 0;   ///< index into BAProblem::points
     Eigen::Vector2d pixel;   ///< Calibration pixel convention (top-left pixel centre = (0.5,0.5))
+    /// 1-sigma image-space accuracy of this measurement, pixels. Each residual
+    /// is divided by it, so every observation carries its own weight 1/sigma^2
+    /// in the one weighted least-squares system (Triggs et al. 2000). A value
+    /// that is not finite and positive means "unweighted": 1 px, the historical
+    /// shared weight.
+    double sigma_px = 0.0;
 };
 
 /// A GPS-like prior on one camera centre, in the problem's coordinate frame.
@@ -230,6 +236,18 @@ struct BAReport {
     /// Robust objective value (the sum of 0.5 * rho(r^2) the solver minimised).
     /// Only meaningful when `cost_valid` is true.
     double robust_cost = 0;
+    /// Robust objective at the starting state, same units as robust_cost, so a
+    /// caller can tell a converged solve from one that barely moved.
+    double initial_cost = 0;
+    /// The solver's termination category as a short name ("convergence",
+    /// "max_iterations", "numerical_failure", ...). Empty for an
+    /// evaluation-only pass.
+    std::string termination;
+    /// Relative cost change of the last accepted iteration,
+    /// |cost_change| / max(cost, eps). Near zero at convergence; the caller can
+    /// tell a solve that stalled from one that hit the iteration cap. 0 for an
+    /// evaluation-only pass.
+    double final_relative_cost_change = 0;
 
     /// Dimension of the residual vector Ceres actually assembled. Exact: points
     /// with no observations are never added, and check observations are skipped
@@ -261,9 +279,14 @@ struct BAReport {
     /// 3-D RMS of X - reference over non-check control points, in problem
     /// units (metres when the problem frame is metric).
     double control_rms_m = 0;
+    /// The same residual split per axis (x, y, z), so a weak vertical can be
+    /// told from a uniform offset.
+    Eigen::Vector3d control_rms_xyz = Eigen::Vector3d::Zero();
     /// 3-D RMS of the re-triangulated X - reference over check control points,
     /// finite ones only, in problem units. 0 when there are none.
     double checkpoint_rms_m = 0;
+    /// The same check residual split per axis.
+    Eigen::Vector3d checkpoint_rms_xyz = Eigen::Vector3d::Zero();
     /// RMS of the length error (|Xa - Xb| - length) over non-check scale bars
     /// with valid length/sigma, in problem units. 0 when there are none.
     double scalebar_rms_m = 0;

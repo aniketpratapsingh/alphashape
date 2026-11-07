@@ -31,8 +31,13 @@ struct ReferenceSettings {
     double scalebar_accuracy_m = 0.001;
     /// 1-sigma tie-point accuracy, pixels.
     double tiepoint_accuracy_px = 1.0;
-    /// Whether marker references act as control points (false turns every
-    /// marker into a check point for the adjustment).
+    /// Whether marker references act as control points. When false, marker
+    /// references contribute no constraint to the bundle adjustment
+    /// (OptimizeCameras) or to the datum fit (UpdateTransform); some of their
+    /// image observations still participate in the solve because a
+    /// triangulated marker is an ordinary point. Check-point markers are
+    /// unaffected: they are held out and reported either way, and camera
+    /// references keep constraining the georeferencing fit.
     bool use_gcp = true;
 
     /// True when every field equals the default, i.e. when the writer may
