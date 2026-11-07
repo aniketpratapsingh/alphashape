@@ -249,11 +249,11 @@ def run_synthetic(args):
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
     doc.run_task("AlignCameras")
     chunk.crs_epsg = 4326
-    # The fixture's EXIF GPS is exact (millimetre-level), so weight the camera
-    # references at 1 cm instead of the 10 m default for a consumer flight.
+    # The fixture's EXIF GPS is exact (sub-millimetre), so weight the camera
+    # references at its actual accuracy instead of the 10 m consumer default.
     # Without that the bundle adjustment leaves the near-planar network free to
     # trade camera depth against scene depth (a ~20 cm warp on this block).
-    chunk.camera_location_accuracy = 0.01
+    chunk.camera_location_accuracy = 0.001
     # The survey references carry 1 cm per-axis noise; say so, so the control
     # points are not treated as exact.
     chunk.marker_location_accuracy = 0.01
