@@ -1063,24 +1063,49 @@ def parse_odm_gcp_list(path):
     return header, gcps
 
 
+def _csv_column(index, names):
+    """The position of the first header name present, else None."""
+    for name in names:
+        if name in index:
+            return index[name]
+    return None
+
+
 def parse_gcp_names_csv(path):
-    """Parse the survey CSV into one dict per point, keyed by its header names."""
-    with open(path, encoding="utf-8") as handle:
+    """Parse the survey CSV into one dict per point.
+
+    The publisher's header is ``Name;Easting;Northing;Elevation;Longitude;Latitude``
+    but it carries a UTF-8 BOM, so the file is read as utf-8-sig and the header names
+    are matched loosely so a rename or a comma/tab delimiter does not silently change
+    the result. A header that names none of the expected columns fails with the header
+    shown, not with a bare KeyError.
+    """
+    with open(path, encoding="utf-8-sig") as handle:
         lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
     if len(lines) < 2:
         raise ValueError("gcp names CSV has no data rows")
-    columns = [column.strip().lower() for column in lines[0].split(";")]
+    header = lines[0]
+    delimiter = ";" if ";" in header else ("," if "," in header else "\t")
+
+    def split(line):
+        return [cell.strip() for cell in line.split(delimiter)]
+
+    columns = [cell.lower() for cell in split(header)]
     index = {name: position for position, name in enumerate(columns)}
+    name_col = _csv_column(index, ("name", "label", "id", "point", "point_name"))
+    lon_col = _csv_column(index, ("longitude", "lon", "long", "x"))
+    lat_col = _csv_column(index, ("latitude", "lat", "y"))
+    elev_col = _csv_column(index, ("elevation", "height", "alt", "altitude", "z"))
+    if None in (name_col, lon_col, lat_col, elev_col):
+        raise ValueError("gcp names CSV header not understood: " + header)
     rows = []
     for line in lines[1:]:
-        fields = [field.strip() for field in line.split(";")]
+        fields = split(line)
         rows.append({
-            "name": fields[index["name"]],
-            "easting": float(fields[index["easting"]]),
-            "northing": float(fields[index["northing"]]),
-            "elevation": float(fields[index["elevation"]]),
-            "longitude": float(fields[index["longitude"]]),
-            "latitude": float(fields[index["latitude"]]),
+            "name": fields[name_col],
+            "elevation": float(fields[elev_col]),
+            "longitude": float(fields[lon_col]),
+            "latitude": float(fields[lat_col]),
         })
     return columns, rows
 
