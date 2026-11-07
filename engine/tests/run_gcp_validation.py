@@ -22,7 +22,9 @@ defect can be told from noise-limited accuracy: (1) no projection noise, no
 reference noise (the check-point 3D total must be <= 2 mm: the pipeline is
 otherwise exact), (2) 1 cm reference noise only, (3) 0.25 px projection noise
 only, and (4) both noises with the camera-GNSS references on, which is the
-gated scenario.
+gated scenario. Scenarios 1-3 keep and pin the fixture's exact camera position
+and attitude, so they isolate the marker/GCP machinery from the tie-point
+network's own noise; scenario 4 takes the attitude from the alignment.
 
 The script prints one JSON object per scenario on stdout and exits 0 when the
 3D total check-point RMS is within the tolerance (2 cm by default), 2
@@ -180,6 +182,9 @@ CAMERA_LOCATION_ACCURACY_M = 3.0
 # camera depth against scene depth (a centimetre-scale warp); the exact
 # reference deserves the sub-millimetre accuracy the fixture actually writes.
 EXACT_CAMERA_ACCURACY_M = 0.001
+# The fixture's attitude is exact too; this is the 1-sigma it is declared at in
+# the exact-camera scenarios (about 1 mm at the 60 m flying height).
+EXACT_ROTATION_ACCURACY_DEG = 0.001
 
 PROJECTION_SEED = 20261107
 PIPELINE_TOLERANCE_M = 0.002
@@ -242,25 +247,100 @@ def write_camera_reference_csv(path, rows):
                 accuracy[0], accuracy[1], accuracy[2]))
 
 
-def apply_exact_camera_accuracy(chunk, directory):
+def apply_exact_camera_accuracy(chunk, by_stem, directory):
     """Re-import the EXIF camera references with their true 1-sigma accuracy.
 
     AddPhotos stores the position but no accuracy, so the fit would fall back
     to the 10 m consumer default and leave the near-planar nadir network free
     to trade camera depth against scene depth. In the exact-camera scenarios
     the fixture GPS is genuinely sub-millimetre; declare that.
+
+    The same rows carry the fixture's exact attitude. The ablation's purpose is
+    to separate a defect in the GCP/bundle machinery from the SfM network's own
+    tie-point noise, so these scenarios pin both the centre and the rotation;
+    the realistic scenario leaves the rotation to the alignment.
     """
-    rows = []
-    for camera in chunk.cameras:
-        reference = camera.reference
-        if reference is None:
-            continue
-        rows.append((camera.label, reference[0], reference[1], reference[2],
-                     (EXACT_CAMERA_ACCURACY_M, EXACT_CAMERA_ACCURACY_M,
-                      EXACT_CAMERA_ACCURACY_M)))
-    path = os.path.join(directory, "camera_accuracy.csv")
-    write_camera_reference_csv(path, rows)
+    path = os.path.join(directory, "camera_exact.csv")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("label,lon,lat,alt,acc_x,acc_y,acc_z,yaw,pitch,roll\n")
+        for camera in chunk.cameras:
+            reference = camera.reference
+            image = by_stem.get(camera.label)
+            if reference is None or image is None:
+                continue
+            yaw, pitch, roll = body_attitude_deg(image["R"])
+            handle.write("{},{!r},{!r},{!r},{!r},{!r},{!r},{!r},{!r},{!r}\n".format(
+                camera.label, reference[0], reference[1], reference[2],
+                EXACT_CAMERA_ACCURACY_M, EXACT_CAMERA_ACCURACY_M,
+                EXACT_CAMERA_ACCURACY_M, yaw, pitch, roll))
     chunk.importReference(path=path, create_markers=False)
+
+
+# Fixed body-to-camera rotation for a nadir mount, as the engine's
+# reference::body_to_camera_nadir() returns it: camera +X is body -y, +Y is
+# body -x, +Z (boresight) is body -z.
+BODY_TO_CAMERA_NADIR = ((0.0, -1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0))
+
+
+def transpose(matrix):
+    return [[matrix[r][c] for r in range(3)] for c in range(3)]
+
+
+def multiply(left, right):
+    return [[sum(left[r][k] * right[k][c] for k in range(3))
+             for c in range(3)] for r in range(3)]
+
+
+def axis_rotation(axis, degrees):
+    angle = degrees * DEG2RAD
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    rows = [[0.0] * 3 for _ in range(3)]
+    rows[axis][axis] = 1.0
+    first, second = (axis + 1) % 3, (axis + 2) % 3
+    rows[first][first] = cos_a
+    rows[first][second] = -sin_a
+    rows[second][first] = sin_a
+    rows[second][second] = cos_a
+    return rows
+
+
+def to_matrix_zyx(yaw, pitch, roll):
+    """The engine's crs::to_matrix for the ZYX order (degrees)."""
+    return multiply(multiply(axis_rotation(2, yaw), axis_rotation(1, pitch)),
+                    axis_rotation(0, roll))
+
+
+def from_matrix_zyx(matrix):
+    """The engine's crs::from_matrix for the ZYX order (degrees)."""
+    permutation = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+    determinant = -1.0
+    r = multiply(multiply(permutation, matrix),
+                 transpose(permutation))
+    cos_middle = math.hypot(r[0][0], r[0][1])
+    if cos_middle > 1e-12:
+        a = math.atan2(-r[1][2], r[2][2])
+        b = math.atan2(r[0][2], cos_middle)
+        c = math.atan2(-r[0][1], r[0][0])
+    else:
+        a = math.atan2(r[2][1], r[1][1])
+        b = math.pi / 2.0 if r[0][2] >= 0.0 else -math.pi / 2.0
+        c = 0.0
+    return (determinant * a * RAD2DEG, determinant * b * RAD2DEG,
+            determinant * c * RAD2DEG)
+
+
+def body_attitude_deg(rotation):
+    """ENU body attitude (yaw, pitch, roll) for a world->camera rotation.
+
+    Mirrors reference::measured_rotation(): R_wc = body_to_camera * R_wb^T,
+    and R_wb = Rz(90 deg) * to_matrix({x, -y, z}). The fixture's R is a
+    world->camera rotation in the local ENU frame, so R_wb = R^T * body_to_camera
+    and the stored triple follows from inverting that composition.
+    """
+    body_to_world = multiply(transpose(rotation), BODY_TO_CAMERA_NADIR)
+    internal = multiply(axis_rotation(2, -90.0), body_to_world)
+    yaw, pitch, roll = from_matrix_zyx(internal)
+    return (yaw, -pitch, roll)
 
 
 def apply_camera_gnss(chunk, by_stem, directory):
@@ -367,8 +447,9 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         # The fixture EXIF GPS is exact (sub-millimetre); say so, so the bundle
         # adjustment cannot trade camera depth against scene depth.
         chunk.camera_location_accuracy = EXACT_CAMERA_ACCURACY_M
+        chunk.camera_rotation_accuracy = EXACT_ROTATION_ACCURACY_DEG
         with tempfile.TemporaryDirectory() as directory:
-            apply_exact_camera_accuracy(chunk, directory)
+            apply_exact_camera_accuracy(chunk, by_stem, directory)
     # A real alignment gives the cameras poses from the (possibly noisy)
     # references above. With the exact references this is the fixture's truth
     # GPS, which is the zero-noise pipeline-exactness ablation.
@@ -481,6 +562,8 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
         "camera_location_accuracy_m": (
             CAMERA_LOCATION_ACCURACY_M if camera_gnss
             else EXACT_CAMERA_ACCURACY_M),
+        "camera_rotation_accuracy_deg": chunk.camera_rotation_accuracy,
+        "camera_attitude_priors": not camera_gnss,
         "camera_gnss_model": None if not camera_gnss else {
             "horizontal_sigma_m": GNSS_HORIZONTAL_SIGMA_M,
             "vertical_sigma_m": GNSS_VERTICAL_SIGMA_M,

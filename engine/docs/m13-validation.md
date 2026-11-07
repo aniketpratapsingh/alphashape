@@ -53,15 +53,18 @@ georeferencing at all.
 
 `--ablations` runs the same block four times with the noise sources switched
 independently, so a pipeline defect can be told from noise-limited accuracy.
-Scenarios 1-3 disable the camera-GNSS references and keep the fixture's exact
-GPS, so only the stated noise source is present.
+Scenarios 1-3 disable the camera-GNSS references, keep the fixture's exact GPS
+and pin its exact attitude, so only the stated image/reference noise source is
+present; the SfM tie-point network's own noise is not part of those ablations.
+Scenario 4 is the realistic pipeline: the attitude comes from the alignment and
+the camera positions from the noisy GNSS.
 
-| # | name | projection noise | reference noise | camera GNSS | gate |
+| # | name | projection noise | reference noise | camera references | gate |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `exact` | 0 px | 0 m | off (exact EXIF GPS) | 3D total <= 2 mm |
-| 2 | `reference-noise` | 0 px | 1 cm per axis | off (exact EXIF GPS) | reported, not gated |
-| 3 | `projection-noise` | ±0.25 px per axis | 0 m | off (exact EXIF GPS) | reported, not gated |
-| 4 | `combined` | ±0.25 px per axis | 1 cm per axis | on (2 m / 4 m sigma) | 3D total <= 2 cm |
+| 1 | `exact` | 0 px | 0 m | exact position + attitude | 3D total <= 2 mm |
+| 2 | `reference-noise` | 0 px | 1 cm per axis | exact position + attitude | reported, not gated |
+| 3 | `projection-noise` | ±0.25 px per axis | 0 m | exact position + attitude | reported, not gated |
+| 4 | `combined` | ±0.25 px per axis | 1 cm per axis | consumer GNSS (2 m / 4 m sigma), attitude from the alignment | 3D total <= 2 cm |
 
 Scenario 1 is the pipeline-exactness check: with exact projections, exact
 references and exact camera GPS, a correct pipeline reconstructs the truth to
