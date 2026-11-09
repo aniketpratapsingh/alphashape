@@ -85,14 +85,14 @@ def validate_reason(text: str | None) -> str:
 def measure_params(metrics: dict) -> dict[str, object]:
     """Any dispatch parameters that make a run an experiment rather than a control.
 
-    All three dispatch inputs the workflow offers — ``depth_params`` for
-    BuildDepthMaps, ``dem_params`` for BuildDem and ``ortho_params`` for
-    BuildOrthomosaic — mean the run measured a configuration rather than the
-    defaults. Any one being present and non-empty withholds the baseline, so any
-    one refuses an acceptance.
+    Every dispatch input the workflow offers — ``depth_params`` for
+    BuildDepthMaps, ``dem_params`` for BuildDem, ``ortho_params`` for
+    BuildOrthomosaic and ``optimize_params`` for OptimizeCameras — means the run
+    measured a configuration rather than the defaults. Any one being present and
+    non-empty withholds the baseline, so any one refuses an acceptance.
     """
     found: dict[str, object] = {}
-    for key in ("depth_params", "dem_params", "ortho_params"):
+    for key in ("depth_params", "dem_params", "ortho_params", "optimize_params"):
         value = metrics.get(key)
         if value:
             found[key] = value

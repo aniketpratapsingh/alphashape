@@ -207,6 +207,15 @@ class RefusalTest(unittest.TestCase):
         self.assertTrue(problems)
         self.assertIn("dem_params", problems[0])
 
+    def test_optimize_params_are_refused_too(self):
+        current = regressing()
+        current["optimize_params"] = {"adaptive_fitting": "true"}
+        problems = accept_regression.refusals(
+            branch="main", default_branch="main", current=current
+        )
+        self.assertTrue(problems)
+        self.assertIn("optimize_params", problems[0])
+
     def test_a_control_run_on_the_default_branch_is_allowed(self):
         self.assertEqual(
             accept_regression.refusals(

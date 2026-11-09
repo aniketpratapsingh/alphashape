@@ -662,6 +662,28 @@ class EngineReportTest(unittest.TestCase):
     def test_a_missing_log_gives_nothing(self):
         self.assertEqual(run_bench.engine_alignment_report(Path("/nonexistent/cli.log")), {})
 
+    def test_the_optimize_summary_line_is_captured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli.log"
+            log.write_text(
+                "[info] AlignCameras: registered 30/30 cameras, RMS 0.412 px\n"
+                "[info] OptimizeCameras: RMS 0.412 -> 0.331 px (120 observations, "
+                "4 iterations, prior RMS 1 sigma, 0 prior axes; control RMS 0 m over 0, "
+                "check-point RMS 0 m over 0, scale-bar RMS 0 m over 0, check-bar RMS 0 m "
+                "over 0)\n"
+            )
+            line = run_bench.engine_optimize_log(log)
+        self.assertTrue(line.startswith("OptimizeCameras: RMS 0.412 -> 0.331 px"))
+        self.assertNotIn("AlignCameras", line)
+
+    def test_no_optimize_line_gives_none(self):
+        # Best effort: a control run has no OptimizeCameras stage at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli.log"
+            log.write_text("[info] AlignCameras: registered 30/30 cameras, RMS 0.4 px\n")
+            self.assertIsNone(run_bench.engine_optimize_log(log))
+        self.assertIsNone(run_bench.engine_optimize_log(Path("/nonexistent/cli.log")))
+
 
 class ReprojectionTest(unittest.TestCase):
     """The tie-point reprojection metric, end to end through the project archive.
@@ -1210,6 +1232,80 @@ class OrthoParamMergeTest(unittest.TestCase):
         self.assertEqual(overrides["BuildOrthomosaic"]["color_correction"], "true")
 
 
+class OptimizeParamsTest(unittest.TestCase):
+    """``optimize_params`` uses the same grammar and the same experiment rules."""
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_optimize_params(""), {})
+        self.assertEqual(run_bench.parse_optimize_params(None), {})
+
+    def test_the_bool_is_a_plain_cli_value(self):
+        # The CLI's Bool parser accepts exactly true/false/1/0; a dispatch value is
+        # already one of those spellings, so it must reach argv unchanged.
+        self.assertEqual(
+            run_bench.parse_optimize_params("adaptive_fitting=true"),
+            {"adaptive_fitting": "true"},
+        )
+        self.assertEqual(run_bench.cli_value("true"), "true")
+
+    def test_a_malformed_string_is_rejected(self):
+        for token in ("adaptive_fitting", "=true", "adaptive_fitting=", "Adaptive=true",
+                      "adaptive-fitting=true", "adaptive_fitting=true;rm"):
+            with self.assertRaises(run_bench.OptimizeParamError, msg=token):
+                run_bench.parse_optimize_params(token)
+
+    def test_the_same_grammar_rejects_the_same_tokens(self):
+        tokens = ["no_equals", "=value", "key=", "Upper=1", "key=a=b", "key=1 key=2"]
+        for token in tokens:
+            with self.assertRaises(run_bench.OptimizeParamError, msg=token):
+                run_bench.parse_optimize_params(token)
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(
+                    ["--dataset", "aerial-nadir", "--list", "--optimize-params", "oops"]
+                )
+
+
+class OptimizeParamMergeTest(unittest.TestCase):
+    """``optimize_params`` land in OptimizeCameras and insert the stage."""
+
+    def dataset(self):
+        return run_bench.load_manifest()["datasets"]["aerial-nadir"]
+
+    def test_a_parameter_is_added_to_optimize_cameras(self):
+        merged = run_bench.merge_optimize_params(self.dataset(), {"adaptive_fitting": "true"})
+        self.assertEqual(
+            merged["param_overrides"]["OptimizeCameras"]["adaptive_fitting"], "true"
+        )
+
+    def test_it_does_not_touch_the_other_tasks(self):
+        merged = run_bench.merge_optimize_params(self.dataset(), {"adaptive_fitting": "true"})
+        self.assertNotIn("adaptive_fitting", merged["param_overrides"]["BuildDepthMaps"])
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        original = self.dataset()
+        self.assertEqual(run_bench.merge_optimize_params(original, {}), original)
+
+    def test_an_empty_pipeline_is_the_control_pipeline(self):
+        # Byte-for-byte behaviour of every scheduled/push run depends on this.
+        self.assertEqual(run_bench.pipeline_with_optimize({}), run_bench.PIPELINE)
+        self.assertEqual(run_bench.pipeline_with_optimize(None), run_bench.PIPELINE)
+
+    def test_the_task_is_inserted_right_after_align_cameras(self):
+        stages = run_bench.pipeline_with_optimize({"OptimizeCameras": {"adaptive_fitting": "true"}})
+        self.assertEqual(
+            stages,
+            ["MatchPhotos", "AlignCameras", "OptimizeCameras", "BuildDepthMaps",
+             "BuildPointCloud", "BuildDem", "BuildOrthomosaic"],
+        )
+        self.assertEqual(len(stages), len(run_bench.PIPELINE) + 1)
+
+
 class IsExperimentTest(unittest.TestCase):
     """The workflow's one definition of "is this a control run"."""
 
@@ -1249,6 +1345,16 @@ class IsExperimentTest(unittest.TestCase):
         # no depth_params.
         self.assertEqual(
             self.status(json.dumps({"dem_params": {"sibson_exact_max_sites": "20000"}})), 1
+        )
+
+    def test_an_empty_optimize_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"optimize_params": {}})), 0)
+
+    def test_an_optimize_only_run_is_an_experiment(self):
+        # The task is not in the control pipeline, so this key is the ONLY sign
+        # that the run measured a configuration; missing it would baseline it.
+        self.assertEqual(
+            self.status(json.dumps({"optimize_params": {"adaptive_fitting": "true"}})), 1
         )
 
     def test_a_run_with_both_inputs_is_an_experiment(self):

@@ -65,6 +65,9 @@ if str(HERE) not in sys.path:
 # The pipeline, in the order the README documents it. Defaults only: the point of
 # a benchmark is to measure what a user gets without tuning, so a run that needs a
 # parameter tweak to work is a finding, not something to work around here.
+#
+# OptimizeCameras is not a stage of the control pipeline; an ``optimize_params``
+# experiment inserts it after AlignCameras (see :func:`pipeline_with_optimize`).
 PIPELINE = [
     "MatchPhotos",
     "AlignCameras",
@@ -131,6 +134,10 @@ class OrthoParamError(ParamError):
     """An ``ortho_params`` string that is not a list of well-formed ``key=value``."""
 
 
+class OptimizeParamError(ParamError):
+    """An ``optimize_params`` string that is not a list of well-formed ``key=value``."""
+
+
 # A task parameter name is what the engine declares: lowercase words and
 # underscores (``cost_type``, ``max_cost``, ``max_neighbors``). A value is a number,
 # a word, or a decimal (``census``, ``-1``, ``0.05``). Both are deliberately
@@ -194,6 +201,31 @@ def parse_ortho_params(text: str | None) -> dict[str, str]:
     return parse_params(text, OrthoParamError)
 
 
+def parse_optimize_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``optimize_params`` string (OptimizeCameras)."""
+    return parse_params(text, OptimizeParamError)
+
+
+def pipeline_with_optimize(overrides: dict | None) -> list[str]:
+    """The pipeline stages for a run, with OptimizeCameras when it is asked for.
+
+    ``OptimizeCameras`` is deliberately absent from :data:`PIPELINE`: a control
+    benchmark measures the pipeline a user gets, and the task never ran there. It
+    joins the pipeline only after ``AlignCameras`` when the run carries
+    ``OptimizeCameras`` overrides (from ``--optimize-params``), so a control run's
+    stage list — and therefore its metrics JSON — is byte-identical to before.
+
+    It is placed immediately after alignment because that is the point at which
+    the block exists and before any product consumes its poses: refining after
+    depth maps were built would change the products without changing the depth
+    maps they were built from, which is not a comparison anyone wants.
+    """
+    stages = list(PIPELINE)
+    if (overrides or {}).get("OptimizeCameras"):
+        stages.insert(stages.index("AlignCameras") + 1, "OptimizeCameras")
+    return stages
+
+
 def merge_task_params(dataset: dict, task: str, params: dict[str, str]) -> dict:
     """The dataset with ``params`` merged into its ``task`` overrides.
 
@@ -224,6 +256,15 @@ def merge_dem_params(dataset: dict, dem_params: dict[str, str]) -> dict:
 def merge_ortho_params(dataset: dict, ortho_params: dict[str, str]) -> dict:
     """The dataset with ``ortho_params`` merged into its BuildOrthomosaic overrides."""
     return merge_task_params(dataset, "BuildOrthomosaic", ortho_params)
+
+
+def merge_optimize_params(dataset: dict, optimize_params: dict[str, str]) -> dict:
+    """The dataset with ``optimize_params`` merged into its OptimizeCameras overrides.
+
+    A non-empty result is also what makes :func:`pipeline_with_optimize` insert
+    the task, so "the parameters exist" and "the stage runs" can never disagree.
+    """
+    return merge_task_params(dataset, "OptimizeCameras", optimize_params)
 
 
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
@@ -846,11 +887,14 @@ def run_pipeline(
 ) -> dict:
     """Create a project from ``images`` and run the pipeline, timing each stage.
 
-    Every stage runs at the engine's DEFAULTS. ``overrides`` exists only for a
-    dataset that cannot fit the job budget at full resolution, and whatever it
-    contains is recorded in the returned dict so the report can say the run was not
-    at defaults. That honesty is the point: a tuned run and a default run are not
-    comparable, and the metric history would silently mix them otherwise.
+    Every stage runs at the engine's DEFAULTS, except where ``overrides`` names a
+    task: those come from the dataset manifest (a dataset that cannot fit the job
+    budget at full resolution) or from a dispatched experiment such as
+    ``optimize_params``. Whatever they contain is recorded in the returned dict so
+    the report can say the run was not at defaults, and an ``OptimizeCameras``
+    entry is what inserts that stage into the pipeline. That honesty is the point:
+    a tuned run and a default run are not comparable, and the metric history would
+    silently mix them otherwise.
 
     Peak RSS is the child's own reported peak via ``getrusage(RUSAGE_CHILDREN)``,
     since the CLI is a short-lived process; it is ``None`` where the platform does
@@ -868,7 +912,7 @@ def run_pipeline(
 
     stages["AddPhotos"] = _timed(run_cli, ["--new", str(project), "--add-images",
                                            *[str(p) for p in images]], log=log)
-    for task in PIPELINE:
+    for task in pipeline_with_optimize(overrides):
         arguments = ["--project", str(project), "--task", task]
         for key, value in (overrides.get(task) or {}).items():
             arguments += ["--set", f"{key}={cli_value(value)}"]
@@ -966,6 +1010,28 @@ def engine_alignment_report(log: Path) -> dict:
     return out
 
 
+def engine_optimize_log(log: Path) -> str | None:
+    """The OptimizeCameras summary line ("RMS before -> after px ...") if present.
+
+    Best effort by design: the task may not have run at all (a control run), and
+    this parser must never turn a missing or reworded line into a failed
+    benchmark. ``None`` means "not captured", never "the refinement did
+    nothing" — the metrics JSON omits the key entirely in that case, which is
+    also what keeps a control run's JSON byte-identical to before the flag
+    existed.
+    """
+    if not log.exists():
+        return None
+    import re  # noqa: PLC0415
+
+    text = log.read_text(encoding="utf-8", errors="replace")
+    # The level prefix ("[Info] ") is not part of what is captured: the summary
+    # begins at the task name, and the same regex then works whether the log was
+    # written with or without a prefix.
+    match = re.search(r"OptimizeCameras: RMS [^\n]*", text)
+    return match.group(0).strip() if match else None
+
+
 def _tail(path: Path, lines: int) -> list[str]:
     if not path.exists():
         return []
@@ -1037,13 +1103,16 @@ def run(
     depth_params: dict[str, str] | None = None,
     dem_params: dict[str, str] | None = None,
     ortho_params: dict[str, str] | None = None,
+    optimize_params: dict[str, str] | None = None,
 ) -> dict:
     """Run one dataset and score it.
 
     ``depth_params`` are extra ``BuildDepthMaps`` keyword arguments from a manual
     dispatch, already validated by :func:`parse_depth_params`; ``dem_params`` are
-    the same for ``BuildDem`` and ``ortho_params`` for ``BuildOrthomosaic``. Each
-    is merged over the dataset's own manifest overrides for its task, so an
+    the same for ``BuildDem`` and ``ortho_params`` for ``BuildOrthomosaic``;
+    ``optimize_params`` are OptimizeCameras' keyword arguments, and giving any of
+    them both sets that task's overrides and inserts it after ``AlignCameras``.
+    Each is merged over the dataset's own manifest overrides for its task, so an
     experiment such as ``cost_type=census`` keeps the dataset's measured
     ``downscale`` and is therefore comparable with the control run of the same
     dataset. The manifest's own dicts are never mutated: they are copied, because
@@ -1058,6 +1127,7 @@ def run(
     dataset = merge_depth_params(dataset, depth_params or {})
     dataset = merge_dem_params(dataset, dem_params or {})
     dataset = merge_ortho_params(dataset, ortho_params or {})
+    dataset = merge_optimize_params(dataset, optimize_params or {})
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1138,6 +1208,7 @@ def run(
     engine_report = engine_alignment_report(work / "cli.log")
     if engine_report:
         camera_stats["engine_report"] = engine_report
+    optimize_log = engine_optimize_log(work / "cli.log")
     if "error" not in camera_stats:
         camera_stats["reprojection"] = _reprojection(work, Path(timing["project"]))
     else:
@@ -1175,6 +1246,13 @@ def run(
         result["dem_params"] = dict(dem_params)
     if ortho_params:
         result["ortho_params"] = dict(ortho_params)
+    if optimize_params:
+        result["optimize_params"] = dict(optimize_params)
+        # Best effort, and only for the run that asked for the stage: an absent
+        # line is recorded as absent rather than guessed, and a control run never
+        # grows this key.
+        if optimize_log:
+            result["optimize_log"] = optimize_log
     result["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1490,6 +1568,13 @@ def main(argv: list[str] | None = None) -> int:
         help='extra BuildOrthomosaic keyword args, e.g. "color_correction=affine"; '
         "marks the run as an experiment (never a baseline, never gated)",
     )
+    parser.add_argument(
+        "--optimize-params",
+        default="",
+        help='extra OptimizeCameras keyword args, e.g. "adaptive_fitting=true"; '
+        "inserts the task after AlignCameras and marks the run as an experiment "
+        "(never a baseline, never gated)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1506,6 +1591,11 @@ def main(argv: list[str] | None = None) -> int:
         ortho_params = parse_ortho_params(args.ortho_params)
     except OrthoParamError as exc:
         parser.error(f"--ortho-params: {exc}")
+
+    try:
+        optimize_params = parse_optimize_params(args.optimize_params)
+    except OptimizeParamError as exc:
+        parser.error(f"--optimize-params: {exc}")
 
     manifest = load_manifest()
 
@@ -1535,6 +1625,7 @@ def main(argv: list[str] | None = None) -> int:
         depth_params=depth_params,
         dem_params=dem_params,
         ortho_params=ortho_params,
+        optimize_params=optimize_params,
     )
 
     if args.json:

@@ -201,7 +201,20 @@ gh workflow run quality-bench.yml --ref <branch> \
   -f dataset=aerial-nadir -f ortho_params=color_correction=affine
 ```
 
-All three parameters are merged over the dataset's own overrides for their task, so the
+`optimize_params` is the same input for `OptimizeCameras`, with one difference: the task is
+not part of the control pipeline, so a non-empty value also inserts it after
+`AlignCameras`. It is how automatic distortion-term selection is measured against the
+fixed-term default:
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=aerial-nadir -f optimize_params=adaptive_fitting=true
+```
+
+The engine's own refinement summary (image RMS before -> after the solve) is captured into
+the metrics JSON as `optimize_log` and printed near the top of the report.
+
+All four parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are
 validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and
 reach the script through an environment variable, never interpolated into a shell line.
@@ -218,8 +231,8 @@ Such a run is an **experiment**, and differs from a normal run in three ways:
 
 An experimental baseline is also refused on the way in: when the newest successful runs
 have no baseline artifact the lookup walks back to one that does, and a restored baseline
-that itself records `depth_params`, `dem_params` or `ortho_params` is only ever compared
-against, never gated on.
+that itself records `depth_params`, `dem_params`, `ortho_params` or `optimize_params` is
+only ever compared against, never gated on.
 
 Every scheduled, push and ordinary manual run passes an empty string, which is the same
 argv and the same metrics JSON as before this input existed.
@@ -232,8 +245,8 @@ never publishes a baseline, so without a way to adopt the trade-off every later 
 fail against a baseline nobody can reach any more.
 
 An on-demand run can accept the trade-off explicitly. Dispatch it on the **default
-branch**, with no `depth_params`, no `dem_params` and no `ortho_params`, and a reason of at
-most 200 printable characters:
+branch**, with no `depth_params`, no `dem_params`, no `ortho_params` and no
+`optimize_params`, and a reason of at most 200 printable characters:
 
 ```sh
 gh workflow run quality-bench.yml --ref main \
@@ -253,8 +266,9 @@ An accepted run differs from a normal one in these ways, and in no others:
   itself months later.
 
 The input is refused with an error, and the run fails before reporting, when it is
-combined with `depth_params`, `dem_params` or `ortho_params` (an experiment measures a
-configuration and is never a baseline), or when the run is not on the default branch. That
+combined with `depth_params`, `dem_params`, `ortho_params` or `optimize_params` (an
+experiment measures a configuration and is never a baseline), or when the run is not on
+the default branch. That
 second rule matters: a feature branch must never move the baseline the whole project is
 measured against, so the accepting run is dispatched on `main` *after* the change is
 merged.

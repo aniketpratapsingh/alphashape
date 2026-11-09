@@ -139,16 +139,18 @@ def experiment_params(metrics: dict) -> dict[str, str]:
     evidence, not a reference point: it must never become the baseline the next
     week compares against, and it must never gate.
 
-    Both dispatch inputs are folded into one mapping, prefixed by the task they
-    belong to, because the question the comparison asks is "were these two runs
+    Every dispatch input is folded into one mapping, prefixed by the task it
+    belongs to, because the question the comparison asks is "were these two runs
     the same configuration" and either input alone changes the answer. A run with
-    only ``dem_params`` must not compare as if it were a control.
+    only ``dem_params`` — or only ``optimize_params`` — must not compare as if it
+    were a control.
     """
     combined: dict[str, str] = {}
     for key, prefix in (
         ("depth_params", "BuildDepthMaps"),
         ("dem_params", "BuildDem"),
         ("ortho_params", "BuildOrthomosaic"),
+        ("optimize_params", "OptimizeCameras"),
     ):
         value = metrics.get(key)
         if isinstance(value, dict):
@@ -620,6 +622,12 @@ def markdown(
         )
         lines.append(f"**Not at defaults:** {rendered}. Results are comparable with other")
         lines.append("runs of this dataset, not with runs at the engine's defaults.")
+        lines.append("")
+    # The engine's own refinement summary: the image RMS before -> after the
+    # OptimizeCameras solve, plus its counts. Best effort — the key is absent for a
+    # control run, and for an experiment whose line the log did not contain.
+    if current.get("optimize_log"):
+        lines.append(f"OptimizeCameras report: `{current['optimize_log']}`")
         lines.append("")
     if timing.get("peak_rss_mb") is not None:
         lines.append(f"Peak resident memory: **{_fmt(timing['peak_rss_mb'])} MB**")
