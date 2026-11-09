@@ -170,7 +170,9 @@
       "gcp": {
         "target_horizontal_m": 0.05,
         "camera_accuracy_fallback_m": 0.05,
-        "marker_location_accuracy_m": 0.015
+        "marker_location_accuracy_m": 0.015,
+        "gcp_height": "ellipsoidal",
+        "diagnostics": true
       },
       "param_overrides": {
         "MatchPhotos": {

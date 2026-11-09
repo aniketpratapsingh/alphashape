@@ -1023,9 +1023,10 @@ ODM_GCP_GROUP_DECIMALS = 9
 # A CSV point is the same survey point as a gcp_list coordinate within this
 # angular tolerance (~1 m at these latitudes) for the label match.
 GCP_NAME_MATCH_TOLERANCE_DEG = 1e-5
-# A z offset this small between gcp_list z and the CSV elevation means the two
-# are the same datum; a several-tens-of-metres offset is the geoid undulation.
-ORTHOMETRIC_OFFSET_M = 2.0
+# The published height reference. The two survey files carry the same z values,
+# so comparing them cannot identify the datum; the publisher states the value,
+# and an orthometric height would need a geoid model this script does not carry.
+GCP_HEIGHT_CHOICES = ("ellipsoidal", "orthometric")
 
 
 def parse_odm_gcp_list(path):
@@ -1130,27 +1131,25 @@ def match_gcp_names(gcps, names):
     return gcps
 
 
-def determine_z_datum(gcps):
-    """Whether gcp_list z is ellipsoidal or orthometric, from the CSV elevation.
+def z_consistency(gcps, gcp_height):
+    """Record how the two survey files' z values compare, and what z means.
 
-    A near-zero mean offset means the gcp_list z is the surveyed orthometric
-    elevation; an offset of tens of metres is the geoid undulation, so z is an
-    ellipsoidal height. The per-point offsets and the decision are recorded.
+    gcp_list z and the CSV elevation are the same published numbers, so their
+    offset only checks that the label match is right — it cannot identify the
+    height datum. The datum is therefore taken from ``--gcp-height`` (the
+    publisher labels the CSV column "Ellipsoidal height"), not inferred here.
     """
     offsets = [gcp["height"] - gcp["csv_elevation"]
                for gcp in gcps if "csv_elevation" in gcp]
+    record = {"gcp_height": gcp_height, "matched_points": len(offsets)}
     if not offsets:
-        return {"decision": "unknown",
-                "reason": "no gcp matched a CSV elevation"}
-    mean = sum(offsets) / len(offsets)
-    if abs(mean) <= ORTHOMETRIC_OFFSET_M:
-        decision = "orthometric"
-    elif abs(mean) > 10.0:
-        decision = "ellipsoidal"
-    else:
-        decision = "ambiguous"
-    return {"decision": decision, "mean_offset_m": mean,
-            "offsets_m": offsets}
+        record["mean_offset_m"] = None
+        record["max_abs_offset_m"] = None
+        record["reason"] = "no gcp matched a CSV elevation"
+        return record
+    record["mean_offset_m"] = sum(offsets) / len(offsets)
+    record["max_abs_offset_m"] = max(abs(value) for value in offsets)
+    return record
 
 
 def run_real(args):
@@ -1229,7 +1228,27 @@ def project_path_for(args):
     return os.path.join(base, "gcp_site.psx")
 
 
-def align_block(args, images):
+def skipped_observations(chunk, gcps):
+    """Count gcp_list observations whose camera is missing or did not align.
+
+    run_fold silently skips an observation whose image label resolves to no
+    enabled camera; this records how many, so a block that registered a small
+    fraction of its images cannot look well observed by accident.
+    """
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    total = 0
+    skipped = 0
+    for gcp in gcps:
+        for observation in gcp["observations"]:
+            total += 1
+            stem = os.path.splitext(observation["image"])[0]
+            camera = cameras.get(stem) or cameras.get(observation["image"])
+            if camera is None or not camera.enabled:
+                skipped += 1
+    return {"observations": total, "in_unaligned_cameras": skipped}
+
+
+def align_block(args, images, gcps):
     """MatchPhotos + AlignCameras once, save the project, return alignment facts.
 
     The same block is reloaded for every fold, so the expensive matching and
@@ -1249,7 +1268,8 @@ def align_block(args, images):
     aligned = sum(1 for camera in chunk.cameras if camera.enabled)
     return {"project": project, "cameras_total": total,
             "cameras_aligned": aligned,
-            "keypoint_limit_per_mpx": args.keypoint_limit}
+            "keypoint_limit_per_mpx": args.keypoint_limit,
+            "observations": skipped_observations(chunk, gcps)}
 
 
 def import_camera_references_for_block(chunk, accuracy_m, directory):
@@ -1279,10 +1299,17 @@ def camera_consistency(chunk):
     to ECEF by chunk.transform) expressed in the reference's local east/north/up
     frame. A constant up offset points at a height-datum mismatch between the
     camera altitudes and the GCP heights; a metre-level spread points at
-    positions that are not RTK-fixed. Measured only, never applied.
+    positions that are not RTK-fixed.
+
+    The horizontal difference is also projected onto the flight direction,
+    taken from each camera's neighbours in capture order (labels sorted). A
+    constant along-track offset is the signature of a trigger/GNSS timing lag
+    (and it does NOT change sign between flight lines, because the direction is
+    per-camera); a constant world offset shows up in mean east/north instead.
+    Measured only, never applied.
     """
     transform = chunk.transform
-    east, north, up = [], [], []
+    samples = []
     for camera in chunk.cameras:
         reference = camera.reference
         if not camera.enabled or reference is None or not all(
@@ -1292,31 +1319,143 @@ def camera_consistency(chunk):
         ecef = [sum(transform[r][c] * local[c] for c in range(3)) + transform[r][3]
                 for r in range(3)]
         enu = ecef_to_enu(ecef, (reference[0], reference[1], reference[2]))
-        east.append(enu[0])
-        north.append(enu[1])
-        up.append(enu[2])
-    if not east:
+        samples.append({"label": camera.label, "reference": reference,
+                        "east": enu[0], "north": enu[1], "up": enu[2]})
+    if not samples:
         return {"cameras": 0}
 
     def mean(values):
-        return sum(values) / len(values)
+        return sum(values) / len(values) if values else None
 
-    return {"cameras": len(east),
-            "mean_east_m": mean(east), "mean_north_m": mean(north),
-            "mean_up_m": mean(up),
-            "rms_east_m": root_mean_square(east),
-            "rms_north_m": root_mean_square(north),
-            "rms_up_m": root_mean_square(up)}
+    ordered = sorted(samples, key=lambda item: item["label"])
+    origin = ordered[0]["reference"]
+    track = {}
+    for item in ordered:
+        reference = item["reference"]
+        track[item["label"]] = geodetic_to_enu(
+            reference[0], reference[1], reference[2], origin)
+
+    along, cross = [], []
+    for index, item in enumerate(ordered):
+        previous = ordered[max(0, index - 1)]["label"]
+        following = ordered[min(len(ordered) - 1, index + 1)]["label"]
+        dx = track[following][0] - track[previous][0]
+        dy = track[following][1] - track[previous][1]
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            continue
+        hx, hy = dx / norm, dy / norm
+        item["along"] = item["east"] * hx + item["north"] * hy
+        item["cross"] = item["east"] * -hy + item["north"] * hx
+        # Group by the dominant axis of travel so a world-frame bias that flips
+        # sign with heading is visible, while a timing lag stays same-signed.
+        item["bound"] = ("positive" if (hy if abs(hy) >= abs(hx) else hx) >= 0.0
+                         else "negative")
+        along.append(item["along"])
+        cross.append(item["cross"])
+
+    result = {"cameras": len(samples),
+              "mean_east_m": mean([item["east"] for item in samples]),
+              "mean_north_m": mean([item["north"] for item in samples]),
+              "mean_up_m": mean([item["up"] for item in samples]),
+              "rms_east_m": root_mean_square([item["east"] for item in samples]),
+              "rms_north_m": root_mean_square([item["north"] for item in samples]),
+              "rms_up_m": root_mean_square([item["up"] for item in samples])}
+    if along:
+        result["mean_along_track_m"] = mean(along)
+        result["mean_cross_track_m"] = mean(cross)
+        result["rms_along_track_m"] = root_mean_square(along)
+        result["rms_cross_track_m"] = root_mean_square(cross)
+        for bound in ("positive", "negative"):
+            values = [item["along"] for item in ordered
+                      if item.get("bound") == bound]
+            result["mean_along_track_{}_m".format(bound)] = mean(values)
+            result["cameras_{}".format(bound)] = len(values)
+    return result
 
 
-def run_fold(args, gcps, check_index, camera_refs, align_report):
-    """One leave-one-out fold: reload, project, import, fit, measure the check."""
+def _meta_float(chunk, key):
+    """A chunk meta value as a float, or None when absent or not a number."""
+    try:
+        value = float(chunk.meta.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def sensor_focals(chunk):
+    """The solved focal length of each sensor, in pixels."""
+    return [{"sensor": sensor.label, "f": sensor.calibration.f}
+            for sensor in chunk.sensors]
+
+
+def focal_changes(before, after):
+    """Per-sensor focal before/after the adjustment and its relative change."""
+    changes = []
+    for old, new in zip(before, after):
+        if old["sensor"] != new["sensor"]:
+            raise ValueError("sensor list changed during OptimizeCameras")
+        relative = ((new["f"] - old["f"]) / old["f"]) if old["f"] else None
+        changes.append({"sensor": new["sensor"], "before_px": old["f"],
+                        "after_px": new["f"], "relative_change": relative})
+    return changes
+
+
+def refine_marker_changes(chunk, before):
+    """How many projections RefineMarkers moved or removed, and the mean shift."""
+    after = {(marker.label, projection.camera_id): projection.pixel
+             for marker in chunk.markers for projection in marker.projections}
+    moved = 0
+    removed = 0
+    shifts = []
+    for key, pixel in before.items():
+        if key not in after:
+            removed += 1
+            continue
+        shift = math.hypot(after[key][0] - pixel[0], after[key][1] - pixel[1])
+        shifts.append(shift)
+        if shift > 1e-6:
+            moved += 1
+    return {"moved": moved, "removed": removed,
+            "kept": len(shifts),
+            "mean_shift_px": (sum(shifts) / len(shifts)) if shifts else None}
+
+
+def optimize_options(options):
+    """The OptimizeCameras kwargs a diagnostic variant asks for."""
+    kwargs = {"use_gcps": True}
+    if options.get("adaptive_fitting"):
+        # Adaptive mode reads the fit_* flags as permission, not instruction:
+        # permit the full extended model and let the likelihood-ratio selection
+        # keep only the terms whose gain pays for their degrees of freedom.
+        kwargs["adaptive_fitting"] = True
+        kwargs.update(fit_k4=True, fit_b1=True, fit_b2=True,
+                      fit_p3=True, fit_p4=True)
+    if options.get("extended_model"):
+        # The default fit is f, cx, cy, k1, k2, p1, p2; free the higher-order
+        # Brown/Fraser terms the defaults hold fixed.
+        kwargs.update(fit_k4=True, fit_b1=True, fit_b2=True,
+                      fit_p3=True, fit_p4=True)
+    return kwargs
+
+
+def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
+    """One leave-one-out fold: reload, project, import, fit, measure the check.
+
+    ``options`` selects a diagnostic variant: a projection pixel shift, a marker
+    projection sigma, extra calibration terms, marker refinement, or a
+    loosened camera accuracy.
+    """
+    options = options or {}
     doc = alphashape.load_project(align_report["project"])
     chunk = doc.active_chunk
 
     # Control and check markers take the survey's stated accuracy: the import
     # rows carry no accuracy column, so the chunk setting is the one applied.
     chunk.marker_location_accuracy = args.marker_accuracy
+    if "marker_projection_accuracy" in options:
+        chunk.marker_projection_accuracy = options["marker_projection_accuracy"]
+    shift = options.get("projection_shift_px", 0.0)
     cameras = {camera.label: camera for camera in chunk.cameras}
     for gcp in gcps:
         chunk.addMarker(label=gcp["label"])
@@ -1328,12 +1467,24 @@ def run_fold(args, gcps, check_index, camera_refs, align_report):
             if target is None:
                 continue
             chunk.setMarkerProjection(gcp["label"], target,
-                                      observation["px"], observation["py"])
+                                      observation["px"] + shift,
+                                      observation["py"] + shift)
+
+    refine = None
+    if options.get("refine_markers"):
+        before = {(marker.label, projection.camera_id): projection.pixel
+                  for marker in chunk.markers for projection in marker.projections}
+        try:
+            chunk.refineMarkers(markers=[gcp["label"] for gcp in gcps])
+            refine = refine_marker_changes(chunk, before)
+        except Exception as error:  # noqa: BLE001 - recorded, never fatal
+            refine = {"error": str(error)}
 
     with tempfile.TemporaryDirectory() as directory:
         if camera_refs:
-            import_camera_references_for_block(chunk, args.camera_accuracy,
-                                               directory)
+            import_camera_references_for_block(
+                chunk, options.get("camera_accuracy", args.camera_accuracy),
+                directory)
         else:
             for camera in chunk.cameras:
                 camera.reference_enabled = False
@@ -1350,8 +1501,10 @@ def run_fold(args, gcps, check_index, camera_refs, align_report):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
+    focal_before = sensor_focals(chunk)
     chunk.updateTransform()
-    chunk.optimizeCameras(use_gcps=True)
+    chunk.optimizeCameras(**optimize_options(options))
+    focal_after = sensor_focals(chunk)
 
     labels = [gcps[check_index]["label"]]
     targets = reference_local_targets(chunk, labels)
@@ -1361,68 +1514,152 @@ def run_fold(args, gcps, check_index, camera_refs, align_report):
                         for index in range(len(gcps)) if index != check_index],
             "horizontal_m": errors["horizontal"],
             "vertical_m": errors["vertical"],
-            "total_m": errors["total"]}
-    if not camera_refs:
-        fold["camera_consistency"] = camera_consistency(chunk)
+            "total_m": errors["total"],
+            "control_rms_m": _meta_float(chunk, "optimize_cameras.control_rms_m"),
+            "control_rms_xyz_m": _meta_float(
+                chunk, "optimize_cameras.control_rms_xyz_m"),
+            "focal": focal_changes(focal_before, focal_after),
+            "camera_consistency": camera_consistency(chunk)}
+    if refine is not None:
+        fold["refine_markers"] = refine
     return fold
+
+
+def summarise_camera_consistency(measured):
+    """Mean over folds of the per-fold camera-consistency records."""
+    per_fold = [fold["camera_consistency"] for fold in measured
+                if fold.get("camera_consistency", {}).get("cameras")]
+    if not per_fold:
+        return None
+    keys = [key for key in per_fold[0]
+            if key.endswith("_m") and per_fold[0][key] is not None]
+    summary = {"folds": len(per_fold), "cameras": per_fold[0]["cameras"]}
+    for key in keys:
+        values = [item[key] for item in per_fold if item.get(key) is not None]
+        if values:
+            summary[key] = sum(values) / len(values)
+    return summary
+
+
+def summarise_focal(measured):
+    """Per-sensor mean/min/max relative focal change across the folds."""
+    by_sensor = {}
+    for fold in measured:
+        for change in fold.get("focal") or []:
+            if change.get("relative_change") is not None:
+                by_sensor.setdefault(change["sensor"], []).append(
+                    change["relative_change"])
+    if not by_sensor:
+        return None
+    return {sensor: {"folds": len(values),
+                     "mean_relative_change": sum(values) / len(values),
+                     "min_relative_change": min(values),
+                     "max_relative_change": max(values)}
+            for sensor, values in by_sensor.items()}
+
+
+def run_variant(args, gcps, align_report, camera_refs, options=None,
+                catch_all=False):
+    """Run the leave-one-out folds of one variant and summarise them."""
+    options = options or {}
+    folds = []
+    for check_index in range(len(gcps)):
+        try:
+            folds.append(run_fold(args, gcps, check_index, camera_refs,
+                                  align_report, options))
+        except Exception as error:  # noqa: BLE001 - diagnostics record, never fatal
+            if not catch_all and not isinstance(error, ValueError):
+                raise
+            folds.append({"check": gcps[check_index]["label"],
+                          "error": str(error)})
+    measured = [fold for fold in folds if "error" not in fold]
+    variant = {
+        "folds": folds,
+        "evaluated": len(measured),
+        "rms_horizontal_m": (
+            root_mean_square([fold["horizontal_m"] for fold in measured])
+            if measured else None),
+        "rms_vertical_m": (
+            root_mean_square([fold["vertical_m"] for fold in measured])
+            if measured else None),
+        "rms_total_m": (
+            root_mean_square([fold["total_m"] for fold in measured])
+            if measured else None),
+    }
+    if options:
+        variant["options"] = {key: value for key, value in options.items()}
+    consistency = summarise_camera_consistency(measured)
+    if consistency:
+        variant["camera_consistency"] = consistency
+    focal = summarise_focal(measured)
+    if focal:
+        variant["focal"] = focal
+    controls = [fold["control_rms_m"] for fold in measured
+                if fold.get("control_rms_m") is not None]
+    if controls:
+        variant["control_rms_m"] = sum(controls) / len(controls)
+    refined = [fold["refine_markers"] for fold in measured
+               if "refine_markers" in fold]
+    if refined:
+        variant["refine_markers"] = {
+            "moved": sum(item.get("moved", 0) for item in refined),
+            "removed": sum(item.get("removed", 0) for item in refined),
+            "fold_errors": sum(1 for item in refined if "error" in item)}
+    return variant
+
+
+# Extra gcps_only leave-one-out variants that probe the leading explanations
+# for the residual (focal/flying-height correlation, calibration model, marker
+# conventions, weight balance). Each is report-only: none is ever gated.
+DIAGNOSTIC_VARIANTS = (
+    ("adaptive_fitting", False, {"adaptive_fitting": True}),
+    ("extended_model", False, {"extended_model": True}),
+    ("refined_markers", False, {"refine_markers": True}),
+    ("px_shift_plus", False, {"projection_shift_px": 0.5}),
+    ("px_shift_minus", False, {"projection_shift_px": -0.5}),
+    ("marker_sigma_0p25", False, {"marker_projection_accuracy": 0.25}),
+    ("marker_sigma_1p0", False, {"marker_projection_accuracy": 1.0}),
+    ("camera_rtk_loose", True, {"camera_accuracy": 0.5}),
+)
 
 
 def run_real_odm(args):
     """The real-block leave-one-out protocol over the ODM GCPs, two variants."""
+    if args.gcp_height != "ellipsoidal":
+        raise ValueError(
+            "--gcp-height {} is not supported: converting an orthometric "
+            "height needs a geoid model this script does not carry".format(
+                args.gcp_height))
     header, gcps = parse_odm_gcp_list(args.gcp_list)
     _, names = parse_gcp_names_csv(args.gcp_names)
     gcps = match_gcp_names(gcps, names)
-    z_datum = determine_z_datum(gcps)
+    z_record = z_consistency(gcps, args.gcp_height)
     images = collect_images(args.real)
     if len(images) < 3:
         raise ValueError("need at least three images in " + args.real)
 
-    align_report = align_block(args, images)
+    align_report = align_block(args, images, gcps)
     variants = {}
     for variant, camera_refs in (("camera_rtk_gcps", True),
                                  ("gcps_only", False)):
-        folds = []
-        for check_index in range(len(gcps)):
-            try:
-                folds.append(run_fold(args, gcps, check_index, camera_refs,
-                                      align_report))
-            except ValueError as error:
-                folds.append({"check": gcps[check_index]["label"],
-                              "error": str(error)})
-        measured = [fold for fold in folds if "error" not in fold]
-        variants[variant] = {
-            "folds": folds,
-            "evaluated": len(measured),
-            "rms_horizontal_m": (
-                root_mean_square([fold["horizontal_m"] for fold in measured])
-                if measured else None),
-            "rms_vertical_m": (
-                root_mean_square([fold["vertical_m"] for fold in measured])
-                if measured else None),
-            "rms_total_m": (
-                root_mean_square([fold["total_m"] for fold in measured])
-                if measured else None),
-        }
-        if not camera_refs:
-            # One line per fold would repeat the same block-level picture; the
-            # mean over folds is the summary, the folds keep their own values.
-            per_fold = [fold["camera_consistency"] for fold in measured
-                        if fold.get("camera_consistency", {}).get("cameras")]
-            if per_fold:
-                summary = {"folds": len(per_fold),
-                           "cameras": per_fold[0]["cameras"]}
-                for key in ("mean_east_m", "mean_north_m", "mean_up_m",
-                            "rms_east_m", "rms_north_m", "rms_up_m"):
-                    summary[key] = sum(item[key] for item in per_fold) / len(per_fold)
-                variants[variant]["camera_consistency"] = summary
-                print("[gcp validation] camera reference - adjusted centre "
-                      "(gcps_only, mean over folds): mean E/N/U "
-                      "{:.3f}/{:.3f}/{:.3f} m, RMS E/N/U {:.3f}/{:.3f}/{:.3f} m "
-                      "over {} cameras".format(
-                          summary["mean_east_m"], summary["mean_north_m"],
-                          summary["mean_up_m"], summary["rms_east_m"],
-                          summary["rms_north_m"], summary["rms_up_m"],
-                          summary["cameras"]))
+        variants[variant] = run_variant(args, gcps, align_report, camera_refs)
+    if args.diagnostics:
+        for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
+            variants[variant] = run_variant(
+                args, gcps, align_report, camera_refs, options,
+                catch_all=True)
+    for variant, data in variants.items():
+        consistency = data.get("camera_consistency")
+        if not consistency:
+            continue
+        print("[gcp validation] camera reference - adjusted centre "
+              "({}, mean over folds): mean E/N/U "
+              "{:.3f}/{:.3f}/{:.3f} m, RMS E/N/U {:.3f}/{:.3f}/{:.3f} m "
+              "over {} cameras".format(
+                  variant, consistency["mean_east_m"],
+                  consistency["mean_north_m"], consistency["mean_up_m"],
+                  consistency["rms_east_m"], consistency["rms_north_m"],
+                  consistency["rms_up_m"], consistency["cameras"]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -1433,9 +1670,10 @@ def run_real_odm(args):
         "gcps": len(gcps),
         "observations": sum(len(gcp["observations"]) for gcp in gcps),
         "crs_header": header,
-        "z_datum": z_datum,
+        "z_consistency": z_record,
         "align": align_report,
         "variants": variants,
+        "diagnostics": bool(args.diagnostics),
         "camera_accuracy_m": args.camera_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
         "target_horizontal_m": target,
@@ -1472,6 +1710,17 @@ def parse_args(argv):
                         help="Name;Easting;Northing;Elevation;Longitude;Latitude "
                              "CSV whose points are matched to --gcp-list by "
                              "coordinates")
+    parser.add_argument("--gcp-height", choices=GCP_HEIGHT_CHOICES,
+                        default="ellipsoidal",
+                        help="height reference of the gcp_list z values "
+                             "(default ellipsoidal, as the publisher states); "
+                             "orthometric is refused because no geoid model is "
+                             "available here")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="after the two standard variants, run the extra "
+                             "gcps_only probes (adaptive/extended calibration, "
+                             "marker refinement, pixel shift, marker sigma, "
+                             "loosened camera weights); report-only")
     parser.add_argument("--camera-accuracy", type=float, default=0.05,
                         help="camera reference accuracy in metres for the "
                              "camera_rtk_gcps variant (the RTK block's stated value)")

@@ -430,7 +430,7 @@ def gcp_markdown(current: dict) -> str:
     manifest = current.get("dataset_manifest", {}) or {}
     licence = current.get("licence", {}) or {}
     align = current.get("align", {}) or {}
-    z_datum = current.get("z_datum", {}) or {}
+    z_record = current.get("z_consistency") or current.get("z_datum") or {}
     target = current.get("target_horizontal_m")
     verdict = "PASS" if current.get("passed") else "MISS"
     lines = ["# Quality benchmark: " + str(manifest.get("title") or current.get("dataset", "?")), ""]
@@ -456,11 +456,21 @@ def gcp_markdown(current: dict) -> str:
     lines.append(f"| GCPs | {current.get('gcps')} |")
     lines.append(f"| Observations | {current.get('observations')} |")
     lines.append(f"| CRS header | {current.get('crs_header')} |")
-    lines.append(f"| z datum | {z_datum.get('decision', '-')} "
-                 f"(mean gcp z - CSV elevation {_fmt(z_datum.get('mean_offset_m'))} m) |")
+    lines.append(f"| gcp z height | {z_record.get('gcp_height', '-')} |")
+    lines.append(f"| z consistency (gcp_list - CSV) | "
+                 f"{_fmt(z_record.get('mean_offset_m'))} m mean, "
+                 f"{_fmt(z_record.get('max_abs_offset_m'))} m max abs |")
+    lines.append(f"| Observations in unaligned cameras | "
+                 f"{(align.get('observations') or {}).get('in_unaligned_cameras', '-')} "
+                 f"of {(align.get('observations') or {}).get('observations', '-')} |")
     lines.append("")
     for variant, data in (current.get("variants") or {}).items():
-        lines.append(f"## Variant: {variant}")
+        options = data.get("options") or {}
+        is_diagnostic = bool(options) or (
+            current.get("diagnostics") and
+            variant not in ("camera_rtk_gcps", "gcps_only"))
+        suffix = " (diagnostic)" if is_diagnostic else ""
+        lines.append(f"## Variant: {variant}{suffix}")
         lines.append("")
         lines.append("| Check | Horizontal (m) | Vertical (m) | 3D total (m) |")
         lines.append("|---|---:|---:|---:|")
@@ -475,6 +485,30 @@ def gcp_markdown(current: dict) -> str:
                      f"**{_fmt(data.get('rms_vertical_m'))}** | "
                      f"**{_fmt(data.get('rms_total_m'))}** |")
         lines.append("")
+        consistency = data.get("camera_consistency") or {}
+        if consistency.get("cameras"):
+            lines.append(
+                f"Camera reference − adjusted centre (mean over folds): "
+                f"E/N/U {_fmt(consistency.get('mean_east_m'))} / "
+                f"{_fmt(consistency.get('mean_north_m'))} / "
+                f"{_fmt(consistency.get('mean_up_m'))} m; along/cross-track "
+                f"{_fmt(consistency.get('mean_along_track_m'))} / "
+                f"{_fmt(consistency.get('mean_cross_track_m'))} m.")
+            lines.append("")
+        focal = data.get("focal") or {}
+        for sensor, change in focal.items():
+            lines.append(
+                f"Focal ({sensor}): mean relative change "
+                f"{_fmt(change.get('mean_relative_change'))} "
+                f"[{_fmt(change.get('min_relative_change'))}, "
+                f"{_fmt(change.get('max_relative_change'))}].")
+            lines.append("")
+        refined = data.get("refine_markers") or {}
+        if refined:
+            lines.append(
+                f"RefineMarkers: {refined.get('moved')} projections moved, "
+                f"{refined.get('removed')} removed across folds.")
+            lines.append("")
     return "\n".join(lines)
 
 

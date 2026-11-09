@@ -228,10 +228,16 @@ GCPs — 4 control + 1 held-out check per fold, `UpdateTransform` +
 `OptimizeCameras(use_gcps=True)`, and the check point's horizontal / vertical / 3D
 error measured against its surveyed reference. Two variants: camera RTK references
 at `--camera-accuracy` (0.05 m) plus the GCPs at `--marker-accuracy` (0.015 m), and
-GCPs only with the camera references disabled. The GCPs-only folds also report how
-far the stored camera references sit from the adjusted camera centres (mean and RMS
-east/north/up), which separates a height-datum mismatch from unfixed positions. Runtime 2702.7 s on a shared CPU runner. The gcp-list
-z is orthometric (mean offset to the CSV elevation 0.0 m).
+GCPs only with the camera references disabled. Both variants report how far the
+stored camera references sit from the adjusted camera centres (mean and RMS
+east/north/up, plus the horizontal difference split into along-track and
+cross-track from the flight direction), which separates a timing offset from
+unfixed positions. Runtime 2702.7 s on a shared CPU runner. The GCP heights are
+**ellipsoidal**: the publisher labels the CSV column "Ellipsoidal height", and
+the gcp_list z carries the same values (the mean gcp_list − CSV offset is a
+consistency check on the label match, not a datum test). The script records this
+as `z_consistency` and refuses an orthometric height because it carries no geoid
+model.
 
 | check | camera_rtk_gcps h / v / 3D (m) | gcps_only h / v / 3D (m) |
 | --- | --- | --- |
@@ -263,12 +269,17 @@ Rerun with the stated accuracies (CI run `42383670611`, same alignment: 146/176,
 
 The 5 cm horizontal target is still **missed** (reported, not gated). The GCPs-only
 folds explain why the camera variant does not help: against the GCP-adjusted
-camera centres, the stored camera positions sit on average 3.45 m too high
-(mean E/N/U -0.61 / 0.20 / 3.45 m, RMS 0.72 / 0.50 / 3.49 m over 146 cameras). The
-near-constant vertical offset is a height-reference mismatch between the camera
-altitudes and the surveyed GCP heights, and the ~0.4 m horizontal scatter is far
-above RTK-fixed precision. Weighted at 5 cm, those positions pull against the GCPs:
-the image residual rises from ~0.95 to ~1.18 px and the camera-variant vertical
-error is worse than GCPs only. Until the camera altitude reference of this block is
-resolved, the GCPs-only variant is the meaningful one: 7.9 cm horizontal and
-10.1 cm vertical from four control points per fold.
+camera centres, the stored camera positions sit on average 3.45 m above the
+adjusted ones (mean E/N/U -0.61 / 0.20 / 3.45 m, RMS 0.72 / 0.50 / 3.49 m over 146
+cameras). Both heights are ellipsoidal and the camera import is correct, so this is
+not a datum mismatch. **Hypothesis (pending the diagnostics numbers below):** in a
+nadir block over nearly flat ground, focal length and flying height are strongly
+correlated — a ~7 % focal error moves a 50 m block's camera centres by about 3.5 m
+vertically while the ground fits. The diagnostics run `adaptive_fitting`, the
+extended (k4/b1/b2/p3/p4) model, marker refinement, a ±0.5 px projection shift, a
+marker-sigma sweep and a loosened camera weight, and record each fold's solved
+focal length (before/after the adjustment). The ~0.4 m horizontal scatter and the
+image RMS rising from ~0.95 to ~1.18 px with the RTK weights are consistent with
+those positions fighting the GCPs. Until the focal/height degeneracy is resolved,
+the GCPs-only variant is the meaningful one: 7.9 cm horizontal and 10.1 cm
+vertical from four control points per fold.
