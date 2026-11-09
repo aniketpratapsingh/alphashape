@@ -272,14 +272,56 @@ folds explain why the camera variant does not help: against the GCP-adjusted
 camera centres, the stored camera positions sit on average 3.45 m above the
 adjusted ones (mean E/N/U -0.61 / 0.20 / 3.45 m, RMS 0.72 / 0.50 / 3.49 m over 146
 cameras). Both heights are ellipsoidal and the camera import is correct, so this is
-not a datum mismatch. **Hypothesis (pending the diagnostics numbers below):** in a
-nadir block over nearly flat ground, focal length and flying height are strongly
-correlated — a ~7 % focal error moves a 50 m block's camera centres by about 3.5 m
-vertically while the ground fits. The diagnostics run `adaptive_fitting`, the
-extended (k4/b1/b2/p3/p4) model, marker refinement, a ±0.5 px projection shift, a
-marker-sigma sweep and a loosened camera weight, and record each fold's solved
-focal length (before/after the adjustment). The ~0.4 m horizontal scatter and the
-image RMS rising from ~0.95 to ~1.18 px with the RTK weights are consistent with
-those positions fighting the GCPs. Until the focal/height degeneracy is resolved,
-the GCPs-only variant is the meaningful one: 7.9 cm horizontal and 10.1 cm
-vertical from four control points per fold.
+not a datum mismatch.
+
+#### Diagnostics (CI runs `42645790811`, `42661142021`)
+
+Leave-one-out check RMS, horizontal / vertical / 3D in cm; "camera vs GPS up" is
+the mean height of the stored camera positions minus the adjusted centres;
+"focal" is the mean relative change of the solved focal length.
+
+| variant | h / v / 3D (cm) | camera vs GPS up | focal |
+| --- | --- | --- | --- |
+| gcps_only (default fit) | 7.9 / 10.1 / 12.8 | +3.45 m | +1.2 % |
+| gcps_only, `adaptive_fitting` | 6.5 / 6.4 / 9.1 | -0.23 m | -4.6 % |
+| gcps_only, extended model | 6.9 / 6.6 / 9.5 | -0.27 m | -4.9 % |
+| gcps_only, `adaptive_fitting`, -0.5 px | 6.2 / **5.9** / **8.6** | -0.24 m | -4.5 % |
+| gcps_only, -0.5 px / +0.5 px | 7.3 / 8.9 / 11.5 — 8.6 / 11.7 / 14.5 | | |
+| gcps_only, marker sigma 0.25 / 1.0 px | 8.7 / 15.2 / 17.5 — 7.8 / 13.8 / 15.9 | | |
+| gcps_only, `refineMarkers` | 12.9 / 24.5 / 27.7 | | |
+| camera_rtk_gcps (default fit) | 7.5 / 16.8 / 18.4 | 0.00 m | -4.3 % |
+| camera_rtk_gcps, camera sigma 0.5 m | 7.1 / 17.4 / 18.8 | | |
+| camera_rtk_gcps, `adaptive_fitting` | 5.4 / 10.3 / 11.6 | 0.00 m | -4.2 % |
+| camera_rtk_gcps, `adaptive_fitting`, -0.5 px | **5.1** / 9.9 / 11.1 | 0.00 m | -4.2 % |
+
+Findings:
+
+- **The default lens model is too thin for this camera.** With the extra terms the
+  3.45 m camera offset disappears and the solved focal length agrees with the one
+  the RTK cameras imply (about -4.5 %): focal length was trading against the
+  distortion terms the default fit holds, not against flying height alone. The
+  RTK camera positions agree with the adjusted centres to ~4.5 cm RMS once they
+  are weighted, so they are good data.
+- **Pixel convention.** -0.5 px helps in every combination and +0.5 px hurts: the
+  gcp_list projections use the pixel-corner origin; the engine uses pixel centres.
+  This belongs in the protocol's import, not the engine.
+- **Vertical with camera RTK.** The per-fold vertical errors are systematic (-7,
+  -9, -1, +11, +15 cm) and the GCP-only adjustment puts the camera centres ~0.23 m
+  below the recorded positions — consistent with an unmodelled GNSS antenna offset
+  above the lens. Not yet tested: setting or estimating the antenna offset.
+- **`refineMarkers` removes about half of the hand-placed projections** on these
+  targets and makes the result much worse — an engine issue, tracked separately.
+- Ruled out: trigger/GNSS timing (no along-track pattern once the cameras are
+  weighted), marker-vs-tie weight (0.5 px is best), unaligned cameras (1 of 35
+  observations).
+
+**`adaptive_fitting` stays off by default.** Run on the other benchmark datasets
+(OptimizeCameras after alignment, adaptive off vs on; runs `42664406276` /
+`42664413306` aerial-nadir, `42664420424` / `42664427402` terrestrial-laser) it was
+worse on both: aerial DEM NMAD 0.76 -> 1.02 m and ortho offset 0.80 -> 1.50 m;
+laser accuracy at 2/5/10 cm 0.092/0.252/0.490 -> 0.076/0.215/0.417 and
+completeness 0.064/0.151/0.277 -> 0.047/0.112/0.218. One run each, and the
+alignment before OptimizeCameras is not bit-identical between runs, so this is
+indicative, not conclusive. For an RTK/GCP block with a single camera, enable
+`adaptive_fitting=True` in OptimizeCameras; the best measured configuration here
+reaches 5.1 cm horizontal, against the 5 cm target.
