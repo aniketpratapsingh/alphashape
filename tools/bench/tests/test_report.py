@@ -647,6 +647,14 @@ class ExperimentTest(unittest.TestCase):
             {"BuildDem.sibson_exact_max_sites": "20000"},
         )
 
+    def test_an_optimize_only_run_is_an_experiment(self):
+        current = metrics()
+        current["optimize_params"] = {"adaptive_fitting": "true"}
+        self.assertEqual(
+            report.experiment_params(current),
+            {"OptimizeCameras.adaptive_fitting": "true"},
+        )
+
     def test_both_inputs_are_folded_into_one_mapping(self):
         current = metrics()
         current["depth_params"] = {"cost_type": "census"}

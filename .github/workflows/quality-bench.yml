@@ -18,7 +18,8 @@ name: Quality benchmark
 #
 #   * it holds the REASON, which must be non-empty printable text of <= 200 characters;
 #   * it is honoured only on the DEFAULT branch, never on a feature branch, and never
-#     for an experiment (empty `depth_params`, `dem_params` and `ortho_params`);
+#     for an experiment (empty `depth_params`, `dem_params`, `ortho_params` and
+#     `optimize_params`);
 #   * when honoured, the verdict is still computed and shown in the report — every
 #     regressed metric with previous -> current — but the job does not fail on it, and
 #     the run publishes its metrics as the new baseline;
@@ -87,13 +88,24 @@ on:
         description: 'Extra BuildOrthomosaic key=value pairs, space separated (e.g. "color_correction=affine")'
         type: string
         default: ""
+      # Extra OptimizeCameras keyword arguments, e.g. "adaptive_fitting=true".
+      # Unlike the three inputs above, this one also INSERTS the task into the
+      # pipeline after AlignCameras: OptimizeCameras is not a stage of the control
+      # run, so a non-empty value is what makes it run at all. Same contract
+      # otherwise: validated by tools/bench/run_bench.py --optimize-params, passed
+      # through an environment variable (never interpolated into `run:`), and
+      # strictly a reporting mode — never the regression baseline, never gates.
+      optimize_params:
+        description: 'Extra OptimizeCameras key=value pairs, space separated (e.g. "adaptive_fitting=true")'
+        type: string
+        default: ""
       # Accept a regression BY HAND, so a deliberate trade-off (worse on one metric,
       # clearly better on the rest) can become the new baseline instead of failing
       # every later run against a baseline nobody can reach.
       #
       # Requires ALL of: a non-empty reason here, a run on the DEFAULT branch, and a
-      # control run (no depth_params, no dem_params and no ortho_params). A non-default
-      # branch, or an
+      # control run (no depth_params, no dem_params, no ortho_params and no
+      # optimize_params). A non-default branch, or an
       # experiment, is refused with an error rather than silently honoured — a
       # feature branch must never move the shared baseline. The reason is untrusted
       # dispatch text: it reaches the script through an environment variable, never
@@ -120,10 +132,15 @@ concurrency:
   # The group is unchanged for scheduled and ordinary manual runs: an experiment is
   # suffixed so it does not cancel (or wait behind) the control run on the same
   # dataset, which is the one it is being compared with. The `||` chain evaluates
-  # left to right, so with neither input set the group is exactly what it was
-  # before. Either input earns the suffix: both are experiments under the same
-  # rules, and a dem_params run must not queue behind the control either.
-  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params) && '-experiment' || '' }}
+  # left to right, so with no input set the group is exactly what it was before.
+  #
+  # The suffix is the RUN ID, not a fixed '-experiment': comparing a configuration
+  # needs at least two experiment runs on the same dataset (adaptive on and off,
+  # say), and a fixed suffix would put them in one group where GitHub cancels the
+  # pending one before it starts. A per-run id keeps every experiment independent
+  # while still keeping all of them away from the control run they are measured
+  # against. Scheduled and push runs take the `|| ''` arm and are unaffected.
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params || github.event.inputs.optimize_params) && format('-experiment-{0}', github.run_id) || '' }}
   cancel-in-progress: false
 
 env:
@@ -346,6 +363,9 @@ jobs:
           DEM_PARAMS: ${{ github.event.inputs.dem_params }}
           # And for BuildOrthomosaic: validated by `--ortho-params`.
           ORTHO_PARAMS: ${{ github.event.inputs.ortho_params }}
+          # And for OptimizeCameras: validated by `--optimize-params`, which also
+          # inserts the task after AlignCameras when the value is non-empty.
+          OPTIMIZE_PARAMS: ${{ github.event.inputs.optimize_params }}
         run: |
           mkdir -p build/bench
           set +e
@@ -354,6 +374,7 @@ jobs:
             --depth-params "$DEPTH_PARAMS" \
             --dem-params "$DEM_PARAMS" \
             --ortho-params "$ORTHO_PARAMS" \
+            --optimize-params "$OPTIMIZE_PARAMS" \
             --work build/bench \
             --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
           status=${PIPESTATUS[0]}
@@ -444,8 +465,9 @@ jobs:
             # that reached the run some other way (a hand upload, or a past bug).
             # The gate must never compare against a configuration that is not the
             # default, and the metrics file itself is the single source of that
-            # answer, so a run whose baseline reports depth_params, dem_params or
-            # ortho_params is skipped like a run with no artifact at all.
+            # answer, so a run whose baseline reports depth_params, dem_params,
+            # ortho_params or optimize_params is skipped like a run with no
+            # artifact at all.
             metrics="build/bench/previous/metrics-$DATASET.json"
             set +e
             python3 tools/bench/is_experiment.py "$metrics"
