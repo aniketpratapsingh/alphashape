@@ -18,6 +18,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/chunk/align_chunks_task.hpp"
+#include "common/algorithm/reference/reference_orientation.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/core/chunk_geometry.hpp"
 #include "model/geo/geodesy.hpp"
@@ -50,6 +51,25 @@ Eigen::Matrix3d pure_rotation(const Eigen::Matrix3d& m) {
         throw ValueError("georeference: camera-shift block carries no valid rotation");
     }
     return m / std::cbrt(determinant);
+}
+
+/// The antenna mount a camera's reference actually measures, or nullptr when
+/// the reference is the projection centre itself.
+///
+/// A sensor with a master shares the master's calibration, and the mount is
+/// part of the physical body, so the effective master's antenna is the one that
+/// moves the phase centre. This is the same resolution the bundle adjustment
+/// (optimize_cameras_task.cpp), AlignFromReference and the reference table use;
+/// keeping it in one place is what stops the datum and the BA prior disagreeing.
+/// A boresight-only mount is still returned: it records the body->camera
+/// rotation even when its offset is zero.
+const Antenna* antenna_mount(const Chunk& chunk, const Camera& camera) {
+    if (camera.sensor_id < 0 ||
+        camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
+        return nullptr;
+    }
+    const Antenna& antenna = reference::effective_antenna(chunk, camera);
+    return (antenna.is_set() || antenna.boresight_deg.has_value()) ? &antenna : nullptr;
 }
 
 /// Median of a non-empty vector (interpolated for an even count).
@@ -312,19 +332,9 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     // the measured reference. The prediction needs the fit's own rotation, so
     // it is iterated to convergence. Without antenna data only the plain fit
     // runs, exactly as before WP-13.19.
-    const auto antenna_of = [&chunk](const Camera& camera) -> const Antenna* {
-        if (camera.sensor_id < 0 ||
-            camera.sensor_id >= static_cast<std::int32_t>(chunk.sensors().size())) {
-            return nullptr;
-        }
-        const Antenna& antenna =
-            chunk.sensors()[static_cast<std::size_t>(camera.sensor_id)].antenna;
-        return (antenna.is_set() || antenna.boresight_deg.has_value()) ? &antenna
-                                                                       : nullptr;
-    };
     bool any_antenna = false;
     for (const Camera* camera : candidates) {
-        any_antenna = any_antenna || antenna_of(*camera) != nullptr;
+        any_antenna = any_antenna || antenna_mount(chunk, *camera) != nullptr;
     }
 
     std::vector<Eigen::Vector3d> fit_targets = reference_enu;
@@ -352,7 +362,7 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
         Eigen::Matrix3d enu_from_source = ransac.similarity->R * map_r;
         for (int pass = 0; pass < kMaxPasses; ++pass) {
             for (std::size_t i = 0; i < candidates.size(); ++i) {
-                const Antenna* antenna = antenna_of(*candidates[i]);
+                const Antenna* antenna = antenna_mount(chunk, *candidates[i]);
                 if (antenna == nullptr) {
                     fit_targets[i] = reference_enu[i];
                     continue;
@@ -425,6 +435,11 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         Eigen::Vector3d reference;  ///< lon_deg, lat_deg, alt_m
         double sigma = kFallbackHorizontalAccuracy;
         std::int32_t marker_id = -1;  ///< -1 for a camera reference
+        /// World(local)->camera rotation of a camera sample, scale removed.
+        Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
+        /// Camera-frame antenna lever arm in metres (zero for a marker or an
+        /// unset mount). The reference measures `local centre + R^T lever`.
+        Eigen::Vector3d lever = Eigen::Vector3d::Zero();
     };
     struct CheckSample {
         std::int32_t marker_id = -1;
@@ -442,6 +457,11 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     };
 
     // (a) aligned cameras with a full, finite reference: centre <-> reference.
+    // A camera's GNSS reference measures the antenna phase centre, so its fit
+    // target is the reference shifted back by the mounted lever arm; the fit
+    // itself supplies the rotation that turns the camera-frame offset into the
+    // ENU frame (iterated below). Without a mount the shift is zero and the
+    // sample is exactly `centre <-> reference`, the pre-WP-13.19 behaviour.
     for (const Camera& camera : chunk.cameras()) {
         if (!camera.enabled || !camera.reference.enabled ||
             !camera.reference.location.has_value()) {
@@ -455,7 +475,17 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         if (!all_finite(centre)) {
             continue;  // a garbage pose contributes no usable source point
         }
-        samples.push_back({centre, loc, sigma_of(camera.reference.accuracy), -1});
+        Sample sample;
+        sample.local = centre;
+        sample.reference = loc;
+        sample.sigma = sigma_of(camera.reference.accuracy);
+        sample.marker_id = -1;
+        const Antenna* antenna = antenna_mount(chunk, camera);
+        if (antenna != nullptr) {
+            sample.rotation = pure_rotation(camera.pose.block<3, 3>(0, 0));
+            sample.lever = antenna->camera_offset();
+        }
+        samples.push_back(std::move(sample));
     }
     // (b) Regular control markers with a position and a full reference. Check
     // points are held out of the fit and measured only after it.
@@ -564,79 +594,140 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         sigmas.push_back(s.sigma);
     }
     const double threshold = std::max(0.05, 5.0 * median(sigmas));
-
     constexpr std::uint64_t kSeed = 0x5eed;
-    const SimilarityRansacResult ransac =
-        estimate_similarity_ransac(source, reference_enu, threshold, kSeed);
-    if (!ransac.similarity.has_value()) {
-        report.reason = "similarity fit failed";
-        return report;
-    }
+    const Eigen::Matrix3d map_block = map.block<3, 3>(0, 0);
+    const Eigen::Matrix3d map_r = pure_rotation(map_block);
+    const Eigen::Vector3d map_t = map.block<3, 1>(0, 3);
 
-    // Weighted refit on `mask`, rejecting a degenerate result. `reason` lets
-    // the caller tell "too few points" from a numerical failure.
-    const auto refit_on = [&](const std::vector<std::uint8_t>& mask,
-                              std::string& reason) -> std::optional<Similarity> {
-        std::vector<Eigen::Vector3d> in_source;
-        std::vector<Eigen::Vector3d> in_reference;
-        std::vector<double> in_weight;
-        for (std::size_t i = 0; i < source.size(); ++i) {
-            if (mask[i] == 0) {
-                continue;
-            }
-            in_source.push_back(source[i]);
-            in_reference.push_back(reference_enu[i]);
-            in_weight.push_back(weights[i]);
-        }
-        if (in_source.size() < 3) {
-            reason = "fewer than 3 reference inliers after the robust fit";
-            return std::nullopt;
-        }
-        const std::optional<Similarity> fit =
-            estimate_similarity_weighted(in_source, in_reference, in_weight);
-        if (!fit.has_value() || !(fit->scale > 0.0) || !std::isfinite(fit->scale) ||
-            !fit->R.allFinite() || !fit->t.allFinite()) {
+    // RANSAC seed, then a weighted refit whose per-point gate reclassifies
+    // samples by their own sigma until the mask settles. `targets` is the ENU
+    // position each source must reproduce; with a mount it is the antenna
+    // reference shifted back to the projection centre.
+    const auto robust_fit = [&](const std::vector<Eigen::Vector3d>& targets,
+                                std::vector<std::uint8_t>& mask,
+                                std::string& reason) -> std::optional<Similarity> {
+        const SimilarityRansacResult ransac =
+            estimate_similarity_ransac(source, targets, threshold, kSeed);
+        if (!ransac.similarity.has_value()) {
             reason = "similarity fit failed";
             return std::nullopt;
+        }
+        // Weighted refit on `mask`, rejecting a degenerate result. `reason`
+        // lets the caller tell "too few points" from a numerical failure.
+        const auto refit_on = [&](const std::vector<std::uint8_t>& in_mask,
+                                  std::string& why) -> std::optional<Similarity> {
+            std::vector<Eigen::Vector3d> in_source;
+            std::vector<Eigen::Vector3d> in_reference;
+            std::vector<double> in_weight;
+            for (std::size_t i = 0; i < source.size(); ++i) {
+                if (in_mask[i] == 0) {
+                    continue;
+                }
+                in_source.push_back(source[i]);
+                in_reference.push_back(targets[i]);
+                in_weight.push_back(weights[i]);
+            }
+            if (in_source.size() < 3) {
+                why = "fewer than 3 reference inliers after the robust fit";
+                return std::nullopt;
+            }
+            const std::optional<Similarity> fit =
+                estimate_similarity_weighted(in_source, in_reference, in_weight);
+            if (!fit.has_value() || !(fit->scale > 0.0) ||
+                !std::isfinite(fit->scale) || !fit->R.allFinite() || !fit->t.allFinite()) {
+                why = "similarity fit failed";
+                return std::nullopt;
+            }
+            return fit;
+        };
+
+        mask.assign(source.size(), 0);
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            mask[i] = ransac.inliers[i] != 0 ? 1 : 0;
+        }
+        std::optional<Similarity> fit = refit_on(mask, reason);
+        if (!fit.has_value()) {
+            return std::nullopt;
+        }
+        // Each sample's own sigma decides whether it is an inlier; the 0.05 m
+        // floor keeps exact references from being rejected by round-off.
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::vector<std::uint8_t> next(source.size(), 0);
+            std::size_t inliers = 0;
+            for (std::size_t i = 0; i < source.size(); ++i) {
+                const double gate = std::max(5.0 * samples[i].sigma, 0.05);
+                if ((fit->apply(source[i]) - targets[i]).norm() <= gate) {
+                    next[i] = 1;
+                    ++inliers;
+                }
+            }
+            if (inliers < 3) {
+                reason = "fewer than 3 reference inliers after the robust fit";
+                return std::nullopt;
+            }
+            if (next == mask) {
+                break;  // `fit` was computed on exactly this mask
+            }
+            mask = next;
+            fit = refit_on(mask, reason);
+            if (!fit.has_value()) {
+                return std::nullopt;
+            }
         }
         return fit;
     };
 
-    // -- per-point gate: refit, reclassify, stop when the mask settles -------
-    // Each sample's own sigma decides whether it is an inlier; the 0.05 m floor
-    // keeps exact references from being rejected by round-off.
-    std::vector<std::uint8_t> mask(source.size(), 0);
-    for (std::size_t i = 0; i < source.size(); ++i) {
-        mask[i] = ransac.inliers[i] != 0 ? 1 : 0;
-    }
+    std::vector<std::uint8_t> mask;
     std::string fail_reason;
-    std::optional<Similarity> fitted = refit_on(mask, fail_reason);
+    std::optional<Similarity> fitted = robust_fit(reference_enu, mask, fail_reason);
     if (!fitted.has_value()) {
         report.reason = fail_reason;
         return report;
     }
-    for (int iteration = 0; iteration < 5; ++iteration) {
-        std::vector<std::uint8_t> next(source.size(), 0);
-        std::size_t inliers = 0;
-        for (std::size_t i = 0; i < source.size(); ++i) {
-            const double gate = std::max(5.0 * samples[i].sigma, 0.05);
-            if ((fitted->apply(source[i]) - reference_enu[i]).norm() <= gate) {
-                next[i] = 1;
-                ++inliers;
+
+    // -- antenna lever arm: correct the camera targets and refit -------------
+    // A reference measures the antenna phase centre, not the projection
+    // centre, so a camera's fit target is
+    //     reference - enu_from_source * R_c^T * lever,
+    // with enu_from_source the fit's own rotation. That rotation depends on the
+    // correction, so the targets are rebuilt from the ORIGINAL references and
+    // refitted until the rotation settles (the same iteration georeference_chunk
+    // uses). Without a mount the targets stay the plain references.
+    std::vector<Eigen::Vector3d> fit_targets = reference_enu;
+    bool any_antenna = false;
+    for (const Sample& sample : samples) {
+        if (sample.marker_id < 0 && !sample.lever.isZero()) {
+            any_antenna = true;
+            break;
+        }
+    }
+    Eigen::Matrix3d enu_from_source = fitted->R * map_r;
+    if (any_antenna) {
+        constexpr int kMaxPasses = 10;
+        constexpr double kRotationTolerance = 1e-12;
+        for (int pass = 0; pass < kMaxPasses; ++pass) {
+            for (std::size_t i = 0; i < samples.size(); ++i) {
+                const Sample& sample = samples[i];
+                const bool mounted = sample.marker_id < 0 && !sample.lever.isZero();
+                if (!mounted) {
+                    fit_targets[i] = reference_enu[i];
+                    continue;
+                }
+                fit_targets[i] =
+                    reference_enu[i] -
+                    enu_from_source * sample.rotation.transpose() * sample.lever;
             }
-        }
-        if (inliers < 3) {
-            report.reason = "fewer than 3 reference inliers after the robust fit";
-            return report;
-        }
-        if (next == mask) {
-            break;  // `fitted` was computed on exactly this mask
-        }
-        mask = next;
-        fitted = refit_on(mask, fail_reason);
-        if (!fitted.has_value()) {
-            report.reason = fail_reason;
-            return report;
+            fitted = robust_fit(fit_targets, mask, fail_reason);
+            if (!fitted.has_value()) {
+                report.reason = fail_reason;
+                return report;
+            }
+            const Eigen::Matrix3d next = fitted->R * map_r;
+            const double change = (next - enu_from_source).norm();
+            enu_from_source = next;
+            if (change < kRotationTolerance) {
+                break;
+            }
         }
     }
     const Similarity& s = *fitted;
@@ -644,9 +735,6 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     // Composite similarity applied to the STORED local coordinates: T = S o map.
     // `map` carries a uniform scale when a local unit is not a metre, so the
     // two scales multiply and the composite keeps a pure rotation.
-    const Eigen::Matrix3d map_block = map.block<3, 3>(0, 0);
-    const Eigen::Matrix3d map_r = pure_rotation(map_block);
-    const Eigen::Vector3d map_t = map.block<3, 1>(0, 3);
     Similarity t_sim;
     t_sim.scale = s.scale * std::cbrt(map_block.determinant());
     t_sim.R = s.R * map_r;
@@ -662,7 +750,9 @@ GeoreferenceReport update_transform(Chunk& chunk) {
             }
             continue;
         }
-        sum_sq += (s.apply(source[i]) - reference_enu[i]).squaredNorm();
+        // Residual against the fitted target: the antenna-corrected position
+        // when a mount was applied, the plain reference otherwise.
+        sum_sq += (s.apply(source[i]) - fit_targets[i]).squaredNorm();
         if (samples[i].marker_id >= 0) {
             ++report.control_points_used;
             report.control_weight += weights[i];

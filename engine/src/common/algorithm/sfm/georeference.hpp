@@ -96,6 +96,12 @@ GeoreferenceReport georeference_chunk(Chunk& chunk);
 ///
 /// Correspondences are (local point -> ENU reference) pairs from
 ///   * aligned enabled cameras with a full lon/lat/alt reference (centre), and
+///     their reference measures the antenna phase centre: when the camera's
+///     effective sensor (its master, when linked) records a mount, the fit
+///     target is the reference shifted back by the lever arm rotated by the
+///     pose, exactly as georeference_chunk does. The rotation is iterated to
+///     convergence. With no mount the camera correspondence is the plain
+///     centre -> reference it has always been; and
 ///   * Regular markers that carry both a local position and a full reference
 ///     and whose meta role is not "check_point", when the chunk's
 ///     ReferenceSettings::use_gcp is true.
