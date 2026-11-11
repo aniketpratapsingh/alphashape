@@ -205,7 +205,11 @@ constexpr double kLeverMagnitude = 0.55;  // |(0.45, -0.2, -0.3)|
 
 TEST(GeoreferenceAntenna, UpdateTransformRecoversDatumWithMount) {
     const Eigen::Vector3d lever(0.45, -0.2, -0.3);
-    Chunk chunk = make_chunk(lever, /*with_antenna=*/true, /*mount_on_master=*/false);
+    // A moderately loose accuracy lets the uncorrected seed include every
+    // camera (the lever offsets would otherwise exceed a 0.1 m gate); the
+    // correction then converges to the exact fit.
+    Chunk chunk = make_chunk(lever, /*with_antenna=*/true, /*mount_on_master=*/false,
+                             /*accuracy_m=*/0.2);
     const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
     ASSERT_TRUE(report.applied) << report.reason;
     const double error = centre_error(chunk);
@@ -236,7 +240,8 @@ TEST(GeoreferenceAntenna, UpdateTransformResolvesMasterMount) {
     // antenna were used, the recovered centres would be off by about twice the
     // lever arm and both assertions below fail.
     const Eigen::Vector3d lever(0.45, -0.2, -0.3);
-    Chunk chunk = make_chunk(lever, /*with_antenna=*/true, /*mount_on_master=*/true);
+    Chunk chunk = make_chunk(lever, /*with_antenna=*/true, /*mount_on_master=*/true,
+                             /*accuracy_m=*/0.2);
     ASSERT_EQ(chunk.sensors()[1].master_sensor_id, 0);
     const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
     ASSERT_TRUE(report.applied) << report.reason;
