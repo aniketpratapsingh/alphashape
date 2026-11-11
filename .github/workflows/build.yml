@@ -95,6 +95,12 @@ jobs:
       - name: Install dependencies
         uses: ./.github/actions/apt-install
         with:
+          # The Qt installer below runs its own apt-get against the runner's
+          # DEFAULT mirror; while the Azure mirror/DNS is failing that step
+          # fetches nothing and fails the whole Linux job. Install the packages
+          # it would fetch here, through the rotating-mirror action, so its
+          # apt-get finds them satisfied. These are the Qt 6.8 xcb/GStreamer
+          # runtime dependencies.
           packages: >-
             build-essential cmake ninja-build ccache
             libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev libpng-dev
@@ -102,6 +108,11 @@ jobs:
             libvulkan-dev glslc spirv-tools
             mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
             libgl-dev libopengl-dev libegl-dev libxkbcommon-dev libfontconfig1-dev libdbus-1-dev
+            libgl1-mesa-dev libgstreamer-gl1.0-0 libpulse-dev
+            libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0
+            libxcb-render0 libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1
+            libxcb-util1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb-dev libxcb-cursor0
+            libxkbcommon-x11-0
 
       - name: Install the VMA header
         run: |
