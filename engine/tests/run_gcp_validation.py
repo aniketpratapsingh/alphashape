@@ -1028,6 +1028,20 @@ GCP_NAME_MATCH_TOLERANCE_DEG = 1e-5
 # and an orthometric height would need a geoid model this script does not carry.
 GCP_HEIGHT_CHOICES = ("ellipsoidal", "orthometric")
 
+# A GNSS reference records the antenna phase centre, not the camera's
+# projection centre. The dataset carries no lever-arm field: the EXIF/XMP
+# records the antenna position (RtkFlag 50, RtkStdLon/Lat/Hgt) and the gimbal
+# angles, and the RINEX marker file records the same antenna positions, but
+# nothing states where the phase centre sits relative to the lens. The fixed
+# value below is the measured seed from the GCP-only adjustment, which put the
+# camera centres about 0.23 m below the recorded RTK positions (m13-validation).
+# In the camera frame +z is forward (down) for a nadir mount, so an antenna
+# above the lens is a NEGATIVE z lever arm.
+ANTENNA_FIXED_OFFSET_M = (0.0, 0.0, -0.23)
+# The estimated variants use the mean camera-frame offset measured on the same
+# fold's GCP-only adjustment. Only control GCPs take part, so the held-out
+# check point never reaches the estimate.
+
 
 def parse_odm_gcp_list(path):
     """Parse an ODM gcp_list.txt into one dict per survey point.
@@ -1036,6 +1050,25 @@ def parse_odm_gcp_list(path):
     following row is ``x y z px py image [label]`` — one image observation of
     one point. Rows with the same (x, y, z) are one GCP, collected in first-seen
     order so the returned list has one entry per distinct surveyed point.
+
+    Pixel convention (verified 2026-11-11). The engine's pixel coordinates are
+    corner-origin: ``Calibration::project`` returns ``width / 2 + f x/z``
+    (``engine/src/model/camera/calibration.hpp``), so the centre of the
+    top-left pixel is (0.5, 0.5) and the image centre is (width/2, height/2);
+    ``keypoint_to_pixel`` adds 0.5 to the detector's corner indices for the
+    same reason. The ODM/OpenSfM *file-format* documentation describes
+    integer-origin pixel coordinates (top-left pixel centre (0,0),
+    bottom-right (width-1, height-1); OpenSfM ``doc/source/geometry.rst``), and
+    OpenSfM normalises a gcp_list value with ``(p + 0.5 - width/2) / size``
+    (``opensfm/features.py``), so a value written to that convention maps to
+    the engine's coordinate ``p + 0.5``. This dataset's file was produced by
+    GCP Editor Pro, whose tagger records the click offset from the image's
+    top-left edge in the continuous range [0, width] (``getPos`` in the 2022
+    ``smartimage`` component, and the SVG viewBox in the current one), so its
+    values are already corner-origin and match the engine. No half-pixel
+    conversion is therefore applied to this file; ``--diagnostics`` keeps the
+    ±0.5 px probes so a file written by an integer-origin producer (or a
+    tool-convention change) remains measurable.
     """
     with open(path, encoding="utf-8") as handle:
         lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
@@ -1374,6 +1407,105 @@ def camera_consistency(chunk):
     return result
 
 
+def matrix_determinant(matrix):
+    """Determinant of a 3x3 matrix given as rows."""
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    return (a * (e * i - f * h) - b * (d * i - f * g) +
+            c * (d * h - e * g))
+
+
+def orthonormal_rotation(matrix):
+    """The rotation part of a 3x3 similarity, with its scale divided out.
+
+    A camera pose is rigid in an ordinary project but an AlignChunks
+    similarity stores A = R / s (see the binding's ``center`` getter). Dividing
+    by the cube root of |det| recovers R either way, so a direction vector is
+    rotated without being scaled.
+    """
+    block = [[float(matrix[r][c]) for c in range(3)] for r in range(3)]
+    scale = abs(matrix_determinant(block)) ** (1.0 / 3.0)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("camera pose has no invertible rotation")
+    return [[block[r][c] / scale for c in range(3)] for r in range(3)]
+
+
+def camera_frame_antenna_offsets(chunk):
+    """The lever arm implied by each adjusted camera, in camera-frame metres.
+
+    For every enabled camera with a finite reference, the stored reference is
+    the GNSS antenna position A and the adjusted pose gives the projection
+    centre C. With ``chunk.transform`` E = s R L + t mapping local to ECEF,
+
+        offset_camera = R_pose * R^T * (A - C)
+
+    because ``R^T (A - C) / s`` is the local-frame displacement and multiplying
+    by s cancels (``R_pose`` maps local directions to the camera). The result
+    is exactly what ``Antenna.offset_m`` expects: antenna relative to the
+    projection centre, x right, y down, z forward. A nadir camera with the
+    antenna above the lens therefore has a negative z.
+
+    Only cameras that took part in the fit are included. Returns None when no
+    camera carries a usable reference; otherwise the mean vector, the per-axis
+    spread across cameras and the sample count.
+    """
+    transform = chunk.transform
+    block = [[float(transform[r][c]) for c in range(3)] for r in range(3)]
+    scale = abs(matrix_determinant(block)) ** (1.0 / 3.0)
+    if not math.isfinite(scale) or scale <= 0.0:
+        return None
+    rotation = [[block[r][c] / scale for c in range(3)] for r in range(3)]
+    shift = [float(transform[r][3]) for r in range(3)]
+    samples = []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if not camera.enabled or reference is None:
+            continue
+        if not all(math.isfinite(float(value)) for value in reference):
+            continue
+        pose = camera.pose
+        pose_rotation = orthonormal_rotation(
+            [[pose[r][c] for c in range(3)] for r in range(3)])
+        centre = camera.center
+        centre_ecef = [
+            sum(block[r][c] * centre[c] for c in range(3)) + shift[r]
+            for r in range(3)]
+        antenna_ecef = geodetic_to_ecef(*reference)
+        delta = [antenna_ecef[i] - centre_ecef[i] for i in range(3)]
+        # ECEF -> local is the transpose of the local -> ECEF rotation.
+        local = [sum(rotation[r][c] * delta[r] for r in range(3))
+                 for c in range(3)]
+        samples.append([sum(pose_rotation[r][c] * local[c] for c in range(3))
+                        for r in range(3)])
+    if not samples:
+        return None
+    mean = [sum(sample[axis] for sample in samples) / len(samples)
+            for axis in range(3)]
+    spread = [
+        math.sqrt(sum((sample[axis] - mean[axis]) ** 2 for sample in samples) /
+                  len(samples))
+        for axis in range(3)]
+    return {"cameras": len(samples), "mean_m": mean, "spread_m": spread}
+
+
+def parse_antenna_offset(text):
+    """A ``x,y,z`` antenna lever-arm string in metres, or None when empty."""
+    if not text:
+        return None
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 3:
+        raise ValueError("--antenna-offset needs three comma-separated metres")
+    try:
+        values = tuple(float(part) for part in parts)
+    except ValueError as error:
+        raise ValueError(
+            "--antenna-offset needs three numbers in metres") from error
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("--antenna-offset values must be finite")
+    return values
+
+
 def _meta_float(chunk, key):
     """A chunk meta value as a float, or None when absent or not a number."""
     try:
@@ -1443,8 +1575,11 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     """One leave-one-out fold: reload, project, import, fit, measure the check.
 
     ``options`` selects a diagnostic variant: a projection pixel shift, a marker
-    projection sigma, extra calibration terms, marker refinement, or a
-    loosened camera accuracy.
+    projection sigma, extra calibration terms, marker refinement, a loosened
+    camera accuracy, or a GNSS antenna lever arm (``antenna_offset_m`` in the
+    camera frame, metres). The check point's reference is imported as a
+    check_point and never constrains the fit; a variant that estimates the
+    lever arm from this fold therefore sees only control GCPs.
     """
     options = options or {}
     doc = alphashape.load_project(align_report["project"])
@@ -1501,6 +1636,14 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
+    # The antenna mount must be in place before updateTransform: the
+    # georeference fit applies the lever arm too, not only the bundle
+    # adjustment.
+    antenna = options.get("antenna_offset_m")
+    if antenna is not None:
+        for sensor_index in range(len(chunk.sensors)):
+            chunk.set_sensor_antenna(sensor_index, list(antenna))
+
     focal_before = sensor_focals(chunk)
     chunk.updateTransform()
     chunk.optimizeCameras(**optimize_options(options))
@@ -1519,7 +1662,13 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             "control_rms_xyz_m": _meta_float(
                 chunk, "optimize_cameras.control_rms_xyz_m"),
             "focal": focal_changes(focal_before, focal_after),
-            "camera_consistency": camera_consistency(chunk)}
+            "camera_consistency": camera_consistency(chunk),
+            # What this fold's own adjusted cameras imply for the lever arm,
+            # whether or not one was applied. On the GCP-only variant this is
+            # the leak-free per-fold estimate the antenna variants reuse.
+            "antenna_offset": camera_frame_antenna_offsets(chunk)}
+    if antenna is not None:
+        fold["antenna_applied_m"] = list(antenna)
     if refine is not None:
         fold["refine_markers"] = refine
     return fold
@@ -1558,15 +1707,64 @@ def summarise_focal(measured):
             for sensor, values in by_sensor.items()}
 
 
+def summarise_antenna(measured):
+    """Per-fold camera-frame lever arm implied by the adjusted cameras.
+
+    Reported for every variant: on the camera-reference variants a lever arm
+    was already applied, so this is the residual offset; on the GCP-only
+    variants it is the unmodelled offset the antenna variants use. A stable
+    value across folds means a rigid mount; a large fold-to-fold swing means
+    the datum, not the mount, is setting it.
+    """
+    records = [fold for fold in measured if fold.get("antenna_offset")]
+    if not records:
+        return None
+    per_fold = {}
+    for fold in records:
+        record = fold["antenna_offset"]
+        per_fold[fold["check"]] = {
+            "mean_m": record["mean_m"],
+            "spread_m": record["spread_m"],
+            "cameras": record["cameras"],
+        }
+    axes = [sum(record["antenna_offset"]["mean_m"][axis]
+                for record in records) / len(records) for axis in range(3)]
+    applied = [fold["antenna_applied_m"] for fold in measured
+               if "antenna_applied_m" in fold]
+    summary = {"folds": len(records), "mean_m": axes, "per_fold": per_fold}
+    if applied:
+        summary["applied_m"] = list(applied[0])
+    return summary
+
+
 def run_variant(args, gcps, align_report, camera_refs, options=None,
-                catch_all=False):
-    """Run the leave-one-out folds of one variant and summarise them."""
+                catch_all=False, estimates=None):
+    """Run the leave-one-out folds of one variant and summarise them.
+
+    ``estimates`` maps a check label to the camera-frame lever arm measured on
+    the SAME fold's GCP-only adjustment (``antenna_offset.mean_m``). An
+    ``estimated_antenna`` option applies that fold's value; the held-out point
+    never enters it because the GCP-only fit constrains only the other GCPs.
+    """
     options = options or {}
+    if options.get("estimated_antenna") and not estimates:
+        raise ValueError(
+            "estimated_antenna needs the GCP-only per-fold estimates")
     folds = []
     for check_index in range(len(gcps)):
+        fold_options = options
+        if options.get("estimated_antenna"):
+            label = gcps[check_index]["label"]
+            estimate = estimates.get(label)
+            if estimate is None:
+                raise ValueError(
+                    "no GCP-only antenna estimate for check " + label)
+            fold_options = dict(options)
+            fold_options.pop("estimated_antenna", None)
+            fold_options["antenna_offset_m"] = tuple(estimate)
         try:
             folds.append(run_fold(args, gcps, check_index, camera_refs,
-                                  align_report, options))
+                                  align_report, fold_options))
         except Exception as error:  # noqa: BLE001 - diagnostics record, never fatal
             if not catch_all and not isinstance(error, ValueError):
                 raise
@@ -1605,6 +1803,9 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
             "moved": sum(item.get("moved", 0) for item in refined),
             "removed": sum(item.get("removed", 0) for item in refined),
             "fold_errors": sum(1 for item in refined if "error" in item)}
+    antenna = summarise_antenna(measured)
+    if antenna:
+        variant["antenna_estimates"] = antenna
     return variant
 
 
@@ -1626,6 +1827,25 @@ DIAGNOSTIC_VARIANTS = (
     ("camera_rtk_adaptive", True, {"adaptive_fitting": True}),
     ("camera_rtk_adaptive_px_minus", True,
      {"adaptive_fitting": True, "projection_shift_px": -0.5}),
+    # Antenna lever-arm probes. The GCP-only adjustment puts the camera centres
+    # about 0.23 m below the recorded RTK antenna positions, which is an
+    # unmodelled mount. The fixed pair applies that measured seed; the
+    # estimated pair applies the mean camera-frame offset of the SAME fold's
+    # GCP-only adjustment, which uses only the control GCPs (the held-out
+    # point never enters it). Each is tried with the default and the adaptive
+    # lens model, because the seed value itself comes from the adaptive fit.
+    ("antenna_fixed", True,
+     {"antenna_offset_m": ANTENNA_FIXED_OFFSET_M}),
+    ("antenna_fixed_adaptive", True,
+     {"antenna_offset_m": ANTENNA_FIXED_OFFSET_M, "adaptive_fitting": True}),
+    ("antenna_estimated", True, {"estimated_antenna": True}),
+    ("antenna_estimated_adaptive", True,
+     {"estimated_antenna": True, "adaptive_fitting": True}),
+    # The best measured combination before the lever arm, with the estimated
+    # mount and the adaptive model.
+    ("antenna_estimated_adaptive_px_minus", True,
+     {"estimated_antenna": True, "adaptive_fitting": True,
+      "projection_shift_px": -0.5}),
 )
 
 
@@ -1645,15 +1865,25 @@ def run_real_odm(args):
         raise ValueError("need at least three images in " + args.real)
 
     align_report = align_block(args, images, gcps)
+    antenna = parse_antenna_offset(args.antenna_offset)
     variants = {}
-    for variant, camera_refs in (("camera_rtk_gcps", True),
-                                 ("gcps_only", False)):
-        variants[variant] = run_variant(args, gcps, align_report, camera_refs)
+    # GCPs only first: its per-fold adjustment is the leak-free source of the
+    # estimated antenna lever arm the later variants reuse. The camera-RTK
+    # variant takes an explicitly configured fixed arm when one is supplied.
+    variants["gcps_only"] = run_variant(args, gcps, align_report, False)
+    estimates = {
+        fold["check"]: fold["antenna_offset"]["mean_m"]
+        for fold in variants["gcps_only"]["folds"]
+        if "error" not in fold and fold.get("antenna_offset")}
+    camera_options = ({"antenna_offset_m": antenna} if antenna is not None
+                      else None)
+    variants["camera_rtk_gcps"] = run_variant(
+        args, gcps, align_report, True, camera_options)
     if args.diagnostics:
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
             variants[variant] = run_variant(
                 args, gcps, align_report, camera_refs, options,
-                catch_all=True)
+                catch_all=True, estimates=estimates)
     for variant, data in variants.items():
         consistency = data.get("camera_consistency")
         if not consistency:
@@ -1666,6 +1896,14 @@ def run_real_odm(args):
                   consistency["mean_north_m"], consistency["mean_up_m"],
                   consistency["rms_east_m"], consistency["rms_north_m"],
                   consistency["rms_up_m"], consistency["cameras"]))
+    # Print the per-fold lever-arm estimate measured on the GCP-only fit: this
+    # is the number the estimated variants apply, so a reader can see whether
+    # the mount is stable across folds.
+    for label, offset in estimates.items():
+        print("[gcp validation] antenna estimate ({}, GCP-only adjusted "
+              "cameras vs RTK, camera frame x/y/z): "
+              "{:.3f} / {:.3f} / {:.3f} m".format(
+                  label, offset[0], offset[1], offset[2]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -1682,6 +1920,8 @@ def run_real_odm(args):
         "diagnostics": bool(args.diagnostics),
         "camera_accuracy_m": args.camera_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
+        "antenna_offset_m": list(antenna) if antenna is not None else None,
+        "antenna_estimates_m": estimates,
         "target_horizontal_m": target,
         "passed": passed,
     }
@@ -1724,14 +1964,20 @@ def parse_args(argv):
                              "available here")
     parser.add_argument("--diagnostics", action="store_true",
                         help="after the two standard variants, run the extra "
-                             "gcps_only probes (adaptive/extended calibration, "
-                             "marker refinement, pixel shift, marker sigma, "
-                             "loosened camera weights); report-only")
+                             "probes (adaptive/extended calibration, marker "
+                             "refinement, pixel shift, marker sigma, loosened "
+                             "camera weights, fixed and per-fold-estimated "
+                             "antenna lever arms); report-only")
     parser.add_argument("--camera-accuracy", type=float, default=0.05,
                         help="camera reference accuracy in metres for the "
                              "camera_rtk_gcps variant (the RTK block's stated value)")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
+    parser.add_argument("--antenna-offset", default="",
+                        help="fixed GNSS antenna lever arm in metres in the "
+                             "camera frame, 'x,y,z' (e.g. '0,0,-0.23' for an "
+                             "antenna 0.23 m above a nadir lens); applied to "
+                             "the camera_rtk_gcps variant and the fit's datum")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
     parser.add_argument("--horizontal-target", type=float, default=0.05,
