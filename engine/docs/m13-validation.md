@@ -360,14 +360,21 @@ records the same antenna positions per image. Neither states where the phase
 centre sits relative to the camera's projection centre, so the dataset carries
 no hardware lever-arm value. The recorded positions are not corrected to the
 camera centre: the GCP-only adaptive adjustment leaves the camera centres about
-0.2 m below them, in both the vertical and the body fore/aft direction, which
-is the mount itself.
+0.2 m below them and about 0.2 m horizontally (mostly along the camera y axis),
+which is the mount itself.
 
 *Protocol.* `--antenna-offset x,y,z` sets a fixed camera-frame lever arm (the
 antenna phase centre relative to the projection centre; x right, y down, z
-forward, so an antenna above a nadir lens is negative z). It is applied before
-`UpdateTransform`, which also consumes the lever arm, as well as before
-`OptimizeCameras`. Diagnostic variants apply either the measured seed
+forward, so an antenna above a nadir lens is negative z). It is set before
+`UpdateTransform` and `OptimizeCameras`. `Chunk.set_sensor_antenna_offset`
+takes the three scalars; the older `set_sensor_antenna` takes an Eigen vector,
+whose pybind11 caster needs `pybind11/eigen.h` and a numpy array, and on the
+benchmark's pybind11 2.11.1 with numpy 2.x that conversion faults (the first
+scalar binding added here therefore avoids the caster). `OptimizeCameras`
+consumes the mount through its centre prior; the task's `UpdateTransform`
+(`update_transform`) does not, and the antenna-aware datum path is the one
+`AlignCameras` uses (`georeference_chunk`). Diagnostic variants apply either
+the measured seed
 `(0, 0, -0.23) m` — the GCP-only adjustment puts the camera centres 0.23 m below
 the antenna positions — or the **per-fold estimate**: the mean camera-frame
 offset `R_pose R^T (A - C)` over the aligned cameras of that fold's GCP-only

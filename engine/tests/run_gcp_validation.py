@@ -1660,17 +1660,15 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     # converts from a numpy array (not from a Python list).
     antenna = options.get("antenna_offset_m")
     if antenna is not None:
-        import numpy  # local: only the real-block antenna path needs it
-        vector = numpy.asarray(antenna, dtype=float)
-        print("[gcp validation][debug] set antenna " + repr(antenna), flush=True)
         for sensor_index in range(len(chunk.sensors)):
-            chunk.set_sensor_antenna(sensor_index, vector)
-        print("[gcp validation][debug] antenna set", flush=True)
+            chunk.set_sensor_antenna_offset(
+                sensor_index, antenna[0], antenna[1], antenna[2])
 
     focal_before = sensor_focals(chunk)
-    print("[gcp validation][debug] updateTransform start", flush=True)
+    # UpdateTransform itself does not consume the mount (georeference_chunk,
+    # used by AlignCameras, does); it runs here so the datum is refit after the
+    # control references are imported, exactly as for every other variant.
     chunk.updateTransform()
-    print("[gcp validation][debug] updateTransform done", flush=True)
     chunk.optimizeCameras(**optimize_options(options))
     focal_after = sensor_focals(chunk)
 
@@ -1776,11 +1774,7 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
         raise ValueError(
             "estimated_antenna needs the GCP-only per-fold estimates")
     folds = []
-    # Debug helper: one fold is enough to reproduce a crash and costs a
-    # fraction of the full leave-one-out run.
-    fold_count = (1 if os.environ.get("ALPHASHAPE_GCP_DEBUG_FAST") == "1"
-                  else len(gcps))
-    for check_index in range(fold_count):
+    for check_index in range(len(gcps)):
         fold_options = options
         if options.get("estimated_antenna"):
             label = gcps[check_index]["label"]
@@ -1920,11 +1914,7 @@ def run_real_odm(args):
     # adaptive fit removes that trade and leaves the ~0.2 m mount.
     applied_estimates = default_estimates
     if args.diagnostics:
-        diagnostics = DIAGNOSTIC_VARIANTS
-        if os.environ.get("ALPHASHAPE_GCP_DEBUG_FAST") == "1":
-            diagnostics = tuple(
-                item for item in diagnostics if "antenna" in item[0])
-        for variant, camera_refs, options in diagnostics:
+        for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
             if options.get("estimated_antenna") and variant.startswith(
                     "antenna_estimated"):
                 if variants.get("adaptive_fitting") is not None:

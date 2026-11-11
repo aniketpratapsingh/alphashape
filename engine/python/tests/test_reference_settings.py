@@ -14,11 +14,6 @@ import unittest
 
 import alphashape
 
-try:
-    import numpy
-except ImportError:  # the module itself does not depend on numpy
-    numpy = None
-
 DATA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "data",
@@ -67,26 +62,26 @@ class ReferenceSettingsTest(unittest.TestCase):
 
 
 class SensorAntennaTest(unittest.TestCase):
-    """The antenna lever-arm setter accepts an array (pybind11's Eigen caster).
+    """The scalar antenna setter needs no numpy or Eigen caster.
 
-    Before the caster was included, ``set_sensor_antenna`` compiled as a
-    generic class caster and rejected every Python value: lists and numpy
-    arrays alike. The GCP protocol depends on this call, so pin it.
+    The GCP validation protocol sets a lever arm before every camera-RTK
+    adjustment. The older ``set_sensor_antenna`` takes an Eigen vector, whose
+    caster needs pybind11/eigen.h and a numpy array; on the benchmark's
+    pybind11 2.11.1 with numpy 2.x that path faults. The scalar spelling is
+    the one the protocol uses, so pin it.
     """
 
-    @unittest.skipUnless(numpy is not None, "numpy is required by the Eigen argument")
-    def test_antenna_offset_accepts_a_numpy_vector(self):
+    def test_antenna_offset_round_trips_three_scalars(self):
         doc = alphashape.Document()
         chunk = doc.add_chunk("Chunk 1")
         doc.active_chunk = chunk
         doc.run_task("AddPhotos", filenames=[CAM_A1])
         self.assertEqual(len(chunk.sensors), 1)
 
-        offset = numpy.array([0.0, -0.2, -0.23])
-        chunk.set_sensor_antenna(0, offset)
+        chunk.set_sensor_antenna_offset(0, 0.0, -0.2, -0.23)
         stored = chunk.sensors[0].antenna_offset
-        for got, want in zip(stored, offset):
-            self.assertAlmostEqual(got, float(want), places=12)
+        for got, want in zip(stored, (0.0, -0.2, -0.23)):
+            self.assertAlmostEqual(got, want, places=12)
 
 
 if __name__ == "__main__":

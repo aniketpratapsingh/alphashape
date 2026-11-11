@@ -1291,7 +1291,6 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
         raise SystemExit("ALPHASHAPE_PYTHON_DIR is not set; the GCP validation needs the built alphashape module")
     env = dict(os.environ)
     env["PYTHONPATH"] = python_dir + os.pathsep + env.get("PYTHONPATH", "")
-    env["ALPHASHAPE_GCP_DEBUG_FAST"] = "1"  # DEBUG: one fold, antenna variants
     python = os.environ.get("ALPHASHAPE_PYTHON") or "python3"
 
     out_json = work / "gcp_report.json"

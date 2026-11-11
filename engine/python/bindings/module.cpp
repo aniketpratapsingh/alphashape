@@ -37,7 +37,6 @@
 #include <vector>
 
 #include <Eigen/Core>
-#include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -3086,7 +3085,29 @@ PYBIND11_MODULE(alphashape, m) {
             },
             py::arg("sensor_index"), py::arg("offset"), py::arg("boresight") = py::none(),
             "Set a sensor's antenna offset in metres (camera frame) and optional "
-            "body-frame boresight angles in degrees.")
+            "body-frame boresight angles in degrees. `offset` is an Eigen vector, "
+            "so pybind11 needs its Eigen caster and a numpy array; the plain-three-"
+            "double spelling is set_sensor_antenna_offset().")
+        // The same mount through three scalars. This exists because the Eigen
+        // argument above needs pybind11/eigen.h, whose numpy caster is built
+        // against the numpy C API: a pybind11 older than 2.12 (Ubuntu 24.04's
+        // 2.11.1) with numpy 2.x faults inside the conversion. Three doubles
+        // have no numpy dependency at all, so the validation protocol and any
+        // other script can set a mount without a numpy ABI coupling.
+        .def(
+            "set_sensor_antenna_offset",
+            [](py::object self, std::int32_t sensor_index, double x, double y,
+               double z) {
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                alphashape::Antenna antenna;
+                antenna.offset_m = Eigen::Vector3d(x, y, z);
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_antenna_command(
+                              chunk.id(), sensor_index, antenna));
+            },
+            py::arg("sensor_index"), py::arg("x"), py::arg("y"), py::arg("z"),
+            "Set a sensor's antenna offset in metres (camera frame x, y, z). "
+            "An antenna above a nadir lens is a negative z.")
         // -- dense products (milestone 6) --------------------------------------
         // BuildDepthMaps fills `depth_maps`; BuildPointCloud fuses them into
         // `point_cloud`. Both are read-only views onto the chunk's containers.
