@@ -534,8 +534,9 @@ drops to `0.003 / 0.002 / 0.004 m` with the fixed arm and
 comparison would have shown the full arm, because only the adjustment applied
 it.
 
-**The check does not improve, and this is the honest result.** The per-fold
-RMS moves by at most about a tenth of a centimetre. The mount is real — the
+**The check does not improve, and this is the honest result.** Every variant's
+check RMS moves by at most about a tenth of a centimetre relative to the run
+with the old datum. The mount is real — the
 datum and the prior now both apply it — but it is not what limits the check.
 The GCP-only adjustment's per-camera antenna estimate has a 0.15–0.24 m spread
 over 146 cameras (table above), so a block-mean arm applied as a 5 cm prior to
