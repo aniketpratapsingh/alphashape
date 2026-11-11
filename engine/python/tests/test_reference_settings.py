@@ -9,9 +9,21 @@ second.
 Run with plain unittest, no pytest.
 """
 
+import os
 import unittest
 
 import alphashape
+
+try:
+    import numpy
+except ImportError:  # the module itself does not depend on numpy
+    numpy = None
+
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data",
+)
+CAM_A1 = os.path.join(DATA_DIR, "cam_a1.jpg")
 
 
 class ReferenceSettingsTest(unittest.TestCase):
@@ -52,6 +64,29 @@ class ReferenceSettingsTest(unittest.TestCase):
                 setattr(self.chunk, name, 0.0)
             with self.assertRaises(Exception):
                 setattr(self.chunk, name, -1.0)
+
+
+class SensorAntennaTest(unittest.TestCase):
+    """The antenna lever-arm setter accepts an array (pybind11's Eigen caster).
+
+    Before the caster was included, ``set_sensor_antenna`` compiled as a
+    generic class caster and rejected every Python value: lists and numpy
+    arrays alike. The GCP protocol depends on this call, so pin it.
+    """
+
+    @unittest.skipUnless(numpy is not None, "numpy is required by the Eigen argument")
+    def test_antenna_offset_accepts_a_numpy_vector(self):
+        doc = alphashape.Document()
+        chunk = doc.add_chunk("Chunk 1")
+        doc.active_chunk = chunk
+        doc.run_task("AddPhotos", filenames=[CAM_A1])
+        self.assertEqual(len(chunk.sensors), 1)
+
+        offset = numpy.array([0.0, -0.2, -0.23])
+        chunk.set_sensor_antenna(0, offset)
+        stored = chunk.sensors[0].antenna_offset
+        for got, want in zip(stored, offset):
+            self.assertAlmostEqual(got, float(want), places=12)
 
 
 if __name__ == "__main__":
