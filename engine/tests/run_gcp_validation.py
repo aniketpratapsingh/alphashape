@@ -1028,6 +1028,14 @@ GCP_NAME_MATCH_TOLERANCE_DEG = 1e-5
 # and an orthometric height would need a geoid model this script does not carry.
 GCP_HEIGHT_CHOICES = ("ellipsoidal", "orthometric")
 
+# How the gcp_list pixel columns are read. "file" trusts the values as written:
+# this dataset's producer writes corner-origin coordinates, the engine's own
+# convention, so the shift is zero. "format" applies the ODM/OpenSfM file
+# format's documented integer-origin -> corner-origin conversion (+0.5 px; see
+# parse_odm_gcp_list). The default is driven by the evidence, not tuned.
+GCP_PIXEL_ORIGINS = ("file", "format")
+GCP_PIXEL_ORIGIN_SHIFT_PX = {"file": 0.0, "format": 0.5}
+
 # A GNSS reference records the antenna phase centre, not the camera's
 # projection centre. The dataset carries no lever-arm field: the EXIF/XMP
 # records the antenna position (RtkFlag 50, RtkStdLon/Lat/Hgt) and the gimbal
@@ -1043,7 +1051,7 @@ ANTENNA_FIXED_OFFSET_M = (0.0, 0.0, -0.23)
 # check point never reaches the estimate.
 
 
-def parse_odm_gcp_list(path):
+def parse_odm_gcp_list(path, pixel_shift_px=0.0):
     """Parse an ODM gcp_list.txt into one dict per survey point.
 
     The header is a CRS string (``EPSG:4326``: x=longitude, y=latitude). Each
@@ -1082,7 +1090,11 @@ def parse_odm_gcp_list(path):
         if len(tokens) < 6:
             continue
         x, y, z = float(tokens[0]), float(tokens[1]), float(tokens[2])
-        px, py = float(tokens[3]), float(tokens[4])
+        # ``pixel_shift_px`` is the convention conversion selected by
+        # --gcp-pixel-origin: 0 for a file already in the engine's corner-origin
+        # frame, +0.5 for a file in the ODM/OpenSfM integer-origin frame.
+        px = float(tokens[3]) + pixel_shift_px
+        py = float(tokens[4]) + pixel_shift_px
         image = tokens[5]
         label = tokens[6] if len(tokens) > 6 else None
         key = (round(x, ODM_GCP_GROUP_DECIMALS),
@@ -1856,7 +1868,8 @@ def run_real_odm(args):
             "--gcp-height {} is not supported: converting an orthometric "
             "height needs a geoid model this script does not carry".format(
                 args.gcp_height))
-    header, gcps = parse_odm_gcp_list(args.gcp_list)
+    pixel_shift = GCP_PIXEL_ORIGIN_SHIFT_PX[args.gcp_pixel_origin]
+    header, gcps = parse_odm_gcp_list(args.gcp_list, pixel_shift)
     _, names = parse_gcp_names_csv(args.gcp_names)
     gcps = match_gcp_names(gcps, names)
     z_record = z_consistency(gcps, args.gcp_height)
@@ -1914,6 +1927,8 @@ def run_real_odm(args):
         "gcps": len(gcps),
         "observations": sum(len(gcp["observations"]) for gcp in gcps),
         "crs_header": header,
+        "gcp_pixel_origin": args.gcp_pixel_origin,
+        "gcp_pixel_shift_px": pixel_shift,
         "z_consistency": z_record,
         "align": align_report,
         "variants": variants,
@@ -1962,6 +1977,14 @@ def parse_args(argv):
                              "(default ellipsoidal, as the publisher states); "
                              "orthometric is refused because no geoid model is "
                              "available here")
+    parser.add_argument("--gcp-pixel-origin", choices=GCP_PIXEL_ORIGINS,
+                        default="file",
+                        help="pixel convention of the gcp_list columns: "
+                             "'file' keeps the values as written (this "
+                             "dataset's producer writes the engine's "
+                             "corner-origin convention); 'format' applies the "
+                             "ODM/OpenSfM integer-origin -> corner-origin "
+                             "conversion (+0.5 px)")
     parser.add_argument("--diagnostics", action="store_true",
                         help="after the two standard variants, run the extra "
                              "probes (adaptive/extended calibration, marker "

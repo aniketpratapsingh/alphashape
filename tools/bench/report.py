@@ -465,6 +465,10 @@ def gcp_markdown(current: dict) -> str:
     lines.append(f"| GCPs | {current.get('gcps')} |")
     lines.append(f"| Observations | {current.get('observations')} |")
     lines.append(f"| CRS header | {current.get('crs_header')} |")
+    pixel_origin = current.get("gcp_pixel_origin")
+    if pixel_origin:
+        lines.append(f"| gcp_list pixel origin | {pixel_origin} "
+                     f"({_fmt(current.get('gcp_pixel_shift_px'))} px shift) |")
     lines.append(f"| gcp z height | {z_record.get('gcp_height', '-')} |")
     lines.append(f"| z consistency (gcp_list - CSV) | "
                  f"{_fmt(z_record.get('mean_offset_m'))} m mean, "
