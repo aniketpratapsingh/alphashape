@@ -373,9 +373,10 @@ takes the three scalars; the older `set_sensor_antenna` takes an Eigen vector,
 whose pybind11 caster needs `pybind11/eigen.h` and a numpy array, and on the
 benchmark's pybind11 2.11.1 with numpy 2.x that conversion faults (the first
 scalar binding added here therefore avoids the caster). `OptimizeCameras`
-consumes the mount through its centre prior; the task's `UpdateTransform`
-(`update_transform`) does not, and the antenna-aware datum path is the one
-`AlignCameras` uses (`georeference_chunk`). Diagnostic variants apply either
+consumes the mount through its centre prior; `UpdateTransform`
+(`update_transform`) did not before PR #115 and now applies the same
+correction as the `AlignCameras` datum path (`georeference_chunk`).
+Diagnostic variants apply either
 the measured seed
 `(0, 0, -0.23) m` — the GCP-only adjustment puts the camera centres 0.23 m below
 the antenna positions — or the **per-fold estimate**: the mean camera-frame
@@ -427,17 +428,17 @@ GCP-only adjustment.
 
 Findings:
 
-- **The antenna does not improve the check.** The BA centre prior does consume
-  it — after each antenna fold the residual offset the protocol measures is
-  the applied arm itself (fixed seed: 0.006 / -0.001 / -0.225 m; estimated:
-  about -0.02 / -0.18 / -0.20 m), so the mount is pinned. The vertical still
-  does not improve, and with the default lens the estimated mount is worse
-  (20.2 cm vertical). The reason is the datum: the task's `UpdateTransform`
-  (`update_transform`) fits one similarity and does not subtract the lever
-  arm; only the `AlignCameras` path (`georeference_chunk`) is antenna-aware.
-  The datum therefore still treats the RTK positions as camera centres, and
-  the BA prior pulls the block against it. Making `update_transform`
-  antenna-aware is the follow-up that would let the mount act on the datum.
+- **The antenna does not improve the check in this run.** The BA centre prior
+  does consume it — after each antenna fold the residual offset the protocol
+  measures is the applied arm itself (fixed seed: 0.006 / -0.001 / -0.225 m;
+  estimated: about -0.02 / -0.18 / -0.20 m), so the mount is pinned. The
+  vertical still does not improve, and with the default lens the estimated
+  mount is worse (20.2 cm vertical). In this run the datum was still the
+  cause: the task's `UpdateTransform` (`update_transform`) fitted one
+  similarity without subtracting the lever arm; only the `AlignCameras` path
+  (`georeference_chunk`) was antenna-aware, so the BA prior pulled the block
+  against the datum. `update_transform` was made antenna-aware in PR #115;
+  the re-measurement is the next subsection.
 - **The 5 cm horizontal target is not met.** With the defaults it is 7.9 cm
   (`gcps_only`) and 7.5 cm (`camera_rtk_gcps`). The closest configurations are
   `camera_rtk_adaptive_px_minus` at 5.08 cm (vertical 9.85) and
@@ -466,3 +467,93 @@ indicative, not conclusive. For an RTK/GCP block with a single camera, enable
 reaches 5.05 cm horizontal (camera RTK + adaptive fit + -0.5 px), against the
 5 cm target. The target is not met with the defaults (7.9 / 7.5 cm) or with the
 antenna lever arm.
+
+#### Datum fix: UpdateTransform consumes the mount (2026-11-12, PR #115)
+
+**The bug.** `update_transform` paired each camera centre directly with its
+GNSS reference and never read `sensor.antenna`
+(`engine/src/common/algorithm/sfm/georeference.cpp`, the camera sample in the
+`update_transform` loop). Every other consumer did read it:
+`georeference_chunk` (the AlignCameras datum path, same file),
+`OptimizeCameras`' centre prior (`optimize_cameras_task.cpp:668`, evaluated as
+`A = C + R^T lever` by `predicted_antenna_position`,
+`bundle_adjustment.cpp:60`), `AlignFromReference`
+(`align_from_reference_task.cpp:236`), and the reference table's camera
+error/RMSE (`reference_table.cpp:44`). With a mount set, the datum therefore
+placed projection centres on the antenna phase centres while the adjustment
+placed them a lever arm away. Auditing those paths also found a second, smaller
+inconsistency: `georeference_chunk` resolved the antenna through
+`camera.sensor_id` directly, while the BA prior, AlignFromReference and the
+reference table use the sensor's **effective master** (the mount is part of the
+physical body). Both datum paths now share one helper,
+`antenna_mount` (`georeference.cpp:66`), which resolves the master.
+
+`update_transform` now shifts each camera fit target to
+`reference - enu_from_source * R_c^T * lever`, re-estimating the fit's rotation
+until it settles, exactly as `georeference_chunk` does
+(`georeference.cpp:704-733`). Without a mount the code takes the unchanged
+centre-to-reference path. Unit test `test_georeference_antenna.cpp` builds a
+block whose references are exact antenna positions and checks the datum
+recovers the true centres with the mount, misses by the lever-arm length
+without it, and resolves a master-sensor mount.
+
+**Sign and frame.** No mismatch was found. The antenna model defines
+`offset_m` as the antenna relative to the projection centre in the camera
+frame (x right, y down, z forward; `antenna.hpp:57`), so
+`A = C + R^T * camera_offset()`. The BA prior divides the metre offset by the
+chunk's metres-per-local-unit scale (`local_scale`, `optimize_cameras_task.cpp:356`)
+and evaluates the same `A = C + R^T lever`; the datum's `A - R^T lever` target
+is its inverse; and the protocol's per-fold estimate
+`R_pose R^T (A - C)` (`run_gcp_validation.py:1452`) is the same camera-frame
+quantity. The vertical sign is correct: an antenna above a nadir lens is
+negative camera z, and applying it lowers the centres. The fixed seed
+`(0, 0, -0.23) m` is only the vertical component; the measured mount also has
+a large camera-y component.
+
+Measured by the `gcp-rtk` quality-bench run `43073749931` (PR branch, same
+protocol and diagnostics; alignment 146/176 cameras at 0.740 px). Leave-one-out
+check RMS, horizontal / vertical / 3D, in cm:
+
+| variant | lens model | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` (default) | default | 7.91 | 10.10 | 12.83 |
+| `gcps_only`, `adaptive_fitting` | adaptive | 6.54 | 6.36 | 9.12 |
+| `camera_rtk_gcps` (default) | default | 7.54 | 16.81 | 18.43 |
+| `camera_rtk_gcps`, `adaptive_fitting` | adaptive | 5.40 | 10.26 | 11.60 |
+| `antenna_fixed` | default | 7.64 | 16.91 | 18.56 |
+| `antenna_fixed`, `adaptive_fitting` | adaptive | 5.47 | 10.37 | 11.72 |
+| `antenna_estimated` | default | 7.99 | 20.15 | 21.68 |
+| `antenna_estimated`, `adaptive_fitting` | adaptive | 5.34 | 12.89 | 13.95 |
+| `antenna_estimated`, adaptive, -0.5 px (report-only) | adaptive | 5.05 | 11.89 | 12.92 |
+
+The fix makes the two datum consumers agree. The protocol's camera-reference
+residual against the **modelled antenna** (mean E/N/U over the 146 cameras)
+drops to `0.003 / 0.002 / 0.004 m` with the fixed arm and
+`0.003 / 0.004 / 0.005 m` with the estimated arm (RMS
+`0.042 / 0.047 / 0.037` and `0.047 / 0.055 / 0.041 m`). Before the fix the same
+comparison would have shown the full arm, because only the adjustment applied
+it.
+
+**The check does not improve, and this is the honest result.** The per-fold
+RMS moves by at most about a tenth of a centimetre. The mount is real — the
+datum and the prior now both apply it — but it is not what limits the check.
+The GCP-only adjustment's per-camera antenna estimate has a 0.15–0.24 m spread
+over 146 cameras (table above), so a block-mean arm applied as a 5 cm prior to
+every camera over-constrains the network; the mean 0.29 m arm predicts a 0.2 m
+shift that the data do not support per camera. Adding the estimate is
+therefore slightly worse than not applying it (vertical 20.15 vs 16.81 cm with
+the default lens; 12.89 vs 10.26 cm adaptive).
+
+**Is ≤5 cm horizontal met? No.** With the defaults it is 7.91 cm (`gcps_only`)
+and 7.54 cm (`camera_rtk_gcps`). The best non-diagnostic configuration is
+`antenna_estimated` with `adaptive_fitting` at **5.34 cm** (vertical 12.89), and
+the report-only −0.5 px probe reaches 5.05 cm. The target is not met and is not
+loosened.
+
+**Vertical.** The fix leaves it essentially unchanged: with the default lens
+`camera_rtk_gcps` is 16.81 cm (was 16.81) and `gcps_only` 10.10 cm; with the
+adaptive model they are 10.26 and 6.36 cm. Applying the fixed arm gives 16.91 cm
+(adaptive 10.37), the estimated arm 20.15 cm (adaptive 12.89). The vertical
+error is the camera-RTK versus GCP datum disagreement, not the mean lever arm:
+the GCP-only adjustment already reaches 6.36 cm vertical without any camera
+positions.
