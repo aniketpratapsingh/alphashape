@@ -302,18 +302,157 @@ Findings:
   distortion terms the default fit holds, not against flying height alone. The
   RTK camera positions agree with the adjusted centres to ~4.5 cm RMS once they
   are weighted, so they are good data.
-- **Pixel convention.** -0.5 px helps in every combination and +0.5 px hurts: the
-  gcp_list projections use the pixel-corner origin; the engine uses pixel centres.
-  This belongs in the protocol's import, not the engine.
+- **Pixel convention.** -0.5 px helps in every combination and +0.5 px hurts; the
+  evidence below shows the dataset file and the engine already share the same
+  corner-origin convention, so this is not a convention mismatch. Both probes stay
+  report-only (`--gcp-pixel-origin` selects the conversion for a file written to
+  the documented OpenSfM format).
 - **Vertical with camera RTK.** The per-fold vertical errors are systematic (-7,
   -9, -1, +11, +15 cm) and the GCP-only adjustment puts the camera centres ~0.23 m
   below the recorded positions — consistent with an unmodelled GNSS antenna offset
-  above the lens. Not yet tested: setting or estimating the antenna offset.
+  above the lens. Tested below with fixed and per-fold-estimated lever arms; the
+  BA prior pins the mount, but the datum fit does not consume it, and the check
+  does not improve.
 - **`refineMarkers` removes about half of the hand-placed projections** on these
   targets and makes the result much worse — an engine issue, tracked separately.
 - Ruled out: trigger/GNSS timing (no along-track pattern once the cameras are
   weighted), marker-vs-tie weight (0.5 px is best), unaligned cameras (1 of 35
   observations).
+
+#### Pixel convention: evidence and decision (2026-11-11)
+
+*Engine.* Pixel coordinates are corner-origin. `try_project_point` in
+`engine/src/model/camera/calibration.hpp` returns
+`width * 0.5 + cx + xd (f + b1) + yd b2`, so a point on the optical axis lands at
+`(width/2, height/2)`; the same header says "top-left pixel centre at
+(0.5, 0.5)". `keypoint_to_pixel` (`detect_features_task.hpp`) adds 0.5 to the
+detector's corner indices, and `test_calibration_io.cpp` /
+`make_chessboard.hpp` state the same convention.
+
+*ODM/OpenSfM file format.* The published format is integer-origin:
+`opensfm/doc/source/geometry.rst` defines pixel coordinates with the origin at
+the centre of the top-left pixel and the bottom-right pixel at
+`(width-1, height-1)`, and `opensfm/features.py:normalized_image_coordinates`
+implements `(p + 0.5 - width/2) / max(width, height)`. A value written to that
+convention therefore maps to the engine's coordinate `p + 0.5`.
+
+*This dataset's file.* The GCPs were placed with GCP Editor Pro (the tool ODM
+links to; the dataset's [community
+thread](https://community.opendronemap.org/t/gcp-projected-coordinates/11762/7)
+says so). Its 2022 tagger, current when the dataset was made, computes the
+click as `(clientX - rect.left) / zoom / scale`
+(`src/app/smartimage/smartimage.component.ts:getPos`), i.e. the offset from the
+image's top-left edge over the continuous range `[0, width]`; the current SVG
+implementation clamps to `[0, naturalWidth]`. Those are corner-origin values,
+the engine's convention, so no shift is applied by default.
+
+The protocol therefore reads the file as written (`--gcp-pixel-origin file`,
+shift 0). `--gcp-pixel-origin format` applies the documented +0.5 conversion for
+a file produced to the OpenSfM convention. The measured ±0.5 px probes remain in
+the diagnostics so a producer or tool-convention change is visible.
+
+#### GNSS antenna lever arm: hardware and per-fold estimate (2026-11-11)
+
+*Hardware.* The block is an Autel EVO II Pro RTK (XT705 1-inch CMOS,
+5472x3648, calibrated focal 4404.1667 px, nadir gimbal; dataset README). The
+EXIF/XMP records the antenna position and RTK quality (`RtkFlag=50`,
+`RtkStdLon/Lat/Hgt` about 0.014 / 0.014 / 0.030 m), the gimbal angles and the
+absolute altitude; the RINEX marker file (`RTK_Data/101FTASK_Timestamp.mrk`)
+records the same antenna positions per image. Neither states where the phase
+centre sits relative to the camera's projection centre, so the dataset carries
+no hardware lever-arm value. The recorded positions are not corrected to the
+camera centre: the GCP-only adaptive adjustment leaves the camera centres about
+0.2 m below them and about 0.2 m horizontally (mostly along the camera y axis),
+which is the mount itself.
+
+*Protocol.* `--antenna-offset x,y,z` sets a fixed camera-frame lever arm (the
+antenna phase centre relative to the projection centre; x right, y down, z
+forward, so an antenna above a nadir lens is negative z). It is set before
+`UpdateTransform` and `OptimizeCameras`. `Chunk.set_sensor_antenna_offset`
+takes the three scalars; the older `set_sensor_antenna` takes an Eigen vector,
+whose pybind11 caster needs `pybind11/eigen.h` and a numpy array, and on the
+benchmark's pybind11 2.11.1 with numpy 2.x that conversion faults (the first
+scalar binding added here therefore avoids the caster). `OptimizeCameras`
+consumes the mount through its centre prior; the task's `UpdateTransform`
+(`update_transform`) does not, and the antenna-aware datum path is the one
+`AlignCameras` uses (`georeference_chunk`). Diagnostic variants apply either
+the measured seed
+`(0, 0, -0.23) m` — the GCP-only adjustment puts the camera centres 0.23 m below
+the antenna positions — or the **per-fold estimate**: the mean camera-frame
+offset `R_pose R^T (A - C)` over the aligned cameras of that fold's GCP-only
+adjustment, where `A` is the stored RTK position and `C` the adjusted centre.
+Only the fold's control GCPs constrain that adjustment, so the held-out check
+point never enters the estimate.
+
+| check | estimated lever arm x / y / z (m) | camera spread x / y / z (m) |
+| --- | --- | --- |
+| 1 | -0.003 / -0.224 / -0.283 | 0.226 / 0.237 / 0.171 |
+| 2 | 0.016 / -0.195 / -0.246 | 0.194 / 0.189 / 0.130 |
+| 3 | -0.040 / -0.188 / -0.170 | 0.154 / 0.162 / 0.095 |
+| 4 | -0.040 / -0.188 / -0.108 | 0.173 / 0.157 / 0.098 |
+| 5 | 0.002 / -0.238 / -0.212 | 0.176 / 0.168 / 0.119 |
+| mean | -0.013 / -0.207 / -0.204 | |
+
+The estimate is a block mean, not a per-camera measurement: the spread over
+the 146 aligned cameras is 0.15-0.24 m per axis, comparable to the value
+itself, so the block datum and the residual lens model still move individual
+cameras. The y and z components (about -0.21 m each, magnitude 0.29 m) are
+stable across folds; z varies from -0.11 to -0.28 m. The measured seed in the
+fixed variant is the vertical component alone, `(0, 0, -0.23) m`.
+
+#### Measured: pixel-origin and antenna variants (CI run `43027876529`, commit `78816cf`)
+
+Leave-one-out check RMS, horizontal / vertical / 3D, in cm. The alignment is
+the same 146/176 cameras at 0.740 px. `--gcp-pixel-origin file` (the default)
+reads the gcp_list values as written; `format` would apply the documented
++0.5 px conversion. The antenna variants apply the fixed seed
+`(0, 0, -0.23) m` or the per-fold control-only estimate from the adaptive
+GCP-only adjustment.
+
+| variant | lens model | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` (default) | default | 7.9 | 10.1 | 12.8 |
+| `camera_rtk_gcps` (default) | default | 7.5 | 16.8 | 18.4 |
+| `gcps_only`, -0.5 px | default | 7.3 | 8.9 | 11.5 |
+| `gcps_only`, +0.5 px (format conversion) | default | 8.6 | 11.7 | 14.5 |
+| `gcps_only`, adaptive | adaptive | 6.5 | 6.4 | 9.1 |
+| `gcps_only`, adaptive, -0.5 px | adaptive | 6.2 | 6.0 | 8.6 |
+| `antenna_fixed` | default | 7.6 | 16.9 | 18.6 |
+| `antenna_estimated` | default | 7.9 | 20.2 | 21.7 |
+| `camera_rtk_adaptive` | adaptive | 5.4 | 10.3 | 11.6 |
+| `camera_rtk_adaptive_px_minus` | adaptive | 5.1 | 9.9 | 11.1 |
+| `antenna_fixed_adaptive` | adaptive | 5.5 | 10.4 | 11.7 |
+| `antenna_estimated_adaptive` | adaptive | 5.3 | 12.9 | 14.0 |
+| `antenna_estimated_adaptive_px_minus` | adaptive | 5.1 | 11.9 | 12.9 |
+
+Findings:
+
+- **The antenna does not improve the check.** The BA centre prior does consume
+  it — after each antenna fold the residual offset the protocol measures is
+  the applied arm itself (fixed seed: 0.006 / -0.001 / -0.225 m; estimated:
+  about -0.02 / -0.18 / -0.20 m), so the mount is pinned. The vertical still
+  does not improve, and with the default lens the estimated mount is worse
+  (20.2 cm vertical). The reason is the datum: the task's `UpdateTransform`
+  (`update_transform`) fits one similarity and does not subtract the lever
+  arm; only the `AlignCameras` path (`georeference_chunk`) is antenna-aware.
+  The datum therefore still treats the RTK positions as camera centres, and
+  the BA prior pulls the block against it. Making `update_transform`
+  antenna-aware is the follow-up that would let the mount act on the datum.
+- **The 5 cm horizontal target is not met.** With the defaults it is 7.9 cm
+  (`gcps_only`) and 7.5 cm (`camera_rtk_gcps`). The closest configurations are
+  `camera_rtk_adaptive_px_minus` at 5.08 cm (vertical 9.85) and
+  `antenna_estimated_adaptive_px_minus` at 5.05 cm (vertical 11.86), i.e.
+  0.05-0.08 cm above the target. The target is not loosened.
+- **The vertical.** Default `camera_rtk_gcps` is 16.8 cm and `gcps_only` 10.1;
+  the best camera-RTK configuration is 9.85 cm (adaptive, -0.5 px) and the
+  best overall is 5.95 cm (`gcps_only`, adaptive, -0.5 px). No antenna variant
+  reduces it below the configuration without the antenna.
+- **The ±0.5 px probe is not a convention correction.** The gcp_list file and
+  the engine share the corner-origin convention, so no shift is applied. The
+  probes show the nudge still changes the check by about 0.7 cm horizontally
+  (-0.5 improves, +0.5 worsens); it is an image-space compensation for a
+  residual in this block, not a half-pixel convention difference, and it is
+  not made the default.
 
 **`adaptive_fitting` stays off by default.** Run on the other benchmark datasets
 (OptimizeCameras after alignment, adaptive off vs on; runs `42664406276` /
@@ -324,4 +463,6 @@ completeness 0.064/0.151/0.277 -> 0.047/0.112/0.218. One run each, and the
 alignment before OptimizeCameras is not bit-identical between runs, so this is
 indicative, not conclusive. For an RTK/GCP block with a single camera, enable
 `adaptive_fitting=True` in OptimizeCameras; the best measured configuration here
-reaches 5.1 cm horizontal, against the 5 cm target.
+reaches 5.05 cm horizontal (camera RTK + adaptive fit + -0.5 px), against the
+5 cm target. The target is not met with the defaults (7.9 / 7.5 cm) or with the
+antenna lever arm.

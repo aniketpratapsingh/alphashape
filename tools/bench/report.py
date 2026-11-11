@@ -422,6 +422,13 @@ def _crs_rows(provenance: Any) -> list[str]:
     return rows
 
 
+def _fmt_offset(values) -> str:
+    """A camera-frame lever arm as ``x / y / z`` with millimetre precision."""
+    if not values:
+        return "-"
+    return " / ".join(_fmt(value, 3) for value in values)
+
+
 def gcp_markdown(current: dict) -> str:
     """The report body for the ground-control dataset, which has no ortho/DEM.
 
@@ -458,6 +465,10 @@ def gcp_markdown(current: dict) -> str:
     lines.append(f"| GCPs | {current.get('gcps')} |")
     lines.append(f"| Observations | {current.get('observations')} |")
     lines.append(f"| CRS header | {current.get('crs_header')} |")
+    pixel_origin = current.get("gcp_pixel_origin")
+    if pixel_origin:
+        lines.append(f"| gcp_list pixel origin | {pixel_origin} "
+                     f"({_fmt(current.get('gcp_pixel_shift_px'))} px shift) |")
     lines.append(f"| gcp z height | {z_record.get('gcp_height', '-')} |")
     lines.append(f"| z consistency (gcp_list - CSV) | "
                  f"{_fmt(z_record.get('mean_offset_m'))} m mean, "
@@ -465,6 +476,16 @@ def gcp_markdown(current: dict) -> str:
     lines.append(f"| Observations in unaligned cameras | "
                  f"{(align.get('observations') or {}).get('in_unaligned_cameras', '-')} "
                  f"of {(align.get('observations') or {}).get('observations', '-')} |")
+    antenna = current.get("antenna_offset_m")
+    if antenna is not None:
+        lines.append(f"| Fixed antenna lever arm (camera x/y/z) | "
+                     f"{_fmt_offset(antenna)} m |")
+    estimates = current.get("antenna_estimates_m") or {}
+    if estimates:
+        lines.append("| Estimated antenna lever arm per fold "
+                     "(camera x/y/z) | " + "; ".join(
+                         f"{label} {_fmt_offset(value)} m"
+                         for label, value in estimates.items()) + " |")
     lines.append("")
     for variant, data in (current.get("variants") or {}).items():
         options = data.get("options") or {}
@@ -487,6 +508,21 @@ def gcp_markdown(current: dict) -> str:
                      f"**{_fmt(data.get('rms_vertical_m'))}** | "
                      f"**{_fmt(data.get('rms_total_m'))}** |")
         lines.append("")
+        applied = options.get("antenna_offset_m")
+        if applied is not None:
+            lines.append(
+                f"Applied antenna lever arm (camera x/y/z): "
+                f"{_fmt_offset(applied)} m.")
+            lines.append("")
+        estimates = data.get("antenna_estimates") or {}
+        if estimates:
+            per_fold = estimates.get("per_fold") or {}
+            if per_fold:
+                lines.append(
+                    "Estimated antenna lever arm per fold (camera x/y/z): " +
+                    "; ".join(f"{label} {_fmt_offset(record.get('mean_m'))} m"
+                              for label, record in per_fold.items()) + ".")
+                lines.append("")
         consistency = data.get("camera_consistency") or {}
         if consistency.get("cameras"):
             lines.append(
