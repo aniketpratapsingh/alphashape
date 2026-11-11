@@ -1650,11 +1650,14 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
 
     # The antenna mount must be in place before updateTransform: the
     # georeference fit applies the lever arm too, not only the bundle
-    # adjustment.
+    # adjustment. The binding takes an Eigen::Vector3d, which pybind11
+    # converts from a numpy array (not from a Python list).
     antenna = options.get("antenna_offset_m")
     if antenna is not None:
+        import numpy  # local: only the real-block antenna path needs it
+        vector = numpy.asarray(antenna, dtype=float)
         for sensor_index in range(len(chunk.sensors)):
-            chunk.set_sensor_antenna(sensor_index, list(antenna))
+            chunk.set_sensor_antenna(sensor_index, vector)
 
     focal_before = sensor_focals(chunk)
     chunk.updateTransform()
@@ -1877,6 +1880,13 @@ def run_real_odm(args):
     if len(images) < 3:
         raise ValueError("need at least three images in " + args.real)
 
+    def per_fold_estimates(variant_name):
+        """The camera-frame lever arm measured on one variant's folds."""
+        return {
+            fold["check"]: fold["antenna_offset"]["mean_m"]
+            for fold in variants[variant_name]["folds"]
+            if "error" not in fold and fold.get("antenna_offset")}
+
     align_report = align_block(args, images, gcps)
     antenna = parse_antenna_offset(args.antenna_offset)
     variants = {}
@@ -1884,19 +1894,28 @@ def run_real_odm(args):
     # estimated antenna lever arm the later variants reuse. The camera-RTK
     # variant takes an explicitly configured fixed arm when one is supplied.
     variants["gcps_only"] = run_variant(args, gcps, align_report, False)
-    estimates = {
-        fold["check"]: fold["antenna_offset"]["mean_m"]
-        for fold in variants["gcps_only"]["folds"]
-        if "error" not in fold and fold.get("antenna_offset")}
+    default_estimates = per_fold_estimates("gcps_only")
     camera_options = ({"antenna_offset_m": antenna} if antenna is not None
                       else None)
     variants["camera_rtk_gcps"] = run_variant(
         args, gcps, align_report, True, camera_options)
+    # The mount is estimated from the ADAPTIVE GCP-only adjustment, not the
+    # default one: with the thin default lens model the GCP-only fit trades
+    # focal length against distortion and puts the camera centres 3.3 m below
+    # the antenna positions, which is a model artefact, not a mount. The
+    # adaptive fit removes that trade and leaves the ~0.2 m mount.
+    applied_estimates = default_estimates
     if args.diagnostics:
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
+            if options.get("estimated_antenna") and variant.startswith(
+                    "antenna_estimated"):
+                if variants.get("adaptive_fitting") is not None:
+                    adaptive = per_fold_estimates("adaptive_fitting")
+                    if adaptive:
+                        applied_estimates = adaptive
             variants[variant] = run_variant(
                 args, gcps, align_report, camera_refs, options,
-                catch_all=True, estimates=estimates)
+                catch_all=True, estimates=applied_estimates)
     for variant, data in variants.items():
         consistency = data.get("camera_consistency")
         if not consistency:
@@ -1909,14 +1928,14 @@ def run_real_odm(args):
                   consistency["mean_north_m"], consistency["mean_up_m"],
                   consistency["rms_east_m"], consistency["rms_north_m"],
                   consistency["rms_up_m"], consistency["cameras"]))
-    # Print the per-fold lever-arm estimate measured on the GCP-only fit: this
-    # is the number the estimated variants apply, so a reader can see whether
-    # the mount is stable across folds.
-    for label, offset in estimates.items():
-        print("[gcp validation] antenna estimate ({}, GCP-only adjusted "
+    # Print the per-fold lever-arm estimate the estimated variants apply: a
+    # reader can see whether the mount is stable across folds.
+    estimate_source = "adaptive" if args.diagnostics else "default"
+    for label, offset in applied_estimates.items():
+        print("[gcp validation] antenna estimate ({}, GCP-only {} adjusted "
               "cameras vs RTK, camera frame x/y/z): "
               "{:.3f} / {:.3f} / {:.3f} m".format(
-                  label, offset[0], offset[1], offset[2]))
+                  label, estimate_source, offset[0], offset[1], offset[2]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -1936,7 +1955,8 @@ def run_real_odm(args):
         "camera_accuracy_m": args.camera_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
         "antenna_offset_m": list(antenna) if antenna is not None else None,
-        "antenna_estimates_m": estimates,
+        "antenna_estimates_m": applied_estimates,
+        "antenna_estimate_source": estimate_source,
         "target_horizontal_m": target,
         "passed": passed,
     }

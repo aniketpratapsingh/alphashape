@@ -302,18 +302,94 @@ Findings:
   distortion terms the default fit holds, not against flying height alone. The
   RTK camera positions agree with the adjusted centres to ~4.5 cm RMS once they
   are weighted, so they are good data.
-- **Pixel convention.** -0.5 px helps in every combination and +0.5 px hurts: the
-  gcp_list projections use the pixel-corner origin; the engine uses pixel centres.
-  This belongs in the protocol's import, not the engine.
+- **Pixel convention.** -0.5 px helps in every combination and +0.5 px hurts; the
+  evidence below shows the dataset file and the engine already share the same
+  corner-origin convention, so this is not a convention mismatch. Both probes stay
+  report-only (`--gcp-pixel-origin` selects the conversion for a file written to
+  the documented OpenSfM format).
 - **Vertical with camera RTK.** The per-fold vertical errors are systematic (-7,
   -9, -1, +11, +15 cm) and the GCP-only adjustment puts the camera centres ~0.23 m
   below the recorded positions — consistent with an unmodelled GNSS antenna offset
-  above the lens. Not yet tested: setting or estimating the antenna offset.
+  above the lens. Tested below with fixed and per-fold-estimated lever arms.
 - **`refineMarkers` removes about half of the hand-placed projections** on these
   targets and makes the result much worse — an engine issue, tracked separately.
 - Ruled out: trigger/GNSS timing (no along-track pattern once the cameras are
   weighted), marker-vs-tie weight (0.5 px is best), unaligned cameras (1 of 35
   observations).
+
+#### Pixel convention: evidence and decision (2026-11-11)
+
+*Engine.* Pixel coordinates are corner-origin. `try_project_point` in
+`engine/src/model/camera/calibration.hpp` returns
+`width * 0.5 + cx + xd (f + b1) + yd b2`, so a point on the optical axis lands at
+`(width/2, height/2)`; the same header says "top-left pixel centre at
+(0.5, 0.5)". `keypoint_to_pixel` (`detect_features_task.hpp`) adds 0.5 to the
+detector's corner indices, and `test_calibration_io.cpp` /
+`make_chessboard.hpp` state the same convention.
+
+*ODM/OpenSfM file format.* The published format is integer-origin:
+`opensfm/doc/source/geometry.rst` defines pixel coordinates with the origin at
+the centre of the top-left pixel and the bottom-right pixel at
+`(width-1, height-1)`, and `opensfm/features.py:normalized_image_coordinates`
+implements `(p + 0.5 - width/2) / max(width, height)`. A value written to that
+convention therefore maps to the engine's coordinate `p + 0.5`.
+
+*This dataset's file.* The GCPs were placed with GCP Editor Pro (the tool ODM
+links to; the dataset's [community
+thread](https://community.opendronemap.org/t/gcp-projected-coordinates/11762/7)
+says so). Its 2022 tagger, current when the dataset was made, computes the
+click as `(clientX - rect.left) / zoom / scale`
+(`src/app/smartimage/smartimage.component.ts:getPos`), i.e. the offset from the
+image's top-left edge over the continuous range `[0, width]`; the current SVG
+implementation clamps to `[0, naturalWidth]`. Those are corner-origin values,
+the engine's convention, so no shift is applied by default.
+
+The protocol therefore reads the file as written (`--gcp-pixel-origin file`,
+shift 0). `--gcp-pixel-origin format` applies the documented +0.5 conversion for
+a file produced to the OpenSfM convention. The measured ±0.5 px probes remain in
+the diagnostics so a producer or tool-convention change is visible.
+
+#### GNSS antenna lever arm: hardware and per-fold estimate (2026-11-11)
+
+*Hardware.* The block is an Autel EVO II Pro RTK (XT705 1-inch CMOS,
+5472x3648, calibrated focal 4404.1667 px, nadir gimbal; dataset README). The
+EXIF/XMP records the antenna position and RTK quality (`RtkFlag=50`,
+`RtkStdLon/Lat/Hgt` about 0.014 / 0.014 / 0.030 m), the gimbal angles and the
+absolute altitude; the RINEX marker file (`RTK_Data/101FTASK_Timestamp.mrk`)
+records the same antenna positions per image. Neither states where the phase
+centre sits relative to the camera's projection centre, so the dataset carries
+no hardware lever-arm value. The recorded positions are not corrected to the
+camera centre: the GCP-only adaptive adjustment leaves the camera centres about
+0.2 m below them, in both the vertical and the body fore/aft direction, which
+is the mount itself.
+
+*Protocol.* `--antenna-offset x,y,z` sets a fixed camera-frame lever arm (the
+antenna phase centre relative to the projection centre; x right, y down, z
+forward, so an antenna above a nadir lens is negative z). It is applied before
+`UpdateTransform`, which also consumes the lever arm, as well as before
+`OptimizeCameras`. Diagnostic variants apply either the measured seed
+`(0, 0, -0.23) m` — the GCP-only adjustment puts the camera centres 0.23 m below
+the antenna positions — or the **per-fold estimate**: the mean camera-frame
+offset `R_pose R^T (A - C)` over the aligned cameras of that fold's GCP-only
+adjustment, where `A` is the stored RTK position and `C` the adjusted centre.
+Only the fold's control GCPs constrain that adjustment, so the held-out check
+point never enters the estimate.
+
+| check | estimated lever arm x / y / z (m) | camera spread x / y / z (m) |
+| --- | --- | --- |
+| 1 | -0.003 / -0.224 / -0.283 | 0.226 / 0.237 / 0.171 |
+| 2 | 0.016 / -0.195 / -0.246 | 0.194 / 0.189 / 0.130 |
+| 3 | -0.040 / -0.188 / -0.170 | 0.154 / 0.162 / 0.095 |
+| 4 | -0.040 / -0.188 / -0.108 | 0.173 / 0.157 / 0.098 |
+| 5 | 0.002 / -0.238 / -0.212 | 0.176 / 0.168 / 0.119 |
+| mean | -0.013 / -0.207 / -0.204 | |
+
+The estimate is a block mean, not a per-camera measurement: the spread over
+the 146 aligned cameras is 0.15-0.24 m per axis, comparable to the value
+itself, so the block datum and the residual lens model still move individual
+cameras. The y and z components (about -0.21 m each, magnitude 0.29 m) are
+stable across folds; z varies from -0.11 to -0.28 m. The measured seed in the
+fixed variant is the vertical component alone, `(0, 0, -0.23) m`.
 
 **`adaptive_fitting` stays off by default.** Run on the other benchmark datasets
 (OptimizeCameras after alignment, adaptive off vs on; runs `42664406276` /
