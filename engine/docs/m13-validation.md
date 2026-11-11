@@ -310,7 +310,9 @@ Findings:
 - **Vertical with camera RTK.** The per-fold vertical errors are systematic (-7,
   -9, -1, +11, +15 cm) and the GCP-only adjustment puts the camera centres ~0.23 m
   below the recorded positions — consistent with an unmodelled GNSS antenna offset
-  above the lens. Tested below with fixed and per-fold-estimated lever arms.
+  above the lens. Tested below with fixed and per-fold-estimated lever arms; the
+  BA prior pins the mount, but the datum fit does not consume it, and the check
+  does not improve.
 - **`refineMarkers` removes about half of the hand-placed projections** on these
   targets and makes the result much worse — an engine issue, tracked separately.
 - Ruled out: trigger/GNSS timing (no along-track pattern once the cameras are
@@ -398,6 +400,60 @@ cameras. The y and z components (about -0.21 m each, magnitude 0.29 m) are
 stable across folds; z varies from -0.11 to -0.28 m. The measured seed in the
 fixed variant is the vertical component alone, `(0, 0, -0.23) m`.
 
+#### Measured: pixel-origin and antenna variants (CI run `43027876529`, commit `78816cf`)
+
+Leave-one-out check RMS, horizontal / vertical / 3D, in cm. The alignment is
+the same 146/176 cameras at 0.740 px. `--gcp-pixel-origin file` (the default)
+reads the gcp_list values as written; `format` would apply the documented
++0.5 px conversion. The antenna variants apply the fixed seed
+`(0, 0, -0.23) m` or the per-fold control-only estimate from the adaptive
+GCP-only adjustment.
+
+| variant | lens model | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` (default) | default | 7.9 | 10.1 | 12.8 |
+| `camera_rtk_gcps` (default) | default | 7.5 | 16.8 | 18.4 |
+| `gcps_only`, -0.5 px | default | 7.3 | 8.9 | 11.5 |
+| `gcps_only`, +0.5 px (format conversion) | default | 8.6 | 11.7 | 14.5 |
+| `gcps_only`, adaptive | adaptive | 6.5 | 6.4 | 9.1 |
+| `gcps_only`, adaptive, -0.5 px | adaptive | 6.2 | 6.0 | 8.6 |
+| `antenna_fixed` | default | 7.6 | 16.9 | 18.6 |
+| `antenna_estimated` | default | 7.9 | 20.2 | 21.7 |
+| `camera_rtk_adaptive` | adaptive | 5.4 | 10.3 | 11.6 |
+| `camera_rtk_adaptive_px_minus` | adaptive | 5.1 | 9.9 | 11.1 |
+| `antenna_fixed_adaptive` | adaptive | 5.5 | 10.4 | 11.7 |
+| `antenna_estimated_adaptive` | adaptive | 5.3 | 12.9 | 14.0 |
+| `antenna_estimated_adaptive_px_minus` | adaptive | 5.1 | 11.9 | 12.9 |
+
+Findings:
+
+- **The antenna does not improve the check.** The BA centre prior does consume
+  it — after each antenna fold the residual offset the protocol measures is
+  the applied arm itself (fixed seed: 0.006 / -0.001 / -0.225 m; estimated:
+  about -0.02 / -0.18 / -0.20 m), so the mount is pinned. The vertical still
+  does not improve, and with the default lens the estimated mount is worse
+  (20.2 cm vertical). The reason is the datum: the task's `UpdateTransform`
+  (`update_transform`) fits one similarity and does not subtract the lever
+  arm; only the `AlignCameras` path (`georeference_chunk`) is antenna-aware.
+  The datum therefore still treats the RTK positions as camera centres, and
+  the BA prior pulls the block against it. Making `update_transform`
+  antenna-aware is the follow-up that would let the mount act on the datum.
+- **The 5 cm horizontal target is not met.** With the defaults it is 7.9 cm
+  (`gcps_only`) and 7.5 cm (`camera_rtk_gcps`). The closest configurations are
+  `camera_rtk_adaptive_px_minus` at 5.08 cm (vertical 9.85) and
+  `antenna_estimated_adaptive_px_minus` at 5.05 cm (vertical 11.86), i.e.
+  0.05-0.08 cm above the target. The target is not loosened.
+- **The vertical.** Default `camera_rtk_gcps` is 16.8 cm and `gcps_only` 10.1;
+  the best camera-RTK configuration is 9.85 cm (adaptive, -0.5 px) and the
+  best overall is 5.95 cm (`gcps_only`, adaptive, -0.5 px). No antenna variant
+  reduces it below the configuration without the antenna.
+- **The ±0.5 px probe is not a convention correction.** The gcp_list file and
+  the engine share the corner-origin convention, so no shift is applied. The
+  probes show the nudge still changes the check by about 0.7 cm horizontally
+  (-0.5 improves, +0.5 worsens); it is an image-space compensation for a
+  residual in this block, not a half-pixel convention difference, and it is
+  not made the default.
+
 **`adaptive_fitting` stays off by default.** Run on the other benchmark datasets
 (OptimizeCameras after alignment, adaptive off vs on; runs `42664406276` /
 `42664413306` aerial-nadir, `42664420424` / `42664427402` terrestrial-laser) it was
@@ -407,4 +463,6 @@ completeness 0.064/0.151/0.277 -> 0.047/0.112/0.218. One run each, and the
 alignment before OptimizeCameras is not bit-identical between runs, so this is
 indicative, not conclusive. For an RTK/GCP block with a single camera, enable
 `adaptive_fitting=True` in OptimizeCameras; the best measured configuration here
-reaches 5.1 cm horizontal, against the 5 cm target.
+reaches 5.05 cm horizontal (camera RTK + adaptive fit + -0.5 px), against the
+5 cm target. The target is not met with the defaults (7.9 / 7.5 cm) or with the
+antenna lever arm.
