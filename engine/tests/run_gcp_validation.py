@@ -1343,7 +1343,7 @@ def import_camera_references_for_block(chunk, accuracy_m, directory):
     chunk.importReference(path=path)
 
 
-def camera_consistency(chunk):
+def camera_consistency(chunk, antenna_offset_m=None):
     """How far each aligned camera's stored reference is from its adjusted centre.
 
     Per camera with a finite reference: the adjusted centre (chunk-local, mapped
@@ -1351,6 +1351,11 @@ def camera_consistency(chunk):
     frame. A constant up offset points at a height-datum mismatch between the
     camera altitudes and the GCP heights; a metre-level spread points at
     positions that are not RTK-fixed.
+
+    When a GNSS antenna lever arm was applied to this fold, the comparison is
+    made against the modelled antenna, ``A = C + R_pose^T * offset`` (the same
+    camera-frame convention the engine's centre prior uses), so the reported
+    offset is what the mount does not explain rather than the mount itself.
 
     The horizontal difference is also projected onto the flight direction,
     taken from each camera's neighbours in capture order (labels sorted). A
@@ -1360,6 +1365,14 @@ def camera_consistency(chunk):
     Measured only, never applied.
     """
     transform = chunk.transform
+    block = [[float(transform[r][c]) for c in range(3)] for r in range(3)]
+    chunk_scale = abs(matrix_determinant(block)) ** (1.0 / 3.0)
+    chunk_rotation = None
+    if antenna_offset_m is not None:
+        if not math.isfinite(chunk_scale) or chunk_scale <= 0.0:
+            raise ValueError("chunk transform has no invertible rotation")
+        chunk_rotation = [[block[r][c] / chunk_scale for c in range(3)]
+                          for r in range(3)]
     samples = []
     for camera in chunk.cameras:
         reference = camera.reference
@@ -1369,6 +1382,19 @@ def camera_consistency(chunk):
         local = camera.center
         ecef = [sum(transform[r][c] * local[c] for c in range(3)) + transform[r][3]
                 for r in range(3)]
+        if antenna_offset_m is not None:
+            pose = camera.pose
+            pose_rotation = orthonormal_rotation(
+                [[pose[r][c] for c in range(3)] for r in range(3)])
+            # R_pose^T maps the camera-frame lever to a local metric direction;
+            # the chunk rotation carries it to ECEF (the chunk scale cancels).
+            lever_local = [
+                sum(pose_rotation[r][c] * antenna_offset_m[r] for r in range(3))
+                for c in range(3)]
+            lever_ecef = [
+                sum(chunk_rotation[r][c] * lever_local[c] for c in range(3))
+                for r in range(3)]
+            ecef = [ecef[r] + lever_ecef[r] for r in range(3)]
         enu = ecef_to_enu(ecef, (reference[0], reference[1], reference[2]))
         samples.append({"label": camera.label, "reference": reference,
                         "east": enu[0], "north": enu[1], "up": enu[2]})
@@ -1654,10 +1680,10 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
         chunk.importReference(path=control_path, marker_type="gcp")
         chunk.importReference(path=check_path, marker_type="check_point")
 
-    # The antenna mount must be in place before updateTransform: the
-    # georeference fit applies the lever arm too, not only the bundle
-    # adjustment. The binding takes an Eigen::Vector3d, which pybind11
-    # converts from a numpy array (not from a Python list).
+    # The antenna mount must be in place before updateTransform: both the datum
+    # refit and the bundle adjustment consume the lever arm, and the two must
+    # agree. The binding takes an Eigen::Vector3d, which pybind11 converts from
+    # a numpy array (not from a Python list).
     antenna = options.get("antenna_offset_m")
     if antenna is not None:
         for sensor_index in range(len(chunk.sensors)):
@@ -1665,9 +1691,9 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
                 sensor_index, antenna[0], antenna[1], antenna[2])
 
     focal_before = sensor_focals(chunk)
-    # UpdateTransform itself does not consume the mount (georeference_chunk,
-    # used by AlignCameras, does); it runs here so the datum is refit after the
-    # control references are imported, exactly as for every other variant.
+    # Refit the datum after the control references are imported, exactly as for
+    # every other variant; with a mount it places the projection centres, not
+    # the antenna phase centres, on the camera GNSS references.
     chunk.updateTransform()
     chunk.optimizeCameras(**optimize_options(options))
     focal_after = sensor_focals(chunk)
@@ -1685,7 +1711,8 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             "control_rms_xyz_m": _meta_float(
                 chunk, "optimize_cameras.control_rms_xyz_m"),
             "focal": focal_changes(focal_before, focal_after),
-            "camera_consistency": camera_consistency(chunk),
+            "camera_consistency": camera_consistency(
+                chunk, options.get("antenna_offset_m")),
             # What this fold's own adjusted cameras imply for the lever arm,
             # whether or not one was applied. On the GCP-only variant this is
             # the leak-free per-fold estimate the antenna variants reuse.
