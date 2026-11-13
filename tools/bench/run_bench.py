@@ -1319,6 +1319,14 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     # The diagnostics are report-only probes; the manifest opts a dataset in.
     if gcp.get("diagnostics"):
         command.append("--diagnostics")
+    # An allowlist makes a targeted re-measurement affordable without changing
+    # the default set. The dispatch input arrives through an environment
+    # variable (never interpolated into a shell line) and the script validates
+    # every name.
+    variant_filter = (os.environ.get("GCP_VARIANTS") or
+                      gcp.get("diagnostic_variants"))
+    if variant_filter:
+        command.extend(["--diagnostic-variants", str(variant_filter)])
 
     print("-- gcp validation")
     print(f"  $ {' '.join(command)}")

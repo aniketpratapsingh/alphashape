@@ -1858,7 +1858,7 @@ def camera_prior_outliers(chunk, antenna_offset_m=None,
                 [[pose[r][c] for c in range(3)] for r in range(3)])
             lever_local = [
                 sum(pose_rotation[r][c] * antenna_offset_m[r] for r in range(3))
-                for r in range(3)]
+                for c in range(3)]
             lever_ecef = [
                 sum(chunk_rotation[r][c] * lever_local[c] for c in range(3))
                 for r in range(3)]
@@ -2590,7 +2590,10 @@ def run_real_odm(args):
     # adaptive fit removes that trade and leaves the ~0.2 m mount.
     applied_estimates = default_estimates
     if args.diagnostics:
+        selected = set(args.diagnostic_variants) if args.diagnostic_variants else None
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
+            if selected is not None and variant not in selected:
+                continue
             if (options.get("camera_accuracy") == CAMERA_ACCURACY_PER_IMAGE
                     and not per_image_mode):
                 # AddPhotos stored no XMP accuracy in a uniform run, so this
@@ -2765,6 +2768,11 @@ def parse_args(argv):
     parser.add_argument("--mrk", metavar="PATH",
                         help="per-exposure event-mark (.mrk) log; enables the "
                              "timing comparison and the along-track timing probe")
+    parser.add_argument("--diagnostic-variants", default="",
+                        help="comma-separated allowlist of diagnostic variant "
+                             "names to run instead of all of them (the base "
+                             "variants and the timing probe always run); e.g. "
+                             "'adaptive_fitting,camera_rtk_per_image_adaptive'")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
     parser.add_argument("--antenna-offset", default="",
@@ -2814,6 +2822,16 @@ def parse_args(argv):
         parser.error(str(error))
     if args.camera_accuracy_uniform == CAMERA_ACCURACY_PER_IMAGE:
         parser.error("--camera-accuracy-uniform must be a number of metres")
+    if args.diagnostic_variants:
+        names = [name.strip() for name in args.diagnostic_variants.split(",")
+                 if name.strip()]
+        known = {name for name, _, _ in DIAGNOSTIC_VARIANTS}
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            parser.error("unknown --diagnostic-variants: " + ", ".join(unknown))
+        args.diagnostic_variants = names
+    else:
+        args.diagnostic_variants = []
     return args
 
 

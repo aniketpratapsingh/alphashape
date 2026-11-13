@@ -56,6 +56,16 @@ on:
           - terrestrial-laser
           - gcp-rtk
           - all
+      # A comma-separated allowlist of the gcp-rtk protocol's diagnostic
+      # variants. Empty runs the full set, which is the normal behaviour; a
+      # subset makes a targeted re-measurement (say the antenna probes after a
+      # fix) affordable. It reaches run_bench.py through an environment
+      # variable, never interpolated into `run:`, and the protocol rejects an
+      # unknown name.
+      gcp_variants:
+        description: 'Comma-separated gcp-rtk diagnostic variant allowlist (empty = all)'
+        type: string
+        default: ""
       # Extra BuildDepthMaps keyword arguments, e.g. "cost_type=census". This exists
       # so a change to a depth-map parameter can be MEASURED on the same dataset as a
       # control run. It is strictly a reporting mode: the run is never published as
@@ -366,6 +376,9 @@ jobs:
           # And for OptimizeCameras: validated by `--optimize-params`, which also
           # inserts the task after AlignCameras when the value is non-empty.
           OPTIMIZE_PARAMS: ${{ github.event.inputs.optimize_params }}
+          # gcp-rtk diagnostic allowlist; empty keeps the full set. Untrusted
+          # dispatch text, validated by the protocol.
+          GCP_VARIANTS: ${{ github.event.inputs.gcp_variants }}
         run: |
           mkdir -p build/bench
           set +e
