@@ -478,10 +478,9 @@ OptimizeCameras is bit-identical; only the final pose differs between adaptive
 on and off, as the different calibration model implies. The GCP protocol never
 re-saves its block after the folds, so it records an alignment hash but no final
 hash. The earlier caveat that the alignment was not bit-identical between runs
-is superseded: that comparison used two unbounded single runs, and the
-adaptive-fit selection that could cross its accept threshold differently under
-threaded summation is now pinned to one thread
-(`engine/src/common/algorithm/sfm/adaptive_fit.cpp`).
+is superseded by these hashes; separately, the adaptive-fit selection that could
+previously cross its accept threshold differently under threaded summation is
+now pinned to one thread (`engine/src/common/algorithm/sfm/adaptive_fit.cpp`).
 
 Every value below is the median of the three runs, and every metric's range was
 `[median–median]` (zero) — the per-run values are in that run's
@@ -522,7 +521,7 @@ conditionally when the chunk has enabled control points.** On the GCP block the
 adaptive model is a clear win — 6.54 / 6.36 / 9.12 against 7.91 / 10.10 / 12.83 cm
 for `gcps_only`, and 5.40 / 10.26 / 11.60 against 7.54 / 16.81 / 18.43 cm for
 `camera_rtk_gcps` — and every improvement is many times the (zero) rep range. On
-aerial-nadir it is a real loss on both gated metrics (NMAD +0.253 m, ortho
+aerial-nadir it is a real loss on both gated metrics (NMAD +0.252 m, ortho
 offset +0.693 m), and on terrestrial-laser it loses accuracy, completeness and
 F-score at every tolerance. A global default-on is therefore not supported.
 
