@@ -1123,7 +1123,23 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     if (ellipse &&
         (!cross ||
          (*ellipse - pixel).squaredNorm() <= (*cross - pixel).squaredNorm())) {
+        if ((*ellipse - pixel).norm() > 1.0) {
+            std::fprintf(stderr,
+                         "REFINE DEBUG 2d pick=ellipse off=%.2f ellipse=%.2f "
+                         "cross=%.2f hint=%.1f seed_radius=%.1f\n",
+                         (*ellipse - pixel).norm(), (*ellipse - pixel).norm(),
+                         cross ? (*cross - pixel).norm() : -1.0, hint,
+                         seed ? seed->radius : -1.0);
+        }
         return ellipse;
+    }
+    if (cross && (*cross - pixel).norm() > 1.0) {
+        std::fprintf(stderr,
+                     "REFINE DEBUG 2d pick=cross off=%.2f ellipse=%s cross=%.2f "
+                     "hint=%.1f seed_radius=%.1f\n",
+                     (*cross - pixel).norm(),
+                     ellipse ? "set" : "none", (*cross - pixel).norm(), hint,
+                     seed ? seed->radius : -1.0);
     }
     return cross;
 }
@@ -1402,6 +1418,15 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
     if (!best.found) {
         std::fprintf(stderr, "REFINE DEBUG search: no winner, references=%zu\n",
                      references.size());
+        for (const BlendView& blend : blends) {
+            const auto projected = project_view(*blend.view, initial);
+            std::fprintf(stderr,
+                         "  cam %d app=%.1f scale=%d proj_dist=%.2f tol=%.2f\n",
+                         blend.view->camera->id, blend.apparent,
+                         blend.has_scale ? 1 : 0,
+                         projected ? (*projected - blend.pixel).norm() : -1.0,
+                         projection_tolerance(blend));
+        }
         return std::nullopt;
     }
     return best;
@@ -1500,7 +1525,12 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             return std::nullopt;
         }
         projected_centres[index] = *projected;
-        const double limit = refinement_limit(blend);
+        // The candidate reprojects a few pixels from the printed centre when
+        // its depth is a step away from the true surface. The 2-D refiner
+        // must be free to reach the centre from there; the only bound that
+        // matters is against the MEASURED pixel (applied below), so it gets
+        // the full correction bound, not the tighter Lucas-Kanade guard.
+        const double limit = maximum_shift(blend);
         // The blob seed is the ellipse refiner's second opinion and its only
         // anchor for a circular target; it is computed even when the saddle
         // supplied the scale, so both refiners stay available.
@@ -1685,7 +1715,10 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
     edit.evaluated = blends.size();
     bool success = false;
     for (BlendView& blend : blends) {
-        const double limit = refinement_limit(blend);
+        // A single view has no consensus to supply a candidate, so the click
+        // is the anchor and the correction bound is the same total bound the
+        // multi-view path applies against its measurement.
+        const double limit = maximum_shift(blend);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, options.patch_size, limit,
             blend.has_scale ? blend.apparent : 0.0);
@@ -1719,6 +1752,24 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         return skipped;
     }
     fill_scales(blends, options.patch_size);
+    {
+        int scaled = 0;
+        int unscaled = 0;
+        for (const BlendView& blend : blends) {
+            (blend.has_scale ? scaled : unscaled) += 1;
+        }
+        if (scaled > 0 && unscaled > 0) {
+            std::fprintf(stderr, "REFINE DEBUG mixed scales:");
+            for (const BlendView& blend : blends) {
+                std::fprintf(stderr, " [cam %d scale=%d app=%.1f blob=%d cross=%d px=(%.1f,%.1f)]",
+                             blend.view->camera->id, blend.has_scale ? 1 : 0,
+                             blend.apparent, blend.blob_scale ? 1 : 0,
+                             blend.cross_scale ? 1 : 0, blend.pixel.x(),
+                             blend.pixel.y());
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     std::vector<BlendView> aligned;
     for (const BlendView& blend : blends) {
         if (blend.view->aligned()) {
