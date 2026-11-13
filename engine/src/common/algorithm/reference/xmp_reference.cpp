@@ -22,6 +22,11 @@ namespace alphashape {
 namespace {
 
 constexpr std::string_view kDjiNamespace = "http://ns.dji.com/drone-dji/1.0/";
+/// Aircraft firmware in the field declares the vendor URI below; both spellings
+/// of the same vocabulary are accepted (the fields are identical). Accepting
+/// only one would make a real DJI/Autel packet parse as empty while every
+/// synthetic test passed.
+constexpr std::string_view kDjiVendorNamespace = "http://www.dji.com/drone-dji/1.0/";
 constexpr std::string_view kXapNamespace = "http://ns.adobe.com/xap/1.0/";
 constexpr std::string_view kTiffNamespace = "http://ns.adobe.com/tiff/1.0/";
 
@@ -125,7 +130,7 @@ std::string_view namespace_of(std::string_view qname,
         return {};
     }
     const std::string_view uri(found->second);
-    if (uri == kDjiNamespace) {
+    if (uri == kDjiNamespace || uri == kDjiVendorNamespace) {
         return kDjiNamespace;
     }
     if (uri == kXapNamespace) {

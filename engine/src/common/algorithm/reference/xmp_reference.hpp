@@ -14,7 +14,10 @@
 /// ## Namespace resolution
 ///
 /// Attribute and element names are resolved through the `xmlns:prefix="uri"`
-/// declarations in the packet; the prefix spelling is not assumed. Both
+/// declarations in the packet; the prefix spelling is not assumed. The drone
+/// vocabulary is accepted under either declared URI,
+/// `http://ns.dji.com/drone-dji/1.0/` (the documentation form) and
+/// `http://www.dji.com/drone-dji/1.0/` (what aircraft firmware writes). Both
 /// serialisations are accepted:
 ///
 ///     <rdf:Description xmlns:drone-dji="http://ns.dji.com/drone-dji/1.0/"

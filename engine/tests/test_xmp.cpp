@@ -645,6 +645,30 @@ TEST(Xmp, AutelRtkPacketGivesPerAxisAccuracy) {
     EXPECT_DOUBLE_EQ((*accuracy)[2], 0.02969);  // up
 }
 
+TEST(Xmp, AcceptsTheVendorNamespaceUri) {
+    // Aircraft firmware declares http://www.dji.com/..., not the
+    // http://ns.dji.com/ documentation form. Accepting only the latter made a
+    // real packet parse as empty; this pins both.
+    const std::string packet =
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" "
+        "xmlns:drone=\"http://www.dji.com/drone-dji/1.0/\">"
+        "<rdf:Description drone:GpsLatitude=\"47.64368732\" "
+        "drone:GpsLongtitude=\"16.47592717\" drone:AbsoluteAltitude=\"+513.00\" "
+        "drone:RtkFlag=\"50\" drone:RtkStdLon=\"0.01370\" "
+        "drone:RtkStdLat=\"0.01439\" drone:RtkStdHgt=\"0.02969\"/>"
+        "</rdf:RDF>";
+    const XmpReference xmp = parse_xmp_reference(packet);
+    ASSERT_TRUE(xmp.has_location());
+    EXPECT_DOUBLE_EQ(*xmp.latitude_deg, 47.64368732);
+    EXPECT_DOUBLE_EQ(*xmp.longitude_deg, 16.47592717);
+    EXPECT_TRUE(xmp.has_rtk_fix());
+    const std::optional<std::array<double, 3>> accuracy = xmp.rtk_accuracy_m();
+    ASSERT_TRUE(accuracy.has_value());
+    EXPECT_DOUBLE_EQ((*accuracy)[0], 0.01370);
+    EXPECT_DOUBLE_EQ((*accuracy)[1], 0.01439);
+    EXPECT_DOUBLE_EQ((*accuracy)[2], 0.02969);
+}
+
 TEST(Xmp, RtkStdsWithoutStatusAreUsedAsIs) {
     // No status field: the packet cannot be classified, so the reported
     // deviations stand (they are still better than the consumer default).
