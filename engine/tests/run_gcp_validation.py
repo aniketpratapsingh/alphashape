@@ -1315,6 +1315,12 @@ CAMERA_ACCURACY_PER_IMAGE = "per-image"
 # It is a report-only threshold: no variant's weights are changed by it.
 OUTLIER_SIGMA_THRESHOLD = 3.0
 
+# How many flagged cameras per fold carry the full residual record. Every
+# flagged label is still listed, but a fold where a per-image weight turns a
+# systematic datum offset into a ten-sigma residual on all 146 cameras would
+# otherwise multiply the report (and the benchmark log) by its size.
+OUTLIER_DETAIL_LIMIT = 20
+
 
 def parse_camera_accuracy(text):
     """``per-image``, or a strictly positive uniform accuracy in metres."""
@@ -1912,8 +1918,12 @@ def camera_prior_outliers(chunk, antenna_offset_m=None,
     for entry in flagged:
         key = "none" if entry["rtk_flag"] is None else str(entry["rtk_flag"])
         status_counts[key] = status_counts.get(key, 0) + 1
+    flagged.sort(key=lambda entry: entry["max_abs_z"], reverse=True)
     return {"threshold": threshold, "cameras": len(samples),
-            "flagged_count": len(flagged), "flagged": flagged,
+            "flagged_count": len(flagged),
+            "labels": [entry["label"] for entry in flagged],
+            "flagged": flagged[:OUTLIER_DETAIL_LIMIT],
+            "detail_truncated": len(flagged) > OUTLIER_DETAIL_LIMIT,
             "fix_status_counts": status_counts}
 
 
@@ -1925,16 +1935,15 @@ def summarise_outliers(records):
     ``fix_status_counts`` sums the GNSS solution codes of every flagged camera
     appearance so a correlation with fix status is readable at a glance.
     """
-    by_fold = {record["check"]: [entry["label"] for entry in record["flagged"]]
+    by_fold = {record.get("check"): list(record.get("labels", []))
                for record in records}
     appearances = {}
     statuses = {}
     for record in records:
-        for entry in record["flagged"]:
-            appearances[entry["label"]] = appearances.get(entry["label"], 0) + 1
-            key = ("none" if entry["rtk_flag"] is None
-                   else str(entry["rtk_flag"]))
-            statuses[key] = statuses.get(key, 0) + 1
+        for label in record.get("labels", []):
+            appearances[label] = appearances.get(label, 0) + 1
+        for key, count in record.get("fix_status_counts", {}).items():
+            statuses[key] = statuses.get(key, 0) + count
     repeat = sorted(label for label, count in appearances.items() if count > 1)
     return {
         "folds": len(records),
@@ -2433,8 +2442,10 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
         # The weights do not change between folds, so the first fold's
         # distribution describes the variant.
         variant["camera_accuracy"] = measured[0]["camera_accuracy"]
-    outliers = [fold["prior_outliers"] for fold in measured
-                if "prior_outliers" in fold]
+    # The fold record carries the diagnostics under its own check label; the
+    # summary groups by it. (camera_prior_outliers itself has no fold identity.)
+    outliers = [dict(fold["prior_outliers"], check=fold["check"])
+                for fold in measured if "prior_outliers" in fold]
     if outliers:
         variant["prior_outliers"] = summarise_outliers(outliers)
     timing_folds = [fold["timing"] for fold in measured if "timing" in fold]
@@ -2610,6 +2621,19 @@ def run_real_odm(args):
                     catch_all=True, estimates=applied_estimates, timing=leads)
     if timing:
         annotate_outlier_timing(variants, timing)
+    accuracy_summary = variants["camera_rtk_gcps"].get("camera_accuracy")
+    if accuracy_summary:
+        print("[gcp validation] camera accuracy ({}): {} cameras, {} still on "
+              "the 10 m default; east {:.4f}-{:.4f} m, north {:.4f}-{:.4f} m, "
+              "up {:.4f}-{:.4f} m".format(
+                  args.camera_accuracy, accuracy_summary["cameras"],
+                  accuracy_summary["uniform_defaults"],
+                  accuracy_summary.get("east", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("east", {}).get("max_m", float("nan")),
+                  accuracy_summary.get("north", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("north", {}).get("max_m", float("nan")),
+                  accuracy_summary.get("up", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("up", {}).get("max_m", float("nan"))))
     for variant, data in variants.items():
         consistency = data.get("camera_consistency")
         if not consistency:
