@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
@@ -225,11 +226,20 @@ void UpdateChecker::download_and_verify(const update::Release& release,
         done({false, {}, "the SHA256SUMS URL is not a GitHub URL"});
         return;
     }
+    // The asset name comes from the release JSON and becomes a file name under
+    // the cache directory. GitHub only allows plain names, but a compromised or
+    // spoofed response must not be able to write outside the cache.
+    const QString name = QString::fromStdString(asset.name);
+    if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\')) ||
+        name.contains(QStringLiteral("..")) || QFileInfo(name).fileName() != name) {
+        done({false, {}, "the update asset has an unsafe file name: " + asset.name});
+        return;
+    }
     if (!QDir().mkpath(cache_dir)) {
         done({false, {}, "could not create the update cache directory"});
         return;
     }
-    const QString path = QDir(cache_dir).filePath(QString::fromStdString(asset.name));
+    const QString path = QDir(cache_dir).filePath(name);
     QFile::remove(path);
 
     const std::string asset_url = asset.browser_download_url;

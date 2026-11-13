@@ -447,6 +447,30 @@ TEST_F(UpdateGuiTest, UpdateUrlAllowListRejectsInsecureForeignAndTrickyUrls) {
     }
 }
 
+TEST_F(UpdateGuiTest, UnsafeAssetNamesAreRefusedBeforeAnyFileIsWritten) {
+    QSettings settings(scratch("unsafe-settings.ini"), QSettings::IniFormat);
+    UpdateChecker checker(settings, std::make_unique<FakeSource>());
+    const auto release = release_from_json();
+    const QDir cache(scratch("cache-unsafe"));
+    const std::vector<std::string> names = {"", "..", "../evil.bin", "a/b.bin", "a\\b.bin"};
+
+    for (const std::string& name : names) {
+        update::Asset asset{name, "https://github.com/x/download/" + name};
+        DownloadResult seen;
+        bool called = false;
+        checker.download_and_verify(release, asset, cache.path(), {},
+                                    [&](const DownloadResult& result) {
+                                        seen = result;
+                                        called = true;
+                                    });
+        ASSERT_TRUE(called) << name;
+        EXPECT_FALSE(seen.ok) << name;
+        EXPECT_NE(seen.error.find("unsafe"), std::string::npos) << name;
+    }
+    // Nothing escaped the cache directory.
+    EXPECT_FALSE(QFile::exists(scratch("evil.bin")));
+}
+
 TEST_F(UpdateGuiTest, PreferencesPersistAutoCheckAndChannel) {
     QSettings settings(scratch("prefs-settings.ini"), QSettings::IniFormat);
     UpdateChecker checker(settings, std::make_unique<FakeSource>());
