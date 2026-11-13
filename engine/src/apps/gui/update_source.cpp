@@ -14,7 +14,8 @@ namespace {
 
 bool allowed_host(const QString& host, bool allow_api) {
     if (host == QStringLiteral("github.com") ||
-        host == QStringLiteral("objects.githubusercontent.com")) {
+        host == QStringLiteral("objects.githubusercontent.com") ||
+        host == QStringLiteral("release-assets.githubusercontent.com")) {
         return true;
     }
     return allow_api && host == QStringLiteral("api.github.com");
@@ -77,8 +78,11 @@ void NetworkUpdateSource::fetch_text(const std::string& url, TextCallback done) 
         return;
     }
     QNetworkRequest request(QUrl(QString::fromStdString(url)));
+    // UserVerifiedRedirectPolicy asks this code about every hop before it
+    // follows it; the automatic policies would follow a redirect to whatever
+    // host the server names.
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QNetworkRequest::NoLessSafeRedirectPolicy);
+                         QNetworkRequest::UserVerifiedRedirectPolicy);
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       QStringLiteral("alphashape-updater"));
     request.setRawHeader("Accept", "application/vnd.github+json");
@@ -92,7 +96,11 @@ void NetworkUpdateSource::fetch_text(const std::string& url, TextCallback done) 
             [reply](const QUrl& target) {
                 if (!allowed_url(target.toString().toStdString(), true)) {
                     reply->abort();
+                    return;
                 }
+                // The next hop arrives as another redirected() signal and goes
+                // through this same check.
+                reply->redirectAllowed();
             });
     connect(reply, &QNetworkReply::finished, reply, [this, reply, body, done]() {
         reply_ = nullptr;
@@ -130,7 +138,7 @@ void NetworkUpdateSource::download_file(const std::string& url, const QString& d
     download_path_ = dest;
     QNetworkRequest request(QUrl(QString::fromStdString(url)));
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QNetworkRequest::NoLessSafeRedirectPolicy);
+                         QNetworkRequest::UserVerifiedRedirectPolicy);
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       QStringLiteral("alphashape-updater"));
     QNetworkReply* reply = network_->get(request);
@@ -148,7 +156,9 @@ void NetworkUpdateSource::download_file(const std::string& url, const QString& d
     connect(reply, &QNetworkReply::redirected, reply, [reply](const QUrl& target) {
         if (!allowed_url(target.toString().toStdString(), false)) {
             reply->abort();
+            return;
         }
+        reply->redirectAllowed();
     });
     connect(reply, &QNetworkReply::finished, reply,
             [this, reply, file, done]() {

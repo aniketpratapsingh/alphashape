@@ -4,9 +4,11 @@
 // every test runs against a fake and never opens a socket. The production
 // implementation is NetworkUpdateSource (QNetworkAccessManager).
 //
-// Security: every URL is checked before a request starts, and every redirect is
-// checked again. HTTPS only, and downloads only from github.com or
-// objects.githubusercontent.com (GitHub redirects release assets there).
+// Security: every URL is checked before a request starts, and every redirect hop
+// is checked again (UserVerifiedRedirectPolicy asks this code before following
+// each one). HTTPS only, and downloads only from github.com or the two asset CDN
+// hosts GitHub redirects release downloads to
+// (objects.githubusercontent.com and release-assets.githubusercontent.com).
 
 #include <cstdint>
 #include <functional>

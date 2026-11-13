@@ -397,6 +397,54 @@ TEST_F(UpdateGuiTest, MissingChecksumEntryRefusesTheDownload) {
     EXPECT_NE(seen.error.find("does not list"), std::string::npos);
 }
 
+TEST_F(UpdateGuiTest, UpdateUrlAllowListAcceptsGitHubAndAssetCdnHosts) {
+    // A GitHub release download redirects to one of two CDN hosts; both must be
+    // allowed, on every hop.
+    const char* const allowed[] = {
+        "https://api.github.com/repos/aniketpratapsingh/alphashape/releases",
+        "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/SHA256SUMS",
+        "https://objects.githubusercontent.com/github-production-release-asset/1/2",
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+        "https://github.com:443/aniketpratapsingh/alphashape",
+    };
+    for (const char* url : allowed) {
+        EXPECT_TRUE(is_allowed_update_metadata_url(url)) << url;
+    }
+    // The API itself is a metadata host only, never an installer host.
+    EXPECT_FALSE(
+        is_allowed_update_download_url("https://api.github.com/repos/a/b/releases"));
+    EXPECT_TRUE(is_allowed_update_download_url(
+        "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/x.dmg"));
+    EXPECT_TRUE(is_allowed_update_download_url(
+        "https://objects.githubusercontent.com/github-production-release-asset/1/2"));
+    EXPECT_TRUE(is_allowed_update_download_url(
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1/2"));
+}
+
+TEST_F(UpdateGuiTest, UpdateUrlAllowListRejectsInsecureForeignAndTrickyUrls) {
+    const char* const rejected[] = {
+        // Not HTTPS.
+        "http://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/x.dmg",
+        // Not a GitHub host.
+        "https://example.com/alphashape.dmg",
+        // Lookalikes: a subdomain and a prefixed host.
+        "https://github.com.evil.com/alphashape.dmg",
+        "https://evilgithub.com/alphashape.dmg",
+        "https://objects.githubusercontent.com.evil.com/x",
+        // A userinfo trick: the real host is evil.com.
+        "https://github.com@evil.com/alphashape.dmg",
+        // GitHub is served on 443; another port is a different server.
+        "https://github.com:8443/alphashape.dmg",
+        // Not a URL at all.
+        "not a url",
+        "",
+    };
+    for (const char* url : rejected) {
+        EXPECT_FALSE(is_allowed_update_metadata_url(url)) << url;
+        EXPECT_FALSE(is_allowed_update_download_url(url)) << url;
+    }
+}
+
 TEST_F(UpdateGuiTest, PreferencesPersistAutoCheckAndChannel) {
     QSettings settings(scratch("prefs-settings.ini"), QSettings::IniFormat);
     UpdateChecker checker(settings, std::make_unique<FakeSource>());
