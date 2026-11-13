@@ -800,6 +800,24 @@ class RepetitionsTest(unittest.TestCase):
         self.assertIn("variants.camera_rtk_gcps.rms_horizontal_m", text)
         self.assertIn("variants.gcps_only.rms_horizontal_m", text)
 
+    def test_a_standard_variant_with_an_option_is_not_called_diagnostic(self):
+        # The adaptive dispatch selects gcps_only / camera_rtk_gcps with
+        # options; they are the two reported configurations, not probes.
+        current = {
+            "kind": "gcp",
+            "dataset": "gcp",
+            "dataset_manifest": {"title": "Block"},
+            "variants": {
+                "gcps_only": {"options": {"adaptive_fitting": True},
+                              "folds": [], "rms_horizontal_m": 0.065},
+                "adaptive_px_minus": {"options": {"adaptive_fitting": True},
+                                      "folds": [], "rms_horizontal_m": 0.062},
+            },
+        }
+        text = report.gcp_markdown(current)
+        self.assertNotIn("gcps_only (diagnostic)", text)
+        self.assertIn("adaptive_px_minus (diagnostic)", text)
+
     def test_the_repetition_block_does_not_become_a_gated_metric(self):
         # The block carries numeric values under dotted paths. flatten() would
         # otherwise turn them into metrics; none may acquire a direction and gate.

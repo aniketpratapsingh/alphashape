@@ -572,9 +572,10 @@ def gcp_markdown(current: dict) -> str:
     lines.append("")
     for variant, data in (current.get("variants") or {}).items():
         options = data.get("options") or {}
-        is_diagnostic = bool(options) or (
-            current.get("diagnostics") and
-            variant not in ("camera_rtk_gcps", "gcps_only"))
+        # A standard variant can now carry an option too: the benchmark's
+        # adaptive_fitting dispatch selects it for gcps_only and camera_rtk_gcps.
+        # It is still one of the two reported configurations, not a probe.
+        is_diagnostic = variant not in ("camera_rtk_gcps", "gcps_only")
         suffix = " (diagnostic)" if is_diagnostic else ""
         lines.append(f"## Variant: {variant}{suffix}")
         lines.append("")
