@@ -109,6 +109,15 @@ on:
         description: 'Extra OptimizeCameras key=value pairs, space separated (e.g. "adaptive_fitting=true")'
         type: string
         default: ""
+      # Run the same dataset this many times and report every run, the median and
+      # the range. One run is the historical behaviour and what every scheduled,
+      # push and ordinary manual job gets. More than one exists to separate a real
+      # effect from the same configuration's own run-to-run scatter: a single run
+      # cannot, which is exactly why an n=1 comparison is not evidence.
+      reps:
+        description: "Independent runs of each dataset (default 1)"
+        type: string
+        default: "1"
       # Accept a regression BY HAND, so a deliberate trade-off (worse on one metric,
       # clearly better on the rest) can become the new baseline instead of failing
       # every later run against a baseline nobody can reach.
@@ -150,7 +159,7 @@ concurrency:
   # pending one before it starts. A per-run id keeps every experiment independent
   # while still keeping all of them away from the control run they are measured
   # against. Scheduled and push runs take the `|| ''` arm and are unaffected.
-  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params || github.event.inputs.optimize_params) && format('-experiment-{0}', github.run_id) || '' }}
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params || github.event.inputs.optimize_params || (github.event.inputs.reps != '' && github.event.inputs.reps != '1')) && format('-experiment-{0}', github.run_id) || '' }}
   cancel-in-progress: false
 
 env:
@@ -293,7 +302,11 @@ jobs:
     # here; the job fails rather than running past the limit. 330 minutes is the
     # ceiling the workflow is allowed (under 6 h) and leaves headroom over the
     # measured need for both datasets at the downscale each declares.
-    timeout-minutes: 330
+    # A repeated run pays the whole pipeline several times on one runner, so it
+    # gets the headroom a single run does not need. The workflow stays under the
+    # 6 h job ceiling either way, and a stage that overruns still fails on its own
+    # budget rather than the job timeout.
+    timeout-minutes: ${{ github.event.inputs.reps != '' && github.event.inputs.reps != '1' && 350 || 330 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.datasets) }}
@@ -376,6 +389,10 @@ jobs:
           # And for OptimizeCameras: validated by `--optimize-params`, which also
           # inserts the task after AlignCameras when the value is non-empty.
           OPTIMIZE_PARAMS: ${{ github.event.inputs.optimize_params }}
+          # How many independent runs of this dataset. Validated by `--reps`;
+          # empty or "1" leaves every scheduled, push and ordinary manual run
+          # exactly as it was.
+          REPS: ${{ github.event.inputs.reps }}
           # gcp-rtk diagnostic allowlist; empty keeps the full set. Untrusted
           # dispatch text, validated by the protocol.
           GCP_VARIANTS: ${{ github.event.inputs.gcp_variants }}
@@ -388,6 +405,7 @@ jobs:
             --dem-params "$DEM_PARAMS" \
             --ortho-params "$ORTHO_PARAMS" \
             --optimize-params "$OPTIMIZE_PARAMS" \
+            --reps "${REPS:-1}" \
             --work build/bench \
             --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
           status=${PIPESTATUS[0]}

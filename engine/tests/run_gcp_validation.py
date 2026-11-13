@@ -2570,10 +2570,17 @@ def run_real_odm(args):
     # GCPs only first: its per-fold adjustment is the leak-free source of the
     # estimated antenna lever arm the later variants reuse. The camera-RTK
     # variant takes an explicitly configured fixed arm when one is supplied.
-    variants["gcps_only"] = run_variant(args, gcps, align_report, False)
+    # The benchmark's adaptive_fitting dispatch parameter selects the same
+    # adaptive calibration model on the two standard variants that the
+    # diagnostics run as an extra probe. Keep the option on the variant's options
+    # dict so the report shows which lens model produced each row.
+    base_options = {"adaptive_fitting": True} if args.adaptive_fitting else None
+    variants["gcps_only"] = run_variant(
+        args, gcps, align_report, False, base_options)
     default_estimates = per_fold_estimates("gcps_only")
-    camera_options = ({"antenna_offset_m": antenna} if antenna is not None
-                      else None)
+    camera_options = dict(base_options or {})
+    if antenna is not None:
+        camera_options["antenna_offset_m"] = antenna
     variants["camera_rtk_gcps"] = run_variant(
         args, gcps, align_report, True, camera_options)
     # In per-image mode the same alignment is also refitted with one uniform
@@ -2775,6 +2782,11 @@ def parse_args(argv):
                              "names to run instead of all of them (the base "
                              "variants and the timing probe always run); e.g. "
                              "'adaptive_fitting,camera_rtk_per_image_adaptive'")
+    parser.add_argument("--adaptive-fitting", action="store_true",
+                        help="run the two standard variants (gcps_only and "
+                             "camera_rtk_gcps) with the adaptive calibration "
+                             "model, the same configuration the benchmark's "
+                             "adaptive_fitting dispatch parameter selects")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
     parser.add_argument("--antenna-offset", default="",

@@ -56,6 +56,13 @@ TEST(CommandLine, HelpAndVersion) {
     EXPECT_EQ(parse_command_line({"--version"}).options.action, Options::Action::Version);
 }
 
+TEST(CommandLine, SelfTestTlsIsAParsedDiagnostic) {
+    const ParseResult r = parse_command_line({"--self-test-tls"});
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_TRUE(r.options.self_test_tls);
+    EXPECT_FALSE(parse_command_line({"--self-test-tls=1"}).ok());
+}
+
 TEST(CommandLine, RejectsBadUsage) {
     const std::vector<std::vector<std::string>> bad = {
         {"--bogus"},           {"--theme"},          {"--theme", "purple"},

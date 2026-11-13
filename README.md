@@ -306,6 +306,39 @@ rules every change is held to.
 
 What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md).
 
+## Update checks
+
+The desktop app can check GitHub for a newer release. It checks once at startup
+(at most once every 24 hours) and shows a non-modal notice in the status bar;
+the user opens the update window from there. **Help > Check for Updates...**
+(on macOS it also appears in the application menu) checks immediately and always
+reports the result. The window shows the release notes and offers Download and
+Install, Skip This Version, Remind Me Later and View on GitHub.
+
+Updates are installed only after the user asks for them. The downloaded file is
+verified against the release's `SHA256SUMS` before any installer runs; a missing
+or mismatched checksum refuses the install. Platform behaviour:
+
+- **macOS:** opens the DMG and asks you to drag the app into Applications and
+  restart (the build is unsigned, so it never replaces a running bundle).
+- **Windows:** offers to quit and starts the NSIS installer.
+- **Linux AppImage:** downloads next to the running file, marks it executable
+  and atomically replaces the AppImage, keeping the old one as `.bak`; offers a
+  restart.
+- **Linux .deb:** opens the package with the system installer.
+
+Preferences (Edit > Preferences) has "Automatically check for updates" (on by
+default), the channel (Stable or Include pre-releases; a pre-release build
+defaults to the pre-release channel) and a Check Now button. "Skip This Version"
+is remembered until the next release.
+
+Set `ALPHASHAPE_NO_UPDATE_CHECK=1` (or start the app with `--no-update-check`)
+to disable every request. The only network traffic is a GET to the public
+GitHub Releases API and, after an approved download, the asset and its
+`SHA256SUMS`; no identifiers, usage data or telemetry are sent. Signature
+verification is future work because the releases are currently unsigned: the
+checksum protects download integrity, not publisher identity.
+
 ## Repository layout
 
 ```

@@ -79,6 +79,17 @@ AdaptiveFitResult adaptive_fit(BAProblem& problem,
     solve_options.compute_point_covariance = false;
     solve_options.compute_calibration_covariance = false;
 
+    // Selection is a COMPARISON of costs between solves, and the accept/reject
+    // threshold can sit within a few ulps of a candidate's cost on a real block.
+    // A threaded Ceres evaluation sums residual blocks in thread-completion
+    // order, so the same candidate can cross the threshold differently on
+    // another run and a different calibration model is selected — which is not a
+    // decision any caller asked to be random. Pinning the selection solves (and
+    // the final accepted solve, which reuses this struct) to one thread makes
+    // the selected model reproducible. The optional covariance pass below uses
+    // the caller's threading unchanged: it reports a matrix, it does not choose.
+    solve_options.num_threads = 1;
+
     set_free_mask(problem, sensor_allowed, base);
     BAReport report = bundle_adjust(problem, solve_options);
     result.solves = 1;

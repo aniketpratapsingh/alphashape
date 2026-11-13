@@ -31,11 +31,13 @@ import argparse
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import shutil
 import socket
 import ssl
+import statistics
 import struct
 import subprocess
 import sys
@@ -136,6 +138,32 @@ class OrthoParamError(ParamError):
 
 class OptimizeParamError(ParamError):
     """An ``optimize_params`` string that is not a list of well-formed ``key=value``."""
+
+
+class RepsError(ValueError):
+    """A ``reps`` value that is not a positive whole number of runs."""
+
+
+def parse_reps(text: str | int | None) -> int:
+    """The number of times to run a dataset, defaulting to one.
+
+    One run is the historical behaviour and is what a scheduled, push or
+    ordinary manual job gets. A larger value exists to tell a real effect from
+    run-to-run noise: a single measurement cannot, because the engine's
+    alignment and its threaded optimiser are not guaranteed to be bit-identical
+    between runs. The value is parsed here rather than with ``argparse``'s
+    ``type=int`` so the error names the contract ("a positive whole number")
+    instead of argparse's generic "invalid int value".
+    """
+    if text is None or text == "":
+        return 1
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise RepsError(f"{text!r} is not a whole number of runs") from None
+    if value < 1:
+        raise RepsError(f"{text!r} is not a positive number of runs")
+    return value
 
 
 # A task parameter name is what the engine declares: lowercase words and
@@ -884,6 +912,7 @@ def run_pipeline(
     overrides: dict | None = None,
     stage_budget_s: float | None = None,
     stage_budgets: dict | None = None,
+    capture_pose_hashes: bool = False,
 ) -> dict:
     """Create a project from ``images`` and run the pipeline, timing each stage.
 
@@ -909,6 +938,11 @@ def run_pipeline(
     # stale log from a previous attempt would bury this one's error.
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_bytes(b"")
+    # The CLI saves the project after every task, so a hash here is the alignment
+    # as it stood BEFORE any later stage refined it. That separation is what lets
+    # repetitions tell "alignment is non-deterministic" from "the threaded
+    # OptimizeCameras pass is", which are different findings.
+    alignment_pose_hash: str | None = None
 
     stages["AddPhotos"] = _timed(run_cli, ["--new", str(project), "--add-images",
                                            *[str(p) for p in images]], log=log)
@@ -920,6 +954,8 @@ def run_pipeline(
         if stage_budget_s:
             budget = float(stage_budgets.get(task, stage_budget_s)) if stage_budgets else stage_budget_s
         stages[task] = _timed(run_cli, arguments, log=log, timeout=budget)
+        if capture_pose_hashes and task == "AlignCameras":
+            alignment_pose_hash = pose_hash(project)
     total = time.monotonic() - started
 
     products: dict[str, str] = {}
@@ -935,7 +971,7 @@ def run_pipeline(
             raise SystemExit(f"{task} reported success but {destination} is missing")
         products[filename] = str(destination)
 
-    return {
+    timing = {
         "stages_s": stages,
         "total_s": total,
         "project": str(project),
@@ -946,6 +982,13 @@ def run_pipeline(
         # Non-empty means this run was NOT at defaults; the report prints it.
         "param_overrides": overrides,
     }
+    # Only a repetition run pays for these: adding them unconditionally would
+    # change every control run's JSON, and the historical file is a contract that
+    # report.py and accept_regression.py read.
+    if capture_pose_hashes:
+        timing["alignment_pose_hash"] = alignment_pose_hash
+        timing["final_pose_hash"] = pose_hash(project)
+    return timing
 
 
 def peak_rss_mb() -> float | None:
@@ -1091,6 +1134,177 @@ def inspect_project(project: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Alignment pose hash and repeated runs
+# ---------------------------------------------------------------------------
+
+# Keys whose numbers describe the harness rather than the reconstruction. A
+# repetition summary must be built from measurements only: a median of wall-clock
+# time or of a manifest hash says nothing about whether two runs agree.
+_REPETITION_EXCLUDED_PREFIXES = (
+    "timing",
+    "dataset_manifest",
+    "repetitions",
+)
+
+HASH_CHARS = 16
+
+
+def pose_hash(project: Path) -> str | None:
+    """A short digest of every stored camera pose, or None when unreadable.
+
+    The point of the digest is to make "were these two runs the same?" answerable
+    without shipping the projects: a matching hash means the poses are
+    bit-identical, a mismatch means some stage moved them. It is taken from the
+    ``doc.xml`` the project writer produced (via ``_decode_cameras``), so it hashes
+    exactly what the engine saved, not an in-memory copy.
+
+    Camera ids are sorted so a different map iteration order cannot change the
+    digest, and each float is written with ``repr`` (round-trip exact for a
+    binary64) so a real change of one unit in the last place changes the hash.
+    """
+    try:
+        bundle = project.with_suffix("")
+        archive = bundle.parent / f"{bundle.name}.files" / "project.zip"
+        if not archive.exists():
+            return None
+        with zipfile.ZipFile(archive) as container:
+            xml = container.read("doc.xml")
+        cameras = _decode_cameras(xml)
+    except Exception:  # noqa: BLE001 - a hash that cannot be taken is reported as absent
+        return None
+    if not cameras:
+        return None
+    lines = []
+    for camera_id in sorted(cameras):
+        entry = cameras[camera_id]
+        values = " ".join(repr(float(value)) for value in entry["pose"].reshape(-1))
+        lines.append(f"{camera_id}:{entry['sensor_id']}:{int(entry['enabled'])}:{values}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:HASH_CHARS]
+
+
+def numeric_leaves(metrics: dict, prefix: str = "") -> dict[str, float]:
+    """Every finite numeric leaf of a metrics dict, keyed by its dotted path.
+
+    Deliberately local rather than imported from ``report``: the runner must be
+    usable on a machine where only the manifest commands' dependencies are
+    present, and this is a dozen lines. Booleans are excluded (``True`` is an int
+    in Python and would otherwise become a fake measurement), as are non-finite
+    values.
+    """
+    out: dict[str, float] = {}
+    if not isinstance(metrics, dict):
+        return out
+    for key, value in metrics.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(numeric_leaves(value, path))
+        elif isinstance(value, bool):
+            continue
+        elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+            out[path] = float(value)
+    return out
+
+
+def summary_paths(metrics: dict) -> dict[str, float]:
+    """The numeric leaves a repetition summary is allowed to compare.
+
+    Timing, the manifest description and any nested repetition record are
+    excluded: two runs that agree on the reconstruction but took different
+    wall-clock time are identical for the question repetitions exist to answer.
+    """
+    return {
+        path: value
+        for path, value in numeric_leaves(metrics).items()
+        if not any(path == prefix or path.startswith(prefix + ".")
+                   for prefix in _REPETITION_EXCLUDED_PREFIXES)
+    }
+
+
+def summarise_repetitions(records: list[dict]) -> dict:
+    """Per-metric median, range and medoid for a list of per-run records.
+
+    Each record is ``{"run": 1-based index, "alignment_pose_hash": str|None,
+    "final_pose_hash": str|None, "metrics": dict}``.
+
+    Only metrics every run reported are summarised, so a metric that one rep
+    skipped cannot make the others look like it moved. The returned
+    ``selected_run`` names the run whose complete metrics are closest to the
+    per-metric medians (a medoid): the report and any later comparison need ONE
+    complete metrics document, and picking the medoid rather than averaging keeps
+    that document internally consistent (an average of nested metrics is not a
+    metrics document).
+    """
+    if not records:
+        raise ValueError("summarise_repetitions needs at least one run")
+    values = [summary_paths(record["metrics"]) for record in records]
+    common = set(values[0])
+    for run in values[1:]:
+        common &= set(run)
+    paths = sorted(common)
+
+    medians = {path: float(statistics.median(run[path] for run in values)) for path in paths}
+    lows = {path: min(run[path] for run in values) for path in paths}
+    highs = {path: max(run[path] for run in values) for path in paths}
+
+    # Medoid: the run whose normalised error against the medians is smallest.
+    # Normalising by the median's magnitude stops a metre-valued metric from
+    # drowning a fraction-valued one; the epsilon keeps an all-zero metric from
+    # dividing by zero (all runs then agree on it and contribute nothing).
+    scores = []
+    for run in values:
+        score = 0.0
+        for path in paths:
+            score += abs(run[path] - medians[path]) / (abs(medians[path]) + 1e-12)
+        scores.append(score)
+    selected = min(range(len(records)), key=lambda index: (scores[index], index))
+
+    alignment_hashes = [record.get("alignment_pose_hash") for record in records]
+    final_hashes = [record.get("final_pose_hash") for record in records]
+
+    def all_identical(hashes: list) -> bool | None:
+        if any(value is None for value in hashes):
+            return None
+        return len(set(hashes)) == 1
+
+    return {
+        "count": len(records),
+        "selected_run": records[selected]["run"],
+        "medians": medians,
+        "min": lows,
+        "max": highs,
+        "runs": [
+            {
+                "run": record["run"],
+                "alignment_pose_hash": record.get("alignment_pose_hash"),
+                "final_pose_hash": record.get("final_pose_hash"),
+                "values": values[index],
+            }
+            for index, record in enumerate(records)
+        ],
+        "alignment_pose_hashes": alignment_hashes,
+        "final_pose_hashes": final_hashes,
+        "alignment_identical": all_identical(alignment_hashes),
+        "final_identical": all_identical(final_hashes),
+    }
+
+
+def with_repetitions(results: list[dict], records: list[dict]) -> dict:
+    """The medoid run's metrics, carrying the repetition summary.
+
+    A single run is returned unchanged: the historical metrics JSON has no
+    ``repetitions`` key, and keeping it that way is what lets an existing
+    baseline, ``accept_regression.py`` and ``report.py`` keep reading it exactly
+    as before.
+    """
+    if len(results) == 1:
+        return results[0]
+    summary = summarise_repetitions(records)
+    primary = dict(results[summary["selected_run"] - 1])
+    primary["repetitions"] = summary
+    return primary
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1104,6 +1318,7 @@ def run(
     dem_params: dict[str, str] | None = None,
     ortho_params: dict[str, str] | None = None,
     optimize_params: dict[str, str] | None = None,
+    reps: int = 1,
 ) -> dict:
     """Run one dataset and score it.
 
@@ -1117,7 +1332,14 @@ def run(
     ``downscale`` and is therefore comparable with the control run of the same
     dataset. The manifest's own dicts are never mutated: they are copied, because
     the manifest is loaded once and a mutation would leak into the next run.
+
+    ``reps`` runs the pipeline (or the GCP protocol) that many times and returns
+    the medoid run's metrics with a ``repetitions`` block holding every run, the
+    per-metric median and range, and the alignment pose hashes. One run returns
+    exactly what it always did, with no ``repetitions`` key.
     """
+    if reps < 1:
+        raise RepsError(f"{reps!r} is not a positive number of runs")
     manifest = load_manifest()
     if dataset_name not in manifest["datasets"]:
         raise SystemExit(
@@ -1184,7 +1406,7 @@ def run(
     references = reference_paths(dataset, work)
 
     if dataset.get("validation") == "gcp":
-        return run_gcp_validation(dataset_name, dataset, work, references)
+        return _run_gcp_repetitions(dataset_name, dataset, work, references, reps)
 
     print("-- pipeline")
     available = collect_images(dataset, work)
@@ -1198,9 +1420,61 @@ def run(
     overrides = dataset.get("param_overrides") or {}
     if overrides:
         print(f"   parameter overrides: {overrides}")
+
+    results: list[dict] = []
+    records: list[dict] = []
+    for index in range(1, reps + 1):
+        # One run keeps the historical layout (the products and project at the
+        # work root). A repetition gets its own directory: two concurrent-ish runs
+        # sharing site.psx would overwrite each other, and the whole point is to
+        # leave the first run's evidence intact while the second runs.
+        rep_work = work if reps == 1 else work / "reps" / f"rep{index}"
+        if reps > 1:
+            print(f"-- run {index}/{reps}")
+        result = _score_pipeline(
+            dataset_name, dataset, rep_work, references, images, available, selection,
+            overrides, manifest, depth_params, dem_params, ortho_params, optimize_params,
+            capture_pose_hashes=reps > 1,
+        )
+        results.append(result)
+        timing = result.get("timing") or {}
+        records.append({
+            "run": index,
+            "alignment_pose_hash": timing.get("alignment_pose_hash"),
+            "final_pose_hash": timing.get("final_pose_hash"),
+            "metrics": result,
+        })
+        if reps > 1:
+            print(f"   alignment pose hash {timing.get('alignment_pose_hash')} "
+                  f"final {timing.get('final_pose_hash')}")
+    return with_repetitions(results, records)
+
+
+def _score_pipeline(
+    dataset_name: str,
+    dataset: dict,
+    work: Path,
+    references: dict,
+    images: list[Path],
+    available: list[Path],
+    selection: dict,
+    overrides: dict,
+    manifest: dict,
+    depth_params: dict[str, str] | None,
+    dem_params: dict[str, str] | None,
+    ortho_params: dict[str, str] | None,
+    optimize_params: dict[str, str] | None,
+    capture_pose_hashes: bool = False,
+) -> dict:
+    """Run the pipeline once in ``work`` and score it.
+
+    Split out of :func:`run` so a repeated run can call it per directory without
+    duplicating the inspection, metrics and provenance block.
+    """
     timing = run_pipeline(
         work, images, overrides,
         dataset.get("stage_budget_s"), dataset.get("stage_budgets"),
+        capture_pose_hashes=capture_pose_hashes,
     )
 
     print("-- inspect")
@@ -1265,7 +1539,48 @@ def run(
     return result
 
 
-def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references: dict) -> dict:
+def _run_gcp_repetitions(
+    dataset_name: str, dataset: dict, work: Path, references: dict, reps: int
+) -> dict:
+    """Repeat the GCP protocol, hashing the alignment each run aligned itself.
+
+    Unlike a pipeline rep, which keeps one project and can hash it after
+    ``AlignCameras``, the GCP protocol saves its block before the folds and never
+    re-saves it, so ``gcp_site.psx`` in a rep's own directory IS that rep's
+    alignment. Each rep therefore gets its own directory even when there is only
+    one, so the hash is always the alignment of the run being recorded rather than
+    a leftover from an earlier one.
+    """
+    results: list[dict] = []
+    records: list[dict] = []
+    for index in range(1, reps + 1):
+        report_dir = work if reps == 1 else work / "reps" / f"rep{index}"
+        if reps > 1:
+            print(f"-- gcp validation run {index}/{reps}")
+        report = run_gcp_validation(
+            dataset_name, dataset, work, references,
+            report_dir=report_dir, reps=reps,
+        )
+        alignment_hash = None
+        if reps > 1:
+            alignment_hash = pose_hash(report_dir / "gcp_site.psx")
+            print(f"   alignment pose hash {alignment_hash}")
+        results.append(report)
+        records.append({
+            "run": index,
+            "alignment_pose_hash": alignment_hash,
+            # The folds never save the project, so there is no meaningful
+            # post-OptimizeCameras pose to hash without changing the protocol.
+            "final_pose_hash": None,
+            "metrics": report,
+        })
+    return with_repetitions(results, records)
+
+
+def run_gcp_validation(
+    dataset_name: str, dataset: dict, work: Path, references: dict,
+    *, report_dir: Path | None = None, reps: int = 1,
+) -> dict:
     """Run the real-block ground-control validation (engine/tests/run_gcp_validation.py).
 
     The GCP protocol is different from the ortho/DEM pipeline: align the block once,
@@ -1293,12 +1608,22 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     env["PYTHONPATH"] = python_dir + os.pathsep + env.get("PYTHONPATH", "")
     python = os.environ.get("ALPHASHAPE_PYTHON") or "python3"
 
-    out_json = work / "gcp_report.json"
+    output_dir = report_dir or work
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_json = output_dir / "gcp_report.json"
     # "per-image" reads each photo's XMP RTK deviations; a number is the
     # uniform baseline. camera_accuracy_fallback_m is the older key, kept so a
     # manifest written before per-image mode still selects a uniform weight.
     camera_accuracy = gcp.get("camera_accuracy",
                               gcp.get("camera_accuracy_fallback_m", 0.05))
+    # The GCP protocol always runs OptimizeCameras, so its dispatch parameters
+    # are translated rather than inserted as a stage. Only adaptive_fitting has a
+    # meaning here: it selects the protocol's adaptive variant (the same extended
+    # permission set its diagnostics use), and anything else is recorded but has
+    # no effect. The run is still marked an experiment below, so it can never
+    # become a baseline.
+    optimize = (dataset.get("param_overrides") or {}).get("OptimizeCameras") or {}
+    adaptive = str(optimize.get("adaptive_fitting", "")).strip().lower() in {"true", "1"}
     command = [
         python, str(script), "--real", str(images_dir),
         "--gcp-list", str(gcp_list), "--gcp-names", str(gcp_names),
@@ -1316,8 +1641,16 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     mrk = references.get("mrk")
     if mrk:
         command.extend(["--mrk", str(mrk)])
+    if adaptive:
+        command.append("--adaptive-fitting")
     # The diagnostics are report-only probes; the manifest opts a dataset in.
-    if gcp.get("diagnostics"):
+    # A repeated run does not: the probes are a dozen extra leave-one-out
+    # variants, and paying for them on every repetition would push the job past
+    # the 6 h ceiling to re-measure rows the n=1 run already reports. The
+    # repeated comparison uses the two standard variants, which is what its
+    # dispatch is about.
+    diagnostics = bool(gcp.get("diagnostics")) and reps == 1
+    if diagnostics:
         command.append("--diagnostics")
     # An allowlist makes a targeted re-measurement affordable without changing
     # the default set. The dispatch input arrives through an environment
@@ -1348,6 +1681,11 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     report["manifest_hash"] = manifest_hash(load_manifest())
     report["timing"] = {"total_s": elapsed, "stages_s": {"gcp_validation": elapsed},
                         "param_overrides": dataset.get("param_overrides") or {}}
+    # The top-level key is what is_experiment.py, report.py and
+    # accept_regression.py read; timing.param_overrides alone would let a
+    # dispatched GCP experiment be published as the regression baseline.
+    if optimize:
+        report["optimize_params"] = dict(optimize)
     report["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1599,6 +1937,12 @@ def main(argv: list[str] | None = None) -> int:
         "inserts the task after AlignCameras and marks the run as an experiment "
         "(never a baseline, never gated)",
     )
+    parser.add_argument(
+        "--reps",
+        default=1,
+        help="run the dataset this many times and report the median and range "
+        "of every metric (default: 1)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1620,6 +1964,11 @@ def main(argv: list[str] | None = None) -> int:
         optimize_params = parse_optimize_params(args.optimize_params)
     except OptimizeParamError as exc:
         parser.error(f"--optimize-params: {exc}")
+
+    try:
+        reps = parse_reps(args.reps)
+    except RepsError as exc:
+        parser.error(f"--reps: {exc}")
 
     manifest = load_manifest()
 
@@ -1650,6 +1999,7 @@ def main(argv: list[str] | None = None) -> int:
         dem_params=dem_params,
         ortho_params=ortho_params,
         optimize_params=optimize_params,
+        reps=reps,
     )
 
     if args.json:

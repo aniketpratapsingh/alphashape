@@ -426,6 +426,11 @@ GCP-only adjustment.
 | `antenna_estimated_adaptive` | adaptive | 5.3 | 12.9 | 14.0 |
 | `antenna_estimated_adaptive_px_minus` | adaptive | 5.1 | 11.9 | 12.9 |
 
+The adaptive rows in this table are one run each. The replicated comparison of
+the two standard variants is in "Replicated: adaptive fitting on and off"
+above; it repeats `gcps_only` and `camera_rtk_gcps` only, so the antenna variants
+here remain single-run.
+
 Findings:
 
 - **The antenna does not improve the check in this run.** The BA centre prior
@@ -455,18 +460,92 @@ Findings:
   residual in this block, not a half-pixel convention difference, and it is
   not made the default.
 
-**`adaptive_fitting` stays off by default.** Run on the other benchmark datasets
-(OptimizeCameras after alignment, adaptive off vs on; runs `42664406276` /
-`42664413306` aerial-nadir, `42664420424` / `42664427402` terrestrial-laser) it was
-worse on both: aerial DEM NMAD 0.76 -> 1.02 m and ortho offset 0.80 -> 1.50 m;
-laser accuracy at 2/5/10 cm 0.092/0.252/0.490 -> 0.076/0.215/0.417 and
-completeness 0.064/0.151/0.277 -> 0.047/0.112/0.218. One run each, and the
-alignment before OptimizeCameras is not bit-identical between runs, so this is
-indicative, not conclusive. For an RTK/GCP block with a single camera, enable
-`adaptive_fitting=True` in OptimizeCameras; the best measured configuration here
-reaches 5.05 cm horizontal (camera RTK + adaptive fit + -0.5 px), against the
-5 cm target. The target is not met with the defaults (7.9 / 7.5 cm) or with the
-antenna lever arm.
+#### Replicated: adaptive fitting on and off (2026-11-13, runs `43450507699` / `43450529571`)
+
+Every dataset was run three times through the quality benchmark at commit
+`4645cc0`, once with `optimize_params=adaptive_fitting=true` (`43450507699`) and
+once with `adaptive_fitting=false` (`43450529571`). The repetition support
+(`--reps 3`) keeps each run in its own directory and records an alignment pose
+hash and a final pose hash per run, so the numbers below are a distribution, not
+a single sample.
+
+**Determinism.** All three repetitions of every dataset reproduced exactly:
+every numeric metric's range is zero and the pose hashes agree. The
+per-dataset alignment hash is identical within a configuration and across the
+two dispatches (`857ee1ac11308946` aerial-nadir, `ea26af008f7fbe47`
+terrestrial-laser, `a4b0f0c4d7916625` gcp-rtk), so the alignment before
+OptimizeCameras is bit-identical; only the final pose differs between adaptive
+on and off, as the different calibration model implies. The GCP protocol never
+re-saves its block after the folds, so it records an alignment hash but no final
+hash. The earlier caveat that the alignment was not bit-identical between runs
+is superseded by these hashes; separately, the adaptive-fit selection that could
+previously cross its accept threshold differently under threaded summation is
+now pinned to one thread (`engine/src/common/algorithm/sfm/adaptive_fit.cpp`).
+
+Every value below is the median of the three runs, and every metric's range was
+`[median–median]` (zero) — the per-run values are in that run's
+`repetitions` block in the benchmark artifact. GCP leave-one-out check RMS is in
+cm:
+
+| variant | adaptive | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` | **on** | 6.54 | 6.36 | 9.12 |
+| `gcps_only` | off | 7.91 | 10.10 | 12.83 |
+| `camera_rtk_gcps` | **on** | 5.40 | 10.26 | 11.60 |
+| `camera_rtk_gcps` | off | 7.54 | 16.81 | 18.43 |
+
+Aerial-nadir (Bandamaji) reference comparison:
+
+| metric | adaptive on | adaptive off |
+| --- | ---: | ---: |
+| DEM ΔZ NMAD, offset removed (m) | 1.017 | **0.764** |
+| DEM ΔZ p68, offset removed (m) | 1.005 | **0.777** |
+| ortho offset (m) | 1.496 | **0.802** |
+| ortho tile dispersion (MAD, m) | 0.490 | **0.044** |
+
+Terrestrial-laser (ETH3D `terrains`) accuracy and completeness are the fraction
+of reconstructed / reference points within the tolerance (higher is better):
+
+| metric | adaptive on | adaptive off |
+| --- | ---: | ---: |
+| accuracy @ 2 cm | 0.0758 | **0.0925** |
+| accuracy @ 5 cm | 0.2148 | **0.2516** |
+| accuracy @ 10 cm | 0.4169 | **0.4899** |
+| completeness @ 2 cm | 0.0475 | **0.0640** |
+| completeness @ 5 cm | 0.1122 | **0.1513** |
+| completeness @ 10 cm | 0.2183 | **0.2773** |
+| F-score @ 5 cm | 0.1474 | **0.1890** |
+
+**Recommendation: keep `adaptive_fitting` off by default, and enable it
+conditionally when the chunk has enabled control points.** On the GCP block the
+adaptive model is a clear win — 6.54 / 6.36 / 9.12 against 7.91 / 10.10 / 12.83 cm
+for `gcps_only`, and 5.40 / 10.26 / 11.60 against 7.54 / 16.81 / 18.43 cm for
+`camera_rtk_gcps` — and every improvement is many times the (zero) rep range. On
+aerial-nadir it is a real loss on both gated metrics (NMAD +0.252 m, ortho
+offset +0.693 m), and on terrestrial-laser it loses accuracy, completeness and
+F-score at every tolerance. A global default-on is therefore not supported.
+
+A camera-reference trigger is also not supported: aerial-nadir is georeferenced
+(90 GNSS prior axes) and has no control points, so turning adaptive on for
+"enabled camera references" would reproduce the regression above. The condition
+that separates the three datasets is enabled **control points** — gcp-rtk has
+five GCPs (four control points in each leave-one-out fold), aerial-nadir and
+terrestrial-laser have none. The engine now has an
+opt-in `adaptive_fitting_auto` parameter (default `false`, so existing behaviour
+is unchanged) that selects adaptive fitting when `control_markers > 0`
+(`optimize_cameras_task.cpp`); the two tests
+`AdaptiveFittingAutoSelectsWithControlMarkers` and
+`AdaptiveFittingAutoIgnoresCameraReferencesAlone` pin both halves of the rule.
+Flipping that default is a one-line change for the coordinator.
+
+**The 5 cm horizontal target is still missed.** The closest replicated
+configuration is `camera_rtk_gcps` with adaptive fitting at 5.40 cm (the
+report-only −0.5 px probe reached 5.05 cm in the single diagnostic run), against
+7.54 cm with the default model and 7.91 cm for `gcps_only`. The target is not
+loosened. For an RTK/GCP block, enabling `adaptive_fitting` (or
+`adaptive_fitting_auto`) is the configuration to use, but it must not be
+described as meeting the target; the defaults miss by 2.5–2.9 cm, and the
+antenna lever arm does not close the gap.
 
 #### Datum fix: UpdateTransform consumes the mount (2026-11-12, PR #115)
 
@@ -525,6 +604,10 @@ check RMS, horizontal / vertical / 3D, in cm:
 | `antenna_estimated` | default | 7.99 | 20.15 | 21.68 |
 | `antenna_estimated`, `adaptive_fitting` | adaptive | 5.34 | 12.89 | 13.95 |
 | `antenna_estimated`, adaptive, -0.5 px (report-only) | adaptive | 5.05 | 11.89 | 12.92 |
+
+The adaptive rows here are one run per variant. The replicated comparison in
+"Replicated: adaptive fitting on and off" repeats only `gcps_only` and
+`camera_rtk_gcps`, so the antenna variants remain single-run.
 
 The fix makes the two datum consumers agree. The protocol's camera-reference
 residual against the **modelled antenna** (mean E/N/U over the 146 cameras)

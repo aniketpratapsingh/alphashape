@@ -15,6 +15,7 @@ constexpr const char* kUsage =
     "  --open <path>        open a project (a lone positional argument does the same)\n"
     "  --theme dark|light   use this theme for the session (overrides the stored choice)\n"
     "  --reset-settings     discard stored settings before starting\n"
+    "  --no-update-check    never contact GitHub to check for updates\n"
     "  --log-level <lvl>    trace, debug, info, warn, error or off (default info)\n"
     "  --offscreen-smoke    build the window headlessly, print \"gui ready\" and exit\n"
     "  --version            print the version and exit\n"
@@ -103,6 +104,11 @@ ParseResult parse_command_line(const std::vector<std::string>& args) {
                 return fail("--reset-settings takes no value");
             }
             opts.reset_settings = true;
+        } else if (arg == "--no-update-check") {
+            if (inline_value) {
+                return fail("--no-update-check takes no value");
+            }
+            opts.no_update_check = true;
         } else if (arg == "--log-level") {
             const auto value = take_value();
             const auto level = value ? log_level_from_name(*value) : std::nullopt;
@@ -115,6 +121,13 @@ ParseResult parse_command_line(const std::vector<std::string>& args) {
                 return fail("--offscreen-smoke takes no value");
             }
             opts.offscreen_smoke = true;
+        } else if (arg == "--self-test-tls") {
+            // Deliberately undocumented: a packaging diagnostic, not a user
+            // option (see the smoke scripts).
+            if (inline_value) {
+                return fail("--self-test-tls takes no value");
+            }
+            opts.self_test_tls = true;
         } else if (looks_like_option(arg)) {
             return fail("unknown option " + arg);
         } else {

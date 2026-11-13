@@ -17,9 +17,14 @@ add_library(alphashape_gui_lib STATIC
     jobs/estimate_model.cpp
     task_dialog.cpp
     calibration_dialog.cpp
+    preferences_dialog.cpp
     transform_dialog.cpp
     marker_tools_dialogs.cpp
     workflow.cpp
+    update_checker.cpp
+    update_dialog.cpp
+    update_source.cpp
+    installer.cpp
     export_controller.cpp
     start_screen.cpp
     main_window.cpp
@@ -37,7 +42,7 @@ add_library(alphashape_gui_lib STATIC
     theme/theme.cpp)
 target_include_directories(alphashape_gui_lib PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
 target_link_libraries(alphashape_gui_lib
-    PUBLIC Qt6::Widgets alphashape_algorithms alphashape_core
+    PUBLIC Qt6::Widgets Qt6::Network alphashape_algorithms alphashape_core alphashape_update
     PRIVATE alphashape_warnings Qt6::GuiPrivate)
 
 # The Reference pane renders the reference table, which is built only with the

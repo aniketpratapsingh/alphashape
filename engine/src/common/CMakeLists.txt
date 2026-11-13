@@ -68,3 +68,17 @@ if(TARGET alphashape_crs)
 endif()
 
 add_subdirectory(algorithm)
+
+# ---------------------------------------------------------------------------
+# Update checks (GUI-30): semantic versions, GitHub Releases JSON, asset choice
+# and SHA-256 verification. Qt-free on purpose so the whole policy is unit
+# tested without a QApplication or a network. The GUI adds the Qt networking
+# and dialogs on top.
+# ---------------------------------------------------------------------------
+add_library(alphashape_update STATIC
+    update/version.cpp
+    update/json.cpp
+    update/release.cpp
+    update/checksum.cpp)
+target_include_directories(alphashape_update PUBLIC ${ALPHASHAPE_INCLUDE_DIR})
+target_link_libraries(alphashape_update PUBLIC alphashape_base)

@@ -107,6 +107,20 @@ grep -q '^gpu device 0:' "$work/gpu.out"
 grep -q "alphashape.app/Contents/Frameworks/libvulkan.1.dylib" "$work/gpu.err"
 grep -q "alphashape.app/Contents/Frameworks/libMoltenVK.dylib" "$work/gpu.err"
 
+echo "== Qt Network (update checks)"
+# Qt uses SecureTransport on macOS, so there is no plugin to copy; the
+# framework itself must be in the bundle for the HTTPS requests to work.
+[ -d "$app/Contents/Frameworks/QtNetwork.framework" ] || {
+    echo "error: the bundle is missing QtNetwork.framework" >&2
+    ls "$app/Contents/Frameworks" >&2 || true
+    exit 1; }
+
+echo "== TLS backend loads"
+# The framework being present is not enough: Qt's TLS backend must actually
+# load, or every HTTPS request fails with no obvious cause. No network is used.
+QT_QPA_PLATFORM=offscreen "$gui" --self-test-tls | tee "$work/tls.txt"
+grep -q '^tls: active: .' "$work/tls.txt"
+
 echo "== GUI (offscreen)"
 # The offscreen platform plugin is not one macdeployqt picks (it deploys cocoa only), so
 # build-app.sh copies it in; check it is present before handing the GUI a headless platform.
@@ -114,7 +128,7 @@ echo "== GUI (offscreen)"
     echo "error: the bundle is missing PlugIns/platforms/libqoffscreen.dylib" >&2
     ls "$app/Contents/PlugIns/platforms" >&2 || true
     exit 1; }
-QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
+ALPHASHAPE_NO_UPDATE_CHECK=1 QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
 grep -q 'gui ready' "$work/gui.txt"
 
 echo "== Python module"

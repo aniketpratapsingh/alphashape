@@ -26,9 +26,14 @@ struct Options {
     /// --theme: overrides the stored preference for this session only.
     std::optional<ThemeMode> theme;
     bool reset_settings = false;
+    /// --no-update-check: start without any network access for updates.
+    bool no_update_check = false;
     std::optional<LogLevel> log_level;
     /// Construct the app and an empty main window, print "gui ready", exit 0.
     bool offscreen_smoke = false;
+    /// Hidden: report the Qt TLS backends this build can load and exit. Used by
+    /// the packaging smoke tests to prove that HTTPS works in the packaged app.
+    bool self_test_tls = false;
 };
 
 struct ParseResult {

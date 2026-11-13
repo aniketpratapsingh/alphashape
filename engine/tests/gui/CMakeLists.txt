@@ -23,6 +23,7 @@ add_executable(alphashape_gui_tests
     test_estimates.cpp
     test_task_dialog.cpp
     test_calibration_dialog.cpp
+    test_update.cpp
     test_region_gizmo.cpp
     test_marker_tools.cpp
     test_workflow.cpp
@@ -81,13 +82,13 @@ endforeach()
 
 include(GoogleTest)
 gtest_discover_tests(alphashape_gui_tests
-    PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
+    PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;ALPHASHAPE_NO_UPDATE_CHECK=1" TIMEOUT 120)
 
 # The pipeline runs the dense stage end to end once, so it gets a timeout that a slow shared
 # runner cannot trip. The test itself waits a bounded time per stage and reports the stage name,
 # so a real hang is diagnosed by the test, not by ctest killing the process silently.
 gtest_discover_tests(alphashape_gui_e2e_tests
-    PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 1800
+    PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;ALPHASHAPE_NO_UPDATE_CHECK=1" TIMEOUT 1800
     DISCOVERY_TIMEOUT 120)
 
 # QT_QPA_PLATFORM is deliberately NOT set here: the render tests need whatever real platform the

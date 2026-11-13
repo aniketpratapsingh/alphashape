@@ -21,6 +21,9 @@ int main(int argc, char** argv) {
                              .filePath(QStringLiteral("settings-%1.ini")
                                            .arg(QCoreApplication::applicationPid()));
     qputenv("ALPHASHAPE_GUI_SETTINGS_FILE", file.toLocal8Bit());
+    // No GUI test may open a socket. Individual update tests clear this for the
+    // duration of a fake-source check and restore it afterwards.
+    qputenv("ALPHASHAPE_NO_UPDATE_CHECK", "1");
 
     QApplication app(argc, argv);
     ::testing::InitGoogleTest(&argc, argv);
