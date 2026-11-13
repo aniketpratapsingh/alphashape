@@ -1383,6 +1383,177 @@ class IsExperimentTest(unittest.TestCase):
         self.assertEqual(is_experiment.main([]), 2)
 
 
+class RepsParseTest(unittest.TestCase):
+    """The repetition count is a dispatch input; one run is the historical default."""
+
+    def test_empty_and_none_mean_one_run(self):
+        self.assertEqual(run_bench.parse_reps(""), 1)
+        self.assertEqual(run_bench.parse_reps(None), 1)
+        self.assertEqual(run_bench.parse_reps(1), 1)
+
+    def test_a_positive_count_is_accepted(self):
+        self.assertEqual(run_bench.parse_reps("3"), 3)
+        self.assertEqual(run_bench.parse_reps(12), 12)
+
+    def test_zero_and_negative_are_rejected(self):
+        for value in ("0", "-2", 0, -1):
+            with self.assertRaises(run_bench.RepsError):
+                run_bench.parse_reps(value)
+
+    def test_a_non_number_is_rejected(self):
+        with self.assertRaises(run_bench.RepsError):
+            run_bench.parse_reps("three")
+
+    def test_the_command_line_rejects_a_bad_count(self):
+        for value in ("0", "many"):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "aerial-nadir", "--list", "--reps", value])
+
+    def test_run_refuses_a_non_positive_count_before_touching_the_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(run_bench.RepsError):
+                run_bench.run("aerial-nadir", Path(tmp), reps=0)
+
+
+class PoseHashTest(unittest.TestCase):
+    """Two runs are the same reconstruction exactly when their pose hash agrees."""
+
+    @staticmethod
+    def _project(tmp: Path, cameras: str) -> Path:
+        project = tmp / "site.psx"
+        project.write_text("alphashape-project 2\nfiles=site.files/project.zip\n")
+        bundle = tmp / "site.files" / "project.zip"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<document version="2"><chunks><chunk id="1" label="Chunk 1">'
+            f"<cameras>{cameras}</cameras>"
+            "</chunk></chunks></document>"
+        )
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("doc.xml", xml)
+        return project
+
+    def test_the_hash_changes_when_a_pose_changes(self):
+        first = ('<camera id="0" sensor_id="0" enabled="true" '
+                 'transform="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>')
+        second = ('<camera id="0" sensor_id="0" enabled="true" '
+                  'transform="1 0 0 0 0 1 0 0 0 0 1 0 0.001 0 0 1"/>')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a").mkdir()
+            (root / "b").mkdir()
+            one = run_bench.pose_hash(self._project(root / "a", first))
+            two = run_bench.pose_hash(self._project(root / "b", second))
+        self.assertIsNotNone(one)
+        self.assertNotEqual(one, two)
+
+    def test_the_hash_is_independent_of_camera_order_in_the_xml(self):
+        one = ('<camera id="0" sensor_id="0" enabled="true" '
+               'transform="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>'
+               '<camera id="1" sensor_id="0" enabled="false" '
+               'transform="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>')
+        two = ('<camera id="1" sensor_id="0" enabled="false" '
+               'transform="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>'
+               '<camera id="0" sensor_id="0" enabled="true" '
+               'transform="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a").mkdir()
+            (root / "b").mkdir()
+            first = run_bench.pose_hash(self._project(root / "a", one))
+            second = run_bench.pose_hash(self._project(root / "b", two))
+        self.assertEqual(first, second)
+
+    def test_a_missing_project_has_no_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run_bench.pose_hash(Path(tmp) / "nothing.psx"))
+
+
+class RepetitionSummaryTest(unittest.TestCase):
+    """Medians, ranges and the medoid that the report and comparison consume."""
+
+    @staticmethod
+    def _metrics(value: float, timing: float = 1.0) -> dict:
+        return {
+            "reference_based": {"dem": {"offset_removed": {"nmad_m": value}}},
+            "reference_free": {"cameras": {"cameras_aligned_fraction": 0.99}},
+            "timing": {"total_s": timing},
+            "dataset_manifest": {"images": 30},
+        }
+
+    def _records(self, hashes, values):
+        return [
+            {
+                "run": index + 1,
+                "alignment_pose_hash": hashes[index],
+                "final_pose_hash": hashes[index],
+                "metrics": self._metrics(value, timing=float(index + 1)),
+            }
+            for index, value in enumerate(values)
+        ]
+
+    def test_median_and_range_come_from_the_measurements(self):
+        records = self._records(["a", "a", "a"], [0.2, 0.4, 0.3])
+        summary = run_bench.summarise_repetitions(records)
+        path = "reference_based.dem.offset_removed.nmad_m"
+        self.assertEqual(summary["count"], 3)
+        self.assertAlmostEqual(summary["medians"][path], 0.3)
+        self.assertAlmostEqual(summary["min"][path], 0.2)
+        self.assertAlmostEqual(summary["max"][path], 0.4)
+
+    def test_timing_is_not_summarised(self):
+        summary = run_bench.summarise_repetitions(
+            self._records(["a", "a", "a"], [0.2, 0.3, 0.4])
+        )
+        self.assertFalse(any(path.startswith("timing") for path in summary["medians"]))
+        self.assertFalse(any(path.startswith("dataset_manifest")
+                             for path in summary["medians"]))
+
+    def test_identical_hashes_are_reported_as_identical(self):
+        summary = run_bench.summarise_repetitions(
+            self._records(["abc", "abc", "abc"], [0.2, 0.2, 0.2])
+        )
+        self.assertTrue(summary["alignment_identical"])
+        self.assertTrue(summary["final_identical"])
+
+    def test_a_differing_hash_is_reported_as_different(self):
+        summary = run_bench.summarise_repetitions(
+            self._records(["abc", "def", "abc"], [0.2, 0.2, 0.2])
+        )
+        self.assertFalse(summary["alignment_identical"])
+
+    def test_a_missing_hash_is_unknown_not_identical(self):
+        summary = run_bench.summarise_repetitions(
+            self._records([None, None, None], [0.2, 0.2, 0.2])
+        )
+        self.assertIsNone(summary["alignment_identical"])
+
+    def test_the_medoid_is_the_run_closest_to_every_median(self):
+        records = self._records(["a", "b", "c"], [0.28, 0.31, 0.90])
+        summary = run_bench.summarise_repetitions(records)
+        self.assertIn(summary["selected_run"], (1, 2))
+        medians = summary["medians"]
+        path = "reference_based.dem.offset_removed.nmad_m"
+        self.assertAlmostEqual(medians[path], 0.31)
+
+    def test_a_single_run_returns_unchanged_without_a_repetitions_key(self):
+        metrics = self._metrics(0.3)
+        records = [{"run": 1, "alignment_pose_hash": None,
+                    "final_pose_hash": None, "metrics": metrics}]
+        self.assertIs(run_bench.with_repetitions([metrics], records), metrics)
+        self.assertNotIn("repetitions", metrics)
+
+    def test_several_runs_return_the_medoid_with_the_summary(self):
+        metrics = [self._metrics(value) for value in (0.2, 0.4, 0.3)]
+        records = self._records(["a", "a", "a"], [0.2, 0.4, 0.3])
+        combined = run_bench.with_repetitions(metrics, records)
+        self.assertIn("repetitions", combined)
+        self.assertEqual(combined["repetitions"]["count"], 3)
+        # The primary document is one REAL run, not an average of nested dicts.
+        self.assertIn(combined["repetitions"]["selected_run"], (1, 2, 3))
+
+
 class PipelineShapeTest(unittest.TestCase):
     def test_the_pipeline_order_matches_the_documented_one(self):
         # A missing or reordered stage is a silent score change, so the order the

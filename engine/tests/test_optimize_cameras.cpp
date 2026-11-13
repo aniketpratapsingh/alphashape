@@ -1891,6 +1891,57 @@ TEST(OptimizeCameras, AdaptiveFittingMetaClearedWhenOff) {
     EXPECT_EQ(adaptive_solves(chunk), 0);
 }
 
+TEST(OptimizeCameras, AdaptiveFittingAutoSelectsWithControlMarkers) {
+    // The benchmark's finding: a block with surveyed control points benefits
+    // from the richer model. The auto option must therefore engage adaptive
+    // fitting without the caller setting adaptive_fitting itself.
+    GeoMarkerScene scene = make_geo_marker_scene(20261130u);
+    ASSERT_EQ(scene.document.active_chunk()->markers().size(), 5U);
+
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    params.set("adaptive_fitting", false);
+    params.set("adaptive_fitting_auto", true);
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    Chunk& chunk = *scene.document.active_chunk();
+    const std::string* selected =
+        chunk.meta().find("optimize_cameras.adaptive_selected");
+    ASSERT_NE(selected, nullptr);
+    EXPECT_FALSE(selected->empty());
+    EXPECT_GE(adaptive_solves(chunk), 1);
+    EXPECT_GT(meta_value(chunk, "optimize_cameras.control_points"), 0.0);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingAutoIgnoresCameraReferencesAlone) {
+    // A consumer block georeferenced only by its camera positions regressed
+    // when the model was widened, so camera references must not trigger the
+    // auto option. Removing the control markers leaves exactly that chunk:
+    // references enabled, no control points.
+    GeoMarkerScene scene = make_geo_marker_scene(20261131u);
+    Chunk& chunk = *scene.document.active_chunk();
+    std::size_t enabled_references = 0;
+    for (const Camera& camera : chunk.cameras()) {
+        if (camera.reference.enabled) {
+            ++enabled_references;
+        }
+    }
+    ASSERT_GT(enabled_references, 0U);
+    chunk.markers().clear();
+
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    params.set("adaptive_fitting", false);
+    params.set("adaptive_fitting_auto", true);
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    Chunk& solved = *scene.document.active_chunk();
+    const std::string* selected =
+        solved.meta().find("optimize_cameras.adaptive_selected");
+    ASSERT_NE(selected, nullptr);
+    EXPECT_TRUE(selected->empty());
+    EXPECT_EQ(adaptive_solves(solved), 0);
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 0.0);
+}
+
 // ---------------------------------------------------------------------------
 // Master sensors share one calibration slot (WP-13.16)
 // ---------------------------------------------------------------------------
