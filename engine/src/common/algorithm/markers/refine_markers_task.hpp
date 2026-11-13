@@ -105,6 +105,14 @@ struct RefineMarkersStats {
     std::size_t shifts_over_5px = 0;
     std::size_t shifts_over_10px = 0;
 
+    // -- scale-source diagnostics ---------------------------------------
+    /// Views whose depth scale came from a blob, from the checker saddle, or
+    /// from neither. A run where most views have no scale means the target
+    /// detector, not the consensus, is the limitation.
+    std::size_t views_blob_scale = 0;
+    std::size_t views_cross_scale = 0;
+    std::size_t views_no_scale = 0;
+
     // -- marker-level failure diagnostics --------------------------------
     std::size_t failed_no_views = 0;
     std::size_t failed_no_scale = 0;

@@ -1620,7 +1620,8 @@ def print_refine_diagnostics(refine):
         "removed_low_correlation", "removed_correlation_margin",
         "shifts_over_2px", "shifts_over_5px", "shifts_over_10px",
         "failed_no_views", "failed_no_scale", "failed_triangulation",
-        "failed_consensus")
+        "failed_consensus", "views_blob_scale", "views_cross_scale",
+        "views_no_scale")
     print("[gcp validation] refineMarkers diagnostics: " + ", ".join(
         "{}={}".format(key, engine.get(key, "?")) for key in ordered) +
         ", shift_mean_px={} max_px={}".format(
@@ -1643,10 +1644,12 @@ def marker_crop_probe(args, gcps, align_report):
     directory = args.crops_dir
     images = {}
     for path in collect_images(args.real):
-        # Both spellings: a gcp_list row may name the file with or without
-        # its extension, exactly as run_fold resolves a camera.
-        images[path.stem] = path
-        images[path.name] = path
+        # collect_images returns plain paths. Both spellings are registered: a
+        # gcp_list row may name the file with or without its extension, exactly
+        # as run_fold resolves a camera.
+        name = os.path.basename(path)
+        images[os.path.splitext(name)[0]] = path
+        images[name] = path
     doc = alphashape.load_project(align_report["project"])
     chunk = doc.active_chunk
     cameras = {camera.label: camera for camera in chunk.cameras}

@@ -618,25 +618,37 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
             }
             out.light_centre = true;
         } else {
-            // No target found: fall back to the original nearest dark blob,
-            // which is how cross targets and low-contrast cases were seeded.
-            const MarkerCandidate* dark = nullptr;
+            // No light interior is anchored on the click. Fall back to the
+            // nearest blob of EITHER polarity: a checker target on grass
+            // prints quadrants that are BRIGHTER than the ground, so the dark
+            // pass alone finds nothing and the whole marker was left without a
+            // scale even though the light pass had already located the target.
+            // The fallback centre is the blob's, which for a quadrant is
+            // biased; the 2-D refiner re-fits it from the click and the
+            // saddle supplies the patch scale when the target is a checker.
+            const MarkerCandidate* nearest = nullptr;
             double best_distance = static_cast<double>(half) * 0.75;
-            for (const MarkerCandidate& blob : dark_blobs) {
-                const double distance = (blob.center - seed).norm();
-                if (distance <= best_distance) {
-                    best_distance = distance;
-                    dark = &blob;
+            for (const std::vector<MarkerCandidate>* list :
+                 {&dark_blobs, &light_blobs}) {
+                for (const MarkerCandidate& blob : *list) {
+                    const double distance = (blob.center - seed).norm();
+                    if (distance <= best_distance) {
+                        best_distance = distance;
+                        nearest = &blob;
+                    }
                 }
             }
-            if (dark == nullptr) {
+            if (nearest == nullptr) {
                 return std::nullopt;
             }
-            centre = dark->center;
-            radius = dark->radius_px;
-            if (const auto fitted = refine_ellipse_center(crop, *dark)) {
+            centre = nearest->center;
+            radius = nearest->radius_px;
+            if (const auto fitted = refine_ellipse_center(crop, *nearest)) {
                 centre = *fitted;
             }
+            // Do NOT mark this as a light-centre seed: that flag tells the
+            // caller the centre came from a fitted target border, and here it
+            // is a quadrant or a bright patch, not the printed centre.
         }
     } else {
         // Non-circular target: keep the original dark-blob path.
@@ -1189,6 +1201,10 @@ struct MarkerEdit {
     std::optional<Eigen::Vector3d> position;
     /// Projections that reached a decision (moved, kept or removed).
     std::size_t evaluated = 0;
+    /// Per-view scale sources, for the run diagnostics.
+    std::size_t blob_views = 0;
+    std::size_t cross_views = 0;
+    std::size_t unscaled_views = 0;
     RefineFailureReason failure = RefineFailureReason::None;
     bool failed = false;
     bool touched = false;
@@ -1771,6 +1787,24 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         return skipped;
     }
     fill_scales(blends, options.patch_size);
+    std::size_t blob_views = 0;
+    std::size_t cross_views = 0;
+    std::size_t unscaled_views = 0;
+    for (const BlendView& blend : blends) {
+        if (!blend.has_scale) {
+            ++unscaled_views;
+        } else if (blend.cross_scale) {
+            ++cross_views;
+        } else {
+            ++blob_views;
+        }
+    }
+    const auto stamp = [&](MarkerEdit edit) {
+        edit.blob_views = blob_views;
+        edit.cross_views = cross_views;
+        edit.unscaled_views = unscaled_views;
+        return edit;
+    };
     std::vector<BlendView> aligned;
     for (const BlendView& blend : blends) {
         if (blend.view->aligned()) {
@@ -1795,7 +1829,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
             failed.failed = true;
             failed.failure = RefineFailureReason::Triangulation;
             failed.evaluated = blends.size();
-            return failed;
+            return stamp(failed);
         }
         if (initial && initial->allFinite()) {
             std::vector<double> physical_samples;
@@ -1818,7 +1852,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 failed.failed = true;
                 failed.failure = RefineFailureReason::NoScale;
                 failed.evaluated = blends.size();
-                return failed;
+                return stamp(failed);
             }
             const double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
@@ -1826,7 +1860,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 failed.failed = true;
                 failed.failure = RefineFailureReason::NoScale;
                 failed.evaluated = blends.size();
-                return failed;
+                return stamp(failed);
             }
             // The patch template has its own scale: the printed pattern's
             // half-size, which for a checker is the saddle's radius rather
@@ -1887,7 +1921,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                     // are left exactly as measured; they still count as
                     // evaluated so the accounting covers every projection.
                     edit->evaluated = blends.size();
-                    return *edit;
+                    return stamp(*edit);
                 }
             }
         }
@@ -1895,9 +1929,9 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         failed.failed = true;
         failed.failure = RefineFailureReason::Consensus;
         failed.evaluated = blends.size();
-        return failed;
+        return stamp(failed);
     }
-    return refine_2d_marker(blends, options);
+    return stamp(refine_2d_marker(blends, options));
 }
 
 /// Validate the selected cameras and keep only those referenced by a selected
@@ -2266,6 +2300,9 @@ void write_refine_meta(Document& document, std::int32_t chunk_id,
     put("failed_no_scale", stats.failed_no_scale);
     put("failed_triangulation", stats.failed_triangulation);
     put("failed_consensus", stats.failed_consensus);
+    put("views_blob_scale", stats.views_blob_scale);
+    put("views_cross_scale", stats.views_cross_scale);
+    put("views_no_scale", stats.views_no_scale);
 }
 
 }  // namespace
@@ -2451,6 +2488,9 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             continue;
         }
         plan.stats.evaluated_projections += edit.evaluated;
+        plan.stats.views_blob_scale += edit.blob_views;
+        plan.stats.views_cross_scale += edit.cross_views;
+        plan.stats.views_no_scale += edit.unscaled_views;
         if (edit.failed) {
             ++plan.stats.failed;
             switch (edit.failure) {
