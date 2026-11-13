@@ -669,6 +669,32 @@ TEST(Xmp, AcceptsTheVendorNamespaceUri) {
     EXPECT_DOUBLE_EQ((*accuracy)[2], 0.02969);
 }
 
+TEST(Xmp, VendorNamespaceAccuracyReachesAddPhotos) {
+    // The full real-world path: depot firmware packet -> AddPhotos with
+    // load_xmp_accuracy -> per-camera reference accuracy. The 10 m default
+    // here would mean the packet was silently ignored.
+    const std::string packet =
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" "
+        "xmlns:drone=\"http://www.dji.com/drone-dji/1.0/\">"
+        "<rdf:Description drone:GpsLatitude=\"47.64368732\" "
+        "drone:GpsLongtitude=\"16.47592717\" drone:AbsoluteAltitude=\"+513.00\" "
+        "drone:RtkFlag=\"50\" drone:RtkStdLon=\"0.01370\" "
+        "drone:RtkStdLat=\"0.01439\" drone:RtkStdHgt=\"0.02969\"/>"
+        "</rdf:RDF>";
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+    Document document = document_with_chunk();
+    run_add_photos(document, path, /*xmp_accuracy=*/true, /*xmp_orientation=*/false);
+    const CameraReference& reference =
+        document.active_chunk()->cameras().front().reference;
+    EXPECT_DOUBLE_EQ(reference.accuracy.x(), 0.01370);
+    EXPECT_DOUBLE_EQ(reference.accuracy.y(), 0.01439);
+    EXPECT_DOUBLE_EQ(reference.accuracy.z(), 0.02969);
+    ASSERT_TRUE(reference.rtk_flag.has_value());
+    EXPECT_EQ(*reference.rtk_flag, 50);
+    remove_file(path);
+}
+
 TEST(Xmp, RtkStdsWithoutStatusAreUsedAsIs) {
     // No status field: the packet cannot be classified, so the reported
     // deviations stand (they are still better than the consumer default).
