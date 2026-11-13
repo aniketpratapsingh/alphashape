@@ -265,6 +265,9 @@ try {
     }
     Assert-Present (Join-Path $perUserDir 'bin\Qt6Core.dll') 'Qt (windeployqt output)'
     Assert-Present (Join-Path $perUserDir 'bin\Qt6Widgets.dll') 'Qt Widgets (windeployqt output)'
+    Assert-Present (Join-Path $perUserDir 'bin\Qt6Network.dll') 'Qt Network (update checks)'
+    $tlsPlugins = @(Get-ChildItem -LiteralPath (Join-Path $perUserDir 'bin\tls') -Filter '*.dll' -ErrorAction SilentlyContinue)
+    Assert ($tlsPlugins.Count -ge 1) 'no Qt TLS backend in bin\tls (the updater cannot reach GitHub)'
     Assert-Present (Join-Path $perUserDir 'python\vcruntime140.dll') 'VC++ runtime beside the module'
 
     Step "licence texts"
@@ -397,11 +400,22 @@ try {
     # redirected. Start-Process -RedirectStandardOutput is exactly the redirected
     # case, so this also proves the shim does not steal a caller's redirection.
     $gui = Join-Path $perUserDir 'bin\alphashape.exe'
-    $smoke = Invoke-Captured $gui @('--offscreen-smoke') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $smoke = Invoke-Captured $gui @('--offscreen-smoke') @{ QT_QPA_PLATFORM = 'offscreen'; ALPHASHAPE_NO_UPDATE_CHECK = '1' }
     $smoke.Output | ForEach-Object { Write-Host "  $_" }
     $smoke.Errors | ForEach-Object { Write-Host "  $_" }
     if ($smoke.ExitCode -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $($smoke.ExitCode)" }
     Assert (($smoke.Output -join "`n") -match 'gui ready') "the GUI did not report 'gui ready'"
+
+    Step "TLS backend loads (update checks can use HTTPS)"
+    # A tls\*.dll that exists but cannot load leaves the updater unable to reach
+    # GitHub. --self-test-tls asks Qt which backend is actually active and exits
+    # non-zero when there is none; it uses no network.
+    $tls = Invoke-Captured $gui @('--self-test-tls') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $tls.Output | ForEach-Object { Write-Host "  $_" }
+    $tls.Errors | ForEach-Object { Write-Host "  $_" }
+    if ($tls.ExitCode -ne 0) { Fail "alphashape.exe --self-test-tls exited $($tls.ExitCode)" }
+    Assert (($tls.Output -join "`n") -match 'tls: active: \S') 'no Qt TLS backend is active'
+    Assert (($tls.Output -join "`n") -match 'tls: backends: \S') 'no Qt TLS backend could be listed'
 
     $version = Invoke-Captured $gui @('--version') @{ QT_QPA_PLATFORM = 'offscreen' }
     $version.Output | ForEach-Object { Write-Host "  $_" }

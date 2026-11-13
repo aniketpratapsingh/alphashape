@@ -195,6 +195,13 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
     // groups whose likelihood-ratio gain pays for their degrees of freedom.
     params.declare({"adaptive_fitting", ParamType::Bool, false,
                     "Select the distortion terms automatically (ordered forward selection)."});
+    // Opt-in convenience for the case the benchmark measured: a block that has
+    // control points needs the richer model, while a block whose only
+    // georeferencing is camera positions does not. Default false keeps every
+    // existing call exactly as it was.
+    params.declare({"adaptive_fitting_auto", ParamType::Bool, false,
+                    "Use adaptive_fitting automatically when the chunk has enabled "
+                    "control points."});
     // Posterior covariance of the cameras and calibration is on by default
     // (subject to the BA caps); tie-point covariance is opt-in because it is
     // O(points) dense output a caller rarely needs.
@@ -762,7 +769,21 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
 
     // -- solve --------------------------------------------------------------
     progress.update("optimize", 0.0);
-    const bool adaptive_fitting = params.get_bool("adaptive_fitting");
+    // The automatic trigger is deliberately narrow. Control points carry
+    // surveyed references at a few centimetres, and on such a block the richer
+    // model is the difference between a 7.9 cm and a 6.5 cm horizontal check
+    // (see docs/m13-validation.md). Camera references alone do not justify it:
+    // a consumer drone block regressed on every DEM and ortho metric when the
+    // model was widened. So the condition is control markers, not merely a
+    // georeferenced chunk.
+    const bool requested_adaptive = params.get_bool("adaptive_fitting");
+    const bool auto_adaptive =
+        params.get_bool("adaptive_fitting_auto") && control_markers > 0;
+    const bool adaptive_fitting = requested_adaptive || auto_adaptive;
+    if (auto_adaptive && !requested_adaptive) {
+        log(LogLevel::Info) << "OptimizeCameras: adaptive_fitting auto-selected for "
+                            << control_markers << " control point(s)";
+    }
     const bool camera_covariance = params.get_bool("camera_covariance");
     sfm::BAOptions ba_options;
     ba_options.compute_camera_covariance = camera_covariance;

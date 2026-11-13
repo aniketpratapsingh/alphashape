@@ -8,6 +8,7 @@ add_executable(alphashape_tests
     test_model_commands.cpp
     test_data_model.cpp
     test_project_roundtrip.cpp
+    test_update.cpp
     test_project_v2.cpp
     test_project_layout.cpp
     test_job_db.cpp
@@ -137,6 +138,7 @@ target_link_libraries(alphashape_tests PRIVATE TIFF::TIFF)
 
 target_link_libraries(alphashape_tests PRIVATE
     alphashape_algorithms
+    alphashape_update
     Ceres::ceres
     GTest::gtest
     GTest::gtest_main)

@@ -13,6 +13,7 @@
 
 #include <QApplication>
 #include <QByteArray>
+#include <QSslSocket>
 #include <QStringList>
 #include <QString>
 #include <QtGlobal>
@@ -21,6 +22,7 @@
 #include "apps/gui/command_line.hpp"
 #include "apps/gui/main_window.hpp"
 #include "base/platform/console.hpp"
+#include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -39,11 +41,12 @@ int main(int argc, char** argv) {
     // a no-op off Windows.
     (void)platform::attach_parent_console();
 
-    // The smoke run must work on a machine with no display server. Only the literal flag is
+    // The smoke run must work on a machine with no display server. Only the literal flags are
     // looked for here; the real parse happens below, once Qt has removed its own options.
     bool wants_smoke = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--offscreen-smoke") {
+        if (std::string_view(argv[i]) == "--offscreen-smoke" ||
+            std::string_view(argv[i]) == "--self-test-tls") {
             wants_smoke = true;
         }
     }
@@ -92,6 +95,28 @@ int main(int argc, char** argv) {
         std::printf("alphashape-gui %s\n", ALPHASHAPE_GUI_VERSION);
         return 0;
     }
+    if (options.self_test_tls) {
+        // Packaging diagnostic: proves the Qt TLS backend in this build actually
+        // loads (an HTTPS plugin that is missing or cannot dlopen its library
+        // leaves the updater unable to reach GitHub). No network is used.
+        const QStringList backends = QSslSocket::availableBackends();
+        QString active = QSslSocket::activeBackend();
+        if (active.isEmpty() && !backends.isEmpty()) {
+            QSslSocket::setActiveBackend(backends.first());
+            active = QSslSocket::activeBackend();
+        }
+        const bool ssl = QSslSocket::supportsSsl();
+        std::printf("tls: ssl supported: %s\n", ssl ? "yes" : "no");
+        std::printf("tls: backends: %s\n",
+                    backends.join(QStringLiteral(",")).toUtf8().constData());
+        std::printf("tls: active: %s\n", active.toUtf8().constData());
+        std::fflush(stdout);
+        if (!ssl || backends.isEmpty() || active.isEmpty()) {
+            std::fputs("alphashape-gui: no usable TLS backend\n", stderr);
+            return 1;
+        }
+        return 0;
+    }
     if (forced_offscreen_for_headless && !options.offscreen_smoke) {
         // We only picked the offscreen platform so that parsing could run; a real session needs one.
         std::fputs("alphashape-gui: no display available (set DISPLAY or QT_QPA_PLATFORM)\n", stderr);
@@ -99,6 +124,11 @@ int main(int argc, char** argv) {
     }
     if (options.log_level) {
         Log::set_level(*options.log_level);
+    }
+    // One switch for both spellings: the checker reads this variable, so the
+    // command-line flag and ALPHASHAPE_NO_UPDATE_CHECK=1 take the same path.
+    if (options.no_update_check) {
+        platform::set_env("ALPHASHAPE_NO_UPDATE_CHECK", "1");
     }
 
     try {

@@ -2100,12 +2100,19 @@ def run_real_odm(args):
     # GCPs only first: its per-fold adjustment is the leak-free source of the
     # estimated antenna lever arm the later variants reuse. The camera-RTK
     # variant takes an explicitly configured fixed arm when one is supplied.
-    variants["gcps_only"] = run_variant(args, gcps, align_report, False)
+    # The benchmark's adaptive_fitting dispatch parameter selects the same
+    # adaptive calibration model on the two standard variants that the
+    # diagnostics run as an extra probe. Keep the option on the variant's options
+    # dict so the report shows which lens model produced each row.
+    base_options = {"adaptive_fitting": True} if args.adaptive_fitting else None
+    variants["gcps_only"] = run_variant(
+        args, gcps, align_report, False, base_options)
     default_estimates = per_fold_estimates("gcps_only")
-    camera_options = ({"antenna_offset_m": antenna} if antenna is not None
-                      else None)
+    camera_options = dict(base_options or {})
+    if antenna is not None:
+        camera_options["antenna_offset_m"] = antenna
     variants["camera_rtk_gcps"] = run_variant(
-        args, gcps, align_report, True, camera_options)
+        args, gcps, align_report, True, camera_options or None)
     # The mount is estimated from the ADAPTIVE GCP-only adjustment, not the
     # default one: with the thin default lens model the GCP-only fit trades
     # focal length against distortion and puts the camera centres 3.3 m below
@@ -2229,6 +2236,11 @@ def parse_args(argv):
                              "zoom) around a few real marker projections into "
                              "this directory, plus index.json; benchmark "
                              "diagnostics only, nothing is written without it")
+    parser.add_argument("--adaptive-fitting", action="store_true",
+                        help="run the two standard variants (gcps_only and "
+                             "camera_rtk_gcps) with the adaptive calibration "
+                             "model, the same configuration the benchmark's "
+                             "adaptive_fitting dispatch parameter selects")
     parser.add_argument("--camera-accuracy", type=float, default=0.05,
                         help="camera reference accuracy in metres for the "
                              "camera_rtk_gcps variant (the RTK block's stated value)")
