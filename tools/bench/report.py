@@ -429,6 +429,88 @@ def _fmt_offset(values) -> str:
     return " / ".join(_fmt(value, 3) for value in values)
 
 
+def _repetition_display_paths(current: dict, block: dict) -> list[str]:
+    """The metrics worth putting in the repetitions table.
+
+    A pipeline run has a gated set (``DIRECTION``) and those are exactly the
+    numbers a reader has to trust; a GCP run has no gated metrics, so its two
+    standard variants' RMS values are shown and the diagnostic probes are left to
+    the variant tables below. Never the whole numeric leaf set: a median of
+    camera counts and image counts is noise beside the measurements.
+    """
+    medians = block.get("medians") or {}
+    if current.get("kind") == "gcp":
+        prefixes = ("variants.gcps_only.", "variants.camera_rtk_gcps.")
+        return sorted(
+            path for path in medians
+            if path.startswith(prefixes) and ".rms_" in path
+        )
+    gated = sorted(path for path in medians if direction(path, {}) is not None)
+    return gated or sorted(medians)[:12]
+
+
+def repetitions_markdown(current: dict) -> list[str]:
+    """The repeated-run table: every run, the median and the range.
+
+    Present only when the run asked for more than one repetition. It answers the
+    question a single run cannot — whether a difference is larger than the same
+    configuration's own scatter — and the pose hashes answer whether two runs
+    were literally the same reconstruction, which is what makes a zero range
+    trustworthy rather than suspicious.
+    """
+    block = current.get("repetitions")
+    if not isinstance(block, dict) or not block.get("count"):
+        return []
+    count = block.get("count")
+    runs = block.get("runs") or []
+    paths = _repetition_display_paths(current, block)
+    medians = block.get("medians") or {}
+    lows = block.get("min") or {}
+    highs = block.get("max") or {}
+
+    lines = ["## Repetitions", ""]
+    lines.append(
+        f"{count} independent runs of the same configuration. The table's run "
+        f"columns are the individual measurements; the primary metrics elsewhere "
+        f"in this report are run {block.get('selected_run')}, the run closest to "
+        "the per-metric medians."
+    )
+    lines.append("")
+    if paths:
+        header = "| Metric | " + " | ".join(f"run {run.get('run')}" for run in runs) + \
+                 " | Median | Range |"
+        lines.append(header)
+        lines.append("|---|" + "---:|" * len(runs) + "---:|---:|")
+        for path in paths:
+            values = []
+            for run in runs:
+                values.append(_fmt((run.get("values") or {}).get(path)))
+            low, high = lows.get(path), highs.get(path)
+            spread = "" if low is None or high is None else f"{_fmt(low)}–{_fmt(high)}"
+            lines.append(f"| `{path}` | " + " | ".join(values) +
+                         f" | {_fmt(medians.get(path))} | {spread} |")
+        lines.append("")
+    else:
+        lines.append("_No comparable numeric metrics were reported by every run._")
+        lines.append("")
+
+    lines.append("| Pose hash | Result |")
+    lines.append("|---|---|")
+    for label, key in (("Alignment", "alignment_pose_hashes"),
+                       ("Final", "final_pose_hashes")):
+        hashes = block.get(key) or []
+        present = [value for value in hashes if value]
+        if not present:
+            lines.append(f"| {label} | not captured |")
+            continue
+        identical = len(set(present)) == 1 and len(present) == len(hashes)
+        state = "identical" if identical else "DIFFERENT"
+        lines.append(f"| {label} | {state}: " +
+                     ", ".join(f"`{value}`" for value in hashes) + " |")
+    lines.append("")
+    return lines
+
+
 def gcp_markdown(current: dict) -> str:
     """The report body for the ground-control dataset, which has no ortho/DEM.
 
@@ -446,6 +528,7 @@ def gcp_markdown(current: dict) -> str:
     lines.append(f"**Verdict: {verdict}** — check-point horizontal RMS target "
                  f"{_fmt(target)} m; reported, not gated (first version)")
     lines.append("")
+    lines.extend(repetitions_markdown(current))
     lines.append("## Provenance")
     lines.append("")
     lines.append("| | |")
@@ -597,6 +680,8 @@ def markdown(
     else:
         lines.append(f"**Verdict: pass** ({len(good)} improved, none regressed)")
     lines.append("")
+
+    lines.extend(repetitions_markdown(current))
 
     if accepted:
         lines.append("## Accepted regression")

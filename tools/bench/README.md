@@ -214,6 +214,27 @@ gh workflow run quality-bench.yml --ref <branch> \
 The engine's own refinement summary (image RMS before -> after the solve) is captured into
 the metrics JSON as `optimize_log` and printed near the top of the report.
 
+`reps` runs the same dataset several times and reports every run, the per-metric median and
+the range. It is the input that tells a real effect from a configuration's own scatter:
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=all -f reps=3 -f optimize_params=adaptive_fitting=true
+```
+
+A repeated run keeps one directory per run (`build/bench/reps/rep1`, `rep2`, ...), records
+each run's alignment pose hash, and writes a `repetitions` block into the metrics JSON:
+the runs, the medians, the min/max and a medoid (`selected_run`) whose complete metrics are
+the primary document the report compares. Identical alignment hashes across runs mean the
+alignment was bit-identical; a differing hash means some stage moved, and the hash is the
+evidence rather than a caveat. `reps=1` (the default everywhere) is byte-for-byte the
+historical output and has no `repetitions` key.
+
+The GCP dataset's protocol does not insert `OptimizeCameras` — it always runs — so a
+dispatched `optimize_params=adaptive_fitting=true` selects its adaptive variants instead
+(`--adaptive-fitting`), and any other OptimizeCameras parameter is recorded but has no
+effect there.
+
 All four parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are
 validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and

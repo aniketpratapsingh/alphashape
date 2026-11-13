@@ -723,6 +723,96 @@ class ExperimentTest(unittest.TestCase):
         self.assertIn("Dispatch parameters", text)
 
 
+class RepetitionsTest(unittest.TestCase):
+    """A repeated run shows every run, the median and the range."""
+
+    @staticmethod
+    def _block(medians, runs, hashes):
+        paths = list(medians)
+        return {
+            "count": len(runs),
+            "selected_run": 1,
+            "medians": dict(medians),
+            "min": {path: min(run[path] for run in runs) for path in paths},
+            "max": {path: max(run[path] for run in runs) for path in paths},
+            "runs": [
+                {"run": index + 1, "alignment_pose_hash": hashes[index],
+                 "final_pose_hash": hashes[index], "values": run}
+                for index, run in enumerate(runs)
+            ],
+            "alignment_pose_hashes": hashes,
+            "final_pose_hashes": hashes,
+            "alignment_identical": len(set(hashes)) == 1,
+            "final_identical": len(set(hashes)) == 1,
+        }
+
+    def test_a_single_run_report_has_no_repetitions_section(self):
+        text = report.markdown(metrics(), None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertNotIn("## Repetitions", text)
+
+    def test_the_table_names_every_run_the_median_and_the_range(self):
+        path = "reference_based.dem.offset_removed.nmad_m"
+        block = self._block(
+            {path: 0.3},
+            [{path: 0.2}, {path: 0.4}, {path: 0.3}],
+            ["aaa", "aaa", "aaa"],
+        )
+        current = metrics()
+        current["repetitions"] = block
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("## Repetitions", text)
+        self.assertIn("3 independent runs", text)
+        self.assertIn("run 3", text)
+        self.assertIn("0.3", text)
+        self.assertIn("0.2–0.4", text)
+        self.assertIn("Alignment | identical", text)
+
+    def test_differing_pose_hashes_are_called_out(self):
+        path = "reference_based.dem.offset_removed.nmad_m"
+        block = self._block(
+            {path: 0.3},
+            [{path: 0.2}, {path: 0.4}, {path: 0.3}],
+            ["aaa", "bbb", "aaa"],
+        )
+        current = metrics()
+        current["repetitions"] = block
+        text = report.markdown(current, None, [], [], thresholds=thresholds(), png_name=None)
+        self.assertIn("DIFFERENT", text)
+
+    def test_a_gcp_report_shows_its_standard_variant_rms(self):
+        current = {
+            "kind": "gcp",
+            "dataset": "gcp",
+            "dataset_manifest": {"title": "Block"},
+            "variants": {},
+        }
+        path = "variants.camera_rtk_gcps.rms_horizontal_m"
+        block = self._block(
+            {path: 0.054, "variants.gcps_only.rms_horizontal_m": 0.065},
+            [{path: 0.053, "variants.gcps_only.rms_horizontal_m": 0.064},
+             {path: 0.055, "variants.gcps_only.rms_horizontal_m": 0.066},
+             {path: 0.054, "variants.gcps_only.rms_horizontal_m": 0.065}],
+            ["abc", "abc", "abc"],
+        )
+        current["repetitions"] = block
+        text = report.gcp_markdown(current)
+        self.assertIn("## Repetitions", text)
+        self.assertIn("variants.camera_rtk_gcps.rms_horizontal_m", text)
+        self.assertIn("variants.gcps_only.rms_horizontal_m", text)
+
+    def test_the_repetition_block_does_not_become_a_gated_metric(self):
+        # The block carries numeric values under dotted paths. flatten() would
+        # otherwise turn them into metrics; none may acquire a direction and gate.
+        path = "reference_based.dem.offset_removed.nmad_m"
+        current = metrics()
+        current["repetitions"] = self._block(
+            {path: 0.3}, [{path: 0.2}, {path: 0.4}, {path: 0.3}], ["a", "a", "a"]
+        )
+        for leaf in report.flatten(current):
+            if leaf.startswith("repetitions."):
+                self.assertIsNone(report.direction(leaf, {}))
+
+
 class FormatTest(unittest.TestCase):
     def test_none_is_a_dash(self):
         self.assertEqual(report._fmt(None), "-")
