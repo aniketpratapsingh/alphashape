@@ -42,7 +42,7 @@ echo "== Qt TLS backend =="
 ls /usr/lib/alphashape/qt/plugins/tls/*.so || { echo "error: no Qt TLS backend in the .deb" >&2; exit 1; }
 
 echo "== GUI (offscreen) =="
-out=$(QT_QPA_PLATFORM=offscreen alphashape-gui --offscreen-smoke)
+out=$(ALPHASHAPE_NO_UPDATE_CHECK=1 QT_QPA_PLATFORM=offscreen alphashape-gui --offscreen-smoke)
 echo "$out"
 echo "$out" | command grep -q "gui ready"
 alphashape-gui --version

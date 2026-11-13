@@ -137,15 +137,15 @@ protected:
 }  // namespace
 
 TEST_F(UpdateGuiTest, UpdateActionExistsAndPreferencesIsEnabled) {
-    QAction* action = window().action("action.help.check_updates");
-    ASSERT_NE(action, nullptr);
-    EXPECT_EQ(action->menuRole(), QAction::ApplicationSpecificRole);
-    EXPECT_TRUE(action->isEnabled());
-    EXPECT_GE(window().menu("menu.help")->actions().indexOf(action), 0);
+    QAction* check_action = action("action.help.check_updates");
+    ASSERT_NE(check_action, nullptr);
+    EXPECT_EQ(check_action->menuRole(), QAction::ApplicationSpecificRole);
+    EXPECT_TRUE(check_action->isEnabled());
+    EXPECT_GE(menu("menu.help")->actions().indexOf(check_action), 0);
 
     // Preferences stopped being a disabled placeholder when update settings
     // landed in it.
-    EXPECT_TRUE(window().action("action.edit.preferences")->isEnabled());
+    EXPECT_TRUE(action("action.edit.preferences")->isEnabled());
 }
 
 TEST_F(UpdateGuiTest, ManualCheckReportsANewerVersion) {
@@ -163,7 +163,7 @@ TEST_F(UpdateGuiTest, ManualCheckReportsANewerVersion) {
         called = true;
     });
 
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_TRUE(pump_until([&]() { return called; }));
     EXPECT_FALSE(automatic);
     EXPECT_EQ(seen.status, CheckResult::Status::Available);
@@ -183,9 +183,9 @@ TEST_F(UpdateGuiTest, ManualCheckBypassesTheThrottle) {
     window().update_checker().record_check(QDateTime::currentSecsSinceEpoch());
     EXPECT_FALSE(window().update_checker().automatic_check_due_now());
 
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_TRUE(pump_until([&]() { return results == 1; }));
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_TRUE(pump_until([&]() { return results == 2; }));
     EXPECT_EQ(fake_raw->api_calls, 2);
 }
@@ -201,7 +201,7 @@ TEST_F(UpdateGuiTest, AlreadyUpToDateIsReported) {
     CheckResult seen;
     window().set_update_result_handler(
         [&](const CheckResult& result, bool) { seen = result; });
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     // The fake is synchronous; the callback has already run.
     EXPECT_EQ(seen.status, CheckResult::Status::UpToDate);
 }
@@ -216,7 +216,7 @@ TEST_F(UpdateGuiTest, NetworkFailureIsReportedAsAnError) {
     CheckResult seen;
     window().set_update_result_handler(
         [&](const CheckResult& result, bool) { seen = result; });
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_EQ(seen.status, CheckResult::Status::Error);
     EXPECT_NE(seen.error.find("connection refused"), std::string::npos);
 }
@@ -231,7 +231,7 @@ TEST_F(UpdateGuiTest, SkippedVersionSuppressesTheSameRelease) {
     CheckResult seen;
     window().set_update_result_handler(
         [&](const CheckResult& result, bool) { seen = result; });
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_EQ(seen.status, CheckResult::Status::UpToDate);
     EXPECT_TRUE(seen.skipped);
 }
@@ -245,7 +245,7 @@ TEST_F(UpdateGuiTest, OptOutBlocksEvenManualChecks) {
     CheckResult seen;
     window().set_update_result_handler(
         [&](const CheckResult& result, bool) { seen = result; });
-    window().trigger("action.help.check_updates");
+    trigger("action.help.check_updates");
     EXPECT_EQ(seen.status, CheckResult::Status::Error);
     EXPECT_NE(seen.error.find("disabled"), std::string::npos);
     EXPECT_EQ(fake_raw->api_calls, 0);
@@ -257,9 +257,9 @@ TEST_F(UpdateGuiTest, UpdateDialogShowsVersionNotesAndButtons) {
     UpdateDialog dialog(available_result(), checker);
 
     ASSERT_NE(dialog.notes(), nullptr);
-    EXPECT_NE(dialog.notes()->toPlainText().find("New things"), std::string::npos);
+    EXPECT_GE(dialog.notes()->toPlainText().indexOf(QStringLiteral("New things")), 0);
     ASSERT_NE(dialog.version_label(), nullptr);
-    EXPECT_NE(dialog.version_label()->text().find("0.3.0"), std::string::npos);
+    EXPECT_GE(dialog.version_label()->text().indexOf(QStringLiteral("0.3.0")), 0);
     ASSERT_NE(dialog.download_button(), nullptr);
     EXPECT_EQ(dialog.download_button()->text(), QStringLiteral("Download and Install"));
     ASSERT_NE(dialog.skip_button(), nullptr);

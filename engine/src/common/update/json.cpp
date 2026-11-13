@@ -1,10 +1,10 @@
 #include "common/update/json.hpp"
 
-#include <charconv>
 #include <cstdint>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <utility>
 
 namespace alphashape::update::json {
@@ -229,11 +229,16 @@ private:
         if (position_ == start) {
             fail("expected a value", start);
         }
+        // std::from_chars for floating point is not available in Apple's libc++
+        // on the deployment target. A stream imbued with the classic locale is
+        // locale-independent (unlike strtod), which matters because the GUI
+        // process may run with a comma-decimal LC_NUMERIC.
+        const std::string token(text_.substr(start, position_ - start));
+        std::istringstream stream(token);
+        stream.imbue(std::locale::classic());
         double number = 0.0;
-        const char* begin = text_.data() + start;
-        const char* end = text_.data() + position_;
-        const auto result = std::from_chars(begin, end, number);
-        if (result.ec != std::errc() || result.ptr != end) {
+        stream >> number;
+        if (!stream || !stream.eof()) {
             fail("invalid number", start);
         }
         return Value::make_number(number);

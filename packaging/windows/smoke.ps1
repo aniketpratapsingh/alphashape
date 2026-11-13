@@ -400,7 +400,7 @@ try {
     # redirected. Start-Process -RedirectStandardOutput is exactly the redirected
     # case, so this also proves the shim does not steal a caller's redirection.
     $gui = Join-Path $perUserDir 'bin\alphashape.exe'
-    $smoke = Invoke-Captured $gui @('--offscreen-smoke') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $smoke = Invoke-Captured $gui @('--offscreen-smoke') @{ QT_QPA_PLATFORM = 'offscreen'; ALPHASHAPE_NO_UPDATE_CHECK = '1' }
     $smoke.Output | ForEach-Object { Write-Host "  $_" }
     $smoke.Errors | ForEach-Object { Write-Host "  $_" }
     if ($smoke.ExitCode -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $($smoke.ExitCode)" }

@@ -45,7 +45,7 @@ echo "== PROJ data is found inside the image =="
 test -f squashfs-root/usr/share/proj/proj.db
 
 echo "== GUI (offscreen) =="
-out=$(QT_QPA_PLATFORM=offscreen "$img" --appimage-extract-and-run --offscreen-smoke)
+out=$(ALPHASHAPE_NO_UPDATE_CHECK=1 QT_QPA_PLATFORM=offscreen "$img" --appimage-extract-and-run --offscreen-smoke)
 echo "$out"
 echo "$out" | command grep -q "gui ready"
 echo "appimage smoke OK"

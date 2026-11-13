@@ -122,7 +122,7 @@ echo "== GUI (offscreen)"
     echo "error: the bundle is missing PlugIns/platforms/libqoffscreen.dylib" >&2
     ls "$app/Contents/PlugIns/platforms" >&2 || true
     exit 1; }
-QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
+ALPHASHAPE_NO_UPDATE_CHECK=1 QT_QPA_PLATFORM=offscreen "$gui" --offscreen-smoke | tee "$work/gui.txt"
 grep -q 'gui ready' "$work/gui.txt"
 
 echo "== Python module"
