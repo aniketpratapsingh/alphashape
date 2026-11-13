@@ -1578,7 +1578,13 @@ def focal_changes(before, after):
 
 
 def refine_marker_changes(chunk, before):
-    """How many projections RefineMarkers moved or removed, and the mean shift."""
+    """How many projections RefineMarkers moved or removed, and the mean shift.
+
+    Also carries the engine's own per-run diagnostics (``chunk.meta`` keys
+    written by the task): the removal-reason histogram, the shift
+    distribution and the marker-failure counts. The projection diff below is
+    an independent check that the engine's counters agree with the document.
+    """
     after = {(marker.label, projection.camera_id): projection.pixel
              for marker in chunk.markers for projection in marker.projections}
     moved = 0
@@ -1592,9 +1598,151 @@ def refine_marker_changes(chunk, before):
         shifts.append(shift)
         if shift > 1e-6:
             moved += 1
+    engine = {key[len("refine_markers."):]: value
+              for key, value in chunk.meta.items()
+              if key.startswith("refine_markers.")}
     return {"moved": moved, "removed": removed,
             "kept": len(shifts),
-            "mean_shift_px": (sum(shifts) / len(shifts)) if shifts else None}
+            "mean_shift_px": (sum(shifts) / len(shifts)) if shifts else None,
+            "max_shift_px": max(shifts) if shifts else None,
+            "engine": engine}
+
+
+def print_refine_diagnostics(refine):
+    """One human-readable line per removal reason and shift band."""
+    engine = (refine or {}).get("engine") or {}
+    if not engine:
+        return
+    ordered = (
+        "projections_evaluated", "projections_moved",
+        "projections_kept_unrefined", "projections_removed",
+        "removed_geometric_gate", "removed_flat_patch",
+        "removed_low_correlation", "removed_correlation_margin",
+        "shifts_over_2px", "shifts_over_5px", "shifts_over_10px",
+        "failed_no_views", "failed_no_scale", "failed_triangulation",
+        "failed_consensus")
+    print("[gcp validation] refineMarkers diagnostics: " + ", ".join(
+        "{}={}".format(key, engine.get(key, "?")) for key in ordered) +
+        ", shift_mean_px={} max_px={}".format(
+            engine.get("shift_mean_px", "?"), engine.get("shift_max_px", "?")))
+
+
+def marker_crop_probe(args, gcps, align_report):
+    """Save before/after crops around a few real marker projections.
+
+    This is the only way to see what the printed target actually is: the
+    benchmark images are not committed, and the engine's diagnostics cannot
+    say whether a rejection is a wrong target model or a noisy measurement.
+    Crops are written only when ``--crops-dir`` is given, and only into that
+    directory (never into the source tree). The same box is cut before and
+    after refinement, so any movement is visible, and the full-resolution
+    pixels and shifts are recorded in ``index.json``.
+    """
+    from PIL import Image as PilImage  # noqa: PLC0415 - benchmark-only dependency
+
+    directory = args.crops_dir
+    images = {}
+    for path in collect_images(args.real):
+        # Both spellings: a gcp_list row may name the file with or without
+        # its extension, exactly as run_fold resolves a camera.
+        images[path.stem] = path
+        images[path.name] = path
+    doc = alphashape.load_project(align_report["project"])
+    chunk = doc.active_chunk
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    for gcp in gcps:
+        chunk.addMarker(label=gcp["label"])
+    for gcp in gcps:
+        for observation in gcp["observations"]:
+            stem = os.path.splitext(observation["image"])[0]
+            target = stem if stem in cameras else (
+                observation["image"] if observation["image"] in cameras else None)
+            if target is None or target not in images:
+                continue
+            chunk.setMarkerProjection(gcp["label"], target,
+                                      observation["px"], observation["py"])
+    # A spread of markers and cameras: the first two usable observers of each
+    # of the first three GCPs, which is enough to see the target and its
+    # obliquity without writing hundreds of crops.
+    before_by_key = {(marker.label, projection.camera_id): projection.pixel
+                     for marker in chunk.markers
+                     for projection in marker.projections}
+    label_of_camera = {camera.id: camera.label for camera in chunk.cameras}
+    before = {(marker_label, label_of_camera[camera_id]): pixel
+              for (marker_label, camera_id), pixel in before_by_key.items()
+              if camera_id in label_of_camera}
+    chosen = []
+    for gcp in gcps[:3]:
+        picked = 0
+        for observation in gcp["observations"]:
+            filename = observation["image"]
+            stem = os.path.splitext(filename)[0]
+            camera_label = stem if stem in cameras else (
+                filename if filename in cameras else None)
+            if camera_label is None:
+                continue
+            if stem not in images and filename not in images:
+                continue
+            chosen.append((gcp["label"], camera_label,
+                           cameras[camera_label].id))
+            picked += 1
+            if picked >= 2:
+                break
+    chosen = [(label, camera, camera_id) for (label, camera, camera_id)
+              in chosen if (label, camera) in before]
+
+    chunk.refineMarkers(markers=[gcp["label"] for gcp in gcps])
+    print_refine_diagnostics(refine_marker_changes(chunk, before_by_key))
+
+    after_by_key = {(marker.label, projection.camera_id): projection.pixel
+                    for marker in chunk.markers
+                    for projection in marker.projections}
+    os.makedirs(directory, exist_ok=True)
+    half = 64
+    zoom = 4
+    records = []
+    opened = {}
+    for label, camera, camera_id in chosen:
+        path = images[camera]
+        image = opened.get(camera)
+        if image is None:
+            image = PilImage.open(path).convert("L")
+            opened[camera] = image
+        px, py = before[(label, camera)]
+        left = int(round(px)) - half
+        top = int(round(py)) - half
+        right, bottom = left + 2 * half, top + 2 * half
+        # Keep the box inside the image so a click near an edge still crops.
+        left = max(0, min(left, image.width - 2 * half))
+        top = max(0, min(top, image.height - 2 * half))
+        right, bottom = left + 2 * half, top + 2 * half
+        crop = image.crop((left, top, right, bottom))
+        crop = crop.resize((crop.width * zoom, crop.height * zoom),
+                           PilImage.NEAREST)
+        stem = "{}_{}_before.png".format(label, camera)
+        crop.save(os.path.join(directory, stem))
+        after = after_by_key.get((label, camera_id))
+        if after is not None:
+            crop.save(os.path.join(directory, "{}_{}_after.png".format(
+                label, camera)))
+        records.append({
+            "marker": label,
+            "camera": camera,
+            "box": [left, top, right, bottom],
+            "before": [px, py],
+            "after": list(after) if after is not None else None,
+            "shift_px": (math.hypot(after[0] - px, after[1] - py)
+                         if after is not None else None),
+            "removed": after is None,
+            "crop_before": stem,
+        })
+    with open(os.path.join(directory, "index.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(records, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print("[gcp validation] wrote {} marker crops to {}".format(
+        len(records), directory))
+    return records
 
 
 def optimize_options(options):
@@ -1849,10 +1997,16 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     refined = [fold["refine_markers"] for fold in measured
                if "refine_markers" in fold]
     if refined:
+        # Refinement runs before any fold-specific import, on the same saved
+        # alignment and the same survey projections, so its diagnostics are
+        # identical in every fold. Report the first fold's engine counters
+        # rather than a sum that would multiply them by the fold count.
         variant["refine_markers"] = {
             "moved": sum(item.get("moved", 0) for item in refined),
             "removed": sum(item.get("removed", 0) for item in refined),
-            "fold_errors": sum(1 for item in refined if "error" in item)}
+            "fold_errors": sum(1 for item in refined if "error" in item),
+            "engine": next((item.get("engine") for item in refined
+                            if item.get("engine")), None)}
     antenna = summarise_antenna(measured)
     if antenna:
         variant["antenna_estimates"] = antenna
@@ -1866,6 +2020,14 @@ DIAGNOSTIC_VARIANTS = (
     ("adaptive_fitting", False, {"adaptive_fitting": True}),
     ("extended_model", False, {"extended_model": True}),
     ("refined_markers", False, {"refine_markers": True}),
+    # Refined markers combined with the adaptive lens model, with and without
+    # the camera RTK priors: refinement and the model are independent fixes,
+    # so their combination is the variant that could reach the 5 cm target.
+    ("refined_adaptive", False,
+     {"refine_markers": True, "adaptive_fitting": True}),
+    ("refined_camera_rtk", True, {"refine_markers": True}),
+    ("refined_camera_rtk_adaptive", True,
+     {"refine_markers": True, "adaptive_fitting": True}),
     ("px_shift_plus", False, {"projection_shift_px": 0.5}),
     ("px_shift_minus", False, {"projection_shift_px": -0.5}),
     ("marker_sigma_0p25", False, {"marker_projection_accuracy": 0.25}),
@@ -1923,6 +2085,16 @@ def run_real_odm(args):
             if "error" not in fold and fold.get("antenna_offset")}
 
     align_report = align_block(args, images, gcps)
+    marker_crops = None
+    if args.crops_dir:
+        # One extra refinement pass only for the crops: the printed target is
+        # not committed anywhere, so this is the recorded evidence for the
+        # target model the refinement must fit.
+        try:
+            marker_crops = marker_crop_probe(args, gcps, align_report)
+        except Exception as error:  # noqa: BLE001 - diagnostics must not fail the run
+            marker_crops = {"error": str(error)}
+            print("[gcp validation] marker crop probe failed: {}".format(error))
     antenna = parse_antenna_offset(args.antenna_offset)
     variants = {}
     # GCPs only first: its per-fold adjustment is the leak-free source of the
@@ -1963,6 +2135,11 @@ def run_real_odm(args):
                   consistency["mean_north_m"], consistency["mean_up_m"],
                   consistency["rms_east_m"], consistency["rms_north_m"],
                   consistency["rms_up_m"], consistency["cameras"]))
+    for variant, data in variants.items():
+        refine = data.get("refine_markers")
+        if refine:
+            print("[gcp validation] variant {}: {}".format(
+                variant, json.dumps(refine, sort_keys=True)))
     # Print the per-fold lever-arm estimate the estimated variants apply: a
     # reader can see whether the mount is stable across folds.
     estimate_source = "adaptive" if args.diagnostics else "default"
@@ -1986,6 +2163,7 @@ def run_real_odm(args):
         "z_consistency": z_record,
         "align": align_report,
         "variants": variants,
+        "marker_crops": marker_crops,
         "diagnostics": bool(args.diagnostics),
         "camera_accuracy_m": args.camera_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
@@ -2046,6 +2224,11 @@ def parse_args(argv):
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
                              "antenna lever arms); report-only")
+    parser.add_argument("--crops-dir", default="",
+                        help="write before/after 128x128 crops (4x nearest "
+                             "zoom) around a few real marker projections into "
+                             "this directory, plus index.json; benchmark "
+                             "diagnostics only, nothing is written without it")
     parser.add_argument("--camera-accuracy", type=float, default=0.05,
                         help="camera reference accuracy in metres for the "
                              "camera_rtk_gcps variant (the RTK block's stated value)")

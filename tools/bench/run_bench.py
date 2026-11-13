@@ -1305,8 +1305,13 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
         "--json-out", str(out_json),
     ]
     # The diagnostics are report-only probes; the manifest opts a dataset in.
+    # With them on, save a handful of before/after marker crops: the images
+    # are never redistributed, so the artifact is the only record of what the
+    # printed target looks like.
     if gcp.get("diagnostics"):
+        crops = work / "gcp_crops"
         command.append("--diagnostics")
+        command.extend(["--crops-dir", str(crops)])
 
     print("-- gcp validation")
     print(f"  $ {' '.join(command)}")
