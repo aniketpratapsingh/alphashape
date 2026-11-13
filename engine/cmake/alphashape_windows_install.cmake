@@ -303,13 +303,13 @@ if(ALPHASHAPE_BUILD_GUI AND TARGET alphashape-gui)
         # Qt Network needs a TLS backend; on Windows the schannel plugin ships in
         # plugins/tls. windeployqt normally copies it, but the update checker is
         # useless without it, so make the dependency explicit and loud.
-        if(EXISTS "${ALPHASHAPE_QT_PLUGINS}/tls")
-            file(COPY "${ALPHASHAPE_QT_PLUGINS}/tls" DESTINATION "\${_bin}")
-            message(STATUS "  added Qt TLS plugins")
+        if(EXISTS \"${ALPHASHAPE_QT_PLUGINS}/tls\")
+            file(COPY \"${ALPHASHAPE_QT_PLUGINS}/tls\" DESTINATION \"\${_bin}\")
+            message(STATUS \"  added Qt TLS plugins\")
         else()
             message(FATAL_ERROR
-                "alphashape: ${ALPHASHAPE_QT_PLUGINS}/tls is missing; the updater "
-                "would have no TLS backend")
+                \"alphashape: ${ALPHASHAPE_QT_PLUGINS}/tls is missing; the updater \"
+                \"would have no TLS backend\")
         endif()" COMPONENT gui)
 endif()
 
