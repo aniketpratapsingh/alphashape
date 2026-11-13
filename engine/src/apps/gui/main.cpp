@@ -21,6 +21,7 @@
 #include "apps/gui/command_line.hpp"
 #include "apps/gui/main_window.hpp"
 #include "base/platform/console.hpp"
+#include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
 
 #ifndef ALPHASHAPE_GUI_VERSION
@@ -99,6 +100,11 @@ int main(int argc, char** argv) {
     }
     if (options.log_level) {
         Log::set_level(*options.log_level);
+    }
+    // One switch for both spellings: the checker reads this variable, so the
+    // command-line flag and ALPHASHAPE_NO_UPDATE_CHECK=1 take the same path.
+    if (options.no_update_check) {
+        platform::set_env("ALPHASHAPE_NO_UPDATE_CHECK", "1");
     }
 
     try {

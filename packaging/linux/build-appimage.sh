@@ -33,7 +33,7 @@ test -f "$appdir/usr/share/proj/proj.db"
 export QMAKE="$QT_ROOT_DIR/bin/qmake"
 export LD_LIBRARY_PATH="$QT_ROOT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
-export EXTRA_QT_PLUGINS="svg;iconengines;imageformats"
+export EXTRA_QT_PLUGINS="svg;iconengines;imageformats;tls"
 export PATH="$work:$PATH"
 cp "$here/AppRun" "$work/AppRun"
 

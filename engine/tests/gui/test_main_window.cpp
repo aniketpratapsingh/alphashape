@@ -90,7 +90,8 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
         "action.tools.print_markers", "action.tools.region_move",
         "action.tools.region_resize", "action.tools.region_rotate",
         "action.tools.transform_object", "action.tools.update_transform",
-        "action.tools.reset_transform", "action.help.about", "action.help.repository",
+        "action.tools.reset_transform", "action.help.check_updates",
+        "action.help.about", "action.help.repository",
     };
     for (const QString& name : actions) {
         EXPECT_NE(action(name), nullptr) << name.toStdString();
@@ -103,8 +104,8 @@ TEST_F(MainWindowTest, EveryMenuAndActionExistsWithAStableName) {
     }
     EXPECT_EQ(titles, (QStringList{"File", "Edit", "View", "Workflow", "Tools", "Help"}));
 
-    // Preferences is present but disabled for now.
-    EXPECT_FALSE(action("action.edit.preferences")->isEnabled());
+    // Preferences now hosts the update settings and is usable.
+    EXPECT_TRUE(action("action.edit.preferences")->isEnabled());
 
     // Standard shortcuts.
     EXPECT_EQ(action("action.file.new")->shortcut(), QKeySequence(QKeySequence::New));

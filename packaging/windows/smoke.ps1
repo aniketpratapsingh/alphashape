@@ -265,6 +265,9 @@ try {
     }
     Assert-Present (Join-Path $perUserDir 'bin\Qt6Core.dll') 'Qt (windeployqt output)'
     Assert-Present (Join-Path $perUserDir 'bin\Qt6Widgets.dll') 'Qt Widgets (windeployqt output)'
+    Assert-Present (Join-Path $perUserDir 'bin\Qt6Network.dll') 'Qt Network (update checks)'
+    $tlsPlugins = @(Get-ChildItem -LiteralPath (Join-Path $perUserDir 'bin\tls') -Filter '*.dll' -ErrorAction SilentlyContinue)
+    Assert ($tlsPlugins.Count -ge 1) 'no Qt TLS backend in bin\tls (the updater cannot reach GitHub)'
     Assert-Present (Join-Path $perUserDir 'python\vcruntime140.dll') 'VC++ runtime beside the module'
 
     Step "licence texts"

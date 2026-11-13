@@ -7,6 +7,7 @@
 // instead of adding a dependency. It is a complete RFC 8259 reader (UTF-8,
 // escapes, surrogate pairs); the writer is not needed and not provided.
 
+#include <functional>
 #include <map>
 #include <string>
 #include <string_view>
@@ -49,8 +50,8 @@ public:
     /// is not valid JSON.
     static Value parse(std::string_view text);
 
-private:
-    friend class Parser;
+    // Construction helpers for the reader. Public so the reader can live in an
+    // anonymous namespace without a second, unrelated Parser class.
     static Value make_null();
     static Value make_bool(bool value);
     static Value make_number(double value);
@@ -58,6 +59,7 @@ private:
     static Value make_array(Array value);
     static Value make_object(Object value);
 
+private:
     Type type_ = Type::Null;
     bool boolean_ = false;
     double number_ = 0.0;

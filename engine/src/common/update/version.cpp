@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <limits>
+#include <system_error>
 
 namespace alphashape::update {
 namespace {

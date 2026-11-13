@@ -37,6 +37,10 @@ if [ -n "$fixtures" ] && [ -f "$fixtures/baseline.jpg" ]; then
     "$img" --appimage-extract-and-run cli --new "$work/smoke.psx" --add-images "$fixtures/baseline.jpg"
     test -s "$work/smoke.psx"
 fi
+echo "== Qt TLS backend =="
+find squashfs-root -path '*/plugins/tls/*.so' | tee "$work/tls.txt"
+test -s "$work/tls.txt" || { echo "error: no Qt TLS backend in the AppImage" >&2; exit 1; }
+
 echo "== PROJ data is found inside the image =="
 test -f squashfs-root/usr/share/proj/proj.db
 

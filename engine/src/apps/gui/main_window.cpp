@@ -24,6 +24,7 @@
 #include <QSettings>
 #include <QStackedWidget>
 #include <QStatusBar>
+#include <QTimer>
 #include <QToolButton>
 #include <QUrl>
 #include <QWidget>
@@ -35,9 +36,13 @@
 #include "apps/gui/marker_tools_dialogs.hpp"
 #include "apps/gui/modal_hooks.hpp"
 #include "apps/gui/photos_pane.hpp"
+#include "apps/gui/preferences_dialog.hpp"
 #include "apps/gui/properties_pane.hpp"
 #include "apps/gui/start_screen.hpp"
 #include "apps/gui/transform_dialog.hpp"
+#include "apps/gui/update_checker.hpp"
+#include "apps/gui/update_dialog.hpp"
+#include "apps/gui/update_source.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "apps/gui/workflow.hpp"
@@ -81,7 +86,11 @@ QDockWidget* make_dock(QMainWindow* parent, const QString& object_name, const QS
 
 }  // namespace
 
-MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_(app) {
+MainWindow::MainWindow(GuiApp& app, QWidget* parent)
+    : QMainWindow(parent),
+      app_(app),
+      update_checker_(std::make_unique<UpdateChecker>(
+          app.settings(), std::make_unique<NetworkUpdateSource>())) {
     setObjectName(QStringLiteral("mainWindow"));
 
     unsaved_handler_ = [this](const QString& name) {
@@ -212,9 +221,27 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent) : QMainWindow(parent), app_
             [this]() { update_marker_actions(); });
     update_job_ui();
     update_marker_actions();
+
+    // A silent check a few seconds after startup. It never interrupts a job and
+    // only posts a status-strip notice; the throttle and opt-out are applied in
+    // the checker. The delay lets a test replace the source first and keeps
+    // startup snappy.
+    if (update_checker_->checks_allowed(false) && update_checker_->automatic_check_due_now()) {
+        QTimer::singleShot(3000, this, [this]() { check_for_updates(false); });
+    }
 }
 
+MainWindow::~MainWindow() = default;
+
 // --- Hooks -------------------------------------------------------------------------------
+
+void MainWindow::set_update_source(std::unique_ptr<UpdateSource> source) {
+    update_checker_->set_source(std::move(source));
+}
+
+void MainWindow::set_update_result_handler(UpdateResultHandler handler) {
+    update_result_handler_ = std::move(handler);
+}
 
 void MainWindow::set_unsaved_handler(UnsavedHandler handler) {
     unsaved_handler_ = std::move(handler);
@@ -374,7 +401,14 @@ void MainWindow::create_actions() {
     QAction* preferences = make_action(QStringLiteral("action.edit.preferences"),
                                        tr("Preferences..."), QKeySequence::Preferences);
     preferences->setMenuRole(QAction::PreferencesRole);
-    preferences->setEnabled(false);
+    connect(preferences, &QAction::triggered, this, &MainWindow::show_preferences);
+
+    // Help > Check for Updates. ApplicationSpecificRole puts it in the application
+    // menu on macOS, where users expect it; the Help menu keeps it elsewhere.
+    QAction* check_updates =
+        make_action(QStringLiteral("action.help.check_updates"), tr("Check for &Updates..."));
+    check_updates->setMenuRole(QAction::ApplicationSpecificRole);
+    connect(check_updates, &QAction::triggered, this, [this]() { check_for_updates(true); });
 
     // View.
     auto* theme_group = new QActionGroup(this);
@@ -584,6 +618,8 @@ void MainWindow::create_menus() {
             [this]() { update_marker_actions(); });
 
     QMenu* help = menu(QStringLiteral("menu.help"), tr("&Help"));
+    help->addAction(act("action.help.check_updates"));
+    help->addSeparator();
     help->addAction(act("action.help.about"));
     help->addAction(act("action.help.repository"));
 }
@@ -615,6 +651,18 @@ void MainWindow::create_status_strip() {
     reveal_button->setDefaultAction(reveal_action_);
     reveal_button_ = reveal_button;
     statusBar()->addPermanentWidget(reveal_button);
+    // The silent startup check never opens a dialog: it puts a button in the
+    // status strip, and the user opens the update window from there.
+    update_button_ = new QToolButton(this);
+    update_button_->setObjectName(QStringLiteral("statusUpdate"));
+    update_button_->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    update_button_->setVisible(false);
+    connect(update_button_, &QToolButton::clicked, this, [this]() {
+        if (pending_update_) {
+            show_update_dialog(*pending_update_);
+        }
+    });
+    statusBar()->addPermanentWidget(update_button_);
     statusBar()->addPermanentWidget(jobs_label_);
     statusBar()->addPermanentWidget(jobs_progress_);
     statusBar()->addPermanentWidget(jobs_cancel_);
@@ -1310,6 +1358,73 @@ QString MainWindow::about_text() const {
 
 void MainWindow::show_about() {
     QMessageBox::about(this, tr("About alphashape"), about_text());
+}
+
+void MainWindow::show_preferences() {
+    PreferencesDialog dialog(*update_checker_, this);
+    connect(&dialog, &PreferencesDialog::check_requested, this,
+            [this]() { check_for_updates(true); });
+    dialog.exec();
+}
+
+void MainWindow::check_for_updates(bool manual) {
+    update_checker_->check(manual, [this, manual](const CheckResult& result) {
+        on_update_result(result, !manual);
+    });
+}
+
+void MainWindow::on_update_result(const CheckResult& result, bool automatic) {
+    if (update_result_handler_) {
+        update_result_handler_(result, automatic);
+        return;
+    }
+    if (automatic) {
+        // The startup check only notifies: a status-strip button, never a modal
+        // window and never anything that touches a running job.
+        if (result.status == CheckResult::Status::Available) {
+            show_update_notice(result.release);
+        }
+        return;
+    }
+    switch (result.status) {
+        case CheckResult::Status::UpToDate:
+            if (result.skipped) {
+                QMessageBox::information(
+                    this, tr("Check for Updates"),
+                    tr("You chose to skip this version. Choose Help > Check for Updates "
+                       "to see it again."));
+            } else {
+                QMessageBox::information(
+                    this, tr("Check for Updates"),
+                    tr("alphashape %1 is up to date.")
+                        .arg(QString::fromStdString(running_version())));
+            }
+            break;
+        case CheckResult::Status::Available:
+            show_update_dialog(result.release);
+            break;
+        case CheckResult::Status::Error:
+            QMessageBox::warning(this, tr("Check for Updates"),
+                                 QString::fromStdString(result.error));
+            break;
+    }
+}
+
+void MainWindow::show_update_dialog(const update::Release& release) {
+    CheckResult result;
+    result.status = CheckResult::Status::Available;
+    result.release = release;
+    UpdateDialog dialog(result, *update_checker_, this);
+    dialog.exec();
+}
+
+void MainWindow::show_update_notice(const update::Release& release) {
+    pending_update_ = release;
+    update_button_->setText(
+        tr("Update %1 available").arg(QString::fromStdString(release.version.to_string())));
+    update_button_->setToolTip(tr("Open the update window"));
+    update_button_->setVisible(true);
+    statusBar()->showMessage(tr("A newer version of alphashape is available."), 8000);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {

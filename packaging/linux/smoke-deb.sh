@@ -38,6 +38,9 @@ fi
 echo "== Python =="
 python3 -c "import alphashape, sys; print('alphashape from', alphashape.__file__, 'python', sys.version.split()[0])"
 
+echo "== Qt TLS backend =="
+ls /usr/lib/alphashape/qt/plugins/tls/*.so || { echo "error: no Qt TLS backend in the .deb" >&2; exit 1; }
+
 echo "== GUI (offscreen) =="
 out=$(QT_QPA_PLATFORM=offscreen alphashape-gui --offscreen-smoke)
 echo "$out"
