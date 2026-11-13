@@ -1235,9 +1235,12 @@ TEST(Markers, RefineKeepsUnconfidentProjection) {
     marker = find_marker(*scene.chunk, id);
     ASSERT_NE(marker, nullptr);
     std::printf("[refine unconfident] projections %zu -> %zu, moved %zu kept "
-                "%zu removed %zu\n",
+                "%zu removed %zu, markers failed %zu (no_scale %zu, "
+                "triangulation %zu, consensus %zu)\n",
                 before, marker->projections.size(), stats.moved_projections,
-                stats.kept_unrefined, stats.removed_projections);
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                stats.failed_no_scale, stats.failed_triangulation,
+                stats.failed_consensus);
     EXPECT_EQ(marker->projections.size(), before);
     EXPECT_EQ(stats.removed_projections, 0U);
     EXPECT_GE(stats.kept_unrefined, 1U);

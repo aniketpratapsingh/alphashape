@@ -1069,7 +1069,7 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
     const std::optional<BlobSeed>& seed, int patch_size, double limit,
-    TargetModel model, double hint_px) {
+    double hint_px) {
     if (!pixel.allFinite() || !std::isfinite(limit)) {
         return std::nullopt;
     }
@@ -1086,46 +1086,39 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     // printed target is centred at the candidate to within a few pixels, so
     // the radial search converges to the real boundary from there.
     std::optional<Eigen::Vector2d> ellipse;
-    if (model != TargetModel::Cross) {
-        if (seed && seed->light_centre) {
-            // The crop re-seed already fitted the outer border from a window
-            // that holds only this target, so reuse that centre. A border fit
-            // on the whole image can lock onto a neighbouring target instead.
-            ellipse = accept(seed->pixel);
-        } else if (seed) {
-            MarkerCandidate ellipse_seed;
-            ellipse_seed.center = pixel / ds;
-            ellipse_seed.radius_px = seed->radius / ds;
-            if (const auto fitted =
-                    refine_ellipse_center(view.gradient_field, ellipse_seed)) {
-                ellipse = accept(*fitted * ds);
-            }
+    if (seed && seed->light_centre) {
+        // The crop re-seed already fitted the outer border from a window that
+        // holds only this target, so reuse that centre. A border fit on the
+        // whole image can lock onto a neighbouring target's outline instead.
+        ellipse = accept(seed->pixel);
+    } else if (seed) {
+        MarkerCandidate ellipse_seed;
+        ellipse_seed.center = pixel / ds;
+        ellipse_seed.radius_px = seed->radius / ds;
+        if (const auto fitted =
+                refine_ellipse_center(view.gradient_field, ellipse_seed)) {
+            ellipse = accept(*fitted * ds);
         }
     }
-    // A checker cross has no printed boundary to fit; its centre is the
-    // saddle where four quadrants meet. The printed half-size is the natural
-    // fit-window hint when the scale is known, and is much more specific than
-    // the generic patch-size hint.
+    // Both printed patterns are refined: the boundary fit locks onto a ring
+    // or disc, the saddle fit onto a checker quadrant crossing. Whichever
+    // converged nearer the candidate wins, because the correct refiner locks
+    // onto the printed centre in a pixel or two while the wrong one lands on
+    // a quadrant, a neighbouring blob or an unrelated saddle far away. On a
+    // rendered checker the two disagree by more than a pixel, so keeping both
+    // and taking the closer one is measurably more accurate than assuming
+    // which pattern the marker carries; a target type only selects the SCALE.
+    const double hint =
+        hint_px > 0.0
+            ? hint_px / ds
+            : std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
     std::optional<Eigen::Vector2d> cross;
-    if (model != TargetModel::Circular) {
-        const double hint =
-            hint_px > 0.0 ? hint_px / ds
-                          : std::max(4.0, static_cast<double>(patch_size) / 4.0) /
-                                ds;
-        Eigen::Vector2d start = pixel;
-        if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
-            start = *saddle;
-        }
-        if (const auto refined =
-                refine_cross_center(view.image, start / ds, hint)) {
-            cross = accept(*refined * ds);
-        }
+    Eigen::Vector2d start = pixel;
+    if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
+        start = *saddle;
     }
-    if (model == TargetModel::Circular) {
-        return ellipse;
-    }
-    if (model == TargetModel::Cross) {
-        return cross;
+    if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
+        cross = accept(*refined * ds);
     }
     if (ellipse &&
         (!cross ||
@@ -1496,15 +1489,15 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
         projected_centres[index] = *projected;
         const double limit = refinement_limit(blend);
-        std::optional<BlobSeed> seed;
-        if (blend.model != TargetModel::Cross && !blend.cross_scale) {
-            seed = circular_seed(*blend.view, *projected, options.patch_size,
-                                 blend.apparent, blend.coded_circular,
-                                 blend.target_kind_known);
-        }
+        // The blob seed is the ellipse refiner's second opinion and its only
+        // anchor for a circular target; it is computed even when the saddle
+        // supplied the scale, so both refiners stay available.
+        const auto seed = circular_seed(
+            *blend.view, *projected, options.patch_size, blend.apparent,
+            blend.coded_circular, blend.target_kind_known);
         const auto refined = refined_2d_pixel(
             *blend.view, *projected, seed, options.patch_size, limit,
-            blend.model, blend.has_scale ? blend.apparent : 0.0);
+            blend.has_scale ? blend.apparent : 0.0);
         anchored[index] = refined ? *refined : *projected;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
@@ -1631,38 +1624,43 @@ double median(std::vector<double> values) {
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
         // A printed saddle is specific evidence: only a checker pattern (or a
-        // genuine bar cross) produces one. When it is present, the blob seed
-        // search must not run at all: on a real survey target the bright
-        // background beside a small checker is often a large light blob, and
-        // the coded-circular light-interior branch would fit its centre and
-        // scale to the road or verge, not to the printed target.
+        // genuine bar cross) produces one, and on a survey target the bright
+        // background beside a small checker is often a large light blob that
+        // the coded-circular light-interior branch would mistake for the
+        // target. The saddle's half-size is therefore the patch scale when it
+        // exists. The blob seed is still computed: it is the ellipse
+        // refiner's independent anchor, and skipping it would hand the whole
+        // decision to one refiner.
         std::optional<double> saddle;
         if (blend.model != TargetModel::Circular) {
             saddle = cross_radius(*blend.view, blend.pixel, patch_size);
         }
+        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
+                                   blend.coded_circular,
+                                   blend.target_kind_known);
         if (saddle.has_value()) {
             blend.apparent = std::max(1.0, *saddle);
             blend.has_scale = true;
             blend.cross_scale = true;
             continue;
         }
-        if (blend.model == TargetModel::Cross) {
-            // A declared checker target with no saddle in this view carries
-            // no usable scale. Do not substitute a quadrant blob's radius:
-            // that is not the target and would mis-size the sampled patch.
-            blend.apparent = 1.0;
-            blend.has_scale = false;
-            continue;
-        }
-        blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
-                                   blend.coded_circular,
-                                   blend.target_kind_known);
         if (blend.seed && std::isfinite(blend.seed->radius) &&
             blend.seed->radius > 0.0) {
             blend.apparent = std::max(1.0, blend.seed->radius);
             blend.has_scale = true;
             blend.blob_scale = true;
             continue;
+        }
+        if (blend.model == TargetModel::Circular) {
+            // A declared circular target with no blob still gets the cross
+            // fallback the previous order used.
+            if (const auto cross =
+                    cross_radius(*blend.view, blend.pixel, patch_size)) {
+                blend.apparent = std::max(1.0, *cross);
+                blend.has_scale = true;
+                blend.cross_scale = true;
+                continue;
+            }
         }
         blend.apparent = 1.0;
         blend.has_scale = false;
@@ -1678,7 +1676,7 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
         const double limit = refinement_limit(blend);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, options.patch_size, limit,
-            blend.model, blend.has_scale ? blend.apparent : 0.0);
+            blend.has_scale ? blend.apparent : 0.0);
         if (!refined) {
             continue;
         }
