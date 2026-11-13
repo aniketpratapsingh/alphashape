@@ -2697,7 +2697,9 @@ def run_real_odm(args):
         "camera_accuracy": args.camera_accuracy,
         "camera_accuracy_uniform_fallback_m": uniform_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
-        "timing": timing,
+        # Named to avoid the benchmark runner's own top-level "timing" block
+        # (stage wall times), which it adds to every dataset's report.
+        "gnss_timing": timing,
         "antenna_offset_m": list(antenna) if antenna is not None else None,
         "antenna_estimates_m": applied_estimates,
         "antenna_estimate_source": estimate_source,
