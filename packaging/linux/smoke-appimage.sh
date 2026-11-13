@@ -40,6 +40,19 @@ fi
 echo "== Qt TLS backend =="
 find squashfs-root -path '*/plugins/tls/*.so' | tee "$work/tls.txt"
 test -s "$work/tls.txt" || { echo "error: no Qt TLS backend in the AppImage" >&2; exit 1; }
+# Qt's openssl backend dlopens libssl/libcrypto, so linuxdeploy cannot see them.
+# They must be in the image explicitly or the plugin loads and then has nothing
+# to talk to.
+test -f squashfs-root/usr/lib/libssl.so.3 || {
+    echo "error: libssl.so.3 is not bundled in the AppImage" >&2; exit 1; }
+test -f squashfs-root/usr/lib/libcrypto.so.3 || {
+    echo "error: libcrypto.so.3 is not bundled in the AppImage" >&2; exit 1; }
+
+echo "== Qt TLS backend loads =="
+tls_out=$(QT_QPA_PLATFORM=offscreen "$img" --appimage-extract-and-run --self-test-tls)
+echo "$tls_out"
+echo "$tls_out" | command grep -q '^tls: active: .' || {
+    echo "error: no Qt TLS backend is active in the AppImage" >&2; exit 1; }
 
 echo "== PROJ data is found inside the image =="
 test -f squashfs-root/usr/share/proj/proj.db

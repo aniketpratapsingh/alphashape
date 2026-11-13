@@ -46,6 +46,24 @@ cp "$here/AppRun" "$work/AppRun"
     --icon-filename org.alphashape.app \
     --custom-apprun "$work/AppRun"
 
+# Qt's openssl TLS backend dlopens libssl/libcrypto instead of linking them, so
+# linuxdeploy's DT_NEEDED scan never sees them. Bundle them explicitly or the
+# packaged app has a TLS plugin that can never connect (and the updater cannot
+# reach GitHub). The deb depends on the distro's libssl3t64 for the same reason;
+# an AppImage must carry its own copy.
+for lib in libssl.so.3 libcrypto.so.3; do
+    source_path=$(ldconfig -p 2>/dev/null | awk -v name="$lib" '$1 == name { print $NF; exit }')
+    if [ -z "$source_path" ]; then
+        source_path=$(find /usr/lib /lib -name "$lib" -print -quit 2>/dev/null)
+    fi
+    if [ -z "$source_path" ] || [ ! -f "$source_path" ]; then
+        echo "error: $lib is not installed on the build host; Qt's TLS backend cannot work" >&2
+        exit 1
+    fi
+    echo "bundling $lib from $source_path"
+    cp -L "$source_path" "$appdir/usr/lib/$lib"
+done
+
 du -sh "$appdir"
 "$work/appimagetool-x86_64.AppImage" --no-appstream "$appdir" "$out"
 chmod +x "$out"

@@ -406,6 +406,17 @@ try {
     if ($smoke.ExitCode -ne 0) { Fail "alphashape.exe --offscreen-smoke exited $($smoke.ExitCode)" }
     Assert (($smoke.Output -join "`n") -match 'gui ready') "the GUI did not report 'gui ready'"
 
+    Step "TLS backend loads (update checks can use HTTPS)"
+    # A tls\*.dll that exists but cannot load leaves the updater unable to reach
+    # GitHub. --self-test-tls asks Qt which backend is actually active and exits
+    # non-zero when there is none; it uses no network.
+    $tls = Invoke-Captured $gui @('--self-test-tls') @{ QT_QPA_PLATFORM = 'offscreen' }
+    $tls.Output | ForEach-Object { Write-Host "  $_" }
+    $tls.Errors | ForEach-Object { Write-Host "  $_" }
+    if ($tls.ExitCode -ne 0) { Fail "alphashape.exe --self-test-tls exited $($tls.ExitCode)" }
+    Assert (($tls.Output -join "`n") -match 'tls: active: \S') 'no Qt TLS backend is active'
+    Assert (($tls.Output -join "`n") -match 'tls: backends: \S') 'no Qt TLS backend could be listed'
+
     $version = Invoke-Captured $gui @('--version') @{ QT_QPA_PLATFORM = 'offscreen' }
     $version.Output | ForEach-Object { Write-Host "  $_" }
     if ($version.ExitCode -ne 0) { Fail "alphashape.exe --version exited $($version.ExitCode)" }

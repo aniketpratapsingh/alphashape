@@ -121,6 +121,13 @@ ParseResult parse_command_line(const std::vector<std::string>& args) {
                 return fail("--offscreen-smoke takes no value");
             }
             opts.offscreen_smoke = true;
+        } else if (arg == "--self-test-tls") {
+            // Deliberately undocumented: a packaging diagnostic, not a user
+            // option (see the smoke scripts).
+            if (inline_value) {
+                return fail("--self-test-tls takes no value");
+            }
+            opts.self_test_tls = true;
         } else if (looks_like_option(arg)) {
             return fail("unknown option " + arg);
         } else {

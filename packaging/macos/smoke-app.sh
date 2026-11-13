@@ -115,6 +115,12 @@ echo "== Qt Network (update checks)"
     ls "$app/Contents/Frameworks" >&2 || true
     exit 1; }
 
+echo "== TLS backend loads"
+# The framework being present is not enough: Qt's TLS backend must actually
+# load, or every HTTPS request fails with no obvious cause. No network is used.
+QT_QPA_PLATFORM=offscreen "$gui" --self-test-tls | tee "$work/tls.txt"
+grep -q '^tls: active: .' "$work/tls.txt"
+
 echo "== GUI (offscreen)"
 # The offscreen platform plugin is not one macdeployqt picks (it deploys cocoa only), so
 # build-app.sh copies it in; check it is present before handing the GUI a headless platform.
