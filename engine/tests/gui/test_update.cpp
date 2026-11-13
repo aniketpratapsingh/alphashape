@@ -15,6 +15,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QLabel>
@@ -140,7 +141,7 @@ TEST_F(UpdateGuiTest, UpdateActionExistsAndPreferencesIsEnabled) {
     ASSERT_NE(action, nullptr);
     EXPECT_EQ(action->menuRole(), QAction::ApplicationSpecificRole);
     EXPECT_TRUE(action->isEnabled());
-    EXPECT_NE(window().menu("menu.help")->actions().indexOf(action), -1);
+    EXPECT_GE(window().menu("menu.help")->actions().indexOf(action), 0);
 
     // Preferences stopped being a disabled placeholder when update settings
     // landed in it.
@@ -179,7 +180,7 @@ TEST_F(UpdateGuiTest, ManualCheckBypassesTheThrottle) {
     window().set_update_result_handler([&](const CheckResult&, bool) { ++results; });
 
     // Pretend the automatic check just ran. A manual check must still run.
-    window().update_checker().record_check(1800000000);
+    window().update_checker().record_check(QDateTime::currentSecsSinceEpoch());
     EXPECT_FALSE(window().update_checker().automatic_check_due_now());
 
     window().trigger("action.help.check_updates");

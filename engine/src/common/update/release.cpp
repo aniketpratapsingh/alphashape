@@ -56,9 +56,9 @@ bool version_allowed(const Release& release, Channel channel) {
 
 }  // namespace
 
-const Asset* Release::find_asset(std::string_view name) const {
+const Asset* Release::find_asset(std::string_view asset_name) const {
     for (const Asset& asset : assets) {
-        if (asset.name == name) {
+        if (asset.name == asset_name) {
             return &asset;
         }
     }

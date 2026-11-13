@@ -68,13 +68,13 @@ public:
 private:
     void transform(const unsigned char* block) {
         std::array<std::uint32_t, 64> words{};
-        for (int i = 0; i < 16; ++i) {
+        for (std::size_t i = 0; i < 16; ++i) {
             words[i] = (static_cast<std::uint32_t>(block[i * 4]) << 24) |
                        (static_cast<std::uint32_t>(block[i * 4 + 1]) << 16) |
                        (static_cast<std::uint32_t>(block[i * 4 + 2]) << 8) |
                        static_cast<std::uint32_t>(block[i * 4 + 3]);
         }
-        for (int i = 16; i < 64; ++i) {
+        for (std::size_t i = 16; i < 64; ++i) {
             const std::uint32_t s0 = rotr(words[i - 15], 7) ^ rotr(words[i - 15], 18) ^
                                      (words[i - 15] >> 3);
             const std::uint32_t s1 = rotr(words[i - 2], 17) ^ rotr(words[i - 2], 19) ^
@@ -91,7 +91,7 @@ private:
         std::uint32_t g = state_[6];
         std::uint32_t h = state_[7];
 
-        for (int i = 0; i < 64; ++i) {
+        for (std::size_t i = 0; i < 64; ++i) {
             const std::uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
             const std::uint32_t choose = (e & f) ^ (~e & g);
             const std::uint32_t temp1 = h + s1 + choose + kRoundConstants[i] + words[i];
