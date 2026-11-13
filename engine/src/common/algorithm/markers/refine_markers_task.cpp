@@ -106,6 +106,19 @@ const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
     return nullptr;
 }
 
+/// Mutable counterpart, for publishing the run diagnostics on the chunk meta.
+Chunk* find_chunk_mutable(Document& document, std::int32_t chunk_id) {
+    for (auto& workspace : document.workspaces()) {
+        if (!workspace) {
+            continue;
+        }
+        if (Chunk* chunk = workspace->find_chunk(chunk_id)) {
+            return chunk;
+        }
+    }
+    return nullptr;
+}
+
 const Frame* frame_of_camera(const Chunk& chunk, std::int32_t camera_id) {
     for (const auto& frame : chunk.frames()) {
         if (frame && frame->camera_id() == camera_id) {
@@ -2130,7 +2143,7 @@ std::string format_number(double value) {
 /// that refined nothing still explains itself.
 void write_refine_meta(Document& document, std::int32_t chunk_id,
                        const RefineMarkersStats& stats) {
-    Chunk* chunk = document.find_chunk(chunk_id);
+    Chunk* chunk = find_chunk_mutable(document, chunk_id);
     if (chunk == nullptr) {
         return;
     }
