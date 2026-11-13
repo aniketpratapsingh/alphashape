@@ -848,7 +848,7 @@ TEST_F(ProjectV2, AttributeVocabulary) {
 
     expect_same_vocabulary(attributes, expected_attributes(),
                            "doc.xml attribute vocabulary");
-    EXPECT_EQ(expected_attributes().size(), 231U);
+    EXPECT_EQ(expected_attributes().size(), 232U);
     expect_reader_understands(document, archive);
 }
 
