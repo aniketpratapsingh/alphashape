@@ -233,7 +233,9 @@ historical output and has no `repetitions` key.
 The GCP dataset's protocol does not insert `OptimizeCameras` — it always runs — so a
 dispatched `optimize_params=adaptive_fitting=true` selects its adaptive variants instead
 (`--adaptive-fitting`), and any other OptimizeCameras parameter is recorded but has no
-effect there.
+effect there. A repeated GCP run skips the manifest's report-only diagnostics (a dozen
+extra leave-one-out variants): paying for them on every repetition would not fit the job
+ceiling, and the repeated comparison uses the two standard variants.
 
 All four parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are

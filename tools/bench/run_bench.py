@@ -1558,7 +1558,8 @@ def _run_gcp_repetitions(
         if reps > 1:
             print(f"-- gcp validation run {index}/{reps}")
         report = run_gcp_validation(
-            dataset_name, dataset, work, references, report_dir=report_dir,
+            dataset_name, dataset, work, references,
+            report_dir=report_dir, reps=reps,
         )
         alignment_hash = None
         if reps > 1:
@@ -1578,7 +1579,7 @@ def _run_gcp_repetitions(
 
 def run_gcp_validation(
     dataset_name: str, dataset: dict, work: Path, references: dict,
-    *, report_dir: Path | None = None,
+    *, report_dir: Path | None = None, reps: int = 1,
 ) -> dict:
     """Run the real-block ground-control validation (engine/tests/run_gcp_validation.py).
 
@@ -1631,7 +1632,13 @@ def run_gcp_validation(
     if adaptive:
         command.append("--adaptive-fitting")
     # The diagnostics are report-only probes; the manifest opts a dataset in.
-    if gcp.get("diagnostics"):
+    # A repeated run does not: the probes are a dozen extra leave-one-out
+    # variants, and paying for them on every repetition would push the job past
+    # the 6 h ceiling to re-measure rows the n=1 run already reports. The
+    # repeated comparison uses the two standard variants, which is what its
+    # dispatch is about.
+    diagnostics = bool(gcp.get("diagnostics")) and reps == 1
+    if diagnostics:
         command.append("--diagnostics")
 
     print("-- gcp validation")
