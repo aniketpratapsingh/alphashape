@@ -1294,16 +1294,28 @@ def run_gcp_validation(dataset_name: str, dataset: dict, work: Path, references:
     python = os.environ.get("ALPHASHAPE_PYTHON") or "python3"
 
     out_json = work / "gcp_report.json"
+    # "per-image" reads each photo's XMP RTK deviations; a number is the
+    # uniform baseline. camera_accuracy_fallback_m is the older key, kept so a
+    # manifest written before per-image mode still selects a uniform weight.
+    camera_accuracy = gcp.get("camera_accuracy",
+                              gcp.get("camera_accuracy_fallback_m", 0.05))
     command = [
         python, str(script), "--real", str(images_dir),
         "--gcp-list", str(gcp_list), "--gcp-names", str(gcp_names),
         "--horizontal-target", str(gcp.get("target_horizontal_m", 0.05)),
-        "--camera-accuracy", str(gcp.get("camera_accuracy_fallback_m", 0.05)),
+        "--camera-accuracy", str(camera_accuracy),
         "--marker-accuracy", str(gcp.get("marker_location_accuracy_m", 0.015)),
         "--keypoint-limit", str(match.get("keypoint_limit_per_mpx", 250)),
         "--gcp-height", str(gcp.get("gcp_height", "ellipsoidal")),
         "--json-out", str(out_json),
     ]
+    if gcp.get("camera_accuracy_uniform_m") is not None:
+        command.extend(["--camera-accuracy-uniform",
+                        str(gcp["camera_accuracy_uniform_m"])])
+    # The timing diagnostics need the RTK module's per-exposure event marks.
+    mrk = references.get("mrk")
+    if mrk:
+        command.extend(["--mrk", str(mrk)])
     # The diagnostics are report-only probes; the manifest opts a dataset in.
     if gcp.get("diagnostics"):
         command.append("--diagnostics")

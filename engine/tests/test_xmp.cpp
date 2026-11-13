@@ -573,31 +573,90 @@ TEST(Xmp, RtkAccuracyApplied) {
     run_add_photos(document, path, /*xmp_accuracy=*/true, /*xmp_orientation=*/false);
     Chunk& chunk = *document.active_chunk();
     ASSERT_EQ(chunk.cameras().size(), 1U);
-    const Eigen::Vector3d& accuracy = chunk.cameras().front().reference.accuracy;
-    EXPECT_DOUBLE_EQ(accuracy.x(), 0.01);
-    EXPECT_DOUBLE_EQ(accuracy.y(), 0.02);
-    EXPECT_DOUBLE_EQ(accuracy.z(), 0.03);
+    const CameraReference& reference = chunk.cameras().front().reference;
+    EXPECT_DOUBLE_EQ(reference.accuracy.x(), 0.01);
+    EXPECT_DOUBLE_EQ(reference.accuracy.y(), 0.02);
+    EXPECT_DOUBLE_EQ(reference.accuracy.z(), 0.03);
+    ASSERT_TRUE(reference.rtk_flag.has_value());
+    EXPECT_EQ(*reference.rtk_flag, 50);
     remove_file(path);
 }
 
-TEST(Xmp, RtkAccuracyIgnoredWithoutFix) {
+TEST(Xmp, NonFixedRtkAccuracyIsInflated) {
     const std::string packet = attribute_packet(
         "drone-dji:RtkFlag=\"0\" drone-dji:RtkStdLon=\"0.01\" "
-        "drone-dji:RtkStdLat=\"0.02\" drone-dji:RtkStdHgt=\"0.03\"");
+        "drone-dji:RtkStdLat=\"0.02\" drone-dji:RtkStdHgt=\"0.30\"");
     const XmpReference parsed = parse_xmp_reference(packet);
     EXPECT_FALSE(parsed.has_rtk_fix());
-    EXPECT_FALSE(parsed.rtk_accuracy_m().has_value());
+    const std::optional<std::array<double, 3>> accuracy = parsed.rtk_accuracy_m();
+    ASSERT_TRUE(accuracy.has_value());
+    // A single-point solution keeps its position but cannot be weighted at
+    // RTK precision: every axis is raised to at least the 0.5 m floor.
+    EXPECT_DOUBLE_EQ((*accuracy)[0], 0.5);
+    EXPECT_DOUBLE_EQ((*accuracy)[1], 0.5);
+    EXPECT_DOUBLE_EQ((*accuracy)[2], 0.5);
 
     const std::string path = temp_path(".jpg");
     write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
     Document document = document_with_chunk();
     run_add_photos(document, path, /*xmp_accuracy=*/true, /*xmp_orientation=*/false);
-    const Eigen::Vector3d& accuracy =
-        document.active_chunk()->cameras().front().reference.accuracy;
-    EXPECT_DOUBLE_EQ(accuracy.x(), 10.0);
-    EXPECT_DOUBLE_EQ(accuracy.y(), 10.0);
-    EXPECT_DOUBLE_EQ(accuracy.z(), 10.0);
+    const CameraReference& reference =
+        document.active_chunk()->cameras().front().reference;
+    EXPECT_DOUBLE_EQ(reference.accuracy.x(), 0.5);
+    EXPECT_DOUBLE_EQ(reference.accuracy.y(), 0.5);
+    EXPECT_DOUBLE_EQ(reference.accuracy.z(), 0.5);
+    ASSERT_TRUE(reference.rtk_flag.has_value());
+    EXPECT_EQ(*reference.rtk_flag, 0);
     remove_file(path);
+}
+
+TEST(Xmp, NonFixedRtkKeepsLargerReportedDeviation) {
+    // The floor is a minimum, not a replacement: a single-point solution that
+    // already reports a metre-level deviation keeps it.
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:RtkFlag=\"16\" drone-dji:RtkStdLon=\"0.8\" "
+        "drone-dji:RtkStdLat=\"1.2\" drone-dji:RtkStdHgt=\"2.5\""));
+    const std::optional<std::array<double, 3>> accuracy = xmp.rtk_accuracy_m();
+    ASSERT_TRUE(accuracy.has_value());
+    EXPECT_DOUBLE_EQ((*accuracy)[0], 0.8);
+    EXPECT_DOUBLE_EQ((*accuracy)[1], 1.2);
+    EXPECT_DOUBLE_EQ((*accuracy)[2], 2.5);
+}
+
+TEST(Xmp, AutelRtkPacketGivesPerAxisAccuracy) {
+    // The packet shape this block writes: longitude standard deviation first,
+    // then latitude, then height, all in metres, with RtkFlag 50 (fixed).
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:GpsLatitude=\"47.64368732\" "
+        "drone-dji:GpsLongtitude=\"16.47592717\" "
+        "drone-dji:AbsoluteAltitude=\"+513.00\" "
+        "drone-dji:RtkFlag=\"50\" drone-dji:RtkStdLon=\"0.01370\" "
+        "drone-dji:RtkStdLat=\"0.01439\" drone-dji:RtkStdHgt=\"0.02969\""));
+    ASSERT_TRUE(xmp.has_location());
+    EXPECT_DOUBLE_EQ(*xmp.latitude_deg, 47.64368732);
+    EXPECT_DOUBLE_EQ(*xmp.longitude_deg, 16.47592717);
+    EXPECT_TRUE(xmp.has_rtk_fix());
+    ASSERT_TRUE(xmp.rtk_flag.has_value());
+    EXPECT_EQ(*xmp.rtk_flag, 50);
+    const std::optional<std::array<double, 3>> accuracy = xmp.rtk_accuracy_m();
+    ASSERT_TRUE(accuracy.has_value());
+    EXPECT_DOUBLE_EQ((*accuracy)[0], 0.01370);  // east
+    EXPECT_DOUBLE_EQ((*accuracy)[1], 0.01439);  // north
+    EXPECT_DOUBLE_EQ((*accuracy)[2], 0.02969);  // up
+}
+
+TEST(Xmp, RtkStdsWithoutStatusAreUsedAsIs) {
+    // No status field: the packet cannot be classified, so the reported
+    // deviations stand (they are still better than the consumer default).
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:RtkStdLon=\"0.02\" drone-dji:RtkStdLat=\"0.03\" "
+        "drone-dji:RtkStdHgt=\"0.04\""));
+    EXPECT_FALSE(xmp.has_rtk_fix());
+    const std::optional<std::array<double, 3>> accuracy = xmp.rtk_accuracy_m();
+    ASSERT_TRUE(accuracy.has_value());
+    EXPECT_DOUBLE_EQ((*accuracy)[0], 0.02);
+    EXPECT_DOUBLE_EQ((*accuracy)[1], 0.03);
+    EXPECT_DOUBLE_EQ((*accuracy)[2], 0.04);
 }
 
 TEST(Xmp, RtkFlagOnlyAcceptsFloatAndFixed) {

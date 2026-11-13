@@ -66,6 +66,12 @@
 
 namespace alphashape {
 
+/// The smallest per-axis accuracy a non-fixed RTK solution is weighted with.
+/// A single-point or otherwise unfixed position is still useful as a weak
+/// prior; trusting its reported (RTK-sized) standard deviation would let a
+/// metre-level position outvote the survey GCPs.
+inline constexpr double kNonFixedRtkFloorM = 0.5;
+
 /// A yaw/pitch/roll triple in degrees, in the engine's stored convention and
 /// the `ZYX` order. See the file comment for the mapping from DJI fields.
 struct XmpOrientation {
@@ -107,9 +113,19 @@ struct XmpReference {
     /// True when `RtkFlag` names a fixed or float RTK solution.
     bool has_rtk_fix() const;
 
-    /// Per-axis 1-sigma accuracy as (east, north, up) in metres. Nullopt unless
-    /// `has_rtk_fix()` and all three standard deviations are present and
-    /// strictly positive; the caller then leaves the existing accuracy alone.
+    /// The reference accuracy a per-photo RTK solution implies, per axis as
+    /// (east, north, up) in metres, or nullopt when the packet carries no
+    /// usable standard deviations.
+    ///
+    /// A fixed or float solution (`has_rtk_fix()`) uses the reported
+    /// `RtkStdLon`/`RtkStdLat`/`RtkStdHgt` directly. A packet that reports a
+    /// status other than those two keeps its own solution but is not trusted at
+    /// RTK precision, so each axis is inflated to at least
+    /// `kNonFixedRtkFloorM`; the position still constrains the adjustment, but
+    /// as a weak prior rather than a centimetre measurement. When no status is
+    /// present the packet cannot be classified and the reported deviations are
+    /// used as they stand. Nullopt means "no per-photo accuracy is available":
+    /// the caller keeps whatever default it already had.
     std::optional<std::array<double, 3>> rtk_accuracy_m() const;
 };
 

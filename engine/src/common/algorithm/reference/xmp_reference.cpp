@@ -1,5 +1,6 @@
 #include "common/algorithm/reference/xmp_reference.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -442,14 +443,25 @@ bool XmpReference::has_rtk_fix() const {
 }
 
 std::optional<std::array<double, 3>> XmpReference::rtk_accuracy_m() const {
-    if (!has_rtk_fix() || !rtk_std_lon_m.has_value() || !rtk_std_lat_m.has_value() ||
+    if (!rtk_std_lon_m.has_value() || !rtk_std_lat_m.has_value() ||
         !rtk_std_hgt_m.has_value()) {
         return std::nullopt;
     }
     if (!(*rtk_std_lon_m > 0.0) || !(*rtk_std_lat_m > 0.0) || !(*rtk_std_hgt_m > 0.0)) {
         return std::nullopt;
     }
-    return std::array<double, 3>{*rtk_std_lon_m, *rtk_std_lat_m, *rtk_std_hgt_m};
+    std::array<double, 3> accuracy{*rtk_std_lon_m, *rtk_std_lat_m, *rtk_std_hgt_m};
+    // A reported status other than fixed/float describes a solution that is
+    // not at RTK precision. The packet still carries a position and a
+    // deviation, but trusting a centimetre deviation for a metre-level fix
+    // would let the prior outvote the survey control. Inflate each axis; a
+    // packet with no status at all is left as reported.
+    if (rtk_flag.has_value() && !has_rtk_fix()) {
+        for (double& axis : accuracy) {
+            axis = std::max(axis, kNonFixedRtkFloorM);
+        }
+    }
+    return accuracy;
 }
 
 std::optional<XmpOrientation> XmpReference::orientation_zyx() const {

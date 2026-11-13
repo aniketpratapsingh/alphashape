@@ -1660,6 +1660,16 @@ PYBIND11_MODULE(alphashape, m) {
             const Eigen::Vector3d& a = c.reference.accuracy;
             return py::make_tuple(a.x(), a.y(), a.z());
         })
+        // The GNSS fix status that came with the position (50 fixed, 34 float
+        // for XMP RTK writers), or None when the source reported none. Read
+        // only: it is provenance, and the accuracy already reflects it.
+        .def_property_readonly("reference_rtk_flag", [](const CameraRef& r) -> py::object {
+            const alphashape::Camera& c = r.get();
+            if (!c.reference.rtk_flag.has_value()) {
+                return py::none();
+            }
+            return py::int_(*c.reference.rtk_flag);
+        })
         // Measured attitude as a (yaw, pitch, roll) tuple in degrees, in the
         // chunk's rotation order; None when the reference carries none.
         .def_property_readonly("reference_orientation",
