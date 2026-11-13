@@ -125,6 +125,8 @@ set(ALPHASHAPE_DEB_DEPENDS
     "libtiff6"
     "libsqlite3-0"
     "zlib1g"
+    # Qt Network's openssl TLS backend dlopens the system libssl 3.
+    "libssl3t64"
     "libvulkan1 (>= 1.3)"
     "python3 (>= 3.12)"
     "python3 (<< 3.13)"

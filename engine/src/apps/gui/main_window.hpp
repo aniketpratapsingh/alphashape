@@ -2,12 +2,16 @@
 
 #include <exception>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 
 #include <QList>
 #include <QMainWindow>
 #include <QString>
 #include <QStringList>
+
+#include "common/update/release.hpp"
 
 class QAction;
 class QActionGroup;
@@ -20,6 +24,7 @@ class QMenu;
 
 namespace alphashape::gui {
 
+struct CheckResult;
 class ExportController;
 class GuiApp;
 class LogPane;
@@ -27,6 +32,8 @@ class PhotosPane;
 class PropertiesPane;
 class ReferencePane;
 class StartScreen;
+class UpdateChecker;
+class UpdateSource;
 class ViewportWidget;
 class WorkflowController;
 enum class RegionGizmoMode;
@@ -52,6 +59,7 @@ class MainWindow : public QMainWindow {
 
 public:
     explicit MainWindow(GuiApp& app, QWidget* parent = nullptr);
+    ~MainWindow() override;
 
     // --- Interaction hooks. Defaults show the usual Qt dialogs; tests replace them. ---
 
@@ -73,6 +81,17 @@ public:
     /// argument is the running task's name.
     using CancelJobsHandler = std::function<bool(const QString& task_name)>;
     void set_cancel_jobs_handler(CancelJobsHandler handler);
+
+    // --- Updates ---
+
+    /// Replace the network seam of the update checker (tests use a fake; the
+    /// GUI tests are also run with ALPHASHAPE_NO_UPDATE_CHECK=1).
+    void set_update_source(std::unique_ptr<UpdateSource> source);
+    UpdateChecker& update_checker() { return *update_checker_; }
+    /// Told about every check result. `automatic` is true for the silent
+    /// startup check. Replaces the default dialogs/status notice.
+    using UpdateResultHandler = std::function<void(const CheckResult&, bool automatic)>;
+    void set_update_result_handler(UpdateResultHandler handler);
 
     // --- Project operations (what the File menu does). Each returns false if cancelled or
     // failed; failures are reported through the error handler. ---
@@ -150,6 +169,14 @@ private:
     /// starts with "Export", which covers an export the controller did not queue.
     void on_job_finished(int state, const QString& message, bool export_note, bool export_task);
     void show_about();
+    void show_preferences();
+    /// `manual` checks bypass the throttle and always report a result through
+    /// on_update_result(); an automatic check is silent when nothing is new.
+    void check_for_updates(bool manual);
+    void on_update_result(const CheckResult& result, bool automatic);
+    void show_update_dialog(const update::Release& release);
+    /// Non-modal notice for the silent startup check (status strip button).
+    void show_update_notice(const update::Release& release);
     void report_error(const QString& title, const std::exception& error);
     /// True when a job owns the document: posts the "wait for it" note and asks the caller to
     /// return false. Every operation that reaches a GuiApp document call must ask first.
@@ -208,6 +235,10 @@ private:
     /// The "Reveal" action of the last export note, and the status-strip button showing it.
     QAction* reveal_action_ = nullptr;
     QToolButton* reveal_button_ = nullptr;
+    QToolButton* update_button_ = nullptr;  ///< "status.update", shown when a release is waiting
+    std::unique_ptr<UpdateChecker> update_checker_;
+    UpdateResultHandler update_result_handler_;
+    std::optional<update::Release> pending_update_;
 
     QMenu* recent_menu_ = nullptr;
     QMenu* export_menu_ = nullptr;

@@ -42,6 +42,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **GUI update checks (automatic and manual).** Help > Check for Updates... runs
+  a manual check that always reports up to date, a newer version, or the reason
+  it failed; a silent startup check runs at most once every 24 hours and only
+  posts a non-modal status-bar notice. The update dialog shows the release notes
+  and offers Download and Install, Skip This Version, Remind Me Later and View
+  on GitHub. Downloads are written to the per-user cache and must match the
+  release's `SHA256SUMS` before any installer runs. Install is per platform: the
+  DMG opens on macOS, the NSIS installer runs on Windows, an AppImage is
+  replaced in place (old file kept as `.bak`), and a `.deb` opens in the system
+  package handler. Preferences gains automatic checks (default on), the
+  Stable/pre-release channel and Check Now, persisted under `updates/...`.
+  `ALPHASHAPE_NO_UPDATE_CHECK=1` and `--no-update-check` disable all requests;
+  the only traffic is the public GitHub Releases API and the approved download.
+
 - **WP-11.8: frames, camera groups and stations, camera selection and frame
   statistics.** `AddPhotos` gains `group_by_folder` (one folder-typed camera
   group per source directory, labelled with the directory name), `recursive`

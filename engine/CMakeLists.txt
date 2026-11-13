@@ -187,10 +187,10 @@ find_package(SQLite3 QUIET)
 # ShaderTools provides qt_add_shaders(), which turns the viewport's GLSL into the .qsb files
 # every QRhi backend loads; the GuiPrivate module supplies the RHI headers (rhi/qrhi.h).
 if(ALPHASHAPE_BUILD_GUI)
-    find_package(Qt6 6.7 QUIET COMPONENTS Widgets Test ShaderTools)
+    find_package(Qt6 6.7 QUIET COMPONENTS Widgets Test ShaderTools Network)
     if(NOT Qt6_FOUND)
         message(FATAL_ERROR "alphashape: ALPHASHAPE_BUILD_GUI=ON but Qt 6.7 or newer (Widgets, "
-                            "Test, ShaderTools) was not found. Point CMAKE_PREFIX_PATH at a Qt 6 "
+                            "Test, ShaderTools, Network) was not found. Point CMAKE_PREFIX_PATH at a Qt 6 "
                             "install, or pass -DALPHASHAPE_BUILD_GUI=OFF.")
     endif()
 endif()
