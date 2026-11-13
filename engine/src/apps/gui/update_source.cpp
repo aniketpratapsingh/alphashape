@@ -140,7 +140,11 @@ void NetworkUpdateSource::download_file(const std::string& url, const QString& d
         file->write(reply->readAll());
     });
     connect(reply, &QNetworkReply::downloadProgress, reply,
-            [progress](qint64 received, qint64 total) { progress(received, total); });
+            [progress](qint64 received, qint64 total) {
+                if (progress) {
+                    progress(received, total);
+                }
+            });
     connect(reply, &QNetworkReply::redirected, reply, [reply](const QUrl& target) {
         if (!allowed_url(target.toString().toStdString(), false)) {
             reply->abort();

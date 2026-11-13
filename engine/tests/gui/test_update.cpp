@@ -74,7 +74,9 @@ public:
         }
         file.write(download_bytes);
         file.close();
-        progress(download_bytes.size(), download_bytes.size());
+        if (progress) {
+            progress(download_bytes.size(), download_bytes.size());
+        }
         done(true, std::string());
     }
 

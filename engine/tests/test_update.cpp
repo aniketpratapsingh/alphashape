@@ -318,6 +318,7 @@ TEST(Update, JsonReaderHandlesEscapesAndUnicode) {
     ASSERT_NE(value.find("list"), nullptr);
     ASSERT_TRUE(value.find("list")->is_array());
     EXPECT_EQ(value.find("list")->array().size(), 2u);
-    EXPECT_TRUE(value.bool_or("missing", false));
+    EXPECT_FALSE(value.bool_or("missing", false));
+    EXPECT_TRUE(value.bool_or("missing", true));
     EXPECT_EQ(value.string_or("missing"), "");
 }
