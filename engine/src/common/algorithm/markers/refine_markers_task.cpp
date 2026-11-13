@@ -1400,6 +1400,8 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
         }
     }
     if (!best.found) {
+        std::fprintf(stderr, "REFINE DEBUG search: no winner, references=%zu\n",
+                     references.size());
         return std::nullopt;
     }
     return best;
@@ -1468,6 +1470,16 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
     }
     if (inliers.size() < 2) {
+        std::fprintf(stderr, "REFINE DEBUG apply: inliers=%zu best_other=%.3f scores=",
+                     inliers.size(), best_other);
+        for (const auto& score : scores) {
+            if (score) {
+                std::fprintf(stderr, "%.3f ", *score);
+            } else {
+                std::fprintf(stderr, "none ");
+            }
+        }
+        std::fprintf(stderr, "\n");
         return std::nullopt;
     }
     // A common lateral offset of the physical patch is invisible to NCC (every

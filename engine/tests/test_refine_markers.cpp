@@ -574,7 +574,13 @@ TEST(Markers, RefineStableOnExactProjection) {
     for (const Marker& marker : scene.chunk->markers()) {
         const std::size_t target = static_cast<std::size_t>(
             std::stoul(marker.label.substr(1)));
-        rms_to_truth(scene, marker, target, &worst);
+        double marker_worst = 0.0;
+        const double rms = rms_to_truth(scene, marker, target, &marker_worst);
+        worst = std::max(worst, marker_worst);
+        std::printf("[refine stable] marker %zu %s rms %.4f worst %.4f\n",
+                    target,
+                    scene.targets[target].cross ? "cross" : "circular", rms,
+                    marker_worst);
     }
     std::printf("[refine stable] worst %.4f px, refined %zu\n",
                 worst, stats.refined);
