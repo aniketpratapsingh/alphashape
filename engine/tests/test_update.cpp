@@ -307,6 +307,29 @@ TEST(Update, ThrottlesAutomaticChecksToTwentyFourHours) {
     EXPECT_TRUE(automatic_check_due(now, now + 120));
 }
 
+TEST(Update, JsonNumbersFollowTheStrictGrammar) {
+    // A leading plus and leading zeros are not JSON numbers. The stream
+    // extraction used to turn "01" into 1 and "+1" into 1, which would let a
+    // malformed API response through.
+    EXPECT_THROW(json::Value::parse("+1"), std::runtime_error);
+    EXPECT_THROW(json::Value::parse("01"), std::runtime_error);
+    EXPECT_THROW(json::Value::parse("[-01]"), std::runtime_error);
+    EXPECT_THROW(json::Value::parse("1."), std::runtime_error);
+    EXPECT_THROW(json::Value::parse(".5"), std::runtime_error);
+    EXPECT_THROW(json::Value::parse("1e"), std::runtime_error);
+
+    // Valid forms, including a negative zero, a fraction and both exponent
+    // signs, still parse.
+    EXPECT_DOUBLE_EQ(json::Value::parse("-0").number(), 0.0);
+    EXPECT_DOUBLE_EQ(json::Value::parse("0.5").number(), 0.5);
+    EXPECT_DOUBLE_EQ(json::Value::parse("-1.25").number(), -1.25);
+    EXPECT_DOUBLE_EQ(json::Value::parse("1e+3").number(), 1000.0);
+    EXPECT_DOUBLE_EQ(json::Value::parse("2E-2").number(), 0.02);
+    const json::Value list = json::Value::parse("[0,10,-3.5]");
+    ASSERT_EQ(list.array().size(), 3u);
+    EXPECT_DOUBLE_EQ(list.array()[1].number(), 10.0);
+}
+
 TEST(Update, JsonReaderHandlesEscapesAndUnicode) {
     const json::Value value = json::Value::parse(
         R"({"text":"line\nnext \u00e9 \ud83d\ude00","n":1.5,"ok":true,"list":[1,2]})");

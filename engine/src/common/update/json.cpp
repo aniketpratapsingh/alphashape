@@ -15,6 +15,8 @@ namespace {
                              std::string(message));
 }
 
+bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
 void append_utf8(std::string& out, std::uint32_t code_point) {
     if (code_point <= 0x7F) {
         out.push_back(static_cast<char>(code_point));
@@ -212,22 +214,48 @@ private:
         fail("unterminated string", position_);
     }
 
+    // RFC 8259 number: [minus] int [frac] [exp], where an integer part is "0"
+    // or a non-zero digit followed by digits. A leading "+" and leading zeros
+    // ("01") are not numbers; the stream extraction below would otherwise
+    // accept them.
     Value parse_number() {
         const std::size_t start = position_;
         if (position_ < text_.size() && text_[position_] == '-') {
             ++position_;
         }
-        while (position_ < text_.size()) {
-            const char c = text_[position_];
-            if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' ||
-                c == '-') {
+        if (position_ >= text_.size() || !is_digit(text_[position_])) {
+            fail("expected a value", start);
+        }
+        if (text_[position_] == '0') {
+            ++position_;
+            if (position_ < text_.size() && is_digit(text_[position_])) {
+                fail("leading zeros are not allowed", start);
+            }
+        } else {
+            while (position_ < text_.size() && is_digit(text_[position_])) {
                 ++position_;
-            } else {
-                break;
             }
         }
-        if (position_ == start) {
-            fail("expected a value", start);
+        if (position_ < text_.size() && text_[position_] == '.') {
+            ++position_;
+            if (position_ >= text_.size() || !is_digit(text_[position_])) {
+                fail("invalid fractional part", start);
+            }
+            while (position_ < text_.size() && is_digit(text_[position_])) {
+                ++position_;
+            }
+        }
+        if (position_ < text_.size() && (text_[position_] == 'e' || text_[position_] == 'E')) {
+            ++position_;
+            if (position_ < text_.size() && (text_[position_] == '+' || text_[position_] == '-')) {
+                ++position_;
+            }
+            if (position_ >= text_.size() || !is_digit(text_[position_])) {
+                fail("invalid exponent", start);
+            }
+            while (position_ < text_.size() && is_digit(text_[position_])) {
+                ++position_;
+            }
         }
         // std::from_chars for floating point is not available in Apple's libc++
         // on the deployment target. A stream imbued with the classic locale is
