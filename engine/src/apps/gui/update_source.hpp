@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include <QObject>
@@ -68,11 +69,19 @@ public:
     void cancel() override;
 
 private:
-    void start_reply(const std::string& url, bool download, const QString& dest);
+    /// Everything one fetch needs: the buffers, the destination file and the
+    /// completion callback. Shared with the reply's lambdas, so it outlives the
+    /// source when a callback is still in flight and closes the file when the
+    /// last reference goes away.
+    struct Transfer;
+
+    void start_get(const std::string& url, const std::shared_ptr<Transfer>& transfer);
 
     QNetworkAccessManager* network_ = nullptr;
     QPointer<QNetworkReply> reply_;
-    QString download_path_;
+    std::shared_ptr<Transfer> transfer_;
+    /// Incremented per request; a reply from an older hop is ignored.
+    int generation_ = 0;
     bool cancelled_ = false;
 };
 
