@@ -70,6 +70,18 @@ InstallResult install_appimage(const update::Release& release, const QString& do
         return fallback(release, QCoreApplication::translate(
                                       "Installer", "The running AppImage was not found."));
     }
+    // Consent comes first, as it does on Windows: nothing is replaced behind
+    // the user's back.
+    const auto answer = QMessageBox::question(
+        nullptr, QCoreApplication::translate("Installer", "Install update"),
+        QCoreApplication::translate(
+            "Installer",
+            "alphashape will replace the running AppImage and restart. Continue?"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes) {
+        return fallback(release, QCoreApplication::translate(
+                                      "Installer", "The AppImage was not replaced."));
+    }
     const QFileInfo info(running);
     const QString staged = info.absoluteFilePath() + QStringLiteral(".new");
     const QString backup = info.absoluteFilePath() + QStringLiteral(".bak");
@@ -95,17 +107,13 @@ InstallResult install_appimage(const update::Release& release, const QString& do
                                       "Installer", "Could not replace the running AppImage."));
     }
 
-    const auto answer = QMessageBox::question(
-        nullptr, QCoreApplication::translate("Installer", "Update installed"),
-        QCoreApplication::translate("Installer",
-                                    "The new AppImage is in place. Restart alphashape now?"),
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
     InstallResult result;
     result.success = true;
     result.message = QCoreApplication::translate(
         "Installer",
-        "The new AppImage is in place. The previous one is kept as a .bak file.");
-    if (answer == QMessageBox::Yes && QProcess::startDetached(info.absoluteFilePath(), {})) {
+        "The new AppImage is in place. The previous one is kept as a .bak file. "
+        "alphashape will now restart.");
+    if (QProcess::startDetached(info.absoluteFilePath(), {})) {
         QCoreApplication::quit();
     }
     return result;
