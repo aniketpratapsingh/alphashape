@@ -6,8 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <QAction>
@@ -65,8 +67,8 @@ public:
         done(true, releases_json, std::string());
     }
 
-    void download_file(const std::string&, const QString& dest, ProgressCallback progress,
-                       FileCallback done) override {
+    void download_file(const std::string&, const QString& dest, std::int64_t /*expected_size*/,
+                       ProgressCallback progress, FileCallback done) override {
         QFile file(dest);
         if (!file.open(QIODevice::WriteOnly)) {
             done(false, "cannot write");

@@ -42,10 +42,13 @@ public:
     /// Fetch a small text resource (the releases JSON or SHA256SUMS).
     virtual void fetch_text(const std::string& url, TextCallback done) = 0;
 
-    /// Download `url` to the file `dest`. The callback runs exactly once;
-    /// `cancel()` may have caused it.
+    /// Download `url` to the file `dest`. `expected_size` is the asset's size
+    /// from the release API, or a negative value when it is unknown; when it is
+    /// known the transfer is capped a little above it. The callback runs exactly
+    /// once; `cancel()` may have caused it.
     virtual void download_file(const std::string& url, const QString& dest,
-                               ProgressCallback progress, FileCallback done) = 0;
+                               std::int64_t expected_size, ProgressCallback progress,
+                               FileCallback done) = 0;
 
     /// Abort the request in flight, if any. The pending callback still runs.
     virtual void cancel() = 0;
@@ -60,8 +63,8 @@ public:
     ~NetworkUpdateSource() override;
 
     void fetch_text(const std::string& url, TextCallback done) override;
-    void download_file(const std::string& url, const QString& dest, ProgressCallback progress,
-                       FileCallback done) override;
+    void download_file(const std::string& url, const QString& dest, std::int64_t expected_size,
+                       ProgressCallback progress, FileCallback done) override;
     void cancel() override;
 
 private:

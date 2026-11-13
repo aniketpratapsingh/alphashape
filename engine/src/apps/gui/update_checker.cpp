@@ -237,7 +237,7 @@ void UpdateChecker::download_and_verify(const update::Release& release,
     const std::string asset_name = asset.name;
 
     source_->download_file(
-        asset_url, path, std::move(progress),
+        asset_url, path, asset.size, std::move(progress),
         [this, path, asset_name, sums_url, done](bool ok, const std::string& error) {
             if (!ok) {
                 done({false, {}, "download failed: " + error});

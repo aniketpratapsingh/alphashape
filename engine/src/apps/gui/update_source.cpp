@@ -12,6 +12,13 @@
 namespace alphashape::gui {
 namespace {
 
+/// The largest release metadata response (the releases JSON or SHA256SUMS) we
+/// will buffer. Both are tens of kilobytes in practice.
+constexpr qint64 kMaxTextBytes = 8 * 1024 * 1024;
+/// Slack over the size the release API declares for an asset, so a rounding or
+/// chunking difference is not mistaken for a malicious response.
+constexpr qint64 kDownloadMarginBytes = 1024 * 1024;
+
 bool allowed_host(const QString& host, bool allow_api) {
     if (host == QStringLiteral("github.com") ||
         host == QStringLiteral("objects.githubusercontent.com") ||
@@ -90,8 +97,12 @@ void NetworkUpdateSource::fetch_text(const std::string& url, TextCallback done) 
     reply_ = reply;
 
     auto* body = new QByteArray();
-    connect(reply, &QNetworkReply::readyRead, reply,
-            [reply, body]() { body->append(reply->readAll()); });
+    connect(reply, &QNetworkReply::readyRead, reply, [reply, body]() {
+        body->append(reply->readAll());
+        if (body->size() > kMaxTextBytes) {
+            reply->abort();
+        }
+    });
     connect(reply, &QNetworkReply::redirected, reply,
             [reply](const QUrl& target) {
                 if (!allowed_url(target.toString().toStdString(), true)) {
@@ -106,9 +117,15 @@ void NetworkUpdateSource::fetch_text(const std::string& url, TextCallback done) 
         reply_ = nullptr;
         const QByteArray rest = reply->readAll();
         body->append(rest);
-        const bool ok = !cancelled_ && reply->error() == QNetworkReply::NoError;
-        const std::string error =
-            ok ? std::string() : network_error_text(reply).toStdString();
+        const bool too_large = body->size() > kMaxTextBytes;
+        const bool ok =
+            !cancelled_ && reply->error() == QNetworkReply::NoError && !too_large;
+        std::string error;
+        if (too_large) {
+            error = "the update response is larger than the 8 MiB limit";
+        } else if (!ok) {
+            error = network_error_text(reply).toStdString();
+        }
         std::string text(body->constData(), static_cast<std::size_t>(body->size()));
         delete body;
         reply->deleteLater();
@@ -117,8 +134,13 @@ void NetworkUpdateSource::fetch_text(const std::string& url, TextCallback done) 
 }
 
 void NetworkUpdateSource::download_file(const std::string& url, const QString& dest,
-                                         ProgressCallback progress, FileCallback done) {
+                                        std::int64_t expected_size, ProgressCallback progress,
+                                        FileCallback done) {
     cancelled_ = false;
+    // When the release API declares a size, a transfer that grows past it (with
+    // a small margin) is refused rather than written to disk.
+    const qint64 limit =
+        expected_size > 0 ? expected_size + kDownloadMarginBytes : static_cast<qint64>(-1);
     if (!is_allowed_update_download_url(url)) {
         done(false, "refusing to download an update from outside GitHub: " + url);
         return;
@@ -144,8 +166,15 @@ void NetworkUpdateSource::download_file(const std::string& url, const QString& d
     QNetworkReply* reply = network_->get(request);
     reply_ = reply;
 
-    connect(reply, &QNetworkReply::readyRead, reply, [reply, file]() {
-        file->write(reply->readAll());
+    auto* received = new qint64(0);
+    connect(reply, &QNetworkReply::readyRead, reply, [reply, file, received, limit]() {
+        const QByteArray chunk = reply->readAll();
+        if (limit >= 0 && *received + chunk.size() > limit) {
+            reply->abort();
+            return;
+        }
+        file->write(chunk);
+        *received += chunk.size();
     });
     connect(reply, &QNetworkReply::downloadProgress, reply,
             [progress](qint64 received, qint64 total) {
@@ -161,18 +190,29 @@ void NetworkUpdateSource::download_file(const std::string& url, const QString& d
         reply->redirectAllowed();
     });
     connect(reply, &QNetworkReply::finished, reply,
-            [this, reply, file, done]() {
+            [this, reply, file, received, limit, done]() {
         reply_ = nullptr;
-        file->write(reply->readAll());
+        const QByteArray rest = reply->readAll();
+        const bool too_large =
+            limit >= 0 && *received + rest.size() > limit;
+        if (!too_large) {
+            file->write(rest);
+        }
         file->close();
-        const bool ok = !cancelled_ && reply->error() == QNetworkReply::NoError;
+        const bool ok =
+            !cancelled_ && reply->error() == QNetworkReply::NoError && !too_large;
         std::string error;
-        if (!ok) {
+        if (too_large) {
+            error = "the download exceeded the size the release declares";
+        } else if (!ok) {
             error = network_error_text(reply).toStdString();
+        }
+        if (!ok) {
             // Never leave a partial installer behind.
             file->remove();
             download_path_.clear();
         }
+        delete received;
         delete file;
         reply->deleteLater();
         done(ok, error);

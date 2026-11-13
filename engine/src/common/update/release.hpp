@@ -28,6 +28,9 @@ inline constexpr const char* kChecksumsAssetName = "SHA256SUMS";
 struct Asset {
     std::string name;
     std::string browser_download_url;
+    /// The size the API declares, or -1 when the response does not carry one.
+    /// The downloader caps the transfer a little above it.
+    std::int64_t size = -1;
 };
 
 /// One entry of the releases list. `version` is parsed from `tag_name`;

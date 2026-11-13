@@ -36,6 +36,12 @@ Release parse_release(const json::Value& value) {
             Asset asset;
             asset.name = entry.string_or("name");
             asset.browser_download_url = entry.string_or("browser_download_url");
+            // "size" is the byte count GitHub reports for the asset. A missing,
+            // non-numeric or non-positive value stays -1 ("unknown").
+            if (const json::Value* size = entry.find("size");
+                size != nullptr && size->is_number() && size->number() > 0) {
+                asset.size = static_cast<std::int64_t>(size->number());
+            }
             if (!asset.name.empty() && !asset.browser_download_url.empty()) {
                 release.assets.push_back(std::move(asset));
             }
