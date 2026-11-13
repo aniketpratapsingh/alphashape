@@ -558,3 +558,108 @@ adaptive model they are 10.26 and 6.36 cm. Applying the fixed arm gives 16.91 cm
 error is the camera-RTK versus GCP datum disagreement, not the mean lever arm:
 the GCP-only adjustment already reaches 6.36 cm vertical without any camera
 positions.
+
+#### Per-photo GNSS accuracy, fix status and timing (2026-11-13, PR #119)
+
+The tables above were measured with one uniform camera weight; this section
+imports each photo's own accuracy and measures the difference.
+
+**Metadata.** Every image's XMP packet (drone namespace
+`http://www.dji.com/drone-dji/1.0/`) carries `RtkFlag=50` and
+`RtkStdLon`/`RtkStdLat`/`RtkStdHgt`. Across all 176 exposures the reported
+1-sigma deviations are 1.21-1.46 cm east (mean 1.29), 1.33-1.55 cm north (mean
+1.39) and 2.45-3.01 cm up (mean 2.66); all 176 are fixed, none float or
+single-point. The RTK module's per-exposure event-mark log
+(`RTK_Data/101FTASK_Timestamp.mrk`, GPS week 2211) carries the same antenna
+positions and deviations, ordered latitude, longitude, height, plus the GPS
+time of week and the same `50` status. Its positions equal the XMP values
+exactly. Each JPEG's comment carries two module counters: `timestamp` (shutter
+command, ms) and `exppts` (exposure event, us).
+
+**Import rule.** `AddPhotos(load_xmp_accuracy=True)` stores each photo's
+reported east/north/up deviation as that camera's reference accuracy. A fixed
+(50) or float (34) solution uses the deviations directly. Any other reported
+status keeps the position but raises each axis to at least 0.5 m, so a
+single-point fix cannot outvote centimetre survey control. A packet with
+deviations but no status uses them as written; a packet with no deviations
+keeps the 10 m consumer default. The status is persisted as the optional
+`rtk_flag` attribute on the camera's `<reference>` (doc.xml v2) and exposed as
+`camera.reference_rtk_flag`. The parser previously recognised only the
+documentation namespace `http://ns.dji.com/...`; this dataset writes
+`http://www.dji.com/...`, so a real packet parsed as empty. Both spellings are
+accepted now.
+
+**Protocol.** `--camera-accuracy per-image` enables the import at AddPhotos
+time and aligns with it; `camera_rtk_uniform` refits the same alignment with one
+uniform weight (0.05 m, `--camera-accuracy-uniform`) to separate the weight
+effect from the alignment. The per-fold diagnostic flags every camera whose
+prior residual exceeds 3 sigma on any axis, keeping all flagged labels and the
+worst 20 full residual records, with the camera's GNSS status and along-track
+residual attached. `--mrk` parses the event-mark log for the timing comparison.
+
+**Timing.** Pairing each exposure's event mark with the image's `exppts`
+counter and removing the constant clock offset leaves a 0.38 ms RMS
+disagreement (max 1.45 ms) over all 176 exposures: the event mark is stamped at
+the exposure, so the recorded position is not late. The shutter command
+precedes the exposure by 0.183-0.188 s (median 0.186), but that is
+trigger-to-exposure, not a position lag. Consecutive event marks give a
+3.99 m/s median block speed (up to 4.08 m/s on straight runs, 0.15 m/s in
+turns); a 0.186 s position lag would be 0.74 m along track. The protocol also
+reports the control-only along-track latency implied by the folded camera
+residuals, and the `camera_rtk_per_image_timing_shift` diagnostic removes that
+lead from every camera position. Both are report-only; the direct
+event/exposure comparison already rules out a real lag.
+
+**Measured** by the `gcp-rtk` quality-bench runs `43468914296` (full diagnostic
+set) and `43499714006` (the antenna subset on the same code; the base variants
+reproduce the full run exactly). Alignment: 146/176 cameras, 0.740 px; all 176
+cameras received their own XMP accuracy (`uniform_defaults` 0). The per-image
+weights tighten `AlignCameras`' robust datum gate (0.5 m floor) to 39/146
+inliers at 0.274 m, so the initial datum is camera-only from 39 cameras; the
+fold's BA (438 prior axes) then moves the block onto the references. Leave-one-out
+check RMS in cm:
+
+| variant | lens | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` | default | 7.91 | 10.15 | 12.87 |
+| `gcps_only`, `adaptive_fitting` | adaptive | 6.54 | 6.46 | 9.19 |
+| `camera_rtk_uniform` (0.05 m) | default | 7.54 | 16.81 | 18.43 |
+| `camera_rtk_gcps` (per-image) | default | 7.94 | 16.26 | 18.10 |
+| `camera_rtk_per_image_adaptive` | adaptive | 5.31 | 12.22 | 13.32 |
+| `camera_rtk_per_image_antenna_estimated` | default | 8.17 | 19.90 | 21.51 |
+| `camera_rtk_per_image_antenna_estimated_adaptive` | adaptive | 5.45 | 12.14 | 13.30 |
+| `camera_rtk_per_image_timing_shift` (report-only) | default | 7.09 | 15.80 | 17.32 |
+| per-image adaptive, −0.5 px (report-only, full run) | adaptive | 4.95 | 10.56 | 11.66 |
+
+Findings:
+
+- **The import does what it says.** With per-image weights the folded camera
+  references sit 0.92 / 0.99 / 2.29 cm RMS (east/north/up) from the adjusted
+  centres; the same alignment refitted at a uniform 0.05 m leaves 4.07 / 4.58
+  / 3.64 cm. The block is genuinely fitted to the RTK positions.
+- **The check does not improve.** The per-image base is 7.94 / 16.26 / 18.10 cm
+  and its adaptive form 5.31 / 12.22 / 13.32; the uniform-weight fold on the
+  same alignment is 7.54 / 16.81 / 18.43 and GCPs-only adaptive is
+  6.54 / 6.46 / 9.19. The camera prior and the GCP datum disagree by about
+  0.2 m vertically (the mount), so weighting the cameras more strongly cannot
+  raise check-point accuracy.
+- **3-sigma outliers.** In the per-image base fold only `MAX_0009` exceeds
+  3 sigma, in all 5 folds (5 of 730 camera-folds); the estimated-antenna
+  adaptive variant flags `MAX_0121` in 3 folds. Every camera in the block is
+  RTK fixed (code 50), so there is no fix-status correlation to find. The
+  flagged cameras' implied latency is −1.6 ms (base) and +16.7 ms (antenna
+  adaptive) against a direct event/exposure disagreement of 0.38 ms; neither
+  is a timing signature.
+- **The antenna does not help.** The per-fold estimated arm is
+  (-0.012, -0.204, -0.205) m, consistent with the earlier measurement. Applied
+  with the adaptive lens it gives 5.45 / 12.14 / 13.30, no better than the same
+  configuration without the mount (5.31 / 12.22 / 13.32).
+- **The timing shift is not a timing fix.** Removing the control-only
+  along-track lead (-0.148 m, -37 ms at 3.99 m/s) improves the check to
+  7.09 / 15.80 / 17.32 from 7.94 / 16.26 / 18.10, but the direct
+  event/exposure comparison rules out a shutter-to-fix lag; the lead is an
+  along-track datum/mount difference, not time.
+- **Target.** No standard configuration reaches 5 cm horizontal: the best is
+  5.31 cm (per-image + adaptive). The report-only −0.5 px probe reaches
+  4.95 cm. The target is not met and is not loosened. Vertical is 12.22 cm in
+  the same configuration, against 6.46 cm for GCPs-only adaptive.
