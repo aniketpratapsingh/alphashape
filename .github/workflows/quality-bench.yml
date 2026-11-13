@@ -627,6 +627,10 @@ jobs:
             # questionable one can be re-measured directly instead of re-running
             # the whole pipeline.
             build/bench/products/ortho.tif
+            # Before/after crops of the real survey targets (gcp-rtk only).
+            # The dataset images are never redistributed; these few 128 px
+            # crops are how the target appearance is recorded.
+            build/bench/gcp_crops/
           if-no-files-found: warn
           retention-days: 90
 

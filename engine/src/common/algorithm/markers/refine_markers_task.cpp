@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <list>
@@ -70,6 +71,27 @@ bool is_circular_coded_target_type(const std::string& type) {
            type == "CircularTarget16bit" || type == "CircularTarget20bit";
 }
 
+/// True for any circular target, coded or not. Both are refined from the
+/// printed ring/disc boundary, never from a saddle.
+bool is_circular_target_type(const std::string& type) {
+    return is_circular_coded_target_type(type) || type == "Circular" ||
+           type == "CircularTarget";
+}
+
+/// True for the checker/bowtie cross families. Their centre is a saddle where
+/// four printed quadrants meet, so the circle/ellipse model does not apply.
+bool is_cross_target_type(const std::string& type) {
+    return type == "Cross" || type == "CrossTarget";
+}
+
+/// Which printed pattern the marker's recorded target type describes.
+/// `Unknown` is a marker whose target type was never recorded (a hand-placed
+/// or imported survey point): neither model may be assumed, so both are
+/// evaluated and the better-supported centre wins. Assuming a circular coded
+/// target here used to apply the ring/parity seed search to square survey
+/// targets, whose dark quadrant looks exactly like a centre dot.
+enum class TargetModel : std::uint8_t { Unknown = 0, Circular = 1, Cross = 2 };
+
 const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
     for (const auto& workspace : document.workspaces()) {
         if (!workspace) {
@@ -79,6 +101,19 @@ const Chunk* find_chunk(const Document& document, std::int32_t chunk_id) {
             if (chunk && chunk->id() == chunk_id) {
                 return chunk.get();
             }
+        }
+    }
+    return nullptr;
+}
+
+/// Mutable counterpart, for publishing the run diagnostics on the chunk meta.
+Chunk* find_chunk_mutable(Document& document, std::int32_t chunk_id) {
+    for (auto& workspace : document.workspaces()) {
+        if (!workspace) {
+            continue;
+        }
+        if (Chunk* chunk = workspace->find_chunk(chunk_id)) {
+            return chunk;
         }
     }
     return nullptr;
@@ -583,25 +618,37 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
             }
             out.light_centre = true;
         } else {
-            // No target found: fall back to the original nearest dark blob,
-            // which is how cross targets and low-contrast cases were seeded.
-            const MarkerCandidate* dark = nullptr;
+            // No light interior is anchored on the click. Fall back to the
+            // nearest blob of EITHER polarity: a checker target on grass
+            // prints quadrants that are BRIGHTER than the ground, so the dark
+            // pass alone finds nothing and the whole marker was left without a
+            // scale even though the light pass had already located the target.
+            // The fallback centre is the blob's, which for a quadrant is
+            // biased; the 2-D refiner re-fits it from the click and the
+            // saddle supplies the patch scale when the target is a checker.
+            const MarkerCandidate* nearest = nullptr;
             double best_distance = static_cast<double>(half) * 0.75;
-            for (const MarkerCandidate& blob : dark_blobs) {
-                const double distance = (blob.center - seed).norm();
-                if (distance <= best_distance) {
-                    best_distance = distance;
-                    dark = &blob;
+            for (const std::vector<MarkerCandidate>* list :
+                 {&dark_blobs, &light_blobs}) {
+                for (const MarkerCandidate& blob : *list) {
+                    const double distance = (blob.center - seed).norm();
+                    if (distance <= best_distance) {
+                        best_distance = distance;
+                        nearest = &blob;
+                    }
                 }
             }
-            if (dark == nullptr) {
+            if (nearest == nullptr) {
                 return std::nullopt;
             }
-            centre = dark->center;
-            radius = dark->radius_px;
-            if (const auto fitted = refine_ellipse_center(crop, *dark)) {
+            centre = nearest->center;
+            radius = nearest->radius_px;
+            if (const auto fitted = refine_ellipse_center(crop, *nearest)) {
                 centre = *fitted;
             }
+            // Do NOT mark this as a light-centre seed: that flag tells the
+            // caller the centre came from a fitted target border, and here it
+            // is a quadrant or a bright patch, not the printed centre.
         }
     } else {
         // Non-circular target: keep the original dark-blob path.
@@ -751,7 +798,13 @@ std::optional<double> cross_radius(const CameraView& view,
             continue;
         }
         const double distance = (detection.target.center - seed).norm();
-        if (distance < best) {
+        // The click is the printed target's centre, so a genuine saddle sits
+        // on it. A textured background (grass, gravel, foliage) produces
+        // spurious saddles everywhere, and without this gate one of those
+        // would supply the patch scale for a circular target. The gate is the
+        // same fraction-of-scale anchor the circular seed uses.
+        const double gate = std::max(4.0, 0.35 * detection.target.radius_px);
+        if (distance <= gate && distance < best) {
             best = distance;
             radius = detection.target.radius_px;
         }
@@ -940,6 +993,12 @@ std::vector<double> depth_candidates(const Eigen::Vector3d& point,
                                             static_cast<double>(i) /
                                             static_cast<double>(count - 1));
         }
+        // The initial triangulation is always a candidate. The evenly spaced
+        // cloud-derived grid does not generally contain it, and on good data
+        // it is the best estimate; dropping it makes the depth search move
+        // the marker off a correct point for a negligible NCC difference.
+        candidates.push_back(0.0);
+        std::sort(candidates.begin(), candidates.end());
         return candidates;
     }
     const int steps = std::max(1, search_steps);
@@ -1027,7 +1086,8 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
 /// unrelated texture.
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
-    const std::optional<BlobSeed>& seed, int patch_size, double limit) {
+    const std::optional<BlobSeed>& seed, int patch_size, double limit,
+    double hint_px) {
     if (!pixel.allFinite() || !std::isfinite(limit)) {
         return std::nullopt;
     }
@@ -1058,12 +1118,23 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
             ellipse = accept(*fitted * ds);
         }
     }
-    const double hint = std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
+    // Both printed patterns are refined: the boundary fit locks onto a ring
+    // or disc, the saddle fit onto a checker quadrant crossing. Whichever
+    // converged nearer the candidate wins, because the correct refiner locks
+    // onto the printed centre in a pixel or two while the wrong one lands on
+    // a quadrant, a neighbouring blob or an unrelated saddle far away. On a
+    // rendered checker the two disagree by more than a pixel, so keeping both
+    // and taking the closer one is measurably more accurate than assuming
+    // which pattern the marker carries; a target type only selects the SCALE.
+    const double hint =
+        hint_px > 0.0
+            ? hint_px / ds
+            : std::max(4.0, static_cast<double>(patch_size) / 4.0) / ds;
+    std::optional<Eigen::Vector2d> cross;
     Eigen::Vector2d start = pixel;
     if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
         start = *saddle;
     }
-    std::optional<Eigen::Vector2d> cross;
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         cross = accept(*refined * ds);
     }
@@ -1124,8 +1195,17 @@ struct MarkerEdit {
     std::int32_t marker_id = -1;
     std::vector<ProjectionEdit> moves;
     std::vector<std::int32_t> removals;
+    /// Parallel to `removals`: why each projection left the marker.
+    std::vector<RefineRemovalReason> removal_reasons;
     /// Re-triangulated estimated position, never the geodetic reference.
     std::optional<Eigen::Vector3d> position;
+    /// Projections that reached a decision (moved, kept or removed).
+    std::size_t evaluated = 0;
+    /// Per-view scale sources, for the run diagnostics.
+    std::size_t blob_views = 0;
+    std::size_t cross_views = 0;
+    std::size_t unscaled_views = 0;
+    RefineFailureReason failure = RefineFailureReason::None;
     bool failed = false;
     bool touched = false;
     bool skipped = false;
@@ -1136,20 +1216,36 @@ struct BlendView {
     const CameraView* view = nullptr;
     Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
     std::optional<BlobSeed> seed;
-    /// Apparent target radius in full-resolution pixels.
+    /// Apparent target radius in full-resolution pixels, used for the depth
+    /// search, the geometric tolerance and the correction guards.
     double apparent = 1.0;
-    /// True when `apparent` came from a detected blob; otherwise it is filled
-    /// from the projected physical radius after the initial triangulation.
+    /// Apparent radius of the printed PATCH, which is not the same quantity
+    /// for a checker target: the blob inside a checker is one quadrant, while
+    /// the printed pattern spans the whole target. Sampling the NCC template
+    /// at 1.5x a quadrant lands mostly on its edge and the surrounding
+    /// ground, which is what makes multi-view correlation unreliable on a
+    /// real survey target. The saddle detector supplies this scale.
+    double patch_apparent = 1.0;
+    /// True when `apparent` is known; otherwise it is filled from the
+    /// projected physical radius after the initial triangulation.
     bool has_scale = false;
+    /// True when `patch_apparent` is known.
+    bool has_patch_scale = false;
     /// True when the scale is a blob radius. A cross-extent scale is real but
     /// carries no blob, so the refiners keep the tighter movement guard.
     bool blob_scale = false;
+    /// True when the scale came from the checker-cross detector's target
+    /// half-size, so the patch is already in printed-target units.
+    bool cross_scale = false;
     /// True when the marker is a coded circular target, the only kind whose
     /// even parity has an enclosed bright interior to seed from.
     bool coded_circular = true;
     /// True when a target kind was recorded for this marker. Without one the
     /// seed search keeps its previous window and only coded kinds widen it.
     bool target_kind_known = false;
+    /// The printed pattern the marker declares, or Unknown when none was
+    /// recorded. Selects which refiners are allowed to move the projection.
+    TargetModel model = TargetModel::Unknown;
     double depth = 1.0;
 };
 
@@ -1161,6 +1257,20 @@ double refinement_limit(const BlendView& blend) {
     const double ds = static_cast<double>(std::max(1, blend.view->downscale));
     const double scale = blend.blob_scale ? blend.apparent : 6.0 * ds;
     return std::max(2.0, 0.5 * scale);
+}
+
+/// Hard bound on how far the FINAL refined pixel may sit from the pixel the
+/// surveyor supplied, regardless of where the consensus candidate landed.
+/// A click on a surveyed target is expected within a couple of pixels, so this
+/// is a correction cap, not an accuracy budget: six full-resolution pixels
+/// (or half the apparent target radius when the target is larger) is enough
+/// for a mis-click to be pulled onto the centre and far too little to wander
+/// onto unrelated texture. A refinement that would exceed it is discarded and
+/// the measurement is kept unchanged.
+double maximum_shift(const BlendView& blend) {
+    const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+    const double scale = blend.has_scale ? blend.apparent : 6.0 * ds;
+    return std::max(6.0 * ds, 0.5 * scale);
 }
 
 /// Mean NCC of every other view against the reference patch. Views without
@@ -1199,10 +1309,19 @@ struct Winner {
     Eigen::Vector3d point = Eigen::Vector3d::Zero();
     std::size_t reference = 0;
     double score = -2.0;
+    /// Signed offset along the reference ray. Used only to break an NCC tie
+    /// in favour of the initial triangulation.
+    double offset = 0.0;
     std::vector<Patch> patches;
     std::vector<std::optional<double>> scores;
     std::vector<ViewStatus> status;
 };
+
+/// NCC difference within which two depth candidates are considered tied. The
+/// template is sampled bilinearly, so the same physical plane can score a
+/// hair differently at two adjacent offsets; the initial triangulation is the
+/// strong prior and wins such a tie.
+constexpr double kNccTie = 1e-4;
 
 /// A view's measured projection has to agree with the candidate's reprojection
 /// within one apparent target radius, with a floor of three full-resolution
@@ -1226,7 +1345,8 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
                                     const Eigen::Vector3d& v,
                                     const std::vector<BlendView>& blends,
                                     const CloudSamples& cloud,
-                                    double physical_radius, int search_steps,
+                                    double physical_radius,
+                                    double patch_radius, int search_steps,
                                     int patch_size) {
     std::vector<std::size_t> references;
     references.reserve(blends.size());
@@ -1244,7 +1364,7 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
               });
     const std::size_t tries = std::min<std::size_t>(3, references.size());
     Winner best;
-    const double half_width = kPatchHalfWidth * physical_radius;
+    const double half_width = kPatchHalfWidth * patch_radius;
     for (std::size_t attempt = 0; attempt < tries; ++attempt) {
         const std::size_t reference = references[attempt];
         const Eigen::Vector3d centre =
@@ -1309,13 +1429,21 @@ std::optional<Winner> search_winner(const Eigen::Vector3d& initial,
             }
             std::vector<std::optional<double>> scores;
             const auto score = score_patches(patches, reference, scores);
-            if (!score || *score <= best.score) {
+            if (!score) {
+                continue;
+            }
+            const bool better = *score > best.score + kNccTie;
+            const bool tied_closer =
+                best.found && *score > best.score - kNccTie &&
+                std::abs(offset) < std::abs(best.offset);
+            if (best.found && !better && !tied_closer) {
                 continue;
             }
             best.found = true;
             best.point = candidate;
             best.reference = reference;
             best.score = *score;
+            best.offset = offset;
             best.patches = std::move(patches);
             best.scores = std::move(scores);
             best.status = std::move(status);
@@ -1359,8 +1487,12 @@ std::optional<Eigen::Vector3d> intersect_plane(const CameraView& view,
 /// Consensus (Fischler & Bolles 1981) at the winning candidate, then subpixel
 /// refinement of every inlier. A view is an inlier when its correlation is
 /// within `correlation_margin` of the best non-reference view and above
-/// `min_correlation`; two inliers are required. Outliers are deleted only when
-/// `remove_invalid` is set, and are never moved otherwise.
+/// `min_correlation`; two inliers are required. A non-inlier is left exactly
+/// where it was measured unless `remove_invalid` is set AND its measured
+/// pixel geometrically contradicts the refined candidate (disagrees by more
+/// than one target radius). A flat patch, a low correlation and a patch that
+/// left the image are all statements about the target model, not about the
+/// measurement, so they never delete an observation.
 std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
                                        const Winner& winner,
                                        const Eigen::Vector3d& u,
@@ -1406,12 +1538,26 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             return std::nullopt;
         }
         projected_centres[index] = *projected;
-        const double limit = refinement_limit(blend);
+        // When the candidate already reprojects onto the measurement, the
+        // tight guard is the accurate choice: on exact projections the
+        // candidate is the truth and a wider acceptance only lets a biased
+        // refinement replace it. When the candidate is displaced (its depth
+        // step was off), a wider guard is required or the refiner can never
+        // reach the printed centre. The final move is always clamped against
+        // the MEASURED pixel below, so the wider guard cannot wander.
+        const double tight = refinement_limit(blend);
+        const double limit = (*projected - blend.pixel).norm() > tight
+                                 ? maximum_shift(blend)
+                                 : tight;
+        // The blob seed is the ellipse refiner's second opinion and its only
+        // anchor for a circular target; it is computed even when the saddle
+        // supplied the scale, so both refiners stay available.
         const auto seed = circular_seed(
             *blend.view, *projected, options.patch_size, blend.apparent,
             blend.coded_circular, blend.target_kind_known);
-        const auto refined = refined_2d_pixel(*blend.view, *projected, seed,
-                                              options.patch_size, limit);
+        const auto refined = refined_2d_pixel(
+            *blend.view, *projected, seed, options.patch_size, limit,
+            blend.has_scale ? blend.apparent : 0.0);
         anchored[index] = refined ? *refined : *projected;
         const auto point = intersect_plane(*blend.view, anchored[index],
                                            winner.point, normal);
@@ -1444,6 +1590,7 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
     }
     MarkerEdit edit;
+    edit.evaluated = blends.size();
     std::vector<Observation> accepted;
     std::vector<double> tolerances;
     for (std::size_t i = 0; i < blends.size(); ++i) {
@@ -1451,12 +1598,34 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         const bool inlier = std::find(inliers.begin(), inliers.end(), i) !=
                             inliers.end();
         if (!inlier) {
-            // A view whose patch left the window was not evidence for or
-            // against this candidate; leave it alone instead of deleting it.
+            // A view is only ever deleted for a geometric contradiction: its
+            // measured pixel is farther from the refined candidate than one
+            // target radius, which no sub-pixel refinement can turn into a
+            // useful observation. Every other non-inlier is NOT evidence
+            // against the measurement (a flat patch, a low correlation or a
+            // patch that left the image all describe the target model, not
+            // the click), so it is kept at its measured position. Deleting
+            // those observations is what used to halve a real survey's
+            // projection count.
+            RefineRemovalReason reason = RefineRemovalReason::None;
             const bool unused = i < winner.status.size() &&
                                 winner.status[i] == ViewStatus::Unused;
-            if (options.remove_invalid && !unused) {
+            if (!unused) {
+                if (i < winner.status.size() &&
+                    winner.status[i] == ViewStatus::Gated) {
+                    reason = RefineRemovalReason::GeometricGate;
+                } else if (i >= scores.size() || !scores[i]) {
+                    reason = RefineRemovalReason::FlatPatch;
+                } else if (*scores[i] < options.min_correlation) {
+                    reason = RefineRemovalReason::LowCorrelation;
+                } else {
+                    reason = RefineRemovalReason::CorrelationMargin;
+                }
+            }
+            if (options.remove_invalid &&
+                reason == RefineRemovalReason::GeometricGate) {
                 edit.removals.push_back(blend.view->camera->id);
+                edit.removal_reasons.push_back(reason);
                 edit.touched = true;
             }
             continue;
@@ -1471,6 +1640,15 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
                 (refined + *shift - projected_centres[i]).norm() <= limit) {
                 refined += *shift;
             }
+        }
+        // The bound that matters is against the MEASURED pixel, not against
+        // the candidate: a bad initial triangulation can put the candidate a
+        // whole target radius from the click, and an unbounded correction
+        // from there would move a good observation far from where the surveyor
+        // clicked. A refinement that would exceed the bound is not trusted;
+        // the projection is kept exactly where it was measured.
+        if ((refined - blend.pixel).norm() > maximum_shift(blend)) {
+            refined = blend.pixel;
         }
         if ((refined - blend.pixel).norm() > 1e-9) {
             edit.moves.push_back({blend.view->camera->id, refined});
@@ -1505,21 +1683,64 @@ double median(std::vector<double> values) {
 /// a sample count, never a pixel scale.
 void fill_scales(std::vector<BlendView>& blends, int patch_size) {
     for (BlendView& blend : blends) {
+        // Two scales with different jobs. `apparent` (the depth-search and
+        // tolerance scale) keeps the previous blob-first priority so the
+        // depth grid is unchanged; `patch_apparent` (the NCC template size)
+        // prefers the saddle, because a blob inside a checker is one quadrant
+        // and a template sized from it is dominated by the pattern edge and
+        // the surrounding ground.
+        std::optional<double> saddle;
+        if (blend.model != TargetModel::Circular) {
+            saddle = cross_radius(*blend.view, blend.pixel, patch_size);
+        }
         blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
                                    blend.coded_circular,
                                    blend.target_kind_known);
-        if (blend.seed && std::isfinite(blend.seed->radius) &&
-            blend.seed->radius > 0.0) {
-            blend.apparent = std::max(1.0, blend.seed->radius);
+        const double blob_radius =
+            blend.seed && std::isfinite(blend.seed->radius) &&
+                    blend.seed->radius > 0.0
+                ? blend.seed->radius
+                : 0.0;
+        const bool verified =
+            blend.seed &&
+            (blend.seed->centre_dot || blend.seed->border_fitted ||
+             blend.seed->light_centre);
+        if (blob_radius > 0.0) {
+            blend.apparent = std::max(1.0, blob_radius);
             blend.has_scale = true;
             blend.blob_scale = true;
-        } else if (const auto cross =
-                       cross_radius(*blend.view, blend.pixel, patch_size)) {
-            blend.apparent = std::max(1.0, *cross);
+        } else if (saddle.has_value()) {
+            blend.apparent = std::max(1.0, *saddle);
             blend.has_scale = true;
-        } else {
+            blend.cross_scale = true;
+        } else if (blend.model == TargetModel::Circular) {
+            // A declared circular target with no blob still gets the cross
+            // fallback the previous order used.
+            if (const auto cross =
+                    cross_radius(*blend.view, blend.pixel, patch_size)) {
+                blend.apparent = std::max(1.0, *cross);
+                blend.has_scale = true;
+                blend.cross_scale = true;
+            }
+        }
+        if (!blend.has_scale) {
             blend.apparent = 1.0;
-            blend.has_scale = false;
+        }
+        // The patch scale is trusted only when the evidence is specific: a
+        // printed saddle, or a blob the seed search verified as the target
+        // (a centre dot, a fitted border or a coded interior). The plain
+        // "nearest dark blob" fallback is how ground texture or a shadow
+        // masquerades as the target; an unverified view then contributes no
+        // patch scale and takes the consensus one.
+        if (saddle.has_value()) {
+            blend.patch_apparent = std::max(1.0, *saddle);
+            blend.has_patch_scale = true;
+        } else if (verified && blob_radius > 0.0) {
+            blend.patch_apparent = std::max(1.0, blob_radius);
+            blend.has_patch_scale = true;
+        } else {
+            blend.patch_apparent = 1.0;
+            blend.has_patch_scale = false;
         }
     }
 }
@@ -1527,13 +1748,15 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
 MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
                             const RefineMarkersOptions& options) {
     MarkerEdit edit;
-    bool any = false;
+    edit.evaluated = blends.size();
     bool success = false;
     for (BlendView& blend : blends) {
-        any = true;
+        // A single view has no consensus to supply a candidate, so the click
+        // is the anchor and only a small correction is trusted.
         const double limit = refinement_limit(blend);
         const auto refined = refined_2d_pixel(
-            *blend.view, blend.pixel, blend.seed, options.patch_size, limit);
+            *blend.view, blend.pixel, blend.seed, options.patch_size, limit,
+            blend.has_scale ? blend.apparent : 0.0);
         if (!refined) {
             continue;
         }
@@ -1543,8 +1766,9 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
             edit.touched = true;
         }
     }
-    if (any && !success) {
+    if (!blends.empty() && !success) {
         edit.failed = true;
+        edit.failure = RefineFailureReason::Consensus;
     }
     return edit;
 }
@@ -1563,6 +1787,24 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         return skipped;
     }
     fill_scales(blends, options.patch_size);
+    std::size_t blob_views = 0;
+    std::size_t cross_views = 0;
+    std::size_t unscaled_views = 0;
+    for (const BlendView& blend : blends) {
+        if (!blend.has_scale) {
+            ++unscaled_views;
+        } else if (blend.cross_scale) {
+            ++cross_views;
+        } else {
+            ++blob_views;
+        }
+    }
+    const auto stamp = [&](MarkerEdit edit) {
+        edit.blob_views = blob_views;
+        edit.cross_views = cross_views;
+        edit.unscaled_views = unscaled_views;
+        return edit;
+    };
     std::vector<BlendView> aligned;
     for (const BlendView& blend : blends) {
         if (blend.view->aligned()) {
@@ -1582,6 +1824,13 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                                                  : 8.0 * ds);
         }
         auto initial = triangulate_robust(observations, tolerances);
+        if (!initial || !initial->allFinite()) {
+            MarkerEdit failed;
+            failed.failed = true;
+            failed.failure = RefineFailureReason::Triangulation;
+            failed.evaluated = blends.size();
+            return stamp(failed);
+        }
         if (initial && initial->allFinite()) {
             std::vector<double> physical_samples;
             for (BlendView& blend : aligned) {
@@ -1601,24 +1850,54 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
                 // marker carries no evidence and is left untouched.
                 MarkerEdit failed;
                 failed.failed = true;
-                return failed;
+                failed.failure = RefineFailureReason::NoScale;
+                failed.evaluated = blends.size();
+                return stamp(failed);
             }
             const double physical = median(physical_samples);
             if (!(physical > 0.0) || !std::isfinite(physical)) {
                 MarkerEdit failed;
                 failed.failed = true;
-                return failed;
+                failed.failure = RefineFailureReason::NoScale;
+                failed.evaluated = blends.size();
+                return stamp(failed);
             }
-            // Every view now carries a pixel radius: measured or projected.
-            for (BlendView& blend : aligned) {
-                if (blend.has_scale) {
+            // The patch template has its own scale: the printed pattern's
+            // half-size, which for a checker is the saddle's radius rather
+            // than a quadrant blob's. Only views with specific evidence
+            // contribute; the rest take the consensus scale.
+            std::vector<double> patch_samples;
+            for (const BlendView& blend : aligned) {
+                if (!blend.has_patch_scale) {
                     continue;
                 }
                 const double focal = std::max(blend.view->calibration.f, 1e-6);
+                const double sample =
+                    blend.patch_apparent * blend.depth / focal;
+                if (std::isfinite(sample) && sample > 0.0) {
+                    patch_samples.push_back(sample);
+                }
+            }
+            double patch_physical =
+                patch_samples.empty() ? physical : median(patch_samples);
+            if (!(patch_physical > 0.0) || !std::isfinite(patch_physical)) {
+                patch_physical = physical;
+            }
+            // Every view now carries a pixel radius: measured or projected.
+            for (BlendView& blend : aligned) {
+                const double focal = std::max(blend.view->calibration.f, 1e-6);
                 const double projected_radius =
                     physical * focal / std::max(blend.depth, 1e-9);
-                blend.apparent = std::max(1.0, projected_radius);
-                blend.has_scale = true;
+                if (!blend.has_scale) {
+                    blend.apparent = std::max(1.0, projected_radius);
+                    blend.has_scale = true;
+                }
+                if (!blend.has_patch_scale) {
+                    const double projected_patch =
+                        patch_physical * focal / std::max(blend.depth, 1e-9);
+                    blend.patch_apparent = std::max(1.0, projected_patch);
+                    blend.has_patch_scale = true;
+                }
             }
             for (std::size_t i = 0; i < aligned.size(); ++i) {
                 tolerances[i] = projection_tolerance(aligned[i]);
@@ -1633,19 +1912,26 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
             const auto axes = plane_axes(normal);
             if (const auto winner = search_winner(
                     *initial, axes.first, axes.second, aligned, cloud,
-                    physical, options.search_steps, options.patch_size)) {
-                if (const auto edit =
+                    physical, patch_physical, options.search_steps,
+                    options.patch_size)) {
+                if (auto edit =
                         apply_winner(aligned, *winner, axes.first, axes.second,
-                                     kPatchHalfWidth * physical, options)) {
-                    return *edit;
+                                     kPatchHalfWidth * patch_physical, options)) {
+                    // Unaligned views were filtered out of the consensus and
+                    // are left exactly as measured; they still count as
+                    // evaluated so the accounting covers every projection.
+                    edit->evaluated = blends.size();
+                    return stamp(*edit);
                 }
             }
         }
         MarkerEdit failed;
         failed.failed = true;
-        return failed;
+        failed.failure = RefineFailureReason::Consensus;
+        failed.evaluated = blends.size();
+        return stamp(failed);
     }
-    return refine_2d_marker(blends, options);
+    return stamp(refine_2d_marker(blends, options));
 }
 
 /// Validate the selected cameras and keep only those referenced by a selected
@@ -1967,6 +2253,58 @@ private:
     std::vector<Marker> snapshot_;
 };
 
+std::string format_number(double value) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%.6g", value);
+    return buffer;
+}
+
+/// Publish the run's diagnostics on the chunk. A validation protocol reads
+/// `chunk.meta` and needs the removal-reason histogram and the shift
+/// distribution to tell a target-model mismatch from noisy measurements; the
+/// same numbers go to the log. Written even when nothing changed, so a run
+/// that refined nothing still explains itself.
+void write_refine_meta(Document& document, std::int32_t chunk_id,
+                       const RefineMarkersStats& stats) {
+    Chunk* chunk = find_chunk_mutable(document, chunk_id);
+    if (chunk == nullptr) {
+        return;
+    }
+    const auto put = [&chunk](const std::string& key, std::size_t value) {
+        chunk->meta().set("refine_markers." + key, std::to_string(value));
+    };
+    put("markers_refined", stats.refined);
+    put("markers_unchanged", stats.unchanged);
+    put("markers_failed", stats.failed);
+    put("markers_skipped", stats.skipped);
+    put("projections_evaluated", stats.evaluated_projections);
+    put("projections_moved", stats.moved_projections);
+    put("projections_kept_unrefined", stats.kept_unrefined);
+    put("projections_removed", stats.removed_projections);
+    put("removed_geometric_gate", stats.removed_geometric_gate);
+    put("removed_flat_patch", stats.removed_flat_patch);
+    put("removed_low_correlation", stats.removed_low_correlation);
+    put("removed_correlation_margin", stats.removed_correlation_margin);
+    chunk->meta().set(
+        "refine_markers.shift_mean_px",
+        format_number(stats.moved_projections == 0
+                          ? 0.0
+                          : stats.shift_sum_px /
+                                static_cast<double>(stats.moved_projections)));
+    chunk->meta().set("refine_markers.shift_max_px",
+                      format_number(stats.shift_max_px));
+    put("shifts_over_2px", stats.shifts_over_2px);
+    put("shifts_over_5px", stats.shifts_over_5px);
+    put("shifts_over_10px", stats.shifts_over_10px);
+    put("failed_no_views", stats.failed_no_views);
+    put("failed_no_scale", stats.failed_no_scale);
+    put("failed_triangulation", stats.failed_triangulation);
+    put("failed_consensus", stats.failed_consensus);
+    put("views_blob_scale", stats.views_blob_scale);
+    put("views_cross_scale", stats.views_cross_scale);
+    put("views_no_scale", stats.views_no_scale);
+}
+
 }  // namespace
 
 RefineMarkersPlan plan_refine_markers(const Document& document,
@@ -2081,11 +2419,25 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
     for (const std::size_t slot : order) {
         cache.make_room(marker_bytes[slot]);
         const Marker& marker = chunk->markers()[selected[slot]];
-        // A recorded target kind decides whether the even-parity light path
-        // is applicable. Without one (user-placed markers) keep the previous
-        // behaviour, which infers the seed from whatever blobs are present.
+        // A recorded target kind selects the printed pattern. With none (a
+        // hand-placed or imported survey point) NEITHER model may be assumed:
+        // assuming a circular coded target is what applied the ring/parity
+        // seed search to square survey targets. Unknown therefore runs both
+        // refiners and keeps the better-supported centre.
         const std::string* target_kind = marker.meta.find("target_type");
         const bool target_kind_known = target_kind != nullptr;
+        TargetModel model = TargetModel::Unknown;
+        if (target_kind_known) {
+            if (is_cross_target_type(*target_kind)) {
+                model = TargetModel::Cross;
+            } else if (is_circular_target_type(*target_kind)) {
+                model = TargetModel::Circular;
+            }
+        }
+        // An unknown kind still gets the light-interior seed: a parity-0
+        // circular target has no dark centre, and with both refiners gated by
+        // `model` above a spurious seed can only produce a bounded,
+        // closest-to-the-click answer, never a deletion.
         const bool coded_circular =
             !target_kind_known || is_circular_coded_target_type(*target_kind);
         std::vector<std::shared_ptr<CameraView>> held;
@@ -2110,6 +2462,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             blend.pixel = projection.pixel;
             blend.coded_circular = coded_circular;
             blend.target_kind_known = target_kind_known;
+            blend.model = model;
             blends.push_back(blend);
         }
         try {
@@ -2134,8 +2487,29 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             ++plan.stats.skipped;
             continue;
         }
+        plan.stats.evaluated_projections += edit.evaluated;
+        plan.stats.views_blob_scale += edit.blob_views;
+        plan.stats.views_cross_scale += edit.cross_views;
+        plan.stats.views_no_scale += edit.unscaled_views;
         if (edit.failed) {
             ++plan.stats.failed;
+            switch (edit.failure) {
+                case RefineFailureReason::NoViews:
+                    ++plan.stats.failed_no_views;
+                    break;
+                case RefineFailureReason::NoScale:
+                    ++plan.stats.failed_no_scale;
+                    break;
+                case RefineFailureReason::Triangulation:
+                    ++plan.stats.failed_triangulation;
+                    break;
+                case RefineFailureReason::Consensus:
+                case RefineFailureReason::None:
+                    ++plan.stats.failed_consensus;
+                    break;
+            }
+            // A failed marker's projections are all left exactly as measured.
+            plan.stats.kept_unrefined += edit.evaluated;
             continue;
         }
         if (edit.position.has_value()) {
@@ -2146,6 +2520,51 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             }
         }
         plan.stats.removed_projections += edit.removals.size();
+        for (const RefineRemovalReason reason : edit.removal_reasons) {
+            switch (reason) {
+                case RefineRemovalReason::GeometricGate:
+                    ++plan.stats.removed_geometric_gate;
+                    break;
+                case RefineRemovalReason::FlatPatch:
+                    ++plan.stats.removed_flat_patch;
+                    break;
+                case RefineRemovalReason::LowCorrelation:
+                    ++plan.stats.removed_low_correlation;
+                    break;
+                case RefineRemovalReason::CorrelationMargin:
+                    ++plan.stats.removed_correlation_margin;
+                    break;
+                case RefineRemovalReason::None:
+                    break;
+            }
+        }
+        // The shift is measured against the projection the SURVEYOR
+        // supplied, which is the only bound a validation protocol can check.
+        const Marker& measured = chunk->markers()[selected[i]];
+        for (const ProjectionEdit& move : edit.moves) {
+            ++plan.stats.moved_projections;
+            const MarkerProjection* before =
+                find_projection(measured, move.camera_id);
+            if (before == nullptr) {
+                continue;
+            }
+            const double shift = (move.pixel - before->pixel).norm();
+            plan.stats.shift_sum_px += shift;
+            plan.stats.shift_max_px = std::max(plan.stats.shift_max_px, shift);
+            if (shift > 2.0) {
+                ++plan.stats.shifts_over_2px;
+            }
+            if (shift > 5.0) {
+                ++plan.stats.shifts_over_5px;
+            }
+            if (shift > 10.0) {
+                ++plan.stats.shifts_over_10px;
+            }
+        }
+        const std::size_t decided =
+            edit.moves.size() + edit.removals.size();
+        plan.stats.kept_unrefined +=
+            edit.evaluated > decided ? edit.evaluated - decided : 0;
         if (edit.touched) {
             ++plan.stats.refined;
         } else {
@@ -2210,9 +2629,13 @@ void RefineMarkersTask::declare_params(Params& params) const {
                         "Lucas-Kanade stopping tolerance in pixels."};
     tolerance.minimum = 1e-6;
     params.declare(tolerance);
-    params.declare({"remove_invalid", ParamType::Bool, true,
-                    "Delete a projection that the multi-view consensus rejects. "
-                    "When false the projection is kept unchanged."});
+    params.declare({"remove_invalid", ParamType::Bool, false,
+                    "Delete a projection whose measured pixel the refined "
+                    "candidate contradicts by more than one target radius. "
+                    "Off by default: an unconfident refinement always keeps "
+                    "the projection where it was measured. Only a geometric "
+                    "contradiction is ever removed, never a flat patch or a "
+                    "low correlation."});
 }
 
 std::vector<Stage> RefineMarkersTask::stages() const {
@@ -2235,14 +2658,16 @@ void RefineMarkersTask::apply(Document& document, Params& params,
 
     progress.update("refine", 0.0);
     const auto started = std::chrono::steady_clock::now();
+    const std::int32_t chunk_id = document.active_chunk_id();
     RefineMarkersPlan plan =
-        plan_refine_markers(document, document.active_chunk_id(), options);
+        plan_refine_markers(document, chunk_id, options);
     progress.update("refine", 1.0);
     progress.update("apply", 0.0);
     if (plan.command) {
         plan.command->apply(document);
     }
     progress.update("apply", 1.0);
+    write_refine_meta(document, chunk_id, plan.stats);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
@@ -2255,6 +2680,24 @@ void RefineMarkersTask::apply(Document& document, Params& params,
             << ", removed projections " << plan.stats.removed_projections
             << ", peak " << plan.stats.peak_bytes / (1024 * 1024) << " MiB"
             << " in " << seconds << " s";
+        log(LogLevel::Info)
+            << "RefineMarkers projections: evaluated "
+            << plan.stats.evaluated_projections << ", moved "
+            << plan.stats.moved_projections << ", kept unrefined "
+            << plan.stats.kept_unrefined << ", removed "
+            << plan.stats.removed_projections << " (geometric gate "
+            << plan.stats.removed_geometric_gate << ", flat patch "
+            << plan.stats.removed_flat_patch << ", low correlation "
+            << plan.stats.removed_low_correlation << ", margin "
+            << plan.stats.removed_correlation_margin
+            << "); shift mean " << format_number(
+                   plan.stats.moved_projections == 0
+                       ? 0.0
+                       : plan.stats.shift_sum_px /
+                             static_cast<double>(plan.stats.moved_projections))
+            << " px, max " << format_number(plan.stats.shift_max_px)
+            << " px, >2px " << plan.stats.shifts_over_2px << ", >5px "
+            << plan.stats.shifts_over_5px;
     }
 }
 
