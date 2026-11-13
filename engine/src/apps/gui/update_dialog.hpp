@@ -19,6 +19,7 @@
 
 #include "apps/gui/update_checker.hpp"
 
+class QCloseEvent;
 class QLabel;
 class QProgressBar;
 class QPushButton;
@@ -34,6 +35,7 @@ public:
 
     UpdateDialog(const CheckResult& result, UpdateChecker& checker,
                  QWidget* parent = nullptr);
+    ~UpdateDialog() override;
 
     /// Replace QDesktopServices::openUrl (tests assert the URL instead of
     /// launching a browser). Returning false is reported as a failure.
@@ -53,7 +55,14 @@ public:
     QPushButton* view_button() const { return view_; }
     QPushButton* cancel_button() const { return cancel_; }
 
+protected:
+    /// Closing the dialog while a download runs cancels it, so its completion
+    /// callback cannot touch a destroyed widget.
+    void reject() override;
+    void closeEvent(QCloseEvent* event) override;
+
 private:
+    void cancel_in_flight();
     void build_ui();
     void set_busy(bool busy);
     void report_error(const QString& message);

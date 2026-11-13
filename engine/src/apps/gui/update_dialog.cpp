@@ -1,10 +1,12 @@
 #include "apps/gui/update_dialog.hpp"
 
+#include <QCloseEvent>
 #include <QCoreApplication>
 #include <QDesktopServices>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QTextBrowser>
@@ -24,8 +26,31 @@ UpdateDialog::UpdateDialog(const CheckResult& result, UpdateChecker& checker, QW
     build_ui();
 }
 
+UpdateDialog::~UpdateDialog() { cancel_in_flight(); }
+
 void UpdateDialog::set_open_url_handler(OpenUrlHandler handler) {
     open_url_ = std::move(handler);
+}
+
+void UpdateDialog::cancel_in_flight() {
+    if (!downloading_) {
+        return;
+    }
+    // Clear the flag first: a source that reports its cancellation
+    // synchronously must not reach finish_download() while the dialog is
+    // closing or being destroyed.
+    downloading_ = false;
+    checker_.cancel_download();
+}
+
+void UpdateDialog::reject() {
+    cancel_in_flight();
+    QDialog::reject();
+}
+
+void UpdateDialog::closeEvent(QCloseEvent* event) {
+    cancel_in_flight();
+    QDialog::closeEvent(event);
 }
 
 void UpdateDialog::build_ui() {
@@ -140,23 +165,33 @@ void UpdateDialog::start_download() {
     progress_->setValue(0);
     set_busy(true);
 
+    // The callbacks outlive the dialog when the network is still finishing, so
+    // they hold a guarded pointer instead of `this`.
+    const QPointer<UpdateDialog> self(this);
     checker_.download_and_verify(
         result_.release, *asset, UpdateChecker::download_directory(),
-        [this](qint64 received, qint64 total) {
-            if (!downloading_) {
+        [self](qint64 received, qint64 total) {
+            if (self == nullptr || !self->downloading_) {
                 return;
             }
             if (total > 0) {
-                progress_->setRange(0, 100);
-                progress_->setValue(static_cast<int>(received * 100 / total));
+                self->progress_->setRange(0, 100);
+                self->progress_->setValue(static_cast<int>(received * 100 / total));
             } else {
-                progress_->setRange(0, 0);  // unknown size: busy indicator
+                self->progress_->setRange(0, 0);  // unknown size: busy indicator
             }
         },
-        [this](const DownloadResult& download) { finish_download(download); });
+        [self](const DownloadResult& download) {
+            if (self != nullptr) {
+                self->finish_download(download);
+            }
+        });
 }
 
 void UpdateDialog::finish_download(const DownloadResult& download) {
+    if (!downloading_) {
+        return;  // cancelled while the dialog was closing
+    }
     downloading_ = false;
     set_busy(false);
     progress_->setVisible(false);

@@ -82,7 +82,33 @@ public:
         done(true, std::string());
     }
 
-    void cancel() override {}
+    void cancel() override { ++cancel_calls; }
+
+    int cancel_calls = 0;
+};
+
+/// A source whose download stays in flight until the test completes it, so a
+/// test can destroy the dialog between the request and its completion.
+class SlowSource : public FakeSource {
+public:
+    void download_file(const std::string&, const QString&, std::int64_t /*expected_size*/,
+                       ProgressCallback progress, FileCallback done) override {
+        pending_progress = std::move(progress);
+        pending_done = std::move(done);
+    }
+
+    bool has_pending() const { return static_cast<bool>(pending_done); }
+
+    void complete(bool ok, const std::string& error) {
+        FileCallback done = std::move(pending_done);
+        pending_done = nullptr;
+        if (done) {
+            done(ok, error);
+        }
+    }
+
+    ProgressCallback pending_progress;
+    FileCallback pending_done;
 };
 
 const char* kNewReleaseJson = R"json([
@@ -445,6 +471,25 @@ TEST_F(UpdateGuiTest, UpdateUrlAllowListRejectsInsecureForeignAndTrickyUrls) {
         EXPECT_FALSE(is_allowed_update_metadata_url(url)) << url;
         EXPECT_FALSE(is_allowed_update_download_url(url)) << url;
     }
+}
+
+TEST_F(UpdateGuiTest, DestroyingTheDialogMidDownloadCancelsWithoutCrashing) {
+    QSettings settings(scratch("destroy-settings.ini"), QSettings::IniFormat);
+    auto fake = std::make_unique<SlowSource>();
+    SlowSource* raw = fake.get();
+    UpdateChecker checker(settings, std::move(fake));
+
+    auto dialog = std::make_unique<UpdateDialog>(available_result(), checker);
+    dialog->start_download();
+    ASSERT_TRUE(raw->has_pending()) << "the fake download did not start";
+
+    dialog.reset();
+    EXPECT_GE(raw->cancel_calls, 1) << "closing the dialog did not cancel the download";
+
+    // The reply arrives after the dialog is gone: the guarded callback must do
+    // nothing rather than touch freed widgets.
+    raw->complete(false, "cancelled");
+    EXPECT_FALSE(raw->has_pending());
 }
 
 TEST_F(UpdateGuiTest, UnsafeAssetNamesAreRefusedBeforeAnyFileIsWritten) {
