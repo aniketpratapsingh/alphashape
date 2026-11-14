@@ -3118,6 +3118,27 @@ PYBIND11_MODULE(alphashape, m) {
             py::arg("sensor_index"), py::arg("x"), py::arg("y"), py::arg("z"),
             "Set a sensor's antenna offset in metres (camera frame x, y, z). "
             "An antenna above a nadir lens is a negative z.")
+        // Hold named calibration coefficients fixed in OptimizeCameras. This is
+        // the scripting route to the "fit on control points, then keep that
+        // calibration" workflow: run a ground-controlled adjustment, read the
+        // solved coefficients, mark every one fixed, then adjust the block
+        // again without letting the lens absorb the camera references. The
+        // OptimizeCameras fit_* flags are an intersection, so an empty list
+        // releases every coefficient again. Unknown or duplicate names raise
+        // ValueError before the chunk changes (undoable in the GUI).
+        .def(
+            "set_sensor_fixed_params",
+            [](py::object self, std::int32_t sensor_index,
+               const std::vector<std::string>& names) {
+                const alphashape::Chunk& chunk = self.cast<const alphashape::Chunk&>();
+                execute_on_chunk(
+                    self, alphashape::make_set_sensor_fixed_params_command(
+                              chunk.id(), sensor_index, names));
+            },
+            py::arg("sensor_index"), py::arg("names"),
+            "Names of the calibration coefficients held fixed during "
+            "OptimizeCameras: any subset of f, cx, cy, b1, b2, k1, k2, k3, k4, "
+            "p1, p2, p3, p4. An empty list releases every coefficient.")
         // -- dense products (milestone 6) --------------------------------------
         // BuildDepthMaps fills `depth_maps`; BuildPointCloud fuses them into
         // `point_cloud`. Both are read-only views onto the chunk's containers.

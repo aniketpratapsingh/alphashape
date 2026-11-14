@@ -1649,7 +1649,8 @@ def align_block(args, images, gcps):
 
 
 def import_camera_references_for_block(chunk, accuracy_m, directory,
-                                       along_shift_m=0.0):
+                                       along_shift_m=0.0,
+                                       accuracy_scale=1.0):
     """Re-import every camera reference with the variant's accuracy/position.
 
     ``accuracy_m`` is a scalar for the uniform baseline or
@@ -1658,6 +1659,10 @@ def import_camera_references_for_block(chunk, accuracy_m, directory,
     stays there: no per-image accuracy exists). The binding's
     ``reference_accuracy`` is never None once a location exists, so a uniform
     run must write the scalar rather than read it back.
+
+    ``accuracy_scale`` multiplies whichever accuracy was selected, which is how
+    the GCP-weight probe loosens every camera's prior by the same factor while
+    the marker weight stays at the survey's stated value.
 
     ``along_shift_m`` is an along-track lead to REMOVE: each position is moved
     this many metres opposite its local flight direction, estimated from the
@@ -1707,6 +1712,8 @@ def import_camera_references_for_block(chunk, accuracy_m, directory,
                 accuracy = tuple(float(v) for v in accuracy)
         else:
             accuracy = (accuracy_m, accuracy_m, accuracy_m)
+        if accuracy_scale != 1.0:
+            accuracy = tuple(float(value) * accuracy_scale for value in accuracy)
         rows.append((camera.label, reference[0], reference[1], reference[2],
                      accuracy))
     path = os.path.join(directory, "camera_references.csv")
@@ -1820,6 +1827,448 @@ def camera_consistency(chunk, antenna_offset_m=None):
             result["mean_along_track_{}_m".format(bound)] = mean(values)
             result["cameras_{}".format(bound)] = len(values)
     return result
+
+
+# Calibration coefficients in the engine's packed order
+# (model/camera/calibration.hpp). The set_sensor_fixed_params binding and
+# OptimizeCameras' fit_* flags use the same names.
+CALIBRATION_PARAM_NAMES = (
+    "f", "cx", "cy", "b1", "b2", "k1", "k2", "k3", "k4", "p1", "p2", "p3", "p4")
+
+# The dome fits scale horizontal distance by this many metres before squaring,
+# so a coefficient is "metres of height per (100 m)^2" instead of a number near
+# 1e-6 that the normal equations cannot resolve cleanly.
+DOME_RADIUS_SCALE_M = 100.0
+
+
+def enu_of_local(chunk, point, origin):
+    """Chunk-local point -> east/north/up metres about a geodetic `origin`."""
+    transform = chunk.transform
+    ecef = [sum(float(transform[r][c]) * point[c] for c in range(3)) +
+            float(transform[r][3]) for r in range(3)]
+    return ecef_to_enu(ecef, origin)
+
+
+def block_origin(chunk):
+    """A geodetic anchor for the fold's ENU frame.
+
+    The first aligned camera's stored reference is used so the frame is the
+    same one the camera residuals are expressed in; a block with no references
+    falls back to its first adjusted centre.
+    """
+    cameras = sorted(chunk.cameras, key=lambda item: item.label)
+    for camera in cameras:
+        reference = camera.reference
+        if camera.enabled and reference is not None and all(
+                math.isfinite(float(value)) for value in reference):
+            return (float(reference[0]), float(reference[1]),
+                    float(reference[2]))
+    for camera in cameras:
+        if not camera.enabled:
+            continue
+        transform = chunk.transform
+        local = camera.center
+        ecef = [sum(float(transform[r][c]) * local[c] for c in range(3)) +
+                float(transform[r][3]) for r in range(3)]
+        lat, lon, height = ecef_to_geodetic(*ecef)
+        return (lon, lat, height)
+    raise ValueError("no aligned camera to anchor the block")
+
+
+def convex_hull_area(points):
+    """Area of the convex hull of (x, y) points in square metres.
+
+    Andrew's monotone chain. Fewer than three distinct points has no area; the
+    GCP hull of a five-point survey is a useful comparison with the block hull
+    because a check point outside the control hull is extrapolation.
+    """
+    unique = sorted(set((float(x), float(y)) for x, y in points))
+    if len(unique) < 3:
+        return 0.0
+
+    def cross(origin, a, b):
+        return ((a[0] - origin[0]) * (b[1] - origin[1]) -
+                (a[1] - origin[1]) * (b[0] - origin[0]))
+
+    lower = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    area = 0.0
+    for index, point in enumerate(hull):
+        following = hull[(index + 1) % len(hull)]
+        area += point[0] * following[1] - following[0] * point[1]
+    return abs(area) * 0.5
+
+
+def linear_least_squares(rows, values, names):
+    """Ordinary least squares with an intercept, standard errors and t values.
+
+    ``rows`` holds one predictor row per sample (the intercept is added here),
+    ``names`` labels the predictors. A model with fewer samples than parameters
+    is reported as ``underdetermined`` rather than silently interpolated: with
+    five check points the six-term quadratic surface is exactly that case, and
+    claiming a fit from it would overstate what the data support. A singular
+    normal matrix (collinear predictors) is reported the same way.
+    """
+    if len(rows) != len(values):
+        raise ValueError("dome fit: rows and values differ in length")
+    samples = len(values)
+    parameters = 1 + len(names)
+    record = {"model": ["intercept"] + list(names), "samples": samples,
+              "parameters": parameters}
+    if samples < parameters:
+        record["status"] = "underdetermined"
+        record["note"] = ("fewer samples ({}) than parameters ({}); no unique "
+                          "fit".format(samples, parameters))
+        return record
+    design = [[1.0] + [float(value) for value in row] for row in rows]
+    normal = [[sum(design[i][a] * design[i][b] for i in range(samples))
+               for b in range(parameters)] for a in range(parameters)]
+    rhs = [sum(design[i][a] * values[i] for i in range(samples))
+           for a in range(parameters)]
+    try:
+        inverse = invert_matrix(normal)
+    except ValueError as error:
+        record["status"] = "singular"
+        record["note"] = str(error)
+        return record
+    coefficients = [sum(inverse[a][b] * rhs[b] for b in range(parameters))
+                    for a in range(parameters)]
+    residuals = [values[i] - sum(design[i][a] * coefficients[a]
+                                 for a in range(parameters))
+                 for i in range(samples)]
+    rss = sum(value * value for value in residuals)
+    mean = sum(values) / samples
+    tss = sum((value - mean) ** 2 for value in values)
+    degrees = samples - parameters
+    record.update({
+        "status": "ok" if degrees > 0 else "zero_degrees_of_freedom",
+        "coefficients": coefficients,
+        "residual_rms_m": math.sqrt(rss / samples),
+        "r_squared": (1.0 - rss / tss) if tss > 0.0 else None,
+        "degrees_of_freedom": degrees,
+    })
+    standard_errors = None
+    t_values = None
+    if degrees > 0:
+        variance = rss / degrees
+        standard_errors = [math.sqrt(max(variance * inverse[a][a], 0.0))
+                           for a in range(parameters)]
+        t_values = [coefficients[a] / standard_errors[a]
+                    if standard_errors[a] > 0.0 else None
+                    for a in range(parameters)]
+    by_name = {}
+    for index, name in enumerate(record["model"]):
+        by_name[name] = {
+            "coefficient": coefficients[index],
+            "standard_error": (standard_errors[index]
+                               if standard_errors is not None else None),
+            "t": (t_values[index] if t_values is not None else None),
+        }
+    record["by_name"] = by_name
+    record["standard_errors"] = standard_errors
+    record["t_values"] = t_values
+    return record
+
+
+def block_geometry(chunk):
+    """The fold's adjusted camera-centre geometry in ENU metres.
+
+    The centroid is the mean of the aligned camera centres and every radius is
+    measured from it, so the check-point and camera dome fits share one origin
+    definition. The hull area is the horizontal extent of the flight plan, to
+    compare with the much smaller survey-GCP hull.
+    """
+    origin = block_origin(chunk)
+    cameras = []
+    for camera in sorted(chunk.cameras, key=lambda item: item.label):
+        if not camera.enabled:
+            continue
+        enu = enu_of_local(chunk, camera.center, origin)
+        cameras.append({"label": camera.label, "east_m": enu[0],
+                        "north_m": enu[1], "up_m": enu[2]})
+    if not cameras:
+        raise ValueError("no aligned cameras in the fold")
+    centroid_east = sum(item["east_m"] for item in cameras) / len(cameras)
+    centroid_north = sum(item["north_m"] for item in cameras) / len(cameras)
+    for item in cameras:
+        item["radius_m"] = math.hypot(item["east_m"] - centroid_east,
+                                      item["north_m"] - centroid_north)
+    return {
+        "origin": origin,
+        "cameras": cameras,
+        "centroid_east_m": centroid_east,
+        "centroid_north_m": centroid_north,
+        "radius_m": max(item["radius_m"] for item in cameras),
+        "hull_area_m2": convex_hull_area(
+            [(item["east_m"], item["north_m"]) for item in cameras]),
+    }
+
+
+def camera_dome_fit(chunk, geometry):
+    """Stored camera reference minus adjusted centre, vertical, versus r^2.
+
+    Every aligned camera with a reference contributes one sample (146 in this
+    block): far more than the five check points, so this is the strongest test
+    for a smooth radial bend. The residual is the same signed quantity the
+    protocol's camera-consistency report calls "camera vs GPS up": positive
+    means the stored RTK position is above the adjusted centre.
+    """
+    origin = geometry["origin"]
+    centroid_east = geometry["centroid_east_m"]
+    centroid_north = geometry["centroid_north_m"]
+    centres = {item["label"]: item for item in geometry["cameras"]}
+    rows = []
+    quadratic_rows = []
+    values = []
+    for camera in sorted(chunk.cameras, key=lambda item: item.label):
+        if not camera.enabled or camera.reference is None:
+            continue
+        if not all(math.isfinite(float(value)) for value in camera.reference):
+            continue
+        centre = centres[camera.label]
+        reference = geodetic_to_enu(float(camera.reference[0]),
+                                    float(camera.reference[1]),
+                                    float(camera.reference[2]), origin)
+        up = reference[2] - centre["up_m"]
+        east = (centre["east_m"] - centroid_east) / DOME_RADIUS_SCALE_M
+        north = (centre["north_m"] - centroid_north) / DOME_RADIUS_SCALE_M
+        rows.append([east * east + north * north])
+        quadratic_rows.append([east, north, east * east, east * north,
+                               north * north])
+        values.append(up)
+    if not values:
+        return None
+    return {
+        "samples": len(values),
+        "mean_up_residual_m": sum(values) / len(values),
+        "radius_100m_squared": linear_least_squares(
+            rows, values, ["radius_100m_squared"]),
+        "quadratic": linear_least_squares(
+            quadratic_rows, values,
+            ["east_100m", "north_100m", "east_100m_squared",
+             "east_100m_north_100m", "north_100m_squared"]),
+    }
+
+
+def gcp_horizontal(gcps, origin):
+    """The survey points' horizontal ENU positions (held-out point included)."""
+    points = []
+    for gcp in gcps:
+        enu = geodetic_to_enu(gcp["lon"], gcp["lat"], gcp["height"], origin)
+        points.append({"label": gcp["label"], "east_m": enu[0],
+                       "north_m": enu[1]})
+    return points
+
+
+def check_point_dome(chunk, gcps, check_label, error, geometry):
+    """One check point's error and its position relative to the block centre."""
+    origin = geometry["origin"]
+    gcp = next(gcp for gcp in gcps if gcp["label"] == check_label)
+    reference = geodetic_to_enu(gcp["lon"], gcp["lat"], gcp["height"], origin)
+    markers = {marker.label: marker for marker in chunk.markers}
+    position = markers[check_label].position
+    if position is None:
+        raise ValueError("check point has no computed position: " + check_label)
+    adjusted = enu_of_local(chunk, position, origin)
+    # The radius is taken from the surveyed reference, not the adjusted point,
+    # so the geometry of the fit does not depend on the solution being tested.
+    east = reference[0] - geometry["centroid_east_m"]
+    north = reference[1] - geometry["centroid_north_m"]
+    return {
+        "label": check_label,
+        "horizontal_m": error["horizontal"],
+        "vertical_m": error["vertical"],
+        "vertical_enu_m": adjusted[2] - reference[2],
+        "east_from_centroid_m": east,
+        "north_from_centroid_m": north,
+        "radius_m": math.hypot(east, north),
+        "radius_squared_m2": east * east + north * north,
+        "reference_enu_m": list(reference),
+        "adjusted_enu_m": list(adjusted),
+    }
+
+
+def fold_dome(chunk, gcps, check_label, error):
+    """The per-fold dome diagnostic record (see the docstrings above)."""
+    geometry = block_geometry(chunk)
+    origin = geometry["origin"]
+    check = check_point_dome(chunk, gcps, check_label, error, geometry)
+    gcp_points = gcp_horizontal(gcps, origin)
+    gcp_area = convex_hull_area(
+        [(item["east_m"], item["north_m"]) for item in gcp_points])
+    return {
+        "centroid_east_m": geometry["centroid_east_m"],
+        "centroid_north_m": geometry["centroid_north_m"],
+        "block_radius_m": geometry["radius_m"],
+        "block_hull_area_m2": geometry["hull_area_m2"],
+        "gcp_hull_area_m2": gcp_area,
+        "gcp_block_area_ratio": (gcp_area / geometry["hull_area_m2"]
+                                 if geometry["hull_area_m2"] > 0.0 else None),
+        "check_point": check,
+        "camera": camera_dome_fit(chunk, geometry),
+    }
+
+
+def calibration_records(chunk):
+    """Solved coefficients, standard errors and f-to-distortion correlations.
+
+    The BA stores a 13x13 posterior covariance per sensor (all-zero rows/columns
+    for coefficients the solve held fixed), so a correlation is only reported
+    when both variances are positive. The standard errors are reported even
+    when the correlation is not, because a fixed term's zero variance is itself
+    information about the model that was solved.
+    """
+    records = []
+    for sensor in chunk.sensors:
+        calibration = sensor.calibration
+        record = {"sensor": sensor.label}
+        for name in CALIBRATION_PARAM_NAMES:
+            record[name] = float(getattr(calibration, name))
+        covariance = calibration.covariance_matrix
+        params = calibration.covariance_params
+        if covariance and params:
+            index = {name: position for position, name in enumerate(params)}
+            record["covariance_params"] = list(params)
+            record["std_errors"] = {
+                name: math.sqrt(max(covariance[index[name]][index[name]], 0.0))
+                for name in CALIBRATION_PARAM_NAMES if name in index}
+            correlations = {}
+            for other in ("k1", "k2", "k3", "cx", "cy"):
+                i = index.get("f")
+                j = index.get(other)
+                if i is None or j is None:
+                    correlations[other] = None
+                    continue
+                variance = covariance[i][i] * covariance[j][j]
+                correlations[other] = (covariance[i][j] / math.sqrt(variance)
+                                       if variance > 0.0 else None)
+            record["correlations_f"] = correlations
+        records.append(record)
+    return records
+
+
+def summarise_dome(measured):
+    """Aggregate the per-fold dome records into the checks a reader needs.
+
+    The check-point fit uses the five leave-one-out points (one per fold); the
+    camera fit has ~146 samples per fold, so its coefficient is quoted per fold
+    and as a mean t statistic rather than pooled (folds share one alignment and
+    are not independent replicates).
+    """
+    records = [fold["dome"] for fold in measured if "dome" in fold]
+    if not records:
+        return None
+    checks = [record["check_point"] for record in records]
+    # The fit uses the ENU vertical difference so it is independent of whether
+    # the chunk-local z axis happens to be up; the per-fold reported error keeps
+    # the protocol's existing local-frame definition.
+    values = [item["vertical_enu_m"] for item in checks]
+    radial_rows = [[(item["radius_m"] / DOME_RADIUS_SCALE_M) ** 2]
+                   for item in checks]
+    linear_rows = [[item["east_from_centroid_m"] / DOME_RADIUS_SCALE_M,
+                    item["north_from_centroid_m"] / DOME_RADIUS_SCALE_M,
+                    (item["radius_m"] / DOME_RADIUS_SCALE_M) ** 2]
+                   for item in checks]
+    quadratic_rows = [[
+        item["east_from_centroid_m"] / DOME_RADIUS_SCALE_M,
+        item["north_from_centroid_m"] / DOME_RADIUS_SCALE_M,
+        (item["east_from_centroid_m"] / DOME_RADIUS_SCALE_M) ** 2,
+        (item["east_from_centroid_m"] / DOME_RADIUS_SCALE_M) *
+        (item["north_from_centroid_m"] / DOME_RADIUS_SCALE_M),
+        (item["north_from_centroid_m"] / DOME_RADIUS_SCALE_M) ** 2]
+        for item in checks]
+    gcp_area = sum(record["gcp_hull_area_m2"] for record in records) / len(records)
+    block_area = (sum(record["block_hull_area_m2"] for record in records) /
+                  len(records))
+    camera_records = [record["camera"] for record in records
+                      if record.get("camera")]
+    per_fold = []
+    for fold, record in zip(
+            [fold for fold in measured if "dome" in fold], records):
+        camera = record.get("camera")
+        if not camera:
+            continue
+        radial = camera["radius_100m_squared"]
+        quadratic = camera["quadratic"]
+        per_fold.append({
+            "check": fold.get("check"),
+            "samples": camera["samples"],
+            "mean_up_residual_m": camera["mean_up_residual_m"],
+            "radial": radial,
+            "quadratic": quadratic,
+        })
+    camera_mean = None
+    if per_fold:
+        coefficients = []
+        t_values = []
+        for record in per_fold:
+            item = record["radial"].get("by_name", {}).get(
+                "radius_100m_squared", {})
+            if item.get("coefficient") is not None:
+                coefficients.append(item["coefficient"])
+            if item.get("t") is not None:
+                t_values.append(item["t"])
+        camera_mean = {
+            "folds": len(per_fold),
+            "coefficient_mean": (sum(coefficients) / len(coefficients)
+                                 if coefficients else None),
+            "t_mean": (sum(t_values) / len(t_values) if t_values else None),
+            "t_min": min(t_values) if t_values else None,
+            "t_max": max(t_values) if t_values else None,
+        }
+    return {
+        "check_points": checks,
+        "check_fit_radial": linear_least_squares(
+            radial_rows, values, ["radius_100m_squared"]),
+        "check_fit_linear_radial": linear_least_squares(
+            linear_rows, values,
+            ["east_100m", "north_100m", "radius_100m_squared"]),
+        "check_fit_quadratic": linear_least_squares(
+            quadratic_rows, values,
+            ["east_100m", "north_100m", "east_100m_squared",
+             "east_100m_north_100m", "north_100m_squared"]),
+        "gcp_hull_area_m2": gcp_area,
+        "block_hull_area_m2": block_area,
+        "gcp_block_area_ratio": (gcp_area / block_area) if block_area else None,
+        "camera_folds": per_fold,
+        "camera_fit_radial_mean": camera_mean,
+    }
+
+
+def summarise_calibration(measured):
+    """Per-sensor coefficient and correlation spread across the folds."""
+    by_sensor = {}
+    for fold in measured:
+        for record in fold.get("calibration") or []:
+            by_sensor.setdefault(record["sensor"], []).append(record)
+    summary = {}
+    for sensor, records in by_sensor.items():
+        entry = {"folds": len(records)}
+        for name in CALIBRATION_PARAM_NAMES:
+            values = [record[name] for record in records if name in record]
+            if values:
+                entry[name] = {"mean": sum(values) / len(values),
+                               "min": min(values), "max": max(values)}
+        correlations = {}
+        for other in ("k1", "k2", "k3", "cx", "cy"):
+            values = [record.get("correlations_f", {}).get(other)
+                      for record in records
+                      if record.get("correlations_f", {}).get(other) is not None]
+            correlations[other] = (
+                {"mean": sum(values) / len(values), "min": min(values),
+                 "max": max(values)} if values else None)
+        entry["correlations_f"] = correlations
+        summary[sensor] = entry
+    return summary
 
 
 def camera_prior_outliers(chunk, antenna_offset_m=None,
@@ -2160,6 +2609,12 @@ def optimize_options(options):
         # Brown/Fraser terms the defaults hold fixed.
         kwargs.update(fit_k4=True, fit_b1=True, fit_b2=True,
                       fit_p3=True, fit_p4=True)
+    # A model-choice probe names the coefficients it wants to move (or hold).
+    # OptimizeCameras intersects its fit_* flags with the sensor's fixed_params,
+    # so a False here holds the term even when a fixed-parameter model is not
+    # in play.
+    for name, value in (options.get("fit") or {}).items():
+        kwargs["fit_" + name] = bool(value)
     return kwargs
 
 
@@ -2208,20 +2663,16 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             refine = {"error": str(error)}
 
     accuracy = options.get("camera_accuracy", args.camera_accuracy)
+    accuracy_scale = options.get("camera_accuracy_scale", 1.0)
     along_shift = options.get("along_shift_m", 0.0)
+    # The "fit on ground control, then keep that calibration" workflow: this
+    # fold's control-only GCP adjustment supplies the lens, and the camera-RTK
+    # adjustment that follows may not move it. The calibration source uses only
+    # the control markers (the held-out point is imported as a check point and
+    # never constrains either fit), so the check never leaks into the lens.
+    calibration_from_control = bool(options.get("fixed_calibration_from_control"))
+    calibration_source = None
     with tempfile.TemporaryDirectory() as directory:
-        if camera_refs:
-            # Per-image mode without a shift needs no re-import: AddPhotos with
-            # load_xmp_accuracy already stored each camera's own accuracy (and
-            # the non-fixed rule applied there). Re-importing the same rows
-            # would only round positions through the CSV.
-            if accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift:
-                import_camera_references_for_block(
-                    chunk, accuracy, directory, along_shift)
-        else:
-            for camera in chunk.cameras:
-                camera.reference_enabled = False
-
         control_rows = [(gcps[index]["label"], gcps[index]["lon"],
                          gcps[index]["lat"], gcps[index]["height"])
                         for index in range(len(gcps)) if index != check_index]
@@ -2231,8 +2682,43 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
         check_path = os.path.join(directory, "check.csv")
         write_reference_csv(control_path, control_rows)
         write_reference_csv(check_path, check_rows)
-        chunk.importReference(path=control_path, marker_type="gcp")
-        chunk.importReference(path=check_path, marker_type="check_point")
+        if calibration_from_control:
+            # 1. Datum and lens from the control GCPs alone: cameras carry no
+            #    reference in this pass, so the ground control is the only
+            #    georeferencing input.
+            for camera in chunk.cameras:
+                camera.reference_enabled = False
+            chunk.importReference(path=control_path, marker_type="gcp")
+            chunk.importReference(path=check_path, marker_type="check_point")
+            chunk.updateTransform()
+            source_options = ({"adaptive_fitting": True}
+                              if options.get("calibration_source_adaptive", True)
+                              else {})
+            chunk.optimizeCameras(**optimize_options(source_options))
+            calibration_source = calibration_records(chunk)
+            for sensor_index in range(len(chunk.sensors)):
+                chunk.set_sensor_fixed_params(
+                    sensor_index, list(CALIBRATION_PARAM_NAMES))
+            # 2. Put the camera references back and adjust again; every
+            #    intrinsic coefficient is held, so the lens cannot trade
+            #    against the heights.
+            import_camera_references_for_block(
+                chunk, accuracy, directory, along_shift, accuracy_scale)
+        else:
+            if camera_refs:
+                # Per-image mode without a shift needs no re-import: AddPhotos
+                # with load_xmp_accuracy already stored each camera's own
+                # accuracy (and the non-fixed rule applied there). Re-importing
+                # the same rows would only round positions through the CSV.
+                if (accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift
+                        or accuracy_scale != 1.0):
+                    import_camera_references_for_block(
+                        chunk, accuracy, directory, along_shift, accuracy_scale)
+            else:
+                for camera in chunk.cameras:
+                    camera.reference_enabled = False
+            chunk.importReference(path=control_path, marker_type="gcp")
+            chunk.importReference(path=check_path, marker_type="check_point")
 
     # The antenna mount must be in place before updateTransform: both the datum
     # refit and the bundle adjustment consume the lever arm, and the two must
@@ -2283,6 +2769,14 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
                           "latency_s": options.get("timing_latency_s")}
     if refine is not None:
         fold["refine_markers"] = refine
+    if calibration_source is not None:
+        fold["calibration_source"] = calibration_source
+    if args.diagnostics:
+        # Report-only block-doming and calibration probes. They never change
+        # the fit, and they are skipped in a plain run so its report stays the
+        # one the regression gate has always compared.
+        fold["calibration"] = calibration_records(chunk)
+        fold["dome"] = fold_dome(chunk, gcps, labels[0], errors)
     return fold
 
 
@@ -2438,6 +2932,21 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     antenna = summarise_antenna(measured)
     if antenna:
         variant["antenna_estimates"] = antenna
+    dome = summarise_dome(measured)
+    if dome:
+        variant["dome"] = dome
+    calibration = summarise_calibration(measured)
+    if calibration:
+        variant["calibration"] = calibration
+    # The control-only fit a fixed-calibration variant freezes is reported
+    # beside the frozen result, so a reader can see the lens that was applied.
+    sources = [fold["calibration_source"] for fold in measured
+               if "calibration_source" in fold]
+    if sources:
+        source_summary = summarise_calibration(
+            [{"calibration": source} for source in sources])
+        if source_summary:
+            variant["calibration_source"] = source_summary
     if measured and "camera_accuracy" in measured[0]:
         # The weights do not change between folds, so the first fold's
         # distribution describes the variant.
@@ -2509,6 +3018,40 @@ DIAGNOSTIC_VARIANTS = (
     ("camera_rtk_per_image_antenna_estimated_adaptive", True,
      {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "estimated_antenna": True,
       "adaptive_fitting": True}),
+    # Block-doming probes (report-only, 2026-11-13). Each isolates one part of
+    # the calibration-geometry coupling a nadir-only parallel-strip block is
+    # prone to: radial-only distortion with the affine terms held, a held focal
+    # length, held tangential terms, and the ground-controlled calibration that
+    # is then frozen for the camera-RTK fit.
+    ("camera_rtk_k1234", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      # Radial terms free, affine terms (b1, b2) held: the classic radial
+      # model. k4 is on so the radial curve can bend, not just scale.
+      "fit": {"k1": True, "k2": True, "k3": True, "k4": True,
+              "b1": False, "b2": False}}),
+    ("camera_rtk_f_fixed", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "fit": {"f": False}}),
+    ("camera_rtk_p_fixed", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      "fit": {"p1": False, "p2": False, "p3": False, "p4": False}}),
+    # The honest leak-free version of "pre-calibrated camera": per fold the
+    # lens comes from the control-only GCP adaptive fit (the held-out point
+    # never enters it), then every coefficient is held for the camera-RTK
+    # adjustment.
+    ("fixed_calibration_camera_rtk", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      "fixed_calibration_from_control": True,
+      "calibration_source_adaptive": True}),
+    # Weight trend: markers unchanged at the survey accuracy, camera priors
+    # loosened by 2x and 5x from the reported per-image value. A block datum
+    # that only agrees with the GCPs when the cameras are outvoted would show
+    # the check improving monotonically with these factors.
+    ("camera_rtk_per_image_weight_x2", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      "camera_accuracy_scale": 2.0}),
+    ("camera_rtk_per_image_weight_x5", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      "camera_accuracy_scale": 5.0}),
 )
 
 
@@ -2677,6 +3220,44 @@ def run_real_odm(args):
                       variant, timing_record["speed_m_s"],
                       timing_record["flagged_implied_latency_median_s"],
                       timing_record["block_implied_latency_median_s"]))
+    # Dome and calibration diagnostics: one line per variant, so the benchmark
+    # log carries the fit (not only the JSON artifact) and a reader can see the
+    # sign, size and significance without opening the artifact.
+    def number(value, digits=4):
+        if value is None:
+            return "n/a"
+        try:
+            return "{:.{}f}".format(float(value), digits)
+        except (TypeError, ValueError):
+            return "n/a"
+
+    for variant, data in variants.items():
+        dome = data.get("dome")
+        if not dome:
+            continue
+        radial = dome.get("check_fit_radial") or {}
+        slope = (radial.get("by_name") or {}).get("radius_100m_squared", {})
+        camera = dome.get("camera_fit_radial_mean") or {}
+        print("[gcp validation] dome ({}): check b {} m/(100 m)^2, t {} "
+              "(n {}); camera b {} m/(100 m)^2, mean t {} over {} folds; "
+              "GCP/block hull area {} / {} m^2".format(
+                  variant, number(slope.get("coefficient")),
+                  number(slope.get("t"), 2), radial.get("samples"),
+                  number(camera.get("coefficient_mean")),
+                  number(camera.get("t_mean"), 2), camera.get("folds") or 0,
+                  number(dome.get("gcp_hull_area_m2"), 0),
+                  number(dome.get("block_hull_area_m2"), 0)))
+    for variant, data in variants.items():
+        for sensor, entry in (data.get("calibration") or {}).items():
+            correlations = entry.get("correlations_f") or {}
+            f_k1 = (correlations.get("k1") or {}).get("mean")
+            print("[gcp validation] calibration ({} / {}): f {} px, "
+                  "k1 {}, k2 {}, corr(f,k1) {}".format(
+                      variant, sensor,
+                      number((entry.get("f") or {}).get("mean"), 2),
+                      number((entry.get("k1") or {}).get("mean"), 8),
+                      number((entry.get("k2") or {}).get("mean"), 8),
+                      number(f_k1, 4)))
     # Print the per-fold lever-arm estimate the estimated variants apply: a
     # reader can see whether the mount is stable across folds.
     estimate_source = "adaptive" if args.diagnostics else "default"
@@ -2763,7 +3344,10 @@ def parse_args(argv):
                              "probes (adaptive/extended calibration, marker "
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
-                             "antenna lever arms); report-only")
+                             "antenna lever arms, model-choice and GCP-weight "
+                             "probes, fixed-calibration workflow) and report "
+                             "the per-fold calibration and block-doming fits; "
+                             "report-only")
     parser.add_argument("--camera-accuracy", default="0.05",
                         help="camera reference accuracy for the camera_rtk_gcps "
                              "variant: 'per-image' uses each photo's XMP RTK "

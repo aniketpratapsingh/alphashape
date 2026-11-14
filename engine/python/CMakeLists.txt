@@ -191,6 +191,11 @@ set_tests_properties(python_gcp_validation PROPERTIES TIMEOUT 900
 alphashape_add_python_test(python_gcp_timing
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_timing.py)
 
+# WP-13.20: the block-doming diagnostics' least-squares fit, convex-hull area
+# and variant option translation. Pure helpers; no chunk is built.
+alphashape_add_python_test(python_gcp_diagnostics
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_diagnostics.py)
+
 # WP-13.21: the camera reference attitude properties through Python.
 alphashape_add_python_test(python_attitude_prior
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)
