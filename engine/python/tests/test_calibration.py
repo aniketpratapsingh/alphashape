@@ -8,6 +8,7 @@ What this file pins:
     Calibration exposes p3, p4 and the (absent by default) covariance matrix;
   * Calibration.save/load round trip the model through the JSON codec;
   * Sensor.makeMaster detaches a slave sensor through the undoable command;
+  * Chunk.set_sensor_fixed_params sets and releases the coefficients held fixed;
   * Chunk.calibrateCamera is bound and refuses a block with no detected board;
   * Chunk.exportSTMap writes a map for a calibrated sensor;
   * Chunk.detectFiducials accepts the public `fiducial_type` spelling.
@@ -86,6 +87,31 @@ class TestSensorMaster(unittest.TestCase):
         _, chunk = chunk_with(CAM_A)
         chunk.sensors[0].makeMaster()
         self.assertEqual(chunk.sensors[0].master, -1)
+
+
+class TestSensorFixedParams(unittest.TestCase):
+    """The fixed-coefficient list OptimizeCameras intersects its fit_* flags with.
+
+    The command itself is pinned in test_model_commands.cpp; this file pins the
+    Python route the GCP protocol's "fix the calibration from a controlled fit"
+    variant uses, including the error contract.
+    """
+
+    def test_set_and_release_fixed_params(self):
+        _, chunk = chunk_with(CAM_A)
+        chunk.set_sensor_fixed_params(0, ["f", "k1"])
+        self.assertEqual(list(chunk.sensors[0].fixed_params), ["f", "k1"])
+        chunk.set_sensor_fixed_params(0, [])
+        self.assertEqual(list(chunk.sensors[0].fixed_params), [])
+
+    def test_unknown_and_duplicate_names_are_refused(self):
+        _, chunk = chunk_with(CAM_A)
+        with self.assertRaises(alphashape.ValueError):
+            chunk.set_sensor_fixed_params(0, ["f", "not_a_coefficient"])
+        with self.assertRaises(alphashape.ValueError):
+            chunk.set_sensor_fixed_params(0, ["k2", "k2"])
+        # A refused command leaves the chunk untouched.
+        self.assertEqual(list(chunk.sensors[0].fixed_params), [])
 
 
 class TestCalibrationTasks(unittest.TestCase):
