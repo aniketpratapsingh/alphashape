@@ -815,6 +815,67 @@ std::optional<double> cross_radius(const CameraView& view,
     return radius * static_cast<double>(std::max(1, view.downscale));
 }
 
+/// Half-size of the printed square outline nearest `pixel`, in the same
+/// scale convention as cross_radius (printed half-size / sqrt(2), which is
+/// exactly what the saddle detector reports for the same target). A checker
+/// or square survey target has a square outer boundary even when its interior
+/// alternates, so this source survives the cases the blob and saddle searches
+/// miss: a small target whose quadrants are all brighter than the ground, or
+/// a saddle rejected as part of a dense checker lattice. A clean circular
+/// target does not have a square outline and returns nullopt.
+std::optional<double> quad_radius(const CameraView& view,
+                                  const Eigen::Vector2d& pixel,
+                                  int patch_size) {
+    const Eigen::Vector2d index = view.index_of(pixel);
+    if (!index.allFinite()) {
+        return std::nullopt;
+    }
+    const int half = std::max(48, 2 * patch_size);
+    const int x0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.x(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.width() - 2 * half - 1));
+    const int y0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.y(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.height() - 2 * half - 1));
+    const int width = std::min(2 * half + 1, view.image.width() - x0);
+    const int height = std::min(2 * half + 1, view.image.height() - y0);
+    if (width < 16 || height < 16) {
+        return std::nullopt;
+    }
+    FloatImage crop(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            crop.at(x, y) = view.image.at(x0 + x, y0 + y);
+        }
+    }
+    const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
+                               index.y() - static_cast<double>(y0) + 0.5);
+    double best = static_cast<double>(half);
+    double radius = 0.0;
+    QuadParams params;
+    params.min_side = 8;
+    params.max_side = 512;
+    for (const bool dark_on_light : {true, false}) {
+        params.dark_on_light = dark_on_light;
+        for (const MarkerCandidate& square : detect_quads(crop, params)) {
+            if (!square.center.allFinite() || !(square.radius_px > 0.0)) {
+                continue;
+            }
+            const double distance = (square.center - seed).norm();
+            const double gate = std::max(4.0, 0.35 * square.radius_px);
+            if (distance <= gate && distance < best) {
+                best = distance;
+                radius = square.radius_px;
+            }
+        }
+    }
+    if (!(radius > 0.0)) {
+        return std::nullopt;
+    }
+    // Square half-diagonal -> saddle-equivalent radius (half-size / sqrt(2)).
+    return 0.5 * radius * static_cast<double>(std::max(1, view.downscale));
+}
+
 /// Local target-plane normal. A plane fitted to nearby cloud points follows a
 /// tilted target; without enough points the marker is assumed fronto-parallel
 /// to the average view (the negated mean viewing direction).
@@ -1690,8 +1751,12 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         // and a template sized from it is dominated by the pattern edge and
         // the surrounding ground.
         std::optional<double> saddle;
+        std::optional<double> square;
         if (blend.model != TargetModel::Circular) {
             saddle = cross_radius(*blend.view, blend.pixel, patch_size);
+            if (!saddle.has_value()) {
+                square = quad_radius(*blend.view, blend.pixel, patch_size);
+            }
         }
         blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
                                    blend.coded_circular,
@@ -1711,6 +1776,10 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
             blend.blob_scale = true;
         } else if (saddle.has_value()) {
             blend.apparent = std::max(1.0, *saddle);
+            blend.has_scale = true;
+            blend.cross_scale = true;
+        } else if (square.has_value()) {
+            blend.apparent = std::max(1.0, *square);
             blend.has_scale = true;
             blend.cross_scale = true;
         } else if (blend.model == TargetModel::Circular) {
@@ -1734,6 +1803,9 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         // patch scale and takes the consensus one.
         if (saddle.has_value()) {
             blend.patch_apparent = std::max(1.0, *saddle);
+            blend.has_patch_scale = true;
+        } else if (square.has_value()) {
+            blend.patch_apparent = std::max(1.0, *square);
             blend.has_patch_scale = true;
         } else if (verified && blob_radius > 0.0) {
             blend.patch_apparent = std::max(1.0, blob_radius);

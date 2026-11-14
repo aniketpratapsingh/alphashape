@@ -59,6 +59,11 @@ struct SceneTarget {
     double rotation = 0.0;
     std::uint32_t word = 0b101101001011U;
     int parity = 1;  ///< 1 prints a dark centre dot, 0 a white one.
+    /// Checker quadrant shades. The default pair is one dark and one bright
+    /// quadrant; a real survey target printed on grass can have BOTH quadrants
+    /// brighter than the ground, which defeats a dark-blob-only seed.
+    double cross_low = 0.05;
+    double cross_high = 0.95;
 };
 
 struct BlankBox {
@@ -86,6 +91,9 @@ struct SceneSpec {
     /// or -1. Used to prove a speck cannot win over the printed centre dot.
     int speck_target = -1;
     double speck_offset_px = 8.0;
+    /// Checker quadrant shades for every cross target in the scene.
+    double cross_low = 0.05;
+    double cross_high = 0.95;
 };
 
 /// Deterministic, continuous ground texture. The value depends only on the
@@ -132,7 +140,8 @@ std::optional<float> target_shade(const SceneTarget& target, double x, double z)
         if (std::abs(u) > half || std::abs(v) > half) {
             return std::nullopt;
         }
-        return (u > 0.0) == (v > 0.0) ? 0.95F : 0.05F;
+        return (u > 0.0) == (v > 0.0) ? static_cast<float>(target.cross_high)
+                                      : static_cast<float>(target.cross_low);
     }
     const double rho = std::sqrt(u * u + v * v) / target.radius;
     if (rho > 1.0) {
@@ -297,6 +306,8 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
         target.parity = i == spec.even_code_target ? 0 : 1;
+        target.cross_low = spec.cross_low;
+        target.cross_high = spec.cross_high;
         scene.targets.push_back(target);
     }
     if (spec.include_blank_target) {
@@ -1200,6 +1211,47 @@ TEST(Markers, RefineSurveyCrossWithoutTargetType) {
     EXPECT_GT(stats.moved_projections, 0U);
     EXPECT_EQ(stats.evaluated_projections,
               stats.moved_projections + stats.kept_unrefined);
+}
+
+TEST(Markers, RefineBrightCheckerWithoutTargetType) {
+    // The real gcp-rtk targets print both checker quadrants BRIGHTER than the
+    // grass they lie on (the "dark" quadrant is a light grey). The dark-blob
+    // pass then finds nothing, so the seed search has to fall back to the
+    // light pass, and the printed square outline supplies the scale. This is
+    // the exact appearance that left four of five real markers with "no
+    // scale" and made refinement do nothing on them.
+    SceneSpec spec;
+    spec.marker_count = 2;  // index 1 prints a checker cross
+    spec.cross_low = 0.72;
+    spec.cross_high = 0.96;
+    RefineScene scene = make_scene(spec, 503U);
+    ASSERT_TRUE(scene.targets[1].cross);
+    std::mt19937 engine(37U);
+    const std::int32_t id = add_scene_marker(scene, 1, "G1", 2.5, engine,
+                                             std::vector<std::size_t>{},
+                                             /*record_target_type=*/false);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const double rms = rms_to_truth(scene, *marker, 1);
+    std::printf("[refine bright checker] projections %zu -> %zu, moved %zu "
+                "kept %zu removed %zu failed %zu, blob %zu cross %zu none %zu, "
+                "RMS %.4f px\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                stats.views_blob_scale, stats.views_cross_scale,
+                stats.views_no_scale, rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_LE(rms, 0.5);
+    EXPECT_GT(stats.moved_projections, 0U);
 }
 
 TEST(Markers, RefineKeepsUnconfidentProjection) {

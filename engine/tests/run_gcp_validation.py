@@ -1640,6 +1640,7 @@ def marker_crop_probe(args, gcps, align_report):
     pixels and shifts are recorded in ``index.json``.
     """
     from PIL import Image as PilImage  # noqa: PLC0415 - benchmark-only dependency
+    from PIL import ImageDraw as PilImageDraw
 
     directory = args.crops_dir
     images = {}
@@ -1722,11 +1723,27 @@ def marker_crop_probe(args, gcps, align_report):
         crop = image.crop((left, top, right, bottom))
         crop = crop.resize((crop.width * zoom, crop.height * zoom),
                            PilImage.NEAREST)
-        stem = "{}_{}_before.png".format(label, camera)
-        crop.save(os.path.join(directory, stem))
+
+        def mark(canvas, x, y, value):
+            """Draw a 15-px crosshair at an image pixel on the zoomed crop."""
+            cx = (x - left) * zoom + zoom / 2.0
+            cy = (y - top) * zoom + zoom / 2.0
+            draw = PilImageDraw.Draw(canvas)
+            arm = 7
+            draw.line([(cx - arm, cy), (cx + arm, cy)], fill=value, width=1)
+            draw.line([(cx, cy - arm), (cx, cy + arm)], fill=value, width=1)
+            draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], outline=value)
+
         after = after_by_key.get((label, camera_id))
+        before_crop = crop.copy()
+        mark(before_crop, px, py, 0)
+        stem = "{}_{}_before.png".format(label, camera)
+        before_crop.save(os.path.join(directory, stem))
         if after is not None:
-            crop.save(os.path.join(directory, "{}_{}_after.png".format(
+            after_crop = crop.copy()
+            mark(after_crop, px, py, 128)
+            mark(after_crop, after[0], after[1], 255)
+            after_crop.save(os.path.join(directory, "{}_{}_after.png".format(
                 label, camera)))
         records.append({
             "marker": label,
