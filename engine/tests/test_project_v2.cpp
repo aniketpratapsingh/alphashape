@@ -479,6 +479,7 @@ Document build_vocabulary_document() {
     second.reference.accuracy = Eigen::Vector3d(0.05, 0.06, 0.07);
     second.reference.orientation_deg = Eigen::Vector3d(1.0, 2.0, 3.0);
     second.reference.rotation_accuracy_deg = Eigen::Vector3d(0.1, 0.2, 0.3);
+    second.reference.rtk_flag = 50;
     second.reference.enabled = false;
 
     // Marker internals, a disabled projection and a track covariance.
@@ -752,7 +753,7 @@ const std::set<std::string>& expected_attributes() {
         "camera@location_covariance", "camera@rotation_covariance",
         "reference@x", "reference@y", "reference@z", "reference@accuracy",
         "reference@yaw", "reference@pitch", "reference@roll",
-        "reference@rotation_accuracy", "reference@enabled",
+        "reference@rotation_accuracy", "reference@rtk_flag", "reference@enabled",
         "reference@camera_location_accuracy", "reference@camera_rotation_accuracy",
         "reference@marker_location_accuracy", "reference@marker_projection_accuracy",
         "reference@scalebar_accuracy", "reference@tiepoint_accuracy",
@@ -847,7 +848,7 @@ TEST_F(ProjectV2, AttributeVocabulary) {
 
     expect_same_vocabulary(attributes, expected_attributes(),
                            "doc.xml attribute vocabulary");
-    EXPECT_EQ(expected_attributes().size(), 231U);
+    EXPECT_EQ(expected_attributes().size(), 232U);
     expect_reader_understands(document, archive);
 }
 

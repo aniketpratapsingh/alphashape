@@ -55,6 +55,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import tempfile
 
@@ -998,6 +999,253 @@ def collect_images(directory):
             if name.lower().endswith(IMAGE_SUFFIXES)]
 
 
+# A drone RTK module writes two integer counters into the JPEG comment of each
+# exposure: `timestamp` in milliseconds and `exppts` in microseconds, both on
+# the module's own clock. They are the only sub-second capture times in the
+# imagery (EXIF stores whole seconds on the camera's unsynchronised clock).
+CAPTURE_TIMING_PATTERN = re.compile(rb"timestamp=(\d+)\s+exppts=(\d+)")
+
+
+def parse_mrk(path):
+    """Parse a per-exposure event-mark (``.mrk``) file.
+
+    The documented layout is whitespace separated::
+
+        index  gps_time_of_week  [gps_week]  <solution tokens>
+        lat,Lat  lon,Lon  height,Ellh
+        sigma_lat, sigma_lon, sigma_height  flag,Quality
+
+    The first token numbers the exposure, the second is the GPS time of week in
+    seconds and the bracketed third is the GPS week. The three ``,unit`` tokens
+    carry the antenna position (decimal degrees and ellipsoidal metres) and the
+    three following comma-separated numbers are its per-axis 1-sigma standard
+    deviations in metres, ordered latitude, longitude, height. The last two
+    tokens are the integer solution status (50 fixed, 34 float, 0/16
+    single-point) and a quality letter. The tokens between the week and the
+    latitude are solution details, not a position, so they are skipped: a
+    firmware that adds or removes one does not shift the columns this parser
+    reads. A malformed line is skipped, never fatal.
+    """
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            tokens = line.split()
+            if len(tokens) < 10 or not tokens[0].isdigit():
+                continue
+            try:
+                index = int(tokens[0])
+                time_s = float(tokens[1])
+            except ValueError:
+                continue
+            week = None
+            for token in tokens[:5]:
+                match = re.fullmatch(r"\[(\d+)\]", token)
+                if match:
+                    week = int(match.group(1))
+                    break
+            latitude = longitude = height = None
+            sigma_start = None
+            for position, token in enumerate(tokens):
+                try:
+                    if token.endswith(",Lat") and latitude is None:
+                        latitude = float(token[:-4])
+                    elif token.endswith(",Lon") and longitude is None:
+                        longitude = float(token[:-4])
+                    elif token.endswith(",Ellh"):
+                        height = float(token[:-5])
+                        sigma_start = position + 1
+                except ValueError:
+                    latitude = longitude = height = None
+                    break
+            if (latitude is None or longitude is None or height is None or
+                    sigma_start is None or sigma_start + 3 >= len(tokens)):
+                continue
+            try:
+                sigma = [float(value.strip(","))
+                         for value in tokens[sigma_start:sigma_start + 3]]
+                # The status and quality letter share the final token ("50,Q").
+                status = tokens[sigma_start + 3].split(",")
+                flag = int(float(status[0]))
+            except ValueError:
+                continue
+            quality = status[1].strip(",") if len(status) > 1 else ""
+            if not all(math.isfinite(value) and value > 0.0 for value in sigma):
+                continue
+            records.append({
+                "index": index,
+                "time_s": time_s,
+                "week": week,
+                "lat": latitude,
+                "lon": longitude,
+                "height_m": height,
+                "sigma_lat_m": sigma[0],
+                "sigma_lon_m": sigma[1],
+                "sigma_hgt_m": sigma[2],
+                "fix_flag": flag,
+                "quality": quality,
+            })
+    return records
+
+
+def read_capture_timing(image_path, limit=262144):
+    """The module's two per-exposure counters, or None when absent.
+
+    Only the JPEG header area is scanned (the comment sits in the first few
+    kilobytes); a full-size frame is never read. ``trigger_us`` is the shutter
+    command, ``exposure_us`` the exposure event, both microseconds on the
+    module clock.
+    """
+    try:
+        with open(image_path, "rb") as handle:
+            data = handle.read(limit)
+    except OSError:
+        return None
+    match = CAPTURE_TIMING_PATTERN.search(data)
+    if match is None:
+        return None
+    return {"trigger_us": int(match.group(1)) * 1000,
+            "exposure_us": int(match.group(2))}
+
+
+def _median(values):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def match_mrk_records(reference_rows, records):
+    """Map camera labels to event-mark records by image number then position.
+
+    ``reference_rows`` is ``[{"label", "reference"}]`` captured right after
+    alignment (the reference triple is lon/lat/height). The event-mark index is
+    the image's trailing number in this dataset (``MAX_0002`` -> record 2), but
+    the match is accepted only when the record position equals the camera's
+    stored reference; otherwise the nearest record within 0.1 m is used, and
+    beyond that the camera is left unmatched rather than paired with a wrong
+    exposure.
+    """
+    by_index = {record["index"]: record for record in records}
+    matched = {}
+    for row in reference_rows:
+        reference = row["reference"]
+        if reference is None or not all(
+                math.isfinite(float(value)) for value in reference):
+            continue
+        lon, lat = float(reference[0]), float(reference[1])
+        record = None
+        number = re.search(r"(\d+)$", row["label"])
+        if number is not None:
+            candidate = by_index.get(int(number.group(1)))
+            if (candidate is not None and
+                    abs(candidate["lat"] - lat) < 1e-6 and
+                    abs(candidate["lon"] - lon) < 1e-6):
+                record = candidate
+        if record is None and records:
+            nearest = min(
+                records,
+                key=lambda item: (item["lat"] - lat) ** 2 +
+                                 (item["lon"] - lon) ** 2)
+            if (abs(nearest["lat"] - lat) < 1e-6 and
+                    abs(nearest["lon"] - lon) < 1e-6):
+                record = nearest
+        if record is not None:
+            matched[row["label"]] = record
+    return matched
+
+
+def analyse_timing(reference_rows, images, records):
+    """Compare each exposure's event time with its capture time.
+
+    The RTK log and the camera write their timestamps on different clocks, so
+    the two series are aligned by the median difference first; what remains is
+    the per-exposure disagreement between the event mark and the exposure.
+    ``trigger_to_exposure`` is the delay between the shutter command and the
+    exposure; it is NOT a position error because the event mark is stamped at
+    the exposure, which the event-vs-exposure residual tests directly.
+
+    Also reports the block flight speed from consecutive event marks (straight
+    line between neighbouring exposures, so line turns lower individual
+    samples and the median is the usable value) and the solution-status and
+    sigma distributions, which are what a per-camera weight can be checked
+    against.
+    """
+    paths = {os.path.splitext(os.path.basename(path))[0]: path
+             for path in images}
+    matched = match_mrk_records(reference_rows, records)
+    rows = []
+    offsets = []
+    trigger_gaps = []
+    for label, record in sorted(matched.items()):
+        path = paths.get(label)
+        if path is None:
+            continue
+        capture = read_capture_timing(path)
+        if capture is None:
+            continue
+        exposure_s = capture["exposure_us"] / 1e6
+        offsets.append(record["time_s"] - exposure_s)
+        trigger_gaps.append(
+            (capture["exposure_us"] - capture["trigger_us"]) / 1e6)
+        rows.append({
+            "label": label,
+            "mrk_time_s": record["time_s"],
+            "trigger_us": capture["trigger_us"],
+            "exposure_us": capture["exposure_us"],
+            "fix_flag": record["fix_flag"],
+        })
+    if not rows:
+        return {"images": 0, "mrk_records": len(records),
+                "matched_cameras": len(matched)}
+
+    clock_offset = _median(offsets)
+    residuals = [offset - clock_offset for offset in offsets]
+    speeds = []
+    for first, second in zip(records, records[1:]):
+        delta = second["time_s"] - first["time_s"]
+        if delta <= 0.05:
+            continue
+        mean_lat = math.radians(0.5 * (first["lat"] + second["lat"]))
+        north = (second["lat"] - first["lat"]) * 111320.0
+        east = (second["lon"] - first["lon"]) * 111320.0 * math.cos(mean_lat)
+        speeds.append(math.hypot(north, east) / delta)
+    status_counts = {}
+    for record in records:
+        key = str(record["fix_flag"])
+        status_counts[key] = status_counts.get(key, 0) + 1
+    return {
+        "images": len(rows),
+        "mrk_records": len(records),
+        "matched_cameras": len(matched),
+        "clock_offset_s": clock_offset,
+        "event_vs_exposure_rms_s": root_mean_square(residuals),
+        "event_vs_exposure_max_abs_s": max(abs(value) for value in residuals),
+        "trigger_to_exposure_median_s": _median(trigger_gaps),
+        "trigger_to_exposure_min_s": min(trigger_gaps),
+        "trigger_to_exposure_max_s": max(trigger_gaps),
+        "block_speed_m_s": _median(speeds) if speeds else None,
+        "block_speed_min_m_s": min(speeds) if speeds else None,
+        "block_speed_max_m_s": max(speeds) if speeds else None,
+        "fix_status_counts": status_counts,
+        "sigma_lat_m": {
+            "min": min(record["sigma_lat_m"] for record in records),
+            "max": max(record["sigma_lat_m"] for record in records),
+        },
+        "sigma_lon_m": {
+            "min": min(record["sigma_lon_m"] for record in records),
+            "max": max(record["sigma_lon_m"] for record in records),
+        },
+        "sigma_hgt_m": {
+            "min": min(record["sigma_hgt_m"] for record in records),
+            "max": max(record["sigma_hgt_m"] for record in records),
+        },
+        "per_image": rows,
+    }
+
+
 def split_csv(path, check_labels):
     """Return (header, control_lines, check_lines) from a label,x,y,z CSV."""
     with open(path, encoding="utf-8") as handle:
@@ -1055,6 +1303,67 @@ ANTENNA_FIXED_OFFSET_M = (0.0, 0.0, -0.23)
 # The estimated variants use the mean camera-frame offset measured on the same
 # fold's GCP-only adjustment. Only control GCPs take part, so the held-out
 # check point never reaches the estimate.
+
+# ``--camera-accuracy per-image`` takes each camera's own accuracy from the
+# XMP the engine's AddPhotos (load_xmp_accuracy) stored, instead of re-importing
+# one scalar for the whole block. The scalar form is still accepted and is the
+# uniform baseline.
+CAMERA_ACCURACY_PER_IMAGE = "per-image"
+
+# A camera whose stored reference sits further than this many of its own
+# per-axis sigmas from the adjusted centre is reported by the robust diagnostic.
+# It is a report-only threshold: no variant's weights are changed by it.
+OUTLIER_SIGMA_THRESHOLD = 3.0
+
+# How many flagged cameras per fold carry the full residual record. Every
+# flagged label is still listed, but a fold where a per-image weight turns a
+# systematic datum offset into a ten-sigma residual on all 146 cameras would
+# otherwise multiply the report (and the benchmark log) by its size.
+OUTLIER_DETAIL_LIMIT = 20
+
+
+def parse_camera_accuracy(text):
+    """``per-image``, or a strictly positive uniform accuracy in metres."""
+    if text == CAMERA_ACCURACY_PER_IMAGE:
+        return text
+    try:
+        value = float(text)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "--camera-accuracy needs 'per-image' or a number of metres") from error
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("--camera-accuracy must be positive and finite")
+    return value
+
+
+def camera_accuracy_summary(chunk):
+    """Distribution of the per-camera reference accuracy the block carries.
+
+    ``uniform_defaults`` counts cameras still on the 10 m consumer-default
+    triple, which is what a block with no per-image metadata looks like. The
+    per-axis min/mean/max show whether the import produced a real spread.
+    """
+    axes = {"east": [], "north": [], "up": []}
+    defaults = 0
+    for camera in chunk.cameras:
+        if camera.reference is None:
+            continue
+        accuracy = camera.reference_accuracy
+        if accuracy is None:
+            continue
+        values = tuple(float(axis) for axis in accuracy)
+        axes["east"].append(values[0])
+        axes["north"].append(values[1])
+        axes["up"].append(values[2])
+        if values == (10.0, 10.0, 10.0):
+            defaults += 1
+    count = len(axes["east"])
+    summary = {"cameras": count, "uniform_defaults": defaults}
+    if count:
+        for name, values in axes.items():
+            summary[name] = {"min_m": min(values), "mean_m": sum(values) / count,
+                             "max_m": max(values)}
+    return summary
 
 
 def parse_odm_gcp_list(path, pixel_shift_px=0.0):
@@ -1309,7 +1618,13 @@ def align_block(args, images, gcps):
     doc = alphashape.Document()
     chunk = doc.add_chunk("Helenenschacht RTK block")
     doc.active_chunk = chunk
-    doc.run_task("AddPhotos", filenames=images)
+    # Per-image mode reads each photo's XMP RTK deviations (and fix status) at
+    # import, so the alignment itself is weighted by them. The uniform modes
+    # keep the historic behaviour (no XMP accuracy) so the comparison against
+    # earlier runs is like for like.
+    per_image = args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE
+    doc.run_task("AddPhotos", filenames=images,
+                 load_xmp_accuracy=per_image)
     chunk.crs_epsg = 4326
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit)
     doc.run_task("AlignCameras")
@@ -1317,27 +1632,83 @@ def align_block(args, images, gcps):
     doc.save(project)
     total = len(chunk.cameras)
     aligned = sum(1 for camera in chunk.cameras if camera.enabled)
+    # Kept out of the JSON report (run_real_odm pops it): the timing analysis
+    # only needs labels and stored positions to pair exposures with event marks.
+    reference_rows = [{"label": camera.label,
+                       "reference": (tuple(float(v) for v in camera.reference)
+                                     if camera.reference is not None else None)}
+                      for camera in chunk.cameras]
     return {"project": project, "cameras_total": total,
             "cameras_aligned": aligned,
             "keypoint_limit_per_mpx": args.keypoint_limit,
-            "observations": skipped_observations(chunk, gcps)}
+            "camera_accuracy": args.camera_accuracy,
+            "xmp_accuracy_imported":
+                args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE,
+            "observations": skipped_observations(chunk, gcps),
+            "_reference_rows": reference_rows}
 
 
-def import_camera_references_for_block(chunk, accuracy_m, directory):
-    """Re-import every camera reference at the block's stated ``accuracy_m``.
+def import_camera_references_for_block(chunk, accuracy_m, directory,
+                                       along_shift_m=0.0):
+    """Re-import every camera reference with the variant's accuracy/position.
 
-    The binding's ``reference_accuracy`` is never None once a location exists:
-    AddPhotos stores the 10 m consumer default, so reading it back would weight
-    the RTK positions as consumer GNSS and leave them without effect.
+    ``accuracy_m`` is a scalar for the uniform baseline or
+    CAMERA_ACCURACY_PER_IMAGE, in which case each row keeps the accuracy
+    AddPhotos stored from that photo's XMP (a camera carrying the 10 m default
+    stays there: no per-image accuracy exists). The binding's
+    ``reference_accuracy`` is never None once a location exists, so a uniform
+    run must write the scalar rather than read it back.
+
+    ``along_shift_m`` is an along-track lead to REMOVE: each position is moved
+    this many metres opposite its local flight direction, estimated from the
+    camera's neighbours in label order. That is how the timing diagnostic
+    applies a speed x latency correction. The direction is computed from the
+    UNshifted track, so the two do not feed back into each other.
     """
-    rows = []
+    cameras = []
     for camera in chunk.cameras:
         reference = camera.reference
         if reference is None or not all(
                 math.isfinite(float(value)) for value in reference):
             continue
+        cameras.append(camera)
+    cameras.sort(key=lambda camera: camera.label)
+
+    shifted = {}
+    if along_shift_m:
+        origin = tuple(float(v) for v in cameras[0].reference) if cameras else None
+        track = {camera.label: geodetic_to_enu(
+            float(camera.reference[0]), float(camera.reference[1]),
+            float(camera.reference[2]), origin) for camera in cameras}
+        for index, camera in enumerate(cameras):
+            previous = cameras[max(0, index - 1)].label
+            following = cameras[min(len(cameras) - 1, index + 1)].label
+            dx = track[following][0] - track[previous][0]
+            dy = track[following][1] - track[previous][1]
+            norm = math.hypot(dx, dy)
+            if norm < 1e-9:
+                finish = tuple(float(v) for v in camera.reference)
+            else:
+                offset = (-along_shift_m * dx / norm,
+                          -along_shift_m * dy / norm, 0.0)
+                finish = enu_to_geodetic(
+                    offset, tuple(float(v) for v in camera.reference))
+            shifted[camera.label] = finish
+
+    rows = []
+    for camera in cameras:
+        reference = shifted.get(
+            camera.label, tuple(float(v) for v in camera.reference))
+        if accuracy_m == CAMERA_ACCURACY_PER_IMAGE:
+            accuracy = camera.reference_accuracy
+            if accuracy is None:
+                accuracy = (10.0, 10.0, 10.0)
+            else:
+                accuracy = tuple(float(v) for v in accuracy)
+        else:
+            accuracy = (accuracy_m, accuracy_m, accuracy_m)
         rows.append((camera.label, reference[0], reference[1], reference[2],
-                     (accuracy_m, accuracy_m, accuracy_m)))
+                     accuracy))
     path = os.path.join(directory, "camera_references.csv")
     write_camera_reference_csv(path, rows)
     chunk.importReference(path=path)
@@ -1449,6 +1820,183 @@ def camera_consistency(chunk, antenna_offset_m=None):
             result["mean_along_track_{}_m".format(bound)] = mean(values)
             result["cameras_{}".format(bound)] = len(values)
     return result
+
+
+def camera_prior_outliers(chunk, antenna_offset_m=None,
+                          threshold=OUTLIER_SIGMA_THRESHOLD):
+    """Cameras whose prior residual exceeds ``threshold`` of their own sigma.
+
+    The residual is the same stored-reference-minus-adjusted-centre vector the
+    consistency report aggregates, whitened per axis by that camera's declared
+    accuracy. A per-image RTK weight near 1.5 cm turns a 0.2 m vertical datum
+    disagreement into a ten-sigma residual on every camera, while a uniform
+    5 cm block weight would see four sigma: naming the cameras distinguishes
+    the two. The GNSS fix status travels with each entry, so an outlier can be
+    checked against the solution it came from. Report only; no weight changes.
+    """
+    transform = chunk.transform
+    block = [[float(transform[r][c]) for c in range(3)] for r in range(3)]
+    chunk_scale = abs(matrix_determinant(block)) ** (1.0 / 3.0)
+    chunk_rotation = None
+    if antenna_offset_m is not None:
+        if not math.isfinite(chunk_scale) or chunk_scale <= 0.0:
+            raise ValueError("chunk transform has no invertible rotation")
+        chunk_rotation = [[block[r][c] / chunk_scale for c in range(3)]
+                          for r in range(3)]
+    samples = []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if not camera.enabled or reference is None or not all(
+                math.isfinite(float(value)) for value in reference):
+            continue
+        local = camera.center
+        ecef = [sum(transform[r][c] * local[c] for c in range(3)) + transform[r][3]
+                for r in range(3)]
+        if antenna_offset_m is not None:
+            pose = camera.pose
+            pose_rotation = orthonormal_rotation(
+                [[pose[r][c] for c in range(3)] for r in range(3)])
+            lever_local = [
+                sum(pose_rotation[r][c] * antenna_offset_m[r] for r in range(3))
+                for c in range(3)]
+            lever_ecef = [
+                sum(chunk_rotation[r][c] * lever_local[c] for c in range(3))
+                for r in range(3)]
+            ecef = [ecef[r] + lever_ecef[r] for r in range(3)]
+        enu = ecef_to_enu(ecef, (reference[0], reference[1], reference[2]))
+        accuracy = camera.reference_accuracy
+        samples.append({"label": camera.label, "reference": reference,
+                        "east": enu[0], "north": enu[1], "up": enu[2],
+                        "sigma": (tuple(float(v) for v in accuracy)
+                                  if accuracy is not None else None),
+                        "rtk_flag": camera.reference_rtk_flag})
+    if not samples:
+        return {"threshold": threshold, "cameras": 0, "flagged_count": 0,
+                "flagged": [], "fix_status_counts": {}}
+
+    # Project onto the local flight direction, exactly as camera_consistency
+    # does, so a flagged camera's along-track residual is available too.
+    ordered = sorted(samples, key=lambda item: item["label"])
+    origin = ordered[0]["reference"]
+    track = {item["label"]: geodetic_to_enu(
+        item["reference"][0], item["reference"][1], item["reference"][2], origin)
+        for item in ordered}
+    for index, item in enumerate(ordered):
+        previous = ordered[max(0, index - 1)]["label"]
+        following = ordered[min(len(ordered) - 1, index + 1)]["label"]
+        dx = track[following][0] - track[previous][0]
+        dy = track[following][1] - track[previous][1]
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            continue
+        hx, hy = dx / norm, dy / norm
+        item["along"] = item["east"] * hx + item["north"] * hy
+        item["cross"] = item["east"] * -hy + item["north"] * hx
+
+    flagged = []
+    for item in ordered:
+        sigma = item["sigma"]
+        if sigma is None or not all(math.isfinite(s) and s > 0.0 for s in sigma):
+            continue
+        values = (item["east"], item["north"], item["up"])
+        z_scores = [value / sigma[axis] for axis, value in enumerate(values)]
+        worst = max(abs(value) for value in z_scores)
+        if worst <= threshold:
+            continue
+        flagged.append({
+            "label": item["label"],
+            "east_m": item["east"], "north_m": item["north"],
+            "up_m": item["up"],
+            "sigma_m": list(sigma),
+            "z_east": z_scores[0], "z_north": z_scores[1], "z_up": z_scores[2],
+            "max_abs_z": worst,
+            "rtk_flag": item["rtk_flag"],
+            "along_track_m": item.get("along"),
+            "cross_track_m": item.get("cross"),
+        })
+    status_counts = {}
+    for entry in flagged:
+        key = "none" if entry["rtk_flag"] is None else str(entry["rtk_flag"])
+        status_counts[key] = status_counts.get(key, 0) + 1
+    flagged.sort(key=lambda entry: entry["max_abs_z"], reverse=True)
+    return {"threshold": threshold, "cameras": len(samples),
+            "flagged_count": len(flagged),
+            "labels": [entry["label"] for entry in flagged],
+            "flagged": flagged[:OUTLIER_DETAIL_LIMIT],
+            "detail_truncated": len(flagged) > OUTLIER_DETAIL_LIMIT,
+            "fix_status_counts": status_counts}
+
+
+def summarise_outliers(records):
+    """Collapse per-fold outlier reports into the variant's summary.
+
+    ``unique_labels`` is the union over folds, ``repeat_labels`` those flagged
+    in more than one fold (a systematic camera, not a one-fold artefact), and
+    ``fix_status_counts`` sums the GNSS solution codes of every flagged camera
+    appearance so a correlation with fix status is readable at a glance.
+    """
+    by_fold = {record.get("check"): list(record.get("labels", []))
+               for record in records}
+    appearances = {}
+    statuses = {}
+    for record in records:
+        for label in record.get("labels", []):
+            appearances[label] = appearances.get(label, 0) + 1
+        for key, count in record.get("fix_status_counts", {}).items():
+            statuses[key] = statuses.get(key, 0) + count
+    repeat = sorted(label for label, count in appearances.items() if count > 1)
+    return {
+        "folds": len(records),
+        "threshold": records[0]["threshold"],
+        "camera_folds": sum(record["cameras"] for record in records),
+        "flagged_camera_folds": sum(record["flagged_count"] for record in records),
+        "unique_labels": sorted(appearances),
+        "repeat_labels": repeat,
+        "fix_status_counts": statuses,
+        "all_fixed": set(statuses) <= {"34", "50"},
+        "by_fold": by_fold,
+    }
+
+
+def annotate_outlier_timing(variants, timing):
+    """Turn each variant's along-track outliers into an implied latency.
+
+    ``along_track_m / block_speed`` is the time offset that would produce the
+    measured along-track lead: near zero means the outliers are not a timing
+    artefact, while a consistent, physically sensible value would be. Both the
+    flagged cameras and the whole block are reported, so the two can be
+    compared. The speed is the block median from the event-mark track.
+    """
+    speed = timing.get("block_speed_m_s")
+    if not speed:
+        return
+    for data in variants.values():
+        outliers = data.get("prior_outliers")
+        if not outliers:
+            continue
+        flagged_latencies = []
+        for fold in data.get("folds", []):
+            record = fold.get("prior_outliers")
+            if not record:
+                continue
+            for entry in record["flagged"]:
+                if entry.get("along_track_m") is not None:
+                    flagged_latencies.append(entry["along_track_m"] / speed)
+        block_latencies = []
+        for fold in data.get("folds", []):
+            consistency = fold.get("camera_consistency") or {}
+            along = consistency.get("mean_along_track_m")
+            if along is not None:
+                block_latencies.append(along / speed)
+        data["outlier_timing"] = {
+            "speed_m_s": speed,
+            "flagged_implied_latency_median_s": _median(flagged_latencies),
+            "flagged_implied_latency_max_abs_s": (
+                max(abs(value) for value in flagged_latencies)
+                if flagged_latencies else None),
+            "flagged_with_along": len(flagged_latencies),
+            "block_implied_latency_median_s": _median(block_latencies),
+        }
 
 
 def matrix_determinant(matrix):
@@ -1659,11 +2207,17 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
         except Exception as error:  # noqa: BLE001 - recorded, never fatal
             refine = {"error": str(error)}
 
+    accuracy = options.get("camera_accuracy", args.camera_accuracy)
+    along_shift = options.get("along_shift_m", 0.0)
     with tempfile.TemporaryDirectory() as directory:
         if camera_refs:
-            import_camera_references_for_block(
-                chunk, options.get("camera_accuracy", args.camera_accuracy),
-                directory)
+            # Per-image mode without a shift needs no re-import: AddPhotos with
+            # load_xmp_accuracy already stored each camera's own accuracy (and
+            # the non-fixed rule applied there). Re-importing the same rows
+            # would only round positions through the CSV.
+            if accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift:
+                import_camera_references_for_block(
+                    chunk, accuracy, directory, along_shift)
         else:
             for camera in chunk.cameras:
                 camera.reference_enabled = False
@@ -1717,8 +2271,16 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             # whether or not one was applied. On the GCP-only variant this is
             # the leak-free per-fold estimate the antenna variants reuse.
             "antenna_offset": camera_frame_antenna_offsets(chunk)}
+    if camera_refs:
+        fold["camera_accuracy"] = camera_accuracy_summary(chunk)
+        fold["prior_outliers"] = camera_prior_outliers(
+            chunk, options.get("antenna_offset_m"),
+            options.get("outlier_threshold", OUTLIER_SIGMA_THRESHOLD))
     if antenna is not None:
         fold["antenna_applied_m"] = list(antenna)
+    if along_shift:
+        fold["timing"] = {"along_shift_m": along_shift,
+                          "latency_s": options.get("timing_latency_s")}
     if refine is not None:
         fold["refine_markers"] = refine
     return fold
@@ -1788,23 +2350,32 @@ def summarise_antenna(measured):
 
 
 def run_variant(args, gcps, align_report, camera_refs, options=None,
-                catch_all=False, estimates=None):
+                catch_all=False, estimates=None, timing=None):
     """Run the leave-one-out folds of one variant and summarise them.
 
     ``estimates`` maps a check label to the camera-frame lever arm measured on
     the SAME fold's GCP-only adjustment (``antenna_offset.mean_m``). An
     ``estimated_antenna`` option applies that fold's value; the held-out point
     never enters it because the GCP-only fit constrains only the other GCPs.
+
+    ``timing`` maps a check label to the along-track lead (metres) of the same
+    fold's GCP-only adjustment. An ``estimated_timing`` option removes that
+    lead from every camera position (speed x latency, with the latency derived
+    from the block speed and the control-only lead), and records the implied
+    latency on the fold. Same leak-free construction as the antenna estimate.
     """
     options = options or {}
     if options.get("estimated_antenna") and not estimates:
         raise ValueError(
             "estimated_antenna needs the GCP-only per-fold estimates")
+    if options.get("estimated_timing") and not timing:
+        raise ValueError(
+            "estimated_timing needs the GCP-only per-fold along-track leads")
     folds = []
     for check_index in range(len(gcps)):
         fold_options = options
+        label = gcps[check_index]["label"]
         if options.get("estimated_antenna"):
-            label = gcps[check_index]["label"]
             estimate = estimates.get(label)
             if estimate is None:
                 raise ValueError(
@@ -1812,6 +2383,17 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
             fold_options = dict(options)
             fold_options.pop("estimated_antenna", None)
             fold_options["antenna_offset_m"] = tuple(estimate)
+        if options.get("estimated_timing"):
+            lead = timing.get(label)
+            if lead is None:
+                raise ValueError(
+                    "no GCP-only along-track lead for check " + label)
+            fold_options = dict(fold_options)
+            fold_options.pop("estimated_timing", None)
+            speed = fold_options.pop("timing_speed_m_s", None)
+            fold_options["along_shift_m"] = lead
+            if speed:
+                fold_options["timing_latency_s"] = lead / speed
         try:
             folds.append(run_fold(args, gcps, check_index, camera_refs,
                                   align_report, fold_options))
@@ -1856,6 +2438,27 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     antenna = summarise_antenna(measured)
     if antenna:
         variant["antenna_estimates"] = antenna
+    if measured and "camera_accuracy" in measured[0]:
+        # The weights do not change between folds, so the first fold's
+        # distribution describes the variant.
+        variant["camera_accuracy"] = measured[0]["camera_accuracy"]
+    # The fold record carries the diagnostics under its own check label; the
+    # summary groups by it. (camera_prior_outliers itself has no fold identity.)
+    outliers = [dict(fold["prior_outliers"], check=fold["check"])
+                for fold in measured if "prior_outliers" in fold]
+    if outliers:
+        variant["prior_outliers"] = summarise_outliers(outliers)
+    timing_folds = [fold["timing"] for fold in measured if "timing" in fold]
+    if timing_folds:
+        latencies = [item["latency_s"] for item in timing_folds
+                     if item.get("latency_s") is not None]
+        variant["timing"] = {
+            "folds": len(timing_folds),
+            "mean_along_shift_m": sum(item["along_shift_m"]
+                                      for item in timing_folds) / len(timing_folds),
+            "mean_latency_s": (sum(latencies) / len(latencies)
+                               if latencies else None),
+        }
     return variant
 
 
@@ -1896,6 +2499,16 @@ DIAGNOSTIC_VARIANTS = (
     ("antenna_estimated_adaptive_px_minus", True,
      {"estimated_antenna": True, "adaptive_fitting": True,
       "projection_shift_px": -0.5}),
+    # Per-image accuracy probes. Only run when the block was imported in
+    # per-image mode (otherwise AddPhotos stored no XMP accuracy and the option
+    # would silently fall back to the 10 m default). Each is report-only.
+    ("camera_rtk_per_image_adaptive", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "adaptive_fitting": True}),
+    ("camera_rtk_per_image_antenna_estimated", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "estimated_antenna": True}),
+    ("camera_rtk_per_image_antenna_estimated_adaptive", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "estimated_antenna": True,
+      "adaptive_fitting": True}),
 )
 
 
@@ -1922,7 +2535,36 @@ def run_real_odm(args):
             for fold in variants[variant_name]["folds"]
             if "error" not in fold and fold.get("antenna_offset")}
 
+    def per_fold_leads(variant_name):
+        """The along-track lead measured on one variant's folds, metres."""
+        return {
+            fold["check"]: fold["camera_consistency"]["mean_along_track_m"]
+            for fold in variants[variant_name]["folds"]
+            if "error" not in fold and fold.get("camera_consistency")
+            and fold["camera_consistency"].get("mean_along_track_m") is not None}
+
     align_report = align_block(args, images, gcps)
+    # Timing needs the aligned cameras' stored positions only; it is popped so
+    # the 176-row helper list never reaches the JSON report.
+    reference_rows = align_report.pop("_reference_rows", [])
+    per_image_mode = args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE
+    uniform_accuracy = parse_camera_accuracy(args.camera_accuracy_uniform)
+    timing = None
+    if args.mrk:
+        records = parse_mrk(args.mrk)
+        if not records:
+            raise ValueError("--mrk {} holds no usable exposure records".format(
+                args.mrk))
+        timing = analyse_timing(reference_rows, images, records)
+        print("[gcp validation] timing: {} exposures matched, event vs exposure "
+              "RMS {:.6f} s (max {:.6f} s), trigger -> exposure median "
+              "{:.6f} s, block speed median {:.3f} m/s, fix statuses {}".format(
+                  timing.get("matched_cameras", 0),
+                  timing.get("event_vs_exposure_rms_s", float("nan")),
+                  timing.get("event_vs_exposure_max_abs_s", float("nan")),
+                  timing.get("trigger_to_exposure_median_s", float("nan")),
+                  timing.get("block_speed_m_s") or float("nan"),
+                  timing.get("fix_status_counts")))
     antenna = parse_antenna_offset(args.antenna_offset)
     variants = {}
     # GCPs only first: its per-fold adjustment is the leak-free source of the
@@ -1940,7 +2582,14 @@ def run_real_odm(args):
     if antenna is not None:
         camera_options["antenna_offset_m"] = antenna
     variants["camera_rtk_gcps"] = run_variant(
-        args, gcps, align_report, True, camera_options or None)
+        args, gcps, align_report, True, camera_options)
+    # In per-image mode the same alignment is also refitted with one uniform
+    # weight, so the per-image effect and the weight effect are separable in a
+    # single run. Report-only.
+    if per_image_mode:
+        variants["camera_rtk_uniform"] = run_variant(
+            args, gcps, align_report, True,
+            {"camera_accuracy": uniform_accuracy}, catch_all=True)
     # The mount is estimated from the ADAPTIVE GCP-only adjustment, not the
     # default one: with the thin default lens model the GCP-only fit trades
     # focal length against distortion and puts the camera centres 3.3 m below
@@ -1948,16 +2597,53 @@ def run_real_odm(args):
     # adaptive fit removes that trade and leaves the ~0.2 m mount.
     applied_estimates = default_estimates
     if args.diagnostics:
+        selected = set(args.diagnostic_variants) if args.diagnostic_variants else None
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
-            if options.get("estimated_antenna") and variant.startswith(
-                    "antenna_estimated"):
-                if variants.get("adaptive_fitting") is not None:
-                    adaptive = per_fold_estimates("adaptive_fitting")
-                    if adaptive:
-                        applied_estimates = adaptive
+            if selected is not None and variant not in selected:
+                continue
+            if (options.get("camera_accuracy") == CAMERA_ACCURACY_PER_IMAGE
+                    and not per_image_mode):
+                # AddPhotos stored no XMP accuracy in a uniform run, so this
+                # probe would silently weight at the 10 m default.
+                continue
+            if options.get("estimated_antenna") and variants.get(
+                    "adaptive_fitting") is not None:
+                adaptive = per_fold_estimates("adaptive_fitting")
+                if adaptive:
+                    applied_estimates = adaptive
             variants[variant] = run_variant(
                 args, gcps, align_report, camera_refs, options,
                 catch_all=True, estimates=applied_estimates)
+        # The timing probe needs an event-mark log to know the speed; without
+        # one there is nothing to estimate a latency from.
+        if timing and timing.get("block_speed_m_s"):
+            source = ("adaptive_fitting"
+                      if variants.get("adaptive_fitting") else "gcps_only")
+            leads = per_fold_leads(source)
+            if leads:
+                name = ("camera_rtk_per_image_timing_shift" if per_image_mode
+                        else "camera_rtk_timing_shift")
+                variants[name] = run_variant(
+                    args, gcps, align_report, True,
+                    {"camera_accuracy": args.camera_accuracy,
+                     "estimated_timing": True,
+                     "timing_speed_m_s": timing["block_speed_m_s"]},
+                    catch_all=True, estimates=applied_estimates, timing=leads)
+    if timing:
+        annotate_outlier_timing(variants, timing)
+    accuracy_summary = variants["camera_rtk_gcps"].get("camera_accuracy")
+    if accuracy_summary:
+        print("[gcp validation] camera accuracy ({}): {} cameras, {} still on "
+              "the 10 m default; east {:.4f}-{:.4f} m, north {:.4f}-{:.4f} m, "
+              "up {:.4f}-{:.4f} m".format(
+                  args.camera_accuracy, accuracy_summary["cameras"],
+                  accuracy_summary["uniform_defaults"],
+                  accuracy_summary.get("east", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("east", {}).get("max_m", float("nan")),
+                  accuracy_summary.get("north", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("north", {}).get("max_m", float("nan")),
+                  accuracy_summary.get("up", {}).get("min_m", float("nan")),
+                  accuracy_summary.get("up", {}).get("max_m", float("nan"))))
     for variant, data in variants.items():
         consistency = data.get("camera_consistency")
         if not consistency:
@@ -1970,6 +2656,27 @@ def run_real_odm(args):
                   consistency["mean_north_m"], consistency["mean_up_m"],
                   consistency["rms_east_m"], consistency["rms_north_m"],
                   consistency["rms_up_m"], consistency["cameras"]))
+    for variant, data in variants.items():
+        outliers = data.get("prior_outliers")
+        if not outliers:
+            continue
+        message = (
+            "[gcp validation] prior outliers ({}, > {:.1f} sigma): "
+            "{}/{} camera-folds, {} unique cameras, fix statuses {}".format(
+                variant, outliers["threshold"],
+                outliers["flagged_camera_folds"], outliers["camera_folds"],
+                len(outliers["unique_labels"]), outliers["fix_status_counts"]))
+        if outliers["repeat_labels"]:
+            message += ", in every flagged fold: {}".format(
+                ",".join(outliers["repeat_labels"][:8]))
+        print(message)
+        timing_record = data.get("outlier_timing")
+        if timing_record:
+            print("[gcp validation] outlier timing ({}, speed {:.3f} m/s): "
+                  "flagged implied latency median {} s, block median {} s".format(
+                      variant, timing_record["speed_m_s"],
+                      timing_record["flagged_implied_latency_median_s"],
+                      timing_record["block_implied_latency_median_s"]))
     # Print the per-fold lever-arm estimate the estimated variants apply: a
     # reader can see whether the mount is stable across folds.
     estimate_source = "adaptive" if args.diagnostics else "default"
@@ -1994,8 +2701,12 @@ def run_real_odm(args):
         "align": align_report,
         "variants": variants,
         "diagnostics": bool(args.diagnostics),
-        "camera_accuracy_m": args.camera_accuracy,
+        "camera_accuracy": args.camera_accuracy,
+        "camera_accuracy_uniform_fallback_m": uniform_accuracy,
         "marker_accuracy_m": args.marker_accuracy,
+        # Named to avoid the benchmark runner's own top-level "timing" block
+        # (stage wall times), which it adds to every dataset's report.
+        "gnss_timing": timing,
         "antenna_offset_m": list(antenna) if antenna is not None else None,
         "antenna_estimates_m": applied_estimates,
         "antenna_estimate_source": estimate_source,
@@ -2053,14 +2764,29 @@ def parse_args(argv):
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
                              "antenna lever arms); report-only")
+    parser.add_argument("--camera-accuracy", default="0.05",
+                        help="camera reference accuracy for the camera_rtk_gcps "
+                             "variant: 'per-image' uses each photo's XMP RTK "
+                             "standard deviations and fix status (AddPhotos "
+                             "load_xmp_accuracy), a number of metres gives every "
+                             "camera the same weight (the uniform baseline)")
+    parser.add_argument("--camera-accuracy-uniform", default="0.05",
+                        help="uniform accuracy in metres used by the "
+                             "camera_rtk_uniform comparison variant when "
+                             "--camera-accuracy is per-image")
+    parser.add_argument("--mrk", metavar="PATH",
+                        help="per-exposure event-mark (.mrk) log; enables the "
+                             "timing comparison and the along-track timing probe")
+    parser.add_argument("--diagnostic-variants", default="",
+                        help="comma-separated allowlist of diagnostic variant "
+                             "names to run instead of all of them (the base "
+                             "variants and the timing probe always run); e.g. "
+                             "'adaptive_fitting,camera_rtk_per_image_adaptive'")
     parser.add_argument("--adaptive-fitting", action="store_true",
                         help="run the two standard variants (gcps_only and "
                              "camera_rtk_gcps) with the adaptive calibration "
                              "model, the same configuration the benchmark's "
                              "adaptive_fitting dispatch parameter selects")
-    parser.add_argument("--camera-accuracy", type=float, default=0.05,
-                        help="camera reference accuracy in metres for the "
-                             "camera_rtk_gcps variant (the RTK block's stated value)")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
     parser.add_argument("--antenna-offset", default="",
@@ -2102,6 +2828,24 @@ def parse_args(argv):
         parser.error("noise magnitudes must not be negative")
     if not 0.0 < args.tolerance < 1.0:
         parser.error("--tolerance must be between 0 and 1 metre")
+    try:
+        args.camera_accuracy = parse_camera_accuracy(args.camera_accuracy)
+        args.camera_accuracy_uniform = parse_camera_accuracy(
+            args.camera_accuracy_uniform)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.camera_accuracy_uniform == CAMERA_ACCURACY_PER_IMAGE:
+        parser.error("--camera-accuracy-uniform must be a number of metres")
+    if args.diagnostic_variants:
+        names = [name.strip() for name in args.diagnostic_variants.split(",")
+                 if name.strip()]
+        known = {name for name, _, _ in DIAGNOSTIC_VARIANTS}
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            parser.error("unknown --diagnostic-variants: " + ", ".join(unknown))
+        args.diagnostic_variants = names
+    else:
+        args.diagnostic_variants = []
     return args
 
 

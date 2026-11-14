@@ -228,6 +228,7 @@ element; a payload attribute is only emitted when the slot holds a payload.
 | `reference` | `pitch` | float | only together when orientation is recorded | pitch, degrees |
 | `reference` | `roll` | float | only together when orientation is recorded | roll, degrees |
 | `reference` | `rotation_accuracy` | v3 | only when set | rotation accuracy, degrees |
+| `reference` | `rtk_flag` | int | only when the source reported a fix status | GNSS solution status (50 fixed, 34 float) |
 | `reference` | `enabled` | bool | always, when the element is present | reference is used |
 | `reference` | `camera_location_accuracy` | float | always, on the chunk element | chunk-level camera weight |
 | `reference` | `camera_rotation_accuracy` | float | always, on the chunk element | chunk-level rotation weight |

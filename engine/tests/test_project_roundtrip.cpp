@@ -173,6 +173,7 @@ Document build_rich_document() {
     // round-trip bit-exactly.
     c1.reference.location = Eigen::Vector3d(-122.4194, 37.7749, 12.25);
     c1.reference.accuracy = Eigen::Vector3d(0.03, 0.03, 0.07);
+    c1.reference.rtk_flag = 50;
     c1.reference.enabled = false;
     chunk.cameras().push_back(c1);
 
@@ -997,6 +998,12 @@ TEST_F(TempDir, ReferenceAccuracySurvivesRoundTrip) {
     ASSERT_EQ(cameras.size(), 3U);
     EXPECT_EQ(cameras[0].reference.accuracy, Eigen::Vector3d(10.0, 10.0, 10.0));
     EXPECT_EQ(cameras[1].reference.accuracy, Eigen::Vector3d(0.03, 0.03, 0.07));
+    // The GNSS fix status is provenance for the accuracy: present on the
+    // camera that carried one, and absent (not 0) on the others.
+    EXPECT_FALSE(cameras[0].reference.rtk_flag.has_value());
+    ASSERT_TRUE(cameras[1].reference.rtk_flag.has_value());
+    EXPECT_EQ(*cameras[1].reference.rtk_flag, 50);
+    EXPECT_FALSE(cameras[2].reference.rtk_flag.has_value());
 }
 
 TEST_F(TempDir, MissingMatchesSidecarFailsOnLoad) {

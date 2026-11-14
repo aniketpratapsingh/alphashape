@@ -103,6 +103,36 @@ edit:
 
 Smaller numbers mean more confidence and a stronger pull on the solution.
 
+### Per-photo GNSS accuracy and fix status
+
+RTK drone photos usually carry a per-photo position accuracy in their XMP
+packet. Give it to `AddPhotos` and each camera is weighted by its own solution
+instead of the 10 m consumer default:
+
+```python
+doc.run_task("AddPhotos", filenames=photos, load_xmp_accuracy=True)
+camera = chunk.cameras[0]
+print(camera.reference_accuracy)   # (east, north, up) metres
+print(camera.reference_rtk_flag)   # 50 fixed, 34 float, None if not reported
+```
+
+The import rule, in order:
+
+- a fixed (50) or float (34) solution uses the reported `RtkStdLon`,
+  `RtkStdLat` and `RtkStdHgt` directly as the east/north/up accuracies;
+- any other reported status (single-point GNSS, for example) keeps the
+  position but its accuracy is raised to at least **0.5 m per axis**, so a
+  metre-level fix cannot outvote centimetre survey control;
+- a packet with standard deviations but no status uses them as written;
+- a packet with no deviations leaves the accuracy at the chunk default (10 m).
+  The fix status is still stored as provenance.
+
+The same per-camera value can be set from a reference file: camera rows import
+`acc_x,acc_y,acc_z`, so `importReference` can carry a manually corrected
+accuracy. `camera.reference_accuracy` itself is read-only; a bare
+`(lon, lat, alt)` reference from EXIF without XMP accuracy keeps the chunk
+default.
+
 ## Control points and check points
 
 A control point is used by the adjustment; a check point is measured after it,
