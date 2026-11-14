@@ -746,3 +746,186 @@ Findings:
   5.31 cm (per-image + adaptive). The report-only −0.5 px probe reaches
   4.95 cm. The target is not met and is not loosened. Vertical is 12.22 cm in
   the same configuration, against 6.46 cm for GCPs-only adaptive.
+
+#### Block deformation from calibration–geometry coupling (2026-11-14, PR #120, run `43540658771`)
+
+This section tests the classic nadir-only parallel-strip failure mode: radial
+distortion and focal length/height correlate, an error in them bends the block
+into a smooth dome or bowl, and the check-point vertical error grows with the
+square of the distance from the block centre. The alignment and folds are the
+same protocol as the run above (146/176 cameras at 0.740 px, per-image camera
+accuracy, 0.015 m marker accuracy, 0.740 px alignment RMS). Every probe is
+report-only; no engine default changed.
+
+**Method.** Under `--diagnostics` each fold now also records
+
+* the adjusted calibration (all 13 coefficients) and the BA posterior standard
+  errors and f-to-coefficient correlations — `OptimizeCameras`'s
+  `camera_covariance` parameter is already on by default, and the 13x13
+  posterior covariance it produces is stored per sensor;
+* the check point's ENU position and its horizontal radius from the centroid of
+  the fold's aligned camera centres;
+* an ordinary-least-squares fit `vertical = a + b (r/100 m)^2` and a full
+  quadratic surface in east/north. The quadratic has six parameters and there
+  are five check points, so it is reported as **underdetermined** and no
+  coefficients are claimed for it; the four-parameter linear+radial fallback
+  has one residual degree of freedom and its t values are not usable either.
+  With five points the two-parameter radial fit has three degrees of freedom,
+  and a two-sided 5% test needs |t| > 3.18;
+* the same radial fit on `stored RTK position - adjusted camera centre` (up
+  component) for all 146 aligned cameras, which has 146 samples instead of 5;
+* the surveyed GCP convex-hull area against the hull of the camera centres.
+  The five GCPs span 773.9 m² (all are within 23 m of their centroid); the
+  camera-centre hull is 4560 m², a ratio of 0.170, and the block's maximum
+  radius is 50.7 m. The check points sit at r = 8.3–28.2 m, so they sample the
+  inner half of the block and a smooth block-wide bend has weak leverage on
+  them. This is exactly why the 146-camera fit is the decisive test.
+
+Sign convention: the camera residual is stored RTK minus adjusted centre, so a
+**bowl** (adjusted block high at the edges relative to the centre) gives b < 0
+in the camera fit and b > 0 in the check-point fit (adjusted minus reference);
+a dome is the opposite.
+
+The fixed-calibration workflow uses the new `Chunk.set_sensor_fixed_params`
+binding. Per fold it first runs the control-only GCP **adaptive** adjustment
+(camera references disabled, held-out point imported as a check point), reads
+that lens, marks all 13 coefficients fixed, re-imports the camera references,
+refits the datum and runs the camera-RTK adjustment with the lens frozen. The
+held-out check point never enters either fit, so the workflow is leak-free.
+Model-choice probes hold or free individual coefficients through the same
+`fit_*` flags (`camera_rtk_k1234` frees k1–k4 with b1/b2 off,
+`camera_rtk_f_fixed`, `camera_rtk_p_fixed`), and the weight probes re-import
+each camera at its reported per-image accuracy ×2 and ×5 with the marker sigma
+unchanged.
+
+**Dome fits.** Check-point fit: 5 points, 2 parameters (df = 3); camera fit:
+146 samples per fold; `b` is metres of height per (100 m)². A 0.5 m/(100 m)²
+slope is about 13 cm across this block's 50.7 m radius.
+
+| variant | check b | check t | check R² | camera b | camera t (per fold) | camera R² |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gcps_only` (default) | 2.82 | 1.80 | 0.52 | **−2.26** | **−3.53** [−3.95, −3.11] | 0.06–0.10 |
+| `gcps_only`, adaptive | 0.94 | 0.66 | 0.13 | +0.13 | +0.88 [+0.25, +1.48] | 0.00–0.02 |
+| `camera_rtk_gcps` (default) | 2.75 | 0.93 | 0.23 | −0.03 | −0.91 [−1.63, −0.20] | 0.00–0.02 |
+| `camera_rtk_adaptive` | 2.95 | 1.28 | 0.35 | +0.02 | +0.70 [0.00, +1.42] | 0.00–0.01 |
+| `camera_rtk_k1234` | 2.55 | 0.93 | 0.22 | −0.03 | −0.99 [−1.70, −0.15] | 0.00–0.02 |
+| `camera_rtk_f_fixed` | 3.99 | 1.64 | 0.47 | **+0.31** | **+4.74** [+4.50, +5.07] | 0.12–0.15 |
+| `camera_rtk_p_fixed` | 3.08 | 1.02 | 0.26 | −0.05 | −1.58 [−2.17, −0.92] | 0.01–0.03 |
+| weight ×2 | 3.23 | 1.10 | 0.29 | −0.07 | −1.45 [−2.82, −0.56] | 0.00–0.05 |
+| weight ×5 | 2.85 | 1.09 | 0.28 | −0.11 | −1.49 [−2.30, −1.04] | 0.01–0.04 |
+| fixed calibration | **4.55** | **3.30** | 0.78 | +0.03 | +0.53 [+0.13, +0.79] | 0.00–0.00 |
+
+The camera residual RMS (after its intercept) is what makes the amplitudes
+comparable: 45–53 cm for `gcps_only` default, 10–16 cm for GCP-only adaptive,
+1.8–1.9 cm for `camera_rtk_adaptive`, 2.2–2.3 cm for `camera_rtk_gcps`, and
+3.7–4.7 cm for the fixed-calibration variant. The default GCP-only fit's
+residual is not purely radial — a full quadratic in east/north explains 60–70%
+of it — but its radial term is significant in all five folds.
+
+**Calibration and correlations.** Mean over the five folds, with the per-fold
+range in brackets where it matters. `f` in pixels; `cx/cy/b1/b2` in pixels;
+`k1`–`k4` are the normalised radial terms.
+
+| coefficient | `gcps_only` default | `gcps_only` adaptive | `camera_rtk_gcps` | `camera_rtk_adaptive` |
+| --- | ---: | ---: | ---: | ---: |
+| f | 4457.30 | 4203.62 [4199.44, 4210.38] | 4217.48 | 4219.45 [4216.12, 4222.84] |
+| f posterior σ | ±5.0 | ±8.0 | ±1.1 | ±1.0 |
+| cx | −19.59 | −15.57 | −20.73 | −13.97 |
+| cy | **−77.15** | +22.00 | −10.06 | −2.70 |
+| k1 | 0.0520 | 0.02656 | 0.0538 | 0.02854 |
+| k2 | −0.2019 | 0 (not selected) | −0.1721 | 0 (not selected) |
+| k3 | 0.2633 | −0.1813 | 0.2029 | −0.2134 |
+| k4 | held | 0.2863 | held | 0.3376 |
+| b1 | held | −12.07 | held | −10.85 |
+| b2 | held | 0.97 [0, 2.45] | held | 1.31 [0, 1.92] |
+| p1 / p2 | −0.00127 / 0.00182 | −0.00106 / 0.00058 | −0.00154 / −0.00005 | −0.00086 / 0.00051 |
+| p3 / p4 | held | 0 / 0 | held | 0 / 0 |
+| corr(f, k1) | **+0.551** | +0.168 | +0.037 | +0.178 |
+| corr(f, k2) | −0.372 | — | +0.038 | — |
+| corr(f, k3) | +0.517 | −0.600 | +0.025 | −0.028 |
+| corr(f, cy) | −0.881 | **−0.957** | −0.558 | −0.564 |
+
+The coupling in this block is **f ↔ cy and f ↔ k1 in the default model**, not
+f ↔ k1 alone. In the default GCP-only fit f and k1 correlate at +0.55, cy
+drifts to −77 px, f sits 1.2% above the EXIF value, and the camera centres end
+up 3.45 m above the RTK positions with a significant radial bowl. The adaptive
+model replaces that trade with a large b1 (−12 px), k4 (0.29) and k3 (−0.18),
+drops the f–k1 correlation to 0.17, leaves f 4.5% below EXIF but determined to
+±8 px, removes the mean camera offset (0.23 m, the mount), and removes the
+radial bowl. In the camera-RTK fits the same extended solution has f determined
+to ±1 px and no radial residual. The strong f–cy correlation (−0.96 GCP-only,
+−0.56 camera-RTK) is the remaining weak direction; it is what makes the
+control-only focal length uncertain, and it is why the frozen lens below does
+not transfer.
+
+**Results.** Leave-one-out check RMS, horizontal / vertical / 3D, in cm. All
+variants are leak-free; the fixed-calibration lens comes from the fold's
+control-only fit.
+
+| variant | h | v | 3D |
+| --- | ---: | ---: | ---: |
+| `gcps_only` (default) | 7.91 | 10.15 | 12.87 |
+| `gcps_only`, adaptive | 6.54 | **6.46** | **9.19** |
+| `camera_rtk_gcps` (default) | 7.94 | 16.26 | 18.10 |
+| `camera_rtk_adaptive` | **5.31** | 12.22 | 13.32 |
+| `camera_rtk_k1234` | 7.93 | 15.58 | 17.48 |
+| `camera_rtk_f_fixed` | 29.21 | 170.92 | 173.40 |
+| `camera_rtk_p_fixed` | 8.40 | 16.85 | 18.83 |
+| weight ×2 | 7.91 | 17.06 | 18.80 |
+| weight ×5 | 6.91 | 15.70 | 17.15 |
+| fixed calibration from control GCPs, adaptive lens | 8.62 | 34.43 | 35.49 |
+
+Findings:
+
+- **Doming is confirmed for the default GCP-only model, as a bowl, and it is
+  removed by the extended lens model.** The 146-camera residual has a
+  significant negative radial slope in every fold (−2.26 m/(100 m)², t −3.1 to
+  −3.95, R² 6–10%). The five check points give a slope of the same sign
+  (+2.82): it implies 0.22 m at the outer check radius against the camera fit's
+  0.58 m at the 50.7 m block edge, but with five points and df = 3 it does not
+  reach significance (t 1.80 < 3.18). Adding b1/k4/k3 drops the camera slope to +0.13 (t 0.25–1.48,
+  not significant) and the check slope to +0.94 (t 0.66), and halves the
+  vertical RMS from 10.15 to 6.46 cm. The camera centres in the default fit are
+  also 3.45 m above the RTK positions; the adaptive fit leaves only the 0.23 m
+  mount.
+- **It is not the explanation for the camera-RTK vertical residual.** With
+  camera priors in play the block is anchored: the camera residual is 1.8–2.3 cm
+  RMS with no significant radial term (|t| ≤ 1.4 per fold, R² ≤ 2%), and the
+  check radial fit is not significant (t 0.93–1.28, and only 5 points). The
+  12.2 cm vertical RMS of `camera_rtk_adaptive` is not a function of radius:
+  checks 1 and 4 sit at r = 24.0 and 22.1 m yet differ by 14 cm in height, and
+  checks 2 and 4 at r = 17.5 and 22.1 m differ by 28 cm. The scatter is local
+  (azimuthal) inside the ~30x40 m survey patch, not a smooth bend. Loosening
+  the camera priors ×2/×5 makes the camera slope
+  slightly more negative (−0.07/−0.11, mean t ≈ −1.5) and moves the check from
+  7.94/16.26 to 6.91/15.70, so the weight balance is not the missing piece
+  either.
+- **Focal length must be free.** Holding f at its EXIF/initial value (4404.17
+  px) is catastrophic — 29.21 / 170.92 / 173.40 cm — because the block's
+  solution needs f ≈ 4217 px and a held focal length forces the height scale
+  wrong even though the camera centres still fit the RTK positions. It is also
+  the mirror image of the coupling: with f held the camera residual gains a
+  significant positive radial slope (+0.31, t 4.50–5.07, R² 12–15%), showing a
+  lens error does bend the camera network, but here a ~1.7 m uniform vertical
+  bias dominates the radial part. Freeing the radial terms alone (`k1234`) is
+  neutral (15.58 vertical), and holding the tangential terms is slightly worse
+  (16.85).
+- **The fixed-calibration workflow as specified does not work.** The
+  control-only adaptive lens (f 4203.6, cy +22.0, b1 −12.1, k4 0.286) is
+  overfitted to four control points in a 774 m² patch: b1 absorbs a −12 px
+  affine term, and freezing it and refitting to the camera positions gives
+  8.62 / 34.43 / 35.49 cm. The camera centres still fit the RTK positions
+  (1.2/1.3 cm east/north, 4.2 cm up RMS), but the triangulated ground surface is
+  bent by 0.2–0.56 m and the check radial fit becomes significant (+4.55,
+  t 3.30, R² 0.78). This is a
+  clean demonstration of the coupling mechanism — a wrong lens deforms the
+  surface while the cameras stay pinned — but the control-only calibration is
+  not transferable to the camera-RTK datum.
+- **The 5 cm horizontal target is not met by any leak-free setting.** The best
+  is `camera_rtk_adaptive` at **5.31 cm** (12.22 vertical), followed by
+  `gcps_only` adaptive at 6.54 cm (its vertical, 6.46 cm, is the best). Weight
+  ×5 reaches 6.91 cm. The target is not loosened. The check-point quadratic
+  surface is underdetermined at five points and the linear+radial fallback has
+  one degree of freedom, so neither supports a stronger claim than the radial
+  fit; the 146-camera fit is the one with power, and it says the standard
+  camera-RTK block does not dome.
