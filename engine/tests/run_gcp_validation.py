@@ -50,6 +50,8 @@ outside a temporary directory.
 """
 
 import argparse
+import calendar
+import datetime
 import faulthandler
 import json
 import math
@@ -76,6 +78,7 @@ WGS84_F = 1.0 / 298.257223563
 WGS84_E2 = 2.0 * WGS84_F - WGS84_F * WGS84_F
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
+ARCSEC_PER_RAD = 180.0 / math.pi * 3600.0
 
 
 def geodetic_to_ecef(lon_deg, lat_deg, height_m):
@@ -1290,6 +1293,35 @@ GCP_HEIGHT_CHOICES = ("ellipsoidal", "orthometric")
 GCP_PIXEL_ORIGINS = ("file", "format")
 GCP_PIXEL_ORIGIN_SHIFT_PX = {"file": 0.0, "format": 0.5}
 
+# Camera RTK positions and the surveyed GCPs can be expressed in two different
+# realizations of the same geodetic system. ETRS89 (what a European NTRIP
+# network such as SAPOS/EPOSA broadcasts) is a static frame fixed at epoch
+# 1989.0; WGS84(G2139)/ITRF2014 is the receiver's own global solution at the
+# capture epoch. At this site in 2022.4 those differ by about 0.85 m
+# horizontally. ``--frame-correction`` names the published transform to apply
+# to the camera references before the adjustment. "none" leaves the references
+# as imported (the historic behaviour). The two named directions are the
+# hypothesis and its mirror image; "empirical" removes the translation measured
+# on the same fold's control-only GCP adjustment, which needs no frame
+# assumption and uses no check point.
+FRAME_CORRECTION_CHOICES = (
+    "none",
+    "itrf2014-to-etrs89",
+    "etrs89-to-itrf2014",
+    "empirical",
+)
+# EPSG geographic 3D CRSs for the published transform. ITRF2014 (EPSG:7912) is
+# the frame WGS84(G2139) is aligned to; ETRS89 (EPSG:4258) is the static
+# European frame. PROJ resolves each pair to its time-dependent ETRF realization
+# and applies the epoch passed as the coordinate's ``t``.
+FRAME_CRS_EPSG = {
+    "itrf2014-to-etrs89": (7912, 4258),
+    "etrs89-to-itrf2014": (4258, 7912),
+}
+# GPS time is ahead of UTC by the leap seconds in force. 18 s covers every
+# epoch since 2017-01-01, which is the era this dataset comes from.
+GPS_UTC_LEAP_SECONDS = 18.0
+
 # A GNSS reference records the antenna phase centre, not the camera's
 # projection centre. The dataset carries no lever-arm field: the EXIF/XMP
 # records the antenna position (RtkFlag 50, RtkStdLon/Lat/Hgt) and the gimbal
@@ -1644,13 +1676,22 @@ def align_block(args, images, gcps):
             "camera_accuracy": args.camera_accuracy,
             "xmp_accuracy_imported":
                 args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE,
+            # The CRS each reference slot is interpreted in. Both are 4326:
+            # the protocol sets the chunk and the importers take lon/lat/height.
+            # EPSG:4326 carries no realization or coordinate epoch, which is
+            # exactly why a camera-vs-GCP frame difference is invisible to the
+            # engine and has to be tested and corrected here.
+            "camera_crs_epsg": chunk.camera_crs_epsg,
+            "marker_crs_epsg": chunk.marker_crs_epsg,
             "observations": skipped_observations(chunk, gcps),
             "_reference_rows": reference_rows}
 
 
 def import_camera_references_for_block(chunk, accuracy_m, directory,
                                        along_shift_m=0.0,
-                                       accuracy_scale=1.0):
+                                       accuracy_scale=1.0,
+                                       frame_shift_enu_m=None,
+                                       frame_transform=None):
     """Re-import every camera reference with the variant's accuracy/position.
 
     ``accuracy_m`` is a scalar for the uniform baseline or
@@ -1669,6 +1710,14 @@ def import_camera_references_for_block(chunk, accuracy_m, directory,
     camera's neighbours in label order. That is how the timing diagnostic
     applies a speed x latency correction. The direction is computed from the
     UNshifted track, so the two do not feed back into each other.
+
+    ``frame_transform`` converts each position into the GCP frame with the
+    published time-dependent transformation (``(lon, lat, height)`` in,
+    converted triple out). ``frame_shift_enu_m`` is the constant local
+    displacement measured as *reference minus adjusted centre* on the same
+    fold's control-only GCP adjustment; it is REMOVED from every position
+    (``reference - shift``), which is the direction that moves the camera
+    positions onto the GCP datum. That correction too is therefore leak-free.
     """
     cameras = []
     for camera in chunk.cameras:
@@ -1704,6 +1753,17 @@ def import_camera_references_for_block(chunk, accuracy_m, directory,
     for camera in cameras:
         reference = shifted.get(
             camera.label, tuple(float(v) for v in camera.reference))
+        lon, lat, height = (float(reference[0]), float(reference[1]),
+                            float(reference[2]))
+        if frame_transform is not None:
+            lon, lat, height = frame_transform(lon, lat, height)
+        if frame_shift_enu_m is not None:
+            # reference - shift: the measured offset (reference minus the
+            # GCP-frame adjusted centre) is removed, not added.
+            lon, lat, height = enu_to_geodetic(
+                (-float(frame_shift_enu_m[0]), -float(frame_shift_enu_m[1]),
+                 -float(frame_shift_enu_m[2])), (lon, lat, height))
+        reference = (lon, lat, height)
         if accuracy_m == CAMERA_ACCURACY_PER_IMAGE:
             accuracy = camera.reference_accuracy
             if accuracy is None:
@@ -2530,6 +2590,273 @@ def camera_frame_antenna_offsets(chunk):
     return {"cameras": len(samples), "mean_m": mean, "spread_m": spread}
 
 
+def gcp_frame_origin(gcps, check_index=None):
+    """Mean surveyed position of the control GCPs, as an ENU frame origin.
+
+    The frame origin only fixes the axes the translation is reported in; the
+    translation vector itself does not depend on it. The held-out point is
+    excluded so every per-fold diagnostic is computed from the fold's control
+    points alone.
+    """
+    rows = [gcp for index, gcp in enumerate(gcps) if index != check_index]
+    if not rows:
+        rows = list(gcps)
+    return (sum(gcp["lon"] for gcp in rows) / len(rows),
+            sum(gcp["lat"] for gcp in rows) / len(rows),
+            sum(gcp["height"] for gcp in rows) / len(rows))
+
+
+def solve_normal_equations(rows, values, parameters):
+    """Least-squares parameters from a design matrix and observations."""
+    normal = [[sum(row[a] * row[b] for row in rows) for b in range(parameters)]
+              for a in range(parameters)]
+    rhs = [sum(row[a] * value for row, value in zip(rows, values))
+           for a in range(parameters)]
+    inverse = invert_matrix(normal)
+    return [sum(inverse[a][b] * rhs[b] for b in range(parameters))
+            for a in range(parameters)]
+
+
+def camera_reference_frame_fit(chunk, origin):
+    """Translation and Helmert fit between adjusted centres and stored references.
+
+    Both coordinate sets are expressed in the local east/north/up frame of
+    ``origin`` (the fold's surveyed control points), so the translation is
+    directly readable as E/N/U in the frame the GCPs define. This is the test
+    for a reference-frame mismatch: if the camera RTK positions are in a
+    different realization (or epoch) of the geodetic system, the adjusted
+    centres --- placed by the GCP datum --- sit a constant distance from them,
+    and a translation of decimetres or more with a small residual after the fit
+    is that offset.
+
+    The translation-only fit removes a constant displacement and reports what
+    remains (mount, network distortion). The 7-parameter Helmert additionally
+    allows a rotation and a scale (`a = s R c + t`); with 146 cameras it is well
+    determined, and the rotation/scale tell a frame rotation from a pure
+    translation. Only cameras that took part in the adjustment are used. The
+    fit consumes no check point: on a GCP-only fold it is computed from the
+    control GCPs' adjustment alone.
+
+    Rotation components are the small-angle vector about the frame's E/N/U
+    axes (positive right-handed about each axis), in arcsec; scale is parts per
+    million (a frame realization difference has scale ~0).
+    """
+    samples = []
+    for camera in chunk.cameras:
+        reference = camera.reference
+        if not camera.enabled or reference is None:
+            continue
+        if not all(math.isfinite(float(value)) for value in reference):
+            continue
+        local = camera.center
+        transform = chunk.transform
+        centre_ecef = [
+            sum(float(transform[r][c]) * local[c] for c in range(3))
+            + float(transform[r][3]) for r in range(3)]
+        centre_enu = ecef_to_enu(centre_ecef, origin)
+        reference_enu = geodetic_to_enu(
+            float(reference[0]), float(reference[1]), float(reference[2]),
+            origin)
+        samples.append({"label": camera.label, "reference": reference_enu,
+                        "centre": centre_enu})
+    if len(samples) < 7:
+        return {"cameras": len(samples), "status": "underdetermined",
+                "note": "fewer aligned cameras than the 7 Helmert parameters"}
+
+    count = len(samples)
+    differences = [[sample["reference"][axis] - sample["centre"][axis]
+                    for axis in range(3)] for sample in samples]
+    translation = [sum(item[axis] for item in differences) / count
+                   for axis in range(3)]
+    translation_residuals = [
+        [item[axis] - translation[axis] for axis in range(3)]
+        for item in differences]
+    translation_rms_enu = [
+        math.sqrt(sum(item[axis] ** 2 for item in translation_residuals)
+                  / count) for axis in range(3)]
+    translation_rms = math.sqrt(sum(
+        sum(value * value for value in item)
+        for item in translation_residuals) / count)
+
+    centre_mean = [sum(sample["centre"][axis] for sample in samples) / count
+                   for axis in range(3)]
+    rows, values = [], []
+    for index, sample in enumerate(samples):
+        delta = differences[index]
+        x, y, z = [sample["centre"][axis] - centre_mean[axis]
+                   for axis in range(3)]
+        # Unknowns: t_x, t_y, t_z, theta_x, theta_y, theta_z, scale (1 + mu).
+        rows.append([1.0, 0.0, 0.0, 0.0, z, -y, x])
+        values.append(delta[0])
+        rows.append([0.0, 1.0, 0.0, -z, 0.0, x, y])
+        values.append(delta[1])
+        rows.append([0.0, 0.0, 1.0, y, -x, 0.0, z])
+        values.append(delta[2])
+    try:
+        parameters = solve_normal_equations(rows, values, 7)
+    except ValueError as error:
+        return {"cameras": count, "status": "singular", "note": str(error)}
+    helmert_residuals = []
+    for index, sample in enumerate(samples):
+        x, y, z = [sample["centre"][axis] - centre_mean[axis]
+                   for axis in range(3)]
+        theta = parameters[3:6]
+        predicted = [
+            parameters[0] + theta[1] * z - theta[2] * y + parameters[6] * x,
+            parameters[1] - theta[0] * z + theta[2] * x + parameters[6] * y,
+            parameters[2] + theta[0] * y - theta[1] * x + parameters[6] * z]
+        helmert_residuals.append(
+            [differences[index][axis] - predicted[axis] for axis in range(3)])
+    helmert_rms_enu = [
+        math.sqrt(sum(item[axis] ** 2 for item in helmert_residuals) / count)
+        for axis in range(3)]
+    helmert_rms = math.sqrt(sum(
+        sum(value * value for value in item)
+        for item in helmert_residuals) / count)
+    rotation_arcsec = [value * ARCSEC_PER_RAD for value in parameters[3:6]]
+    return {
+        "cameras": count,
+        "status": "ok",
+        "frame_origin_lon_lat_height": list(origin),
+        # Translation-only fit: the offset a frame mismatch produces.
+        "translation_m": translation,
+        "translation_horizontal_m": math.hypot(translation[0], translation[1]),
+        "translation_residual_rms_enu_m": translation_rms_enu,
+        "translation_residual_rms_m": translation_rms,
+        # 7-parameter Helmert: translation at the camera centroid, rotation and
+        # scale on top of it.
+        "helmert_translation_m": parameters[0:3],
+        "rotation_arcsec": rotation_arcsec,
+        "rotation_total_arcsec": math.sqrt(
+            sum(value * value for value in rotation_arcsec)),
+        "scale_ppm": parameters[6] * 1e6,
+        "helmert_residual_rms_enu_m": helmert_rms_enu,
+        "helmert_residual_rms_m": helmert_rms,
+    }
+
+
+def decimal_year_from_gps(week, time_s):
+    """Decimal year of a GPS week / time-of-week stamp, in UTC."""
+    moment = (datetime.datetime(1980, 1, 6)
+              + datetime.timedelta(weeks=int(week),
+                                   seconds=float(time_s) - GPS_UTC_LEAP_SECONDS))
+    start = datetime.datetime(moment.year, 1, 1)
+    days = 366.0 if calendar.isleap(moment.year) else 365.0
+    return moment.year + (moment - start).total_seconds() / 86400.0 / days
+
+
+def capture_epoch_from_images(images):
+    """Decimal year of the first image's EXIF capture time, or None.
+
+    Pillow is in the benchmark environment; a manual run without it simply
+    cannot derive an epoch and must pass ``--capture-epoch``.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    for path in images[:8]:
+        try:
+            with Image.open(path) as image:
+                exif = image.getexif()
+        except Exception:  # noqa: BLE001 - an unreadable image is not fatal
+            continue
+        # 36867 DateTimeOriginal, 36868 DateTimeDigitized, 306 DateTime.
+        for tag in (36867, 36868, 306):
+            value = exif.get(tag)
+            if not value:
+                continue
+            try:
+                moment = datetime.datetime.strptime(
+                    str(value).strip(), "%Y:%m:%d %H:%M:%S")
+            except ValueError:
+                continue
+            start = datetime.datetime(moment.year, 1, 1)
+            days = 366.0 if calendar.isleap(moment.year) else 365.0
+            return moment.year + (moment - start).total_seconds() / 86400.0 / days
+    return None
+
+
+def make_published_frame_transform(mode, epoch):
+    """Build the published time-dependent transform for ``mode``.
+
+    Returns ``(transform, description)``. ``transform`` takes
+    ``(lon, lat, height)`` in degrees and metres and returns the converted
+    triple. The epoch is the coordinate epoch (decimal year) passed to PROJ as
+    the point's time coordinate, so the plate motion between the static ETRS89
+    realization and the ITRF realization at capture is applied, not a nominal
+    constant. PROJ chooses the ETRF realization from its own database; the
+    description it reports is returned for the report.
+    """
+    if mode not in FRAME_CRS_EPSG:
+        raise ValueError("unknown frame correction " + str(mode))
+    if epoch is None:
+        raise ValueError(
+            "frame correction {} needs a capture epoch".format(mode))
+    try:
+        from pyproj import CRS
+        from pyproj.transformer import TransformerGroup
+    except ImportError as error:  # pragma: no cover - environment error
+        raise ValueError(
+            "--frame-correction needs pyproj in the protocol environment") from error
+    source, target = FRAME_CRS_EPSG[mode]
+    # The group lists PROJ's candidate operations; the first is the global
+    # time-dependent ETRF/ITRF realization pair (accuracy stated in its
+    # description). A plain Transformer's ``description`` is not populated for
+    # a CRS-to-CRS pair, so the group is also what gives the report a citable
+    # operation string.
+    group = TransformerGroup(
+        CRS.from_epsg(source), CRS.from_epsg(target), always_xy=True)
+    if not group.transformers:
+        raise ValueError(
+            "PROJ knows no {} operation between EPSG:{} and EPSG:{}".format(
+                mode, source, target))
+    operation = group.transformers[0]
+    description = operation.description
+
+    def transform(lon, lat, height):
+        out = operation.transform(lon, lat, height, tt=float(epoch))
+        return (float(out[0]), float(out[1]), float(out[2]))
+
+    return transform, description
+
+
+def published_frame_offsets(gcps, epoch):
+    """The published transform's displacement at this site, in E/N/U.
+
+    Evaluated on the surveyed points so the report states the expected size and
+    direction of each hypothesis at the capture epoch and the block's own
+    location. A frame offset should match this vector; a mount, a timing lag or
+    a lens error has a different signature.
+    """
+    origin = gcp_frame_origin(gcps)
+    result = {}
+    for mode in FRAME_CRS_EPSG:
+        try:
+            transform, description = make_published_frame_transform(mode, epoch)
+        except Exception as error:  # noqa: BLE001 - report, never fatal
+            result[mode] = {"error": str(error)}
+            continue
+        shifts = []
+        for gcp in gcps:
+            converted = transform(gcp["lon"], gcp["lat"], gcp["height"])
+            before = geodetic_to_enu(gcp["lon"], gcp["lat"], gcp["height"], origin)
+            after = geodetic_to_enu(converted[0], converted[1], converted[2],
+                                    origin)
+            shifts.append([after[axis] - before[axis] for axis in range(3)])
+        mean = [sum(item[axis] for item in shifts) / len(shifts)
+                for axis in range(3)]
+        result[mode] = {
+            "description": description,
+            "epoch": epoch,
+            "mean_enu_m": mean,
+            "horizontal_m": math.hypot(mean[0], mean[1]),
+            "max_horizontal_m": max(math.hypot(item[0], item[1])
+                                    for item in shifts),
+        }
+    return result
+
+
 def parse_antenna_offset(text):
     """A ``x,y,z`` antenna lever-arm string in metres, or None when empty."""
     if not text:
@@ -2665,6 +2992,20 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     accuracy = options.get("camera_accuracy", args.camera_accuracy)
     accuracy_scale = options.get("camera_accuracy_scale", 1.0)
     along_shift = options.get("along_shift_m", 0.0)
+    # Reference-frame correction. "published" converts every stored camera
+    # position with the time-dependent PROJ operation at the capture epoch;
+    # "empirical" removes the constant translation measured on this fold's
+    # control-only GCP adjustment (run_variant supplies it). Both are applied
+    # before the datum refit and the bundle adjustment, so the camera priors and
+    # the GCP datum share one frame. Which references actually moved is visible
+    # in camera_consistency below.
+    frame_mode = options.get("frame_correction")
+    frame_transform = None
+    frame_description = None
+    if frame_mode in FRAME_CRS_EPSG:
+        frame_transform, frame_description = make_published_frame_transform(
+            frame_mode, options.get("capture_epoch"))
+    frame_shift = options.get("frame_shift_enu_m")
     # The "fit on ground control, then keep that calibration" workflow: this
     # fold's control-only GCP adjustment supplies the lens, and the camera-RTK
     # adjustment that follows may not move it. The calibration source uses only
@@ -2711,9 +3052,12 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
                 # accuracy (and the non-fixed rule applied there). Re-importing
                 # the same rows would only round positions through the CSV.
                 if (accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift
-                        or accuracy_scale != 1.0):
+                        or accuracy_scale != 1.0
+                        or frame_transform is not None or frame_shift is not None):
                     import_camera_references_for_block(
-                        chunk, accuracy, directory, along_shift, accuracy_scale)
+                        chunk, accuracy, directory, along_shift, accuracy_scale,
+                        frame_shift_enu_m=frame_shift,
+                        frame_transform=frame_transform)
             else:
                 for camera in chunk.cameras:
                     camera.reference_enabled = False
@@ -2764,6 +3108,14 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             options.get("outlier_threshold", OUTLIER_SIGMA_THRESHOLD))
     if antenna is not None:
         fold["antenna_applied_m"] = list(antenna)
+    if frame_mode in FRAME_CRS_EPSG:
+        fold["frame_applied"] = {"mode": frame_mode,
+                                 "epoch": options.get("capture_epoch"),
+                                 "description": frame_description}
+    elif frame_shift is not None:
+        fold["frame_applied"] = {"mode": "empirical",
+                                 "shift_enu_m": list(frame_shift),
+                                 "applied_as": "reference minus shift"}
     if along_shift:
         fold["timing"] = {"along_shift_m": along_shift,
                           "latency_s": options.get("timing_latency_s")}
@@ -2777,6 +3129,16 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
         # one the regression gate has always compared.
         fold["calibration"] = calibration_records(chunk)
         fold["dome"] = fold_dome(chunk, gcps, labels[0], errors)
+        if not camera_refs and (args.diagnostics
+                                or args.frame_correction == "empirical"):
+            # On the GCP-only fold the adjusted centres are placed by the
+            # surveyed control points alone, so the fit against the stored RTK
+            # positions is exactly the frame test. (On a camera-referenced fold
+            # the cameras are pinned to those positions and the fit is
+            # trivially zero.) Computed for the empirical correction too, even
+            # without --diagnostics, because that variant needs the estimate.
+            fold["frame_fit"] = camera_reference_frame_fit(
+                chunk, gcp_frame_origin(gcps, check_index))
     return fold
 
 
@@ -2843,8 +3205,49 @@ def summarise_antenna(measured):
     return summary
 
 
+def summarise_frame_fit(measured):
+    """Per-fold frame fits and their stability across folds.
+
+    The per-fold translation and rotation are kept as measured; the summary
+    adds the mean and the min/max range of each axis. A frame offset is a
+    consistent value across folds (the four control subsets differ by one
+    point), so a tight range around a decimetre translation is the signature,
+    while a fold-to-fold swing of the same size as the value means the datum,
+    not a frame difference, is setting it.
+    """
+    records = [(fold["check"], fold["frame_fit"]) for fold in measured
+               if fold.get("frame_fit")]
+    if not records:
+        return None
+    summary = {"folds": len(records),
+               "per_fold": {label: record for label, record in records}}
+    for key, axes in (("translation_m", 3), ("rotation_arcsec", 3),
+                      ("helmert_translation_m", 3)):
+        values = [record[key] for _, record in records
+                  if record.get("status") == "ok" and record.get(key)]
+        if not values:
+            continue
+        summary[key + "_mean"] = [sum(item[axis] for item in values) / len(values)
+                                  for axis in range(axes)]
+        summary[key + "_min"] = [min(item[axis] for item in values)
+                                 for axis in range(axes)]
+        summary[key + "_max"] = [max(item[axis] for item in values)
+                                 for axis in range(axes)]
+    for key in ("translation_residual_rms_m", "helmert_residual_rms_m",
+                "translation_horizontal_m", "rotation_total_arcsec",
+                "scale_ppm"):
+        values = [record[key] for _, record in records
+                  if record.get("status") == "ok" and record.get(key) is not None]
+        if values:
+            summary[key + "_mean"] = sum(values) / len(values)
+            summary[key + "_min"] = min(values)
+            summary[key + "_max"] = max(values)
+    return summary
+
+
 def run_variant(args, gcps, align_report, camera_refs, options=None,
-                catch_all=False, estimates=None, timing=None):
+                catch_all=False, estimates=None, timing=None,
+                frame_shifts=None):
     """Run the leave-one-out folds of one variant and summarise them.
 
     ``estimates`` maps a check label to the camera-frame lever arm measured on
@@ -2857,6 +3260,13 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     lead from every camera position (speed x latency, with the latency derived
     from the block speed and the control-only lead), and records the implied
     latency on the fold. Same leak-free construction as the antenna estimate.
+
+    ``frame_shifts`` maps a check label to the E/N/U translation (metres) of
+    the same fold's GCP-only frame fit, measured as reference minus adjusted
+    centre. An ``estimated_frame_shift`` option removes it from every camera
+    reference, which moves the camera RTK positions onto the GCP datum without
+    assuming which realization they were recorded in. The held-out point is
+    not in the GCP-only fit, so it is leak-free.
     """
     options = options or {}
     if options.get("estimated_antenna") and not estimates:
@@ -2865,6 +3275,9 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     if options.get("estimated_timing") and not timing:
         raise ValueError(
             "estimated_timing needs the GCP-only per-fold along-track leads")
+    if options.get("estimated_frame_shift") and not frame_shifts:
+        raise ValueError(
+            "estimated_frame_shift needs the GCP-only per-fold frame shifts")
     folds = []
     for check_index in range(len(gcps)):
         fold_options = options
@@ -2888,6 +3301,14 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
             fold_options["along_shift_m"] = lead
             if speed:
                 fold_options["timing_latency_s"] = lead / speed
+        if options.get("estimated_frame_shift"):
+            shift = frame_shifts.get(label)
+            if shift is None:
+                raise ValueError(
+                    "no GCP-only frame shift for check " + label)
+            fold_options = dict(fold_options)
+            fold_options.pop("estimated_frame_shift", None)
+            fold_options["frame_shift_enu_m"] = tuple(shift)
         try:
             folds.append(run_fold(args, gcps, check_index, camera_refs,
                                   align_report, fold_options))
@@ -2932,6 +3353,9 @@ def run_variant(args, gcps, align_report, camera_refs, options=None,
     antenna = summarise_antenna(measured)
     if antenna:
         variant["antenna_estimates"] = antenna
+    frame_fit = summarise_frame_fit(measured)
+    if frame_fit:
+        variant["frame_fit"] = frame_fit
     dome = summarise_dome(measured)
     if dome:
         variant["dome"] = dome
@@ -3052,6 +3476,29 @@ DIAGNOSTIC_VARIANTS = (
     ("camera_rtk_per_image_weight_x5", True,
      {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
       "camera_accuracy_scale": 5.0}),
+    # Reference-frame probes (2026-11-14, report-only). The camera RTK
+    # positions and the surveyed GCPs can be in different realizations of the
+    # same geodetic system: ETRS89 (a European NTRIP network, fixed at epoch
+    # 1989.0) against WGS84(G2139)/ITRF2014 at the 2022.4 capture epoch, which
+    # is about 0.85 m horizontally at this site. The "published" pair applies
+    # PROJ's time-dependent ETRF/ITRF operation at the EXIF/mrk capture epoch
+    # in each direction, so the hypothesis and its mirror image are both
+    # measured. "estimated" removes the translation measured on the SAME fold's
+    # control-only GCP adjustment instead: it makes no frame assumption and is
+    # leak-free. The epoch is filled in at run time from the dataset's own
+    # capture time.
+    ("camera_rtk_frame_itrf_to_etrs", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE,
+      "frame_correction": "itrf2014-to-etrs89", "capture_epoch": None}),
+    ("camera_rtk_frame_itrf_to_etrs_adaptive", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "adaptive_fitting": True,
+      "frame_correction": "itrf2014-to-etrs89", "capture_epoch": None}),
+    ("camera_rtk_frame_etrs_to_itrf_adaptive", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "adaptive_fitting": True,
+      "frame_correction": "etrs89-to-itrf2014", "capture_epoch": None}),
+    ("camera_rtk_frame_estimated_adaptive", True,
+     {"camera_accuracy": CAMERA_ACCURACY_PER_IMAGE, "adaptive_fitting": True,
+      "estimated_frame_shift": True}),
 )
 
 
@@ -3086,6 +3533,15 @@ def run_real_odm(args):
             if "error" not in fold and fold.get("camera_consistency")
             and fold["camera_consistency"].get("mean_along_track_m") is not None}
 
+    def per_fold_frame_shifts(variant_name):
+        """The frame translation measured on one variant's GCP-only folds."""
+        record = variants.get(variant_name) or {}
+        return {
+            fold["check"]: fold["frame_fit"]["translation_m"]
+            for fold in record.get("folds", [])
+            if "error" not in fold and fold.get("frame_fit")
+            and fold["frame_fit"].get("status") == "ok"}
+
     align_report = align_block(args, images, gcps)
     # Timing needs the aligned cameras' stored positions only; it is popped so
     # the 176-row helper list never reaches the JSON report.
@@ -3093,6 +3549,7 @@ def run_real_odm(args):
     per_image_mode = args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE
     uniform_accuracy = parse_camera_accuracy(args.camera_accuracy_uniform)
     timing = None
+    records = []
     if args.mrk:
         records = parse_mrk(args.mrk)
         if not records:
@@ -3108,6 +3565,43 @@ def run_real_odm(args):
                   timing.get("trigger_to_exposure_median_s", float("nan")),
                   timing.get("block_speed_m_s") or float("nan"),
                   timing.get("fix_status_counts")))
+    # Capture epoch for the published frame transform: the coordinate epoch is
+    # what makes the ETRS89 <-> ITRF2014 transformation time-dependent. Take it
+    # from the dataset's own record (an explicit flag, then the RTK module's GPS
+    # event marks, then the EXIF capture time). Nothing is assumed when none is
+    # available: the published variants then report the reason they could not
+    # run rather than applying a nominal epoch.
+    capture_epoch = args.capture_epoch
+    capture_epoch_source = "flag" if capture_epoch is not None else None
+    if capture_epoch is None and records:
+        first = next((record for record in records
+                      if record.get("week") is not None), None)
+        if first is not None:
+            capture_epoch = decimal_year_from_gps(first["week"], first["time_s"])
+            capture_epoch_source = "mrk"
+    if capture_epoch is None:
+        capture_epoch = capture_epoch_from_images(images)
+        capture_epoch_source = "exif" if capture_epoch is not None else None
+    frame_summary = None
+    if args.diagnostics:
+        frame_summary = {"capture_epoch": capture_epoch,
+                         "capture_epoch_source": capture_epoch_source}
+        if capture_epoch is not None:
+            frame_summary["published"] = published_frame_offsets(
+                gcps, capture_epoch)
+        print("[gcp validation] frame: capture epoch {} ({})".format(
+            "{:.4f}".format(capture_epoch) if capture_epoch is not None
+            else "unknown", capture_epoch_source or "not derivable"))
+        for mode, record in (frame_summary.get("published") or {}).items():
+            if "mean_enu_m" in record:
+                print("[gcp validation] frame: {} is {:+.3f} / {:+.3f} / "
+                      "{:+.3f} m E/N/U at this site ({:.3f} m horizontal)".format(
+                          mode, record["mean_enu_m"][0],
+                          record["mean_enu_m"][1], record["mean_enu_m"][2],
+                          record["horizontal_m"]))
+            else:
+                print("[gcp validation] frame: {} unavailable: {}".format(
+                    mode, record.get("error", "unknown error")))
     antenna = parse_antenna_offset(args.antenna_offset)
     variants = {}
     # GCPs only first: its per-fold adjustment is the leak-free source of the
@@ -3121,11 +3615,18 @@ def run_real_odm(args):
     variants["gcps_only"] = run_variant(
         args, gcps, align_report, False, base_options)
     default_estimates = per_fold_estimates("gcps_only")
+    default_frame_shifts = per_fold_frame_shifts("gcps_only")
     camera_options = dict(base_options or {})
     if antenna is not None:
         camera_options["antenna_offset_m"] = antenna
+    if args.frame_correction in FRAME_CRS_EPSG:
+        camera_options["frame_correction"] = args.frame_correction
+        camera_options["capture_epoch"] = capture_epoch
+    elif args.frame_correction == "empirical":
+        camera_options["estimated_frame_shift"] = True
     variants["camera_rtk_gcps"] = run_variant(
-        args, gcps, align_report, True, camera_options)
+        args, gcps, align_report, True, camera_options,
+        frame_shifts=default_frame_shifts)
     # In per-image mode the same alignment is also refitted with one uniform
     # weight, so the per-image effect and the weight effect are separable in a
     # single run. Report-only.
@@ -3139,6 +3640,7 @@ def run_real_odm(args):
     # the antenna positions, which is a model artefact, not a mount. The
     # adaptive fit removes that trade and leaves the ~0.2 m mount.
     applied_estimates = default_estimates
+    applied_frame_shifts = default_frame_shifts
     if args.diagnostics:
         selected = set(args.diagnostic_variants) if args.diagnostic_variants else None
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
@@ -3149,14 +3651,24 @@ def run_real_odm(args):
                 # AddPhotos stored no XMP accuracy in a uniform run, so this
                 # probe would silently weight at the 10 m default.
                 continue
+            options = dict(options)
+            if "frame_correction" in options and options.get(
+                    "capture_epoch") is None:
+                options["capture_epoch"] = capture_epoch
             if options.get("estimated_antenna") and variants.get(
                     "adaptive_fitting") is not None:
                 adaptive = per_fold_estimates("adaptive_fitting")
                 if adaptive:
                     applied_estimates = adaptive
+            if options.get("estimated_frame_shift") and variants.get(
+                    "adaptive_fitting") is not None:
+                adaptive = per_fold_frame_shifts("adaptive_fitting")
+                if adaptive:
+                    applied_frame_shifts = adaptive
             variants[variant] = run_variant(
                 args, gcps, align_report, camera_refs, options,
-                catch_all=True, estimates=applied_estimates)
+                catch_all=True, estimates=applied_estimates,
+                frame_shifts=applied_frame_shifts)
         # The timing probe needs an event-mark log to know the speed; without
         # one there is nothing to estimate a latency from.
         if timing and timing.get("block_speed_m_s"):
@@ -3266,6 +3778,39 @@ def run_real_odm(args):
               "cameras vs RTK, camera frame x/y/z): "
               "{:.3f} / {:.3f} / {:.3f} m".format(
                   label, estimate_source, offset[0], offset[1], offset[2]))
+    # The frame test: the GCP-only adjusted centres against the stored camera
+    # positions. A consistent translation across folds is a frame offset.
+    for variant, data in variants.items():
+        frame_fit = data.get("frame_fit")
+        if not frame_fit:
+            continue
+        per_fold = frame_fit.get("per_fold") or {}
+        for label, record in per_fold.items():
+            if record.get("status") != "ok":
+                print("[gcp validation] frame fit ({}, {}): {}".format(
+                    variant, label, record.get("status")))
+                continue
+            print("[gcp validation] frame fit ({}, {}): translation "
+                  "E/N/U {:.3f} / {:.3f} / {:.3f} m, rotation "
+                  "{:.1f} / {:.1f} / {:.1f} arcsec, scale {:.2f} ppm, "
+                  "translation residual {:.3f} m, Helmert residual {:.3f} m".format(
+                      variant, label, record["translation_m"][0],
+                      record["translation_m"][1], record["translation_m"][2],
+                      record["rotation_arcsec"][0], record["rotation_arcsec"][1],
+                      record["rotation_arcsec"][2], record["scale_ppm"],
+                      record["translation_residual_rms_m"],
+                      record["helmert_residual_rms_m"]))
+        mean = frame_fit.get("translation_m_mean")
+        if mean:
+            print("[gcp validation] frame fit ({}): translation mean "
+                  "E/N/U {:.3f} / {:.3f} / {:.3f} m over {} folds".format(
+                      variant, mean[0], mean[1], mean[2],
+                      frame_fit.get("folds", 0)))
+    for label, shift in applied_frame_shifts.items():
+        print("[gcp validation] frame shift estimate ({}, reference minus "
+              "GCP-only adjusted centre, E/N/U; removed from every camera): "
+              "{:.3f} / {:.3f} / {:.3f} m".format(
+                  label, shift[0], shift[1], shift[2]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -3291,6 +3836,19 @@ def run_real_odm(args):
         "antenna_offset_m": list(antenna) if antenna is not None else None,
         "antenna_estimates_m": applied_estimates,
         "antenna_estimate_source": estimate_source,
+        # What each coordinate set is declared/interpreted as, the capture
+        # epoch, and the published transform's expected offset at this site.
+        "frame": {
+            "gcp_list_header": header,
+            "chunk_crs_epsg": 4326,
+            "camera_crs_epsg": align_report.get("camera_crs_epsg"),
+            "marker_crs_epsg": align_report.get("marker_crs_epsg"),
+            "capture_epoch": capture_epoch,
+            "capture_epoch_source": capture_epoch_source,
+            "correction": args.frame_correction,
+            "published": (frame_summary or {}).get("published"),
+            "shifts_m": applied_frame_shifts,
+        },
         "target_horizontal_m": target,
         "passed": passed,
     }
@@ -3345,9 +3903,10 @@ def parse_args(argv):
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
                              "antenna lever arms, model-choice and GCP-weight "
-                             "probes, fixed-calibration workflow) and report "
-                             "the per-fold calibration and block-doming fits; "
-                             "report-only")
+                             "probes, fixed-calibration workflow, published and "
+                             "empirical reference-frame corrections) and report "
+                             "the per-fold calibration, block-doming and "
+                             "camera-vs-RTK frame fits; report-only")
     parser.add_argument("--camera-accuracy", default="0.05",
                         help="camera reference accuracy for the camera_rtk_gcps "
                              "variant: 'per-image' uses each photo's XMP RTK "
@@ -3373,6 +3932,22 @@ def parse_args(argv):
                              "adaptive_fitting dispatch parameter selects")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
+    parser.add_argument("--frame-correction", choices=FRAME_CORRECTION_CHOICES,
+                        default="none",
+                        help="transform the camera references into the GCP "
+                             "frame before the adjustment (default none, the "
+                             "historic behaviour). 'itrf2014-to-etrs89' applies "
+                             "the published time-dependent transform for "
+                             "cameras recorded in WGS84(G2139)/ITRF2014 and GCPs "
+                             "in ETRS89; 'etrs89-to-itrf2014' is the mirror "
+                             "image; 'empirical' removes the translation "
+                             "measured on the same fold's control-only GCP "
+                             "adjustment. The published modes use "
+                             "--capture-epoch (or the mrk/EXIF capture time).")
+    parser.add_argument("--capture-epoch", type=float, default=None,
+                        help="coordinate epoch (decimal year) for the published "
+                             "frame transform; default: derived from the --mrk "
+                             "GPS event times, then the first image's EXIF")
     parser.add_argument("--antenna-offset", default="",
                         help="fixed GNSS antenna lever arm in metres in the "
                              "camera frame, 'x,y,z' (e.g. '0,0,-0.23' for an "
