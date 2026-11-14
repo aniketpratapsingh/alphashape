@@ -839,7 +839,7 @@ range in brackets where it matters. `f` in pixels; `cx/cy/b1/b2` in pixels;
 | b1 | held | −12.07 | held | −10.85 |
 | b2 | held | 0.97 [0, 2.45] | held | 1.31 [0, 1.92] |
 | p1 / p2 | −0.00127 / 0.00182 | −0.00106 / 0.00058 | −0.00154 / −0.00005 | −0.00086 / 0.00051 |
-| p3 / p4 | held | 0 / 0 | held | 0 / 0 |
+| p3 / p4 | held | not selected (0 / 0) | held | not selected (0 / 0) |
 | corr(f, k1) | **+0.551** | +0.168 | +0.037 | +0.178 |
 | corr(f, k2) | −0.372 | — | +0.038 | — |
 | corr(f, k3) | +0.517 | −0.600 | +0.025 | −0.028 |
@@ -912,8 +912,9 @@ Findings:
   (16.85).
 - **The fixed-calibration workflow as specified does not work.** The
   control-only adaptive lens (f 4203.6, cy +22.0, b1 −12.1, k4 0.286) is
-  overfitted to four control points in a 774 m² patch: b1 absorbs a −12 px
-  affine term, and freezing it and refitting to the camera positions gives
+  overfitted to four control points in a survey patch whose five-point hull is
+  only 774 m²: b1 absorbs a −12 px affine term, and freezing it and refitting
+  to the camera positions gives
   8.62 / 34.43 / 35.49 cm. The camera centres still fit the RTK positions
   (1.2/1.3 cm east/north, 4.2 cm up RMS), but the triangulated ground surface is
   bent by 0.2–0.56 m and the check radial fit becomes significant (+4.55,
