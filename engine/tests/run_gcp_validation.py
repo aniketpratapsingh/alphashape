@@ -1760,9 +1760,8 @@ def import_camera_references_for_block(chunk, accuracy_m, directory,
         if frame_shift_enu_m is not None:
             # reference - shift: the measured offset (reference minus the
             # GCP-frame adjusted centre) is removed, not added.
-            lon, lat, height = enu_to_geodetic(
-                (-float(frame_shift_enu_m[0]), -float(frame_shift_enu_m[1]),
-                 -float(frame_shift_enu_m[2])), (lon, lat, height))
+            lon, lat, height = remove_frame_shift(
+                lon, lat, height, frame_shift_enu_m)
         reference = (lon, lat, height)
         if accuracy_m == CAMERA_ACCURACY_PER_IMAGE:
             accuracy = camera.reference_accuracy
@@ -2604,6 +2603,18 @@ def gcp_frame_origin(gcps, check_index=None):
     return (sum(gcp["lon"] for gcp in rows) / len(rows),
             sum(gcp["lat"] for gcp in rows) / len(rows),
             sum(gcp["height"] for gcp in rows) / len(rows))
+
+
+def remove_frame_shift(lon, lat, height, shift_enu_m):
+    """Remove a measured reference-minus-datum translation from a position.
+
+    ``shift_enu_m`` is ``reference - adjusted centre`` in the local ENU frame.
+    The corrected reference is ``reference - shift``, i.e. the position moved
+    by the opposite vector. Kept as a named helper because the sign is the one
+    thing an empirical frame correction is easy to get backwards.
+    """
+    return enu_to_geodetic((-float(shift_enu_m[0]), -float(shift_enu_m[1]),
+                            -float(shift_enu_m[2])), (lon, lat, height))
 
 
 def solve_normal_equations(rows, values, parameters):
