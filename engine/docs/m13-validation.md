@@ -288,7 +288,8 @@ the mean height of the stored camera positions minus the adjusted centres;
 | gcps_only, `adaptive_fitting`, -0.5 px | 6.2 / **5.9** / **8.6** | -0.24 m | -4.5 % |
 | gcps_only, -0.5 px / +0.5 px | 7.3 / 8.9 / 11.5 — 8.6 / 11.7 / 14.5 | | |
 | gcps_only, marker sigma 0.25 / 1.0 px | 8.7 / 15.2 / 17.5 — 7.8 / 13.8 / 15.9 | | |
-| gcps_only, `refineMarkers` | 12.9 / 24.5 / 27.7 | | |
+| gcps_only, `refineMarkers` (fixed, 2026-11-15) | 7.9 / 10.2 / 12.9 | | |
+| gcps_only, `refineMarkers` + `adaptive_fitting` | 6.5 / 6.3 / 9.1 | | |
 | camera_rtk_gcps (default fit) | 7.5 / 16.8 / 18.4 | 0.00 m | -4.3 % |
 | camera_rtk_gcps, camera sigma 0.5 m | 7.1 / 17.4 / 18.8 | | |
 | camera_rtk_gcps, `adaptive_fitting` | 5.4 / 10.3 / 11.6 | 0.00 m | -4.2 % |
@@ -313,11 +314,77 @@ Findings:
   above the lens. Tested below with fixed and per-fold-estimated lever arms; the
   BA prior pins the mount, but the datum fit does not consume it, and the check
   does not improve.
-- **`refineMarkers` removes about half of the hand-placed projections** on these
-  targets and makes the result much worse — an engine issue, tracked separately.
+- **`refineMarkers` no longer touches these clicks.** The first run removed about
+  half of the projections and made the result much worse (12.9 / 24.5 / 27.7 cm).
+  The targets turn out to be printed 2x2 checkers whose quadrant crossing is on
+  the surveyor's click, so the refinement now declines to move them; see the
+  marker-refinement subsection below.
 - Ruled out: trigger/GNSS timing (no along-track pattern once the cameras are
   weighted), marker-vs-tie weight (0.5 px is best), unaligned cameras (1 of 35
   observations).
+
+#### Marker refinement on the real block (2026-11-15)
+
+The five GCPs are printed 2x2 checkerboards: two opposite quadrants white, the
+other two light grey, about 31 px across in the 20 MP frames, lying on grass and
+gravel. The benchmark's before/after crops (`gcp_crops/` in the report
+artifact) show the quadrant crossing within a pixel of the drawn gcp_list click
+on all six sampled projections. **The check residual is therefore not click
+error**, and moving an accurate click can only add noise.
+
+The original probe made the check worse (12.9 / 24.5 / 27.7 cm) and removed
+about half of the projections. Two mechanisms did it. The imported markers carry
+no `target_type`, so the task ran the coded-circular light-interior seed; on a
+checker the brightest blob is one quadrant, half a target from the printed
+centre, and the ellipse refiner fitted that quadrant. And when no 2-D refiner
+converged, `apply_winner` adopted the consensus candidate's reprojection as the
+"refined" pixel, so a depth step moved accurate clicks by several pixels.
+
+The fix (`engine/src/common/algorithm/markers/refine_markers_task.cpp`):
+
+- A bright blob seeds a circle only for a declared circular target or a printed
+  centre dot; the seed search at `fill_scales` (`refine_markers_task.cpp:1936`)
+  no longer reads one checker quadrant as a target interior.
+- A saddle correction is validated as a 2x2 checker with the same validator the
+  scale search uses (`checker_at`, `refine_markers_task.cpp:1170`), and the
+  pattern is identified once per marker so a foreshortened view can still use
+  the saddle.
+- The refiner starts on the validated detection found on the click
+  (`refined_2d_pixel`, `refine_markers_task.cpp:1230`), because the consensus
+  candidate can be several pixels away after its depth step.
+- A projection with no converged refinement is kept exactly where it was
+  measured — the candidate is never adopted (`refine_markers_task.cpp:1758`).
+- A correction is applied only when at least two views corroborate it
+  (`refine_markers_task.cpp:1783`); the only correction the intermediate code
+  applied on this block was one view per fold moving one projection by 5.65 px,
+  which made the check worse.
+- No projection is ever deleted; every move is bounded by `maximum_shift`
+  (6 px, or half the apparent radius when larger) against the measured pixel.
+
+Final quality-bench run `43746926638` (`dataset=gcp-rtk`, diagnostics on,
+head `4c6bed5`). Per fold: 35 projections kept, 0 removed, 34 evaluated, 34 kept
+unrefined; of the 5 markers, 4 were confidently processed and left at their
+clicks and 1 had no specific scale. Nothing moved, so the refined variants
+reproduce the unrefined rows to within the run's noise:
+
+| variant | h / v / 3D (cm) |
+| --- | --- |
+| gcps_only | 7.9 / 10.1 / 12.9 |
+| `refineMarkers` | 7.9 / 10.2 / 12.9 |
+| gcps_only, `adaptive_fitting` | 6.5 / 6.5 / 9.2 |
+| `refineMarkers` + `adaptive_fitting` | 6.5 / 6.3 / 9.1 |
+| camera_rtk_gcps | 7.9 / 16.3 / 18.1 |
+| camera_rtk_gcps + `refineMarkers` | 8.0 / 16.3 / 18.1 |
+| camera_rtk_gcps, `adaptive_fitting` | 5.3 / 12.2 / 13.3 |
+| camera_rtk_gcps, `adaptive_fitting` + `refineMarkers` | 5.4 / 12.2 / 13.4 |
+
+**On this dataset refinement cannot beat the unrefined clicks**, because the
+clicks are already on the printed centre; the honest outcome is that it declines
+to move them rather than adding noise. On rendered checkers (dark and bright,
+normal incidence and 50-60 degree obliquity, and on fine ground grain) the same
+code refines to under 0.1 px. The 5 cm horizontal target is still missed (best
+5.3 cm with camera RTK and the adaptive model), so it remains reported and not
+gated.
 
 #### Pixel convention: evidence and decision (2026-11-11)
 
