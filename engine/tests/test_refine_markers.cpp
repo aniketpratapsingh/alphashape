@@ -1217,9 +1217,21 @@ TEST(Markers, RefineSurveyCrossWithoutTargetType) {
     ASSERT_NE(marker, nullptr);
     const double rms = rms_to_truth(scene, *marker, 1);
     std::printf("[refine survey cross, no target_type] projections %zu -> %zu, "
-                "moved %zu kept %zu removed %zu, RMS %.4f px\n",
+                "moved %zu kept %zu removed %zu, blob %zu cross %zu none %zu, "
+                "RMS %.4f px\n",
                 before, marker->projections.size(), stats.moved_projections,
-                stats.kept_unrefined, stats.removed_projections, rms);
+                stats.kept_unrefined, stats.removed_projections,
+                stats.views_blob_scale, stats.views_cross_scale,
+                stats.views_no_scale, rms);
+    for (const MarkerProjection& projection : marker->projections) {
+        const auto truth = scene.truth(
+            1, camera_index(scene, projection.camera_id));
+        if (truth) {
+            std::printf("[refine survey cross] camera %d error %.4f px\n",
+                        projection.camera_id,
+                        (projection.pixel - *truth).norm());
+        }
+    }
     // Deleting a real observation was the bug.
     EXPECT_EQ(marker->projections.size(), before);
     EXPECT_EQ(stats.removed_projections, 0U);
