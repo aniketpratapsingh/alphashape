@@ -745,7 +745,8 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
 /// also how an unpainted region is recognised: it has no printed target.
 std::optional<double> cross_radius(const CameraView& view,
                                    const Eigen::Vector2d& pixel,
-                                   int patch_size) {
+                                   int patch_size,
+                                   Eigen::Vector2d* centre = nullptr) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
@@ -792,6 +793,7 @@ std::optional<double> cross_radius(const CameraView& view,
                                index.y() - static_cast<double>(y0) + 0.5);
     double best = static_cast<double>(half);
     double radius = 0.0;
+    Eigen::Vector2d detected = Eigen::Vector2d::Zero();
     for (const CrossDetection& detection : detections) {
         if (!detection.target.center.allFinite() ||
             !(detection.target.radius_px > 0.0)) {
@@ -807,10 +809,20 @@ std::optional<double> cross_radius(const CameraView& view,
         if (distance <= gate && distance < best) {
             best = distance;
             radius = detection.target.radius_px;
+            // The detection is reported in crop-index coordinates with the
+            // same +0.5 convention as `seed`; map it back to a full-resolution
+            // pixel so the caller can start the refiner on it.
+            detected = (detection.target.center +
+                        Eigen::Vector2d(static_cast<double>(x0),
+                                        static_cast<double>(y0))) *
+                       static_cast<double>(std::max(1, view.downscale));
         }
     }
     if (!(radius > 0.0)) {
         return std::nullopt;
+    }
+    if (centre != nullptr) {
+        *centre = detected;
     }
     return radius * static_cast<double>(std::max(1, view.downscale));
 }
@@ -825,7 +837,8 @@ std::optional<double> cross_radius(const CameraView& view,
 /// target does not have a square outline and returns nullopt.
 std::optional<double> quad_radius(const CameraView& view,
                                   const Eigen::Vector2d& pixel,
-                                  int patch_size) {
+                                  int patch_size,
+                                  Eigen::Vector2d* centre = nullptr) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
@@ -852,6 +865,7 @@ std::optional<double> quad_radius(const CameraView& view,
                                index.y() - static_cast<double>(y0) + 0.5);
     double best = static_cast<double>(half);
     double radius = 0.0;
+    Eigen::Vector2d detected = Eigen::Vector2d::Zero();
     QuadParams params;
     params.min_side = 8;
     params.max_side = 512;
@@ -866,11 +880,18 @@ std::optional<double> quad_radius(const CameraView& view,
             if (distance <= gate && distance < best) {
                 best = distance;
                 radius = square.radius_px;
+                detected = (square.center +
+                            Eigen::Vector2d(static_cast<double>(x0),
+                                            static_cast<double>(y0))) *
+                           static_cast<double>(std::max(1, view.downscale));
             }
         }
     }
     if (!(radius > 0.0)) {
         return std::nullopt;
+    }
+    if (centre != nullptr) {
+        *centre = detected;
     }
     // Square half-diagonal -> saddle-equivalent radius (half-size / sqrt(2)).
     return 0.5 * radius * static_cast<double>(std::max(1, view.downscale));
@@ -1208,8 +1229,10 @@ bool checker_at(const CameraView& view, const Eigen::Vector2d& centre,
 /// an untyped marker that validated in another view).
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
-    const std::optional<BlobSeed>& seed, int patch_size, double limit,
-    double hint_px, bool allow_ellipse, bool require_checker_evidence) {
+    const std::optional<BlobSeed>& seed,
+    const std::optional<Eigen::Vector2d>& saddle_anchor, int patch_size,
+    double limit, double hint_px, bool allow_ellipse,
+    bool require_checker_evidence) {
     if (!pixel.allFinite() || !std::isfinite(limit)) {
         return std::nullopt;
     }
@@ -1259,13 +1282,24 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     const double hint = hint_full / ds;
     std::optional<Eigen::Vector2d> cross;
     Eigen::Vector2d start = pixel;
-    if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
+    // Start on the validated detection found on the measured click when there
+    // is one: the consensus candidate can be several pixels away after its
+    // depth step, and a seed searched around the candidate can miss the
+    // printed target's basin. The final clamp against the measured pixel still
+    // bounds the move, so the wider acceptance below cannot wander.
+    bool anchored = false;
+    if (saddle_anchor && saddle_anchor->allFinite() &&
+        view.contains_pixel(*saddle_anchor)) {
+        start = *saddle_anchor;
+        anchored = true;
+    } else if (const auto saddle = saddle_seed(view, pixel, patch_size)) {
         start = *saddle;
     }
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         const Eigen::Vector2d full = *refined * ds;
         if (!require_checker_evidence || checker_at(view, full, hint_full)) {
-            cross = accept(full);
+            cross = anchored ? std::optional<Eigen::Vector2d>(full)
+                             : accept(full);
         }
     }
     if (ellipse &&
@@ -1383,6 +1417,11 @@ struct BlendView {
     /// enough to let an untyped marker use the saddle in its other views,
     /// where foreshortening can push the validator over its extent bound.
     bool marker_checker = false;
+    /// Sub-pixel centre of the validated printed pattern found on the
+    /// MEASURED pixel, full-resolution. It seeds the saddle refiner: the
+    /// consensus candidate can be several pixels away after a depth step, and
+    /// a seed searched around the candidate can miss the target's basin.
+    std::optional<Eigen::Vector2d> saddle_anchor;
     /// The printed pattern the marker declares, or Unknown when none was
     /// recorded. Selects which refiners are allowed to move the projection.
     TargetModel model = TargetModel::Unknown;
@@ -1711,7 +1750,8 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             blend.model == TargetModel::Cross ||
             (blend.model == TargetModel::Unknown && blend.marker_checker);
         const auto refined = refined_2d_pixel(
-            *blend.view, *projected, seed, options.patch_size, limit,
+            *blend.view, *projected, seed, blend.saddle_anchor,
+            options.patch_size, limit,
             blend.has_scale ? blend.apparent : 0.0, allow_ellipse,
             !checker_model);
         if (!refined) {
@@ -1864,9 +1904,16 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         std::optional<double> saddle;
         std::optional<double> square;
         if (blend.model != TargetModel::Circular) {
-            saddle = cross_radius(*blend.view, blend.pixel, patch_size);
-            if (!saddle.has_value()) {
-                square = quad_radius(*blend.view, blend.pixel, patch_size);
+            Eigen::Vector2d anchor = Eigen::Vector2d::Zero();
+            saddle = cross_radius(*blend.view, blend.pixel, patch_size, &anchor);
+            if (saddle.has_value()) {
+                blend.saddle_anchor = anchor;
+            } else {
+                square =
+                    quad_radius(*blend.view, blend.pixel, patch_size, &anchor);
+                if (square.has_value()) {
+                    blend.saddle_anchor = anchor;
+                }
             }
         }
         const bool checker_evidence = saddle.has_value() || square.has_value();
@@ -1952,7 +1999,8 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
             blend.model == TargetModel::Cross ||
             (blend.model == TargetModel::Unknown && blend.marker_checker);
         const auto refined = refined_2d_pixel(
-            *blend.view, blend.pixel, blend.seed, options.patch_size, limit,
+            *blend.view, blend.pixel, blend.seed, blend.saddle_anchor,
+            options.patch_size, limit,
             blend.has_scale ? blend.apparent : 0.0, allow_ellipse,
             !checker_model);
         if (!refined) {
