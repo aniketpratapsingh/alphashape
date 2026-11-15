@@ -1202,12 +1202,14 @@ bool checker_at(const CameraView& view, const Eigen::Vector2d& centre,
 /// target and whose only seed is a bright blob. On a checker the light blob is
 /// one quadrant, half a target away from the printed centre, and an ellipse
 /// fitted at the candidate with that radius can land on the quadrant boundary.
-/// The saddle result is additionally validated as a printed checker so a
-/// texture saddle cannot supply the correction either.
+/// `require_checker_evidence` additionally validates the saddle as a printed
+/// checker, so a texture saddle cannot supply the correction either; it is
+/// relaxed for a marker whose pattern is already known (a recorded cross, or
+/// an untyped marker that validated in another view).
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
     const std::optional<BlobSeed>& seed, int patch_size, double limit,
-    double hint_px, bool allow_ellipse) {
+    double hint_px, bool allow_ellipse, bool require_checker_evidence) {
     if (!pixel.allFinite() || !std::isfinite(limit)) {
         return std::nullopt;
     }
@@ -1262,7 +1264,7 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     }
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         const Eigen::Vector2d full = *refined * ds;
-        if (checker_at(view, full, hint_full)) {
+        if (!require_checker_evidence || checker_at(view, full, hint_full)) {
             cross = accept(full);
         }
     }
@@ -1376,6 +1378,11 @@ struct BlendView {
     /// True when a target kind was recorded for this marker. Without one the
     /// seed search keeps its previous window and only coded kinds widen it.
     bool target_kind_known = false;
+    /// True when ANY view of this marker showed a validated printed checker.
+    /// The pattern is a property of the marker, so one validated view is
+    /// enough to let an untyped marker use the saddle in its other views,
+    /// where foreshortening can push the validator over its extent bound.
+    bool marker_checker = false;
     /// The printed pattern the marker declares, or Unknown when none was
     /// recorded. Selects which refiners are allowed to move the projection.
     TargetModel model = TargetModel::Unknown;
@@ -1696,9 +1703,17 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         const bool allow_ellipse =
             blend.model == TargetModel::Circular ||
             (seed && seed->centre_dot);
+        // The saddle is validated as a printed checker unless the marker's
+        // pattern is already known: a recorded cross, or an untyped marker
+        // that validated in another view. A circular target still requires
+        // it, because for that model the saddle is only a fallback.
+        const bool checker_model =
+            blend.model == TargetModel::Cross ||
+            (blend.model == TargetModel::Unknown && blend.marker_checker);
         const auto refined = refined_2d_pixel(
             *blend.view, *projected, seed, options.patch_size, limit,
-            blend.has_scale ? blend.apparent : 0.0, allow_ellipse);
+            blend.has_scale ? blend.apparent : 0.0, allow_ellipse,
+            !checker_model);
         if (!refined) {
             // Nothing specific converged. The consensus candidate is NOT a
             // refinement: adopting its reprojection is how an accurate survey
@@ -1933,9 +1948,13 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
         const bool allow_ellipse =
             blend.model == TargetModel::Circular ||
             (blend.seed && blend.seed->centre_dot);
+        const bool checker_model =
+            blend.model == TargetModel::Cross ||
+            (blend.model == TargetModel::Unknown && blend.marker_checker);
         const auto refined = refined_2d_pixel(
             *blend.view, blend.pixel, blend.seed, options.patch_size, limit,
-            blend.has_scale ? blend.apparent : 0.0, allow_ellipse);
+            blend.has_scale ? blend.apparent : 0.0, allow_ellipse,
+            !checker_model);
         if (!refined) {
             continue;
         }
@@ -1969,6 +1988,7 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
     std::size_t blob_views = 0;
     std::size_t cross_views = 0;
     std::size_t unscaled_views = 0;
+    bool checker_seen = false;
     for (const BlendView& blend : blends) {
         if (!blend.has_scale) {
             ++unscaled_views;
@@ -1977,6 +1997,13 @@ MarkerEdit refine_marker(std::vector<BlendView> blends,
         } else {
             ++blob_views;
         }
+        checker_seen = checker_seen || blend.cross_scale;
+    }
+    // The printed pattern belongs to the marker, not to one view. One
+    // validated saddle lets every view of an untyped marker use the saddle
+    // even where foreshortening pushes the validator over its extent bound.
+    for (BlendView& blend : blends) {
+        blend.marker_checker = checker_seen;
     }
     const auto stamp = [&](MarkerEdit edit) {
         edit.blob_views = blob_views;
