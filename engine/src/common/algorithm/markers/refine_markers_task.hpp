@@ -10,14 +10,19 @@
 /// view with zero-mean normalised cross-correlation, and only then moves the
 /// inlier projections. The printed pattern decides which refiners may move a
 /// projection: a circular ring/disc is refined from its boundary, a checker
-/// cross from its saddle centre. A marker with no recorded target type runs
-/// both and keeps the better-supported answer; a saddle found near the click
-/// is specific evidence for the checker model.
+/// cross from its saddle centre. A marker with no recorded target type uses a
+/// saddle found near the click as specific evidence for the checker model, and
+/// otherwise trusts only a printed centre dot; a plain bright blob is not a
+/// circular-target seed, because on a checker it is one quadrant. A saddle
+/// correction is accepted only when the four quadrants around it alternate,
+/// which rejects the sharper saddles in ground texture.
 ///
-/// A projection is NEVER lost to an unconfident refinement. It is moved only
-/// by a bounded amount (six full-resolution pixels, or half the apparent
-/// target radius when the target is larger) relative to the pixel the
-/// surveyor supplied, and otherwise kept exactly where it was measured.
+/// A projection is NEVER lost to an unconfident refinement, and the consensus
+/// candidate is never adopted as a refinement: when no target-specific refiner
+/// converges, the projection stays exactly where it was measured. It is moved
+/// only by a bounded amount (six full-resolution pixels, or half the apparent
+/// target radius when the target is larger) relative to the pixel the surveyor
+/// supplied.
 /// Deletion is off by default; when explicitly enabled, only a measured pixel
 /// that the refined candidate contradicts by more than one target radius is
 /// removed. A flat patch, a low correlation or a patch that left the image
