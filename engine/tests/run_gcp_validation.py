@@ -3652,6 +3652,13 @@ def run_real_odm(args):
     # adaptive fit removes that trade and leaves the ~0.2 m mount.
     applied_estimates = default_estimates
     applied_frame_shifts = default_frame_shifts
+    # Which GCP-only adjustment supplied the empirical frame translation. The
+    # adaptive model is the one the frame test is specified against: the thin
+    # default lens bends the block, so its translation also carries the
+    # deformation. Reporting the source keeps a run that forgot to include the
+    # adaptive variant from silently presenting the default-lens shift as the
+    # frame estimate.
+    applied_frame_shift_source = "gcps_only"
     if args.diagnostics:
         selected = set(args.diagnostic_variants) if args.diagnostic_variants else None
         for variant, camera_refs, options in DIAGNOSTIC_VARIANTS:
@@ -3676,6 +3683,7 @@ def run_real_odm(args):
                 adaptive = per_fold_frame_shifts("adaptive_fitting")
                 if adaptive:
                     applied_frame_shifts = adaptive
+                    applied_frame_shift_source = "adaptive_fitting"
             variants[variant] = run_variant(
                 args, gcps, align_report, camera_refs, options,
                 catch_all=True, estimates=applied_estimates,
@@ -3817,11 +3825,14 @@ def run_real_odm(args):
                   "E/N/U {:.3f} / {:.3f} / {:.3f} m over {} folds".format(
                       variant, mean[0], mean[1], mean[2],
                       frame_fit.get("folds", 0)))
+    print("[gcp validation] frame shift source: {}".format(
+        applied_frame_shift_source))
     for label, shift in applied_frame_shifts.items():
         print("[gcp validation] frame shift estimate ({}, reference minus "
-              "GCP-only adjusted centre, E/N/U; removed from every camera): "
+              "{} adjusted centre, E/N/U; removed from every camera): "
               "{:.3f} / {:.3f} / {:.3f} m".format(
-                  label, shift[0], shift[1], shift[2]))
+                  label, applied_frame_shift_source, shift[0], shift[1],
+                  shift[2]))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -3858,6 +3869,7 @@ def run_real_odm(args):
             "capture_epoch_source": capture_epoch_source,
             "correction": args.frame_correction,
             "published": (frame_summary or {}).get("published"),
+            "shift_source": applied_frame_shift_source,
             "shifts_m": applied_frame_shifts,
         },
         "target_horizontal_m": target,
