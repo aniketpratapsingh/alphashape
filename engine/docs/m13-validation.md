@@ -986,7 +986,7 @@ ETRF2020 chain, with a stated accuracy of 0.1 m. At this site and epoch it is
 **-0.6981 / -0.4912 / +0.0001 m** east / north / up: 0.854 m horizontally
 (azimuth 234.9°) and no vertical. The mirror operation is its exact inverse.
 ITRF2020 to ETRS89 gives -0.6993 / -0.4879 / -0.0016 m (0.853 m); the ETRF2014
-and ETRF2005 realizations give 0.871 and 0.893 m. The realization choice moves
+and ETRF2000 realizations give 0.871 and 0.893 m. The realization choice moves
 the magnitude by 2 cm and the vertical not at all. The parameters are those of
 Altamimi et al. (2016) for ITRF2014 and the EUREF definition of ETRS89
 (coincident with the ITRS at epoch 1989.0).
