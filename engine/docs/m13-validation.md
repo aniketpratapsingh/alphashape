@@ -930,3 +930,147 @@ Findings:
   one degree of freedom, so neither supports a stronger claim than the radial
   fit; the 146-camera fit is the one with power, and it says the standard
   camera-RTK block does not dome.
+
+#### Reference frames: camera RTK vs the surveyed GCPs (2026-11-15, PR #121, run `43721644793`)
+
+The camera RTK positions and the surveyed GCPs are independent absolute
+sources. If they were expressed in different realizations of the same geodetic
+system — the European NTRIP frame ETRS89 (fixed at epoch 1989.0) against the
+receiver's WGS 84(G2139)/ITRF2014 solution at the 2022.4 capture epoch — they
+would differ by about 0.85 m horizontally and a few millimetres vertically at
+this site. That would explain a systematic fault when the camera references are
+added while the GCP-only adaptive adjustment reaches 6.5 cm. This section
+measures the frame directly. Every probe is report-only; no engine default
+changed.
+
+**What each set declares.** None of the dataset's files names a realization or
+a coordinate epoch.
+
+| set | declaration in the file | source |
+| --- | --- | --- |
+| camera RTK | EXIF `GPSMapDatum = WGS-84`; XMP has no datum, `RtkFlag=50`, `RtkStdLon/Lat/Hgt` 0.0137 / 0.0144 / 0.0297 m | `images/MAX_0002.JPG`, GPS IFD tag 18 and the drone XMP |
+| GCP list | header `EPSG:4326`, then `lon lat height px py image label` | `GCP/gcp_list.txt` line 1 |
+| survey CSV | `Name;Easting;Northing;Elevation;Longitude;Latitude`, no CRS column; the eastings/northings are UTM zone 33N | `GCP/latlon-easting_northing.csv` |
+| drone GNSS | RINEX 3.04 rover file; `MARKER NAME/NUMBER/TYPE`, `OBSERVER`, `ANT # / TYPE` blank, `APPROX POSITION XYZ` 0 0 0 | `RTK_Data/101FTASK_Rinex.obs` header |
+| event marks | per-exposure latitude, longitude, ellipsoidal height, per-axis deviations and status `50`, GPS week 2211 | `RTK_Data/101FTASK_Timestamp.mrk` |
+| dataset README | GCP "Emlid Reach RS2, NTRIP, estimated 1-2cm accuracy"; RTK yes | `README.md` |
+
+No file records the NTRIP mountpoint, the correction network, or a coordinate
+epoch, so "WGS-84" in the EXIF is the receiver's label rather than a
+realization. The site is 47.6435 N, 16.4759 E, which reverse-geocodes to
+Ritzing, Bezirk Oberpullendorf, Burgenland, Austria; the dataset is Austrian,
+not German. The projected CSV does not resolve the realization either:
+projecting its own longitude/latitude in EPSG:32633 (WGS 84 / UTM 33N) or
+EPSG:25833 (ETRS89 / UTM 33N) reproduces the CSV eastings and northings to
+within 3.6 cm, because PROJ applies the null ETRS89-to-WGS 84 operation when no
+coordinate epoch is supplied.
+
+**How the engine reads them.** The protocol declares the chunk `EPSG:4326` and
+both reference slots default to the chunk CRS (`engine/src/common/core/chunk.hpp`
+lines 499-511). The CRS DTO carries WKT, an EPSG code and an optional vertical
+datum only (`engine/src/common/core/types.hpp` line 72); it has no realization
+or coordinate epoch, and EPSG:4326 has none by definition. Both sets are
+therefore read as one realization-less geographic frame, so a realization
+difference cannot appear inside the engine — only in the residual against the
+independent set. That is why the test lives in the protocol.
+
+**Capture epoch.** The first RTK event mark is GPS week 2211, time of week
+296288.242869 s, i.e. 2022-05-25 10:17:50 UTC after the 18 s leap-second
+offset: decimal year 2022.3957. The EXIF `DateTimeOriginal` is 2022:05:25
+12:17:49 local and the RINEX covers 10:18:04.4-10:26:30.6 UTC, so the epoch is
+consistent to the minute.
+
+**Expected offset.** PROJ 9.5.1 (EPSG database) resolves the time-dependent
+EPSG:7912 (ITRF2014, geographic 3D) to EPSG:4258 (ETRS89) operation through the
+ETRF2020 chain, with a stated accuracy of 0.1 m. At this site and epoch it is
+**-0.6981 / -0.4912 / +0.0001 m** east / north / up: 0.854 m horizontally
+(azimuth 234.9°) and no vertical. The mirror operation is its exact inverse.
+ITRF2020 to ETRS89 gives -0.6993 / -0.4879 / -0.0016 m (0.853 m); the ETRF2014
+and ETRF2000 realizations give 0.871 and 0.893 m. The realization choice moves
+the magnitude by 2 cm and the vertical not at all. The parameters are those of
+Altamimi et al. (2016) for ITRF2014 and the EUREF definition of ETRS89
+(coincident with the ITRS at epoch 1989.0).
+
+**Leak-free per-fold test.** Each fold first runs the GCP-only adjustment with
+the adaptive lens model: the four control GCPs are the only georeferencing
+input, the held-out point is imported as a check marker, and the camera
+references are disabled. The fit is then `stored RTK position - adjusted camera
+centre` over the 146 aligned cameras. A 3-parameter translation and a
+7-parameter Helmert (`a = s R c + t`) are reported; rotations are the
+small-angle vector about the frame's E/N/U axes in arcsec, scale in ppm.
+
+| fold | translation E / N / U (m) | horizontal (m) | rotation E / N / U (arcsec) | scale (ppm) | translation residual (m) | Helmert residual (m) |
+| --- | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | +0.215 / +0.175 / +0.318 | 0.277 | -819.8 / +757.8 / +13.1 | +489.4 | 0.309 | 0.276 |
+| 2 | +0.173 / +0.112 / +0.268 | 0.206 | -493.1 / +613.1 / +213.8 | -1630.9 | 0.273 | 0.248 |
+| 3 | +0.052 / +0.113 / +0.200 | 0.124 | -618.9 / +87.2 / -128.4 | -241.7 | 0.264 | 0.254 |
+| 4 | +0.145 / +0.019 / +0.138 | 0.146 | -192.9 / +552.3 / -250.2 | -1741.4 | 0.268 | 0.252 |
+| 5 | +0.097 / +0.093 / +0.247 | 0.134 | -609.1 / +250.2 / +169.8 | -1765.5 | 0.310 | 0.294 |
+| mean | **+0.137 / +0.102 / +0.234** | **0.178** | -546.8 / +452.1 / +3.6 | -978.0 | **0.285** | **0.265** |
+
+The per-axis ranges across folds are 0.052-0.215 m east, 0.019-0.175 m north
+and 0.138-0.318 m up; the horizontal mean is 0.178 m (0.124-0.277 m). The
+translation-only residual is 0.285 m and the 7-parameter fit leaves 0.265 m,
+only 7% smaller. Its rotation (total 636-1116 arcsec) and scale (-1766 to
++489 ppm) change sign across folds. With a 0.28 m camera scatter and a control
+pattern spanning 774 m², those four extra parameters are not a rigid frame
+rotation and scale: they are the datum absorbing the block, and the translation
+is the only stable part. The default-lens GCP-only fold is reported too and is
+not a frame estimate at all: it puts the centres 3.45 m below the references
+(mean +0.611 / -0.203 / -3.448 m, residual 0.772 m, rotation 3734 arcsec,
+scale 11984 ppm), which is the calibration-geometry trade identified above.
+This is why the frame test, and the empirical correction below, use the
+adaptive GCP-only fold. (The earlier run `43556154502` was dispatched with
+`optimize_params=adaptive_fitting=true`, so its `gcps_only` frame fit was
+already this adaptive one; the present run separates the two and reproduces the
+same adaptive translation.)
+
+**The translation is the antenna mount, not a frame offset.** The same folds
+estimate the camera-frame antenna offset at -0.013 / -0.207 / -0.206 m (mean;
+magnitude 0.292 m, per-fold magnitude 0.22-0.37 m). The measured translation has
+per-fold magnitude 0.20-0.42 m (mean 0.290 m) and a +0.234 m up component,
+which is the mount's +0.21 m up. The two magnitudes agree within 5 cm in every
+fold and to 1% on the mean. A realization offset would be 0.854 m horizontal
+with 0.000 m vertical: nearly three times the whole measured vector, with all
+of it in the horizontal instead of the vertical.
+
+**Remedy variants.** All are leak-free: the published transform is applied to
+the stored camera references before the datum refit and the adjustment, and the
+empirical translation is measured on the same fold's control-only GCP
+adjustment (the held-out point never enters it). Leave-one-out check RMS,
+horizontal / vertical / 3D, in cm:
+
+| variant | lens | h | v | 3D |
+| --- | --- | ---: | ---: | ---: |
+| `gcps_only` (default) | default | 7.91 | 10.15 | 12.87 |
+| `gcps_only`, adaptive | adaptive | 6.54 | 6.46 | 9.19 |
+| `camera_rtk_gcps` (per-image) | default | 7.94 | 16.26 | 18.10 |
+| `camera_rtk_adaptive` (best horizontal) | adaptive | **5.31** | 12.22 | 13.32 |
+| published ITRF2014 → ETRS89 | default | 85.26 | 26.41 | 89.26 |
+| published ITRF2014 → ETRS89, adaptive | adaptive | 81.44 | 13.36 | 82.53 |
+| published ETRS89 → ITRF2014 (mirror), adaptive | adaptive | 76.29 | 13.30 | 77.44 |
+| empirical per-fold translation, adaptive | adaptive | 16.01 | 15.27 | 22.12 |
+
+The published transform is applied in the hypothesis direction (cameras in
+WGS 84/ITRF2014, GCPs in ETRS89) and in the mirror direction. Both take the
+check to about 0.8 m, the size of the applied displacement: the correct
+direction would remove a real 0.85 m bias and leave the block at the
+no-transform level, whereas here it adds it. That is the signature of
+references that were already in the target frame. The empirical translation
+also fails to help: it removes the mount from the references but the adjustment
+already places the centres acceptably, and the check moves from 5.31 to
+16.01 cm horizontal.
+
+**Verdict: no frame mismatch.** The camera RTK positions and the surveyed GCPs
+are in the same geodetic frame to within the test's resolution. The observed
+camera-vs-GCP offset is the antenna mount (0.29 m, dominated by +0.23 m
+vertical), not a realization difference: the published ETRS89 ↔ ITRF2014 offset
+is 0.854 m horizontal and 0.000 m vertical, while the measured translation is
+0.178 m horizontal and +0.234 m up. Applying the published transform in either
+direction adds about 0.8 m to the check; a real mismatch would be removed by
+the correct direction. The empirical correction is leak-free but also does not
+improve the check. The 5 cm horizontal target is **not met**: the best leak-free
+setting remains per-image camera RTK with adaptive fitting at **5.31 cm**
+horizontal (12.22 vertical, 13.32 3D); GCP-only adaptive is 6.54 / 6.46 /
+9.19 cm. No frame correction beats the uncorrected variant, and the target is
+not loosened.

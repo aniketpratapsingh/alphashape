@@ -196,6 +196,14 @@ alphashape_add_python_test(python_gcp_timing
 alphashape_add_python_test(python_gcp_diagnostics
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_diagnostics.py)
 
+# WP-13.20: the real-block protocol's reference-frame test. The translation and
+# 7-parameter Helmert between adjusted camera centres and stored RTK positions,
+# the sign of the empirical correction, and the GPS-week capture epoch are pure
+# helpers. The published ETRS89 <-> ITRF2014 check needs pyproj and skips when
+# the test environment does not have it.
+alphashape_add_python_test(python_gcp_frame
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_frame.py)
+
 # WP-13.21: the camera reference attitude properties through Python.
 alphashape_add_python_test(python_attitude_prior
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)
