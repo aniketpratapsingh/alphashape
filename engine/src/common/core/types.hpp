@@ -195,6 +195,13 @@ struct CameraReference {
     /// `orientation_deg` is absent.
     std::optional<Eigen::Vector3d> rotation_accuracy_deg;
 
+    /// GNSS solution status that accompanied the position, when the source
+    /// reported one. XMP writers use the RTK flag codes 50 (fixed) and 34
+    /// (float); a consumer-GNSS or single-point solution has another code or
+    /// none. Stored so a per-camera accuracy can be traced back to the fix it
+    /// came from (AddPhotos stores it when `load_xmp_accuracy` is on).
+    std::optional<int> rtk_flag;
+
     bool enabled = true;  ///< used as a constraint in adjustment
 
     bool operator==(const CameraReference& other) const;

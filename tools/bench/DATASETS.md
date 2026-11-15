@@ -202,6 +202,10 @@ OpenDroneMap (GPL-3.0).**
     (`Name;Easting;Northing;Elevation;Longitude;Latitude`), surveyed with an Emlid
     Reach RS2 via NTRIP at a stated 1–2 cm accuracy. Matched to the GCP list by
     coordinates to recover the survey names.
+  - `RTK_Data/101FTASK_Timestamp.mrk` — the RTK module's per-exposure event-mark log,
+    used only by the timing diagnostics. Each line carries the antenna position, its
+    per-axis deviations and the solution flag, plus the GPS event time; the protocol
+    pairs it with the JPEG comment's trigger/exposure counters. Parsed at run time.
 - The gcp-list coordinate `z` is compared with the CSV `Elevation` to decide whether it
   is ellipsoidal or orthometric; the decision and the mean offset are recorded in the
   report rather than assumed.
@@ -209,8 +213,12 @@ OpenDroneMap (GPL-3.0).**
   (`MatchPhotos keypoint_limit_per_mpx=250` + `AlignCameras`, no dense stage), saved,
   then per fold 4 points are control and 1 is a held-out check. Two variants are
   measured — camera RTK references at their stated accuracy plus the GCPs, and GCPs
-  alone with the camera references disabled. The target is <= 5 cm horizontal RMS over
-  the folds, reported as PASS/MISS and not gated in this first version.
+  alone with the camera references disabled. The primary camera variant imports each
+  photo's XMP RTK deviations and fix status (`--camera-accuracy per-image`), so a
+  camera is weighted by its own solution rather than one block-wide scalar; the
+  uniform 5 cm weight remains as a comparison variant. The target is <= 5 cm
+  horizontal RMS over the folds, reported as PASS/MISS and not gated in this first
+  version.
 - Why this one: it is the only ODM sample repository with surveyed ground-control
   points and RTK camera positions in one place, which is exactly what a ground-control
   validation needs. `odm_data_*` sample repos publish images only (see "Also surveyed").

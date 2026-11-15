@@ -462,6 +462,11 @@ void write_cameras(const Chunk& chunk, XmlNode& node) {
                 }
                 set_attr(ref, "rotation_accuracy", vec3(rot_acc));
             }
+            // Optional GNSS fix status that came with the position. Omitted
+            // when unset so projects measured without it stay byte-identical.
+            if (c.reference.rtk_flag.has_value()) {
+                set_attr(ref, "rtk_flag", std::to_string(*c.reference.rtk_flag));
+            }
             set_attr(ref, "enabled", c.reference.enabled ? "1" : "0");
         }
         // Per-scan film geometry (WP-13.18a). Both children are optional, so a
@@ -1269,6 +1274,11 @@ CameraReference read_camera_reference(const XmlNode* ref) {
                 *rot_acc + "'");
         }
         reference.rotation_accuracy_deg = value;
+    }
+    // Optional GNSS fix status (see CameraReference::rtk_flag). Absent in
+    // files written before it existed.
+    if (const std::string* flag = find_attr(*ref, "rtk_flag")) {
+        reference.rtk_flag = parse_int(*flag);
     }
     reference.enabled = parse_int(require_attr(*ref, "enabled")) != 0;
     return reference;

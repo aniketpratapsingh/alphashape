@@ -185,6 +185,17 @@ add_test(
 set_tests_properties(python_gcp_validation PROPERTIES TIMEOUT 900
     LABELS "light")
 
+# WP-13.20: the event-mark and capture-timing parsers the real-block GCP
+# protocol's timing diagnostics use. Parsing only; the script's top-level
+# `import alphashape` is satisfied by the module this configuration builds.
+alphashape_add_python_test(python_gcp_timing
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_timing.py)
+
+# WP-13.20: the block-doming diagnostics' least-squares fit, convex-hull area
+# and variant option translation. Pure helpers; no chunk is built.
+alphashape_add_python_test(python_gcp_diagnostics
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gcp_diagnostics.py)
+
 # WP-13.21: the camera reference attitude properties through Python.
 alphashape_add_python_test(python_attitude_prior
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attitude_prior.py)

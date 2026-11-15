@@ -350,8 +350,10 @@ void AddPhotosTask::declare_params(Params& params) const {
     params.declare({"strip_extensions", ParamType::Bool, true,
                     "Label each camera with the file name without its extension."});
     params.declare({"load_xmp_accuracy", ParamType::Bool, false,
-                    "Use a fixed/float RTK standard deviation from XMP as the reference "
-                    "accuracy."});
+                    "Use the per-photo XMP RTK standard deviations as the reference "
+                    "accuracy and record the GNSS fix status. A fixed or float solution "
+                    "uses its reported deviations; any other reported status is inflated "
+                    "to at least 0.5 m per axis."});
     params.declare({"load_xmp_orientation", ParamType::Bool, false,
                     "Store the XMP gimbal (or flight) yaw/pitch/roll as the camera "
                     "reference orientation."});
@@ -546,6 +548,12 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             }
 
             if (load_xmp_accuracy) {
+                // The status is recorded even when no usable deviation follows,
+                // so a consumer-GNSS photo is not mistaken for a weighted RTK
+                // one later. A non-fixed status inflates the accuracy inside
+                // rtk_accuracy_m(); without any deviation the reference keeps
+                // the chunk default rather than silently dropping the photo.
+                item.camera.reference.rtk_flag = xmp.rtk_flag;
                 if (const auto accuracy = xmp.rtk_accuracy_m()) {
                     item.camera.reference.accuracy =
                         Eigen::Vector3d((*accuracy)[0], (*accuracy)[1], (*accuracy)[2]);

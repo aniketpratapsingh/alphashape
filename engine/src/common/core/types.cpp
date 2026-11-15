@@ -223,7 +223,7 @@ bool CameraReference::operator==(const CameraReference& other) const {
            accuracy == other.accuracy &&
            optional_vector_equal(orientation_deg, other.orientation_deg) &&
            optional_vector_equal(rotation_accuracy_deg, other.rotation_accuracy_deg) &&
-           enabled == other.enabled;
+           rtk_flag == other.rtk_flag && enabled == other.enabled;
 }
 
 bool Camera::operator==(const Camera& other) const {

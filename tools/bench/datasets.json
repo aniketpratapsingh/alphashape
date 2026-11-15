@@ -164,12 +164,19 @@
           "from_archive": "odm_data_helenenschacht.tar.gz",
           "archive_member": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/GCP/latlon-easting_northing.csv",
           "kind": "gcp_names"
+        },
+        {
+          "path": "reference/101FTASK_Timestamp.mrk",
+          "from_archive": "odm_data_helenenschacht.tar.gz",
+          "archive_member": "odm_data_helenenschacht-eece33e9ece2ff358a7bdc02e1db6f67925e00c4/RTK_Data/101FTASK_Timestamp.mrk",
+          "kind": "mrk"
         }
       ],
       "expected_images": 176,
       "gcp": {
         "target_horizontal_m": 0.05,
-        "camera_accuracy_fallback_m": 0.05,
+        "camera_accuracy": "per-image",
+        "camera_accuracy_uniform_m": 0.05,
         "marker_location_accuracy_m": 0.015,
         "gcp_height": "ellipsoidal",
         "diagnostics": true
@@ -180,7 +187,7 @@
         }
       },
       "param_overrides_reason": "176 frames at 20 MP each do not fit a 16 GB runner at the default keypoint density (the same measured limit as the aerial set). keypoint_limit_per_mpx=250 yields ~5000 keypoints per image, and reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera, keeping MatchPhotos + AlignCameras inside the two-hour budget. The GCP validation never runs the dense stage.",
-      "notes": "35 image observations of 5 surveyed GCPs (ODM gcp_list format, header EPSG:4326) and a 5-point CSV (Name;Easting;Northing;Elevation;Longitude;Latitude) surveyed with an Emlid Reach RS2 via NTRIP at a stated 1-2 cm accuracy. Photographs by Daniel Dobosi, published by OpenDroneMap under GPL-3.0."
+      "notes": "35 image observations of 5 surveyed GCPs (ODM gcp_list format, header EPSG:4326) and a 5-point CSV (Name;Easting;Northing;Elevation;Longitude;Latitude) surveyed with an Emlid Reach RS2 via NTRIP at a stated 1-2 cm accuracy. Every image's XMP carries RtkFlag 50 (fixed) and RtkStdLon/Lat/Hgt, and RTK_Data/101FTASK_Timestamp.mrk carries the same per-exposure antenna positions, deviations and the GPS event time; the benchmark runs the protocol with --camera-accuracy per-image, so each camera is weighted by its own solution, and uses the event-mark log for the timing comparison. Photographs by Daniel Dobosi, published by OpenDroneMap under GPL-3.0."
     }
   }
 }
