@@ -19,7 +19,9 @@
 ///
 /// A projection is NEVER lost to an unconfident refinement, and the consensus
 /// candidate is never adopted as a refinement: when no target-specific refiner
-/// converges, the projection stays exactly where it was measured. It is moved
+/// converges, the projection stays exactly where it was measured. A correction
+/// is applied only when at least two views of the marker corroborate it, since
+/// one view's refiner can lock onto a different local structure. It is moved
 /// only by a bounded amount (six full-resolution pixels, or half the apparent
 /// target radius when the target is larger) relative to the pixel the surveyor
 /// supplied.

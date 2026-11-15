@@ -1771,6 +1771,16 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             usable[index] = anchored_patches[index].valid;
         }
     }
+    // A correction is only trusted when at least two views corroborate it.
+    // The consensus exists precisely because one view's refiner can lock onto
+    // a different local structure; on the real block the sole refined view
+    // moved an accurate click by 5.65 px and made the leave-one-out check RMS
+    // worse. With fewer than two refinements the marker is left as measured.
+    std::size_t refined_views = 0;
+    for (const bool ok : refined_ok) {
+        refined_views += ok ? 1U : 0U;
+    }
+    const bool corroborated = refined_views >= 2;
     std::vector<double> mean(static_cast<std::size_t>(options.patch_size) *
                                  static_cast<std::size_t>(options.patch_size),
                              0.0);
@@ -1834,9 +1844,10 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
             }
             continue;
         }
-        if (!refined_ok[i]) {
-            // No target-specific refinement converged for this view: it stays
-            // exactly where the surveyor measured it.
+        if (!refined_ok[i] || !corroborated) {
+            // No target-specific refinement converged for this view, or only
+            // one view refined: it stays exactly where the surveyor measured
+            // it.
             accepted.push_back({blend.view, blend.pixel});
             tolerances.push_back(projection_tolerance(blend));
             continue;
@@ -2007,7 +2018,11 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
             continue;
         }
         success = true;
-        if ((*refined - blend.pixel).norm() > 1e-9) {
+        // The same hard bound the consensus path applies: a validated anchor
+        // bypasses the candidate-relative acceptance, so the move itself has
+        // to stay within the bounded correction of the measured pixel.
+        const double shift = (*refined - blend.pixel).norm();
+        if (shift > 1e-9 && shift <= maximum_shift(blend)) {
             edit.moves.push_back({blend.view->camera->id, *refined});
             edit.touched = true;
         }
