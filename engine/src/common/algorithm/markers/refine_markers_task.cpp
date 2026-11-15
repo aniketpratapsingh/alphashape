@@ -1138,69 +1138,56 @@ std::optional<Eigen::Vector2d> saddle_seed(const CameraView& view,
                            (static_cast<double>(best_y) + 0.5) * ds);
 }
 
-/// Local mean of the working image in a 3x3 block, sampled at a
-/// full-resolution pixel. `view.sample` is bilinear on the working (possibly
-/// reduced) image, so the block spacing is one working pixel.
-double probe_mean(const CameraView& view, const Eigen::Vector2d& pixel) {
-    const double step = static_cast<double>(std::max(1, view.downscale));
-    double sum = 0.0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            sum += static_cast<double>(view.sample(
-                pixel + Eigen::Vector2d(static_cast<double>(dx) * step,
-                                        static_cast<double>(dy) * step)));
-        }
-    }
-    return sum / 9.0;
-}
-
-/// True when the printed pattern around `centre` is a 2x2 checker: two
-/// opposite quadrants share one intensity, the other pair shares another, and
-/// the two pairs differ. This is the only evidence that a local saddle is the
-/// printed target rather than a corner in the ground texture, which on a real
-/// survey is finer and sharper than the target itself. `radius_px` is the
-/// saddle-convention target radius (half the full printed side). The probe
-/// distance is scanned, so a scale that is off by up to a factor of two still
-/// samples the quadrant centres, and the axes are scanned because the target
-/// lies at an arbitrary angle in the image.
-bool checker_signature(const CameraView& view, const Eigen::Vector2d& centre,
-                       double radius_px) {
+/// True when a validated checker detection sits on `centre`. This reuses the
+/// same validator the scale search uses, whose quadrant test follows the
+/// fitted Hessian axes and the observed extents, so it tolerates the shear of
+/// an oblique view and the print's own aspect. It is the evidence that a
+/// refined saddle is the printed target and not a corner in the ground
+/// texture, which on a real survey is finer and sharper than the target
+/// itself. `radius_px` is the saddle-convention target radius (half the
+/// printed side).
+bool checker_at(const CameraView& view, const Eigen::Vector2d& centre,
+                double radius_px) {
     const double ds = static_cast<double>(std::max(1, view.downscale));
-    if (!centre.allFinite() || !(radius_px >= 4.0 * ds)) {
+    if (!centre.allFinite() || !(radius_px >= 4.0 * ds) ||
+        !view.contains_pixel(centre, radius_px)) {
         return false;
     }
-    if (!view.contains_pixel(centre, radius_px)) {
+    const Eigen::Vector2d index = view.index_of(centre);
+    const int half = std::clamp(
+        static_cast<int>(std::ceil(2.5 * radius_px / ds)) + 4, 16,
+        std::max(16, std::min(view.image.width(), view.image.height()) / 2));
+    const int x0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.x(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.width() - 2 * half - 1));
+    const int y0 = std::clamp(
+        static_cast<int>(std::floor(std::clamp(index.y(), 0.0, 1.0e6))) - half,
+        0, std::max(0, view.image.height() - 2 * half - 1));
+    const int width = std::min(2 * half + 1, view.image.width() - x0);
+    const int height = std::min(2 * half + 1, view.image.height() - y0);
+    if (width < 16 || height < 16) {
         return false;
     }
-    constexpr std::array<double, 6> kProbeFractions{
-        0.2, 0.3, 0.4, 0.5, 0.6, 0.75};
-    double best = 0.0;
-    for (int step = 0; step < 18; ++step) {
-        // A checker repeats every 90 degrees.
-        const double angle =
-            std::numbers::pi_v<double> * static_cast<double>(step) / 36.0;
-        const Eigen::Vector2d u(std::cos(angle), std::sin(angle));
-        const Eigen::Vector2d v(-std::sin(angle), std::cos(angle));
-        for (const double fraction : kProbeFractions) {
-            const double d = fraction * radius_px;
-            const double q0 = probe_mean(view, centre + d * (-u - v));
-            const double q1 = probe_mean(view, centre + d * (u - v));
-            const double q2 = probe_mean(view, centre + d * (-u + v));
-            const double q3 = probe_mean(view, centre + d * (u + v));
-            const double diagonal_a = 0.5 * (q0 + q3);
-            const double diagonal_b = 0.5 * (q1 + q2);
-            const double between = std::abs(diagonal_a - diagonal_b);
-            const double within =
-                std::max(std::abs(q0 - q3), std::abs(q1 - q2));
-            // Printed targets are high contrast (white against a light grey
-            // or a dark ground). A textured patch can put four different
-            // values in the four probes but not two matching pairs.
-            if (between >= 0.10 && within <= 0.5 * between) {
-                best = std::max(best, between - within);
-            }
+    FloatImage crop(width, height, 0.0F);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            crop.at(x, y) = view.image.at(x0 + x, y0 + y);
         }
     }
-    return best > 0.0;
+    CrossParams params;
+    params.minimum_size = 2.0;
+    params.minimum_dist = 8.0;
+    const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
+                               index.y() - static_cast<double>(y0) + 0.5);
+    const double gate = std::max(2.0, 0.25 * radius_px / ds);
+    for (const CrossDetection& detection :
+         detect_crosses_styled(crop, params)) {
+        if (detection.target.center.allFinite() &&
+            (detection.target.center - seed).norm() <= gate) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// 2-D-only refinement for a marker with fewer than two usable views. Both
@@ -1215,8 +1202,8 @@ bool checker_signature(const CameraView& view, const Eigen::Vector2d& centre,
 /// target and whose only seed is a bright blob. On a checker the light blob is
 /// one quadrant, half a target away from the printed centre, and an ellipse
 /// fitted at the candidate with that radius can land on the quadrant boundary.
-/// The saddle result is additionally validated against the checker signature
-/// so a texture saddle cannot supply the correction either.
+/// The saddle result is additionally validated as a printed checker so a
+/// texture saddle cannot supply the correction either.
 std::optional<Eigen::Vector2d> refined_2d_pixel(
     const CameraView& view, const Eigen::Vector2d& pixel,
     const std::optional<BlobSeed>& seed, int patch_size, double limit,
@@ -1275,7 +1262,7 @@ std::optional<Eigen::Vector2d> refined_2d_pixel(
     }
     if (const auto refined = refine_cross_center(view.image, start / ds, hint)) {
         const Eigen::Vector2d full = *refined * ds;
-        if (checker_signature(view, full, hint_full)) {
+        if (checker_at(view, full, hint_full)) {
             cross = accept(full);
         }
     }
