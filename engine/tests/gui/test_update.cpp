@@ -34,6 +34,7 @@
 #include "apps/gui/update_source.hpp"
 #include "common/update/checksum.hpp"
 #include "common/update/release.hpp"
+#include "common/update/version.hpp"
 #include "harness.hpp"
 
 using namespace alphashape;
@@ -526,11 +527,17 @@ TEST_F(UpdateGuiTest, PreferencesPersistAutoCheckAndChannel) {
     ASSERT_NE(dialog.auto_check(), nullptr);
     EXPECT_TRUE(dialog.auto_check()->isChecked());
     ASSERT_NE(dialog.channel(), nullptr);
-    EXPECT_EQ(dialog.channel()->currentIndex(), 0);
+    // With nothing stored, the channel follows the build: a pre-release build
+    // (a tagged rc) starts on pre-releases, any other build on stable.
+    const auto build = update::Version::parse(running_version());
+    ASSERT_TRUE(build.has_value()) << running_version();
+    EXPECT_EQ(dialog.channel()->currentIndex(), build->is_prerelease() ? 1 : 0);
 
     dialog.auto_check()->setChecked(false);
     EXPECT_FALSE(settings.value("updates/auto_check", true).toBool());
 
+    // Stable first, so the switch to pre-releases below is a real change on any build.
+    dialog.channel()->setCurrentIndex(0);
     dialog.channel()->setCurrentIndex(1);
     EXPECT_EQ(settings.value("updates/channel").toString(), QStringLiteral("prerelease"));
     EXPECT_EQ(static_cast<int>(checker.channel()), static_cast<int>(update::Channel::Prerelease));
