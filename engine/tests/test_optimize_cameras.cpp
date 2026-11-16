@@ -1942,6 +1942,72 @@ TEST(OptimizeCameras, AdaptiveFittingAutoIgnoresCameraReferencesAlone) {
     EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 0.0);
 }
 
+TEST(OptimizeCameras, AdaptiveFittingAutoIsTheDefault) {
+    // A caller that sets nothing gets the adaptive model on a controlled block.
+    const Params defaults = make_params(builtin_registry().require("OptimizeCameras"));
+    EXPECT_TRUE(defaults.get_bool("adaptive_fitting_auto"));
+    EXPECT_FALSE(defaults.get_bool("adaptive_fitting"));
+
+    GeoMarkerScene scene = make_geo_marker_scene(20261132u);
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", defaults);
+
+    Chunk& chunk = *scene.document.active_chunk();
+    EXPECT_GT(meta_value(chunk, "optimize_cameras.control_points"), 0.0);
+    EXPECT_GE(adaptive_solves(chunk), 1);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingAutoOffKeepsThePlainModel) {
+    // Turning the automatic mode off is how a caller keeps the plain model on
+    // a block that has control points.
+    GeoMarkerScene scene = make_geo_marker_scene(20261133u);
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    params.set("adaptive_fitting_auto", false);
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    Chunk& chunk = *scene.document.active_chunk();
+    EXPECT_GT(meta_value(chunk, "optimize_cameras.control_points"), 0.0);
+    EXPECT_EQ(adaptive_solves(chunk), 0);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingAutoIgnoresCheckPoints) {
+    // Check points never constrain the solve, so a block whose markers are all
+    // check points has no control and must not switch the model.
+    GeoMarkerScene scene = make_geo_marker_scene(20261134u);
+    Chunk& chunk = *scene.document.active_chunk();
+    for (Marker& marker : chunk.markers()) {
+        marker.meta.set("type", "check_point");
+    }
+    const Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    Chunk& solved = *scene.document.active_chunk();
+    EXPECT_EQ(meta_value(solved, "optimize_cameras.control_points"), 0.0);
+    EXPECT_EQ(adaptive_solves(solved), 0);
+}
+
+TEST(OptimizeCameras, AdaptiveFittingAutoLeavesAFixedLensFixed) {
+    // A caller holding every base coefficient asked for a fixed lens; the
+    // automatic mode must not free the higher-order terms behind its back.
+    GeoMarkerScene scene = make_geo_marker_scene(20261135u);
+    const Calibration before = scene.document.active_chunk()->sensors()[0].calibration;
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    for (const char* name : {"fit_f", "fit_cx", "fit_cy", "fit_k1", "fit_k2", "fit_k3",
+                             "fit_p1", "fit_p2"}) {
+        params.set(name, false);
+    }
+    run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
+
+    Chunk& solved = *scene.document.active_chunk();
+    EXPECT_GT(meta_value(solved, "optimize_cameras.control_points"), 0.0);
+    EXPECT_EQ(adaptive_solves(solved), 0);
+    const Calibration& after = solved.sensors()[0].calibration;
+    EXPECT_EQ(after.b1, before.b1);
+    EXPECT_EQ(after.b2, before.b2);
+    EXPECT_EQ(after.k4, before.k4);
+    EXPECT_EQ(after.p3, before.p3);
+    EXPECT_EQ(after.p4, before.p4);
+}
+
 // ---------------------------------------------------------------------------
 // Master sensors share one calibration slot (WP-13.16)
 // ---------------------------------------------------------------------------

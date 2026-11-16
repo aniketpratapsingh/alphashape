@@ -15,6 +15,16 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **OptimizeCameras selects the adaptive lens model automatically on a block
+  with ground control.** `adaptive_fitting_auto` now defaults to true: when the
+  chunk has at least one control point (a referenced marker that is not a check
+  point, with `use_gcp` on) and the lens is self-calibrated, the bundle
+  adjustment runs adaptive fitting with the higher-order terms (k4, b1, b2, p3,
+  p4) as candidates. On the real RTK test block the leave-one-out horizontal
+  check error drops from 7.9 to 6.5 cm and vertical from 10.1 to 6.5 cm. Blocks
+  without control points, such as camera-GNSS-only aerial surveys, solve exactly
+  as before. Set `adaptive_fitting_auto=False` to keep the plain model.
+
 - **WP-13.0: the camera model gains the higher-order tangential terms p3/p4
   (13 parameters).** `Calibration` packs f, cx, cy, b1, b2, k1..k4, p1..p4 in
   that order; p3/p4 are appended, so every pre-existing index keeps its meaning

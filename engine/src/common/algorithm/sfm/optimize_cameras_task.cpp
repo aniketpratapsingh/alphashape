@@ -195,13 +195,17 @@ void OptimizeCamerasTask::declare_params(Params& params) const {
     // groups whose likelihood-ratio gain pays for their degrees of freedom.
     params.declare({"adaptive_fitting", ParamType::Bool, false,
                     "Select the distortion terms automatically (ordered forward selection)."});
-    // Opt-in convenience for the case the benchmark measured: a block that has
-    // control points needs the richer model, while a block whose only
-    // georeferencing is camera positions does not. Default false keeps every
-    // existing call exactly as it was.
-    params.declare({"adaptive_fitting_auto", ParamType::Bool, false,
-                    "Use adaptive_fitting automatically when the chunk has enabled "
-                    "control points."});
+    // The case the benchmark measured: a block with surveyed control points
+    // needs the richer model, while a block whose only georeferencing is camera
+    // positions does not (docs/m13-validation.md). On by default, so a chunk
+    // without control points, or a call that holds every base coefficient,
+    // solves exactly as before. When it engages and the caller enabled none of
+    // the higher-order terms (k4, b1, b2, p3, p4), those become candidates for
+    // the selection unless the sensor fixes them. Turn this off to keep the
+    // plain model on a controlled block.
+    params.declare({"adaptive_fitting_auto", ParamType::Bool, true,
+                    "Use adaptive_fitting, with the extended model as candidates, "
+                    "automatically when the chunk has control points."});
     // Posterior covariance of the cameras and calibration is on by default
     // (subject to the BA caps); tie-point covariance is opt-in because it is
     // O(points) dense output a caller rarely needs.
@@ -297,19 +301,24 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
 
     // Free mask per sensor: fit_X && X not in the effective sensor's
     // fixed_params (the master's, for a slave).
-    problem.fit_intrinsics.resize(problem.calibrations.size());
-    for (std::size_t s = 0; s < problem.calibrations.size(); ++s) {
-        const Sensor& sensor =
-            chunk->sensors()[static_cast<std::size_t>(slot_sensor[s])];
-        std::array<bool, kCalibrationParamCount> mask = {};
-        for (int k = 0; k < kCalibrationParamCount; ++k) {
-            const std::size_t kk = static_cast<std::size_t>(k);
-            const bool fixed = std::find(sensor.fixed_params.begin(), sensor.fixed_params.end(),
-                                         std::string(kCalibrationParamNames[kk])) != sensor.fixed_params.end();
-            mask[kk] = fit[kk] && !fixed;
+    const auto apply_free_masks = [&]() {
+        problem.fit_intrinsics.resize(problem.calibrations.size());
+        for (std::size_t s = 0; s < problem.calibrations.size(); ++s) {
+            const Sensor& sensor =
+                chunk->sensors()[static_cast<std::size_t>(slot_sensor[s])];
+            std::array<bool, kCalibrationParamCount> mask = {};
+            for (int k = 0; k < kCalibrationParamCount; ++k) {
+                const std::size_t kk = static_cast<std::size_t>(k);
+                const bool fixed =
+                    std::find(sensor.fixed_params.begin(), sensor.fixed_params.end(),
+                              std::string(kCalibrationParamNames[kk])) !=
+                    sensor.fixed_params.end();
+                mask[kk] = fit[kk] && !fixed;
+            }
+            problem.fit_intrinsics[s] = mask;
         }
-        problem.fit_intrinsics[s] = mask;
-    }
+    };
+    apply_free_masks();
 
     // Points: every triangulated track, with the track -> BA point map.
     std::unordered_map<std::size_t, std::size_t> point_slot;
@@ -776,11 +785,49 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     // a consumer drone block regressed on every DEM and ortho metric when the
     // model was widened. So the condition is control markers, not merely a
     // georeferenced chunk.
+    //
+    // The automatic mode only refines a self-calibration: a caller that holds
+    // every base coefficient (f, cx, cy, k1-k3, p1, p2) has asked for a fixed
+    // lens, and there is nothing for the selection to adapt.
+    const auto param_index = [](const char* name) {
+        for (int k = 0; k < kCalibrationParamCount; ++k) {
+            if (std::string(kCalibrationParamNames[static_cast<std::size_t>(k)]) == name) {
+                return static_cast<std::size_t>(k);
+            }
+        }
+        throw Error(std::string("OptimizeCameras: unknown calibration term ") + name);
+    };
+    constexpr std::array<const char*, 8> kBaseTerms = {"f",  "cx", "cy", "k1",
+                                                       "k2", "k3", "p1", "p2"};
+    constexpr std::array<const char*, 5> kExtendedTerms = {"b1", "b2", "k4", "p3", "p4"};
+    bool base_free = false;
+    for (const auto& mask : problem.fit_intrinsics) {
+        for (const char* name : kBaseTerms) {
+            base_free = base_free || mask[param_index(name)];
+        }
+    }
     const bool requested_adaptive = params.get_bool("adaptive_fitting");
-    const bool auto_adaptive =
-        params.get_bool("adaptive_fitting_auto") && control_markers > 0;
+    const bool auto_adaptive = !requested_adaptive &&
+                               params.get_bool("adaptive_fitting_auto") &&
+                               control_markers > 0 && base_free;
     const bool adaptive_fitting = requested_adaptive || auto_adaptive;
-    if (auto_adaptive && !requested_adaptive) {
+    if (auto_adaptive) {
+        // The measured gain came from letting the selection consider the
+        // extended model, so the automatic mode offers those terms as
+        // candidates when the caller has not chosen any of them. A caller that
+        // enabled some extended term keeps exactly its own set. Whether a
+        // candidate is kept is still the likelihood-ratio decision, and a term
+        // the sensor fixes stays fixed.
+        bool caller_chose_extended = false;
+        for (const char* name : kExtendedTerms) {
+            caller_chose_extended = caller_chose_extended || fit[param_index(name)];
+        }
+        if (!caller_chose_extended) {
+            for (const char* name : kExtendedTerms) {
+                fit[param_index(name)] = true;
+            }
+            apply_free_masks();
+        }
         log(LogLevel::Info) << "OptimizeCameras: adaptive_fitting auto-selected for "
                             << control_markers << " control point(s)";
     }
