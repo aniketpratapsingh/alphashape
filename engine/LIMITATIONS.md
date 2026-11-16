@@ -1626,3 +1626,30 @@ close-out (WP-12.12). The engine guide is
 - **`Chunk.ground_control` is a view.** It groups the referenced Marker
   proxies into `markers`, `control_points` and `check_points`; it is not a
   separate ground-control object with its own editing commands.
+- **Ground-control accuracy misses the 5 cm target on the real RTK test block.**
+  On the `gcp-rtk` benchmark (a real RTK drone survey with five surveyed GCPs),
+  the leave-one-out check-point RMS is:
+
+  | Setup | Horizontal | Vertical |
+  |---|---|---|
+  | Plain lens model, GCPs only | 7.9 cm | 10.1 cm |
+  | 0.3.0 defaults: adaptive model, selected automatically for a block with control points | 6.5 cm | 6.5 cm |
+  | Best horizontal: camera RTK with per-photo accuracy + adaptive model | 5.3 cm | 12.2 cm |
+
+  The project target is 5 cm horizontal. Adding the camera RTK positions
+  improves horizontal but costs vertical: the camera heights and the GCPs
+  disagree by about 10 cm. Investigated and ruled out as the cause:
+  - pixel convention;
+  - the antenna mount;
+  - shutter-to-fix timing;
+  - fix status (every photo is RTK-fixed);
+  - per-photo weighting;
+  - block doming under camera RTK;
+  - a reference-frame mismatch;
+  - marker refinement (the clicks are already sub-pixel).
+
+  What remains is the block's geometry: the five GCPs cover 17 % of the flown
+  area, and focal length and the vertical principal point are almost fully
+  correlated (r = −0.96). For a survey that needs vertical accuracy, use the GCPs
+  without camera RTK priors. See the real-block section of
+  `docs/m13-validation.md`.

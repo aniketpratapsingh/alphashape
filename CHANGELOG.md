@@ -12,6 +12,14 @@ All notable changes to alphashape are recorded here. The format follows
   expanded CRS limits in `engine/LIMITATIONS.md` and CRS test notes in
   `engine/TESTING.md`, plus an opt-in `alphashape_crs_fixtures` CMake target that
   regenerates the CRS fixtures from their committed generator scripts.
+- **Project file reference.** `engine/docs/project-format-v2.md` is the
+  authoritative table of every doc.xml element and attribute; tests now fail
+  when the writer emits anything that table does not list.
+- **Ground-control accuracy on a real RTK block.** `engine/docs/m13-validation.md`
+  records the leave-one-out check-point results on a real RTK drone survey and
+  every cause investigated (lens model, pixel convention, antenna mount, timing,
+  fix status, per-photo weighting, block doming, reference frame, marker
+  refinement).
 
 ### Changed
 
@@ -55,6 +63,115 @@ All notable changes to alphashape are recorded here. The format follows
   Stable/pre-release channel and Check Now, persisted under `updates/...`.
   `ALPHASHAPE_NO_UPDATE_CHECK=1` and `--no-update-check` disable all requests;
   the only traffic is the public GitHub Releases API and the approved download.
+
+- **Per-photo GNSS accuracy and RTK fix status.** With `load_xmp_accuracy`,
+  `AddPhotos` reads each photo's own RTK standard deviations and fix status from
+  its XMP and uses them as that camera's reference accuracy. A fixed or float
+  solution uses the reported deviations; any other reported status keeps the
+  position but raises its accuracy to at least 0.5 m per axis. The status is
+  stored as the optional `reference@rtk_flag` attribute in doc.xml and exposed
+  as `Camera.reference_rtk_flag` in Python.
+
+- **Ground control in the bundle adjustment.** `OptimizeCameras` triangulates
+  markers seen in at least two aligned cameras, adds their projections to the
+  adjustment, and writes the solved positions back. Referenced markers are
+  control points with per-axis accuracy; markers typed `check_point` are held out
+  and only measured. Marker-to-marker scale bars fix the scale of a block that has
+  no georeference. `use_gcp=False` drops the marker references from the fit.
+  Each observation carries its own image accuracy, so marker projections and
+  tie points are weighted separately.
+
+- **`UpdateTransform`.** Refits the chunk's georeference as one weighted
+  seven-parameter similarity from the camera references and the control markers,
+  reporting control and check residuals, rejected markers and the recovered
+  scale (`chunk.updateTransform()` in Python; Tools > Update Transform).
+
+- **Adaptive camera-model fitting.** `OptimizeCameras` gains `adaptive_fitting`:
+  the solve starts from f, cx, cy and k1 and admits each further term (k2, the
+  p1/p2 pair, k3, b1, b2, k4, the p3/p4 pair) only when a likelihood-ratio test
+  and a robust-cost gain both justify it. The `fit_*` flags and the sensor's
+  `fixed_params` still exclude terms. The selected terms are recorded in the
+  chunk metadata.
+
+- **Posterior covariance.** `OptimizeCameras` computes the posterior covariance
+  of every camera and calibration (and of the tie points with
+  `tiepoint_covariance=True`), and the project file stores it. A rank-deficient
+  problem reports the covariance as invalid instead of failing.
+
+- **GNSS antenna lever arm and boresight.** A sensor can carry the antenna's
+  offset from the camera and an optional boresight. Camera GNSS references are
+  then treated as antenna positions by the bundle adjustment, the alignment
+  georeference and `UpdateTransform`. Python: `Chunk.set_sensor_antenna` and the
+  plain-number `Chunk.set_sensor_antenna_offset(sensor, x, y, z)`.
+
+- **Camera attitude priors.** A measured camera orientation (gimbal log or INS)
+  enters the bundle adjustment as a soft prior, with heading weighted separately
+  from pitch and roll.
+
+- **Cameras placed from reference data.** `AlignFromReference` places the
+  selected cameras from their GNSS position, attitude and lever arm, and
+  `TriangulateTiePoints` rebuilds and triangulates the tie points with the poses
+  held fixed (`chunk.alignFromReference()`, `chunk.triangulateTiePoints()`).
+
+- **Marker tracking.** `TrackMarkers` follows markers through an image sequence
+  with pyramidal Lucas-Kanade and a forward-backward check, never overwriting an
+  existing projection (`chunk.trackMarkers()`).
+
+- **Camera calibration from a chessboard.** `CalibrateCamera` detects chessboard
+  corners across a sensor's photos and solves the calibration with its
+  covariance, honouring the sensor's `fixed_params`. It can write an HTML or PDF
+  calibration report, and `ExportSTMap` writes an undistortion STMap.
+
+- **Calibration files and master sensors.** Calibrations load and save in
+  alphashape's XML and JSON forms and import/export as OpenCV XML/YAML. A sensor
+  can follow a master sensor and share its calibration in the adjustment.
+
+- **Printable marker and calibration sheets.** Circular coded targets, checker
+  crosses, AprilTag 36h11 and chessboards at exact physical size, as PDF or
+  raster (`alphashape-cli --make-sheet`, Python `make_marker_sheet` /
+  `make_chessboard_sheet`, Tools > Print Markers).
+
+- **Scanned film cameras.** `DetectFiducials` and `CalibrateFiducials` find the
+  fiducial marks and fit each scan's film transform; scans are resampled at load
+  time into a film-normalised frame so every later step runs unchanged.
+
+- **Project layouts.** A project can be saved as one `.psz` file as well as the
+  directory layout. Photo paths are stored relative to the project when
+  possible, a missing photo is a warning on load, and the project has a cache
+  directory and a lock file.
+
+- **Job database and `RunScript`.** Jobs are recorded in a SQLite database (with
+  a JSON-lines fallback), and the `RunScript` task runs a Python script against
+  the open project with a timeout (`Document.run_script`).
+
+- **Python bindings for the full data model.** Chunks, frames, marker groups,
+  scale bars, shapes and the remaining containers are scriptable, and every
+  change made from Python is undoable.
+
+- **GUI: reference pane and dialogs.** A reference pane lists camera and marker
+  references with their errors and inline editing. New dialogs: a CRS picker,
+  Reference Settings, Camera Calibration (initial and adjusted values, sigmas,
+  correlations, GNSS/INS mount), Detect Markers with a target preview, Detect
+  Fiducials and Print Markers.
+
+- **GUI: region box gizmo and Transform Object.** The reconstruction region can
+  be dragged and rotated in the viewport, or edited numerically; Tools gains
+  Transform Object, Update Transform and Reset Transform.
+
+- **GUI: time and memory estimates.** Task dialogs show an estimated run time
+  that learns from the machine's past jobs, and warn when a task is expected to
+  need more than 75 % of the RAM.
+
+- **Orthomosaic seam and hole options.** `BuildOrthomosaic` gains an opt-in
+  gradient-matching seam term (`seam_gradient_weight`) with a small-region merge
+  (`seam_min_region`), and `hole_fill_method="texture"` fills interior holes by
+  exemplar texture synthesis. The defaults leave the output unchanged.
+
+- **Quality benchmark: real RTK ground-control block.** `tools/bench` gains the
+  `gcp-rtk` dataset, a leave-one-out check-point protocol on a real RTK drone
+  survey, plus a `reps` input that repeats a run and reports every repetition
+  with its median and range, and an `optimize_params` input for camera-model
+  experiments.
 
 - **WP-11.8: frames, camera groups and stations, camera selection and frame
   statistics.** `AddPhotos` gains `group_by_folder` (one folder-typed camera
@@ -659,6 +776,35 @@ All notable changes to alphashape are recorded here. The format follows
   the DEM first" — it is accepted, and the ortho is written in the DEM's CRS (a
   cross-CRS conversion is an export-time reprojection). The `geo::Projection`
   and `TransverseMercator` implementation is removed.
+
+### Fixed
+
+- **`UpdateTransform` ignored the GNSS antenna mount.** It paired each camera
+  centre with its antenna reference, so with a lever arm set the datum fit and
+  the bundle adjustment disagreed. It now applies the same mount correction as
+  the bundle adjustment, and the alignment georeference uses the effective
+  master sensor's mount.
+- **`RefineMarkers` deleted real marker projections.** A projection it could
+  not refine confidently was removed, and an unconfirmed candidate could move an
+  accurate click by several pixels. It now keeps the measured pixel when no
+  refiner converges, moves a marker only when two views agree, and handles
+  printed checker targets.
+- **RTK accuracy in the `www.dji.com` XMP namespace was read as empty**, so
+  photos using that spelling lost their per-photo accuracy and fix status. Both
+  namespace spellings are read now.
+- **Adaptive camera-model fitting gave different results from run to run.** Its
+  model-selection solves now run single-threaded, so repeated runs are
+  identical.
+- **A pre-release build reported a plain version number.** The app now reports
+  its full release tag (for example `0.3.0-rc.2`), so the update check offers
+  the final release to a pre-release user.
+
+### Upgrading
+
+- 0.3.0 is the first release with the in-app update check. Install it by hand
+  once from the Releases page; later versions can then be found and installed
+  from Help > Check for Updates. A 0.3.0 pre-release (rc.1 and earlier) does not
+  have the update check.
 
 ## [0.2.0] - 2026-10-28
 
