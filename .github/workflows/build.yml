@@ -143,9 +143,14 @@ jobs:
             ccache-linux-gcc-main-
 
       - name: Configure
+        env:
+          VERSION_LABEL: ${{ inputs.version }}
         run: |
+          # The version label lets a pre-release build report itself as one
+          # (v0.3.0-rc.2), which the in-app update check needs.
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DALPHASHAPE_WARNINGS_AS_ERRORS=ON \
+            "-DALPHASHAPE_VERSION_LABEL=$VERSION_LABEL" \
             -DALPHASHAPE_BUILD_GUI=ON -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           # A missing Vulkan tool silently turns the GPU layer off; refuse that in CI.
@@ -309,6 +314,8 @@ jobs:
             ccache-macos-clang-main-
 
       - name: Configure
+        env:
+          VERSION_LABEL: ${{ inputs.version }}
         run: |
           # FindPython3 is pointed at the pinned interpreter explicitly rather than
           # left to the search order: the Homebrew formulae (pybind11 is one) pull a
@@ -316,6 +323,7 @@ jobs:
           # The module must be built against the interpreter the test lanes install.
           cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DALPHASHAPE_WARNINGS_AS_ERRORS=ON -DALPHASHAPE_GPU=ON \
+            "-DALPHASHAPE_VERSION_LABEL=$VERSION_LABEL" \
             -DALPHASHAPE_BUILD_GUI=ON -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
             "-DPython3_ROOT_DIR=$pythonLocation" -DPython3_FIND_STRATEGY=LOCATION \
             "-DPython3_EXECUTABLE=$pythonLocation/python" \
@@ -511,6 +519,8 @@ jobs:
           setup-python: false
 
       - name: Configure
+        env:
+          VERSION_LABEL: ${{ inputs.version }}
         shell: pwsh
         run: |
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
@@ -528,6 +538,7 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows -DALPHASHAPE_WARNINGS_AS_ERRORS=ON `
             -DALPHASHAPE_BUILD_PYTHON=OFF -DALPHASHAPE_GPU=ON `
+            "-DALPHASHAPE_VERSION_LABEL=$env:VERSION_LABEL" `
             -DALPHASHAPE_BUILD_GUI=ON "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # A missing Vulkan tool silently turns the GPU layer off; refuse that in
