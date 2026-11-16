@@ -111,25 +111,27 @@ public:
     FileCallback pending_done;
 };
 
+// The canned "newer" release. Its version is far ahead of any real build, so the
+// test does not start failing when the project version reaches it.
 const char* kNewReleaseJson = R"json([
   {
-    "tag_name": "v0.3.0",
-    "name": "0.3.0",
+    "tag_name": "v9.9.0",
+    "name": "9.9.0",
     "body": "## New things\n\n- **Faster** alignment\n- Fixed seams",
-    "html_url": "https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.3.0",
+    "html_url": "https://github.com/aniketpratapsingh/alphashape/releases/tag/v9.9.0",
     "draft": false,
     "prerelease": false,
     "assets": [
-      {"name": "alphashape-v0.3.0-macos-arm64.dmg",
-       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/alphashape-v0.3.0-macos-arm64.dmg"},
-      {"name": "alphashape-v0.3.0-windows-x86_64.exe",
-       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/alphashape-v0.3.0-windows-x86_64.exe"},
-      {"name": "alphashape-v0.3.0-linux-x86_64.AppImage",
-       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/alphashape-v0.3.0-linux-x86_64.AppImage"},
-      {"name": "alphashape-v0.3.0-linux-amd64.deb",
-       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/alphashape-v0.3.0-linux-amd64.deb"},
+      {"name": "alphashape-v9.9.0-macos-arm64.dmg",
+       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/alphashape-v9.9.0-macos-arm64.dmg"},
+      {"name": "alphashape-v9.9.0-windows-x86_64.exe",
+       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/alphashape-v9.9.0-windows-x86_64.exe"},
+      {"name": "alphashape-v9.9.0-linux-x86_64.AppImage",
+       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/alphashape-v9.9.0-linux-x86_64.AppImage"},
+      {"name": "alphashape-v9.9.0-linux-amd64.deb",
+       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/alphashape-v9.9.0-linux-amd64.deb"},
       {"name": "SHA256SUMS",
-       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/SHA256SUMS"}
+       "browser_download_url": "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/SHA256SUMS"}
     ]
   }
 ])json";
@@ -140,7 +142,7 @@ update::Release release_from_json() {
     return releases.front();
 }
 
-/// A dialog-ready result: Available with the 0.3.0 release.
+/// A dialog-ready result: Available with the 9.9.0 release.
 CheckResult available_result() {
     CheckResult result;
     result.status = CheckResult::Status::Available;
@@ -197,7 +199,7 @@ TEST_F(UpdateGuiTest, ManualCheckReportsANewerVersion) {
     EXPECT_TRUE(pump_until([&]() { return called; }));
     EXPECT_FALSE(automatic);
     EXPECT_EQ(seen.status, CheckResult::Status::Available);
-    EXPECT_EQ(seen.release.version.to_string(), "0.3.0");
+    EXPECT_EQ(seen.release.version.to_string(), "9.9.0");
 }
 
 TEST_F(UpdateGuiTest, ManualCheckBypassesTheThrottle) {
@@ -256,7 +258,7 @@ TEST_F(UpdateGuiTest, SkippedVersionSuppressesTheSameRelease) {
     auto fake = std::make_unique<FakeSource>();
     fake->releases_json = kNewReleaseJson;
     window().set_update_source(std::move(fake));
-    window().update_checker().skip_version(update::Version::parse("0.3.0").value());
+    window().update_checker().skip_version(update::Version::parse("9.9.0").value());
 
     CheckResult seen;
     window().set_update_result_handler(
@@ -289,7 +291,7 @@ TEST_F(UpdateGuiTest, UpdateDialogShowsVersionNotesAndButtons) {
     ASSERT_NE(dialog.notes(), nullptr);
     EXPECT_GE(dialog.notes()->toPlainText().indexOf(QStringLiteral("New things")), 0);
     ASSERT_NE(dialog.version_label(), nullptr);
-    EXPECT_GE(dialog.version_label()->text().indexOf(QStringLiteral("0.3.0")), 0);
+    EXPECT_GE(dialog.version_label()->text().indexOf(QStringLiteral("9.9.0")), 0);
     ASSERT_NE(dialog.download_button(), nullptr);
     EXPECT_EQ(dialog.download_button()->text(), QStringLiteral("Download and Install"));
     ASSERT_NE(dialog.skip_button(), nullptr);
@@ -309,8 +311,8 @@ TEST_F(UpdateGuiTest, SkippingFromTheDialogPersistsTheVersion) {
     dialog.skip_button()->click();
     EXPECT_EQ(dialog.result(), QDialog::Accepted);
     ASSERT_TRUE(checker.skipped_version().has_value());
-    EXPECT_EQ(checker.skipped_version()->to_string(), "0.3.0");
-    EXPECT_EQ(settings.value("updates/skipped_version").toString().toStdString(), "0.3.0");
+    EXPECT_EQ(checker.skipped_version()->to_string(), "9.9.0");
+    EXPECT_EQ(settings.value("updates/skipped_version").toString().toStdString(), "9.9.0");
 }
 
 TEST_F(UpdateGuiTest, RemindMeLaterClosesWithoutSkipping) {
@@ -335,7 +337,7 @@ TEST_F(UpdateGuiTest, ViewOnGitHubUsesTheReleaseUrl) {
     });
     dialog.view_button()->click();
     EXPECT_EQ(opened, QStringLiteral(
-                          "https://github.com/aniketpratapsingh/alphashape/releases/tag/v0.3.0"));
+                          "https://github.com/aniketpratapsingh/alphashape/releases/tag/v9.9.0"));
 }
 
 TEST_F(UpdateGuiTest, DownloadWithoutAPlatformAssetReportsTheReason) {
@@ -366,7 +368,7 @@ TEST_F(UpdateGuiTest, DownloadVerifiesTheChecksum) {
     const auto release = release_from_json();
     update::Asset asset{"payload.bin",
                         "https://github.com/aniketpratapsingh/alphashape/releases/download/"
-                        "v0.3.0/payload.bin"};
+                        "v9.9.0/payload.bin"};
     DownloadResult seen;
     bool called = false;
     checker.download_and_verify(release, asset, scratch("cache"), {},
@@ -391,7 +393,7 @@ TEST_F(UpdateGuiTest, ChecksumMismatchRefusesTheDownload) {
     const auto release = release_from_json();
     update::Asset asset{"payload.bin",
                         "https://github.com/aniketpratapsingh/alphashape/releases/download/"
-                        "v0.3.0/payload.bin"};
+                        "v9.9.0/payload.bin"};
     DownloadResult seen;
     bool called = false;
     const QString cache = scratch("cache-mismatch");
@@ -417,7 +419,7 @@ TEST_F(UpdateGuiTest, MissingChecksumEntryRefusesTheDownload) {
     const auto release = release_from_json();
     update::Asset asset{"payload.bin",
                         "https://github.com/aniketpratapsingh/alphashape/releases/download/"
-                        "v0.3.0/payload.bin"};
+                        "v9.9.0/payload.bin"};
     DownloadResult seen;
     checker.download_and_verify(release, asset, scratch("cache-missing"), {},
                                 [&](const DownloadResult& result) { seen = result; });
@@ -430,7 +432,7 @@ TEST_F(UpdateGuiTest, UpdateUrlAllowListAcceptsGitHubAndAssetCdnHosts) {
     // allowed, on every hop.
     const char* const allowed[] = {
         "https://api.github.com/repos/aniketpratapsingh/alphashape/releases",
-        "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/SHA256SUMS",
+        "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/SHA256SUMS",
         "https://objects.githubusercontent.com/github-production-release-asset/1/2",
         "https://release-assets.githubusercontent.com/github-production-release-asset/1/2",
         "https://github.com:443/aniketpratapsingh/alphashape",
@@ -442,7 +444,7 @@ TEST_F(UpdateGuiTest, UpdateUrlAllowListAcceptsGitHubAndAssetCdnHosts) {
     EXPECT_FALSE(
         is_allowed_update_download_url("https://api.github.com/repos/a/b/releases"));
     EXPECT_TRUE(is_allowed_update_download_url(
-        "https://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/x.dmg"));
+        "https://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/x.dmg"));
     EXPECT_TRUE(is_allowed_update_download_url(
         "https://objects.githubusercontent.com/github-production-release-asset/1/2"));
     EXPECT_TRUE(is_allowed_update_download_url(
@@ -452,7 +454,7 @@ TEST_F(UpdateGuiTest, UpdateUrlAllowListAcceptsGitHubAndAssetCdnHosts) {
 TEST_F(UpdateGuiTest, UpdateUrlAllowListRejectsInsecureForeignAndTrickyUrls) {
     const char* const rejected[] = {
         // Not HTTPS.
-        "http://github.com/aniketpratapsingh/alphashape/releases/download/v0.3.0/x.dmg",
+        "http://github.com/aniketpratapsingh/alphashape/releases/download/v9.9.0/x.dmg",
         // Not a GitHub host.
         "https://example.com/alphashape.dmg",
         // Lookalikes: a subdomain and a prefixed host.
