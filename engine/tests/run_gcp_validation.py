@@ -907,7 +907,8 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
                           fit_f=False, fit_cx=False, fit_cy=False,
                           fit_k1=False, fit_k2=False, fit_k3=False, fit_k4=False,
                           fit_p1=False, fit_p2=False,
-                          fit_p3=False, fit_p4=False)
+                          fit_p3=False, fit_p4=False,
+                          adaptive_fitting_auto=False)
     # The check-point error right after the bundle adjustment, in the datum the
     # adjustment itself worked in. Comparing it with the post-datum error tells
     # a bundle-adjustment defect from a datum-fit one.
@@ -3110,6 +3111,14 @@ def optimize_options(options):
         kwargs["adaptive_fitting"] = True
         kwargs.update(fit_k4=True, fit_b1=True, fit_b2=True,
                       fit_p3=True, fit_p4=True)
+    elif not options.get("engine_defaults"):
+        # Every variant names its lens model, so its numbers stay comparable
+        # across engine versions: one that did not ask for the adaptive model
+        # gets the plain one even though OptimizeCameras now selects the
+        # adaptive model by itself on a block with control points. The
+        # engine_defaults variant is the one that shows what a caller who sets
+        # nothing gets.
+        kwargs["adaptive_fitting_auto"] = False
     if options.get("extended_model"):
         # The default fit is f, cx, cy, k1, k2, p1, p2; free the higher-order
         # Brown/Fraser terms the defaults hold fixed.
@@ -3830,6 +3839,13 @@ def run_real_odm(args):
     variants["camera_rtk_gcps"] = run_variant(
         args, gcps, align_report, True, camera_options,
         frame_shifts=default_frame_shifts)
+    # What a caller who sets nothing gets: OptimizeCameras with its own
+    # defaults, which select the adaptive model because the block has control
+    # points. Report-only, so the two standard variants above keep their
+    # meaning across engine versions.
+    variants["engine_defaults"] = run_variant(
+        args, gcps, align_report, False, {"engine_defaults": True},
+        catch_all=True)
     # In per-image mode the same alignment is also refitted with one uniform
     # weight, so the per-image effect and the weight effect are separable in a
     # single run. Report-only.

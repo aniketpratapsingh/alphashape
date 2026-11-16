@@ -597,13 +597,34 @@ A camera-reference trigger is also not supported: aerial-nadir is georeferenced
 "enabled camera references" would reproduce the regression above. The condition
 that separates the three datasets is enabled **control points** — gcp-rtk has
 five GCPs (four control points in each leave-one-out fold), aerial-nadir and
-terrestrial-laser have none. The engine now has an
-opt-in `adaptive_fitting_auto` parameter (default `false`, so existing behaviour
-is unchanged) that selects adaptive fitting when `control_markers > 0`
-(`optimize_cameras_task.cpp`); the two tests
+terrestrial-laser have none. The engine has an `adaptive_fitting_auto`
+parameter that selects adaptive fitting when `control_markers > 0`
+(`optimize_cameras_task.cpp`).
+
+**Default since 0.3.0: `adaptive_fitting_auto = true`.** The rule, in full:
+
+- It engages only on a block with at least one control point: a referenced,
+  triangulated marker that is not a check point, with `use_gcp` on. Camera
+  references alone never trigger it, and a block without control solves exactly
+  as before, so aerial-nadir and terrestrial-laser are unaffected by
+  construction.
+- It does not engage when the caller holds every base coefficient (f, cx, cy,
+  k1–k3, p1, p2): that call asked for a fixed lens.
+- When it engages and the caller enabled none of k4, b1, b2, p3, p4, those terms
+  become candidates for the selection, matching the measured configuration. A
+  caller that enabled some of them keeps exactly its own set, and a term in the
+  sensor's `fixed_params` stays fixed.
+- An explicit `adaptive_fitting = true` behaves as before. To keep the plain
+  model on a controlled block, set `adaptive_fitting_auto = false`.
+
+The tests `AdaptiveFittingAutoIsTheDefault`, `AdaptiveFittingAutoOffKeepsThePlainModel`,
+`AdaptiveFittingAutoIgnoresCheckPoints`, `AdaptiveFittingAutoLeavesAFixedLensFixed`,
 `AdaptiveFittingAutoSelectsWithControlMarkers` and
-`AdaptiveFittingAutoIgnoresCameraReferencesAlone` pin both halves of the rule.
-Flipping that default is a one-line change for the coordinator.
+`AdaptiveFittingAutoIgnoresCameraReferencesAlone` pin the rule. The validation
+protocol names the lens model of every variant explicitly (a variant that does
+not ask for the adaptive model passes `adaptive_fitting_auto=False`), so the
+`gcps_only` and `camera_rtk_gcps` rows keep their meaning across versions; the
+report-only `engine_defaults` variant shows what a caller who sets nothing gets.
 
 **The 5 cm horizontal target is still missed.** The closest replicated
 configuration is `camera_rtk_gcps` with adaptive fitting at 5.40 cm (the

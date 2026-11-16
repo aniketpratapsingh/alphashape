@@ -130,6 +130,20 @@ class TestVariantOptions(unittest.TestCase):
         self.assertTrue(options["fit_k1"])
         self.assertFalse(options["fit_p1"])
 
+    def test_every_variant_names_its_lens_model(self):
+        # A variant that does not ask for the adaptive model pins the plain
+        # one, so its row keeps its meaning now that OptimizeCameras selects
+        # the adaptive model by itself on a controlled block.
+        plain = SCRIPT.optimize_options({})
+        self.assertIs(plain["adaptive_fitting_auto"], False)
+        self.assertNotIn("adaptive_fitting", plain)
+        adaptive = SCRIPT.optimize_options({"adaptive_fitting": True})
+        self.assertTrue(adaptive["adaptive_fitting"])
+        self.assertNotIn("adaptive_fitting_auto", adaptive)
+        # Only the engine_defaults variant leaves the engine's own default.
+        defaults = SCRIPT.optimize_options({"engine_defaults": True})
+        self.assertEqual(defaults, {"use_gcps": True})
+
     def test_doming_variants_are_registered(self):
         names = {name for name, _, _ in SCRIPT.DIAGNOSTIC_VARIANTS}
         for name in ("camera_rtk_k1234", "camera_rtk_f_fixed",
