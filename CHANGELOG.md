@@ -58,6 +58,101 @@ All notable changes to alphashape are recorded here. The format follows
   selected, and `false` reads as `"none"`. The Python binder likewise accepts a
   Bool and converts it to its text form.
 
+- **`BuildDem` `interpolation="enabled"` now fills the area the cameras
+  cover.** It used to fill only holes fully enclosed by data, which on a real
+  flight is almost none of them: the nodata outside the photos' cover surrounds
+  the surveyed block, so nearly every genuine hole inside it is connected to
+  the raster border through invalid cells. The mode now fills holes whose cells
+  lie inside the union of the enabled cameras' ground footprints (each camera's
+  image border projected onto the DEM's surface plane, convex hulled per camera
+  and rasterised -- NOT the convex hull of all cameras, so a gap between
+  adjacent flight strips stays nodata). Cells outside every footprint stay
+  nodata. `"extrapolated"` (fill everything) and `"disabled"` (fill nothing)
+  are unchanged. If no footprint can be computed the builder logs a warning and
+  falls back to the old interior-only rule. A georeferenced aerial DEM built
+  with `enabled` therefore has fewer nodata cells, including across gaps in the
+  observation raster that used to survive only because they touched the outer
+  rim. The new `max_fill_distance` parameter (Float, metres, default 0 =
+  unlimited) caps how far a filled cell may sit from the nearest measured cell,
+  for every fill method; filled cells sag with distance (see
+  `engine/LIMITATIONS.md`), so `max_fill_distance=10` suits a measurement-grade
+  DEM while the orthomosaic keeps the uncapped default.
+
+- **`BuildDepthMaps` now defaults to `filter_mode="moderate"` and
+  `max_neighbors=8`.** Both changes come from the aerial-nadir quality
+  benchmark (CPU, 30 images, downscale 8) and cost nothing:
+  - `moderate` filtering against `mild` left **21% less hole area**, with DSM
+    NMAD **0.653 → 0.574 m** and p95 error **2.51 → 2.12 m**, at no measurable
+    time cost.
+  - `max_neighbors=8` against `16` made the depth stage **30-40% faster**, with
+    coverage, hole area and DSM accuracy equal or slightly better — a wider
+    neighbourhood is search time that buys nothing on typical blocks.
+
+  A project whose maps were built with the old defaults is rebuilt on the next
+  run with defaults: `max_neighbors` is part of the depth-map fingerprint and
+  the filter mode is part of a map's identity, so the stored maps do not
+  describe the requested settings. That is the intended behaviour, and the task
+  now logs a per-camera reason ("built from different settings, alignment or
+  neighbourhood", "filtered with a different mode", …) plus the run's neighbour
+  and reuse counts. `filter_mode="mild"` and `max_neighbors=16` restore the
+  previous behaviour exactly; every mode and the whole `[1, 256)` neighbour
+  range remain legal.
+- **A pair on aligned datums no longer needs `allow_ballpark`.** An unpinned
+  transform is PROJ's own pipeline, and PROJ used to be asked for a pipeline
+  that PROJ itself described as a ballpark for pairs such as WGS 84 ↔ ETRS89,
+  NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 and NTF, so `create()`
+  refused them even though the real EPSG operation exists (a null shift, a
+  Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
+  are accepted and their numbers come from the EPSG operation PROJ picks per
+  point rather than a `+proj=noop` fallback; `accuracy_m()` reports the best
+  stated accuracy among the pair's real operations (1 m for ETRS89 ↔ WGS 84,
+  2 m for the NAD83(2011) Helmert, 3 m for GDA2020).
+- **A target whose extent is wider than the real shift is not a ballpark.**
+  The refusal decision now reads a partial-intersection candidate list, not
+  PROJ's default strict one. Strict containment asks an operation's area to
+  contain *both* CRSs' entire extents, so WGS 84 → EPSG:3035 (ETRS89 / LAEA
+  Europe) listed nothing but the world ballpark: EPSG:3035 reaches 24.6°N while
+  `ETRS89 to WGS 84 (1)` (EPSG:1149) stops at 33.26°N. PROJ's per-point
+  pipeline applies the 1 m operation throughout its area regardless, so
+  `create()` was refusing a transform the engine runs correctly (`BuildDem` in
+  EPSG:3035 works again). Pairs newly accepted without `allow_ballpark`, each
+  reporting the best stated accuracy among its real operations and transforming
+  per point exactly as bare PROJ does: WGS 84 / ETRS89, geographic 2D and 3D, →
+  EPSG:3035; WGS 84 → EPSG:28992 (Amersfoort / RD New); WGS 84 ↔ NAD 27
+  (EPSG:4267); WGS 84 ↔ NAD83 (EPSG:4269); and ETRS89 → EPSG:27700 (British
+  National Grid, the OSNet ETRS89-GBR realisation) and OSGB36 → EPSG:25832.
+  Nothing previously accepted is now refused. A pair with no published
+  transformation at all (WGS 84 ↔ OSGB70/EPSG:4278, a custom `+ellps=` with no
+  datum name) still has only a ballpark candidate and is still refused without
+  `allow_ballpark`. See `engine/LIMITATIONS.md`.
+- **An optional grid is not reported missing.** PROJ's `+grids=@name` means
+  "use it if installed, otherwise run without it". Such a grid is now listed
+  without the leading `@` and never reported under `missing_grids`, so a
+  transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
+  instead of failing with `transformation needs grid @name; install proj-data`.
+- **DEMs and orthomosaics are built through the CRS engine, in any CRS.**
+  `SurfaceFrame` no longer carries a hand-written Transverse Mercator series
+  and a three-CRS selector; it is now the exact chain chunk-local → ECEF (the
+  chunk transform) → `crs::LocalFrame` → target CRS. DEM and orthomosaic grids
+  can therefore be built in any CRS PROJ knows — a national grid such as
+  ETRS89 / LAEA Europe (EPSG:3035), a compound CRS, or one described by WKT —
+  not just UTM or geographic lon/lat. Auto-selection for an unspecified CRS is
+  still the regular 6-degree UTM rule at the chunk origin, so an existing
+  project's DEM lands in exactly the same zone as before, and the change is
+  numerically neutral for UTM/lon-lat output (the retired series and PROJ agree
+  well inside a millimetre). `BuildDem` and `BuildOrthomosaic` keep the
+  `projection` (Int, EPSG) parameter and gain `crs` (String: `"EPSG:<code>"`, a
+  PROJ string or WKT); setting both to disagreeing values is a `ValueError`. A
+  DEM names its CRS as `Elevation::crs` (`Orthomosaic::crs` likewise) with an
+  `epsg()` compatibility accessor; doc.xml writes the EPSG code as before and
+  adds a `crs_wkt` attribute only when the CRS carries one, so an old project
+  (an EPSG code and nothing else) loads to the same CRS and a plain-code
+  project re-saves byte-identically. `BuildOrthomosaic` now always builds on the
+  DEM's own plane: a request for a different CRS no longer fails with "reproject
+  the DEM first" — it is accepted, and the ortho is written in the DEM's CRS (a
+  cross-CRS conversion is an export-time reprojection). The `geo::Projection`
+  and `TransverseMercator` implementation is removed.
+
 ### Added
 
 - **GUI update checks (automatic and manual).** Help > Check for Updates... runs
@@ -689,103 +784,6 @@ All notable changes to alphashape are recorded here. The format follows
   honoured by the CPU and GPU search paths. Each is folded into a depth map's
   fingerprint only when it differs from its default, so existing maps stay
   reusable; out-of-range values are rejected before the chunk is touched.
-
-### Changed
-
-- **`BuildDem` `interpolation="enabled"` now fills the area the cameras
-  cover.** It used to fill only holes fully enclosed by data, which on a real
-  flight is almost none of them: the nodata outside the photos' cover surrounds
-  the surveyed block, so nearly every genuine hole inside it is connected to
-  the raster border through invalid cells. The mode now fills holes whose cells
-  lie inside the union of the enabled cameras' ground footprints (each camera's
-  image border projected onto the DEM's surface plane, convex hulled per camera
-  and rasterised -- NOT the convex hull of all cameras, so a gap between
-  adjacent flight strips stays nodata). Cells outside every footprint stay
-  nodata. `"extrapolated"` (fill everything) and `"disabled"` (fill nothing)
-  are unchanged. If no footprint can be computed the builder logs a warning and
-  falls back to the old interior-only rule. A georeferenced aerial DEM built
-  with `enabled` therefore has fewer nodata cells, including across gaps in the
-  observation raster that used to survive only because they touched the outer
-  rim. The new `max_fill_distance` parameter (Float, metres, default 0 =
-  unlimited) caps how far a filled cell may sit from the nearest measured cell,
-  for every fill method; filled cells sag with distance (see
-  `engine/LIMITATIONS.md`), so `max_fill_distance=10` suits a measurement-grade
-  DEM while the orthomosaic keeps the uncapped default.
-
-- **`BuildDepthMaps` now defaults to `filter_mode="moderate"` and
-  `max_neighbors=8`.** Both changes come from the aerial-nadir quality
-  benchmark (CPU, 30 images, downscale 8) and cost nothing:
-  - `moderate` filtering against `mild` left **21% less hole area**, with DSM
-    NMAD **0.653 → 0.574 m** and p95 error **2.51 → 2.12 m**, at no measurable
-    time cost.
-  - `max_neighbors=8` against `16` made the depth stage **30-40% faster**, with
-    coverage, hole area and DSM accuracy equal or slightly better — a wider
-    neighbourhood is search time that buys nothing on typical blocks.
-
-  A project whose maps were built with the old defaults is rebuilt on the next
-  run with defaults: `max_neighbors` is part of the depth-map fingerprint and
-  the filter mode is part of a map's identity, so the stored maps do not
-  describe the requested settings. That is the intended behaviour, and the task
-  now logs a per-camera reason ("built from different settings, alignment or
-  neighbourhood", "filtered with a different mode", …) plus the run's neighbour
-  and reuse counts. `filter_mode="mild"` and `max_neighbors=16` restore the
-  previous behaviour exactly; every mode and the whole `[1, 256)` neighbour
-  range remain legal.
-- **A pair on aligned datums no longer needs `allow_ballpark`.** An unpinned
-  transform is PROJ's own pipeline, and PROJ used to be asked for a pipeline
-  that PROJ itself described as a ballpark for pairs such as WGS 84 ↔ ETRS89,
-  NZGD2000, GDA2020, SIRGAS 2000, NAD83(2011), OSGB36 and NTF, so `create()`
-  refused them even though the real EPSG operation exists (a null shift, a
-  Helmert or a grid shift). The pipeline is now built bare, so those 38 pairs
-  are accepted and their numbers come from the EPSG operation PROJ picks per
-  point rather than a `+proj=noop` fallback; `accuracy_m()` reports the best
-  stated accuracy among the pair's real operations (1 m for ETRS89 ↔ WGS 84,
-  2 m for the NAD83(2011) Helmert, 3 m for GDA2020).
-- **A target whose extent is wider than the real shift is not a ballpark.**
-  The refusal decision now reads a partial-intersection candidate list, not
-  PROJ's default strict one. Strict containment asks an operation's area to
-  contain *both* CRSs' entire extents, so WGS 84 → EPSG:3035 (ETRS89 / LAEA
-  Europe) listed nothing but the world ballpark: EPSG:3035 reaches 24.6°N while
-  `ETRS89 to WGS 84 (1)` (EPSG:1149) stops at 33.26°N. PROJ's per-point
-  pipeline applies the 1 m operation throughout its area regardless, so
-  `create()` was refusing a transform the engine runs correctly (`BuildDem` in
-  EPSG:3035 works again). Pairs newly accepted without `allow_ballpark`, each
-  reporting the best stated accuracy among its real operations and transforming
-  per point exactly as bare PROJ does: WGS 84 / ETRS89, geographic 2D and 3D, →
-  EPSG:3035; WGS 84 → EPSG:28992 (Amersfoort / RD New); WGS 84 ↔ NAD 27
-  (EPSG:4267); WGS 84 ↔ NAD83 (EPSG:4269); and ETRS89 → EPSG:27700 (British
-  National Grid, the OSNet ETRS89-GBR realisation) and OSGB36 → EPSG:25832.
-  Nothing previously accepted is now refused. A pair with no published
-  transformation at all (WGS 84 ↔ OSGB70/EPSG:4278, a custom `+ellps=` with no
-  datum name) still has only a ballpark candidate and is still refused without
-  `allow_ballpark`. See `engine/LIMITATIONS.md`.
-- **An optional grid is not reported missing.** PROJ's `+grids=@name` means
-  "use it if installed, otherwise run without it". Such a grid is now listed
-  without the leading `@` and never reported under `missing_grids`, so a
-  transform whose CRS carries `+nadgrids=@name` builds as it did before WP-12.4
-  instead of failing with `transformation needs grid @name; install proj-data`.
-- **DEMs and orthomosaics are built through the CRS engine, in any CRS.**
-  `SurfaceFrame` no longer carries a hand-written Transverse Mercator series
-  and a three-CRS selector; it is now the exact chain chunk-local → ECEF (the
-  chunk transform) → `crs::LocalFrame` → target CRS. DEM and orthomosaic grids
-  can therefore be built in any CRS PROJ knows — a national grid such as
-  ETRS89 / LAEA Europe (EPSG:3035), a compound CRS, or one described by WKT —
-  not just UTM or geographic lon/lat. Auto-selection for an unspecified CRS is
-  still the regular 6-degree UTM rule at the chunk origin, so an existing
-  project's DEM lands in exactly the same zone as before, and the change is
-  numerically neutral for UTM/lon-lat output (the retired series and PROJ agree
-  well inside a millimetre). `BuildDem` and `BuildOrthomosaic` keep the
-  `projection` (Int, EPSG) parameter and gain `crs` (String: `"EPSG:<code>"`, a
-  PROJ string or WKT); setting both to disagreeing values is a `ValueError`. A
-  DEM names its CRS as `Elevation::crs` (`Orthomosaic::crs` likewise) with an
-  `epsg()` compatibility accessor; doc.xml writes the EPSG code as before and
-  adds a `crs_wkt` attribute only when the CRS carries one, so an old project
-  (an EPSG code and nothing else) loads to the same CRS and a plain-code
-  project re-saves byte-identically. `BuildOrthomosaic` now always builds on the
-  DEM's own plane: a request for a different CRS no longer fails with "reproject
-  the DEM first" — it is accepted, and the ortho is written in the DEM's CRS (a
-  cross-CRS conversion is an export-time reprojection). The `geo::Projection`
-  and `TransverseMercator` implementation is removed.
 
 ### Fixed
 
