@@ -1944,7 +1944,7 @@ TEST(OptimizeCameras, AdaptiveFittingAutoIgnoresCameraReferencesAlone) {
 
 TEST(OptimizeCameras, AdaptiveFittingAutoIsTheDefault) {
     // A caller that sets nothing gets the adaptive model on a controlled block.
-    const Params defaults = make_params(builtin_registry().require("OptimizeCameras"));
+    Params defaults = make_params(builtin_registry().require("OptimizeCameras"));
     EXPECT_TRUE(defaults.get_bool("adaptive_fitting_auto"));
     EXPECT_FALSE(defaults.get_bool("adaptive_fitting"));
 
@@ -1977,7 +1977,7 @@ TEST(OptimizeCameras, AdaptiveFittingAutoIgnoresCheckPoints) {
     for (Marker& marker : chunk.markers()) {
         marker.meta.set("type", "check_point");
     }
-    const Params params = make_params(builtin_registry().require("OptimizeCameras"));
+    Params params = make_params(builtin_registry().require("OptimizeCameras"));
     run_task(builtin_registry(), scene.document, "OptimizeCameras", params);
 
     Chunk& solved = *scene.document.active_chunk();
