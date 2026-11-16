@@ -59,7 +59,7 @@ endif()
 # The engine uses `slots` and `signals` as ordinary identifiers (core/assets.hpp), which Qt's
 # keyword macros would break, so Qt code here spells them Q_SLOTS / Q_SIGNALS / Q_EMIT.
 target_compile_definitions(alphashape_gui_lib PUBLIC QT_NO_KEYWORDS)
-target_compile_definitions(alphashape_gui_lib PRIVATE ALPHASHAPE_GUI_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(alphashape_gui_lib PRIVATE ALPHASHAPE_GUI_VERSION="${ALPHASHAPE_DISPLAY_VERSION}")
 
 # The style sheets are generated from design/system/tokens.json by tools/theme/compile_qss.py
 # and checked in; they are embedded so the binary has no files to find at run time.
@@ -96,7 +96,7 @@ qt_add_shaders(alphashape_gui_lib alphashape_shaders
 
 add_executable(alphashape-gui main.cpp)
 target_link_libraries(alphashape-gui PRIVATE alphashape_gui_lib alphashape_warnings)
-target_compile_definitions(alphashape-gui PRIVATE ALPHASHAPE_GUI_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(alphashape-gui PRIVATE ALPHASHAPE_GUI_VERSION="${ALPHASHAPE_DISPLAY_VERSION}")
 # Windows gets a GUI subsystem, so starting the app from Explorer or a shortcut
 # does not open a console window beside it. Qt's WinMain (Qt6::EntryPointPrivate,
 # which Qt6::Core pulls in for a WIN32_EXECUTABLE target) calls the main() below,

@@ -1,9 +1,33 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(alphashape
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Photogrammetry engine"
     LANGUAGES CXX)
+
+# The version the app reports about itself (About box, update check). A release
+# build passes its tag (v0.3.0, v0.3.0-rc.2, ...) so a pre-release knows it is
+# one: the update check must see v0.3.0-rc.2 as older than v0.3.0, which a bare
+# PROJECT_VERSION of 0.3.0 cannot express. A label whose numeric part does not
+# match PROJECT_VERSION, or that is not a semantic version, is ignored with a
+# warning rather than stamped.
+set(ALPHASHAPE_VERSION_LABEL "" CACHE STRING
+    "Release tag stamped into the app's reported version (e.g. v0.3.0-rc.2); empty or 'dev' reports PROJECT_VERSION")
+set(ALPHASHAPE_DISPLAY_VERSION "${PROJECT_VERSION}")
+if(ALPHASHAPE_VERSION_LABEL AND NOT ALPHASHAPE_VERSION_LABEL STREQUAL "dev")
+    string(REGEX REPLACE "^[vV]" "" _alphashape_label "${ALPHASHAPE_VERSION_LABEL}")
+    if(_alphashape_label MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)(-[0-9A-Za-z.-]+)?$")
+        if(CMAKE_MATCH_1 VERSION_EQUAL PROJECT_VERSION)
+            set(ALPHASHAPE_DISPLAY_VERSION "${_alphashape_label}")
+        else()
+            message(WARNING "alphashape: version label ${ALPHASHAPE_VERSION_LABEL} does not "
+                            "match VERSION ${PROJECT_VERSION}; reporting ${PROJECT_VERSION}")
+        endif()
+    else()
+        message(WARNING "alphashape: version label ${ALPHASHAPE_VERSION_LABEL} is not a "
+                        "semantic version; reporting ${PROJECT_VERSION}")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Global settings
@@ -285,7 +309,7 @@ endif()
 # Summary
 # ---------------------------------------------------------------------------
 message(STATUS "")
-message(STATUS "alphashape ${PROJECT_VERSION}")
+message(STATUS "alphashape ${ALPHASHAPE_DISPLAY_VERSION}")
 message(STATUS "  build type ....... ${CMAKE_BUILD_TYPE}")
 message(STATUS "  OpenMP ........... ${OpenMP_CXX_FOUND}")
 message(STATUS "  tests ............ ${ALPHASHAPE_BUILD_TESTS}")
