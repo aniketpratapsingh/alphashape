@@ -1651,7 +1651,12 @@ def run_gcp_validation(
     # dispatch is about.
     diagnostics = bool(gcp.get("diagnostics")) and reps == 1
     if diagnostics:
+        # With them on, save a handful of before/after marker crops: the
+        # images are never redistributed, so the artifact is the only record
+        # of what the printed target looks like.
+        crops = work / "gcp_crops"
         command.append("--diagnostics")
+        command.extend(["--crops-dir", str(crops)])
     # An allowlist makes a targeted re-measurement affordable without changing
     # the default set. The dispatch input arrives through an environment
     # variable (never interpolated into a shell line) and the script validates

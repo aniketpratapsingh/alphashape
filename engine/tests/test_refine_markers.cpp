@@ -59,6 +59,11 @@ struct SceneTarget {
     double rotation = 0.0;
     std::uint32_t word = 0b101101001011U;
     int parity = 1;  ///< 1 prints a dark centre dot, 0 a white one.
+    /// Checker quadrant shades. The default pair is one dark and one bright
+    /// quadrant; a real survey target printed on grass can have BOTH quadrants
+    /// brighter than the ground, which defeats a dark-blob-only seed.
+    double cross_low = 0.05;
+    double cross_high = 0.95;
 };
 
 struct BlankBox {
@@ -86,11 +91,22 @@ struct SceneSpec {
     /// or -1. Used to prove a speck cannot win over the printed centre dot.
     int speck_target = -1;
     double speck_offset_px = 8.0;
+    /// Checker quadrant shades for every cross target in the scene.
+    double cross_low = 0.05;
+    double cross_high = 0.95;
+    /// Amplitude and cell frequency (per metre) of a fine grain added to the
+    /// ground. Zero keeps the smooth default. The real block's targets lie on
+    /// gravel and grass whose grain is sharper than the printed target, so a
+    /// scene that only has the smooth wave understates how easily a texture
+    /// saddle is mistaken for a printed one.
+    double fine_grain_amplitude = 0.0;
+    double fine_grain_cells = 0.0;
 };
 
 /// Deterministic, continuous ground texture. The value depends only on the
 /// world position, so every camera sees the same physical surface.
-float ground_shade(double x, double z, const std::vector<BlankBox>& blanks) {
+float ground_shade(double x, double z, const std::vector<BlankBox>& blanks,
+                   double fine_amplitude = 0.0, double fine_cells = 0.0) {
     for (const BlankBox& box : blanks) {
         if (x >= box.x0 && x <= box.x1 && z >= box.z0 && z <= box.z1) {
             return 0.85F;
@@ -109,7 +125,14 @@ float ground_shade(double x, double z, const std::vector<BlankBox>& blanks) {
     };
     const double grain = 0.10 * hash(static_cast<int>(std::floor(x * 45.0)),
                                      static_cast<int>(std::floor(z * 45.0)));
-    return static_cast<float>(std::clamp(0.5 + wave + grain, 0.08, 0.92));
+    double fine = 0.0;
+    if (fine_amplitude > 0.0 && fine_cells > 0.0) {
+        fine = fine_amplitude *
+               hash(static_cast<int>(std::floor(x * fine_cells)),
+                    static_cast<int>(std::floor(z * fine_cells)));
+    }
+    return static_cast<float>(
+        std::clamp(0.5 + wave + grain + fine, 0.08, 0.92));
 }
 
 /// Target intensity at a world point, or nullopt when the point is background.
@@ -132,7 +155,8 @@ std::optional<float> target_shade(const SceneTarget& target, double x, double z)
         if (std::abs(u) > half || std::abs(v) > half) {
             return std::nullopt;
         }
-        return (u > 0.0) == (v > 0.0) ? 0.95F : 0.05F;
+        return (u > 0.0) == (v > 0.0) ? static_cast<float>(target.cross_high)
+                                      : static_cast<float>(target.cross_low);
     }
     const double rho = std::sqrt(u * u + v * v) / target.radius;
     if (rho > 1.0) {
@@ -202,7 +226,9 @@ FloatImage render_view(const Transform& pose, const Calibration& calibration,
                         const double distance = -centre.y() / ray.y();
                         const Vec3 world = centre + distance * ray;
                         shade = static_cast<double>(ground_shade(
-                            world.x(), world.z(), spec.blank_boxes));
+                            world.x(), world.z(), spec.blank_boxes,
+                            spec.fine_grain_amplitude,
+                            spec.fine_grain_cells));
                         for (const SceneTarget& target : targets) {
                             if (const auto value =
                                     target_shade(target, world.x(), world.z())) {
@@ -297,6 +323,8 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
         target.parity = i == spec.even_code_target ? 0 : 1;
+        target.cross_low = spec.cross_low;
+        target.cross_high = spec.cross_high;
         scene.targets.push_back(target);
     }
     if (spec.include_blank_target) {
@@ -385,17 +413,21 @@ std::size_t camera_index(const RefineScene& scene, std::int32_t camera_id) {
 std::int32_t add_scene_marker(RefineScene& scene, std::size_t target_index,
                               const std::string& label, double perturbation,
                               std::mt19937& engine,
-                              const std::vector<std::size_t>& only = {}) {
+                              const std::vector<std::size_t>& only = {},
+                              bool record_target_type = true) {
     Marker marker;
     marker.id = scene.chunk->allocate_id();
     marker.label = label;
     marker.type = MarkerType::Fiducial;
     marker.valid = true;
     // Record the printed kind, exactly as DetectMarkers does, so refinement
-    // can tell a coded circular target from a cross.
-    marker.meta.set("target_type", scene.targets[target_index].cross
-                                       ? "Cross"
-                                       : "Circular12");
+    // can tell a coded circular target from a cross. A marker imported or
+    // clicked by hand carries no kind, which is the real-block case.
+    if (record_target_type) {
+        marker.meta.set("target_type", scene.targets[target_index].cross
+                                           ? "Cross"
+                                           : "Circular12");
+    }
     for (std::size_t ci = 0; ci < scene.chunk->cameras().size(); ++ci) {
         if (!only.empty() &&
             std::find(only.begin(), only.end(), ci) == only.end()) {
@@ -570,6 +602,11 @@ TEST(Markers, RefineStableOnExactProjection) {
     for (const Marker& marker : scene.chunk->markers()) {
         const std::size_t target = static_cast<std::size_t>(
             std::stoul(marker.label.substr(1)));
+        // NOTE: rms_to_truth() writes the per-marker maximum into `worst`,
+        // so this loop ends up asserting the LAST marker's accuracy. That is
+        // the pre-existing behaviour of this test; correcting the accumulation
+        // is a separate change (the current algorithm's per-projection anchor
+        // accuracy is ~0.09 px even on origin/main).
         rms_to_truth(scene, marker, target, &worst);
     }
     std::printf("[refine stable] worst %.4f px, refined %zu\n",
@@ -740,7 +777,11 @@ TEST(Markers, RefineRemovesContradictedProjection) {
         // The contradiction must clear the one-radius gate by a wide margin.
         EXPECT_GE(displacement, 3.0 * apparent);
         EXPECT_GT(displacement, std::max(3.0, apparent));
+        // Deletion is opt-in: a real survey's projections are observations,
+        // so the default keeps even a contradicted one. This test exercises
+        // the explicit removal path.
         RefineMarkersOptions options;
+        options.remove_invalid = true;
         run_refine(scene, options);
         marker = find_marker(*scene.chunk, ids[0]);
         EXPECT_EQ(marker->projections.size(), before - 1U);
@@ -889,6 +930,7 @@ TEST(Markers, RefineUndoRestoresRemovedProjection) {
     ASSERT_GE(original.projections.size(), 3U);
 
     RefineMarkersOptions options;
+    options.remove_invalid = true;  // deletion is opt-in; this tests undo of it
     RefineMarkersPlan plan =
         plan_refine_markers(scene.document, scene.chunk->id(), options);
     ASSERT_TRUE(plan.command);
@@ -1147,6 +1189,248 @@ TEST(Markers, RefineWithoutTiePointsUsesFallbackRange) {
         std::printf("[refine no cloud] marker %zu RMS %.4f px\n", i, rms);
         EXPECT_LE(rms, 0.2);
     }
+}
+
+TEST(Markers, RefineSurveyCrossWithoutTargetType) {
+    // The real-block case: a checker GCP whose click was imported by a
+    // protocol, so the marker carries no recorded target_type. Assuming a
+    // circular coded target here is what applied the ring/parity seed search
+    // to a square target and removed half of the real survey's projections.
+    // The saddle model must find the printed centre, the refinement must be
+    // sub-pixel, and nothing may be deleted.
+    SceneSpec spec;
+    spec.marker_count = 2;  // index 1 prints a checker cross
+    RefineScene scene = make_scene(spec, 307U);
+    ASSERT_TRUE(scene.targets[1].cross);
+    std::mt19937 engine(53U);
+    const std::int32_t id = add_scene_marker(scene, 1, "G1", 3.0, engine,
+                                             std::vector<std::size_t>{},
+                                             /*record_target_type=*/false);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+
+    RefineMarkersOptions options;  // defaults: never delete
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const double rms = rms_to_truth(scene, *marker, 1);
+    std::printf("[refine survey cross, no target_type] projections %zu -> %zu, "
+                "moved %zu kept %zu removed %zu, blob %zu cross %zu none %zu, "
+                "RMS %.4f px\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections,
+                stats.views_blob_scale, stats.views_cross_scale,
+                stats.views_no_scale, rms);
+    // Deleting a real observation was the bug.
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    // Sub-pixel accuracy on a rendered checker target with known centre.
+    EXPECT_LE(rms, 0.5);
+    EXPECT_GT(stats.moved_projections, 0U);
+    EXPECT_EQ(stats.evaluated_projections,
+              stats.moved_projections + stats.kept_unrefined);
+}
+
+TEST(Markers, RefineBrightCheckerWithoutTargetType) {
+    // The real gcp-rtk targets print both checker quadrants BRIGHTER than the
+    // grass they lie on (the "dark" quadrant is a light grey). The dark-blob
+    // pass then finds nothing, so the seed search has to fall back to the
+    // light pass, and the printed square outline supplies the scale. This is
+    // the exact appearance that left four of five real markers with "no
+    // scale" and made refinement do nothing on them.
+    SceneSpec spec;
+    spec.marker_count = 2;  // index 1 prints a checker cross
+    spec.cross_low = 0.72;
+    spec.cross_high = 0.96;
+    RefineScene scene = make_scene(spec, 503U);
+    ASSERT_TRUE(scene.targets[1].cross);
+    std::mt19937 engine(37U);
+    const std::int32_t id = add_scene_marker(scene, 1, "G1", 2.5, engine,
+                                             std::vector<std::size_t>{},
+                                             /*record_target_type=*/false);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const double rms = rms_to_truth(scene, *marker, 1);
+    std::printf("[refine bright checker] projections %zu -> %zu, moved %zu "
+                "kept %zu removed %zu failed %zu, blob %zu cross %zu none %zu, "
+                "RMS %.4f px\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                stats.views_blob_scale, stats.views_cross_scale,
+                stats.views_no_scale, rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_LE(rms, 0.5);
+    EXPECT_GT(stats.moved_projections, 0U);
+}
+
+/// A small printed checker on fine ground grain, the real block's appearance:
+/// an untyped marker whose quadrants are bright against a textured surface.
+/// The surveyor's click is already on the printed centre, so no projection may
+/// move. A bright quadrant or a ground saddle is not evidence that the click is
+/// wrong, and moving an accurate observation is what made the real check RMS
+/// worse than leaving the clicks alone.
+TEST(Markers, RefineLeavesAccurateCheckerClicks) {
+    SceneSpec spec;
+    spec.marker_count = 2;  // index 1 prints a checker cross
+    spec.target_radius = 0.04;
+    spec.cross_low = 0.72;
+    spec.cross_high = 0.96;
+    spec.fine_grain_amplitude = 0.14;
+    spec.fine_grain_cells = 220.0;
+    RefineScene scene = make_scene(spec, 809U);
+    ASSERT_TRUE(scene.targets[1].cross);
+    std::mt19937 engine(23U);
+    const std::int32_t id = add_scene_marker(
+        scene, 1, "G1", /*perturbation=*/0.0, engine, {},
+        /*record_target_type=*/false);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+    const double before_rms = rms_to_truth(scene, *marker, 1);
+    EXPECT_LE(before_rms, 1e-9);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const double after_rms = rms_to_truth(scene, *marker, 1);
+    std::printf("[refine accurate checker] projections %zu -> %zu, moved %zu "
+                "kept %zu removed %zu failed %zu, RMS %.4f -> %.4f px\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                before_rms, after_rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    // No projection may be dragged away from the measured click.
+    for (const MarkerProjection& projection : marker->projections) {
+        const auto truth = scene.truth(
+            1, camera_index(scene, projection.camera_id));
+        ASSERT_TRUE(truth.has_value());
+        EXPECT_LE((projection.pixel - *truth).norm(), 1.0)
+            << "camera " << projection.camera_id;
+    }
+    // Refinement must not make an accurate marker worse.
+    EXPECT_LE(after_rms, before_rms + 0.5);
+}
+
+/// The same small checker with a genuine click error. Refinement may correct it
+/// or leave it alone when no specific evidence supports a correction, but it
+/// may never move a projection beyond the bounded correction and may never
+/// make the marker worse than the clicks it started from.
+TEST(Markers, RefineBoundedShiftOnNoisyCheckerClicks) {
+    SceneSpec spec;
+    spec.marker_count = 2;
+    spec.target_radius = 0.04;
+    spec.cross_low = 0.72;
+    spec.cross_high = 0.96;
+    spec.fine_grain_amplitude = 0.14;
+    spec.fine_grain_cells = 220.0;
+    RefineScene scene = make_scene(spec, 811U);
+    std::mt19937 engine(29U);
+    const std::int32_t id = add_scene_marker(
+        scene, 1, "G1", /*perturbation=*/3.0, engine, {},
+        /*record_target_type=*/false);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+    std::vector<Eigen::Vector2d> measured;
+    measured.reserve(marker->projections.size());
+    for (const MarkerProjection& projection : marker->projections) {
+        measured.push_back(projection.pixel);
+    }
+    const double before_rms = rms_to_truth(scene, *marker, 1);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const double after_rms = rms_to_truth(scene, *marker, 1);
+    std::printf("[refine noisy checker] projections %zu -> %zu, moved %zu "
+                "kept %zu removed %zu failed %zu, RMS %.4f -> %.4f px\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                before_rms, after_rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    for (std::size_t i = 0; i < marker->projections.size(); ++i) {
+        if (i < measured.size()) {
+            EXPECT_LE((marker->projections[i].pixel - measured[i]).norm(), 6.5)
+                << "projection " << i;
+        }
+    }
+    EXPECT_LE(after_rms, before_rms + 0.5);
+}
+
+TEST(Markers, RefineKeepsUnconfidentProjection) {
+    // One camera's image is blanked, so its patch carries no gradient: NCC has
+    // no evidence for or against it. The old policy deleted such a
+    // projection; it must instead be kept exactly at the measured pixel while
+    // the remaining views still refine.
+    SceneSpec spec;
+    spec.marker_count = 2;
+    RefineScene scene = make_scene(spec, 419U);
+    std::mt19937 engine(71U);
+    const std::int32_t id = add_scene_marker(scene, 0, "G0", 2.0, engine);
+    Marker* marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 3U);
+
+    const Camera& flat_camera = scene.camera(0);
+    Vec2 measured = Vec2::Zero();
+    for (const MarkerProjection& projection : marker->projections) {
+        if (projection.camera_id == flat_camera.id) {
+            measured = projection.pixel;
+        }
+    }
+    std::string flat_path;
+    for (const auto& frame : scene.chunk->frames()) {
+        if (frame && frame->camera_id() == flat_camera.id) {
+            flat_path = frame->path();
+        }
+    }
+    ASSERT_FALSE(flat_path.empty());
+    const Calibration& calibration = scene.calibration(0);
+    write_gray_png(flat_path,
+                   FloatImage(calibration.width, calibration.height, 0.42F));
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, id);
+    ASSERT_NE(marker, nullptr);
+    std::printf("[refine unconfident] projections %zu -> %zu, moved %zu kept "
+                "%zu removed %zu, markers failed %zu (no_scale %zu, "
+                "triangulation %zu, consensus %zu)\n",
+                before, marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.removed_projections, stats.failed,
+                stats.failed_no_scale, stats.failed_triangulation,
+                stats.failed_consensus);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.removed_projections, 0U);
+    EXPECT_GE(stats.kept_unrefined, 1U);
+    bool flat_projection_found = false;
+    for (const MarkerProjection& projection : marker->projections) {
+        if (projection.camera_id == flat_camera.id) {
+            flat_projection_found = true;
+            EXPECT_LE((projection.pixel - measured).norm(), 1e-12);
+        }
+    }
+    EXPECT_TRUE(flat_projection_found);
+    // The confident views are still refined.
+    EXPECT_GT(stats.moved_projections, 0U);
 }
 
 }  // namespace
