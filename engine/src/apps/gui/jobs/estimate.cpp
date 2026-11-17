@@ -5,14 +5,18 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
 #include "apps/gui/jobs/estimate_model.hpp"
 #include "base/platform/memory.hpp"
+#include "common/algorithm/feature/detect_features_task.hpp"
+#include "common/algorithm/match/preselection.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/frame.hpp"
 #include "common/core/types.hpp"
@@ -21,6 +25,9 @@ namespace alphashape::gui {
 namespace {
 
 constexpr double kDefaultNeighbours = 8.0;
+/// Keypoints per megapixel assumed when both keypoint limits are off: the
+/// detector then keeps everything it finds, typically this order on photographs.
+constexpr double kUnlimitedKeypointsPerMpx = 2000.0;
 constexpr double kColdSigma = 0.35;
 constexpr double kSigmaFloor = 0.10;
 constexpr double kMinSeconds = 0.05;
@@ -34,6 +41,16 @@ std::optional<std::int64_t> param_int(const Params& params, const std::string& n
     try {
         if (params.declares(name)) {
             return params.get_int(name);
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> param_bool(const Params& params, const std::string& name) {
+    try {
+        if (params.declares(name)) {
+            return params.get_bool(name);
         }
     } catch (...) {
     }
@@ -232,6 +249,41 @@ bool consumes_depth_maps(const std::string& task) {
     return task == "BuildPointCloud" || task == "BuildModel";
 }
 
+/// Keypoints per camera after the two keypoint limits (the engine's cap rule),
+/// and how many images the engine will detect at once on this machine.
+void add_feature_work(WorkItem& work, const Params& params) {
+    double cap = std::numeric_limits<double>::infinity();
+    if (const auto limit = param_int(params, "keypoint_limit"); limit && *limit > 0) {
+        cap = static_cast<double>(*limit);
+    }
+    if (const auto per_mpx = param_int(params, "keypoint_limit_per_mpx"); per_mpx && *per_mpx > 0) {
+        cap = std::min(cap, static_cast<double>(*per_mpx) * work.megapixels);
+    }
+    work.keypoints = std::isfinite(cap) ? cap : kUnlimitedKeypointsPerMpx * work.megapixels;
+    const unsigned hardware = std::thread::hardware_concurrency();
+    work.detect_concurrency = static_cast<double>(detection_concurrency(
+        hardware > 0 ? static_cast<int>(hardware) : 1, work.megapixels * 1.0e6,
+        platform::memory_budget_bytes()));
+}
+
+/// Pairs the preselection hands to the matcher: GPS or capture-order
+/// neighbours bound each camera's partners, and generic preselection keeps at
+/// most its per-image count of those.
+void add_pair_work(WorkItem& work, const Params& params) {
+    const double cameras = work.cameras;
+    double pairs = cameras * std::max(0.0, cameras - 1.0) / 2.0;
+    if (param_bool(params, "reference_preselection").value_or(true)) {
+        const double neighbours =
+            static_cast<double>(param_int(params, "reference_preselection_neighbors").value_or(20));
+        pairs = std::min(pairs, cameras * std::max(1.0, neighbours));
+    }
+    if (param_bool(params, "generic_preselection").value_or(true)) {
+        pairs = std::min(pairs,
+                         cameras * static_cast<double>(match::GenericOptions{}.pairs_per_image));
+    }
+    work.pairs = pairs;
+}
+
 bool any_camera_enabled(const ChunkFacts& facts) {
     for (const ChunkFacts::CameraFacts& camera : facts.cameras) {
         if (camera.enabled) {
@@ -311,6 +363,12 @@ WorkItem work_for(const std::string& task, const Params& params, const ChunkFact
     }
     // A texture page carries roughly four texels per output cell.
     work.texels = work.product_pixels * 4.0;
+    if (task == "DetectFeatures" || task == "MatchPhotos") {
+        add_feature_work(work, params);
+        if (task == "MatchPhotos") {
+            add_pair_work(work, params);
+        }
+    }
     return work;
 }
 
