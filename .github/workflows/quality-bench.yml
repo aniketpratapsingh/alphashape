@@ -18,8 +18,8 @@ name: Quality benchmark
 #
 #   * it holds the REASON, which must be non-empty printable text of <= 200 characters;
 #   * it is honoured only on the DEFAULT branch, never on a feature branch, and never
-#     for an experiment (empty `depth_params`, `dem_params`, `ortho_params` and
-#     `optimize_params`);
+#     for an experiment (empty `depth_params`, `dem_params`, `ortho_params`,
+#     `optimize_params` and `match_params`);
 #   * when honoured, the verdict is still computed and shown in the report — every
 #     regressed metric with previous -> current — but the job does not fail on it, and
 #     the run publishes its metrics as the new baseline;
@@ -109,6 +109,16 @@ on:
         description: 'Extra OptimizeCameras key=value pairs, space separated (e.g. "adaptive_fitting=true")'
         type: string
         default: ""
+      # Extra MatchPhotos keyword arguments, e.g. "keypoint_limit_per_mpx=1000".
+      # Same contract as depth_params: validated by tools/bench/run_bench.py
+      # --match-params, passed through an environment variable (never
+      # interpolated into `run:`), merged over the dataset's own MatchPhotos
+      # overrides, and strictly a reporting mode — never the baseline, never
+      # gates. A denser setting than the manifest's may not fit the runner.
+      match_params:
+        description: 'Extra MatchPhotos key=value pairs, space separated (e.g. "keypoint_limit_per_mpx=1000")'
+        type: string
+        default: ""
       # Run the same dataset this many times and report every run, the median and
       # the range. One run is the historical behaviour and what every scheduled,
       # push and ordinary manual job gets. More than one exists to separate a real
@@ -159,7 +169,7 @@ concurrency:
   # pending one before it starts. A per-run id keeps every experiment independent
   # while still keeping all of them away from the control run they are measured
   # against. Scheduled and push runs take the `|| ''` arm and are unaffected.
-  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params || github.event.inputs.optimize_params || (github.event.inputs.reps != '' && github.event.inputs.reps != '1')) && format('-experiment-{0}', github.run_id) || '' }}
+  group: quality-bench-${{ github.event.inputs.dataset || 'scheduled' }}${{ (github.event.inputs.depth_params || github.event.inputs.dem_params || github.event.inputs.ortho_params || github.event.inputs.optimize_params || github.event.inputs.match_params || (github.event.inputs.reps != '' && github.event.inputs.reps != '1')) && format('-experiment-{0}', github.run_id) || '' }}
   cancel-in-progress: false
 
 env:
@@ -389,6 +399,8 @@ jobs:
           # And for OptimizeCameras: validated by `--optimize-params`, which also
           # inserts the task after AlignCameras when the value is non-empty.
           OPTIMIZE_PARAMS: ${{ github.event.inputs.optimize_params }}
+          # And for MatchPhotos: validated by `--match-params`.
+          MATCH_PARAMS: ${{ github.event.inputs.match_params }}
           # How many independent runs of this dataset. Validated by `--reps`;
           # empty or "1" leaves every scheduled, push and ordinary manual run
           # exactly as it was.
@@ -405,6 +417,7 @@ jobs:
             --dem-params "$DEM_PARAMS" \
             --ortho-params "$ORTHO_PARAMS" \
             --optimize-params "$OPTIMIZE_PARAMS" \
+            --match-params "$MATCH_PARAMS" \
             --reps "${REPS:-1}" \
             --work build/bench \
             --json "build/bench/metrics-${{ matrix.dataset }}.json" 2>&1 | tee build/bench/run.log
@@ -497,7 +510,7 @@ jobs:
             # The gate must never compare against a configuration that is not the
             # default, and the metrics file itself is the single source of that
             # answer, so a run whose baseline reports depth_params, dem_params,
-            # ortho_params or optimize_params is skipped like a run with no
+            # ortho_params, optimize_params or match_params is skipped like a run with no
             # artifact at all.
             metrics="build/bench/previous/metrics-$DATASET.json"
             set +e

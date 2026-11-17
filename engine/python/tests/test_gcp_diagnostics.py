@@ -162,5 +162,26 @@ class TestVariantOptions(unittest.TestCase):
         self.assertNotIn("adaptive_fitting", options)
 
 
+class TestMatchParams(unittest.TestCase):
+    def test_values_are_typed_for_the_task(self):
+        self.assertEqual(
+            SCRIPT.parse_match_params(["tiepoint_limit=8000",
+                                       "generic_preselection=false",
+                                       "reference_preselection_mode=sequential"]),
+            {"tiepoint_limit": 8000, "generic_preselection": False,
+             "reference_preselection_mode": "sequential"})
+
+    def test_bad_pairs_are_refused(self):
+        for pairs in (["tiepoint_limit"], ["=1"], ["tiepoint_limit="],
+                      ["a=1", "a=2"], ["keypoint_limit_per_mpx=1000"]):
+            with self.assertRaises(ValueError, msg=pairs):
+                SCRIPT.parse_match_params(pairs)
+
+    def test_the_flag_reaches_the_arguments(self):
+        args = SCRIPT.parse_args(["--real", "/x", "--match-param", "tiepoint_limit=8000"])
+        self.assertEqual(args.match_params, {"tiepoint_limit": 8000})
+        self.assertEqual(SCRIPT.parse_args(["--real", "/x"]).match_params, {})
+
+
 if __name__ == "__main__":
     unittest.main()

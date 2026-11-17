@@ -1641,6 +1641,38 @@ def skipped_observations(chunk, gcps):
     return {"observations": total, "in_unaligned_cameras": skipped}
 
 
+def match_param_value(text):
+    """A MatchPhotos value from text: bool, int, float, else the word itself."""
+    lowered = text.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    for convert in (int, float):
+        try:
+            return convert(text)
+        except ValueError:
+            pass
+    return text
+
+
+def parse_match_params(pairs):
+    """``["key=value", ...]`` as MatchPhotos keyword arguments.
+
+    keypoint_limit_per_mpx has its own flag, so naming it here is an error
+    rather than a second, silently conflicting source of the same setting.
+    """
+    params = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key or not value:
+            raise ValueError(f"--match-param {pair!r} is not KEY=VALUE")
+        if key == "keypoint_limit_per_mpx":
+            raise ValueError("use --keypoint-limit for keypoint_limit_per_mpx")
+        if key in params:
+            raise ValueError(f"--match-param {key} is given more than once")
+        params[key] = match_param_value(value)
+    return params
+
+
 def align_block(args, images, gcps):
     """MatchPhotos + AlignCameras once, save the project, return alignment facts.
 
@@ -1659,7 +1691,9 @@ def align_block(args, images, gcps):
     doc.run_task("AddPhotos", filenames=images,
                  load_xmp_accuracy=per_image)
     chunk.crs_epsg = 4326
-    doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit)
+    match_params = getattr(args, "match_params", {}) or {}
+    doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit,
+                 **match_params)
     doc.run_task("AlignCameras")
     project = project_path_for(args)
     doc.save(project)
@@ -1674,6 +1708,7 @@ def align_block(args, images, gcps):
     return {"project": project, "cameras_total": total,
             "cameras_aligned": aligned,
             "keypoint_limit_per_mpx": args.keypoint_limit,
+            "match_params": dict(match_params),
             "camera_accuracy": args.camera_accuracy,
             "xmp_accuracy_imported":
                 args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE,
@@ -4197,6 +4232,10 @@ def parse_args(argv):
                              "the camera_rtk_gcps variant and the fit's datum")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
+    parser.add_argument("--match-param", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="extra MatchPhotos argument for the block's "
+                             "alignment (repeatable), e.g. tiepoint_limit=8000")
     parser.add_argument("--horizontal-target", type=float, default=0.05,
                         help="maximum acceptable horizontal check-point RMS over "
                              "the folds, metres (the real-block target)")
@@ -4237,6 +4276,10 @@ def parse_args(argv):
         parser.error(str(error))
     if args.camera_accuracy_uniform == CAMERA_ACCURACY_PER_IMAGE:
         parser.error("--camera-accuracy-uniform must be a number of metres")
+    try:
+        args.match_params = parse_match_params(args.match_param)
+    except ValueError as error:
+        parser.error(str(error))
     if args.diagnostic_variants:
         names = [name.strip() for name in args.diagnostic_variants.split(",")
                  if name.strip()]

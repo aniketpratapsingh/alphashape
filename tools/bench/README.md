@@ -237,6 +237,17 @@ effect there. A repeated GCP run skips the manifest's report-only diagnostics (a
 extra leave-one-out variants): paying for them on every repetition would not fit the job
 ceiling, and the repeated comparison uses the two standard variants.
 
+`match_params` is the same input for `MatchPhotos`. It is how denser matching is measured
+against a dataset whose manifest caps `keypoint_limit_per_mpx` for the runner's memory:
+naming the key replaces the cap, and any other key leaves it in place. The GCP protocol
+receives the keypoint density as `--keypoint-limit` and every other key as
+`--match-param key=value` for the block's single alignment.
+
+```sh
+gh workflow run quality-bench.yml --ref <branch> \
+  -f dataset=gcp-rtk -f match_params=keypoint_limit_per_mpx=1000
+```
+
 All four parameters are merged over the dataset's own overrides for their task, so the
 measured `downscale` of the control run is kept and the two runs stay comparable. They are
 validated at the boundary — keys `[a-z_]+`, values `[A-Za-z0-9_.-]+`, no repeated key — and

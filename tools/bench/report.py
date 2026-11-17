@@ -151,6 +151,7 @@ def experiment_params(metrics: dict) -> dict[str, str]:
         ("dem_params", "BuildDem"),
         ("ortho_params", "BuildOrthomosaic"),
         ("optimize_params", "OptimizeCameras"),
+        ("match_params", "MatchPhotos"),
     ):
         value = metrics.get(key)
         if isinstance(value, dict):

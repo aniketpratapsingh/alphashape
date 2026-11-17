@@ -87,12 +87,14 @@ def measure_params(metrics: dict) -> dict[str, object]:
 
     Every dispatch input the workflow offers — ``depth_params`` for
     BuildDepthMaps, ``dem_params`` for BuildDem, ``ortho_params`` for
-    BuildOrthomosaic and ``optimize_params`` for OptimizeCameras — means the run
+    BuildOrthomosaic, ``optimize_params`` for OptimizeCameras and
+    ``match_params`` for MatchPhotos — means the run
     measured a configuration rather than the defaults. Any one being present and
     non-empty withholds the baseline, so any one refuses an acceptance.
     """
     found: dict[str, object] = {}
-    for key in ("depth_params", "dem_params", "ortho_params", "optimize_params"):
+    for key in ("depth_params", "dem_params", "ortho_params", "optimize_params",
+                "match_params"):
         value = metrics.get(key)
         if value:
             found[key] = value
