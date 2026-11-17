@@ -228,6 +228,7 @@ def triangulate(observations: list[dict], reconstruction: dict) -> dict:
     # Linear start: the point closest to every viewing ray.
     a = np.zeros((3, 3))
     b = np.zeros(3)
+    names = [obs["image"] for obs in observations if obs["image"] in reconstruction["shots"]]
     for camera, rotation, translation, u, v in rays:
         centre = -rotation.T @ translation
         direction = rotation.T @ camera.bearing(u, v)
@@ -257,9 +258,12 @@ def triangulate(observations: list[dict], reconstruction: dict) -> dict:
         if np.linalg.norm(delta) < 1e-7:
             break
     size = max(rays[0][0].width, rays[0][0].height)
-    rms_px = float(np.sqrt(np.mean(residuals(point) ** 2)) * size)
+    final = residuals(point) * size
+    rms_px = float(np.sqrt(np.mean(final ** 2)))
+    per_view = {name: [float(final[2 * i]), float(final[2 * i + 1])]
+                for i, name in enumerate(names)}
     return {"status": "ok", "views": len(rays), "point": point.tolist(),
-            "reprojection_rms_px": rms_px}
+            "reprojection_rms_px": rms_px, "residuals_px": per_view}
 
 
 def measure(point: dict, reconstruction: dict, reference: dict) -> dict:
@@ -277,14 +281,17 @@ def measure(point: dict, reconstruction: dict, reference: dict) -> dict:
     return result
 
 
-def load_reconstruction(opensfm: Path) -> tuple[dict, dict, int]:
+def load_reconstruction(opensfm: Path, name: str = "reconstruction.topocentric.json"
+                        ) -> tuple[dict, dict, int]:
     """The largest topocentric reconstruction, its reference, and the part count.
 
     ODM moves the topocentric reconstruction aside and replaces
     ``reconstruction.json`` with projected coordinates once the block is
-    georeferenced; the topocentric file is the one in OpenSfM's own frame.
+    georeferenced; the topocentric file is the one in OpenSfM's own frame. A
+    reconstruction re-run with ``opensfm reconstruct`` after ODM is topocentric
+    again under the plain name, which is what ``name`` selects.
     """
-    path = opensfm / "reconstruction.topocentric.json"
+    path = opensfm / name
     if not path.exists():
         raise SystemExit(f"{path} is missing: ODM did not georeference the block")
     parts = json.loads(path.read_text(encoding="utf-8"))
@@ -293,9 +300,11 @@ def load_reconstruction(opensfm: Path) -> tuple[dict, dict, int]:
     return largest, reference, len(parts)
 
 
-def evaluate(project: Path, holdout_path: Path, mode: str) -> dict:
+def evaluate(project: Path, holdout_path: Path, mode: str,
+             reconstruction_name: str = "reconstruction.topocentric.json") -> dict:
     holdout = json.loads(holdout_path.read_text(encoding="utf-8"))
-    reconstruction, reference, parts = load_reconstruction(project / "opensfm")
+    reconstruction, reference, parts = load_reconstruction(project / "opensfm",
+                                                           reconstruction_name)
     projection_types = sorted({c.get("projection_type") for c in reconstruction["cameras"].values()})
     return {
         "mode": mode,
@@ -421,6 +430,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project", type=Path, required=True)
     p.add_argument("--holdout", type=Path, required=True)
     p.add_argument("--mode", required=True)
+    p.add_argument("--reconstruction", default="reconstruction.topocentric.json",
+                   help="file under opensfm/ holding the topocentric reconstruction")
     p.add_argument("--out", type=Path, required=True)
 
     p = sub.add_parser("summarize", help="per-mode RMS over every fold result")
@@ -437,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"-- fold {args.fold}: check {holdout['check']['label']}, control "
               + ", ".join(p["label"] for p in holdout["control"]))
     elif args.command == "evaluate":
-        result = evaluate(args.project, args.holdout, args.mode)
+        result = evaluate(args.project, args.holdout, args.mode, args.reconstruction)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(result, indent=2), encoding="utf-8")
         check = result["check"]

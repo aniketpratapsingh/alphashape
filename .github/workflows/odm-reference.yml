@@ -3,8 +3,8 @@ name: ODM reference
 # Runs the gcp-rtk leave-one-out folds through OpenDroneMap, so the engine's
 # ground-control numbers (quality-bench.yml, dataset gcp-rtk) can be read
 # against an independent tool on the same photographs and the same survey.
-# Manual only: it is a reference measurement, not a gate, and it costs ten
-# runner-hours. Only numbers are uploaded; no image, survey file or ODM
+# It is a reference measurement, not a gate, and it costs about five
+# runner-hours, so it never runs on a schedule or on main. Only numbers are uploaded; no image, survey file or ODM
 # product is published (the dataset is GPL-3.0, download-and-measure only).
 #
 #   gh workflow run odm-reference.yml --ref <branch>
@@ -18,6 +18,11 @@ name: ODM reference
 #             and seeds the alignment, the bundle adjustment uses the GCPs only.
 #   gcp_gps   --force-gps: the camera RTK positions are adjusted together with
 #             the GCPs, at the accuracy ODM reads from the images.
+#   gcp_strong  gcp_only, then OpenSfM's reconstruction re-run with the GCPs
+#             weighted as a survey: ODM's defaults give all GCP terms together
+#             1% of the weight of the tie points (gcp_global_weight 0.01) and a
+#             10 cm vertical sd, which deliberately lets the block override the
+#             survey. This mode asks what OpenSfM does when it may not.
 
 on:
   push:
@@ -79,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [gcp_only, gcp_gps]
+        mode: [gcp_only, gcp_gps, gcp_strong]
         fold: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -132,16 +137,36 @@ jobs:
           test "${PIPESTATUS[0]}" -eq 0
           df -h /
 
+      - name: Re-adjust with survey-weighted GCPs
+        if: matrix.mode == 'gcp_strong'
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: |
+          docker run --rm --entrypoint bash -v "$PWD/build/odm:/datasets" "$IMAGE" -c '
+            set -e
+            cd /datasets/project/opensfm
+            printf "\ngcp_global_weight: 1.0\ngcp_horizontal_sd: 0.02\ngcp_vertical_sd: 0.02\n" >> config.yaml
+            /code/SuperBuild/install/bin/opensfm/bin/opensfm reconstruct /datasets/project/opensfm
+          ' 2>&1 | tail -n 100 | tee build/odm/opensfm-strong.log
+
       - name: Measure the held-out point
         env:
           MODE: ${{ matrix.mode }}
           FOLD: ${{ matrix.fold }}
         run: |
           mkdir -p build/odm/result
+          name=reconstruction.topocentric.json
+          if [ "$MODE" = "gcp_strong" ]; then name=reconstruction.json; fi
           python3 tools/bench/odm_reference.py evaluate \
             --project build/odm/project --holdout build/odm/holdout.json \
-            --mode "$MODE" --out "build/odm/result/odm-$MODE-fold$FOLD.json"
+            --mode "$MODE" --reconstruction "$name" \
+            --out "build/odm/result/odm-$MODE-fold$FOLD.json"
           cp build/odm/image-digest.txt build/odm/result/
+          # ODM's own control-point errors and the OpenSfM settings it used:
+          # numbers and configuration only, to check the triangulation above.
+          stats=build/odm/project/opensfm/stats/ground_control_points.json
+          if [ -f "$stats" ]; then cp "$stats" "build/odm/result/gcp-stats-$MODE-fold$FOLD.json"; fi
+          cp build/odm/project/opensfm/config.yaml "build/odm/result/opensfm-config-$MODE-fold$FOLD.yaml"
           tail -n 200 build/odm/odm.log > "build/odm/result/odm-$MODE-fold$FOLD.log"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
