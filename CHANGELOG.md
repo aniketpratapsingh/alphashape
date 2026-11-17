@@ -23,6 +23,13 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **The coordinate-system picker searches every EPSG system.** Typing in the
+  search field now looks through all current EPSG geographic, geocentric and
+  projected systems in the PROJ database by code, name or area (for example
+  `7854` or `mga zone 54` finds GDA2020 / MGA zone 54), instead of only the 48
+  curated systems. The curated list is still what shows while the field is
+  empty. New engine call: `crs::crs_catalog()`.
+
 - **OptimizeCameras selects the adaptive lens model automatically on a block
   with ground control.** `adaptive_fitting_auto` now defaults to true: when the
   chunk has at least one control point (a referenced marker that is not a check

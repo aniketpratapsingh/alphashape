@@ -12,6 +12,7 @@
 #include <QListWidgetItem>
 #include <QPlainTextEdit>
 #include <QSignalBlocker>
+#include <QStringList>
 #include <QTabWidget>
 #include <QVBoxLayout>
 
@@ -22,6 +23,51 @@ QString entry_text(const crs::BuiltinCrs& entry) {
     return QStringLiteral("EPSG:%1  %2")
         .arg(entry.epsg)
         .arg(QString::fromStdString(entry.name));
+}
+
+QString entry_text(const crs::CrsCatalogEntry& entry) {
+    QString text = QStringLiteral("EPSG:%1  %2")
+                       .arg(entry.epsg)
+                       .arg(QString::fromStdString(entry.name));
+    if (!entry.area.empty()) {
+        text += QStringLiteral("  (%1)").arg(QString::fromStdString(entry.area));
+    }
+    return text;
+}
+
+/// The whole PROJ catalogue with each entry's searchable text, lower-cased
+/// once: the filter runs on every keystroke over several thousand entries.
+/// When PROJ cannot list its database, the curated list is searched instead.
+struct SearchableCatalog {
+    std::vector<crs::CrsCatalogEntry> entries;
+    std::vector<QString> haystacks;
+};
+
+const SearchableCatalog& searchable_catalog() {
+    static const SearchableCatalog catalog = [] {
+        SearchableCatalog built;
+        built.entries = crs::crs_catalog();
+        if (built.entries.empty()) {
+            for (const crs::BuiltinCrs& entry : crs::builtin_crs_list()) {
+                built.entries.push_back(crs::CrsCatalogEntry{entry.epsg, entry.name, entry.kind, {}});
+            }
+        }
+        built.haystacks.reserve(built.entries.size());
+        for (const crs::CrsCatalogEntry& entry : built.entries) {
+            built.haystacks.push_back(entry_text(entry).toLower());
+        }
+        return built;
+    }();
+    return catalog;
+}
+
+bool is_curated(int epsg) {
+    for (const crs::BuiltinCrs& entry : crs::builtin_crs_list()) {
+        if (entry.epsg == epsg) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -49,7 +95,7 @@ void CrsPicker::build_search_tab() {
     auto* layout = new QVBoxLayout(page);
     filter_ = new QLineEdit(page);
     filter_->setObjectName(QStringLiteral("crs.filter"));
-    filter_->setPlaceholderText(tr("Search by EPSG code or name"));
+    filter_->setPlaceholderText(tr("Search every EPSG system by code, name or area"));
     filter_->setClearButtonEnabled(true);
     layout->addWidget(filter_);
     auto* epsg_row = new QHBoxLayout();
@@ -61,10 +107,7 @@ void CrsPicker::build_search_tab() {
     layout->addLayout(epsg_row);
     list_ = new QListWidget(page);
     list_->setObjectName(QStringLiteral("crs.list"));
-    for (const crs::BuiltinCrs& entry : crs::builtin_crs_list()) {
-        auto* item = new QListWidgetItem(entry_text(entry), list_);
-        item->setData(Qt::UserRole, entry.epsg);
-    }
+    show_curated();
     layout->addWidget(list_, 1);
     auto* vertical_row = new QHBoxLayout();
     vertical_ = new QCheckBox(tr("Vertical CRS"), page);
@@ -116,23 +159,81 @@ void CrsPicker::build_wkt_tab() {
     });
 }
 
+void CrsPicker::show_curated() {
+    const QSignalBlocker blocker(list_);
+    list_->clear();
+    for (const crs::BuiltinCrs& entry : crs::builtin_crs_list()) {
+        auto* item = new QListWidgetItem(entry_text(entry), list_);
+        item->setData(Qt::UserRole, entry.epsg);
+    }
+    list_->setCurrentRow(-1);
+}
+
 void CrsPicker::apply_filter(const QString& text) {
-    const QString needle = text.trimmed();
-    int visible = 0;
-    int only_row = -1;
-    for (int row = 0; row < list_->count(); ++row) {
-        QListWidgetItem* item = list_->item(row);
-        const bool matches =
-            needle.isEmpty() || item->text().contains(needle, Qt::CaseInsensitive);
-        item->setHidden(!matches);
-        if (matches) {
-            ++visible;
-            only_row = row;
+    const QString needle = text.trimmed().toLower();
+    if (needle.isEmpty()) {
+        show_curated();
+        refresh_validity();
+        Q_EMIT selection_changed();
+        return;
+    }
+    // Every word must appear somewhere in "EPSG:code  name  (area)". A typed
+    // code that names a system exactly comes first, then the curated systems,
+    // then the rest of the catalogue in code order.
+    const QStringList words = needle.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    bool numeric = false;
+    const int exact_code = needle.toInt(&numeric);
+    const SearchableCatalog& catalog = searchable_catalog();
+    std::vector<std::size_t> exact;
+    std::vector<std::size_t> curated;
+    std::vector<std::size_t> others;
+    for (std::size_t i = 0; i < catalog.haystacks.size(); ++i) {
+        const QString& haystack = catalog.haystacks[i];
+        bool all = true;
+        for (const QString& word : words) {
+            if (!haystack.contains(word)) {
+                all = false;
+                break;
+            }
+        }
+        if (!all) {
+            continue;
+        }
+        const int epsg = catalog.entries[i].epsg;
+        if (numeric && epsg == exact_code) {
+            exact.push_back(i);
+        } else if (is_curated(epsg)) {
+            curated.push_back(i);
+        } else {
+            others.push_back(i);
         }
     }
-    if (visible == 1 && only_row >= 0) {
-        list_->setCurrentRow(only_row);
+    const std::size_t total = exact.size() + curated.size() + others.size();
+    {
+        const QSignalBlocker blocker(list_);
+        list_->clear();
+        std::size_t shown = 0;
+        for (const std::vector<std::size_t>* group : {&exact, &curated, &others}) {
+            for (const std::size_t i : *group) {
+                if (shown == kMaxSearchResults) {
+                    break;
+                }
+                const crs::CrsCatalogEntry& entry = catalog.entries[i];
+                auto* item = new QListWidgetItem(entry_text(entry), list_);
+                item->setData(Qt::UserRole, entry.epsg);
+                ++shown;
+            }
+        }
+        if (total > shown) {
+            // Informational only: no code, not selectable.
+            auto* more = new QListWidgetItem(
+                tr("%n more, refine the search", nullptr, static_cast<int>(total - shown)), list_);
+            more->setFlags(Qt::NoItemFlags);
+        }
+        list_->setCurrentRow(!exact.empty() || total == 1 ? 0 : -1);
     }
+    refresh_validity();
+    Q_EMIT selection_changed();
 }
 
 int CrsPicker::selected_epsg() const {
@@ -140,7 +241,8 @@ int CrsPicker::selected_epsg() const {
     if (item == nullptr || item->isHidden()) {
         return -1;
     }
-    return item->data(Qt::UserRole).toInt();
+    const int code = item->data(Qt::UserRole).toInt();
+    return code > 0 ? code : -1;
 }
 
 int CrsPicker::typed_epsg() const {
@@ -164,7 +266,9 @@ void CrsPicker::refresh_validity() {
         const int code = typed >= 0 ? typed : selected_epsg();
         if (code < 0) {
             error_text_ = tr("Select a coordinate system or type an EPSG code.");
-        } else if (typed >= 0) {
+        } else {
+            // Typed or picked from the PROJ catalogue: either way the engine
+            // has to be able to build it.
             try {
                 (void)crs::CoordinateSystem::from_epsg(code);
             } catch (const std::exception& failure) {
@@ -207,6 +311,11 @@ void CrsPicker::set_coordinate_system(const crs::CoordinateSystem& cs) {
     }
     vertical_name_->setEnabled(vertical_state_.has_value());
     epsg_->clear();
+    {
+        const QSignalBlocker blocker(filter_);
+        filter_->clear();
+    }
+    show_curated();
     if (cs.is_set() && !cs.is_local() && cs.epsg() > 0) {
         tabs_->setCurrentIndex(0);
         bool listed = false;

@@ -1,8 +1,14 @@
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <proj.h>
+
 #include "model/crs/coordinate_system.hpp"
+#include "model/crs/proj_context.hpp"
 
 namespace alphashape::crs {
 namespace {
@@ -76,6 +82,64 @@ std::vector<std::string> builtin_crs_names() {
         names.push_back(entry.name);
     }
     return names;
+}
+
+namespace {
+
+std::vector<CrsCatalogEntry> read_catalog() {
+    std::vector<CrsCatalogEntry> catalog;
+    PJ_CONTEXT* ctx = thread_context();
+    PROJ_CRS_LIST_PARAMETERS* params = proj_get_crs_list_parameters_create();
+    if (params == nullptr) {
+        return catalog;
+    }
+    const PJ_TYPE types[] = {PJ_TYPE_GEOGRAPHIC_2D_CRS, PJ_TYPE_GEOGRAPHIC_3D_CRS,
+                             PJ_TYPE_GEOCENTRIC_CRS, PJ_TYPE_PROJECTED_CRS};
+    params->types = types;
+    params->typesCount = sizeof(types) / sizeof(types[0]);
+    params->allow_deprecated = 0;
+    int count = 0;
+    PROJ_CRS_INFO** list = proj_get_crs_info_list_from_database(ctx, "EPSG", params, &count);
+    proj_get_crs_list_parameters_destroy(params);
+    if (list == nullptr) {
+        return catalog;
+    }
+    catalog.reserve(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        const PROJ_CRS_INFO* info = list[i];
+        if (info == nullptr || info->code == nullptr || info->name == nullptr) {
+            continue;
+        }
+        char* end = nullptr;
+        const long code = std::strtol(info->code, &end, 10);
+        if (end == info->code || *end != '\0' || code <= 0) {
+            continue;  // EPSG codes are numeric; anything else is not one
+        }
+        CrsCatalogEntry entry;
+        entry.epsg = static_cast<int>(code);
+        entry.name = info->name;
+        switch (info->type) {
+            case PJ_TYPE_GEOGRAPHIC_2D_CRS: entry.kind = CrsKind::Geographic2D; break;
+            case PJ_TYPE_GEOGRAPHIC_3D_CRS: entry.kind = CrsKind::Geographic3D; break;
+            case PJ_TYPE_GEOCENTRIC_CRS: entry.kind = CrsKind::Geocentric; break;
+            default: entry.kind = CrsKind::Projected; break;
+        }
+        if (info->area_name != nullptr) {
+            entry.area = info->area_name;
+        }
+        catalog.push_back(std::move(entry));
+    }
+    proj_crs_info_list_destroy(list);
+    std::sort(catalog.begin(), catalog.end(),
+              [](const CrsCatalogEntry& a, const CrsCatalogEntry& b) { return a.epsg < b.epsg; });
+    return catalog;
+}
+
+}  // namespace
+
+const std::vector<CrsCatalogEntry>& crs_catalog() {
+    static const std::vector<CrsCatalogEntry> catalog = read_catalog();
+    return catalog;
 }
 
 }  // namespace alphashape::crs

@@ -277,4 +277,18 @@ const std::vector<BuiltinCrs>& builtin_crs_list();
 /// `CoordinateSystem.listBuiltinCRS` order).
 std::vector<std::string> builtin_crs_names();
 
+/// One EPSG coordinate system from the PROJ database, for searching.
+struct CrsCatalogEntry {
+    int epsg = 0;
+    std::string name;
+    CrsKind kind = CrsKind::Projected;
+    std::string area;  ///< PROJ's area-of-use name; empty when it has none
+};
+
+/// Every current (not deprecated) EPSG geographic, geocentric and projected
+/// CRS in the PROJ database, ordered by code: what a user can pick by name or
+/// code without knowing whether it is in the curated list. Read from proj.db
+/// on first call; empty when the database cannot be listed.
+const std::vector<CrsCatalogEntry>& crs_catalog();
+
 }  // namespace alphashape::crs
