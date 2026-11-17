@@ -9,6 +9,10 @@ name: ODM reference
 #
 #   gh workflow run odm-reference.yml --ref <branch>
 #
+# A push that changes this workflow or its script on a branch other than main
+# also runs it, with the defaults: a dispatch needs the file on the default
+# branch first, and the change has to be proven before it gets there.
+#
 # Modes:
 #   gcp_only  ODM's default with a GCP file: the camera GPS chooses image pairs
 #             and seeds the alignment, the bundle adjustment uses the GCPs only.
@@ -16,6 +20,11 @@ name: ODM reference
 #             the GCPs, at the accuracy ODM reads from the images.
 
 on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - ".github/workflows/odm-reference.yml"
+      - "tools/bench/odm_reference.py"
   workflow_dispatch:
     inputs:
       odm_version:
@@ -50,7 +59,7 @@ jobs:
       - name: Resolve the image and the download cache key
         id: plan
         env:
-          ODM_VERSION: ${{ inputs.odm_version }}
+          ODM_VERSION: ${{ inputs.odm_version || '3.6.2' }}
         run: |
           # A dispatch input is untrusted text; only a plain version reaches docker.
           if ! printf '%s' "$ODM_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -108,7 +117,7 @@ jobs:
         env:
           IMAGE: ${{ needs.plan.outputs.image }}
           MODE: ${{ matrix.mode }}
-          FEATURE_QUALITY: ${{ inputs.feature_quality }}
+          FEATURE_QUALITY: ${{ inputs.feature_quality || 'high' }}
         run: |
           extra=()
           if [ "$MODE" = "gcp_gps" ]; then extra+=(--force-gps); fi
