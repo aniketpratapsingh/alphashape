@@ -243,6 +243,14 @@ TEST(Crs, CatalogListsEveryEpsgSystem) {
     for (std::size_t i = 1; i < catalog.size(); ++i) {
         ASSERT_LT(catalog[i - 1].epsg, catalog[i].epsg) << "not ordered by unique code";
     }
+    // PROJ's own listing emits one row per area of use, so a CRS with several
+    // usage extents (EPSG:2393 KKJ / Finland, the ETRS89 / UTM zones, ...)
+    // appears there more than once. The catalogue is one entry per code, so a
+    // search never shows the same system twice.
+    std::set<int> codes;
+    for (const CrsCatalogEntry& entry : catalog) {
+        EXPECT_TRUE(codes.insert(entry.epsg).second) << "duplicate code " << entry.epsg;
+    }
     const auto find = [&catalog](int epsg) -> const CrsCatalogEntry* {
         for (const CrsCatalogEntry& entry : catalog) {
             if (entry.epsg == epsg) {
@@ -251,6 +259,11 @@ TEST(Crs, CatalogListsEveryEpsgSystem) {
         }
         return nullptr;
     };
+    // EPSG:2393 has two areas of use in proj.db; it must still be one entry.
+    const CrsCatalogEntry* kkj = find(2393);
+    ASSERT_NE(kkj, nullptr);
+    EXPECT_EQ(kkj->name, CoordinateSystem::from_epsg(2393).name());
+    EXPECT_FALSE(kkj->area.empty());
     const CrsCatalogEntry* mga54 = find(7854);
     ASSERT_NE(mga54, nullptr);
     EXPECT_EQ(mga54->name, "GDA2020 / MGA zone 54");

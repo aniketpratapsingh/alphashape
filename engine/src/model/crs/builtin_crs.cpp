@@ -130,8 +130,20 @@ std::vector<CrsCatalogEntry> read_catalog() {
         catalog.push_back(std::move(entry));
     }
     proj_crs_info_list_destroy(list);
-    std::sort(catalog.begin(), catalog.end(),
-              [](const CrsCatalogEntry& a, const CrsCatalogEntry& b) { return a.epsg < b.epsg; });
+    // PROJ lists one row per area of use, so a CRS with several usage extents
+    // (EPSG:2393, the ETRS89 / UTM zones, ...) comes back more than once with
+    // the same code and name but a different area. The catalogue is one entry
+    // per code: a stable sort keeps the first row PROJ returned for each code
+    // and unique() drops the rest, so the area shown is deterministic.
+    std::stable_sort(catalog.begin(), catalog.end(),
+                     [](const CrsCatalogEntry& a, const CrsCatalogEntry& b) {
+                         return a.epsg < b.epsg;
+                     });
+    catalog.erase(std::unique(catalog.begin(), catalog.end(),
+                              [](const CrsCatalogEntry& a, const CrsCatalogEntry& b) {
+                                  return a.epsg == b.epsg;
+                              }),
+                  catalog.end());
     return catalog;
 }
 
