@@ -239,9 +239,13 @@ class SummaryTest(unittest.TestCase):
         # triangulation is exact.
         results = [self.result("gcp_strong", 1, 0.09, 0.4, control_v=0.0)]
         results[0]["control"][0]["horizontal_m"] = 0.0
+        results[0]["control_residuals"] = {"observations": 28, "mean_px": [0.0, 0.0],
+                                           "std_px": [0.0, 0.0], "rms_px": 0.0}
         _, markdown = odm_reference.summarize(results, 0.05)
         self.assertIn("pinned by this mode's weights", markdown)
         self.assertNotIn("Control points, measured the same way: 0.00 cm horizontal", markdown)
+        # A zero residual from pinned points is not a measurement; do not print it.
+        self.assertNotIn("Control reprojection residual", markdown)
 
 
 class OdmAgreementTest(unittest.TestCase):

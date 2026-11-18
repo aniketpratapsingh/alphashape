@@ -507,7 +507,10 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
                          f"(max {agreement['max_horizontal_m'] * 100:.2f} / "
                          f"{agreement['max_vertical_m'] * 100:.2f} cm).")
         residuals = entry.get("control_residuals")
-        if residuals:
+        pinned = (entry["control_horizontal_rms_m"] is not None
+                  and entry["control_horizontal_rms_m"] < 1e-3
+                  and entry["control_vertical_rms_m"] < 1e-3)
+        if residuals and not pinned:
             mean_u, mean_v = residuals["mean_px"]
             std_u, std_v = residuals["std_px"]
             lines.append("")
