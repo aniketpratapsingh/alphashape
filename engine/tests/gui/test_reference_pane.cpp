@@ -14,7 +14,9 @@
 #include <gtest/gtest.h>
 
 #include <QAbstractItemModel>
+#include <QAction>
 #include <QModelIndex>
+#include <QObject>
 #include <QString>
 #include <QTableView>
 #include <QVariant>
@@ -301,8 +303,29 @@ TEST_F(ReferencePane, SwitchingChunkRefreshesRows) {
     EXPECT_EQ(pane().cameras().chunk_id(), second.id());
 }
 
-TEST_F(ReferencePane, ThousandRowsWithinBudget) {
-    build_chunk(1000, 0);
+TEST_F(ReferencePane, ImportMarkersAndPlaceOnPhotoActions) {
+    build_chunk(2, 1);
+    QAction* import_markers = pane().action("action.reference.import_markers");
+    ASSERT_NE(import_markers, nullptr);
+    // ImportMarkers is a built-in task, so the action is live on an idle chunk.
+    EXPECT_TRUE(import_markers->isEnabled());
+    EXPECT_FALSE(import_markers->toolTip().isEmpty());
+
+    // "Place on photo" replaced the disabled "Pick in viewport" placeholder and keeps its
+    // objectName; it is enabled and asks the window to open a camera.
+    QAction* pick = pane().action("action.reference.pick");
+    ASSERT_NE(pick, nullptr);
+    EXPECT_TRUE(pick->isEnabled());
+    EXPECT_TRUE(pick->text().contains(QStringLiteral("photo")));
+
+    int requested = -1;
+    QObject::connect(&pane(), &ReferencePane::place_on_photo_requested,
+                     [&requested](qint32 camera_id) { requested = camera_id; });
+    pick->trigger();
+    EXPECT_EQ(requested, 0);
+}
+
+TEST_F(ReferencePane, ThousandRowsWithinBudget) {    build_chunk(1000, 0);
     ReferenceModel& model = pane().cameras();
     const auto start = std::chrono::steady_clock::now();
     model.refresh();

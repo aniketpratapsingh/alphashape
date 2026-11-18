@@ -195,10 +195,43 @@ void ReferencePane::create_toolbar() {
         refresh();
     });
 
-    QAction* pick = make(QStringLiteral("action.reference.pick"),
-                         tr("Pick in viewport"));
-    pick->setEnabled(false);
-    pick->setToolTip(tr("Picking a reference in the viewport is not available yet"));
+    import_markers_ = make(QStringLiteral("action.reference.import_markers"),
+                           tr("Import Markers"));
+    if (builtin_registry().find("ImportMarkers") != nullptr) {
+        import_markers_->setToolTip(
+            tr("Import marker projections from a CSV or XML file"));
+        connect(import_markers_, &QAction::triggered, this,
+                [this]() { run_task("ImportMarkers"); });
+    } else {
+        import_markers_->setEnabled(false);
+        import_markers_->setToolTip(tr("ImportMarkers is not available in this build"));
+    }
+
+    // Placing a marker is done on the photo, not in this table: the action is a hint that
+    // switches the central area to the Photo tab. It keeps its objectName so a shortcut or a
+    // test that named it still finds it.
+    pick_ = make(QStringLiteral("action.reference.pick"), tr("Place on photo"));
+    pick_->setToolTip(tr("Open the selected photo to place markers on it"));
+    connect(pick_, &QAction::triggered, this, [this]() {
+        if (app_.jobs().busy()) {
+            return;
+        }
+        const std::int32_t camera_id = app_.read_document([](const Document& document) {
+            const Chunk* chunk = document.active_chunk();
+            if (chunk == nullptr) {
+                return std::int32_t{-1};
+            }
+            for (const Camera& camera : chunk->cameras()) {
+                if (camera.selected) {
+                    return camera.id;
+                }
+            }
+            return chunk->cameras().empty() ? std::int32_t{-1} : chunk->cameras().front().id;
+        });
+        if (camera_id >= 0) {
+            Q_EMIT place_on_photo_requested(camera_id);
+        }
+    });
 }
 
 QAction* ReferencePane::action(const QString& object_name) const {
@@ -264,6 +297,13 @@ void ReferencePane::update_actions() {
         if (entry != nullptr) {
             entry->setEnabled(idle_chunk);
         }
+    }
+    if (import_markers_ != nullptr &&
+        builtin_registry().find("ImportMarkers") != nullptr) {
+        import_markers_->setEnabled(idle_chunk);
+    }
+    if (pick_ != nullptr) {
+        pick_->setEnabled(idle_chunk);
     }
     if (QAction* settings = action(QStringLiteral("action.reference.settings"))) {
         settings->setEnabled(idle_chunk);

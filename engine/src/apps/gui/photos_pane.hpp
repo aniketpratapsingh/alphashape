@@ -71,6 +71,11 @@ public:
     /// disabled ones stay listed.
     std::unique_ptr<QMenu> build_context_menu();
 
+Q_SIGNALS:
+    /// A photo was double-clicked (or activated from the keyboard): the window opens it in the
+    /// Photo tab. Emitted with the camera id, never for a row without one.
+    void open_photo_requested(qint32 camera_id);
+
 private:
     void on_view_selection_changed();
     void on_shared_selection_changed();

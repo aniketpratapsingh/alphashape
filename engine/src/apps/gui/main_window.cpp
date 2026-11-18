@@ -24,6 +24,7 @@
 #include <QSettings>
 #include <QStackedWidget>
 #include <QStatusBar>
+#include <QTabWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
@@ -35,6 +36,7 @@
 #include "apps/gui/log_pane.hpp"
 #include "apps/gui/marker_tools_dialogs.hpp"
 #include "apps/gui/modal_hooks.hpp"
+#include "apps/gui/photo_view.hpp"
 #include "apps/gui/photos_pane.hpp"
 #include "apps/gui/preferences_dialog.hpp"
 #include "apps/gui/properties_pane.hpp"
@@ -138,13 +140,19 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent)
     };
 
     viewport_ = new ViewportWidget(app_, app_.theme(), this);
+    photo_view_ = new PhotoView(app_, this);
     start_screen_ = new StartScreen(app_, this);
 
-    // Two central pages: the 3-D view, and the start screen that shows while no project is
-    // open. A widget stack (not QML) keeps the application free of a QML runtime.
+    // Two central pages: the model/photo tabs, and the start screen that shows while no project
+    // is open. A widget stack (not QML) keeps the application free of a QML runtime. The tabs
+    // are page 0, so central_page() keeps its 0 = viewport / 1 = start screen meaning.
+    central_tabs_ = new QTabWidget(this);
+    central_tabs_->setObjectName(QStringLiteral("centralTabs"));
+    central_tabs_->addTab(viewport_, tr("Model"));
+    central_tabs_->addTab(photo_view_, tr("Photo"));
     stack_ = new QStackedWidget(this);
     stack_->setObjectName(QStringLiteral("centralStack"));
-    stack_->addWidget(viewport_);
+    stack_->addWidget(central_tabs_);
     stack_->addWidget(start_screen_);
     setCentralWidget(stack_);
 
@@ -164,6 +172,14 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent)
             [this](const QStringList& files) { new_project_from_photos(files); });
     connect(start_screen_, &StartScreen::paths_dropped, this,
             [this](const QStringList& paths) { handle_dropped_paths(paths); });
+    // A double-clicked photo opens in the Photo tab.
+    connect(photos_pane_, &PhotosPane::open_photo_requested, this,
+            [this](qint32 camera_id) { open_photo(camera_id); });
+#if defined(ALPHASHAPE_USE_PROJ)
+    // "Place on photo" in the Reference pane opens the selected camera in the Photo tab.
+    connect(reference_pane_, &ReferencePane::place_on_photo_requested, this,
+            [this](qint32 camera_id) { open_photo(camera_id); });
+#endif
 
     // The start screen appears when no project is open. The command line decides the initial
     // page: an explicit --open / --new is a request for a project, not for the launcher.
@@ -180,6 +196,11 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent)
     update_recent_menu();
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_title);
     connect(&app_, &GuiApp::document_replaced, this, &MainWindow::update_central_page);
+    // A new project starts on the Model tab; the Photo tab belongs to the photos of the
+    // project that was open when it was last used.
+    connect(&app_, &GuiApp::document_replaced, this, [this]() {
+        central_tabs_->setCurrentWidget(viewport_);
+    });
     connect(&app_, &GuiApp::document_replaced, this, [this]() { clear_export_note(); });
     // A chunk added through the command layer (the Workspace tree, a test) is a project open,
     // so the launcher must give way to the view.
@@ -1124,7 +1145,20 @@ void MainWindow::show_start_page() {
 }
 
 void MainWindow::show_viewport_page() {
-    stack_->setCurrentWidget(viewport_);
+    stack_->setCurrentWidget(central_tabs_);
+}
+
+void MainWindow::open_photo(std::int32_t camera_id) {
+    if (photo_view_ == nullptr || central_tabs_ == nullptr) {
+        return;
+    }
+    // Opening a photo is a request for the project view, so the launcher gives way first.
+    start_page_ = false;
+    update_central_page();
+    if (!photo_view_->set_camera(camera_id)) {
+        return;
+    }
+    central_tabs_->setCurrentWidget(photo_view_);
 }
 
 void MainWindow::update_central_page() {

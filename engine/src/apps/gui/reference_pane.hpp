@@ -45,6 +45,11 @@ public:
     /// Rebuild both tables and the status line from the document.
     void refresh();
 
+Q_SIGNALS:
+    /// "Place on photo" was triggered: the window opens `camera_id` in the Photo tab, where
+    /// markers are placed. The pane never opens the tab itself.
+    void place_on_photo_requested(qint32 camera_id);
+
 private:
     void create_toolbar();
     void create_tables();
@@ -63,6 +68,8 @@ private:
     QAction* import_ = nullptr;
     QAction* export_ = nullptr;
     QAction* convert_ = nullptr;
+    QAction* import_markers_ = nullptr;
+    QAction* pick_ = nullptr;
 };
 
 }  // namespace alphashape::gui

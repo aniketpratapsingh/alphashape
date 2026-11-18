@@ -274,6 +274,17 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
             &PhotosPane::on_shared_selection_changed);
     connect(view_, &QListView::customContextMenuRequested, this,
             &PhotosPane::on_context_menu_requested);
+    // Double-click (or Enter on the focused row) opens the photo in the Photo tab. The signal
+    // carries the camera id, so the window never has to read the model.
+    connect(view_, &QListView::activated, this, [this](const QModelIndex& index) {
+        if (!index.isValid()) {
+            return;
+        }
+        const int camera_id = index.data(PhotosModel::CameraIdRole).toInt();
+        if (camera_id >= 0) {
+            Q_EMIT open_photo_requested(camera_id);
+        }
+    });
     connect(&app_, &GuiApp::undo_changed, this, [this]() {
         // The model refreshes itself on undo_changed; the pane only re-reads the flags its
         // actions depend on.

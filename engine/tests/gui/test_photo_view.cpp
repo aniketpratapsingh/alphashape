@@ -1,0 +1,197 @@
+// PhotoView.*: the Photo tab's marker placement (WP-14.25). A real PNG is written into the
+// test's scratch directory and linked to a camera, so the view decodes through the engine's
+// image IO exactly as it does in the application. Every edit goes through the command layer,
+// which is what makes the undo assertions meaningful.
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include <gtest/gtest.h>
+
+#include <QPointF>
+#include <QString>
+
+#include "apps/gui/app.hpp"
+#include "apps/gui/photo_view.hpp"
+#include "common/commands/model_commands.hpp"
+#include "common/core/chunk.hpp"
+#include "common/core/document.hpp"
+#include "common/core/frame.hpp"
+#include "image/image.hpp"
+#include "image/io/image_io.hpp"
+#include "model/camera/calibration.hpp"
+#include "harness.hpp"
+
+using namespace alphashape;
+using namespace alphashape::gui;
+using alphashape::gui::testing::GuiTest;
+
+namespace {
+
+constexpr int kWidth = 64;
+constexpr int kHeight = 48;
+
+class PhotoViewFixture : public GuiTest {
+protected:
+    PhotoView& view() { return *window().photo_view(); }
+
+    /// A chunk with one camera whose frame is a real PNG in the scratch directory. The camera
+    /// is aligned (identity pose) and has a sensor, so a marker with a position projects.
+    Chunk& build_chunk() {
+        const QString path = scratch(QStringLiteral("frame.png"));
+        Image image(kWidth, kHeight, 3);
+        for (int y = 0; y < kHeight; ++y) {
+            for (int x = 0; x < kWidth; ++x) {
+                image.at(x, y, 0) = static_cast<std::uint8_t>(x * 4);
+                image.at(x, y, 1) = static_cast<std::uint8_t>(y * 5);
+                image.at(x, y, 2) = 128;
+            }
+        }
+        write_png(path.toStdString(), image);
+
+        Document& document = app().document();
+        Chunk& chunk = document.workspace().add_chunk("Photo");
+        Sensor sensor;
+        sensor.width = kWidth;
+        sensor.height = kHeight;
+        sensor.calibration = Calibration::initial(CameraType::Frame, kWidth, kHeight, 50.0);
+        chunk.sensors().push_back(sensor);
+
+        Camera camera;
+        camera.id = 0;
+        camera.sensor_id = 0;
+        camera.label = "cam0";
+        camera.enabled = true;
+        chunk.cameras().push_back(camera);
+
+        auto frame = std::make_shared<Frame>(path.toStdString(), kWidth, kHeight);
+        frame->set_id(0);
+        frame->set_camera_id(0);
+        chunk.frames().push_back(frame);
+
+        document.set_active_chunk_id(chunk.id());
+        return chunk;
+    }
+
+    /// The marker with `marker_id`, or nullptr.
+    const Marker* marker(std::int32_t marker_id) {
+        const Chunk* chunk = app().document().active_chunk();
+        if (chunk == nullptr) {
+            return nullptr;
+        }
+        for (const Marker& candidate : chunk->markers()) {
+            if (candidate.id == marker_id) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    }
+};
+
+using PhotoViewTest = PhotoViewFixture;
+
+TEST_F(PhotoViewTest, OpensTheCameraImage) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    EXPECT_EQ(view().camera_id(), 0);
+    EXPECT_TRUE(view().has_image());
+    EXPECT_EQ(view().marker_items_count(), 0);
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+TEST_F(PhotoViewTest, AddMarkerCreatesOneProjectionAndUndoRemovesIt) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const std::size_t before = app().undo_stack().size();
+
+    ASSERT_TRUE(view().add_marker_at(QPointF(12.0, 9.0)));
+    EXPECT_EQ(app().undo_stack().size(), before + 1);
+    ASSERT_EQ(app().document().active_chunk()->markers().size(), 1U);
+    const Marker& created = app().document().active_chunk()->markers().front();
+    ASSERT_EQ(created.projections.size(), 1U);
+    EXPECT_EQ(created.projections.front().camera_id, 0);
+    EXPECT_NEAR(created.projections.front().pixel.x(), 12.0, 1e-9);
+    EXPECT_NEAR(created.projections.front().pixel.y(), 9.0, 1e-9);
+    EXPECT_EQ(view().marker_items_count(), 1);
+
+    app().undo();
+    EXPECT_TRUE(app().document().active_chunk()->markers().empty());
+    EXPECT_EQ(view().marker_items_count(), 0);
+}
+
+TEST_F(PhotoViewTest, MoveProjectionChangesThePixel) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    ASSERT_TRUE(view().add_marker_at(QPointF(10.0, 10.0)));
+    const std::int32_t marker_id = app().document().active_chunk()->markers().front().id;
+
+    ASSERT_TRUE(view().move_projection(marker_id, QPointF(30.0, 20.0)));
+    const Marker* moved = marker(marker_id);
+    ASSERT_NE(moved, nullptr);
+    ASSERT_EQ(moved->projections.size(), 1U);
+    EXPECT_NEAR(moved->projections.front().pixel.x(), 30.0, 1e-9);
+    EXPECT_NEAR(moved->projections.front().pixel.y(), 20.0, 1e-9);
+
+    app().undo();
+    const Marker* restored = marker(marker_id);
+    ASSERT_NE(restored, nullptr);
+    EXPECT_NEAR(restored->projections.front().pixel.x(), 10.0, 1e-9);
+}
+
+TEST_F(PhotoViewTest, PlaceMarkerAddsAProjectionToAnExistingMarker) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const std::int32_t chunk_id = app().document().active_chunk()->id();
+    app().execute(make_add_marker_command(chunk_id, std::string("GCP 1"), std::nullopt));
+    ASSERT_EQ(app().document().active_chunk()->markers().size(), 1U);
+    const std::int32_t marker_id = app().document().active_chunk()->markers().front().id;
+    ASSERT_TRUE(marker(marker_id)->projections.empty());
+
+    ASSERT_TRUE(view().place_marker_at(marker_id, QPointF(40.0, 30.0)));
+    const Marker* placed = marker(marker_id);
+    ASSERT_NE(placed, nullptr);
+    ASSERT_EQ(placed->projections.size(), 1U);
+    EXPECT_EQ(placed->projections.front().camera_id, 0);
+    EXPECT_NEAR(placed->projections.front().pixel.x(), 40.0, 1e-9);
+    EXPECT_EQ(view().marker_items_count(), 1);
+}
+
+TEST_F(PhotoViewTest, PredictedFlagIsDrawnForAMarkerWithAPosition) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const std::int32_t chunk_id = app().document().active_chunk()->id();
+    // A point on the optical axis projects to the image centre (32, 24).
+    app().execute(make_add_marker_command(chunk_id, std::string("Predicted"),
+                                          Eigen::Vector3d(0.0, 0.0, 1.0)));
+    EXPECT_EQ(view().marker_items_count(), 1);
+    const Marker& predicted = app().document().active_chunk()->markers().front();
+    EXPECT_TRUE(predicted.projections.empty());
+}
+
+TEST_F(PhotoViewTest, RemoveProjectionDeletesTheLastOneWithTheMarker) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    ASSERT_TRUE(view().add_marker_at(QPointF(5.0, 5.0)));
+    const std::int32_t marker_id = app().document().active_chunk()->markers().front().id;
+
+    ASSERT_TRUE(view().remove_projection(marker_id));
+    EXPECT_TRUE(app().document().active_chunk()->markers().empty());
+    EXPECT_EQ(view().marker_items_count(), 0);
+}
+
+TEST_F(PhotoViewTest, PixelAndSceneCoordinatesAgree) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const QPointF pixel(17.0, 23.0);
+    EXPECT_EQ(view().scene_to_pixel(view().pixel_to_scene(pixel)), pixel);
+}
+
+TEST_F(PhotoViewTest, UnknownCameraShowsNothing) {
+    build_chunk();
+    EXPECT_FALSE(view().set_camera(99));
+    EXPECT_FALSE(view().has_image());
+    EXPECT_EQ(view().marker_items_count(), 0);
+}
+
+}  // namespace
