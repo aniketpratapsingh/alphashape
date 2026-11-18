@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,8 @@
 #include "common/algorithm/sfm/georeference.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/core/chunk.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/crs/transform.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -297,6 +300,47 @@ TEST(Georeference, RepeatedCallIsStable) {
     EXPECT_LT(worst, 1e-6);
     EXPECT_LT((chunk.transform() - transform_before).cwiseAbs().maxCoeff(), 1e-6);
     EXPECT_EQ(chunk.crs().epsg, 4326);
+}
+
+// A projected camera slot is converted, not refused: the same cameras with
+// their references re-expressed in UTM zone 32N georeference to the same
+// transform as the geographic slot does.
+TEST(Georeference, ConvertsProjectedCameraCrs) {
+    Chunk geographic = make_synthetic_chunk();
+    Chunk projected = make_synthetic_chunk();
+
+    const crs::CoordinateSystem utm32 = crs::CoordinateSystem::from_epsg(32632);
+    const crs::CrsTransform to_utm =
+        crs::CrsTransform::create(crs::CoordinateSystem::from_epsg(4979), utm32);
+    for (Camera& camera : projected.cameras()) {
+        ASSERT_TRUE(camera.reference.location.has_value());
+        const Eigen::Vector3d& lonlat = *camera.reference.location;
+        const std::optional<crs::CrsPoint> out =
+            to_utm.forward(crs::CrsPoint{lonlat.x(), lonlat.y(), lonlat.z()});
+        ASSERT_TRUE(out.has_value());
+        camera.reference.location = Eigen::Vector3d(out->x, out->y, out->z);
+    }
+    CRS slot;
+    slot.epsg = 32632;
+    projected.set_camera_crs(slot);
+
+    const sfm::GeoreferenceReport geographic_report = sfm::georeference_chunk(geographic);
+    const sfm::GeoreferenceReport projected_report = sfm::georeference_chunk(projected);
+
+    ASSERT_TRUE(geographic_report.applied) << geographic_report.reason;
+    ASSERT_TRUE(projected_report.applied) << projected_report.reason;
+    EXPECT_EQ(projected_report.references_used, geographic_report.references_used);
+    // The UTM round trip is exact to about 0.1 mm, so the recovered transform
+    // matches the geographic one to that order. A wrong reading (eastings taken
+    // as degrees) would be off by kilometres, so this still catches the bug.
+    EXPECT_LT((projected.transform() - geographic.transform()).cwiseAbs().maxCoeff(), 1e-3);
+    for (std::size_t i = 0; i < projected.cameras().size(); ++i) {
+        EXPECT_LT((camera_centre(projected.cameras()[i].pose) -
+                   camera_centre(geographic.cameras()[i].pose))
+                      .norm(),
+                  1e-3)
+            << "camera " << i;
+    }
 }
 
 // WP-13.13b: a track covariance follows the same similarity as its point, so

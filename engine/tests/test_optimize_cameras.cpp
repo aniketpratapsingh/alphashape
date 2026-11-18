@@ -42,6 +42,8 @@
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/crs/transform.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -769,6 +771,56 @@ TEST(OptimizeCamerasGeo, UsesGpsPriorsOnGeoSequence) {
     std::printf("[optimize_cameras] geo_seq: worst ECEF centre %.4f m, RMS %.4f m\n", worst,
                 prior_rms);
     EXPECT_LT(worst, 0.08) << "worst ECEF centre error " << worst;
+}
+
+// A projected camera slot is converted, not read as degrees: the same geo
+// sequence with its references re-expressed in UTM zone 32N solves to the same
+// camera centres as the geographic slot does.
+TEST(OptimizeCamerasGeo, ConvertsProjectedCameraCrs) {
+    Document document = make_document(geo_seq_files());
+    run_match_photos(document);
+    run_align_cameras(document);
+    Chunk& chunk = *document.active_chunk();
+    const Chunk aligned = chunk;
+
+    // Geographic slot: the baseline solve.
+    run_optimize_cameras(document);
+    std::vector<Eigen::Vector3d> geographic_centres;
+    for (const Camera& camera : document.active_chunk()->cameras()) {
+        geographic_centres.push_back(camera_centre(camera.pose));
+    }
+
+    // Same aligned chunk, references re-expressed in UTM zone 32N and the slot
+    // labelled with it. The values are the engine's own projection, so the two
+    // chunks describe the same ground points.
+    chunk = aligned;
+    const crs::CoordinateSystem utm32 = crs::CoordinateSystem::from_epsg(32632);
+    const crs::CrsTransform to_utm =
+        crs::CrsTransform::create(crs::CoordinateSystem::from_epsg(4979), utm32);
+    for (Camera& camera : chunk.cameras()) {
+        ASSERT_TRUE(camera.reference.location.has_value());
+        const Eigen::Vector3d& lonlat = *camera.reference.location;
+        const std::optional<crs::CrsPoint> out =
+            to_utm.forward(crs::CrsPoint{lonlat.x(), lonlat.y(), lonlat.z()});
+        ASSERT_TRUE(out.has_value());
+        camera.reference.location = Eigen::Vector3d(out->x, out->y, out->z);
+    }
+    CRS slot;
+    slot.epsg = 32632;
+    chunk.set_camera_crs(slot);
+
+    run_optimize_cameras(document);
+
+    // The UTM round trip is exact to about 0.1 mm, so the solved centres match
+    // the geographic run to that order. A wrong reading (eastings taken as
+    // degrees) would be off by kilometres, so this still catches the bug.
+    const Chunk& solved = *document.active_chunk();
+    ASSERT_EQ(solved.cameras().size(), geographic_centres.size());
+    for (std::size_t i = 0; i < solved.cameras().size(); ++i) {
+        EXPECT_LT((camera_centre(solved.cameras()[i].pose) - geographic_centres[i]).norm(),
+                  1e-3)
+            << "camera " << i;
+    }
 }
 
 // ---------------------------------------------------------------------------

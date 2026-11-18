@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -24,6 +25,8 @@
 #include "common/algorithm/sfm/georeference.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/core/chunk.hpp"
+#include "model/crs/coordinate_system.hpp"
+#include "model/crs/transform.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -422,41 +425,52 @@ TEST(Georeference, MarkerPositionsTransformed) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. A projected marker CRS is refused before any mutation
+// 8. A projected marker CRS is converted, not refused: the same markers given
+//    in a UTM slot produce the same transform as in EPSG:4326
 // ---------------------------------------------------------------------------
 
-TEST(Georeference, ProjectedMarkerCrsRefused) {
+TEST(Georeference, ProjectedMarkerCrsConverted) {
     Scene scene;
     scene.marker_count = 5;
-    Chunk chunk = make_scene(scene);
-    CRS projected;
-    projected.epsg = 32633;  // UTM zone 33N: projected, not lon/lat
-    chunk.set_marker_crs(projected);
+    Chunk geographic = make_scene(scene);
+    Chunk projected = make_scene(scene);
 
-    const Transform transform_before = chunk.transform();
-    std::vector<Eigen::Vector3d> positions_before;
-    for (const Marker& marker : chunk.markers()) {
-        positions_before.push_back(*marker.position);
+    // Re-express every marker reference in UTM zone 32N (the scene's origin is
+    // at 7 E, inside that zone) and label the slot with it. The values are the
+    // engine's own projection of the geographic references, so the two chunks
+    // describe the same ground points.
+    const crs::CoordinateSystem utm32 = crs::CoordinateSystem::from_epsg(32632);
+    const crs::CrsTransform to_utm =
+        crs::CrsTransform::create(crs::CoordinateSystem::from_epsg(4979), utm32);
+    for (Marker& marker : projected.markers()) {
+        ASSERT_TRUE(marker.reference.has_value());
+        const Eigen::Vector3d& lonlat = *marker.reference;
+        const std::optional<crs::CrsPoint> out =
+            to_utm.forward(crs::CrsPoint{lonlat.x(), lonlat.y(), lonlat.z()});
+        ASSERT_TRUE(out.has_value());
+        marker.reference = Eigen::Vector3d(out->x, out->y, out->z);
     }
-    std::vector<Transform> poses_before;
-    for (const Camera& camera : chunk.cameras()) {
-        poses_before.push_back(camera.pose);
-    }
+    CRS slot;
+    slot.epsg = 32632;
+    projected.set_marker_crs(slot);
 
-    const sfm::GeoreferenceReport report = sfm::update_transform(chunk);
+    const sfm::GeoreferenceReport geographic_report = sfm::update_transform(geographic);
+    const sfm::GeoreferenceReport projected_report = sfm::update_transform(projected);
 
-    EXPECT_FALSE(report.applied);
-    EXPECT_NE(report.reason.find("not geographic"), std::string::npos) << report.reason;
-    EXPECT_LT((chunk.transform() - transform_before).cwiseAbs().maxCoeff(), 1e-12);
-    EXPECT_EQ(chunk.crs().epsg, 0);
-    for (std::size_t i = 0; i < chunk.markers().size(); ++i) {
-        ASSERT_TRUE(chunk.markers()[i].position.has_value());
-        EXPECT_LT((*chunk.markers()[i].position - positions_before[i]).norm(), 1e-12)
+    ASSERT_TRUE(geographic_report.applied) << geographic_report.reason;
+    ASSERT_TRUE(projected_report.applied) << projected_report.reason;
+    EXPECT_EQ(projected_report.control_points_used, geographic_report.control_points_used);
+    // The UTM round trip is exact to about 0.1 mm, so the recovered similarity
+    // matches the geographic one to that order. A wrong reading (eastings taken
+    // as degrees) would be off by kilometres, so this still catches the bug.
+    EXPECT_LT((projected.transform() - geographic.transform()).cwiseAbs().maxCoeff(), 1e-3);
+    EXPECT_NEAR(projected_report.scale, geographic_report.scale, 1e-4);
+    for (std::size_t i = 0; i < projected.markers().size(); ++i) {
+        ASSERT_TRUE(projected.markers()[i].position.has_value());
+        ASSERT_TRUE(geographic.markers()[i].position.has_value());
+        EXPECT_LT((*projected.markers()[i].position - *geographic.markers()[i].position).norm(),
+                  1e-3)
             << "marker " << i;
-    }
-    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
-        EXPECT_LT((chunk.cameras()[i].pose - poses_before[i]).cwiseAbs().maxCoeff(), 1e-12)
-            << "camera " << i;
     }
 }
 
