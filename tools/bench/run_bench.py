@@ -140,6 +140,10 @@ class OptimizeParamError(ParamError):
     """An ``optimize_params`` string that is not a list of well-formed ``key=value``."""
 
 
+class MatchParamError(ParamError):
+    """A ``match_params`` string that is not a list of well-formed ``key=value``."""
+
+
 class RepsError(ValueError):
     """A ``reps`` value that is not a positive whole number of runs."""
 
@@ -234,6 +238,11 @@ def parse_optimize_params(text: str | None) -> dict[str, str]:
     return parse_params(text, OptimizeParamError)
 
 
+def parse_match_params(text: str | None) -> dict[str, str]:
+    """Parse the workflow's optional ``match_params`` string (MatchPhotos)."""
+    return parse_params(text, MatchParamError)
+
+
 def pipeline_with_optimize(overrides: dict | None) -> list[str]:
     """The pipeline stages for a run, with OptimizeCameras when it is asked for.
 
@@ -293,6 +302,16 @@ def merge_optimize_params(dataset: dict, optimize_params: dict[str, str]) -> dic
     the task, so "the parameters exist" and "the stage runs" can never disagree.
     """
     return merge_task_params(dataset, "OptimizeCameras", optimize_params)
+
+
+def merge_match_params(dataset: dict, match_params: dict[str, str]) -> dict:
+    """The dataset with ``match_params`` merged into its MatchPhotos overrides.
+
+    A dataset that caps ``keypoint_limit_per_mpx`` for the runner's memory keeps
+    that cap unless the experiment names the key itself, which is what makes a
+    denser-matching run a deliberate, recorded choice.
+    """
+    return merge_task_params(dataset, "MatchPhotos", match_params)
 
 
 def downloads_for(dataset: dict) -> list[tuple[str, RemoteFile]]:
@@ -1318,6 +1337,7 @@ def run(
     dem_params: dict[str, str] | None = None,
     ortho_params: dict[str, str] | None = None,
     optimize_params: dict[str, str] | None = None,
+    match_params: dict[str, str] | None = None,
     reps: int = 1,
 ) -> dict:
     """Run one dataset and score it.
@@ -1326,7 +1346,8 @@ def run(
     dispatch, already validated by :func:`parse_depth_params`; ``dem_params`` are
     the same for ``BuildDem`` and ``ortho_params`` for ``BuildOrthomosaic``;
     ``optimize_params`` are OptimizeCameras' keyword arguments, and giving any of
-    them both sets that task's overrides and inserts it after ``AlignCameras``.
+    them both sets that task's overrides and inserts it after ``AlignCameras``;
+    ``match_params`` are MatchPhotos' keyword arguments.
     Each is merged over the dataset's own manifest overrides for its task, so an
     experiment such as ``cost_type=census`` keeps the dataset's measured
     ``downscale`` and is therefore comparable with the control run of the same
@@ -1350,6 +1371,7 @@ def run(
     dataset = merge_dem_params(dataset, dem_params or {})
     dataset = merge_ortho_params(dataset, ortho_params or {})
     dataset = merge_optimize_params(dataset, optimize_params or {})
+    dataset = merge_match_params(dataset, match_params or {})
     work.mkdir(parents=True, exist_ok=True)
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -1406,7 +1428,8 @@ def run(
     references = reference_paths(dataset, work)
 
     if dataset.get("validation") == "gcp":
-        return _run_gcp_repetitions(dataset_name, dataset, work, references, reps)
+        return _run_gcp_repetitions(dataset_name, dataset, work, references, reps,
+                                    match_params=match_params)
 
     print("-- pipeline")
     available = collect_images(dataset, work)
@@ -1434,7 +1457,7 @@ def run(
         result = _score_pipeline(
             dataset_name, dataset, rep_work, references, images, available, selection,
             overrides, manifest, depth_params, dem_params, ortho_params, optimize_params,
-            capture_pose_hashes=reps > 1,
+            capture_pose_hashes=reps > 1, match_params=match_params,
         )
         results.append(result)
         timing = result.get("timing") or {}
@@ -1465,6 +1488,7 @@ def _score_pipeline(
     ortho_params: dict[str, str] | None,
     optimize_params: dict[str, str] | None,
     capture_pose_hashes: bool = False,
+    match_params: dict[str, str] | None = None,
 ) -> dict:
     """Run the pipeline once in ``work`` and score it.
 
@@ -1527,6 +1551,8 @@ def _score_pipeline(
         # grows this key.
         if optimize_log:
             result["optimize_log"] = optimize_log
+    if match_params:
+        result["match_params"] = dict(match_params)
     result["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1540,7 +1566,8 @@ def _score_pipeline(
 
 
 def _run_gcp_repetitions(
-    dataset_name: str, dataset: dict, work: Path, references: dict, reps: int
+    dataset_name: str, dataset: dict, work: Path, references: dict, reps: int,
+    *, match_params: dict[str, str] | None = None,
 ) -> dict:
     """Repeat the GCP protocol, hashing the alignment each run aligned itself.
 
@@ -1559,7 +1586,7 @@ def _run_gcp_repetitions(
             print(f"-- gcp validation run {index}/{reps}")
         report = run_gcp_validation(
             dataset_name, dataset, work, references,
-            report_dir=report_dir, reps=reps,
+            report_dir=report_dir, reps=reps, match_params=match_params,
         )
         alignment_hash = None
         if reps > 1:
@@ -1580,6 +1607,7 @@ def _run_gcp_repetitions(
 def run_gcp_validation(
     dataset_name: str, dataset: dict, work: Path, references: dict,
     *, report_dir: Path | None = None, reps: int = 1,
+    match_params: dict[str, str] | None = None,
 ) -> dict:
     """Run the real-block ground-control validation (engine/tests/run_gcp_validation.py).
 
@@ -1641,6 +1669,11 @@ def run_gcp_validation(
     mrk = references.get("mrk")
     if mrk:
         command.extend(["--mrk", str(mrk)])
+    # Every other MatchPhotos override reaches the block's alignment as-is; the
+    # keypoint density already travels as --keypoint-limit above.
+    for key, value in sorted(match.items()):
+        if key != "keypoint_limit_per_mpx":
+            command.extend(["--match-param", f"{key}={value}"])
     if adaptive:
         command.append("--adaptive-fitting")
     # The diagnostics are report-only probes; the manifest opts a dataset in.
@@ -1691,6 +1724,8 @@ def run_gcp_validation(
     # dispatched GCP experiment be published as the regression baseline.
     if optimize:
         report["optimize_params"] = dict(optimize)
+    if match_params:
+        report["match_params"] = dict(match_params)
     report["dataset_manifest"] = {
         "title": dataset["title"],
         "doi": dataset.get("doi"),
@@ -1943,6 +1978,12 @@ def main(argv: list[str] | None = None) -> int:
         "(never a baseline, never gated)",
     )
     parser.add_argument(
+        "--match-params",
+        default="",
+        help='extra MatchPhotos keyword args, e.g. "keypoint_limit_per_mpx=1000"; '
+        "marks the run as an experiment (never a baseline, never gated)",
+    )
+    parser.add_argument(
         "--reps",
         default=1,
         help="run the dataset this many times and report the median and range "
@@ -1969,6 +2010,11 @@ def main(argv: list[str] | None = None) -> int:
         optimize_params = parse_optimize_params(args.optimize_params)
     except OptimizeParamError as exc:
         parser.error(f"--optimize-params: {exc}")
+
+    try:
+        match_params = parse_match_params(args.match_params)
+    except MatchParamError as exc:
+        parser.error(f"--match-params: {exc}")
 
     try:
         reps = parse_reps(args.reps)
@@ -2004,6 +2050,7 @@ def main(argv: list[str] | None = None) -> int:
         dem_params=dem_params,
         ortho_params=ortho_params,
         optimize_params=optimize_params,
+        match_params=match_params,
         reps=reps,
     )
 
