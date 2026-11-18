@@ -70,6 +70,45 @@ TEST_F(CrsPicker, AcceptsCodeOutsideTheCuratedList) {
     EXPECT_FALSE(picker.is_valid());
 }
 
+TEST_F(CrsPicker, SearchFindsSystemsOutsideTheCuratedList) {
+    alphashape::gui::CrsPicker picker;
+    picker.filter_edit()->setText(QStringLiteral("7854"));
+    ASSERT_NE(picker.list_widget()->currentItem(), nullptr);
+    EXPECT_TRUE(picker.is_valid());
+    EXPECT_EQ(picker.coordinate_system().epsg(), 7854);
+    EXPECT_EQ(picker.coordinate_system().name(), "GDA2020 / MGA zone 54");
+}
+
+TEST_F(CrsPicker, SearchMatchesEveryWordOfTheName) {
+    alphashape::gui::CrsPicker picker;
+    picker.filter_edit()->setText(QStringLiteral("mga zone 54"));
+    bool gda2020 = false;
+    bool gda94 = false;
+    for (int row = 0; row < picker.list_widget()->count(); ++row) {
+        const int code = picker.list_widget()->item(row)->data(Qt::UserRole).toInt();
+        gda2020 = gda2020 || code == 7854;
+        gda94 = gda94 || code == 28354;
+    }
+    EXPECT_TRUE(gda2020);
+    EXPECT_TRUE(gda94);
+    // Several systems match, so none is chosen for the user.
+    EXPECT_FALSE(picker.is_valid());
+    picker.list_widget()->setCurrentRow(0);
+    EXPECT_TRUE(picker.is_valid());
+}
+
+TEST_F(CrsPicker, ClearingTheSearchShowsTheCuratedList) {
+    alphashape::gui::CrsPicker picker;
+    const int curated = picker.list_widget()->count();
+    EXPECT_EQ(static_cast<std::size_t>(curated), crs::builtin_crs_list().size());
+    picker.filter_edit()->setText(QStringLiteral("utm"));
+    // Hundreds of UTM systems: the list is capped, with one summary line.
+    EXPECT_EQ(static_cast<std::size_t>(picker.list_widget()->count()),
+              alphashape::gui::CrsPicker::kMaxSearchResults + 1);
+    picker.filter_edit()->clear();
+    EXPECT_EQ(picker.list_widget()->count(), curated);
+}
+
 TEST_F(CrsPicker, CurrentCodeOutsideTheListIsShown) {
     alphashape::gui::CrsPicker picker;
     picker.set_coordinate_system(crs::CoordinateSystem::from_epsg(32644));
