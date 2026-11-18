@@ -300,6 +300,32 @@ def load_reconstruction(opensfm: Path, name: str = "reconstruction.topocentric.j
     return largest, reference, len(parts)
 
 
+def residual_statistics(points: list[dict]) -> dict | None:
+    """Mean and scatter of the per-view reprojection residuals, in pixels.
+
+    A reprojection RMS alone cannot say whether the block is off by a constant
+    (a frame or convention error) or scatters about the point (a real
+    measurement residual). The mean is the systematic part and the standard
+    deviation the scatter; when the mean dominates, the residual is a shift.
+    """
+    du, dv = [], []
+    for point in points:
+        for residual in (point.get("residuals_px") or {}).values():
+            du.append(residual[0])
+            dv.append(residual[1])
+    if not du:
+        return None
+    mean_u, mean_v = sum(du) / len(du), sum(dv) / len(dv)
+    var_u = sum((x - mean_u) ** 2 for x in du) / len(du)
+    var_v = sum((x - mean_v) ** 2 for x in dv) / len(dv)
+    return {
+        "observations": len(du),
+        "mean_px": [mean_u, mean_v],
+        "std_px": [math.sqrt(var_u), math.sqrt(var_v)],
+        "rms_px": math.sqrt(sum(x * x for x in du + dv) / len(du + dv)),
+    }
+
+
 def load_odm_control_points(opensfm: Path) -> dict[str, list[float]]:
     """ODM's own triangulated control points, from its statistics file.
 
@@ -372,6 +398,9 @@ def evaluate(project: Path, holdout_path: Path, mode: str,
     agreement = odm_agreement(project / "opensfm", control, reconstruction_name)
     if agreement is not None:
         result["odm_agreement"] = agreement
+    residuals = residual_statistics(control)
+    if residuals is not None:
+        result["control_residuals"] = residuals
     return result
 
 
@@ -400,6 +429,7 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
             "views": check["views"], "reprojection_rms_px": check["reprojection_rms_px"],
             "control_horizontal_rms_m": rms([c["horizontal_m"] for c in control]),
             "control_vertical_rms_m": rms([c["vertical_m"] for c in control]),
+            "control_residuals": result.get("control_residuals"),
             "odm_agreement": result.get("odm_agreement"),
             "shots_reconstructed": result["shots_reconstructed"],
         })
@@ -420,6 +450,14 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
             "max_horizontal_m": max((a["max_horizontal_m"] for a in agreements), default=None),
             "max_vertical_m": max((a["max_vertical_m"] for a in agreements), default=None),
         } if agreements else None
+        residuals = [f["control_residuals"] for f in entry["folds"] if f["control_residuals"]]
+        entry["control_residuals"] = {
+            "folds": len(residuals),
+            "mean_px": [sum(r["mean_px"][i] for r in residuals) / len(residuals)
+                        for i in range(2)],
+            "std_px": [rms([r["std_px"][i] for r in residuals]) for i in range(2)],
+            "rms_px": rms([r["rms_px"] for r in residuals]),
+        } if residuals else None
         h = entry["horizontal_rms_m"]
         entry["meets_target"] = (h is not None and h <= target_m and not entry["missing"])
 
@@ -468,6 +506,16 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
                          f"{agreement['vertical_rms_m'] * 100:.2f} cm vertical RMS "
                          f"(max {agreement['max_horizontal_m'] * 100:.2f} / "
                          f"{agreement['max_vertical_m'] * 100:.2f} cm).")
+        residuals = entry.get("control_residuals")
+        if residuals:
+            mean_u, mean_v = residuals["mean_px"]
+            std_u, std_v = residuals["std_px"]
+            lines.append("")
+            lines.append(f"Control reprojection residual ({residuals['folds']} folds): "
+                         f"{residuals['rms_px']:.2f} px RMS, mean "
+                         f"({mean_u:+.2f}, {mean_v:+.2f}) px, scatter "
+                         f"({std_u:.2f}, {std_v:.2f}) px. A mean that dominates the "
+                         "scatter is a systematic shift, not measurement noise.")
         lines.append("")
     return {"target_horizontal_m": target_m, "modes": modes}, "\n".join(lines)
 

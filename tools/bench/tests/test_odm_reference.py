@@ -152,6 +152,27 @@ class TriangulationTest(unittest.TestCase):
         self.assertEqual(result["status"], "too_few_views")
 
 
+class ResidualStatisticsTest(unittest.TestCase):
+    def test_a_constant_shift_is_all_mean(self):
+        points = [{"residuals_px": {"A.JPG": [2.0, -3.0], "B.JPG": [2.0, -3.0]}}]
+        stats = odm_reference.residual_statistics(points)
+        self.assertEqual(stats["observations"], 2)
+        self.assertAlmostEqual(stats["mean_px"][0], 2.0)
+        self.assertAlmostEqual(stats["mean_px"][1], -3.0)
+        self.assertAlmostEqual(stats["std_px"][0], 0.0)
+        # The RMS is over every component, as the per-point reprojection RMS is.
+        self.assertAlmostEqual(stats["rms_px"], math.sqrt((2.0 ** 2 + 3.0 ** 2) / 2))
+
+    def test_scatter_about_zero_is_all_std(self):
+        points = [{"residuals_px": {"A.JPG": [1.0, 0.0], "B.JPG": [-1.0, 0.0]}}]
+        stats = odm_reference.residual_statistics(points)
+        self.assertAlmostEqual(stats["mean_px"][0], 0.0)
+        self.assertAlmostEqual(stats["std_px"][0], 1.0)
+
+    def test_no_residuals_is_none(self):
+        self.assertIsNone(odm_reference.residual_statistics([{"status": "ok"}]))
+
+
 class SummaryTest(unittest.TestCase):
     def result(self, mode, fold, h, v, status="ok", control_v=0.01, agreement=None):
         check = {"label": str(fold), "status": status}
