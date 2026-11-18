@@ -20,14 +20,20 @@ All notable changes to alphashape are recorded here. The format follows
   every cause investigated (lens model, pixel convention, antenna mount, timing,
   fix status, per-photo weighting, block doming, reference frame, marker
   refinement).
-- **Second ground-control dataset surveyed and rejected.** `tools/bench/DATASETS.md`
-  records why the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) cannot
-  serve as a second ground-control block: it publishes 51 check points and 8 GCPs as
-  3-D coordinates but no image observations of the targets, which the leave-one-out
-  protocol requires. The complete file lists of both large archives were read from
-  their 7z headers over HTTP range requests, so the conclusion rests on the full
-  contents rather than a sample. The entry also records the orthometric-height and
-  label-shift traps a future attempt would hit.
+- **Second ground-control block: the EuroSDR RPAS benchmark.** `tools/bench/DATASETS.md`
+  now records the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) as a
+  second ground-control block rather than a rejected candidate. The publisher ships
+  the surveyed coordinates of 8 GCPs and 51 check points but not the pixel
+  observations of their targets, so a CI-only workflow
+  (`.github/workflows/eurosdr-observations.yml`, driving
+  `tools/bench/eurosdr_observations.py`) measures them: it aligns the P4 RTK flight
+  with no ground control, projects each surveyed station into every camera that sees
+  it, and snaps the projection onto the circular target with the engine's multi-view
+  marker refinement. The point coordinates come from the xlsx in ETRS89 ellipsoidal
+  terms, so the orthometric-height obstacle the earlier entry recorded does not
+  apply. The accepted observations are committed as our own derived data (CC BY 4.0,
+  Mills et al. 2023, Newcastle University / EuroSDR) and read by the `gcp-eurosdr`
+  bench dataset.
 
 ### Changed
 
