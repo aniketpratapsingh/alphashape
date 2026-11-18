@@ -1233,7 +1233,7 @@ GCP observations better than a few pixels; the same residual appears in the
 engine's own diagnostics on this block (the default lens model is too thin for
 this camera, and the adaptive model reduces it).
 
-**Reading it against the engine.** ODM's 9.3–9.8 cm horizontal and 46–51 cm
+**Reading it against the engine.** ODM's 9.3–9.9 cm horizontal and 46–50 cm
 vertical are worse than the engine's best leak-free setting (5.31 cm horizontal,
 12.22 vertical with per-image camera RTK and adaptive fitting; 6.54 / 6.46 with
 GCPs only). The vertical is the striking part: ODM's control points already sit
