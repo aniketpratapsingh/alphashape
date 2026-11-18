@@ -1162,3 +1162,38 @@ setting remains per-image camera RTK with adaptive fitting at **5.31 cm**
 horizontal (12.22 vertical, 13.32 3D); GCP-only adaptive is 6.54 / 6.46 /
 9.19 cm. No frame correction beats the uncorrected variant, and the target is
 not loosened.
+
+#### Gate variant and the fold-3 check point (2026-11-18)
+
+**Which variant is gated.** The real-block pass/fail verdict reads
+`camera_rtk_engine_defaults`: camera RTK references plus the surveyed GCPs,
+with the lens model left to `OptimizeCameras`' own defaults. On a block with
+control points those defaults select the adaptive model, so this is the
+configuration the product ships. The earlier gate read `camera_rtk_gcps`, which
+pins the plain lens model (`adaptive_fitting_auto=False`); that variant is
+still computed and reported beside the gated one as the pinned plain-lens
+reference, so its row keeps its meaning across engine versions. The 5 cm
+horizontal threshold is the same for both and is never loosened. The gate
+variant is leak-free: the held-out point is imported as a check marker, and the
+engine's automatic rule counts only control points (`control_markers` in
+`optimize_cameras_task.cpp` excludes any marker whose role is `check_point`),
+so the auto selection never sees the fold's check point.
+
+**Fold 3 holds out the interior point.** Fold 3 holds out GCP 3, which sits
+1.7 m from the GCP centroid while the other four are 21-23 m out. It is the
+only fold whose check point lies inside the control hull, so it is the only
+fold that tests interpolation rather than extrapolation.
+
+**Its error is systematic, not noise.** Across 35 runs the fold-3 error is
+mean (-7.9, +4.2) cm with per-axis sd 2.3 / 1.7 cm, at azimuth 298°. It does
+not change with the lens model, the weighting, the marker sigma, the
+pixel-origin probe or the keypoint density. OpenDroneMap reproduces it on the
+same block: (-7.1, +5.2) cm at azimuth 306°. As a control point, GCP 3 also
+carries the largest residual, 7.1 cm, in the same direction. The conclusion is
+that this is a property of the block or its survey, not an engine defect.
+
+**Vertical errors are not common-mode.** The per-fold vertical means are
+-5.0, -13.5, -3.1, +9.8 and +11.2 cm, with an overall mean of -0.1 cm and an
+sd of 10.5 cm. A datum, geoid or antenna-height bias would move every fold the
+same way; these do not, which rules those out as the source of the vertical
+error.

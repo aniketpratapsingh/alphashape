@@ -23,6 +23,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **The ground-control accuracy gate reads the shipped configuration.** The
+  real-block leave-one-out check now gates on `camera_rtk_engine_defaults`:
+  camera RTK references plus the surveyed GCPs with the lens model left to
+  `OptimizeCameras`' own defaults, which select the adaptive model on a block
+  with control points. The previous gate variant, `camera_rtk_gcps`, pins the
+  plain lens model and is still computed and reported as the pinned plain-lens
+  reference. The 5 cm horizontal threshold is unchanged.
+
 - **The coordinate-system picker searches every EPSG system.** Typing in the
   search field now looks through all current EPSG geographic, geocentric and
   projected systems in the PROJ database by code, name or area (for example
