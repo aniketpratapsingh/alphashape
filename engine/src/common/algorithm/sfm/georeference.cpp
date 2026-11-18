@@ -18,6 +18,7 @@
 
 #include "base/utils/error.hpp"
 #include "common/algorithm/chunk/align_chunks_task.hpp"
+#include "common/algorithm/reference/convert_reference.hpp"
 #include "common/algorithm/reference/reference_orientation.hpp"
 #include "common/algorithm/sfm/similarity.hpp"
 #include "common/core/chunk_geometry.hpp"
@@ -183,7 +184,14 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
         // left unchanged (see the note in the non-geometry path below).
         apply_geometry(chunk, geometry);
         chunk.crs().epsg = 4326;
-        chunk.set_camera_crs(chunk.crs());
+        // The camera slot labels the reference numbers, which this fit did not
+        // rewrite. A geographic (or unset) slot becomes the chunk CRS; a
+        // projected slot keeps its own label, because its numbers are still
+        // eastings and northings and relabelling them as degrees would make the
+        // next read misinterpret them.
+        if (crs_is_geographic(chunk.camera_crs())) {
+            chunk.set_camera_crs(chunk.crs());
+        }
         chunk.set_world_crs(chunk.crs());
         return;
     }
@@ -241,9 +249,14 @@ void apply_similarity_to_chunk(Chunk& chunk, const Similarity& t_sim,
     // The GNSS references this fit consumed are lon/lat/alt in that CRS, and the
     // chunk's local frame is now metric ENU expressible in it, so the camera and
     // world slots name it explicitly (M12 §4.4, WP-12.6). The slots only label
-    // the numbers; nothing below converts them. The marker slot keeps following
-    // the chunk CRS unless the caller explicitly transformed marker positions.
-    chunk.set_camera_crs(chunk.crs());
+    // the numbers; nothing below converts them. A projected camera slot keeps
+    // its own label, because its numbers are still eastings and northings and
+    // relabelling them as degrees would make the next read misinterpret them.
+    // The marker slot keeps following the chunk CRS unless the caller explicitly
+    // transformed marker positions.
+    if (crs_is_geographic(chunk.camera_crs())) {
+        chunk.set_camera_crs(chunk.crs());
+    }
     chunk.set_world_crs(chunk.crs());
 }
 
@@ -258,19 +271,36 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
 
     // Candidates: aligned cameras with an enabled, finite GNSS reference. Their
     // poses are in the chunk's CURRENT local frame.
+    //
+    // The references are read through `geodetic_camera_locations`, which returns
+    // lon/lat/ellipsoidal height whatever CRS the camera slot names: a projected
+    // survey (UTM, MGA, a national grid) is converted to WGS 84 here instead of
+    // being read as degrees. A conversion that cannot run (no CRS engine, a point
+    // outside the projection, a geoid with no grid) is reported, not thrown, so
+    // the chunk is left untouched exactly as the other refusals do.
+    std::vector<std::optional<Eigen::Vector3d>> camera_geodetic;
+    try {
+        camera_geodetic = reference::geodetic_camera_locations(chunk);
+    } catch (const Error& error) {
+        report.reason = error.what();
+        return report;
+    }
     std::vector<const Camera*> candidates;
     std::vector<Eigen::Vector3d> candidate_centres;
-    for (const Camera& camera : chunk.cameras()) {
+    std::vector<Eigen::Vector3d> candidate_references;
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        const Camera& camera = chunk.cameras()[i];
         if (!camera.enabled || !camera.reference.enabled ||
-            !camera.reference.location.has_value()) {
+            !camera_geodetic[i].has_value()) {
             continue;
         }
-        const Eigen::Vector3d& loc = *camera.reference.location;
+        const Eigen::Vector3d& loc = *camera_geodetic[i];
         if (!all_finite(loc)) {
             continue;
         }
         candidates.push_back(&camera);
         candidate_centres.push_back(camera_centre(camera.pose));
+        candidate_references.push_back(loc);
     }
     report.references_total = candidates.size();
     if (candidates.size() < 3) {
@@ -285,15 +315,13 @@ GeoreferenceReport georeference_chunk(Chunk& chunk) {
     Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
     std::vector<Eigen::Vector3d> reference_enu;
     reference_enu.reserve(candidates.size());
-    for (const Camera* camera : candidates) {
-        const Eigen::Vector3d& loc = *camera->reference.location;
+    for (const Eigen::Vector3d& loc : candidate_references) {
         mean_ecef += geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
     }
     mean_ecef /= static_cast<double>(candidates.size());
     const geo::Geodetic origin = geo::ecef_to_geodetic(mean_ecef);
     const Transform ecef_to_local = geo::ecef_to_enu(origin);
-    for (const Camera* camera : candidates) {
-        const Eigen::Vector3d& loc = *camera->reference.location;
+    for (const Eigen::Vector3d& loc : candidate_references) {
         const Eigen::Vector3d ecef =
             geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
         reference_enu.push_back((ecef_to_local * ecef.homogeneous()).head<3>());
@@ -462,12 +490,28 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     // itself supplies the rotation that turns the camera-frame offset into the
     // ENU frame (iterated below). Without a mount the shift is zero and the
     // sample is exactly `centre <-> reference`, the pre-WP-13.19 behaviour.
-    for (const Camera& camera : chunk.cameras()) {
+    //
+    // The references are read through the geodetic helpers, which return
+    // lon/lat/ellipsoidal height whatever CRS the slots name: a projected survey
+    // (UTM, MGA, a national grid) is converted to WGS 84 here instead of being
+    // read as degrees. A conversion that cannot run is reported, not thrown, so
+    // the chunk is left untouched exactly as the other refusals do.
+    std::vector<std::optional<Eigen::Vector3d>> camera_geodetic;
+    std::vector<std::optional<Eigen::Vector3d>> marker_geodetic;
+    try {
+        camera_geodetic = reference::geodetic_camera_locations(chunk);
+        marker_geodetic = reference::geodetic_marker_references(chunk);
+    } catch (const Error& error) {
+        report.reason = error.what();
+        return report;
+    }
+    for (std::size_t i = 0; i < chunk.cameras().size(); ++i) {
+        const Camera& camera = chunk.cameras()[i];
         if (!camera.enabled || !camera.reference.enabled ||
-            !camera.reference.location.has_value()) {
+            !camera_geodetic[i].has_value()) {
             continue;
         }
-        const Eigen::Vector3d& loc = *camera.reference.location;
+        const Eigen::Vector3d& loc = *camera_geodetic[i];
         if (!all_finite(loc)) {
             continue;
         }
@@ -493,12 +537,13 @@ GeoreferenceReport update_transform(Chunk& chunk) {
     // fit; they are not converted to check points, so their reference still
     // has no effect on the transform.
     const bool use_gcp = chunk.reference_settings().use_gcp;
-    for (const Marker& marker : chunk.markers()) {
+    for (std::size_t i = 0; i < chunk.markers().size(); ++i) {
+        const Marker& marker = chunk.markers()[i];
         if (marker.type != MarkerType::Regular || !marker.position.has_value() ||
-            !marker.reference.has_value()) {
+            !marker_geodetic[i].has_value()) {
             continue;
         }
-        const Eigen::Vector3d& loc = *marker.reference;
+        const Eigen::Vector3d& loc = *marker_geodetic[i];
         if (!all_finite(loc) || !all_finite(*marker.position)) {
             continue;  // non-finite source/derived positions poison every fit
         }
@@ -512,27 +557,6 @@ GeoreferenceReport update_transform(Chunk& chunk) {
         }
         samples.push_back(
             {*marker.position, loc, sigma_of(marker.reference_accuracy), marker.id});
-    }
-
-    // -- reference CRS guard ------------------------------------------------
-    // The numbers gathered above are interpreted as lon/lat/ellipsoidal height.
-    // A slot that names a projected CRS cannot be consumed here, so refuse
-    // before any mutation. Only the slots that actually contribute are checked:
-    // a lone camera reference must not be blocked by a projected marker slot,
-    // and vice versa.
-    const bool uses_cameras = std::any_of(
-        samples.begin(), samples.end(), [](const Sample& s) { return s.marker_id < 0; });
-    const bool uses_markers =
-        !checks.empty() || std::any_of(samples.begin(), samples.end(),
-                                       [](const Sample& s) { return s.marker_id >= 0; });
-    if (uses_cameras && !crs_is_geographic(chunk.camera_crs())) {
-        report.reason =
-            "camera reference CRS is not geographic; references must be lon/lat";
-        return report;
-    }
-    if (uses_markers && !crs_is_geographic(chunk.marker_crs())) {
-        report.reason = "marker reference CRS is not geographic; references must be lon/lat";
-        return report;
     }
 
     if (samples.size() < 3) {

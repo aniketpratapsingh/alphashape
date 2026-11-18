@@ -1234,15 +1234,17 @@ engine's own diagnostics on this block (the default lens model is too thin for
 this camera, and the adaptive model reduces it).
 
 **Reading it against the engine.** ODM's 9.3–9.9 cm horizontal and 46–50 cm
-vertical are worse than the engine's best leak-free setting (5.31 cm horizontal,
-12.22 vertical with per-image camera RTK and adaptive fitting; 6.54 / 6.46 with
-GCPs only). The vertical is the striking part: ODM's control points already sit
-11 cm off vertically and the held-out point 46 cm, so the block's vertical
-geometry is the limit, not the triangulation. The engine reaches 6.5 cm vertical
-on the same block with the adaptive lens model, which is the difference the
-lens model makes. Caveats: ODM ran at `--feature-quality high` with its own
-defaults otherwise, the engine's numbers are from a different run and a
-different alignment, and neither tool is ground truth — the survey is. The
-comparison says the 5 cm horizontal target is not reachable by ODM on this
-block either, and that the engine's remaining gap is in the vertical, where the
-block itself is weak.
+vertical are worse than the engine on the same folds. With per-image camera RTK
+and adaptive fitting the engine gives 4.36 cm horizontal and 10.98 cm vertical at
+500 keypoints per megapixel (the manifest's setting since PR #131; 169/176
+cameras aligned) and 5.31 / 12.22 cm at 250. The vertical gap is the largest:
+ODM's control points already sit 11 cm off vertically in its own adjustment, and
+its held-out points 46 cm. ODM's lens model fits the GCP observations no better
+than the 3–4 px shift above, which is consistent with the engine's finding that
+the default lens model is too thin for this camera and the adaptive model is
+what closes the gap. Both tools put fold 3 (GCP 3, the one interior point) off in
+the same direction: about 9 cm towards the north-west (azimuth 298° in the engine, 306° in ODM). That points to the
+block or its survey rather than to either pipeline. Caveats: ODM ran at
+`--feature-quality high` with its own defaults otherwise, the engine's numbers
+are from a different run and a different alignment, and neither tool is ground
+truth — the survey is.

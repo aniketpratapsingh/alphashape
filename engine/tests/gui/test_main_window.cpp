@@ -20,13 +20,16 @@
 #include <QMenuBar>
 #include <QMetaObject>
 #include <QRegularExpression>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QStringList>
+#include <QTabWidget>
 #include <QToolButton>
 #include <QtTest/QTest>
 
 #include "apps/gui/export_controller.hpp"
 #include "apps/gui/modal_hooks.hpp"
+#include "apps/gui/photo_view.hpp"
 #include "apps/gui/viewer/viewport_widget.hpp"
 #include "apps/gui/workspace_model.hpp"
 #include "common/commands/model_commands.hpp"
@@ -853,4 +856,45 @@ TEST_F(MainWindowTest, ResetTransformAsksBeforeDroppingGeoreferencing) {
             EXPECT_DOUBLE_EQ(chunk.transform()(row, col), Transform::Identity()(row, col));
         }
     }
+}
+
+// --- central tabs ---------------------------------------------------------------------
+
+TEST_F(MainWindowTest, CentralTabsHoldTheModelAndPhotoViews) {
+    show_window();
+    // A chunk makes the project view the central page (the launcher gives way).
+    add_chunk(app(), "Block A");
+    pump(20);
+    QTabWidget* tabs = window().central_tabs();
+    ASSERT_NE(tabs, nullptr);
+    EXPECT_EQ(tabs->objectName(), QStringLiteral("centralTabs"));
+    ASSERT_EQ(tabs->count(), 2);
+    EXPECT_EQ(tabs->tabText(0), QStringLiteral("Model"));
+    EXPECT_EQ(tabs->tabText(1), QStringLiteral("Photo"));
+    EXPECT_EQ(tabs->widget(0), window().viewport());
+    EXPECT_EQ(tabs->widget(1), window().photo_view());
+    // The stack keeps its 0 = viewport / 1 = start screen meaning, with the tabs as page 0.
+    EXPECT_EQ(window().central_page(), 0);
+    EXPECT_EQ(window().central_stack()->widget(0), tabs);
+}
+
+TEST_F(MainWindowTest, OpeningAPhotoSwitchesToThePhotoTab) {
+    show_window();
+    add_chunk(app(), "Block A");
+    Chunk& chunk = *app().document().workspace().chunks().front();
+    app().document().set_active_chunk_id(chunk.id());
+    Camera camera;
+    camera.id = 0;
+    camera.label = "cam0";
+    camera.enabled = true;
+    chunk.cameras().push_back(camera);
+    pump(20);
+
+    window().open_photo(0);
+    QTabWidget* tabs = window().central_tabs();
+    ASSERT_NE(tabs, nullptr);
+    EXPECT_EQ(tabs->currentWidget(), window().photo_view());
+    EXPECT_EQ(window().photo_view()->camera_id(), 0);
+    // No frame is linked, so the view says so rather than showing a picture.
+    EXPECT_FALSE(window().photo_view()->has_image());
 }

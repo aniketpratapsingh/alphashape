@@ -32,6 +32,7 @@ add_library(alphashape_gui_lib STATIC
     workspace_pane.cpp
     photos_model.cpp
     photos_pane.cpp
+    photo_view.cpp
     properties_pane.cpp
     log_pane.cpp
     viewer/camera_controller.cpp

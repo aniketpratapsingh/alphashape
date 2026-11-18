@@ -441,5 +441,51 @@ TEST(MatchPhotos, RedetectingFeaturesDropsStaleMatchesAndTracks) {
     EXPECT_EQ(document.active_chunk()->tie_points().matches.size(), 3U);
 }
 
+TEST(MatchPhotos, DetectionConcurrencyFollowsTheMemoryBudget) {
+    const double twenty_mp = 20.0e6;
+    const double per_image = twenty_mp * kDetectionBytesPerPixel;
+    // A 16 GB machine's task budget (60 %): half of it holds three 20 MP scale spaces.
+    const auto budget = static_cast<std::uint64_t>(0.6 * 16.0e9);
+    const int fitting = static_cast<int>(kDetectionBudgetShare * static_cast<double>(budget) / per_image);
+    EXPECT_EQ(fitting, 3);
+    EXPECT_EQ(detection_concurrency(10, twenty_mp, budget), 3);
+    EXPECT_EQ(detection_concurrency(2, twenty_mp, budget), 2);  // fewer threads than fit
+    EXPECT_EQ(detection_concurrency(10, twenty_mp, 0), 10);     // unknown budget: no cap
+    EXPECT_EQ(detection_concurrency(10, 0.0, budget), 10);      // unknown size: no cap
+    EXPECT_EQ(detection_concurrency(10, twenty_mp, 1000), 1);   // never below one
+    EXPECT_EQ(detection_concurrency(0, twenty_mp, budget), 1);
+}
+
+// Capping how many images are detected at once changes the schedule only:
+// every image is still detected on its own, so the tie points are identical.
+TEST(MatchPhotos, DetectionUnderATightBudgetGivesTheSameTiePoints) {
+    const char* previous = std::getenv("ALPHASHAPE_MEMORY_BUDGET_MB");
+    const std::string saved = previous != nullptr ? previous : "";
+    Document unlimited = make_scene_document();
+    run_match_photos(unlimited);
+#if defined(_WIN32)
+    _putenv_s("ALPHASHAPE_MEMORY_BUDGET_MB", "1");
+#else
+    setenv("ALPHASHAPE_MEMORY_BUDGET_MB", "1", 1);
+#endif
+    Document tight = make_scene_document();
+    run_match_photos(tight);
+    if (previous != nullptr) {
+#if defined(_WIN32)
+        _putenv_s("ALPHASHAPE_MEMORY_BUDGET_MB", saved.c_str());
+#else
+        setenv("ALPHASHAPE_MEMORY_BUDGET_MB", saved.c_str(), 1);
+#endif
+    } else {
+#if defined(_WIN32)
+        _putenv_s("ALPHASHAPE_MEMORY_BUDGET_MB", "");
+#else
+        unsetenv("ALPHASHAPE_MEMORY_BUDGET_MB");
+#endif
+    }
+    ASSERT_FALSE(unlimited.active_chunk()->tie_points().matches.empty());
+    EXPECT_TRUE(unlimited.active_chunk()->tie_points() == tight.active_chunk()->tie_points());
+}
+
 }  // namespace
 }  // namespace alphashape

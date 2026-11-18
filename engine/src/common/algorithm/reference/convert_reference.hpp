@@ -82,6 +82,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -203,6 +204,28 @@ std::unique_ptr<AbstractCommand> make_convert_reference_command(
 /// Human-readable label for a kind, used in the command name ("Convert Camera
 /// References").
 const char* reference_kind_name(ReferenceKind kind);
+
+/// The marker references as the adjustment and georeferencing read them:
+/// longitude and latitude in degrees and ellipsoidal height in metres. A
+/// geographic (or unset) marker slot is returned as stored; any other slot -- a
+/// projected grid such as a UTM or MGA zone, with or without a vertical datum --
+/// is converted to WGS 84 (EPSG:4979) exactly as `convert_reference` would, but
+/// into a detached list, so the chunk keeps its own values and labels. Entries
+/// follow `chunk.markers()`; nullopt where a marker has no reference or a
+/// non-finite horizontal position (the same "no usable reference" the callers
+/// already drop).
+///
+/// @throws Error when the slot's values cannot be converted (no CRS engine in
+///         this build, a point outside the projection, a geoid with no grid).
+std::vector<std::optional<Eigen::Vector3d>> geodetic_marker_references(
+    const Chunk& chunk, const crs::GeoidStore* geoids = nullptr);
+
+/// The camera reference locations in the same terms, from the camera slot.
+/// Entries follow `chunk.cameras()`; nullopt where a camera has no location or a
+/// non-finite horizontal position. Only the locations are converted, so an
+/// orientation that cannot be re-expressed never blocks a position-only read.
+std::vector<std::optional<Eigen::Vector3d>> geodetic_camera_locations(
+    const Chunk& chunk, const crs::GeoidStore* geoids = nullptr);
 
 }  // namespace reference
 }  // namespace alphashape

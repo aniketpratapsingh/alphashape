@@ -1,10 +1,14 @@
 #pragma once
 
-// CrsPicker: chooses a coordinate reference system from the engine's curated
-// built-in list, or from a pasted WKT definition. The widget reports validity
-// through is_valid(); a containing dialog disables its OK button when false.
-// Everything is gated on the PROJ-backed engine (alphashape_crs).
+// CrsPicker: chooses a coordinate reference system. The list shows the
+// engine's curated built-in systems until something is typed in the search
+// field, which then searches every EPSG system in the PROJ database by code,
+// name or area. A code can also be typed directly, or a WKT definition
+// pasted. The widget reports validity through is_valid(); a containing dialog
+// disables its OK button when false. Everything is gated on the PROJ-backed
+// engine (alphashape_crs).
 
+#include <cstddef>
 #include <optional>
 
 #include <QString>
@@ -41,12 +45,18 @@ public:
     QLabel* error_label() { return error_; }
     QTabWidget* tabs() { return tabs_; }
 
+    /// Search results listed at most; the rest are summarised in one line.
+    static constexpr std::size_t kMaxSearchResults = 200;
+
 Q_SIGNALS:
     void selection_changed();
 
 private:
     void build_search_tab();
     void build_wkt_tab();
+    /// The curated list, shown while the search field is empty.
+    void show_curated();
+    /// Search the whole PROJ catalogue; an empty needle shows the curated list.
     void apply_filter(const QString& text);
     void refresh_validity();
     int selected_epsg() const;

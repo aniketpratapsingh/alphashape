@@ -109,6 +109,18 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
     // Cameras the task may place: enabled, explicitly selected (or every one
     // when the list is empty), with an enabled reference. A requested camera
     // whose reference is disabled is reset below when reset_unreferenced is set.
+    //
+    // The references are read through `geodetic_camera_locations`, which returns
+    // lon/lat/ellipsoidal height whatever CRS the camera slot names: a projected
+    // survey (UTM, MGA, a national grid) is converted to WGS 84 here instead of
+    // being read as degrees. A conversion that cannot run is a data error, so it
+    // is reported as a ValueError before any mutation.
+    std::vector<std::optional<Eigen::Vector3d>> camera_geodetic;
+    try {
+        camera_geodetic = reference::geodetic_camera_locations(*chunk);
+    } catch (const Error& error) {
+        throw ValueError(std::string("AlignFromReference: ") + error.what());
+    }
     std::vector<std::size_t> candidates;
     std::vector<std::size_t> disabled_reference;
     Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
@@ -129,19 +141,12 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
                              " has no sensor");
         }
         candidates.push_back(i);
-        if (!camera.reference.location.has_value()) {
+        if (!camera_geodetic[i].has_value()) {
             continue;
         }
-        const Eigen::Vector3d& loc = *camera.reference.location;
+        const Eigen::Vector3d& loc = *camera_geodetic[i];
         if (!std::isfinite(loc.x()) || !std::isfinite(loc.y()) || !std::isfinite(loc.z())) {
             continue;
-        }
-        // References are lon/lat/ellipsoidal height. A projected camera CRS
-        // cannot be consumed; refusing here matches update_transform, before
-        // any conversion or mutation.
-        if (!crs_is_geographic(chunk->camera_crs())) {
-            throw ValueError("AlignFromReference: camera reference CRS is not geographic; "
-                             "convert the camera references to lon/lat first");
         }
         mean_ecef += geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
         ++located;
@@ -181,7 +186,14 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
         CRS geographic;
         geographic.epsg = 4326;
         crs = geographic;
-        camera_crs = geographic;
+        // The camera slot labels the reference numbers, which this task did not
+        // rewrite. A geographic (or unset) slot becomes the chunk CRS; a
+        // projected slot keeps its own label, because its numbers are still
+        // eastings and northings and relabelling them as degrees would make the
+        // next read misinterpret them.
+        if (crs_is_geographic(chunk->camera_crs())) {
+            camera_crs = geographic;
+        }
         world_crs = geographic;
     }
     const Transform inverse = transform.inverse();
@@ -204,7 +216,7 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
     std::vector<bool> is_placed(state.cameras.size(), false);
     for (const std::size_t index : candidates) {
         Camera& camera = state.cameras[index];
-        const std::optional<Eigen::Vector3d>& loc = camera.reference.location;
+        const std::optional<Eigen::Vector3d>& loc = camera_geodetic[index];
         const bool finite_xy =
             loc.has_value() && std::isfinite(loc->x()) && std::isfinite(loc->y());
         const bool usable_position = finite_xy && std::isfinite(loc->z());
@@ -223,9 +235,11 @@ void AlignFromReferenceTask::apply(Document& document, Params& params,
             continue;
         }
         // A rotation cannot be derived without an attitude, so a camera whose
-        // reference carries none is always skipped.
+        // reference carries none is always skipped. The ENU origin of the
+        // measured attitude is the converted reference position, so a projected
+        // slot's attitude is placed at the right meridian.
         const std::optional<reference::ReferenceRotation> measured =
-            reference::measured_rotation(*chunk, camera, transform);
+            reference::measured_rotation(*chunk, camera, transform, &*loc);
         if (!measured.has_value()) {
             ++skipped;
             if (reset_unreferenced) {

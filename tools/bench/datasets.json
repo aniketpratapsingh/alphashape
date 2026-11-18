@@ -183,10 +183,10 @@
       },
       "param_overrides": {
         "MatchPhotos": {
-          "keypoint_limit_per_mpx": 250
+          "keypoint_limit_per_mpx": 500
         }
       },
-      "param_overrides_reason": "176 frames at 20 MP each do not fit a 16 GB runner at the default keypoint density (the same measured limit as the aerial set). keypoint_limit_per_mpx=250 yields ~5000 keypoints per image, and reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera, keeping MatchPhotos + AlignCameras inside the two-hour budget. The GCP validation never runs the dense stage.",
+      "param_overrides_reason": "keypoint_limit_per_mpx=500 (~10000 keypoints per 20 MP image) was measured best on this block with the match_params experiments: 250 aligned 146 of 176 cameras at 5.31 cm horizontal check RMS in 12342 s, 500 aligned 169 at 4.36 cm in 5924 s, and 1000 aligned 174 at 4.47 cm in 14980 s. 500 is the most accurate and the fastest of the three. Reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera. The GCP validation never runs the dense stage.",
       "notes": "35 image observations of 5 surveyed GCPs (ODM gcp_list format, header EPSG:4326) and a 5-point CSV (Name;Easting;Northing;Elevation;Longitude;Latitude) surveyed with an Emlid Reach RS2 via NTRIP at a stated 1-2 cm accuracy. Every image's XMP carries RtkFlag 50 (fixed) and RtkStdLon/Lat/Hgt, and RTK_Data/101FTASK_Timestamp.mrk carries the same per-exposure antenna positions, deviations and the GPS event time; the benchmark runs the protocol with --camera-accuracy per-image, so each camera is weighted by its own solution, and uses the event-mark log for the timing comparison. Photographs by Daniel Dobosi, published by OpenDroneMap under GPL-3.0."
     }
   }

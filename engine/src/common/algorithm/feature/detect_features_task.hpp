@@ -11,6 +11,7 @@
 // when a camera has no keypoints yet (MatchPhotos' detect stage is this task). Both tasks share one implementation, so the two cannot diverge.
 
 #include <cstdint>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -48,6 +49,29 @@ KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& ch
                                        std::int64_t keypoint_limit,
                                        std::int64_t keypoint_limit_per_mpx,
                                        double fiducial_exclusion_mm = 0.0);
+
+/// Peak bytes one image's detection holds per image pixel, from the buffers
+/// detect_keypoints_for_frame keeps alive at once: the float luminance (4), the
+/// blurred base and one blur scratch (4 + 4), and the scale space's six
+/// Gaussian and five DoG float levels per octave (11 x 4 = 44 at full size,
+/// x 4/3 over the halving octaves = 58.7). 70.7, rounded up to 72. The decoded
+/// 8-bit RGB is released before the scale space is built.
+inline constexpr double kDetectionBytesPerPixel = 72.0;
+
+/// The share of the task memory budget (platform::memory_budget_bytes) that
+/// concurrent detections may take together. The rest is the keypoint sets,
+/// the document and the matching that follows.
+inline constexpr double kDetectionBudgetShare = 0.5;
+
+/// How many images detection may work on at once: `threads`, unless that many
+/// working sets of `image_pixels` each would not fit kDetectionBudgetShare of
+/// `budget_bytes`. 0 for `budget_bytes` or `image_pixels` means unknown (no
+/// cap). Always at least 1, so an image larger than the budget still runs.
+int detection_concurrency(int threads, double image_pixels, std::uint64_t budget_bytes);
+
+/// detection_concurrency for detecting `frames` on this machine: the OpenMP
+/// thread count, the largest frame, and platform::memory_budget_bytes().
+int detection_concurrency_for(const std::vector<const Frame*>& frames);
 
 /// Convert a detector keypoint to the Calibration pixel convention.
 ///

@@ -1306,6 +1306,45 @@ class OptimizeParamMergeTest(unittest.TestCase):
         self.assertEqual(len(stages), len(run_bench.PIPELINE) + 1)
 
 
+class MatchParamsTest(unittest.TestCase):
+    """``match_params`` share the grammar and merge over the manifest's MatchPhotos."""
+
+    def test_empty_is_no_parameters(self):
+        self.assertEqual(run_bench.parse_match_params(""), {})
+        self.assertEqual(run_bench.parse_match_params(None), {})
+
+    def test_a_malformed_string_is_rejected(self):
+        for token in ("keypoint_limit_per_mpx", "=1000", "Upper=1",
+                      "keypoint_limit_per_mpx=1000;rm", "a=1 a=2"):
+            with self.assertRaises(run_bench.MatchParamError, msg=token):
+                run_bench.parse_match_params(token)
+
+    def test_the_command_line_exits_on_a_bad_string(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_bench.main(["--dataset", "gcp-rtk", "--list", "--match-params", "oops"])
+
+    def test_the_value_overrides_the_manifest_cap(self):
+        dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
+        merged = run_bench.merge_match_params(dataset, {"keypoint_limit_per_mpx": "1000"})
+        self.assertEqual(merged["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], "1000")
+        # The manifest itself is untouched: it is shared by every run in the job.
+        self.assertEqual(dataset["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], 500)
+
+    def test_other_keys_keep_the_manifest_cap(self):
+        dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
+        merged = run_bench.merge_match_params(dataset, {"tiepoint_limit": "8000"})
+        self.assertEqual(merged["param_overrides"]["MatchPhotos"],
+                         {"keypoint_limit_per_mpx": 500, "tiepoint_limit": "8000"})
+
+    def test_no_parameters_returns_the_dataset_unchanged(self):
+        dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
+        self.assertEqual(run_bench.merge_match_params(dataset, {}), dataset)
+
+
 class IsExperimentTest(unittest.TestCase):
     """The workflow's one definition of "is this a control run"."""
 
@@ -1355,6 +1394,14 @@ class IsExperimentTest(unittest.TestCase):
         # that the run measured a configuration; missing it would baseline it.
         self.assertEqual(
             self.status(json.dumps({"optimize_params": {"adaptive_fitting": "true"}})), 1
+        )
+
+    def test_an_empty_match_params_dict_is_a_control(self):
+        self.assertEqual(self.status(json.dumps({"match_params": {}})), 0)
+
+    def test_a_match_only_run_is_an_experiment(self):
+        self.assertEqual(
+            self.status(json.dumps({"match_params": {"keypoint_limit_per_mpx": "1000"}})), 1
         )
 
     def test_a_run_with_both_inputs_is_an_experiment(self):

@@ -27,9 +27,33 @@ All notable changes to alphashape are recorded here. The format follows
   check RMS, with the triangulation validated against ODM's own control points
   to 0.14 cm horizontal. Only numbers are published; the GPL-3.0 dataset is
   downloaded and measured, never redistributed.
+- **Second ground-control dataset surveyed and rejected.** `tools/bench/DATASETS.md`
+  records why the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) cannot
+  serve as a second ground-control block: it publishes 51 check points and 8 GCPs as
+  3-D coordinates but no image observations of the targets, which the leave-one-out
+  protocol requires. The complete file lists of both large archives were read from
+  their 7z headers over HTTP range requests, so the conclusion rests on the full
+  contents rather than a sample. The entry also records the orthometric-height and
+  label-shift traps a future attempt would hit.
 
 ### Changed
 
+- **Feature detection fits the machine's memory.** DetectFeatures and the
+  detection stage of MatchPhotos work on fewer images at once when one scale
+  space per thread would not fit half the task memory budget (about three 20 MP
+  photographs at a time on a 16 GB machine). Results are unchanged; only the
+  schedule is. The decoded colour image is also released before the scale space
+  is built.
+- **Realistic RAM estimate for Match Photos and Detect Features.** The job
+  dialog used to charge every pixel of the block at once (a 169-photo, 20 MP
+  block showed ~75 GB). It now counts what the stages hold: the scale spaces
+  being detected, the keypoint sets, the matches and the track tables.
+- **The coordinate-system picker searches every EPSG system.** Typing in the
+  search field now looks through all current EPSG geographic, geocentric and
+  projected systems in the PROJ database by code, name or area (for example
+  `7854` or `mga zone 54` finds GDA2020 / MGA zone 54), instead of only the 48
+  curated systems. The curated list is still what shows while the field is
+  empty. New engine call: `crs::crs_catalog()`.
 - **OptimizeCameras selects the adaptive lens model automatically on a block
   with ground control.** `adaptive_fitting_auto` now defaults to true: when the
   chunk has at least one control point (a referenced marker that is not a check
@@ -161,6 +185,18 @@ All notable changes to alphashape are recorded here. The format follows
   and `TransverseMercator` implementation is removed.
 
 ### Added
+
+- **Marker placement in the GUI.** The central area gains a Photo tab beside the
+  3-D Model view: double-click a photo in the Photos dock (or use Reference >
+  Place on photo) to open it, then right-click to add a marker at the cursor,
+  place an existing marker, or remove a projection. A placed marker is drawn as
+  a green flag; a marker with an estimated position but no projection in this
+  camera is drawn as a blue flag where the engine predicts it. Drag a flag to
+  move its projection (a predicted flag becomes placed). Wheel zooms about the
+  cursor, drag pans, and the image opens fitted. Every edit is one undo entry
+  through the command layer, and the view refuses edits while a job runs. The
+  Reference pane gains Import Markers, which runs the existing `ImportMarkers`
+  task on a CSV or XML file.
 
 - **GUI update checks (automatic and manual).** Help > Check for Updates... runs
   a manual check that always reports up to date, a newer version, or the reason
@@ -794,6 +830,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
+  were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
+  `AlignFromReference` and the alignment georeference now convert a projected
+  reference slot to WGS 84 lon/lat/ellipsoidal height before the adjustment and
+  the similarity fit, instead of interpreting eastings and northings as
+  longitude and latitude or refusing the slot with "not geographic". A survey
+  in GDA2020 / MGA zone 54 (EPSG:7854) now georeferences and adjusts correctly;
+  a geographic slot is unchanged.
 - **`UpdateTransform` ignored the GNSS antenna mount.** It paired each camera
   centre with its antenna reference, so with a lever arm set the datum fit and
   the bundle adjustment disagreed. It now applies the same mount correction as
