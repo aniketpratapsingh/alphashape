@@ -1188,7 +1188,7 @@ measured the same way. Three modes: `gcp_only` (ODM's default with a GCP file),
 **The triangulation is correct.** It was checked against ODM's own
 `stats/ground_control_points.json`, which `compute_statistics` writes from the
 topocentric reconstruction. Our control points agree with ODM's own to
-**0.13 cm horizontal and 2.0 cm vertical RMS** on every fold (max 0.19 / 2.8
+**0.14 cm horizontal and 1.9 cm vertical RMS** on every fold (max 0.20 / 2.8
 cm). The four conventions that could have been wrong were each checked against
 OpenSfM's source and are right: the pixel normalisation
 `(px + 0.5 - w/2) / max(w, h)` (`opensfm/features.py`), the Brown distortion
@@ -1201,34 +1201,37 @@ survey heights are ellipsoidal on both sides (the dataset's `gcp_height` is
 `ellipsoidal` and the `gcp_list` z matches the CSV exactly), so a geoid swap —
 which would be about 46 m at this site, not 0.5 m — is not in play.
 
-**Results** (CI run `44161902615`, ODM 3.6.2, 176/176 shots reconstructed in
+**Results** (CI run `44345966742`, ODM 3.6.2, 176/176 shots reconstructed in
 every fold). Check-point error against the survey, cm:
 
 | mode | fold 1 | fold 2 | fold 3 | fold 4 | fold 5 | h RMS | v RMS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gcp_only` h | 13.21 | 6.18 | 8.85 | 11.76 | 4.15 | **9.45** | |
-| `gcp_only` v | +73.88 | -2.73 | -24.89 | +65.47 | +23.42 | | **46.73** |
-| `gcp_gps` h | 12.87 | 6.21 | 8.87 | 11.65 | 4.11 | **9.33** | |
-| `gcp_gps` v | +72.27 | -3.82 | -25.42 | +64.90 | +24.83 | | **46.29** |
-| `gcp_strong` h | 13.29 | 8.22 | 7.81 | 13.08 | 2.79 | **9.84** | |
-| `gcp_strong` v | +83.18 | +0.03 | -18.13 | +70.68 | +26.66 | | **50.90** |
+| `gcp_only` h | 13.18 | 6.23 | 8.78 | 11.76 | 4.15 | **9.43** | |
+| `gcp_only` v | +73.49 | -2.45 | -24.49 | +64.93 | +24.87 | | **46.57** |
+| `gcp_gps` h | 12.92 | 6.23 | 8.87 | 11.73 | 3.90 | **9.35** | |
+| `gcp_gps` v | +73.02 | -3.86 | -26.24 | +65.78 | +24.90 | | **46.87** |
+| `gcp_strong` h | 13.16 | 8.06 | 7.80 | 13.27 | 2.88 | **9.83** | |
+| `gcp_strong` v | +83.12 | -2.92 | -18.50 | +70.65 | +26.00 | | **50.85** |
 
-Control points, measured the same way: **3.06 cm horizontal, 11.47 cm vertical
-RMS** in `gcp_only` and `gcp_gps`. In `gcp_strong` the control points are pinned
-by the weights, so their residual is 0.00 cm by construction and says nothing
-about the triangulation; the held-out point is the only measurement there.
+Control points, measured the same way: **3.06 cm horizontal, 11.46 cm vertical
+RMS** in `gcp_gps` and 3.04 / 11.43 cm in `gcp_only`. In `gcp_strong` the
+control points are pinned by the weights, so their residual is 0.00 cm by
+construction and says nothing about the triangulation; the held-out point is
+the only measurement there.
 
 **The 3–4 px reprojection is ODM's real residual, not a projection mismatch.**
 ODM's own statistics report the same residual on the same observations: a mean
 of about (-2.2, -3.6) px with a scatter of about 2 px, i.e. a systematic shift
 that dominates the noise, present identically in `gcp_only` and in `gcp_strong`
-where the control points are pinned. It is not a pixel-origin or normalisation
-error, because our projection reproduces ODM's own reprojected pixels to the
-same statistics and our triangulated points match ODM's to 0.13 cm horizontal.
-It is the block's lens model and geometry not fitting the GCP observations
-better than a few pixels; the same residual appears in the engine's own
-diagnostics on this block (the default lens model is too thin for this camera,
-and the adaptive model reduces it).
+where the control points are pinned. Our own triangulation's control residual
+is 3.18 px RMS with mean (-1.65, -3.43) px and scatter (1.87, 1.49) px — the
+same shift, measured through our projection. It is not a pixel-origin or
+normalisation error, because our projection reproduces ODM's own reprojected
+pixels to the same statistics and our triangulated points match ODM's to
+0.14 cm horizontal. It is the block's lens model and geometry not fitting the
+GCP observations better than a few pixels; the same residual appears in the
+engine's own diagnostics on this block (the default lens model is too thin for
+this camera, and the adaptive model reduces it).
 
 **Reading it against the engine.** ODM's 9.3–9.8 cm horizontal and 46–51 cm
 vertical are worse than the engine's best leak-free setting (5.31 cm horizontal,
