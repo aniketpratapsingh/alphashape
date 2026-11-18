@@ -434,7 +434,7 @@ def _repetition_display_paths(current: dict, block: dict) -> list[str]:
     """The metrics worth putting in the repetitions table.
 
     A pipeline run has a gated set (``DIRECTION``) and those are exactly the
-    numbers a reader has to trust; a GCP run has no gated metrics, so its two
+    numbers a reader has to trust; a GCP run has no gated metrics, so its three
     standard variants' RMS values are shown and the diagnostic probes are left to
     the variant tables below. Never the whole numeric leaf set: a median of
     camera counts and image counts is noise beside the measurements.

@@ -3755,7 +3755,13 @@ DIAGNOSTIC_VARIANTS = (
 
 
 def run_real_odm(args):
-    """The real-block leave-one-out protocol over the ODM GCPs, two variants."""
+    """The real-block leave-one-out protocol over the ODM GCPs.
+
+    Three standard variants: ``gcps_only`` (no camera references),
+    ``camera_rtk_gcps`` (camera references, plain lens pinned) and
+    ``camera_rtk_engine_defaults`` (camera references, the engine's own lens
+    default, the gated one).
+    """
     if args.gcp_height != "ellipsoidal":
         raise ValueError(
             "--gcp-height {} is not supported: converting an orthometric "
@@ -3868,11 +3874,13 @@ def run_real_odm(args):
     variants = {}
     # GCPs only first: its per-fold adjustment is the leak-free source of the
     # estimated antenna lever arm the later variants reuse. The camera-RTK
-    # variant takes an explicitly configured fixed arm when one is supplied.
+    # variants take an explicitly configured fixed arm when one is supplied.
     # The benchmark's adaptive_fitting dispatch parameter selects the same
-    # adaptive calibration model on the two standard variants that the
+    # adaptive calibration model on gcps_only and camera_rtk_gcps that the
     # diagnostics run as an extra probe. Keep the option on the variant's options
-    # dict so the report shows which lens model produced each row.
+    # dict so the report shows which lens model produced each row. The gated
+    # camera_rtk_engine_defaults variant ignores it: the engine's own default
+    # already selects the adaptive model on a controlled block.
     base_options = {"adaptive_fitting": True} if args.adaptive_fitting else None
     variants["gcps_only"] = run_variant(
         args, gcps, align_report, False, base_options)
@@ -4210,7 +4218,7 @@ def parse_args(argv):
                              "ODM/OpenSfM integer-origin -> corner-origin "
                              "conversion (+0.5 px)")
     parser.add_argument("--diagnostics", action="store_true",
-                        help="after the two standard variants, run the extra "
+                        help="after the three standard variants, run the extra "
                              "probes (adaptive/extended calibration, marker "
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
@@ -4245,14 +4253,13 @@ def parse_args(argv):
                              "variants and the timing probe always run); e.g. "
                              "'adaptive_fitting,camera_rtk_per_image_adaptive'")
     parser.add_argument("--adaptive-fitting", action="store_true",
-                        help="run the two standard variants (gcps_only and "
-                             "camera_rtk_gcps) with the adaptive calibration "
-                             "model, the same configuration the benchmark's "
-                             "adaptive_fitting dispatch parameter selects. The "
-                             "gated camera_rtk_engine_defaults variant already "
-                             "gets the adaptive model from the engine's own "
-                             "default on a controlled block, so this flag does "
-                             "not change it")
+                        help="run gcps_only and camera_rtk_gcps with the "
+                             "adaptive calibration model, the same configuration "
+                             "the benchmark's adaptive_fitting dispatch parameter "
+                             "selects. The gated camera_rtk_engine_defaults "
+                             "variant already gets the adaptive model from the "
+                             "engine's own default on a controlled block, so this "
+                             "flag does not change it")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
     parser.add_argument("--frame-correction", choices=FRAME_CORRECTION_CHOICES,
