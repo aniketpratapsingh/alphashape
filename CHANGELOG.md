@@ -23,13 +23,22 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **Feature detection fits the machine's memory.** DetectFeatures and the
+  detection stage of MatchPhotos work on fewer images at once when one scale
+  space per thread would not fit half the task memory budget (about three 20 MP
+  photographs at a time on a 16 GB machine). Results are unchanged; only the
+  schedule is. The decoded colour image is also released before the scale space
+  is built.
+- **Realistic RAM estimate for Match Photos and Detect Features.** The job
+  dialog used to charge every pixel of the block at once (a 169-photo, 20 MP
+  block showed ~75 GB). It now counts what the stages hold: the scale spaces
+  being detected, the keypoint sets, the matches and the track tables.
 - **The coordinate-system picker searches every EPSG system.** Typing in the
   search field now looks through all current EPSG geographic, geocentric and
   projected systems in the PROJ database by code, name or area (for example
   `7854` or `mga zone 54` finds GDA2020 / MGA zone 54), instead of only the 48
   curated systems. The curated list is still what shows while the field is
   empty. New engine call: `crs::crs_catalog()`.
-
 - **OptimizeCameras selects the adaptive lens model automatically on a block
   with ground control.** `adaptive_fitting_auto` now defaults to true: when the
   chunk has at least one control point (a referenced marker that is not a check
