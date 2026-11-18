@@ -20,6 +20,13 @@ All notable changes to alphashape are recorded here. The format follows
   every cause investigated (lens model, pixel convention, antenna mount, timing,
   fix status, per-photo weighting, block doming, reference frame, marker
   refinement).
+- **Independent reference on the same block.** `engine/docs/m13-validation.md`
+  records the same five leave-one-out folds run through OpenDroneMap 3.6.2
+  (OpenSfM) by `.github/workflows/odm-reference.yml` and
+  `tools/bench/odm_reference.py`: 9.3-9.8 cm horizontal and 46-51 cm vertical
+  check RMS, with the triangulation validated against ODM's own control points
+  to 0.13 cm horizontal. Only numbers are published; the GPL-3.0 dataset is
+  downloaded and measured, never redistributed.
 
 ### Changed
 
