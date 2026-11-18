@@ -153,14 +153,18 @@ class TriangulationTest(unittest.TestCase):
 
 
 class SummaryTest(unittest.TestCase):
-    def result(self, mode, fold, h, v, status="ok"):
+    def result(self, mode, fold, h, v, status="ok", control_v=0.01, agreement=None):
         check = {"label": str(fold), "status": status}
         if status == "ok":
             check.update({"horizontal_m": h, "vertical_m": v, "views": 7,
                           "reprojection_rms_px": 0.5})
-        return {"mode": mode, "fold": fold, "check": check,
-                "control": [{"status": "ok", "horizontal_m": 0.01}],
-                "shots_reconstructed": 176}
+        result = {"mode": mode, "fold": fold, "check": check,
+                  "control": [{"status": "ok", "horizontal_m": 0.01,
+                               "vertical_m": control_v}],
+                  "shots_reconstructed": 176}
+        if agreement is not None:
+            result["odm_agreement"] = agreement
+        return result
 
     def test_rms_per_mode_and_the_target(self):
         results = [self.result("gcp_only", 1, 0.03, 0.04), self.result("gcp_only", 2, 0.04, -0.03),
@@ -178,6 +182,95 @@ class SummaryTest(unittest.TestCase):
         summary, _ = odm_reference.summarize(results, 0.05)
         self.assertFalse(summary["modes"]["gcp_only"]["meets_target"])
         self.assertEqual(len(summary["modes"]["gcp_only"]["missing"]), 1)
+
+    def test_control_vertical_rms_is_reported(self):
+        # The control vertical RMS is the diagnostic that tells a triangulation
+        # bug from a block that simply does not fit its survey.
+        results = [self.result("gcp_only", 1, 0.09, 0.4, control_v=0.12),
+                   self.result("gcp_only", 2, 0.09, -0.4, control_v=0.10)]
+        summary, markdown = odm_reference.summarize(results, 0.05)
+        entry = summary["modes"]["gcp_only"]
+        self.assertAlmostEqual(entry["control_vertical_rms_m"],
+                               math.sqrt((0.12 ** 2 + 0.10 ** 2) / 2))
+        self.assertIn("Control v RMS", markdown)
+        self.assertIn("Control points, measured the same way", markdown)
+
+    def test_odm_agreement_is_aggregated(self):
+        agreement = {"points": 4, "horizontal_rms_m": 0.001, "vertical_rms_m": 0.02,
+                     "max_horizontal_m": 0.002, "max_vertical_m": 0.03}
+        results = [self.result("gcp_only", 1, 0.09, 0.4, agreement=agreement),
+                   self.result("gcp_only", 2, 0.09, -0.4, agreement=agreement)]
+        summary, markdown = odm_reference.summarize(results, 0.05)
+        entry = summary["modes"]["gcp_only"]["odm_agreement"]
+        self.assertEqual(entry["folds"], 2)
+        self.assertAlmostEqual(entry["vertical_rms_m"], 0.02)
+        self.assertIn("Agreement with ODM's own control points", markdown)
+
+    def test_a_mode_without_agreement_omits_the_line(self):
+        results = [self.result("gcp_strong", 1, 0.09, 0.4)]
+        summary, markdown = odm_reference.summarize(results, 0.05)
+        self.assertIsNone(summary["modes"]["gcp_strong"]["odm_agreement"])
+        self.assertNotIn("Agreement with ODM", markdown)
+
+    def test_pinned_control_points_are_not_read_as_a_perfect_triangulation(self):
+        # gcp_strong pins the control points, so their residual is zero by
+        # construction; the summary must say so rather than imply the
+        # triangulation is exact.
+        results = [self.result("gcp_strong", 1, 0.09, 0.4, control_v=0.0)]
+        results[0]["control"][0]["horizontal_m"] = 0.0
+        _, markdown = odm_reference.summarize(results, 0.05)
+        self.assertIn("pinned by this mode's weights", markdown)
+        self.assertNotIn("Control points, measured the same way: 0.00 cm horizontal", markdown)
+
+
+class OdmAgreementTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.opensfm = Path(self.directory.name)
+        (self.opensfm / "stats").mkdir()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def write_stats(self, points):
+        (self.opensfm / "stats" / "ground_control_points.json").write_text(
+            json.dumps(points), encoding="utf-8")
+
+    def test_our_points_are_compared_with_odms(self):
+        self.write_stats([
+            {"id": "1", "coordinates": [1.0, 2.0, 3.0]},
+            {"id": "2", "coordinates": [4.0, 5.0, 6.0]},
+        ])
+        control = [
+            {"label": "1", "status": "ok", "point": [1.01, 2.0, 3.02]},
+            {"label": "2", "status": "ok", "point": [4.0, 5.0, 5.98]},
+        ]
+        agreement = odm_reference.odm_agreement(
+            self.opensfm, control, "reconstruction.topocentric.json")
+        self.assertEqual(agreement["points"], 2)
+        self.assertAlmostEqual(agreement["max_horizontal_m"], 0.01)
+        self.assertAlmostEqual(agreement["max_vertical_m"], 0.02)
+
+    def test_a_missing_stats_file_is_not_an_error(self):
+        control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]}]
+        self.assertIsNone(odm_reference.odm_agreement(
+            self.opensfm, control, "reconstruction.topocentric.json"))
+
+    def test_a_rerun_reconstruction_is_not_compared(self):
+        # ODM's statistics describe the topocentric block; a re-run
+        # reconstruction leaves them stale, so the comparison is skipped.
+        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0]}])
+        control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]}]
+        self.assertIsNone(odm_reference.odm_agreement(
+            self.opensfm, control, "reconstruction.json"))
+
+    def test_a_point_odm_did_not_measure_is_skipped(self):
+        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0]}])
+        control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]},
+                   {"label": "9", "status": "ok", "point": [1.0, 1.0, 1.0]}]
+        agreement = odm_reference.odm_agreement(
+            self.opensfm, control, "reconstruction.topocentric.json")
+        self.assertEqual(agreement["points"], 1)
 
 
 if __name__ == "__main__":

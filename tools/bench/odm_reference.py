@@ -300,22 +300,74 @@ def load_reconstruction(opensfm: Path, name: str = "reconstruction.topocentric.j
     return largest, reference, len(parts)
 
 
+def load_odm_control_points(opensfm: Path) -> dict[str, list[float]]:
+    """ODM's own triangulated control points, from its statistics file.
+
+    ``stats/ground_control_points.json`` holds, per point, the triangulated
+    position in the topocentric frame (``coordinates``) and the error against
+    the survey (``error``). ``compute_statistics`` writes it from the
+    topocentric reconstruction, so it is in the same frame this script measures
+    in and is an independent check on the triangulation here.
+    """
+    path = opensfm / "stats" / "ground_control_points.json"
+    if not path.exists():
+        return {}
+    points = json.loads(path.read_text(encoding="utf-8"))
+    return {str(p["id"]): [float(v) for v in p["coordinates"]]
+            for p in points if "coordinates" in p}
+
+
+def odm_agreement(opensfm: Path, control: list[dict],
+                  reconstruction_name: str) -> dict | None:
+    """How far this script's control points sit from ODM's own, per axis.
+
+    Only meaningful for the topocentric reconstruction: ODM's statistics are
+    computed from it, and a re-run reconstruction (``gcp_strong``) leaves the
+    file describing the earlier block, so the comparison is skipped there.
+    """
+    if reconstruction_name != "reconstruction.topocentric.json":
+        return None
+    odm = load_odm_control_points(opensfm)
+    if not odm:
+        return None
+    deltas = []
+    for point in control:
+        reference = odm.get(str(point.get("label")))
+        if point.get("status") != "ok" or reference is None:
+            continue
+        deltas.append([point["point"][i] - reference[i] for i in range(3)])
+    if not deltas:
+        return None
+    return {
+        "points": len(deltas),
+        "horizontal_rms_m": rms([math.hypot(d[0], d[1]) for d in deltas]),
+        "vertical_rms_m": rms([d[2] for d in deltas]),
+        "max_horizontal_m": max(math.hypot(d[0], d[1]) for d in deltas),
+        "max_vertical_m": max(abs(d[2]) for d in deltas),
+    }
+
+
 def evaluate(project: Path, holdout_path: Path, mode: str,
              reconstruction_name: str = "reconstruction.topocentric.json") -> dict:
     holdout = json.loads(holdout_path.read_text(encoding="utf-8"))
     reconstruction, reference, parts = load_reconstruction(project / "opensfm",
                                                            reconstruction_name)
     projection_types = sorted({c.get("projection_type") for c in reconstruction["cameras"].values()})
-    return {
+    control = [measure(p, reconstruction, reference) for p in holdout["control"]]
+    result = {
         "mode": mode,
         "fold": holdout["fold"],
         "check": measure(holdout["check"], reconstruction, reference),
-        "control": [measure(p, reconstruction, reference) for p in holdout["control"]],
+        "control": control,
         "shots_reconstructed": len(reconstruction["shots"]),
         "reconstruction_parts": parts,
         "projection_types": projection_types,
         "cameras": reconstruction["cameras"],
     }
+    agreement = odm_agreement(project / "opensfm", control, reconstruction_name)
+    if agreement is not None:
+        result["odm_agreement"] = agreement
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -336,17 +388,33 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
             entry["missing"].append({"fold": result["fold"], "label": check.get("label"),
                                      "status": check.get("status")})
             continue
-        control_h = [c["horizontal_m"] for c in result["control"] if c.get("status") == "ok"]
+        control = [c for c in result["control"] if c.get("status") == "ok"]
         entry["folds"].append({
             "fold": result["fold"], "label": check["label"],
             "horizontal_m": check["horizontal_m"], "vertical_m": check["vertical_m"],
             "views": check["views"], "reprojection_rms_px": check["reprojection_rms_px"],
-            "control_horizontal_rms_m": rms(control_h),
+            "control_horizontal_rms_m": rms([c["horizontal_m"] for c in control]),
+            "control_vertical_rms_m": rms([c["vertical_m"] for c in control]),
+            "odm_agreement": result.get("odm_agreement"),
             "shots_reconstructed": result["shots_reconstructed"],
         })
     for entry in modes.values():
         entry["horizontal_rms_m"] = rms([f["horizontal_m"] for f in entry["folds"]])
         entry["vertical_rms_m"] = rms([f["vertical_m"] for f in entry["folds"]])
+        entry["control_horizontal_rms_m"] = rms(
+            [f["control_horizontal_rms_m"] for f in entry["folds"]
+             if f["control_horizontal_rms_m"] is not None])
+        entry["control_vertical_rms_m"] = rms(
+            [f["control_vertical_rms_m"] for f in entry["folds"]
+             if f["control_vertical_rms_m"] is not None])
+        agreements = [f["odm_agreement"] for f in entry["folds"] if f["odm_agreement"]]
+        entry["odm_agreement"] = {
+            "folds": len(agreements),
+            "horizontal_rms_m": rms([a["horizontal_rms_m"] for a in agreements]),
+            "vertical_rms_m": rms([a["vertical_rms_m"] for a in agreements]),
+            "max_horizontal_m": max((a["max_horizontal_m"] for a in agreements), default=None),
+            "max_vertical_m": max((a["max_vertical_m"] for a in agreements), default=None),
+        } if agreements else None
         h = entry["horizontal_rms_m"]
         entry["meets_target"] = (h is not None and h <= target_m and not entry["missing"])
 
@@ -356,20 +424,45 @@ def summarize(results: list[dict], target_m: float) -> tuple[dict, str]:
         h, v = entry["horizontal_rms_m"], entry["vertical_rms_m"]
         lines.append(f"## {mode}")
         lines.append("")
-        lines.append("| Fold | Check point | Horizontal (cm) | Vertical (cm) | Views | Reproj. (px) | Control h RMS (cm) | Shots |")
-        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|")
+        lines.append("| Fold | Check point | Horizontal (cm) | Vertical (cm) | Views | Reproj. (px) | Control h RMS (cm) | Control v RMS (cm) | Shots |")
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|")
         for f in entry["folds"]:
-            ctrl = f["control_horizontal_rms_m"]
+            ch, cv = f["control_horizontal_rms_m"], f["control_vertical_rms_m"]
             lines.append(
                 f"| {f['fold']} | {f['label']} | {f['horizontal_m'] * 100:.2f} | "
                 f"{f['vertical_m'] * 100:+.2f} | {f['views']} | {f['reprojection_rms_px']:.2f} | "
-                f"{'' if ctrl is None else f'{ctrl * 100:.2f}'} | {f['shots_reconstructed']} |")
+                f"{'' if ch is None else f'{ch * 100:.2f}'} | "
+                f"{'' if cv is None else f'{cv * 100:.2f}'} | {f['shots_reconstructed']} |")
         for m in entry["missing"]:
-            lines.append(f"| {m['fold']} | {m['label']} | — | — | {m['status']} | | | |")
+            lines.append(f"| {m['fold']} | {m['label']} | — | — | {m['status']} | | | | |")
         lines.append("")
         if h is not None:
             lines.append(f"**RMS: {h * 100:.2f} cm horizontal, {v * 100:.2f} cm vertical "
                          f"over {len(entry['folds'])} folds.**")
+            ch, cv = entry["control_horizontal_rms_m"], entry["control_vertical_rms_m"]
+            if ch is not None:
+                lines.append("")
+                if ch < 1e-3 and cv < 1e-3:
+                    lines.append("Control points, measured the same way: 0.00 cm. The "
+                                 "control points are pinned by this mode's weights, so "
+                                 "their residual says nothing about the triangulation; "
+                                 "the held-out point is the only measurement here.")
+                else:
+                    lines.append(f"Control points, measured the same way: {ch * 100:.2f} cm "
+                                 f"horizontal, {cv * 100:.2f} cm vertical RMS. A control RMS "
+                                 "near the check RMS means the triangulation is consistent "
+                                 "with the block; a control RMS far below it means the block "
+                                 "fits the points it was given and the held-out point is the "
+                                 "real error.")
+        agreement = entry.get("odm_agreement")
+        if agreement:
+            lines.append("")
+            lines.append(f"Agreement with ODM's own control points "
+                         f"(`stats/ground_control_points.json`, {agreement['folds']} folds): "
+                         f"{agreement['horizontal_rms_m'] * 100:.2f} cm horizontal, "
+                         f"{agreement['vertical_rms_m'] * 100:.2f} cm vertical RMS "
+                         f"(max {agreement['max_horizontal_m'] * 100:.2f} / "
+                         f"{agreement['max_vertical_m'] * 100:.2f} cm).")
         lines.append("")
     return {"target_horizontal_m": target_m, "modes": modes}, "\n".join(lines)
 
