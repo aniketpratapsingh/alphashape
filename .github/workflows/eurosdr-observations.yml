@@ -24,6 +24,16 @@ name: EuroSDR observations
 #   gh workflow run eurosdr-observations.yml --ref <branch>
 
 on:
+  # A change to the measurement itself exercises it on the branch that changed
+  # it. This is the only way to run a new workflow before it reaches the default
+  # branch (workflow_dispatch is not dispatchable until then), and it is also
+  # the right behaviour afterwards: a change to the script or the workflow is
+  # exactly when the observations need re-measuring. The scope is narrow so an
+  # unrelated push does not spend the runner time.
+  push:
+    paths:
+      - ".github/workflows/eurosdr-observations.yml"
+      - "tools/bench/eurosdr_observations.py"
   workflow_dispatch:
     inputs:
       keypoint_limit_per_mpx:
