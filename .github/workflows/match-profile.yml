@@ -92,6 +92,12 @@ jobs:
       matrix:
         kp: [250, 1000]
         threads: ["1", ""]
+        # One thread at 1000 keypoints per megapixel runs past the 330-minute
+        # job limit (two runs, both stopped). The single-thread memory per
+        # image is already measured at 250, and 1000 is measured on all threads.
+        exclude:
+          - kp: 1000
+            threads: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
