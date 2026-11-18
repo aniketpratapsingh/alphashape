@@ -267,7 +267,7 @@ targets, which the protocol requires.
     receivers in static/kinematic mode against four GNSS reference stations; the paper
     quotes average standard deviations of 5.3 mm E, 6.1 mm N, 3.4 mm H.
   - `Phase1.7z` (33.2 GB) — no ground control: DJI P4 RTK (489 images, 3 flights),
-    DJI P1 (1024 nadir + 25 oblique), DJI L1 (254), Riegl MiniVUX, Routescene LidarPod.
+    DJI P1 (1024 nadir), DJI L1 (254), Riegl MiniVUX, Routescene LidarPod.
   - `Phase2.7z` (9.9 GB) — RTK / local base station: P4 RTK (500 images, 3 flights),
     DJI L1 (252), Riegl MiniVUX, Routescene LidarPod, plus the local base-station RINEX.
   - `Phase3.7z` (401 bytes) — a single text file, `EuroSDR-Phase3-GCPs.txt`: the 8 GCPs
