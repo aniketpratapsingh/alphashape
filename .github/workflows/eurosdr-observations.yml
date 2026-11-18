@@ -223,7 +223,12 @@ jobs:
             echo "::error::archive md5 is $actual, expected $PHASE2_MD5"
             exit 1
           fi
-          echo "verified $archive ($size bytes, md5 $actual)"
+          # Zenodo publishes an md5, not a SHA-256, but the bench manifest pins
+          # SHA-256. Compute it here and print it, so the manifest entry can be
+          # filled in from this run's log rather than from a local download.
+          sha=$(sha256sum "$archive" | cut -d' ' -f1)
+          echo "verified $archive ($size bytes, md5 $actual, sha256 $sha)"
+          echo "::notice::Phase2.7z sha256 $sha ($size bytes)"
 
       - name: Download the coordinates
         env:
