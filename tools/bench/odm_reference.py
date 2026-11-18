@@ -303,18 +303,23 @@ def load_reconstruction(opensfm: Path, name: str = "reconstruction.topocentric.j
 def load_odm_control_points(opensfm: Path) -> dict[str, list[float]]:
     """ODM's own triangulated control points, from its statistics file.
 
-    ``stats/ground_control_points.json`` holds, per point, the triangulated
-    position in the topocentric frame (``coordinates``) and the error against
-    the survey (``error``). ``compute_statistics`` writes it from the
-    topocentric reconstruction, so it is in the same frame this script measures
-    in and is an independent check on the triangulation here.
+    ``stats/ground_control_points.json`` holds, per point, the survey position
+    in the topocentric frame (``coordinates``) and the triangulated position
+    minus that survey position (``error``). ``compute_statistics`` writes it
+    from the topocentric reconstruction, so it is in the same frame this script
+    measures in and is an independent check on the triangulation here.
     """
     path = opensfm / "stats" / "ground_control_points.json"
     if not path.exists():
         return {}
     points = json.loads(path.read_text(encoding="utf-8"))
-    return {str(p["id"]): [float(v) for v in p["coordinates"]]
-            for p in points if "coordinates" in p}
+    triangulated = {}
+    for point in points:
+        if "coordinates" not in point or "error" not in point:
+            continue
+        triangulated[str(point["id"])] = [float(point["coordinates"][i] + point["error"][i])
+                                          for i in range(3)]
+    return triangulated
 
 
 def odm_agreement(opensfm: Path, control: list[dict],

@@ -237,9 +237,11 @@ class OdmAgreementTest(unittest.TestCase):
             json.dumps(points), encoding="utf-8")
 
     def test_our_points_are_compared_with_odms(self):
+        # ODM's file holds the survey position and the triangulated-minus-survey
+        # error; the triangulated point is their sum.
         self.write_stats([
-            {"id": "1", "coordinates": [1.0, 2.0, 3.0]},
-            {"id": "2", "coordinates": [4.0, 5.0, 6.0]},
+            {"id": "1", "coordinates": [1.0, 2.0, 3.0], "error": [0.01, 0.0, 0.02]},
+            {"id": "2", "coordinates": [4.0, 5.0, 6.0], "error": [0.0, 0.0, -0.02]},
         ])
         control = [
             {"label": "1", "status": "ok", "point": [1.01, 2.0, 3.02]},
@@ -248,8 +250,17 @@ class OdmAgreementTest(unittest.TestCase):
         agreement = odm_reference.odm_agreement(
             self.opensfm, control, "reconstruction.topocentric.json")
         self.assertEqual(agreement["points"], 2)
-        self.assertAlmostEqual(agreement["max_horizontal_m"], 0.01)
-        self.assertAlmostEqual(agreement["max_vertical_m"], 0.02)
+        self.assertAlmostEqual(agreement["max_horizontal_m"], 0.0, places=9)
+        self.assertAlmostEqual(agreement["max_vertical_m"], 0.0, places=9)
+
+    def test_a_point_odm_did_not_measure_is_skipped(self):
+        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0],
+                           "error": [0.0, 0.0, 0.0]}])
+        control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]},
+                   {"label": "9", "status": "ok", "point": [1.0, 1.0, 1.0]}]
+        agreement = odm_reference.odm_agreement(
+            self.opensfm, control, "reconstruction.topocentric.json")
+        self.assertEqual(agreement["points"], 1)
 
     def test_a_missing_stats_file_is_not_an_error(self):
         control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]}]
@@ -259,18 +270,11 @@ class OdmAgreementTest(unittest.TestCase):
     def test_a_rerun_reconstruction_is_not_compared(self):
         # ODM's statistics describe the topocentric block; a re-run
         # reconstruction leaves them stale, so the comparison is skipped.
-        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0]}])
+        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0],
+                           "error": [0.0, 0.0, 0.0]}])
         control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]}]
         self.assertIsNone(odm_reference.odm_agreement(
             self.opensfm, control, "reconstruction.json"))
-
-    def test_a_point_odm_did_not_measure_is_skipped(self):
-        self.write_stats([{"id": "1", "coordinates": [0.0, 0.0, 0.0]}])
-        control = [{"label": "1", "status": "ok", "point": [0.0, 0.0, 0.0]},
-                   {"label": "9", "status": "ok", "point": [1.0, 1.0, 1.0]}]
-        agreement = odm_reference.odm_agreement(
-            self.opensfm, control, "reconstruction.topocentric.json")
-        self.assertEqual(agreement["points"], 1)
 
 
 if __name__ == "__main__":
