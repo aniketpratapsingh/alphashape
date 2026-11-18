@@ -242,6 +242,59 @@ combination of licence, size, nadir flight and publisher-supplied reference.
 | OpenDroneMap `odm_data_*` (aukerman, seneca, bellus, ...) | CC0 / BSD-2 / none | **none** | The ODM sample repos publish images only. DroneDB Hub shows *user* runs, not publisher references, so they cannot support reference-based metrics |
 | `pierotofy/drone_dataset_*` (sand_key, brighton_beach) | BSD-2-Clause | none | Same problem: images only |
 | ETH3D `bridge` / `exhibition_hall` (test split) | CC BY-NC-SA 4.0 | laser scans | Ground truth for the test split is not published; only training scenes can be scored |
+| Zenodo 10059050 (EuroSDR RPAS benchmark, Wards Hill quarry) | CC BY 4.0 | 51 check points + 8 GCPs, 3-D coordinates only | **No image observations of the targets are published**, so the leave-one-out protocol cannot run. See the section below |
+
+## Studied and rejected: EuroSDR RPAS benchmark (Zenodo 10059050)
+
+**Wards Hill quarry, Morpeth, Northumberland, UK — August 2021.** Studied 2026-11-18 as
+the second independent ground-control block, so the 5 cm horizontal target would not be
+tuned to one survey. Rejected: the published data has no pixel observations of the
+targets, which the protocol requires.
+
+- Publisher: Zenodo record 10059050, DOI [10.5281/zenodo.10059050](https://doi.org/10.5281/zenodo.10059050)
+  (concept DOI 10.5281/zenodo.8309678). Newcastle University Geospatial Engineering for
+  EuroSDR. Described in Mills et al., *The EuroSDR RPAS benchmark: open dataset
+  description and summary of key results*, ISPRS Archives XLVIII-1/W3-2023, 107–114,
+  DOI [10.5194/isprs-archives-XLVIII-1-W3-2023-107-2023](https://doi.org/10.5194/isprs-archives-XLVIII-1-W3-2023-107-2023).
+- Licence: **CC BY 4.0** (`metadata.license.id == "cc-by-4.0"`). Redistribution is
+  allowed with attribution, so the licence is not the obstacle.
+- Files (four, all on the record):
+  - `GCPsandCPs_coords.xlsx` (30 KB) — 59 stations, each with ETRS89 Cartesian
+    (X/Y/Z), ETRS89 geodetic on GRS80 (lat/lon/ellipsoidal height) and OSGB36/ODN
+    (E/N/orthometric height). 51 check points (50 named `A2`–`F8`, `S1`–`S3`, plus one
+    unnamed row) and 8 GCPs (`GA1`, `GA5`, `GA8`, `GC6`, `GD4`, `GF1`, `GF4`, `GF8`),
+    matching the paper's "51 CP and eight GCP targets". Surveyed with Leica GS18
+    receivers in static/kinematic mode against four GNSS reference stations; the paper
+    quotes average standard deviations of 5.3 mm E, 6.1 mm N, 3.4 mm H.
+  - `Phase1.7z` (33.2 GB) — no ground control: DJI P4 RTK (489 images, 3 flights),
+    DJI P1 (1024 nadir + 25 oblique), DJI L1 (254), Riegl MiniVUX, Routescene LidarPod.
+  - `Phase2.7z` (9.9 GB) — RTK / local base station: P4 RTK (500 images, 3 flights),
+    DJI L1 (252), Riegl MiniVUX, Routescene LidarPod, plus the local base-station RINEX.
+  - `Phase3.7z` (401 bytes) — a single text file, `EuroSDR-Phase3-GCPs.txt`: the 8 GCPs
+    as `id E N H` in OSGB36/ODN. Coordinates only.
+- **Why it cannot be used.** The protocol needs, for every control point, its 3-D
+  coordinate *and* the pixel position of its target in the images that see it. The
+  record publishes the coordinates but not the observations. The complete file lists of
+  both large archives were read from their 7z headers over HTTP range requests (no
+  multi-GB download): they contain imagery, PPK/RINEX/event-mark logs, lidar, and
+  dataset-information PDFs, and **no** GCP list, marker file or observation table. The
+  paper's method section confirms the participants were asked to submit CP coordinates
+  and products, and that the ground truth is the surveyed coordinates — the image
+  observations were never part of the release. The targets are 300 mm circular
+  photogrammetric targets with a 100 mm black centre, which the engine's non-coded
+  circular detector could in principle find, but the protocol's real mode takes its
+  observations from a `gcp_list` and does not run detection, so that is not a
+  substitute without new work.
+- Two further obstacles, recorded for completeness: the GCP heights are orthometric
+  (OSGB36/ODN), and the protocol refuses a non-ellipsoidal `--gcp-height` because it
+  carries no geoid model; and the smallest usable photogrammetric flight (P4 RTK,
+  ~430 images at 3.7 GB) is larger than the current ground-control block (176 images).
+- A label trap worth recording: the `Phase3` text file's GCP labels are shifted by one
+  against the xlsx. `Phase3` `GA1` is the xlsx `GA5`, `GA5` is `GA8`, and so on, with
+  `Phase3` `GF8` matching no xlsx row within 9 m. The coordinates are identical to the
+  millimetre under the shifted labels, so a loader that joined the two files by label
+  would silently pair every point with the wrong name. The xlsx is the authoritative
+  file (it is the one the paper describes).
 
 ## Adding a dataset
 
