@@ -642,5 +642,70 @@ TEST(Crs, ConvertReferenceFailureLeavesChunkUntouched) {
     EXPECT_EQ(chunk.marker_crs().epsg, 4979);
 }
 
+// The geodetic helpers the adjustment and georeferencing read through: a
+// projected slot (GDA2020 / MGA zone 54, the Adelaide case) is converted to
+// lon/lat/ellipsoidal height, and a geographic slot is returned unchanged.
+TEST(Crs, GeodeticMarkerReferencesConvertProjectedSlot) {
+    // A known point in Adelaide, and its MGA zone 54 projection computed by the
+    // engine's own transform -- the test's independent expectation of what the
+    // helper must return.
+    const Eigen::Vector3d lonlat(138.6007, -34.9285, 50.0);
+    const crs::CoordinateSystem mga54 = crs::CoordinateSystem::from_epsg(7854);
+    const crs::CrsPoint projected =
+        transform_point(geographic(), mga54, lonlat);
+
+    Chunk chunk = make_chunk(geographic(), 0, 2, lonlat.x(), lonlat.y());
+    chunk.markers()[0].reference = Eigen::Vector3d(projected.x, projected.y, projected.z);
+    chunk.markers()[1].reference = std::nullopt;  // a marker with no reference
+    chunk.set_marker_crs(CRS(mga54));
+
+    const std::vector<std::optional<Eigen::Vector3d>> geodetic =
+        geodetic_marker_references(chunk);
+    ASSERT_EQ(geodetic.size(), 2U);
+    ASSERT_TRUE(geodetic[0].has_value());
+    EXPECT_LE(std::abs(geodetic[0]->x() - lonlat.x()), 1e-7) << "longitude";
+    EXPECT_LE(std::abs(geodetic[0]->y() - lonlat.y()), 1e-7) << "latitude";
+    EXPECT_NEAR(geodetic[0]->z(), lonlat.z(), 1e-3) << "ellipsoidal height";
+    EXPECT_FALSE(geodetic[1].has_value()) << "an absent reference stays absent";
+    // The chunk keeps its own values and label: the helper is a detached read.
+    EXPECT_EQ(chunk.marker_crs().epsg, 7854);
+    EXPECT_DOUBLE_EQ(chunk.markers()[0].reference->x(), projected.x);
+}
+
+TEST(Crs, GeodeticMarkerReferencesPassGeographicSlotThrough) {
+    Chunk chunk = make_chunk(geographic(), 0, 2, 11.5820, 48.1351);
+    const std::vector<std::optional<Eigen::Vector3d>> geodetic =
+        geodetic_marker_references(chunk);
+    ASSERT_EQ(geodetic.size(), 2U);
+    for (std::size_t i = 0; i < geodetic.size(); ++i) {
+        ASSERT_TRUE(geodetic[i].has_value());
+        EXPECT_DOUBLE_EQ(geodetic[i]->x(), chunk.markers()[i].reference->x());
+        EXPECT_DOUBLE_EQ(geodetic[i]->y(), chunk.markers()[i].reference->y());
+        EXPECT_DOUBLE_EQ(geodetic[i]->z(), chunk.markers()[i].reference->z());
+    }
+}
+
+TEST(Crs, GeodeticCameraLocationsConvertProjectedSlot) {
+    const Eigen::Vector3d lonlat(138.6007, -34.9285, 120.0);
+    const crs::CoordinateSystem mga54 = crs::CoordinateSystem::from_epsg(7854);
+    const crs::CrsPoint projected = transform_point(geographic(), mga54, lonlat);
+
+    Chunk chunk = make_chunk(geographic(), 2, 0, lonlat.x(), lonlat.y());
+    chunk.cameras()[0].reference.location =
+        Eigen::Vector3d(projected.x, projected.y, projected.z);
+    chunk.cameras()[1].reference.location = std::nullopt;
+    chunk.set_camera_crs(CRS(mga54));
+
+    const std::vector<std::optional<Eigen::Vector3d>> geodetic =
+        geodetic_camera_locations(chunk);
+    ASSERT_EQ(geodetic.size(), 2U);
+    ASSERT_TRUE(geodetic[0].has_value());
+    EXPECT_LE(std::abs(geodetic[0]->x() - lonlat.x()), 1e-7) << "longitude";
+    EXPECT_LE(std::abs(geodetic[0]->y() - lonlat.y()), 1e-7) << "latitude";
+    EXPECT_NEAR(geodetic[0]->z(), lonlat.z(), 1e-3) << "ellipsoidal height";
+    EXPECT_FALSE(geodetic[1].has_value());
+    EXPECT_EQ(chunk.camera_crs().epsg, 7854);
+}
+
 }  // namespace
 }  // namespace alphashape::reference

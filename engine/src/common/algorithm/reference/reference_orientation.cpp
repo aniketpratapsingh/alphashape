@@ -57,15 +57,23 @@ const Antenna& effective_antenna(const Chunk& chunk, const Camera& camera) {
 
 std::optional<ReferenceRotation> measured_rotation(const Chunk& chunk,
                                                    const Camera& camera,
-                                                   const Eigen::Matrix4d& internal_to_ecef) {
+                                                   const Eigen::Matrix4d& internal_to_ecef,
+                                                   const Eigen::Vector3d* geodetic_location) {
     if (!camera.reference.orientation_deg.has_value()) {
         return std::nullopt;
     }
     // The ENU frame is taken at the reference position; without one, at the
     // camera's current estimated centre converted to geodetic. The difference
-    // only changes the local meridian convergence over the block.
+    // only changes the local meridian convergence over the block. A caller that
+    // has already converted a projected slot passes the geodetic value, so the
+    // ENU origin is right whatever CRS the slot names.
     geo::Geodetic geodetic;
-    if (camera.reference.location.has_value()) {
+    if (geodetic_location != nullptr) {
+        geodetic = geo::Geodetic{geodetic_location->x(), geodetic_location->y(),
+                                 std::isfinite(geodetic_location->z())
+                                     ? geodetic_location->z()
+                                     : 0.0};
+    } else if (camera.reference.location.has_value()) {
         const Eigen::Vector3d& loc = *camera.reference.location;
         geodetic = geo::Geodetic{loc.x(), loc.y(), std::isfinite(loc.z()) ? loc.z() : 0.0};
     } else {

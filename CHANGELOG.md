@@ -33,6 +33,12 @@ All notable changes to alphashape are recorded here. The format follows
   dialog used to charge every pixel of the block at once (a 169-photo, 20 MP
   block showed ~75 GB). It now counts what the stages hold: the scale spaces
   being detected, the keypoint sets, the matches and the track tables.
+- **The coordinate-system picker searches every EPSG system.** Typing in the
+  search field now looks through all current EPSG geographic, geocentric and
+  projected systems in the PROJ database by code, name or area (for example
+  `7854` or `mga zone 54` finds GDA2020 / MGA zone 54), instead of only the 48
+  curated systems. The curated list is still what shows while the field is
+  empty. New engine call: `crs::crs_catalog()`.
 - **OptimizeCameras selects the adaptive lens model automatically on a block
   with ground control.** `adaptive_fitting_auto` now defaults to true: when the
   chunk has at least one control point (a referenced marker that is not a check
@@ -164,6 +170,18 @@ All notable changes to alphashape are recorded here. The format follows
   and `TransverseMercator` implementation is removed.
 
 ### Added
+
+- **Marker placement in the GUI.** The central area gains a Photo tab beside the
+  3-D Model view: double-click a photo in the Photos dock (or use Reference >
+  Place on photo) to open it, then right-click to add a marker at the cursor,
+  place an existing marker, or remove a projection. A placed marker is drawn as
+  a green flag; a marker with an estimated position but no projection in this
+  camera is drawn as a blue flag where the engine predicts it. Drag a flag to
+  move its projection (a predicted flag becomes placed). Wheel zooms about the
+  cursor, drag pans, and the image opens fitted. Every edit is one undo entry
+  through the command layer, and the view refuses edits while a job runs. The
+  Reference pane gains Import Markers, which runs the existing `ImportMarkers`
+  task on a CSV or XML file.
 
 - **GUI update checks (automatic and manual).** Help > Check for Updates... runs
   a manual check that always reports up to date, a newer version, or the reason
@@ -797,6 +815,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
+  were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
+  `AlignFromReference` and the alignment georeference now convert a projected
+  reference slot to WGS 84 lon/lat/ellipsoidal height before the adjustment and
+  the similarity fit, instead of interpreting eastings and northings as
+  longitude and latitude or refusing the slot with "not geographic". A survey
+  in GDA2020 / MGA zone 54 (EPSG:7854) now georeferences and adjusts correctly;
+  a geographic slot is unchanged.
 - **`UpdateTransform` ignored the GNSS antenna mount.** It paired each camera
   centre with its antenna reference, so with a lever arm set the datum fit and
   the bundle adjustment disagreed. It now applies the same mount correction as

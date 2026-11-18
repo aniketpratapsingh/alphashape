@@ -216,6 +216,15 @@ class RefusalTest(unittest.TestCase):
         self.assertTrue(problems)
         self.assertIn("optimize_params", problems[0])
 
+    def test_match_params_are_refused_too(self):
+        current = regressing()
+        current["match_params"] = {"keypoint_limit_per_mpx": "1000"}
+        problems = accept_regression.refusals(
+            branch="main", default_branch="main", current=current
+        )
+        self.assertTrue(problems)
+        self.assertIn("match_params", problems[0])
+
     def test_a_control_run_on_the_default_branch_is_allowed(self):
         self.assertEqual(
             accept_regression.refusals(

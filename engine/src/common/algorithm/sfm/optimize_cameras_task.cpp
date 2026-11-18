@@ -492,9 +492,14 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
     std::size_t checkpoint_markers = 0;
     if (georeferenced) {
         const Transform inverse = transform.inverse();
+        // Lon/lat/ellipsoidal height whatever CRS the marker slot names: a
+        // projected survey (UTM, MGA, a national grid) is converted here, never
+        // read as degrees.
+        const std::vector<std::optional<Eigen::Vector3d>> marker_geodetic =
+            reference::geodetic_marker_references(*chunk);
         for (std::size_t m = 0; m < chunk->markers().size(); ++m) {
             const Marker& marker = chunk->markers()[m];
-            if (!marker.reference.has_value() || marker_point[m] == kNoPoint) {
+            if (!marker_geodetic[m].has_value() || marker_point[m] == kNoPoint) {
                 continue;
             }
             const std::string* role = marker.meta.find("type");
@@ -502,7 +507,7 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             if (!checkpoint && !use_gcp) {
                 continue;  // markers disabled as control points
             }
-            const Eigen::Vector3d& loc = *marker.reference;
+            const Eigen::Vector3d& loc = *marker_geodetic[m];
             if (!std::isfinite(loc.x()) || !std::isfinite(loc.y())) {
                 continue;  // no usable horizontal reference
             }
@@ -626,6 +631,12 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
         const Transform inverse = transform.inverse();
         const double default_rotation_accuracy =
             chunk->reference_settings().camera_rotation_accuracy_deg;
+        // Lon/lat/ellipsoidal height whatever CRS the camera slot names: a
+        // projected survey (UTM, MGA, a national grid) is converted here, never
+        // read as degrees. Indexed by the chunk camera index, so a prior for BA
+        // camera `b` reads `camera_geodetic[camera_index[b]]`.
+        const std::vector<std::optional<Eigen::Vector3d>> camera_geodetic =
+            reference::geodetic_camera_locations(*chunk);
         std::unordered_set<std::int32_t> logged_antenna_sensors;
         for (std::size_t b = 0; b < camera_index.size(); ++b) {
             const Camera& camera = chunk->cameras()[camera_index[b]];
@@ -634,8 +645,16 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
             }
             // -- attitude prior ---------------------------------------------
             if (use_orientation && camera.reference.orientation_deg.has_value()) {
+                // The ENU origin of the measured attitude is the camera's
+                // reference position, which is only lon/lat when the slot is
+                // geographic; pass the converted value so a projected slot's
+                // attitude prior is placed at the right meridian.
+                const std::optional<Eigen::Vector3d>& reference_geodetic =
+                    camera_geodetic[camera_index[b]];
                 const std::optional<reference::ReferenceRotation> measured =
-                    reference::measured_rotation(*chunk, camera, transform);
+                    reference::measured_rotation(
+                        *chunk, camera, transform,
+                        reference_geodetic.has_value() ? &*reference_geodetic : nullptr);
                 if (!measured.has_value()) {
                     continue;
                 }
@@ -658,10 +677,10 @@ void OptimizeCamerasTask::apply(Document& document, Params& params, const Progre
                 problem.rotation_priors.push_back(prior);
                 ++rotation_prior_count;
             }
-            if (!camera.reference.location.has_value()) {
+            if (!camera_geodetic[camera_index[b]].has_value()) {
                 continue;
             }
-            const Eigen::Vector3d& loc = *camera.reference.location;
+            const Eigen::Vector3d& loc = *camera_geodetic[camera_index[b]];
             const bool has_alt = std::isfinite(loc.z());
             const geo::Geodetic geodetic{loc.x(), loc.y(), has_alt ? loc.z() : 0.0};
             const Eigen::Vector3d ecef = geo::geodetic_to_ecef(geodetic);

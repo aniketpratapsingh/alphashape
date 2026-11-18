@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -19,6 +20,7 @@ class QDockWidget;
 class QLabel;
 class QProgressBar;
 class QStackedWidget;
+class QTabWidget;
 class QToolButton;
 class QMenu;
 
@@ -28,6 +30,7 @@ struct CheckResult;
 class ExportController;
 class GuiApp;
 class LogPane;
+class PhotoView;
 class PhotosPane;
 class PropertiesPane;
 class ReferencePane;
@@ -126,6 +129,13 @@ public:
     StartScreen* start_screen() const { return start_screen_; }
     /// The 3-D view: page 0 of the central stack ("viewport").
     ViewportWidget* viewport() const { return viewport_; }
+    /// The Photo tab's view ("photo.view"): one camera's image with its markers.
+    PhotoView* photo_view() const { return photo_view_; }
+    /// The central tabs ("centralTabs"): tab 0 "Model" holds the viewport, tab 1 "Photo" the
+    /// photo view. Page 0 of the central stack.
+    QTabWidget* central_tabs() const { return central_tabs_; }
+    /// Show the Photo tab and open `camera_id` in it.
+    void open_photo(std::int32_t camera_id);
     /// The central-area stack: page 0 is the viewport ("viewport"), page 1 the start screen.
     /// Exposed so a test can say which page is showing without guessing by visibility.
     QStackedWidget* central_stack() const { return stack_; }
@@ -216,7 +226,9 @@ private:
     QDockWidget* photos_dock_ = nullptr;
     QDockWidget* log_dock_ = nullptr;
     QStackedWidget* stack_ = nullptr;   ///< central area: viewport / start screen
+    QTabWidget* central_tabs_ = nullptr;  ///< page 0 of the stack: Model / Photo
     ViewportWidget* viewport_ = nullptr;
+    PhotoView* photo_view_ = nullptr;
     StartScreen* start_screen_ = nullptr;
     WorkspaceSelection* selection_ = nullptr;  ///< tree -> Properties, Photos panes and viewport
     WorkspacePane* workspace_pane_ = nullptr;
