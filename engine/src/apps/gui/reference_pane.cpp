@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
 
 #include <QAction>
@@ -24,8 +25,10 @@
 #include "apps/gui/job_manager.hpp"
 #include "apps/gui/reference_settings_dialog.hpp"
 #include "apps/gui/task_dialog.hpp"
+#include "apps/gui/workspace_model.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
+#include "common/core/frame.hpp"
 #include "common/tasks/registry.hpp"
 #include "model/crs/coordinate_system.hpp"
 
@@ -78,8 +81,8 @@ private:
 
 }  // namespace
 
-ReferencePane::ReferencePane(GuiApp& app, QWidget* parent)
-    : QWidget(parent), app_(app) {
+ReferencePane::ReferencePane(GuiApp& app, WorkspaceSelection& selection, QWidget* parent)
+    : QWidget(parent), app_(app), selection_(selection) {
     setObjectName(QStringLiteral("pane.reference"));
     camera_model_ = new ReferenceModel(app_, ReferenceModel::Section::Cameras, this);
     marker_model_ = new ReferenceModel(app_, ReferenceModel::Section::Markers, this);
@@ -195,10 +198,66 @@ void ReferencePane::create_toolbar() {
         refresh();
     });
 
-    QAction* pick = make(QStringLiteral("action.reference.pick"),
-                         tr("Pick in viewport"));
-    pick->setEnabled(false);
-    pick->setToolTip(tr("Picking a reference in the viewport is not available yet"));
+    import_markers_ = make(QStringLiteral("action.reference.import_markers"),
+                           tr("Import Markers"));
+    if (builtin_registry().find("ImportMarkers") != nullptr) {
+        import_markers_->setToolTip(
+            tr("Import marker projections from a CSV or XML file"));
+        connect(import_markers_, &QAction::triggered, this,
+                [this]() { run_task("ImportMarkers"); });
+    } else {
+        import_markers_->setEnabled(false);
+        import_markers_->setToolTip(tr("ImportMarkers is not available in this build"));
+    }
+
+    // Placing a marker is done on the photo, not in this table: the action is a hint that
+    // switches the central area to the Photo tab. It keeps its objectName so a shortcut or a
+    // test that named it still finds it.
+    pick_ = make(QStringLiteral("action.reference.pick"), tr("Place on photo"));
+    pick_->setToolTip(tr("Open the selected photo to place markers on it"));
+    connect(pick_, &QAction::triggered, this, [this]() {
+        if (app_.jobs().busy()) {
+            return;
+        }
+        const std::int32_t camera_id = camera_for_photo();
+        if (camera_id >= 0) {
+            Q_EMIT place_on_photo_requested(camera_id);
+        }
+    });
+}
+
+std::int32_t ReferencePane::camera_for_photo() const {
+    // The camera the Workspace tree (or the Photos list) has selected, when it belongs to the
+    // active chunk. The tree publishes into the shared selection; the engine's per-camera
+    // `selected` flag is not maintained by the GUI, so it is not consulted.
+    const std::int32_t active = app_.read_document([](const Document& document) {
+        const Chunk* chunk = document.active_chunk();
+        return chunk == nullptr ? std::int32_t{-1} : chunk->id();
+    });
+    if (active < 0) {
+        return -1;
+    }
+    for (const NodeRef& ref : selection_.items()) {
+        if (ref.kind == NodeKind::Camera && ref.chunk_id == active) {
+            return ref.item_id;
+        }
+    }
+    // Nothing selected: fall back to the first camera that actually has a frame, so the Photo
+    // tab opens on a picture rather than an empty message.
+    return app_.read_document([active](const Document& document) {
+        const Chunk* chunk = document.active_chunk();
+        if (chunk == nullptr || chunk->id() != active) {
+            return std::int32_t{-1};
+        }
+        for (const Camera& camera : chunk->cameras()) {
+            for (const std::shared_ptr<Frame>& frame : chunk->frames()) {
+                if (frame != nullptr && frame->camera_id() == camera.id) {
+                    return camera.id;
+                }
+            }
+        }
+        return chunk->cameras().empty() ? std::int32_t{-1} : chunk->cameras().front().id;
+    });
 }
 
 QAction* ReferencePane::action(const QString& object_name) const {
@@ -264,6 +323,13 @@ void ReferencePane::update_actions() {
         if (entry != nullptr) {
             entry->setEnabled(idle_chunk);
         }
+    }
+    if (import_markers_ != nullptr &&
+        builtin_registry().find("ImportMarkers") != nullptr) {
+        import_markers_->setEnabled(idle_chunk);
+    }
+    if (pick_ != nullptr) {
+        pick_->setEnabled(idle_chunk);
     }
     if (QAction* settings = action(QStringLiteral("action.reference.settings"))) {
         settings->setEnabled(idle_chunk);

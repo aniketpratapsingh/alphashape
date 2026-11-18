@@ -162,6 +162,18 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Marker placement in the GUI.** The central area gains a Photo tab beside the
+  3-D Model view: double-click a photo in the Photos dock (or use Reference >
+  Place on photo) to open it, then right-click to add a marker at the cursor,
+  place an existing marker, or remove a projection. A placed marker is drawn as
+  a green flag; a marker with an estimated position but no projection in this
+  camera is drawn as a blue flag where the engine predicts it. Drag a flag to
+  move its projection (a predicted flag becomes placed). Wheel zooms about the
+  cursor, drag pans, and the image opens fitted. Every edit is one undo entry
+  through the command layer, and the view refuses edits while a job runs. The
+  Reference pane gains Import Markers, which runs the existing `ImportMarkers`
+  task on a CSV or XML file.
+
 - **GUI update checks (automatic and manual).** Help > Check for Updates... runs
   a manual check that always reports up to date, a newer version, or the reason
   it failed; a silent startup check runs at most once every 24 hours and only
