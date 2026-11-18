@@ -400,6 +400,48 @@ class ExtractTest(unittest.TestCase):
             self.assertFalse((out / "keep" / "dem.tif").exists())
             self.assertFalse((out / "skip" / "other.tif").exists())
 
+    def test_an_include_pattern_limits_the_extraction(self):
+        # The EuroSDR Phase2 archive holds three flights; the benchmark needs
+        # one. `extract_include` selects that subfolder and nothing else.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(
+                archive,
+                {
+                    "Phase2/flight_a/100_0004/one.JPG": b"1",
+                    "Phase2/flight_a/100_0004/two.JPG": b"2",
+                    "Phase2/flight_b/100_0005/three.JPG": b"3",
+                },
+            )
+            out = Path(tmp) / "out"
+            run_bench.extract_archive(
+                archive, out, include="Phase2/flight_a/100_0004/*")
+            self.assertTrue((out / "Phase2/flight_a/100_0004/one.JPG").exists())
+            self.assertTrue((out / "Phase2/flight_a/100_0004/two.JPG").exists())
+            self.assertFalse((out / "Phase2/flight_b/100_0005/three.JPG").exists())
+
+    def test_an_include_that_matches_nothing_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(archive, {"Phase2/flight_a/one.JPG": b"1"})
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(
+                    archive, Path(tmp) / "out", include="Phase2/missing/*")
+
+    def test_members_and_include_together_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(archive, {"a.JPG": b"1"})
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(
+                    archive, Path(tmp) / "out", members=["a.JPG"],
+                    include="*.JPG")
+
+    def test_resolve_include_matches_whole_paths(self):
+        present = ["Phase2/a/one.JPG", "Phase2/b/two.JPG"]
+        matched = run_bench._resolve_include(present, "Phase2/a/*", Path("x.7z"))
+        self.assertEqual(matched, ["Phase2/a/one.JPG"])
+
     def test_the_extension_decides_the_unpacker(self):
         # A zip named .7z would be a manifest error, and must fail rather than be
         # unpacked by guesswork: the extension is the only signal a download has.

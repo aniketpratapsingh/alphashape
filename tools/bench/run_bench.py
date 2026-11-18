@@ -606,13 +606,17 @@ def seven_zip_members(archive: Path) -> list[str]:
     return [line[len("Path = "):] for line in listing.splitlines() if line.startswith("Path = ")]
 
 
-def extract_archive(archive: Path, destination: Path, *, members: list[str] | None = None) -> None:
+def extract_archive(archive: Path, destination: Path, *, members: list[str] | None = None,
+                    include: str | None = None) -> None:
     """Extract ``archive`` under ``destination``.
 
     ``members`` limits the extraction to the named entries, which is how a single
     reference archive is unpacked once even when several reference files come out
-    of it. Zip and tar (including .tar.zst handled by the external `tar`) are
-    supported; a `.7z` needs `7z`, which the workflow installs.
+    of it. ``include`` is a 7-Zip include pattern (``-ir!<pattern>``) that limits
+    a large multi-flight archive to one subfolder; it is resolved to the matching
+    members first, so the same name check applies. The two are mutually exclusive.
+    Zip and tar (including .tar.zst handled by the external `tar`) are supported;
+    a `.7z` needs `7z`, which the workflow installs.
 
     Every entry is checked against :func:`check_member_name` BEFORE it is written,
     including the entries of a full extraction: an archive is downloaded from a
@@ -620,6 +624,9 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
     malformed archive or an attempt to write outside it. Both fail the run here,
     with the offending name, rather than landing a file somewhere else.
     """
+    if members is not None and include is not None:
+        raise SystemExit(
+            f"{archive.name}: pass either members or include, not both")
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
     name = archive.name.lower()
@@ -640,37 +647,42 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
 
     if name.endswith(".zip"):
         with zipfile.ZipFile(archive) as bundle:
-            wanted = members if members is not None else bundle.namelist()
+            present = bundle.namelist()
+            wanted = _resolve_include(present, include, archive) if include else (
+                members if members is not None else present)
             for member in wanted:
                 checked(member)
                 check_resolved(destination / member, member)
-            if members is None:
+            if members is None and include is None:
                 bundle.extractall(destination)
             else:
-                for member in members:
+                for member in wanted:
                     bundle.extract(member, destination)
         return
 
     if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.zst", ".tar.xz", ".tar.bz2")):
         with tarfile.open(archive) as bundle:
-            wanted = members if members is not None else [entry.name for entry in bundle.getmembers()]
+            present = [entry.name for entry in bundle.getmembers()]
+            wanted = _resolve_include(present, include, archive) if include else (
+                members if members is not None else present)
             for member in wanted:
                 checked(member)
                 check_resolved(destination / member, member)
-            if members is None:
+            if members is None and include is None:
                 # `data` refuses absolute paths on its own, but the names are
                 # already checked above and leaving it off keeps the behaviour
                 # identical to the named-member path.
                 bundle.extractall(destination)
             else:
-                for member in members:
+                for member in wanted:
                     bundle.extract(member, destination)
         return
 
     if name.endswith(".7z"):
         seven = _seven_zip()
         present = seven_zip_members(archive)
-        wanted = members if members is not None else present
+        wanted = _resolve_include(present, include, archive) if include else (
+            members if members is not None else present)
         for member in wanted:
             checked(member)
             check_resolved(destination / member, member)
@@ -686,12 +698,36 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
                     f"{len(present)} entries, e.g. {present[:3]!r}"
                 )
         command = [seven, "x", "-y", f"-o{destination}", str(archive)]
-        if members:
+        if include:
+            # The include pattern is passed to 7-Zip directly so it does not
+            # have to be expanded into hundreds of member names on the command
+            # line; the members it selects were already checked above.
+            command.append(f"-ir!{include}")
+        elif members:
             command.extend(members)
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
         return
 
     raise SystemExit(f"{archive}: unsupported archive type")
+
+
+def _resolve_include(present: list[str], include: str, archive: Path) -> list[str]:
+    """The members of ``present`` that match a 7-Zip include pattern.
+
+    The pattern is a shell-style glob (``*`` and ``?``), matched against the
+    whole member path, which is what ``-ir!`` does. A pattern that matches
+    nothing is a named error: 7-Zip exits 0 on an unmatched include and unpacks
+    nothing, which would leave the images silently absent.
+    """
+    import fnmatch  # noqa: PLC0415 - only needed for the include path
+
+    matched = [member for member in present if fnmatch.fnmatchcase(member, include)]
+    if not matched:
+        raise SystemExit(
+            f"{archive.name}: include pattern {include!r} matched no member; "
+            f"the archive holds {len(present)} entries, e.g. {present[:3]!r}"
+        )
+    return matched
 
 
 def collect_images(dataset: dict, work: Path) -> list[Path]:
@@ -1387,15 +1423,29 @@ def run(
     archive = cache / dataset["images_archive"]["download"]
     image_root = work / "images"
     if not any(image_root.rglob("*")):
-        extract_archive(archive, image_root)
+        # `extract_include` limits a large multi-flight archive to the one
+        # subfolder the dataset uses. The EuroSDR Phase2 archive is 9.9 GB and
+        # holds three P4 RTK flights plus lidar; the benchmark needs one flight,
+        # so extracting the whole archive would spend the runner's disk on data
+        # it never reads. The pattern is a 7-Zip include (`-ir!<pattern>`), and
+        # the members it selects are still checked by `extract_archive`.
+        include = dataset["images_archive"].get("extract_include")
+        if include:
+            extract_archive(archive, image_root, include=include)
+        else:
+            extract_archive(archive, image_root)
     else:
         print(f"  cached   {image_root}")
 
     # References: one extraction per download, then the named members. Keyed by the
     # cache file name so a single archive that supplies several members (two laser
-    # scans, both GeoTIFFs from one ODM run) is unpacked once.
+    # scans, both GeoTIFFs from one ODM run) is unpacked once. A reference with a
+    # `repo_path` is committed to this repository (our own derived data, e.g. the
+    # EuroSDR observations) and is copied from the checkout, not downloaded.
     by_download: dict[str, list[str]] = {}
     for reference in dataset["reference_files"]:
+        if reference.get("repo_path"):
+            continue
         source = reference.get("from_archive") or reference["download"]
         by_download.setdefault(source, [])
         if reference.get("archive_member"):
@@ -1415,6 +1465,18 @@ def run(
         if target.exists():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
+        repo_path = reference.get("repo_path")
+        if repo_path:
+            # A committed reference: copy it from the checkout. The path is
+            # relative to the repository root, so the run is reproducible from
+            # the commit alone.
+            found = HERE.parent.parent / repo_path
+            if not found.exists():
+                raise SystemExit(
+                    f"{dataset_name}: committed reference {repo_path!r} is missing "
+                    f"from the checkout ({found})")
+            shutil.copy2(found, target)
+            continue
         archive_name = reference.get("from_archive") or reference["download"]
         source_root = work / "reference_raw" / Path(archive_name).stem
         member = reference.get("archive_member")
