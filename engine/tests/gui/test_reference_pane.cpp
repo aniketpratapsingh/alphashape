@@ -319,7 +319,7 @@ TEST_F(ReferencePane, ImportMarkersAndPlaceOnPhotoActions) {
     EXPECT_TRUE(pick->text().contains(QStringLiteral("photo")));
 
     int requested = -1;
-    QObject::connect(&pane(), &ReferencePane::place_on_photo_requested,
+    QObject::connect(&pane(), &alphashape::gui::ReferencePane::place_on_photo_requested,
                      [&requested](qint32 camera_id) { requested = camera_id; });
     pick->trigger();
     EXPECT_EQ(requested, 0);

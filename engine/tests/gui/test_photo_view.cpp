@@ -5,7 +5,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+
+#include <Eigen/Core>
 
 #include <gtest/gtest.h>
 
