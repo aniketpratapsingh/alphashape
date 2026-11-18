@@ -20,6 +20,14 @@ All notable changes to alphashape are recorded here. The format follows
   every cause investigated (lens model, pixel convention, antenna mount, timing,
   fix status, per-photo weighting, block doming, reference frame, marker
   refinement).
+- **Second ground-control dataset surveyed and rejected.** `tools/bench/DATASETS.md`
+  records why the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) cannot
+  serve as a second ground-control block: it publishes 51 check points and 8 GCPs as
+  3-D coordinates but no image observations of the targets, which the leave-one-out
+  protocol requires. The complete file lists of both large archives were read from
+  their 7z headers over HTTP range requests, so the conclusion rests on the full
+  contents rather than a sample. The entry also records the orthometric-height and
+  label-shift traps a future attempt would hit.
 
 ### Changed
 
