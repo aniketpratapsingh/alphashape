@@ -1,0 +1,324 @@
+name: EuroSDR observations
+
+# Measure the EuroSDR RPAS benchmark's GCP image observations ourselves.
+#
+# The publisher (Zenodo 10059050, Wards Hill quarry) ships the surveyed
+# coordinates of 8 GCPs and 51 check points but NOT the pixel observations of
+# their printed targets, which the ground-control protocol needs. This workflow
+# produces them: it aligns the P4 RTK flight with no ground control, projects
+# each surveyed station into every camera that sees it, and snaps the projection
+# onto the circular target with the engine's multi-view marker refinement. The
+# accepted observations are uploaded as an ODM gcp_list plus a JSON summary.
+#
+# This is a MEASUREMENT, not a weekly benchmark: it is dispatched by hand when
+# the observation file needs regenerating (a new engine version, a changed
+# refinement parameter), and its output is committed to the repository as our
+# own derived data. The ordinary `gcp-eurosdr` bench run reads that committed
+# file and never re-measures.
+#
+# The archive is 9.9 GB and the flight is 430 images, so the job frees the
+# runner's preinstalled toolchains first, extracts ONLY the one flight folder,
+# and deletes the archive immediately after extraction. Nothing is committed by
+# this workflow; the artifacts are downloaded and committed by hand.
+#
+#   gh workflow run eurosdr-observations.yml --ref <branch>
+
+on:
+  workflow_dispatch:
+    inputs:
+      keypoint_limit_per_mpx:
+        description: "MatchPhotos keypoint_limit_per_mpx"
+        type: string
+        default: "500"
+      patch_size:
+        description: "RefineMarkers patch_size"
+        type: string
+        default: "25"
+      min_correlation:
+        description: "RefineMarkers min_correlation"
+        type: string
+        default: "0.5"
+      search_steps:
+        description: "RefineMarkers search_steps"
+        type: string
+        default: "10"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One measurement at a time. A second dispatch waits rather than cancelling
+  # the first: the run is hours long and its output is the point.
+  group: eurosdr-observations
+  cancel-in-progress: false
+
+env:
+  # CPU only: the measurement is a matching and alignment job, and a shared
+  # runner's software Vulkan device is slower and would make the run
+  # incomparable with the CPU one.
+  ALPHASHAPE_GPU: "0"
+  ALPHASHAPE_PERF_ASSERTS: "0"
+  OMP_NUM_THREADS: "4"
+  OMP_WAIT_POLICY: passive
+
+jobs:
+  build:
+    name: Build the Python module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Only the Python module is built: the measurement drives the engine
+      # through `alphashape`, not the CLI, and it never touches the GUI or
+      # Vulkan. The configure flags are the ones quality-bench.yml uses for
+      # Linux, minus the CLI.
+      - name: Install build dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake ninja-build ccache
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
+            libpng-dev libtiff-dev pybind11-dev python3-dev
+          attempt-timeout: "240"
+          install-timeout: "420"
+
+      - name: Restore the compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .ccache
+          key: eurosdr-ccache-${{ github.sha }}
+          restore-keys: |
+            eurosdr-ccache-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_BUILD_TESTS=OFF \
+            -DALPHASHAPE_BUILD_PYTHON=ON \
+            -DALPHASHAPE_BUILD_GUI=OFF \
+            -DALPHASHAPE_GPU=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build the module
+        run: cmake --build build --target alphashape_python --parallel 4
+
+      - name: Smoke the module
+        # A module that cannot import would fail the measurement for a reason
+        # that has nothing to do with the data; catch it here.
+        run: |
+          PYTHONPATH="$PWD/build/python" python3 -c \
+            "import alphashape; print('alphashape', alphashape.__file__)"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: eurosdr-python
+          path: build/python/
+          retention-days: 1
+          if-no-files-found: error
+
+  measure:
+    name: Measure the observations
+    needs: build
+    runs-on: ubuntu-24.04
+    # The download (9.9 GB), the extraction, the matching and alignment of 430
+    # images, and the refinement of 59 stations over every camera that sees them
+    # has to fit here. 350 minutes is under the 6 h job ceiling and leaves
+    # headroom over the measured need; a stage that overruns fails on its own
+    # budget rather than the job timeout.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: eurosdr-python
+          path: build/bench/python
+
+      # Free the runner's preinstalled toolchains. The archive is 9.9 GB and the
+      # extracted flight is ~3.7 GB, which does not fit the default ~14 GB free
+      # on an ubuntu-24.04 runner. These directories are the standard large
+      # ones and none is used by this job.
+      - name: Free runner disk
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/az /usr/share/swift || true
+          sudo apt-get clean
+          echo "after:"; df -h /
+
+      - name: Install runtime dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libceres4t64 libproj25 proj-data
+            libtiff6 libjpeg-turbo8 libpng16-16t64 p7zip-full
+          attempt-timeout: "240"
+          install-timeout: "420"
+
+      - name: Install the measurement dependencies
+        # openpyxl reads the xlsx; the rest are the bench's pinned stack. Pinned
+        # exactly, for the same reason the actions are pinned to a commit: the
+        # output is a file that is committed and compared, so a silent
+        # minor-version bump in a reader would move it for no commit.
+        run: |
+          python3 -m pip install --disable-pip-version-check --break-system-packages \
+            -r tools/bench/requirements.txt openpyxl==3.1.5
+
+      - name: Resolve the archive URL and md5
+        id: record
+        # The Zenodo API record lists each file's URL and md5. Reading them from
+        # the record rather than hard-coding them keeps the workflow correct if
+        # the publisher re-uploads, and the md5 is verified below.
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, urllib.request
+          with urllib.request.urlopen(
+                  "https://zenodo.org/api/records/10059050") as response:
+              record = json.load(response)
+          files = {f["key"]: f for f in record["files"]}
+          phase2 = files["Phase2.7z"]
+          xlsx = files["GCPsandCPs_coords.xlsx"]
+          print("phase2_url=" + phase2["links"]["self"])
+          print("phase2_md5=" + phase2["checksum"].split(":", 1)[1])
+          print("phase2_bytes=" + str(phase2["size"]))
+          print("xlsx_url=" + xlsx["links"]["self"])
+          print("xlsx_md5=" + xlsx["checksum"].split(":", 1)[1])
+          PY
+
+      - name: Download and verify the archive
+        env:
+          PHASE2_URL: ${{ steps.record.outputs.phase2_url }}
+          PHASE2_MD5: ${{ steps.record.outputs.phase2_md5 }}
+          PHASE2_BYTES: ${{ steps.record.outputs.phase2_bytes }}
+        run: |
+          mkdir -p build/bench/eurosdr
+          archive="build/bench/eurosdr/Phase2.7z"
+          # A university host, not a CDN: retry a bounded number of times and
+          # resume from the bytes already on disk, exactly as run_bench.py does.
+          for attempt in 1 2 3 4; do
+            curl --fail --location --retry 3 --retry-delay 5 \
+              --continue-at - --output "$archive" "$PHASE2_URL" && break
+            echo "download attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          size=$(stat -c %s "$archive")
+          if [ "$size" != "$PHASE2_BYTES" ]; then
+            echo "::error::archive is $size bytes, expected $PHASE2_BYTES"
+            exit 1
+          fi
+          actual=$(md5sum "$archive" | cut -d' ' -f1)
+          if [ "$actual" != "$PHASE2_MD5" ]; then
+            echo "::error::archive md5 is $actual, expected $PHASE2_MD5"
+            exit 1
+          fi
+          echo "verified $archive ($size bytes, md5 $actual)"
+
+      - name: Download the coordinates
+        env:
+          XLSX_URL: ${{ steps.record.outputs.xlsx_url }}
+          XLSX_MD5: ${{ steps.record.outputs.xlsx_md5 }}
+        run: |
+          xlsx="build/bench/eurosdr/GCPsandCPs_coords.xlsx"
+          curl --fail --location --retry 3 --output "$xlsx" "$XLSX_URL"
+          actual=$(md5sum "$xlsx" | cut -d' ' -f1)
+          if [ "$actual" != "$XLSX_MD5" ]; then
+            echo "::error::xlsx md5 is $actual, expected $XLSX_MD5"
+            exit 1
+          fi
+          echo "verified $xlsx (md5 $actual)"
+
+      - name: Check the archive member paths
+        # The extraction below names one flight folder. 7-Zip exits 0 on an
+        # unmatched name and unpacks nothing, which would leave the images
+        # silently absent; listing first and asserting the count makes that a
+        # named failure instead.
+        run: |
+          archive="build/bench/eurosdr/Phase2.7z"
+          flight="Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004"
+          7z l "$archive" | grep -F "$flight/" | head -5
+          count=$(7z l "$archive" | grep -cF "$flight/" || true)
+          echo "members under $flight: $count"
+          if [ "$count" -lt 400 ]; then
+            echo "::error::expected the P4 RTK flight folder to hold ~430 images, found $count members"
+            exit 1
+          fi
+
+      - name: Extract the P4 RTK flight
+        # Only the one flight folder (430 JPEGs and its Timestamp.MRK). The
+        # archive is deleted immediately after, so the runner never holds both
+        # the archive and the extracted tree for longer than the extraction.
+        run: |
+          archive="build/bench/eurosdr/Phase2.7z"
+          out="build/bench/eurosdr/extracted"
+          mkdir -p "$out"
+          7z x -y "$archive" \
+            "-ir!Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004/*" \
+            "-o$out"
+          images=$(find "$out" -iname '*.JPG' | wc -l)
+          echo "extracted $images images"
+          if [ "$images" -lt 400 ]; then
+            echo "::error::expected ~430 images, extracted $images"
+            exit 1
+          fi
+          rm -f "$archive"
+          echo "deleted the archive; disk now:"; df -h /
+
+      - name: Measure the observations
+        env:
+          ALPHASHAPE_PYTHON_DIR: ${{ github.workspace }}/build/bench/python
+          ALPHASHAPE_PYTHON: python3
+          KEYPOINT_LIMIT: ${{ github.event.inputs.keypoint_limit_per_mpx }}
+          PATCH_SIZE: ${{ github.event.inputs.patch_size }}
+          MIN_CORRELATION: ${{ github.event.inputs.min_correlation }}
+          SEARCH_STEPS: ${{ github.event.inputs.search_steps }}
+        run: |
+          export PYTHONPATH="$ALPHASHAPE_PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
+          images="build/bench/eurosdr/extracted/Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004"
+          python3 tools/bench/eurosdr_observations.py \
+            --images "$images" \
+            --xlsx build/bench/eurosdr/GCPsandCPs_coords.xlsx \
+            --gcp-list build/bench/eurosdr/gcp_list.txt \
+            --summary build/bench/eurosdr/observations.json \
+            --keypoint-limit "${KEYPOINT_LIMIT:-500}" \
+            --patch-size "${PATCH_SIZE:-25}" \
+            --min-correlation "${MIN_CORRELATION:-0.5}" \
+            --search-steps "${SEARCH_STEPS:-10}" 2>&1 | tee build/bench/eurosdr/run.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          summary="build/bench/eurosdr/observations.json"
+          if [ -f "$summary" ]; then
+            python3 - "$summary" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print("## EuroSDR observation measurement\n")
+          print(f"- images: {data.get('images')}")
+          print(f"- cameras aligned: {data.get('cameras_aligned')} / {data.get('cameras_total')}")
+          print(f"- views projected: {data.get('views_projected')}")
+          print(f"- views accepted: {data.get('views_accepted')} "
+                f"({(data.get('acceptance_rate') or 0.0) * 100:.1f}%)")
+          print(f"- GCPs with >= 2 views: {data.get('gcps_with_min_views')} / {data.get('gcps')}")
+          print("\n| station | role | projected | accepted | mean shift px |")
+          print("|---|---|---:|---:|---:|")
+          for point in data.get("points", []):
+              shift = point.get("mean_shift_px")
+              shift_text = f"{shift:.2f}" if shift is not None else "-"
+              print(f"| {point['label']} | {point['role']} | "
+                    f"{point['views_projected']} | {point['views_accepted']} | {shift_text} |")
+          PY
+          fi
+
+      - name: Upload the observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: eurosdr-observations
+          path: |
+            build/bench/eurosdr/gcp_list.txt
+            build/bench/eurosdr/observations.json
+            build/bench/eurosdr/run.log
+          if-no-files-found: warn
+          retention-days: 30
