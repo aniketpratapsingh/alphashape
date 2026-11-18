@@ -508,5 +508,64 @@ std::unique_ptr<AbstractCommand> make_convert_reference_command(
     return std::make_unique<ConvertReferenceCommand>(chunk_id, std::move(target), kind, geoids);
 }
 
+std::vector<std::optional<Eigen::Vector3d>> geodetic_marker_references(
+    const Chunk& chunk, const crs::GeoidStore* geoids) {
+    if (crs_is_geographic(chunk.marker_crs())) {
+        std::vector<std::optional<Eigen::Vector3d>> stored;
+        stored.reserve(chunk.markers().size());
+        for (const Marker& marker : chunk.markers()) {
+            stored.push_back(marker.reference);
+        }
+        return stored;
+    }
+    // A non-finite horizontal position is "no usable reference", which the
+    // geographic path leaves for the caller's finite check to drop; return
+    // nullopt here so both paths behave the same instead of throwing.
+    const Converter converter =
+        build_converter(chunk.marker_crs(), crs::CoordinateSystem::from_epsg(4979), "marker",
+                        geoids);
+    std::vector<std::optional<Eigen::Vector3d>> converted;
+    converted.reserve(chunk.markers().size());
+    for (const Marker& marker : chunk.markers()) {
+        if (marker.reference.has_value() &&
+            (!std::isfinite(marker.reference->x()) || !std::isfinite(marker.reference->y()))) {
+            converted.push_back(std::nullopt);
+            continue;
+        }
+        converted.push_back(convert_point(marker.reference, converter, where(marker)));
+    }
+    return converted;
+}
+
+std::vector<std::optional<Eigen::Vector3d>> geodetic_camera_locations(
+    const Chunk& chunk, const crs::GeoidStore* geoids) {
+    std::vector<std::optional<Eigen::Vector3d>> locations;
+    locations.reserve(chunk.cameras().size());
+    if (crs_is_geographic(chunk.camera_crs())) {
+        for (const Camera& camera : chunk.cameras()) {
+            locations.push_back(camera.reference.location);
+        }
+        return locations;
+    }
+    // Locations only: an orientation that cannot be re-expressed must not block
+    // a caller that reads positions (the adjustment's centre priors, the
+    // georeference fit). The full `convert_reference` still converts both. A
+    // non-finite horizontal position is "no usable reference", returned as
+    // nullopt so both paths behave the same instead of throwing.
+    const Converter converter =
+        build_converter(chunk.camera_crs(), crs::CoordinateSystem::from_epsg(4979), "camera",
+                        geoids);
+    for (const Camera& camera : chunk.cameras()) {
+        const std::optional<Eigen::Vector3d>& value = camera.reference.location;
+        if (value.has_value() &&
+            (!std::isfinite(value->x()) || !std::isfinite(value->y()))) {
+            locations.push_back(std::nullopt);
+            continue;
+        }
+        locations.push_back(convert_point(value, converter, where(camera)));
+    }
+    return locations;
+}
+
 }  // namespace reference
 }  // namespace alphashape

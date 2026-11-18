@@ -787,6 +787,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
+  were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
+  `AlignFromReference` and the alignment georeference now convert a projected
+  reference slot to WGS 84 lon/lat/ellipsoidal height before the adjustment and
+  the similarity fit, instead of interpreting eastings and northings as
+  longitude and latitude or refusing the slot with "not geographic". A survey
+  in GDA2020 / MGA zone 54 (EPSG:7854) now georeferences and adjusts correctly;
+  a geographic slot is unchanged.
 - **`UpdateTransform` ignored the GNSS antenna mount.** It paired each camera
   centre with its antenna reference, so with a lever arm set the datum fit and
   the bundle adjustment disagreed. It now applies the same mount correction as

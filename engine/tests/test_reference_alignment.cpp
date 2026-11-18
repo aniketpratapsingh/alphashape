@@ -31,7 +31,9 @@
 #include "common/commands/model_commands.hpp"
 #include "common/core/document.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/crs/coordinate_system.hpp"
 #include "model/crs/euler.hpp"
+#include "model/crs/transform.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -744,16 +746,53 @@ TEST(ReferenceAlignment, ReusedFrameAppliesSimilarityScale) {
     EXPECT_LE(max_error, 1e-6) << "lever arm must be divided by the similarity scale";
 }
 
-TEST(ReferenceAlignment, RefusesProjectedCameraCrs) {
-    Scene scene = make_scene(4, Eigen::Vector3d(0.2, 0.0, 0.1), true, {});
-    CRS projected;
-    projected.epsg = 32632;  // a projected UTM slot
-    scene.chunk->set_camera_crs(projected);
-    const ChunkPoseState before = capture_chunk_pose_state(*scene.chunk);
-    EXPECT_THROW(run_task_named(scene.document, "AlignFromReference"), ValueError);
-    const ChunkPoseState after = capture_chunk_pose_state(*scene.chunk);
-    EXPECT_EQ(after.transform, before.transform);
-    EXPECT_EQ(after.meta, before.meta);
+// A projected camera slot is converted, not refused: the same cameras with
+// their reference positions re-expressed in UTM zone 32N place at the same
+// truth poses as the geographic slot does.
+//
+// Only the positions are re-expressed here. The stored attitude triple is read
+// by `measured_rotation` in true ENU regardless of the slot, so leaving it in
+// true ENU keeps the fixture's attitude meaning unchanged; the position path is
+// what this test exercises.
+TEST(ReferenceAlignment, ConvertsProjectedCameraCrs) {
+    const Eigen::Vector3d lever(0.2, 0.0, 0.1);
+    Scene geographic = make_scene(4, lever, true, {});
+    Scene projected = make_scene(4, lever, true, {});
+
+    const crs::CoordinateSystem utm32 = crs::CoordinateSystem::from_epsg(32632);
+    const crs::CrsTransform to_utm =
+        crs::CrsTransform::create(crs::CoordinateSystem::from_epsg(4979), utm32);
+    for (Camera& camera : projected.chunk->cameras()) {
+        ASSERT_TRUE(camera.reference.location.has_value());
+        const Eigen::Vector3d& lonlat = *camera.reference.location;
+        const std::optional<crs::CrsPoint> out =
+            to_utm.forward(crs::CrsPoint{lonlat.x(), lonlat.y(), lonlat.z()});
+        ASSERT_TRUE(out.has_value());
+        camera.reference.location = Eigen::Vector3d(out->x, out->y, out->z);
+    }
+    CRS slot;
+    slot.epsg = 32632;
+    projected.chunk->set_camera_crs(slot);
+
+    run_task_named(geographic.document, "AlignFromReference");
+    run_task_named(projected.document, "AlignFromReference");
+
+    ASSERT_NE(projected.chunk->meta().find("align_from_reference.placed"), nullptr);
+    EXPECT_EQ(*projected.chunk->meta().find("align_from_reference.placed"), "4");
+    // The UTM round trip is exact to about 0.1 mm, so the placed poses match
+    // the geographic run to that order. A wrong reading (eastings taken as
+    // degrees) would be off by kilometres, so this still catches the bug.
+    EXPECT_LT((projected.chunk->transform() - geographic.chunk->transform())
+                  .cwiseAbs()
+                  .maxCoeff(),
+              1e-3);
+    for (std::size_t i = 0; i < projected.chunk->cameras().size(); ++i) {
+        EXPECT_LT((projected.chunk->cameras()[i].pose - geographic.chunk->cameras()[i].pose)
+                      .cwiseAbs()
+                      .maxCoeff(),
+                  1e-3)
+            << "camera " << i;
+    }
 }
 
 TEST(ReferenceAlignment, BuiltFrameDisablesUnplacedCameras) {

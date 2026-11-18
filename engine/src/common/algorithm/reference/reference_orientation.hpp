@@ -52,9 +52,15 @@ Eigen::Matrix3d rotation_of_similarity(const Eigen::Matrix3d& matrix);
 /// camera has no reference position and no usable orientation (a position at
 /// least supplies the ENU origin). `camera` must belong to `chunk`; the caller
 /// has already checked that the reference is enabled.
-std::optional<ReferenceRotation> measured_rotation(const Chunk& chunk,
-                                                   const Camera& camera,
-                                                   const Eigen::Matrix4d& internal_to_ecef);
+///
+/// `geodetic_location`, when non-null, is the camera's reference position as
+/// lon/lat/ellipsoidal height -- the value `geodetic_camera_locations` returns
+/// for a projected slot. It is used for the ENU origin instead of
+/// `camera.reference.location`, which is only lon/lat when the camera slot is
+/// geographic. A null pointer keeps the stored value (the geographic case).
+std::optional<ReferenceRotation> measured_rotation(
+    const Chunk& chunk, const Camera& camera, const Eigen::Matrix4d& internal_to_ecef,
+    const Eigen::Vector3d* geodetic_location = nullptr);
 
 /// The effective master sensor's antenna for `camera` (a sensor with a master
 /// resolves its master's mount; the mount is part of the physical body).
