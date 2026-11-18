@@ -51,7 +51,7 @@ class QResizeEvent;
 class QWheelEvent;
 
 namespace alphashape {
-class Camera;
+struct Camera;
 class Chunk;
 class Document;
 }  // namespace alphashape
