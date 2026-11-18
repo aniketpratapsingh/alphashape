@@ -6,11 +6,14 @@
 // Every cell edit is one undoable command (see ReferenceModel). The toolbar
 // opens the existing task dialogs for OptimizeCameras, ImportReference,
 // ExportReference and ConvertReference; the Settings action opens the reference
-// settings dialog. Picking a reference in the viewport is still a placeholder.
+// settings dialog. "Place on photo" opens the camera the Workspace tree has
+// selected (through the shared WorkspaceSelection), falling back to the first
+// camera with a frame when nothing is selected.
 //
 // The pane never reads the document while a job owns it: the models mark
 // themselves stale and rebuild when the job finishes.
 
+#include <cstdint>
 #include <string>
 
 #include <QString>
@@ -26,12 +29,15 @@ class QToolBar;
 namespace alphashape::gui {
 
 class GuiApp;
+class WorkspaceSelection;
 
 class ReferencePane : public QWidget {
     Q_OBJECT
 
 public:
-    explicit ReferencePane(GuiApp& app, QWidget* parent = nullptr);
+    /// `selection` is the shared Workspace selection the tree, the Properties sheet and the
+    /// Photos list publish into; "Place on photo" reads the selected camera from it.
+    ReferencePane(GuiApp& app, WorkspaceSelection& selection, QWidget* parent = nullptr);
 
     ReferenceModel& cameras() { return *camera_model_; }
     ReferenceModel& markers() { return *marker_model_; }
@@ -56,8 +62,12 @@ private:
     void run_task(const std::string& task);
     void update_status();
     void update_actions();
+    /// The camera "Place on photo" should open: the selected camera of the active chunk, else
+    /// the first camera that has a frame, else -1.
+    std::int32_t camera_for_photo() const;
 
     GuiApp& app_;
+    WorkspaceSelection& selection_;
     ReferenceModel* camera_model_ = nullptr;
     ReferenceModel* marker_model_ = nullptr;
     QTableView* camera_view_ = nullptr;

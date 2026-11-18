@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <QAction>
 #include <QColor>
 #include <QContextMenuEvent>
+#include <QFileInfo>
 #include <QFont>
 #include <QFontMetrics>
 #include <QGraphicsItem>
@@ -34,11 +36,13 @@
 #include <QResizeEvent>
 #include <QScrollBar>
 #include <QStyleOptionGraphicsItem>
+#include <QTransform>
 #include <QWheelEvent>
 
 #include "apps/gui/app.hpp"
 #include "apps/gui/job_manager.hpp"
 #include "apps/gui/theme/theme.hpp"
+#include "base/platform/env.hpp"
 #include "common/algorithm/markers/project_markers.hpp"
 #include "common/commands/model_commands.hpp"
 #include "common/core/chunk.hpp"
@@ -55,6 +59,15 @@ namespace {
 /// Longest side of the pixmap kept in memory. A 24 MP frame is downscaled for display; the
 /// scene is scaled back up so every coordinate stays a full-resolution pixel.
 constexpr int kMaxDisplaySide = 2048;
+
+/// Display pixmaps kept for recently opened cameras. Four covers the usual back-and-forth
+/// between a handful of photos without holding a large frame for every camera in the chunk.
+constexpr std::size_t kMaxCachedImages = 4;
+
+/// Zoom limits, in view pixels per scene pixel. The lower bound is relative to the fit scale
+/// (a frame may be zoomed out to an eighth of "fit"); the upper bound is 32x pixel.
+constexpr double kMaxZoom = 32.0;
+constexpr double kMinZoomFactorOfFit = 1.0 / 8.0;
 
 /// Flag colours. Placed (a measured pixel) is green; predicted (projected from the marker's
 /// estimated position) is a muted blue, so a hint never reads as a measurement.
@@ -153,10 +166,10 @@ PhotoView::PhotoView(GuiApp& app, QWidget* parent) : QGraphicsView(parent), app_
     connect(&app_, &GuiApp::undo_changed, this, &PhotoView::refresh);
     connect(&app_, &GuiApp::document_replaced, this, [this]() { reset_view(); });
     // A different active chunk means a different frame for the same camera id, so the image is
-    // reloaded, not just the flags.
+    // reloaded, not just the flags. While a job runs the document is off limits; the reload
+    // happens when the manager goes idle (busy_changed(false) below).
     connect(&app_, &GuiApp::active_chunk_changed, this, [this](qint32) {
         if (app_.jobs().busy()) {
-            stale_ = true;
             return;
         }
         if (camera_id_ >= 0) {
@@ -164,11 +177,14 @@ PhotoView::PhotoView(GuiApp& app, QWidget* parent) : QGraphicsView(parent), app_
         }
     });
     connect(&app_.jobs(), &JobManager::busy_changed, this, [this](bool busy) {
-        if (busy || !stale_) {
+        if (busy) {
             return;
         }
         // A finished job may have changed the frame itself (a calibration, a film transform),
-        // so the image is reloaded rather than only the flags.
+        // so the image is reloaded rather than only the flags. This must not be gated on a
+        // "stale" flag: GuiApp::task_changed_document() emits undo_changed after the queue is
+        // popped, so refresh() already ran with busy() == false and rebuilt the flags. The image
+        // cache makes the reload cheap when the frame is unchanged (a cache hit, no decode).
         if (camera_id_ >= 0) {
             set_camera(camera_id_);
         } else {
@@ -214,6 +230,17 @@ int PhotoView::marker_items_count() const {
     return count;
 }
 
+std::vector<std::pair<std::int32_t, QPointF>> PhotoView::marker_flag_positions() const {
+    std::vector<std::pair<std::int32_t, QPointF>> positions;
+    for (QGraphicsItem* item : scene_->items()) {
+        auto* flag = dynamic_cast<MarkerFlagItem*>(item);
+        if (flag != nullptr) {
+            positions.emplace_back(flag->marker_id(), flag->scenePos());
+        }
+    }
+    return positions;
+}
+
 void PhotoView::update_background() {
     // The image is the subject, so the surround follows the theme's window colour rather than
     // the viewport's canvas choice: a light theme gets a light surround.
@@ -245,6 +272,85 @@ void PhotoView::clear_marker_items() {
     drag_item_ = nullptr;
 }
 
+std::optional<PhotoView::ImageKey> PhotoView::image_key(const Document& document,
+                                                        const Chunk& chunk,
+                                                        const Camera& camera) {
+    const Frame* linked = nullptr;
+    for (const std::shared_ptr<Frame>& frame : chunk.frames()) {
+        if (frame != nullptr && frame->camera_id() == camera.id) {
+            linked = frame.get();
+            break;
+        }
+    }
+    if (linked == nullptr) {
+        return std::nullopt;
+    }
+    ImageKey key;
+    key.camera_id = camera.id;
+    key.chunk_id = chunk.id();
+    // The engine's paths are UTF-8; path_to_utf8 keeps a non-ASCII frame path intact on Windows.
+    key.path = QString::fromStdString(
+        platform::path_to_utf8(resolve_frame_path(document, linked->path())));
+    key.width = linked->width();
+    key.height = linked->height();
+    // The file's modification time catches a frame replaced on disk under the same path.
+    const QFileInfo info(key.path);
+    key.mtime = info.exists() ? info.lastModified().toMSecsSinceEpoch() : -1;
+    // A scanned frame is resampled through the film transform and the sensor's film geometry,
+    // so a calibration that rewrites either must invalidate the cached picture. A broken master
+    // link is not this function's to report: the decode below raises it with the camera's name.
+    try {
+        if (const Sensor* sensor = find_effective_sensor(chunk, camera)) {
+            key.film_enabled = sensor->film.enabled;
+            key.film_resolution = sensor->film.resolution_mm_per_px;
+            key.film_size_x = sensor->film.film_size_mm.x();
+            key.film_size_y = sensor->film.film_size_mm.y();
+        }
+    } catch (const std::exception&) {
+        // Leave the film fields at their defaults; the decode reports the real problem.
+    }
+    if (camera.film_transform.has_value()) {
+        key.has_film_transform = true;
+        const Eigen::Matrix3d& film = *camera.film_transform;
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                key.film_transform[static_cast<std::size_t>(row * 3 + column)] =
+                    film(row, column);
+            }
+        }
+    }
+    return key;
+}
+
+const PhotoView::CachedImage* PhotoView::cached_image(const ImageKey& key) {
+    for (std::size_t i = 0; i < image_cache_.size(); ++i) {
+        if (image_cache_[i].key == key) {
+            // Move the hit to the front: the vector is the LRU order.
+            if (i != 0) {
+                CachedImage hit = std::move(image_cache_[i]);
+                image_cache_.erase(image_cache_.begin() + static_cast<std::ptrdiff_t>(i));
+                image_cache_.insert(image_cache_.begin(), std::move(hit));
+            }
+            return &image_cache_.front();
+        }
+    }
+    return nullptr;
+}
+
+void PhotoView::store_image(ImageKey key, QPixmap pixmap, QSizeF full_size) {
+    for (std::size_t i = 0; i < image_cache_.size(); ++i) {
+        if (image_cache_[i].key == key) {
+            image_cache_.erase(image_cache_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    image_cache_.insert(image_cache_.begin(),
+                        CachedImage{std::move(key), std::move(pixmap), full_size});
+    while (image_cache_.size() > kMaxCachedImages) {
+        image_cache_.pop_back();
+    }
+}
+
 bool PhotoView::load_image() {
     if (image_item_ != nullptr) {
         scene_->removeItem(image_item_);
@@ -262,7 +368,8 @@ bool PhotoView::load_image() {
         show_message(tr("No photo selected"));
         return false;
     }
-    QImage display;
+    QPixmap display;
+    QSizeF full_size;
     QString failure;
     const bool loaded = app_.read_document([&](const Document& document) {
         const Chunk* chunk = document.active_chunk();
@@ -281,6 +388,16 @@ bool PhotoView::load_image() {
             failure = tr("The active chunk has no camera %1").arg(camera_id_);
             return false;
         }
+        // A cache hit skips the decode entirely: re-opening a photo, or refreshing its markers,
+        // does not touch the disk.
+        const std::optional<ImageKey> key = image_key(document, *chunk, *camera);
+        if (key.has_value()) {
+            if (const CachedImage* hit = cached_image(*key)) {
+                display = hit->pixmap;
+                full_size = hit->full_size;
+                return true;
+            }
+        }
         try {
             const Image decoded = load_camera_image(document, *chunk, *camera);
             if (decoded.empty()) {
@@ -298,12 +415,18 @@ bool PhotoView::load_image() {
                 channels == 1 ? QImage::Format_Grayscale8 : QImage::Format_RGB888;
             // QImage does not own the bytes: copy() detaches them before `decoded` dies.
             const QImage framed(decoded.data(), width, height, width * channels, format);
-            image_size_ = QSizeF(static_cast<double>(width), static_cast<double>(height));
-            display = (width > kMaxDisplaySide || height > kMaxDisplaySide)
-                          ? framed.scaled(kMaxDisplaySide, kMaxDisplaySide, Qt::KeepAspectRatio,
-                                          Qt::SmoothTransformation)
-                                .copy()
-                          : framed.copy();
+            full_size = QSizeF(static_cast<double>(width), static_cast<double>(height));
+            const QImage scaled =
+                (width > kMaxDisplaySide || height > kMaxDisplaySide)
+                    ? framed.scaled(kMaxDisplaySide, kMaxDisplaySide, Qt::KeepAspectRatio,
+                                    Qt::SmoothTransformation)
+                          .copy()
+                    : framed.copy();
+            display = QPixmap::fromImage(scaled);
+            ++image_loads_;
+            if (key.has_value()) {
+                store_image(*key, display, full_size);
+            }
             return true;
         } catch (const std::exception& error) {
             failure = QString::fromUtf8(error.what());
@@ -316,11 +439,14 @@ bool PhotoView::load_image() {
         return false;
     }
 
-    image_item_ = scene_->addPixmap(QPixmap::fromImage(display));
+    image_size_ = full_size;
+    image_item_ = scene_->addPixmap(display);
     image_item_->setTransformationMode(Qt::SmoothTransformation);
     // Scene coordinates are full-resolution pixels: the downscaled pixmap is scaled back up.
-    const double scale = image_size_.width() / static_cast<double>(display.width());
-    image_item_->setScale(scale);
+    // The two axes are scaled separately so a portrait or odd-sized frame maps exactly.
+    const double scale_x = image_size_.width() / static_cast<double>(display.width());
+    const double scale_y = image_size_.height() / static_cast<double>(display.height());
+    image_item_->setTransform(QTransform::fromScale(scale_x, scale_y));
     image_item_->setPos(0.0, 0.0);
     image_item_->setZValue(0.0);
     scene_->setSceneRect(0.0, 0.0, image_size_.width(), image_size_.height());
@@ -364,6 +490,9 @@ bool PhotoView::set_camera(std::int32_t camera_id) {
 void PhotoView::reset_view() {
     camera_id_ = -1;
     fit_mode_ = true;
+    // A replaced document may reuse a chunk id and a frame path for different pixels, so the
+    // cache is dropped rather than trusted across the swap.
+    image_cache_.clear();
     clear_marker_items();
     load_image();
 }
@@ -384,10 +513,9 @@ void PhotoView::fit_image() {
 
 void PhotoView::refresh() {
     if (app_.jobs().busy()) {
-        stale_ = true;
+        // The document belongs to the worker; busy_changed(false) rebuilds the flags.
         return;
     }
-    stale_ = false;
     clear_marker_items();
     if (image_item_ == nullptr || camera_id_ < 0) {
         return;
@@ -658,9 +786,36 @@ void PhotoView::wheelEvent(QWheelEvent* event) {
     }
     // AnchorUnderMouse keeps the pixel under the cursor fixed while the scale changes.
     const double factor = std::pow(1.2, steps);
-    scale(factor, factor);
+    // Clamp the resulting scale: never below an eighth of "fit" (so the frame cannot shrink to
+    // a speck) and never above 32 view pixels per image pixel (past that there is nothing to
+    // see). The fit scale is the scale fitInView() would choose for the current viewport.
+    const double current = transform().m11();
+    const double fit = fit_scale();
+    const double minimum = fit > 0.0 ? fit * kMinZoomFactorOfFit : 0.0;
+    // A tiny frame in a large viewport can fit at more than 32x; the ceiling never sits below
+    // the fit scale, so a zoom-in gesture can never zoom out.
+    const double maximum = std::max(kMaxZoom, fit);
+    double target = current * factor;
+    if (minimum > 0.0) {
+        target = std::max(target, minimum);
+    }
+    target = std::min(target, maximum);
+    if (current <= 0.0 || std::abs(target - current) < 1e-9) {
+        event->accept();
+        return;
+    }
+    scale(target / current, target / current);
     fit_mode_ = false;
     event->accept();
+}
+
+double PhotoView::fit_scale() const {
+    if (image_size_.isEmpty() || viewport()->width() <= 0 || viewport()->height() <= 0) {
+        return 0.0;
+    }
+    const double sx = static_cast<double>(viewport()->width()) / image_size_.width();
+    const double sy = static_cast<double>(viewport()->height()) / image_size_.height();
+    return std::min(sx, sy);
 }
 
 void PhotoView::mousePressEvent(QMouseEvent* event) {

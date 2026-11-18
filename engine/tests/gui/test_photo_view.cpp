@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -183,11 +185,51 @@ TEST_F(PhotoViewTest, RemoveProjectionDeletesTheLastOneWithTheMarker) {
     EXPECT_EQ(view().marker_items_count(), 0);
 }
 
-TEST_F(PhotoViewTest, PixelAndSceneCoordinatesAgree) {
+TEST_F(PhotoViewTest, PlacedMarkerFlagSitsOnItsStoredPixel) {
     build_chunk();
     ASSERT_TRUE(view().set_camera(0));
     const QPointF pixel(17.0, 23.0);
-    EXPECT_EQ(view().scene_to_pixel(view().pixel_to_scene(pixel)), pixel);
+    ASSERT_TRUE(view().add_marker_at(pixel));
+    const std::int32_t marker_id = app().document().active_chunk()->markers().front().id;
+
+    // The flag's scene position is the full-resolution pixel the document stores, so a click
+    // at scene (x, y) lands on the marker the engine knows about.
+    const Marker* stored = marker(marker_id);
+    ASSERT_NE(stored, nullptr);
+    ASSERT_EQ(stored->projections.size(), 1U);
+    const std::vector<std::pair<std::int32_t, QPointF>> flags = view().marker_flag_positions();
+    ASSERT_EQ(flags.size(), 1U);
+    EXPECT_EQ(flags.front().first, marker_id);
+    EXPECT_NEAR(flags.front().second.x(), stored->projections.front().pixel.x(), 1e-9);
+    EXPECT_NEAR(flags.front().second.y(), stored->projections.front().pixel.y(), 1e-9);
+    EXPECT_NEAR(flags.front().second.x(), pixel.x(), 1e-9);
+    EXPECT_NEAR(flags.front().second.y(), pixel.y(), 1e-9);
+}
+
+TEST_F(PhotoViewTest, ReopeningTheSameCameraDoesNotDecodeAgain) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const int loads = view().image_loads();
+    ASSERT_EQ(loads, 1);
+
+    // Re-opening the same camera (a finished job, a chunk switch) serves the cached pixmap.
+    ASSERT_TRUE(view().set_camera(0));
+    EXPECT_EQ(view().image_loads(), loads);
+    EXPECT_TRUE(view().has_image());
+}
+
+TEST_F(PhotoViewTest, UndoOfAMarkerAddRebuildsFlagsWithoutReloading) {
+    build_chunk();
+    ASSERT_TRUE(view().set_camera(0));
+    const int loads = view().image_loads();
+    ASSERT_TRUE(view().add_marker_at(QPointF(12.0, 9.0)));
+    EXPECT_EQ(view().marker_items_count(), 1);
+
+    // The undo emits undo_changed, which rebuilds the flags only: the image is not decoded.
+    app().undo();
+    EXPECT_EQ(view().marker_items_count(), 0);
+    EXPECT_EQ(view().image_loads(), loads);
+    EXPECT_TRUE(view().has_image());
 }
 
 TEST_F(PhotoViewTest, UnknownCameraShowsNothing) {

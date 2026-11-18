@@ -307,7 +307,7 @@ void MainWindow::create_docks() {
     workspace_pane_ = new WorkspacePane(app_, *selection_, workspace_dock_);
     properties_pane_ = new PropertiesPane(app_, *selection_, properties_dock_);
 #if defined(ALPHASHAPE_USE_PROJ)
-    reference_pane_ = new ReferencePane(app_, reference_dock_);
+    reference_pane_ = new ReferencePane(app_, *selection_, reference_dock_);
 #endif
     photos_pane_ = new PhotosPane(app_, *selection_, photos_dock_);
     log_pane_ = new LogPane(app_, log_dock_);

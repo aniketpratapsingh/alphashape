@@ -280,8 +280,13 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
         if (!index.isValid()) {
             return;
         }
-        const int camera_id = index.data(PhotosModel::CameraIdRole).toInt();
-        if (camera_id >= 0) {
+        const QVariant value = index.data(PhotosModel::CameraIdRole);
+        if (!value.isValid()) {
+            return;
+        }
+        bool ok = false;
+        const int camera_id = value.toInt(&ok);
+        if (ok && camera_id >= 0) {
             Q_EMIT open_photo_requested(camera_id);
         }
     });

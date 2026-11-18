@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,9 +25,11 @@
 #include "apps/gui/app.hpp"
 #include "apps/gui/reference_model.hpp"
 #include "apps/gui/reference_pane.hpp"
+#include "apps/gui/workspace_model.hpp"
 #include "apps/gui/workspace_pane.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
+#include "common/core/frame.hpp"
 #include "model/crs/coordinate_system.hpp"
 #include "model/crs/transform.hpp"
 #include "harness.hpp"
@@ -325,7 +328,39 @@ TEST_F(ReferencePane, ImportMarkersAndPlaceOnPhotoActions) {
     EXPECT_EQ(requested, 0);
 }
 
-TEST_F(ReferencePane, ThousandRowsWithinBudget) {    build_chunk(1000, 0);
+TEST_F(ReferencePane, PlaceOnPhotoUsesTheSelectedCamera) {
+    Chunk& chunk = build_chunk(3, 0);
+    // Give the middle camera a frame so the "first camera with a frame" fallback is distinct
+    // from the first camera.
+    auto frame = std::make_shared<Frame>("frame.png", 64, 48);
+    frame->set_id(0);
+    frame->set_camera_id(1);
+    chunk.frames().push_back(frame);
+
+    auto* selection =
+        window().findChild<WorkspaceSelection*>(QStringLiteral("selection.workspace"));
+    ASSERT_NE(selection, nullptr);
+    selection->clear();
+
+    QAction* pick = pane().action("action.reference.pick");
+    ASSERT_NE(pick, nullptr);
+    int requested = -1;
+    QObject::connect(&pane(), &alphashape::gui::ReferencePane::place_on_photo_requested,
+                     [&requested](qint32 camera_id) { requested = camera_id; });
+
+    // Nothing selected: the first camera that has a frame (camera 1), not camera 0.
+    pick->trigger();
+    EXPECT_EQ(requested, 1);
+
+    // A camera selected in the shared Workspace selection wins over the fallback.
+    selection->set({NodeRef{NodeKind::Camera, chunk.id(), 2}});
+    requested = -1;
+    pick->trigger();
+    EXPECT_EQ(requested, 2);
+}
+
+TEST_F(ReferencePane, ThousandRowsWithinBudget) {
+    build_chunk(1000, 0);
     ReferenceModel& model = pane().cameras();
     const auto start = std::chrono::steady_clock::now();
     model.refresh();
