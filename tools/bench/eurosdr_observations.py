@@ -53,7 +53,23 @@ import sys
 # The engine's Python module is built into a directory the workflow names; the
 # import is deferred to main() so the pure helpers below can be imported and
 # unit-tested on a machine with no engine build.
-DEFAULT_KEYPOINT_LIMIT_PER_MPX = 500
+#
+# 250 keypoints per megapixel is the density the aerial-nadir and
+# terrestrial-laser datasets use, and it is what fits a 16 GB runner: the
+# gcp-rtk block (176 images) runs at 500, and 430 images at 500 is 2.4x that
+# block's keypoint load, which killed the runner out of memory on the first
+# measurement attempt. 250 halves it, and the strided image subset below halves
+# the image count again, so the block is smaller than gcp-rtk's.
+DEFAULT_KEYPOINT_LIMIT_PER_MPX = 250
+# The flight is 430 images at 20 MP. Matching and aligning all of them is more
+# than a shared runner can hold, and the measurement does not need every frame:
+# it needs each of the 59 targets seen by enough cameras. A stride of 2 keeps
+# every other frame, which on a lawnmower flight leaves ~60% forward overlap
+# within a strip (enough to match) and every strip present (so the whole site,
+# and therefore every target, is still covered). A centroid cluster, which the
+# other datasets use, would cover only the middle of the quarry and miss the
+# edge targets, so a stride is the right selection here.
+DEFAULT_MAX_IMAGES = 215
 # The targets are 300 mm circles with a 100 mm black centre. At a 1-2 cm GSD the
 # outer circle is 15-30 px across, so the search radius that must cover the
 # RTK-only alignment error plus a margin is a few tens of pixels. The projection
@@ -431,6 +447,25 @@ def collect_images(directory):
     return sorted(found)
 
 
+def select_images(images, limit):
+    """A strided subset of ``images`` that keeps the whole site covered.
+
+    The flight is a lawnmower pattern, so taking every ``stride``-th frame keeps
+    every strip (the whole site, and therefore every target) while leaving enough
+    forward overlap within a strip to match. ``stride`` is chosen so the result
+    is at most ``limit`` images: ``ceil(len / limit)``. A stride of 1 (no limit,
+    or a set already small enough) returns every image.
+
+    This is deliberately NOT the centroid cluster the other datasets use: that
+    keeps the middle of the site and drops the edges, which is exactly where
+    several of the 59 targets sit. A stride keeps the spatial extent.
+    """
+    if limit is None or limit <= 0 or len(images) <= limit:
+        return list(images), 1
+    stride = math.ceil(len(images) / limit)
+    return images[::stride], stride
+
+
 def calibration_dict(calibration):
     """A ``Calibration`` proxy as the plain dict :func:`project_point` reads."""
     return {
@@ -617,38 +652,55 @@ def refine_and_collect(chunk, stations, projections, per_point, refine_options,
     return observations, per_point
 
 
+def log(message):
+    """Print a progress line and flush it.
+
+    The measurement runs for hours in CI, and a runner that is killed (out of
+    memory, or the job timeout) loses everything still in the stdout buffer. A
+    flushed line per stage is what makes a killed run diagnosable: the last line
+    says which stage it died in.
+    """
+    print(message, flush=True)
+
+
 def run(args):
     """The whole measurement: align, project, refine, write."""
     import alphashape  # noqa: PLC0415 - needs the built module on PYTHONPATH
 
-    images = collect_images(args.images)
-    if len(images) < 3:
-        raise SystemExit(f"need at least three images under {args.images}, found {len(images)}")
+    available = collect_images(args.images)
+    if len(available) < 3:
+        raise SystemExit(f"need at least three images under {args.images}, found {len(available)}")
+    images, stride = select_images(available, args.max_images)
     stations = read_stations(args.xlsx)
-    print(f"[eurosdr] {len(images)} images, {len(stations)} stations "
-          f"({sum(1 for s in stations if s['role'] == 'gcp')} GCPs)")
+    log(f"[eurosdr] {len(images)} of {len(available)} images (stride {stride}), "
+        f"{len(stations)} stations "
+        f"({sum(1 for s in stations if s['role'] == 'gcp')} GCPs)")
 
+    log("[eurosdr] importing, matching and aligning (no GCPs)")
     document, chunk = align_block(alphashape, images, args.keypoint_limit)
     aligned = sum(1 for camera in chunk.cameras if camera.enabled)
-    print(f"[eurosdr] aligned {aligned} of {len(chunk.cameras)} cameras")
+    log(f"[eurosdr] aligned {aligned} of {len(chunk.cameras)} cameras")
     if aligned < 3:
         raise SystemExit("fewer than three cameras aligned; cannot project the stations")
 
     add_stations(chunk, stations)
     projections, per_point, calibrations, poses = project_stations(chunk, stations)
-    print(f"[eurosdr] projected {sum(len(v) for v in projections.values())} "
-          f"observations over {len(projections)} stations")
+    log(f"[eurosdr] projected {sum(len(v) for v in projections.values())} "
+        f"observations over {len(projections)} stations")
 
     refine_options = {
         "patch_size": args.patch_size,
         "min_correlation": args.min_correlation,
         "search_steps": args.search_steps,
     }
+    log("[eurosdr] refining the projections onto the targets")
     observations, per_point = refine_and_collect(
         chunk, stations, projections, per_point, refine_options,
         calibrations, poses)
     summary = summarise(stations, observations, per_point)
     summary["images"] = len(images)
+    summary["images_available"] = len(available)
+    summary["image_stride"] = stride
     summary["cameras_aligned"] = aligned
     summary["cameras_total"] = len(chunk.cameras)
     summary["keypoint_limit_per_mpx"] = args.keypoint_limit
@@ -657,15 +709,15 @@ def run(args):
     summary["max_shift_target_radii"] = MAX_SHIFT_TARGET_RADII
 
     rows = write_gcp_list(args.gcp_list, stations, observations)
-    print(f"[eurosdr] wrote {rows} observations to {args.gcp_list}")
+    log(f"[eurosdr] wrote {rows} observations to {args.gcp_list}")
     with open(args.summary, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    print(f"[eurosdr] acceptance {summary['views_accepted']}/"
-          f"{summary['views_projected']} "
-          f"({(summary['acceptance_rate'] or 0.0) * 100:.1f}%), "
-          f"{summary['gcps_with_min_views']}/{summary['gcps']} GCPs with "
-          f">= {MIN_VIEWS_PER_POINT} views")
+    log(f"[eurosdr] acceptance {summary['views_accepted']}/"
+        f"{summary['views_projected']} "
+        f"({(summary['acceptance_rate'] or 0.0) * 100:.1f}%), "
+        f"{summary['gcps_with_min_views']}/{summary['gcps']} GCPs with "
+        f">= {MIN_VIEWS_PER_POINT} views")
     return 0
 
 
@@ -682,7 +734,10 @@ def parse_args(argv):
                         help="write the JSON summary here")
     parser.add_argument("--keypoint-limit", type=int,
                         default=DEFAULT_KEYPOINT_LIMIT_PER_MPX,
-                        help="MatchPhotos keypoint_limit_per_mpx (default 500)")
+                        help="MatchPhotos keypoint_limit_per_mpx (default 250)")
+    parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES,
+                        help="cap the images with a stride that keeps the whole "
+                             "site covered (default 215; 0 = every image)")
     parser.add_argument("--patch-size", type=int, default=25,
                         help="RefineMarkers patch_size (default 25)")
     parser.add_argument("--min-correlation", type=float, default=0.5,

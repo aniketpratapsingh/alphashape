@@ -293,6 +293,44 @@ class SummaryTest(unittest.TestCase):
         self.assertAlmostEqual(point["max_shift_px"], 3.0, places=9)
 
 
+class SelectImagesTest(unittest.TestCase):
+    """The strided subset must keep the whole site covered, not just the middle."""
+
+    def test_no_limit_keeps_everything(self):
+        images = [f"img{i:04d}.JPG" for i in range(430)]
+        selected, stride = eo.select_images(images, None)
+        self.assertEqual(selected, images)
+        self.assertEqual(stride, 1)
+
+    def test_a_limit_at_or_above_the_count_keeps_everything(self):
+        images = [f"img{i:04d}.JPG" for i in range(10)]
+        selected, stride = eo.select_images(images, 10)
+        self.assertEqual(selected, images)
+        self.assertEqual(stride, 1)
+
+    def test_a_stride_keeps_the_first_and_last_strips(self):
+        # 430 images, limit 215 -> stride 2, so every other frame. The first and
+        # last frames are kept, which is what keeps the site's extent.
+        images = [f"img{i:04d}.JPG" for i in range(430)]
+        selected, stride = eo.select_images(images, 215)
+        self.assertEqual(stride, 2)
+        self.assertEqual(len(selected), 215)
+        self.assertEqual(selected[0], images[0])
+        self.assertEqual(selected[-1], images[-2])
+
+    def test_the_stride_is_the_ceiling_of_the_ratio(self):
+        images = [f"img{i:04d}.JPG" for i in range(430)]
+        selected, stride = eo.select_images(images, 100)
+        self.assertEqual(stride, 5)  # ceil(430 / 100) = 5
+        self.assertLessEqual(len(selected), 100)
+
+    def test_a_zero_limit_keeps_everything(self):
+        images = [f"img{i:04d}.JPG" for i in range(10)]
+        selected, stride = eo.select_images(images, 0)
+        self.assertEqual(selected, images)
+        self.assertEqual(stride, 1)
+
+
 class XlsxReaderTest(unittest.TestCase):
     """The xlsx reader must take the ETRS89 ellipsoidal block, not OSGB36/ODN."""
 

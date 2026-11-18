@@ -39,7 +39,11 @@ on:
       keypoint_limit_per_mpx:
         description: "MatchPhotos keypoint_limit_per_mpx"
         type: string
-        default: "500"
+        default: "250"
+      max_images:
+        description: "Cap the images with a stride that keeps the whole site covered (0 = all 430)"
+        type: string
+        default: "215"
       patch_size:
         description: "RefineMarkers patch_size"
         type: string
@@ -285,18 +289,22 @@ jobs:
           ALPHASHAPE_PYTHON_DIR: ${{ github.workspace }}/build/bench/python
           ALPHASHAPE_PYTHON: python3
           KEYPOINT_LIMIT: ${{ github.event.inputs.keypoint_limit_per_mpx }}
+          MAX_IMAGES: ${{ github.event.inputs.max_images }}
           PATCH_SIZE: ${{ github.event.inputs.patch_size }}
           MIN_CORRELATION: ${{ github.event.inputs.min_correlation }}
           SEARCH_STEPS: ${{ github.event.inputs.search_steps }}
         run: |
           export PYTHONPATH="$ALPHASHAPE_PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
           images="build/bench/eurosdr/extracted/Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004"
+          # `tee` keeps the log on disk for the artifact, and the script flushes
+          # a line per stage so a killed run still says where it died.
           python3 tools/bench/eurosdr_observations.py \
             --images "$images" \
             --xlsx build/bench/eurosdr/GCPsandCPs_coords.xlsx \
             --gcp-list build/bench/eurosdr/gcp_list.txt \
             --summary build/bench/eurosdr/observations.json \
-            --keypoint-limit "${KEYPOINT_LIMIT:-500}" \
+            --keypoint-limit "${KEYPOINT_LIMIT:-250}" \
+            --max-images "${MAX_IMAGES:-215}" \
             --patch-size "${PATCH_SIZE:-25}" \
             --min-correlation "${MIN_CORRELATION:-0.5}" \
             --search-steps "${SEARCH_STEPS:-10}" 2>&1 | tee build/bench/eurosdr/run.log
