@@ -62,10 +62,13 @@ class ManifestTest(unittest.TestCase):
                 self.assertEqual(cache_name, Path(cache_name).name, (name, cache_name))
 
     def test_a_reference_without_a_url_is_served_by_another_download(self):
-        # Every reference either downloads its own archive or names one that does.
+        # Every reference either downloads its own archive, names one that does,
+        # or is committed to the repository (repo_path, our own derived data).
         for name, dataset in run_bench.load_manifest()["datasets"].items():
             downloaded = {cache for cache, _ in run_bench.downloads_for(dataset)}
             for reference in dataset["reference_files"]:
+                if reference.get("repo_path"):
+                    continue
                 if reference.get("url"):
                     self.assertIn(reference["download"], downloaded, (name, reference["path"]))
                 else:
