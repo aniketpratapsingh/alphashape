@@ -265,6 +265,60 @@ class GcpListTest(unittest.TestCase):
         self.assertEqual(lines[2].split()[5], "100_0004_0003")
 
 
+class GcpNamesTest(unittest.TestCase):
+    """The survey CSV must carry the labels and ellipsoidal heights the
+    protocol matches the gcp_list against."""
+
+    def stations(self):
+        return [
+            {"label": "GA1", "lat": 55.263526429, "lon": -1.874199729,
+             "height": 211.0931, "role": "gcp"},
+            {"label": "A2", "lat": 55.263009727, "lon": -1.879550263,
+             "height": 228.9753, "role": "check_point"},
+        ]
+
+    def test_header_is_the_publisher_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gcp_names.csv"
+            eo.write_gcp_names(path, self.stations())
+            lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            lines[0], "Name;Easting;Northing;Elevation;Longitude;Latitude")
+
+    def test_one_row_per_station_with_the_ellipsoidal_height(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gcp_names.csv"
+            rows = eo.write_gcp_names(path, self.stations())
+            lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(rows, 2)
+        fields = lines[1].split(";")
+        self.assertEqual(fields[0], "GA1")
+        self.assertAlmostEqual(float(fields[3]), 211.0931, places=4)
+        self.assertAlmostEqual(float(fields[4]), -1.874199729, places=9)
+        self.assertAlmostEqual(float(fields[5]), 55.263526429, places=9)
+
+    def test_the_protocol_parser_reads_it_back(self):
+        # The CSV must round-trip through the protocol's own parser, so a
+        # format drift is caught here rather than in a multi-hour bench run.
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))),
+            "engine", "tests"))
+        try:
+            import run_gcp_validation as rgv  # noqa: PLC0415
+        except ImportError:  # pragma: no cover - engine tree always present
+            self.skipTest("run_gcp_validation is not importable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gcp_names.csv"
+            eo.write_gcp_names(path, self.stations())
+            columns, rows = rgv.parse_gcp_names_csv(path)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["name"], "GA1")
+        self.assertAlmostEqual(rows[0]["elevation"], 211.0931, places=4)
+        self.assertAlmostEqual(rows[0]["longitude"], -1.874199729, places=9)
+        self.assertAlmostEqual(rows[0]["latitude"], 55.263526429, places=9)
+
+
 class SummaryTest(unittest.TestCase):
     """The summary must count views and acceptance the way the report reads it."""
 

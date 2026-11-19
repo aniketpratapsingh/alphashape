@@ -401,6 +401,27 @@ def accept_observation(detect_shift_px, target_radius_px, residual_px=None,
     return True
 
 
+def write_gcp_names(path, stations):
+    """Write the survey CSV the ground-control protocol matches labels against.
+
+    The protocol (``engine/tests/run_gcp_validation.py``) reads a
+    ``Name;Easting;Northing;Elevation;Longitude;Latitude`` CSV and matches each
+    gcp_list point to the nearest CSV row by lon/lat, so the CSV is the
+    authoritative label source. It is generated from the same xlsx the
+    observations come from, so the two files cannot disagree. Easting/Northing
+    are left empty (the protocol reads only Name, Longitude, Latitude and
+    Elevation); the elevation is the ETRS89 ellipsoidal height, the same value
+    the gcp_list carries, so ``z_consistency`` reports a zero offset.
+    """
+    lines = ["Name;Easting;Northing;Elevation;Longitude;Latitude"]
+    for station in stations:
+        lines.append("{};;;{!r};{!r};{!r}".format(
+            station["label"], station["height"], station["lon"], station["lat"]))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return len(lines) - 1
+
+
 def write_gcp_list(path, stations, observations):
     """Write the accepted observations as an ODM ``gcp_list.txt``.
 
@@ -916,6 +937,16 @@ def run(args):
 
     rows = write_gcp_list(args.gcp_list, stations, observations)
     log(f"[eurosdr] wrote {rows} observations to {args.gcp_list}")
+    # The ground-control protocol does leave-one-out over EVERY point in the
+    # gcp_list, so a 59-station list would be 59 folds. The bench block is the
+    # eight GCPs (8 folds, the same shape as gcp-rtk's 5), so a GCP-only list is
+    # written alongside the full one. The full list is the complete derived data
+    # (all 59 stations); the GCP-only list is what the weekly bench reads.
+    gcp_stations = [station for station in stations if station["role"] == "gcp"]
+    gcp_rows = write_gcp_list(args.gcp_list_gcps, gcp_stations, observations)
+    log(f"[eurosdr] wrote {gcp_rows} GCP observations to {args.gcp_list_gcps}")
+    names_rows = write_gcp_names(args.gcp_names, stations)
+    log(f"[eurosdr] wrote {names_rows} survey names to {args.gcp_names}")
     with open(args.summary, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -936,6 +967,13 @@ def parse_args(argv):
                         help="GCPsandCPs_coords.xlsx from the Zenodo record")
     parser.add_argument("--gcp-list", required=True,
                         help="write the accepted observations here (ODM gcp_list.txt)")
+    parser.add_argument("--gcp-list-gcps", required=True,
+                        help="write the GCP-only observations here (the 8 GCPs; "
+                             "the bench protocol folds over every point, so this "
+                             "is the list the weekly run reads)")
+    parser.add_argument("--gcp-names", required=True,
+                        help="write the survey Name;...;Longitude;Latitude CSV "
+                             "the protocol matches labels against")
     parser.add_argument("--summary", required=True,
                         help="write the JSON summary here")
     parser.add_argument("--keypoint-limit", type=int,

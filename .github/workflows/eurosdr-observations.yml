@@ -327,6 +327,8 @@ jobs:
             --images "$images" \
             --xlsx build/bench/eurosdr/GCPsandCPs_coords.xlsx \
             --gcp-list build/bench/eurosdr/gcp_list.txt \
+            --gcp-list-gcps build/bench/eurosdr/gcp_list_gcps.txt \
+            --gcp-names build/bench/eurosdr/gcp_names.csv \
             --summary build/bench/eurosdr/observations.json \
             --keypoint-limit "${KEYPOINT_LIMIT:-250}" \
             --max-images "${MAX_IMAGES:-0}" \
@@ -371,6 +373,8 @@ jobs:
           name: eurosdr-observations
           path: |
             build/bench/eurosdr/gcp_list.txt
+            build/bench/eurosdr/gcp_list_gcps.txt
+            build/bench/eurosdr/gcp_names.csv
             build/bench/eurosdr/observations.json
             build/bench/eurosdr/run.log
           if-no-files-found: warn
