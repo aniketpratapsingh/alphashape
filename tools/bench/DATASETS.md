@@ -292,22 +292,32 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   marker file or observation table — the complete file lists of both large archives
   were read from their 7z headers over HTTP range requests (no multi-GB download) and
   contain imagery, PPK/RINEX/event-mark logs, lidar and dataset-information PDFs only.
-  The targets are 300 mm circular photogrammetric targets with a 100 mm black centre,
-  which the engine's non-coded circular detector and multi-view refinement can locate.
-  The measurement workflow (`.github/workflows/eurosdr-observations.yml`, driving
-  `tools/bench/eurosdr_observations.py`) does exactly that:
+  The targets are 300 mm circular Perspex disks with a 100 mm black centre (white for
+  check points, yellow for GCPs), mounted on stakes 0.15–0.45 m above ground (Mills
+  et al. 2023, §2.1.2). The P4 RTK flew at 55 m AGL with an 8.8 mm lens and 2.41 µm
+  pixels, so the GSD is ~1.5 cm: the black centre is only ~3.3 px radius and the disk
+  ~10 px. The measurement workflow (`.github/workflows/eurosdr-observations.yml`,
+  driving `tools/bench/eurosdr_observations.py`) does exactly that:
   1. import the 430 P4 RTK images with their DJI RTK XMP positions and accuracies, then
-     `MatchPhotos` (`keypoint_limit_per_mpx=500`, reference preselection) and
+     `MatchPhotos` (`keypoint_limit_per_mpx=250`, reference preselection) and
      `AlignCameras` with **no** GCPs;
   2. read the xlsx with openpyxl and add all 59 stations as markers in EPSG:4979
      (ETRS89 geodetic, ellipsoidal height);
-  3. project each point into every aligned camera that sees it, then run `RefineMarkers`
-     to snap each projection onto the circular target centre;
-  4. keep only refinements that pass the detector's acceptance and have a sane residual,
-     and write the accepted observations as an ODM `gcp_list.txt` plus a JSON summary.
+  3. project each point into every aligned camera that sees it, then run `DetectMarkers`
+     (non-coded `Circular`, full resolution, 2 px floor) to FIND the printed target near
+     each projection, and `RefineMarkers` to snap the detected centre onto the printed
+     centre with multi-view consensus;
+  4. keep only detections within the search radius of the projection (the RTK-only
+     georeference is ~16 px off, so the search radius, not one target radius, is the
+     "right target" gate) and, where the refinement triangulated the marker, a small
+     reprojection residual; write the accepted observations as an ODM `gcp_list.txt`
+     plus a JSON summary.
   The accepted `gcp_list` is committed under `tools/bench/data/eurosdr/` as our own
   derived data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR), so the
-  weekly `gcp-eurosdr` run reads it from the repository and never re-measures.
+  weekly `gcp-eurosdr` run reads it from the repository and never re-measures. The
+  committed file is the GCP-only list (the eight GCPs): the protocol does leave-one-out
+  over every point in the list, so a 59-station list would be 59 folds, while the eight
+  GCPs give eight folds — the same shape as `gcp-rtk`'s five.
 - A label trap worth recording: the `Phase3` text file's GCP labels are shifted by one
   against the xlsx. `Phase3` `GA1` is the xlsx `GA5`, `GA5` is `GA8`, and so on, with
   `Phase3` `GF8` matching no xlsx row within 9 m. The coordinates are identical to the
@@ -316,8 +326,12 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   file (it is the one the paper describes), and the measurement script reads labels
   from the xlsx only.
 - The smallest usable photogrammetric flight (P4 RTK `100_0004`, 430 images) is larger
-  than the current ground-control block (176 images), so the manifest caps the weekly
-  run at a spatial subset and records why.
+  than the current ground-control block (176 images). The `gcp-rtk` block (176 images,
+  5 folds) takes ~3 h of protocol time on a shared runner, so 430 images with 8 folds
+  would run past the 330-minute job ceiling. The manifest therefore caps the weekly
+  `gcp-eurosdr` run with `max_images`, selecting the nearest-to-centroid cluster the
+  pipeline datasets use (a contiguous block with the overlap the alignment needs) and
+  recording the choice and the selected file names in the report.
 
 ## Adding a dataset
 
