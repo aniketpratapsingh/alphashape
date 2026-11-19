@@ -774,6 +774,28 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     positions_before = {}
     for marker in chunk.markers:
         positions_before[marker.label] = marker.position
+    # DetectMarkers attached EVERY detection to its marker, so a station seen by
+    # ~95 cameras carries ~95 projections. RefineMarkers holds every view of a
+    # marker in memory at once, so refining all of them is the 11 GB peak the
+    # first run hit. Remove the projections that are not among the selected
+    # observers BEFORE refining, so the refiner only ever holds `max_views`
+    # views per marker. The removed detections are still reported in the summary
+    # (they were found, just not refined), and the selected ones are re-set to
+    # their detected pixel so the refiner starts from the measured centre.
+    for station in stations:
+        label = station["label"]
+        keep = {view["camera"] for view in refine_views.get(label, [])}
+        # Snapshot the camera labels first: each removal executes a command that
+        # reallocates the marker's projection vector, so a MarkerProjection ref
+        # taken before the loop would dangle.
+        drop = []
+        for marker in chunk.markers:
+            if marker.label == label:
+                drop = [projection.camera.label for projection in marker.projections
+                        if projection.camera.label not in keep]
+                break
+        for camera_label in drop:
+            chunk.removeMarkerProjection(label, camera_label)
     for station in stations:
         label = station["label"]
         for projection in refine_views.get(label, []):
