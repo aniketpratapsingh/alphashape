@@ -812,6 +812,34 @@ def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], di
     }
 
 
+def _stride_subset(images: list[Path], limit: int) -> tuple[list[Path], dict]:
+    """Every ``stride``-th image, keeping the whole site covered.
+
+    A lawnmower flight is a set of parallel strips; taking every ``stride``-th
+    frame keeps every strip (and therefore every control point, including the
+    ones at the site's edges) while leaving enough forward overlap within a
+    strip to match. ``stride`` is ``ceil(len / limit)``. This is the right
+    selection when the control points span the site: the nearest-to-centroid
+    cluster keeps the middle and drops the edges, which is exactly where several
+    of the EuroSDR GCPs sit.
+    """
+    if limit <= 0 or len(images) <= limit:
+        return images, {
+            "requested": limit,
+            "selected": len(images),
+            "mode": "all",
+            "images": [path.name for path in images],
+        }
+    stride = math.ceil(len(images) / limit)
+    selected = images[::stride]
+    return selected, {
+        "requested": limit,
+        "selected": len(selected),
+        "mode": f"stride {stride}",
+        "images": [path.name for path in selected],
+    }
+
+
 def np_median(values: list[float]) -> float:
     """Median of a list of floats, without pulling numpy in for one number."""
     ordered = sorted(values)
@@ -1684,13 +1712,23 @@ def run_gcp_validation(
     images_dir = available[0].parent
     # `max_images` caps the block for a dataset whose full flight does not fit
     # the weekly budget. The protocol reads a flat directory, so the subset is
-    # exposed as a directory of symlinks to the selected frames: the selection
-    # is the same nearest-to-centroid cluster the pipeline datasets use, and the
+    # exposed as a directory of symlinks to the selected frames, and the
     # protocol's own image list is then exactly that subset. A dataset with no
     # cap (gcp-rtk) keeps the whole directory, unchanged.
+    #
+    # `max_images_mode` picks the selection. "cluster" (the default) is the
+    # nearest-to-centroid block the pipeline datasets use: a contiguous
+    # neighbourhood with the overlap the alignment needs. "stride" takes every
+    # n-th frame, which keeps the whole site covered — the right choice when the
+    # control points span the site, because a centroid cluster would drop the
+    # edge points and leave the block under-constrained at its margins.
     limit = dataset.get("max_images")
     if limit:
-        selected, selection = select_subset(available, limit)
+        mode = dataset.get("max_images_mode", "cluster")
+        if mode == "stride":
+            selected, selection = _stride_subset(available, limit)
+        else:
+            selected, selection = select_subset(available, limit)
         if selection["mode"] != "all":
             subset_dir = work / "images_subset"
             subset_dir.mkdir(parents=True, exist_ok=True)

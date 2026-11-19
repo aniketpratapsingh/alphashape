@@ -175,6 +175,51 @@ class SubsetTest(unittest.TestCase):
         self.assertAlmostEqual(run_bench._dms((11.0, 40.0, 7.5477)), 11.0 + 40.0 / 60 + 7.5477 / 3600)
 
 
+class StrideSubsetTest(unittest.TestCase):
+    """A stride keeps the whole site, which a centroid cluster does not."""
+
+    def _images(self, tmp: Path, count: int) -> list[Path]:
+        paths = []
+        for index in range(count):
+            path = tmp / f"IMG_{index:04d}.JPG"
+            path.write_bytes(b"x")
+            paths.append(path)
+        return paths
+
+    def test_no_limit_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 10)
+            selected, info = run_bench._stride_subset(images, 0)
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(info["mode"], "all")
+
+    def test_a_stride_keeps_the_first_and_last_strips(self):
+        # The whole site is covered: the first frame survives and the selection
+        # reaches the end of the flight, which a centroid cluster would not.
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 430)
+            selected, info = run_bench._stride_subset(images, 100)
+            self.assertEqual(selected[0], images[0])
+            # The last selected frame is within one stride of the end.
+            self.assertGreaterEqual(images.index(selected[-1]), len(images) - 5)
+            self.assertLessEqual(len(selected), 100)
+            self.assertIn("stride", info["mode"])
+
+    def test_the_stride_is_the_ceiling_of_the_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 430)
+            selected, info = run_bench._stride_subset(images, 100)
+            self.assertEqual(info["mode"], "stride 5")  # ceil(430 / 100) = 5
+            self.assertEqual(len(selected), 86)  # 430 / 5 rounded up
+
+    def test_the_selection_names_every_image_it_chose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 20)
+            selected, info = run_bench._stride_subset(images, 7)
+            self.assertEqual(info["images"], [path.name for path in selected])
+            self.assertEqual(info["selected"], len(selected))
+
+
 class MedianTest(unittest.TestCase):
     def test_odd_count(self):
         self.assertEqual(run_bench.np_median([3.0, 1.0, 2.0]), 2.0)
