@@ -436,6 +436,120 @@ class DefaultsTest(unittest.TestCase):
         # radius must cover several sigma of that, not one target radius.
         self.assertGreaterEqual(eo.DEFAULT_SEARCH_RADIUS_PX, 40.0)
 
+    def test_the_block_is_bundle_adjusted_before_projecting(self):
+        # AlignCameras georeferences with ONE global similarity, and on this
+        # flight that fit keeps only 6 of 430 cameras inside its inlier
+        # threshold: the block drifts, the projections land tens of pixels off
+        # the targets, and the multi-view consensus fails. The bundle adjustment
+        # with the camera GNSS priors is what removes the drift, so it must be
+        # on by default.
+        self.assertTrue(eo.DEFAULT_OPTIMIZE)
+
+
+class AlignBlockTest(unittest.TestCase):
+    """The alignment runs the bundle adjustment before any station exists."""
+
+    def _fake_alphashape(self, calls):
+        class FakeChunk:
+            def __init__(self):
+                self.crs_epsg = None
+                self.cameras = []
+
+            def optimizeCameras(self, **kwargs):
+                calls.append(("optimizeCameras", kwargs))
+
+        class FakeDocument:
+            def __init__(self):
+                self.active_chunk = None
+
+            def add_chunk(self, name):
+                chunk = FakeChunk()
+                self.active_chunk = chunk
+                return chunk
+
+            def run_task(self, name, **kwargs):
+                calls.append((name, kwargs))
+
+        class FakeModule:
+            Document = FakeDocument
+
+        return FakeModule()
+
+    def test_the_bundle_adjustment_runs_after_alignment(self):
+        calls = []
+        eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
+        names = [name for name, _ in calls]
+        self.assertIn("AlignCameras", names)
+        self.assertIn("optimizeCameras", names)
+        self.assertGreater(names.index("optimizeCameras"),
+                           names.index("AlignCameras"))
+
+    def test_no_station_is_added_before_the_bundle_adjustment(self):
+        # The measurement must not let the surveyed control influence the
+        # alignment that is used to project it: the bundle adjustment runs on a
+        # chunk with no markers at all.
+        calls = []
+        eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
+        self.assertNotIn("addMarker", [name for name, _ in calls])
+
+    def test_optimize_can_be_switched_off(self):
+        calls = []
+        eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250,
+                       optimize=False)
+        self.assertNotIn("optimizeCameras", [name for name, _ in calls])
+
+
+class CameraReferenceStatsTest(unittest.TestCase):
+    """The summary must say whether the cameras carry the RTK solution."""
+
+    class _Camera:
+        def __init__(self, enabled=True, reference=True, flag=50, accuracy=(0.02, 0.02, 0.04)):
+            self.enabled = enabled
+            self.reference = (0.0, 0.0, 0.0) if reference else None
+            self.reference_rtk_flag = flag
+            self.reference_accuracy = accuracy
+
+    class _Chunk:
+        def __init__(self, cameras):
+            self.cameras = cameras
+
+    def test_counts_fixed_and_float_solutions(self):
+        chunk = self._Chunk([
+            self._Camera(flag=50),
+            self._Camera(flag=34),
+            self._Camera(flag=0),
+        ])
+        stats = eo.camera_reference_stats(chunk)
+        self.assertEqual(stats["cameras"], 3)
+        self.assertEqual(stats["with_reference"], 3)
+        self.assertEqual(stats["rtk_fixed"], 2)
+
+    def test_a_disabled_camera_is_not_counted(self):
+        chunk = self._Chunk([self._Camera(), self._Camera(enabled=False)])
+        stats = eo.camera_reference_stats(chunk)
+        self.assertEqual(stats["cameras"], 1)
+        self.assertEqual(stats["with_reference"], 1)
+
+    def test_a_camera_without_a_reference_is_not_counted(self):
+        chunk = self._Chunk([self._Camera(), self._Camera(reference=False)])
+        stats = eo.camera_reference_stats(chunk)
+        self.assertEqual(stats["with_reference"], 1)
+
+    def test_the_median_horizontal_accuracy_is_reported(self):
+        # The horizontal sigma is hypot(x, y): 0.014, 0.042, 0.071 -> 0.042.
+        chunk = self._Chunk([
+            self._Camera(accuracy=(0.01, 0.01, 0.02)),
+            self._Camera(accuracy=(0.03, 0.03, 0.06)),
+            self._Camera(accuracy=(0.05, 0.05, 0.10)),
+        ])
+        stats = eo.camera_reference_stats(chunk)
+        self.assertEqual(stats["median_horizontal_m"], "0.042")
+
+    def test_no_accuracy_reports_a_dash(self):
+        chunk = self._Chunk([self._Camera(accuracy=None)])
+        stats = eo.camera_reference_stats(chunk)
+        self.assertEqual(stats["median_horizontal_m"], "-")
+
 
 class SelectRefineViewsTest(unittest.TestCase):
     """Each marker is refined against its closest observers, not all of them."""

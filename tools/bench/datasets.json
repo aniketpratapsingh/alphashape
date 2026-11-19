@@ -204,7 +204,7 @@
       "images_archive": {
         "download": "Phase2.7z",
         "url": "https://zenodo.org/api/records/10059050/files/Phase2.7z/content",
-        "sha256": "PLACEHOLDER_PHASE2_SHA256",
+        "sha256": "8f321443ce33b45155742c12f2baa8c008c57bb08de1577d291528a17d795c4a",
         "bytes": 9904885993,
         "extract_include": "Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004/*",
         "extract_glob": "Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004/*.JPG"

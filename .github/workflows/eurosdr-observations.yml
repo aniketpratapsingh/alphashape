@@ -40,6 +40,10 @@ on:
         description: "MatchPhotos keypoint_limit_per_mpx"
         type: string
         default: "250"
+      optimize:
+        description: "Run OptimizeCameras with the camera GNSS priors after AlignCameras (1 = on)"
+        type: string
+        default: "1"
       max_images:
         description: "Cap the images with a stride (0 = all 430; a stride breaks the flight's overlap)"
         type: string
@@ -55,7 +59,7 @@ on:
       search_radius_px:
         description: "DetectMarkers maximum_residual: how far from the projection a target may be found"
         type: string
-        default: "40"
+        default: "60"
       minimum_target_px:
         description: "DetectMarkers minimum_size: smallest target radius in pixels"
         type: string
@@ -309,6 +313,7 @@ jobs:
           ALPHASHAPE_PYTHON_DIR: ${{ github.workspace }}/build/bench/python
           ALPHASHAPE_PYTHON: python3
           KEYPOINT_LIMIT: ${{ github.event.inputs.keypoint_limit_per_mpx }}
+          OPTIMIZE: ${{ github.event.inputs.optimize }}
           MAX_IMAGES: ${{ github.event.inputs.max_images }}
           MAX_VIEWS: ${{ github.event.inputs.max_views }}
           TARGET_TYPE: ${{ github.event.inputs.target_type }}
@@ -321,6 +326,13 @@ jobs:
         run: |
           export PYTHONPATH="$ALPHASHAPE_PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
           images="build/bench/eurosdr/extracted/Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004"
+          # The bundle adjustment is on unless the dispatch asks for the raw
+          # AlignCameras georeference; build the flag as an array so an empty
+          # value is simply absent rather than an empty argument.
+          optimize=()
+          if [ "${OPTIMIZE:-1}" = "0" ]; then
+            optimize=(--no-optimize)
+          fi
           # `tee` keeps the log on disk for the artifact, and the script flushes
           # a line per stage so a killed run still says where it died.
           python3 tools/bench/eurosdr_observations.py \
@@ -331,10 +343,11 @@ jobs:
             --gcp-names build/bench/eurosdr/gcp_names.csv \
             --summary build/bench/eurosdr/observations.json \
             --keypoint-limit "${KEYPOINT_LIMIT:-250}" \
+            "${optimize[@]}" \
             --max-images "${MAX_IMAGES:-0}" \
             --max-views "${MAX_VIEWS:-16}" \
             --target-type "${TARGET_TYPE:-Circular}" \
-            --search-radius-px "${SEARCH_RADIUS_PX:-40}" \
+            --search-radius-px "${SEARCH_RADIUS_PX:-60}" \
             --minimum-target-px "${MINIMUM_TARGET_PX:-2}" \
             --marker-downscale "${MARKER_DOWNSCALE:-1}" \
             --patch-size "${PATCH_SIZE:-25}" \

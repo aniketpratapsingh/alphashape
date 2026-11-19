@@ -78,6 +78,19 @@ DEFAULT_MAX_IMAGES = 0
 # so the most pixels on the target) bounds one marker's working set to about
 # 16 x 80 MB = 1.3 GB, under the cache budget.
 MAX_VIEWS_PER_MARKER = 16
+# A bundle adjustment with the camera GNSS priors runs after AlignCameras and
+# before any station is added. AlignCameras georeferences the block with ONE
+# global similarity fitted to the camera centres, and on this flight that fit
+# keeps only 6 of 430 cameras inside its 0.5 m inlier threshold: the block has
+# the metre-scale drift a 430-frame lawnmower flight accumulates, which a single
+# similarity cannot absorb. The projections then land 20-40 px (0.3-0.6 m) off
+# the targets, beyond the refiner's reach, and the multi-view consensus fails.
+# OptimizeCameras re-solves the poses against the tie points WITH each camera's
+# own RTK position as a prior, which removes the drift camera by camera. It runs
+# with no markers in the chunk, so no surveyed station can influence the
+# alignment that is used to project them: the measurement stays independent of
+# the control it is measuring.
+DEFAULT_OPTIMIZE = True
 # The targets are plain 300 mm circles with a 100 mm black centre, not coded
 # rings, so the non-coded "Circular" detector is the right one. A coded target
 # would need a ring word the publisher never printed.
@@ -566,12 +579,21 @@ def calibration_dict(calibration):
     }
 
 
-def align_block(alphashape, images, keypoint_limit_per_mpx):
+def align_block(alphashape, images, keypoint_limit_per_mpx, optimize=True):
     """Import, match and align the block with no ground control.
 
     Returns ``(document, chunk)``. The chunk is georeferenced by the camera RTK
     positions alone, which is the point: the GCPs must not influence the
     alignment that is used to project them.
+
+    ``optimize`` runs a bundle adjustment with the camera GNSS priors after
+    ``AlignCameras``. The similarity fit that georeferences the block keeps only
+    a handful of cameras inside its inlier threshold on this flight (the block
+    drifts over 430 frames), so the projections land tens of pixels off the
+    targets. The bundle adjustment re-solves every pose against the tie points
+    with each camera's own RTK position as a prior, which removes the drift
+    camera by camera. It runs BEFORE any station is added, so the surveyed
+    control cannot influence the alignment that is used to project it.
     """
     document = alphashape.Document()
     chunk = document.add_chunk("EuroSDR P4 RTK block")
@@ -584,6 +606,10 @@ def align_block(alphashape, images, keypoint_limit_per_mpx):
                       keypoint_limit_per_mpx=keypoint_limit_per_mpx,
                       reference_preselection=True)
     document.run_task("AlignCameras")
+    if optimize:
+        # No markers exist yet, so `use_gcps` is moot; the camera references are
+        # the only priors and they are what the block is georeferenced by.
+        chunk.optimizeCameras()
     return document, chunk
 
 
@@ -906,6 +932,49 @@ def log(message):
     print(message, flush=True)
 
 
+def camera_reference_stats(chunk):
+    """Summarise the camera references the alignment was weighted by.
+
+    A run that refines nothing is usually a georeference problem, and the first
+    question is whether the cameras actually carry the RTK solution the flight
+    recorded. This reports how many enabled cameras have a reference, how many
+    of those are RTK-fixed (RtkFlag 50) or float (34), and the median horizontal
+    1-sigma. A block whose references are consumer-GNSS (10 m) or whose fix
+    status is single-point cannot be georeferenced to the centimetre the targets
+    need, and this is the number that says so.
+    """
+    cameras = [camera for camera in chunk.cameras if camera.enabled]
+    with_reference = 0
+    rtk_fixed = 0
+    horizontal = []
+    for camera in cameras:
+        if camera.reference is None:
+            continue
+        with_reference += 1
+        flag = camera.reference_rtk_flag
+        if flag in (34, 50):
+            rtk_fixed += 1
+        accuracy = camera.reference_accuracy
+        if accuracy is not None:
+            h = math.hypot(accuracy[0], accuracy[1])
+            if math.isfinite(h) and h > 0.0:
+                horizontal.append(h)
+    median = "-"
+    if horizontal:
+        horizontal.sort()
+        middle = len(horizontal) // 2
+        if len(horizontal) % 2:
+            median = f"{horizontal[middle]:.3f}"
+        else:
+            median = f"{0.5 * (horizontal[middle - 1] + horizontal[middle]):.3f}"
+    return {
+        "cameras": len(cameras),
+        "with_reference": with_reference,
+        "rtk_fixed": rtk_fixed,
+        "median_horizontal_m": median,
+    }
+
+
 def run(args):
     """The whole measurement: align, project, refine, write."""
     import alphashape  # noqa: PLC0415 - needs the built module on PYTHONPATH
@@ -920,11 +989,17 @@ def run(args):
         f"({sum(1 for s in stations if s['role'] == 'gcp')} GCPs)")
 
     log("[eurosdr] importing, matching and aligning (no GCPs)")
-    document, chunk = align_block(alphashape, images, args.keypoint_limit)
+    document, chunk = align_block(alphashape, images, args.keypoint_limit,
+                                  optimize=args.optimize)
     aligned = sum(1 for camera in chunk.cameras if camera.enabled)
     log(f"[eurosdr] aligned {aligned} of {len(chunk.cameras)} cameras")
     if aligned < 3:
         raise SystemExit("fewer than three cameras aligned; cannot project the stations")
+    reference_stats = camera_reference_stats(chunk)
+    log(f"[eurosdr] camera references: {reference_stats['with_reference']} of "
+        f"{reference_stats['cameras']} enabled, "
+        f"{reference_stats['rtk_fixed']} RTK-fixed, "
+        f"median horizontal accuracy {reference_stats['median_horizontal_m']} m")
 
     add_stations(chunk, stations)
     projections, per_point, calibrations, poses = project_stations(chunk, stations)
@@ -972,6 +1047,8 @@ def run(args):
     summary["cameras_aligned"] = aligned
     summary["cameras_total"] = len(chunk.cameras)
     summary["keypoint_limit_per_mpx"] = args.keypoint_limit
+    summary["optimize_cameras"] = args.optimize
+    summary["camera_references"] = reference_stats
     summary["detect_options"] = detect_options
     summary["refine_options"] = refine_options
     summary["max_views_per_marker"] = args.max_views
@@ -1030,6 +1107,14 @@ def parse_args(argv):
     parser.add_argument("--keypoint-limit", type=int,
                         default=DEFAULT_KEYPOINT_LIMIT_PER_MPX,
                         help="MatchPhotos keypoint_limit_per_mpx (default 250)")
+    parser.add_argument("--optimize", dest="optimize", action="store_true",
+                        default=DEFAULT_OPTIMIZE,
+                        help="run OptimizeCameras with the camera GNSS priors "
+                             "after AlignCameras (default on: the block drifts "
+                             "and a single similarity cannot absorb it)")
+    parser.add_argument("--no-optimize", dest="optimize", action="store_false",
+                        help="skip the bundle adjustment (the raw AlignCameras "
+                             "georeference; kept for comparison)")
     parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES,
                         help="cap the images with a stride that keeps the whole "
                              "site covered (default 0 = every image)")
