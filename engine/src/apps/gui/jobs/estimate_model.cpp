@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "common/algorithm/feature/detect_features_task.hpp"
+
 namespace alphashape::gui::estimates {
 namespace {
 
@@ -15,6 +17,11 @@ double product_megapixels(const WorkItem& work) {
 }
 
 constexpr double kModelReferenceVoxels = 128.0 * 128.0 * 128.0;
+
+/// One image's detection working set (the engine's own per-pixel figure).
+double scale_space_bytes(double megapixels) {
+    return megapixels * 1.0e6 * kDetectionBytesPerPixel;
+}
 
 // 2^64 as a double. The largest double below it still converts to a valid
 // uint64; anything at or above saturates instead of being undefined.
@@ -139,6 +146,9 @@ ColdEstimate cold_estimate(ColdTask task, const WorkItem& raw) {
     work.product_pixels = non_negative(raw.product_pixels);
     work.texels = non_negative(raw.texels);
     work.detect_cameras = non_negative(raw.detect_cameras);
+    work.detect_concurrency = non_negative(raw.detect_concurrency);
+    work.keypoints = non_negative(raw.keypoints);
+    work.pairs = non_negative(raw.pairs);
 
     const ColdCoefficients co = cold_coefficients(task);
     const double input_mpx = work.cameras * work.megapixels;
@@ -190,19 +200,41 @@ ColdEstimate cold_estimate(ColdTask task, const WorkItem& raw) {
             out.output_bytes = saturating_bytes(input_mpx * 1.0e6 * 6.0);
             out.peak_ram_bytes = saturating_bytes(input_mpx * 1.0e6 * 48.0);
             break;
-        case ColdTask::Features:
+        case ColdTask::Features: {
+            // Every image of the block is detected, a few at a time: the peak
+            // is the scale spaces in flight plus the keypoint sets so far.
+            const double store = work.cameras * work.keypoints * kKeypointBytes;
+            const double in_flight = std::min(work.cameras, std::max(1.0, work.detect_concurrency));
+            const double detect =
+                work.cameras > 0.0 ? in_flight * scale_space_bytes(work.megapixels) : 0.0;
             out.seconds = co.a + co.b * input_mpx;
-            out.output_bytes = saturating_bytes(input_mpx * 144000.0);  // ~2000 keypoints/Mpx at 72 B
-            out.peak_ram_bytes = saturating_bytes(input_mpx * 1.0e6 * 24.0);
+            out.output_bytes = saturating_bytes(store);
+            out.peak_ram_bytes = saturating_bytes(kTaskBaseBytes + store + detect);
             break;
-        case ColdTask::MatchPhotos:
+        }
+        case ColdTask::MatchPhotos: {
             // Matching covers every camera; detection only the ones that have
             // no keypoint set yet (work.detect_cameras, 0 when all are done).
             out.seconds = co.a + co.b * input_mpx +
                           kFeatureDetectionSecondsPerCameraMpx * detect_mpx;
-            out.output_bytes = saturating_bytes(input_mpx * 288000.0);
-            out.peak_ram_bytes = saturating_bytes(input_mpx * 1.0e6 * 24.0);
+            // Existing keypoint sets are held twice (the chunk's and the run's
+            // working copy); new ones only in the copy until the commit.
+            const double reused = std::max(0.0, work.cameras - work.detect_cameras);
+            const double sets = work.cameras * work.keypoints * kKeypointBytes;
+            const double store = sets + reused * work.keypoints * kKeypointBytes;
+            const double in_flight =
+                std::min(work.detect_cameras, std::max(1.0, work.detect_concurrency));
+            const double detect =
+                work.detect_cameras > 0.0 ? in_flight * scale_space_bytes(work.megapixels) : 0.0;
+            const double matches = work.pairs * work.keypoints * kPairMatchFraction * kMatchBytes;
+            // Track building visits each matched (camera, keypoint) once.
+            const double tracks = work.cameras * work.keypoints * kTrackNodeBytes;
+            out.output_bytes = saturating_bytes(sets + matches);
+            // Detection ends before matching starts, so the two do not add up.
+            out.peak_ram_bytes =
+                saturating_bytes(kTaskBaseBytes + store + std::max(detect, matches + tracks));
             break;
+        }
         case ColdTask::Generic:
             out.seconds = co.a + co.b * input_mpx;
             out.output_bytes = saturating_bytes(input_mpx * 288000.0);

@@ -20,6 +20,21 @@ All notable changes to alphashape are recorded here. The format follows
   every cause investigated (lens model, pixel convention, antenna mount, timing,
   fix status, per-photo weighting, block doming, reference frame, marker
   refinement).
+- **Independent reference on the same block.** `engine/docs/m13-validation.md`
+  records the same five leave-one-out folds run through OpenDroneMap 3.6.2
+  (OpenSfM) by `.github/workflows/odm-reference.yml` and
+  `tools/bench/odm_reference.py`: 9.3-9.9 cm horizontal and 46-50 cm vertical
+  check RMS, with the triangulation validated against ODM's own control points
+  to 0.14 cm horizontal. Only numbers are published; the GPL-3.0 dataset is
+  downloaded and measured, never redistributed.
+- **Second ground-control dataset surveyed and rejected.** `tools/bench/DATASETS.md`
+  records why the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) cannot
+  serve as a second ground-control block: it publishes 51 check points and 8 GCPs as
+  3-D coordinates but no image observations of the targets, which the leave-one-out
+  protocol requires. The complete file lists of both large archives were read from
+  their 7z headers over HTTP range requests, so the conclusion rests on the full
+  contents rather than a sample. The entry also records the orthometric-height and
+  label-shift traps a future attempt would hit.
 
 ### Changed
 
@@ -30,14 +45,22 @@ All notable changes to alphashape are recorded here. The format follows
   with control points. The previous gate variant, `camera_rtk_gcps`, pins the
   plain lens model and is still computed and reported as the pinned plain-lens
   reference. The 5 cm horizontal threshold is unchanged.
-
+- **Feature detection fits the machine's memory.** DetectFeatures and the
+  detection stage of MatchPhotos work on fewer images at once when one scale
+  space per thread would not fit half the task memory budget (about three 20 MP
+  photographs at a time on a 16 GB machine). Results are unchanged; only the
+  schedule is. The decoded colour image is also released before the scale space
+  is built.
+- **Realistic RAM estimate for Match Photos and Detect Features.** The job
+  dialog used to charge every pixel of the block at once (a 169-photo, 20 MP
+  block showed ~75 GB). It now counts what the stages hold: the scale spaces
+  being detected, the keypoint sets, the matches and the track tables.
 - **The coordinate-system picker searches every EPSG system.** Typing in the
   search field now looks through all current EPSG geographic, geocentric and
   projected systems in the PROJ database by code, name or area (for example
   `7854` or `mga zone 54` finds GDA2020 / MGA zone 54), instead of only the 48
   curated systems. The curated list is still what shows while the field is
   empty. New engine call: `crs::crs_catalog()`.
-
 - **OptimizeCameras selects the adaptive lens model automatically on a block
   with ground control.** `adaptive_fitting_auto` now defaults to true: when the
   chunk has at least one control point (a referenced marker that is not a check

@@ -1,0 +1,173 @@
+name: MatchPhotos memory profile
+
+# Peak resident memory of MatchPhotos and AlignCameras, stage by stage, on the
+# gcp-rtk block (176 images at 20 MP), at two keypoint densities and two thread
+# counts. The numbers calibrate the job dialog's RAM estimate and show which
+# stage has to shrink for the default density to fit a 16 GB machine. It is a
+# measurement, not a gate, so it never runs on a schedule or on main. Only
+# numbers are uploaded; the dataset is download-and-measure only.
+#
+#   gh workflow run match-profile.yml --ref <branch>
+#
+# A push that changes this workflow or its script on a branch other than main
+# also runs it: a dispatch needs the file on the default branch first.
+
+on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - ".github/workflows/match-profile.yml"
+      - "tools/bench/match_profile.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: match-profile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build CLI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      cache-key: ${{ steps.key.outputs.cache-key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve the download cache key
+        id: key
+        run: |
+          # The quality bench caches the same verified archive under this key.
+          key=$(python3 tools/bench/run_bench.py --manifest-hash)
+          echo "cache-key=bench-data-$key-gcp-rtk" >> "$GITHUB_OUTPUT"
+
+      # The same Linux build as quality-bench.yml, CLI only.
+      - name: Install build dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake ninja-build ccache
+            libeigen3-dev libceres-dev libproj-dev proj-data zlib1g-dev libjpeg-dev
+            libpng-dev libtiff-dev pybind11-dev python3-dev
+          attempt-timeout: "240"
+          install-timeout: "420"
+
+      - name: Restore the compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .ccache
+          key: bench-ccache-${{ github.sha }}
+          restore-keys: |
+            bench-ccache-
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DALPHASHAPE_BUILD_TESTS=OFF \
+            -DALPHASHAPE_BUILD_PYTHON=OFF \
+            -DALPHASHAPE_BUILD_GUI=OFF \
+            -DALPHASHAPE_GPU=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build the CLI
+        run: cmake --build build --target alphashape-cli --parallel 4
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: profile-cli
+          path: build/src/apps/cli/alphashape-cli
+          retention-days: 1
+          if-no-files-found: error
+
+  profile:
+    name: kp/mpx ${{ matrix.kp }}, threads ${{ matrix.threads || 'all' }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        kp: [250, 1000]
+        threads: ["1", ""]
+        # One thread at 1000 keypoints per megapixel runs past the 330-minute
+        # job limit (two runs, both stopped). The single-thread memory per
+        # image is already measured at 250, and 1000 is measured on all threads.
+        exclude:
+          - kp: 1000
+            threads: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: profile-cli
+          path: build/profile/bin
+
+      - name: Install runtime dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libceres4t64 libproj25 proj-data
+            libtiff6 libjpeg-turbo8 libpng16-16t64
+          attempt-timeout: "240"
+          install-timeout: "420"
+
+      - name: Install the helper dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --break-system-packages \
+            -r tools/bench/requirements.txt
+
+      - name: Restore the bench's download cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build/bench/cache
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Profile
+        env:
+          KP: ${{ matrix.kp }}
+          THREADS: ${{ matrix.threads }}
+        run: |
+          export ALPHASHAPE_CLI="$PWD/build/profile/bin/alphashape-cli"
+          chmod +x "$ALPHASHAPE_CLI"
+          if [ -n "$THREADS" ]; then export OMP_NUM_THREADS="$THREADS"; fi
+          free -m
+          mkdir -p build/profile/result
+          python3 tools/bench/match_profile.py run --dataset gcp-rtk \
+            --work build/profile --cache build/bench/cache --kp "$KP" \
+            --out "build/profile/result/profile-kp$KP-t${THREADS:-all}.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: profile-kp${{ matrix.kp }}-t${{ matrix.threads || 'all' }}
+          path: build/profile/result/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summary:
+    name: Summary
+    needs: profile
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: profile-kp*
+          path: build/profile/results
+          merge-multiple: true
+      - name: Summarize
+        run: |
+          shopt -s nullglob
+          results=(build/profile/results/profile-*.json)
+          if [ "${#results[@]}" -eq 0 ]; then
+            echo "::error::no profile produced a result"
+            exit 1
+          fi
+          python3 tools/bench/match_profile.py summarize --out-md build/profile/summary.md "${results[@]}"
+          cat build/profile/summary.md >> "$GITHUB_STEP_SUMMARY"

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -19,6 +20,7 @@
 #include "apps/gui/jobs/estimate.hpp"
 #include "apps/gui/task_dialog.hpp"
 #include "apps/gui/jobs/estimate_model.hpp"
+#include "common/algorithm/feature/detect_features_task.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/frame.hpp"
 #include "common/tasks/registry.hpp"
@@ -315,5 +317,94 @@ TEST(Estimates, MatchPhotosOnlyDetectsCamerasWithoutKeypoints) {
     const Estimate matching_only = estimate_task(
         builtin_registry(), "MatchPhotos", params, chunk, ThroughputHistory{});
     EXPECT_LT(matching_only.seconds, with_detection.seconds);
+}
+
+namespace {
+
+/// Sets ALPHASHAPE_MEMORY_BUDGET_MB for one scope, restoring it afterwards.
+class ScopedBudget {
+public:
+    explicit ScopedBudget(const char* megabytes) {
+        const char* previous = std::getenv(kName);
+        had_ = previous != nullptr;
+        saved_ = had_ ? previous : "";
+        set(megabytes);
+    }
+    ~ScopedBudget() {
+        if (had_) {
+            set(saved_.c_str());
+        } else {
+#if defined(_WIN32)
+            _putenv_s(kName, "");
+#else
+            unsetenv(kName);
+#endif
+        }
+    }
+    ScopedBudget(const ScopedBudget&) = delete;
+    ScopedBudget& operator=(const ScopedBudget&) = delete;
+
+private:
+    static void set(const char* value) {
+#if defined(_WIN32)
+        _putenv_s(kName, value);
+#else
+        setenv(kName, value, 1);
+#endif
+    }
+    static constexpr const char* kName = "ALPHASHAPE_MEMORY_BUDGET_MB";
+    bool had_ = false;
+    std::string saved_;
+};
+
+Chunk make_photo_chunk(int cameras, int width, int height) {
+    Chunk chunk = make_chunk(cameras, width, height);
+    for (int i = 0; i < cameras; ++i) {
+        auto frame = std::make_shared<Frame>("image" + std::to_string(i) + ".jpg", width, height);
+        frame->set_camera_id(i);
+        chunk.frames().push_back(frame);
+    }
+    return chunk;
+}
+
+}  // namespace
+
+// 169 photographs of 20 MP once asked for ~75 GB: the old rule charged every
+// pixel of the block at once. The engine detects a few images at a time and
+// keeps keypoints, not pixels, so a 16 GB machine is not warned off.
+TEST(Estimates, MatchPhotosAtDefaultsFitsA16GbMachine) {
+    const ScopedBudget budget("9830");  // 60 % of 16 GiB, the engine's task budget
+    const Chunk chunk = make_photo_chunk(169, 5472, 3648);
+    const Params params = make_params(builtin_registry().require("MatchPhotos"));
+    const Estimate estimate = estimate_task(
+        builtin_registry(), "MatchPhotos", params, chunk, ThroughputHistory{});
+    const std::uint64_t budget_bytes = estimate_memory_budget();
+    ASSERT_EQ(budget_bytes, 9830ULL * 1024ULL * 1024ULL);
+    EXPECT_FALSE(needs_ram_warning(estimate, budget_bytes))
+        << "peak " << estimate.peak_ram_bytes;
+    // At least one 20 MP scale space is in flight during detection.
+    EXPECT_GT(static_cast<double>(estimate.peak_ram_bytes),
+              5472.0 * 3648.0 * kDetectionBytesPerPixel);
+}
+
+TEST(Estimates, FeatureMemoryFollowsTheKeypointLimit) {
+    const ScopedBudget budget("9830");
+    Chunk chunk = make_photo_chunk(169, 5472, 3648);
+    for (int i = 0; i < 169; ++i) {
+        KeypointSet set;
+        set.camera_id = i;
+        chunk.tie_points().keypoint_sets.push_back(set);
+    }
+    Params dense = make_params(builtin_registry().require("MatchPhotos"));
+    Params sparse = dense;
+    sparse.set("keypoint_limit_per_mpx", std::int64_t{250});
+    const Estimate dense_estimate = estimate_task(
+        builtin_registry(), "MatchPhotos", dense, chunk, ThroughputHistory{});
+    const Estimate sparse_estimate = estimate_task(
+        builtin_registry(), "MatchPhotos", sparse, chunk, ThroughputHistory{});
+    // Matching only (every camera has keypoints): memory is keypoints and
+    // matches, so a quarter of the density needs clearly less.
+    EXPECT_LT(sparse_estimate.peak_ram_bytes, dense_estimate.peak_ram_bytes);
+    EXPECT_LT(dense_estimate.peak_ram_bytes, 4ULL * 1000ULL * 1000ULL * 1000ULL);
 }
 

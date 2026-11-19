@@ -21,7 +21,9 @@
 //
 // Peak memory follows the spec's rules (SP 4.8): 96 MB per working megapixel
 // of depth maps, eight bytes per voxel for meshing, and twice the product
-// bytes for DEM/ortho. Disk is the product bytes times 1.15.
+// bytes for DEM/ortho. Disk is the product bytes times 1.15. The feature
+// stages are modelled on what they hold: one scale space per image being
+// detected at once, the keypoint sets, and the matches and track tables.
 //
 // No Qt types here: this header is also usable from the headless estimator
 // tests and from a future job.db replacement.
@@ -110,7 +112,28 @@ struct WorkItem {
     /// MatchPhotos only: cameras with no keypoint set yet, which still have to
     /// run detection (the rest go straight to matching).
     double detect_cameras = 0.0;
+    /// DetectFeatures / MatchPhotos: images detected at once, as the engine
+    /// chooses it (detection_concurrency). 0 is read as 1.
+    double detect_concurrency = 0.0;
+    /// DetectFeatures / MatchPhotos: keypoints kept per camera after the
+    /// keypoint limits.
+    double keypoints = 0.0;
+    /// MatchPhotos: camera pairs the preselection hands to the matcher.
+    double pairs = 0.0;
 };
+
+/// Memory of the feature stages, from the structures the engine keeps.
+/// A keypoint is a 16 B position/scale/angle plus a 63 B descriptor.
+inline constexpr double kKeypointBytes = 79.0;
+/// Inlier matches kept per pair, as a fraction of one image's keypoints.
+inline constexpr double kPairMatchFraction = 0.25;
+/// One stored match: two 32-bit keypoint indices.
+inline constexpr double kMatchBytes = 8.0;
+/// Track building: per observation node, the union-find hash entry, parent
+/// and size, the node table entry and the component lists, rounded up.
+inline constexpr double kTrackNodeBytes = 128.0;
+/// The process before the task allocates: code, the document, the libraries.
+inline constexpr double kTaskBaseBytes = 256.0e6;
 
 /// Detector coefficient shared by Features and MatchPhotos' detect term:
 /// 0.35 s for 4 single-image runs of 480x360 = 0.1728 Mpx is

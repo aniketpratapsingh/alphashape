@@ -1332,13 +1332,13 @@ class MatchParamsTest(unittest.TestCase):
         merged = run_bench.merge_match_params(dataset, {"keypoint_limit_per_mpx": "1000"})
         self.assertEqual(merged["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], "1000")
         # The manifest itself is untouched: it is shared by every run in the job.
-        self.assertEqual(dataset["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], 250)
+        self.assertEqual(dataset["param_overrides"]["MatchPhotos"]["keypoint_limit_per_mpx"], 500)
 
     def test_other_keys_keep_the_manifest_cap(self):
         dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
         merged = run_bench.merge_match_params(dataset, {"tiepoint_limit": "8000"})
         self.assertEqual(merged["param_overrides"]["MatchPhotos"],
-                         {"keypoint_limit_per_mpx": 250, "tiepoint_limit": "8000"})
+                         {"keypoint_limit_per_mpx": 500, "tiepoint_limit": "8000"})
 
     def test_no_parameters_returns_the_dataset_unchanged(self):
         dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]

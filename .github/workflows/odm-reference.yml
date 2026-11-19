@@ -1,0 +1,211 @@
+name: ODM reference
+
+# Runs the gcp-rtk leave-one-out folds through OpenDroneMap, so the engine's
+# ground-control numbers (quality-bench.yml, dataset gcp-rtk) can be read
+# against an independent tool on the same photographs and the same survey.
+# It is a reference measurement, not a gate, and it costs about five
+# runner-hours, so it never runs on a schedule or on main. Only numbers are uploaded; no image, survey file or ODM
+# product is published (the dataset is GPL-3.0, download-and-measure only).
+#
+#   gh workflow run odm-reference.yml --ref <branch>
+#
+# A push that changes this workflow or its script on a branch other than main
+# also runs it, with the defaults: a dispatch needs the file on the default
+# branch first, and the change has to be proven before it gets there.
+#
+# Modes:
+#   gcp_only  ODM's default with a GCP file: the camera GPS chooses image pairs
+#             and seeds the alignment, the bundle adjustment uses the GCPs only.
+#   gcp_gps   --force-gps: the camera RTK positions are adjusted together with
+#             the GCPs, at the accuracy ODM reads from the images.
+#   gcp_strong  gcp_only, then OpenSfM's reconstruction re-run with the GCPs
+#             weighted as a survey: ODM's defaults give all GCP terms together
+#             1% of the weight of the tie points (gcp_global_weight 0.01) and a
+#             10 cm vertical sd, which deliberately lets the block override the
+#             survey. This mode asks what OpenSfM does when it may not.
+
+on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - ".github/workflows/odm-reference.yml"
+      - "tools/bench/odm_reference.py"
+  workflow_dispatch:
+    inputs:
+      odm_version:
+        description: "opendronemap/odm image tag (x.y.z)"
+        type: string
+        default: "3.6.2"
+      feature_quality:
+        description: "ODM --feature-quality"
+        type: choice
+        default: high
+        options:
+          - high
+          - ultra
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odm-reference-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      cache-key: ${{ steps.plan.outputs.cache-key }}
+      image: ${{ steps.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Resolve the image and the download cache key
+        id: plan
+        env:
+          ODM_VERSION: ${{ inputs.odm_version || '3.6.2' }}
+        run: |
+          # A dispatch input is untrusted text; only a plain version reaches docker.
+          if ! printf '%s' "$ODM_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::odm_version must look like 3.6.2, got '$ODM_VERSION'"
+            exit 1
+          fi
+          echo "image=opendronemap/odm:$ODM_VERSION" >> "$GITHUB_OUTPUT"
+          # The quality bench caches the same verified archive under this key.
+          key=$(python3 tools/bench/run_bench.py --manifest-hash)
+          echo "cache-key=bench-data-$key-gcp-rtk" >> "$GITHUB_OUTPUT"
+
+  fold:
+    name: ODM ${{ matrix.mode }} fold ${{ matrix.fold }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [gcp_only, gcp_gps, gcp_strong]
+        fold: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Free disk space
+        # The archive, the extracted photographs, the ODM image and its working
+        # files together exceed the runner's free space.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install the helper dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --break-system-packages \
+            -r tools/bench/requirements.txt
+
+      - name: Restore the bench's download cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build/bench/cache
+          key: ${{ needs.plan.outputs.cache-key }}
+
+      - name: Fetch and lay out the project
+        run: python3 tools/bench/odm_reference.py fetch --work build/odm --cache build/bench/cache
+
+      - name: Write the fold
+        env:
+          FOLD: ${{ matrix.fold }}
+        run: |
+          python3 tools/bench/odm_reference.py fold \
+            --gcp-list build/odm/gcp_list_full.txt --fold "$FOLD" \
+            --out-list build/odm/project/gcp_list.txt --out-holdout build/odm/holdout.json
+
+      - name: Run OpenDroneMap to the end of OpenSfM
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          MODE: ${{ matrix.mode }}
+          FEATURE_QUALITY: ${{ inputs.feature_quality || 'high' }}
+        run: |
+          extra=()
+          if [ "$MODE" = "gcp_gps" ]; then extra+=(--force-gps); fi
+          docker pull "$IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | tee build/odm/image-digest.txt
+          docker run --rm -v "$PWD/build/odm:/datasets" "$IMAGE" \
+            --project-path /datasets project \
+            --gcp /datasets/project/gcp_list.txt \
+            --feature-quality "$FEATURE_QUALITY" \
+            --end-with opensfm \
+            "${extra[@]}" 2>&1 | tee build/odm/odm.log
+          test "${PIPESTATUS[0]}" -eq 0
+          df -h /
+
+      - name: Re-adjust with survey-weighted GCPs
+        if: matrix.mode == 'gcp_strong'
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: |
+          docker run --rm --entrypoint bash -v "$PWD/build/odm:/datasets" "$IMAGE" -c '
+            set -e
+            cd /datasets/project/opensfm
+            printf "\ngcp_global_weight: 1.0\ngcp_horizontal_sd: 0.02\ngcp_vertical_sd: 0.02\n" >> config.yaml
+            /code/SuperBuild/install/bin/opensfm/bin/opensfm reconstruct /datasets/project/opensfm
+          ' 2>&1 | tail -n 100 | tee build/odm/opensfm-strong.log
+
+      - name: Measure the held-out point
+        env:
+          MODE: ${{ matrix.mode }}
+          FOLD: ${{ matrix.fold }}
+        run: |
+          mkdir -p build/odm/result
+          name=reconstruction.topocentric.json
+          if [ "$MODE" = "gcp_strong" ]; then name=reconstruction.json; fi
+          python3 tools/bench/odm_reference.py evaluate \
+            --project build/odm/project --holdout build/odm/holdout.json \
+            --mode "$MODE" --reconstruction "$name" \
+            --out "build/odm/result/odm-$MODE-fold$FOLD.json"
+          cp build/odm/image-digest.txt build/odm/result/
+          # ODM's own control-point errors and the OpenSfM settings it used:
+          # numbers and configuration only, to check the triangulation above.
+          stats=build/odm/project/opensfm/stats/ground_control_points.json
+          if [ -f "$stats" ]; then cp "$stats" "build/odm/result/gcp-stats-$MODE-fold$FOLD.json"; fi
+          cp build/odm/project/opensfm/config.yaml "build/odm/result/opensfm-config-$MODE-fold$FOLD.yaml"
+          tail -n 200 build/odm/odm.log > "build/odm/result/odm-$MODE-fold$FOLD.log"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: odm-${{ matrix.mode }}-fold${{ matrix.fold }}
+          path: build/odm/result/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summary:
+    name: Summary
+    needs: fold
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: odm-*
+          path: build/odm/results
+          merge-multiple: true
+      - name: Summarize
+        run: |
+          python3 -m pip install --disable-pip-version-check numpy
+          shopt -s nullglob
+          results=(build/odm/results/odm-*-fold*.json)
+          if [ "${#results[@]}" -eq 0 ]; then
+            echo "::error::no fold produced a result"
+            exit 1
+          fi
+          python3 tools/bench/odm_reference.py summarize \
+            --out-json build/odm/summary.json --out-md build/odm/summary.md "${results[@]}"
+          cat build/odm/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: odm-reference-summary
+          path: |
+            build/odm/summary.json
+            build/odm/summary.md
+          retention-days: 90

@@ -1,15 +1,18 @@
 #include "common/algorithm/feature/detect_features_task.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <optional>
 #include <set>
+#include <vector>
 
 #if defined(ALPHASHAPE_HAVE_OPENMP)
 #include <omp.h>
 #endif
 
+#include "base/platform/memory.hpp"
 #include "base/utils/error.hpp"
 #include "common/algorithm/feature/dog_detector.hpp"
 #include "common/algorithm/feature/mldb_descriptor.hpp"
@@ -61,6 +64,34 @@ std::size_t keypoint_cap_from_limits(std::int64_t limit, std::int64_t per_mpx, i
 
 }  // namespace
 
+int detection_concurrency(int threads, double image_pixels, std::uint64_t budget_bytes) {
+    const int wanted = std::max(1, threads);
+    if (budget_bytes == 0 || !(image_pixels > 0.0)) {
+        return wanted;
+    }
+    const double per_image = image_pixels * kDetectionBytesPerPixel;
+    const double share = kDetectionBudgetShare * static_cast<double>(budget_bytes);
+    const double fitting = std::floor(share / per_image);
+    if (fitting >= static_cast<double>(wanted)) {
+        return wanted;
+    }
+    return std::max(1, static_cast<int>(fitting));
+}
+
+int detection_concurrency_for(const std::vector<const Frame*>& frames) {
+#if defined(ALPHASHAPE_HAVE_OPENMP)
+    const int threads = omp_get_max_threads();
+#else
+    const int threads = 1;
+#endif
+    double largest = 0.0;
+    for (const Frame* frame : frames) {
+        largest = std::max(largest, static_cast<double>(frame->width()) *
+                                        static_cast<double>(frame->height()));
+    }
+    return detection_concurrency(threads, largest, platform::memory_budget_bytes());
+}
+
 KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& chunk,
                                        const Frame& frame,
                                        std::int64_t keypoint_limit,
@@ -82,9 +113,20 @@ KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& ch
     }
     // Reads the raw scan for a digital camera and the film-normalised image for
     // a scanned film (WP-13.18b), so detection always sees pipeline pixels.
-    const Image image = load_camera_image(document, chunk, *camera);
+    // The decoded RGB is only needed for its luminance and size, so it is
+    // released before the scale space (the detection peak) is built.
+    int width = 0;
+    int height = 0;
+    FloatImage luminance;
+    {
+        const Image image = load_camera_image(document, chunk, *camera);
+        width = image.width();
+        height = image.height();
+        luminance = image.to_luminance();
+    }
     const DogDetector detector;
-    const ScaleSpace space = detector.build_scale_space(image.to_luminance());
+    const ScaleSpace space = detector.build_scale_space(luminance);
+    luminance = FloatImage();
     std::vector<Detection> detections = detector.detect(space);
 
     // Fiducial marks are at the same film position in every frame and would
@@ -138,7 +180,7 @@ KeypointSet detect_keypoints_for_frame(const Document& document, const Chunk& ch
         return a.keypoint.orientation < b.keypoint.orientation;
     });
     const std::size_t cap =
-        keypoint_cap_from_limits(keypoint_limit, keypoint_limit_per_mpx, image.width(), image.height());
+        keypoint_cap_from_limits(keypoint_limit, keypoint_limit_per_mpx, width, height);
     if (detections.size() > cap) detections.resize(cap);
 
     KeypointSet set;
@@ -180,20 +222,20 @@ void DetectFeaturesTask::apply(Document& document, Params& params, const Progres
     // workers below touch no callback at all: they only fill `results` and
     // `errors`. Progress is reported between batches, on the calling thread.
     // A batch is one thread's worth of frames, so each batch keeps all cores
-    // busy while a cancelled flag can be honoured at batch granularity.
-#if defined(ALPHASHAPE_HAVE_OPENMP)
-    const std::ptrdiff_t batch_size =
-        std::max<std::ptrdiff_t>(1, static_cast<std::ptrdiff_t>(omp_get_max_threads()));
-#else
-    const std::ptrdiff_t batch_size = 1;
-#endif
+    // busy while a cancelled flag can be honoured at batch granularity. Fewer
+    // threads run when that many images would not fit the memory budget.
+    std::vector<const Frame*> frame_list;
+    frame_list.reserve(frames.size());
+    for (const auto& frame : frames) frame_list.push_back(frame.get());
+    const int concurrency = detection_concurrency_for(frame_list);
+    const std::ptrdiff_t batch_size = concurrency;
 
     progress.update("detect", 0.0);
     std::ptrdiff_t processed = 0;
     while (processed < total) {
         const std::ptrdiff_t batch_end = std::min(total, processed + batch_size);
 #if defined(ALPHASHAPE_HAVE_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(concurrency)
 #endif
         for (std::ptrdiff_t i = processed; i < batch_end; ++i) {
             const auto idx = static_cast<std::size_t>(i);

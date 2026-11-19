@@ -204,14 +204,20 @@ void MatchPhotosTask::apply(Document& document, Params& params, const Progress& 
         const std::ptrdiff_t total = static_cast<std::ptrdiff_t>(detect_ids.size());
         std::vector<std::optional<KeypointSet>> results(detect_ids.size());
         std::vector<std::string> errors(detect_ids.size());
-        const std::ptrdiff_t batch = batch_size();
+        // Each detection holds a full scale space, so fewer images run at once
+        // when every thread's would not fit the memory budget.
+        std::vector<const Frame*> detect_frames;
+        detect_frames.reserve(detect_ids.size());
+        for (const std::int32_t id : detect_ids) detect_frames.push_back(frame_of.at(id));
+        const int concurrency = detection_concurrency_for(detect_frames);
+        const std::ptrdiff_t batch = concurrency;
         std::ptrdiff_t done = 0;
         // Workers touch no callback: progress/cancelled are user callbacks that
         // may throw, and nothing may unwind out of an OpenMP region.
         while (done < total) {
             const std::ptrdiff_t end = std::min(total, done + batch);
 #if defined(ALPHASHAPE_HAVE_OPENMP)
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(concurrency)
 #endif
             for (std::ptrdiff_t i = done; i < end; ++i) {
                 const std::int32_t id = detect_ids[static_cast<std::size_t>(i)];
