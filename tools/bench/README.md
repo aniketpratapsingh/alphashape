@@ -233,9 +233,12 @@ historical output and has no `repetitions` key.
 The GCP dataset's protocol does not insert `OptimizeCameras` — it always runs — so a
 dispatched `optimize_params=adaptive_fitting=true` selects its adaptive variants instead
 (`--adaptive-fitting`), and any other OptimizeCameras parameter is recorded but has no
-effect there. A repeated GCP run skips the manifest's report-only diagnostics (a dozen
+effect there. The pass/fail verdict reads `camera_rtk_engine_defaults` (camera RTK
+references plus the GCPs with the engine's own lens default, the configuration the
+product ships); `camera_rtk_gcps` pins the plain lens and is reported beside it as the
+reference row. A repeated GCP run skips the manifest's report-only diagnostics (a dozen
 extra leave-one-out variants): paying for them on every repetition would not fit the job
-ceiling, and the repeated comparison uses the two standard variants.
+ceiling, and the repeated comparison uses the three standard variants.
 
 `match_params` is the same input for `MatchPhotos`. It is how denser matching is measured
 against a dataset whose manifest caps `keypoint_limit_per_mpx` for the runner's memory:

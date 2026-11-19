@@ -144,6 +144,14 @@ class TestVariantOptions(unittest.TestCase):
         defaults = SCRIPT.optimize_options({"engine_defaults": True})
         self.assertEqual(defaults, {"use_gcps": True})
 
+    def test_engine_defaults_wins_over_an_explicit_adaptive_request(self):
+        # The gated variant must run exactly the shipped default: no fit_*
+        # permission set and no adaptive_fitting_auto override, even if a
+        # caller also names adaptive_fitting.
+        options = SCRIPT.optimize_options(
+            {"engine_defaults": True, "adaptive_fitting": True})
+        self.assertEqual(options, {"use_gcps": True})
+
     def test_doming_variants_are_registered(self):
         names = {name for name, _, _ in SCRIPT.DIAGNOSTIC_VARIANTS}
         for name in ("camera_rtk_k1234", "camera_rtk_f_fixed",
