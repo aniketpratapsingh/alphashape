@@ -151,26 +151,35 @@ class ProjectionTest(unittest.TestCase):
 class AcceptanceTest(unittest.TestCase):
     """The acceptance gate is what decides which observations are written."""
 
-    def test_a_corroborated_small_move_is_accepted(self):
-        # A 2 px move on a 20 px target radius, with a 1 px residual.
+    def test_a_detection_on_the_target_is_accepted(self):
+        # A target found 2 px from the projection, on a 20 px target radius,
+        # with a 1 px residual.
         self.assertTrue(eo.accept_observation(2.0, 20.0, 1.0))
 
-    def test_an_unmoved_projection_is_rejected(self):
-        # RefineMarkers leaves a projection exactly where it was measured when
-        # no target-specific refiner converged; that is not an observation.
-        self.assertFalse(eo.accept_observation(0.0, 20.0, 0.0))
+    def test_a_detection_at_the_projection_is_accepted(self):
+        # A detected target is already on the target, so a detection exactly at
+        # the projection (shift 0) is a valid observation.
+        self.assertTrue(eo.accept_observation(0.0, 20.0, 0.0))
 
-    def test_a_move_beyond_one_target_radius_is_rejected(self):
+    def test_a_detection_beyond_one_target_radius_is_rejected(self):
+        # More than a target radius away is more likely a neighbouring target.
         self.assertFalse(eo.accept_observation(25.0, 20.0, 1.0))
 
+    def test_a_detection_beyond_the_search_radius_is_rejected(self):
+        self.assertFalse(eo.accept_observation(50.0, 20.0, 1.0,
+                                               search_radius_px=40.0))
+
     def test_a_large_residual_is_rejected(self):
-        # The refinement moved onto a different target: the triangulated
-        # position reprojects far from the refined pixel.
+        # The detection is a different target: the triangulated position
+        # reprojects far from the detected pixel.
         self.assertFalse(eo.accept_observation(2.0, 20.0, 50.0))
 
-    def test_a_scale_less_view_uses_the_fixed_pixel_bound(self):
-        self.assertTrue(eo.accept_observation(3.0, 0.0, None))
-        self.assertFalse(eo.accept_observation(10.0, 0.0, None))
+    def test_a_scale_less_view_uses_the_search_radius(self):
+        # With no target scale, the search radius is the only bound.
+        self.assertTrue(eo.accept_observation(3.0, 0.0, None,
+                                              search_radius_px=40.0))
+        self.assertFalse(eo.accept_observation(50.0, 0.0, None,
+                                               search_radius_px=40.0))
 
     def test_a_non_finite_shift_is_rejected(self):
         self.assertFalse(eo.accept_observation(float("nan"), 20.0, 1.0))

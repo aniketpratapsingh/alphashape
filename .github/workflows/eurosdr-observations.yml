@@ -48,6 +48,14 @@ on:
         description: "Refine each marker against at most this many of its closest observers"
         type: string
         default: "16"
+      target_type:
+        description: "DetectMarkers target_type (the targets are plain 300 mm circles)"
+        type: string
+        default: "Circular"
+      search_radius_px:
+        description: "DetectMarkers maximum_residual: how far from the projection a target may be found"
+        type: string
+        default: "40"
       patch_size:
         description: "RefineMarkers patch_size"
         type: string
@@ -295,6 +303,8 @@ jobs:
           KEYPOINT_LIMIT: ${{ github.event.inputs.keypoint_limit_per_mpx }}
           MAX_IMAGES: ${{ github.event.inputs.max_images }}
           MAX_VIEWS: ${{ github.event.inputs.max_views }}
+          TARGET_TYPE: ${{ github.event.inputs.target_type }}
+          SEARCH_RADIUS_PX: ${{ github.event.inputs.search_radius_px }}
           PATCH_SIZE: ${{ github.event.inputs.patch_size }}
           MIN_CORRELATION: ${{ github.event.inputs.min_correlation }}
           SEARCH_STEPS: ${{ github.event.inputs.search_steps }}
@@ -311,6 +321,8 @@ jobs:
             --keypoint-limit "${KEYPOINT_LIMIT:-250}" \
             --max-images "${MAX_IMAGES:-0}" \
             --max-views "${MAX_VIEWS:-16}" \
+            --target-type "${TARGET_TYPE:-Circular}" \
+            --search-radius-px "${SEARCH_RADIUS_PX:-40}" \
             --patch-size "${PATCH_SIZE:-25}" \
             --min-correlation "${MIN_CORRELATION:-0.5}" \
             --search-steps "${SEARCH_STEPS:-10}" 2>&1 | tee build/bench/eurosdr/run.log
@@ -330,7 +342,7 @@ jobs:
           print(f"- views accepted: {data.get('views_accepted')} "
                 f"({(data.get('acceptance_rate') or 0.0) * 100:.1f}%)")
           print(f"- GCPs with >= 2 views: {data.get('gcps_with_min_views')} / {data.get('gcps')}")
-          print("\n| station | role | projected | accepted | mean shift px |")
+          print("\n| station | role | projected | accepted | mean detect shift px |")
           print("|---|---|---:|---:|---:|")
           for point in data.get("points", []):
               shift = point.get("mean_shift_px")
