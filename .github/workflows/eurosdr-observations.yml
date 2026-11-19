@@ -41,9 +41,13 @@ on:
         type: string
         default: "250"
       max_images:
-        description: "Cap the images with a stride that keeps the whole site covered (0 = all 430)"
+        description: "Cap the images with a stride (0 = all 430; a stride breaks the flight's overlap)"
         type: string
-        default: "215"
+        default: "0"
+      max_views:
+        description: "Refine each marker against at most this many of its closest observers"
+        type: string
+        default: "16"
       patch_size:
         description: "RefineMarkers patch_size"
         type: string
@@ -290,6 +294,7 @@ jobs:
           ALPHASHAPE_PYTHON: python3
           KEYPOINT_LIMIT: ${{ github.event.inputs.keypoint_limit_per_mpx }}
           MAX_IMAGES: ${{ github.event.inputs.max_images }}
+          MAX_VIEWS: ${{ github.event.inputs.max_views }}
           PATCH_SIZE: ${{ github.event.inputs.patch_size }}
           MIN_CORRELATION: ${{ github.event.inputs.min_correlation }}
           SEARCH_STEPS: ${{ github.event.inputs.search_steps }}
@@ -304,7 +309,8 @@ jobs:
             --gcp-list build/bench/eurosdr/gcp_list.txt \
             --summary build/bench/eurosdr/observations.json \
             --keypoint-limit "${KEYPOINT_LIMIT:-250}" \
-            --max-images "${MAX_IMAGES:-215}" \
+            --max-images "${MAX_IMAGES:-0}" \
+            --max-views "${MAX_VIEWS:-16}" \
             --patch-size "${PATCH_SIZE:-25}" \
             --min-correlation "${MIN_CORRELATION:-0.5}" \
             --search-steps "${SEARCH_STEPS:-10}" 2>&1 | tee build/bench/eurosdr/run.log

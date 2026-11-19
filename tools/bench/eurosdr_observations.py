@@ -58,18 +58,26 @@ import sys
 # terrestrial-laser datasets use, and it is what fits a 16 GB runner: the
 # gcp-rtk block (176 images) runs at 500, and 430 images at 500 is 2.4x that
 # block's keypoint load, which killed the runner out of memory on the first
-# measurement attempt. 250 halves it, and the strided image subset below halves
-# the image count again, so the block is smaller than gcp-rtk's.
+# measurement attempt. 250 halves it.
 DEFAULT_KEYPOINT_LIMIT_PER_MPX = 250
-# The flight is 430 images at 20 MP. Matching and aligning all of them is more
-# than a shared runner can hold, and the measurement does not need every frame:
-# it needs each of the 59 targets seen by enough cameras. A stride of 2 keeps
-# every other frame, which on a lawnmower flight leaves ~60% forward overlap
-# within a strip (enough to match) and every strip present (so the whole site,
-# and therefore every target, is still covered). A centroid cluster, which the
-# other datasets use, would cover only the middle of the quarry and miss the
-# edge targets, so a stride is the right selection here.
-DEFAULT_MAX_IMAGES = 215
+# Every image is aligned. A strided subset was tried first and rejected: taking
+# every other frame of a lawnmower flight halves the forward overlap, so only
+# 95 of 215 cameras registered and the datum came from 4 references at 0.23 m
+# RMS — a projection error of about 1.5 target radii, which the refinement
+# cannot reach. The whole flight registers ~95% of its frames and georeferences
+# from many more references, which is what puts the projections on the targets.
+# The memory that a strided subset was meant to save is instead bounded in the
+# refinement (see MAX_VIEWS_PER_MARKER), which is where the peak actually was.
+DEFAULT_MAX_IMAGES = 0
+# A target seen by every camera in the block does not need every view: the
+# multi-view consensus needs at least two corroborating views, and a dozen
+# well-spread ones are plenty. Refining a marker against ALL its observers is
+# what peaked at 11 GB — a marker seen by ~95 full-resolution 20 MP views is
+# ~15 GB, which the 1.5 GB view cache cannot evict below. Refining each marker
+# against its closest MAX_VIEWS_PER_MARKER observers (largest apparent target,
+# so the most pixels on the target) bounds one marker's working set to about
+# 16 x 80 MB = 1.3 GB, under the cache budget.
+MAX_VIEWS_PER_MARKER = 16
 # The targets are 300 mm circles with a 100 mm black centre. At a 1-2 cm GSD the
 # outer circle is 15-30 px across, so the search radius that must cover the
 # RTK-only alignment error plus a margin is a few tens of pixels. The projection
@@ -584,26 +592,49 @@ def project_stations(chunk, stations):
     return projections, per_point, calibrations, poses
 
 
+def select_refine_views(projections, limit):
+    """The ``limit`` observers of each station with the largest apparent target.
+
+    RefineMarkers holds every view of a marker in memory at once, so a marker
+    seen by ~95 full-resolution 20 MP cameras is ~15 GB and cannot be evicted
+    under the 1.5 GB view cache. The multi-view consensus needs only a handful
+    of corroborating views, so each marker is refined against its ``limit``
+    closest observers (largest apparent target radius, which is the most pixels
+    on the target and the least foreshortening). Returns a dict of the same
+    shape as ``projections`` with at most ``limit`` entries per station.
+    """
+    selected = {}
+    for label, views in projections.items():
+        ordered = sorted(views, key=lambda view: -view["target_radius_px"])
+        selected[label] = ordered[:limit]
+    return selected
+
+
 def refine_and_collect(chunk, stations, projections, per_point, refine_options,
-                       calibrations, poses):
+                       calibrations, poses, max_views):
     """Set the projections, refine them, and record the accepted observations.
 
-    The projections are written onto the markers, ``RefineMarkers`` is run over
-    every station, and each projection's movement is measured against the pixel
-    it was projected to. A projection is accepted when the refinement moved it
-    and the marker's triangulated position reprojects onto it; the accepted pixel
-    is the refined one.
+    Only the ``max_views`` closest observers of each station are written onto
+    the marker and refined (see :func:`select_refine_views`); the rest are
+    reported as visible but not refined. ``RefineMarkers`` is run over every
+    station, and each refined projection's movement is measured against the
+    pixel it was projected to. A projection is accepted when the refinement
+    moved it and the marker's triangulated position reprojects onto it; the
+    accepted pixel is the refined one.
 
     ``calibrations`` and ``poses`` map a camera label to its calibration dict and
     its 4x4 pose, so the residual of each refined projection against the
     triangulated marker position can be computed here without another engine
-    call. Returns ``(observations, per_point)`` where ``observations`` maps a
-    station label to the accepted ``{"image", "px", "py"}`` rows.
+    call. Returns ``(observations, per_point, refine_meta)`` where
+    ``observations`` maps a station label to the accepted ``{"image", "px",
+    "py"}`` rows and ``refine_meta`` is the engine's own ``refine_markers.*``
+    diagnostics, so a run that refines nothing explains itself.
     """
+    refine_views = select_refine_views(projections, max_views)
     before = {}
     for station in stations:
         label = station["label"]
-        for projection in projections.get(label, []):
+        for projection in refine_views.get(label, []):
             chunk.setMarkerProjection(label, projection["camera"],
                                       projection["px"], projection["py"])
             before[(label, projection["camera"])] = (projection["px"], projection["py"])
@@ -625,6 +656,8 @@ def refine_and_collect(chunk, stations, projections, per_point, refine_options,
             key = (label, record["image"])
             refined = after.get(key)
             if refined is None:
+                # Not one of the refined observers: reported as visible, not
+                # refined, so it is not an observation.
                 continue
             original = before.get(key)
             if original is None:
@@ -649,7 +682,9 @@ def refine_and_collect(chunk, stations, projections, per_point, refine_options,
                     "px": refined[0],
                     "py": refined[1],
                 })
-    return observations, per_point
+    refine_meta = {key: value for key, value in chunk.meta.items()
+                   if key.startswith("refine_markers.")}
+    return observations, per_point, refine_meta
 
 
 def log(message):
@@ -693,10 +728,11 @@ def run(args):
         "min_correlation": args.min_correlation,
         "search_steps": args.search_steps,
     }
-    log("[eurosdr] refining the projections onto the targets")
-    observations, per_point = refine_and_collect(
+    log(f"[eurosdr] refining the projections onto the targets "
+        f"(up to {args.max_views} views per marker)")
+    observations, per_point, refine_meta = refine_and_collect(
         chunk, stations, projections, per_point, refine_options,
-        calibrations, poses)
+        calibrations, poses, args.max_views)
     summary = summarise(stations, observations, per_point)
     summary["images"] = len(images)
     summary["images_available"] = len(available)
@@ -705,6 +741,8 @@ def run(args):
     summary["cameras_total"] = len(chunk.cameras)
     summary["keypoint_limit_per_mpx"] = args.keypoint_limit
     summary["refine_options"] = refine_options
+    summary["max_views_per_marker"] = args.max_views
+    summary["refine_meta"] = refine_meta
     summary["target_diameter_m"] = TARGET_DIAMETER_M
     summary["max_shift_target_radii"] = MAX_SHIFT_TARGET_RADII
 
@@ -737,7 +775,10 @@ def parse_args(argv):
                         help="MatchPhotos keypoint_limit_per_mpx (default 250)")
     parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES,
                         help="cap the images with a stride that keeps the whole "
-                             "site covered (default 215; 0 = every image)")
+                             "site covered (default 0 = every image)")
+    parser.add_argument("--max-views", type=int, default=MAX_VIEWS_PER_MARKER,
+                        help="refine each marker against at most this many of its "
+                             "closest observers (default 16)")
     parser.add_argument("--patch-size", type=int, default=25,
                         help="RefineMarkers patch_size (default 25)")
     parser.add_argument("--min-correlation", type=float, default=0.5,

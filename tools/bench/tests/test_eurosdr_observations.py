@@ -331,6 +331,37 @@ class SelectImagesTest(unittest.TestCase):
         self.assertEqual(stride, 1)
 
 
+class SelectRefineViewsTest(unittest.TestCase):
+    """Each marker is refined against its closest observers, not all of them."""
+
+    def test_keeps_the_largest_apparent_targets(self):
+        projections = {
+            "GA1": [
+                {"camera": "a", "px": 0.0, "py": 0.0, "target_radius_px": 5.0},
+                {"camera": "b", "px": 0.0, "py": 0.0, "target_radius_px": 20.0},
+                {"camera": "c", "px": 0.0, "py": 0.0, "target_radius_px": 12.0},
+            ],
+        }
+        selected = eo.select_refine_views(projections, 2)
+        cameras = [view["camera"] for view in selected["GA1"]]
+        self.assertEqual(cameras, ["b", "c"])
+
+    def test_a_marker_with_fewer_views_keeps_them_all(self):
+        projections = {
+            "GA1": [{"camera": "a", "px": 0.0, "py": 0.0, "target_radius_px": 5.0}],
+        }
+        selected = eo.select_refine_views(projections, 16)
+        self.assertEqual(len(selected["GA1"]), 1)
+
+    def test_every_station_is_present(self):
+        projections = {
+            "GA1": [{"camera": "a", "px": 0.0, "py": 0.0, "target_radius_px": 5.0}],
+            "A2": [{"camera": "b", "px": 0.0, "py": 0.0, "target_radius_px": 6.0}],
+        }
+        selected = eo.select_refine_views(projections, 16)
+        self.assertEqual(set(selected), {"GA1", "A2"})
+
+
 class XlsxReaderTest(unittest.TestCase):
     """The xlsx reader must take the ETRS89 ellipsoidal block, not OSGB36/ODN."""
 
