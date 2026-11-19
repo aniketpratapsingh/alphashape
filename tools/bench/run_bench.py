@@ -1682,6 +1682,26 @@ def run_gcp_validation(
     """
     available = collect_images(dataset, work)
     images_dir = available[0].parent
+    # `max_images` caps the block for a dataset whose full flight does not fit
+    # the weekly budget. The protocol reads a flat directory, so the subset is
+    # exposed as a directory of symlinks to the selected frames: the selection
+    # is the same nearest-to-centroid cluster the pipeline datasets use, and the
+    # protocol's own image list is then exactly that subset. A dataset with no
+    # cap (gcp-rtk) keeps the whole directory, unchanged.
+    limit = dataset.get("max_images")
+    if limit:
+        selected, selection = select_subset(available, limit)
+        if selection["mode"] != "all":
+            subset_dir = work / "images_subset"
+            subset_dir.mkdir(parents=True, exist_ok=True)
+            for path in selected:
+                link = subset_dir / path.name
+                if not link.exists():
+                    link.symlink_to(path.resolve())
+            images_dir = subset_dir
+            print(f"   {len(selected)} of {len(available)} images "
+                  f"({selection['mode']})")
+            print("   selected: " + ", ".join(selection["images"]))
     gcp_list = references.get("gcp_list")
     gcp_names = references.get("gcp_names")
     if not gcp_list or not gcp_names:
