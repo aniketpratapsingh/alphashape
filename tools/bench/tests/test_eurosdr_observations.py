@@ -163,7 +163,21 @@ class AcceptanceTest(unittest.TestCase):
 
     def test_a_detection_beyond_one_target_radius_is_rejected(self):
         # More than a target radius away is more likely a neighbouring target.
+        # This is the target-relative bound, which applies only when no search
+        # radius is supplied (a caller that projects accurately).
         self.assertFalse(eo.accept_observation(25.0, 20.0, 1.0))
+
+    def test_a_search_radius_supersedes_the_target_relative_bound(self):
+        # The RTK-only projection can sit ~16 px from the printed centre, which
+        # is more than one target radius (~10 px) but well inside the search
+        # radius. The search radius is the "right target" gate in that case: the
+        # neighbouring target is thousands of pixels away, so a detection inside
+        # the radius is unambiguously this station.
+        self.assertTrue(eo.accept_observation(16.0, 10.0, None,
+                                              search_radius_px=40.0))
+        # Beyond the search radius it is still rejected.
+        self.assertFalse(eo.accept_observation(45.0, 10.0, None,
+                                               search_radius_px=40.0))
 
     def test_a_detection_beyond_the_search_radius_is_rejected(self):
         self.assertFalse(eo.accept_observation(50.0, 20.0, 1.0,
@@ -340,6 +354,24 @@ class SelectImagesTest(unittest.TestCase):
         self.assertEqual(stride, 1)
 
 
+class DefaultsTest(unittest.TestCase):
+    """The detection defaults must suit the printed target, not a coded ring."""
+
+    def test_detection_runs_at_full_resolution(self):
+        # The 100 mm black centre is ~3.3 px radius at the 1.5 cm GSD. The auto
+        # downscale of 2 halves it below the detector's 3 px floor, so the
+        # default must force full resolution.
+        self.assertEqual(eo.DEFAULT_MARKER_DOWNSCALE, 1)
+
+    def test_the_minimum_target_admits_the_black_centre(self):
+        # The black centre is ~3.3 px radius; a floor above that rejects it.
+        self.assertLessEqual(eo.DEFAULT_MINIMUM_TARGET_PX, 3.0)
+
+    def test_the_target_is_the_plain_circle(self):
+        # The publisher printed plain 300 mm disks, not coded rings.
+        self.assertEqual(eo.DEFAULT_TARGET_TYPE, "Circular")
+
+
 class SelectRefineViewsTest(unittest.TestCase):
     """Each marker is refined against its closest observers, not all of them."""
 
@@ -373,6 +405,16 @@ class SelectRefineViewsTest(unittest.TestCase):
 
 class XlsxReaderTest(unittest.TestCase):
     """The xlsx reader must take the ETRS89 ellipsoidal block, not OSGB36/ODN."""
+
+    def setUp(self):
+        # openpyxl is a benchmark-only dependency: the measurement workflow
+        # installs it, but the Plan job's unit-test step runs on the stdlib +
+        # numpy alone. Skip rather than error, exactly as the rasterio tests in
+        # test_metrics.py do, so a missing optional reader never fails the plan.
+        try:
+            import openpyxl  # noqa: F401, PLC0415
+        except ImportError:  # pragma: no cover - openpyxl is in the workflow
+            self.skipTest("openpyxl is not installed")
 
     def write_workbook(self, directory, rows):
         import openpyxl  # noqa: PLC0415 - test-only dependency

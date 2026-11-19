@@ -56,6 +56,14 @@ on:
         description: "DetectMarkers maximum_residual: how far from the projection a target may be found"
         type: string
         default: "40"
+      minimum_target_px:
+        description: "DetectMarkers minimum_size: smallest target radius in pixels"
+        type: string
+        default: "2"
+      marker_downscale:
+        description: "DetectMarkers marker_downscale (1 = full resolution; 0 = auto)"
+        type: string
+        default: "1"
       patch_size:
         description: "RefineMarkers patch_size"
         type: string
@@ -305,6 +313,8 @@ jobs:
           MAX_VIEWS: ${{ github.event.inputs.max_views }}
           TARGET_TYPE: ${{ github.event.inputs.target_type }}
           SEARCH_RADIUS_PX: ${{ github.event.inputs.search_radius_px }}
+          MINIMUM_TARGET_PX: ${{ github.event.inputs.minimum_target_px }}
+          MARKER_DOWNSCALE: ${{ github.event.inputs.marker_downscale }}
           PATCH_SIZE: ${{ github.event.inputs.patch_size }}
           MIN_CORRELATION: ${{ github.event.inputs.min_correlation }}
           SEARCH_STEPS: ${{ github.event.inputs.search_steps }}
@@ -323,6 +333,8 @@ jobs:
             --max-views "${MAX_VIEWS:-16}" \
             --target-type "${TARGET_TYPE:-Circular}" \
             --search-radius-px "${SEARCH_RADIUS_PX:-40}" \
+            --minimum-target-px "${MINIMUM_TARGET_PX:-2}" \
+            --marker-downscale "${MARKER_DOWNSCALE:-1}" \
             --patch-size "${PATCH_SIZE:-25}" \
             --min-correlation "${MIN_CORRELATION:-0.5}" \
             --search-steps "${SEARCH_STEPS:-10}" 2>&1 | tee build/bench/eurosdr/run.log

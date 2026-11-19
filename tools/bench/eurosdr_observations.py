@@ -87,17 +87,30 @@ DEFAULT_TARGET_TYPE = "Circular"
 # 1.5 cm GSD is ~16 px; 40 px covers the worst camera plus a mis-projection,
 # and is still far smaller than the spacing between targets (tens of metres).
 DEFAULT_SEARCH_RADIUS_PX = 40.0
-# The smallest target radius DetectMarkers accepts, in pixels. A 300 mm target
-# at a 1.5 cm GSD is ~10 px radius; 4 px admits the oblique edge of the frame
-# without admitting ground texture.
-DEFAULT_MINIMUM_TARGET_PX = 4.0
-# The targets are 300 mm circles with a 100 mm black centre. At a 1-2 cm GSD the
-# outer circle is 15-30 px across, so the search radius that must cover the
-# RTK-only alignment error plus a margin is a few tens of pixels. The projection
-# is the RTK-aligned guess; the refinement moves it by at most half the apparent
-# target radius (or six full-resolution pixels, whichever is larger), so a
-# projection that lands within a target radius of the true centre is refined and
-# one that lands further is rejected rather than dragged across the image.
+# The smallest target radius DetectMarkers accepts, in pixels. The P4 RTK flew
+# at 55 m AGL with an 8.8 mm lens and 2.41 um pixels, so the GSD is ~1.5 cm: the
+# 100 mm black centre is ~3.3 px radius and the 300 mm disk ~10 px. The black
+# centre is the pointing fiducial and the detector's dark-blob floor is 3 px, so
+# 2 px admits it (and the oblique edge of the frame) without admitting ground
+# texture. A larger floor (the first attempt used 4) rejects the centre outright.
+DEFAULT_MINIMUM_TARGET_PX = 2.0
+# DetectMarkers runs its blob search on a downscaled copy when the image is
+# large: 0 selects the smallest integer d with long_side / d <= 4096, which is
+# 2 for a 5472 px frame. That halves the 3.3 px black centre to 1.65 px, below
+# the detector's 3 px floor, so the target is never found. 1 forces full
+# resolution, where the centre is detectable. The cost is ~4x the detection
+# time (the Hessian pyramid runs on 4x the pixels), which the 350 min budget
+# absorbs; the memory is unchanged because a >8 MP camera is already processed
+# one at a time.
+DEFAULT_MARKER_DOWNSCALE = 1
+# The targets are 300 mm circles with a 100 mm black centre. At a 1.5 cm GSD the
+# outer circle is ~20 px across and the black centre ~6.7 px, so the search
+# radius that must cover the RTK-only alignment error plus a margin is a few
+# tens of pixels. The projection is the RTK-aligned guess; the refinement moves
+# it by at most half the apparent target radius (or six full-resolution pixels,
+# whichever is larger), so a projection that lands within a target radius of the
+# true centre is refined and one that lands further is rejected rather than
+# dragged across the image.
 TARGET_DIAMETER_M = 0.30
 TARGET_CENTRE_DIAMETER_M = 0.10
 # A refinement is accepted when the projection moved by no more than this many
@@ -347,28 +360,36 @@ def accept_observation(detect_shift_px, target_radius_px, residual_px=None,
 
     The pixel is a target DetectMarkers FOUND near the projection, so the
     question is not "did the refinement move it" (a detected target is already
-    on the target) but "is this the right target". Three conditions, each of
-    which a wrong detection fails:
+    on the target) but "is this the right target". The conditions, each of which
+    a wrong detection fails:
 
-    * the detection is within the search radius of the projection. DetectMarkers
-      already enforces this, but the gate is repeated here so a caller that
-      widens the radius cannot silently accept a detection from across the
-      image. When no radius is supplied the check is skipped.
-    * the detection is no farther than ``MAX_SHIFT_TARGET_RADII`` target radii
-      from the projection. This is the tighter, target-relative bound: a
-      detection more than a target radius away is more likely a neighbouring
-      target than the one the projection predicted. A target radius of zero (no
-      scale) falls back to the search radius alone.
-    * when a residual is supplied, the marker's triangulated position reprojects
-      within ``max(MIN_RESIDUAL_PX, 0.5 * target_radius_px)`` of the detected
-      pixel. A detection that is a different target is an outlier of the
-      triangulation and its residual is large.
+    * the detection is not farther from the projection than the search radius
+      that was used to find it. When a search radius is supplied it is the
+      "right target" gate: the projection is a coarse RTK-only guess that can
+      sit ~16 px (0.24 m at 1.5 cm GSD) from the printed centre, while the
+      neighbouring target is tens of metres (thousands of pixels) away, so any
+      detection inside the search radius is unambiguously THIS station. The
+      target-relative bound below is then NOT applied, because it would reject
+      the very offset the coarse georeference produces.
+    * when no search radius is supplied, the detection is no farther than
+      ``MAX_SHIFT_TARGET_RADII`` target radii from the projection. This is the
+      tighter, target-relative bound for a caller that projects accurately. A
+      target radius of zero (no scale) falls back to the search radius alone.
+    * when a residual is supplied, the marker's TRIANGULATED position (which
+      the refinement writes back) reprojects within
+      ``max(MIN_RESIDUAL_PX, 0.5 * target_radius_px)`` of the detected pixel. A
+      detection that is a different target is an outlier of the triangulation
+      and its residual is large. Before the refinement triangulates, the marker
+      still carries the surveyed reference, whose residual is the block's own
+      georeference error (~16 px), so the caller passes the residual only once
+      the position is the triangulated one — see :func:`refine_and_collect`.
     """
     if not math.isfinite(detect_shift_px) or detect_shift_px < 0.0:
         return False
-    if search_radius_px is not None and detect_shift_px > search_radius_px:
-        return False
-    if target_radius_px > 0.0:
+    if search_radius_px is not None:
+        if detect_shift_px > search_radius_px:
+            return False
+    elif target_radius_px > 0.0:
         if detect_shift_px > MAX_SHIFT_TARGET_RADII * target_radius_px:
             return False
     if residual_px is not None:
@@ -701,16 +722,27 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     """Refine the DETECTED projections and record the accepted observations.
 
     The detected projections are already on the targets (DetectMarkers found
-    them), so the refinement here is the multi-view consensus that snaps each
-    one onto the printed centre and rejects a detection that refined onto a
-    different target. Only the ``max_views`` closest observers of each station
-    are refined (see :func:`select_refine_views`); the rest are reported as
-    detected but not refined.
+    them and fitted each centre at full resolution), so the detected pixel is a
+    valid measurement on its own. The refinement here adds the multi-view
+    consensus: it snaps each projection onto the printed centre and, when it
+    succeeds, triangulates the marker and writes that position back. Only the
+    ``max_views`` closest observers of each station are refined (see
+    :func:`select_refine_views`); the rest are reported as detected but not
+    refined.
 
-    A projection is accepted when the refinement moved it (a corroborated
-    sub-pixel correction) and the marker's triangulated position reprojects onto
-    it. ``calibrations`` and ``poses`` map a camera label to its calibration
-    dict and 4x4 pose, so the residual of each refined projection against the
+    A detection is accepted when it is within the search radius of the
+    projection (the "right target" gate: the neighbouring target is thousands of
+    pixels away). When the refinement TRIANGULATED the marker, the residual of
+    the triangulated position against the detected pixel is also required to be
+    small — a detection that is a different target is an outlier of the
+    triangulation. A marker the refinement could not triangulate (no consensus,
+    or too few views) keeps its surveyed reference as ``position``; the residual
+    against that reference is the block's own georeference error (~16 px), which
+    is NOT a wrong-target signal, so the residual gate is skipped for it and the
+    detected pixel is written as measured.
+
+    ``calibrations`` and ``poses`` map a camera label to its calibration dict
+    and 4x4 pose, so the residual of each refined projection against the
     triangulated marker position is computed here without another engine call.
     Returns ``(observations, per_point, refine_meta)`` where ``observations``
     maps a station label to the accepted ``{"image", "px", "py"}`` rows and
@@ -718,6 +750,9 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     """
     refine_views = select_refine_views(detected, max_views)
     before = {}
+    positions_before = {}
+    for marker in chunk.markers:
+        positions_before[marker.label] = marker.position
     for station in stations:
         label = station["label"]
         for projection in refine_views.get(label, []):
@@ -730,14 +765,23 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     for marker in chunk.markers:
         for projection in marker.projections:
             after[(marker.label, projection.camera.label)] = projection.pixel
-    # The triangulated marker position, for the residual gate. A marker with no
-    # position (fewer than two usable views) has no residual to check, so its
-    # projections are accepted on the shift gate alone.
-    positions = {marker.label: marker.position for marker in chunk.markers}
+    # A marker the refinement triangulated has a NEW position; one it could not
+    # keeps the surveyed reference it was given. Only the former's residual is a
+    # wrong-target signal (see the docstring).
+    positions = {}
+    triangulated = {}
+    for marker in chunk.markers:
+        positions[marker.label] = marker.position
+        old = positions_before.get(marker.label)
+        new = marker.position
+        triangulated[marker.label] = (
+            new is not None and (old is None or
+                                 math.dist(old, new) > 1e-6))
     observations = {}
     for station in stations:
         label = station["label"]
         position = positions.get(label)
+        was_triangulated = triangulated.get(label, False)
         for record in per_point.get(label, []):
             key = (label, record["image"])
             refined = after.get(key)
@@ -752,7 +796,7 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
                                       refined[1] - original[1])
             record["refine_shift_px"] = refine_shift
             residual = None
-            if position is not None:
+            if was_triangulated and position is not None:
                 calibration = calibrations.get(record["image"])
                 pose = poses.get(record["image"])
                 if calibration is not None and pose is not None:
@@ -774,6 +818,8 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
                     "px": refined[0],
                     "py": refined[1],
                 })
+    # `chunk.meta` is already a dict (the binding materialises it), so iterate
+    # its items directly; `.items` on the dict would be the method object.
     refine_meta = {key: value for key, value in chunk.meta.items()
                    if key.startswith("refine_markers.")}
     return observations, per_point, refine_meta
@@ -820,14 +866,18 @@ def run(args):
     # must cover the RTK-only alignment error plus a margin: the georeference
     # fits a handful of references at ~0.24 m RMS, which at a 1.5 cm GSD is
     # ~16 px, so 40 px leaves room for the worst camera and a mis-projection.
+    # marker_downscale=1 forces full-resolution detection: the auto factor of 2
+    # halves the 3.3 px black centre below the detector's 3 px floor.
     detect_options = {
         "target_type": args.target_type,
         "maximum_residual": args.search_radius_px,
         "create_markers": False,
         "minimum_size": args.minimum_target_px,
+        "marker_downscale": args.marker_downscale,
     }
     log(f"[eurosdr] detecting {args.target_type} targets within "
-        f"{args.search_radius_px} px of each projection")
+        f"{args.search_radius_px} px of each projection "
+        f"(downscale {args.marker_downscale or 'auto'})")
     detected, per_point = detect_targets(
         chunk, stations, projections, per_point, detect_options)
     log(f"[eurosdr] detected {sum(len(v) for v in detected.values())} targets "
@@ -858,8 +908,9 @@ def run(args):
     # references the similarity fit used, and its RMS) are in the artifact. A
     # run that refines nothing is usually a georeference problem — the
     # projections land beyond the refinement's reach — and this is the number
-    # that says so.
-    summary["chunk_meta"] = dict(chunk.meta.items)
+    # that says so. `chunk.meta` is already a dict (the binding materialises
+    # it), so it is copied directly; `.items` here would be the dict method.
+    summary["chunk_meta"] = dict(chunk.meta)
     summary["target_diameter_m"] = TARGET_DIAMETER_M
     summary["max_shift_target_radii"] = MAX_SHIFT_TARGET_RADII
 
@@ -906,7 +957,12 @@ def parse_args(argv):
     parser.add_argument("--minimum-target-px", type=float,
                         default=DEFAULT_MINIMUM_TARGET_PX,
                         help="DetectMarkers minimum_size: smallest target radius "
-                             "in pixels (default 4)")
+                             "in pixels (default 2)")
+    parser.add_argument("--marker-downscale", type=int,
+                        default=DEFAULT_MARKER_DOWNSCALE,
+                        help="DetectMarkers marker_downscale (default 1 = full "
+                             "resolution; 0 = auto, which halves the black centre "
+                             "below the detector's floor)")
     parser.add_argument("--patch-size", type=int, default=25,
                         help="RefineMarkers patch_size (default 25)")
     parser.add_argument("--min-correlation", type=float, default=0.5,
